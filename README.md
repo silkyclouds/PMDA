@@ -2,6 +2,13 @@
   <img src="/static/PMDA.png" alt="PMDA Logo" width="450"/>
 </p>
 
+<p align="center">
+  <a href="https://discord.gg/9eEAvvZW">
+    👉 Join us on Discord — let's improve this thing together!
+  </a>
+</p>
+
+
 # PMDA – Plex Music Dedupe Assistant
 
 You know that special moment when you search for an album in Plex... and find **five versions** of it? Same title. Different folders. Possibly different formats. Mostly just chaos.
