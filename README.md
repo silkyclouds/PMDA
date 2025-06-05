@@ -93,14 +93,28 @@ requests>=2.25
 
 Update the values for:
 
-- `plex_db_file`
-- `plex_token`
-- `plex_host`
-- `library_section_id`
-- `path_map`
-- `dupe_root`
-- `stats_file`
-- `webui_port`
+- `plex_db_file`: Full path to your `com.plexapp.plugins.library.db` file. On Unraid or Dockerized Plex, this might look like `/mnt/user/appdata/plex/Library/Application Support/Plex Media Server/Plug-in Support/Databases/com.plexapp.plugins.library.db`.
+
+- `plex_token`: Your Plex token. You can find it [by following these steps](https://support.plex.tv/articles/204059436-finding-an-authentication-token-x-plex-token/).
+
+- `plex_host`: The full URL to access your Plex server. For example: `http://192.168.1.50:32400`.
+
+- `library_section_id`: The section ID for your music library. You can find it by inspecting the URL when browsing your music in Plex: `.../library/sections/5/...` → your ID is `5`.
+
+- `path_map`: A dictionary mapping internal Plex paths to actual filesystem paths. For example:
+  ```json
+  {
+    "/data/music": "/mnt/user/Music"
+  }
+  ```
+
+- `dupe_root`: Where the script should move detected duplicates. It must exist and be writable. Example: `/mnt/user/Music/Plex_dupes`.
+
+- `stats_file`: A JSON file where stats about deduplication runs will be stored. Example: `/mnt/user/appdata/plex_dedupe/stats.json`.
+
+- `webui_port`: The port where you want to expose the Web UI. Default is `5005`.
+
+Make sure all these paths exist and are accessible to your Python script!
 
 ---
 
