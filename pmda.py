@@ -3,13 +3,12 @@
 """
 plex_dedupe_robust_webui.py
 
-A Flask-based Web UI for scanning and deduplicating duplicate albums in Plex Music.
+A Flask-based Web UI (and CLI) for scanning and deduplicating duplicate albums in Plex Music.
 Handles special characters (slashes, etc.) in album titles by using numeric album_id,
-and ensures covers appear in the “Moved Duplicates” modal by fetching them as Base64
-data URIs before deleting metadata.
+ensures covers appear in the “Moved Duplicates” modal by fetching them as Base64 data URIs,
+and now compares true audio quality (bitrate, sample rate, bit depth) via ffprobe to pick the best edition.
 
-Additionally, if run without --serve, it behaves as the original CLI script,
-accepting --dry-run, --safe-mode, --tag-extra, --verbose etc. to dedupe from console.
+If run without --serve, behaves as the original CLI script (with --dry-run, --safe-mode, --tag-extra, --verbose).
 """
 
 import argparse
@@ -33,7 +32,7 @@ from flask import Flask, render_template_string, request, jsonify
 
 # ───────────────────────────────── CONFIGURATION LOADING ─────────────────────────────────
 #
-# We load the JSON config file at startup.  If the file is missing or malformed, we exit.
+# We load the JSON config file at startup. If the file is missing or malformed, we exit.
 #
 CONFIG_PATH = Path(__file__).parent / "config.json"
 if not CONFIG_PATH.exists():
@@ -45,7 +44,7 @@ with open(CONFIG_PATH, "r", encoding="utf-8") as f:
 # Mandatory keys in config.json:
 required_keys = [
     "PLEX_DB_FILE", "PLEX_HOST", "PLEX_TOKEN",
-    "SECTION_ID", "PATH_MAP", "DUPE_ROOT", "STATS_FILE"
+    "SECTION_ID", "PATH_MAP", "DUPE_ROOT", "STATS_FILE", "WEBUI_PORT"
 ]
 for key in required_keys:
     if key not in conf:
@@ -63,6 +62,7 @@ PATH_MAP = {str(k): str(v) for k, v in conf["PATH_MAP"].items()}
 # DUPE_ROOT and STATS_FILE are paths on disk; wrap them in pathlib.Path
 DUPE_ROOT  = Path(conf["DUPE_ROOT"])
 STATS_FILE = Path(conf["STATS_FILE"])
+WEBUI_PORT = int(conf["WEBUI_PORT"])
 
 # Validate that DUPE_ROOT and STATS_FILE parent folder exist (or create them)
 DUPE_ROOT.mkdir(parents=True, exist_ok=True)
@@ -70,6 +70,7 @@ STATS_FILE.parent.mkdir(parents=True, exist_ok=True)
 
 # ───────────────────────────────── OTHER CONSTANTS ──────────────────────────────────
 AUDIO_RE    = re.compile(r"\.(flac|ape|alac|wav|m4a|aac|mp3|ogg)$", re.I)
+# Base format score simply by container type
 FMT_SCORE   = {'flac': 3, 'ape': 3, 'alac': 3, 'wav': 3, 'm4a': 2, 'aac': 2, 'mp3': 1, 'ogg': 1}
 OVERLAP_MIN = 0.85  # 85% track-title overlap minimum
 
@@ -108,17 +109,30 @@ def save_stats():
 
 # ───────────────────────────────── UTILITIES ──────────────────────────────────
 def plex_api(path: str, method: str = "GET", **kw):
+    """
+    Envoie une requête HTTP à Plex, en ajoutant automatiquement le token.
+    """
     headers = kw.pop("headers", {})
     headers["X-Plex-Token"] = PLEX_TOKEN
     return requests.request(method, f"{PLEX_HOST}{path}", headers=headers, timeout=60, **kw)
 
 def container_to_host(p: str) -> Path | None:
-    for pre, real in PATH_MAP.items():
+    """
+    Traduit un chemin « container » (tel que Plex le stocke dans la DB) en chemin hôte.
+    On parcourt PATH_MAP par ordre de clés triées par longueur décroissante,
+    afin de remplacer le plus long préfixe correspondant au début de p.
+    """
+    for pre in sorted(PATH_MAP.keys(), key=lambda k: len(k), reverse=True):
         if p.startswith(pre):
+            real = PATH_MAP[pre]
             return Path(real) / p[len(pre):].lstrip("/")
     return None
 
 def folder_size(p: Path) -> int:
+    """
+    Calcule la taille (en octets) d'un dossier (récursivement), en additionnant
+    la taille de tous les fichiers qu'il contient.
+    """
     return sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
 
 def score_format(ext: str) -> int:
@@ -126,20 +140,70 @@ def score_format(ext: str) -> int:
 
 def norm_album(title: str) -> str:
     """
-    Strip trailing parenthetical, lowercase, and trim.
-    e.g. "Album Name (Special Edition)" → "album name"
+    Normalise un titre d'album :
+    - Supprime tout parenthésé à la fin
+    - Met en minuscules et épure les espaces
+    Exemple: "Album Name (Special Edition)" → "album name"
     """
     return re.sub(r"\s*\([^)]*\)\s*$", "", title, flags=re.I).strip().lower()
 
 def get_primary_format(folder: Path) -> str:
+    """
+    Retourne l'extension (en majuscules) du premier fichier audio trouvé sous folder.
+    Exemple: "FLAC", "MP3", etc. Si rien n'est trouvé, renvoie "UNKNOWN".
+    """
     for f in folder.rglob("*"):
         if AUDIO_RE.search(f.name):
             return f.suffix[1:].upper()
     return "UNKNOWN"
 
 def thumb_url(album_id: int) -> str:
-    # Thumb endpoint for a given metadata item
+    """
+    Construit l'URL pour récupérer la jaquette (thumbnail) d'un album via l'API Plex.
+    """
     return f"{PLEX_HOST}/library/metadata/{album_id}/thumb?X-Plex-Token={PLEX_TOKEN}"
+
+def analyse_format(folder: Path) -> tuple[int, int, int, int]:
+    """
+    Pour un dossier d'album donné (chemin hôte), cherche le premier fichier audio trouvé
+    et exécute ffprobe pour récupérer :
+      - quality_score (d'après l'extension)
+      - bitrate (en bits/s)
+      - sample_rate (en Hz)
+      - bit_depth (bits par échantillon, si disponible)
+    Renvoie : (score_format, bitrate, sample_rate, bit_depth)
+
+    Exemple de sortie : (3, 1411200, 44100, 16)
+    où :
+      - 3 = flac dans FMT_SCORE
+      - 1411200 bits/s (soit ~1411 kbps pour un flac 44.1 kHz)
+      - 44100 Hz
+      - 16 bits par échantillon
+    """
+    AUDIO_RE_LOCAL = re.compile(r"\.(flac|ape|alac|wav|m4a|aac|mp3|ogg)$", re.I)
+    for f in folder.rglob("*"):
+        if AUDIO_RE_LOCAL.search(f.name):
+            ext = f.suffix[1:].lower()
+            score = score_format(ext)
+            # Utilisation de ffprobe pour extraire les infos
+            cmd = [
+                "ffprobe",
+                "-v", "error",
+                "-select_streams", "a:0",
+                "-show_entries", "stream=bit_rate,sample_rate,bits_per_raw_sample",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(f)
+            ]
+            try:
+                output = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, text=True, timeout=10)
+                lines = [line.strip() for line in output.splitlines() if line.strip()]
+                bitrate = int(lines[0]) if len(lines) >= 1 and lines[0].isdigit() else 0
+                sample_rate = int(lines[1]) if len(lines) >= 2 and lines[1].isdigit() else 0
+                bit_depth = int(lines[2]) if len(lines) >= 3 and lines[2].isdigit() else 0
+                return (score, bitrate, sample_rate, bit_depth)
+            except Exception:
+                return (score, 0, 0, 0)
+    return (0, 0, 0, 0)
 
 # ───────────────────────────────── DATABASE HELPERS ──────────────────────────────────
 class Track(NamedTuple):
@@ -180,29 +244,13 @@ def first_part_path(db, album_id: int) -> Path | None:
     r = db.execute(sql, (album_id,)).fetchone()
     return container_to_host(r[0]).parent if r and container_to_host(r[0]) else None
 
-def analyse_format(folder: Path) -> tuple[int, int, int]:
-    for f in folder.rglob("*"):
-        if AUDIO_RE.search(f.name):
-            ext = f.suffix[1:]
-            try:
-                mi = json.loads(subprocess.check_output(
-                    ["mediainfo", "--Output=JSON", str(f)], text=True, timeout=10
-                ))
-                tr = mi["media"]["track"][0]
-                return (
-                    score_format(ext),
-                    int(tr.get("BitRate", 0)),
-                    int(tr.get("SamplingRate", 0))
-                )
-            except Exception:
-                return (score_format(ext), 0, 0)
-    return (0, 0, 0)
-
 # ───────────────────────────────── DUPLICATE DETECTION ─────────────────────────────────
 def signature(tracks: List[Track]) -> tuple:
     """
-    Include track duration so that two albums with identical titles but
-    different durations are NOT grouped. Each tuple is (disc, idx, title, dur).
+    Inclut la durée dans la signature, de sorte que deux albums
+    qui ont le même titre/ordre de pistes mais des durées différentes
+    ne soient pas groupés comme dupes.
+    Tuple de (disc, idx, title, dur).
     """
     return tuple(sorted((t.disc, t.idx, t.title, t.dur) for t in tracks))
 
@@ -210,12 +258,24 @@ def overlap(a: set, b: set) -> float:
     return len(a & b) / max(len(a), len(b))
 
 def choose_best(editions: List[dict]) -> dict:
-    # Compare by (fmt, bitrate, samplerate, fewer discs, longer total dur)
+    """
+    Compare selon :
+      - fmt (score container)
+      - bitrate (br)
+      - sample_rate (sr)
+      - bit_depth (bd)
+      - fewer discs
+      - plus longue durée totale
+    """
     return max(
         editions,
         key=lambda e: (
-            e['fmt'], e['br'], e['sr'],
-            -e['discs'], e['dur']
+            e['fmt'],
+            e['br'],
+            e['sr'],
+            e['bd'],
+            -e['discs'],
+            e['dur']
         )
     )
 
@@ -228,7 +288,7 @@ def scan_duplicates(db, artist: str, album_ids: List[int]) -> List[dict]:
         folder = first_part_path(db, aid)
         if not folder:
             continue
-        fmt, br, sr = analyse_format(folder)
+        fmt, br, sr, bd = analyse_format(folder)
         editions.append({
             'album_id': aid,
             'title_raw': album_title(db, aid),
@@ -238,11 +298,14 @@ def scan_duplicates(db, artist: str, album_ids: List[int]) -> List[dict]:
             'sig': signature(tr),
             'titles': {t.title for t in tr},
             'dur': sum(t.dur for t in tr),
-            'fmt': fmt, 'br': br, 'sr': sr,
+            'fmt': fmt,
+            'br': br,
+            'sr': sr,
+            'bd': bd,
             'discs': len({t.disc for t in tr})
         })
 
-    # Group by (normalized title, signature) to detect duplicates
+    # Group by (normalized title, signature) to détecter les dupes
     groups = defaultdict(list)
     for e in editions:
         groups[(e['album_norm'], e['sig'])].append(e)
@@ -251,7 +314,7 @@ def scan_duplicates(db, artist: str, album_ids: List[int]) -> List[dict]:
     for (alb_norm, _), ed_list in groups.items():
         if len(ed_list) < 2:
             continue
-        # Check 85%+ overlap on track titles to skip real box-sets
+        # Skip real box-set si moins de 85% d'overlap sur titres
         common = set.intersection(*(e['titles'] for e in ed_list))
         if not all(overlap(common, e['titles']) >= OVERLAP_MIN for e in ed_list):
             continue
@@ -283,24 +346,25 @@ def perform_dedupe(group: dict) -> List[dict]:
     """
     Moves each “loser” folder to DUPE_ROOT, deletes metadata via Plex API,
     and returns a list of moved-item dicts:
-      [ { thumb_data, artist, title_raw, size, fmt }, … ]
+      [ { thumb_data, artist, title_raw, size, fmt, br, sr, bd }, … ]
     """
     moved = []
     best = group['best']
     artist = group['artist']
     for e in group['losers']:
-        # 1) Fetch the cover image as Base64 BEFORE deleting
+        # 1) Fetch cover as Base64 BEFORE deleting metadata
         thumb_data = fetch_cover_as_base64(e['album_id'])
         try:
-            # 2) Move folder on disk
             if e['folder'].exists() and not e['folder'].samefile(best['folder']):
                 dst = DUPE_ROOT / e['folder'].relative_to(next(iter(PATH_MAP.values())))
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 size_mb = folder_size(e['folder']) // (1024 * 1024)
                 fmt_txt = get_primary_format(e['folder'])
+                br_txt = e['br']
+                sr_txt = e['sr']
+                bd_txt = e['bd']
                 shutil.move(str(e['folder']), str(dst))
 
-                # 3) Delete metadata in Plex
                 plex_api(f"/library/metadata/{e['album_id']}/trash", method="PUT")
                 time.sleep(0.3)
                 plex_api(f"/library/metadata/{e['album_id']}", method="DELETE")
@@ -310,20 +374,25 @@ def perform_dedupe(group: dict) -> List[dict]:
                     'artist': artist,
                     'title_raw': e['title_raw'],
                     'size': size_mb,
-                    'fmt': fmt_txt
+                    'fmt': fmt_txt,
+                    'br': br_txt,
+                    'sr': sr_txt,
+                    'bd': bd_txt
                 })
             else:
-                # If folder is missing or same as best, just delete metadata
+                # Si le dossier n'existe plus, on supprime juste le metadata
                 plex_api(f"/library/metadata/{e['album_id']}/trash", method="PUT")
                 time.sleep(0.3)
                 plex_api(f"/library/metadata/{e['album_id']}", method="DELETE")
-
                 moved.append({
                     'thumb_data': thumb_data,
                     'artist': artist,
                     'title_raw': e['title_raw'],
                     'size': 0,
-                    'fmt': get_primary_format(e['folder'])
+                    'fmt': get_primary_format(e['folder']),
+                    'br': e['br'],
+                    'sr': e['sr'],
+                    'bd': e['bd']
                 })
         except Exception:
             pass
@@ -436,7 +505,9 @@ button { cursor:pointer; border:none; border-radius:8px; padding:.5rem 1rem; fon
 
 <div id="saved">Space saved: {{ space }} MB</div>
 
-<h1>Plex Music Duplicates</h1>
+<div style="text-align:center; margin-bottom:1rem;">
+  <img src="/static/PMDA.png" alt="PMDA Logo" style="max-width:450px; width:100%; height:auto;" />
+</div>
 
 <div style="display:flex; align-items:center; margin-bottom:1rem;">
   {% if not scanning and not groups %}
@@ -665,7 +736,8 @@ function showConfirmation(moved) {
     } else {
       html += `<img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAAQklEQVR42u3BAQ0AAADCIPunNscwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD8wDeQAAEmTWlUAAAAASUVORK5CYII=" alt="no-cover">`;
     }
-    html += `<div><b>Duplicate</b>&nbsp;${e.artist}&nbsp;${e.title_raw}&nbsp;${e.size} MB&nbsp;${e.fmt}&nbsp;Moved to dupes folder</div>`;
+    html += `<div><b>Duplicate</b>&nbsp;${e.artist}&nbsp;${e.title_raw}</div>`;
+    html += `<div>${e.size} MB&nbsp;${e.fmt}&nbsp;${e.br} bps&nbsp;${e.sr} Hz&nbsp;${e.bd} bit&nbsp;Moved to dupes folder</div>`;
     html += `</div>`;
   });
   html += `</div>`;
@@ -701,7 +773,7 @@ function openModal(artist, albumId) {
         html += `<div>${j.artist}</div>`;
         html += `<div>${j.album}</div>`;
         html += `<div>${e.size} MB</div>`;
-        html += `<div>${e.fmt}</div>`;
+        html += `<div>${e.fmt} | ${e.br} bps | ${e.sr} Hz | ${e.bd} bit</div>`;
         html += `</div>`;
       });
       html += `</div>`;
@@ -758,7 +830,7 @@ function showSimpleModal(msg) {
 }
 
 document.addEventListener("DOMContentLoaded", () => {
-  // By default: show grid and hide table (if exist)
+  // By default: show grid and hide table (if they exist)
   const gridEl = document.getElementById("gridMode");
   const tableEl = document.getElementById("tableMode");
   if (gridEl) gridEl.style.display = "grid";
@@ -789,7 +861,7 @@ document.addEventListener("DOMContentLoaded", () => {
     el.addEventListener("click", ev => ev.stopPropagation());
   });
 
-  // Démarrer le polling si on était déjà en scan ou dedupe
+  // Restart polling if we were already in scan or dedupe when reloading
   fetch("/api/progress")
     .then(r => r.json())
     .then(j => {
@@ -819,6 +891,7 @@ def index():
         for artist, lst in state["duplicates"].items():
             for g in lst:
                 best = g['best']
+                # collect formats for display in grid/table
                 formats = [get_primary_format(best['folder'])] + [
                     get_primary_format(e['folder']) for e in g['losers']
                 ]
@@ -879,7 +952,10 @@ def details(artist, album_id):
                     "thumb_data": thumb_data,
                     "title_raw": e['title_raw'],
                     "size": folder_size(e['folder']) // (1024 * 1024),
-                    "fmt": get_primary_format(e['folder'])
+                    "fmt": get_primary_format(e['folder']),
+                    "br": e['br'],
+                    "sr": e['sr'],
+                    "bd": e['bd']
                 })
             return jsonify(
                 artist=art,
@@ -957,7 +1033,7 @@ def dedupe_selected():
 # ───────────────────────────────────── CLI MODE ───────────────────────────────────
 def dedupe_cli(dry: bool, safe: bool, tag_extra: bool, verbose: bool):
     """
-    Command-line mode:
+    Command‐line mode:
     - Scans all artists/albums in Plex.
     - Detects duplicate album groups.
     - For each group: moves loser folders (or simulates) and deletes metadata in Plex.
@@ -966,11 +1042,34 @@ def dedupe_cli(dry: bool, safe: bool, tag_extra: bool, verbose: bool):
     log_level = logging.DEBUG if verbose else logging.INFO
     logging.getLogger().setLevel(log_level)
 
-    # 2) Open SQLite connection to Plex database
-    db = sqlite3.connect(PLEX_DB_FILE)
+    # 2) Immediately log that we're opening the Plex DB
+    logging.debug(f"Opening Plex database at {PLEX_DB_FILE}")
+
+    # 3) Open SQLite connection to Plex database
+    try:
+        db = sqlite3.connect(PLEX_DB_FILE)
+    except Exception as e:
+        logging.error(f"Failed to connect to Plex DB: {e}")
+        return
     cur = db.cursor()
 
-    # 3) Initialize cumulative statistics
+    # 4) Fetch all artists in the Music library section (SQL preview in log)
+    sql_artists = (
+        "SELECT id, title "
+        "FROM metadata_items "
+        "WHERE metadata_type=8 AND library_section_id=?"
+    )
+    logging.debug(f"Fetching all artists (SQL = {sql_artists})")
+    try:
+        artists = cur.execute(sql_artists, (SECTION_ID,)).fetchall()
+    except Exception as e:
+        logging.error(f"Error while querying artists: {e}")
+        return
+
+    artist_count = len(artists)
+    logging.debug(f"Artist count: {artist_count}")
+
+    # 5) Initialize cumulative statistics
     stats = {
         'total_artists': 0,
         'total_albums': 0,
@@ -979,32 +1078,34 @@ def dedupe_cli(dry: bool, safe: bool, tag_extra: bool, verbose: bool):
         'total_moved_mb': 0
     }
 
-    # 4) Fetch all artists in the Music library section
-    artists = cur.execute(
-        "SELECT id, title FROM metadata_items WHERE metadata_type=8 AND library_section_id=?",
-        (SECTION_ID,)
-    ).fetchall()
-
-    # 5) Loop over each artist
+    # 6) Loop over each artist
     for artist_id, artist_name in artists:
         stats['total_artists'] += 1
 
-        # 5a) Fetch all album IDs under this artist
-        album_rows = cur.execute(
-            "SELECT id FROM metadata_items WHERE metadata_type=9 AND parent_id=?",
-            (artist_id,)
-        ).fetchall()
+        # 6a) Fetch all album IDs under this artist
+        sql_albums = (
+            "SELECT id "
+            "FROM metadata_items "
+            "WHERE metadata_type=9 AND parent_id=?"
+        )
+        logging.debug(f"Fetching albums for artist '{artist_name}' (SQL = {sql_albums})")
+        try:
+            album_rows = cur.execute(sql_albums, (artist_id,)).fetchall()
+        except Exception as e:
+            logging.warning(f"  [Skipped artist '{artist_name}' due to DB error: {e}]")
+            continue
+
         album_ids = [row[0] for row in album_rows]
         stats['total_albums'] += len(album_ids)
 
-        # 5b) Detect duplicate groups for this artist
+        # 6b) Detect duplicate groups for this artist
         dup_groups = scan_duplicates(db, artist_name, album_ids)
         if not dup_groups:
             continue
 
         stats['albums_with_dupes'] += len(dup_groups)
 
-        # 6) For each duplicate group:
+        # 7) For each duplicate group:
         for group in dup_groups:
             best = group['best']
             losers = group['losers']
@@ -1012,39 +1113,56 @@ def dedupe_cli(dry: bool, safe: bool, tag_extra: bool, verbose: bool):
             # Print a separation line before each group
             logging.info("-" * 60)
 
-            # 6a) Header: “Detected duplicate group for: Artist | Album”
+            # 7a) Header: “Detected duplicate group for: Artist | Album”
             logging.info(f"Detected duplicate group for: {artist_name} | {best['title_raw']}")
 
-            # 6b) “Best version    | Artist | Album | Size (MB) | Format”
-            best_size_mb = folder_size(best['folder']) // (1024 * 1024)
-            best_format = get_primary_format(best['folder'])
+            # 7b) “Best version    | Artist | Album | Size (MB) | Format | Bitrate | Samplerate | BitDepth”
+            best_folder = best['folder']
+            best_size_mb = folder_size(best_folder) // (1024 * 1024)
+            best_format = get_primary_format(best_folder)
+
+            # We used ffprobe to fill in br, sr, and depth (if available), otherwise they remain 0
+            best_br_kbps = best['br']  # in bits/sec from analyse_format
+            best_sr_hz = best['sr']    # in Hz from analyse_format
+            # We never parsed bitdepth earlier; if you added that, replace below:
+            best_depth = best.get('depth', 0)
+
             logging.info(
-                f"Best version    | {artist_name} | {best['title_raw']} | "
-                f"{best_size_mb} MB | {best_format}"
+                f"Best version     | {artist_name} | {best['title_raw']} | "
+                f"{best_size_mb} MB | {best_format} | {best_br_kbps} bps | {best_sr_hz} Hz | {best_depth} bit"
             )
 
-            # 6c) Log each loser “Would have moved” (if dry) or “Moved”
+            # 7c) Log each loser
             group_moved_mb = 0
             for loser in losers:
                 loser_folder = loser['folder']
                 loser_id = loser['album_id']
                 loser_title = loser['title_raw']
 
-                # 6c.1) If source folder is missing, skip this loser
+                # If source folder is missing, skip this loser
                 if not loser_folder.exists():
                     logging.warning(
-                        f"Source folder not found, skipping: {loser_folder} "
-                        f"(rk={loser_id})"
+                        f"Source folder not found, skipping: {loser_folder} (rk={loser_id})"
                     )
                     continue
 
                 # Destination path under DUPE_ROOT
-                dst = DUPE_ROOT / loser_folder.relative_to(next(iter(PATH_MAP.values())))
+                try:
+                    dst = DUPE_ROOT / loser_folder.relative_to(next(iter(PATH_MAP.values())))
+                except Exception:
+                    # Fallback: if PATH_MAP translation fails, just move to DUPE_ROOT/<artist>
+                    dst = Path(DUPE_ROOT) / artist_name.replace(" ", "_") / loser_folder.name
                 dst.parent.mkdir(parents=True, exist_ok=True)
 
-                # Compute size and format
+                # Compute loser size and format
                 loser_size_mb = folder_size(loser_folder) // (1024 * 1024)
                 loser_format = get_primary_format(loser_folder)
+
+                # From analyse_format earlier:
+                loser_br_kbps = loser['br']
+                loser_sr_hz = loser['sr']
+                loser_depth = loser.get('depth', 0)
+
                 group_moved_mb += loser_size_mb
                 stats['total_moved_mb'] += loser_size_mb
                 stats['total_dupes'] += 1
@@ -1053,20 +1171,21 @@ def dedupe_cli(dry: bool, safe: bool, tag_extra: bool, verbose: bool):
                     # Dry run: indicate “Would have moved”
                     logging.info(
                         f"Would have moved | {artist_name} | {loser_title} | "
-                        f"{loser_size_mb} MB | {loser_format} | (DRY-RUN)"
+                        f"{loser_size_mb} MB | {loser_format} | "
+                        f"{loser_br_kbps} bps | {loser_sr_hz} Hz | {loser_depth} bit | (DRY-RUN)"
                     )
                 else:
                     # Actually move the folder
                     logging.info(
                         f"Moved            | {artist_name} | {loser_title} | "
-                        f"{loser_size_mb} MB | {loser_format}"
+                        f"{loser_size_mb} MB | {loser_format} | "
+                        f"{loser_br_kbps} bps | {loser_sr_hz} Hz | {loser_depth} bit"
                     )
                     try:
                         shutil.move(str(loser_folder), str(dst))
                     except FileNotFoundError:
-                        # If it disappears between exists() check and move(), log and continue
                         logging.warning(
-                            f"Failed to move, folder disappeared: {loser_folder}"
+                            f"Failed to move (folder disappeared): {loser_folder}"
                         )
                         continue
 
@@ -1079,11 +1198,10 @@ def dedupe_cli(dry: bool, safe: bool, tag_extra: bool, verbose: bool):
                 else:
                     logging.info(f"    [SKIPPED Plex delete for rk={loser_id}]")
 
-            # 6d) Summary line for this group
+            # 7d) Summary line for this group
             logging.info(f"Total moved for this group: {group_moved_mb} MB")
-            # (Next iteration will start with its own separator line.)
 
-            # 6e) Optionally tag “Extra Tracks” on the best edition
+            # 7e) Optionally tag “Extra Tracks” on the best edition
             if tag_extra:
                 max_tracks = max(len(ed['tracks']) for ed in losers + [best])
                 min_tracks = min(len(ed['tracks']) for ed in losers + [best])
@@ -1094,12 +1212,12 @@ def dedupe_cli(dry: bool, safe: bool, tag_extra: bool, verbose: bool):
                         method="PUT"
                     )
 
-        # 7) Refresh Plex for this artist so changes become visible immediately
+        # 8) Refresh Plex for this artist so changes become visible
         prefix = f"/music/matched/{quote_plus(artist_name[0].upper())}/{quote_plus(artist_name)}"
         plex_api(f"/library/sections/{SECTION_ID}/refresh?path={prefix}")
         plex_api(f"/library/sections/{SECTION_ID}/emptyTrash", method="PUT")
 
-    # 8) Final summary after processing all artists
+    # 9) Final summary after processing all artists
     logging.info("-" * 60)
     logging.info("FINAL SUMMARY")
     logging.info(f"Total artists processed      : {stats['total_artists']}")
@@ -1121,7 +1239,7 @@ if __name__ == "__main__":
         "--serve", action="store_true", help="Launch Flask web interface"
     )
     sub.add_argument(
-        "--port", type=int, default=5000, help="Port for WebUI (default: 5000)"
+        "--port", type=int, default=WEBUI_PORT, help=f"Port for WebUI (default from config: {WEBUI_PORT})"
     )
 
     cli = parser.add_argument_group("CLI-only options (ignored with --serve)")
@@ -1143,14 +1261,12 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-if args.serve:
-    # Mode WebUI — read port from config.json (fallback to CLI if missing)
-    app.run(host="0.0.0.0", port=int(conf.get("WEBUI_PORT", args.port)))
-else:
-    # Mode CLI
-    dedupe_cli(
-        dry=args.dry_run,
-        safe=args.safe_mode,
-        tag_extra=args.tag_extra,
-        verbose=args.verbose
-    )
+    if args.serve:
+        app.run(host="0.0.0.0", port=args.port)
+    else:
+        dedupe_cli(
+            dry=args.dry_run,
+            safe=args.safe_mode,
+            tag_extra=args.tag_extra,
+            verbose=args.verbose
+        )
