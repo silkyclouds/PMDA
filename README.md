@@ -159,4 +159,4 @@ Other CLI options:
 
 ## 🖖 Happy Deduping
 
-Enjoy your streamlined, space-saving Plex music library. And remember: if Plex won’t do it, we will.
+Enjoy your streamlined, space-saving Plex music library. 
