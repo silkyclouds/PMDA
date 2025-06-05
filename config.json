@@ -1,0 +1,35 @@
+{
+  // Full path to the Plex SQLite database file.
+  // You can locate it by connecting to your Plex server and looking under:
+  // <Plex data directory>/Library/Application Support/Plex Media Server/Plug-in Support/Databases/com.plexapp.plugins.library.db
+  "PLEX_DB_FILE": "/path/to/your/plex/config/Library/Application Support/Plex Media Server/Plug-in Support/Databases/com.plexapp.plugins.library.db",
+
+  // URL of your Plex Media Server, including the port.
+  // You can find this by opening Plex in a browser and copying the address.
+  "PLEX_HOST": "http://your.plex.server:32400",
+
+  // Plex authentication token.
+  // You can retrieve it by inspecting your browser’s network traffic when using Plex Web, or by checking logs.
+  // NEVER share your real token publicly.
+  "PLEX_TOKEN": "your_plex_token_here",
+
+  // ID of the music library section to scan for duplicates.
+  // You can find the section ID by inspecting the URL in Plex Web:
+  // e.g., https://app.plex.tv/.../library/sections/1
+  "SECTION_ID": 1,
+
+  // Maps the path used inside Plex metadata to the actual filesystem path.
+  // Adjust this to match your server’s file structure.
+  "PATH_MAP": {
+    "/music/matched": "/mnt/your_storage/music/Music_matched"
+  },
+
+  // Where to move detected duplicate albums for manual review or deletion.
+  "DUPE_ROOT": "/mnt/your_storage/music/Plex_dupes",
+
+  // File to store deduplication stats (JSON format).
+  "STATS_FILE": "/path/to/your/scripts/dedupe_stats.json",
+
+  // Port used to serve the optional web UI for deduplication stats.
+  "WEBUI_PORT": 5004
+}
