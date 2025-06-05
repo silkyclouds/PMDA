@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="PMDA.png" alt="PMDA Logo" width="200"/>
+  <img src="/static/PMDA.png" alt="PMDA Logo" width="200"/>
 </p>
 
 # PMDA – Plex Music Dedupe Assistant
