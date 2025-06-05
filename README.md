@@ -94,6 +94,8 @@ Flask>=2.0
 requests>=2.25
 ```
 
+> 💡 To enable audio quality analysis (bitrate, sample rate, bit depth), make sure to install **ffmpeg**, which includes the required `ffprobe` tool. PMDA will still run without it, but your duplicate scoring will be less accurate.
+
 ---
 
 ### 3. Configure `config.json`
@@ -158,4 +160,3 @@ Other CLI options:
 ## 🖖 Happy Deduping
 
 Enjoy your streamlined, space-saving Plex music library. And remember: if Plex won’t do it, we will.
-
