@@ -1,18 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PMDA V 0.3
-
-A Flask-based Web UI for scanning and deduplicating duplicate albums in Plex Music.
-Handles special characters (slashes, etc.) in album titles by using numeric album_id,
-and ensures covers appear in the “Moved Duplicates” modal by fetching them as Base64
-data URIs before deleting metadata.
-
-Additionally, it can run in CLI mode with --dry-run, --safe-mode, --tag-extra, --verbose.
-All state (duplicate groups, stats) is persisted in a SQLite database. The “Start New Scan”
-button launches a fresh scan; previous results are automatically loaded into memory and displayed.
-A configuration option lets the user specify how many threads to use when scanning.
-When `--verbose` is passed, both CLI and WebUI modes output DEBUG-level logging.
+PMDA V0.4
 """
 
 import argparse
@@ -845,23 +834,35 @@ HTML = """<!DOCTYPE html>
     </div>
 
 
-    <div style="display:flex; align-items:center; margin-bottom:1rem;">
-      {% if not scanning and not groups %}
-        <button id="start" onclick="startScan()" style="background:#006f5f;color:#fff; margin-right:.5rem;">
-          Start New Scan
-        </button>
-        <!-- “Show Previous Results” removed -->
-      {% endif %}
-      {% if groups %}
-        <button id="deleteSel" onclick="submitSelected()">Delete Selected Dupes</button>
-        <button id="all" onclick="submitAll()">Deduplicate ALL</button>
-      {% endif %}
-      {% if groups %}
-        <button id="modeswitch" onclick="toggleMode()" style="margin-left:auto;">
-          Switch to Table View
-        </button>
-      {% endif %}
-    </div>
+<div style="display:flex; align-items:center; margin-bottom:1rem;">
+  {# Show “Start New Scan” whenever we are not currently scanning #}
+  {% if not scanning %}
+    <button id="start"
+            onclick="startScan()"
+            style="background:#006f5f;color:#fff; margin-right:.5rem;">
+      Start New Scan
+    </button>
+  {% endif %}
+
+  {# If there are existing duplicate‐cards on the page, show the Dedup buttons #}
+  {% if groups %}
+    <button id="deleteSel" onclick="submitSelected()">
+      Delete Selected Dupes
+    </button>
+    <button id="all" onclick="submitAll()">
+      Deduplicate ALL
+    </button>
+  {% endif %}
+
+  {# Keep the mode‐switch button (Grid ↔ Table view) if groups exist #}
+  {% if groups %}
+    <button id="modeswitch"
+            onclick="toggleMode()"
+            style="margin-left:auto;">
+      Switch to Table View
+    </button>
+  {% endif %}
+</div>
 
     <div id="scanBox" class="progress"><div id="scanBar" class="bar" style="width:0%"></div></div>
     {% if scanning %}
