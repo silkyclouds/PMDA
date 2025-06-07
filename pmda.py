@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PMDA V0.4
+PMDA V0.4.1
+
 """
 
 import argparse
@@ -835,30 +836,35 @@ HTML = """<!DOCTYPE html>
 
 
 <div style="display:flex; align-items:center; margin-bottom:1rem;">
-  {# Show “Start New Scan” whenever we are not currently scanning #}
   {% if not scanning %}
     <button id="start"
             onclick="startScan()"
-            style="background:#006f5f;color:#fff; margin-right:.5rem;">
+            style="background:#006f5f;color:#fff;margin-right:.5rem;">
       Start New Scan
     </button>
   {% endif %}
 
-  {# If there are existing duplicate‐cards on the page, show the Dedup buttons #}
   {% if groups %}
-    <button id="deleteSel" onclick="submitSelected()">
+    <button id="deleteSel" onclick="submitSelected()" style="margin-right:.5rem;">
       Delete Selected Dupes
     </button>
-    <button id="all" onclick="submitAll()">
+    <button id="all" onclick="submitAll()" style="margin-right:1rem;">
       Deduplicate ALL
     </button>
+
+    <!-- ─── NEW SEARCH BOX ─── -->
+    <input id="search"
+           type="text"
+           placeholder="Search artist or album..."
+           style="margin-right:auto; padding:.4rem; border-radius:6px; border:1px solid #ccc;"/>
+  {% else %}
+    <div style="margin-right:auto;"></div>
   {% endif %}
 
-  {# Keep the mode‐switch button (Grid ↔ Table view) if groups exist #}
   {% if groups %}
     <button id="modeswitch"
             onclick="toggleMode()"
-            style="margin-left:auto;">
+            style="margin-left:1rem;">
       Switch to Table View
     </button>
   {% endif %}
@@ -1209,6 +1215,30 @@ HTML = """<!DOCTYPE html>
               dedupeTimer = setInterval(pollDedupe, 1000);
             }
           });
+
+        // ───── SEARCH FILTER ─────
+        // Listen for input on the search box and hide/show cards & rows
+        document.getElementById('search').addEventListener('input', ev => {
+          const q = ev.target.value.trim().toLowerCase();
+
+          // Grid cards
+          document.querySelectorAll('#gridMode .card').forEach(card => {
+            const artist = card.getAttribute('data-artist').replace(/_/g,' ').toLowerCase();
+            const title  = card.getAttribute('data-title').toLowerCase();
+            card.style.display = (!q || artist.includes(q) || title.includes(q))
+                                 ? 'flex'
+                                 : 'none';
+          });
+
+          // Table rows
+          document.querySelectorAll('#tableMode .table-row').forEach(row => {
+            const artist = row.getAttribute('data-artist').replace(/_/g,' ').toLowerCase();
+            const title  = row.getAttribute('data-title').toLowerCase();
+            row.style.display = (!q || artist.includes(q) || title.includes(q))
+                                ? ''
+                                : 'none';
+          });
+        });
       });
     </script>
   </body>
