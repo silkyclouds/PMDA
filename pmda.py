@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PMDA V0.4.1
+PMDA V0.4.2
 
 """
 
@@ -198,6 +198,16 @@ logging.basicConfig(
     datefmt="%H:%M:%S"
 )
 
+# ──────────────────────────────── PLEX DB helper ────────────────────────────────
+def plex_connect() -> sqlite3.Connection:
+    """
+    Open the Plex SQLite DB using UTF-8 *surrogate-escape* decoding so that any
+    non-UTF-8 bytes are mapped to the U+DCxx range instead of throwing an error.
+    """
+    con = sqlite3.connect(PLEX_DB_FILE, timeout=30)
+    con.text_factory = lambda b: b.decode("utf-8", "surrogateescape")
+    return con
+
 # ───────────────────────────────── UTILITIES ──────────────────────────────────
 def plex_api(path: str, method: str = "GET", **kw):
     headers = kw.pop("headers", {})
@@ -380,19 +390,32 @@ def choose_best(editions: List[dict]) -> dict:
 
 def scan_artist_duplicates(args):
     """
-    Worker function for ThreadPoolExecutor.  Scans one artist’s albums for duplicates.
-    Returns a tuple: (artist_name, [group_dicts, ...], album_count).
+    ThreadPool worker: scan one artist for duplicate albums.
+    Returns (artist_name, list_of_groups, album_count).
     """
     artist_id, artist_name = args
-    logging.debug(f"scan_artist_duplicates(): starting scan for artist '{artist_name}' (ID {artist_id})")
-    db_conn = sqlite3.connect(PLEX_DB_FILE)
-    album_ids = [rk for rk, in db_conn.execute(
-        "SELECT id FROM metadata_items WHERE metadata_type=9 AND parent_id=?",
-        (artist_id,)
-    ).fetchall()]
+    logging.debug(
+        f"scan_artist_duplicates(): start '{artist_name}' (ID {artist_id})"
+    )
+
+    db_conn = plex_connect()
+
+    album_ids = [
+        row[0]
+        for row in db_conn.execute(
+            "SELECT id FROM metadata_items "
+            "WHERE metadata_type=9 AND parent_id=?",
+            (artist_id,),
+        )
+    ]
+
     groups = scan_duplicates(db_conn, artist_name, album_ids)
     db_conn.close()
-    logging.debug(f"scan_artist_duplicates(): done with artist '{artist_name}'. Found {len(groups)} groups, {len(album_ids)} albums scanned.")
+
+    logging.debug(
+        f"scan_artist_duplicates(): done '{artist_name}' – "
+        f"{len(groups)} groups, {len(album_ids)} albums"
+    )
     return (artist_name, groups, len(album_ids))
 
 def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
@@ -491,67 +514,101 @@ def save_scan_to_db(scan_results: Dict[str, List[dict]]):
 
 def load_scan_from_db() -> Dict[str, List[dict]]:
     """
-    Load the last scan’s duplicates from the DB into the in‐memory state["duplicates"].
-    Returns a dict { artist: [ {artist, album_id, best, losers}, ... ] }.
+    Read the most-recent duplicate-scan from STATE_DB_FILE and rebuild the
+    in-memory structure used by the Web UI.
+
+    Returns
+    -------
+    dict
+        { artist_name : [ group_dict, ... ] }
     """
     con = sqlite3.connect(str(STATE_DB_FILE))
     cur = con.cursor()
-    # First, fetch all "best" rows
-    cur.execute("""
-      SELECT artist, album_id, title_raw, album_norm, folder, fmt_text, br, sr, bd, dur, discs
-      FROM duplicates_best
-    """)
+
+    # ---- 1) Best editions -----------------------------------------------------
+    cur.execute(
+        """
+        SELECT artist, album_id, title_raw, album_norm, folder,
+               fmt_text, br, sr, bd, dur, discs
+        FROM   duplicates_best
+        """
+    )
     best_rows = cur.fetchall()
-    # Next, fetch all "loser" rows
-    cur.execute("""
-      SELECT artist, album_id, folder, fmt_text, br, sr, bd, size_mb
-      FROM duplicates_loser
-    """)
+
+    # ---- 2) Loser editions ----------------------------------------------------
+    cur.execute(
+        """
+        SELECT artist, album_id, folder, fmt_text, br, sr, bd, size_mb
+        FROM   duplicates_loser
+        """
+    )
     loser_rows = cur.fetchall()
     con.close()
 
-    # Organize losers by (artist, album_id)
-    loser_dict: Dict[tuple, List[dict]] = defaultdict(list)
-    for artist, album_id, folder, fmt_text, br, sr, bd, size_mb in loser_rows:
-        loser_dict[(artist, album_id)].append({
-            'folder': Path(folder),
-            'fmt': fmt_text,
-            'br': br,
-            'sr': sr,
-            'bd': bd,
-            'size': size_mb,
-            'album_id': album_id,
-            'artist': artist,
-            'title_raw': None
-        })
+    # Map losers by (artist, album_id) for quick lookup
+    loser_map: Dict[tuple, List[dict]] = defaultdict(list)
+    for artist, aid, folder, fmt, br, sr, bd, size_mb in loser_rows:
+        loser_map[(artist, aid)].append(
+            {
+                "folder": Path(folder),
+                "fmt": fmt,
+                "br": br,
+                "sr": sr,
+                "bd": bd,
+                "size": size_mb,
+                "album_id": aid,
+                "artist": artist,
+                "title_raw": None,  # we may fill this in a moment
+            }
+        )
 
     results: Dict[str, List[dict]] = defaultdict(list)
-    for artist, album_id, title_raw, album_norm, folder, fmt_text, br, sr, bd, dur, discs in best_rows:
+
+    for (
+        artist,
+        aid,
+        title_raw,
+        album_norm,
+        folder,
+        fmt_txt,
+        br,
+        sr,
+        bd,
+        dur,
+        discs,
+    ) in best_rows:
+
         best_entry = {
-            'album_id': album_id,
-            'title_raw': title_raw,
-            'album_norm': album_norm,
-            'folder': Path(folder),
-            'fmt_text': fmt_text,
-            'br': br,
-            'sr': sr,
-            'bd': bd,
-            'dur': dur,
-            'discs': discs
+            "album_id": aid,
+            "title_raw": title_raw,
+            "album_norm": album_norm,
+            "folder": Path(folder),
+            "fmt_text": fmt_txt,
+            "br": br,
+            "sr": sr,
+            "bd": bd,
+            "dur": dur,
+            "discs": discs,
         }
-        losers_list = loser_dict.get((artist, album_id), [])
-        # Fill missing title_raw for losers
-        for l in losers_list:
-            if l['title_raw'] is None:
-                db_plx = sqlite3.connect(PLEX_DB_FILE)
-                l['title_raw'] = album_title(db_plx, album_id)
+
+        losers = loser_map.get((artist, aid), [])
+
+        # Some loser rows still need the readable title; fetch it from Plex DB.
+        for l in losers:
+            if l["title_raw"] is None:
+                db_plx = plex_connect()
+                l["title_raw"] = album_title(db_plx, aid)
                 db_plx.close()
-        results[artist].append({
-            'artist': artist,
-            'album_id': album_id,
-            'best': best_entry,
-            'losers': losers_list
-        })
+
+        results[artist].append(
+            {
+                "artist": artist,
+                "album_id": aid,
+                "best": best_entry,
+                "losers": losers,
+            }
+        )
+
     return results
 
 def clear_db_on_new_scan():
@@ -570,62 +627,60 @@ def clear_db_on_new_scan():
 # ───────────────────────────── BACKGROUND TASKS (WEB) ─────────────────────────────
 def background_scan():
     """
-    Scans all artists in parallel using a ThreadPoolExecutor with SCAN_THREADS workers.
-    Persists results to the SQLite state DB, and updates in‐memory state for real‐time UI.
+    Scan the entire library in parallel, persist results to SQLite,
+    and update the in-memory `state` for the Web UI.
     """
     logging.debug(f"background_scan(): opening Plex DB at {PLEX_DB_FILE}")
-    db_conn = sqlite3.connect(PLEX_DB_FILE)
+    db_conn = plex_connect()
 
-    # 1) Count total albums
+    # 1) Total albums for progress bar
     with lock:
         state["scan_progress"] = 0
     total_albums = db_conn.execute(
-        "SELECT COUNT(*) FROM metadata_items WHERE metadata_type=9 AND library_section_id=?",
-        (SECTION_ID,)
+        "SELECT COUNT(*) FROM metadata_items "
+        "WHERE metadata_type=9 AND library_section_id=?",
+        (SECTION_ID,),
     ).fetchone()[0]
 
     # 2) Fetch all artists
     artists = db_conn.execute(
-        "SELECT id, title FROM metadata_items WHERE metadata_type=8 AND library_section_id=?",
-        (SECTION_ID,)
+        "SELECT id, title FROM metadata_items "
+        "WHERE metadata_type=8 AND library_section_id=?",
+        (SECTION_ID,),
     ).fetchall()
     db_conn.close()
 
-    logging.debug(f"background_scan(): found {len(artists)} artists to process, {total_albums} total albums")
+    logging.debug(
+        f"background_scan(): {len(artists)} artists, {total_albums} albums total"
+    )
 
+    # Reset live state
     with lock:
         state.update(scanning=True, scan_progress=0, scan_total=total_albums)
         state["duplicates"].clear()
 
-    # 3) Clear DB since new scan is requested
-    clear_db_on_new_scan()
+    clear_db_on_new_scan()  # wipe previous duplicate tables
 
-    # 4) Use ThreadPoolExecutor to scan each artist concurrently
-    all_results: Dict[str, List[dict]] = {}
-    futures = []
-
-    logging.debug(f"background_scan(): submitting {len(artists)} artists into ThreadPoolExecutor ({SCAN_THREADS} threads)")
+    all_results, futures = {}, []
     with ThreadPoolExecutor(max_workers=SCAN_THREADS) as executor:
         for artist_id, artist_name in artists:
-            futures.append(executor.submit(scan_artist_duplicates, (artist_id, artist_name)))
+            futures.append(
+                executor.submit(scan_artist_duplicates, (artist_id, artist_name))
+            )
 
         for future in as_completed(futures):
-            artist_name, groups, album_count = future.result()
-            logging.debug(f"background_scan(): artist '{artist_name}' returned {len(groups)} duplicate groups")
+            artist_name, groups, album_cnt = future.result()
             with lock:
                 all_results[artist_name] = groups
                 if groups:
                     state["duplicates"][artist_name] = groups
-                state["scan_progress"] += album_count
-                logging.debug(f"background_scan(): updated scan_progress to {state['scan_progress']} / {state['scan_total']}")
+                state["scan_progress"] += album_cnt
 
-    # 5) Persist the full scan results into the database
     save_scan_to_db(all_results)
-    logging.debug("background_scan(): all results saved to STATE_DB_FILE")
 
     with lock:
         state["scanning"] = False
-    logging.debug("background_scan(): scanning completed")
+    logging.debug("background_scan(): finished")
 
 def background_dedupe(all_groups: List[dict]):
     """
@@ -895,7 +950,9 @@ HTML = """<!DOCTYPE html>
         </div>
         <button class="btn-dedup"
                 onclick="event.stopPropagation();
-                         dedupeSingle('{{ g.artist_key }}', {{ g.album_id }}, '{{ g.best_title|replace(\"'\",\"\\'\") }}')">
+                         dedupeSingle({{ g.artist_key|tojson }},
+                                      {{ g.album_id }},
+                                      {{ g.best_title|tojson }});">
           Deduplicate
         </button>
       </div>
@@ -933,11 +990,13 @@ HTML = """<!DOCTYPE html>
             <td>{{ g.n }}</td>
             <td>{{ g.formats|join(', ') }}</td>
             <td>
-              <button class="row-dedup-btn"
-                      onclick="event.stopPropagation();
-                               dedupeSingle('{{ g.artist_key }}', {{ g.album_id }}, '{{ g.best_title|replace(\"'\",\"\\'\") }}')">
-                Deduplicate
-              </button>
+             <button class="row-dedup-btn"
+                     onclick="event.stopPropagation();
+                              dedupeSingle({{ g.artist_key|tojson }},
+                                           {{ g.album_id }},
+                                           {{ g.best_title|tojson }});">
+               Deduplicate
+             </button>
             </td>
           </tr>
         {% endfor %}
@@ -957,22 +1016,38 @@ HTML = """<!DOCTYPE html>
         <div id="modalBody"></div>
       </div>
     </div>
-
     <script>
-      let scanTimer = null, dedupeTimer = null, inTableMode = false;
+      // ────────────────────── timers & view mode ──────────────────────
+      let scanTimer   = null;
+      let dedupeTimer = null;
 
-      function toggleMode() {
-        const gridEl = document.getElementById("gridMode");
+      /*  true  → user last chose Table view
+          false → user last chose Grid  view (default)                  */
+      let inTableMode = (localStorage.getItem("pmdaViewMode") === "table");
+
+      /* ─── View helpers ─────────────────────────────────────────────── */
+      function setViewMode() {
+        const gridEl  = document.getElementById("gridMode");
         const tableEl = document.getElementById("tableMode");
-        if (gridEl)  gridEl.style.display  = inTableMode ? "grid"  : "none";
-        if (tableEl) tableEl.style.display = inTableMode ? "none"  : "block";
-        inTableMode = !inTableMode;
+
+        if (gridEl)  gridEl.style.display  = inTableMode ? "none"  : "grid";
+        if (tableEl) tableEl.style.display = inTableMode ? "block" : "none";
+
         const switchBtn = document.getElementById("modeswitch");
         if (switchBtn) {
-          switchBtn.innerText = inTableMode ? "Switch to Grid View" : "Switch to Table View";
+          switchBtn.innerText = inTableMode
+                                ? "Switch to Grid View"
+                                : "Switch to Table View";
         }
       }
 
+      function toggleMode() {
+        inTableMode = !inTableMode;
+        localStorage.setItem("pmdaViewMode", inTableMode ? "table" : "grid");
+        setViewMode();
+      }
+
+      /* ─── Scan progress polling ────────────────────────────────────── */
       function pollScan() {
         fetch("/api/progress")
           .then(r => r.json())
@@ -1003,6 +1078,19 @@ HTML = """<!DOCTYPE html>
           });
       }
 
+      /* ─── Dedupe helpers & polling ─────────────────────────────────── */
+      function pollDedupe() {
+        fetch("/api/dedupe")
+          .then(r => r.json())
+          .then(j => {
+            if (!j.deduping) {
+              clearInterval(dedupeTimer);
+              showSimpleModal(`Moved ${j.saved} MB in total`);
+              setTimeout(() => location.reload(), 3000);
+            }
+          });
+      }
+
       function submitAll() {
         fetch("/dedupe/all", { method: "POST" }).then(() => {
           showLoadingModal("Moving all duplicates…");
@@ -1010,40 +1098,24 @@ HTML = """<!DOCTYPE html>
         });
       }
 
-      function pollDedupe() {
-        fetch("/api/dedupe")
-          .then(r => r.json())
-          .then(j => {
-            if (!j.deduping) {
-              clearInterval(dedupeTimer);
-              // Show the “Moved … MB” message:
-              showSimpleModal(`Moved ${j.saved} MB in total`);
-              // After the modal auto‐closes, reload to clear out old cards:
-              setTimeout(() => {
-                location.reload();
-              }, 3000);  // match the 3s hide delay in showSimpleModal()
-            }
-          });
-      }
-
       function submitSelected() {
         const checked = Array.from(
           document.querySelectorAll("input[name='selected']:checked")
         ).map(cb => cb.value);
+
         if (!checked.length) {
           showSimpleModal("No albums selected.");
           return;
         }
+
         showLoadingModal("Moving selected duplicates…");
         fetch("/dedupe/selected", {
-          method: "POST",
+          method:  "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ selected: checked })
+          body:    JSON.stringify({ selected: checked })
         })
         .then(r => r.json())
-        .then(resp => {
-          showConfirmation(resp.moved);
-        })
+        .then(resp => showConfirmation(resp.moved))
         .catch(() => {
           closeModal();
           showSimpleModal("An error occurred during deduplication.");
@@ -1051,33 +1123,38 @@ HTML = """<!DOCTYPE html>
       }
 
       function dedupeSingle(artist, albumId, title) {
-        showLoadingModal(`Moving duplicate for ${artist.replace(/_/g, " ")} – ${title}`);
+        showLoadingModal(`Moving duplicate for ${artist.replace(/_/g," ")} – ${title}`);
         fetch(`/dedupe/artist/${artist}`, {
-          method: "POST",
+          method:  "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ album_id: albumId })
+          body:    JSON.stringify({ album_id: albumId })
         })
         .then(r => r.json())
-        .then(resp => {
-          showConfirmation(resp.moved);
-        })
+        .then(resp => showConfirmation(resp.moved))
         .catch(() => {
           closeModal();
           showSimpleModal("An error occurred during single deduplication.");
         });
       }
 
+      /* ─── Modal helpers ─────────────────────────────────────────────── */
       function showLoadingModal(text) {
-        const html = `<div id="loadingSpinner">${text}</div>`;
         const modalBody = document.getElementById("modalBody");
-        if (modalBody) modalBody.innerHTML = html;
+        if (modalBody) modalBody.innerHTML = `<div id="loadingSpinner">${text}</div>`;
         const modal = document.getElementById("modal");
         if (modal) modal.style.display = "flex";
       }
 
+      function showSimpleModal(msg) {
+        const modalBody = document.getElementById("modalBody");
+        if (modalBody) modalBody.innerHTML = `<h3>${msg}</h3>`;
+        const modal = document.getElementById("modal");
+        if (modal) modal.style.display = "flex";
+        setTimeout(closeModal, 3000);
+      }
+
       function showConfirmation(moved) {
-        let html = `<h3>Moved Duplicates</h3>`;
-        html += `<div class="ed-container">`;
+        let html = `<h3>Moved Duplicates</h3><div class="ed-container">`;
         moved.forEach(e => {
           html += `<div class="edition">`;
           if (e.thumb_data) {
@@ -1089,26 +1166,30 @@ HTML = """<!DOCTYPE html>
           html += `</div>`;
         });
         html += `</div>`;
+
         const modalBody = document.getElementById("modalBody");
         if (modalBody) modalBody.innerHTML = html;
         const modal = document.getElementById("modal");
         if (modal) modal.style.display = "flex";
+
         setTimeout(() => {
           closeModal();
           location.reload();
         }, 5000);
       }
 
+      function closeModal() {
+        const modal = document.getElementById("modal");
+        if (modal) modal.style.display = "none";
+      }
+
+      /* ─── Details modal ─────────────────────────────────────────────── */
       function openModal(artist, albumId) {
         showLoadingModal("Loading album details…");
         fetch(`/details/${artist}/${albumId}`)
-          .then(r => {
-            if (!r.ok) throw new Error("404");
-            return r.json();
-          })
+          .then(r => { if (!r.ok) throw new Error("404"); return r.json(); })
           .then(j => {
-            let html = `<h3>${j.artist} – ${j.album}</h3>`;
-            html += `<div class="ed-container">`;
+            let html = `<h3>${j.artist} – ${j.album}</h3><div class="ed-container">`;
             j.editions.forEach((e, i) => {
               html += `<div class="edition">`;
               if (e.thumb_data) {
@@ -1117,42 +1198,30 @@ HTML = """<!DOCTYPE html>
                 html += `<img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAAQklEQVR42u3BAQ0AAADCIPunNscwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD8wDeQAAEmTWlUAAAAASUVORK5CYII=" alt="no-cover">`;
               }
               html += `<div><b>${i === 0 ? "Best" : "Duplicate"}</b></div>`;
-              html += `<div>${j.artist}</div>`;
-              html += `<div>${j.album}</div>`;
-              html += `<div>${e.size} MB</div>`;
-              html += `<div>${e.fmt} • ${e.br} kbps • ${e.sr} Hz • ${e.bd} bit</div>`;
-              html += `</div>`;
+              html += `<div>${j.artist}</div><div>${j.album}</div><div>${e.size} MB</div>`;
+              html += `<div>${e.fmt} • ${e.br} kbps • ${e.sr} Hz • ${e.bd} bit</div></div>`;
             });
-            html += `</div>`;
-            html += `<button id="modalDedup" style="
-                         background:#006f5f; color:#fff; border:none;
-                         border-radius:8px; padding:.4rem .9rem; cursor:pointer; margin-top:1rem;">
-                       Deduplicate
-                     </button>`;
+            html += `</div><button id="modalDedup" style="background:#006f5f;color:#fff;border:none;border-radius:8px;padding:.4rem .9rem;cursor:pointer;margin-top:1rem;">Deduplicate</button>`;
+
             const modalBody = document.getElementById("modalBody");
             if (modalBody) modalBody.innerHTML = html;
             const modal = document.getElementById("modal");
             if (modal) modal.style.display = "flex";
 
-            const btn = document.getElementById("modalDedup");
-            if (btn) {
-              btn.onclick = () => {
-                showLoadingModal(`Moving duplicate for ${j.artist} – ${j.album}`);
-                fetch(`/dedupe/artist/${artist}`, {
-                  method: "POST",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({ album_id: albumId })
-                })
-                .then(r => r.json())
-                .then(resp => {
-                  showConfirmation(resp.moved);
-                })
-                .catch(() => {
-                  closeModal();
-                  showSimpleModal("An error occurred during modal deduplication.");
-                });
-              };
-            }
+            document.getElementById("modalDedup").onclick = () => {
+              showLoadingModal(`Moving duplicate for ${j.artist} – ${j.album}`);
+              fetch(`/dedupe/artist/${artist}`, {
+                method:  "POST",
+                headers: { "Content-Type": "application/json" },
+                body:    JSON.stringify({ album_id: albumId })
+              })
+              .then(r => r.json())
+              .then(resp => showConfirmation(resp.moved))
+              .catch(() => {
+                closeModal();
+                showSimpleModal("An error occurred during modal deduplication.");
+              });
+            };
           })
           .catch(() => {
             closeModal();
@@ -1160,83 +1229,49 @@ HTML = """<!DOCTYPE html>
           });
       }
 
-      function closeModal() {
-        const modal = document.getElementById("modal");
-        if (modal) modal.style.display = "none";
-      }
-
-      function showSimpleModal(msg) {
-        const html = `<h3>${msg}</h3>`;
-        const modalBody = document.getElementById("modalBody");
-        if (modalBody) modalBody.innerHTML = html;
-        const modal = document.getElementById("modal");
-        if (modal) modal.style.display = "flex";
-        setTimeout(() => closeModal(), 3000);
-      }
-
+      /* ─── Startup ───────────────────────────────────────────────────── */
       document.addEventListener("DOMContentLoaded", () => {
-        const gridEl = document.getElementById("gridMode");
-        const tableEl = document.getElementById("tableMode");
-        if (gridEl) gridEl.style.display = "grid";
-        if (tableEl) tableEl.style.display = "none";
+        setViewMode();                          // restore view mode
 
+        // card / row click-throughs
         document.querySelectorAll(".card").forEach(card => {
           card.addEventListener("click", () => {
-            const artist  = card.getAttribute("data-artist");
-            const albumId = card.getAttribute("data-album-id");
-            openModal(artist, albumId);
+            openModal(card.dataset.artist, card.dataset.albumId);
           });
         });
         document.querySelectorAll(".table-row").forEach(row => {
           row.addEventListener("click", () => {
-            const artist  = row.getAttribute("data-artist");
-            const albumId = row.getAttribute("data-album-id");
-            openModal(artist, albumId);
+            openModal(row.dataset.artist, row.dataset.albumId);
           });
         });
         document.querySelectorAll(
           "input[type='checkbox'], .btn-dedup, .row-dedup-btn"
-        ).forEach(el => {
-          el.addEventListener("click", ev => ev.stopPropagation());
+        ).forEach(el => el.addEventListener("click", ev => ev.stopPropagation()));
+
+        // resume running tasks if user refreshed mid-operation
+        fetch("/api/progress").then(r => r.json()).then(j => {
+          if (j.scanning) scanTimer = setInterval(pollScan, 1000);
+        });
+        fetch("/api/dedupe").then(r => r.json()).then(j => {
+          if (j.deduping) dedupeTimer = setInterval(pollDedupe, 1000);
         });
 
-        fetch("/api/progress")
-          .then(r => r.json())
-          .then(j => {
-            if (j.scanning) {
-              scanTimer = setInterval(pollScan, 1000);
-            }
-          });
-
-        fetch("/api/dedupe")
-          .then(r => r.json())
-          .then(j => {
-            if (j.deduping) {
-              dedupeTimer = setInterval(pollDedupe, 1000);
-            }
-          });
-
-        // ───── SEARCH FILTER ─────
-        // Listen for input on the search box and hide/show cards & rows
-        document.getElementById('search').addEventListener('input', ev => {
+        /* ─── Client-side search filter ──────────────────────────────── */
+        document.getElementById("search").addEventListener("input", ev => {
           const q = ev.target.value.trim().toLowerCase();
 
           // Grid cards
-          document.querySelectorAll('#gridMode .card').forEach(card => {
-            const artist = card.getAttribute('data-artist').replace(/_/g,' ').toLowerCase();
-            const title  = card.getAttribute('data-title').toLowerCase();
-            card.style.display = (!q || artist.includes(q) || title.includes(q))
-                                 ? 'flex'
-                                 : 'none';
+          document.querySelectorAll("#gridMode .card").forEach(card => {
+            const artist = card.dataset.artist.replace(/_/g," ").toLowerCase();
+            const title  = card.dataset.title.toLowerCase();
+            card.style.display = (!q || artist.includes(q) || title.includes(q)) ? "flex" : "none";
           });
 
           // Table rows
-          document.querySelectorAll('#tableMode .table-row').forEach(row => {
-            const artist = row.getAttribute('data-artist').replace(/_/g,' ').toLowerCase();
-            const title  = row.getAttribute('data-title').toLowerCase();
-            row.style.display = (!q || artist.includes(q) || title.includes(q))
-                                ? ''
-                                : 'none';
+          document.querySelectorAll("#tableMode .table-row").forEach(row => {
+            const artist = row.dataset.artist.replace(/_/g," ").toLowerCase();
+            const title  = row.dataset.title.toLowerCase();
+            row.style.display = (!q || artist.includes(q) || title.includes(q)) ? "" : "none";
           });
         });
       });
@@ -1250,50 +1285,56 @@ app = Flask(__name__)
 
 @app.get("/")
 def index():
-    # On each page load, load duplicates from DB if in-memory is empty
+    """
+    Main page: load duplicates from DB (if not already in memory),
+    gather stats, build card list and render the template.
+    """
     with lock:
         if not state["duplicates"]:
-            logging.debug("index(): loading scan results from STATE_DB_FILE into memory")
+            logging.debug("index(): loading scan results from DB into memory")
             state["duplicates"] = load_scan_from_db()
 
-    # Gather stats
     space_saved   = get_stat("space_saved")
     removed_dupes = get_stat("removed_dupes")
 
-    # Count total artists & albums in Plex
-    db_conn = sqlite3.connect(PLEX_DB_FILE)
+    db_conn = plex_connect()
     total_artists = db_conn.execute(
-        "SELECT COUNT(*) FROM metadata_items WHERE metadata_type=8 AND library_section_id=?",
-        (SECTION_ID,)
+        "SELECT COUNT(*) FROM metadata_items "
+        "WHERE metadata_type=8 AND library_section_id=?",
+        (SECTION_ID,),
     ).fetchone()[0]
     total_albums = db_conn.execute(
-        "SELECT COUNT(*) FROM metadata_items WHERE metadata_type=9 AND library_section_id=?",
-        (SECTION_ID,)
+        "SELECT COUNT(*) FROM metadata_items "
+        "WHERE metadata_type=9 AND library_section_id=?",
+        (SECTION_ID,),
     ).fetchone()[0]
     db_conn.close()
 
-    # Build “cards” from in-memory state
+    # Build the card / row structures for the UI
     with lock:
-        cards: List[Dict] = []
-        for artist, lst in state["duplicates"].items():
-            for g in lst:
+        cards = []
+        for artist, groups in state["duplicates"].items():
+            for g in groups:
                 best = g["best"]
-                best_fmt = best.get("fmt_text", get_primary_format(Path(best["folder"])))
+                best_fmt = best.get(
+                    "fmt_text", get_primary_format(Path(best["folder"]))
+                )
                 formats = [best_fmt] + [
                     loser.get("fmt", get_primary_format(Path(loser["folder"])))
                     for loser in g["losers"]
                 ]
-                cards.append({
-                    "artist_key": artist.replace(" ", "_"),
-                    "artist": artist,
-                    "album_id": best["album_id"],
-                    "n": len(g["losers"]) + 1,
-                    "best_thumb": thumb_url(best["album_id"]),
-                    "best_title": best["title_raw"],
-                    "best_fmt": best_fmt,
-                    "formats": formats
-                })
-
+                cards.append(
+                    {
+                        "artist_key": artist.replace(" ", "_"),
+                        "artist": artist,
+                        "album_id": best["album_id"],
+                        "n": len(g["losers"]) + 1,
+                        "best_thumb": thumb_url(best["album_id"]),
+                        "best_title": best["title_raw"],
+                        "best_fmt": best_fmt,
+                        "formats": formats,
+                    }
+                )
         remaining_dupes = len(cards)
 
     return render_template_string(
@@ -1304,7 +1345,7 @@ def index():
         removed_dupes=removed_dupes,
         total_artists=total_artists,
         total_albums=total_albums,
-        remaining_dupes=remaining_dupes
+        remaining_dupes=remaining_dupes,
     )
 
 @app.post("/start")
@@ -1470,142 +1511,166 @@ def dedupe_selected():
 def dedupe_cli(dry: bool, safe: bool, tag_extra: bool, verbose: bool):
     """
     Command-line mode:
-    - Scans all artists/albums in Plex.
-    - Detects duplicate album groups.
-    - For each group: moves loser folders (or simulates) and deletes metadata in Plex.
+    * Scans every artist and album in Plex.
+    * Detects duplicate album groups.
+    * Optionally moves loser folders and deletes Plex metadata.
+
+    Parameters
+    ----------
+    dry : bool
+        If True, simulate actions only (no moves / deletes).
+    safe : bool
+        If True, never delete Plex metadata (even when not dry-run).
+    tag_extra : bool
+        If True, tag "(Extra Tracks)" on the best edition that has more tracks
+        than the shortest edition in the group.
+    verbose : bool
+        Enable DEBUG-level logging.
     """
-    log_level = logging.DEBUG if verbose else logging.INFO
-    logging.getLogger().setLevel(log_level)
+    # ─── logging setup ────────────────────────────────────────────────────────
+    log_lvl = logging.DEBUG if verbose else logging.INFO
+    logging.getLogger().setLevel(log_lvl)
 
     if verbose:
-        logging.debug(f"dedupe_cli(): Opening Plex database at {PLEX_DB_FILE}")
+        logging.debug(f"dedupe_cli(): opening Plex DB at {PLEX_DB_FILE}")
 
-    db_conn = sqlite3.connect(PLEX_DB_FILE)
+    db_conn = plex_connect()
     cur = db_conn.cursor()
 
+    # ─── headline counters ────────────────────────────────────────────────────
     stats = {
-        'total_artists': 0,
-        'total_albums': 0,
-        'albums_with_dupes': 0,
-        'total_dupes': 0,
-        'total_moved_mb': 0
+        "total_artists": 0,
+        "total_albums": 0,
+        "albums_with_dupes": 0,
+        "total_dupes": 0,
+        "total_moved_mb": 0,
     }
 
+    # ─── iterate over all artists ────────────────────────────────────────────
     artists = cur.execute(
-        "SELECT id, title FROM metadata_items WHERE metadata_type=8 AND library_section_id=?",
-        (SECTION_ID,)
+        "SELECT id, title FROM metadata_items "
+        "WHERE metadata_type=8 AND library_section_id=?",
+        (SECTION_ID,),
     ).fetchall()
+
     if verbose:
-        logging.debug(f"dedupe_cli(): Fetched {len(artists)} artists from Plex DB")
+        logging.debug(f"dedupe_cli(): {len(artists)} artists loaded from Plex DB")
 
     for artist_id, artist_name in artists:
-        stats['total_artists'] += 1
-        album_rows = cur.execute(
-            "SELECT id FROM metadata_items WHERE metadata_type=9 AND parent_id=?",
-            (artist_id,)
-        ).fetchall()
-        album_ids = [row[0] for row in album_rows]
-        stats['total_albums'] += len(album_ids)
+        stats["total_artists"] += 1
+
+        album_ids = [
+            row[0]
+            for row in cur.execute(
+                "SELECT id FROM metadata_items "
+                "WHERE metadata_type=9 AND parent_id=?",
+                (artist_id,),
+            ).fetchall()
+        ]
+        stats["total_albums"] += len(album_ids)
 
         dup_groups = scan_duplicates(db_conn, artist_name, album_ids)
         if dup_groups:
-            stats['albums_with_dupes'] += len(dup_groups)
+            stats["albums_with_dupes"] += len(dup_groups)
 
+        # ---- process each duplicate group -----------------------------------
         for group in dup_groups:
-            best = group['best']
-            losers = group['losers']
+            best = group["best"]
+            losers = group["losers"]
 
-            logging.info("-" * 60)
-            logging.info(f"Detected duplicate group for: {artist_name} | {best['title_raw']}")
-
-            best_size_mb = folder_size(best['folder']) // (1024 * 1024)
-            best_fmt = get_primary_format(best['folder'])
-            best_br = best['br'] // 1000
-            best_sr = best['sr']
-            best_bd = best.get('bd', 0)
+            logging.info("-" * 70)
             logging.info(
-                f"Best version     | {artist_name} | {best['title_raw']} | "
-                f"{best_size_mb} MB | {best_fmt} | {best_br} kbps | {best_sr} Hz | {best_bd} bit"
+                f"Duplicate group: {artist_name}  |  {best['title_raw']}"
+            )
+
+            best_size = folder_size(best["folder"]) // (1024 * 1024)
+            best_fmt = get_primary_format(best["folder"])
+            best_br = best["br"] // 1000
+            best_sr = best["sr"]
+            best_bd = best.get("bd", 0)
+            logging.info(
+                f" Best  | {best_size} MB | {best_fmt} | "
+                f"{best_br} kbps | {best_sr} Hz | {best_bd} bit"
             )
 
             group_moved_mb = 0
-            for loser in losers:
-                loser_folder = Path(loser['folder'])
-                loser_id = loser['album_id']
-                loser_title = loser['title_raw']
 
-                if not loser_folder.exists():
-                    logging.warning(
-                        f"Source folder not found, skipping: {loser_folder} (rk={loser_id})"
-                    )
+            # ---- each loser --------------------------------------------------
+            for loser in losers:
+                src = Path(loser["folder"])
+                loser_id = loser["album_id"]
+
+                if not src.exists():
+                    logging.warning(f"Folder not found, skipping: {src}")
                     continue
 
+                # Build destination path under DUPE_ROOT
                 try:
                     base_real = next(iter(PATH_MAP.values()))
-                    rel = loser_folder.relative_to(base_real)
+                    rel = src.relative_to(base_real)
                 except Exception:
-                    rel = loser_folder.name
-
+                    rel = src.name
                 dst = DUPE_ROOT / rel
                 dst.parent.mkdir(parents=True, exist_ok=True)
 
-                loser_size_mb = folder_size(loser_folder) // (1024 * 1024)
-                loser_fmt = get_primary_format(loser_folder)
-                loser_br = loser['br'] // 1000
-                loser_sr = loser['sr']
-                loser_bd = loser.get('bd', 0)
-                group_moved_mb += loser_size_mb
-                stats['total_moved_mb'] += loser_size_mb
-                stats['total_dupes'] += 1
+                # Deal with name collisions
+                if dst.exists():
+                    root_name = dst.name
+                    counter = 1
+                    while (dst.parent / f"{root_name} ({counter})").exists():
+                        counter += 1
+                    dst = dst.parent / f"{root_name} ({counter})"
+
+                size_mb = folder_size(src) // (1024 * 1024)
+                group_moved_mb += size_mb
+                stats["total_moved_mb"] += size_mb
+                stats["total_dupes"] += 1
 
                 if dry:
                     logging.info(
-                        f"Would have moved | {artist_name} | {loser_title} | "
-                        f"{loser_size_mb} MB | {loser_fmt} | {loser_br} kbps | {loser_sr} Hz | {loser_bd} bit | (DRY-RUN)"
+                        f" DRY-RUN  | would move {src}  →  {dst}  "
+                        f"({size_mb} MB)"
                     )
                 else:
-                    logging.info(
-                        f"Moved            | {artist_name} | {loser_title} | "
-                        f"{loser_size_mb} MB | {loser_fmt} | {loser_br} kbps | {loser_sr} Hz | {loser_bd} bit"
-                    )
-                    try:
-                        shutil.move(str(loser_folder), str(dst))
-                    except FileNotFoundError:
-                        logging.warning(f"Failed to move, folder disappeared: {loser_folder}")
-                        continue
+                    logging.info(f" Moving   | {src}  →  {dst}")
+                    shutil.move(str(src), str(dst))
 
-                if not dry and not safe:
-                    logging.info(f"    Deleting metadata in Plex for rk={loser_id}")
+                # Delete Plex metadata (unless dry/safe)
+                if (not dry) and (not safe):
+                    logging.debug(f"   deleting Plex metadata rk={loser_id}")
                     plex_api(f"/library/metadata/{loser_id}/trash", method="PUT")
                     time.sleep(0.3)
                     plex_api(f"/library/metadata/{loser_id}", method="DELETE")
                 else:
-                    logging.info(f"    [SKIPPED Plex delete for rk={loser_id}]")
+                    logging.debug(f"   Plex delete skipped rk={loser_id}")
 
-            logging.info(f"Total moved for this group: {group_moved_mb} MB")
+            logging.info(f" Group freed {group_moved_mb} MB")
 
+            # ---- optional “Extra Tracks” tag --------------------------------
             if tag_extra:
-                max_tracks = max(len(ed['tracks']) for ed in losers + [best])
-                min_tracks = min(len(ed['tracks']) for ed in losers + [best])
-                if len(best['tracks']) > min_tracks:
-                    logging.info(f"    Tagging 'Extra Tracks' on best rk={best['album_id']}")
+                all_editions = losers + [best]
+                max_tracks = max(len(e["tracks"]) for e in all_editions)
+                min_tracks = min(len(e["tracks"]) for e in all_editions)
+                if len(best["tracks"]) > min_tracks:
+                    logging.info(" Tagging '(Extra Tracks)' on best edition")
                     plex_api(
-                        f"/library/metadata/{best['album_id']}?title.value=(Extra Tracks)&title.lock=1",
-                        method="PUT"
+                        f"/library/metadata/{best['album_id']}"
+                        f"?title.value=(Extra Tracks)&title.lock=1",
+                        method="PUT",
                     )
 
+        # Refresh Plex for this artist
         prefix = f"/music/matched/{quote_plus(artist_name[0].upper())}/{quote_plus(artist_name)}"
         plex_api(f"/library/sections/{SECTION_ID}/refresh?path={prefix}")
         plex_api(f"/library/sections/{SECTION_ID}/emptyTrash", method="PUT")
 
-    logging.info("-" * 60)
+    # ---- summary ------------------------------------------------------------
+    logging.info("-" * 70)
     logging.info("FINAL SUMMARY")
-    logging.info(f"Total artists processed      : {stats['total_artists']}")
-    logging.info(f"Total albums processed       : {stats['total_albums']}")
-    logging.info(f"Albums with duplicates       : {stats['albums_with_dupes']}")
-    logging.info(f"Duplicate editions moved     : {stats['total_dupes']}")
-    logging.info(f"Total space moved (MB)       : {stats['total_moved_mb']} MB")
-    logging.info("-" * 60)
+    for key, val in stats.items():
+        logging.info(f"{key.replace('_',' ').title():26}: {val}")
+    logging.info("-" * 70)
+
     db_conn.close()
 
 # ───────────────────────────────── MAIN ───────────────────────────────────
