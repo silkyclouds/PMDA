@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PMDA V0.4.2
+PMDA V0.4.3
 
 """
 
@@ -925,10 +925,11 @@ HTML = """<!DOCTYPE html>
   {% endif %}
 </div>
 
-    <div id="scanBox" class="progress"><div id="scanBar" class="bar" style="width:0%"></div></div>
-    {% if scanning %}
-      <div id="scanTxt">0 / 0 albums</div>
-    {% endif %}
+    <div id="scanBox" class="progress">
+      <div id="scanBar" class="bar" style="width:0%"></div>
+    </div>
+    <!-- on rend toujours dispo le texte, mais caché par défaut -->
+    <div id="scanTxt" style="display:none; margin-top:0.5rem;">0 / 0 albums</div>
 
 {% if groups %}
   <!-- ==== Grid Mode ==== -->
@@ -1049,33 +1050,44 @@ HTML = """<!DOCTYPE html>
 
       /* ─── Scan progress polling ────────────────────────────────────── */
       function pollScan() {
-        fetch("/api/progress")
-          .then(r => r.json())
-          .then(j => {
-            if (j.scanning) {
-              const scanBox = document.getElementById("scanBox");
-              if (scanBox) scanBox.style.display = "block";
-              const scanBar = document.getElementById("scanBar");
-              if (scanBar) {
-                const pct = j.total ? Math.round(100 * j.progress / j.total) : 0;
-                scanBar.style.width = pct + "%";
-              }
-              const scanTxt = document.getElementById("scanTxt");
-              if (scanTxt) scanTxt.innerText = `${j.progress} / ${j.total} albums`;
-            } else {
-              clearInterval(scanTimer);
-              location.reload();
-            }
-          });
+            fetch("/api/progress")
+                .then(r => r.json())
+                .then(j => {
+                    if (j.scanning) {
+                        const scanBox = document.getElementById("scanBox");
+                        if (scanBox) {
+                            scanBox.style.display = "block";
+                        }
+                        const scanBar = document.getElementById("scanBar");
+                        if (scanBar) {
+                            const pct = j.total ? Math.round(100 * j.progress / j.total) : 0;
+                            scanBar.style.width = pct + "%";
+                        }
+                        const scanTxt = document.getElementById("scanTxt");
+                        if (scanTxt) {
+                            scanTxt.innerText = `${j.progress} / ${j.total} albums`;
+                        }
+                    } else {
+                        clearInterval(scanTimer);
+                        location.reload();
+                    }
+                });
       }
 
+      /* ─── Start scan ───────────────────────────────────────────────── */
       function startScan() {
-        fetch("/start", { method: "POST" })
-          .then(() => {
-            const scanBox = document.getElementById("scanBox");
-            if (scanBox) scanBox.style.display = "block";
-            scanTimer = setInterval(pollScan, 1000);
-          });
+            fetch("/start", { method: "POST" })
+                .then(() => {
+                    const scanBox = document.getElementById("scanBox");
+                    if (scanBox) {
+                        scanBox.style.display = "block";
+                    }
+                    const scanTxt = document.getElementById("scanTxt");
+                    if (scanTxt) {
+                        scanTxt.style.display = "block";
+                    }
+                    scanTimer = setInterval(pollScan, 1000);
+                });
       }
 
       /* ─── Dedupe helpers & polling ─────────────────────────────────── */
@@ -1256,8 +1268,10 @@ HTML = """<!DOCTYPE html>
           if (j.deduping) dedupeTimer = setInterval(pollDedupe, 1000);
         });
 
-        /* ─── Client-side search filter ──────────────────────────────── */
-        document.getElementById("search").addEventListener("input", ev => {
+      /* ─── Client-side search filter ──────────────────────────────── */
+      const searchInput = document.getElementById("search");
+      if (searchInput) {
+        searchInput.addEventListener("input", ev => {
           const q = ev.target.value.trim().toLowerCase();
 
           // Grid cards
@@ -1274,7 +1288,8 @@ HTML = """<!DOCTYPE html>
             row.style.display = (!q || artist.includes(q) || title.includes(q)) ? "" : "none";
           });
         });
-      });
+      }
+    });
     </script>
   </body>
 </html>
