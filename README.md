@@ -9,154 +9,128 @@
 </p>
 
 
-# PMDA – Plex Music Dedupe Assistant
+PMDA – Plex Music Dedupe Assistant
+==================================
 
-You know that special moment when you search for an album in Plex... and find **five versions** of it? Same title. Different folders. Possibly different formats. Mostly just chaos.
+You know that special moment when you search for an album in Plex... and find FIVE versions of it? Same title. Different folders. Possibly different formats. Mostly just chaos.
 
-After waiting patiently for Plex to address this (spoiler: they didn’t), I gave up and built **PMDA** (Plex Music Dedupe Assistant...) - a tool that automatically finds and deduplicates those pesky duplicate albums in your Plex Music library.
+After waiting patiently for Plex to address this (spoiler: they didn’t), I gave up and built PMDA — a tool that automatically finds and deduplicates those pesky duplicate albums in your Plex Music library.
 
 Whether you're a FLAC connoisseur or just tired of MP3 clutter, PMDA has your back.
 
----
+🌟 What PMDA Does
+-----------------
 
-## ✨ What PMDA Does
-
-- **Scans your entire Plex Music library**
+- Scans your entire Plex Music library
 - Detects duplicate albums based on:
-  - Normalized title
-  - Identical track listing
-  - 85%+ overlap in track titles
-  - Audio format, bitrate, and samplerate
+  - Normalized album titles
+  - Identical or overlapping track listings
+  - Matching track titles (85%+ similarity)
+  - Audio format, bitrate, and sample rate
 - Picks the best-quality version (FLAC wins!)
-- Moves the losers to a `Plex_dupes/` folder
-- Cleans up metadata from Plex via the API
-- Offers a fast and clean Web UI to review and manually dedupe albums
+- Moves duplicates to a `Plex_dupes/` folder
+- Cleans metadata from Plex via API
+- Offers a fast Web UI to review and dedupe
 
----
+🧠 Now with AI!
+---------------
 
-## 💡 Features
+PMDA integrates a lightweight GPT-4o model (gpt-4o-nano via OpenRouter) to explain differences between album versions. This feature costs virtually nothing to run and can be customized with your own `ai_prompt.txt` to fit your style.
 
-- **Web UI**
-  - Visual grid of duplicates
-  - Covers, formats, version count
-  - “Deduplicate All” or per-album control
-  - Shows size savings after cleanup
+💻 Web UI Features
+------------------
 
-- **Safe Mode & Dry-Run**
-  - `--dry-run`: Simulate every move and delete—log what *would* happen
-  - `--safe-mode`: Move files but skip the Plex API calls that delete metadata
+- Visual grid of duplicates with cover art
+- Album format and version info
+- Deduplicate one-by-one or all at once
+- Shows potential space savings
+- Reversible merge logic
 
-- **Stat Tracking**
-  - Keeps a persistent “space_saved” tally in `dedupe_stats.json`
-  - Displays the total reclaimed space in the top-right of the Web UI
+⚙️ Configuration (config.json)
+------------------------------
 
-- **Customizable via `config.json`**
-  - Easily configure your Plex DB path, Plex token, library section ID, path mappings, and more
-  - No more hunting through Python code—everything is in one JSON file
+Here is a sample `config.json` to adjust:
 
----
+```json
+{
+  "PLEX_DB_FILE": "/database/com.plexapp.plugins.library.db",
+  "PLEX_HOST": "http://192.168.3.2:32401",
+  "PLEX_TOKEN": "YOUR_TOKEN_HERE",
+  "SECTION_ID": 1,
+  "PATH_MAP": {
+    "/music/matched": "/mnt/user/MURRAY/Music/Music_matched"
+  },
+  "DUPE_ROOT": "/mnt/user/MURRAY/Music/Music_dupes/Plex_dupes",
+  "WEBUI_PORT": 5005,
+  "STATE_DB_FILE": "/mnt/cache/appdata/scripts/plex_dedupe/pmda_state.db",
+  "CACHE_DB_FILE": "/mnt/cache/appdata/scripts/plex_dedupe/pmda_cache.db"
+}
+```
 
-## 🚀 Getting Started
+Optional:
+- `ai_prompt.txt`: Customize how the AI explains duplicates.
 
-### 1. Clone the Repo
+🚀 Run PMDA in Docker
+---------------------
+
+```bash
+docker run -d \
+  --name pmda \
+  -p 5005:5005 \
+  -v /mnt/cache/appdata/pmda/config.json:/app/config.json:ro \
+  -v /mnt/cache/appdata/pmda/ai_prompt.txt:/app/ai_prompt.txt:ro \
+  -v "/mnt/cache/plex-saturday/config/Library/Application Support/Plex Media Server/Plug-in Support/Databases":/database:ro \
+  -v /mnt/user/MURRAY/Music/Music_dupes/Plex_dupes:/dupes \
+  -v /mnt/user/MURRAY/Music/Music_matched:/music/matched \
+  silkyclouds/pmda:0.5.0
+```
+
+It runs in verbose mode by default.
+
+🧪 Run Without Docker (Bare Metal or Virtualenv)
+------------------------------------------------
+
+1. Clone the repo:
 
 ```bash
 git clone https://github.com/silkyclouds/PMDA.git
 cd PMDA
 ```
 
-You should see:
-
-```
-PMDA/
-├── PMDA.png
-├── config.json
-├── pmda.py
-├── requirements.txt
-├── README.md
-└── static/
-```
-
----
-
-### 2. Install Dependencies
-
-We use a minimal set of Python libraries:
+2. Create a virtualenv and install dependencies:
 
 ```bash
+python3 -m venv venv
+source venv/bin/activate
 pip install -r requirements.txt
+sudo apt install ffmpeg  # for ffprobe
 ```
 
-The `requirements.txt` might look like:
+3. Adjust `config.json` as shown above.
 
-```
-Flask>=2.0
-requests>=2.25
-```
-
-> 💡 To enable audio quality analysis (bitrate, sample rate, bit depth), make sure to install **ffmpeg**, which includes the required `ffprobe` tool. PMDA will still run without it, but your duplicate scoring will be less accurate.
-
----
-
-### 3. Configure `config.json`
-
-Update the values for:
-
-- `plex_db_file`: Full path to your `com.plexapp.plugins.library.db` file. On Unraid or Dockerized Plex, this might look like `/mnt/user/appdata/plex/Library/Application Support/Plex Media Server/Plug-in Support/Databases/com.plexapp.plugins.library.db`.
-
-- `plex_token`: Your Plex token. You can find it [by following these steps](https://support.plex.tv/articles/204059436-finding-an-authentication-token-x-plex-token/).
-
-- `plex_host`: The full URL to access your Plex server. For example: `http://192.168.1.50:32400`.
-
-- `library_section_id`: The section ID for your music library. You can find it by inspecting the URL when browsing your music in Plex: `.../library/sections/5/...` → your ID is `5`.
-
-- `path_map`: A dictionary mapping internal Plex paths to actual filesystem paths. For example:
-  ```json
-  {
-    "/data/music": "/mnt/user/Music"
-  }
-  ```
-
-- `dupe_root`: Where the script should move detected duplicates. It must exist and be writable. Example: `/mnt/user/Music/Plex_dupes`.
-
-- `stats_file`: A JSON file where stats about deduplication runs will be stored. Example: `/mnt/user/appdata/plex_dedupe/stats.json`.
-
-- `webui_port`: The port where you want to expose the Web UI. Default is `5005`.
-
-Make sure all these paths exist and are accessible to your Python script!
-
----
-
-### 4. Launch the Web UI
+4. Run the Web UI:
 
 ```bash
-python3 pmda.py --serve
+python3 pmda.py --serve --verbose
 ```
 
-Then open your browser and go to:
-
-```
-http://localhost:5000
-```
-
-Or whichever port you set in the config.
-
----
-
-### 5. Or Use the CLI Mode
+5. Or run CLI mode:
 
 ```bash
 python3 pmda.py --dry-run
 ```
 
-Other CLI options:
+🛠 CLI Options
+--------------
 
-- `--safe-mode`
-- `--tag-extra`
-- `--verbose`
+- `--dry-run`: Simulate actions
+- `--safe-mode`: Skip Plex API deletions
+- `--tag-extra`: Keep non-standard album metadata
+- `--verbose`: Show detailed logging
+- `--serve`: Run Web UI
 
----
+🫶 Thanks & Community
+---------------------
 
-## 🖖 Happy Deduping
-
-Enjoy your streamlined, space-saving Plex music library. 
+Have a bug, suggestion, or idea? Join the Discord:
+👉 https://discord.gg/9eEAvvZW
