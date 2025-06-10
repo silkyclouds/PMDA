@@ -2,7 +2,7 @@
   "PLEX_DB_FILE": "/path/to/Plex Media Server/Plug-in Support/Databases/com.plexapp.plugins.library.db",
   "PLEX_HOST": "http://<PLEX_HOST_IP>:32400",
   "PLEX_TOKEN": "<YOUR_PLEX_TOKEN>",
-  "SECTION_ID": <YOUR_MUSIC_SECTION_ID>,
+  "SECTION_ID": 1,
   "PATH_MAP": {
     "/music/matched": "/path/to/your/Music_matched"
   },
