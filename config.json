@@ -1,12 +1,12 @@
 {
-  "PLEX_DB_FILE": "/path/to/Plex Media Server/Plug-in Support/Databases/com.plexapp.plugins.library.db",
+  "PLEX_DB_FILE": "/database/com.plexapp.plugins.library.db",
   "PLEX_HOST": "http://<PLEX_HOST_IP>:32400",
   "PLEX_TOKEN": "<YOUR_PLEX_TOKEN>",
   "SECTION_ID": 1,
   "PATH_MAP": {
-    "/music/matched": "/path/to/your/Music_matched"
+    "/music/matched": "/music/matched"
   },
-  "DUPE_ROOT": "/path/to/your/Music_dupes/Plex_dupes",
+  "DUPE_ROOT": "/dupes",
   "WEBUI_PORT": 5005,
   "STATE_DB_FILE": "./.pmda_state.db",
   "CACHE_DB_FILE": "./.pmda_cache.db",
