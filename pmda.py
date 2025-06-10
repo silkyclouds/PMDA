@@ -1,7 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 """
-PMDA V0.4.3
+PMDA V0.5.0
+
+Summary:
+- Scans your Plex music library to identify duplicate albums by exact track signatures and, optionally, fuzzy matching via AI.
+- Selects the best edition based on format quality, bit depth, track count, and bitrate (with AI fallback).
+- Presents a web UI to merge bonus tracks, review duplicates, and deduplicate automatically or selectively.
+- Moves duplicate folders to a dedicated dupe root and cleans up Plex metadata.
+- Don't be stupid, use it with caution ! 
 
 """
 
@@ -23,6 +31,7 @@ from typing import NamedTuple, List, Dict, Optional
 from urllib.parse import quote_plus
 
 import requests
+import openai
 from flask import Flask, render_template_string, request, jsonify
 
 # ───────────────────────────────── CONFIGURATION LOADING ─────────────────────────────────
@@ -30,13 +39,25 @@ CONFIG_PATH = Path(__file__).parent / "config.json"
 if not CONFIG_PATH.exists():
     raise FileNotFoundError(f"Configuration file not found: {CONFIG_PATH}")
 
+import re
 with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-    conf = json.load(f)
+    raw = f.read()
+# Strip any stray control characters that break JSON parsing
+raw = re.sub(r'[\x00-\x1f]', '', raw)
+conf = json.loads(raw)
+
+# Path to external AI prompt template
+AI_PROMPT_FILE = Path(conf.get("AI_PROMPT_FILE", Path(__file__).parent / "ai_prompt.txt"))
+
+# Optional custom format lists
+FORMAT_PREFERENCE = conf.get("FORMAT_PREFERENCE", [
+    "dsf","aif","aiff","wav","flac","m4a","mp4","m4b","m4p","aifc","ogg","mp3","wma"
+])
 
 required_keys = [
     "PLEX_DB_FILE", "PLEX_HOST", "PLEX_TOKEN",
     "SECTION_ID", "PATH_MAP", "DUPE_ROOT", "STATE_DB_FILE", "WEBUI_PORT",
-    "CACHE_DB_FILE", "SCAN_THREADS"
+    "CACHE_DB_FILE", "SCAN_THREADS", "OPENAI_API_KEY", "OPENAI_MODEL"
 ]
 for key in required_keys:
     if key not in conf:
@@ -52,6 +73,15 @@ STATE_DB_FILE   = Path(conf["STATE_DB_FILE"])
 CACHE_DB_FILE   = Path(conf["CACHE_DB_FILE"])
 WEBUI_PORT      = int(conf["WEBUI_PORT"])
 SCAN_THREADS    = int(conf["SCAN_THREADS"])
+OPENAI_API_KEY = conf.get("OPENAI_API_KEY")
+# Model to use for AI selection (configurable in config.json)
+OPENAI_MODEL = conf.get("OPENAI_MODEL", "gpt-4")
+
+# Initialize OpenAI API key if provided
+if OPENAI_API_KEY:
+    openai.api_key = OPENAI_API_KEY
+else:
+    logging.info("No OPENAI_API_KEY provided; AI-driven selection disabled.")
 
 DUPE_ROOT.mkdir(parents=True, exist_ok=True)
 STATE_DB_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -59,7 +89,8 @@ CACHE_DB_FILE.parent.mkdir(parents=True, exist_ok=True)
 
 # ───────────────────────────────── OTHER CONSTANTS ──────────────────────────────────
 AUDIO_RE    = re.compile(r"\.(flac|ape|alac|wav|m4a|aac|mp3|ogg)$", re.I)
-FMT_SCORE   = {'flac': 3, 'ape': 3, 'alac': 3, 'wav': 3, 'm4a': 2, 'aac': 2, 'mp3': 1, 'ogg': 1}
+# Derive format scores from user preference order
+FMT_SCORE   = {ext: len(FORMAT_PREFERENCE)-i for i, ext in enumerate(FORMAT_PREFERENCE)}
 OVERLAP_MIN = 0.85  # 85% track-title overlap minimum
 
 # ───────────────────────────────── STATE DB SETUP ──────────────────────────────────
@@ -80,6 +111,9 @@ def init_state_db():
             bd          INTEGER,
             dur         INTEGER,
             discs       INTEGER,
+            rationale   TEXT,
+            merge_list  TEXT,
+            ai_used     INTEGER DEFAULT 0,
             PRIMARY KEY (artist, album_id)
         )
     """)
@@ -228,10 +262,15 @@ def score_format(ext: str) -> int:
 
 def norm_album(title: str) -> str:
     """
-    Strip trailing parenthetical, lowercase, and trim.
-    e.g. "Album Name (Special Edition)" → "album name"
+    Strip any parenthetical or bracketed content, collapse whitespace,
+    lowercase, and trim.
+    e.g. "Album Name (Special Edition) [HD]" → "album name"
     """
-    return re.sub(r"\s*\([^)]*\)\s*$", "", title, flags=re.I).strip().lower()
+    # Remove any content in parentheses or brackets
+    cleaned = re.sub(r"[\(\[][^\)\]]*[\)\]]", "", title)
+    # Collapse multiple spaces into one and strip leading/trailing whitespace
+    cleaned = " ".join(cleaned.split())
+    return cleaned.lower()
 
 def get_primary_format(folder: Path) -> str:
     for f in folder.rglob("*"):
@@ -241,6 +280,37 @@ def get_primary_format(folder: Path) -> str:
 
 def thumb_url(album_id: int) -> str:
     return f"{PLEX_HOST}/library/metadata/{album_id}/thumb?X-Plex-Token={PLEX_TOKEN}"
+
+def build_cards() -> list[dict]:
+    """
+    Convert the live state["duplicates"] structure into the list of card
+    dictionaries expected by the front-end.  Called both by the initial
+    page render and the /api/duplicates endpoint so that new cards appear
+    incrementally while a scan is running.
+    """
+    cards: list[dict] = []
+    for artist, groups in state["duplicates"].items():
+        for g in groups:
+            best = g["best"]
+            best_fmt = best.get("fmt_text") or get_primary_format(Path(best["folder"]))
+            cards.append(
+                {
+                    "artist_key": artist.replace(" ", "_"),
+                    "artist": artist,
+                    "album_id": best["album_id"],
+                    "n": len(g["losers"]) + 1,
+                    "best_thumb": thumb_url(best["album_id"]),
+                    "best_title": best["title_raw"],
+                    "best_fmt": best_fmt,
+                    "formats": [best_fmt]
+                    + [
+                        l.get("fmt_text") or l.get("fmt") or get_primary_format(Path(l["folder"]))
+                        for l in g["losers"]
+                    ],
+                    "used_ai": best.get("used_ai", False),
+                }
+            )
+    return cards
 
 # ───────────────────────────────── DATABASE HELPERS ──────────────────────────────────
 class Track(NamedTuple):
@@ -290,23 +360,25 @@ def analyse_format(folder: Path) -> tuple[int, int, int, int]:
     We cache results keyed by (path, mtime). If a FLAC cache entry is (0,0,0),
     force a re‐probe. SQLite connections use a 30s timeout to avoid “database is locked.”
     """
+    # Scan all audio files, collect max values for each property
+    fmt_score_max, br_max, sr_max, bd_max = 0, 0, 0, 0
     for f in folder.rglob("*"):
         if AUDIO_RE.search(f.name):
             ext = f.suffix[1:].lower()
             file_path = str(f)
             mtime = int(f.stat().st_mtime)
-
             # 1) Check cache
             cached = get_cached_info(file_path, mtime)
             if cached:
                 br, sr, bd = cached
                 if not (ext == "flac" and (br == 0 and sr == 0 and bd == 0)):
-                    logging.debug(f"analyse_format(): cache hit for {file_path} → {br}bps, {sr}Hz, {bd}bit")
-                    return score_format(ext), br, sr, bd
-                logging.debug(
-                    f"analyse_format(): FLAC cache is zeroed for {file_path}, re‐running ffprobe"
-                )
-
+                    fmt_score = score_format(ext)
+                    fmt_score_max = max(fmt_score_max, fmt_score)
+                    br_max = max(br_max, br)
+                    sr_max = max(sr_max, sr)
+                    bd_max = max(bd_max, bd)
+                    continue
+                # If FLAC cache is zeroed, re-probe
             # 2) Build ffprobe command
             cmd = [
                 "ffprobe", "-v", "error",
@@ -315,20 +387,15 @@ def analyse_format(folder: Path) -> tuple[int, int, int, int]:
                 "-show_entries", "stream=sample_rate,sample_fmt",
                 "-of", "default=noprint_wrappers=1", file_path
             ]
-
             try:
-                logging.debug(f"analyse_format(): running ffprobe on {file_path}")
                 output = subprocess.check_output(
                     cmd, stderr=subprocess.DEVNULL, text=True, timeout=10
                 )
-
-                # Initialize defaults
                 br = 0
                 sr = 0
                 bd = 0
                 sample_fmt = None
                 format_br = None
-
                 for line in output.splitlines():
                     if line.startswith("bit_rate="):
                         value = line.split("=", 1)[1].strip()
@@ -344,28 +411,26 @@ def analyse_format(folder: Path) -> tuple[int, int, int, int]:
                             sr = 0
                     elif line.startswith("sample_fmt="):
                         sample_fmt = line.split("=", 1)[1].strip()
-
                 if format_br is not None:
                     br = format_br
-
                 if sample_fmt:
                     m = re.match(r"s(\d+)", sample_fmt)
                     if m:
                         bd = int(m.group(1))
                     else:
                         bd = 0
-
-                logging.debug(f"analyse_format(): ffprobe result for {file_path} → {br}bps, {sr}Hz, {bd}bit")
                 set_cached_info(file_path, mtime, br, sr, bd)
-                return score_format(ext), br, sr, bd
-
+                fmt_score = score_format(ext)
+                fmt_score_max = max(fmt_score_max, fmt_score)
+                br_max = max(br_max, br)
+                sr_max = max(sr_max, sr)
+                bd_max = max(bd_max, bd)
             except Exception as e:
-                logging.debug(f"analyse_format(): ffprobe failed for {file_path} ({e}), storing zeroed cache")
                 set_cached_info(file_path, mtime, 0, 0, 0)
-                return score_format(ext), 0, 0, 0
-
-    # No audio files found
-    return (0, 0, 0, 0)
+                fmt_score = score_format(ext)
+                fmt_score_max = max(fmt_score_max, fmt_score)
+                # Keep zeros for br, sr, bd
+    return (fmt_score_max, br_max, sr_max, bd_max)
 
 # ───────────────────────────────── DUPLICATE DETECTION ─────────────────────────────────
 def signature(tracks: List[Track]) -> tuple:
@@ -379,14 +444,148 @@ def overlap(a: set, b: set) -> float:
     return len(a & b) / max(len(a), len(b))
 
 def choose_best(editions: List[dict]) -> dict:
-    # Compare by (fmt_score, bitrate, samplerate, bitdepth, fewer discs, longer total dur)
-    return max(
-        editions,
-        key=lambda e: (
-            e['fmt_score'], e['br'], e['sr'], e['bd'],
-            -e['discs'], e['dur']
-        )
+    """
+    Selects the best edition either via OpenAI (if API key is available),
+    or via heuristic, first reusing any previously cached AI result.
+    """
+    import sqlite3, json
+
+    # 1) Reuse previously cached AI choice
+    con = sqlite3.connect(str(STATE_DB_FILE))
+    cur = con.cursor()
+    ids = tuple(e['album_id'] for e in editions)
+    placeholders = ",".join("?" for _ in ids)
+    # on suppose que toutes les éditions ont le même artist
+    artist = editions[0]['artist']
+    cur.execute(
+        f"SELECT album_id, rationale, merge_list "
+        f"FROM duplicates_best "
+        f"WHERE artist = ? AND album_id IN ({placeholders}) AND ai_used = 1",
+        (artist, ) + ids
     )
+    row = cur.fetchone()
+    con.close()
+    if row:
+        prev_id, rationale, merge_json = row
+        best = next(e for e in editions if e['album_id'] == prev_id)
+        best["rationale"]  = rationale
+        best["merge_list"] = json.loads(merge_json)
+        best["used_ai"]    = True
+        return best
+
+    # 2) If no cached AI result, call OpenAI if API key is available
+    used_ai = False
+    if OPENAI_API_KEY:
+        used_ai = True
+        # Load prompt template from external file
+        template = AI_PROMPT_FILE.read_text(encoding="utf-8")
+        user_msg = template + "\nÉditions candidates :\n"
+        for idx, e in enumerate(editions):
+            user_msg += (
+                f"{idx}: fmt_score={e['fmt_score']}, bitdepth={e['bd']}, "
+                f"tracks={len(e['tracks'])}, files={e['file_count']}, "
+                f"bitrate={e['br']}, samplerate={e['sr']}, duration={e['dur']}\n"
+            )
+
+        system_msg = (
+            "You are an expert digital-music librarian. "
+            "Reply **only** with: <index>|<brief rationale>|<comma-separated extra tracks>. "
+            "Do not add anything before or after. "
+            "If there are no extra tracks leave the third field empty but keep the trailing pipe."
+        )
+        try:
+            resp = openai.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[
+                    {"role": "system", "content": system_msg},
+                    {"role": "user",   "content": user_msg},
+                ],
+                temperature=0.0,
+                max_tokens=64,
+            )
+            txt = resp.choices[0].message.content.strip()
+            p1, p2 = txt.find("|"), txt.find("|", txt.find("|") + 1)
+            if p1 < 0 or p2 < 0:
+                raise ValueError("Format de réponse IA invalide")
+
+            idx       = int(re.search(r"\d+", txt[:p1]).group())
+            rationale = txt[p1+1 : p2].strip()
+            merge_raw = txt[p2+1 :].strip()
+            merge_list = [t.strip() for t in merge_raw.split(",") if t.strip()]
+
+            best = editions[idx]
+            best.update({
+                "rationale":  rationale,
+                "merge_list": merge_list,
+                "used_ai":    True,
+            })
+        except Exception as e:
+            logging.warning(f"AI failed ({e}), using heuristic fallback")
+            used_ai = False
+
+    # 3) Heuristic fallback if AI is disabled or fails
+    if not used_ai:
+        best = max(
+            editions,
+            key=lambda e: (
+                e["fmt_score"],
+                e["bd"],
+                len(e["tracks"]),
+                e["file_count"],
+                e["br"],
+            ),
+        )
+        best["used_ai"] = False
+
+        # mini-rationale
+        others = [e for e in editions if e is not best]
+        reasons = []
+        if any(best["fmt_score"] > o["fmt_score"] for o in others):
+            reasons.append("lossless format preferred")
+        if any(best["bd"] > o["bd"] for o in others):
+            reasons.append(f"bit-depth {best['bd']} bit higher")
+        if any(len(best["tracks"]) > len(o["tracks"]) for o in others):
+            reasons.append(f"{len(best['tracks'])} tracks (most)")
+        if any(best["file_count"] > o["file_count"] for o in others):
+            reasons.append("more audio files")
+        if any(best["br"] > o["br"] for o in others):
+            reasons.append(f"bitrate {best['br']//1000} kbps higher")
+        best["rationale"] = "; ".join(reasons)
+
+        # detect bonus tracks
+        all_titles = best["titles"]
+        extras = sorted({t for o in others for t in o["titles"] if t not in all_titles})
+        best["merge_list"] = extras
+
+    # 4) Persister en DB (INSERT OR IGNORE pour ne pas écraser un cache existant)
+    con = sqlite3.connect(str(STATE_DB_FILE))
+    cur = con.cursor()
+    cur.execute("""
+        INSERT OR IGNORE INTO duplicates_best
+          (artist, album_id, title_raw, album_norm, folder, fmt_text,
+           br, sr, bd, dur, discs, rationale, merge_list, ai_used)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        best["artist"],
+        best["album_id"],
+        best["title_raw"],
+        best["album_norm"],
+        str(best["folder"]),
+        get_primary_format(Path(best["folder"])),
+        best["br"],
+        best["sr"],
+        best["bd"],
+        best["dur"],
+        best["discs"],
+        best.get("rationale", ""),
+        json.dumps(best.get("merge_list", [])),
+        int(best.get("used_ai", False)),
+    ))
+    con.commit()
+    con.close()
+
+    return best
+app = Flask(__name__)
 
 def scan_artist_duplicates(args):
     """
@@ -435,6 +634,9 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
             'artist': artist,
             'folder': folder,
             'tracks': tr,
+            'file_count': sum(
+                1 for f in folder.rglob("*") if AUDIO_RE.search(f.name)
+            ),
             'sig': signature(tr),
             'titles': {t.title for t in tr},
             'dur': sum(t.dur for t in tr),
@@ -442,12 +644,15 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
             'discs': len({t.disc for t in tr})
         })
 
-    groups: Dict[tuple, List[dict]] = defaultdict(list)
+    # --- First pass: exact match on (album_norm, sig) ---
+    from collections import defaultdict
+    exact_groups = defaultdict(list)
     for e in editions:
-        groups[(e['album_norm'], e['sig'])].append(e)
+        exact_groups[(e['album_norm'], e['sig'])].append(e)
 
     out = []
-    for (_, _), ed_list in groups.items():
+    used_ids = set()
+    for ed_list in exact_groups.values():
         if len(ed_list) < 2:
             continue
         common = set.intersection(*(e['titles'] for e in ed_list))
@@ -455,31 +660,64 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
             continue
         best = choose_best(ed_list)
         losers = [e for e in ed_list if e is not best]
+        # Ensure rationale is preserved in group
         out.append({
             'artist': artist,
             'album_id': best['album_id'],
             'best': best,
-            'losers': losers
+            'losers': losers,
+            'fuzzy': False
         })
+        used_ids.update(e['album_id'] for e in ed_list)
+
+    # --- Second pass: fuzzy match on album_norm only, for remaining editions ---
+    norm_groups = defaultdict(list)
+    for e in editions:
+        if e['album_id'] not in used_ids:
+            norm_groups[e['album_norm']].append(e)
+
+    for ed_list in norm_groups.values():
+        if len(ed_list) < 2:
+            continue
+        # Only perform fuzzy grouping via AI; skip if no API key
+        if not OPENAI_API_KEY:
+            continue
+        # Force AI selection for fuzzy groups
+        best = choose_best(ed_list)
+        losers = [e for e in ed_list if e is not best]
+        # Mark as fuzzy
+        out.append({
+            'artist': artist,
+            'album_id': best['album_id'],
+            'best': best,
+            'losers': losers,
+            'fuzzy': True
+        })
+
     return out
 
 def save_scan_to_db(scan_results: Dict[str, List[dict]]):
     """
     Given a dict of { artist_name: [group_dicts...] }, clear duplicates tables and re‐populate them.
     """
+    import sqlite3, json
     con = sqlite3.connect(str(STATE_DB_FILE))
     cur = con.cursor()
-    # Clear existing duplicates
+
+    # 1) On vide complètement les tables
     cur.execute("DELETE FROM duplicates_loser")
     cur.execute("DELETE FROM duplicates_best")
-    # Insert new duplicates
+
+    # 2) On ré-insère tout
     for artist, groups in scan_results.items():
         for g in groups:
             best = g['best']
+            # Best edition
             cur.execute("""
-                INSERT INTO duplicates_best
-                (artist, album_id, title_raw, album_norm, folder, fmt_text, br, sr, bd, dur, discs)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT OR IGNORE INTO duplicates_best
+                  (artist, album_id, title_raw, album_norm, folder,
+                   fmt_text, br, sr, bd, dur, discs, rationale, merge_list, ai_used)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 artist,
                 best['album_id'],
@@ -491,13 +729,18 @@ def save_scan_to_db(scan_results: Dict[str, List[dict]]):
                 best['sr'],
                 best['bd'],
                 best['dur'],
-                best['discs']
+                best['discs'],
+                best.get('rationale', ''),
+                json.dumps(best.get('merge_list', [])),
+                int(best.get('used_ai', False))
             ))
+
+            # Toutes les éditions "loser"
             for e in g['losers']:
                 size_mb = folder_size(e['folder']) // (1024 * 1024)
                 cur.execute("""
                     INSERT INTO duplicates_loser
-                    (artist, album_id, folder, fmt_text, br, sr, bd, size_mb)
+                      (artist, album_id, folder, fmt_text, br, sr, bd, size_mb)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     artist,
@@ -509,6 +752,8 @@ def save_scan_to_db(scan_results: Dict[str, List[dict]]):
                     e['bd'],
                     size_mb
                 ))
+
+    # 3) Commit & close
     con.commit()
     con.close()
 
@@ -529,7 +774,7 @@ def load_scan_from_db() -> Dict[str, List[dict]]:
     cur.execute(
         """
         SELECT artist, album_id, title_raw, album_norm, folder,
-               fmt_text, br, sr, bd, dur, discs
+               fmt_text, br, sr, bd, dur, discs, rationale, merge_list, ai_used
         FROM   duplicates_best
         """
     )
@@ -576,6 +821,9 @@ def load_scan_from_db() -> Dict[str, List[dict]]:
         bd,
         dur,
         discs,
+        rationale,
+        merge_list_json,
+        ai_used,
     ) in best_rows:
 
         best_entry = {
@@ -589,6 +837,9 @@ def load_scan_from_db() -> Dict[str, List[dict]]:
             "bd": bd,
             "dur": dur,
             "discs": discs,
+            "rationale": rationale,
+            "merge_list": json.loads(merge_list_json) if merge_list_json else [],
+            "used_ai": bool(ai_used),
         }
 
         losers = loser_map.get((artist, aid), [])
@@ -822,6 +1073,10 @@ def perform_dedupe(group: dict) -> List[dict]:
 
 # ───────────────────────────────── HTML TEMPLATE ─────────────────────────────────
 HTML = """<!DOCTYPE html>
+<script>
+  const PLEX_HOST = "{{ plex_host }}";
+  const PLEX_TOKEN = "{{ plex_token }}";
+</script>
 <html lang="en">
   <head>
     <meta charset="utf-8">
@@ -834,6 +1089,7 @@ HTML = """<!DOCTYPE html>
       #all { background:#e63946; color:#fff; margin-right:1rem; }
       #deleteSel { background:#d90429; color:#fff; margin-right:1rem; }
       #modeswitch { background:#1d3557; color:#fff; }
+      #mergeAll { background:#e63946; color:#fff; margin-right:auto; }
       .stats-panel { position:fixed; top:1rem; right:1rem; display:flex; gap:.5rem; }
       .badge { background:#006f5f; color:#fff; padding:.4rem .8rem; border-radius:8px; font-size:.9rem; }
       .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(260px,1fr)); gap:1.2rem; }
@@ -891,74 +1147,55 @@ HTML = """<!DOCTYPE html>
 
 
 <div style="display:flex; align-items:center; margin-bottom:1rem;">
-  {% if not scanning %}
-    <button id="start"
-            onclick="startScan()"
-            style="background:#006f5f;color:#fff;margin-right:.5rem;">
-      Start New Scan
-    </button>
-  {% endif %}
-
-  {% if groups %}
-    <button id="deleteSel" onclick="submitSelected()" style="margin-right:.5rem;">
-      Delete Selected Dupes
-    </button>
-    <button id="all" onclick="submitAll()" style="margin-right:1rem;">
-      Deduplicate ALL
-    </button>
-
-    <!-- ─── NEW SEARCH BOX ─── -->
-    <input id="search"
-           type="text"
-           placeholder="Search artist or album..."
-           style="margin-right:auto; padding:.4rem; border-radius:6px; border:1px solid #ccc;"/>
-  {% else %}
-    <div style="margin-right:auto;"></div>
-  {% endif %}
-
-  {% if groups %}
-    <button id="modeswitch"
-            onclick="toggleMode()"
-            style="margin-left:1rem;">
-      Switch to Table View
-    </button>
-  {% endif %}
+  <button id="start" onclick="startScan()" style="background:#006f5f;color:#fff;margin-right:.5rem;">
+    Start New Scan
+  </button>
+  <button id="deleteSel" onclick="submitSelected()" style="margin-right:.5rem;">
+    Deduplicate Selected Groups
+  </button>
+  <button id="all" onclick="submitAll()" style="margin-right:.5rem;">
+    Deduplicate ALL
+  </button>
+  <button id="mergeAll" onclick="submitMergeAll()">
+    Merge and Deduplicate ALL
+  </button>
+  <input id="search" type="text" placeholder="Search artist or album..."
+         style="padding:.4rem; border-radius:6px; border:1px solid #ccc;"/>
 </div>
 
     <div id="scanBox" class="progress">
       <div id="scanBar" class="bar" style="width:0%"></div>
     </div>
     <!-- on rend toujours dispo le texte, mais caché par défaut -->
-    <div id="scanTxt" style="display:none; margin-top:0.5rem;">0 / 0 albums</div>
+    <div id="scanTxt" style="display:block; margin-top:0.5rem;">0 / 0 albums</div>
 
-{% if groups %}
-  <!-- ==== Grid Mode ==== -->
-  <div id="gridMode" class="grid">
-    {% for g in groups %}
-      <div class="card"
-           data-artist="{{ g.artist_key }}"
-           data-album-id="{{ g.album_id }}"
-           data-title="{{ g.best_title }}">
-        <input class="checkbox-grid" type="checkbox"
-               name="selected" value="{{ g.artist_key }}||{{ g.album_id }}"
-               onclick="event.stopPropagation();">
-        <img src="{{ g.best_thumb }}" alt="cover">
-        <div style="font-weight:600;">{{ g.artist }}</div>
-        <div style="margin-bottom:.3rem;">{{ g.best_title }}</div>
-        <div>
-          <span class="tag">versions {{ g.n }}</span>
-          <span class="tag">{{ g.best_fmt }}</span>
+    <!-- ==== Grid Mode ==== -->
+    <div id="gridMode" class="grid">
+      {% for g in groups %}
+        <div class="card"
+             data-artist="{{ g.artist_key }}"
+             data-album-id="{{ g.album_id }}"
+             data-title="{{ g.best_title }}">
+          <input class="checkbox-grid" type="checkbox"
+                 name="selected" value="{{ g.artist_key }}||{{ g.album_id }}"
+                 onclick="event.stopPropagation();">
+          <img src="{{ g.best_thumb }}" alt="cover">
+          <div style="font-weight:600;">{{ g.artist }}</div>
+          <div style="margin-bottom:.3rem;">{{ g.best_title }}</div>
+          <div>
+            <span class="tag">versions {{ g.n }}</span>
+            <span class="tag">{{ g.best_fmt }}</span>
+          </div>
+          <button class="btn-dedup"
+                  onclick="event.stopPropagation();
+                           dedupeSingle({{ g.artist_key|tojson }},
+                                        {{ g.album_id }},
+                                        {{ g.best_title|tojson }});">
+            Deduplicate
+          </button>
         </div>
-        <button class="btn-dedup"
-                onclick="event.stopPropagation();
-                         dedupeSingle({{ g.artist_key|tojson }},
-                                      {{ g.album_id }},
-                                      {{ g.best_title|tojson }});">
-          Deduplicate
-        </button>
-      </div>
-    {% endfor %}
-  </div>
+      {% endfor %}
+    </div>
 
   <!-- ==== Table Mode ==== -->
   <div id="tableMode" class="table-mode">
@@ -970,6 +1207,7 @@ HTML = """<!DOCTYPE html>
           <th>Artist</th>
           <th>Album</th>
           <th># Versions</th>
+          <th>Detection Through</th>
           <th>Formats</th>
           <th></th>
         </tr>
@@ -989,7 +1227,10 @@ HTML = """<!DOCTYPE html>
             <td>{{ g.artist }}</td>
             <td>{{ g.best_title }}</td>
             <td>{{ g.n }}</td>
-            <td>{{ g.formats|join(', ') }}</td>
+            <td>{{ 'LLM' if g.used_ai else 'Signature Match' }}</td>
+            <td>
+              {{ g.formats|join(', ') }}
+            </td>
             <td>
              <button class="row-dedup-btn"
                      onclick="event.stopPropagation();
@@ -1004,11 +1245,7 @@ HTML = """<!DOCTYPE html>
       </tbody>
     </table>
   </div>
-{% else %}
-  <div style="text-align:center; margin-top:2rem; color:#666;">
-    🎉 All clear – no duplicates found!
-  </div>
-{% endif %}
+    <!-- end always-show grid/table; removed server-side “no duplicates” branch -->
 
     <!-- ==== Modal for Edition Details & Confirmations ==== -->
     <div id="modal" class="modal">
@@ -1049,6 +1286,77 @@ HTML = """<!DOCTYPE html>
       }
 
       /* ─── Scan progress polling ────────────────────────────────────── */
+      let currentDupTotal = 0;        // how many dup groups are on screen
+
+      /* build ONE card/row – shared by grid & table ----------------------- */
+      function dedupeCardHtml(g){
+        return `
+          <div class="card"
+               data-artist="${g.artist_key}"
+               data-album-id="${g.album_id}"
+               data-title="${g.best_title}">
+            <input class="checkbox-grid" type="checkbox"
+                   name="selected" value="${g.artist_key}||${g.album_id}"
+                   onclick="event.stopPropagation();">
+            <img src="${g.best_thumb}" alt="cover">
+            <div style="font-weight:600;">${g.artist}</div>
+            <div style="margin-bottom:.3rem;">${g.best_title}</div>
+            <div><span class="tag">versions ${g.n}</span>
+                 <span class="tag">${g.best_fmt}</span></div>
+            <button class="btn-dedup"
+                    onclick="event.stopPropagation();
+                             dedupeSingle('${g.artist_key}',
+                                          ${g.album_id},
+                                          ${JSON.stringify(g.best_title)});">
+              Deduplicate
+            </button>
+          </div>`;
+      }
+
+      /* redraw grid + (optionally) table ---------------------------------- */
+      function renderDuplicates(list){
+        // GRID
+        const grid = document.getElementById("gridMode");
+        if (grid){
+          grid.innerHTML = list.map(dedupeCardHtml).join("");
+          // re-attach click handlers to new cards
+          grid.querySelectorAll(".card").forEach(card=>{
+            card.addEventListener("click",()=>openModal(card.dataset.artist,
+                                                        card.dataset.albumId));
+          });
+        }
+        // TABLE (show only when in Table view)
+        const tbody = document.querySelector("#tableMode tbody");
+        if (tbody){
+          tbody.innerHTML = list.map(g=>`
+            <tr class="table-row"
+                data-artist="${g.artist_key}"
+                data-album-id="${g.album_id}"
+                data-title="${g.best_title}">
+              <td class="checkbox-col">
+                <input type="checkbox" name="selected"
+                       value="${g.artist_key}||${g.album_id}"
+                       onclick="event.stopPropagation();">
+              </td>
+              <td class="cover-col"><img src="${g.best_thumb}" alt="cover"></td>
+              <td>${g.artist}</td>
+              <td>${g.best_title}</td>
+              <td>${g.n}</td>
+              <td>${g.used_ai ? "LLM" : "Signature Match"}</td>
+              <td>${g.formats.join(", ")}</td>
+              <td><button class="row-dedup-btn"
+                          onclick="event.stopPropagation();
+                                   dedupeSingle('${g.artist_key}',
+                                                ${g.album_id},
+                                                ${JSON.stringify(g.best_title)});">
+                    Deduplicate</button></td></tr>`).join("");
+          tbody.querySelectorAll(".table-row").forEach(row=>{
+            row.addEventListener("click",()=>openModal(row.dataset.artist,
+                                                       row.dataset.albumId));
+          });
+        }
+      }
+
       function pollScan() {
             fetch("/api/progress")
                 .then(r => r.json())
@@ -1067,11 +1375,31 @@ HTML = """<!DOCTYPE html>
                         if (scanTxt) {
                             scanTxt.innerText = `${j.progress} / ${j.total} albums`;
                         }
+                        // live-refresh duplicate cards as they arrive
+                        fetch("/api/duplicates")
+                            .then(r => r.json())
+                            .then(dups => {
+                                /* Only redraw when something new arrived */
+                                if (dups.length !== currentDupTotal) {
+                                    currentDupTotal = dups.length;
+                                    renderDuplicates(dups);
+                                }
+                            });
                     } else {
                         clearInterval(scanTimer);
-                        location.reload();
                     }
                 });
+      }
+      function submitMergeAll() {
+        showLoadingModal("Merging all duplicates...");
+        fetch("/merge/all", { method: "POST" })
+          .then(() => {
+            showLoadingModal("Merging and deduplicating all duplicates...");
+            fetch("/dedupe/all", { method: "POST" })
+              .then(() => {
+                dedupeTimer = setInterval(pollDedupe, 1000);
+              });
+          });
       }
 
       /* ─── Start scan ───────────────────────────────────────────────── */
@@ -1086,7 +1414,7 @@ HTML = """<!DOCTYPE html>
                     if (scanTxt) {
                         scanTxt.style.display = "block";
                     }
-                    scanTimer = setInterval(pollScan, 1000);
+                    scanTimer = setInterval(pollScan, 2000);
                 });
       }
 
@@ -1165,30 +1493,57 @@ HTML = """<!DOCTYPE html>
         setTimeout(closeModal, 3000);
       }
 
-      function showConfirmation(moved) {
-        let html = `<h3>Moved Duplicates</h3><div class="ed-container">`;
+    function showConfirmation(moved) {
+    const defaultThumb =
+        'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAAQklEQVR42u3BAQ0AAADCIPunNscwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD8wDeQAAEmTWlUAAAAASUVORK5CYII=';
+    const modalBody = document.getElementById("modalBody");
+    const modal     = document.getElementById("modal");
+
+    // Build content
+    let html = `<h3>Moved Duplicates</h3>`;
+    if (moved.length === 0) {
+        html += `<p>No duplicates were moved.</p>`;
+    } else {
+        html += `<div class="ed-container">`;
         moved.forEach(e => {
-          html += `<div class="edition">`;
-          if (e.thumb_data) {
-            html += `<img src="${e.thumb_data}" alt="cover">`;
-          } else {
-            html += `<img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAAQklEQVR42u3BAQ0AAADCIPunNscwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD8wDeQAAEmTWlUAAAAASUVORK5CYII=" alt="no-cover">`;
-          }
-          html += `<div><b>Duplicate</b>&nbsp;${e.artist}&nbsp;${e.title_raw}&nbsp;${e.size} MB&nbsp;${e.fmt}&nbsp;${e.br} kbps&nbsp;${e.sr} Hz&nbsp;${e.bd} bit&nbsp;Moved to dupes folder</div>`;
-          html += `</div>`;
+        html += `
+            <div class="edition">
+            <img src="${e.thumb_data || defaultThumb}" alt="cover">
+            <div class="edition-info">
+                <strong>Duplicate</strong><br>
+                ${e.artist} — ${e.title_raw}<br>
+                ${e.size} MB · ${e.fmt} · ${e.br} kbps · ${e.sr} Hz · ${e.bd} bit
+            </div>
+            </div>`;
         });
         html += `</div>`;
+    }
 
-        const modalBody = document.getElementById("modalBody");
-        if (modalBody) modalBody.innerHTML = html;
-        const modal = document.getElementById("modal");
-        if (modal) modal.style.display = "flex";
+    // Close button
+    html += `
+        <div class="modal-actions" style="text-align:right; margin-top:1rem;">
+        <button id="modalCloseBtn" style="
+            background:#006f5f;color:#fff;border:none;
+            border-radius:6px;padding:.5rem 1rem;
+            cursor:pointer;
+        ">Close</button>
+        </div>`;
 
-        setTimeout(() => {
-          closeModal();
-          location.reload();
-        }, 5000);
-      }
+    // Render & show
+    modalBody.innerHTML = html;
+    modal.style.display = "flex";
+
+    // Wire up Escape key and Close button
+    function closeHandler() {
+        closeModal();
+        document.removeEventListener("keydown", escHandler);
+    }
+    function escHandler(e) {
+        if (e.key === "Escape") closeHandler();
+    }
+    document.getElementById("modalCloseBtn").onclick = closeHandler;
+    document.addEventListener("keydown", escHandler);
+    }
 
       function closeModal() {
         const modal = document.getElementById("modal");
@@ -1201,7 +1556,24 @@ HTML = """<!DOCTYPE html>
         fetch(`/details/${artist}/${albumId}`)
           .then(r => { if (!r.ok) throw new Error("404"); return r.json(); })
           .then(j => {
-            let html = `<h3>${j.artist} – ${j.album}</h3><div class="ed-container">`;
+            let html = `<h3>${j.artist} – ${j.album}</h3>`;
+            // Insert rationale as a numbered list if present
+            if (j.rationale) {
+              const items = j.rationale.split(";");
+              html += '<ul style="margin-left:1.2rem;list-style-type:disc;">';
+              items.forEach(it => { if (it.trim()) html += `<li>${it.trim()}</li>`; });
+              html += "</ul>";
+            }
+            // Only show merge section if there are extras
+            if (j.merge_list && j.merge_list.length > 0) {
+              html += `<div><strong>Detected extra tracks:</strong>`;
+              html += `<ul style="margin-left:1.2rem;list-style-type:disc;">`;
+              j.merge_list.forEach(function(track) {
+                html += `<li>${track}</li>`;
+              });
+              html += `</ul></div>`;
+            }
+            html += `<div class="ed-container">`;
             j.editions.forEach((e, i) => {
               html += `<div class="edition">`;
               if (e.thumb_data) {
@@ -1214,6 +1586,11 @@ HTML = """<!DOCTYPE html>
               html += `<div>${e.fmt} • ${e.br} kbps • ${e.sr} Hz • ${e.bd} bit</div></div>`;
             });
             html += `</div><button id="modalDedup" style="background:#006f5f;color:#fff;border:none;border-radius:8px;padding:.4rem .9rem;cursor:pointer;margin-top:1rem;">Deduplicate</button>`;
+            // Only show merge/merge+dedup buttons if extras
+            if (j.merge_list && j.merge_list.length > 0) {
+              html += `<button id="modalMerge" style="background:#1d3557;color:#fff;border:none;border-radius:8px;padding:.4rem .9rem;cursor:pointer;margin-top:1rem;margin-left:1rem;">Merge Tracks</button>`;
+              html += `<button id="modalMergeDedup" style="background:#1d3557;color:#fff;border:none;border-radius:8px;padding:.4rem .9rem;cursor:pointer;margin-top:1rem;margin-left:1rem;">Merge and Deduplicate</button>`;
+            }
 
             const modalBody = document.getElementById("modalBody");
             if (modalBody) modalBody.innerHTML = html;
@@ -1234,6 +1611,36 @@ HTML = """<!DOCTYPE html>
                 showSimpleModal("An error occurred during modal deduplication.");
               });
             };
+            if (j.merge_list && j.merge_list.length > 0) {
+              const mergeBtn = document.getElementById("modalMerge");
+              if (mergeBtn) {
+                mergeBtn.onclick = () => {
+                  // send merge request to backend
+                  fetch(`/merge/${artist}/${albumId}`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ merge_list: j.merge_list })
+                  })
+                  .then(r => r.json())
+                  .then(resp => showSimpleModal(resp.message))
+                  .catch(() => showSimpleModal("Merge failed."));
+                };
+              }
+              const mergeDedupBtn = document.getElementById("modalMergeDedup");
+              if (mergeDedupBtn) {
+                mergeDedupBtn.onclick = () => {
+                  // First merge tracks, then deduplicate
+                  fetch(`/merge/${artist}/${albumId}`, { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({merge_list:j.merge_list}) })
+                    .then(() => {
+                      showLoadingModal(`Merging tracks then deduplicating ${j.artist} – ${j.album}`);
+                      fetch(`/dedupe/artist/${artist}`, { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({album_id:albumId}) })
+                        .then(r => r.json()).then(resp => showSimpleModal(resp.message))
+                        .catch(() => showSimpleModal("Merge+Dedup failed."));
+                    })
+                    .catch(() => showSimpleModal("Merge failed."));
+                };
+              }
+            }
           })
           .catch(() => {
             closeModal();
@@ -1290,13 +1697,49 @@ HTML = """<!DOCTYPE html>
         });
       }
     });
-    </script>
+  // close modal on Escape
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape') closeModal();
+  });
+</script>
   </body>
 </html>
 """
 
-# ───────────────────────────────── FLASK APP ─────────────────────────────────
-app = Flask(__name__)
+
+# ────────────────────────── UI card helper ──────────────────────────
+def _build_card_list(dup_dict) -> list[dict]:
+    """
+    Convert the nested `state["duplicates"]` dict into the flat list of
+    cards expected by both the main page and /api/duplicates.
+    """
+    cards = []
+    for artist, groups in dup_dict.items():
+        for g in groups:
+            best = g["best"]
+            best_fmt = best.get("fmt_text",
+                                get_primary_format(Path(best["folder"])))
+            formats = [best_fmt] + [
+                loser.get("fmt",
+                          get_primary_format(Path(loser["folder"])))
+                for loser in g["losers"]
+            ]
+            display_title = best["album_norm"].title()
+            cards.append(
+                {
+                    "artist_key": artist.replace(" ", "_"),
+                    "artist": artist,
+                    "album_id": best["album_id"],
+                    "n": len(g["losers"]) + 1,
+                    "best_thumb": thumb_url(best["album_id"]),
+                    "best_title": display_title,
+                    "best_fmt": best_fmt,
+                    "formats": formats,
+                    "used_ai": best.get("used_ai", False),
+                }
+            )
+    return cards
+
 
 @app.get("/")
 def index():
@@ -1327,29 +1770,7 @@ def index():
 
     # Build the card / row structures for the UI
     with lock:
-        cards = []
-        for artist, groups in state["duplicates"].items():
-            for g in groups:
-                best = g["best"]
-                best_fmt = best.get(
-                    "fmt_text", get_primary_format(Path(best["folder"]))
-                )
-                formats = [best_fmt] + [
-                    loser.get("fmt", get_primary_format(Path(loser["folder"])))
-                    for loser in g["losers"]
-                ]
-                cards.append(
-                    {
-                        "artist_key": artist.replace(" ", "_"),
-                        "artist": artist,
-                        "album_id": best["album_id"],
-                        "n": len(g["losers"]) + 1,
-                        "best_thumb": thumb_url(best["album_id"]),
-                        "best_title": best["title_raw"],
-                        "best_fmt": best_fmt,
-                        "formats": formats,
-                    }
-                )
+        cards = _build_card_list(state["duplicates"])
         remaining_dupes = len(cards)
 
     return render_template_string(
@@ -1361,12 +1782,16 @@ def index():
         total_artists=total_artists,
         total_albums=total_albums,
         remaining_dupes=remaining_dupes,
+        plex_host=PLEX_HOST,
+        plex_token=PLEX_TOKEN,
     )
 
 @app.post("/start")
 def start():
     with lock:
         if not state["scanning"]:
+            # Pré-flag pour afficher immédiatement la barre de progression
+            state.update(scanning=True, scan_progress=0, scan_total=0)
             logging.debug("start(): launching background_scan() thread")
             threading.Thread(target=background_scan, daemon=True).start()
     return "", 204
@@ -1399,6 +1824,8 @@ def details(artist, album_id):
         if g["album_id"] == album_id:
             editions = [g["best"]] + g["losers"]
             out = []
+            # Get rationale for best edition, if present
+            rationale = g["best"].get("rationale", "")
             for e in editions:
                 thumb_data = fetch_cover_as_base64(e["album_id"])
                 out.append({
@@ -1413,7 +1840,9 @@ def details(artist, album_id):
             return jsonify(
                 artist=art,
                 album=g["best"]["title_raw"],
-                editions=out
+                editions=out,
+                rationale=rationale,
+                merge_list=g["best"].get("merge_list", []),
             )
     return jsonify({}), 404
 
@@ -1466,7 +1895,6 @@ def dedupe_all():
         con = sqlite3.connect(str(STATE_DB_FILE))
         cur = con.cursor()
         cur.execute("DELETE FROM duplicates_loser")
-        cur.execute("DELETE FROM duplicates_best")
         con.commit()
         con.close()
         logging.debug("dedupe_all(): cleared in-memory and DB duplicates tables")
@@ -1597,6 +2025,8 @@ def dedupe_cli(dry: bool, safe: bool, tag_extra: bool, verbose: bool):
             logging.info(
                 f"Duplicate group: {artist_name}  |  {best['title_raw']}"
             )
+            sel_method = "AI selection" if best.get("used_ai") else "Heuristic selection"
+            logging.info(f"Selection method: {sel_method}")
 
             best_size = folder_size(best["folder"]) // (1024 * 1024)
             best_fmt = get_primary_format(best["folder"])
@@ -1688,6 +2118,53 @@ def dedupe_cli(dry: bool, safe: bool, tag_extra: bool, verbose: bool):
 
     db_conn.close()
 
+@app.post("/merge/<artist>/<int:album_id>")
+def merge_tracks(artist, album_id):
+    data = request.get_json() or {}
+    merge_list = data.get("merge_list", [])
+    # Locate group in state, get best folder path
+    art = artist.replace("_", " ")
+    group = next((g for g in state["duplicates"].get(art, []) if g["album_id"] == album_id), None)
+    if not group:
+        return jsonify(message="Album not found."), 404
+    best_folder = Path(group["best"]["folder"])
+    # Determine current max track index in best_folder
+    max_idx = 0
+    for f in best_folder.iterdir():
+        m = re.match(r"^(\d{2})\s*-\s*", f.name)
+        if m:
+            try:
+                idx = int(m.group(1))
+                if idx > max_idx:
+                    max_idx = idx
+            except Exception:
+                continue
+    # For each edition beyond best, copy any tracks matching merge_list into best_folder
+    copied = []
+    idx_counter = max_idx
+    for e in group["losers"]:
+        src_folder = Path(e["folder"])
+        for track in merge_list:
+            src_file = next(src_folder.rglob(f"*{track}*"), None)
+            if src_file:
+                idx_counter += 1
+                orig_name = src_file.name
+                ext = src_file.suffix
+                base = src_file.stem
+                new_name = f"{idx_counter:02d} - {base} (bonus track){ext}"
+                shutil.copy2(str(src_file), str(best_folder / new_name))
+                copied.append(new_name)
+    return jsonify(message=f"Copied {len(copied)} tracks: {', '.join(copied)}")
+# Update the /api/duplicates route to use the card helper
+@app.get("/api/duplicates")
+def api_duplicates():
+    """
+    Live‑feed of duplicate groups discovered so far, formatted like the
+    cards used on the main page, so the JS can drop them straight in.
+    """
+    with lock:
+        return jsonify(_build_card_list(state["duplicates"]))
+
 # ───────────────────────────────── MAIN ───────────────────────────────────
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -1733,3 +2210,4 @@ if __name__ == "__main__":
             tag_extra=args.tag_extra,
             verbose=args.verbose
         )
+
