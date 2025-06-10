@@ -35,7 +35,7 @@ Whether you're a FLAC connoisseur or just tired of MP3 clutter, PMDA has your ba
 🧠 Now with AI!
 ---------------
 
-PMDA integrates a lightweight GPT-4o model (gpt-4o-nano via OpenRouter) to explain differences between album versions. This feature costs virtually nothing to run and can be customized with your own `ai_prompt.txt` to fit your style.
+PMDA now (optionally) uses the openai API to explain differences between album versions. This feature costs a few cents to run and can be customized with your own `ai_prompt.txt` to fit your style.
 
 💻 Web UI Features
 ------------------
@@ -132,5 +132,5 @@ python3 pmda.py --dry-run
 🫶 Thanks & Community
 ---------------------
 
-Have a bug, suggestion, or idea? Join the Discord:
+Have a bug, suggestion, or idea? Want to add features and help developing PMDA ?  Join the Discord:
 👉 https://discord.gg/9eEAvvZW
