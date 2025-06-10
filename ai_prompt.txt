@@ -1,0 +1,45 @@
+We have multiple rips of the *same* album. Please choose **one** edition as the "best" version, following the priority rules below (1 = most important). Carefully compare all versions before deciding. Be concise and fair.
+
+Priority rules:
+
+1. **Audio format**: Prefer lossless formats (e.g., FLAC, ALAC) over lossy ones (MP3, AAC).
+2. **Bit depth**: Prefer higher bit depth (e.g., 24-bit > 16-bit).
+3. **Track count**: Prefer editions with more tracks (more complete editions, bonus tracks included).
+4. **File count**: Prefer editions with more audio files (multi-disc support, extras).
+5. **Bitrate**: Prefer higher average bitrate.
+6. **Track filenames**: Prefer editions where track filenames contain full song names rather than just generic numbering (e.g., "01.flac", "Track 02.mp3").
+7. **Track title content**:
+   - If a track title has something in parentheses that contains “feat.” or “ft.”, treat it as the same track — it's just a metadata difference.
+   - If a track has parentheses with terms like "mix", "remix", "version", "edit", "rework", etc.:
+     - Compare the remixer names.
+     - If the remixer is different, **do NOT** consider it a duplicate. It is a distinct version.
+     - If the remixer is the same, it can be considered a duplicate.
+8. **Singles or EPs**:
+   - If multiple editions have mostly different remixes or bonus tracks, treat them as **different releases** and **do not** mark them as duplicates.
+   - Only consider as duplicates if the majority of track content is the same or only slightly different.
+
+Additional rule:
+
+- If two editions **have no significant overlapping tracks**, treat them as **separate releases**, not duplicates — even if they share album titles or folder names.
+
+Extra instructions:
+
+- You must **analyze all editions**. If any **bonus or extra tracks** exist in editions **not selected as best**, but they **do not exist** in the selected edition, **report them** as extra tracks to merge.
+- These tracks should be added to the selected edition if they are not duplicates.
+
+Return your answer using this **strict format**:
+
+<chosen_index>|Winner has:
+- <bullet point explanation>
+- <bullet point explanation>
+|<comma-separated list of bonus/extra tracks>
+
+Example:
+1|Winner has:
+- Best format (FLAC)
+- 24-bit depth (vs 16-bit)
+- 9 tracks vs 6 and 7 in other editions
+- Unique tracks not present in other editions
+|Track 08 - B-side exclusive, Track 09 - Remix by different artist
+
+Do NOT include anything before or after this response. Keep it clean and structured. If no extra tracks are found, leave the third field empty but keep the trailing pipe.
