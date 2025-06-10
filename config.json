@@ -1,44 +1,17 @@
 {
-  // Full path to your Plex SQLite database file.
-  // Locate it under:
-  // <Plex data directory>/Library/Application Support/Plex Media Server/Plug-in Support/Databases/com.plexapp.plugins.library.db
-  "PLEX_DB_FILE": "/path/to/plex/Library/Application Support/Plex Media Server/Plug-in Support/Databases/com.plexapp.plugins.library.db",
-
-  // URL of your Plex Media Server (including port).
-  // Example: http://192.168.1.100:32400
-  "PLEX_HOST": "http://your.plex.server:32400",
-
-  // Your Plex authentication token.
-  // Retrieve this by inspecting Plex Web’s network traffic or checking Plex logs.
-  // DO NOT share this token publicly.
-  "PLEX_TOKEN": "your_plex_token_here",
-
-  // Integer ID of the music library section to scan for duplicates.
-  // Find this by navigating to your music section in Plex Web and noting the section number in the URL.
-  "SECTION_ID": 1,
-
-  // Maps the internal Plex path prefix to your actual filesystem path.
-  // Adjust “/music/matched” and the real mount point to match your environment.
+  "PLEX_DB_FILE": "/path/to/Plex Media Server/Plug-in Support/Databases/com.plexapp.plugins.library.db",
+  "PLEX_HOST": "http://<PLEX_HOST_IP>:32400",
+  "PLEX_TOKEN": "<YOUR_PLEX_TOKEN>",
+  "SECTION_ID": <YOUR_MUSIC_SECTION_ID>,
   "PATH_MAP": {
-    "/music/matched": "/mnt/your_storage/music/Music_matched"
+    "/music/matched": "/path/to/your/Music_matched"
   },
-
-  // Directory where detected duplicate albums will be moved.
-  // You can review or delete them manually later.
-  "DUPE_ROOT": "/mnt/your_storage/music/Plex_dupes",
-
-  // Path to JSON file for persisting dedupe stats (space saved, removed dupes).
-  "STATS_FILE": "/path/to/your/scripts/dedupe_stats.json",
-
-  // Port on which the optional Web UI will be served.
+  "DUPE_ROOT": "/path/to/your/Music_dupes/Plex_dupes",
   "WEBUI_PORT": 5005,
-
-  // SQLite file for persisting scan state (duplicate groups, stats).
-  "STATE_DB_FILE": "/path/to/your/scripts/pmda_state.db",
-
-  // SQLite file for caching audio metadata (bitrate, sample rate, bit depth).
-  "CACHE_DB_FILE": "/path/to/your/scripts/pmda_cache.db",
-
-  // Number of concurrent threads to use when scanning Plex for duplicates.
+  "STATE_DB_FILE": "./.pmda_state.db",
+  "CACHE_DB_FILE": "./.pmda_cache.db",
+  "OPENAI_API_KEY": "<YOUR_OPENAI_API_KEY>",
+  "OPENAI_MODEL": "gpt-4.1-nano",
+  "AI_PROMPT_FILE": "ai_prompt.txt",
   "SCAN_THREADS": 16
 }
