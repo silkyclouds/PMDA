@@ -64,6 +64,14 @@ PMDA now (optionally) uses the openai API to detect and explain differences betw
 - Shows potential space savings
 - Reversible merge logic
 
+<p align="center">
+<img width="991" alt="image" src="https://github.com/user-attachments/assets/3e7ee041-0080-42e2-8679-533af99b0671" />
+</p>
+
+<p align="center"><i>
+ Main dashboard showing total artists, albums, removed and remaining duplicates, total space saved, with live updates during scans.
+</i></p>
+
 ⚙️ Configuration (config.json)
 ------------------------------
 
