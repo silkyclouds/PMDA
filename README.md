@@ -35,7 +35,10 @@ Whether you're a FLAC connoisseur or just tired of MP3 clutter, PMDA has your ba
 🧠 Now with AI!
 ---------------
 
-PMDA now (optionally) uses the openai API to explain differences between album versions. This feature costs a few cents to run and can be customized with your own `ai_prompt.txt` to fit your style.
+PMDA now (optionally) uses the openai API to detect and explain differences between album versions. This feature costs a few cents to run and can be customized with your own `ai_prompt.txt` to fit your style.
+Below is what I paid to identify a set of approximately 7000 dupe groups during my tests:
+<img width="322" alt="image" src="https://github.com/user-attachments/assets/e8691602-e6dc-40ec-a3c1-977b9e4894b9" />
+
 
 💻 Web UI Features
 ------------------
