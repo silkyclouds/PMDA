@@ -155,6 +155,28 @@ python3 pmda.py --dry-run
 - `--verbose`: Show detailed logging
 - `--serve`: Run Web UI
 
+## 🛣️ Roadmap
+
+Here are the next features planned for PMDA:
+
+1. **Rollback System for Deduped Albums**  
+   Add a second page listing all previously moved albums, with cover previews and metadata, allowing users to:
+   - Restore individual albums
+   - Selectively rollback multiple albums
+   - Revert all deduplicated albums in one click
+
+2. **"Re-download This Album" Flagging**  
+   Detect albums with:
+   - Missing tracks
+   - MP3 or mixed FLAC/MP3 content  
+   ...and mark them for replacement with clean, lossless versions.
+
+3. **Local LLM Support (OpenLLaMA)**  
+   Allow PMDA to run LLM-based logic locally using [OpenLLaMA](https://github.com/openlm-research/open_llama), for environments without internet or for cost-saving purposes.
+
+4. **OpenAI Usage Tracking**  
+   Display a badge in the main dashboard showing the current OpenAI API usage cost, if used.
+
 🫶 Thanks & Community
 ---------------------
 
