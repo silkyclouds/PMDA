@@ -58,12 +58,12 @@ Here is a sample `config.json` to adjust:
   "PLEX_TOKEN": "YOUR_TOKEN_HERE",
   "SECTION_ID": 1,
   "PATH_MAP": {
-    "/music/matched": "/mnt/user/MURRAY/Music/Music_matched"
+    "/music/matched": "/music/matched"
   },
-  "DUPE_ROOT": "/mnt/user/MURRAY/Music/Music_dupes/Plex_dupes",
+  "DUPE_ROOT": "/dupes",
   "WEBUI_PORT": 5005,
-  "STATE_DB_FILE": "/mnt/cache/appdata/scripts/plex_dedupe/pmda_state.db",
-  "CACHE_DB_FILE": "/mnt/cache/appdata/scripts/plex_dedupe/pmda_cache.db"
+  "STATE_DB_FILE": "/app/pmda_state.db",
+  "CACHE_DB_FILE": "/app/pmda_cache.db"
 }
 ```
 
