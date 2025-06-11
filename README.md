@@ -47,6 +47,13 @@ PMDA now (optionally) uses the openai API to detect and explain differences betw
   Example usage of OpenAI with PMDA — this cost ($0.35) reflects several full test scans, identifying ~7000 duplicate album groups within a 150,000 album test library.
 </i></p>
 
+<p align="center">
+<img width="562" alt="image" src="https://github.com/user-attachments/assets/c7149b28-d5a8-4cda-88a4-329fb4211d1b" />
+</p>
+
+<p align="center"><i>
+  Example of the analysis of two versions of an album.
+</i></p>
 
 💻 Web UI Features
 ------------------
