@@ -18,19 +18,51 @@ After waiting patiently for Plex to address this (spoiler: they didn’t), I gav
 
 Whether you're a FLAC connoisseur or just tired of MP3 clutter, PMDA has your back.
 
-🌟 What PMDA Does
------------------
+## 🌟 What PMDA Does
 
-- Scans your entire Plex Music library
-- Detects duplicate albums based on:
+PMDA (Plex Music Dedupe Assistant) helps you identify and clean up duplicate albums in your Plex music library, with smart logic and a user-friendly interface.
+
+Here's what it currently does:
+
+- 🔍 **Scans your entire Plex Music library**  
+  Connects directly to your Plex database for deep access to metadata and file structure.
+
+- 🎯 **Detects duplicate albums using advanced logic**  
   - Normalized album titles
   - Identical or overlapping track listings
-  - Matching track titles (85%+ similarity)
-  - Audio format, bitrate, and sample rate
-- Picks the best-quality version (FLAC wins!)
-- Moves duplicates to a `Plex_dupes/` folder
-- Cleans metadata from Plex via API
-- Offers a fast Web UI to review and dedupe
+  - 85%+ track title similarity
+  - Audio format, bitrate, sample rate, and bit depth
+  - Prefers FLAC over MP3 and higher quality over lossy
+
+- 🏆 **Automatically picks the best-quality version**  
+  Keeps the best copy, moves the rest to a `Plex_dupes/` folder.
+
+- 🧹 **Cleans metadata via the Plex API**  
+  Optionally removes leftover metadata references to moved albums (unless in safe mode).
+
+- 🖥️ **Provides a modern Web UI**  
+  - Grid view of all duplicate groups with covers and metadata
+  - Stats: total albums, artists, dupes, space saved
+  - Real-time scanning feedback with dynamic updates
+  - Options to deduplicate per album, per selection, or globally
+
+- 🧪 **Supports dry-run and safe-mode**  
+  - `--dry-run`: preview actions without changing anything
+  - `--safe-mode`: move files but skip Plex API cleanup
+
+- 📊 **Tracks stats over time**  
+  - Total space reclaimed
+  - Number of deduplicated albums
+  - Persistent tracking in local databases
+
+- 🔧 **Fully configurable via `config.json`**  
+  Set everything from the Web UI port to Plex paths, token, section ID, and more.
+
+- 🤖 **Optional OpenAI integration**  
+  Uses `gpt-4o` or another model to help score duplicates (almost zero cost with GPT-4o-Nano).
+
+- 🧠 **Works entirely offline (if OpenAI is disabled)**  
+  No dependency on cloud services unless you choose to use the LLM helper.
 
 
 
