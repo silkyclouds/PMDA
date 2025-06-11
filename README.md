@@ -68,7 +68,7 @@ Here is a sample `config.json` to adjust:
 ```
 
 Optional:
-- `ai_prompt.txt`: Customize how the AI explains duplicates.
+- `ai_prompt.txt`: Customize how the AI handles and explains duplicates.
 
 🚀 Run PMDA in Docker
 ---------------------
