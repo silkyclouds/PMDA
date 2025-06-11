@@ -77,12 +77,12 @@ Optional:
 docker run -d \
   --name pmda \
   -p 5005:5005 \
-  -v /mnt/cache/appdata/pmda/config.json:/app/config.json:ro \
-  -v /mnt/cache/appdata/pmda/ai_prompt.txt:/app/ai_prompt.txt:ro \
-  -v "/mnt/cache/plex-saturday/config/Library/Application Support/Plex Media Server/Plug-in Support/Databases":/database:ro \
-  -v /mnt/user/MURRAY/Music/Music_dupes/Plex_dupes:/dupes \
-  -v /mnt/user/MURRAY/Music/Music_matched:/music/matched \
-  silkyclouds/pmda:0.5.0
+  -v /path/to/config/config.json:/app/config.json:ro \
+  -v /path/to/config/ai_prompt.txt:/app/ai_prompt.txt:ro \
+  -v "/path/to/plex/Library/Application Support/Plex Media Server/Plug-in Support/Databases":/database:ro \
+  -v /path/to/music:/music \
+  -v /path/to/dupes:/dupes \
+  silkyclouds/pmda:latest
 ```
 
 It runs in verbose mode by default.
