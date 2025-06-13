@@ -87,6 +87,14 @@ PMDA now (optionally) uses the openai API to detect and explain differences betw
   Example of the analysis of two versions of an album.
 </i></p>
 
+<p align="center">
+<img width="554" alt="image" src="https://github.com/user-attachments/assets/cc7d1ce2-8ade-4451-bde6-396e3a1eaaf7" />
+</p>
+
+<p align="center"><i>
+  Example of an album with extra tracks detected. Enabling a way to merge extra tracks to the winning edition folder. 
+</i></p>
+
 💻 Web UI Features
 ------------------
 
