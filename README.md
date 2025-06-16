@@ -149,7 +149,7 @@ docker run -d \
   -v "/path/to/plex/Library/Application Support/Plex Media Server/Plug-in Support/Databases":/database:ro \
   -v /path/to/music:/music \
   -v /path/to/dupes:/dupes \
-  silkyclouds/pmda:latest
+  meaning/pmda:latest
 ```
 
 It runs in verbose mode by default.
