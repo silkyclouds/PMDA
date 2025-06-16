@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PMDA V0.5.2
+PMDA V0.5.3
+
+- fixes an issue where plex would refresh artist pages that didn't had any dupes removed (in CLI mode only)
 
 """
 
@@ -12,6 +14,7 @@ import logging
 import os
 import re
 import shutil
+import errno
 import sqlite3
 import subprocess
 import threading
@@ -532,7 +535,7 @@ def choose_best(editions: List[dict]) -> dict:
             txt = resp.choices[0].message.content.strip()
             p1, p2 = txt.find("|"), txt.find("|", txt.find("|") + 1)
             if p1 < 0 or p2 < 0:
-                raise ValueError("Format de réponse IA invalide")
+                raise ValueError("Invalid AI response format")
 
             idx       = int(re.search(r"\d+", txt[:p1]).group())
             rationale = txt[p1+1 : p2].strip()
@@ -788,7 +791,7 @@ def save_scan_to_db(scan_results: Dict[str, List[dict]]):
                 int(best.get('used_ai', False))
             ))
 
-            # Toutes les éditions "loser"
+            # All “loser” editions
             for e in g['losers']:
                 size_mb = folder_size(e['folder']) // (1024 * 1024)
                 cur.execute("""
@@ -1046,17 +1049,7 @@ def fetch_cover_as_base64(album_id: int) -> Optional[str]:
 def perform_dedupe(group: dict) -> List[dict]:
     """
     Move each “loser” folder out to DUPE_ROOT, delete metadata in Plex,
-    and return a list of dicts describing each moved item:
-      {
-       	"artist": <artist_name>,
-       	"title_raw": <best_album_title>,
-       	"size": <size_in_MB>,
-       	"fmt": <format_text>,
-       	"br": <bitrate_kbps>,
-       	"sr": <sample_rate>,
-       	"bd": <bit_depth>,
-       	"thumb_data": <base64_data_uri_or_None>
-      }
+    and return a list of dicts describing each moved item.
     """
     moved_items: List[dict] = []
     artist = group["artist"]
@@ -1064,18 +1057,16 @@ def perform_dedupe(group: dict) -> List[dict]:
     cover_data = fetch_cover_as_base64(group["best"]["album_id"])
 
     for loser in group["losers"]:
-        src_folder: Path = Path(loser["folder"])
+        src_folder = Path(loser["folder"])
         try:
             base_real = next(iter(PATH_MAP.values()))
             rel = src_folder.relative_to(base_real)
         except Exception:
             rel = src_folder.name
 
-        # Build initial destination path under DUPE_ROOT
         dst = DUPE_ROOT / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
 
-        # If destination already exists, append “ (1)”, “ (2)”, etc.
         if dst.exists():
             base_name = dst.name
             parent_dir = dst.parent
@@ -1090,9 +1081,13 @@ def perform_dedupe(group: dict) -> List[dict]:
         logging.debug(f"perform_dedupe(): moving {src_folder} → {dst}")
         try:
             shutil.move(str(src_folder), str(dst))
-        except Exception as e:
-            logging.warning(f"perform_dedupe(): failed to move {src_folder} → {dst}: {e}")
-            continue
+        except OSError as e:
+            if e.errno == errno.EXDEV:
+                logging.info(f"Cross-device move for {src_folder}; falling back to copy")
+                shutil.copytree(str(src_folder), str(dst))
+                shutil.rmtree(str(src_folder))
+            else:
+                raise
 
         size_mb = folder_size(dst) // (1024 * 1024)
         fmt_text = loser.get("fmt_text", loser.get("fmt", ""))
@@ -1109,13 +1104,13 @@ def perform_dedupe(group: dict) -> List[dict]:
             logging.warning(f"perform_dedupe(): failed to delete Plex metadata for {loser_id}: {e}")
 
         moved_items.append({
-            "artist":     artist,
-            "title_raw":  best_title,
-            "size":       size_mb,
-            "fmt":        fmt_text,
-            "br":         br_kbps,
-            "sr":         sr,
-            "bd":         bd,
+            "artist":    artist,
+            "title_raw": best_title,
+            "size":      size_mb,
+            "fmt":       fmt_text,
+            "br":        br_kbps,
+            "sr":        sr,
+            "bd":        bd,
             "thumb_data": cover_data
         })
 
@@ -2209,7 +2204,7 @@ def dedupe_cli(dry: bool, safe: bool, tag_extra: bool, verbose: bool):
     verbose : bool
         Enable DEBUG-level logging.
     """
-    # ─── logging setup ────────────────────────────────────────────────────────
+    # ─── logging setup ────────────────────────────────────────────────────
     log_lvl = logging.DEBUG if verbose else logging.INFO
     logging.getLogger().setLevel(log_lvl)
 
@@ -2219,7 +2214,7 @@ def dedupe_cli(dry: bool, safe: bool, tag_extra: bool, verbose: bool):
     db_conn = plex_connect()
     cur = db_conn.cursor()
 
-    # ─── headline counters ────────────────────────────────────────────────────
+    # ─── headline counters ──────────────────────────────────────────────
     stats = {
         "total_artists": 0,
         "total_albums": 0,
@@ -2228,7 +2223,7 @@ def dedupe_cli(dry: bool, safe: bool, tag_extra: bool, verbose: bool):
         "total_moved_mb": 0,
     }
 
-    # ─── iterate over all artists ────────────────────────────────────────────
+    # ─── iterate over all artists ───────────────────────────────────────
     artists = cur.execute(
         "SELECT id, title FROM metadata_items "
         "WHERE metadata_type=8 AND library_section_id=?",
@@ -2255,7 +2250,10 @@ def dedupe_cli(dry: bool, safe: bool, tag_extra: bool, verbose: bool):
         if dup_groups:
             stats["albums_with_dupes"] += len(dup_groups)
 
-        # ---- process each duplicate group -----------------------------------
+        # Track removals per artist
+        removed_for_current_artist = 0
+
+        # ---- process each duplicate group -----------------------------
         for group in dup_groups:
             best = group["best"]
             losers = group["losers"]
@@ -2279,7 +2277,7 @@ def dedupe_cli(dry: bool, safe: bool, tag_extra: bool, verbose: bool):
 
             group_moved_mb = 0
 
-            # ---- each loser --------------------------------------------------
+            # ---- each loser --------------------------------------------
             for loser in losers:
                 src = Path(loser["folder"])
                 loser_id = loser["album_id"]
@@ -2300,15 +2298,20 @@ def dedupe_cli(dry: bool, safe: bool, tag_extra: bool, verbose: bool):
                 # Deal with name collisions
                 if dst.exists():
                     root_name = dst.name
+                    parent_dir = dst.parent
                     counter = 1
-                    while (dst.parent / f"{root_name} ({counter})").exists():
+                    while True:
+                        candidate = parent_dir / f"{root_name} ({counter})"
+                        if not candidate.exists():
+                            dst = candidate
+                            break
                         counter += 1
-                    dst = dst.parent / f"{root_name} ({counter})"
 
                 size_mb = folder_size(src) // (1024 * 1024)
                 group_moved_mb += size_mb
                 stats["total_moved_mb"] += size_mb
                 stats["total_dupes"] += 1
+                removed_for_current_artist += 1
 
                 if dry:
                     logging.info(
@@ -2317,7 +2320,15 @@ def dedupe_cli(dry: bool, safe: bool, tag_extra: bool, verbose: bool):
                     )
                 else:
                     logging.info(f" Moving   | {src}  →  {dst}")
-                    shutil.move(str(src), str(dst))
+                    try:
+                        shutil.move(str(src), str(dst))
+                    except OSError as e:
+                        if e.errno == errno.EXDEV:
+                            logging.info(f"Cross-device move detected for {src} → {dst}, falling back to copy")
+                            shutil.copytree(str(src), str(dst))
+                            shutil.rmtree(str(src))
+                        else:
+                            raise
 
                 # Delete Plex metadata (unless dry/safe)
                 if (not dry) and (not safe):
@@ -2330,7 +2341,7 @@ def dedupe_cli(dry: bool, safe: bool, tag_extra: bool, verbose: bool):
 
             logging.info(f" Group freed {group_moved_mb} MB")
 
-            # ---- optional “Extra Tracks” tag --------------------------------
+            # ---- optional “Extra Tracks” tag ----------------------------
             if tag_extra:
                 all_editions = losers + [best]
                 max_tracks = max(len(e["tracks"]) for e in all_editions)
@@ -2343,10 +2354,14 @@ def dedupe_cli(dry: bool, safe: bool, tag_extra: bool, verbose: bool):
                         method="PUT",
                     )
 
-        # Refresh Plex for this artist
-        prefix = f"/music/matched/{quote_plus(artist_name[0].upper())}/{quote_plus(artist_name)}"
-        plex_api(f"/library/sections/{SECTION_ID}/refresh?path={prefix}")
-        plex_api(f"/library/sections/{SECTION_ID}/emptyTrash", method="PUT")
+        # Refresh Plex only if we removed duplicates for this artist
+        if removed_for_current_artist > 0:
+            prefix = f"/music/matched/{quote_plus(artist_name[0].upper())}/{quote_plus(artist_name)}"
+            try:
+                plex_api(f"/library/sections/{SECTION_ID}/refresh?path={prefix}")
+                plex_api(f"/library/sections/{SECTION_ID}/emptyTrash", method="PUT")
+            except Exception as e:
+                logging.warning(f"CLI-mode Plex refresh failed for {artist_name}: {e}")
 
     # ---- summary ------------------------------------------------------------
     logging.info("-" * 70)
