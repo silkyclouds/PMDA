@@ -2,6 +2,7 @@
   <img src="/static/PMDA.png" alt="PMDA Logo" width="450"/>
 </p>
 
+
 <p align="center">
   <a href="https://discord.gg/9eEAvvZW">
     👉 Join us on Discord — let's improve this thing together!
