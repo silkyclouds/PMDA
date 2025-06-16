@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PMDA V0.5.2
+PMDA V0.5.1
 
 """
 
@@ -114,6 +114,9 @@ OVERLAP_MIN = 0.85  # 85% track-title overlap minimum
 # ───────────────────────────────── STATE DB SETUP ──────────────────────────────────
 def init_state_db():
     con = sqlite3.connect(str(STATE_DB_FILE))
+    # Enable WAL mode up‑front to allow concurrent reads/writes
+    con.execute("PRAGMA journal_mode=WAL;")
+    con.commit()
     cur = con.cursor()
     # Table for duplicate “best” entries
     cur.execute("""
@@ -178,8 +181,13 @@ def set_stat(key: str, value: int):
     con.close()
 
 def increment_stat(key: str, delta: int):
-    current = get_stat(key)
-    set_stat(key, current + delta)
+    """Atomically add *delta* to a stat counter."""
+    con = sqlite3.connect(str(STATE_DB_FILE), timeout=30)
+    con.execute("PRAGMA busy_timeout=30000;")
+    cur = con.cursor()
+    cur.execute("UPDATE stats SET value = value + ? WHERE key = ?", (delta, key))
+    con.commit()
+    con.close()
 
 init_state_db()
 
