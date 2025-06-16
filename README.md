@@ -197,6 +197,14 @@ python3 pmda.py --dry-run
 - `--verbose`: Show detailed logging
 - `--serve`: Run Web UI
 
+<p align="center"><i>
+<img width="1904" alt="image" src="https://github.com/user-attachments/assets/731ce313-1d91-46fb-8892-b752bb34c412" />
+</p>
+
+<p align="center"><i>
+  Example of PMDA running un CLI mode. 
+</i></p>
+
 ## 🛣️ Roadmap
 
 Here are the next features planned for PMDA:
