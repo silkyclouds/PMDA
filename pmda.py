@@ -1,15 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 """
-PMDA V0.5.0
-
-Summary:
-- Scans your Plex music library to identify duplicate albums by exact track signatures and, optionally, fuzzy matching via AI.
-- Selects the best edition based on format quality, bit depth, track count, and bitrate (with AI fallback).
-- Presents a web UI to merge bonus tracks, review duplicates, and deduplicate automatically or selectively.
-- Moves duplicate folders to a dedicated dupe root and cleans up Plex metadata.
-- Don't be stupid, use it with caution ! 
+PMDA V0.5.2
 
 """
 
@@ -32,7 +24,33 @@ from urllib.parse import quote_plus
 
 import requests
 import openai
+
 from flask import Flask, render_template_string, request, jsonify
+
+# ──────────────────────────── FFmpeg sanity-check ──────────────────────────────
+def _check_ffmpeg():
+    """
+    Log the location of ffmpeg/ffprobe or warn clearly if they are missing.
+    Runs once at startup.
+    """
+    missing = []
+    for tool in ("ffmpeg", "ffprobe"):
+        path = shutil.which(tool)
+        if path:
+            logging.info("%s detected at %s", tool, path)
+        else:
+            missing.append(tool)
+    if missing:
+        logging.warning(
+            "⚠️  %s not found in PATH – bit‑rate, sample‑rate and bit‑depth will be 0",
+            ", ".join(missing),
+        )
+
+_check_ffmpeg()
+
+# --- Scan control flags (global) ---------------------------------
+scan_should_stop = threading.Event()
+scan_is_paused   = threading.Event()
 
 # ───────────────────────────────── CONFIGURATION LOADING ─────────────────────────────────
 CONFIG_PATH = Path(__file__).parent / "config.json"
@@ -238,7 +256,8 @@ def plex_connect() -> sqlite3.Connection:
     Open the Plex SQLite DB using UTF-8 *surrogate-escape* decoding so that any
     non-UTF-8 bytes are mapped to the U+DCxx range instead of throwing an error.
     """
-    con = sqlite3.connect(PLEX_DB_FILE, timeout=30)
+    # Open the Plex database in read-only mode to avoid write errors
+    con = sqlite3.connect(f"file:{PLEX_DB_FILE}?mode=ro", uri=True, timeout=30)
     con.text_factory = lambda b: b.decode("utf-8", "surrogateescape")
     return con
 
@@ -353,84 +372,84 @@ def first_part_path(db_conn, album_id: int) -> Optional[Path]:
 
 def analyse_format(folder: Path) -> tuple[int, int, int, int]:
     """
-    For a given album folder, scan the first audio file found and retrieve:
-      (fmt_score, bit_rate, sample_rate, bit_depth)
+    Inspect *one* representative audio file inside **folder** and return:
 
-    We treat FLAC specially: fetch “format=bit_rate” and “sample_fmt” to derive bit_depth.
-    We cache results keyed by (path, mtime). If a FLAC cache entry is (0,0,0),
-    force a re‐probe. SQLite connections use a 30s timeout to avoid “database is locked.”
+        (fmt_score, bit_rate, sample_rate, bit_depth)
+
+    * **fmt_score** is derived from FORMAT_PREFERENCE.
+    * **bit_rate** is in **bps** (0 when unavailable, e.g. lossless FLAC).
+    * **sample_rate** is in **Hz**.
+    * **bit_depth** is 16 / 24 / 32 when derivable, otherwise 0.
+
+    We probe only the *first* audio file we encounter.  This re‑verts the
+    “scan‑every‑track” logic that was flooding the machine with hundreds of
+    `ffprobe` processes and causing time‑outs – the root cause of the all‑zero
+    technical data you observed in the UI.
+
+    Results are cached in the ``audio_cache`` table keyed on (path, mtime) so
+    that we call ``ffprobe`` at most once per file unless it has changed.
+    A cached triple ``(0, 0, 0)`` for a **FLAC** file triggers a re‑probe
+    because it usually indicates a transient failure.
     """
-    # Scan all audio files, collect max values for each property
-    fmt_score_max, br_max, sr_max, bd_max = 0, 0, 0, 0
-    for f in folder.rglob("*"):
-        if AUDIO_RE.search(f.name):
-            ext = f.suffix[1:].lower()
-            file_path = str(f)
-            mtime = int(f.stat().st_mtime)
-            # 1) Check cache
-            cached = get_cached_info(file_path, mtime)
-            if cached:
-                br, sr, bd = cached
-                if not (ext == "flac" and (br == 0 and sr == 0 and bd == 0)):
-                    fmt_score = score_format(ext)
-                    fmt_score_max = max(fmt_score_max, fmt_score)
-                    br_max = max(br_max, br)
-                    sr_max = max(sr_max, sr)
-                    bd_max = max(bd_max, bd)
-                    continue
-                # If FLAC cache is zeroed, re-probe
-            # 2) Build ffprobe command
-            cmd = [
-                "ffprobe", "-v", "error",
-                "-select_streams", "a:0",
-                "-show_entries", "format=bit_rate",
-                "-show_entries", "stream=sample_rate,sample_fmt",
-                "-of", "default=noprint_wrappers=1", file_path
-            ]
-            try:
-                output = subprocess.check_output(
-                    cmd, stderr=subprocess.DEVNULL, text=True, timeout=10
-                )
-                br = 0
-                sr = 0
-                bd = 0
-                sample_fmt = None
-                format_br = None
-                for line in output.splitlines():
-                    if line.startswith("bit_rate="):
-                        value = line.split("=", 1)[1].strip()
-                        try:
-                            format_br = int(value)
-                        except ValueError:
-                            format_br = 0
-                    elif line.startswith("sample_rate="):
-                        value = line.split("=", 1)[1].strip()
-                        try:
-                            sr = int(value)
-                        except ValueError:
-                            sr = 0
-                    elif line.startswith("sample_fmt="):
-                        sample_fmt = line.split("=", 1)[1].strip()
-                if format_br is not None:
-                    br = format_br
-                if sample_fmt:
-                    m = re.match(r"s(\d+)", sample_fmt)
-                    if m:
-                        bd = int(m.group(1))
-                    else:
-                        bd = 0
-                set_cached_info(file_path, mtime, br, sr, bd)
-                fmt_score = score_format(ext)
-                fmt_score_max = max(fmt_score_max, fmt_score)
-                br_max = max(br_max, br)
-                sr_max = max(sr_max, sr)
-                bd_max = max(bd_max, bd)
-            except Exception as e:
-                set_cached_info(file_path, mtime, 0, 0, 0)
-                fmt_score = score_format(ext)
-                fmt_score_max = max(fmt_score_max, fmt_score)
-                # Keep zeros for br, sr, bd
-    return (fmt_score_max, br_max, sr_max, bd_max)
+    # locate *one* audio file
+    audio_file = next((p for p in folder.rglob("*") if AUDIO_RE.search(p.name)), None)
+    if audio_file is None:
+        return (0, 0, 0, 0)
+
+    ext   = audio_file.suffix[1:].lower()
+    fpath = str(audio_file)
+    mtime = int(audio_file.stat().st_mtime)
+
+    # ─── 1) cache lookup ───────────────────────────────────────────────
+    cached = get_cached_info(fpath, mtime)
+    if cached and not (ext == "flac" and cached == (0, 0, 0)):
+        br, sr, bd = cached
+        return (score_format(ext), br, sr, bd)
+
+    # ─── 2) ffprobe ────────────────────────────────────────────────────
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "a:0",
+        "-show_entries", "format=bit_rate:stream=bit_rate,sample_rate,bits_per_raw_sample,bits_per_sample,sample_fmt",
+        "-of", "default=noprint_wrappers=1",
+        fpath,
+    ]
+
+    br = sr = bd = 0
+    try:
+        out = subprocess.check_output(
+            cmd, stderr=subprocess.DEVNULL, text=True, timeout=10
+        )
+        for line in out.splitlines():
+            key, _, val = line.partition("=")
+            if key == "bit_rate":
+                try:
+                    v = int(val)
+                    if v > br:
+                        br = v           # keep the highest bit‑rate seen
+                except ValueError:
+                    pass
+            elif key == "sample_rate":
+                try:
+                    sr = int(val)
+                except ValueError:
+                    pass
+            elif key in ("bits_per_raw_sample", "bits_per_sample"):
+                try:
+                    bd = int(val)
+                except ValueError:
+                    pass
+            elif key == "sample_fmt" and not bd:
+                m = re.match(r"s(\d+)", val)
+                if m:
+                    bd = int(m.group(1))
+    except Exception:
+        # leave br/sr/bd at 0 on failure
+        pass
+
+    # ─── 3) cache & return ────────────────────────────────────────────
+    set_cached_info(fpath, mtime, br, sr, bd)
+    return (score_format(ext), br, sr, bd)
 
 # ───────────────────────────────── DUPLICATE DETECTION ─────────────────────────────────
 def signature(tracks: List[Track]) -> tuple:
@@ -445,12 +464,11 @@ def overlap(a: set, b: set) -> float:
 
 def choose_best(editions: List[dict]) -> dict:
     """
-    Selects the best edition either via OpenAI (if API key is available),
-    or via heuristic, first reusing any previously cached AI result.
+    Selects the best edition either via OpenAI (when an API key is provided) or via a local heuristic, re‑using any existing AI cache first.
     """
     import sqlite3, json
 
-    # 1) Reuse previously cached AI choice
+    # 1) Re‑use a previously stored AI choice
     con = sqlite3.connect(str(STATE_DB_FILE))
     cur = con.cursor()
     ids = tuple(e['album_id'] for e in editions)
@@ -473,7 +491,7 @@ def choose_best(editions: List[dict]) -> dict:
         best["used_ai"]    = True
         return best
 
-    # 2) If no cached AI result, call OpenAI if API key is available
+    # 2) If there is no AI cache, call OpenAI when possible
     used_ai = False
     if OPENAI_API_KEY:
         used_ai = True
@@ -520,10 +538,10 @@ def choose_best(editions: List[dict]) -> dict:
                 "used_ai":    True,
             })
         except Exception as e:
-            logging.warning(f"AI failed ({e}), using heuristic fallback")
+            logging.warning(f"AI failed ({e}); falling back to heuristic selection")
             used_ai = False
 
-    # 3) Heuristic fallback if AI is disabled or fails
+    # 3) Heuristic selection (or fallback when AI is disabled / failed)
     if not used_ai:
         best = max(
             editions,
@@ -537,7 +555,7 @@ def choose_best(editions: List[dict]) -> dict:
         )
         best["used_ai"] = False
 
-        # mini-rationale
+        # brief-rationale
         others = [e for e in editions if e is not best]
         reasons = []
         if any(best["fmt_score"] > o["fmt_score"] for o in others):
@@ -557,7 +575,7 @@ def choose_best(editions: List[dict]) -> dict:
         extras = sorted({t for o in others for t in o["titles"] if t not in all_titles})
         best["merge_list"] = extras
 
-    # 4) Persister en DB (INSERT OR IGNORE pour ne pas écraser un cache existant)
+    # 4) Persist choice to DB (INSERT OR IGNORE so we never overwrite an existing cache)
     con = sqlite3.connect(str(STATE_DB_FILE))
     cur = con.cursor()
     cur.execute("""
@@ -582,6 +600,25 @@ def choose_best(editions: List[dict]) -> dict:
         int(best.get("used_ai", False)),
     ))
     con.commit()
+    # Persist loser editions so details modal can show all versions after restart
+    for e in editions:
+        if e['album_id'] != best['album_id']:
+            size_mb = folder_size(Path(e['folder'])) // (1024 * 1024)
+            cur.execute("""
+                INSERT INTO duplicates_loser
+                  (artist, album_id, folder, fmt_text, br, sr, bd, size_mb)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                best["artist"],
+                best["album_id"],
+                str(e["folder"]),
+                get_primary_format(Path(e["folder"])),
+                e.get("br", 0),
+                e.get("sr", 0),
+                e.get("bd", 0),
+                size_mb
+            ))
+    con.commit()
     con.close()
 
     return best
@@ -593,6 +630,10 @@ def scan_artist_duplicates(args):
     Returns (artist_name, list_of_groups, album_count).
     """
     artist_id, artist_name = args
+    if scan_should_stop.is_set():
+        return (artist_name, [], 0)
+    while scan_is_paused.is_set() and not scan_should_stop.is_set():
+        time.sleep(0.5)
     logging.debug(
         f"scan_artist_duplicates(): start '{artist_name}' (ID {artist_id})"
     )
@@ -620,6 +661,10 @@ def scan_artist_duplicates(args):
 def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
     editions = []
     for aid in album_ids:
+        if scan_should_stop.is_set():
+            break
+        while scan_is_paused.is_set() and not scan_should_stop.is_set():
+            time.sleep(0.5)
         tr = get_tracks(db_conn, aid)
         if not tr:
             continue
@@ -704,11 +749,11 @@ def save_scan_to_db(scan_results: Dict[str, List[dict]]):
     con = sqlite3.connect(str(STATE_DB_FILE))
     cur = con.cursor()
 
-    # 1) On vide complètement les tables
+    # 1) Clear both duplicates tables
     cur.execute("DELETE FROM duplicates_loser")
     cur.execute("DELETE FROM duplicates_best")
 
-    # 2) On ré-insère tout
+    # 2) Re-insert all scan results
     for artist, groups in scan_results.items():
         for g in groups:
             best = g['best']
@@ -864,14 +909,9 @@ def load_scan_from_db() -> Dict[str, List[dict]]:
 
 def clear_db_on_new_scan():
     """
-    When a user triggers “Start New Scan,” wipe prior duplicates from both memory and DB.
+    When a user triggers “Start New Scan,” wipe prior duplicates from memory.
+    The DB will be cleared and repopulated only once the scan completes.
     """
-    con = sqlite3.connect(str(STATE_DB_FILE))
-    cur = con.cursor()
-    cur.execute("DELETE FROM duplicates_loser")
-    cur.execute("DELETE FROM duplicates_best")
-    con.commit()
-    con.close()
     with lock:
         state["duplicates"].clear()
 
@@ -920,6 +960,8 @@ def background_scan():
             )
 
         for future in as_completed(futures):
+            if scan_should_stop.is_set():
+                break
             artist_name, groups, album_cnt = future.result()
             with lock:
                 all_results[artist_name] = groups
@@ -1081,6 +1123,7 @@ HTML = """<!DOCTYPE html>
   <head>
     <meta charset="utf-8">
     <title>PMDA</title>
+    <link rel="icon" type="image/png" href="/static/P.png">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&display=swap" rel="stylesheet">
     <style>
       body { font-family:Inter,Arial,sans-serif; background:#f5f7fa; margin:0; padding:2rem; }
@@ -1127,6 +1170,34 @@ HTML = """<!DOCTYPE html>
       .row-dedup-btn { background:#006f5f; color:#fff; border:none; border-radius:6px;
                        font-size:.75rem; padding:.25rem .7rem; cursor:pointer; }
     </style>
+    <style>
+      .pagination {
+        display: flex;
+        justify-content: center;
+        margin: 1rem 0;
+        list-style: none;
+        padding: 0;
+      }
+      .pagination li {
+        margin: 0 0.25rem;
+      }
+      .pagination a, .pagination span {
+        display: block;
+        padding: 0.5rem 0.75rem;
+        border: 1px solid #ccc;
+        border-radius: 4px;
+        text-decoration: none;
+        color: #333;
+      }
+      .pagination a:hover {
+        background-color: #f0f0f0;
+      }
+      .pagination .active {
+        background-color: #006f5f;
+        color: #fff;
+        border-color: #006f5f;
+      }
+    </style>
   </head>
   <body>
 
@@ -1145,11 +1216,6 @@ HTML = """<!DOCTYPE html>
       <div class="badge" id="saved">Space saved: {{ space_saved }} MB</div>
     </div>
 
-
-<div style="display:flex; align-items:center; margin-bottom:1rem;">
-  <button id="start" onclick="startScan()" style="background:#006f5f;color:#fff;margin-right:.5rem;">
-    Start New Scan
-  </button>
   <button id="deleteSel" onclick="submitSelected()" style="margin-right:.5rem;">
     Deduplicate Selected Groups
   </button>
@@ -1166,10 +1232,57 @@ HTML = """<!DOCTYPE html>
     <div id="scanBox" class="progress">
       <div id="scanBar" class="bar" style="width:0%"></div>
     </div>
-    <!-- on rend toujours dispo le texte, mais caché par défaut -->
+    <!-- the text element is always present but hidden by default -->
     <div id="scanTxt" style="display:block; margin-top:0.5rem;">0 / 0 albums</div>
+    <div id="scanControls" style="margin-bottom:1rem; display:flex; align-items:center; gap:0.5rem;">
+      {% if scanning %}
+        <button onclick="fetch('/scan/pause', {method:'POST'})">⏸ Pause</button>
+      {% else %}
+        {% if remaining_dupes > 0 %}
+          <button onclick="scanLibrary()">▶️ Resume</button>
+        {% else %}
+          <button onclick="scanLibrary()">New Scan</button>
+        {% endif %}
+      {% endif %}
+      <span id="scanStatus">
+        Status: 
+        {% if scanning and not paused %}running{% elif scanning and paused %}paused{% else %}stopped{% endif %}
+      </span>
+    </div>
 
     <!-- ==== Grid Mode ==== -->
+    {% if total_pages > 1 %}
+    <nav>
+      <ul class="pagination">
+        {% if page > 1 %}
+          <li><a href="/?page=1">First</a></li>
+          <li><a href="/?page={{ page-1 }}">Previous</a></li>
+        {% endif %}
+        {# Calculate window boundaries #}
+        {% set start_page = page - 7 if page - 7 > 1 else 1 %}
+        {% set end_page = page + 7 if page + 7 < total_pages else total_pages %}
+        {% if start_page > 1 %}
+          <li><span>…</span></li>
+        {% endif %}
+        {% for p in range(start_page, end_page + 1) %}
+          <li>
+            {% if p == page %}
+              <span class="active">{{ p }}</span>
+            {% else %}
+              <a href="/?page={{ p }}">{{ p }}</a>
+            {% endif %}
+          </li>
+        {% endfor %}
+        {% if end_page < total_pages %}
+          <li><span>…</span></li>
+        {% endif %}
+        {% if page < total_pages %}
+          <li><a href="/?page={{ page+1 }}">Next</a></li>
+          <li><a href="/?page={{ total_pages }}">Last</a></li>
+        {% endif %}
+      </ul>
+    </nav>
+    {% endif %}
     <div id="gridMode" class="grid">
       {% for g in groups %}
         <div class="card"
@@ -1357,39 +1470,76 @@ HTML = """<!DOCTYPE html>
         }
       }
 
-      function pollScan() {
-            fetch("/api/progress")
-                .then(r => r.json())
-                .then(j => {
-                    if (j.scanning) {
-                        const scanBox = document.getElementById("scanBox");
-                        if (scanBox) {
-                            scanBox.style.display = "block";
-                        }
-                        const scanBar = document.getElementById("scanBar");
-                        if (scanBar) {
-                            const pct = j.total ? Math.round(100 * j.progress / j.total) : 0;
-                            scanBar.style.width = pct + "%";
-                        }
-                        const scanTxt = document.getElementById("scanTxt");
-                        if (scanTxt) {
-                            scanTxt.innerText = `${j.progress} / ${j.total} albums`;
-                        }
-                        // live-refresh duplicate cards as they arrive
-                        fetch("/api/duplicates")
-                            .then(r => r.json())
-                            .then(dups => {
-                                /* Only redraw when something new arrived */
-                                if (dups.length !== currentDupTotal) {
-                                    currentDupTotal = dups.length;
-                                    renderDuplicates(dups);
-                                }
-                            });
-                    } else {
-                        clearInterval(scanTimer);
-                    }
-                });
-      }
+    function pollScan() {
+    fetch("/api/progress")
+        .then(r => r.json())
+        .then(j => {
+        if (j.scanning) {
+            const scanBox = document.getElementById("scanBox");
+            if (scanBox) {
+            scanBox.style.display = "block";
+            }
+
+            const scanBar = document.getElementById("scanBar");
+            if (scanBar) {
+            const pct = j.total ? Math.round(100 * j.progress / j.total) : 0;
+            scanBar.style.width = pct + "%";
+            }
+
+            const scanTxt = document.getElementById("scanTxt");
+            if (scanTxt) {
+            scanTxt.innerText = `${j.progress} / ${j.total} albums`;
+            }
+
+            // Update status text
+            const statusEl = document.getElementById("scanStatus");
+            if (statusEl) {
+            statusEl.innerText = "Status: " + j.status;
+            }
+
+            // Update control buttons when paused
+            const controls = document.getElementById("scanControls");
+            if (controls && j.status === "paused") {
+            controls.innerHTML = `
+                <button onclick="fetch('/scan/resume', {method:'POST'}).then(()=>window.location.reload())">
+                ▶️ Resume
+                </button>
+                <span id="scanStatus">Status: paused</span>
+            `;
+            }
+
+            // live-refresh duplicate cards as they arrive
+            fetch("/api/duplicates")
+            .then(r => r.json())
+            .then(dups => {
+                if (dups.length !== currentDupTotal) {
+                currentDupTotal = dups.length;
+                renderDuplicates(dups);
+
+                // Update remaining dupes badge
+                const remBadge = document.getElementById("remainingDupes");
+                if (remBadge) {
+                    remBadge.innerText = `Remaining Dupes: ${dups.length}`;
+                }
+
+                // Auto-advance page when exceeding 100 dupes per page
+                const params = new URLSearchParams(window.location.search);
+                const page = parseInt(params.get("page") || "1", 10);
+                const PER_PAGE = 100;
+                if (dups.length > page * PER_PAGE) {
+                    params.set("page", page + 1);
+                    window.location.search = params.toString();
+                }
+                }
+            });
+
+        } else {
+            clearInterval(scanTimer);
+        }
+        })
+        .catch(err => console.error("pollScan() failed:", err));
+    }
+
       function submitMergeAll() {
         showLoadingModal("Merging all duplicates...");
         fetch("/merge/all", { method: "POST" })
@@ -1403,20 +1553,17 @@ HTML = """<!DOCTYPE html>
       }
 
       /* ─── Start scan ───────────────────────────────────────────────── */
-      function startScan() {
-            fetch("/start", { method: "POST" })
-                .then(() => {
-                    const scanBox = document.getElementById("scanBox");
-                    if (scanBox) {
-                        scanBox.style.display = "block";
-                    }
-                    const scanTxt = document.getElementById("scanTxt");
-                    if (scanTxt) {
-                        scanTxt.style.display = "block";
-                    }
-                    scanTimer = setInterval(pollScan, 2000);
-                });
+      function scanLibrary() {
+        fetch('/scan/start', { method: 'POST' })
+          .then(() => {
+            // reload page to update UI buttons and start polling
+            window.location.reload();
+          })
+          .catch(err => console.error("Scan start failed:", err));
       }
+
+      // keep backward compatibility for the old call
+      function startScan() { scanLibrary(); }
 
       /* ─── Dedupe helpers & polling ─────────────────────────────────── */
       function pollDedupe() {
@@ -1667,35 +1814,67 @@ HTML = """<!DOCTYPE html>
           "input[type='checkbox'], .btn-dedup, .row-dedup-btn"
         ).forEach(el => el.addEventListener("click", ev => ev.stopPropagation()));
 
-        // resume running tasks if user refreshed mid-operation
-        fetch("/api/progress").then(r => r.json()).then(j => {
-          if (j.scanning) scanTimer = setInterval(pollScan, 1000);
-        });
+        // resume running tasks and init progress bar if a scan is already in flight
+        fetch("/api/progress")
+        .then(r => r.json())
+        .then(j => {
+            // Always show the progress bar/text if any scan ever started
+            const scanBox = document.getElementById("scanBox");
+            const scanBar = document.getElementById("scanBar");
+            const scanTxt = document.getElementById("scanTxt");
+            const statusEl = document.getElementById("scanStatus");
+
+            // Display progress UI
+            if (scanBox) scanBox.style.display = "block";
+            if (scanBar) {
+            const pct = j.total ? Math.round(100 * j.progress / j.total) : 0;
+            scanBar.style.width = pct + "%";
+            }
+            if (scanTxt) scanTxt.innerText = `${j.progress} / ${j.total} albums`;
+
+            // Update status text immediately
+            if (statusEl) statusEl.innerText = "Status: " + j.status;
+
+            // If scanning is true (running or paused), start the polling loop
+            if (j.scanning) {
+            scanTimer = setInterval(pollScan, 1000);
+            }
+        })
+        .catch(err => console.error("Failed to init scan status:", err));
         fetch("/api/dedupe").then(r => r.json()).then(j => {
           if (j.deduping) dedupeTimer = setInterval(pollDedupe, 1000);
         });
 
       /* ─── Client-side search filter ──────────────────────────────── */
-      const searchInput = document.getElementById("search");
-      if (searchInput) {
-        searchInput.addEventListener("input", ev => {
-          const q = ev.target.value.trim().toLowerCase();
+    const searchInput = document.getElementById("search");
+    if (searchInput) {
+    searchInput.addEventListener("input", ev => {
+        const q = ev.target.value.trim().toLowerCase();
 
-          // Grid cards
-          document.querySelectorAll("#gridMode .card").forEach(card => {
-            const artist = card.dataset.artist.replace(/_/g," ").toLowerCase();
-            const title  = card.dataset.title.toLowerCase();
-            card.style.display = (!q || artist.includes(q) || title.includes(q)) ? "flex" : "none";
+        if (!q) {
+        // reset filter and restore full list with pagination
+        fetch("/api/duplicates")
+          .then(r => r.json())
+          .then(allGroups => {
+            renderDuplicates(allGroups);
+            document.querySelector("nav .pagination").style.display = "flex";
           });
+        return;
+        }
 
-          // Table rows
-          document.querySelectorAll("#tableMode .table-row").forEach(row => {
-            const artist = row.dataset.artist.replace(/_/g," ").toLowerCase();
-            const title  = row.dataset.title.toLowerCase();
-            row.style.display = (!q || artist.includes(q) || title.includes(q)) ? "" : "none";
-          });
+        fetch("/api/duplicates")
+        .then(r => r.json())
+        .then(allGroups => {
+            const filtered = allGroups.filter(g =>
+            g.artist.toLowerCase().includes(q) ||
+            g.best_title.toLowerCase().includes(q)
+            );
+            renderDuplicates(filtered);
+            // hide pagination during filtered search
+            document.querySelector("nav .pagination").style.display = "none";
         });
-      }
+    });
+    }
     });
   // close modal on Escape
   document.addEventListener('keydown', e => {
@@ -1751,6 +1930,7 @@ def index():
         if not state["duplicates"]:
             logging.debug("index(): loading scan results from DB into memory")
             state["duplicates"] = load_scan_from_db()
+        paused = scan_is_paused.is_set()
 
     space_saved   = get_stat("space_saved")
     removed_dupes = get_stat("removed_dupes")
@@ -1770,8 +1950,17 @@ def index():
 
     # Build the card / row structures for the UI
     with lock:
-        cards = _build_card_list(state["duplicates"])
-        remaining_dupes = len(cards)
+        page = int(request.args.get("page", 1))
+        PER_PAGE = 100
+        cards_all = _build_card_list(state["duplicates"])
+        # Total number of duplicate groups
+        total_dup_groups = len(cards_all)
+        total_pages = (total_dup_groups + PER_PAGE - 1) // PER_PAGE
+        start = (page - 1) * PER_PAGE
+        end = start + PER_PAGE
+        cards = cards_all[start:end]
+        # The "Remaining Dupes" badge should show the total count, not just the current page
+        remaining_dupes = total_dup_groups
 
     return render_template_string(
         HTML,
@@ -1784,25 +1973,64 @@ def index():
         remaining_dupes=remaining_dupes,
         plex_host=PLEX_HOST,
         plex_token=PLEX_TOKEN,
+        page=page,
+        total_pages=total_pages,
+        paused=paused,
     )
 
-@app.post("/start")
-def start():
+
+# --- New scan control endpoints ---
+from flask import Response
+
+def start_background_scan():
     with lock:
         if not state["scanning"]:
-            # Pré-flag pour afficher immédiatement la barre de progression
             state.update(scanning=True, scan_progress=0, scan_total=0)
-            logging.debug("start(): launching background_scan() thread")
+            logging.debug("start_scan(): launching background_scan() thread")
             threading.Thread(target=background_scan, daemon=True).start()
+
+@app.route("/scan/start", methods=["POST"])
+def start_scan():
+    scan_should_stop.clear()
+    scan_is_paused.clear()
+    start_background_scan()
+    return "Scan started"
+
+@app.route("/scan/pause", methods=["POST"])
+def pause_scan():
+    scan_is_paused.set()
+    with lock:
+        state["scanning"] = True   # still scanning, just paused
+    return "", 204
+
+
+@app.route("/scan/resume", methods=["POST"])
+def resume_scan():
+    scan_is_paused.clear()
+    # no state change needed; polling loop will continue
+    return "", 204
+
+
+@app.route("/scan/stop", methods=["POST"])
+def stop_scan():
+    scan_should_stop.set()
+    with lock:
+        state["scanning"] = False
     return "", 204
 
 @app.get("/api/progress")
 def api_progress():
     with lock:
+        if state["scanning"]:
+            status = "paused" if scan_is_paused.is_set() else "running"
+        else:
+            status = "stopped"
+
         return jsonify(
             scanning=state["scanning"],
             progress=state["scan_progress"],
-            total=state["scan_total"]
+            total=state["scan_total"],
+            status=status,
         )
 
 @app.get("/api/dedupe")
@@ -1818,8 +2046,11 @@ def api_dedupe():
 @app.get("/details/<artist>/<int:album_id>")
 def details(artist, album_id):
     art = artist.replace("_", " ")
+    # Prefer in-memory duplicates (with full loser lists) during runtime, fallback to DB
     with lock:
-        groups = state["duplicates"].get(art, [])
+        groups = state["duplicates"].get(art)
+    if groups is None:
+        groups = load_scan_from_db().get(art, [])
     for g in groups:
         if g["album_id"] == album_id:
             editions = [g["best"]] + g["losers"]
@@ -2210,4 +2441,3 @@ if __name__ == "__main__":
             tag_extra=args.tag_extra,
             verbose=args.verbose
         )
-
