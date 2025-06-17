@@ -4,7 +4,7 @@
 
 
 <p align="center">
-  <a href="https://discord.gg/9eEAvvZW">
+  <a href="https://discord.gg/2jkwnNhHHR">
     👉 Join us on Discord — let's improve this thing together!
   </a>
 </p>
@@ -231,4 +231,4 @@ Here are the next features planned for PMDA:
 ---------------------
 
 Have a bug, suggestion, or idea? Want to add features and help developing PMDA ?  Join the Discord:
-👉 https://discord.gg/9eEAvvZW
+👉 https://discord.gg/2jkwnNhHHR
