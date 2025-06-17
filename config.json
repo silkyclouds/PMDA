@@ -13,5 +13,5 @@
   "OPENAI_API_KEY": "<YOUR_OPENAI_API_KEY>",
   "OPENAI_MODEL": "gpt-4.1-nano",
   "AI_PROMPT_FILE": "ai_prompt.txt",
-  "SCAN_THREADS": 16
+  "SCAN_THREADS": 8
 }
