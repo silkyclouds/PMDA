@@ -132,6 +132,7 @@ Here is a sample `config.json` to adjust:
   "WEBUI_PORT": 5005,
   "STATE_DB_FILE": "/app/pmda_state.db",
   "CACHE_DB_FILE": "/app/pmda_cache.db"
+  "SCAN_THREADS": 8
 }
 ```
 
