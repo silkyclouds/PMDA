@@ -1,7 +1,9 @@
+PMDA – Plex Music Dedupe Assistant
+==================================
+
 <p align="center">
   <img src="/static/PMDA.png" alt="PMDA Logo" width="450"/>
 </p>
-
 
 <p align="center">
   <a href="https://discord.gg/2jkwnNhHHR">
@@ -9,75 +11,51 @@
   </a>
 </p>
 
+---
 
-PMDA – Plex Music Dedupe Assistant
-==================================
+PMDA (Plex Music Dedupe Assistant) is a powerful tool to scan your Plex Music library, detect duplicate albums, and remove the lowest-quality versions — automatically or via a beautiful web interface.
 
-You know that special moment when you search for an album in Plex... and find FIVE versions of it? Same title. Different folders. Possibly different formats. Mostly just chaos.
-
-After waiting patiently for Plex to address this (spoiler: they didn’t), I gave up and built PMDA — a tool that automatically finds and deduplicates those pesky duplicate albums in your Plex Music library.
-
-Whether you're a FLAC connoisseur or just tired of MP3 clutter, PMDA has your back.
+Whether you're a FLAC snob or just want fewer copies of the same album floating around, PMDA's got your back.
 
 ## 🌟 What PMDA Does
 
-PMDA (Plex Music Dedupe Assistant) helps you identify and clean up duplicate albums in your Plex music library, with smart logic and a user-friendly interface.
+Here's what PMDA currently supports:
 
-Here's what it currently does:
+- 🔍 **Scans** your entire Plex Music library
+- 🎯 **Detects duplicate albums** using precise matching and format heuristics
+- 🧠 **(New!) Uses AI** (OpenAI) to pick the best version among dupes with rationale
+- 📉 **Calculates bitrate/sample-rate/bit-depth** via FFmpeg
+- 🧹 **Trash and delete duplicate entries** via Plex API
+- 🧪 **Supports dry-run / safe mode** if you want to preview effects
+- 🖥️ **Modern Web UI** to dedupe one-by-one or all at once (But you want to use it in CLI mode anyway, right?)
+- 🧠 **Fully works offline** (if AI is not used)
+- ⚙️ **Full `config.json` support** with baked-in defaults, but you rather want to use the variable config, see below...
+- 🐳 **Full Docker variable support** – no file edits needed
+- 📊 **Stats panel** in UI: space saved, dupes removed, etc.
+- 🔄 **Merge extra tracks** from lesser versions
+- 💾 **Caches audio info** with SQLite so re-runs are fast
+- 🧬 **Auto-detects** Plex paths and DB structure
+- 📁 **Uses path mapping (PATH_MAP)** to resolve Docker volume mappings
 
-- 🔍 **Scans your entire Plex Music library**  
-  Connects directly to your Plex database for deep access to metadata and file structure.
+🧠 AI-Powered Comparison
+-------------------------
+PMDA uses OpenAI to determine the "best" version of an album — comparing format score, bitrate, depth, number of tracks, and presence of extra tracks. The UI even shows the rationale behind the decision. This is how you want to run it, really... don't be cheap. 
 
-- 🎯 **Detects duplicate albums using advanced logic**  
-  - Normalized album titles
-  - Identical or overlapping track listings
-  - 85%+ track title similarity
-  - Audio format, bitrate, sample rate, and bit depth
-  - Prefers FLAC over MP3 and higher quality over lossy
-
-- 🏆 **Automatically picks the best-quality version**  
-  Keeps the best copy, moves the rest to a `Plex_dupes/` folder.
-
-- 🧹 **Cleans metadata via the Plex API**  
-  Optionally removes leftover metadata references to moved albums (unless in safe mode).
-
-- 🖥️ **Provides a modern Web UI**  
-  - Grid view of all duplicate groups with covers and metadata
-  - Stats: total albums, artists, dupes, space saved
-  - Real-time scanning feedback with dynamic updates
-  - Options to deduplicate per album, per selection, or globally
-
-- 🧪 **Supports dry-run and safe-mode**  
-  - `--dry-run`: preview actions without changing anything
-  - `--safe-mode`: move files but skip Plex API cleanup
-
-- 📊 **Tracks stats over time**  
-  - Total space reclaimed
-  - Number of deduplicated albums
-  - Persistent tracking in local databases
-
-- 🔧 **Fully configurable via `config.json`**  
-  Set everything from the Web UI port to Plex paths, token, section ID, and more.
-
-- 🤖 **Optional OpenAI integration**  
-  Uses `gpt-4o` or another model to help score duplicates (almost zero cost with GPT-4o-Nano).
-
-- 🧠 **Works entirely offline (if OpenAI is disabled)**  
-  No dependency on cloud services unless you choose to use the LLM helper.
-
-
-
-🧠 Now with AI!
----------------
-
-PMDA now (optionally) uses the openai API to detect and explain differences between album versions. This feature costs a few cents to run and can be customized with your own `ai_prompt.txt` to fit your style.
+💻 Web UI Highlights
+---------------------
+- Table view
+- Filter by artist or album
+- One-click deduplication
+- Merge and deduplicate with rationale
+- Statistics on space saved, dedupes removed
 
 <p align="center">
-  <img src="https://github.com/user-attachments/assets/e8691602-e6dc-40ec-a3c1-977b9e4894b9" alt="AI Token Cost" width="400"/>
+<img width="1904" alt="image" src="https://github.com/user-attachments/assets/637848ff-9710-4e9d-993f-9ca7404bd35a" />
 </p>
 
+
 <p align="center"><i>
-  Example usage of OpenAI with PMDA — this cost ($0.35) reflects several full test scans, identifying ~7000 duplicate album groups within a 150,000 album test library.
+ Main dashboard showing total artists, albums, removed and remaining duplicates, total space saved, with live updates during scans.
 </i></p>
 
 <p align="center">
@@ -96,28 +74,67 @@ PMDA now (optionally) uses the openai API to detect and explain differences betw
   Example of an album with extra tracks detected. Enabling a way to merge extra tracks to the winning edition folder. 
 </i></p>
 
-💻 Web UI Features
-------------------
+⚙️ Configuration
+----------------
 
-- Visual grid of duplicates with cover art
-- Album format and version info
-- Deduplicate one-by-one or all at once
-- Shows potential space savings
-- Reversible merge logic
+All config can be controlled either via `config.json` or environment variables (in Docker).
 
-<p align="center">
-<img width="1904" alt="image" src="https://github.com/user-attachments/assets/637848ff-9710-4e9d-993f-9ca7404bd35a" />
-</p>
+Supported variables:
 
+- `PLEX_DB_PATH`     — Directory or full path to Plex DB
+- `PLEX_DB_FILE`     — Plex DB filename (default: `com.plexapp.plugins.library.db`)
+- `PLEX_HOST`        — Base URL to Plex (e.g. `http://192.168.3.2:32400`)
+- `PLEX_TOKEN`       — Plex auth token
+- `SECTION_ID`       — Section ID for music library
+- `PATH_MAP`         — Map container paths to host paths (e.g. `"/mnt:/host/path"`)
+- `DUPE_ROOT`        — Folder to move removed duplicates
+- `WEBUI_PORT`       — Port for the Web UI (default: 6000)
+- `SCAN_THREADS`     — Parallelism level for scanning
+- `DISABLE_WEBUI`    — If true, disables the web interface
+- `LOG_LEVEL`        — DEBUG / INFO / WARNING etc.
+- `OPENAI_API_KEY`   — Optional key for smarter selection
+- `OPENAI_MODEL`     — Model to use (`gpt-4`, `gpt-3.5-turbo`, etc.)
+- `STATE_DB_FILE`    — Path for state cache (default: `config_dir/state.db`)
+- `CACHE_DB_FILE`    — Path for FFmpeg audio info cache
+- `FORMAT_PREFERENCE` — List of formats ordered by priority
 
-<p align="center"><i>
- Main dashboard showing total artists, albums, removed and remaining duplicates, total space saved, with live updates during scans.
-</i></p>
+### 🐳 Docker Run Example (with inline explanations)
 
-⚙️ Configuration (config.json)
-------------------------------
+```bash
+docker run --rm --name pmda \
+  -e PLEX_HOST="http://192.168.3.1:32400" \       # The full URL to your Plex server, including port
+  -e PLEX_TOKEN="your-real-plex-token" \         # Your Plex token (required for API access)
+  -e SECTION_ID="1" \                            # Section ID of your music library (integer)
+  -e PLEX_DB_PATH="/database" \                  # Path *inside the container* to the Plex DB mount
+  -e PLEX_DB_FILE="com.plexapp.plugins.library.db" \  # Plex database file name (default name)
+  -e PMDA_CONFIG_DIR="/app/config" \             # Config directory inside container (bind-mounted for persistence)
+  -e PMDA_DEFAULT_MODE="serve" \                   # Mode to launch: 'serve', 'cli', 'dryrun', or 'dedupe'
+  -e LOG_LEVEL="INFO" \                          # Logging level: DEBUG, INFO, WARNING, etc.
+  -e SCAN_THREADS="8" \                         # Number of threads for faster scanning
+  -e OPENAI_MODEL="gpt-4.1-nano" \               # OpenAI model for enhanced matching (optional)
+  -e OPENAI_API_KEY="sk-..." \                   # Your OpenAI API key (optional – leave empty to disable)
+  -e PATH_MAP='{"\/music\/matched":"\/music\/matched","\/music\/unmatched":"\/music\/unmatched","\/music\/compilations":"\/music\/compilations"}' \  
+                                                # JSON mapping of Plex paths to container mounts
+  -e DUPE_ROOT="/dupes" \                        # Directory inside container where deduped albums go
+  -v "/path/where/you/store/your/config:/app/config:rw" \  # Mount for config & state files
+  -v "/path/to/plex/database:/database:ro" \ # Mount of the Plex database folder
+  -v "/first/path/of/your/music/lib:/music/matched:rw" \        
+  -v "/second/path/of/your/music/lib:/music/unmatched:rw" \        
+  -v "/third/path/of/your/music/lib:/music/compilations:rw" \   
+  -v "/mnt/user/MURRAY/Music/Music_dupes/Plex_dupes:/dupes:rw" \      
+  -p 5005:5005 \                                  # Web UI port (only needed if using 'serve' mode)
+  meaning/pmda:latest                             # Docker image name
+```
 
-Here is a sample `config.json` to adjust:
+> 🔁 `PMDA_DEFAULT_MODE` options:
+>
+> - `"serve"` → Web UI mode
+> - `"cli"` → Interactive terminal mode
+> - `"dryrun"` → Simulate deduplication without changes
+> - `"dedupe"` → Run auto-deduplication immediately
+
+🛠 Example config.json 
+-----------------------
 
 ```json
 {
@@ -126,110 +143,20 @@ Here is a sample `config.json` to adjust:
   "PLEX_TOKEN": "YOUR_TOKEN_HERE",
   "SECTION_ID": 1,
   "PATH_MAP": {
-    "/music/matched": "/music/matched"
+    "/music/matched": "/mnt/user/Music"
   },
-  "DUPE_ROOT": "/dupes",
+  "DUPE_ROOT": "/mnt/user/Music/dupes",
   "WEBUI_PORT": 5005,
-  "STATE_DB_FILE": "/app/pmda_state.db",
-  "CACHE_DB_FILE": "/app/pmda_cache.db"
-  "SCAN_THREADS": 8
+  "SCAN_THREADS": 8,
+  "STATE_DB_FILE": "/config/pmda_state.db",
+  "CACHE_DB_FILE": "/config/pmda_cache.db",
+  "OPENAI_API_KEY": "sk-...",
+  "OPENAI_MODEL": "gpt-4"
 }
 ```
 
-Optional:
-- `ai_prompt.txt`: Customize how the AI handles and explains duplicates.
+🔗 Join the community
+----------------------
+Need help? Want to share cool use cases? Feature ideas? Bug reports?
 
-🚀 Run PMDA in Docker
----------------------
-
-```bash
-docker run -d \
-  --name pmda \
-  -p 5005:5005 \
-  -v /path/to/config/config.json:/app/config.json:ro \
-  -v /path/to/config/ai_prompt.txt:/app/ai_prompt.txt:ro \
-  -v "/path/to/plex/Library/Application Support/Plex Media Server/Plug-in Support/Databases":/database:ro \
-  -v /path/to/music:/music \
-  -v /path/to/dupes:/dupes \
-  meaning/pmda:latest
-```
-
-It runs in verbose mode by default.
-
-🧪 Run Without Docker (Bare Metal or Virtualenv)
-------------------------------------------------
-
-1. Clone the repo:
-
-```bash
-git clone https://github.com/silkyclouds/PMDA.git
-cd PMDA
-```
-
-2. Create a virtualenv and install dependencies:
-
-```bash
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-sudo apt install ffmpeg  # for ffprobe
-```
-
-3. Adjust `config.json` as shown above.
-
-4. Run the Web UI:
-
-```bash
-python3 pmda.py --serve --verbose
-```
-
-5. Or run CLI mode:
-
-```bash
-python3 pmda.py --dry-run
-```
-
-🛠 CLI Options
---------------
-
-- `--dry-run`: Simulate actions
-- `--safe-mode`: Skip Plex API deletions
-- `--tag-extra`: Keep non-standard album metadata
-- `--verbose`: Show detailed logging
-- `--serve`: Run Web UI
-
-<p align="center"><i>
-<img width="1904" alt="image" src="https://github.com/user-attachments/assets/731ce313-1d91-46fb-8892-b752bb34c412" />
-</p>
-
-<p align="center"><i>
-  Example of PMDA running un CLI mode. 
-</i></p>
-
-## 🛣️ Roadmap
-
-Here are the next features planned for PMDA:
-
-1. **Rollback System for Deduped Albums**  
-   Add a second page listing all previously moved albums, with cover previews and metadata, allowing users to:
-   - Restore individual albums
-   - Selectively rollback multiple albums
-   - Revert all deduplicated albums in one click
-
-2. **"Re-download This Album" Flagging**  
-   Detect albums with:
-   - Missing tracks
-   - MP3 or mixed FLAC/MP3 content  
-   ...and mark them for replacement with clean, lossless versions.
-
-3. **Local LLM Support (OpenLLaMA)**  
-   Allow PMDA to run LLM-based logic locally using [OpenLLaMA](https://github.com/openlm-research/open_llama), for environments without internet or for cost-saving purposes.
-
-4. **OpenAI Usage Tracking**  
-   Display a badge in the main dashboard showing the current OpenAI API usage cost, if used.
-
-🫶 Thanks & Community
----------------------
-
-Have a bug, suggestion, or idea? Want to add features and help developing PMDA ?  Join the Discord:
-👉 https://discord.gg/2jkwnNhHHR
+👉 Join us on Discord: https://discord.gg/2jkwnNhHHR
