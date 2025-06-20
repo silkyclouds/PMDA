@@ -1,22 +1,20 @@
-# Dockerfile
 FROM python:3.11-slim
 
-# install ffmpeg
+ENV PMDA_CONFIG_DIR=/config
+
 RUN apt-get update && \
-    apt-get install -y ffmpeg && \
-    rm -rf /var/lib/apt/lists/*
+    apt-get install -y --no-install-recommends \
+      ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+COPY . /app
 
-# Copy code in config
-COPY requirements.txt ai_prompt.txt config.json pmda.py ./
-COPY static/ ./static/
+RUN pip install --no-cache-dir \
+      flask \
+      requests \
+      openai
 
-# Install python dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+EXPOSE 6000
 
-# Expose the default port
-EXPOSE 5005
-
-# Start the server in verbose mode and serve mode (to enable webui)
-ENTRYPOINT ["python3", "pmda.py", "--serve", "--verbose"]
+ENTRYPOINT ["python", "pmda.py"]
