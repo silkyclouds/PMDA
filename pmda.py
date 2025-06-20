@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PMDA V0.5.3
+PMDA V0.5.4 (2025-06-20 14:28)
 
-- fixes an issue where plex would refresh artist pages that didn't had any dupes removed (in CLI mode only)
+- allows the usage of variables at container creation in order to autoconfigure the config.json
+- autodetection (when possible) of plex paths, section, etc.
 
 """
+
+from __future__ import annotations
 
 import argparse
 import base64
@@ -14,6 +17,7 @@ import logging
 import os
 import re
 import shutil
+import filecmp
 import errno
 import sqlite3
 import subprocess
@@ -27,6 +31,8 @@ from urllib.parse import quote_plus
 
 import requests
 import openai
+import unittest
+import sys
 
 from flask import Flask, render_template_string, request, jsonify
 
@@ -55,58 +61,207 @@ _check_ffmpeg()
 scan_should_stop = threading.Event()
 scan_is_paused   = threading.Event()
 
+#
 # ───────────────────────────────── CONFIGURATION LOADING ─────────────────────────────────
-CONFIG_PATH = Path(__file__).parent / "config.json"
+"""
+Robust configuration helper:
+
+* Loads defaults from the baked‑in config.json shipped inside the Docker image.
+* Copies that file (and ai_prompt.txt) into the user‑writable config dir on first run.
+* Overrides every value with an environment variable when present.
+* Falls back to sensible, documented defaults when neither file nor env provides a value.
+* Validates critical keys so we fail early instead of crashing later.
+* Logs where each value came from (env vs config vs default).
+"""
+
+import filecmp
+
+# Helper parsers --------------------------------------------------------------
+def _parse_bool(val: str | bool) -> bool:
+    """Return *True* for typical truthy strings / bools."""
+    if isinstance(val, bool):
+        return val
+    return str(val).strip().lower() in {"1", "true", "yes", "on"}
+
+def _parse_int(val, default: int | None = None) -> int | None:
+    """Return *int* or *default* on failure / None."""
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return default
+
+def _parse_path_map(val) -> dict[str, str]:
+    """
+    Accept either a dict, a JSON string or a CSV string of ``SRC:DEST`` pairs.
+    Every key/val is coerced to *str*.
+    """
+    if isinstance(val, dict):
+        return {str(k): str(v) for k, v in val.items()}
+    if not val:
+        return {}
+    s = str(val).strip()
+    if s.startswith("{"):
+        try:
+            data = json.loads(s)
+            return {str(k): str(v) for k, v in data.items()}
+        except json.JSONDecodeError as e:
+            logging.warning("Failed to decode PATH_MAP JSON from env – %s", e)
+            return {}
+    mapping: dict[str, str] = {}
+    for pair in s.split(","):
+        if ":" in pair:
+            src, dst = pair.split(":", 1)
+            mapping[src.strip()] = dst.strip()
+    return mapping
+
+# Determine runtime config dir -------------------------------------------------
+BASE_DIR   = Path(__file__).parent
+CONFIG_DIR = Path(os.getenv("PMDA_CONFIG_DIR", BASE_DIR))
+CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+
+# Location of baked‑in template files (shipped inside the image)
+DEFAULT_CONFIG_PATH  = BASE_DIR / "config.json"
+DEFAULT_PROMPT_PATH  = BASE_DIR / "ai_prompt.txt"
+
+CONFIG_PATH   = CONFIG_DIR / "config.json"
+AI_PROMPT_FILE = CONFIG_DIR / "ai_prompt.txt"
+
+# (1) Ensure config.json exists -----------------------------------------------
 if not CONFIG_PATH.exists():
-    raise FileNotFoundError(f"Configuration file not found: {CONFIG_PATH}")
+    logging.info("No config.json found — using default template from image")
+    shutil.copyfile(DEFAULT_CONFIG_PATH, CONFIG_PATH)
 
-import re
-with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-    raw = f.read()
-# Strip any stray control characters that break JSON parsing
-raw = re.sub(r'[\x00-\x1f]', '', raw)
-conf = json.loads(raw)
+# (2) Ensure ai_prompt.txt exists -------------------------------------------
+if not AI_PROMPT_FILE.exists():
+    logging.info("ai_prompt.txt not found — default prompt created")
+    shutil.copyfile(DEFAULT_PROMPT_PATH, AI_PROMPT_FILE)
 
-# Path to external AI prompt template
-AI_PROMPT_FILE = Path(conf.get("AI_PROMPT_FILE", Path(__file__).parent / "ai_prompt.txt"))
+# (3) Load JSON config ---------------------------------------------------------
+with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
+    conf: dict = json.load(fh)
 
-# Optional custom format lists
-FORMAT_PREFERENCE = conf.get("FORMAT_PREFERENCE", [
-    "dsf","aif","aiff","wav","flac","m4a","mp4","m4b","m4p","aifc","ogg","mp3","wma"
-])
+# (4) Merge with environment variables ----------------------------------------
+ENV_SOURCES: dict[str, str] = {}
 
-required_keys = [
-    "PLEX_DB_FILE", "PLEX_HOST", "PLEX_TOKEN",
-    "SECTION_ID", "PATH_MAP", "DUPE_ROOT", "STATE_DB_FILE", "WEBUI_PORT",
-    "CACHE_DB_FILE", "SCAN_THREADS", "OPENAI_API_KEY", "OPENAI_MODEL"
-]
-for key in required_keys:
-    if key not in conf:
-        raise KeyError(f"Missing required configuration key: '{key}' in {CONFIG_PATH}")
+def _get(key: str, *, default=None, cast=lambda x: x):
+    """Return the merged value and remember where it came from."""
+    if (env_val := os.getenv(key)) is not None:
+        ENV_SOURCES[key] = "env"
+        raw = env_val
+    elif key in conf:
+        ENV_SOURCES[key] = "config"
+        raw = conf[key]
+    else:
+        ENV_SOURCES[key] = "default"
+        raw = default
+    return cast(raw)
 
-PLEX_DB_FILE    = conf["PLEX_DB_FILE"]
-PLEX_HOST       = conf["PLEX_HOST"]
-PLEX_TOKEN      = conf["PLEX_TOKEN"]
-SECTION_ID      = int(conf["SECTION_ID"])
-PATH_MAP        = {str(k): str(v) for k, v in conf["PATH_MAP"].items()}
-DUPE_ROOT       = Path(conf["DUPE_ROOT"])
-STATE_DB_FILE   = Path(conf["STATE_DB_FILE"])
-CACHE_DB_FILE   = Path(conf["CACHE_DB_FILE"])
-WEBUI_PORT      = int(conf["WEBUI_PORT"])
-SCAN_THREADS    = int(conf["SCAN_THREADS"])
-OPENAI_API_KEY = conf.get("OPENAI_API_KEY")
-# Model to use for AI selection (configurable in config.json)
-OPENAI_MODEL = conf.get("OPENAI_MODEL", "gpt-4")
+merged = {
+    "PLEX_DB_PATH":   _get("PLEX_DB_PATH",   default="",                                cast=str),
+    "PLEX_DB_FILE":   _get("PLEX_DB_FILE",   default="com.plexapp.plugins.library.db",  cast=str),
+    "PLEX_HOST":      _get("PLEX_HOST",      default="",                                cast=str),
+    "PLEX_TOKEN":     _get("PLEX_TOKEN",     default="",                                cast=str),
+    "SECTION_ID":     _get("SECTION_ID",     default=1,                                 cast=_parse_int),
+    "DUPE_ROOT":      _get("DUPE_ROOT",      default="/dupes",                          cast=str),
+    "SCAN_THREADS":   _get("SCAN_THREADS",   default=os.cpu_count() or 4,               cast=_parse_int),
+    "PATH_MAP":       _parse_path_map(_get("PATH_MAP", default={})),
+    "WEBUI_PORT":     _get("WEBUI_PORT",     default=6000,                              cast=_parse_int),
+    "LOG_LEVEL":      _get("LOG_LEVEL",      default="INFO").upper(),
+    "DISABLE_WEBUI":  _parse_bool(_get("DISABLE_WEBUI", default="false")),
+    "OPENAI_API_KEY": _get("OPENAI_API_KEY", default="",                                cast=str),
+    "OPENAI_MODEL":   _get("OPENAI_MODEL",   default="gpt-4",                           cast=str),
+}
 
-# Initialize OpenAI API key if provided
+# (5) Validate critical values -------------------------------------------------
+if not merged["PLEX_DB_PATH"] and not merged["PLEX_DB_FILE"]:
+    raise SystemExit("Missing required config value: PLEX_DB_PATH or PLEX_DB_FILE")
+for key in ("PLEX_HOST", "PLEX_TOKEN", "SECTION_ID"):
+    if not merged[key]:
+        raise SystemExit(f"Missing required config value: {key}")
+
+# (6) Derive the absolute SQLite file path ------------------------------------
+plex_db_candidate = Path(merged["PLEX_DB_PATH"]) if merged["PLEX_DB_PATH"] else Path(merged["PLEX_DB_FILE"])
+if plex_db_candidate.is_dir():
+    merged["PLEX_DB_FILE"] = str(plex_db_candidate / merged["PLEX_DB_FILE"])
+else:
+    merged["PLEX_DB_FILE"] = str(plex_db_candidate)
+
+# (7) Export as module‑level constants ----------------------------------------
+PLEX_DB_FILE   = merged["PLEX_DB_FILE"]
+PLEX_HOST      = merged["PLEX_HOST"]
+PLEX_TOKEN     = merged["PLEX_TOKEN"]
+SECTION_ID     = int(merged["SECTION_ID"])
+PATH_MAP       = merged["PATH_MAP"]
+DUPE_ROOT      = Path(merged["DUPE_ROOT"])
+WEBUI_PORT     = int(merged["WEBUI_PORT"])
+SCAN_THREADS   = int(merged["SCAN_THREADS"])
+LOG_LEVEL      = merged["LOG_LEVEL"]
+DISABLE_WEBUI  = merged["DISABLE_WEBUI"]
+OPENAI_API_KEY = merged["OPENAI_API_KEY"]
+OPENAI_MODEL   = merged["OPENAI_MODEL"]
+
+# stash original JSON config (used later for STATE_DB_FILE / CACHE_DB_FILE)
+_state_db_path_default  = CONFIG_DIR / "state.db"
+_cache_db_path_default  = CONFIG_DIR / "cache.db"
+
+STATE_DB_FILE = Path(conf.get("STATE_DB_FILE", _state_db_path_default))
+CACHE_DB_FILE = Path(conf.get("CACHE_DB_FILE", _cache_db_path_default))
+
+# File-format preference order (can be overridden in config.json)
+FORMAT_PREFERENCE = conf.get(
+    "FORMAT_PREFERENCE",
+    ["dsf","aif","aiff","wav","flac","m4a","mp4","m4b","m4p","aifc","ogg","mp3","wma"]
+)
+
+# (8) Logging setup (must happen BEFORE any log statements elsewhere) ---------
+_level_num = getattr(logging, LOG_LEVEL, logging.INFO)
+logging.basicConfig(
+    level=_level_num,
+    format="%(asctime)s │ %(levelname)s │ %(message)s",
+    datefmt="%H:%M:%S",
+    force=True,                         # ensure we (re‑)configure root logger
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+
+# Mask & dump effective config ------------------------------------------------
+for k, src in ENV_SOURCES.items():
+    val = merged.get(k)
+    if k in {"PLEX_TOKEN", "OPENAI_API_KEY"} and val:
+        val = val[:4] + "…"  # keep first 4 chars, mask the rest
+    logging.info("Config %-15s = %-30s (source: %s)", k, val, src)
+
+if _level_num == logging.DEBUG:
+    scrubbed = {k: ("***" if k in {"PLEX_TOKEN", "OPENAI_API_KEY"} else v)
+                for k, v in merged.items()}
+    logging.debug("Full merged config:\n%s", json.dumps(scrubbed, indent=2))
+
+# (9) Initialise OpenAI if key present ----------------------------------------
 if OPENAI_API_KEY:
     openai.api_key = OPENAI_API_KEY
 else:
     logging.info("No OPENAI_API_KEY provided; AI-driven selection disabled.")
 
-DUPE_ROOT.mkdir(parents=True, exist_ok=True)
-STATE_DB_FILE.parent.mkdir(parents=True, exist_ok=True)
-CACHE_DB_FILE.parent.mkdir(parents=True, exist_ok=True)
+# (10) Validate Plex connection ------------------------------------------------
+def _validate_plex_connection():
+    """
+    Perform a lightweight request to Plex `/library/sections` to make sure the
+    server is reachable and the token is valid.  We only warn on failure so
+    the application can still run in offline mode.
+    """
+    url = f"{PLEX_HOST}/library/sections"
+    try:
+        resp = requests.get(url, headers={"X-Plex-Token": PLEX_TOKEN}, timeout=10)
+        if resp.status_code != 200:
+            logging.warning(
+                "⚠️  Plex connection failed (HTTP %s) – check PLEX_HOST and PLEX_TOKEN",
+                resp.status_code,
+            )
+        else:
+            logging.info("Plex connection OK (HTTP %s)", resp.status_code)
+    except Exception as e:
+        logging.warning("⚠️  Plex connection failed – %s", e)
+
+_validate_plex_connection()
 
 # ───────────────────────────────── OTHER CONSTANTS ──────────────────────────────────
 AUDIO_RE    = re.compile(r"\.(flac|ape|alac|wav|m4a|aac|mp3|ogg)$", re.I)
@@ -254,12 +409,7 @@ state = {
 }
 lock = threading.Lock()
 
-# ───────────────────────────────── LOGGING ──────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s │ %(levelname)s │ %(message)s",
-    datefmt="%H:%M:%S"
-)
+
 
 # ──────────────────────────────── PLEX DB helper ────────────────────────────────
 def plex_connect() -> sqlite3.Connection:
@@ -533,14 +683,13 @@ def choose_best(editions: List[dict]) -> dict:
                 max_tokens=64,
             )
             txt = resp.choices[0].message.content.strip()
-            p1, p2 = txt.find("|"), txt.find("|", txt.find("|") + 1)
-            if p1 < 0 or p2 < 0:
-                raise ValueError("Invalid AI response format")
-
-            idx       = int(re.search(r"\d+", txt[:p1]).group())
-            rationale = txt[p1+1 : p2].strip()
-            merge_raw = txt[p2+1 :].strip()
-            merge_list = [t.strip() for t in merge_raw.split(",") if t.strip()]
+            logging.debug(f"AI raw response: {txt}")
+            parts = [part.strip() for part in txt.split("|")]
+            if len(parts) != 3:
+                raise ValueError(f"Invalid AI response format, expected 3 parts but got {len(parts)}")
+            idx = int(re.search(r"\d+", parts[0]).group())
+            rationale = parts[1]
+            merge_list = [t.strip() for t in parts[2].split(",") if t.strip()]
 
             best = editions[idx]
             best.update({
@@ -645,6 +794,7 @@ def scan_artist_duplicates(args):
         return (artist_name, [], 0)
     while scan_is_paused.is_set() and not scan_should_stop.is_set():
         time.sleep(0.5)
+    logging.info(f"Processing artist: {artist_name}")
     logging.debug(
         f"scan_artist_duplicates(): start '{artist_name}' (ID {artist_id})"
     )
@@ -2234,6 +2384,10 @@ def dedupe_cli(dry: bool, safe: bool, tag_extra: bool, verbose: bool):
         logging.debug(f"dedupe_cli(): {len(artists)} artists loaded from Plex DB")
 
     for artist_id, artist_name in artists:
+        logging.info("Processing artist: %s", artist_name)
+        logging.info(f"Processing artist: {artist_name}")
+        # Log each artist being scanned
+        logging.info(f"Scanning artist: {artist_name}")
         stats["total_artists"] += 1
 
         album_ids = [
@@ -2420,44 +2574,80 @@ def api_duplicates():
         return jsonify(_build_card_list(state["duplicates"]))
 
 # ───────────────────────────────── MAIN ───────────────────────────────────
+import os
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Scan & dedupe Plex Music duplicates (CLI or WebUI)."
     )
+
+    # Options for WebUI or CLI modes
     sub = parser.add_argument_group("Options for WebUI or CLI modes")
     sub.add_argument(
-        "--serve", action="store_true", help="Launch Flask web interface"
+        "--serve",
+        action="store_true",
+        help="Launch Flask web interface"
+    )
+    # Legacy alias for Unraid CA compatibility
+    sub.add_argument(
+        "--webui",
+        dest="serve",
+        action="store_true",
+        help="Alias for --serve (legacy compatibility)"
     )
 
+    # CLI-only options
     cli = parser.add_argument_group("CLI-only options (ignored with --serve)")
     cli.add_argument(
-        "--dry-run", action="store_true",
+        "--dry-run",
+        action="store_true",
         help="Simulate moves & deletes but do not actually move files or call API."
     )
     cli.add_argument(
-        "--safe-mode", action="store_true",
+        "--safe-mode",
+        action="store_true",
         help="Do not delete Plex metadata even if not dry-run."
     )
     cli.add_argument(
-        "--tag-extra", action="store_true",
+        "--tag-extra",
+        action="store_true",
         help="If an edition has extra tracks, tag 'Extra Tracks' on the best version."
     )
     cli.add_argument(
-        "--verbose", action="store_true", help="Enable DEBUG-logging"
+        "--verbose",
+        action="store_true",
+        help="Enable DEBUG-logging"
     )
 
     args = parser.parse_args()
 
-    # If --verbose was passed, set root logger to DEBUG (both CLI and Serve modes)
+    # Require PMDA_DEFAULT_MODE when no flags provided
+    if not any([args.serve, args.dry_run, args.safe_mode, args.tag_extra, args.verbose]):
+        mode = os.environ.get("PMDA_DEFAULT_MODE")
+        if mode is None:
+            raise SystemExit("Environment variable PMDA_DEFAULT_MODE must be set to 'serve' or 'cli'")
+        mode = mode.lower()
+        if mode == "serve":
+            args.serve = True
+        elif mode in ("cli", "run"):
+            # CLI mode: no serve flag
+            pass
+        else:
+            raise SystemExit(f"Invalid PMDA_DEFAULT_MODE: {mode}. Must be 'serve' or 'cli'")
+
+    # Early logging setup for verbose
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
         logging.debug("Main: verbose mode enabled; root logger set to DEBUG")
 
     if args.serve:
-        # Mode WebUI
+        # WebUI mode
         app.run(host="0.0.0.0", port=WEBUI_PORT)
     else:
-        # Mode CLI
+        # CLI mode: full scan, then dedupe
+        logging.info("CLI mode: starting full library scan")
+        background_scan()
+        logging.info("CLI mode: scan complete, starting dedupe")
         dedupe_cli(
             dry=args.dry_run,
             safe=args.safe_mode,
