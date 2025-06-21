@@ -81,22 +81,25 @@ All config can be controlled either via `config.json` or environment variables (
 
 Supported variables:
 
-- `PLEX_DB_PATH`     — Directory or full path to Plex DB
-- `PLEX_DB_FILE`     — Plex DB filename (default: `com.plexapp.plugins.library.db`)
-- `PLEX_HOST`        — Base URL to Plex (e.g. `http://192.168.3.2:32400`)
-- `PLEX_TOKEN`       — Plex auth token
-- `SECTION_ID`       — Section ID for music library
-- `PATH_MAP`         — Map container paths to host paths (e.g. `"/mnt:/host/path"`)
-- `DUPE_ROOT`        — Folder to move removed duplicates
-- `WEBUI_PORT`       — Port for the Web UI (default: 6000)
-- `SCAN_THREADS`     — Parallelism level for scanning
-- `DISABLE_WEBUI`    — If true, disables the web interface
-- `LOG_LEVEL`        — DEBUG / INFO / WARNING etc.
-- `OPENAI_API_KEY`   — Optional key for smarter selection
-- `OPENAI_MODEL`     — Model to use (`gpt-4`, `gpt-3.5-turbo`, etc.)
-- `STATE_DB_FILE`    — Path for state cache (default: `config_dir/state.db`)
-- `CACHE_DB_FILE`    — Path for FFmpeg audio info cache
+- `PLEX_DB_PATH` — Directory or full path to Plex DB
+- `PLEX_DB_FILE` — Plex DB filename (default: `com.plexapp.plugins.library.db`)
+- `PLEX_HOST` — Base URL to Plex (e.g. `http://192.168.3.2:32400`)
+- `PLEX_TOKEN` — Plex auth token
+- `SECTION_ID` — Section ID for music library
+- `PATH_MAP` — Map container paths to host paths (e.g. `"/mnt:/host/path"`)
+- `DUPE_ROOT` — Folder to move removed duplicates
+- `WEBUI_PORT` — Port for the Web UI (default: 6000)
+- `SCAN_THREADS` — Parallelism level for scanning
+- `DISABLE_WEBUI` — If true, disables the web interface
+- `LOG_LEVEL` — DEBUG / INFO / WARNING etc.
+- `OPENAI_API_KEY` — Optional key for smarter selection
+- `OPENAI_MODEL` — Model to use (`gpt-4`, `gpt-3.5-turbo`, etc.)
+- `STATE_DB_FILE` — Path for state cache (default: `config_dir/state.db`)
+- `CACHE_DB_FILE` — Path for FFmpeg audio info cache
 - `FORMAT_PREFERENCE` — List of formats ordered by priority
+- `PMDA_CONFIG_DIR` — Path to store config, state, and cache files
+- `PMDA_DEFAULT_MODE` — Default mode to launch (`serve`, `cli`, etc.)
+
 
 ### 🐳 Docker Run Example (with inline explanations)
 
