@@ -1,22 +1,15 @@
 {
-  "PLEX_DB_PATH":    "/database",
-  "PLEX_DB_FILE":    "com.plexapp.plugins.library.db",
-  "PLEX_HOST":       "http://<PLEX_IP>:32401",
-  "PLEX_TOKEN":      "<PLEX_TOKEN>",
-  "SECTION_ID":      1,
+  "PLEX_DB_PATH": "/path/to/plex/Plug-in Support/Databases",
+  "PLEX_HOST": "http://<PLEX_IP>:32400",
+  "PLEX_TOKEN": "<YOUR_PLEX_TOKEN>",
+  "SECTION_ID": 1,
   "PATH_MAP": {
-    "/music/matched":      "/music/matched",
-    "/music/unmatched":    "/music/unmatched",
-    "/music/compilations": "/music/compilations"
+    "/music/matched":      "/path/to/music/matched",
+    "/music/unmatched":    "/path/to/music/unmatched",
+    "/music/compilations": "/path/to/music/compilations"
   },
-  "DUPE_ROOT":       "/dupes",
-  "SCAN_THREADS":    16,
-  "WEBUI_PORT":      5005,
-  "LOG_LEVEL":       "INFO",
-  "DISABLE_WEBUI":   false,
-  "OPENAI_API_KEY":  "<OPENAI_API_KEY>",
-  "OPENAI_MODEL":    "gpt-4.1-nano",
-  "AI_PROMPT_FILE":  "ai_prompt.txt",
-  "STATE_DB_FILE":   "./pmda_state.db",
-  "CACHE_DB_FILE":   "./pmda_cache.db"
+  "SCAN_THREADS": 16,
+  "LOG_LEVEL": "INFO",
+  "OPENAI_API_KEY": "<YOUR_OPENAI_API_KEY>",
+  "OPENAI_MODEL": "gpt-4o-nano"
 }
