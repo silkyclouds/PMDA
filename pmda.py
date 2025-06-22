@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PMDA V0.5.4 (2025-06-20 14:28)
-
-- allows the usage of variables at container creation in order to autoconfigure the config.json
-- autodetection (when possible) of plex paths, section, etc.
-
+v0.5.5
+- fixed port mapping issue
 """
 
 from __future__ import annotations
@@ -158,54 +155,45 @@ def _get(key: str, *, default=None, cast=lambda x: x):
 
 merged = {
     "PLEX_DB_PATH":   _get("PLEX_DB_PATH",   default="",                                cast=str),
-    "PLEX_DB_FILE":   _get("PLEX_DB_FILE",   default="com.plexapp.plugins.library.db",  cast=str),
     "PLEX_HOST":      _get("PLEX_HOST",      default="",                                cast=str),
     "PLEX_TOKEN":     _get("PLEX_TOKEN",     default="",                                cast=str),
     "SECTION_ID":     _get("SECTION_ID",     default=1,                                 cast=_parse_int),
-    "DUPE_ROOT":      _get("DUPE_ROOT",      default="/dupes",                          cast=str),
     "SCAN_THREADS":   _get("SCAN_THREADS",   default=os.cpu_count() or 4,               cast=_parse_int),
     "PATH_MAP":       _parse_path_map(_get("PATH_MAP", default={})),
-    "WEBUI_PORT":     _get("WEBUI_PORT",     default=6000,                              cast=_parse_int),
     "LOG_LEVEL":      _get("LOG_LEVEL",      default="INFO").upper(),
-    "DISABLE_WEBUI":  _parse_bool(_get("DISABLE_WEBUI", default="false")),
     "OPENAI_API_KEY": _get("OPENAI_API_KEY", default="",                                cast=str),
     "OPENAI_MODEL":   _get("OPENAI_MODEL",   default="gpt-4",                           cast=str),
 }
 
+# ─────────────────────────────── Fixed container constants ───────────────────────────────
+# DB filename is always fixed under the Plex DB folder
+PLEX_DB_FILE = str(Path(merged["PLEX_DB_PATH"]) / "com.plexapp.plugins.library.db")
+# Duplicates always move to /dupes inside the container
+DUPE_ROOT = Path("/dupes")
+# WebUI always listens on container port 5005 inside the container
+WEBUI_PORT = 5005
+
 # (5) Validate critical values -------------------------------------------------
-if not merged["PLEX_DB_PATH"] and not merged["PLEX_DB_FILE"]:
-    raise SystemExit("Missing required config value: PLEX_DB_PATH or PLEX_DB_FILE")
+if not merged["PLEX_DB_PATH"]:
+    raise SystemExit("Missing required config value: PLEX_DB_PATH")
 for key in ("PLEX_HOST", "PLEX_TOKEN", "SECTION_ID"):
     if not merged[key]:
         raise SystemExit(f"Missing required config value: {key}")
 
-# (6) Derive the absolute SQLite file path ------------------------------------
-plex_db_candidate = Path(merged["PLEX_DB_PATH"]) if merged["PLEX_DB_PATH"] else Path(merged["PLEX_DB_FILE"])
-if plex_db_candidate.is_dir():
-    merged["PLEX_DB_FILE"] = str(plex_db_candidate / merged["PLEX_DB_FILE"])
-else:
-    merged["PLEX_DB_FILE"] = str(plex_db_candidate)
-
 # (7) Export as module‑level constants ----------------------------------------
-PLEX_DB_FILE   = merged["PLEX_DB_FILE"]
 PLEX_HOST      = merged["PLEX_HOST"]
 PLEX_TOKEN     = merged["PLEX_TOKEN"]
 SECTION_ID     = int(merged["SECTION_ID"])
 PATH_MAP       = merged["PATH_MAP"]
-DUPE_ROOT      = Path(merged["DUPE_ROOT"])
-WEBUI_PORT     = int(merged["WEBUI_PORT"])
 SCAN_THREADS   = int(merged["SCAN_THREADS"])
 LOG_LEVEL      = merged["LOG_LEVEL"]
-DISABLE_WEBUI  = merged["DISABLE_WEBUI"]
 OPENAI_API_KEY = merged["OPENAI_API_KEY"]
 OPENAI_MODEL   = merged["OPENAI_MODEL"]
 
-# stash original JSON config (used later for STATE_DB_FILE / CACHE_DB_FILE)
-_state_db_path_default  = CONFIG_DIR / "state.db"
-_cache_db_path_default  = CONFIG_DIR / "cache.db"
-
-STATE_DB_FILE = Path(conf.get("STATE_DB_FILE", _state_db_path_default))
-CACHE_DB_FILE = Path(conf.get("CACHE_DB_FILE", _cache_db_path_default))
+#
+# State and cache DB always live in the config directory
+STATE_DB_FILE = CONFIG_DIR / "state.db"
+CACHE_DB_FILE = CONFIG_DIR / "cache.db"
 
 # File-format preference order (can be overridden in config.json)
 FORMAT_PREFERENCE = conf.get(
