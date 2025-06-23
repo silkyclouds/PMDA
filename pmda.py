@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-v0.5.6
-- gracefully skip missing source folders during deduplication
-  (prevents FileNotFoundError when the album folder has already
-  been moved, renamed or never existed on disk)
+v0.5.7
+- detect end of scan and auto-stop scanning when scan_progress reaches scan_total (avoids UI hanging)
 """
 
 from __future__ import annotations
@@ -2168,17 +2166,18 @@ def stop_scan():
 @app.get("/api/progress")
 def api_progress():
     with lock:
-        if state["scanning"]:
-            status = "paused" if scan_is_paused.is_set() else "running"
-        else:
-            status = "stopped"
-
-        return jsonify(
-            scanning=state["scanning"],
-            progress=state["scan_progress"],
-            total=state["scan_total"],
-            status=status,
-        )
+        if state["scan_total"] and state["scan_progress"] >= state["scan_total"]:
+            state["scanning"] = False
+        scanning = state["scanning"]
+        status = "paused" if (scanning and scan_is_paused.is_set()) else ("running" if scanning else "stopped")
+        progress = state["scan_progress"]
+        total = state["scan_total"]
+    return jsonify(
+        scanning=scanning,
+        progress=progress,
+        total=total,
+        status=status,
+    )
 
 @app.get("/api/dedupe")
 def api_dedupe():
