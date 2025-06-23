@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-v0.5.8
-- background_scan now guards against worker crashes: every worker exception is caught so one bad artist can’t kill the whole scan
-- background_scan always clears state["scanning"] in a finally‑block, ensuring the UI never stays stuck in “running”
+v0.5.9
+- startup self‑diagnostic: checks DB, PATH_MAP coverage, permissions
+- background_scan progress is now exact even when a worker crashes
 """
 
 from __future__ import annotations
@@ -231,6 +231,7 @@ else:
     logging.info("No OPENAI_API_KEY provided; AI-driven selection disabled.")
 
 # (10) Validate Plex connection ------------------------------------------------
+# (10) Validate Plex connection ------------------------------------------------
 def _validate_plex_connection():
     """
     Perform a lightweight request to Plex `/library/sections` to make sure the
@@ -250,7 +251,76 @@ def _validate_plex_connection():
     except Exception as e:
         logging.warning("⚠️  Plex connection failed – %s", e)
 
-_validate_plex_connection()
+# ─────────────────────────────── SELF‑DIAGNOSTIC ────────────────────────────────
+def _self_diag() -> bool:
+    """
+    Runs a quick start‑up check and prints a colour‑coded report:
+    1) Plex DB reachability
+    2) Coverage of every PATH_MAP entry
+    3) R/W permissions on mapped music folders and /dupes
+    4) Rough count of albums with no PATH_MAP match
+
+    Returns *True* when every mandatory check passes, otherwise *False*.
+    """
+    logging.info("──────── PMDA self‑diagnostic ────────")
+
+    # 1) Plex DB readable?
+    try:
+        db = plex_connect()
+        db.execute("SELECT 1").fetchone()
+        logging.info("✓ Plex DB reachable (%s)", PLEX_DB_FILE)
+    except Exception as e:
+        logging.error("✗ Plex DB ERROR – %s", e)
+        return False
+
+    # Compute exact album counts for each PATH_MAP prefix (no sampling)
+    prefix_stats: dict[str, int] = {}
+    for pre in PATH_MAP:
+        cnt = db.execute(
+            """
+            SELECT COUNT(*)
+            FROM media_parts mp
+            JOIN metadata_items md ON md.id = mp.media_item_id
+            WHERE md.metadata_type = 9
+              AND mp.file LIKE ?
+            """,
+            (f"{pre}/%",)
+        ).fetchone()[0]
+        prefix_stats[pre] = cnt
+
+    for pre, dest in PATH_MAP.items():
+        albums_seen = prefix_stats.get(pre, 0)
+        if albums_seen == 0:
+            logging.warning("⚠ %s → %s  (prefix not found in DB)", pre, dest)
+        elif not Path(dest).exists():
+            logging.error("✗ %s → %s  (host path missing)", pre, dest)
+            return False
+        else:
+            logging.info("✓ %s → %s  (%d albums)", pre, dest, albums_seen)
+
+    # 3) Permission checks
+    for mount in [*PATH_MAP.values(), str(DUPE_ROOT), str(CONFIG_DIR)]:
+        p = Path(mount)
+        if not p.exists():
+            continue
+        rw = ("r" if os.access(p, os.R_OK) else "-") + \
+             ("w" if os.access(p, os.W_OK) else "-")
+        if rw != "rw":
+            logging.warning("⚠ %s permissions: %s", p, rw)
+        else:
+            logging.info("✓ %s permissions: %s", p, rw)
+
+    # 4) Albums with no mapping
+    unmapped = db.execute(
+        "SELECT COUNT(*) FROM media_parts WHERE " +
+        " AND ".join([f"file NOT LIKE '{pre}%'" for pre in PATH_MAP])
+    ).fetchone()[0]
+    if unmapped:
+        logging.warning("⚠ %d albums have no PATH_MAP match", unmapped)
+
+    logging.info("──────── diagnostic complete ─────────")
+    return True
+
 
 # ───────────────────────────────── OTHER CONSTANTS ──────────────────────────────────
 AUDIO_RE    = re.compile(r"\.(flac|ape|alac|wav|m4a|aac|mp3|ogg)$", re.I)
@@ -410,6 +480,11 @@ def plex_connect() -> sqlite3.Connection:
     con = sqlite3.connect(f"file:{PLEX_DB_FILE}?mode=ro", uri=True, timeout=30)
     con.text_factory = lambda b: b.decode("utf-8", "surrogateescape")
     return con
+
+# ─── Run connection check & self‑diagnostic only after helpers are defined ───
+_validate_plex_connection()
+if not _self_diag():
+    raise SystemExit("Self‑diagnostic failed – please fix the issues above and restart PMDA.")
 
 # ───────────────────────────────── UTILITIES ──────────────────────────────────
 def plex_api(path: str, method: str = "GET", **kw):
@@ -1095,7 +1170,6 @@ def background_scan():
             "WHERE metadata_type=8 AND library_section_id=?",
             (SECTION_ID,),
         ).fetchall()
-        db_conn.close()
 
         logging.debug(
             f"background_scan(): {len(artists)} artists, {total_albums} albums total"
@@ -1109,29 +1183,36 @@ def background_scan():
         clear_db_on_new_scan()  # wipe previous duplicate tables
 
         all_results, futures = {}, []
+        import concurrent.futures
+        future_to_albums: dict[concurrent.futures.Future, int] = {}
         with ThreadPoolExecutor(max_workers=SCAN_THREADS) as executor:
             for artist_id, artist_name in artists:
-                futures.append(
-                    executor.submit(scan_artist_duplicates, (artist_id, artist_name))
-                )
+                album_cnt = db_conn.execute(
+                    "SELECT COUNT(*) FROM metadata_items WHERE metadata_type=9 AND parent_id=?",
+                    (artist_id,)
+                ).fetchone()[0]
+                fut = executor.submit(scan_artist_duplicates, (artist_id, artist_name))
+                futures.append(fut)
+                future_to_albums[fut] = album_cnt
+            # close the shared connection; workers use their own
+            db_conn.close()
 
             for future in as_completed(futures):
                 # Allow stop/pause mid‑scan
                 if scan_should_stop.is_set():
                     break
+                album_cnt = future_to_albums.get(future, 0)
                 try:
-                    artist_name, groups, album_cnt = future.result()
+                    artist_name, groups, _ = future.result()
                 except Exception as e:
-                    # Log the stack trace but carry on with the remaining artists
                     logging.exception(f"background_scan(): worker crashed – {e}")
-                    album_cnt = 0
-                    continue
-
-                with lock:
-                    all_results[artist_name] = groups
-                    if groups:
-                        state["duplicates"][artist_name] = groups
-                    state["scan_progress"] += album_cnt
+                    groups = []
+                finally:
+                    with lock:
+                        state["scan_progress"] += album_cnt
+                        if groups:
+                            all_results[artist_name] = groups
+                            state["duplicates"][artist_name] = groups
 
         # Persist what we’ve found so far (even if some artists failed)
         save_scan_to_db(all_results)
