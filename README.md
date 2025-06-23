@@ -77,6 +77,8 @@ PMDA uses OpenAI to determine the "best" version of an album — comparing forma
 ⚙️ Configuration
 ----------------
 
+▶️ [Watch the video guide on YouTube](https://youtu.be/YbCklQJwc_w)
+
 All config can be controlled either via `config.json` or environment variables (in Docker).
 
 Supported variables:
