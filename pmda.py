@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-v0.5.7
-- detect end of scan and auto-stop scanning when scan_progress reaches scan_total (avoids UI hanging)
+v0.5.8
+- background_scan now guards against worker crashes: every worker exception is caught so one bad artist can’t kill the whole scan
+- background_scan always clears state["scanning"] in a finally‑block, ensuring the UI never stays stuck in “running”
 """
 
 from __future__ import annotations
@@ -1068,61 +1069,78 @@ def clear_db_on_new_scan():
 def background_scan():
     """
     Scan the entire library in parallel, persist results to SQLite,
-    and update the in-memory `state` for the Web UI.
+    and update the in‑memory `state` for the Web UI.
+
+    The function is now exception‑safe: no single worker failure will abort
+    the whole scan, and `state["scanning"]` is **always** cleared even when
+    an unexpected error occurs, so the front‑end never hangs in “running”.
     """
     logging.debug(f"background_scan(): opening Plex DB at {PLEX_DB_FILE}")
-    db_conn = plex_connect()
 
-    # 1) Total albums for progress bar
-    with lock:
-        state["scan_progress"] = 0
-    total_albums = db_conn.execute(
-        "SELECT COUNT(*) FROM metadata_items "
-        "WHERE metadata_type=9 AND library_section_id=?",
-        (SECTION_ID,),
-    ).fetchone()[0]
+    try:
+        db_conn = plex_connect()
 
-    # 2) Fetch all artists
-    artists = db_conn.execute(
-        "SELECT id, title FROM metadata_items "
-        "WHERE metadata_type=8 AND library_section_id=?",
-        (SECTION_ID,),
-    ).fetchall()
-    db_conn.close()
+        # 1) Total albums for progress bar
+        with lock:
+            state["scan_progress"] = 0
+        total_albums = db_conn.execute(
+            "SELECT COUNT(*) FROM metadata_items "
+            "WHERE metadata_type=9 AND library_section_id=?",
+            (SECTION_ID,),
+        ).fetchone()[0]
 
-    logging.debug(
-        f"background_scan(): {len(artists)} artists, {total_albums} albums total"
-    )
+        # 2) Fetch all artists
+        artists = db_conn.execute(
+            "SELECT id, title FROM metadata_items "
+            "WHERE metadata_type=8 AND library_section_id=?",
+            (SECTION_ID,),
+        ).fetchall()
+        db_conn.close()
 
-    # Reset live state
-    with lock:
-        state.update(scanning=True, scan_progress=0, scan_total=total_albums)
-        state["duplicates"].clear()
+        logging.debug(
+            f"background_scan(): {len(artists)} artists, {total_albums} albums total"
+        )
 
-    clear_db_on_new_scan()  # wipe previous duplicate tables
+        # Reset live state
+        with lock:
+            state.update(scanning=True, scan_progress=0, scan_total=total_albums)
+            state["duplicates"].clear()
 
-    all_results, futures = {}, []
-    with ThreadPoolExecutor(max_workers=SCAN_THREADS) as executor:
-        for artist_id, artist_name in artists:
-            futures.append(
-                executor.submit(scan_artist_duplicates, (artist_id, artist_name))
-            )
+        clear_db_on_new_scan()  # wipe previous duplicate tables
 
-        for future in as_completed(futures):
-            if scan_should_stop.is_set():
-                break
-            artist_name, groups, album_cnt = future.result()
-            with lock:
-                all_results[artist_name] = groups
-                if groups:
-                    state["duplicates"][artist_name] = groups
-                state["scan_progress"] += album_cnt
+        all_results, futures = {}, []
+        with ThreadPoolExecutor(max_workers=SCAN_THREADS) as executor:
+            for artist_id, artist_name in artists:
+                futures.append(
+                    executor.submit(scan_artist_duplicates, (artist_id, artist_name))
+                )
 
-    save_scan_to_db(all_results)
+            for future in as_completed(futures):
+                # Allow stop/pause mid‑scan
+                if scan_should_stop.is_set():
+                    break
+                try:
+                    artist_name, groups, album_cnt = future.result()
+                except Exception as e:
+                    # Log the stack trace but carry on with the remaining artists
+                    logging.exception(f"background_scan(): worker crashed – {e}")
+                    album_cnt = 0
+                    continue
 
-    with lock:
-        state["scanning"] = False
-    logging.debug("background_scan(): finished")
+                with lock:
+                    all_results[artist_name] = groups
+                    if groups:
+                        state["duplicates"][artist_name] = groups
+                    state["scan_progress"] += album_cnt
+
+        # Persist what we’ve found so far (even if some artists failed)
+        save_scan_to_db(all_results)
+
+    finally:
+        # Make absolutely sure we leave the UI in a consistent state
+        with lock:
+            state["scanning"] = False
+        logging.debug("background_scan(): finished (flag cleared)")
 
 def background_dedupe(all_groups: List[dict]):
     """
