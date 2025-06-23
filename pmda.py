@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-v0.5.5
-- fixed port mapping issue
+v0.5.6
+- gracefully skip missing source folders during deduplication
+  (prevents FileNotFoundError when the album folder has already
+  been moved, renamed or never existed on disk)
 """
 
 from __future__ import annotations
@@ -1196,6 +1198,10 @@ def perform_dedupe(group: dict) -> List[dict]:
 
     for loser in group["losers"]:
         src_folder = Path(loser["folder"])
+        # Skip if the source folder is absent (e.g. already moved or path mapping issue)
+        if not src_folder.exists():
+            logging.warning(f"perform_dedupe(): source folder missing – {src_folder}; skipping.")
+            continue
         try:
             base_real = next(iter(PATH_MAP.values()))
             rel = src_folder.relative_to(base_real)
