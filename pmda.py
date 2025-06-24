@@ -119,7 +119,10 @@ def _auto_detect_path_map() -> dict[str, str]:
     Derive a default PATH_MAP by parsing /proc/self/mountinfo.
 
     For every bind‑mount whose *container* mount‑point starts with
-    “/music”, we map that mount‑point to the *host* source path.
+    “/music”, we produce an *identity* mapping:
+        "/music/matched" → "/music/matched"
+    This matches the usual Plex-in‑Docker convention where the exact same
+    inside‑container path is mounted into PMDA.
 
     mountinfo format (kernel ≥ 3.8):
         … mount_point … - fstype src_path super_opts
@@ -150,7 +153,10 @@ def _auto_detect_path_map() -> dict[str, str]:
                 host_src = post_parts[1]   # always take full bind‑source after the hyphen
                 mount_point = pre_parts[4]         # path inside container
                 if mount_point.startswith("/music"):
-                    mapping[mount_point] = host_src
+                    # We deliberately map container → container (identity) so that
+                    # PATH_MAP stays `/music/...` → `/music/...` when the user has bound
+                    # the *same* paths into both Plex and PMDA containers.
+                    mapping[mount_point] = mount_point
     except Exception as e:
         logging.debug("Auto PATH_MAP detection failed: %s", e)
     return mapping
