@@ -506,6 +506,27 @@ def notify_discord(content: str):
     except Exception as e:
         logging.warning("Discord notification failed: %s", e)
 
+# ──────────────────────────────── Discord embed notification ────────────────────────────────
+def notify_discord_embed(title: str, description: str, thumbnail_url: str = "", fields: list[dict] | None = None):
+    """
+    Send a nicely formatted Discord embed so we can show album artwork
+    and keep the message tidy.
+    """
+    if not DISCORD_WEBHOOK:
+        return
+    embed: dict = {
+        "title": title,
+        "description": description,
+    }
+    if thumbnail_url:
+        embed["thumbnail"] = {"url": thumbnail_url}
+    if fields:
+        embed["fields"] = fields[:25]   # Discord hard‑limit is 25 fields / embed
+    try:
+        requests.post(DISCORD_WEBHOOK, json={"embeds": [embed]}, timeout=10)
+    except Exception as e:
+        logging.warning("Discord embed failed: %s", e)
+
 def container_to_host(p: str) -> Optional[Path]:
     for pre, real in PATH_MAP.items():
         if p.startswith(pre):
@@ -952,11 +973,15 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
             'fuzzy': False
         }
         out.append(group_data)
-        notify_discord(
-            f"Duplicate group found: {artist} – {best['title_raw']} "
-            f"({len(losers)+1} versions). "
-            f"Best: {get_primary_format(Path(best['folder']))}, "
-            f"{best['bd']}‑bit, {len(best['tracks'])} tracks."
+        notify_discord_embed(
+            title="Duplicate group found",
+            description=(
+                f"**{artist} – {best['title_raw']}**\n"
+                f"Versions: {len(losers)+1}\n"
+                f"Best: {get_primary_format(Path(best['folder']))}, "
+                f"{best['bd']}‑bit, {len(best['tracks'])} tracks."
+            ),
+            thumbnail_url=thumb_url(best['album_id'])
         )
         used_ids.update(e['album_id'] for e in ed_list)
 
@@ -983,11 +1008,15 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
             'fuzzy': True
         }
         out.append(group_data)
-        notify_discord(
-            f"Duplicate group (fuzzy) found: {artist} – {best['title_raw']} "
-            f"({len(losers)+1} versions). "
-            f"Best: {get_primary_format(Path(best['folder']))}, "
-            f"{best['bd']}‑bit, {len(best['tracks'])} tracks."
+        notify_discord_embed(
+            title="Duplicate group (fuzzy) found",
+            description=(
+                f"**{artist} – {best['title_raw']}**\n"
+                f"Versions: {len(losers)+1}\n"
+                f"Best: {get_primary_format(Path(best['folder']))}, "
+                f"{best['bd']}‑bit, {len(best['tracks'])} tracks."
+            ),
+            thumbnail_url=thumb_url(best['album_id'])
         )
 
     return out
