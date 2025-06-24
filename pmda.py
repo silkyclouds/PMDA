@@ -153,10 +153,7 @@ def _auto_detect_path_map() -> dict[str, str]:
                 host_src = post_parts[1]   # always take full bind‑source after the hyphen
                 mount_point = pre_parts[4]         # path inside container
                 if mount_point.startswith("/music"):
-                    # We deliberately map container → container (identity) so that
-                    # PATH_MAP stays `/music/...` → `/music/...` when the user has bound
-                    # the *same* paths into both Plex and PMDA containers.
-                    mapping[mount_point] = mount_point
+                    mapping[mount_point] = mount_point  # identity mapping: container → container
     except Exception as e:
         logging.debug("Auto PATH_MAP detection failed: %s", e)
     return mapping
