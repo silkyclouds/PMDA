@@ -116,30 +116,38 @@ def _parse_path_map(val) -> dict[str, str]:
 # ──────────────────────── Auto‑detect PATH_MAP from mounts ────────────────────────
 def _auto_detect_path_map() -> dict[str, str]:
     """
-    When the user did not provide PATH_MAP via env or config, derive a sane default
-    by inspecting Docker bind‑mounts listed in /proc/self/mountinfo.
+    Derive a default PATH_MAP by parsing /proc/self/mountinfo.
 
-    We keep every mount‑point whose *container‑side* path starts with "/music"
-    (e.g. "/music", "/music/matched", "/music2", …) and map it to the *host*
-    source path reported by the kernel.  This gives us a container→host mapping
-    good enough for `container_to_host()` and for the self‑diagnostic.
+    For every bind‑mount whose *container* mount‑point starts with
+    “/music”, we map that mount‑point to the *host* source path.
 
-    The function is deliberately silent on failure – PMDA will fall back to an
-    empty mapping and the self‑diagnostic will warn as usual.
+    mountinfo format (kernel ≥ 3.8):
+        … mount_point … - fstype src_path super_opts
+
+    We must therefore split each line at " - " first, then take the first
+    entry *after* the hyphen (the bind source).  Using parts[3] (root)
+    was incorrect and trimmed leading segments such as “/mnt/user”.
     """
     mapping: dict[str, str] = {}
     try:
         with open("/proc/self/mountinfo", "r", encoding="utf-8") as fh:
             for line in fh:
-                parts = line.strip().split()
-                if len(parts) < 5:
+                # separate pre/post‑hyphen fields
+                pre, _, post = line.partition(" - ")
+                if not post:
                     continue
-                host_src   = parts[3]      # original (bind) source path
-                mount_point = parts[4]     # container‑side path
+                post_parts = post.split()
+                if len(post_parts) < 2:
+                    continue
+                host_src = post_parts[1]           # bind source path on host
+                # mount‑point is field 5 in pre‑hyphen section
+                pre_parts = pre.split()
+                if len(pre_parts) < 5:
+                    continue
+                mount_point = pre_parts[4]         # path inside container
                 if mount_point.startswith("/music"):
                     mapping[mount_point] = host_src
     except Exception as e:
-        # only log at DEBUG level to avoid noise for end‑users
         logging.debug("Auto PATH_MAP detection failed: %s", e)
     return mapping
 
