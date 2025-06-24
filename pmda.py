@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-v0.6.0
-- Added auto detection of plex paths, and automatic configuration of previously existing PATH MAP variable. 
-- BE SURE TO USE THE EXACT PLEX PATH STRUCTURE WHEN MAPPING YOUR PATHS USING THE BIND MOUNT! 
+v0.5.9
+- startup self‑diagnostic: checks DB, PATH_MAP coverage, permissions
+- background_scan progress is now exact even when a worker crashes
 """
 
 from __future__ import annotations
@@ -88,7 +88,6 @@ def _parse_int(val, default: int | None = None) -> int | None:
     except (TypeError, ValueError):
         return default
 
-
 def _parse_path_map(val) -> dict[str, str]:
     """
     Accept either a dict, a JSON string or a CSV string of ``SRC:DEST`` pairs.
@@ -111,43 +110,6 @@ def _parse_path_map(val) -> dict[str, str]:
         if ":" in pair:
             src, dst = pair.split(":", 1)
             mapping[src.strip()] = dst.strip()
-    return mapping
-
-# ──────────────────────── Auto‑detect PATH_MAP from mounts ────────────────────────
-def _auto_detect_path_map() -> dict[str, str]:
-    """
-    Build a *container‑only* identity mapping by inspecting the Linux
-    mount‑table.
-
-    For every bind‑mount whose mount‑point **inside the container**
-    commence par “/music”, we simply return:
-
-        "/music/matched" → "/music/matched"
-
-    A single identity rule is all PMDA needs because Plex (when run in
-    Docker) and PMDA both see the *same* in‑container paths.  We do **not**
-    attempt to reconstruct the host source path – it is irrelevant and
-    unreliable (e.g. Unraid truncates “/mnt/user/…”).
-
-    The kernel’s `/proc/self/mountinfo` has the format:
-
-        … <mount_point> … - <fstype> <source> <super_opts>
-
-    We only care about column 5 (<mount_point>); everything after “ - ”
-    is ignored.
-    """
-    mapping: dict[str, str] = {}
-    try:
-        with open("/proc/self/mountinfo", "r", encoding="utf-8") as fh:
-            for line in fh:
-                parts = line.split()
-                if len(parts) < 5:
-                    continue
-                mount_point = parts[4]          # path *inside* the container
-                if mount_point.startswith("/music"):
-                    mapping[mount_point] = mount_point   # identity mapping
-    except Exception as e:
-        logging.debug("Auto PATH_MAP detection failed: %s", e)
     return mapping
 
 # Determine runtime config dir -------------------------------------------------
@@ -192,58 +154,13 @@ def _get(key: str, *, default=None, cast=lambda x: x):
         raw = default
     return cast(raw)
 
-
-# Derive effective PATH_MAP (env/config first, fallback to auto‑detect)
-_raw_path_map = _get("PATH_MAP", default="")
-_path_map     = _parse_path_map(_raw_path_map)
-
-# --- Prefer bind‑mount auto‑detection when PATH_MAP only comes from config -------
-# If the user did not provide a PATH_MAP environment variable and the
-# value originated from *config.json*, we ignore it entirely and fall
-# back to the bind‑mount inspection.  This avoids shipping someone
-# else’s hard‑coded paths inside the default template.
-if ENV_SOURCES.get("PATH_MAP") == "config":
-    logging.info("Ignoring PATH_MAP from config.json; using auto‑detected bind mounts")
-    _path_map = {}
-
-if not _path_map:
-    _path_map = _auto_detect_path_map()
-    if _path_map:
-        logging.info("Auto‑detected PATH_MAP from container mounts: %s",
-                     json.dumps(_path_map))
-
-# --- Ignore ONLY the baked‑in template placeholder --------------------------
-# If every destination begins with the canonical "/path/to/" stub shipped in the
-# sample config, we treat it as an unedited template and fall back to the
-# auto‑detected mapping.  We deliberately *do not* include “/MURRAY/” (or any
-# other real username) so that legitimate paths on the host are never rejected.
-
-_placeholder_prefix = "/path/to/"
-if _path_map and all(dst.startswith(_placeholder_prefix) for dst in _path_map.values()):
-    logging.info("Ignoring placeholder PATH_MAP from default template; falling back to auto‑detect")
-    _path_map = _auto_detect_path_map()
-
-# ─── Fallback 2: ignore obviously wrong mappings ────────────────────────
-# When every destination folder in PATH_MAP is missing on the host, we
-# assume the values are stale leftovers from someone else’s environment
-# (e.g. “/MURRAY/…” committed by mistake).  In that case we revert to the
-# auto‑detected mapping derived from the container bind‑mounts.
-from pathlib import Path  # already imported at top; safe to repeat
-
-if _path_map and all(not Path(dst).exists() for dst in _path_map.values()):
-    logging.info(
-        "Ignoring PATH_MAP because none of the mapped host folders exist; "
-        "falling back to auto‑detect"
-    )
-    _path_map = _auto_detect_path_map()
-
 merged = {
     "PLEX_DB_PATH":   _get("PLEX_DB_PATH",   default="",                                cast=str),
     "PLEX_HOST":      _get("PLEX_HOST",      default="",                                cast=str),
     "PLEX_TOKEN":     _get("PLEX_TOKEN",     default="",                                cast=str),
     "SECTION_ID":     _get("SECTION_ID",     default=1,                                 cast=_parse_int),
     "SCAN_THREADS":   _get("SCAN_THREADS",   default=os.cpu_count() or 4,               cast=_parse_int),
-    "PATH_MAP":       _path_map,
+    "PATH_MAP":       _parse_path_map(_get("PATH_MAP", default={})),
     "LOG_LEVEL":      _get("LOG_LEVEL",      default="INFO").upper(),
     "OPENAI_API_KEY": _get("OPENAI_API_KEY", default="",                                cast=str),
     "OPENAI_MODEL":   _get("OPENAI_MODEL",   default="gpt-4",                           cast=str),
