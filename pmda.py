@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-v0.5.9
-- startup self‑diagnostic: checks DB, PATH_MAP coverage, permissions
-- background_scan progress is now exact even when a worker crashes
+v0.6.0
+- Added discord webhook support to get dupes notification and final statistics of a scan
 """
 
 from __future__ import annotations
@@ -164,6 +163,7 @@ merged = {
     "LOG_LEVEL":      _get("LOG_LEVEL",      default="INFO").upper(),
     "OPENAI_API_KEY": _get("OPENAI_API_KEY", default="",                                cast=str),
     "OPENAI_MODEL":   _get("OPENAI_MODEL",   default="gpt-4",                           cast=str),
+    "DISCORD_WEBHOOK": _get("DISCORD_WEBHOOK", default="", cast=str),
 }
 
 # ─────────────────────────────── Fixed container constants ───────────────────────────────
@@ -190,6 +190,7 @@ SCAN_THREADS   = int(merged["SCAN_THREADS"])
 LOG_LEVEL      = merged["LOG_LEVEL"]
 OPENAI_API_KEY = merged["OPENAI_API_KEY"]
 OPENAI_MODEL   = merged["OPENAI_MODEL"]
+DISCORD_WEBHOOK = merged["DISCORD_WEBHOOK"]
 
 #
 # State and cache DB always live in the config directory
@@ -215,12 +216,12 @@ logging.basicConfig(
 # Mask & dump effective config ------------------------------------------------
 for k, src in ENV_SOURCES.items():
     val = merged.get(k)
-    if k in {"PLEX_TOKEN", "OPENAI_API_KEY"} and val:
+    if k in {"PLEX_TOKEN", "OPENAI_API_KEY", "DISCORD_WEBHOOK"} and val:
         val = val[:4] + "…"  # keep first 4 chars, mask the rest
     logging.info("Config %-15s = %-30s (source: %s)", k, val, src)
 
 if _level_num == logging.DEBUG:
-    scrubbed = {k: ("***" if k in {"PLEX_TOKEN", "OPENAI_API_KEY"} else v)
+    scrubbed = {k: ("***" if k in {"PLEX_TOKEN", "OPENAI_API_KEY", "DISCORD_WEBHOOK"} else v)
                 for k, v in merged.items()}
     logging.debug("Full merged config:\n%s", json.dumps(scrubbed, indent=2))
 
@@ -491,6 +492,19 @@ def plex_api(path: str, method: str = "GET", **kw):
     headers = kw.pop("headers", {})
     headers["X-Plex-Token"] = PLEX_TOKEN
     return requests.request(method, f"{PLEX_HOST}{path}", headers=headers, timeout=60, **kw)
+
+# ──────────────────────────────── Discord notifications ────────────────────────────────
+def notify_discord(content: str):
+    """
+    Fire‑and‑forget Discord webhook notifier.
+    Disabled when DISCORD_WEBHOOK is empty.
+    """
+    if not DISCORD_WEBHOOK:
+        return
+    try:
+        requests.post(DISCORD_WEBHOOK, json={"content": content}, timeout=10)
+    except Exception as e:
+        logging.warning("Discord notification failed: %s", e)
 
 def container_to_host(p: str) -> Optional[Path]:
     for pre, real in PATH_MAP.items():
@@ -930,14 +944,20 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
             continue
         best = choose_best(ed_list)
         losers = [e for e in ed_list if e is not best]
-        # Ensure rationale is preserved in group
-        out.append({
+        group_data = {
             'artist': artist,
             'album_id': best['album_id'],
             'best': best,
             'losers': losers,
             'fuzzy': False
-        })
+        }
+        out.append(group_data)
+        notify_discord(
+            f"Duplicate group found: {artist} – {best['title_raw']} "
+            f"({len(losers)+1} versions). "
+            f"Best: {get_primary_format(Path(best['folder']))}, "
+            f"{best['bd']}‑bit, {len(best['tracks'])} tracks."
+        )
         used_ids.update(e['album_id'] for e in ed_list)
 
     # --- Second pass: fuzzy match on album_norm only, for remaining editions ---
@@ -955,14 +975,20 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
         # Force AI selection for fuzzy groups
         best = choose_best(ed_list)
         losers = [e for e in ed_list if e is not best]
-        # Mark as fuzzy
-        out.append({
+        group_data = {
             'artist': artist,
             'album_id': best['album_id'],
             'best': best,
             'losers': losers,
             'fuzzy': True
-        })
+        }
+        out.append(group_data)
+        notify_discord(
+            f"Duplicate group (fuzzy) found: {artist} – {best['title_raw']} "
+            f"({len(losers)+1} versions). "
+            f"Best: {get_primary_format(Path(best['folder']))}, "
+            f"{best['bd']}‑bit, {len(best['tracks'])} tracks."
+        )
 
     return out
 
@@ -1151,6 +1177,7 @@ def background_scan():
     an unexpected error occurs, so the front‑end never hangs in “running”.
     """
     logging.debug(f"background_scan(): opening Plex DB at {PLEX_DB_FILE}")
+    start_time = time.perf_counter()
 
     try:
         db_conn = plex_connect()
@@ -1222,6 +1249,20 @@ def background_scan():
         with lock:
             state["scanning"] = False
         logging.debug("background_scan(): finished (flag cleared)")
+        duration = time.perf_counter() - start_time
+        groups_found = sum(len(v) for v in all_results.values()) if 'all_results' in locals() else 0
+        removed_dupes = get_stat("removed_dupes")
+        space_saved   = get_stat("space_saved")
+        total_artists = len(artists) if 'artists' in locals() else 0
+        notify_discord(
+            "🟢 PMDA scan completed in "
+            f"{duration:.1f}s\n"
+            f"Artists: {total_artists}\n"
+            f"Albums: {total_albums if 'total_albums' in locals() else 0}\n"
+            f"Duplicate groups found: {groups_found}\n"
+            f"Duplicates removed so far: {removed_dupes}\n"
+            f"Space saved: {space_saved} MB"
+        )
 
 def background_dedupe(all_groups: List[dict]):
     """
@@ -1252,6 +1293,10 @@ def background_dedupe(all_groups: List[dict]):
     # Update stats in DB
     increment_stat("space_saved", total_moved)
     increment_stat("removed_dupes", removed_count)
+    notify_discord(
+        f"🟢 Deduplication finished: {removed_count} duplicate folders moved, "
+        f"{total_moved} MB reclaimed."
+    )
     logging.debug(f"background_dedupe(): updated stats: space_saved += {total_moved}, removed_dupes += {removed_count}")
 
     # Refresh Plex for all affected artists
