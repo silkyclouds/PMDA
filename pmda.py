@@ -201,6 +201,16 @@ def _get(key: str, *, default=None, cast=lambda x: x):
 # Derive effective PATH_MAP (env/config first, fallback to auto‑detect)
 _raw_path_map = _get("PATH_MAP", default="")
 _path_map     = _parse_path_map(_raw_path_map)
+
+# --- Prefer bind‑mount auto‑detection when PATH_MAP only comes from config -------
+# If the user did not provide a PATH_MAP environment variable and the
+# value originated from *config.json*, we ignore it entirely and fall
+# back to the bind‑mount inspection.  This avoids shipping someone
+# else’s hard‑coded paths inside the default template.
+if ENV_SOURCES.get("PATH_MAP") == "config":
+    logging.info("Ignoring PATH_MAP from config.json; using auto‑detected bind mounts")
+    _path_map = {}
+
 if not _path_map:
     _path_map = _auto_detect_path_map()
     if _path_map:
