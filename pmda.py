@@ -139,11 +139,15 @@ def _auto_detect_path_map() -> dict[str, str]:
                 post_parts = post.split()
                 if len(post_parts) < 2:
                     continue
-                host_src = post_parts[1]           # bind source path on host
-                # mount‑point is field 5 in pre‑hyphen section
+                # Prefer the *root* field (pre‑hyphen, column 4) because it
+                # keeps the full original host path even on Unraid, where the
+                # mount‑source shown after the hyphen may lose the leading
+                # “/mnt/user”.  Fallback to the post‑hyphen source when the
+                # root field is “/”.
                 pre_parts = pre.split()
                 if len(pre_parts) < 5:
                     continue
+                host_src = pre_parts[3] if pre_parts[3] != "/" else post_parts[1]
                 mount_point = pre_parts[4]         # path inside container
                 if mount_point.startswith("/music"):
                     mapping[mount_point] = host_src
