@@ -195,11 +195,14 @@ if not _path_map:
         logging.info("Auto‑detected PATH_MAP from container mounts: %s",
                      json.dumps(_path_map))
 
-# --- Ignore placeholder PATH_MAP that slips through the default template ----
-_placeholder_markers = ("/path/to/", "/MURRAY/")
-if _path_map and all(any(marker in dst for marker in _placeholder_markers)
-                     for dst in _path_map.values()):
-    logging.info("Ignoring placeholder PATH_MAP from baked‑in template; falling back to auto‑detect")
+# --- Ignore ONLY the baked‑in template placeholder --------------------------
+# If every destination begins with the canonical "/path/to/" stub shipped in the
+# sample config, we treat it as an unedited template and fall back to the
+# auto‑detected mapping.  We deliberately *do not* include “/MURRAY/” (or any
+# other real username) so that legitimate paths on the host are never rejected.
+_placeholder_prefix = "/path/to/"
+if _path_map and all(dst.startswith(_placeholder_prefix) for dst in _path_map.values()):
+    logging.info("Ignoring placeholder PATH_MAP from default template; falling back to auto‑detect")
     _path_map = _auto_detect_path_map()
 
 merged = {
