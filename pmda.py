@@ -147,7 +147,7 @@ def _auto_detect_path_map() -> dict[str, str]:
                 pre_parts = pre.split()
                 if len(pre_parts) < 5:
                     continue
-                host_src = pre_parts[3] if pre_parts[3] != "/" else post_parts[1]
+                host_src = post_parts[1]   # always take full bind‑source after the hyphen
                 mount_point = pre_parts[4]         # path inside container
                 if mount_point.startswith("/music"):
                     mapping[mount_point] = host_src
