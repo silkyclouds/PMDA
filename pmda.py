@@ -195,6 +195,13 @@ if not _path_map:
         logging.info("Auto‑detected PATH_MAP from container mounts: %s",
                      json.dumps(_path_map))
 
+# --- Ignore placeholder PATH_MAP that slips through the default template ----
+_placeholder_markers = ("/path/to/", "/MURRAY/")
+if _path_map and all(any(marker in dst for marker in _placeholder_markers)
+                     for dst in _path_map.values()):
+    logging.info("Ignoring placeholder PATH_MAP from baked‑in template; falling back to auto‑detect")
+    _path_map = _auto_detect_path_map()
+
 merged = {
     "PLEX_DB_PATH":   _get("PLEX_DB_PATH",   default="",                                cast=str),
     "PLEX_HOST":      _get("PLEX_HOST",      default="",                                cast=str),
