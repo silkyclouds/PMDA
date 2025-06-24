@@ -1227,6 +1227,15 @@ def background_scan():
             (SECTION_ID,),
         ).fetchall()
 
+        # ─── Discord: announce scan start ────────────────────────────────
+        notify_discord_embed(
+            title="🔄 PMDA scan started",
+            description=(
+                f"Scanning {len(artists)} artists / {total_albums} albums… "
+                "Buckle up!"
+            )
+        )
+
         logging.debug(
             f"background_scan(): {len(artists)} artists, {total_albums} albums total"
         )
