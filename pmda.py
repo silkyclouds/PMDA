@@ -116,44 +116,36 @@ def _parse_path_map(val) -> dict[str, str]:
 # ──────────────────────── Auto‑detect PATH_MAP from mounts ────────────────────────
 def _auto_detect_path_map() -> dict[str, str]:
     """
-    Derive a default PATH_MAP by parsing /proc/self/mountinfo.
+    Build a *container‑only* identity mapping by inspecting the Linux
+    mount‑table.
 
-    For every bind‑mount whose *container* mount‑point starts with
-    “/music”, we produce an *identity* mapping:
+    For every bind‑mount whose mount‑point **inside the container**
+    commence par “/music”, we simply return:
+
         "/music/matched" → "/music/matched"
-    This matches the usual Plex-in‑Docker convention where the exact same
-    inside‑container path is mounted into PMDA.
 
-    mountinfo format (kernel ≥ 3.8):
-        … mount_point … - fstype src_path super_opts
+    A single identity rule is all PMDA needs because Plex (when run in
+    Docker) and PMDA both see the *same* in‑container paths.  We do **not**
+    attempt to reconstruct the host source path – it is irrelevant and
+    unreliable (e.g. Unraid truncates “/mnt/user/…”).
 
-    We must therefore split each line at " - " first, then take the first
-    entry *after* the hyphen (the bind source).  Using parts[3] (root)
-    was incorrect and trimmed leading segments such as “/mnt/user”.
+    The kernel’s `/proc/self/mountinfo` has the format:
+
+        … <mount_point> … - <fstype> <source> <super_opts>
+
+    We only care about column 5 (<mount_point>); everything after “ - ”
+    is ignored.
     """
     mapping: dict[str, str] = {}
     try:
         with open("/proc/self/mountinfo", "r", encoding="utf-8") as fh:
             for line in fh:
-                # separate pre/post‑hyphen fields
-                pre, _, post = line.partition(" - ")
-                if not post:
+                parts = line.split()
+                if len(parts) < 5:
                     continue
-                post_parts = post.split()
-                if len(post_parts) < 2:
-                    continue
-                # Prefer the *root* field (pre‑hyphen, column 4) because it
-                # keeps the full original host path even on Unraid, where the
-                # mount‑source shown after the hyphen may lose the leading
-                # “/mnt/user”.  Fallback to the post‑hyphen source when the
-                # root field is “/”.
-                pre_parts = pre.split()
-                if len(pre_parts) < 5:
-                    continue
-                host_src = post_parts[1]   # always take full bind‑source after the hyphen
-                mount_point = pre_parts[4]         # path inside container
+                mount_point = parts[4]          # path *inside* the container
                 if mount_point.startswith("/music"):
-                    mapping[mount_point] = mount_point  # identity mapping: container → container
+                    mapping[mount_point] = mount_point   # identity mapping
     except Exception as e:
         logging.debug("Auto PATH_MAP detection failed: %s", e)
     return mapping
