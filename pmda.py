@@ -212,9 +212,24 @@ if not _path_map:
 # sample config, we treat it as an unedited template and fall back to the
 # auto‑detected mapping.  We deliberately *do not* include “/MURRAY/” (or any
 # other real username) so that legitimate paths on the host are never rejected.
+
 _placeholder_prefix = "/path/to/"
 if _path_map and all(dst.startswith(_placeholder_prefix) for dst in _path_map.values()):
     logging.info("Ignoring placeholder PATH_MAP from default template; falling back to auto‑detect")
+    _path_map = _auto_detect_path_map()
+
+# ─── Fallback 2: ignore obviously wrong mappings ────────────────────────
+# When every destination folder in PATH_MAP is missing on the host, we
+# assume the values are stale leftovers from someone else’s environment
+# (e.g. “/MURRAY/…” committed by mistake).  In that case we revert to the
+# auto‑detected mapping derived from the container bind‑mounts.
+from pathlib import Path  # already imported at top; safe to repeat
+
+if _path_map and all(not Path(dst).exists() for dst in _path_map.values()):
+    logging.info(
+        "Ignoring PATH_MAP because none of the mapped host folders exist; "
+        "falling back to auto‑detect"
+    )
     _path_map = _auto_detect_path_map()
 
 merged = {
