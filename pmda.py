@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-v0.5.9
-- startup self‑diagnostic: checks DB, PATH_MAP coverage, permissions
-- background_scan progress is now exact even when a worker crashes
+v0.6.0
+- Added auto detection of plex paths, and automatic configuration of previously existing PATH MAP variable. 
+- BE SURE TO USE THE EXACT PLEX PATH STRUCTURE WHEN MAPPING YOUR PATHS USING THE BIND MOUNT! 
 """
 
 from __future__ import annotations
@@ -88,6 +88,7 @@ def _parse_int(val, default: int | None = None) -> int | None:
     except (TypeError, ValueError):
         return default
 
+
 def _parse_path_map(val) -> dict[str, str]:
     """
     Accept either a dict, a JSON string or a CSV string of ``SRC:DEST`` pairs.
@@ -110,6 +111,36 @@ def _parse_path_map(val) -> dict[str, str]:
         if ":" in pair:
             src, dst = pair.split(":", 1)
             mapping[src.strip()] = dst.strip()
+    return mapping
+
+# ──────────────────────── Auto‑detect PATH_MAP from mounts ────────────────────────
+def _auto_detect_path_map() -> dict[str, str]:
+    """
+    When the user did not provide PATH_MAP via env or config, derive a sane default
+    by inspecting Docker bind‑mounts listed in /proc/self/mountinfo.
+
+    We keep every mount‑point whose *container‑side* path starts with "/music"
+    (e.g. "/music", "/music/matched", "/music2", …) and map it to the *host*
+    source path reported by the kernel.  This gives us a container→host mapping
+    good enough for `container_to_host()` and for the self‑diagnostic.
+
+    The function is deliberately silent on failure – PMDA will fall back to an
+    empty mapping and the self‑diagnostic will warn as usual.
+    """
+    mapping: dict[str, str] = {}
+    try:
+        with open("/proc/self/mountinfo", "r", encoding="utf-8") as fh:
+            for line in fh:
+                parts = line.strip().split()
+                if len(parts) < 5:
+                    continue
+                host_src   = parts[3]      # original (bind) source path
+                mount_point = parts[4]     # container‑side path
+                if mount_point.startswith("/music"):
+                    mapping[mount_point] = host_src
+    except Exception as e:
+        # only log at DEBUG level to avoid noise for end‑users
+        logging.debug("Auto PATH_MAP detection failed: %s", e)
     return mapping
 
 # Determine runtime config dir -------------------------------------------------
@@ -154,13 +185,23 @@ def _get(key: str, *, default=None, cast=lambda x: x):
         raw = default
     return cast(raw)
 
+
+# Derive effective PATH_MAP (env/config first, fallback to auto‑detect)
+_raw_path_map = _get("PATH_MAP", default="")
+_path_map     = _parse_path_map(_raw_path_map)
+if not _path_map:
+    _path_map = _auto_detect_path_map()
+    if _path_map:
+        logging.info("Auto‑detected PATH_MAP from container mounts: %s",
+                     json.dumps(_path_map))
+
 merged = {
     "PLEX_DB_PATH":   _get("PLEX_DB_PATH",   default="",                                cast=str),
     "PLEX_HOST":      _get("PLEX_HOST",      default="",                                cast=str),
     "PLEX_TOKEN":     _get("PLEX_TOKEN",     default="",                                cast=str),
     "SECTION_ID":     _get("SECTION_ID",     default=1,                                 cast=_parse_int),
     "SCAN_THREADS":   _get("SCAN_THREADS",   default=os.cpu_count() or 4,               cast=_parse_int),
-    "PATH_MAP":       _parse_path_map(_get("PATH_MAP", default={})),
+    "PATH_MAP":       _path_map,
     "LOG_LEVEL":      _get("LOG_LEVEL",      default="INFO").upper(),
     "OPENAI_API_KEY": _get("OPENAI_API_KEY", default="",                                cast=str),
     "OPENAI_MODEL":   _get("OPENAI_MODEL",   default="gpt-4",                           cast=str),
