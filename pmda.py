@@ -138,25 +138,51 @@ if not AI_PROMPT_FILE.exists():
 with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
     conf: dict = json.load(fh)
 
-# ─── Auto-generate PATH_MAP from Plex on every startup ──────────────────────
+# ─── Auto‑generate PATH_MAP from Plex at *every* startup ────────────────────
 import xml.etree.ElementTree as ET
-plex_host = os.getenv("PLEX_HOST") or conf.get("PLEX_HOST")
-plex_token = os.getenv("PLEX_TOKEN") or conf.get("PLEX_TOKEN")
-section    = os.getenv("SECTION_ID") or conf.get("SECTION_ID")
-try:
-    url = f"{plex_host}/library/sections/{section}"
+
+def _discover_path_map(plex_host: str, plex_token: str, section_id: int) -> dict[str, str]:
+    """
+    Query Plex for all <Location> paths belonging to *section_id* and return
+    a mapping of {container_path: container_path}.  This is run at each
+    startup so that changes in the Plex UI (adding/removing folders) are
+    picked up automatically.
+
+    A hard failure (network/XML/bad token/empty list) is surfaced so that
+    users notice mis‑configuration early.
+    """
+    url = f"{plex_host.rstrip('/')}/library/sections/{section_id}"
     resp = requests.get(url, headers={"X-Plex-Token": plex_token}, timeout=10)
     resp.raise_for_status()
-    root = ET.fromstring(resp.text)
-    auto_map = {loc.attrib["path"]: loc.attrib["path"] for loc in root.findall(".//Location")}
-    if auto_map:
-        conf["PATH_MAP"] = auto_map
-        # Persist updated PATH_MAP
-        with open(CONFIG_PATH, "w", encoding="utf-8") as fh_cfg:
-            json.dump(conf, fh_cfg, indent=2)
-        logging.info("Auto‑generated PATH_MAP: %r", auto_map)
+
+    try:
+        root = ET.fromstring(resp.text)
+    except ET.ParseError as e:
+        raise RuntimeError(f"Invalid XML returned by Plex: {e}") from None
+
+    locations = [
+        loc.attrib.get("path") for loc in root.iter("Location")
+        if loc.attrib.get("path")
+    ]
+    if not locations:
+        raise RuntimeError("No <Location> elements found for this section")
+
+    return {p: p for p in locations}
+
+# Always attempt discovery – even when PATH_MAP already exists – so the file
+# stays in sync with the Plex configuration.
+try:
+    plex_host   = os.getenv("PLEX_HOST")   or conf.get("PLEX_HOST")
+    plex_token  = os.getenv("PLEX_TOKEN")  or conf.get("PLEX_TOKEN")
+    section_id  = int(os.getenv("SECTION_ID") or conf.get("SECTION_ID", 1))
+    auto_map    = _discover_path_map(plex_host, plex_token, section_id)
+
+    conf["PATH_MAP"] = auto_map     # update in‑memory config
+    with open(CONFIG_PATH, "w", encoding="utf-8") as fh_cfg:
+        json.dump(conf, fh_cfg, indent=2)
+    logging.info("🔄 Auto‑generated PATH_MAP from Plex: %s", auto_map)
 except Exception as e:
-    logging.warning("Failed to auto‑generate PATH_MAP: %s", e)
+    logging.warning("⚠️  Failed to auto‑generate PATH_MAP – %s", e)
 
 # (4) Merge with environment variables ----------------------------------------
 ENV_SOURCES: dict[str, str] = {}
