@@ -30,6 +30,7 @@ import requests
 import xml.etree.ElementTree as ET
 import openai
 import unittest
+from queue import SimpleQueue
 import sys
 
 from flask import Flask, render_template_string, request, jsonify
@@ -58,6 +59,9 @@ _check_ffmpeg()
 # --- Scan control flags (global) ---------------------------------
 scan_should_stop = threading.Event()
 scan_is_paused   = threading.Event()
+
+# Central store for worker exceptions
+worker_errors = SimpleQueue()
 
 #
 # ───────────────────────────────── CONFIGURATION LOADING ─────────────────────────────────
@@ -265,14 +269,33 @@ FORMAT_PREFERENCE = conf.get(
     ["dsf","aif","aiff","wav","flac","m4a","mp4","m4b","m4p","aifc","ogg","mp3","wma"]
 )
 
+# Optional external log file (rotates @ 5 MB × 3)
+LOG_FILE = os.getenv("LOG_FILE", str(CONFIG_DIR / "pmda.log"))
+
 # (8) Logging setup (must happen BEFORE any log statements elsewhere) ---------
 _level_num = getattr(logging, LOG_LEVEL, logging.INFO)
+
+handlers = [logging.StreamHandler(sys.stdout)]
+try:
+    from logging.handlers import RotatingFileHandler
+    handlers.append(
+        RotatingFileHandler(
+            LOG_FILE,
+            maxBytes=5_000_000,   # 5 MB
+            backupCount=3,
+            encoding="utf-8"
+        )
+    )
+except Exception as e:
+    # Never fail hard if the volume is read‑only or path invalid
+    print(f"⚠️  File logging disabled – {e}", file=sys.stderr)
+
 logging.basicConfig(
     level=_level_num,
-    format="%(asctime)s │ %(levelname)s │ %(message)s",
+    format="%(asctime)s │ %(levelname)s │ %(threadName)s │ %(message)s",
     datefmt="%H:%M:%S",
-    force=True,                         # ensure we (re‑)configure root logger
-    handlers=[logging.StreamHandler(sys.stdout)]
+    force=True,
+    handlers=handlers
 )
 
 # Mask & dump effective config ------------------------------------------------
@@ -1320,6 +1343,7 @@ def background_scan():
         all_results, futures = {}, []
         import concurrent.futures
         future_to_albums: dict[concurrent.futures.Future, int] = {}
+        future_to_artist: dict[concurrent.futures.Future, str] = {}
         with ThreadPoolExecutor(max_workers=SCAN_THREADS) as executor:
             for artist_id, artist_name in artists:
                 album_cnt = db_conn.execute(
@@ -1329,6 +1353,7 @@ def background_scan():
                 fut = executor.submit(scan_artist_duplicates, (artist_id, artist_name))
                 futures.append(fut)
                 future_to_albums[fut] = album_cnt
+                future_to_artist[fut] = artist_name
             # close the shared connection; workers use their own
             db_conn.close()
 
@@ -1337,10 +1362,12 @@ def background_scan():
                 if scan_should_stop.is_set():
                     break
                 album_cnt = future_to_albums.get(future, 0)
+                artist_name = future_to_artist.get(future, "<unknown>")
                 try:
                     artist_name, groups, _ = future.result()
                 except Exception as e:
-                    logging.exception(f"background_scan(): worker crashed – {e}")
+                    logging.exception("Worker crash for artist %s: %s", artist_name, e)
+                    worker_errors.put((artist_name, str(e)))
                     groups = []
                 finally:
                     with lock:
@@ -1362,6 +1389,20 @@ def background_scan():
         removed_dupes = get_stat("removed_dupes")
         space_saved   = get_stat("space_saved")
         total_artists = len(artists) if 'artists' in locals() else 0
+        err_count = worker_errors.qsize()
+        if err_count:
+            errs = []
+            while not worker_errors.empty():
+                errs.append(worker_errors.get())
+            err_file = CONFIG_DIR / f"scan_errors_{int(time.time())}.log"
+            with err_file.open("w", encoding="utf-8") as fh:
+                for art, msg in errs:
+                    fh.write(f"{art}: {msg}\n")
+            logging.warning("⚠️  %d worker errors – details in %s", err_count, err_file)
+            notify_discord(
+                f"⚠️  PMDA scan terminé avec {err_count} erreurs. "
+                f"Voir {err_file.name} pour le détail."
+            )
         notify_discord(
             "🟢 PMDA scan completed in "
             f"{duration:.1f}s\n"
