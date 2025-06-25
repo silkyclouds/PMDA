@@ -1,4 +1,44 @@
- # ──────────────────────────────── AUTO–PURGE “INVALID” EDITIONS ────────────────────────────────
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+"""
+v0.6.0
+- Added discord webhook support to get dupes notification and final statistics of a scan
+"""
+
+import argparse
+import base64
+import json
+import logging
+import os
+import re
+import shutil
+import filecmp
+import errno
+import sqlite3
+import subprocess
+import threading
+import time
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from typing import NamedTuple, List, Dict, Optional
+from urllib.parse import quote_plus
+
+import requests
+import xml.etree.ElementTree as ET
+import openai
+import unittest
+from queue import SimpleQueue
+import sys
+
+from flask import Flask, render_template_string, request, jsonify
+
+# ──────────────────────────── FFmpeg sanity-check ──────────────────────────────
+# Central store for worker exceptions
+worker_errors = SimpleQueue()
+
+# ──────────────────────────────── AUTO–PURGE “INVALID” EDITIONS ────────────────────────────────
 def _purge_invalid_edition(edition: dict):
     """
     Instantly move technically‑invalid rips (0‑byte folder or no media‑info) to
@@ -64,42 +104,7 @@ def _purge_invalid_edition(edition: dict):
 
     except Exception as exc:
         logging.warning("Auto‑purge of invalid edition failed: %s", exc)
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-v0.6.0
-- Added discord webhook support to get dupes notification and final statistics of a scan
-"""
 
-from __future__ import annotations
-
-import argparse
-import base64
-import json
-import logging
-import os
-import re
-import shutil
-import filecmp
-import errno
-import sqlite3
-import subprocess
-import threading
-import time
-from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
-from typing import NamedTuple, List, Dict, Optional
-from urllib.parse import quote_plus
-
-import requests
-import xml.etree.ElementTree as ET
-import openai
-import unittest
-from queue import SimpleQueue
-import sys
-
-from flask import Flask, render_template_string, request, jsonify
 
 # ──────────────────────────── FFmpeg sanity-check ──────────────────────────────
 def _check_ffmpeg():
