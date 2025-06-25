@@ -1,6 +1,8 @@
 PMDA – Plex Music Dedupe Assistant
 ==================================
 
+▶️ [Watch the installation video guide on YouTube](https://www.youtube.com/watch?v=ohrKH4g2vGI)
+
 <p align="center">
   <img src="/static/PMDA.png" alt="PMDA Logo" width="450"/>
 </p>
@@ -76,8 +78,7 @@ PMDA uses OpenAI to determine the "best" version of an album — comparing forma
 
 ⚙️ Configuration
 ----------------
-
-▶️ [Watch the video guide on YouTube](https://youtu.be/YbCklQJwc_w)
+▶️ [Watch the video guide on YouTube](https://www.youtube.com/watch?v=ohrKH4g2vGI)
 
 All config can be controlled either via `config.json` or environment variables (in Docker).
 
