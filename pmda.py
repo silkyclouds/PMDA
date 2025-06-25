@@ -3,8 +3,8 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 """
-v0.6.1
-- PMDA will only count music items and not other media types (thanks to Auxren for the bug report!)
+v0.6.2
+- fixed a cli error when an non empty destination folder was found
 """
 
 import argparse
@@ -2979,7 +2979,7 @@ def dedupe_cli(dry: bool, safe: bool, tag_extra: bool, verbose: bool):
         notify_discord(summary)
     except Exception as e:
         logging.warning("Discord summary failed: %s", e)
-        
+
     db_conn.close()
 
 @app.post("/merge/<artist>/<int:album_id>")
