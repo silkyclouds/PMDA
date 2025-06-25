@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 """
-v0.6.0
-- Added discord webhook support to get dupes notification and final statistics of a scan
+v0.6.1
+- PMDA will only count music items and not other media types (thanks to Auxren for the bug report!)
 """
 
 import argparse
@@ -469,9 +469,17 @@ def _self_diag() -> bool:
 
     # 4) Albums with no mapping (skip if no PATH_MAP entries)
     if PATH_MAP:
-        where_clauses = " AND ".join(f"file NOT LIKE '{pre}%'" for pre in PATH_MAP)
-        query = f"SELECT COUNT(*) FROM media_parts WHERE {where_clauses}"
-        unmapped = db.execute(query).fetchone()[0]
+        # Restrict the “un‑mapped” check to the chosen MUSIC section only
+        where_clauses = " AND ".join(f"mp.file NOT LIKE '{pre}%'" for pre in PATH_MAP)
+        query = f"""
+            SELECT COUNT(*)
+            FROM   media_parts  mp
+            JOIN   metadata_items md ON md.id = mp.media_item_id
+            WHERE  md.library_section_id = ?
+              AND  md.metadata_type     = 9          -- 9 = album
+              AND  {where_clauses}
+        """
+        unmapped = db.execute(query, (SECTION_ID,)).fetchone()[0]
         if unmapped:
             logging.warning("⚠ %d albums have no PATH_MAP match", unmapped)
     else:
