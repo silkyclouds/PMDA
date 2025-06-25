@@ -3,8 +3,8 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 """
-v0.6.1
-- PMDA will only count music items and not other media types (thanks to Auxren for the bug report!)
+v0.6.2
+- Fix for non empty destination path in cli mode
 """
 
 import argparse
