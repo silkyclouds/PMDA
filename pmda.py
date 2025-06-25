@@ -3,8 +3,8 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 """
-v0.6.2
-- Fix for non empty destination path in cli mode
+v0.6.1
+- PMDA will only count music items and not other media types (thanks to Auxren for the bug report!)
 """
 
 import argparse
@@ -2966,6 +2966,20 @@ def dedupe_cli(dry: bool, safe: bool, tag_extra: bool, verbose: bool):
         logging.info(f"{k.replace('_',' ').title():26}: {v}")
     logging.info("-" * 70)
 
+    # -------- Discord wrap-up -----------------------------------------
+    try:
+        summary = (
+            f"🟢 **PMDA CLI run finished**\n"
+            f"Artists scanned: {stats['total_artists']}\n"
+            f"Albums scanned: {stats['total_albums']}\n"
+            f"Duplicate albums: {stats['albums_with_dupes']}\n"
+            f"Folders moved: {stats['total_dupes']}\n"
+            f"Space reclaimed: {stats['total_moved_mb']} MB"
+        )
+        notify_discord(summary)
+    except Exception as e:
+        logging.warning("Discord summary failed: %s", e)
+        
     db_conn.close()
 
 @app.post("/merge/<artist>/<int:album_id>")
