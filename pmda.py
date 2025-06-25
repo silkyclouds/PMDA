@@ -29,6 +29,33 @@ import requests
 import xml.etree.ElementTree as ET
 import openai
 import unittest
+
+# ────────────────────── Robust cross‑device move helper ──────────────────────
+def safe_move(src: str, dst: str):
+    """
+    Move *src* → *dst* even when they live on different mount points.
+
+    • First try the regular rename.
+    • On EXDEV (cross‑device) fall back to copytree → rmtree.
+    • If rmtree raises ENOTEMPTY (e.g. SMB latency) wait 1 s and retry once.
+    """
+    try:
+        shutil.move(src, dst)
+        return
+    except OSError as exc:
+        if exc.errno != errno.EXDEV:
+            raise                                      #  not a cross‑device issue
+    # Fallback: copy then delete ― keep permissions/mtime
+    shutil.copytree(src, dst, dirs_exist_ok=True)
+    try:
+        shutil.rmtree(src)
+    except OSError as exc:
+        if exc.errno == errno.ENOTEMPTY:               # race: still busy, retry
+            logging.warning("safe_move(): ENOTEMPTY while deleting %s – retrying", src)
+            time.sleep(1.0)
+            shutil.rmtree(src, ignore_errors=True)
+        else:
+            raise
 from queue import SimpleQueue
 import sys
 
@@ -71,13 +98,11 @@ def _purge_invalid_edition(edition: dict):
 
         # Move (or copy‑then‑delete) the folder ----------------------
         try:
-            shutil.move(str(src_folder), str(dst))
-        except OSError as e:
-            if e.errno == errno.EXDEV:                                # cross‑device
-                shutil.copytree(str(src_folder), str(dst))
-                shutil.rmtree(str(src_folder))
-            else:
-                raise
+            safe_move(str(src_folder), str(dst))
+        except Exception as move_err:
+            logging.warning("Auto‑purge: moving %s → %s failed – %s",
+                            src_folder, dst, move_err)
+            return
 
         size_mb = folder_size(dst) // (1024 * 1024)
         increment_stat("removed_dupes", 1)
@@ -1640,16 +1665,13 @@ def perform_dedupe(group: dict) -> List[dict]:
                     break
                 counter += 1
 
-        logging.debug(f"perform_dedupe(): moving {src_folder} → {dst}")
+        logging.debug("perform_dedupe(): moving %s → %s", src_folder, dst)
         try:
-            shutil.move(str(src_folder), str(dst))
-        except OSError as e:
-            if e.errno == errno.EXDEV:
-                logging.info(f"Cross-device move for {src_folder}; falling back to copy")
-                shutil.copytree(str(src_folder), str(dst))
-                shutil.rmtree(str(src_folder))
-            else:
-                raise
+            safe_move(str(src_folder), str(dst))
+        except Exception as move_err:
+            logging.error("perform_dedupe(): move failed for %s → %s – %s",
+                          src_folder, dst, move_err)
+            continue
 
         size_mb = folder_size(dst) // (1024 * 1024)
         fmt_text = loser.get("fmt_text", loser.get("fmt", ""))
