@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-v0.6.1
-- path map autogeneration by using plex curl and figuring outthe right library folders
+v0.6.0
+- Added discord webhook support to get dupes notification and final statistics of a scan
 """
 
 from __future__ import annotations
@@ -332,13 +332,15 @@ def _self_diag() -> bool:
         else:
             logging.info("✓ %s permissions: %s", p, rw)
 
-    # 4) Albums with no mapping
-    unmapped = db.execute(
-        "SELECT COUNT(*) FROM media_parts WHERE " +
-        " AND ".join([f"file NOT LIKE '{pre}%'" for pre in PATH_MAP])
-    ).fetchone()[0]
-    if unmapped:
-        logging.warning("⚠ %d albums have no PATH_MAP match", unmapped)
+    # 4) Albums with no mapping (skip if no PATH_MAP entries)
+    if PATH_MAP:
+        where_clauses = " AND ".join(f"file NOT LIKE '{pre}%'" for pre in PATH_MAP)
+        query = f"SELECT COUNT(*) FROM media_parts WHERE {where_clauses}"
+        unmapped = db.execute(query).fetchone()[0]
+        if unmapped:
+            logging.warning("⚠ %d albums have no PATH_MAP match", unmapped)
+    else:
+        logging.info("Skipping unmapped album check because PATH_MAP is empty")
 
     logging.info("──────── diagnostic complete ─────────")
     # ─── Log AI prompt for user review ─────────────────────────────────
