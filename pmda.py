@@ -138,25 +138,25 @@ if not AI_PROMPT_FILE.exists():
 with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
     conf: dict = json.load(fh)
 
-# ─── Auto-generate PATH_MAP from Plex if none configured ────────────────────
+# ─── Auto-generate PATH_MAP from Plex on every startup ──────────────────────
+import xml.etree.ElementTree as ET
 plex_host = os.getenv("PLEX_HOST") or conf.get("PLEX_HOST")
 plex_token = os.getenv("PLEX_TOKEN") or conf.get("PLEX_TOKEN")
-section = os.getenv("SECTION_ID") or conf.get("SECTION_ID")
-if not conf.get("PATH_MAP") and plex_host and plex_token and section:
-    try:
-        url = f"{plex_host}/library/sections/{section}"
-        resp = requests.get(url, headers={"X-Plex-Token": plex_token}, timeout=10)
-        if resp.status_code == 200:
-            root = ET.fromstring(resp.text)
-            auto_map = {loc.attrib["path"]: loc.attrib["path"] for loc in root.findall(".//Location")}
-            if auto_map:
-                conf["PATH_MAP"] = auto_map
-                # Persist to config.json
-                with open(CONFIG_PATH, "w", encoding="utf-8") as fh_cfg:
-                    json.dump(conf, fh_cfg, indent=2)
-                logging.info("Auto‑generated PATH_MAP: %r", auto_map)
-    except Exception as e:
-        logging.warning("Failed to auto‑generate PATH_MAP: %s", e)
+section    = os.getenv("SECTION_ID") or conf.get("SECTION_ID")
+try:
+    url = f"{plex_host}/library/sections/{section}"
+    resp = requests.get(url, headers={"X-Plex-Token": plex_token}, timeout=10)
+    resp.raise_for_status()
+    root = ET.fromstring(resp.text)
+    auto_map = {loc.attrib["path"]: loc.attrib["path"] for loc in root.findall(".//Location")}
+    if auto_map:
+        conf["PATH_MAP"] = auto_map
+        # Persist updated PATH_MAP
+        with open(CONFIG_PATH, "w", encoding="utf-8") as fh_cfg:
+            json.dump(conf, fh_cfg, indent=2)
+        logging.info("Auto‑generated PATH_MAP: %r", auto_map)
+except Exception as e:
+    logging.warning("Failed to auto‑generate PATH_MAP: %s", e)
 
 # (4) Merge with environment variables ----------------------------------------
 ENV_SOURCES: dict[str, str] = {}
