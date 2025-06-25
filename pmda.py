@@ -155,7 +155,7 @@ def _discover_path_map(plex_host: str, plex_token: str, section_id: int) -> dict
     url = f"{plex_host.rstrip('/')}/library/sections/{section_id}"
     resp = requests.get(url, headers={"X-Plex-Token": plex_token}, timeout=10)
     logging.debug("PATH_MAP discovery: HTTP %s – %d bytes", resp.status_code, len(resp.content))
-    if _level_num == logging.DEBUG:
+    if logging.getLogger().isEnabledFor(logging.DEBUG):
         logging.debug("PATH_MAP discovery response (first 500 chars): %s", resp.text[:500])
     resp.raise_for_status()
 
