@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-v0.6.0
-- Added discord webhook support to get dupes notification and final statistics of a scan
+v0.6.1
+- path map autogeneration by using plex curl and figuring outthe right library folders
 """
 
 from __future__ import annotations
@@ -27,6 +27,7 @@ from typing import NamedTuple, List, Dict, Optional
 from urllib.parse import quote_plus
 
 import requests
+import xml.etree.ElementTree as ET
 import openai
 import unittest
 import sys
@@ -136,6 +137,26 @@ if not AI_PROMPT_FILE.exists():
 # (3) Load JSON config ---------------------------------------------------------
 with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
     conf: dict = json.load(fh)
+
+# ─── Auto-generate PATH_MAP from Plex if none configured ────────────────────
+plex_host = os.getenv("PLEX_HOST") or conf.get("PLEX_HOST")
+plex_token = os.getenv("PLEX_TOKEN") or conf.get("PLEX_TOKEN")
+section = os.getenv("SECTION_ID") or conf.get("SECTION_ID")
+if not conf.get("PATH_MAP") and plex_host and plex_token and section:
+    try:
+        url = f"{plex_host}/library/sections/{section}"
+        resp = requests.get(url, headers={"X-Plex-Token": plex_token}, timeout=10)
+        if resp.status_code == 200:
+            root = ET.fromstring(resp.text)
+            auto_map = {loc.attrib["path"]: loc.attrib["path"] for loc in root.findall(".//Location")}
+            if auto_map:
+                conf["PATH_MAP"] = auto_map
+                # Persist to config.json
+                with open(CONFIG_PATH, "w", encoding="utf-8") as fh_cfg:
+                    json.dump(conf, fh_cfg, indent=2)
+                logging.info("Auto‑generated PATH_MAP: %r", auto_map)
+    except Exception as e:
+        logging.warning("Failed to auto‑generate PATH_MAP: %s", e)
 
 # (4) Merge with environment variables ----------------------------------------
 ENV_SOURCES: dict[str, str] = {}
@@ -320,6 +341,12 @@ def _self_diag() -> bool:
         logging.warning("⚠ %d albums have no PATH_MAP match", unmapped)
 
     logging.info("──────── diagnostic complete ─────────")
+    # ─── Log AI prompt for user review ─────────────────────────────────
+    try:
+        prompt_text = AI_PROMPT_FILE.read_text(encoding="utf-8")
+        logging.info("Using ai_prompt.txt:\n%s", prompt_text)
+    except Exception as e:
+        logging.warning("Could not read ai_prompt.txt: %s", e)
     return True
 
 
