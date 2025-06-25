@@ -850,7 +850,7 @@ def choose_best(editions: List[dict]) -> dict:
         used_ai = True
         # Load prompt template from external file
         template = AI_PROMPT_FILE.read_text(encoding="utf-8")
-        user_msg = template + "\nÉditions candidates :\n"
+        user_msg = template + "\nCandidate editions:\n"
         for idx, e in enumerate(editions):
             user_msg += (
                 f"{idx}: fmt_score={e['fmt_score']}, bitdepth={e['bd']}, "
@@ -974,6 +974,8 @@ def choose_best(editions: List[dict]) -> dict:
     con.close()
 
     return best
+    # Check for any other literal uses of the French header and replace
+    # (This is for the extremely rare case where it appears elsewhere in this function.)
 app = Flask(__name__)
 
 def scan_artist_duplicates(args):
@@ -1423,8 +1425,8 @@ def background_scan():
                     fh.write(f"{art}: {msg}\n")
             logging.warning("⚠️  %d worker errors – details in %s", err_count, err_file)
             notify_discord(
-                f"⚠️  PMDA scan terminé avec {err_count} erreurs. "
-                f"Voir {err_file.name} pour le détail."
+                f"⚠️  PMDA scan finished with {err_count} errors. "
+                f"See {err_file.name} for details."
             )
         notify_discord(
             "🟢 PMDA scan completed in "
