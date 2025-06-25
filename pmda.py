@@ -1382,6 +1382,7 @@ def background_scan():
     finally:
         # Make absolutely sure we leave the UI in a consistent state
         with lock:
+            state["scan_progress"] = state["scan_total"]  # force 100 % before stopping
             state["scanning"] = False
         logging.debug("background_scan(): finished (flag cleared)")
         duration = time.perf_counter() - start_time
@@ -1973,6 +1974,29 @@ HTML = """<!DOCTYPE html>
 
         } else {
             clearInterval(scanTimer);
+            // ─── Scan finished: refresh duplicates & UI ─────────────────────
+            fetch("/api/duplicates")
+              .then(r => r.json())
+              .then(list => {
+                currentDupTotal = list.length;
+                renderDuplicates(list);           // show all found groups
+
+                // update “Remaining Dupes” badge
+                const remBadge = document.getElementById("remainingDupes");
+                if (remBadge) {
+                  remBadge.innerText = `Remaining Dupes: ${list.length}`;
+                }
+              });
+
+            // force final progress text & status
+            const scanTxt = document.getElementById("scanTxt");
+            if (scanTxt) {
+              scanTxt.innerText = `${j.progress} / ${j.total} albums`;
+            }
+            const statusEl = document.getElementById("scanStatus");
+            if (statusEl) {
+              statusEl.innerText = "Status: stopped";
+            }
         }
         })
         .catch(err => console.error("pollScan() failed:", err));
