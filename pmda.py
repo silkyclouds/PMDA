@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 from __future__ import annotations
@@ -169,7 +170,7 @@ Robust configuration helper:
 * Overrides every value with an environment variable when present.
 * Falls back to sensible, documented defaults when neither file nor env provides a value.
 * Validates critical keys so we fail early instead of crashing later.
-* Logs where each value came from (env vs config vs default).
+* Logs where each value came from (env vs config vs default).
 """
 
 import filecmp
@@ -365,7 +366,7 @@ FORMAT_PREFERENCE = conf.get(
     ["dsf","aif","aiff","wav","flac","m4a","mp4","m4b","m4p","aifc","ogg","mp3","wma"]
 )
 
-# Optional external log file (rotates @ 5 MB × 3)
+# Optional external log file (rotates @ 5 MB × 3)
 LOG_FILE = os.getenv("LOG_FILE", str(CONFIG_DIR / "pmda.log"))
 
 # (8) Logging setup (must happen BEFORE any log statements elsewhere) ---------
@@ -377,13 +378,13 @@ try:
     handlers.append(
         RotatingFileHandler(
             LOG_FILE,
-            maxBytes=5_000_000,   # 5 MB
+            maxBytes=5_000_000,   # 5 MB
             backupCount=3,
             encoding="utf-8"
         )
     )
 except Exception as e:
-    # Never fail hard if the volume is read‑only or path invalid
+    # Never fail hard if the volume is read‑only or path invalid
     print(f"⚠️  File logging disabled – {e}", file=sys.stderr)
 
 logging.basicConfig(
@@ -836,13 +837,13 @@ def analyse_format(folder: Path) -> tuple[int, int, int, int]:
     *   **fmt_score** derives from the global FORMAT_PREFERENCE list.
     *   **bit_rate** is in **bps** (`0` when not reported, e.g. lossless FLAC).
     *   **sample_rate** is in **Hz**.
-    *   **bit_depth** is 16 / 24 / 32 when derivable, otherwise 0.
+    *   **bit_depth** is 16 / 24 / 32 when derivable, otherwise 0.
 
     Rationale for retry logic
     -------------------------
     A single, transient ffprobe failure (network share hiccup, race during mount,
     etc.) previously led to a *false « invalid »* verdict because all tech values
-    were 0.  
+    were 0.  
     We now:
 
     1. Collect *all* audio files under the folder (breadth‑first, glob pattern
@@ -852,8 +853,8 @@ def analyse_format(folder: Path) -> tuple[int, int, int, int]:
     3. Only if **every attempt** yields `(0, 0, 0)` do we fall back to the
        “invalid” classification.
 
-    Each `(path, mtime)` result – even the all‑zero case – is cached so we
-    never hammer ffprobe, but a later scan still re‑probes if the file changes.
+    Each `(path, mtime)` result – even the all‑zero case – is cached so we
+    never hammer ffprobe, but a later scan still re‑probes if the file changes.
     """
     audio_files = [p for p in folder.rglob("*") if AUDIO_RE.search(p.name)]
     if not audio_files:
@@ -1476,7 +1477,7 @@ def background_scan():
             title="🔄 PMDA scan started",
             description=(
                 f"Scanning {len(artists)} artists / {total_albums} albums… "
-                "Buckle up!"
+                "Buckle up!"
             )
         )
 
@@ -2807,52 +2808,45 @@ def dedupe_cli(dry: bool, safe: bool, tag_extra: bool, verbose: bool):
     safe : bool
         If True, never delete Plex metadata (even when not dry-run).
     tag_extra : bool
-        If True, tag "(Extra Tracks)" on the best edition that has more tracks
-        than the shortest edition in the group.
+        If True, tag "(Extra Tracks)" on the best edition that has more
+        tracks than the shortest edition in the group.
     verbose : bool
         Enable DEBUG-level logging.
     """
-    # ─── logging setup ────────────────────────────────────────────────────
+    # ─── logging setup ──────────────────────────────────────────────────
     log_lvl = logging.DEBUG if verbose else logging.INFO
     logging.getLogger().setLevel(log_lvl)
-
     if verbose:
         logging.debug(f"dedupe_cli(): opening Plex DB at {PLEX_DB_FILE}")
 
     db_conn = plex_connect()
     cur = db_conn.cursor()
 
-    # ─── headline counters ──────────────────────────────────────────────
+    # ─── headline counters ─────────────────────────────────────────────
     stats = {
-        "total_artists": 0,
-        "total_albums": 0,
-        "albums_with_dupes": 0,
-        "total_dupes": 0,
-        "total_moved_mb": 0,
+        "total_artists":      0,
+        "total_albums":       0,
+        "albums_with_dupes":  0,
+        "total_dupes":        0,
+        "total_moved_mb":     0,
     }
 
-    # ─── iterate over all artists ───────────────────────────────────────
+    # ─── iterate over all artists ──────────────────────────────────────
     artists = cur.execute(
         "SELECT id, title FROM metadata_items "
-        "WHERE metadata_type=8 AND library_section_id=?",
+        "WHERE metadata_type = 8 AND library_section_id = ?",
         (SECTION_ID,),
     ).fetchall()
-
-    if verbose:
-        logging.debug(f"dedupe_cli(): {len(artists)} artists loaded from Plex DB")
+    logging.debug("dedupe_cli(): %d artists loaded from Plex DB", len(artists))
 
     for artist_id, artist_name in artists:
         logging.info("Processing artist: %s", artist_name)
-        logging.info(f"Processing artist: {artist_name}")
-        # Log each artist being scanned
-        logging.info(f"Scanning artist: {artist_name}")
         stats["total_artists"] += 1
 
         album_ids = [
-            row[0]
-            for row in cur.execute(
+            r[0] for r in cur.execute(
                 "SELECT id FROM metadata_items "
-                "WHERE metadata_type=9 AND parent_id=?",
+                "WHERE metadata_type = 9 AND parent_id = ?",
                 (artist_id,),
             ).fetchall()
         ]
@@ -2862,124 +2856,114 @@ def dedupe_cli(dry: bool, safe: bool, tag_extra: bool, verbose: bool):
         if dup_groups:
             stats["albums_with_dupes"] += len(dup_groups)
 
-        # Track removals per artist
         removed_for_current_artist = 0
 
-        # ---- process each duplicate group -----------------------------
+        # ─── each duplicate-group ──────────────────────────────────────
         for group in dup_groups:
-            best = group["best"]
+            best   = group["best"]
             losers = group["losers"]
 
             logging.info("-" * 70)
-            logging.info(
-                f"Duplicate group: {artist_name}  |  {best['title_raw']}"
-            )
-            sel_method = "AI selection" if best.get("used_ai") else "Heuristic selection"
-            logging.info(f"Selection method: {sel_method}")
+            logging.info("Duplicate group: %s  |  %s", artist_name, best["title_raw"])
+            logging.info("Selection method: %s",
+                         "AI" if best.get("used_ai") else "Heuristic")
 
             best_size = folder_size(best["folder"]) // (1024 * 1024)
-            best_fmt = get_primary_format(best["folder"])
-            best_br = best["br"] // 1000
-            best_sr = best["sr"]
-            best_bd = best.get("bd", 0)
-            logging.info(
-                f" Best  | {best_size} MB | {best_fmt} | "
-                f"{best_br} kbps | {best_sr} Hz | {best_bd} bit"
-            )
+            best_fmt  = get_primary_format(best["folder"])
+            best_br   = best["br"] // 1000
+            best_sr   = best["sr"]
+            best_bd   = best.get("bd", 0)
+            logging.info(" Best  | %d MB | %s | %d kbps | %d Hz | %d-bit",
+                         best_size, best_fmt, best_br, best_sr, best_bd)
 
             group_moved_mb = 0
 
-            # ---- each loser --------------------------------------------
+            # ── losers --------------------------------------------------
             for loser in losers:
-                src = Path(loser["folder"])
-                loser_id = loser["album_id"]
+                src       = Path(loser["folder"])
+                loser_id  = loser["album_id"]
 
                 if not src.exists():
-                    logging.warning(f"Folder not found, skipping: {src}")
+                    logging.warning("Folder not found, skipping: %s", src)
                     continue
 
-                # Build destination path under DUPE_ROOT
+                # destination in /dupes (keep relative structure)
                 try:
                     base_real = next(iter(PATH_MAP.values()))
-                    rel = src.relative_to(base_real)
+                    rel       = src.relative_to(base_real)
                 except Exception:
                     rel = src.name
                 dst = DUPE_ROOT / rel
                 dst.parent.mkdir(parents=True, exist_ok=True)
 
-                # Deal with name collisions
+                # avoid name collisions
                 if dst.exists():
-                    root_name = dst.name
-                    parent_dir = dst.parent
-                    counter = 1
+                    root = dst.name
+                    par  = dst.parent
+                    n    = 1
                     while True:
-                        candidate = parent_dir / f"{root_name} ({counter})"
-                        if not candidate.exists():
-                            dst = candidate
+                        cand = par / f"{root} ({n})"
+                        if not cand.exists():
+                            dst = cand
                             break
-                        counter += 1
+                        n += 1
 
                 size_mb = folder_size(src) // (1024 * 1024)
-                group_moved_mb += size_mb
                 stats["total_moved_mb"] += size_mb
-                stats["total_dupes"] += 1
+                stats["total_dupes"]    += 1
                 removed_for_current_artist += 1
+                group_moved_mb += size_mb
 
                 if dry:
-                    logging.info(
-                        f" DRY-RUN  | would move {src}  →  {dst}  "
-                        f"({size_mb} MB)"
-                    )
+                    logging.info(" DRY-RUN | would move %s  →  %s (%d MB)", src, dst, size_mb)
                 else:
-                    logging.info(f" Moving   | {src}  →  {dst}")
+                    logging.info(" Moving  | %s  →  %s", src, dst)
                     try:
-                        shutil.move(str(src), str(dst))
-                    except OSError as e:
-                        if e.errno == errno.EXDEV:
-                            logging.info(f"Cross-device move detected for {src} → {dst}, falling back to copy")
-                            shutil.copytree(str(src), str(dst))
-                            shutil.rmtree(str(src))
-                        else:
-                            raise
+                        safe_move(str(src), str(dst))          # <── robust helper
+                    except Exception as move_err:
+                        logging.error("Move failed %s → %s – %s", src, dst, move_err)
+                        continue      # skip this loser but keep processing others
 
-                # Delete Plex metadata (unless dry/safe)
+                # Plex metadata removal
                 if (not dry) and (not safe):
-                    logging.debug(f"   deleting Plex metadata rk={loser_id}")
-                    plex_api(f"/library/metadata/{loser_id}/trash", method="PUT")
-                    time.sleep(0.3)
-                    plex_api(f"/library/metadata/{loser_id}", method="DELETE")
-                else:
-                    logging.debug(f"   Plex delete skipped rk={loser_id}")
+                    try:
+                        plex_api(f"/library/metadata/{loser_id}/trash", method="PUT")
+                        time.sleep(0.3)
+                        plex_api(f"/library/metadata/{loser_id}",       method="DELETE")
+                    except Exception as api_err:
+                        logging.warning("Plex delete failed for %s – %s", loser_id, api_err)
 
-            logging.info(f" Group freed {group_moved_mb} MB")
+            logging.info(" Group freed %d MB", group_moved_mb)
 
-            # ---- optional “Extra Tracks” tag ----------------------------
+            # ── optional “Extra Tracks” tag -----------------------------
             if tag_extra:
-                all_editions = losers + [best]
-                max_tracks = max(len(e["tracks"]) for e in all_editions)
-                min_tracks = min(len(e["tracks"]) for e in all_editions)
-                if len(best["tracks"]) > min_tracks:
-                    logging.info(" Tagging '(Extra Tracks)' on best edition")
-                    plex_api(
-                        f"/library/metadata/{best['album_id']}"
-                        f"?title.value=(Extra Tracks)&title.lock=1",
-                        method="PUT",
-                    )
+                all_ed   = losers + [best]
+                min_trks = min(len(e["tracks"]) for e in all_ed)
+                if len(best["tracks"]) > min_trks:
+                    try:
+                        plex_api(
+                            f"/library/metadata/{best['album_id']}"
+                            f"?title.value=(Extra Tracks)&title.lock=1",
+                            method="PUT",
+                        )
+                        logging.info(" Tagged '(Extra Tracks)' on best edition")
+                    except Exception as tag_err:
+                        logging.warning("Failed to tag extra tracks – %s", tag_err)
 
-        # Refresh Plex only if we removed duplicates for this artist
-        if removed_for_current_artist > 0:
+        # ─── Plex refresh per artist -----------------------------------
+        if removed_for_current_artist:
             prefix = f"/music/matched/{quote_plus(artist_name[0].upper())}/{quote_plus(artist_name)}"
             try:
                 plex_api(f"/library/sections/{SECTION_ID}/refresh?path={prefix}")
                 plex_api(f"/library/sections/{SECTION_ID}/emptyTrash", method="PUT")
-            except Exception as e:
-                logging.warning(f"CLI-mode Plex refresh failed for {artist_name}: {e}")
+            except Exception as ref_err:
+                logging.warning("Plex refresh failed for %s – %s", artist_name, ref_err)
 
-    # ---- summary ------------------------------------------------------------
+    # ─── summary -------------------------------------------------------
     logging.info("-" * 70)
     logging.info("FINAL SUMMARY")
-    for key, val in stats.items():
-        logging.info(f"{key.replace('_',' ').title():26}: {val}")
+    for k, v in stats.items():
+        logging.info(f"{k.replace('_',' ').title():26}: {v}")
     logging.info("-" * 70)
 
     db_conn.close()
