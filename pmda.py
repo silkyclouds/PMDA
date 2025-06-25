@@ -1,3 +1,69 @@
+ # ──────────────────────────────── AUTO–PURGE “INVALID” EDITIONS ────────────────────────────────
+def _purge_invalid_edition(edition: dict):
+    """
+    Instantly move technically‑invalid rips (0‑byte folder or no media‑info) to
+    /dupes and wipe their Plex metadata so they never show up as duplicates.
+
+    This runs during the *scan* phase, therefore it must be completely
+    exception‑safe and thread‑safe.
+    """
+    try:
+        src_folder = Path(edition["folder"])
+        if not src_folder.exists():
+            return                                                    # already gone
+
+        # Destination under /dupes, keep relative path when possible
+        try:
+            base_real = next(iter(PATH_MAP.values()))
+            rel = src_folder.relative_to(base_real)
+        except Exception:
+            rel = src_folder.name
+        dst = DUPE_ROOT / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+
+        if dst.exists():                                              # avoid clashes
+            base_name = dst.name
+            parent_dir = dst.parent
+            counter = 1
+            while (parent_dir / f"{base_name} ({counter})").exists():
+                counter += 1
+            dst = parent_dir / f"{base_name} ({counter})"
+
+        # Move (or copy‑then‑delete) the folder ----------------------
+        try:
+            shutil.move(str(src_folder), str(dst))
+        except OSError as e:
+            if e.errno == errno.EXDEV:                                # cross‑device
+                shutil.copytree(str(src_folder), str(dst))
+                shutil.rmtree(str(src_folder))
+            else:
+                raise
+
+        size_mb = folder_size(dst) // (1024 * 1024)
+        increment_stat("removed_dupes", 1)
+
+        # Tech‑data are irrelevant (all zero), but we still log them
+        notify_discord(
+            f"🗑️  Auto‑purged invalid rip for **{edition['artist']} – "
+            f"{edition['title_raw']}** ({size_mb} MB moved to /dupes)"
+        )
+
+        # Kill Plex metadata so the ghost album disappears
+        try:
+            plex_api(f"/library/metadata/{edition['album_id']}/trash", method="PUT")
+            time.sleep(0.3)
+            plex_api(f"/library/metadata/{edition['album_id']}", method="DELETE")
+            # Refresh artist view & empty trash
+            art_enc = quote_plus(edition['artist'])
+            letter  = quote_plus(edition['artist'][0].upper())
+            plex_api(f"/library/sections/{SECTION_ID}/refresh"
+                     f"?path=/music/matched/{letter}/{art_enc}", method="GET")
+            plex_api(f"/library/sections/{SECTION_ID}/emptyTrash", method="PUT")
+        except Exception as e:
+            logging.debug("Plex cleanup for invalid edition failed: %s", e)
+
+    except Exception as exc:
+        logging.warning("Auto‑purge of invalid edition failed: %s", exc)
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -1041,6 +1107,16 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
         # Mark as invalid if file_count == 0 OR all tech data are zero
         is_invalid = (file_count == 0) or (br == 0 and sr == 0 and bd == 0)
 
+        # --- Skip & purge technically invalid editions immediately -------------
+        if is_invalid:
+            _purge_invalid_edition({
+                "folder":   folder,
+                "artist":   artist,
+                "title_raw": album_title(db_conn, aid),
+                "album_id": aid
+            })
+            continue            # do NOT add to the editions list
+
         editions.append({
             'album_id':  aid,
             'title_raw': album_title(db_conn, aid),
@@ -1057,7 +1133,7 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
             'sr':        sr,
             'bd':        bd,
             'discs':     len({t.disc for t in tr}),
-            'invalid':   is_invalid
+            'invalid':   False
         })
 
     # --- First pass: exact match on (album_norm, sig) ---
@@ -1139,10 +1215,7 @@ def save_scan_to_db(scan_results: Dict[str, List[dict]]):
     """
     import sqlite3, json
 
-    # ─── filter out technically invalid rips (0‑byte, 0 kbps …) ───
-    valid_editions = [e for e in editions if not e.get("invalid")]
-    if valid_editions:
-        editions = valid_editions
+    # (Removed: filtering of invalid editions; already purged upstream)
     con = sqlite3.connect(str(STATE_DB_FILE))
     cur = con.cursor()
 
