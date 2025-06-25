@@ -796,84 +796,100 @@ def first_part_path(db_conn, album_id: int) -> Optional[Path]:
 
 def analyse_format(folder: Path) -> tuple[int, int, int, int]:
     """
-    Inspect *one* representative audio file inside **folder** and return:
+    Inspect up to **three** audio files inside *folder* and return a 4‑tuple:
 
         (fmt_score, bit_rate, sample_rate, bit_depth)
 
-    * **fmt_score** is derived from FORMAT_PREFERENCE.
-    * **bit_rate** is in **bps** (0 when unavailable, e.g. lossless FLAC).
-    * **sample_rate** is in **Hz**.
-    * **bit_depth** is 16 / 24 / 32 when derivable, otherwise 0.
+    *   **fmt_score** derives from the global FORMAT_PREFERENCE list.
+    *   **bit_rate** is in **bps** (`0` when not reported, e.g. lossless FLAC).
+    *   **sample_rate** is in **Hz**.
+    *   **bit_depth** is 16 / 24 / 32 when derivable, otherwise 0.
 
-    We probe only the *first* audio file we encounter.  This re‑verts the
-    “scan‑every‑track” logic that was flooding the machine with hundreds of
-    `ffprobe` processes and causing time‑outs – the root cause of the all‑zero
-    technical data you observed in the UI.
+    Rationale for retry logic
+    -------------------------
+    A single, transient ffprobe failure (network share hiccup, race during mount,
+    etc.) previously led to a *false « invalid »* verdict because all tech values
+    were 0.  
+    We now:
 
-    Results are cached in the ``audio_cache`` table keyed on (path, mtime) so
-    that we call ``ffprobe`` at most once per file unless it has changed.
-    A cached triple ``(0, 0, 0)`` for a **FLAC** file triggers a re‑probe
-    because it usually indicates a transient failure.
+    1. Collect *all* audio files under the folder (breadth‑first, glob pattern
+       from `AUDIO_RE`).
+    2. Probe **up to three distinct files** or **two attempts per file** (cache +
+       fresh call) until we obtain at least one non‑zero technical metric.
+    3. Only if **every attempt** yields `(0, 0, 0)` do we fall back to the
+       “invalid” classification.
+
+    Each `(path, mtime)` result – even the all‑zero case – is cached so we
+    never hammer ffprobe, but a later scan still re‑probes if the file changes.
     """
-    # locate *one* audio file
-    audio_file = next((p for p in folder.rglob("*") if AUDIO_RE.search(p.name)), None)
-    if audio_file is None:
+    audio_files = [p for p in folder.rglob("*") if AUDIO_RE.search(p.name)]
+    if not audio_files:
         return (0, 0, 0, 0)
 
-    ext   = audio_file.suffix[1:].lower()
-    fpath = str(audio_file)
-    mtime = int(audio_file.stat().st_mtime)
+    # Probe up to three different files for robustness
+    for audio_file in audio_files[:3]:
+        ext   = audio_file.suffix[1:].lower()
+        fpath = str(audio_file)
+        mtime = int(audio_file.stat().st_mtime)
 
-    # ─── 1) cache lookup ───────────────────────────────────────────────
-    cached = get_cached_info(fpath, mtime)
-    if cached and not (ext == "flac" and cached == (0, 0, 0)):
-        br, sr, bd = cached
-        return (score_format(ext), br, sr, bd)
+        # ── 1) cached result ───────────────────────────────────────────
+        cached = get_cached_info(fpath, mtime)
+        if cached and not (cached == (0, 0, 0) and ext == "flac"):
+            br, sr, bd = cached
+            if br or sr or bd:
+                return (score_format(ext), br, sr, bd)
 
-    # ─── 2) ffprobe ────────────────────────────────────────────────────
-    cmd = [
-        "ffprobe", "-v", "error",
-        "-select_streams", "a:0",
-        "-show_entries", "format=bit_rate:stream=bit_rate,sample_rate,bits_per_raw_sample,bits_per_sample,sample_fmt",
-        "-of", "default=noprint_wrappers=1",
-        fpath,
-    ]
+        # ── 2) fresh ffprobe ───────────────────────────────────────────
+        cmd = [
+            "ffprobe", "-v", "error",
+            "-select_streams", "a:0",
+            "-show_entries",
+            "format=bit_rate:stream=bit_rate,sample_rate,bits_per_raw_sample,bits_per_sample,sample_fmt",
+            "-of", "default=noprint_wrappers=1",
+            fpath,
+        ]
 
-    br = sr = bd = 0
-    try:
-        out = subprocess.check_output(
-            cmd, stderr=subprocess.DEVNULL, text=True, timeout=10
-        )
-        for line in out.splitlines():
-            key, _, val = line.partition("=")
-            if key == "bit_rate":
-                try:
-                    v = int(val)
-                    if v > br:
-                        br = v           # keep the highest bit‑rate seen
-                except ValueError:
-                    pass
-            elif key == "sample_rate":
-                try:
-                    sr = int(val)
-                except ValueError:
-                    pass
-            elif key in ("bits_per_raw_sample", "bits_per_sample"):
-                try:
-                    bd = int(val)
-                except ValueError:
-                    pass
-            elif key == "sample_fmt" and not bd:
-                m = re.match(r"s(\d+)", val)
-                if m:
-                    bd = int(m.group(1))
-    except Exception:
-        # leave br/sr/bd at 0 on failure
-        pass
+        br = sr = bd = 0
+        try:
+            out = subprocess.check_output(
+                cmd, stderr=subprocess.DEVNULL, text=True, timeout=10
+            )
+            for line in out.splitlines():
+                key, _, val = line.partition("=")
+                if key == "bit_rate":
+                    try:
+                        v = int(val)
+                        if v > br:
+                            br = v  # keep highest bit‑rate seen
+                    except ValueError:
+                        pass
+                elif key == "sample_rate":
+                    try:
+                        sr = int(val)
+                    except ValueError:
+                        pass
+                elif key in ("bits_per_raw_sample", "bits_per_sample"):
+                    try:
+                        bd = int(val)
+                    except ValueError:
+                        pass
+                elif key == "sample_fmt" and not bd:
+                    m = re.match(r"s(\d+)", val)
+                    if m:
+                        bd = int(m.group(1))
+        except Exception:
+            # leave br/sr/bd at 0 on failure
+            pass
 
-    # ─── 3) cache & return ────────────────────────────────────────────
-    set_cached_info(fpath, mtime, br, sr, bd)
-    return (score_format(ext), br, sr, bd)
+        # cache *every* attempt (even zeros) so we don't re-run unnecessarily
+        set_cached_info(fpath, mtime, br, sr, bd)
+
+        if br or sr or bd:                 # success on this file → done
+            return (score_format(ext), br, sr, bd)
+
+    # After probing up to 3 files and still nothing usable → treat as invalid
+    first_ext = audio_files[0].suffix[1:].lower()
+    return (score_format(first_ext), 0, 0, 0)
 
 # ───────────────────────────────── DUPLICATE DETECTION ─────────────────────────────────
 def signature(tracks: List[Track]) -> tuple:
