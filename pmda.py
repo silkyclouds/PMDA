@@ -151,8 +151,12 @@ def _discover_path_map(plex_host: str, plex_token: str, section_id: int) -> dict
     A hard failure (network/XML/bad token/empty list) is surfaced so that
     users notice mis‑configuration early.
     """
+    logging.debug("PATH_MAP discovery: requesting %s (section=%s)", plex_host.rstrip('/') + f"/library/sections/{section_id}", section_id)
     url = f"{plex_host.rstrip('/')}/library/sections/{section_id}"
     resp = requests.get(url, headers={"X-Plex-Token": plex_token}, timeout=10)
+    logging.debug("PATH_MAP discovery: HTTP %s – %d bytes", resp.status_code, len(resp.content))
+    if _level_num == logging.DEBUG:
+        logging.debug("PATH_MAP discovery response (first 500 chars): %s", resp.text[:500])
     resp.raise_for_status()
 
     try:
@@ -164,9 +168,11 @@ def _discover_path_map(plex_host: str, plex_token: str, section_id: int) -> dict
         loc.attrib.get("path") for loc in root.iter("Location")
         if loc.attrib.get("path")
     ]
+    logging.debug("PATH_MAP discovery: parsed %d <Location> paths -> %s", len(locations), locations)
     if not locations:
         raise RuntimeError("No <Location> elements found for this section")
 
+    logging.info("PATH_MAP discovery successful – %d paths found", len(locations))
     return {p: p for p in locations}
 
 # Always attempt discovery – even when PATH_MAP already exists – so the file
@@ -176,11 +182,12 @@ try:
     plex_token  = os.getenv("PLEX_TOKEN")  or conf.get("PLEX_TOKEN")
     section_id  = int(os.getenv("SECTION_ID") or conf.get("SECTION_ID", 1))
     auto_map    = _discover_path_map(plex_host, plex_token, section_id)
+    logging.debug("Auto‑generated PATH_MAP raw content: %s", auto_map)
 
     conf["PATH_MAP"] = auto_map     # update in‑memory config
     with open(CONFIG_PATH, "w", encoding="utf-8") as fh_cfg:
         json.dump(conf, fh_cfg, indent=2)
-    logging.info("🔄 Auto‑generated PATH_MAP from Plex: %s", auto_map)
+    logging.info("🔄 Auto‑generated/updated PATH_MAP from Plex: %s", auto_map)
 except Exception as e:
     logging.warning("⚠️  Failed to auto‑generate PATH_MAP – %s", e)
 
