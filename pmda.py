@@ -1024,22 +1024,38 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
         folder = first_part_path(db_conn, aid)
         if not folder:
             continue
+        # count audio files once – we re‑use it later
+        file_count = sum(1 for f in folder.rglob("*") if AUDIO_RE.search(f.name))
+
+        # consider edition invalid when technical data are all zero OR no files found
+        is_invalid = ((br := 0) or True)  # placeholder, will be updated below
+
+        # ─── audio‑format inspection ──────────────────────────────────────
         fmt_score, br, sr, bd = analyse_format(folder)
+
+        # Count of audio files
+        file_count = sum(1 for f in folder.rglob("*") if AUDIO_RE.search(f.name))
+
+        # Mark as invalid if file_count == 0 OR all tech data are zero
+        is_invalid = (file_count == 0) or (br == 0 and sr == 0 and bd == 0)
+
         editions.append({
-            'album_id': aid,
+            'album_id':  aid,
             'title_raw': album_title(db_conn, aid),
             'album_norm': norm_album(album_title(db_conn, aid)),
-            'artist': artist,
-            'folder': folder,
-            'tracks': tr,
-            'file_count': sum(
-                1 for f in folder.rglob("*") if AUDIO_RE.search(f.name)
-            ),
-            'sig': signature(tr),
-            'titles': {t.title for t in tr},
-            'dur': sum(t.dur for t in tr),
-            'fmt_score': fmt_score, 'br': br, 'sr': sr, 'bd': bd,
-            'discs': len({t.disc for t in tr})
+            'artist':    artist,
+            'folder':    folder,
+            'tracks':    tr,
+            'file_count': file_count,
+            'sig':       signature(tr),
+            'titles':    {t.title for t in tr},
+            'dur':       sum(t.dur for t in tr),
+            'fmt_score': fmt_score,
+            'br':        br,
+            'sr':        sr,
+            'bd':        bd,
+            'discs':     len({t.disc for t in tr}),
+            'invalid':   is_invalid
         })
 
     # --- First pass: exact match on (album_norm, sig) ---
@@ -1111,7 +1127,8 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
             ),
             thumbnail_url=thumb_url(best['album_id'])
         )
-
+    # Remove groups where every loser was discarded (e.g. only one valid edition)
+    out = [g for g in out if g.get("losers")]
     return out
 
 def save_scan_to_db(scan_results: Dict[str, List[dict]]):
@@ -1119,6 +1136,11 @@ def save_scan_to_db(scan_results: Dict[str, List[dict]]):
     Given a dict of { artist_name: [group_dicts...] }, clear duplicates tables and re‐populate them.
     """
     import sqlite3, json
+
+    # ─── filter out technically invalid rips (0‑byte, 0 kbps …) ───
+    valid_editions = [e for e in editions if not e.get("invalid")]
+    if valid_editions:
+        editions = valid_editions
     con = sqlite3.connect(str(STATE_DB_FILE))
     cur = con.cursor()
 
