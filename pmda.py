@@ -151,8 +151,12 @@ def _discover_path_map(plex_host: str, plex_token: str, section_id: int) -> dict
     A hard failure (network/XML/bad token/empty list) is surfaced so that
     users notice mis‑configuration early.
     """
-    logging.debug("PATH_MAP discovery: requesting %s (section=%s)", plex_host.rstrip('/') + f"/library/sections/{section_id}", section_id)
-    url = f"{plex_host.rstrip('/')}/library/sections/{section_id}"
+    logging.debug(
+        "PATH_MAP discovery: requesting %s (filter section=%s)",
+        plex_host.rstrip('/') + "/library/sections",
+        section_id
+    )
+    url = f"{plex_host.rstrip('/')}/library/sections"
     resp = requests.get(url, headers={"X-Plex-Token": plex_token}, timeout=10)
     logging.debug("PATH_MAP discovery: HTTP %s – %d bytes", resp.status_code, len(resp.content))
     if logging.getLogger().isEnabledFor(logging.DEBUG):
@@ -164,10 +168,14 @@ def _discover_path_map(plex_host: str, plex_token: str, section_id: int) -> dict
     except ET.ParseError as e:
         raise RuntimeError(f"Invalid XML returned by Plex: {e}") from None
 
-    locations = [
-        loc.attrib.get("path") for loc in root.iter("Location")
-        if loc.attrib.get("path")
-    ]
+    locations: list[str] = []
+    for directory in root.iter("Directory"):
+        if directory.attrib.get("key") == str(section_id):
+            for loc in directory.iter("Location"):
+                path = loc.attrib.get("path")
+                if path:
+                    locations.append(path)
+            break  # only one matching section expected
     logging.debug("PATH_MAP discovery: parsed %d <Location> paths -> %s", len(locations), locations)
     if not locations:
         raise RuntimeError("No <Location> elements found for this section")
