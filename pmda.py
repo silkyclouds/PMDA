@@ -3,8 +3,8 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 """
-v0.6.3
-- should handle both final path maps than general path maps
+v0.6.2
+- fixed a cli error when an non empty destination folder was found
 """
 
 import argparse
@@ -290,27 +290,10 @@ try:
     plex_host   = os.getenv("PLEX_HOST")   or conf.get("PLEX_HOST")
     plex_token  = os.getenv("PLEX_TOKEN")  or conf.get("PLEX_TOKEN")
     section_id  = int(os.getenv("SECTION_ID") or conf.get("SECTION_ID", 1))
-    raw_map = _discover_path_map(plex_host, plex_token, section_id)
-    logging.debug("Auto‑generated PATH_MAP raw content: %s", raw_map)
+    auto_map    = _discover_path_map(plex_host, plex_token, section_id)
+    logging.debug("Auto‑generated PATH_MAP raw content: %s", auto_map)
 
-    # Optional host→container base-path re-write if users mount a parent directory:
-    host_base = os.getenv("HOST_PATH_BASE")
-    cont_base = os.getenv("CONTAINER_PATH_BASE")
-    if host_base and cont_base:
-        new_map = {}
-        for host_path, _ in raw_map.items():
-            if host_path.startswith(host_base):
-                rel = host_path[len(host_base):].lstrip(os.sep)
-                cont_path = os.path.join(cont_base, rel)
-                new_map[cont_path] = host_path
-            else:
-                new_map[host_path] = host_path
-        auto_map = new_map
-    else:
-        auto_map = raw_map
-
-    # update in‑memory config and persist
-    conf["PATH_MAP"] = auto_map
+    conf["PATH_MAP"] = auto_map     # update in‑memory config
     with open(CONFIG_PATH, "w", encoding="utf-8") as fh_cfg:
         json.dump(conf, fh_cfg, indent=2)
     logging.info("🔄 Auto‑generated/updated PATH_MAP from Plex: %s", auto_map)
@@ -482,10 +465,9 @@ def _self_diag() -> bool:
             FROM media_parts mp
             JOIN metadata_items md ON md.id = mp.media_item_id
             WHERE md.metadata_type = 9
-              AND md.library_section_id = ?
               AND mp.file LIKE ?
             """,
-            (SECTION_ID, f"{pre}/%")
+            (f"{pre}/%",)
         ).fetchone()[0]
         prefix_stats[pre] = cnt
 
