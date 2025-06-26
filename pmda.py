@@ -291,7 +291,7 @@ try:
     plex_token  = os.getenv("PLEX_TOKEN")  or conf.get("PLEX_TOKEN")
     section_id  = int(os.getenv("SECTION_ID") or conf.get("SECTION_ID", 1))
     auto_map    = _discover_path_map(plex_host, plex_token, section_id)
-    logging.debug("Auto‑generated PATH_MAP raw content: %s", auto_map)
+    logging.info("Auto‑generated raw PATH_MAP from Plex: %s", auto_map)
 
     # preserve any user‐specified base mappings from env/config
     raw_env_map = _parse_path_map(os.getenv("PATH_MAP") or conf.get("PATH_MAP", {}))
