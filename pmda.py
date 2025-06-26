@@ -60,7 +60,34 @@ def safe_move(src: str, dst: str):
 from queue import SimpleQueue
 import sys
 
+
 from flask import Flask, render_template_string, request, jsonify
+
+# (8) Logging setup (must happen BEFORE any log statements elsewhere) ---------
+_level_num = getattr(logging, LOG_LEVEL, logging.INFO)
+
+handlers = [logging.StreamHandler(sys.stdout)]
+try:
+    from logging.handlers import RotatingFileHandler
+    handlers.append(
+        RotatingFileHandler(
+            LOG_FILE,
+            maxBytes=5_000_000,   # 5 MB
+            backupCount=3,
+            encoding="utf-8"
+        )
+    )
+except Exception as e:
+    # Never fail hard if the volume is read‑only or path invalid
+    print(f"⚠️  File logging disabled – {e}", file=sys.stderr)
+
+logging.basicConfig(
+    level=_level_num,
+    format="%(asctime)s │ %(levelname)s │ %(threadName)s │ %(message)s",
+    datefmt="%H:%M:%S",
+    force=True,
+    handlers=handlers
+)
 
 # ──────────────────────────── FFmpeg sanity-check ──────────────────────────────
 # Central store for worker exceptions
@@ -388,31 +415,6 @@ FORMAT_PREFERENCE = conf.get(
 # Optional external log file (rotates @ 5 MB × 3)
 LOG_FILE = os.getenv("LOG_FILE", str(CONFIG_DIR / "pmda.log"))
 
-# (8) Logging setup (must happen BEFORE any log statements elsewhere) ---------
-_level_num = getattr(logging, LOG_LEVEL, logging.INFO)
-
-handlers = [logging.StreamHandler(sys.stdout)]
-try:
-    from logging.handlers import RotatingFileHandler
-    handlers.append(
-        RotatingFileHandler(
-            LOG_FILE,
-            maxBytes=5_000_000,   # 5 MB
-            backupCount=3,
-            encoding="utf-8"
-        )
-    )
-except Exception as e:
-    # Never fail hard if the volume is read‑only or path invalid
-    print(f"⚠️  File logging disabled – {e}", file=sys.stderr)
-
-logging.basicConfig(
-    level=_level_num,
-    format="%(asctime)s │ %(levelname)s │ %(threadName)s │ %(message)s",
-    datefmt="%H:%M:%S",
-    force=True,
-    handlers=handlers
-)
 
 # Mask & dump effective config ------------------------------------------------
 for k, src in ENV_SOURCES.items():
