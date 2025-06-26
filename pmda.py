@@ -326,8 +326,11 @@ try:
     logging.info("Auto‑generated raw PATH_MAP from Plex: %s", auto_map)
 
     # preserve any user‐specified base mappings from env/config
-    raw_env_map = _parse_path_map(os.getenv("PATH_MAP") or conf.get("PATH_MAP", {}))
-    logging.info("Raw PATH_MAP from env/config: %s", raw_env_map)
+    raw_env_map = _parse_path_map(os.getenv("PATH_MAP", "{}"))
+    if raw_env_map:
+        logging.info("Raw PATH_MAP from env: %s", raw_env_map)
+    else:
+        logging.info("No PATH_MAP provided via environment; using container paths only")
     merged_map: dict[str, str] = {}
     for cont_path, cont_val in auto_map.items():
         # try to apply a broader host‐base mapping first
@@ -341,11 +344,7 @@ try:
         if not mapped:
             # fallback to container==host mapping
             merged_map[cont_path] = cont_val
-    logging.info("Merged PATH_MAP for startup: %s", merged_map)
-    conf["PATH_MAP"] = merged_map
-    with open(CONFIG_PATH, "w", encoding="utf-8") as fh_cfg:
-        json.dump(conf, fh_cfg, indent=2)
-    logging.info("🔄 Auto‑generated/updated PATH_MAP from Plex: %s", auto_map)
+    logging.info("🔄 Using merged PATH_MAP for startup: %s", merged_map)
 except Exception as e:
     logging.warning("⚠️  Failed to auto‑generate PATH_MAP – %s", e)
 
@@ -533,7 +532,7 @@ def _self_diag() -> bool:
         """
         unmapped = db.execute(query, (SECTION_ID,)).fetchone()[0]
         if unmapped:
-            logging.warning("⚠ %d albums have no PATH_MAP match", unmapped)
+            logging.info("ℹ️ %d albums have no PATH_MAP match (not blocking; could be due to outdated config or albums outside current mappings)", unmapped)
     else:
         logging.info("Skipping unmapped album check because PATH_MAP is empty")
 
