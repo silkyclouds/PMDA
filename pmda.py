@@ -321,8 +321,16 @@ def _discover_path_map(plex_host: str, plex_token: str, section_id: int) -> dict
 try:
     plex_host   = os.getenv("PLEX_HOST")   or conf.get("PLEX_HOST")
     plex_token  = os.getenv("PLEX_TOKEN")  or conf.get("PLEX_TOKEN")
-    section_id  = int(os.getenv("SECTION_ID") or conf.get("SECTION_ID", 1))
-    auto_map    = _discover_path_map(plex_host, plex_token, section_id)
+    # Support multiple sections
+    raw_sections = os.getenv("SECTION_IDS", None)
+    if raw_sections:
+        SECTION_IDS = [int(s) for s in raw_sections.split(",") if s.strip().isdigit()]
+    else:
+        SECTION_IDS = [int(os.getenv("SECTION_ID") or conf.get("SECTION_ID", 1))]
+    auto_map = {}
+    for sid in SECTION_IDS:
+        part = _discover_path_map(plex_host, plex_token, sid)
+        auto_map.update(part)
     logging.info("Auto‑generated raw PATH_MAP from Plex: %s", auto_map)
 
     # preserve any user‐specified base mappings from env/config
@@ -398,7 +406,9 @@ for key in ("PLEX_HOST", "PLEX_TOKEN", "SECTION_ID"):
 # (7) Export as module‑level constants ----------------------------------------
 PLEX_HOST      = merged["PLEX_HOST"]
 PLEX_TOKEN     = merged["PLEX_TOKEN"]
-SECTION_ID     = int(merged["SECTION_ID"])
+ # For backward compatibility, expose first section as SECTION_ID
+SECTION_IDS    = SECTION_IDS
+SECTION_ID     = SECTION_IDS[0]
 PATH_MAP       = merged["PATH_MAP"]
 SCAN_THREADS   = int(merged["SCAN_THREADS"])
 LOG_LEVEL      = merged["LOG_LEVEL"]
@@ -521,17 +531,18 @@ def _self_diag() -> bool:
 
     # 4) Albums with no mapping (skip if no PATH_MAP entries)
     if PATH_MAP:
-        # Restrict the “un‑mapped” check to the chosen MUSIC section only
+        # Restrict the “un‑mapped” check to the chosen MUSIC section(s) only
         where_clauses = " AND ".join(f"mp.file NOT LIKE '{pre}%'" for pre in PATH_MAP)
+        placeholders = ",".join("?" for _ in SECTION_IDS)
         query = f"""
             SELECT COUNT(*)
             FROM   media_parts  mp
             JOIN   metadata_items md ON md.id = mp.media_item_id
-            WHERE  md.library_section_id = ?
+            WHERE  md.library_section_id IN ({placeholders})
               AND  md.metadata_type     = 9          -- 9 = album
               AND  {where_clauses}
         """
-        unmapped = db.execute(query, (SECTION_ID,)).fetchone()[0]
+        unmapped = db.execute(query, SECTION_IDS).fetchone()[0]
         if unmapped:
             logging.warning(
                 "⚠ %d albums have no PATH_MAP match; this is not necessarily blocking – "
@@ -1489,17 +1500,18 @@ def background_scan():
         # 1) Total albums for progress bar
         with lock:
             state["scan_progress"] = 0
+        placeholders = ",".join("?" for _ in SECTION_IDS)
         total_albums = db_conn.execute(
-            "SELECT COUNT(*) FROM metadata_items "
-            "WHERE metadata_type=9 AND library_section_id=?",
-            (SECTION_ID,),
+            f"SELECT COUNT(*) FROM metadata_items "
+            f"WHERE metadata_type=9 AND library_section_id IN ({placeholders})",
+            SECTION_IDS,
         ).fetchone()[0]
 
         # 2) Fetch all artists
         artists = db_conn.execute(
-            "SELECT id, title FROM metadata_items "
-            "WHERE metadata_type=8 AND library_section_id=?",
-            (SECTION_ID,),
+            f"SELECT id, title FROM metadata_items "
+            f"WHERE metadata_type=8 AND library_section_id IN ({placeholders})",
+            SECTION_IDS,
         ).fetchall()
 
         # ─── Discord: announce scan start ────────────────────────────────
