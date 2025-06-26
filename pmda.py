@@ -61,7 +61,12 @@ from queue import SimpleQueue
 import sys
 
 
+
 from flask import Flask, render_template_string, request, jsonify
+
+# Ensure LOG_LEVEL and LOG_FILE exist for initial logging setup
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+LOG_FILE  = os.getenv("LOG_FILE", "/config/pmda.log")
 
 # (8) Logging setup (must happen BEFORE any log statements elsewhere) ---------
 _level_num = getattr(logging, LOG_LEVEL, logging.INFO)
