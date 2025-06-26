@@ -2598,15 +2598,18 @@ def index():
     removed_dupes = get_stat("removed_dupes")
 
     db_conn = plex_connect()
+    # Count across all configured sections
+    placeholders   = ",".join("?" for _ in SECTION_IDS)
+    section_params = tuple(SECTION_IDS)
     total_artists = db_conn.execute(
-        "SELECT COUNT(*) FROM metadata_items "
-        "WHERE metadata_type=8 AND library_section_id=?",
-        (SECTION_ID,),
+        f"SELECT COUNT(*) FROM metadata_items "
+        f"WHERE metadata_type=8 AND library_section_id IN ({placeholders})",
+        section_params,
     ).fetchone()[0]
     total_albums = db_conn.execute(
-        "SELECT COUNT(*) FROM metadata_items "
-        "WHERE metadata_type=9 AND library_section_id=?",
-        (SECTION_ID,),
+        f"SELECT COUNT(*) FROM metadata_items "
+        f"WHERE metadata_type=9 AND library_section_id IN ({placeholders})",
+        section_params,
     ).fetchone()[0]
     db_conn.close()
 
