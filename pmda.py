@@ -377,11 +377,13 @@ def _get(key: str, *, default=None, cast=lambda x: x):
         raw = default
     return cast(raw)
 
+# Use first element of SECTION_IDS list for backward compatibility
 merged = {
     "PLEX_DB_PATH":   _get("PLEX_DB_PATH",   default="",                                cast=str),
     "PLEX_HOST":      _get("PLEX_HOST",      default="",                                cast=str),
     "PLEX_TOKEN":     _get("PLEX_TOKEN",     default="",                                cast=str),
-    "SECTION_ID":     _get("SECTION_ID",     default=1,                                 cast=_parse_int),
+    # Use first element of SECTION_IDS list for backward compatibility
+    "SECTION_ID": SECTION_IDS[0],
     "SCAN_THREADS":   _get("SCAN_THREADS",   default=os.cpu_count() or 4,               cast=_parse_int),
     "PATH_MAP":       _parse_path_map(_get("PATH_MAP", default={})),
     "LOG_LEVEL":      _get("LOG_LEVEL",      default="INFO").upper(),
@@ -403,9 +405,12 @@ WEBUI_PORT = 5005
 # (5) Validate critical values -------------------------------------------------
 if not merged["PLEX_DB_PATH"]:
     raise SystemExit("Missing required config value: PLEX_DB_PATH")
-for key in ("PLEX_HOST", "PLEX_TOKEN", "SECTION_ID"):
+for key in ("PLEX_HOST", "PLEX_TOKEN"):
     if not merged[key]:
         raise SystemExit(f"Missing required config value: {key}")
+# Ensure at least one section was provided
+if not SECTION_IDS:
+    raise SystemExit("Missing required config value: SECTION_IDS")
 
 # (7) Export as module‑level constants ----------------------------------------
 PLEX_HOST      = merged["PLEX_HOST"]
