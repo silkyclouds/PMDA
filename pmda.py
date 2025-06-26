@@ -321,12 +321,16 @@ def _discover_path_map(plex_host: str, plex_token: str, section_id: int) -> dict
 try:
     plex_host   = os.getenv("PLEX_HOST")   or conf.get("PLEX_HOST")
     plex_token  = os.getenv("PLEX_TOKEN")  or conf.get("PLEX_TOKEN")
-    # Support multiple sections
-    raw_sections = os.getenv("SECTION_IDS", None)
-    if raw_sections:
-        SECTION_IDS = [int(s) for s in raw_sections.split(",") if s.strip().isdigit()]
-    else:
-        SECTION_IDS = [int(os.getenv("SECTION_ID") or conf.get("SECTION_ID", 1))]
+    # Support multiple section IDs via SECTION_IDS or SECTION_ID (comma-separated)
+    import re
+    raw_sections = os.getenv("SECTION_IDS") or os.getenv("SECTION_ID") or conf.get("SECTION_IDS") or conf.get("SECTION_ID", 1)
+    # Split on commas, strip whitespace, parse ints
+    SECTION_IDS: list[int] = []
+    for part in re.split(r'\s*,\s*', str(raw_sections)):
+        if part.strip().isdigit():
+            SECTION_IDS.append(int(part.strip()))
+    if not SECTION_IDS:
+        SECTION_IDS = [1]  # fallback to section 1 if nothing parsed
     auto_map = {}
     for sid in SECTION_IDS:
         part = _discover_path_map(plex_host, plex_token, sid)
