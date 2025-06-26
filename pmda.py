@@ -535,7 +535,7 @@ def _self_diag() -> bool:
         if unmapped:
             logging.warning(
                 "⚠ %d albums have no PATH_MAP match; this is not necessarily blocking – "
-                "these albums may lie outside the Plex library for which paths were discovered",
+                "these albums may lie outside the Plex library for which paths were discovered or be part of another plex music library if you have several ones",
                 unmapped
             )
     else:
