@@ -295,6 +295,7 @@ try:
 
     # preserve any user‐specified base mappings from env/config
     raw_env_map = _parse_path_map(os.getenv("PATH_MAP") or conf.get("PATH_MAP", {}))
+    logging.info("Raw PATH_MAP from env/config: %s", raw_env_map)
     merged_map: dict[str, str] = {}
     for cont_path, cont_val in auto_map.items():
         # try to apply a broader host‐base mapping first
@@ -308,6 +309,7 @@ try:
         if not mapped:
             # fallback to container==host mapping
             merged_map[cont_path] = cont_val
+    logging.info("Merged PATH_MAP for startup: %s", merged_map)
     conf["PATH_MAP"] = merged_map
     with open(CONFIG_PATH, "w", encoding="utf-8") as fh_cfg:
         json.dump(conf, fh_cfg, indent=2)
