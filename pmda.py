@@ -293,7 +293,22 @@ try:
     auto_map    = _discover_path_map(plex_host, plex_token, section_id)
     logging.debug("Auto‑generated PATH_MAP raw content: %s", auto_map)
 
-    conf["PATH_MAP"] = auto_map     # update in‑memory config
+    # preserve any user‐specified base mappings from env/config
+    raw_env_map = _parse_path_map(os.getenv("PATH_MAP") or conf.get("PATH_MAP", {}))
+    merged_map: dict[str, str] = {}
+    for cont_path, cont_val in auto_map.items():
+        # try to apply a broader host‐base mapping first
+        mapped = False
+        for prefix, host_base in raw_env_map.items():
+            if cont_path.startswith(prefix):
+                suffix = cont_path[len(prefix):].lstrip("/")
+                merged_map[cont_path] = os.path.join(host_base, suffix)
+                mapped = True
+                break
+        if not mapped:
+            # fallback to container==host mapping
+            merged_map[cont_path] = cont_val
+    conf["PATH_MAP"] = merged_map
     with open(CONFIG_PATH, "w", encoding="utf-8") as fh_cfg:
         json.dump(conf, fh_cfg, indent=2)
     logging.info("🔄 Auto‑generated/updated PATH_MAP from Plex: %s", auto_map)
@@ -328,6 +343,8 @@ merged = {
     "OPENAI_MODEL":   _get("OPENAI_MODEL",   default="gpt-4",                           cast=str),
     "DISCORD_WEBHOOK": _get("DISCORD_WEBHOOK", default="", cast=str),
 }
+# Always use the auto‑generated PATH_MAP from config.json
+merged["PATH_MAP"] = conf.get("PATH_MAP", {})
 
 # ─────────────────────────────── Fixed container constants ───────────────────────────────
 # DB filename is always fixed under the Plex DB folder
