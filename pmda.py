@@ -332,7 +332,7 @@ try:
     for cont_path, cont_val in auto_map.items():
         # try to apply a broader host‐base mapping first
         mapped = False
-        for prefix, host_base in raw_env_map.items():
+        for prefix, host_base in sorted(raw_env_map.items(), key=lambda item: len(item[0]), reverse=True):
             if cont_path.startswith(prefix):
                 suffix = cont_path[len(prefix):].lstrip("/")
                 merged_map[cont_path] = os.path.join(host_base, suffix)
@@ -535,7 +535,7 @@ def _self_diag() -> bool:
         if unmapped:
             logging.warning(
                 "⚠ %d albums have no PATH_MAP match; this is not necessarily blocking – "
-                "these albums may lie outside the Plex library for which paths were discovered or be part of another plex music library if you have several ones",
+                "these albums may lie outside the Plex library for which paths were discovered",
                 unmapped
             )
     else:
