@@ -537,11 +537,12 @@ def _self_diag() -> bool:
     for pre in PATH_MAP:
         cnt = db.execute(
             """
-            SELECT COUNT(*)
-            FROM media_parts mp
-            JOIN metadata_items md ON md.id = mp.media_item_id
-            WHERE md.metadata_type = 9
-              AND mp.file LIKE ?
+            SELECT COUNT(DISTINCT alb.id)
+            FROM   media_parts      mp
+            JOIN   media_items      mi  ON mi.id       = mp.media_item_id
+            JOIN   metadata_items   tr  ON tr.id       = mi.metadata_item_id   -- track (type 10)
+            JOIN   metadata_items   alb ON alb.id      = tr.parent_id          -- album (type 9)
+            WHERE  mp.file LIKE ?
             """,
             (f"{pre}/%",)
         ).fetchone()[0]
