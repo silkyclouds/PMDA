@@ -536,7 +536,6 @@ def _self_diag() -> bool:
     Returns *True* when every mandatory check passes, otherwise *False*.
     """
     logging.info("──────── PMDA self‑diagnostic ────────")
-    ok = True          # will flip to False whenever we spot a blocking/worrying issue
 
     # 1) Plex DB readable?
     try:
@@ -568,10 +567,9 @@ def _self_diag() -> bool:
         if albums_seen == 0:
             logging.warning("%s %s → %s  (prefix not found in DB)",
                             colour('⚠', ANSI_YELLOW), pre, dest)
-            ok = False
         elif not Path(dest).exists():
             logging.error("✗ %s → %s  (host path missing)", pre, dest)
-            ok = False
+            return False
         else:
             logging.info("%s %s → %s  (%d albums)",
                          colour('✓', ANSI_GREEN), pre, dest, albums_seen)
@@ -609,13 +607,9 @@ def _self_diag() -> bool:
                 "to avoid this warning, set SECTION_IDS to include all relevant section IDs, separated by commas.",
                 unmapped
             )
-            ok = False
     else:
         logging.info("Skipping unmapped album check because PATH_MAP is empty")
 
-    if ok:
-        logging.info(colour("🎉  All checks passed — PMDA is ready to scan & dedupe!",
-                            ANSI_BOLD + ANSI_MAGENTA))
     logging.info("──────── diagnostic complete ─────────")
     # ─── Log AI prompt for user review ─────────────────────────────────
     try:
@@ -624,7 +618,7 @@ def _self_diag() -> bool:
             logging.debug("Using ai_prompt.txt:\n%s", prompt_text)
     except Exception as e:
         logging.warning("Could not read ai_prompt.txt: %s", e)
-    return ok
+    return True
 
 
 # ───────────────────────────────── OTHER CONSTANTS ──────────────────────────────────
