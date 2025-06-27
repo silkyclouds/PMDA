@@ -33,10 +33,24 @@ from pathlib import Path
 from typing import NamedTuple, List, Dict, Optional
 from urllib.parse import quote_plus
 
+
 import requests
 import xml.etree.ElementTree as ET
 import openai
 import unittest
+
+# ──────────────── ANSI colours for prettier logs ────────────────
+ANSI_RESET  = "\033[0m"
+ANSI_BOLD   = "\033[1m"
+ANSI_GREEN  = "\033[92m"
+ANSI_YELLOW = "\033[93m"
+ANSI_CYAN   = "\033[96m"
+
+def colour(txt: str, code: str) -> str:
+    """Wrap *txt* in an ANSI colour code unless NO_COLOR env var is set."""
+    if os.getenv("NO_COLOR"):
+        return txt
+    return f"{code}{txt}{ANSI_RESET}"
 
 # ────────────────────── Robust cross‑device move helper ──────────────────────
 def safe_move(src: str, dst: str):
@@ -348,7 +362,7 @@ try:
     except Exception:
         SECTION_NAMES = {}
     if SECTION_NAMES:
-        logging.info("\n----- LIBRARY SECTIONS -----")
+        logging.info("\n%s", colour("----- LIBRARY SECTIONS -----", ANSI_BOLD + ANSI_CYAN))
         for sid in SECTION_IDS:
             name = SECTION_NAMES.get(sid, "<unknown>")
             logging.info("  %s (ID %d)", name, sid)
@@ -359,7 +373,7 @@ try:
     for sid in SECTION_IDS:
         part = _discover_path_map(plex_host, plex_token, sid)
         auto_map.update(part)
-    logging.info("\n----- PATH_MAP DISCOVERY -----\n")
+    logging.info("\n%s\n", colour("----- PATH_MAP DISCOVERY -----", ANSI_BOLD + ANSI_CYAN))
     logging.info("Auto‑generated raw PATH_MAP from Plex: %s", auto_map)
 
     # preserve any user‐specified base mappings from env/config
@@ -379,7 +393,7 @@ try:
             # fallback to container==host mapping
             merged_map[cont_path] = cont_val
     logging.info("Merged PATH_MAP for startup: %s", merged_map)
-    logging.info("\n----- VOLUME BINDINGS (PLEX → PMDA → HOST) -----")
+    logging.info("\n%s", colour("----- VOLUME BINDINGS (PLEX → PMDA → HOST) -----", ANSI_BOLD + ANSI_CYAN))
     logging.info("%-40s | %-30s | %s", "PLEX_PATH", "PMDA_PATH", "HOST_PATH")
     for plex_path, host_path in merged_map.items():
         # for now, treat host_path as both PMDA_PATH and HOST_PATH
@@ -551,12 +565,14 @@ def _self_diag() -> bool:
     for pre, dest in PATH_MAP.items():
         albums_seen = prefix_stats.get(pre, 0)
         if albums_seen == 0:
-            logging.warning("⚠ %s → %s  (prefix not found in DB)", pre, dest)
+            logging.warning("%s %s → %s  (prefix not found in DB)",
+                            colour('⚠', ANSI_YELLOW), pre, dest)
         elif not Path(dest).exists():
             logging.error("✗ %s → %s  (host path missing)", pre, dest)
             return False
         else:
-            logging.info("✓ %s → %s  (%d albums)", pre, dest, albums_seen)
+            logging.info("%s %s → %s  (%d albums)",
+                         colour('✓', ANSI_GREEN), pre, dest, albums_seen)
 
     # 3) Permission checks
     for mount in [*PATH_MAP.values(), str(DUPE_ROOT), str(CONFIG_DIR)]:
@@ -597,8 +613,9 @@ def _self_diag() -> bool:
     logging.info("──────── diagnostic complete ─────────")
     # ─── Log AI prompt for user review ─────────────────────────────────
     try:
-        prompt_text = AI_PROMPT_FILE.read_text(encoding="utf-8")
-        logging.info("Using ai_prompt.txt:\n%s", prompt_text)
+        if logging.getLogger().isEnabledFor(logging.DEBUG):
+            prompt_text = AI_PROMPT_FILE.read_text(encoding="utf-8")
+            logging.debug("Using ai_prompt.txt:\n%s", prompt_text)
     except Exception as e:
         logging.warning("Could not read ai_prompt.txt: %s", e)
     return True
@@ -1750,6 +1767,7 @@ def perform_dedupe(group: dict) -> List[dict]:
                     break
                 counter += 1
 
+        logging.info("Moving dupe: %s  →  %s", src_folder, dst)
         logging.debug("perform_dedupe(): moving %s → %s", src_folder, dst)
         try:
             safe_move(str(src_folder), str(dst))
