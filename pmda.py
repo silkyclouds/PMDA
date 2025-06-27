@@ -2223,11 +2223,21 @@ HTML = """<!DOCTYPE html>
             // force final progress text & status
             const scanTxt = document.getElementById("scanTxt");
             if (scanTxt) {
-              scanTxt.innerText = `${j.progress} / ${j.total} albums`;
+            scanTxt.innerText = `${j.progress} / ${j.total} albums`;
             }
+
             const statusEl = document.getElementById("scanStatus");
             if (statusEl) {
-              statusEl.innerText = "Status: stopped";
+            statusEl.innerText = "Status: stopped";
+            }
+
+            // rebuild control bar so the user can launch a new scan
+            const controls = document.getElementById("scanControls");
+            if (controls) {
+            controls.innerHTML = `
+                <button onclick="scanLibrary()">New Scan</button>
+                <span id="scanStatus">Status: stopped</span>
+            `;
             }
         }
         })
