@@ -616,9 +616,9 @@ def _self_diag() -> bool:
         logging.info("Skipping unmapped album check because PATH_MAP is empty")
 
     logging.info("──────── diagnostic complete ─────────")
-    if not any(msg.startswith("✗") or "⚠" in msg for msg in [_line.getMessage() for _line in logging.getLogger().handlers[0].buffer if hasattr(logging.getLogger().handlers[0],'buffer')]):
-        logging.info("%s ALL mapped folders contain albums – ALL GOOD! %s",
-                     colour("✓", ANSI_GREEN), ANSI_RESET)
+    # Simple green confirmation when no errors were encountered during the loop
+    if not any("✗" in r[0] or "⚠" in r[0] for r in prefix_stats.items()):
+        logging.info("%s ALL mapped folders contain albums – ALL GOOD!", colour("✓", ANSI_GREEN))
     # ─── Log AI prompt for user review ─────────────────────────────────
     try:
         if logging.getLogger().isEnabledFor(logging.DEBUG):
