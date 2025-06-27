@@ -3,7 +3,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 """
-v0.6.4
+v0.6.4 BETA
 
 Changelog:
 - added support for multiple Plex library sections via a comma-separated `SECTION_IDS`, so you can scan and dedupe across several music libraries in one run
@@ -361,6 +361,9 @@ try:
             # fallback to container==host mapping
             merged_map[cont_path] = cont_val
     logging.info("Merged PATH_MAP for startup: %s", merged_map)
+    logging.info("Detected Docker volume bindings:")
+    for cont_path, host_path in merged_map.items():
+        logging.info("  container %s  →  host %s", cont_path, host_path)
     conf["PATH_MAP"] = merged_map
     with open(CONFIG_PATH, "w", encoding="utf-8") as fh_cfg:
         json.dump(conf, fh_cfg, indent=2)
