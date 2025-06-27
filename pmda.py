@@ -46,6 +46,10 @@ ANSI_GREEN  = "\033[92m"
 ANSI_YELLOW = "\033[93m"
 ANSI_CYAN   = "\033[96m"
 
+def log_header(title: str) -> None:
+    """Print a bold cyan header like `----- TITLE -----`."""
+    logging.info("\n%s", colour(f"----- {title.upper()} -----", ANSI_BOLD + ANSI_CYAN))
+
 def colour(txt: str, code: str) -> str:
     """Wrap *txt* in an ANSI colour code unless NO_COLOR env var is set."""
     if os.getenv("NO_COLOR"):
@@ -191,6 +195,7 @@ def _check_ffmpeg():
     Log the location of ffmpeg/ffprobe or warn clearly if they are missing.
     Runs once at startup.
     """
+    log_header("ffmpeg")
     missing = []
     for tool in ("ffmpeg", "ffprobe"):
         path = shutil.which(tool)
@@ -362,18 +367,17 @@ try:
     except Exception:
         SECTION_NAMES = {}
     if SECTION_NAMES:
-        logging.info("\n%s", colour("----- LIBRARY SECTIONS -----", ANSI_BOLD + ANSI_CYAN))
+        log_header("libraries")
         for sid in SECTION_IDS:
             name = SECTION_NAMES.get(sid, "<unknown>")
             logging.info("  %s (ID %d)", name, sid)
-        logging.info("")  # blank line
     else:
         logging.info("Library section IDs: %s\n", SECTION_IDS)
     auto_map = {}
     for sid in SECTION_IDS:
         part = _discover_path_map(plex_host, plex_token, sid)
         auto_map.update(part)
-    logging.info("\n%s\n", colour("----- PATH_MAP DISCOVERY -----", ANSI_BOLD + ANSI_CYAN))
+    log_header("path_map discovery")
     logging.info("Auto‑generated raw PATH_MAP from Plex: %s", auto_map)
 
     # preserve any user‐specified base mappings from env/config
@@ -393,7 +397,7 @@ try:
             # fallback to container==host mapping
             merged_map[cont_path] = cont_val
     logging.info("Merged PATH_MAP for startup: %s", merged_map)
-    logging.info("\n%s", colour("----- VOLUME BINDINGS (PLEX → PMDA → HOST) -----", ANSI_BOLD + ANSI_CYAN))
+    log_header("volume bindings (plex → pmda → host)")
     logging.info("%-40s | %-30s | %s", "PLEX_PATH", "PMDA_PATH", "HOST_PATH")
     for plex_path, host_path in merged_map.items():
         # for now, treat host_path as both PMDA_PATH and HOST_PATH
@@ -485,6 +489,7 @@ FORMAT_PREFERENCE = conf.get(
 LOG_FILE = os.getenv("LOG_FILE", str(CONFIG_DIR / "pmda.log"))
 
 
+log_header("configuration")
 # Mask & dump effective config ------------------------------------------------
 for k, src in ENV_SOURCES.items():
     val = merged.get(k)
@@ -535,7 +540,7 @@ def _self_diag() -> bool:
 
     Returns *True* when every mandatory check passes, otherwise *False*.
     """
-    logging.info("──────── PMDA self‑diagnostic ────────")
+    log_header("self diagnostic")
 
     # 1) Plex DB readable?
     try:
@@ -611,6 +616,9 @@ def _self_diag() -> bool:
         logging.info("Skipping unmapped album check because PATH_MAP is empty")
 
     logging.info("──────── diagnostic complete ─────────")
+    if not any(msg.startswith("✗") or "⚠" in msg for msg in [_line.getMessage() for _line in logging.getLogger().handlers[0].buffer if hasattr(logging.getLogger().handlers[0],'buffer')]):
+        logging.info("%s ALL mapped folders contain albums – ALL GOOD! %s",
+                     colour("✓", ANSI_GREEN), ANSI_RESET)
     # ─── Log AI prompt for user review ─────────────────────────────────
     try:
         if logging.getLogger().isEnabledFor(logging.DEBUG):
