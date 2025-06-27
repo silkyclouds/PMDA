@@ -379,9 +379,12 @@ try:
             # fallback to container==host mapping
             merged_map[cont_path] = cont_val
     logging.info("Merged PATH_MAP for startup: %s", merged_map)
-    logging.info("\n----- DOCKER VOLUME BINDINGS -----")
-    for cont_path, host_path in merged_map.items():
-        logging.info("  container %s  →  host %s", cont_path, host_path)
+    logging.info("\n----- VOLUME BINDINGS (PLEX → PMDA → HOST) -----")
+    logging.info("%-40s | %-30s | %s", "PLEX_PATH", "PMDA_PATH", "HOST_PATH")
+    for plex_path, host_path in merged_map.items():
+        # for now, treat host_path as both PMDA_PATH and HOST_PATH
+        pmda_path = host_path
+        logging.info("%-40s | %-30s | %s", plex_path, pmda_path, host_path)
     conf["PATH_MAP"] = merged_map
     with open(CONFIG_PATH, "w", encoding="utf-8") as fh_cfg:
         json.dump(conf, fh_cfg, indent=2)
