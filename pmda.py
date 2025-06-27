@@ -338,10 +338,28 @@ try:
             SECTION_IDS.append(int(part.strip()))
     if not SECTION_IDS:
         SECTION_IDS = [1]  # fallback to section 1 if nothing parsed
+
+    # ----- LIBRARY SECTIONS -----
+    try:
+        # fetch section names from Plex for friendly logging
+        resp = requests.get(f"{plex_host.rstrip('/')}/library/sections", headers={"X-Plex-Token": plex_token}, timeout=10)
+        root = ET.fromstring(resp.text)
+        SECTION_NAMES = {int(directory.attrib['key']): directory.attrib.get('title', '<unknown>') for directory in root.iter('Directory')}
+    except Exception:
+        SECTION_NAMES = {}
+    if SECTION_NAMES:
+        logging.info("\n----- LIBRARY SECTIONS -----")
+        for sid in SECTION_IDS:
+            name = SECTION_NAMES.get(sid, "<unknown>")
+            logging.info("  %s (ID %d)", name, sid)
+        logging.info("")  # blank line
+    else:
+        logging.info("Library section IDs: %s\n", SECTION_IDS)
     auto_map = {}
     for sid in SECTION_IDS:
         part = _discover_path_map(plex_host, plex_token, sid)
         auto_map.update(part)
+    logging.info("\n----- PATH_MAP DISCOVERY -----\n")
     logging.info("Auto‑generated raw PATH_MAP from Plex: %s", auto_map)
 
     # preserve any user‐specified base mappings from env/config
@@ -361,7 +379,7 @@ try:
             # fallback to container==host mapping
             merged_map[cont_path] = cont_val
     logging.info("Merged PATH_MAP for startup: %s", merged_map)
-    logging.info("Detected Docker volume bindings:")
+    logging.info("\n----- DOCKER VOLUME BINDINGS -----")
     for cont_path, host_path in merged_map.items():
         logging.info("  container %s  →  host %s", cont_path, host_path)
     conf["PATH_MAP"] = merged_map
