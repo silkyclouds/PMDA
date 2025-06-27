@@ -3,8 +3,15 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 """
-v0.6.3 BETA
-- playing with path maps headache again
+v0.6.4 BETA
+
+Changelog:
+- added support for multiple Plex library sections via a comma-separated `SECTION_IDS`, so you can scan and dedupe across several music libraries in one run
+- revamped PATH_MAP auto-discovery to merge all sections’ locations and always overwrite `config.json`, ensuring parent-folder binds and subfolders map correctly
+- fixed the “slash in the middle” bug—folders like `/music/flac-hd` now map cleanly without inserting an extra `/`
+- improved the unmapped-albums warning to clarify it’s non-blocking (albums may belong to other libraries) and advise including all relevant section IDs to suppress it
+- ensured the web UI scan progress bar polls `/api/progress` automatically every second after you click “New Scan,” so it updates continuously without manual refresh
+- tightened up logging messages for PATH_MAP discovery and diagnostics to be more informative and reassuring for end users
 """
 
 import argparse
@@ -554,8 +561,9 @@ def _self_diag() -> bool:
         unmapped = db.execute(query, SECTION_IDS).fetchone()[0]
         if unmapped:
             logging.warning(
-                "⚠ %d albums have no PATH_MAP match; this is not necessarily blocking – "
-                "these albums may lie outside the Plex library for which paths were discovered",
+                "⚠ %d albums have no PATH_MAP match; this is not necessarily an error. "
+                "these albums may belong to Plex library sections you haven’t included. "
+                "to avoid this warning, set SECTION_IDS to include all relevant section IDs, separated by commas.",
                 unmapped
             )
     else:
@@ -997,7 +1005,7 @@ def choose_best(editions: List[dict]) -> dict:
     cur = con.cursor()
     ids = tuple(e['album_id'] for e in editions)
     placeholders = ",".join("?" for _ in ids)
-    # on suppose que toutes les éditions ont le même artist
+    # assume all editions have the same artist
     artist = editions[0]['artist']
     cur.execute(
         f"SELECT album_id, rationale, merge_list "
