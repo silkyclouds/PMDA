@@ -3,7 +3,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 """
-v0.6.4
+v0.6.4 BETA
 
 Changelog:
 - added support for multiple Plex library sections via a comma-separated `SECTION_IDS`, so you can scan and dedupe across several music libraries in one run
@@ -614,6 +614,63 @@ def _self_diag() -> bool:
             )
     else:
         logging.info("Skipping unmapped album check because PATH_MAP is empty")
+
+    # 5) External service checks -------------------------------------------------
+    openai_ok = False
+    discord_ok = False
+
+    # --- OpenAI key -------------------------------------------------------------
+    if OPENAI_API_KEY:
+        try:
+            # a 1‑token “ping” to verify the key / model combination works
+            openai.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[{"role": "user", "content": "ping"}],
+                max_tokens=1,
+                temperature=0.0,
+            )
+            logging.info("%s OpenAI API key valid – model **%s** reachable",
+                         colour("✓", ANSI_GREEN), OPENAI_MODEL)
+            openai_ok = True
+        except Exception as e:
+            logging.warning("%s OpenAI API key present but failed: %s",
+                            colour("⚠", ANSI_YELLOW), e)
+    else:
+        logging.info("• No OPENAI_API_KEY provided; AI features disabled.")
+
+    # --- Discord webhook --------------------------------------------------------
+    if DISCORD_WEBHOOK:
+        try:
+            resp = requests.post(DISCORD_WEBHOOK, json={"content": "🔔 PMDA startup…"}, timeout=6)
+            if resp.status_code == 204:
+                logging.info("%s Discord webhook reachable",
+                             colour("✓", ANSI_GREEN))
+                discord_ok = True
+            else:
+                logging.warning("%s Discord webhook returned HTTP %s",
+                                colour("⚠", ANSI_YELLOW), resp.status_code)
+        except Exception as e:
+            logging.warning("%s Discord webhook test failed: %s",
+                            colour("⚠", ANSI_YELLOW), e)
+    else:
+        logging.info("• No DISCORD_WEBHOOK configured.")
+
+    # ---------------------------------------------------------------------------
+    # Send a nicely formatted embed with the startup summary (if webhook works)
+    if discord_ok:
+        fields = [
+            {"name": "Libraries",
+             "value": ", ".join(f"{SECTION_NAMES.get(i, i)}" for i in SECTION_IDS) },
+            {"name": "OpenAI",
+             "value": "✅ working" if openai_ok else "❌ disabled / error"},
+            {"name": "Albums scanned",
+             "value": str(sum(prefix_stats.values()))},
+        ]
+        notify_discord_embed(
+            title="🟢 PMDA started",
+            description="All folder mappings look good – ready to scan!",
+            fields=fields
+        )
 
     logging.info("──────── diagnostic complete ─────────")
     # Simple green confirmation when no errors were encountered during the loop
