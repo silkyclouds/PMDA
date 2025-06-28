@@ -656,16 +656,46 @@ def _self_diag() -> bool:
         logging.info("• No DISCORD_WEBHOOK configured.")
 
     # ---------------------------------------------------------------------------
-    # Send a nicely formatted embed with the startup summary (if webhook works)
+    # ─── Build a richer Discord embed ------------------------------------
     if discord_ok:
+        bindings_txt = "\n".join(
+            f"`{src}` → `{dst}`"
+            for src, dst in PATH_MAP.items()
+        )
+
+        albums_txt = "\n".join(
+            f"{src}: **{cnt}**"
+            for src, cnt in prefix_stats.items()
+        )
+
         fields = [
-            {"name": "Libraries",
-             "value": ", ".join(f"{SECTION_NAMES.get(i, i)}" for i in SECTION_IDS) },
-            {"name": "OpenAI",
-             "value": "✅ working" if openai_ok else "❌ disabled / error"},
-            {"name": "Albums scanned",
-             "value": str(sum(prefix_stats.values()))},
+            {
+                "name": "Libraries",
+                "value": ", ".join(SECTION_NAMES.get(i, str(i)) for i in SECTION_IDS),
+                "inline": False,
+            },
+            {
+                "name": "Volume bindings",
+                "value": bindings_txt or "n/a",
+                "inline": False,
+            },
+            {
+                "name": "Albums per bind",
+                "value": albums_txt or "n/a",
+                "inline": False,
+            },
+            {
+                "name": "OpenAI",
+                "value": "✅ working" if openai_ok else "❌ disabled / error",
+                "inline": True,
+            },
+            {
+                "name": "Discord",
+                "value": "✅ webhook OK" if discord_ok else "❌ not configured",
+                "inline": True,
+            },
         ]
+
         notify_discord_embed(
             title="🟢 PMDA started",
             description="All folder mappings look good – ready to scan!",
