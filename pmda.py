@@ -3,7 +3,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 """
-v0.6.4 BETA
+v0.6.5
 
 Changelog:
 - added support for multiple Plex library sections via a comma-separated `SECTION_IDS`, so you can scan and dedupe across several music libraries in one run
