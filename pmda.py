@@ -1036,6 +1036,37 @@ def first_part_path(db_conn, album_id: int) -> Optional[Path]:
     r = db_conn.execute(sql, (album_id,)).fetchone()
     return container_to_host(r[0]).parent if r and container_to_host(r[0]) else None
 
+def extract_tags(audio_path: Path) -> dict[str, str]:
+    """
+    Return *all* container‑level metadata tags for the given audio file
+    (FLAC/MP3/M4A/…).
+
+    Uses ffprobe so no external Python deps are required.
+    """
+    try:
+        out = subprocess.check_output(
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format_tags",
+                "-of", "default=noprint_wrappers=1",
+                str(audio_path)
+            ],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=10
+        )
+        tags = {}
+        for line in out.splitlines():
+            if "=" in line:
+                k, v = line.split("=", 1)
+                # ffprobe returns TAG:KEY=VAL sometimes – strip the prefix
+                if k.startswith("TAG:"):
+                    k = k[4:]
+                tags[k.lower()] = v.strip()
+        return tags
+    except Exception:
+        return {}
+
 def analyse_format(folder: Path) -> tuple[int, int, int, int]:
     """
     Inspect up to **three** audio files inside *folder* and return a 4‑tuple:
@@ -1367,6 +1398,10 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
         # Count of audio files
         file_count = sum(1 for f in folder.rglob("*") if AUDIO_RE.search(f.name))
 
+        # --- metadata tags (first track only) -----------------------------
+        first_audio = next((p for p in folder.rglob("*") if AUDIO_RE.search(p.name)), None)
+        meta_tags = extract_tags(first_audio) if first_audio else {}
+
         # Mark as invalid if file_count == 0 OR all tech data are zero
         is_invalid = (file_count == 0) or (br == 0 and sr == 0 and bd == 0)
 
@@ -1396,6 +1431,7 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
             'sr':        sr,
             'bd':        bd,
             'discs':     len({t.disc for t in tr}),
+            'meta':      meta_tags,
             'invalid':   False
         })
 
