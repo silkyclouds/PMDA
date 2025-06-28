@@ -1453,45 +1453,27 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
 
     # ───────────────────────── EXACT‑MATCH PASS ──────────────────────────
     out: list[dict] = []
-    used_ids: set[int] = set()
-
     for ed_list in exact_groups.values():
-        # need at least two editions to form a “group”
+        # need at least two editions to form a group
         if len(ed_list) < 2:
             continue
 
-        # same‑album check: require ≥ OVERLAP_MIN track‑title overlap
+        # ensure significant track overlap
         common = set.intersection(*(e["titles"] for e in ed_list))
         if not all(overlap(common, e["titles"]) >= OVERLAP_MIN for e in ed_list):
             continue
 
-        # choose the winner edition
+        # pick the best edition and include all others as losers
         best = choose_best(ed_list)
-        # include all other editions as losers
         losers = [e for e in ed_list if e["album_id"] != best["album_id"]]
 
-        # send Discord embed notification for this duplicate group
-        notify_discord_embed(
-            title="Duplicate group found",
-            description=(
-                f"**{artist} – {best['title_raw']}**\n"
-                f"Versions detected: {len(ed_list)}\n"
-                f"Best: {get_primary_format(Path(best['folder']))}, "
-                f"{best['bd']}‑bit, {len(best['tracks'])} tracks."
-            ),
-            thumbnail_url=thumb_url(best["album_id"]),
-        )
-
-        # record album IDs to skip in fuzzy pass
-        used_ids.update(e["album_id"] for e in ed_list)
-
-        # append this group
+        # build the group with all versions counted (n = losers + best)
         group_data = {
-            "artist":   artist,
+            "artist": artist,
             "album_id": best["album_id"],
-            "best":     best,
-            "losers":   losers,
-            "fuzzy":    False,
+            "best": best,
+            "losers": losers,
+            "fuzzy": False,
         }
         out.append(group_data)
 
