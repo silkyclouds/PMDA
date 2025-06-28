@@ -1453,33 +1453,49 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
 
     out = []
     used_ids = set()
+
     for ed_list in exact_groups.values():
+        # need at least two editions to be a “group”
         if len(ed_list) < 2:
             continue
-        common = set.intersection(*(e['titles'] for e in ed_list))
-        if not all(overlap(common, e['titles']) >= OVERLAP_MIN for e in ed_list):
+
+        # same-album check: require ≥ 85 % overlap of shared track titles
+        common = set.intersection(*(e["titles"] for e in ed_list))
+        if not all(overlap(common, e["titles"]) >= OVERLAP_MIN for e in ed_list):
             continue
-        best = choose_best(ed_list)
-        losers = [e for e in ed_list if e is not best]
+
+        # pick the “winner” but keep *all* others as losers
+        best   = choose_best(ed_list)
+        losers = [e for e in ed_list if e["album_id"] != best["album_id"]]
+
+        # safety-net: if everything was identical choose_best() might return any
+        # of them – skip groups that would degenerate to a single edition
+        if not losers:
+            continue
+
         group_data = {
-            'artist': artist,
-            'album_id': best['album_id'],
-            'best': best,
-            'losers': losers,
-            'fuzzy': False
+            "artist":  artist,
+            "album_id": best["album_id"],
+            "best":    best,
+            "losers":  losers,
+            "fuzzy":   False,
         }
         out.append(group_data)
+
+        # — Discord notification —
         notify_discord_embed(
             title="Duplicate group found",
             description=(
                 f"**{artist} – {best['title_raw']}**\n"
-                f"Versions: {len(losers)+1}\n"
+                f"Versions detected: {len(ed_list)}\n"
                 f"Best: {get_primary_format(Path(best['folder']))}, "
-                f"{best['bd']}‑bit, {len(best['tracks'])} tracks."
+                f"{best['bd']}-bit, {len(best['tracks'])} tracks."
             ),
-            thumbnail_url=thumb_url(best['album_id'])
+            thumbnail_url=thumb_url(best["album_id"]),
         )
-        used_ids.update(e['album_id'] for e in ed_list)
+
+        # remember every album_id we’ve already processed
+        used_ids.update(e["album_id"] for e in ed_list)
 
     # --- Second pass: fuzzy match on album_norm only, for remaining editions ---
     norm_groups = defaultdict(list)
