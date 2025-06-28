@@ -1456,35 +1456,21 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
     used_ids: set[int] = set()
 
     for ed_list in exact_groups.values():
-
-        # 1) at least two editions to form a “group”
+        # need at least two editions to form a “group”
         if len(ed_list) < 2:
             continue
 
-        # 2) make sure these really are the *same* album
-        shared = set.intersection(*(e["titles"] for e in ed_list))
-        if any(overlap(shared, e["titles"]) < OVERLAP_MIN for e in ed_list):
+        # same‑album check: require ≥ OVERLAP_MIN track‑title overlap
+        common = set.intersection(*(e["titles"] for e in ed_list))
+        if not all(overlap(common, e["titles"]) >= OVERLAP_MIN for e in ed_list):
             continue
 
-        # 3) choose the “winner” but keep *all* the others
-        best   = choose_best(ed_list)
+        # choose the winner edition
+        best = choose_best(ed_list)
+        # include all other editions as losers
         losers = [e for e in ed_list if e["album_id"] != best["album_id"]]
 
-        #  If choose_best somehow returned all‑identical copies, keep the
-        #  first alternative so the UI still reports ≥ 2 versions.
-        if not losers and len(ed_list) > 1:
-            losers = [e for e in ed_list if e is not best][:1]
-
-        group_data = {
-            "artist":   artist,
-            "album_id": best["album_id"],
-            "best":     best,
-            "losers":   losers,
-            "fuzzy":    False,
-        }
-        out.append(group_data)
-
-        # 🎧 Discord notification (optional)
+        # send Discord embed notification for this duplicate group
         notify_discord_embed(
             title="Duplicate group found",
             description=(
@@ -1496,8 +1482,18 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
             thumbnail_url=thumb_url(best["album_id"]),
         )
 
-        # remember processed album IDs so the fuzzy pass can ignore them
+        # record album IDs to skip in fuzzy pass
         used_ids.update(e["album_id"] for e in ed_list)
+
+        # append this group
+        group_data = {
+            "artist":   artist,
+            "album_id": best["album_id"],
+            "best":     best,
+            "losers":   losers,
+            "fuzzy":    False,
+        }
+        out.append(group_data)
 
     # --- Second pass: fuzzy match on album_norm only, for remaining editions ---
     norm_groups = defaultdict(list)
