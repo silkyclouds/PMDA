@@ -82,6 +82,10 @@ def safe_move(src: str, dst: str):
             shutil.rmtree(src, ignore_errors=True)
         else:
             raise
+    # Final safety‑net: if *anything* is still left behind, wipe it quietly
+    if os.path.exists(src):
+        logging.warning("safe_move(): forcing removal of residual files in %s", src)
+        shutil.rmtree(src, ignore_errors=True)
 from queue import SimpleQueue
 import sys
 
@@ -551,6 +555,13 @@ def _self_diag() -> bool:
         logging.error("✗ Plex DB ERROR – %s", e)
         return False
 
+    # 0) /dupes sanity  (warn but do NOT hard‑fail)
+    if not (DUPE_ROOT.exists() and os.access(DUPE_ROOT, os.W_OK)):
+        warn = ("⚠ /dupes is missing or read‑only – PMDA can’t move duplicates.\n"
+                "👉 Please bind‑mount a writable host folder, e.g.  -v /path/on/host:/dupes")
+        logging.warning(warn)
+        notify_discord(warn)
+
     # Compute exact album counts for each PATH_MAP prefix (no sampling)
     prefix_stats: dict[str, int] = {}
     for pre in PATH_MAP:
@@ -704,7 +715,7 @@ def _self_diag() -> bool:
 
     logging.info("──────── diagnostic complete ─────────")
     # Simple green confirmation when no errors were encountered during the loop
-    if not any("✗" in r[0] or "⚠" in r[0] for r in prefix_stats.items()):
+    if (not any("✗" in k or "⚠" in k for k in prefix_stats)):
         logging.info("%s ALL mapped folders contain albums – ALL GOOD!", colour("✓", ANSI_GREEN))
     # ─── Log AI prompt for user review ─────────────────────────────────
     try:
@@ -1872,6 +1883,11 @@ def perform_dedupe(group: dict) -> List[dict]:
             logging.error("perform_dedupe(): move failed for %s → %s – %s",
                           src_folder, dst, move_err)
             continue
+
+        # warn if something prevented full deletion (e.g. Thumbs.db)
+        if src_folder.exists():
+            logging.warning("perform_dedupe(): %s was not fully removed (left‑over non‑audio files?)", src_folder)
+            notify_discord(f"⚠ Folder **{src_folder.name}** could not be fully removed (non‑audio files locked?). Check manually.")
 
         size_mb = folder_size(dst) // (1024 * 1024)
         fmt_text = loser.get("fmt_text", loser.get("fmt", ""))
