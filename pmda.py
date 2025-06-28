@@ -760,6 +760,11 @@ def init_state_db():
             PRIMARY KEY (artist, album_id)
         )
     """)
+    # Extend schema: add meta_json if missing
+    cur.execute("PRAGMA table_info(duplicates_best)")
+    cols = [r[1] for r in cur.fetchall()]
+    if "meta_json" not in cols:
+        cur.execute("ALTER TABLE duplicates_best ADD COLUMN meta_json TEXT")
     # Table for duplicate “loser” entries
     cur.execute("""
         CREATE TABLE IF NOT EXISTS duplicates_loser (
@@ -1215,8 +1220,12 @@ def choose_best(editions: List[dict]) -> dict:
             user_msg += (
                 f"{idx}: fmt_score={e['fmt_score']}, bitdepth={e['bd']}, "
                 f"tracks={len(e['tracks'])}, files={e['file_count']}, "
-                f"bitrate={e['br']}, samplerate={e['sr']}, duration={e['dur']}\n"
+                f"bitrate={e['br']}, samplerate={e['sr']}, duration={e['dur']}"
             )
+            # Add year and mbid tags from meta
+            year = e["meta"].get("date") or e["meta"].get("originaldate") or ""
+            mbid = e["meta"].get("musicbrainz_albumid","")
+            user_msg += f" year={year} mbid={mbid}\n"
 
         system_msg = (
             "You are an expert digital-music librarian. "
@@ -1293,8 +1302,8 @@ def choose_best(editions: List[dict]) -> dict:
     cur.execute("""
         INSERT OR IGNORE INTO duplicates_best
           (artist, album_id, title_raw, album_norm, folder, fmt_text,
-           br, sr, bd, dur, discs, rationale, merge_list, ai_used)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           br, sr, bd, dur, discs, rationale, merge_list, ai_used, meta_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         best["artist"],
         best["album_id"],
@@ -1310,6 +1319,7 @@ def choose_best(editions: List[dict]) -> dict:
         best.get("rationale", ""),
         json.dumps(best.get("merge_list", [])),
         int(best.get("used_ai", False)),
+        json.dumps(best.get("meta", {})),
     ))
     con.commit()
     # Persist loser editions so details modal can show all versions after restart
@@ -1530,8 +1540,8 @@ def save_scan_to_db(scan_results: Dict[str, List[dict]]):
             cur.execute("""
                 INSERT OR IGNORE INTO duplicates_best
                   (artist, album_id, title_raw, album_norm, folder,
-                   fmt_text, br, sr, bd, dur, discs, rationale, merge_list, ai_used)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   fmt_text, br, sr, bd, dur, discs, rationale, merge_list, ai_used, meta_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 artist,
                 best['album_id'],
@@ -1546,7 +1556,8 @@ def save_scan_to_db(scan_results: Dict[str, List[dict]]):
                 best['discs'],
                 best.get('rationale', ''),
                 json.dumps(best.get('merge_list', [])),
-                int(best.get('used_ai', False))
+                int(best.get('used_ai', False)),
+                json.dumps(best.get('meta', {})),
             ))
 
             # All “loser” editions
@@ -1581,6 +1592,7 @@ def load_scan_from_db() -> Dict[str, List[dict]]:
     dict
         { artist_name : [ group_dict, ... ] }
     """
+    import json
     con = sqlite3.connect(str(STATE_DB_FILE))
     cur = con.cursor()
 
@@ -1588,7 +1600,7 @@ def load_scan_from_db() -> Dict[str, List[dict]]:
     cur.execute(
         """
         SELECT artist, album_id, title_raw, album_norm, folder,
-               fmt_text, br, sr, bd, dur, discs, rationale, merge_list, ai_used
+               fmt_text, br, sr, bd, dur, discs, rationale, merge_list, ai_used, meta_json
         FROM   duplicates_best
         """
     )
@@ -1638,6 +1650,7 @@ def load_scan_from_db() -> Dict[str, List[dict]]:
         rationale,
         merge_list_json,
         ai_used,
+        meta_json,
     ) in best_rows:
 
         best_entry = {
@@ -1654,6 +1667,7 @@ def load_scan_from_db() -> Dict[str, List[dict]]:
             "rationale": rationale,
             "merge_list": json.loads(merge_list_json) if merge_list_json else [],
             "used_ai": bool(ai_used),
+            "meta": json.loads(meta_json or "{}"),
         }
 
         losers = loser_map.get((artist, aid), [])
