@@ -845,10 +845,6 @@ def plex_connect() -> sqlite3.Connection:
     con.text_factory = lambda b: b.decode("utf-8", "surrogateescape")
     return con
 
-# ─── Run connection check & self‑diagnostic only after helpers are defined ───
-_validate_plex_connection()
-if not _self_diag():
-    raise SystemExit("Self‑diagnostic failed – please fix the issues above and restart PMDA.")
 
 # ───────────────────────────────── UTILITIES ──────────────────────────────────
 def plex_api(path: str, method: str = "GET", **kw):
@@ -870,6 +866,7 @@ def notify_discord(content: str):
         logging.warning("Discord notification failed: %s", e)
 
 # ──────────────────────────────── Discord embed notification ────────────────────────────────
+
 def notify_discord_embed(title: str, description: str, thumbnail_url: str = "", fields: list[dict] | None = None):
     """
     Send a nicely formatted Discord embed so we can show album artwork
@@ -889,6 +886,11 @@ def notify_discord_embed(title: str, description: str, thumbnail_url: str = "", 
         requests.post(DISCORD_WEBHOOK, json={"embeds": [embed]}, timeout=10)
     except Exception as e:
         logging.warning("Discord embed failed: %s", e)
+
+# ─── Run connection check & self‑diagnostic only after helpers are defined ───
+_validate_plex_connection()
+if not _self_diag():
+    raise SystemExit("Self‑diagnostic failed – please fix the issues above and restart PMDA.")
 
 def container_to_host(p: str) -> Optional[Path]:
     for pre, real in PATH_MAP.items():
