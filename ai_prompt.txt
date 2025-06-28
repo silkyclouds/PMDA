@@ -18,6 +18,12 @@ Priority rules:
    - If multiple editions have mostly different remixes or bonus tracks, treat them as **different releases** and **do not** mark them as duplicates.
    - Only consider as duplicates if the majority of track content is the same or only slightly different.
 
+9. **MusicBrainz ID** (mbid):  
+   - If editions share the **same** mbid → they are the *same* release.  
+   - If mbids differ → consider them **different releases** unless all other factors (track list, bit-depth…) are identical.
+
+10. **Release year**: newer re-masters / deluxe editions (higher year) are preferred *only* when they offer better technical quality or extra tracks.
+
 Additional rule:
 
 - If two editions **have no significant overlapping tracks**, treat them as **separate releases**, not duplicates — even if they share album titles or folder names.
