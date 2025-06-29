@@ -1038,8 +1038,17 @@ def first_part_path(db_conn, album_id: int) -> Optional[Path]:
       JOIN media_parts mp ON mp.media_item_id = mi.id
       WHERE tr.parent_id = ? LIMIT 1
     """
-    r = db_conn.execute(sql, (album_id,)).fetchone()
-    return container_to_host(r[0]).parent if r and container_to_host(r[0]) else None
+    row = db_conn.execute(sql, (album_id,)).fetchone()
+    if not row:
+        return None
+
+    raw_path = row[0]
+    # Try to map to host path, fallback to container path if mapping missing
+    host_loc = container_to_host(raw_path)
+    if host_loc is None:
+        return Path(raw_path).parent
+
+    return host_loc.parent
 
 def extract_tags(audio_path: Path) -> dict[str, str]:
     """
