@@ -1395,6 +1395,7 @@ def scan_artist_duplicates(args):
     )
     album_ids = [row[0] for row in cursor.fetchall()]
     logging.debug(f"[Artist {artist_name} (ID {artist_id})] Retrieved {len(album_ids)} album IDs: {album_ids}")
+    logging.debug(f"[Artist {artist_name} (ID {artist_id})] Album list for scan: {album_ids}")
 
     groups = scan_duplicates(db_conn, artist_name, album_ids)
     db_conn.close()
@@ -1468,15 +1469,27 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
         })
 
     logging.debug(f"[Artist {artist}] Computed stats for {len(editions)} valid editions: {[e['album_id'] for e in editions]}")
+    for e in editions:
+        logging.debug(
+            f"[Artist {artist}] Edition {e['album_id']}: "
+            f"norm='{e['album_norm']}', tracks={len(e['tracks'])}, dur_ms={e['dur']}, "
+            f"files={e['file_count']}, fmt_score={e['fmt_score']}, "
+            f"br={e['br']}, sr={e['sr']}, bd={e['bd']}"
+        )
     # --- First pass: group by album_norm only ---
     from collections import defaultdict
     exact_groups = defaultdict(list)
     for e in editions:
         exact_groups[e['album_norm']].append(e)
-    logging.debug(f"[Artist {artist}] Grouping editions by normalized title: {[(e['album_norm'], [ed['album_id'] for ed in eds]) for e_norm, eds in exact_groups.items()]}")
+    logging.debug(
+        f"[Artist {artist}] Exact groups by normalized title: "
+        f"{[(norm, [ed['album_id'] for ed in eds]) for norm, eds in exact_groups.items()]}"
+    )
 
     out: list[dict] = []
     used_ids: set[int] = set()
+    for norm, ed_list in exact_groups.items():
+        logging.debug(f"[Artist {artist}] Processing exact group for norm='{norm}' with albums {[e['album_id'] for e in ed_list]}")
     for ed_list in exact_groups.values():
         if len(ed_list) < 2:
             continue
@@ -1507,6 +1520,8 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
         if e['album_id'] not in used_ids:
             norm_groups[e['album_norm']].append(e)
 
+    for norm, ed_list in norm_groups.items():
+        logging.debug(f"[Artist {artist}] Processing fuzzy group for norm='{norm}' with albums {[e['album_id'] for e in ed_list]}")
     for ed_list in norm_groups.values():
         if len(ed_list) < 2:
             continue
