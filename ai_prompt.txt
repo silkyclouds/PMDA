@@ -15,8 +15,9 @@ Priority rules:
      - If the remixer is different, **do NOT** consider it a duplicate. It is a distinct version.
      - If the remixer is the same, it can be considered a duplicate.
 8. **Singles or EPs**:
-   - If multiple editions have mostly different remixes or bonus tracks, treat them as **different releases** and **do not** mark them as duplicates.
-   - Only consider as duplicates if the majority of track content is the same or only slightly different.
+	-	Always treat multiple editions of the same single or EP as duplicates.
+	-	Group any editions sharing the same normalized album title, regardless of remixes or bonus-track differences.
+	-	Once grouped, apply the standard criteria (format, bit depth, track count, file count, bitrate, etc.) to select the best version and merge any extra tracks.
 
 9. **MusicBrainz ID** (mbid):  
    - If editions share the **same** mbid → they are the *same* release.  
