@@ -123,6 +123,12 @@ logging.basicConfig(
     handlers=handlers
 )
 
+# Suppress verbose internal debug from OpenAI and HTTP libraries
+logging.getLogger("openai").setLevel(logging.INFO)
+logging.getLogger("openai.api_requestor").setLevel(logging.INFO)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+
 # ──────────────────────────── FFmpeg sanity-check ──────────────────────────────
 # Central store for worker exceptions
 worker_errors = SimpleQueue()
@@ -1238,6 +1244,12 @@ def choose_best(editions: List[dict]) -> dict:
             mbid = e["meta"].get("musicbrainz_albumid","")
             user_msg += f" year={year} mbid={mbid}\n"
 
+        # Log concise OpenAI request summary
+        logging.info(
+            f"OpenAI request: model={OPENAI_MODEL}, max_tokens=64, "
+            f"temperature=0.0, candidate_editions={len(editions)}"
+        )
+
         system_msg = (
             "You are an expert digital-music librarian. "
             "Reply **only** with: <index>|<brief rationale>|<comma-separated extra tracks>. "
@@ -1370,6 +1382,7 @@ def scan_artist_duplicates(args):
     while scan_is_paused.is_set() and not scan_should_stop.is_set():
         time.sleep(0.5)
     logging.info(f"Processing artist: {artist_name}")
+    logging.debug(f"[Artist {artist_name} (ID {artist_id})] Fetching album IDs from Plex DB")
     logging.debug(
         f"scan_artist_duplicates(): start '{artist_name}' (ID {artist_id})"
     )
@@ -1393,17 +1406,19 @@ def scan_artist_duplicates(args):
         (artist_id, *SECTION_IDS)
     )
     album_ids = [row[0] for row in cursor.fetchall()]
+    logging.debug(f"[Artist {artist_name} (ID {artist_id})] Retrieved {len(album_ids)} album IDs: {album_ids}")
+    logging.debug(f"[Artist {artist_name} (ID {artist_id})] Album list for scan: {album_ids}")
 
     groups = scan_duplicates(db_conn, artist_name, album_ids)
     db_conn.close()
 
     logging.debug(
-        f"scan_artist_duplicates(): done '{artist_name}' – "
-        f"{len(groups)} groups, {len(album_ids)} albums"
+        f"scan_artist_duplicates(): done Artist {artist_name} (ID {artist_id}) – {len(groups)} groups, {len(album_ids)} albums"
     )
     return (artist_name, groups, len(album_ids))
 
 def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
+    logging.debug(f"[Artist {artist}] Starting duplicate scan for album IDs: {album_ids}")
     editions = []
     for aid in album_ids:
         if scan_should_stop.is_set():
@@ -1465,20 +1480,36 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
             'invalid':   False
         })
 
+    logging.debug(f"[Artist {artist}] Computed stats for {len(editions)} valid editions: {[e['album_id'] for e in editions]}")
+    for e in editions:
+        logging.debug(
+            f"[Artist {artist}] Edition {e['album_id']}: "
+            f"norm='{e['album_norm']}', tracks={len(e['tracks'])}, dur_ms={e['dur']}, "
+            f"files={e['file_count']}, fmt_score={e['fmt_score']}, "
+            f"br={e['br']}, sr={e['sr']}, bd={e['bd']}"
+        )
     # --- First pass: group by album_norm only ---
     from collections import defaultdict
     exact_groups = defaultdict(list)
     for e in editions:
         exact_groups[e['album_norm']].append(e)
+    logging.debug(
+        f"[Artist {artist}] Exact groups by normalized title: "
+        f"{[(norm, [ed['album_id'] for ed in eds]) for norm, eds in exact_groups.items()]}"
+    )
 
     out: list[dict] = []
     used_ids: set[int] = set()
+    for norm, ed_list in exact_groups.items():
+        logging.debug(f"[Artist {artist}] Processing exact group for norm='{norm}' with albums {[e['album_id'] for e in ed_list]}")
     for ed_list in exact_groups.values():
         if len(ed_list) < 2:
             continue
+        logging.debug(f"[Artist {artist}] Exact group members: {[e['album_id'] for e in ed_list]}")
         # Choose best across all identical normalized titles
         best = choose_best(ed_list)
         losers = [e for e in ed_list if e['album_id'] != best['album_id']]
+        logging.debug(f"[Artist {artist}] Exact grouping selected best {best['album_id']}, losers { [e['album_id'] for e in losers] }")
         if not losers:
             continue
 
@@ -1501,15 +1532,19 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
         if e['album_id'] not in used_ids:
             norm_groups[e['album_norm']].append(e)
 
+    for norm, ed_list in norm_groups.items():
+        logging.debug(f"[Artist {artist}] Processing fuzzy group for norm='{norm}' with albums {[e['album_id'] for e in ed_list]}")
     for ed_list in norm_groups.values():
         if len(ed_list) < 2:
             continue
+        logging.debug(f"[Artist {artist}] Fuzzy group members: {[e['album_id'] for e in ed_list]}")
         # Only perform fuzzy grouping via AI; skip if no API key
         if not OPENAI_API_KEY:
             continue
         # Force AI selection for fuzzy groups
         best = choose_best(ed_list)
         losers = [e for e in ed_list if e is not best]
+        logging.debug(f"[Artist {artist}] Fuzzy grouping selected best {best['album_id']}, losers { [e['album_id'] for e in losers] }")
         group_data = {
             'artist': artist,
             'album_id': best['album_id'],
