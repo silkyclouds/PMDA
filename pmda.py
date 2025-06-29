@@ -1465,35 +1465,23 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
             'invalid':   False
         })
 
-    # --- First pass: exact match on (album_norm, sig) ---
+    # --- First pass: group by album_norm only ---
     from collections import defaultdict
     exact_groups = defaultdict(list)
     for e in editions:
-        exact_groups[(e['album_norm'], e['sig'])].append(e)
+        exact_groups[e['album_norm']].append(e)
 
-    # ───────────────────────── EXACT‑MATCH PASS ──────────────────────────
     out: list[dict] = []
-    # track which album_ids have been grouped exactly
     used_ids: set[int] = set()
     for ed_list in exact_groups.values():
-        # need at least two editions to form a group
         if len(ed_list) < 2:
             continue
-
-        # require ≥ OVERLAP_MIN overlap of track titles
-        common = set.intersection(*(e["titles"] for e in ed_list))
-        if not all(overlap(common, e["titles"]) >= OVERLAP_MIN for e in ed_list):
-            continue
-
-        # pick the best edition and mark all others as losers
+        # Choose best across all identical normalized titles
         best = choose_best(ed_list)
-        losers = [e for e in ed_list if e["album_id"] != best["album_id"]]
-
-        # skip if no actual duplicates
+        losers = [e for e in ed_list if e['album_id'] != best['album_id']]
         if not losers:
             continue
 
-        # build the group including every duplicate
         group_data = {
             "artist":  artist,
             "album_id": best["album_id"],
@@ -1502,9 +1490,10 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
             "fuzzy":   False,
         }
         out.append(group_data)
+        used_ids.update(e['album_id'] for e in ed_list)
 
-        # remember which album_ids we've already grouped
-        used_ids.update(e["album_id"] for e in ed_list)
+    # Filter out editions already grouped exactly so fuzzy pass only sees the rest
+    editions = [e for e in editions if e['album_id'] not in used_ids]
 
     # --- Second pass: fuzzy match on album_norm only, for remaining editions ---
     norm_groups = defaultdict(list)
