@@ -1180,11 +1180,13 @@ def analyse_format(folder: Path) -> tuple[int, int, int, int]:
 
 # ───────────────────────────────── DUPLICATE DETECTION ─────────────────────────────────
 def signature(tracks: List[Track]) -> tuple:
-    """
-    Include track duration so that two albums with identical titles but
-    different durations are NOT grouped. Each tuple is (disc, idx, title, dur).
-    """
-    return tuple(sorted((t.disc, t.idx, t.title, t.dur) for t in tracks))
+    # round durations to seconds before grouping
+    return tuple(sorted((
+        t.disc,
+        t.idx,
+        t.title,
+        int(round(t.dur/1000))
+    ) for t in tracks))
 
 def overlap(a: set, b: set) -> float:
     return len(a & b) / max(len(a), len(b))
