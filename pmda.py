@@ -1374,14 +1374,23 @@ def scan_artist_duplicates(args):
 
     db_conn = plex_connect()
 
-    album_ids = [
-        row[0]
-        for row in db_conn.execute(
-            "SELECT id FROM metadata_items "
-            "WHERE metadata_type=9 AND parent_id=?",
-            (artist_id,),
-        )
-    ]
+    # Fetch all album IDs for this artist, grouping by media parts exactly as in your sqlite query
+    placeholders = ",".join("?" for _ in SECTION_IDS)
+    cursor = db_conn.execute(
+        f"""
+        SELECT alb.id
+        FROM metadata_items alb
+        JOIN metadata_items tr  ON tr.parent_id      = alb.id
+        JOIN media_items      mi ON mi.metadata_item_id = tr.id
+        JOIN media_parts      mp ON mp.media_item_id = mi.id
+        WHERE alb.metadata_type = 9
+          AND alb.parent_id = ?
+          AND alb.library_section_id IN ({placeholders})
+        GROUP BY alb.id
+        """,
+        (artist_id, *SECTION_IDS)
+    )
+    album_ids = [row[0] for row in cursor.fetchall()]
 
     groups = scan_duplicates(db_conn, artist_name, album_ids)
     db_conn.close()
