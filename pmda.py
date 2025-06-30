@@ -45,6 +45,7 @@ ANSI_BOLD   = "\033[1m"
 ANSI_GREEN  = "\033[92m"
 ANSI_YELLOW = "\033[93m"
 ANSI_CYAN   = "\033[96m"
+ANSI_RED    = "\033[91m"
 
 def log_header(title: str) -> None:
     """Print a bold cyan header like `----- TITLE -----`."""
@@ -1481,6 +1482,28 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
         })
 
     logging.debug(f"[Artist {artist}] Computed stats for {len(editions)} valid editions: {[e['album_id'] for e in editions]}")
+    # Alert when albums exist in Plex DB but no files found on filesystem
+    if album_ids and not editions:
+        warn_msg = (
+            f"[Artist {artist}] No valid files found on filesystem "
+            f"for {len(album_ids)} albums detected in Plex DB. "
+            "Check your PATH_MAP or container volume bindings!"
+        )
+        logging.warning(warn_msg)
+        notify_discord(warn_msg)
+        # Prominent log message in red and bold at INFO level
+        big_warn = colour(
+            f"[Artist {artist}] NO FILES FOUND for {len(album_ids)} albums! "
+            "Please check your PATH_MAP and volume bindings!",
+            ANSI_BOLD + ANSI_RED
+        )
+        logging.info("\n%s\n", big_warn)
+    elif album_ids and editions:
+        ok_msg = colour(
+            f"[Artist {artist}] FOUND {len(editions)} valid file editions on filesystem for {len(album_ids)} albums. PATH_MAP and volume bindings appear correct!",
+            ANSI_BOLD + ANSI_GREEN
+        )
+        logging.info("\n%s\n", ok_msg)
     for e in editions:
         logging.debug(
             f"[Artist {artist}] Edition {e['album_id']}: "
