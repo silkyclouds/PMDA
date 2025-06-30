@@ -56,6 +56,41 @@ from urllib.parse import quote_plus
 import requests
 import musicbrainzngs
 
+# ──────────────── MusicBrainz batch fetch helper and ETA state ────────────────
+import math
+
+# Module-level variables for ETA calculation
+_scan_start_time: float | None = None
+_albums_processed: int = 0
+
+def fetch_mb_release_group_info_batch(mbids: list[str]) -> None:
+    """
+    Fetch up to 20 release-groups from MusicBrainz in one HTTP request
+    and cache each result.
+    """
+    if not mbids:
+        return
+    params = [("fmt", "json"), ("inc", "media")] + [("release-group", mbid) for mbid in mbids]
+    url = "https://musicbrainz.org/ws/2/release-group"
+    try:
+        resp = requests.get(url, params=params,
+                            headers={"User-Agent": "PMDA/0.6.5 ( pmda@example.com )"},
+                            timeout=10)
+        resp.raise_for_status()
+        data = resp.json().get("release-group-list", [])
+        for entry in data:
+            info = {
+                "primary_type": entry.get("primary-type", ""),
+                "secondary_types": entry.get("secondary-type-list", []) or [],
+                "format_summary": ", ".join(
+                    f"{m.get('track-count',1)}×{m.get('format')}"
+                    for m in entry.get("media", []) if m.get("format")
+                )
+            }
+            set_cached_mb_info(entry["id"], info)
+    except Exception as e:
+        logging.debug(f"[MusicBrainz Batch] error fetching batch {mbids}: {e}")
+
 # Configure MusicBrainz NGS client
 musicbrainzngs.set_useragent(
     "PMDA",               # application name
@@ -1684,49 +1719,56 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
     if not USE_MUSICBRAINZ:
         logging.debug(f"[Artist {artist}] Skipping MusicBrainz enrichment (USE_MUSICBRAINZ=False).")
     else:
-        # ─── MusicBrainz enrichment & Box Set handling ─────────────────────────────
-        # Enrich using any available MusicBrainz ID tags (in priority order)
-        id_tags = [
-            'musicbrainz_releasegroupid',
-            'musicbrainz_releaseid',
-            'musicbrainz_originalreleaseid',
-            'musicbrainz_albumid'
-        ]
+        # Initialize ETA timer
+        global _scan_start_time, _albums_processed
+        total = len(album_ids)
+        if _scan_start_time is None:
+            _scan_start_time = time.time()
+        _albums_processed = 0
+
+        # Collect all MBIDs from editions metadata
+        id_tags = ['musicbrainz_releasegroupid', 'musicbrainz_releaseid',
+                   'musicbrainz_originalreleaseid', 'musicbrainz_albumid']
+        mbids = set()
         for e in editions:
-            meta = e.get('meta', {})
-            rg_info = None
             for tag in id_tags:
-                mbid = meta.get(tag)
-                if not mbid:
-                    continue
-                try:
-                    if tag == 'musicbrainz_releasegroupid':
-                        # direct lookup of release-group
-                        rg_info = fetch_mb_release_group_info(mbid)
-                    else:
-                        # lookup release to derive its release-group ID
-                        rel = musicbrainzngs.get_release_by_id(mbid, includes=['release-group'])['release']
-                        rgid = rel['release-group']['id']
-                        rg_info = fetch_mb_release_group_info(rgid)
-                    logging.debug(f"[Artist {artist}] Edition {e['album_id']} RG info (via {tag} {mbid}): {rg_info}")
-                    break
-                except Exception as exc:
-                    logging.debug(f"[Artist {artist}] MusicBrainz lookup failed for {tag} ({mbid}): {exc}")
-            if rg_info:
-                e['rg_info_source'] = tag
-            # fallback: search by metadata if no ID tag yielded results
-            album_norm = e['album_norm']
-            tracks = {t.title for t in e['tracks']}
-            if not rg_info:
+                mbid = e['meta'].get(tag)
+                if mbid:
+                    mbids.add(mbid)
+        mbid_list = list(mbids)
+        # Batch fetch MB info in chunks of 20
+        for i in range(0, len(mbid_list), 20):
+            fetch_mb_release_group_info_batch(mbid_list[i:i+20])
+
+        # Inject cached info and compute ETA per album
+        for e in editions:
+            # assign RG info from cache if available
+            for tag in id_tags:
+                mbid = e['meta'].get(tag)
+                if mbid:
+                    cached = get_cached_mb_info(mbid)
+                    if cached:
+                        e['rg_info'] = cached
+                        e['rg_info_source'] = tag
+                        break
+            # fallback search if no rg_info
+            if 'rg_info' not in e:
+                album_norm = e['album_norm']
+                tracks = {t.title for t in e['tracks']}
                 rg_info = search_mb_release_group_by_metadata(artist, album_norm, tracks)
                 if rg_info:
+                    e['rg_info'] = rg_info
                     e['rg_info_source'] = 'fallback'
-                    logging.debug(f"[Artist {artist}] Edition {e['album_id']} RG info (search fallback): {rg_info}")
-                else:
-                    logging.debug(f"[Artist {artist}] No RG info found via search for '{album_norm}'")
-            if rg_info:
-                e['rg_info'] = rg_info
-        # --- MusicBrainz enrichment summary ---
+            # Update ETA
+            _albums_processed += 1
+            elapsed = time.time() - _scan_start_time
+            avg = elapsed / _albums_processed if _albums_processed else 0
+            remaining = total - _albums_processed
+            eta = remaining * avg
+            eta_str = time.strftime("%H:%M:%S", time.gmtime(eta))
+            logging.info(f"[{artist}] Albums {_albums_processed}/{total} – ETA remaining: {eta_str}")
+
+        # Summary log
         direct = sum(1 for e in editions if 'rg_info' in e and e.get('rg_info_source') in id_tags)
         fallback = sum(1 for e in editions if 'rg_info' in e and e.get('rg_info_source') == 'fallback')
         missing = sum(1 for e in editions if 'rg_info' not in e)
