@@ -22,7 +22,7 @@ no_file_streak_global = 0
 popup_displayed = False
 
 """
-v0.6.5
+v0.6.6
 
 Changelog:
 - added support for multiple Plex library sections via a comma-separated `SECTION_IDS`, so you can scan and dedupe across several music libraries in one run
@@ -1068,6 +1068,12 @@ def build_cards() -> list[dict]:
     for artist, groups in state["duplicates"].items():
         for g in groups:
             best = g["best"]
+            # Ensure "date" is present in each version for modal rendering
+            if "meta" in best:
+                best["date"] = best["meta"].get("date") or best["meta"].get("originaldate") or ""
+            for l in g.get("losers", []):
+                if "meta" in l:
+                    l["date"] = l["meta"].get("date") or l["meta"].get("originaldate") or ""
             best_fmt = best.get("fmt_text") or get_primary_format(Path(best["folder"]))
             cards.append(
                 {
@@ -1087,6 +1093,32 @@ def build_cards() -> list[dict]:
                 }
             )
     return cards
+@app.route("/api/edition_details")
+def edition_details():
+    album_id = int(request.args["album_id"])
+    folder   = Path(request.args["folder"])
+    tracks   = get_tracks(plex_connect(), album_id)
+    info = analyse_format(folder)
+    html = render_template_string(
+        "{% for t in tracks %}<div>{{'%02d' % t.idx}}. {{t.title}} – {{'%.2f' % (t.dur/60000)}} min</div>{% endfor %}"
+        "<hr><pre>{{info}}</pre>",
+        tracks=tracks,
+        info=info
+    )
+    return jsonify({"html": html})
+
+@app.route("/api/dedupe_manual", methods=["POST"])
+def dedupe_manual():
+    req = request.get_json(force=True)
+    for item in req:
+        # reuse existing purge logic
+        _purge_invalid_edition({
+            "folder"   : item["folder"],
+            "artist"   : "",           # not needed for purge
+            "title_raw": "",
+            "album_id" : int(item["album_id"])
+        })
+    return jsonify({"status":"ok"})
 
 # ───────────────────────────────── DATABASE HELPERS ──────────────────────────────────
 class Track(NamedTuple):
