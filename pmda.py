@@ -1270,7 +1270,7 @@ def search_mb_release_group_by_metadata(artist: str, album_norm: str, tracks: se
     """
     try:
         # search release-groups by artist and release title
-        result = musicbrainzngs.search_release_group(
+        result = musicbrainzngs.search_release_groups(
             artist=artist,
             release=album_norm,
             limit=5,
@@ -1308,7 +1308,7 @@ def search_mb_release_group_by_metadata(artist: str, album_norm: str, tracks: se
             except musicbrainzngs.WebServiceError:
                 continue
     except Exception as e:
-        logging.debug(f"[MusicBrainz Search] failed for '{artist}' / '{album_norm}': {e}")
+        logging.debug(f"[MusicBrainz Search Groups] failed for '{artist}' / '{album_norm}': {e}")
     return None
 
 def choose_best(editions: List[dict]) -> dict:
