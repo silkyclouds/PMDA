@@ -1,14 +1,14 @@
- # Maximum consecutive artists with no valid files before aborting scan
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+import logging
+
+# Maximum consecutive artists with no valid files before aborting scan
 NO_FILE_THRESHOLD = 10
 # Global counter for consecutive no-file artists
 no_file_streak_global = 0
 # Track whether the no‑files popup has been shown to avoid duplicates
 popup_displayed = False
-
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-from __future__ import annotations
-import logging
 
 """
 v0.6.5
