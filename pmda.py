@@ -35,6 +35,14 @@ from urllib.parse import quote_plus
 
 
 import requests
+import musicbrainzngs
+
+# Configure MusicBrainz NGS client
+musicbrainzngs.set_useragent(
+    "PMDA",               # application name
+    "0.6.5",              # application version
+    "pmda@example.com"    # contact / support email
+)
 import xml.etree.ElementTree as ET
 import openai
 import unittest
@@ -1201,25 +1209,41 @@ def overlap(a: set, b: set) -> float:
 def fetch_mb_release_group_info(mbid: str) -> dict:
     """
     Fetch primary type, secondary-types, and media format summary from MusicBrainz release-group.
+    Uses musicbrainzngs for proper rate-limiting and parsing.
     """
-    url = f"https://musicbrainz.org/ws/2/release-group/{mbid}?fmt=json&inc=releases"
-    headers = {"User-Agent": "PMDA/0.6.5 ( pmda@example.com )"}
-    resp = requests.get(url, headers=headers, timeout=10)
-    resp.raise_for_status()
-    data = resp.json()
-    primary = data.get("primary-type", "")
-    secondary = data.get("secondary-types", [])
-    releases = data.get("releases", [])
-    formats = []
-    for rel in releases:
-        for media in rel.get("media", []):
-            fmt = media.get("format")
-            qty = media.get("quantity")
-            if fmt and qty:
-                formats.append(f"{qty}×{fmt}")
-    unique_formats = sorted(set(formats))
-    format_summary = ", ".join(unique_formats)
-    return {"primary_type": primary, "secondary_types": secondary, "format_summary": format_summary}
+    try:
+        # Query release-group with all media details
+        result = musicbrainzngs.get_release_group_by_id(
+            mbid,
+            includes=["releases", "media"]
+        )["release-group"]
+    except musicbrainzngs.WebServiceError as e:
+        raise RuntimeError(f"MusicBrainz lookup failed for {mbid}: {e}") from None
+
+    primary = result.get("primary-type", "")
+    secondary = result.get("secondary-types", [])
+    formats = set()
+
+    # Each release may have multiple medium entries
+    for release in result.get("releases", []):
+        for medium in release.get("media", []):
+            fmt = medium.get("format")
+            qty = medium.get("track-count") or medium.get("position") or medium.get("discs-count") or medium.get("count")
+            # Some media entries include 'track-count' and 'format'
+            if fmt:
+                # quantity fallback: if medium["discs"] is present
+                if isinstance(medium.get("format"), str):
+                    quantity = medium.get("track-count", 1)
+                else:
+                    quantity = 1
+                formats.add(f"{quantity}×{fmt}")
+
+    format_summary = ", ".join(sorted(formats))
+    return {
+        "primary_type": primary,
+        "secondary_types": secondary,
+        "format_summary": format_summary
+    }
 
 def choose_best(editions: List[dict]) -> dict:
     """
