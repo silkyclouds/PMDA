@@ -1616,7 +1616,7 @@ def scan_artist_duplicates(args):
 
 
 def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
-    global no_file_streak_global
+    global no_file_streak_global, popup_displayed, gui
     logging.debug(f"[Artist {artist}] Starting duplicate scan for album IDs: {album_ids}")
     editions = []
     for aid in album_ids:
