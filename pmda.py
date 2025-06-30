@@ -4,7 +4,14 @@
 from __future__ import annotations
 import logging
 
-import gui
+try:
+    import gui
+except ModuleNotFoundError:
+    # Fallback GUI stub: define display_popup
+    class gui:
+        @staticmethod
+        def display_popup(message: str):
+            logging.error(f"[GUI POPUP] {message}")
 """
 v0.6.5
 
