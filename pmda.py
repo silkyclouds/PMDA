@@ -3,6 +3,17 @@
 from __future__ import annotations
 import logging
 
+# --- GUI fallback stub for display_popup ---------------------------------------
+try:
+    import gui
+except ModuleNotFoundError:
+    # Fallback GUI stub if real gui module is missing
+    class gui:
+        @staticmethod
+        def display_popup(message: str):
+            # In headless mode, log the popup message as an error
+            logging.error(f"[GUI POPUP] {message}")
+
 # Maximum consecutive artists with no valid files before aborting scan
 NO_FILE_THRESHOLD = 10
 # Global counter for consecutive no-file artists
