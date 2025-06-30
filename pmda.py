@@ -681,6 +681,23 @@ def _self_diag() -> bool:
     else:
         logging.info("• No DISCORD_WEBHOOK configured.")
 
+    # --- MusicBrainz connectivity check --------------------------------------
+    try:
+        mb_resp = requests.get(
+            "https://musicbrainz.org/ws/2/?fmt=json",
+            timeout=5,
+            headers={"User-Agent": "PMDA/0.6.5 ( pmda@example.com )"}
+        )
+        if mb_resp.status_code == 200:
+            logging.info("✓ MusicBrainz reachable – status HTTP %s", mb_resp.status_code)
+        else:
+            logging.warning(
+                "⚠️ MusicBrainz returned HTTP %s – check network or MusicBrainz uptime",
+                mb_resp.status_code
+            )
+    except Exception as e:
+        logging.warning("⚠️ MusicBrainz connectivity failed – %s", e)
+
     # ---------------------------------------------------------------------------
     # ─── Build a richer Discord embed ------------------------------------
     if discord_ok:
