@@ -477,7 +477,7 @@ merged = {
     "OPENAI_API_KEY": _get("OPENAI_API_KEY", default="",                                cast=str),
     "OPENAI_MODEL":   _get("OPENAI_MODEL",   default="gpt-4",                           cast=str),
     "DISCORD_WEBHOOK": _get("DISCORD_WEBHOOK", default="", cast=str),
-    "USE_MUSICBRAINZ": _get("USE_MUSICBRAINZ", default=True, cast=_parse_bool),
+    "USE_MUSICBRAINZ": _get("USE_MUSICBRAINZ", default=False, cast=_parse_bool),
 }
 # Always use the auto‑generated PATH_MAP from config.json
 merged["PATH_MAP"] = conf.get("PATH_MAP", {})
