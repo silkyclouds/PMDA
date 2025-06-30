@@ -1262,6 +1262,55 @@ def fetch_mb_release_group_info(mbid: str) -> dict:
         "format_summary": format_summary
     }
 
+# ──────────────────────────────── MusicBrainz search fallback ────────────────────────────────
+def search_mb_release_group_by_metadata(artist: str, album_norm: str, tracks: set[str]) -> dict | None:
+    """
+    Fallback search on MusicBrainz by artist name, normalized album title, and optional track titles.
+    Returns the release-group info dict or None if not found.
+    """
+    try:
+        # search release-groups by artist and release title
+        result = musicbrainzngs.search_release_group(
+            artist=artist,
+            release=album_norm,
+            limit=5,
+            strict=True
+        )
+        candidates = result.get('release-group-list', [])
+        # optionally refine by track count if available
+        for rg in candidates:
+            # fetch details for each candidate
+            try:
+                info = musicbrainzngs.get_release_group_by_id(
+                    rg['id'], includes=['media']
+                )['release-group']
+                # compare track counts if we have track list
+                mb_track_count = sum(
+                    medium.get('track-count', 0)
+                    for release in rg.get('release-list', [])
+                    for medium in release.get('medium-list', [])
+                )
+                if not tracks or abs(len(tracks) - mb_track_count) <= 1:
+                    # build summary
+                    formats = set()
+                    for release in rg.get('release-list', []):
+                        for medium in release.get('medium-list', []):
+                            fmt = medium.get('format')
+                            qty = medium.get('track-count', 1)
+                            if fmt:
+                                formats.add(f"{qty}×{fmt}")
+                    return {
+                        'primary_type': info.get('primary-type', ''),
+                        'secondary_types': info.get('secondary-types', []),
+                        'format_summary': ', '.join(sorted(formats)),
+                        'id': rg['id']
+                    }
+            except musicbrainzngs.WebServiceError:
+                continue
+    except Exception as e:
+        logging.debug(f"[MusicBrainz Search] failed for '{artist}' / '{album_norm}': {e}")
+    return None
+
 def choose_best(editions: List[dict]) -> dict:
     """
     Selects the best edition either via OpenAI (when an API key is provided) or via a local heuristic, re‑using any existing AI cache first.
@@ -1557,20 +1606,32 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
     logging.debug(f"[Artist {artist}] Computed stats for {len(editions)} valid editions: {[e['album_id'] for e in editions]}")
 
     # ─── MusicBrainz enrichment & Box Set handling ─────────────────────────────
-    # Fetch MusicBrainz release-group info for every edition
+    # Fetch MusicBrainz release-group info for every edition, with fallback search
     for e in editions:
+        artist = e['artist']
+        album_norm = e['album_norm']
+        tracks = {t.title for t in e['tracks']}
         mbid = e['meta'].get('musicbrainz_albumid')
+        rg_info = None
+
+        # first, try direct lookup
         if mbid:
             try:
-                e['rg_info'] = fetch_mb_release_group_info(mbid)
-                logging.debug(
-                    f"[Artist {artist}] Edition {e['album_id']} MusicBrainz RG info: "
-                    f"primary_type={e['rg_info']['primary_type']}, "
-                    f"secondary_types={e['rg_info']['secondary_types']}, "
-                    f"format_summary={e['rg_info']['format_summary']}"
-                )
-            except Exception as mb_e:
-                logging.debug(f"[Artist {artist}] MusicBrainz lookup failed for {mbid}: {mb_e}")
+                rg_info = fetch_mb_release_group_info(mbid)
+                logging.debug(f"[Artist {artist}] Edition {e['album_id']} RG info (direct MBID): {rg_info}")
+            except Exception:
+                logging.debug(f"[Artist {artist}] Direct MB lookup failed for {mbid}, falling back to search")
+
+        # fallback: search by metadata
+        if not rg_info:
+            rg_info = search_mb_release_group_by_metadata(artist, album_norm, tracks)
+            if rg_info:
+                logging.debug(f"[Artist {artist}] Edition {e['album_id']} RG info (search): {rg_info}")
+            else:
+                logging.debug(f"[Artist {artist}] No RG info found via search for '{album_norm}'")
+
+        if rg_info:
+            e['rg_info'] = rg_info
 
     # Detect and collapse Box Set discs (skip as duplicates)
     from collections import defaultdict
