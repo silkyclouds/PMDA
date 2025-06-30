@@ -1,17 +1,15 @@
+ # Maximum consecutive artists with no valid files before aborting scan
+NO_FILE_THRESHOLD = 10
+# Global counter for consecutive no-file artists
+no_file_streak_global = 0
+# Track whether the no‑files popup has been shown to avoid duplicates
+popup_displayed = False
 
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 import logging
 
-try:
-    import gui
-except ModuleNotFoundError:
-    # Fallback GUI stub: define display_popup
-    class gui:
-        @staticmethod
-        def display_popup(message: str):
-            logging.error(f"[GUI POPUP] {message}")
 """
 v0.6.5
 
@@ -1571,8 +1569,6 @@ def scan_artist_duplicates(args):
         f"scan_artist_duplicates(): start '{artist_name}' (ID {artist_id})"
     )
 
-    # --- Streak counter for no file editions ---
-    no_file_streak = 0
 
     db_conn = plex_connect()
 
@@ -1599,7 +1595,7 @@ def scan_artist_duplicates(args):
     groups = []
     # Only call scan_duplicates if there are album_ids
     if album_ids:
-        groups = scan_duplicates_with_streak(db_conn, artist_name, album_ids, no_file_streak)
+        groups = scan_duplicates(db_conn, artist_name, album_ids)
     db_conn.close()
 
     logging.debug(
@@ -1608,16 +1604,8 @@ def scan_artist_duplicates(args):
     return (artist_name, groups, len(album_ids))
 
 
-# Wrapper for scan_duplicates to handle no_file_streak logic
-def scan_duplicates_with_streak(db_conn, artist_name: str, album_ids: list, no_file_streak: int):
-    """
-    Calls scan_duplicates and manages the no_file_streak counter and error popup logic.
-    """
-    # The logic for editions and file streak is handled inside scan_duplicates
-    # so just delegate
-    return scan_duplicates(db_conn, artist_name, album_ids, no_file_streak=no_file_streak)
-
-def scan_duplicates(db_conn, artist: str, album_ids: List[int], no_file_streak: int = 0) -> List[dict]:
+def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
+    global no_file_streak_global
     logging.debug(f"[Artist {artist}] Starting duplicate scan for album IDs: {album_ids}")
     editions = []
     for aid in album_ids:
@@ -1754,7 +1742,7 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int], no_file_streak: 
     # --- NO FILES HANDLING ---
     if editions:
         # Reset streak on success
-        no_file_streak = 0
+        no_file_streak_global = 0
         ok_msg = colour(
             f"[Artist {artist}] FOUND {len(editions)} valid file editions on filesystem for {len(album_ids)} albums. PATH_MAP and volume bindings appear correct!",
             ANSI_BOLD + ANSI_GREEN
@@ -1762,18 +1750,24 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int], no_file_streak: 
         logging.info("\n%s\n", ok_msg)
     else:
         # No valid editions found
-        no_file_streak += 1
+        no_file_streak_global += 1
         logger = logging.getLogger()
         logger.error(f"[Artist {artist}] FOUND 0 valid file editions on filesystem!")
         notify_discord = globals().get("notify_discord", None)
         if notify_discord:
             notify_discord(f"No files found for {artist}.")
-        gui.display_popup(
-            f"PMDA didn't find any files for {no_file_streak} artist(s) in a row during the scan. "
-            "It indicates your files are not reachable from inside the container! "
-            "Please check your volume bindings."
-        )
-        # Stop the scan immediately after showing the popup
+        global popup_displayed
+        if no_file_streak_global >= NO_FILE_THRESHOLD:
+            if not popup_displayed:
+                gui.display_popup(
+                    f"PMDA didn't find any files for {NO_FILE_THRESHOLD} artists in a row. "
+                    "Aborting scan. Files appear unreachable from inside the container; "
+                    "please check your volume bindings."
+                )
+                popup_displayed = True
+            scan_should_stop.set()
+            return []
+        # Below threshold, do not show repeated popups -- let scan continue or fail silently
         return []
     for e in editions:
         logging.debug(
