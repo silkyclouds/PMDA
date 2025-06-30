@@ -22,7 +22,7 @@ no_file_streak_global = 0
 popup_displayed = False
 
 """
-v0.6.6
+v0.6.5
 
 Changelog:
 - added support for multiple Plex library sections via a comma-separated `SECTION_IDS`, so you can scan and dedupe across several music libraries in one run
@@ -120,6 +120,8 @@ import sys
 
 
 from flask import Flask, render_template_string, request, jsonify
+
+app = Flask(__name__)
 
 # Ensure LOG_LEVEL and LOG_FILE exist for initial logging setup
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -1594,7 +1596,6 @@ def choose_best(editions: List[dict]) -> dict:
     return best
     # Check for any other literal uses of the French header and replace
     # (This is for the extremely rare case where it appears elsewhere in this function.)
-app = Flask(__name__)
 
 def scan_artist_duplicates(args):
     """
