@@ -3,6 +3,8 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 import logging
+
+import gui
 """
 v0.6.5
 
@@ -1562,6 +1564,9 @@ def scan_artist_duplicates(args):
         f"scan_artist_duplicates(): start '{artist_name}' (ID {artist_id})"
     )
 
+    # --- Streak counter for no file editions ---
+    no_file_streak = 0
+
     db_conn = plex_connect()
 
     # Fetch all album IDs for this artist, grouping by media parts exactly as in your sqlite query
@@ -1584,7 +1589,10 @@ def scan_artist_duplicates(args):
     logging.debug(f"[Artist {artist_name} (ID {artist_id})] Retrieved {len(album_ids)} album IDs: {album_ids}")
     logging.debug(f"[Artist {artist_name} (ID {artist_id})] Album list for scan: {album_ids}")
 
-    groups = scan_duplicates(db_conn, artist_name, album_ids)
+    groups = []
+    # Only call scan_duplicates if there are album_ids
+    if album_ids:
+        groups = scan_duplicates_with_streak(db_conn, artist_name, album_ids, no_file_streak)
     db_conn.close()
 
     logging.debug(
@@ -1592,7 +1600,17 @@ def scan_artist_duplicates(args):
     )
     return (artist_name, groups, len(album_ids))
 
-def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
+
+# Wrapper for scan_duplicates to handle no_file_streak logic
+def scan_duplicates_with_streak(db_conn, artist_name: str, album_ids: list, no_file_streak: int):
+    """
+    Calls scan_duplicates and manages the no_file_streak counter and error popup logic.
+    """
+    # The logic for editions and file streak is handled inside scan_duplicates
+    # so just delegate
+    return scan_duplicates(db_conn, artist_name, album_ids, no_file_streak=no_file_streak)
+
+def scan_duplicates(db_conn, artist: str, album_ids: List[int], no_file_streak: int = 0) -> List[dict]:
     logging.debug(f"[Artist {artist}] Starting duplicate scan for album IDs: {album_ids}")
     editions = []
     for aid in album_ids:
@@ -1726,28 +1744,30 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
             ))
         # Exclude all Box Set disc folders from further duplicate grouping
         editions = [e for e in editions if e['folder'].parent not in box_set_groups]
-    # Alert when albums exist in Plex DB but no files found on filesystem
-    if album_ids and not editions:
-        warn_msg = (
-            f"[Artist {artist}] No valid files found on filesystem "
-            f"for {len(album_ids)} albums detected in Plex DB. "
-            "Check your PATH_MAP or container volume bindings!"
-        )
-        logging.warning(warn_msg)
-        notify_discord(warn_msg)
-        # Prominent log message in red and bold at INFO level
-        big_warn = colour(
-            f"[Artist {artist}] NO FILES FOUND for {len(album_ids)} albums! "
-            "Please check your PATH_MAP and volume bindings!",
-            ANSI_BOLD + ANSI_RED
-        )
-        logging.info("\n%s\n", big_warn)
-    elif album_ids and editions:
+    # --- NO FILES HANDLING ---
+    if editions:
+        # Reset streak on success
+        no_file_streak = 0
         ok_msg = colour(
             f"[Artist {artist}] FOUND {len(editions)} valid file editions on filesystem for {len(album_ids)} albums. PATH_MAP and volume bindings appear correct!",
             ANSI_BOLD + ANSI_GREEN
         )
         logging.info("\n%s\n", ok_msg)
+    else:
+        # No valid editions found
+        no_file_streak += 1
+        logger = logging.getLogger()
+        logger.error(f"[Artist {artist}] FOUND 0 valid file editions on filesystem!")
+        notify_discord = globals().get("notify_discord", None)
+        if notify_discord:
+            notify_discord(f"No files found for {artist}.")
+        gui.display_popup(
+            f"PMDA didn't find any files for {no_file_streak} artist(s) in a row during the scan. "
+            "It indicates your files are not reachable from inside the container! "
+            "Please check your volume bindings."
+        )
+        # Stop the scan immediately after showing the popup
+        return []
     for e in editions:
         logging.debug(
             f"[Artist {artist}] Edition {e['album_id']}: "
