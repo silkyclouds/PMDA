@@ -1198,6 +1198,29 @@ def signature(tracks: List[Track]) -> tuple:
 def overlap(a: set, b: set) -> float:
     return len(a & b) / max(len(a), len(b))
 
+def fetch_mb_release_group_info(mbid: str) -> dict:
+    """
+    Fetch primary type, secondary-types, and media format summary from MusicBrainz release-group.
+    """
+    url = f"https://musicbrainz.org/ws/2/release-group/{mbid}?fmt=json&inc=releases"
+    headers = {"User-Agent": "PMDA/0.6.5 ( pmda@example.com )"}
+    resp = requests.get(url, headers=headers, timeout=10)
+    resp.raise_for_status()
+    data = resp.json()
+    primary = data.get("primary-type", "")
+    secondary = data.get("secondary-types", [])
+    releases = data.get("releases", [])
+    formats = []
+    for rel in releases:
+        for media in rel.get("media", []):
+            fmt = media.get("format")
+            qty = media.get("quantity")
+            if fmt and qty:
+                formats.append(f"{qty}×{fmt}")
+    unique_formats = sorted(set(formats))
+    format_summary = ", ".join(unique_formats)
+    return {"primary_type": primary, "secondary_types": secondary, "format_summary": format_summary}
+
 def choose_best(editions: List[dict]) -> dict:
     """
     Selects the best edition either via OpenAI (when an API key is provided) or via a local heuristic, re‑using any existing AI cache first.
@@ -1244,6 +1267,15 @@ def choose_best(editions: List[dict]) -> dict:
             year = e["meta"].get("date") or e["meta"].get("originaldate") or ""
             mbid = e["meta"].get("musicbrainz_albumid","")
             user_msg += f" year={year} mbid={mbid}\n"
+
+        # --- Append MusicBrainz release-group info to AI prompt ---
+        first_mbid = editions[0].get("meta", {}).get("musicbrainz_albumid")
+        if first_mbid:
+            try:
+                rg_info = fetch_mb_release_group_info(first_mbid)
+                user_msg += f"Release group info: primary_type={rg_info['primary_type']}, formats={rg_info['format_summary']}\n"
+            except Exception as e:
+                logging.debug("MusicBrainz lookup failed for %s: %s", first_mbid, e)
 
         # Log concise OpenAI request summary
         logging.info(
@@ -1482,6 +1514,41 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
         })
 
     logging.debug(f"[Artist {artist}] Computed stats for {len(editions)} valid editions: {[e['album_id'] for e in editions]}")
+
+    # ─── MusicBrainz enrichment & Box Set handling ─────────────────────────────
+    # Fetch MusicBrainz release-group info for every edition
+    for e in editions:
+        mbid = e['meta'].get('musicbrainz_albumid')
+        if mbid:
+            try:
+                e['rg_info'] = fetch_mb_release_group_info(mbid)
+                logging.debug(
+                    f"[Artist {artist}] Edition {e['album_id']} MusicBrainz RG info: "
+                    f"primary_type={e['rg_info']['primary_type']}, "
+                    f"secondary_types={e['rg_info']['secondary_types']}, "
+                    f"format_summary={e['rg_info']['format_summary']}"
+                )
+            except Exception as mb_e:
+                logging.debug(f"[Artist {artist}] MusicBrainz lookup failed for {mbid}: {mb_e}")
+
+    # Detect and collapse Box Set discs (skip as duplicates)
+    from collections import defaultdict
+    box_set_groups = defaultdict(list)
+    for e in editions:
+        sec_types = e.get('rg_info', {}).get('secondary_types', [])
+        if 'Box Set' in sec_types:
+            parent_folder = e['folder'].parent
+            box_set_groups[parent_folder].append(e)
+
+    if box_set_groups:
+        for parent_folder, items in box_set_groups.items():
+            logging.info(colour(
+                f"[Artist {artist}] Box Set detected at {parent_folder} "
+                f"with {len(items)} discs – skipping duplicate detection for these discs.",
+                ANSI_BOLD + ANSI_CYAN
+            ))
+        # Exclude all Box Set disc folders from further duplicate grouping
+        editions = [e for e in editions if e['folder'].parent not in box_set_groups]
     # Alert when albums exist in Plex DB but no files found on filesystem
     if album_ids and not editions:
         warn_msg = (
