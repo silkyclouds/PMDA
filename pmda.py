@@ -66,16 +66,32 @@ _albums_processed: int = 0
 def fetch_mb_release_group_info_batch(mbids: list[str]) -> None:
     """
     Fetch up to 20 release-groups from MusicBrainz in one HTTP request
-    and cache each result.
+    and cache each result. Uses requests.Session with retry, logs errors, and
+    sleeps 1s after each batch to respect rate limits.
     """
     if not mbids:
         return
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
     params = [("fmt", "json"), ("inc", "media")] + [("release-group", mbid) for mbid in mbids]
     url = "https://musicbrainz.org/ws/2/release-group"
+    session = requests.Session()
+    retries = Retry(
+        total=3,
+        backoff_factor=1,
+        status_forcelist=[429, 503, 504],
+        allowed_methods=["GET"]
+    )
+    adapter = HTTPAdapter(max_retries=retries)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
     try:
-        resp = requests.get(url, params=params,
-                            headers={"User-Agent": "PMDA/0.6.5 ( pmda@example.com )"},
-                            timeout=10)
+        resp = session.get(
+            url,
+            params=params,
+            headers={"User-Agent": "PMDA/0.6.5 ( pmda@example.com )"},
+            timeout=10
+        )
         resp.raise_for_status()
         data = resp.json().get("release-group-list", [])
         for entry in data:
@@ -88,6 +104,10 @@ def fetch_mb_release_group_info_batch(mbids: list[str]) -> None:
                 )
             }
             set_cached_mb_info(entry["id"], info)
+        # Respect MusicBrainz API rate limits: sleep 1s after each successful batch
+        time.sleep(1)
+    except requests.exceptions.RetryError as e:
+        logging.debug(f"[MusicBrainz Batch] RetryError fetching batch {mbids}: {e}")
     except Exception as e:
         logging.debug(f"[MusicBrainz Batch] error fetching batch {mbids}: {e}")
 
@@ -1739,6 +1759,8 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
         # Batch fetch MB info in chunks of 20
         for i in range(0, len(mbid_list), 20):
             fetch_mb_release_group_info_batch(mbid_list[i:i+20])
+        # Throttle batch calls if needed (sleep 1s after all batches)
+        time.sleep(1)
 
         # Inject cached info and compute ETA per album
         for e in editions:
