@@ -1621,30 +1621,42 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
         logging.debug(f"[Artist {artist}] Skipping MusicBrainz enrichment (USE_MUSICBRAINZ=False).")
     else:
         # ─── MusicBrainz enrichment & Box Set handling ─────────────────────────────
-        # Fetch MusicBrainz release-group info for every edition, with fallback search
+        # Enrich using any available MusicBrainz ID tags (in priority order)
         for e in editions:
-            artist = e['artist']
+            meta = e.get('meta', {})
+            id_tags = [
+                'musicbrainz_releasegroupid',
+                'musicbrainz_releaseid',
+                'musicbrainz_originalreleaseid',
+                'musicbrainz_albumid'
+            ]
+            rg_info = None
+            for tag in id_tags:
+                mbid = meta.get(tag)
+                if not mbid:
+                    continue
+                try:
+                    if tag == 'musicbrainz_releasegroupid':
+                        # direct lookup of release-group
+                        rg_info = fetch_mb_release_group_info(mbid)
+                    else:
+                        # lookup release to derive its release-group ID
+                        rel = musicbrainzngs.get_release_by_id(mbid, includes=['release-group'])['release']
+                        rgid = rel['release-group']['id']
+                        rg_info = fetch_mb_release_group_info(rgid)
+                    logging.debug(f"[Artist {artist}] Edition {e['album_id']} RG info (via {tag} {mbid}): {rg_info}")
+                    break
+                except Exception as exc:
+                    logging.debug(f"[Artist {artist}] MusicBrainz lookup failed for {tag} ({mbid}): {exc}")
+            # fallback: search by metadata if no ID tag yielded results
             album_norm = e['album_norm']
             tracks = {t.title for t in e['tracks']}
-            mbid = e['meta'].get('musicbrainz_albumid')
-            rg_info = None
-
-            # first, try direct lookup
-            if mbid:
-                try:
-                    rg_info = fetch_mb_release_group_info(mbid)
-                    logging.debug(f"[Artist {artist}] Edition {e['album_id']} RG info (direct MBID): {rg_info}")
-                except Exception:
-                    logging.debug(f"[Artist {artist}] Direct MB lookup failed for {mbid}, falling back to search")
-
-            # fallback: search by metadata
             if not rg_info:
                 rg_info = search_mb_release_group_by_metadata(artist, album_norm, tracks)
                 if rg_info:
-                    logging.debug(f"[Artist {artist}] Edition {e['album_id']} RG info (search): {rg_info}")
+                    logging.debug(f"[Artist {artist}] Edition {e['album_id']} RG info (search fallback): {rg_info}")
                 else:
                     logging.debug(f"[Artist {artist}] No RG info found via search for '{album_norm}'")
-
             if rg_info:
                 e['rg_info'] = rg_info
 
