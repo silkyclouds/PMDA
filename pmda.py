@@ -870,6 +870,14 @@ def init_cache_db():
             bit_depth  INTEGER
         )
     """)
+    # Table for caching MusicBrainz release-group info
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS musicbrainz_cache (
+            mbid       TEXT PRIMARY KEY,
+            info_json  TEXT,
+            created_at INTEGER
+        )
+    """)
     con.commit()
     con.close()
 
@@ -903,6 +911,27 @@ def set_cached_info(path: str, mtime: int, bit_rate: int, sample_rate: int, bit_
     con.close()
 
 init_cache_db()
+
+# --- MusicBrainz cache helpers ---
+def get_cached_mb_info(mbid: str) -> dict | None:
+    con = sqlite3.connect(str(CACHE_DB_FILE), timeout=30)
+    cur = con.cursor()
+    cur.execute("SELECT info_json FROM musicbrainz_cache WHERE mbid = ?", (mbid,))
+    row = cur.fetchone()
+    con.close()
+    if row:
+        return json.loads(row[0])
+    return None
+
+def set_cached_mb_info(mbid: str, info: dict):
+    con = sqlite3.connect(str(CACHE_DB_FILE), timeout=30)
+    cur = con.cursor()
+    cur.execute(
+        "INSERT OR REPLACE INTO musicbrainz_cache (mbid, info_json, created_at) VALUES (?, ?, ?)",
+        (mbid, json.dumps(info), int(time.time()))
+    )
+    con.commit()
+    con.close()
 
 # ───────────────────────────────── STATE IN MEMORY ──────────────────────────────────
 state = {
@@ -1235,6 +1264,11 @@ def fetch_mb_release_group_info(mbid: str) -> dict:
     Fetch primary type, secondary-types, and media format summary from MusicBrainz release-group.
     Uses musicbrainzngs for proper rate-limiting and parsing.
     """
+    # Attempt to reuse cached MusicBrainz release-group info
+    cached = get_cached_mb_info(mbid)
+    if cached:
+        logging.debug(f"[MusicBrainz RG Info] using cached info for MBID {mbid}")
+        return cached
     try:
         # Query release-group with all media details
         result = musicbrainzngs.get_release_group_by_id(
@@ -1265,11 +1299,14 @@ def fetch_mb_release_group_info(mbid: str) -> dict:
     format_summary = ", ".join(sorted(formats))
     logging.debug(f"[MusicBrainz RG Info] raw response for MBID {mbid}: {result}")
     logging.debug(f"[MusicBrainz RG Info] parsed primary_type={primary}, secondary_types={secondary}, format_summary={format_summary}")
-    return {
+    info = {
         "primary_type": primary,
         "secondary_types": secondary,
         "format_summary": format_summary
     }
+    # Cache the lookup result
+    set_cached_mb_info(mbid, info)
+    return info
 
 # ──────────────────────────────── MusicBrainz search fallback ────────────────────────────────
 def search_mb_release_group_by_metadata(artist: str, album_norm: str, tracks: set[str]) -> dict | None:
@@ -1311,12 +1348,15 @@ def search_mb_release_group_by_metadata(artist: str, album_norm: str, tracks: se
                             if fmt:
                                 formats.add(f"{qty}×{fmt}")
                     logging.debug(f"[MusicBrainz Search] selected RG info: {{ 'id': {rg['id']}, 'primary_type': {info.get('primary-type')}, 'format_summary': {', '.join(sorted(formats))} }}")
-                    return {
+                    result_dict = {
                         'primary_type': info.get('primary-type', ''),
                         'secondary_types': info.get('secondary-types', []),
                         'format_summary': ', '.join(sorted(formats)),
                         'id': rg['id']
                     }
+                    # Cache fallback match
+                    set_cached_mb_info(rg['id'], result_dict)
+                    return result_dict
             except musicbrainzngs.WebServiceError:
                 continue
     except Exception as e:
@@ -1622,14 +1662,14 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
     else:
         # ─── MusicBrainz enrichment & Box Set handling ─────────────────────────────
         # Enrich using any available MusicBrainz ID tags (in priority order)
+        id_tags = [
+            'musicbrainz_releasegroupid',
+            'musicbrainz_releaseid',
+            'musicbrainz_originalreleaseid',
+            'musicbrainz_albumid'
+        ]
         for e in editions:
             meta = e.get('meta', {})
-            id_tags = [
-                'musicbrainz_releasegroupid',
-                'musicbrainz_releaseid',
-                'musicbrainz_originalreleaseid',
-                'musicbrainz_albumid'
-            ]
             rg_info = None
             for tag in id_tags:
                 mbid = meta.get(tag)
@@ -1648,17 +1688,25 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
                     break
                 except Exception as exc:
                     logging.debug(f"[Artist {artist}] MusicBrainz lookup failed for {tag} ({mbid}): {exc}")
+            if rg_info:
+                e['rg_info_source'] = tag
             # fallback: search by metadata if no ID tag yielded results
             album_norm = e['album_norm']
             tracks = {t.title for t in e['tracks']}
             if not rg_info:
                 rg_info = search_mb_release_group_by_metadata(artist, album_norm, tracks)
                 if rg_info:
+                    e['rg_info_source'] = 'fallback'
                     logging.debug(f"[Artist {artist}] Edition {e['album_id']} RG info (search fallback): {rg_info}")
                 else:
                     logging.debug(f"[Artist {artist}] No RG info found via search for '{album_norm}'")
             if rg_info:
                 e['rg_info'] = rg_info
+        # --- MusicBrainz enrichment summary ---
+        direct = sum(1 for e in editions if 'rg_info' in e and e.get('rg_info_source') in id_tags)
+        fallback = sum(1 for e in editions if 'rg_info' in e and e.get('rg_info_source') == 'fallback')
+        missing = sum(1 for e in editions if 'rg_info' not in e)
+        logging.info(f"[Artist {artist}] MusicBrainz enrichment summary: direct={direct}, fallback={fallback}, missing={missing}")
 
     # Detect and collapse Box Set discs (skip as duplicates)
     from collections import defaultdict
