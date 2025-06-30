@@ -1570,49 +1570,52 @@ def scan_artist_duplicates(args):
     Returns (artist_name, list_of_groups, album_count).
     """
     artist_id, artist_name = args
-    if scan_should_stop.is_set():
+    try:
+        if scan_should_stop.is_set():
+            return (artist_name, [], 0)
+        while scan_is_paused.is_set() and not scan_should_stop.is_set():
+            time.sleep(0.5)
+        logging.info(f"Processing artist: {artist_name}")
+        logging.debug(f"[Artist {artist_name} (ID {artist_id})] Fetching album IDs from Plex DB")
+        logging.debug(
+            f"scan_artist_duplicates(): start '{artist_name}' (ID {artist_id})"
+        )
+
+        db_conn = plex_connect()
+
+        # Fetch all album IDs for this artist...
+        placeholders = ",".join("?" for _ in SECTION_IDS)
+        cursor = db_conn.execute(
+            f"""
+            SELECT alb.id
+            FROM metadata_items alb
+            JOIN metadata_items tr  ON tr.parent_id      = alb.id
+            JOIN media_items      mi ON mi.metadata_item_id = tr.id
+            JOIN media_parts      mp ON mp.media_item_id = mi.id
+            WHERE alb.metadata_type = 9
+              AND alb.parent_id = ?
+              AND alb.library_section_id IN ({placeholders})
+            GROUP BY alb.id
+            """,
+            (artist_id, *SECTION_IDS)
+        )
+        album_ids = [row[0] for row in cursor.fetchall()]
+        logging.debug(f"[Artist {artist_name} (ID {artist_id})] Retrieved {len(album_ids)} album IDs: {album_ids}")
+        logging.debug(f"[Artist {artist_name} (ID {artist_id})] Album list for scan: {album_ids}")
+
+        groups = []
+        if album_ids:
+            groups = scan_duplicates(db_conn, artist_name, album_ids)
+        db_conn.close()
+
+        logging.debug(
+            f"scan_artist_duplicates(): done Artist {artist_name} (ID {artist_id}) – {len(groups)} groups, {len(album_ids)} albums"
+        )
+        return (artist_name, groups, len(album_ids))
+    except Exception as e:
+        logging.error(f"Unexpected error scanning artist {artist_name}: {e}", exc_info=True)
+        # On error, return no groups and zero albums so scan can continue
         return (artist_name, [], 0)
-    while scan_is_paused.is_set() and not scan_should_stop.is_set():
-        time.sleep(0.5)
-    logging.info(f"Processing artist: {artist_name}")
-    logging.debug(f"[Artist {artist_name} (ID {artist_id})] Fetching album IDs from Plex DB")
-    logging.debug(
-        f"scan_artist_duplicates(): start '{artist_name}' (ID {artist_id})"
-    )
-
-
-    db_conn = plex_connect()
-
-    # Fetch all album IDs for this artist, grouping by media parts exactly as in your sqlite query
-    placeholders = ",".join("?" for _ in SECTION_IDS)
-    cursor = db_conn.execute(
-        f"""
-        SELECT alb.id
-        FROM metadata_items alb
-        JOIN metadata_items tr  ON tr.parent_id      = alb.id
-        JOIN media_items      mi ON mi.metadata_item_id = tr.id
-        JOIN media_parts      mp ON mp.media_item_id = mi.id
-        WHERE alb.metadata_type = 9
-          AND alb.parent_id = ?
-          AND alb.library_section_id IN ({placeholders})
-        GROUP BY alb.id
-        """,
-        (artist_id, *SECTION_IDS)
-    )
-    album_ids = [row[0] for row in cursor.fetchall()]
-    logging.debug(f"[Artist {artist_name} (ID {artist_id})] Retrieved {len(album_ids)} album IDs: {album_ids}")
-    logging.debug(f"[Artist {artist_name} (ID {artist_id})] Album list for scan: {album_ids}")
-
-    groups = []
-    # Only call scan_duplicates if there are album_ids
-    if album_ids:
-        groups = scan_duplicates(db_conn, artist_name, album_ids)
-    db_conn.close()
-
-    logging.debug(
-        f"scan_artist_duplicates(): done Artist {artist_name} (ID {artist_id}) – {len(groups)} groups, {len(album_ids)} albums"
-    )
-    return (artist_name, groups, len(album_ids))
 
 
 def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
@@ -1620,64 +1623,68 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
     logging.debug(f"[Artist {artist}] Starting duplicate scan for album IDs: {album_ids}")
     editions = []
     for aid in album_ids:
-        if scan_should_stop.is_set():
-            break
-        while scan_is_paused.is_set() and not scan_should_stop.is_set():
-            time.sleep(0.5)
-        tr = get_tracks(db_conn, aid)
-        if not tr:
-            continue
-        folder = first_part_path(db_conn, aid)
-        if not folder:
-            continue
-        # count audio files once – we re‑use it later
-        file_count = sum(1 for f in folder.rglob("*") if AUDIO_RE.search(f.name))
+        try:
+            if scan_should_stop.is_set():
+                break
+            while scan_is_paused.is_set() and not scan_should_stop.is_set():
+                time.sleep(0.5)
+            tr = get_tracks(db_conn, aid)
+            if not tr:
+                continue
+            folder = first_part_path(db_conn, aid)
+            if not folder:
+                continue
+            # count audio files once – we re‑use it later
+            file_count = sum(1 for f in folder.rglob("*") if AUDIO_RE.search(f.name))
 
-        # consider edition invalid when technical data are all zero OR no files found
-        is_invalid = ((br := 0) or True)  # placeholder, will be updated below
+            # consider edition invalid when technical data are all zero OR no files found
+            is_invalid = ((br := 0) or True)  # placeholder, will be updated below
 
-        # ─── audio‑format inspection ──────────────────────────────────────
-        fmt_score, br, sr, bd = analyse_format(folder)
+            # ─── audio‑format inspection ──────────────────────────────────────
+            fmt_score, br, sr, bd = analyse_format(folder)
 
-        # Count of audio files
-        file_count = sum(1 for f in folder.rglob("*") if AUDIO_RE.search(f.name))
+            # Count of audio files
+            file_count = sum(1 for f in folder.rglob("*") if AUDIO_RE.search(f.name))
 
-        # --- metadata tags (first track only) -----------------------------
-        first_audio = next((p for p in folder.rglob("*") if AUDIO_RE.search(p.name)), None)
-        meta_tags = extract_tags(first_audio) if first_audio else {}
+            # --- metadata tags (first track only) -----------------------------
+            first_audio = next((p for p in folder.rglob("*") if AUDIO_RE.search(p.name)), None)
+            meta_tags = extract_tags(first_audio) if first_audio else {}
 
-        # Mark as invalid if file_count == 0 OR all tech data are zero
-        is_invalid = (file_count == 0) or (br == 0 and sr == 0 and bd == 0)
+            # Mark as invalid if file_count == 0 OR all tech data are zero
+            is_invalid = (file_count == 0) or (br == 0 and sr == 0 and bd == 0)
 
-        # --- Skip & purge technically invalid editions immediately -------------
-        if is_invalid:
-            _purge_invalid_edition({
-                "folder":   folder,
-                "artist":   artist,
-                "title_raw": album_title(db_conn, aid),
-                "album_id": aid
+            # --- Skip & purge technically invalid editions immediately -------------
+            if is_invalid:
+                _purge_invalid_edition({
+                    "folder":   folder,
+                    "artist":   artist,
+                    "title_raw": album_title(db_conn, aid),
+                    "album_id": aid
+                })
+                continue            # do NOT add to the editions list
+
+            editions.append({
+                'album_id':  aid,
+                'title_raw': album_title(db_conn, aid),
+                'album_norm': norm_album(album_title(db_conn, aid)),
+                'artist':    artist,
+                'folder':    folder,
+                'tracks':    tr,
+                'file_count': file_count,
+                'sig':       signature(tr),
+                'titles':    {t.title for t in tr},
+                'dur':       sum(t.dur for t in tr),
+                'fmt_score': fmt_score,
+                'br':        br,
+                'sr':        sr,
+                'bd':        bd,
+                'discs':     len({t.disc for t in tr}),
+                'meta':      meta_tags,
+                'invalid':   False
             })
-            continue            # do NOT add to the editions list
-
-        editions.append({
-            'album_id':  aid,
-            'title_raw': album_title(db_conn, aid),
-            'album_norm': norm_album(album_title(db_conn, aid)),
-            'artist':    artist,
-            'folder':    folder,
-            'tracks':    tr,
-            'file_count': file_count,
-            'sig':       signature(tr),
-            'titles':    {t.title for t in tr},
-            'dur':       sum(t.dur for t in tr),
-            'fmt_score': fmt_score,
-            'br':        br,
-            'sr':        sr,
-            'bd':        bd,
-            'discs':     len({t.disc for t in tr}),
-            'meta':      meta_tags,
-            'invalid':   False
-        })
+        except Exception as e:
+            logging.error(f"Error processing album {aid} for artist {artist}: {e}", exc_info=True)
+            continue
 
     logging.debug(f"[Artist {artist}] Computed stats for {len(editions)} valid editions: {[e['album_id'] for e in editions]}")
 
