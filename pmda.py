@@ -22,15 +22,10 @@ no_file_streak_global = 0
 popup_displayed = False
 
 """
-v0.6.5
+v0.6.6
 
 Changelog:
-- added support for multiple Plex library sections via a comma-separated `SECTION_IDS`, so you can scan and dedupe across several music libraries in one run
-- revamped PATH_MAP auto-discovery to merge all sections’ locations and always overwrite `config.json`, ensuring parent-folder binds and subfolders map correctly
-- fixed the “slash in the middle” bug—folders like `/music/flac-hd` now map cleanly without inserting an extra `/`
-- improved the unmapped-albums warning to clarify it’s non-blocking (albums may belong to other libraries) and advise including all relevant section IDs to suppress it
-- ensured the web UI scan progress bar polls `/api/progress` automatically every second after you click “New Scan,” so it updates continuously without manual refresh
-- tightened up logging messages for PATH_MAP discovery and diagnostics to be more informative and reassuring for end users
+- added a SKIP_FOLDERS variable to allow users to skip detecting dupes in specific folder locations
 """
 
 import argparse
@@ -480,10 +475,13 @@ merged = {
     "OPENAI_MODEL":   _get("OPENAI_MODEL",   default="gpt-4",                           cast=str),
     "DISCORD_WEBHOOK": _get("DISCORD_WEBHOOK", default="", cast=str),
     "USE_MUSICBRAINZ": _get("USE_MUSICBRAINZ", default=False, cast=_parse_bool),
+    "SKIP_FOLDERS": _get("SKIP_FOLDERS", default="", cast=lambda s: [p.strip() for p in str(s).split(",") if p.strip()]),
 }
 # Always use the auto‑generated PATH_MAP from config.json
 merged["PATH_MAP"] = conf.get("PATH_MAP", {})
 
+
+SKIP_FOLDERS: list[str] = merged["SKIP_FOLDERS"]
 USE_MUSICBRAINZ: bool = bool(merged["USE_MUSICBRAINZ"])
 
 # ─────────────────────────────── Fixed container constants ───────────────────────────────
@@ -1666,6 +1664,10 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
                 continue
             folder = first_part_path(db_conn, aid)
             if not folder:
+                continue
+            # Skip albums in configured skip folders
+            if SKIP_FOLDERS and any(str(folder).startswith(skip) for skip in SKIP_FOLDERS):
+                logging.info(f"Skipping album {aid} since folder {folder} matches skip prefixes")
                 continue
             # count audio files once – we re‑use it later
             file_count = sum(1 for f in folder.rglob("*") if AUDIO_RE.search(f.name))
