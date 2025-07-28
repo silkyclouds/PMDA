@@ -1434,11 +1434,13 @@ def choose_best(editions: List[dict]) -> dict:
     )
     row = cur.fetchone()
     con.close()
-    if row:
+    existing_list = json.loads(row[2]) if row and row[2] else []
+    # Only reuse cache if no new editions have appeared
+    if row and (len(existing_list) + 1) == len(editions):
         prev_id, rationale, merge_json = row
         best = next(e for e in editions if e['album_id'] == prev_id)
         best["rationale"]  = rationale
-        best["merge_list"] = json.loads(merge_json)
+        best["merge_list"] = existing_list
         best["used_ai"]    = True
         return best
 
