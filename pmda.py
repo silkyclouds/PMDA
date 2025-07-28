@@ -142,11 +142,25 @@ except Exception as e:
 
 logging.basicConfig(
     level=_level_num,
-    format="%(asctime)s │ %(levelname)s │ %(threadName)s │ %(message)s",
+    format="%(asctime)s %(progress)s │ %(levelname)s │ %(threadName)s │ %(message)s",
     datefmt="%H:%M:%S",
     force=True,
     handlers=handlers
 )
+
+# Progress header filter: displays current/total progress as [cur/total X.X%]
+PROGRESS_STATE = {"total": 0, "current": 0}
+class ProgressFilter(logging.Filter):
+    def filter(self, record):
+        total = PROGRESS_STATE["total"]
+        current = PROGRESS_STATE["current"]
+        if total:
+            pct = current * 100.0 / total
+            record.progress = f"[{current}/{total} {pct:.1f}%]"
+        else:
+            record.progress = ""
+        return True
+logging.getLogger().addFilter(ProgressFilter())
 
 # Suppress verbose internal debug from OpenAI and HTTP libraries
 logging.getLogger("openai").setLevel(logging.INFO)
@@ -1657,7 +1671,15 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
     logging.debug(f"Verbose SKIP_FOLDERS: {SKIP_FOLDERS}")
     skip_count = 0
     editions = []
+    total_albums = len(album_ids)
+    processed_albums = 0
+    PROGRESS_STATE["total"] = total_albums
     for aid in album_ids:
+        processed_albums += 1
+        PROGRESS_STATE["current"] = processed_albums
+        # Periodic progress update every 100 albums
+        if processed_albums % 100 == 0:
+            logging.info(f"[Artist {artist}] processed {processed_albums}/{total_albums} albums (skipped {skip_count} so far)")
         try:
             if scan_should_stop.is_set():
                 break
@@ -1839,14 +1861,44 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
             f"files={e['file_count']}, fmt_score={e['fmt_score']}, "
             f"br={e['br']}, sr={e['sr']}, bd={e['bd']}"
         )
-    # --- First pass: group by album_norm only ---
+    # --- First pass: group by album_norm, with classical disambiguation ---
     from collections import defaultdict
-    exact_groups = defaultdict(list)
+    # initial grouping by normalized title
+    raw_groups: dict[str, list[dict]] = defaultdict(list)
     for e in editions:
-        exact_groups[e['album_norm']].append(e)
+        raw_groups[e['album_norm']].append(e)
+    # refine groups: for classical, split by year and first-track duration threshold
+    exact_groups: dict[tuple, list[dict]] = {}
+    for norm, ed_list in raw_groups.items():
+        if len(ed_list) < 2:
+            # single edition or no duplicates
+            exact_groups[(norm, None, None)] = ed_list
+            continue
+        # detect classical genre in metadata (case-insensitive)
+        genres = [e.get('meta', {}).get('genre', '').lower() for e in ed_list]
+        is_classical = all('classical' in g for g in genres if g)
+        if is_classical:
+            # subdivide editions by year and duration of first track
+            subgroups: list[dict] = []
+            for e in ed_list:
+                year = e.get('meta', {}).get('date') or e.get('meta', {}).get('originaldate') or ''
+                dur = e['tracks'][0].dur if e.get('tracks') else 0
+                placed = False
+                for sg in subgroups:
+                    if sg['year'] == year and abs(sg['dur'] - dur) <= 10000:
+                        sg['editions'].append(e)
+                        placed = True
+                        break
+                if not placed:
+                    subgroups.append({'year': year, 'dur': dur, 'editions': [e]})
+            for sg in subgroups:
+                exact_groups[(norm, sg['year'], sg['dur'])] = sg['editions']
+        else:
+            # non-classical: group all under single key
+            exact_groups[(norm, None, None)] = ed_list
     logging.debug(
-        f"[Artist {artist}] Exact groups by normalized title: "
-        f"{[(norm, [ed['album_id'] for ed in eds]) for norm, eds in exact_groups.items()]}"
+        f"[Artist {artist}] Exact groups after classical filter: "
+        f"{[(k, [ed['album_id'] for ed in v]) for k, v in exact_groups.items()]}"
     )
 
     out: list[dict] = []
@@ -3780,7 +3832,12 @@ if __name__ == "__main__":
     else:
         # CLI mode: full scan, then dedupe
         logging.info("CLI mode: starting full library scan")
+        # Temporarily disable Discord notifications during scan stage
+        original_notify = globals().get("notify_discord")
+        globals()["notify_discord"] = lambda *args, **kwargs: None
         background_scan()
+        # Restore Discord notification function
+        globals()["notify_discord"] = original_notify
         logging.info("CLI mode: scan complete, starting dedupe")
         dedupe_cli(
             dry=args.dry_run,
