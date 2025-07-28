@@ -1652,6 +1652,8 @@ def scan_artist_duplicates(args):
 def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
     global no_file_streak_global, popup_displayed, gui
     logging.debug(f"[Artist {artist}] Starting duplicate scan for album IDs: {album_ids}")
+    logging.debug(f"Verbose SKIP_FOLDERS: {SKIP_FOLDERS}")
+    skip_count = 0
     editions = []
     for aid in album_ids:
         try:
@@ -1666,8 +1668,10 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
             if not folder:
                 continue
             # Skip albums in configured skip folders
+            logging.debug(f"Checking album {aid} at folder {folder} against skip prefixes {SKIP_FOLDERS}")
             if SKIP_FOLDERS and any(str(folder).startswith(skip) for skip in SKIP_FOLDERS):
-                logging.info(f"Skipping album {aid} since folder {folder} matches skip prefixes")
+                skip_count += 1
+                logging.info(f"Skipping album {aid} since folder {folder} matches skip prefixes {SKIP_FOLDERS}")
                 continue
             # count audio files once – we re‑use it later
             file_count = sum(1 for f in folder.rglob("*") if AUDIO_RE.search(f.name))
@@ -1804,24 +1808,28 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
     else:
         # No valid editions found
         no_file_streak_global += 1
-        logger = logging.getLogger()
-        logger.error(f"[Artist {artist}] FOUND 0 valid file editions on filesystem!")
-        notify_discord = globals().get("notify_discord", None)
-        if notify_discord:
-            notify_discord(f"No files found for {artist}.")
-        global popup_displayed
-        if no_file_streak_global >= NO_FILE_THRESHOLD:
-            if not popup_displayed:
-                gui.display_popup(
-                    f"PMDA didn't find any files for {NO_FILE_THRESHOLD} artists in a row. "
-                    "Aborting scan. Files appear unreachable from inside the container; "
-                    "please check your volume bindings."
-                )
-                popup_displayed = True
-            scan_should_stop.set()
+        if skip_count == len(album_ids):
+            logging.info(f"[Artist {artist}] All {skip_count} albums skipped due to SKIP_FOLDERS {SKIP_FOLDERS}")
             return []
-        # Below threshold, do not show repeated popups -- let scan continue or fail silently
-        return []
+        else:
+            logger = logging.getLogger()
+            logger.error(f"[Artist {artist}] FOUND 0 valid file editions on filesystem! Checked SKIP_FOLDERS: {SKIP_FOLDERS}")
+            notify_discord = globals().get("notify_discord", None)
+            if notify_discord:
+                notify_discord(f"No files found for {artist}.")
+            global popup_displayed
+            if no_file_streak_global >= NO_FILE_THRESHOLD:
+                if not popup_displayed:
+                    gui.display_popup(
+                        f"PMDA didn't find any files for {NO_FILE_THRESHOLD} artists in a row. "
+                        "Aborting scan. Files appear unreachable from inside the container; "
+                        "please check your volume bindings."
+                    )
+                    popup_displayed = True
+                scan_should_stop.set()
+                return []
+            # Below threshold, do not show repeated popups -- let scan continue or fail silently
+            return []
     for e in editions:
         logging.debug(
             f"[Artist {artist}] Edition {e['album_id']}: "
