@@ -2175,8 +2175,9 @@ def background_scan():
             f"WHERE metadata_type=8 AND library_section_id IN ({placeholders})",
             SECTION_IDS,
         ).fetchall()
+        total_artists = len(artists)
 
-        # ─── Discord: announce scan start ────────────────────────────────
+        # --- Discord: announce scan start ---
         notify_discord_embed(
             title="🔄 PMDA scan started",
             description=(
@@ -2213,6 +2214,7 @@ def background_scan():
             # close the shared connection; workers use their own
             db_conn.close()
 
+            artists_processed = 0
             for future in as_completed(futures):
                 # Allow stop/pause mid‑scan
                 if scan_should_stop.is_set():
@@ -2231,6 +2233,10 @@ def background_scan():
                         if groups:
                             all_results[artist_name] = groups
                             state["duplicates"][artist_name] = groups
+                    artists_processed += 1
+                    # Log scan progress every 10 artists or if debug/verbose
+                    if artists_processed % 10 == 0 or logging.getLogger().isEnabledFor(logging.DEBUG):
+                        logging.info(f"Scanning artist {artists_processed} / {total_artists}: {artist_name}")
 
         # Persist what we've found so far (even if some artists failed)
         save_scan_to_db(all_results)
