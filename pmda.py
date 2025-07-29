@@ -142,7 +142,7 @@ except Exception as e:
 
 logging.basicConfig(
     level=_level_num,
-    format="%(asctime)s %(progress)s │ %(levelname)s │ %(threadName)s │ %(message)s",
+    format="%(asctime)s │ %(levelname)s │ %(threadName)s │ %(message)s",
     datefmt="%H:%M:%S",
     force=True,
     handlers=handlers
@@ -150,17 +150,6 @@ logging.basicConfig(
 
 # Progress header filter: displays current/total progress as [cur/total X.X%]
 PROGRESS_STATE = {"total": 0, "current": 0}
-class ProgressFilter(logging.Filter):
-    def filter(self, record):
-        total = PROGRESS_STATE["total"]
-        current = PROGRESS_STATE["current"]
-        if total:
-            pct = current * 100.0 / total
-            record.progress = f"[{current}/{total} {pct:.1f}%]"
-        else:
-            record.progress = ""
-        return True
-logging.getLogger().addFilter(ProgressFilter())
 
 # Suppress verbose internal debug from OpenAI and HTTP libraries
 logging.getLogger("openai").setLevel(logging.INFO)
