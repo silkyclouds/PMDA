@@ -3523,128 +3523,249 @@ def dedupe_selected():
     return jsonify(moved=moved_list), 200
 
 # ───────────────────────────────────── CLI MODE ───────────────────────────────────
-def dedupe_cli(dry: bool, safe: bool, tag_extra: bool, verbose: bool):
+def dedupe_cli(
+    dry: bool,
+    safe: bool,
+    tag_extra: bool,
+    verbose: bool,
+) -> None:
     """
     Command-line mode:
-    * Scans every artist and album in Plex.
-    * Detects duplicate album groups.
-    * Optionally moves loser folders and deletes Plex metadata.
+    1. Scan every artist / album in the selected Plex sections.
+    2. Detect duplicate album groups.
+    3. Optionally move the “loser” folders and clean Plex metadata.
 
     Parameters
     ----------
-    dry : bool
-        If True, simulate actions only (no moves / deletes).
-    safe : bool
-        If True, never delete Plex metadata (even when not dry-run).
-    tag_extra : bool
-        If True, tag "(Extra Tracks)" on the best edition that has more
-        tracks than the shortest edition in the group.
-    verbose : bool
-        Enable DEBUG-level logging.
+    dry       : Simulate actions only (no file moves / API calls).
+    safe      : Never delete Plex metadata, even when not dry-run.
+    tag_extra : Tag “(Extra Tracks)” on the best edition if it has
+                more tracks than the shortest one in the group.
+    verbose   : Enable DEBUG-level logging.
     """
-    global SECTION_IDS
-    log_lvl = logging.DEBUG if verbose else logging.INFO
-    logging.getLogger().setLevel(log_lvl)
-    if verbose:
-        logging.debug(f"dedupe_cli(): opening Plex DB at {PLEX_DB_FILE}")
+    # ------------------------------------------------------------------ #
+    #  Logging & DB setup
+    # ------------------------------------------------------------------ #
+    log_level = logging.DEBUG if verbose else logging.INFO
+    logging.getLogger().setLevel(log_level)
 
-    db_conn = plex_connect()
-    cur = db_conn.cursor()
+    db = plex_connect()
+    cur = db.cursor()
 
-    # Headline counters
-    stats = {
-        "total_artists":      0,
-        "total_albums":       0,
-        "albums_with_dupes":  0,
-        "total_dupes":        0,
-        "total_moved_mb":     0,
-    }
+    # ------------------------------------------------------------------ #
+    #  Statistics that we’ll summarise at the end
+    # ------------------------------------------------------------------ #
+    stats = dict.fromkeys(
+        (
+            "total_artists",
+            "total_albums",
+            "albums_with_dupes",
+            "total_dupes",
+            "total_moved_mb",
+        ),
+        0,
+    )
 
-    # Compute total number of albums (all sections)
+    # ------------------------------------------------------------------ #
+    #  Pre-compute totals so we can show progress
+    # ------------------------------------------------------------------ #
     placeholders = ",".join("?" for _ in SECTION_IDS)
-    total_albums = cur.execute(
-        f"SELECT COUNT(*) FROM metadata_items WHERE metadata_type=9 AND library_section_id IN ({placeholders})",
-        tuple(SECTION_IDS)
+    total_albums_overall = cur.execute(
+        f"""
+        SELECT COUNT(*)
+        FROM   metadata_items
+        WHERE  metadata_type = 9
+          AND  library_section_id IN ({placeholders})
+        """,
+        tuple(SECTION_IDS),
     ).fetchone()[0]
-    logging.info(f"Total albums to process: {total_albums}")
+    logging.info("🔍 About to scan %,d albums…", total_albums_overall)
 
-    # Iterate over all artists
     artists = cur.execute(
-        "SELECT id, title FROM metadata_items "
-        "WHERE metadata_type = 8 AND library_section_id = ?",
+        """
+        SELECT id, title
+        FROM   metadata_items
+        WHERE  metadata_type = 8
+          AND  library_section_id = ?
+        """,
         (SECTION_ID,),
     ).fetchall()
-    logging.debug("dedupe_cli(): %d artists loaded from Plex DB", len(artists))
 
-    processed_albums = 0
+    processed_albums = 0  # for progress updates
 
+    # ------------------------------------------------------------------ #
+    #  Main artist loop
+    # ------------------------------------------------------------------ #
     for artist_id, artist_name in artists:
+        stats["total_artists"] += 1
+
         album_ids = [
-            r[0] for r in cur.execute(
-                "SELECT id FROM metadata_items "
-                "WHERE metadata_type = 9 AND parent_id = ?",
+            row[0]
+            for row in cur.execute(
+                """
+                SELECT id
+                FROM   metadata_items
+                WHERE  metadata_type = 9
+                  AND  parent_id      = ?
+                """,
                 (artist_id,),
             ).fetchall()
         ]
+        stats["total_albums"] += len(album_ids)
+
+        # Progress ticker
         for aid in album_ids:
             processed_albums += 1
-            album_title_str = album_title(db_conn, aid)
             if processed_albums % 100 == 0 or verbose:
-                logging.info(f"Processing album {processed_albums} / {total_albums}: {album_title_str} ({artist_name})")
-        stats["total_artists"] += 1
-        stats["total_albums"] += len(album_ids)
-        dup_groups = scan_duplicates(db_conn, artist_name, album_ids)
+                title = album_title(db, aid)
+                logging.info(
+                    "Progress: %,d / %,d – %s – %s",
+                    processed_albums,
+                    total_albums_overall,
+                    artist_name,
+                    title,
+                )
+
+        dup_groups = scan_duplicates(db, artist_name, album_ids)
         if dup_groups:
             stats["albums_with_dupes"] += len(dup_groups)
-        removed_for_current_artist = 0
-        # ... (rest unchanged)
 
-@app.post("/merge/<artist>/<int:album_id>")
-def merge_tracks(artist, album_id):
-    data = request.get_json() or {}
-    merge_list = data.get("merge_list", [])
-    # Locate group in state, get best folder path
-    art = artist.replace("_", " ")
-    group = next((g for g in state["duplicates"].get(art, []) if g["album_id"] == album_id), None)
-    if not group:
-        return jsonify(message="Album not found."), 404
-    best_folder = Path(group["best"]["folder"])
-    # Determine current max track index in best_folder
-    max_idx = 0
-    for f in best_folder.iterdir():
-        m = re.match(r"^(\d{2})\s*-\s*", f.name)
-        if m:
+        removed_this_artist = 0
+
+        # -------------------------------------------------------------- #
+        #  Handle each duplicate group
+        # -------------------------------------------------------------- #
+        for group in dup_groups:
+            best   = group["best"]
+            losers = group["losers"]
+
+            logging.info(
+                "🏷  Duplicate group: %s — %s  (versions: %d)",
+                artist_name,
+                best["title_raw"],
+                len(losers) + 1,
+            )
+            logging.info(
+                "    Selected BEST: %s, %d-bit, %d tracks",
+                get_primary_format(Path(best["folder"])),
+                best["bd"],
+                len(best["tracks"]),
+            )
+
+            # Accumulator for this group
+            space_freed_mb = 0
+
+            # Move every loser edition
+            for loser in losers:
+                src = Path(loser["folder"])
+                if not src.exists():
+                    logging.warning("Source missing (skipped): %s", src)
+                    continue
+
+                # Build destination under /dupes
+                try:
+                    base_path = next(iter(PATH_MAP.values()))
+                    relative  = src.relative_to(base_path)
+                except Exception:
+                    relative = src.name
+                dst = DUPE_ROOT / relative
+                dst.parent.mkdir(parents=True, exist_ok=True)
+
+                # Avoid collisions with numbered suffixes
+                counter = 1
+                while dst.exists():
+                    dst = dst.parent / f"{relative} ({counter})"
+                    counter += 1
+
+                size_mb = folder_size(src) // (1024 * 1024)
+
+                if dry:
+                    logging.info("    DRY-RUN – would move %s → %s  (%,d MB)", src, dst, size_mb)
+                else:
+                    logging.info("    Moving %s → %s  (%,d MB)", src, dst, size_mb)
+                    safe_move(str(src), str(dst))
+
+                space_freed_mb += size_mb
+                stats["total_dupes"] += 1
+                stats["total_moved_mb"] += size_mb
+                removed_this_artist += 1
+
+                # Plex metadata cleanup
+                if not (dry or safe):
+                    try:
+                        loser_id = loser["album_id"]
+                        plex_api(f"/library/metadata/{loser_id}/trash", method="PUT")
+                        time.sleep(0.3)
+                        plex_api(f"/library/metadata/{loser_id}", method="DELETE")
+                    except Exception as api_err:
+                        logging.warning("Could not delete Plex metadata: %s", api_err)
+
+            logging.info("    ➜ Freed %,d MB in this group", space_freed_mb)
+
+            # Optional extra-track tagging
+            if tag_extra:
+                editions = losers + [best]
+                min_tracks = min(len(e["tracks"]) for e in editions)
+                if len(best["tracks"]) > min_tracks:
+                    try:
+                        plex_api(
+                            f"/library/metadata/{best['album_id']}"
+                            "?title.value=(Extra Tracks)&title.lock=1",
+                            method="PUT",
+                        )
+                        logging.info("    Tagged best edition with '(Extra Tracks)'")
+                    except Exception as err:
+                        logging.warning("Failed to tag edition: %s", err)
+
+        # Refresh Plex for this artist after processing all groups
+        if removed_this_artist and not dry:
             try:
-                idx = int(m.group(1))
-                if idx > max_idx:
-                    max_idx = idx
-            except Exception:
-                continue
-    # For each edition beyond best, copy any tracks matching merge_list into best_folder
-    copied = []
-    idx_counter = max_idx
-    for e in group["losers"]:
-        src_folder = Path(e["folder"])
-        for track in merge_list:
-            src_file = next(src_folder.rglob(f"*{track}*"), None)
-            if src_file:
-                idx_counter += 1
-                orig_name = src_file.name
-                ext = src_file.suffix
-                base = src_file.stem
-                new_name = f"{idx_counter:02d} - {base} (bonus track){ext}"
-                shutil.copy2(str(src_file), str(best_folder / new_name))
-                copied.append(new_name)
-    return jsonify(message=f"Copied {len(copied)} tracks: {', '.join(copied)}")
-# Update the /api/duplicates route to use the card helper
-@app.get("/api/duplicates")
-def api_duplicates():
-    """
-    Live‑feed of duplicate groups discovered so far, formatted like the
-    cards used on the main page, so the JS can drop them straight in.
-    """
-    with lock:
-        return jsonify(_build_card_list(state["duplicates"]))
+                encoded_artist = quote_plus(artist_name)
+                prefix = f"/music/matched/{artist_name[0].upper()}/{encoded_artist}"
+                plex_api(f"/library/sections/{SECTION_ID}/refresh?path={prefix}")
+                plex_api(f"/library/sections/{SECTION_ID}/emptyTrash", method="PUT")
+            except Exception as refresh_err:
+                logging.warning("Plex refresh failed for %s: %s", artist_name, refresh_err)
+
+    db.close()
+
+    # ------------------------------------------------------------------ #
+    #  FINAL SUMMARY
+    # ------------------------------------------------------------------ #
+    summary_lines = [
+        "",
+        "─" * 70,
+        "FINAL SUMMARY",
+        f"Total artists           : {stats['total_artists']:,}",
+        f"Total albums            : {stats['total_albums']:,}",
+        f"Albums with dupes       : {stats['albums_with_dupes']:,}",
+        f"Folders moved           : {stats['total_dupes']:,}",
+        f"Total space reclaimed   : {stats['total_moved_mb']:,} MB",
+        "─" * 70,
+        "",
+    ]
+    for line in summary_lines:
+        logging.info(line)
+
+    # ------------------------------------------------------------------ #
+    #  Discord – always attempt to notify
+    # ------------------------------------------------------------------ #
+    try:
+        notify_discord(
+            "\n".join(
+                [
+                    "🟢 **PMDA CLI run finished**",
+                    f"Artists scanned: {stats['total_artists']:,}",
+                    f"Albums scanned: {stats['total_albums']:,}",
+                    f"Duplicate albums: {stats['albums_with_dupes']:,}",
+                    f"Folders moved: {stats['total_dupes']:,}",
+                    f"Space reclaimed: {stats['total_moved_mb']:,} MB",
+                    "(dry-run)" if dry else "",
+                ]
+            )
+        )
+    except Exception as e:
+        logging.warning("Discord summary failed: %s", e)
 
 # ───────────────────────────────── MAIN ───────────────────────────────────
 import os
