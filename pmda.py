@@ -1147,9 +1147,10 @@ def get_tracks(db_conn, album_id: int) -> List[Track]:
             for t, i, d, dur in rows]
 
 def album_title(db_conn, album_id: int) -> str:
-    return db_conn.execute(
+    row = db_conn.execute(
         "SELECT title FROM metadata_items WHERE id = ?", (album_id,)
-    ).fetchone()[0]
+    ).fetchone()
+    return row[0] if row else ""
 
 def first_part_path(db_conn, album_id: int) -> Optional[Path]:
     sql = """
@@ -2117,7 +2118,10 @@ def load_scan_from_db() -> Dict[str, List[dict]]:
         for l in losers:
             if l["title_raw"] is None:
                 db_plx = plex_connect()
-                l["title_raw"] = album_title(db_plx, aid)
+                title = album_title(db_plx, aid)
+                if not title:
+                    continue
+                l["title_raw"] = title
                 db_plx.close()
 
         results[artist].append(
