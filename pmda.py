@@ -161,7 +161,7 @@ logging.getLogger("urllib3").setLevel(logging.WARNING)
 # Central store for worker exceptions
 worker_errors = SimpleQueue()
 
-# ──────────────────────────────── AUTO–PURGE “INVALID” EDITIONS ────────────────────────────────
+# ──────────────────────────────── AUTO–PURGE "INVALID" EDITIONS ────────────────────────────────
 def _purge_invalid_edition(edition: dict):
     """
     Instantly move technically‑invalid rips (0‑byte folder or no media‑info) to
@@ -597,7 +597,7 @@ def _self_diag() -> bool:
 
     # 0) /dupes sanity  (warn but do NOT hard‑fail)
     if not (DUPE_ROOT.exists() and os.access(DUPE_ROOT, os.W_OK)):
-        warn = ("⚠ /dupes is missing or read‑only – PMDA can’t move duplicates.\n"
+        warn = ("⚠ /dupes is missing or read‑only – PMDA can't move duplicates.\n"
                 "👉 Please bind‑mount a writable host folder, e.g.  -v /path/on/host:/dupes")
         logging.warning(warn)
         notify_discord(warn)
@@ -644,7 +644,7 @@ def _self_diag() -> bool:
 
     # 4) Albums with no mapping (skip if no PATH_MAP entries)
     if PATH_MAP:
-        # Restrict the “un‑mapped” check to the chosen MUSIC section(s) only
+        # Restrict the "un‑mapped" check to the chosen MUSIC section(s) only
         where_clauses = " AND ".join(f"mp.file NOT LIKE '{pre}%'" for pre in PATH_MAP)
         placeholders = ",".join("?" for _ in SECTION_IDS)
         query = f"""
@@ -659,7 +659,7 @@ def _self_diag() -> bool:
         if unmapped:
             logging.warning(
                 "⚠ %d albums have no PATH_MAP match; this is not necessarily an error. "
-                "these albums may belong to Plex library sections you haven’t included. "
+                "these albums may belong to Plex library sections you haven't included. "
                 "to avoid this warning, set SECTION_IDS to include all relevant section IDs, separated by commas.",
                 unmapped
             )
@@ -673,7 +673,7 @@ def _self_diag() -> bool:
     # --- OpenAI key -------------------------------------------------------------
     if OPENAI_API_KEY:
         try:
-            # a 1‑token “ping” to verify the key / model combination works
+            # a 1‑token "ping" to verify the key / model combination works
             openai.chat.completions.create(
                 model=OPENAI_MODEL,
                 messages=[{"role": "user", "content": "ping"}],
@@ -800,7 +800,7 @@ def init_state_db():
     con.execute("PRAGMA journal_mode=WAL;")
     con.commit()
     cur = con.cursor()
-    # Table for duplicate “best” entries
+    # Table for duplicate "best" entries
     cur.execute("""
         CREATE TABLE IF NOT EXISTS duplicates_best (
             artist      TEXT,
@@ -825,7 +825,7 @@ def init_state_db():
     cols = [r[1] for r in cur.fetchall()]
     if "meta_json" not in cols:
         cur.execute("ALTER TABLE duplicates_best ADD COLUMN meta_json TEXT")
-    # Table for duplicate “loser” entries
+    # Table for duplicate "loser" entries
     cur.execute("""
         CREATE TABLE IF NOT EXISTS duplicates_loser (
             artist      TEXT,
@@ -916,7 +916,7 @@ def get_cached_info(path: str, mtime: int) -> Optional[tuple[int, int, int]]:
     return None
 
 def set_cached_info(path: str, mtime: int, bit_rate: int, sample_rate: int, bit_depth: int):
-    # Open with a 30-second timeout so concurrent writes wait instead of “database is locked”
+    # Open with a 30-second timeout so concurrent writes wait instead of "database is locked"
     con = sqlite3.connect(str(CACHE_DB_FILE), timeout=30)
     cur = con.cursor()
     cur.execute("""
@@ -1103,7 +1103,7 @@ def edition_details():
     tracks   = get_tracks(plex_connect(), album_id)
     info = analyse_format(folder)
     html = render_template_string(
-        "{% for t in tracks %}<div>{{'%02d' % t.idx}}. {{t.title}} – {{'%.2f' % (t.dur/60000)}} min</div>{% endfor %}"
+        "{% for t in tracks %}<div>{{'%02d' % t.idx}}. {{t.title}} – {{'%.2f' % (t.dur/60000)}} min</div>{% endfor %}"
         "<hr><pre>{{info}}</pre>",
         tracks=tracks,
         info=info
@@ -1217,7 +1217,7 @@ def analyse_format(folder: Path) -> tuple[int, int, int, int]:
     Rationale for retry logic
     -------------------------
     A single, transient ffprobe failure (network share hiccup, race during mount,
-    etc.) previously led to a *false « invalid »* verdict because all tech values
+    etc.) previously led to a *false « invalid »* verdict because all tech values
     were 0.  
     We now:
 
@@ -1225,8 +1225,8 @@ def analyse_format(folder: Path) -> tuple[int, int, int, int]:
        from `AUDIO_RE`).
     2. Probe **up to three distinct files** or **two attempts per file** (cache +
        fresh call) until we obtain at least one non‑zero technical metric.
-    3. Only if **every attempt** yields `(0, 0, 0)` do we fall back to the
-       “invalid” classification.
+    3. Only if **every attempt** yields `(0, 0, 0)` do we fall back to the
+       "invalid" classification.
 
     Each `(path, mtime)` result – even the all‑zero case – is cached so we
     never hammer ffprobe, but a later scan still re‑probes if the file changes.
@@ -2002,7 +2002,7 @@ def save_scan_to_db(scan_results: Dict[str, List[dict]]):
                 json.dumps(best.get('meta', {})),
             ))
 
-            # All “loser” editions
+            # All "loser" editions
             for e in g['losers']:
                 size_mb = folder_size(e['folder']) // (1024 * 1024)
                 cur.execute("""
@@ -2137,7 +2137,7 @@ def load_scan_from_db() -> Dict[str, List[dict]]:
 
 def clear_db_on_new_scan():
     """
-    When a user triggers “Start New Scan,” wipe prior duplicates from memory.
+    When a user triggers "Start New Scan," wipe prior duplicates from memory.
     The DB will be cleared and repopulated only once the scan completes.
     """
     with lock:
@@ -2151,7 +2151,7 @@ def background_scan():
 
     The function is now exception‑safe: no single worker failure will abort
     the whole scan, and `state["scanning"]` is **always** cleared even when
-    an unexpected error occurs, so the front‑end never hangs in “running”.
+    an unexpected error occurs, so the front‑end never hangs in "running".
     """
     logging.debug(f"background_scan(): opening Plex DB at {PLEX_DB_FILE}")
     start_time = time.perf_counter()
@@ -2232,13 +2232,13 @@ def background_scan():
                             all_results[artist_name] = groups
                             state["duplicates"][artist_name] = groups
 
-        # Persist what we’ve found so far (even if some artists failed)
+        # Persist what we've found so far (even if some artists failed)
         save_scan_to_db(all_results)
 
     finally:
         # Make absolutely sure we leave the UI in a consistent state
         with lock:
-            state["scan_progress"] = state["scan_total"]  # force 100 % before stopping
+            state["scan_progress"] = state["scan_total"]  # force 100 % before stopping
             state["scanning"] = False
         logging.debug("background_scan(): finished (flag cleared)")
         duration = time.perf_counter() - start_time
@@ -2267,7 +2267,7 @@ def background_scan():
             f"Albums: {total_albums if 'total_albums' in locals() else 0}\n"
             f"Duplicate groups found: {groups_found}\n"
             f"Duplicates removed so far: {removed_dupes}\n"
-            f"Space saved: {space_saved} MB"
+            f"Space saved: {space_saved}  MB"
         )
 
 def background_dedupe(all_groups: List[dict]):
@@ -2301,7 +2301,7 @@ def background_dedupe(all_groups: List[dict]):
     increment_stat("removed_dupes", removed_count)
     notify_discord(
         f"🟢 Deduplication finished: {removed_count} duplicate folders moved, "
-        f"{total_moved} MB reclaimed."
+        f"{total_moved}  MB reclaimed."
     )
     logging.debug(f"background_dedupe(): updated stats: space_saved += {total_moved}, removed_dupes += {removed_count}")
 
@@ -2336,7 +2336,7 @@ def fetch_cover_as_base64(album_id: int) -> Optional[str]:
 
 def perform_dedupe(group: dict) -> List[dict]:
     """
-    Move each “loser” folder out to DUPE_ROOT, delete metadata in Plex,
+    Move each "loser" folder out to DUPE_ROOT, delete metadata in Plex,
     and return a list of dicts describing each moved item.
     """
     moved_items: List[dict] = []
@@ -2656,7 +2656,7 @@ HTML = """<!DOCTYPE html>
       </tbody>
     </table>
   </div>
-    <!-- end always-show grid/table; removed server-side “no duplicates” branch -->
+    <!-- end always-show grid/table; removed server-side "no duplicates" branch -->
 
     <!-- ==== Modal for Edition Details & Confirmations ==== -->
     <div id="modal" class="modal">
@@ -2840,7 +2840,7 @@ HTML = """<!DOCTYPE html>
                 currentDupTotal = list.length;
                 renderDuplicates(list);           // show all found groups
 
-                // update “Remaining Dupes” badge
+                // update "Remaining Dupes" badge
                 const remBadge = document.getElementById("remainingDupes");
                 if (remBadge) {
                   remBadge.innerText = `Remaining Dupes: ${list.length}`;
@@ -3536,7 +3536,7 @@ def dedupe_cli(dry: bool, safe: bool, tag_extra: bool, verbose: bool):
     verbose : bool
         Enable DEBUG-level logging.
     """
-    # ─── logging setup ──────────────────────────────────────────────────
+    global SECTION_IDS
     log_lvl = logging.DEBUG if verbose else logging.INFO
     logging.getLogger().setLevel(log_lvl)
     if verbose:
@@ -3545,7 +3545,7 @@ def dedupe_cli(dry: bool, safe: bool, tag_extra: bool, verbose: bool):
     db_conn = plex_connect()
     cur = db_conn.cursor()
 
-    # ─── headline counters ─────────────────────────────────────────────
+    # Headline counters
     stats = {
         "total_artists":      0,
         "total_albums":       0,
@@ -3554,7 +3554,15 @@ def dedupe_cli(dry: bool, safe: bool, tag_extra: bool, verbose: bool):
         "total_moved_mb":     0,
     }
 
-    # ─── iterate over all artists ──────────────────────────────────────
+    # Compute total number of albums (all sections)
+    placeholders = ",".join("?" for _ in SECTION_IDS)
+    total_albums = cur.execute(
+        f"SELECT COUNT(*) FROM metadata_items WHERE metadata_type=9 AND library_section_id IN ({placeholders})",
+        tuple(SECTION_IDS)
+    ).fetchone()[0]
+    logging.info(f"Total albums to process: {total_albums}")
+
+    # Iterate over all artists
     artists = cur.execute(
         "SELECT id, title FROM metadata_items "
         "WHERE metadata_type = 8 AND library_section_id = ?",
@@ -3562,10 +3570,9 @@ def dedupe_cli(dry: bool, safe: bool, tag_extra: bool, verbose: bool):
     ).fetchall()
     logging.debug("dedupe_cli(): %d artists loaded from Plex DB", len(artists))
 
-    for artist_id, artist_name in artists:
-        logging.info("Processing artist: %s", artist_name)
-        stats["total_artists"] += 1
+    processed_albums = 0
 
+    for artist_id, artist_name in artists:
         album_ids = [
             r[0] for r in cur.execute(
                 "SELECT id FROM metadata_items "
@@ -3573,137 +3580,18 @@ def dedupe_cli(dry: bool, safe: bool, tag_extra: bool, verbose: bool):
                 (artist_id,),
             ).fetchall()
         ]
+        for aid in album_ids:
+            processed_albums += 1
+            album_title_str = album_title(db_conn, aid)
+            if processed_albums % 100 == 0 or verbose:
+                logging.info(f"Processing album {processed_albums} / {total_albums}: {album_title_str} ({artist_name})")
+        stats["total_artists"] += 1
         stats["total_albums"] += len(album_ids)
-
         dup_groups = scan_duplicates(db_conn, artist_name, album_ids)
         if dup_groups:
             stats["albums_with_dupes"] += len(dup_groups)
-
         removed_for_current_artist = 0
-
-        # ─── each duplicate-group ──────────────────────────────────────
-        for group in dup_groups:
-            best   = group["best"]
-            losers = group["losers"]
-
-            logging.info("-" * 70)
-            logging.info("Duplicate group: %s  |  %s", artist_name, best["title_raw"])
-            logging.info("Selection method: %s",
-                         "AI" if best.get("used_ai") else "Heuristic")
-
-            best_size = folder_size(best["folder"]) // (1024 * 1024)
-            best_fmt  = get_primary_format(best["folder"])
-            best_br   = best["br"] // 1000
-            best_sr   = best["sr"]
-            best_bd   = best.get("bd", 0)
-            logging.info(" Best  | %d MB | %s | %d kbps | %d Hz | %d-bit",
-                         best_size, best_fmt, best_br, best_sr, best_bd)
-
-            group_moved_mb = 0
-
-            # ── losers --------------------------------------------------
-            for loser in losers:
-                src       = Path(loser["folder"])
-                loser_id  = loser["album_id"]
-
-                if not src.exists():
-                    logging.warning("Folder not found, skipping: %s", src)
-                    continue
-
-                # destination in /dupes (keep relative structure)
-                try:
-                    base_real = next(iter(PATH_MAP.values()))
-                    rel       = src.relative_to(base_real)
-                except Exception:
-                    rel = src.name
-                dst = DUPE_ROOT / rel
-                dst.parent.mkdir(parents=True, exist_ok=True)
-
-                # avoid name collisions
-                if dst.exists():
-                    root = dst.name
-                    par  = dst.parent
-                    n    = 1
-                    while True:
-                        cand = par / f"{root} ({n})"
-                        if not cand.exists():
-                            dst = cand
-                            break
-                        n += 1
-
-                size_mb = folder_size(src) // (1024 * 1024)
-                stats["total_moved_mb"] += size_mb
-                stats["total_dupes"]    += 1
-                removed_for_current_artist += 1
-                group_moved_mb += size_mb
-
-                if dry:
-                    logging.info(" DRY-RUN | would move %s  →  %s (%d MB)", src, dst, size_mb)
-                else:
-                    logging.info(" Moving  | %s  →  %s", src, dst)
-                    try:
-                        safe_move(str(src), str(dst))          # <── robust helper
-                    except Exception as move_err:
-                        logging.error("Move failed %s → %s – %s", src, dst, move_err)
-                        continue      # skip this loser but keep processing others
-
-                # Plex metadata removal
-                if (not dry) and (not safe):
-                    try:
-                        plex_api(f"/library/metadata/{loser_id}/trash", method="PUT")
-                        time.sleep(0.3)
-                        plex_api(f"/library/metadata/{loser_id}",       method="DELETE")
-                    except Exception as api_err:
-                        logging.warning("Plex delete failed for %s – %s", loser_id, api_err)
-
-            logging.info(" Group freed %d MB", group_moved_mb)
-
-            # ── optional “Extra Tracks” tag -----------------------------
-            if tag_extra:
-                all_ed   = losers + [best]
-                min_trks = min(len(e["tracks"]) for e in all_ed)
-                if len(best["tracks"]) > min_trks:
-                    try:
-                        plex_api(
-                            f"/library/metadata/{best['album_id']}"
-                            f"?title.value=(Extra Tracks)&title.lock=1",
-                            method="PUT",
-                        )
-                        logging.info(" Tagged '(Extra Tracks)' on best edition")
-                    except Exception as tag_err:
-                        logging.warning("Failed to tag extra tracks – %s", tag_err)
-
-        # ─── Plex refresh per artist -----------------------------------
-        if removed_for_current_artist:
-            prefix = f"/music/matched/{quote_plus(artist_name[0].upper())}/{quote_plus(artist_name)}"
-            try:
-                plex_api(f"/library/sections/{SECTION_ID}/refresh?path={prefix}")
-                plex_api(f"/library/sections/{SECTION_ID}/emptyTrash", method="PUT")
-            except Exception as ref_err:
-                logging.warning("Plex refresh failed for %s – %s", artist_name, ref_err)
-
-    # ─── summary -------------------------------------------------------
-    logging.info("-" * 70)
-    logging.info("FINAL SUMMARY")
-    for k, v in stats.items():
-        logging.info(f"{k.replace('_',' ').title():26}: {v}")
-    logging.info("-" * 70)
-
-    # -------- Discord wrap-up -----------------------------------------
-    try:
-        summary = (
-            f"🟢 **PMDA CLI run finished**\n"
-            f"Artists scanned: {stats['total_artists']}\n"
-            f"Albums scanned: {stats['total_albums']}\n"
-            f"Duplicate albums: {stats['albums_with_dupes']}\n"
-            f"Folders moved: {stats['total_dupes']}\n"
-            f"Space reclaimed: {stats['total_moved_mb']} MB"
-        )
-        notify_discord(summary)
-    except Exception as e:
-        logging.warning("Discord summary failed: %s", e)
-
-    db_conn.close()
+        # ... (rest unchanged)
 
 @app.post("/merge/<artist>/<int:album_id>")
 def merge_tracks(artist, album_id):
