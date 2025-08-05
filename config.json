@@ -1,10 +1,13 @@
 {
-  "PLEX_DB_PATH": "/path/to/plex/Plug-in Support/Databases",
-  "PLEX_HOST": "http://<PLEX_IP>:32400",
-  "PLEX_TOKEN": "<YOUR_PLEX_TOKEN>",
-  "SECTION_ID": 1,
+  "PLEX_DB_PATH": "",
+  "PLEX_HOST": "",
+  "PLEX_TOKEN": "",
   "SCAN_THREADS": 16,
   "LOG_LEVEL": "INFO",
-  "OPENAI_API_KEY": "<YOUR_OPENAI_API_KEY>",
-  "OPENAI_MODEL": "gpt-4o-nano"
+  "OPENAI_API_KEY": "",
+  "OPENAI_MODEL": "gpt-4o-nano",
+  "DISCORD_WEBHOOK": "",
+  "PATH_MAP": {},
+  "USE_MUSICBRAINZ": false,
+  "SKIP_FOLDERS": []
 }
