@@ -857,13 +857,21 @@ def _cross_check_bindings():
             logging.debug("No sub‑directories under %s – cannot guess roots", search_base)
         candidate_counts: dict[str, int] = {}
         for cand in candidate_roots:
+            logging.debug("→ checking %s …", cand)
             ok = 0
-            for _, rel in missing:
+            for idx, (_, rel) in enumerate(missing, 1):
                 dst = cand / rel
                 if dst.exists():
                     ok += 1
+                    logging.debug("   %2d/%d matches so far (%s)", ok, CROSSCHECK_SAMPLES, rel if ok <= 3 else "…")
+                # early‑exit: all samples matched
+                if ok == CROSSCHECK_SAMPLES:
+                    break
             if ok:
+                logging.info("   %s → %d/%d samples matched", cand, ok, CROSSCHECK_SAMPLES)
                 candidate_counts[str(cand)] = ok
+            else:
+                logging.debug("   %s → 0 matches", cand)
         # ─── fallback: deep scan when nothing found above ─────────────────────
         if not candidate_counts:
             logging.debug("Immediate child scan found nothing – performing deep filename search")
@@ -874,13 +882,17 @@ def _cross_check_bindings():
                     for _ in Path(rel).parts:
                         root = root.parent
                     root = str(root)
-                    candidate_counts[root] = candidate_counts.get(root, 0) + 1
+                    cnt = candidate_counts.get(root, 0) + 1
+                    candidate_counts[root] = cnt
+                    if cnt == CROSSCHECK_SAMPLES // 2:
+                        logging.info("   halfway there: %d/%d samples align under %s", cnt, CROSSCHECK_SAMPLES, root)
 
         best_root, matched = (None, 0)
         if candidate_counts:
             best_root, matched = max(candidate_counts.items(), key=lambda kv: kv[1])
         logging.debug("Candidate roots and match counts: %s", candidate_counts)
-
+        if matched:
+            logging.info("Best candidate %s matched %d/%d samples", best_root, matched, CROSSCHECK_SAMPLES)
         if matched == CROSSCHECK_SAMPLES:
             updates[plex_root] = best_root
             logging.info("Resolved new host root for %s: %s", plex_root, best_root)
