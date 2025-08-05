@@ -856,11 +856,10 @@ def _cross_check_bindings():
         if not candidate_roots:
             logging.debug("No sub‑directories under %s – cannot guess roots", search_base)
         candidate_counts: dict[str, int] = {}
-        rel_parts = [Path(p).parts for p, _ in missing]   # pre‑split once
         for cand in candidate_roots:
             ok = 0
-            for (src_path, rel), rel_p in zip(missing, rel_parts):
-                dst = cand.joinpath(*rel_p)
+            for _, rel in missing:
+                dst = cand / rel
                 if dst.exists():
                     ok += 1
             if ok:
