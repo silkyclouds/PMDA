@@ -387,6 +387,8 @@ def _discover_path_map(plex_host: str, plex_token: str, section_id: int) -> dict
 try:
     plex_host   = os.getenv("PLEX_HOST")   or conf.get("PLEX_HOST")
     plex_token  = os.getenv("PLEX_TOKEN")  or conf.get("PLEX_TOKEN")
+except Exception as e:
+    logging.warning("⚠️  Failed to auto‑generate PATH_MAP – %s", e)
 def _auto_music_sections(plex_host: str, plex_token: str) -> list[int]:
     """
     Return the IDs of all Plex libraries whose Directory type is "artist"
