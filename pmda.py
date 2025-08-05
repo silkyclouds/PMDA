@@ -138,6 +138,7 @@ try:
             encoding="utf-8"
         )
     )
+except Exception as e:
     # Never fail hard if the volume is read‑only or path invalid
     print(f"⚠️  File logging disabled – {e}", file=sys.stderr)
 
@@ -386,49 +387,16 @@ def _discover_path_map(plex_host: str, plex_token: str, section_id: int) -> dict
 try:
     plex_host   = os.getenv("PLEX_HOST")   or conf.get("PLEX_HOST")
     plex_token  = os.getenv("PLEX_TOKEN")  or conf.get("PLEX_TOKEN")
-except Exception as e:
-    logging.warning("⚠️  Failed to auto‑generate PATH_MAP – %s", e)
-def _auto_music_sections(plex_host: str, plex_token: str) -> list[int]:
-    """
-    Return the IDs of all Plex libraries whose Directory type is "artist"
-    (i.e. music sections).  Falls back to an empty list on error.
-    """
-    try:
-        url = f"{plex_host.rstrip('/')}/library/sections"
-        resp = requests.get(url, headers={"X-Plex-Token": plex_token}, timeout=10)
-        resp.raise_for_status()
-        root = ET.fromstring(resp.text)
-        return [
-            int(d.attrib["key"])
-            for d in root.iter("Directory")
-            if d.attrib.get("type") == "artist"
-        ]
-    except Exception as exc:
-        logging.warning("Auto-detect music sections failed: %s", exc)
-        return []
-
-# Support multiple section IDs via SECTION_IDS or SECTION_ID (comma-separated)
-raw_sections = (
-    os.getenv("SECTION_IDS")
-    or os.getenv("SECTION_ID")
-    or conf.get("SECTION_IDS")
-    or conf.get("SECTION_ID")
-    or ""
-)
-
-# Parse comma‑separated integers
-SECTION_IDS: list[int] = [
-    int(part.strip()) for part in re.split(r"\s*,\s*", raw_sections) if part.strip().isdigit()
-]
-
-# Nothing specified → auto‑detect every music section
-if not SECTION_IDS:
-    SECTION_IDS = _auto_music_sections(plex_host, plex_token)
-    logging.info("Auto-detected music sections: %s", SECTION_IDS)
-
-# Hard‑fail when still empty (token or Plex down)
-if not SECTION_IDS:
-    raise SystemExit("No music sections found – check Plex connectivity and PLEX_TOKEN")
+    # Support multiple section IDs via SECTION_IDS or SECTION_ID (comma-separated)
+    import re
+    raw_sections = os.getenv("SECTION_IDS") or os.getenv("SECTION_ID") or conf.get("SECTION_IDS") or conf.get("SECTION_ID", 1)
+    # Split on commas, strip whitespace, parse ints
+    SECTION_IDS: list[int] = []
+    for part in re.split(r'\s*,\s*', str(raw_sections)):
+        if part.strip().isdigit():
+            SECTION_IDS.append(int(part.strip()))
+    if not SECTION_IDS:
+        SECTION_IDS = [1]  # fallback to section 1 if nothing parsed
 
     # ----- LIBRARY SECTIONS -----
     try:
