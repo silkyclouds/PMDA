@@ -22,10 +22,10 @@ no_file_streak_global = 0
 popup_displayed = False
 
 """
-v0.6.6
+v0.6.7
 
 Changelog:
-- added a SKIP_FOLDERS variable to allow users to skip detecting dupes in specific folder locations
+- PMDA now scans the parent music folder recursively in search of the right folder and files, no more need to bind 50 folders anymore ! it's all automated babe ! 
 """
 
 import argparse
