@@ -109,8 +109,10 @@ def safe_move(src: str, dst: str):
     if os.path.exists(src):
         logging.warning("safe_move(): forcing removal of residual files in %s", src)
         shutil.rmtree(src, ignore_errors=True)
+
 from queue import SimpleQueue
 import sys
+import random
 
 
 
@@ -487,6 +489,9 @@ merged["PATH_MAP"] = conf.get("PATH_MAP", {})
 SKIP_FOLDERS: list[str] = merged["SKIP_FOLDERS"]
 USE_MUSICBRAINZ: bool = bool(merged["USE_MUSICBRAINZ"])
 
+# Number of sample tracks per Plex mount to verify; override with env CROSSCHECK_SAMPLES
+CROSSCHECK_SAMPLES = int(os.getenv("CROSSCHECK_SAMPLES", 20))
+
 # ─────────────────────────────── Fixed container constants ───────────────────────────────
 # DB filename is always fixed under the Plex DB folder
 PLEX_DB_FILE = str(Path(merged["PLEX_DB_PATH"]) / "com.plexapp.plugins.library.db")
@@ -787,6 +792,108 @@ def _self_diag() -> bool:
     return True
 
 
+# ──────────────────────────────── CROSS‑CHECK PATH BINDINGS ────────────────────────────────
+def _cross_check_bindings():
+    """
+    Verify that every PATH_MAP binding actually resolves to real audio
+    files on the host.
+
+    • Randomly samples CROSSCHECK_SAMPLES audio files per Plex root.
+    • If all samples exist under the mapped host root, the binding is valid.
+    • Otherwise performs a recursive search to locate the files; if they are
+      all found under the same parent folder we treat that folder as the
+      correct host root and patch PATH_MAP (memory + config.json).
+    • If any binding cannot be validated or repaired, the startup aborts
+      with SystemExit to avoid destructive behaviour later on.
+    """
+    log_header("cross‑check path bindings")
+
+    con = plex_connect()
+    cur = con.cursor()
+    updates: dict[str, str] = {}
+    abort = False
+
+    for plex_root, host_root in PATH_MAP.items():
+        # 1) Pull a random sample of audio files
+        cur.execute(
+            '''
+            SELECT mp.file
+            FROM   media_parts mp
+            WHERE  mp.file LIKE ?
+              AND (mp.file LIKE '%.flac' OR mp.file LIKE '%.wav' OR mp.file LIKE '%.m4a'
+                   OR mp.file LIKE '%.mp3' OR mp.file LIKE '%.ogg' OR mp.file LIKE '%.aac')
+            ORDER BY RANDOM()
+            LIMIT ?
+            ''',
+            (f"{plex_root}/%", CROSSCHECK_SAMPLES)
+        )
+        rows = [r[0] for r in cur.fetchall()]
+
+        if len(rows) < CROSSCHECK_SAMPLES:
+            logging.error("Only %d/%d sample files found under %s – aborting.", len(rows), CROSSCHECK_SAMPLES, plex_root)
+            abort = True
+            continue
+
+        # 2) Direct existence test
+        missing: list[tuple[str, str]] = []
+        for src_path in rows:
+            rel = src_path[len(plex_root):].lstrip("/")
+            dst_path = os.path.join(host_root, rel)
+            if not Path(dst_path).exists():
+                missing.append((src_path, rel))
+
+        if not missing:
+            logging.info("✓ Binding verified: %s → %s", plex_root, host_root)
+            continue
+
+        logging.warning("Binding failed for %s → %s – attempting recursive search…", plex_root, host_root)
+
+        # 3) Recursive search
+        candidate_counts: dict[str, int] = {}
+        for _, rel in missing:
+            fname = os.path.basename(rel)
+            for found in Path(host_root).rglob(fname):
+                rel_parts = Path(rel).parts
+                root = found
+                for _ in rel_parts:
+                    root = root.parent
+                root = str(root)
+                candidate_counts[root] = candidate_counts.get(root, 0) + 1
+
+        best_root, matched = (None, 0)
+        if candidate_counts:
+            best_root, matched = max(candidate_counts.items(), key=lambda kv: kv[1])
+
+        if matched == CROSSCHECK_SAMPLES:
+            updates[plex_root] = best_root
+            logging.info("Resolved new host root for %s: %s", plex_root, best_root)
+        else:
+            logging.error("Could not validate binding for %s – matched %d/%d samples", plex_root, matched, CROSSCHECK_SAMPLES)
+            abort = True
+
+    con.close()
+
+    if abort:
+        notify_discord("❌ PMDA startup aborted: PATH_MAP bindings failed cross‑check.")
+        raise SystemExit("Cross‑check PATH_MAP failed")
+
+    # Apply fixes
+    if updates:
+        PATH_MAP.update(updates)
+        conf['PATH_MAP'] = PATH_MAP
+        with open(CONFIG_PATH, 'w', encoding='utf-8') as fh:
+            json.dump(conf, fh, indent=2)
+
+        msg = "\n".join(f"`{k}` → `{v}`" for k, v in updates.items())
+        notify_discord_embed(
+            title="🔄 PATH_MAP corrected",
+            description=msg
+        )
+        logging.info("Updated PATH_MAP in memory and config.json")
+
+    logging.info("All PATH_MAP bindings verified OK.")
+
+
 # ───────────────────────────────── OTHER CONSTANTS ──────────────────────────────────
 AUDIO_RE    = re.compile(r"\.(flac|ape|alac|wav|m4a|aac|mp3|ogg)$", re.I)
 # Derive format scores from user preference order
@@ -1026,6 +1133,7 @@ def notify_discord_embed(title: str, description: str, thumbnail_url: str = "", 
 _validate_plex_connection()
 if not _self_diag():
     raise SystemExit("Self‑diagnostic failed – please fix the issues above and restart PMDA.")
+_cross_check_bindings()
 
 def container_to_host(p: str) -> Optional[Path]:
     for pre, real in PATH_MAP.items():
