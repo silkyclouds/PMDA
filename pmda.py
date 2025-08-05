@@ -138,7 +138,6 @@ try:
             encoding="utf-8"
         )
     )
-except Exception as e:
     # Never fail hard if the volume is read‑only or path invalid
     print(f"⚠️  File logging disabled – {e}", file=sys.stderr)
 
