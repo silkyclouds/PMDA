@@ -389,14 +389,24 @@ try:
     plex_token  = os.getenv("PLEX_TOKEN")  or conf.get("PLEX_TOKEN")
     # Support multiple section IDs via SECTION_IDS or SECTION_ID (comma-separated)
     import re
-    raw_sections = os.getenv("SECTION_IDS") or os.getenv("SECTION_ID") or conf.get("SECTION_IDS") or conf.get("SECTION_ID", 1)
-    # Split on commas, strip whitespace, parse ints
-    SECTION_IDS: list[int] = []
-    for part in re.split(r'\s*,\s*', str(raw_sections)):
-        if part.strip().isdigit():
-            SECTION_IDS.append(int(part.strip()))
-    if not SECTION_IDS:
-        SECTION_IDS = [1]  # fallback to section 1 if nothing parsed
+    raw_sections = os.getenv("SECTION_IDS") or os.getenv("SECTION_ID") or conf.get("SECTION_IDS") or conf.get("SECTION_ID")
+
+    if not raw_sections:
+        # Auto-detect all available sections from Plex
+        try:
+            resp = requests.get(f"{plex_host.rstrip('/')}/library/sections", headers={"X-Plex-Token": plex_token}, timeout=10)
+            root = ET.fromstring(resp.text)
+            SECTION_IDS = [int(d.attrib['key']) for d in root.iter("Directory") if d.attrib.get('type') == 'artist']
+            logging.info("Auto-detected SECTION_IDS from Plex: %s", SECTION_IDS)
+        except Exception as e:
+            logging.error("Failed to auto-detect SECTION_IDS: %s", e)
+            raise SystemExit("Could not auto-detect Plex sections")
+    else:
+        # Split on commas, strip whitespace, parse ints
+        SECTION_IDS = []
+        for part in re.split(r'\s*,\s*', str(raw_sections)):
+            if part.strip().isdigit():
+                SECTION_IDS.append(int(part.strip()))
 
     # ----- LIBRARY SECTIONS -----
     try:
