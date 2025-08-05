@@ -24,10 +24,12 @@ Whether you're a FLAC snob or just want fewer copies of the same album floating 
 Here's what PMDA currently supports:
 
 - 🔍 **Scans** your entire Plex Music library
+- 🧬 **Auto-detects** Plex libraries, paths and DB structure
+- 🔍 **Automatically** maps your Plex Music librar(ies) paths with PMDA paths
 - 🎯 **Detects duplicate albums** using precise matching and format heuristics
-- 🧠 **(New!) Uses AI** (OpenAI) to pick the best version among dupes with rationale
+- 🧠 **(Optionally (but recommended) Uses AI** (OpenAI) to pick the best version among dupes with rationale
 - 📉 **Calculates bitrate/sample-rate/bit-depth** via FFmpeg
-- 🧹 **Trash and delete duplicate entries** via Plex API
+- 🧹 **Trash and delete duplicate entries from Plex libraries** via Plex API
 - 🧪 **Supports dry-run / safe mode** if you want to preview effects
 - 🖥️ **Modern Web UI** to dedupe one-by-one or all at once (But you want to use it in CLI mode anyway, right?)
 - 🧠 **Fully works offline** (if AI is not used)
@@ -36,7 +38,6 @@ Here's what PMDA currently supports:
 - 📊 **Stats panel** in UI: space saved, dupes removed, etc.
 - 🔄 **Merge extra tracks** from lesser versions
 - 💾 **Caches audio info** with SQLite so re-runs are fast
-- 🧬 **Auto-detects** Plex paths and DB structure
 - 📁 **Uses path mapping (PATH_MAP)** to resolve Docker volume mappings
 
 🧠 AI-Powered Comparison
@@ -78,7 +79,6 @@ PMDA uses OpenAI to determine the "best" version of an album — comparing forma
 
 ⚙️ Configuration
 ----------------
-▶️ [Watch the video guide on YouTube](https://www.youtube.com/watch?v=ohrKH4g2vGI)
 
 All config can be controlled either via `config.json` or environment variables (in Docker).
 
