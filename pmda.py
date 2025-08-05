@@ -389,7 +389,19 @@ try:
     plex_token  = os.getenv("PLEX_TOKEN")  or conf.get("PLEX_TOKEN")
     # Support multiple section IDs via SECTION_IDS or SECTION_ID (comma-separated)
     import re
-    raw_sections = os.getenv("SECTION_IDS") or os.getenv("SECTION_ID") or conf.get("SECTION_IDS") or conf.get("SECTION_ID")
+    # Read any user‑provided value first
+    raw_sections = (
+        os.getenv("SECTION_IDS")
+        or os.getenv("SECTION_ID")
+        or conf.get("SECTION_IDS")
+        or conf.get("SECTION_ID")
+    )
+
+    # Treat an empty string or whitespace‑only value as “not provided”
+    if raw_sections is not None and str(raw_sections).strip() == "":
+        raw_sections = None
+
+    logging.debug("SECTION_IDS raw input = %r", raw_sections)
 
     if not raw_sections:
         # Auto-detect all available sections from Plex
@@ -476,13 +488,19 @@ def _get(key: str, *, default=None, cast=lambda x: x):
         raw = default
     return cast(raw)
 
+# Validate we have at least one section ID before we start referencing it
+if not SECTION_IDS:
+    raise SystemExit(
+        "Auto‑discovery found no music sections. "
+        "Please set SECTION_IDS (comma‑separated) or SECTION_ID in your config/env."
+    )
 # Use first element of SECTION_IDS list for backward compatibility
 merged = {
     "PLEX_DB_PATH":   _get("PLEX_DB_PATH",   default="",                                cast=str),
     "PLEX_HOST":      _get("PLEX_HOST",      default="",                                cast=str),
     "PLEX_TOKEN":     _get("PLEX_TOKEN",     default="",                                cast=str),
     # Use first element of SECTION_IDS list for backward compatibility
-    "SECTION_ID": SECTION_IDS[0],
+    "SECTION_ID": SECTION_IDS[0],  # safe: we validated SECTION_IDS just above
     "SCAN_THREADS":   _get("SCAN_THREADS",   default=os.cpu_count() or 4,               cast=_parse_int),
     "PATH_MAP":       _parse_path_map(_get("PATH_MAP", default={})),
     "LOG_LEVEL":      _get("LOG_LEVEL",      default="INFO").upper(),
