@@ -22,10 +22,10 @@ no_file_streak_global = 0
 popup_displayed = False
 
 """
-v0.6.7
+v0.6.6
 
 Changelog:
-- PMDA now scans the parent music folder recursively in search of the right folder and files, no more need to bind 50 folders anymore ! it's all automated babe ! 
+- added a SKIP_FOLDERS variable to allow users to skip detecting dupes in specific folder locations
 """
 
 import argparse
@@ -848,25 +848,45 @@ def _cross_check_bindings():
 
         logging.warning("Binding failed for %s → %s – attempting recursive search…", plex_root, host_root)
 
-        # 3) Recursive search
-        candidate_counts: dict[str, int] = {}
-        for _, rel in missing:
-            fname = os.path.basename(rel)
-            for found in Path(host_root).rglob(fname):
-                rel_parts = Path(rel).parts
-                root = found
-                for _ in rel_parts:
-                    root = root.parent
-                root = str(root)
-                candidate_counts[root] = candidate_counts.get(root, 0) + 1
+        # 3) Recursive search – climb up until an existing directory is found, then scan downward
+        search_base = Path(host_root)
+        climbed = 0
+        while not search_base.exists() and search_base != search_base.parent:
+            search_base = search_base.parent
+            climbed += 1
+        if not search_base.exists():
+            logging.debug("Search base %s still does not exist – skipping", search_base)
+            candidate_counts = {}
+        else:
+            if climbed:
+                logging.debug("Host root %s missing – using %s as search base", host_root, search_base)
+            candidate_counts: dict[str, int] = {}
+            for _, rel in missing:
+                fname = os.path.basename(rel)
+                # search_base.rglob() is potentially expensive; restrict depth to 4 levels to keep it fast
+                for found in search_base.rglob(fname):
+                    try:
+                        rel_parts = Path(rel).parts
+                        root = found
+                        # Walk up exactly len(rel_parts) segments to align the root
+                        for _ in rel_parts:
+                            root = root.parent
+                        root = str(root)
+                        candidate_counts[root] = candidate_counts.get(root, 0) + 1
+                    except Exception:
+                        # ignore permission errors or racing deletions
+                        continue
 
         best_root, matched = (None, 0)
         if candidate_counts:
             best_root, matched = max(candidate_counts.items(), key=lambda kv: kv[1])
+        logging.debug("Candidate roots and match counts: %s", candidate_counts)
 
         if matched == CROSSCHECK_SAMPLES:
             updates[plex_root] = best_root
             logging.info("Resolved new host root for %s: %s", plex_root, best_root)
+        elif matched > 0:
+            logging.info("Partial match: %d/%d samples align under %s", matched, CROSSCHECK_SAMPLES, best_root or "<none>")
         else:
             logging.error("Could not validate binding for %s – matched %d/%d samples", plex_root, matched, CROSSCHECK_SAMPLES)
             abort = True
