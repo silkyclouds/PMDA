@@ -3828,9 +3828,9 @@ def dedupe_cli(
             if processed_albums % 100 == 0 or verbose:
                 title = album_title(db, aid)
                 logging.info(
-                    "Progress: %,d / %,d – %s – %s",
-                    processed_albums,
-                    total_albums_overall,
+                    "Progress: %s / %s – %s – %s",
+                    f"{processed_albums:,}",
+                    f"{total_albums_overall:,}",
                     artist_name,
                     title,
                 )
