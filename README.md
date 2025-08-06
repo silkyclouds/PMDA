@@ -1,8 +1,6 @@
 PMDA – Plex Music Dedupe Assistant
 ==================================
 
-▶️ [Watch the installation video guide on YouTube](https://www.youtube.com/watch?v=ohrKH4g2vGI)
-
 <p align="center">
   <img src="/static/PMDA.png" alt="PMDA Logo" width="450"/>
 </p>
@@ -39,6 +37,7 @@ Here's what PMDA currently supports:
 - 🔄 **Merge extra tracks** from lesser versions
 - 💾 **Caches audio info** with SQLite so re-runs are fast
 - 📁 **Uses path mapping (PATH_MAP)** to resolve Docker volume mappings
+- 🧠 **Cross-library deduplication mode** toggleable via config/env
 
 🧠 AI-Powered Comparison
 -------------------------
