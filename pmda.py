@@ -275,10 +275,19 @@ import filecmp
 
 # Helper parsers --------------------------------------------------------------
 def _parse_bool(val: str | bool) -> bool:
-    """Return *True* for typical truthy strings / bools."""
+    """Return *True* for typical truthy strings / bools and *False* otherwise."""
     if isinstance(val, bool):
         return val
-    return str(val).strip().lower() in {"1", "true", "yes", "on"}
+    val_normalized = str(val).strip().lower()
+    return val_normalized in {"1", "true", "yes", "on"}
+
+# Helper for falsy logic, if needed later
+def _is_false(val: str | bool) -> bool:
+    """Return *True* for typical falsy strings / bools and *False* otherwise."""
+    if isinstance(val, bool):
+        return not val
+    val_normalized = str(val).strip().lower()
+    return val_normalized in {"0", "false", "no", "off"}
 
 def _parse_int(val, default: int | None = None) -> int | None:
     """Return *int* or *default* on failure / None."""
