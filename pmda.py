@@ -516,6 +516,8 @@ merged["PATH_MAP"] = conf.get("PATH_MAP", {})
 
 SKIP_FOLDERS: list[str] = merged["SKIP_FOLDERS"]
 USE_MUSICBRAINZ: bool = bool(merged["USE_MUSICBRAINZ"])
+# Cross-library dedupe configuration
+CROSS_LIBRARY_DEDUPE = _parse_bool(os.getenv("CROSS_LIBRARY_DEDUPE", "true"))
 
 # Number of sample tracks per Plex mount to verify; override with env CROSSCHECK_SAMPLES
 CROSSCHECK_SAMPLES = int(os.getenv("CROSSCHECK_SAMPLES", 20))
@@ -1795,6 +1797,13 @@ def scan_artist_duplicates(args):
 
         # Fetch all album IDs for this artist...
         placeholders = ",".join("?" for _ in SECTION_IDS)
+        if CROSS_LIBRARY_DEDUPE:
+            section_filter = ""
+            section_args = []
+        else:
+            section_filter = f"AND alb.library_section_id IN ({placeholders})"
+            section_args = list(SECTION_IDS)
+
         cursor = db_conn.execute(
             f"""
             SELECT alb.id
@@ -1804,10 +1813,10 @@ def scan_artist_duplicates(args):
             JOIN media_parts      mp ON mp.media_item_id = mi.id
             WHERE alb.metadata_type = 9
               AND alb.parent_id = ?
-              AND alb.library_section_id IN ({placeholders})
+              {section_filter}
             GROUP BY alb.id
             """,
-            (artist_id, *SECTION_IDS)
+            (artist_id, *section_args)
         )
         album_ids = [row[0] for row in cursor.fetchall()]
         logging.debug(f"[Artist {artist_name} (ID {artist_id})] Retrieved {len(album_ids)} album IDs: {album_ids}")
