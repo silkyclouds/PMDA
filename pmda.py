@@ -858,6 +858,12 @@ def _cross_check_bindings():
         rows = [r[0] for r in cur.fetchall()]
 
         if len(rows) < CROSSCHECK_SAMPLES:
+            logging.warning("🚨 PATH CHECK ABORTED: only %d sample files found under %s, need at least %d to proceed.",
+                            len(rows), plex_root, CROSSCHECK_SAMPLES)
+            logging.warning("🤨 You don’t have enough albums to validate the binding for '%s'.", plex_root)
+            logging.warning("👉 PMDA needs at least %d albums per library path to perform a meaningful cross-check!", CROSSCHECK_SAMPLES)
+            logging.warning("💡 If you’re just testing, add more albums or reduce CROSSCHECK_SAMPLES via env.")
+            logging.warning("🎵 Running PMDA on a baby-sized library? You rebel. But we need more juice to continue.")
             logging.error("Only %d/%d sample files found under %s – aborting.", len(rows), CROSSCHECK_SAMPLES, plex_root)
             abort = True
             continue
