@@ -556,7 +556,16 @@ PLEX_TOKEN     = merged["PLEX_TOKEN"]
 SECTION_IDS    = SECTION_IDS
 SECTION_ID     = SECTION_IDS[0]
 PATH_MAP       = merged["PATH_MAP"]
-SCAN_THREADS   = int(merged["SCAN_THREADS"])
+import multiprocessing
+threads_env = os.getenv("SCAN_THREADS", "auto").strip().lower()
+if threads_env in ("auto", "", "all"):
+    SCAN_THREADS = multiprocessing.cpu_count()
+else:
+    try:
+        SCAN_THREADS = max(1, int(threads_env))
+    except ValueError:
+        print(f"⚠️ Invalid SCAN_THREADS value: '{threads_env}', defaulting to 1")
+        SCAN_THREADS = 1
 LOG_LEVEL      = merged["LOG_LEVEL"]
 OPENAI_API_KEY = merged["OPENAI_API_KEY"]
 OPENAI_MODEL   = merged["OPENAI_MODEL"]
