@@ -12,7 +12,7 @@ except ModuleNotFoundError:
         @staticmethod
         def display_popup(message: str):
             # In headless mode, log the popup message as an error
-            logging.error(f"[GUI POPUP] {message}")
+            logging.error("[GUI POPUP] %s", message)
 
 # Maximum consecutive artists with no valid files before aborting scan
 NO_FILE_THRESHOLD = 10
@@ -575,6 +575,14 @@ for k, src in ENV_SOURCES.items():
     if k in {"PLEX_TOKEN", "OPENAI_API_KEY", "DISCORD_WEBHOOK"} and val:
         val = val[:4] + "…"  # keep first 4 chars, mask the rest
     logging.info("Config %-15s = %-30s (source: %s)", k, val, src)
+
+# Add CROSS_LIBRARY_DEDUPE config logging
+import os
+logging.info("Config CROSS_LIBRARY_DEDUPE = %s (source: %s)", CROSS_LIBRARY_DEDUPE, "env" if "CROSS_LIBRARY_DEDUPE" in os.environ else "default")
+if CROSS_LIBRARY_DEDUPE:
+    logging.info("➡️  Duplicate detection mode: cross-library (editions compared across ALL libraries)")
+else:
+    logging.info("➡️  Duplicate detection mode: per-library only (no cross-library comparisons)")
 
 if _level_num == logging.DEBUG:
     scrubbed = {k: ("***" if k in {"PLEX_TOKEN", "OPENAI_API_KEY", "DISCORD_WEBHOOK"} else v)
@@ -1496,7 +1504,7 @@ def fetch_mb_release_group_info(mbid: str) -> dict:
     # Attempt to reuse cached MusicBrainz release-group info
     cached = get_cached_mb_info(mbid)
     if cached:
-        logging.debug(f"[MusicBrainz RG Info] using cached info for MBID {mbid}")
+        logging.debug("[MusicBrainz RG Info] using cached info for MBID %s", mbid)
         return cached
     try:
         # Query release-group with all media details
@@ -1526,8 +1534,8 @@ def fetch_mb_release_group_info(mbid: str) -> dict:
                 formats.add(f"{quantity}×{fmt}")
 
     format_summary = ", ".join(sorted(formats))
-    logging.debug(f"[MusicBrainz RG Info] raw response for MBID {mbid}: {result}")
-    logging.debug(f"[MusicBrainz RG Info] parsed primary_type={primary}, secondary_types={secondary}, format_summary={format_summary}")
+    logging.debug("[MusicBrainz RG Info] raw response for MBID %s: %s", mbid, result)
+    logging.debug("[MusicBrainz RG Info] parsed primary_type=%s, secondary_types=%s, format_summary=%s", primary, secondary, format_summary)
     info = {
         "primary_type": primary,
         "secondary_types": secondary,
@@ -1551,11 +1559,11 @@ def search_mb_release_group_by_metadata(artist: str, album_norm: str, tracks: se
             limit=5,
             strict=True
         )
-        logging.debug(f"[MusicBrainz Search] raw search response for '{artist}'/'{album_norm}': {result}")
+        logging.debug("[MusicBrainz Search] raw search response for '%s'/'%s': %s", artist, album_norm, result)
         candidates = result.get('release-group-list', [])
         # optionally refine by track count if available
         for rg in candidates:
-            logging.debug(f"[MusicBrainz Search] candidate RG id={rg['id']}, title={rg.get('title')}")
+            logging.debug("[MusicBrainz Search] candidate RG id=%s, title=%s", rg['id'], rg.get('title'))
             # fetch details for each candidate
             try:
                 info = musicbrainzngs.get_release_group_by_id(
@@ -1576,7 +1584,7 @@ def search_mb_release_group_by_metadata(artist: str, album_norm: str, tracks: se
                             qty = medium.get('track-count', 1)
                             if fmt:
                                 formats.add(f"{qty}×{fmt}")
-                    logging.debug(f"[MusicBrainz Search] selected RG info: {{ 'id': {rg['id']}, 'primary_type': {info.get('primary-type')}, 'format_summary': {', '.join(sorted(formats))} }}")
+                    logging.debug("[MusicBrainz Search] selected RG info: { 'id': %s, 'primary_type': %s, 'format_summary': %s }", rg['id'], info.get('primary-type'), ', '.join(sorted(formats)))
                     result_dict = {
                         'primary_type': info.get('primary-type', ''),
                         'secondary_types': info.get('secondary-types', []),
@@ -1589,7 +1597,7 @@ def search_mb_release_group_by_metadata(artist: str, album_norm: str, tracks: se
             except musicbrainzngs.WebServiceError:
                 continue
     except Exception as e:
-        logging.debug(f"[MusicBrainz Search Groups] failed for '{artist}' / '{album_norm}': {e}")
+        logging.debug("[MusicBrainz Search Groups] failed for '%s' / '%s': %s", artist, album_norm, e)
     return None
 
 def choose_best(editions: List[dict]) -> dict:
@@ -1652,8 +1660,8 @@ def choose_best(editions: List[dict]) -> dict:
 
         # Log concise OpenAI request summary
         logging.info(
-            f"OpenAI request: model={OPENAI_MODEL}, max_tokens=64, "
-            f"temperature=0.0, candidate_editions={len(editions)}"
+            "OpenAI request: model=%s, max_tokens=64, temperature=0.0, candidate_editions=%d",
+            OPENAI_MODEL, len(editions)
         )
 
         system_msg = (
@@ -1673,7 +1681,7 @@ def choose_best(editions: List[dict]) -> dict:
                 max_tokens=64,
             )
             txt = resp.choices[0].message.content.strip()
-            logging.debug(f"AI raw response: {txt}")
+            logging.debug("AI raw response: %s", txt)
             parts = [part.strip() for part in txt.split("|")]
             if len(parts) != 3:
                 raise ValueError(f"Invalid AI response format, expected 3 parts but got {len(parts)}")
@@ -1688,7 +1696,7 @@ def choose_best(editions: List[dict]) -> dict:
                 "used_ai":    True,
             })
         except Exception as e:
-            logging.warning(f"AI failed ({e}); falling back to heuristic selection")
+            logging.warning("AI failed (%s); falling back to heuristic selection", e)
             used_ai = False
 
     # 3) Heuristic selection (or fallback when AI is disabled / failed)
@@ -1787,10 +1795,10 @@ def scan_artist_duplicates(args):
             return (artist_name, [], 0)
         while scan_is_paused.is_set() and not scan_should_stop.is_set():
             time.sleep(0.5)
-        logging.info(f"Processing artist: {artist_name}")
-        logging.debug(f"[Artist {artist_name} (ID {artist_id})] Fetching album IDs from Plex DB")
+        logging.info("Processing artist: %s", artist_name)
+        logging.debug("[Artist %s (ID %s)] Fetching album IDs from Plex DB", artist_name, artist_id)
         logging.debug(
-            f"scan_artist_duplicates(): start '{artist_name}' (ID {artist_id})"
+            "scan_artist_duplicates(): start '%s' (ID %s)", artist_name, artist_id
         )
 
         db_conn = plex_connect()
@@ -1819,8 +1827,8 @@ def scan_artist_duplicates(args):
             (artist_id, *section_args)
         )
         album_ids = [row[0] for row in cursor.fetchall()]
-        logging.debug(f"[Artist {artist_name} (ID {artist_id})] Retrieved {len(album_ids)} album IDs: {album_ids}")
-        logging.debug(f"[Artist {artist_name} (ID {artist_id})] Album list for scan: {album_ids}")
+        logging.debug("[Artist %s (ID %s)] Retrieved %d album IDs: %s", artist_name, artist_id, len(album_ids), album_ids)
+        logging.debug("[Artist %s (ID %s)] Album list for scan: %s", artist_name, artist_id, album_ids)
 
         groups = []
         if album_ids:
@@ -1828,19 +1836,20 @@ def scan_artist_duplicates(args):
         db_conn.close()
 
         logging.debug(
-            f"scan_artist_duplicates(): done Artist {artist_name} (ID {artist_id}) – {len(groups)} groups, {len(album_ids)} albums"
+            "scan_artist_duplicates(): done Artist %s (ID %s) – %d groups, %d albums",
+            artist_name, artist_id, len(groups), len(album_ids)
         )
         return (artist_name, groups, len(album_ids))
     except Exception as e:
-        logging.error(f"Unexpected error scanning artist {artist_name}: {e}", exc_info=True)
+        logging.error("Unexpected error scanning artist %s: %s", artist_name, e, exc_info=True)
         # On error, return no groups and zero albums so scan can continue
         return (artist_name, [], 0)
 
 
 def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
     global no_file_streak_global, popup_displayed, gui
-    logging.debug(f"[Artist {artist}] Starting duplicate scan for album IDs: {album_ids}")
-    logging.debug(f"Verbose SKIP_FOLDERS: {SKIP_FOLDERS}")
+    logging.debug("[Artist %s] Starting duplicate scan for album IDs: %s", artist, album_ids)
+    logging.debug("Verbose SKIP_FOLDERS: %s", SKIP_FOLDERS)
     skip_count = 0
     editions = []
     total_albums = len(album_ids)
@@ -1851,7 +1860,7 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
         PROGRESS_STATE["current"] = processed_albums
         # Periodic progress update every 100 albums
         if processed_albums % 100 == 0:
-            logging.info(f"[Artist {artist}] processed {processed_albums}/{total_albums} albums (skipped {skip_count} so far)")
+            logging.info("[Artist %s] processed %d/%d albums (skipped %d so far)", artist, processed_albums, total_albums, skip_count)
         try:
             if scan_should_stop.is_set():
                 break
@@ -1864,10 +1873,10 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
             if not folder:
                 continue
             # Skip albums in configured skip folders
-            logging.debug(f"Checking album {aid} at folder {folder} against skip prefixes {SKIP_FOLDERS}")
+            logging.debug("Checking album %s at folder %s against skip prefixes %s", aid, folder, SKIP_FOLDERS)
             if SKIP_FOLDERS and any(str(folder).startswith(skip) for skip in SKIP_FOLDERS):
                 skip_count += 1
-                logging.info(f"Skipping album {aid} since folder {folder} matches skip prefixes {SKIP_FOLDERS}")
+                logging.info("Skipping album %s since folder %s matches skip prefixes %s", aid, folder, SKIP_FOLDERS)
                 continue
             # count audio files once – we re‑use it later
             file_count = sum(1 for f in folder.rglob("*") if AUDIO_RE.search(f.name))
@@ -1918,13 +1927,13 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
                 'invalid':   False
             })
         except Exception as e:
-            logging.error(f"Error processing album {aid} for artist {artist}: {e}", exc_info=True)
+            logging.error("Error processing album %s for artist %s: %s", aid, artist, e, exc_info=True)
             continue
 
-    logging.debug(f"[Artist {artist}] Computed stats for {len(editions)} valid editions: {[e['album_id'] for e in editions]}")
+    logging.debug("[Artist %s] Computed stats for %d valid editions: %s", artist, len(editions), [e['album_id'] for e in editions])
 
     if not USE_MUSICBRAINZ:
-        logging.debug(f"[Artist {artist}] Skipping MusicBrainz enrichment (USE_MUSICBRAINZ=False).")
+        logging.debug("[Artist %s] Skipping MusicBrainz enrichment (USE_MUSICBRAINZ=False).", artist)
     else:
         # ─── MusicBrainz enrichment & Box Set handling ─────────────────────────────
         # Enrich using any available MusicBrainz ID tags (in priority order)
@@ -1950,10 +1959,10 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
                         rel = musicbrainzngs.get_release_by_id(mbid, includes=['release-group'])['release']
                         rgid = rel['release-group']['id']
                         rg_info = fetch_mb_release_group_info(rgid)
-                    logging.debug(f"[Artist {artist}] Edition {e['album_id']} RG info (via {tag} {mbid}): {rg_info}")
+                    logging.debug("[Artist %s] Edition %s RG info (via %s %s): %s", artist, e['album_id'], tag, mbid, rg_info)
                     break
                 except Exception as exc:
-                    logging.debug(f"[Artist {artist}] MusicBrainz lookup failed for {tag} ({mbid}): {exc}")
+                    logging.debug("[Artist %s] MusicBrainz lookup failed for %s (%s): %s", artist, tag, mbid, exc)
             if rg_info:
                 e['rg_info_source'] = tag
             # fallback: search by metadata if no ID tag yielded results
@@ -1963,9 +1972,9 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
                 rg_info = search_mb_release_group_by_metadata(artist, album_norm, tracks)
                 if rg_info:
                     e['rg_info_source'] = 'fallback'
-                    logging.debug(f"[Artist {artist}] Edition {e['album_id']} RG info (search fallback): {rg_info}")
+                    logging.debug("[Artist %s] Edition %s RG info (search fallback): %s", artist, e['album_id'], rg_info)
                 else:
-                    logging.debug(f"[Artist {artist}] No RG info found via search for '{album_norm}'")
+                    logging.debug("[Artist %s] No RG info found via search for '%s'", artist, album_norm)
             if rg_info:
                 e['rg_info'] = rg_info
         # --- MusicBrainz enrichment summary ---
