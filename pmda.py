@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 from __future__ import annotations
-import logging
 
 # --- GUI fallback stub for display_popup ---------------------------------------
 try:
@@ -22,18 +21,14 @@ no_file_streak_global = 0
 popup_displayed = False
 
 """
-v0.6.6
-
-Changelog:
-- added a SKIP_FOLDERS variable to allow users to skip detecting dupes in specific folder locations
+v0.7.0
+- improved the end of process sumarry
 """
 
 import argparse
 import base64
 import json
-import logging
 import os
-import re
 import shutil
 import filecmp
 import errno
@@ -41,12 +36,16 @@ import sqlite3
 import subprocess
 import threading
 import time
+import atexit
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import NamedTuple, List, Dict, Optional
 from urllib.parse import quote_plus
 
+import logging
+import re
+import xml.etree.ElementTree as ET
 
 import requests
 import musicbrainzngs
@@ -54,12 +53,10 @@ import musicbrainzngs
 # Configure MusicBrainz NGS client
 musicbrainzngs.set_useragent(
     "PMDA",               # application name
-    "0.6.5",              # application version
+    "0.6.6",              # application version (sync with header)
     "pmda@example.com"    # contact / support email
 )
-import xml.etree.ElementTree as ET
-import openai
-import unittest
+from openai import OpenAI
 
 # ──────────────── ANSI colours for prettier logs ────────────────
 ANSI_RESET  = "\033[0m"
@@ -120,34 +117,18 @@ from flask import Flask, render_template_string, request, jsonify
 
 app = Flask(__name__)
 
-# Ensure LOG_LEVEL and LOG_FILE exist for initial logging setup
+# Ensure LOG_LEVEL exists for initial logging setup
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-LOG_FILE  = os.getenv("LOG_FILE", "/config/pmda.log")
 
 # (8) Logging setup (must happen BEFORE any log statements elsewhere) ---------
 _level_num = getattr(logging, LOG_LEVEL, logging.INFO)
-
-handlers = [logging.StreamHandler(sys.stdout)]
-try:
-    from logging.handlers import RotatingFileHandler
-    handlers.append(
-        RotatingFileHandler(
-            LOG_FILE,
-            maxBytes=5_000_000,   # 5 MB
-            backupCount=3,
-            encoding="utf-8"
-        )
-    )
-except Exception as e:
-    # Never fail hard if the volume is read‑only or path invalid
-    print(f"⚠️  File logging disabled – {e}", file=sys.stderr)
 
 logging.basicConfig(
     level=_level_num,
     format="%(asctime)s │ %(levelname)s │ %(threadName)s │ %(message)s",
     datefmt="%H:%M:%S",
     force=True,
-    handlers=handlers
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
 
 # Progress header filter: displays current/total progress as [cur/total X.X%]
@@ -204,6 +185,7 @@ def _purge_invalid_edition(edition: dict):
 
         size_mb = folder_size(dst) // (1024 * 1024)
         increment_stat("removed_dupes", 1)
+        increment_stat("space_saved", size_mb)
 
         # Tech‑data are irrelevant (all zero), but we still log them
         notify_discord(
@@ -254,9 +236,6 @@ _check_ffmpeg()
 # --- Scan control flags (global) ---------------------------------
 scan_should_stop = threading.Event()
 scan_is_paused   = threading.Event()
-
-# Central store for worker exceptions
-worker_errors = SimpleQueue()
 
 #
 # ───────────────────────────────── CONFIGURATION LOADING ─────────────────────────────────
@@ -347,7 +326,6 @@ with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
     conf: dict = json.load(fh)
 
 # ─── Auto‑generate PATH_MAP from Plex at *every* startup ────────────────────
-import xml.etree.ElementTree as ET
 
 def _discover_path_map(plex_host: str, plex_token: str, section_id: int) -> dict[str, str]:
     """
@@ -397,7 +375,6 @@ try:
     plex_host   = os.getenv("PLEX_HOST")   or conf.get("PLEX_HOST")
     plex_token  = os.getenv("PLEX_TOKEN")  or conf.get("PLEX_TOKEN")
     # Support multiple section IDs via SECTION_IDS or SECTION_ID (comma-separated)
-    import re
     # Read any user‑provided value first
     raw_sections = (
         os.getenv("SECTION_IDS")
@@ -582,8 +559,19 @@ FORMAT_PREFERENCE = conf.get(
     ["dsf","aif","aiff","wav","flac","m4a","mp4","m4b","m4p","aifc","ogg","mp3","wma"]
 )
 
-# Optional external log file (rotates @ 5 MB × 3)
+ # Optional external log file (rotates @ 5 MB × 3)
 LOG_FILE = os.getenv("LOG_FILE", str(CONFIG_DIR / "pmda.log"))
+
+# Attach rotating file handler now that CONFIG_DIR / LOG_FILE are final
+try:
+    from logging.handlers import RotatingFileHandler
+    _final_level = getattr(logging, LOG_LEVEL, logging.INFO)
+    root_logger = logging.getLogger()
+    root_logger.setLevel(_final_level)
+    file_handler = RotatingFileHandler(LOG_FILE, maxBytes=5_000_000, backupCount=3, encoding="utf-8")
+    root_logger.addHandler(file_handler)
+except Exception as e:
+    print(f"⚠️  File logging disabled – {e}", file=sys.stderr)
 
 
 log_header("configuration")
@@ -594,8 +582,6 @@ for k, src in ENV_SOURCES.items():
         val = val[:4] + "…"  # keep first 4 chars, mask the rest
     logging.info("Config %-15s = %-30s (source: %s)", k, val, src)
 
-# Add CROSS_LIBRARY_DEDUPE config logging
-import os
 logging.info("Config CROSS_LIBRARY_DEDUPE = %s (source: %s)", CROSS_LIBRARY_DEDUPE, "env" if "CROSS_LIBRARY_DEDUPE" in os.environ else "default")
 if CROSS_LIBRARY_DEDUPE:
     logging.info("➡️  Duplicate detection mode: cross-library (editions compared across ALL libraries)")
@@ -608,8 +594,14 @@ if _level_num == logging.DEBUG:
     logging.debug("Full merged config:\n%s", json.dumps(scrubbed, indent=2))
 
 # (9) Initialise OpenAI if key present ----------------------------------------
+openai_client = None
 if OPENAI_API_KEY:
-    openai.api_key = OPENAI_API_KEY
+    # Ensure the environment variable is available to the SDK
+    os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
+    try:
+        openai_client = OpenAI()
+    except Exception as e:
+        logging.warning("OpenAI client init failed: %s", e)
 else:
     logging.info("No OPENAI_API_KEY provided; AI-driven selection disabled.")
 
@@ -646,6 +638,7 @@ def _self_diag() -> bool:
     Returns *True* when every mandatory check passes, otherwise *False*.
     """
     log_header("self diagnostic")
+    had_warning = False
 
     # 1) Plex DB readable?
     try:
@@ -662,6 +655,7 @@ def _self_diag() -> bool:
                 "👉 Please bind‑mount a writable host folder, e.g.  -v /path/on/host:/dupes")
         logging.warning(warn)
         notify_discord(warn)
+        had_warning = True
 
     # Compute exact album counts for each PATH_MAP prefix (no sampling)
     prefix_stats: dict[str, int] = {}
@@ -684,6 +678,7 @@ def _self_diag() -> bool:
         if albums_seen == 0:
             logging.warning("%s %s → %s  (prefix not found in DB)",
                             colour('⚠', ANSI_YELLOW), pre, dest)
+            had_warning = True
         elif not Path(dest).exists():
             logging.error("✗ %s → %s  (host path missing)", pre, dest)
             return False
@@ -700,6 +695,7 @@ def _self_diag() -> bool:
              ("w" if os.access(p, os.W_OK) else "-")
         if rw != "rw":
             logging.warning("⚠ %s permissions: %s", p, rw)
+            had_warning = True
         else:
             logging.info("✓ %s permissions: %s", p, rw)
 
@@ -724,6 +720,7 @@ def _self_diag() -> bool:
                 "to avoid this warning, set SECTION_IDS to include all relevant section IDs, separated by commas.",
                 unmapped
             )
+            had_warning = True
     else:
         logging.info("Skipping unmapped album check because PATH_MAP is empty")
 
@@ -732,10 +729,10 @@ def _self_diag() -> bool:
     discord_ok = False
 
     # --- OpenAI key -------------------------------------------------------------
-    if OPENAI_API_KEY:
+    if OPENAI_API_KEY and openai_client:
         try:
             # a 1‑token "ping" to verify the key / model combination works
-            openai.chat.completions.create(
+            openai_client.chat.completions.create(
                 model=OPENAI_MODEL,
                 messages=[{"role": "user", "content": "ping"}],
                 max_tokens=1,
@@ -775,7 +772,7 @@ def _self_diag() -> bool:
             mb_resp = requests.get(
                 "https://musicbrainz.org/ws/2/?fmt=json",
                 timeout=5,
-                headers={"User-Agent": "PMDA/0.6.5 ( pmda@example.com )"}
+                headers={"User-Agent": "PMDA/0.6.6 ( pmda@example.com )"}
             )
             if mb_resp.status_code == 200:
                 logging.info("✓ MusicBrainz reachable – status HTTP %s", mb_resp.status_code)
@@ -835,8 +832,7 @@ def _self_diag() -> bool:
         )
 
     logging.info("──────── diagnostic complete ─────────")
-    # Simple green confirmation when no errors were encountered during the loop
-    if (not any("✗" in k or "⚠" in k for k in prefix_stats)):
+    if not had_warning:
         logging.info("%s ALL mapped folders contain albums – ALL GOOD!", colour("✓", ANSI_GREEN))
     # ─── Log AI prompt for user review ─────────────────────────────────
     try:
@@ -876,8 +872,7 @@ def _cross_check_bindings():
             SELECT mp.file
             FROM   media_parts mp
             WHERE  mp.file LIKE ?
-              AND (mp.file LIKE '%.flac' OR mp.file LIKE '%.wav' OR mp.file LIKE '%.m4a'
-                   OR mp.file LIKE '%.mp3' OR mp.file LIKE '%.ogg' OR mp.file LIKE '%.aac')
+              AND (mp.file LIKE '%.flac' OR mp.file LIKE '%.wav' OR mp.file LIKE '%.m4a' OR mp.file LIKE '%.mp3' OR mp.file LIKE '%.ogg' OR mp.file LIKE '%.aac' OR mp.file LIKE '%.ape' OR mp.file LIKE '%.alac' OR mp.file LIKE '%.dsf' OR mp.file LIKE '%.aif' OR mp.file LIKE '%.aiff' OR mp.file LIKE '%.wma' OR mp.file LIKE '%.mp4' OR mp.file LIKE '%.m4b' OR mp.file LIKE '%.m4p' OR mp.file LIKE '%.aifc')
             ORDER BY RANDOM()
             LIMIT ?
             ''',
@@ -885,16 +880,13 @@ def _cross_check_bindings():
         )
         rows = [r[0] for r in cur.fetchall()]
 
-        if len(rows) < CROSSCHECK_SAMPLES:
-            logging.warning("🚨 PATH CHECK ABORTED: only %d sample files found under %s, need at least %d to proceed.",
-                            len(rows), plex_root, CROSSCHECK_SAMPLES)
-            logging.warning("🤨 You don’t have enough albums to validate the binding for '%s'.", plex_root)
-            logging.warning("👉 PMDA needs at least %d albums per library path to perform a meaningful cross-check!", CROSSCHECK_SAMPLES)
-            logging.warning("💡 If you’re just testing, add more albums or reduce CROSSCHECK_SAMPLES via env.")
-            logging.warning("🎵 Running PMDA on a baby-sized library? You rebel. But we need more juice to continue.")
-            logging.error("Only %d/%d sample files found under %s – aborting.", len(rows), CROSSCHECK_SAMPLES, plex_root)
+        target = len(rows)
+        if target == 0:
+            logging.error("No audio samples found under %s – cannot validate this binding.", plex_root)
             abort = True
             continue
+        if target < CROSSCHECK_SAMPLES:
+            logging.warning("PATH CHECK: only %d/%d samples available under %s – proceeding with reduced target.", target, CROSSCHECK_SAMPLES, plex_root)
 
         # 2) Direct existence test
         missing: list[tuple[str, str]] = []
@@ -921,22 +913,25 @@ def _cross_check_bindings():
         for cand in candidate_roots:
             logging.debug("→ checking %s …", cand)
             ok = 0
+            missing_target = len(missing)
             for idx, (_, rel) in enumerate(missing, 1):
                 dst = cand / rel
                 if dst.exists():
                     ok += 1
-                    logging.debug("   %2d/%d matches so far (%s)", ok, CROSSCHECK_SAMPLES, rel if ok <= 3 else "…")
+                    logging.debug("   %2d/%d matches so far (%s)", ok, missing_target, rel if ok <= 3 else "…")
                 # early‑exit: all samples matched
-                if ok == CROSSCHECK_SAMPLES:
+                if ok == missing_target:
                     break
             if ok:
-                logging.info("   %s → %d/%d samples matched", cand, ok, CROSSCHECK_SAMPLES)
+                logging.info("   %s → %d/%d samples matched", cand, ok, missing_target)
                 candidate_counts[str(cand)] = ok
             else:
                 logging.debug("   %s → 0 matches", cand)
+        # Remove unintended reassignment of target here (do not force target = CROSSCHECK_SAMPLES)
         # ─── fallback: deep scan when nothing found above ─────────────────────
         if not candidate_counts:
             logging.debug("Immediate child scan found nothing – performing deep filename search")
+            missing_target = len(missing)
             for _, rel in missing:
                 fname = os.path.basename(rel)
                 for found in search_base.rglob(fname):
@@ -946,22 +941,23 @@ def _cross_check_bindings():
                     root = str(root)
                     cnt = candidate_counts.get(root, 0) + 1
                     candidate_counts[root] = cnt
-                    if cnt == CROSSCHECK_SAMPLES // 2:
-                        logging.info("   halfway there: %d/%d samples align under %s", cnt, CROSSCHECK_SAMPLES, root)
+                    if cnt == max(1, missing_target // 2):
+                        logging.info("   halfway there: %d/%d samples align under %s", cnt, missing_target, root)
 
         best_root, matched = (None, 0)
         if candidate_counts:
             best_root, matched = max(candidate_counts.items(), key=lambda kv: kv[1])
         logging.debug("Candidate roots and match counts: %s", candidate_counts)
+        missing_target = len(missing)
         if matched:
-            logging.info("Best candidate %s matched %d/%d samples", best_root, matched, CROSSCHECK_SAMPLES)
-        if matched == CROSSCHECK_SAMPLES:
+            logging.info("Best candidate %s matched %d/%d samples", best_root, matched, missing_target)
+        if matched == missing_target:
             updates[plex_root] = best_root
             logging.info("Resolved new host root for %s: %s", plex_root, best_root)
         elif matched > 0:
-            logging.info("Partial match: %d/%d samples align under %s", matched, CROSSCHECK_SAMPLES, best_root or "<none>")
+            logging.info("Partial match: %d/%d samples align under %s", matched, missing_target, best_root or "<none>")
         else:
-            logging.error("Could not validate binding for %s – matched %d/%d samples", plex_root, matched, CROSSCHECK_SAMPLES)
+            logging.error("Could not validate binding for %s – matched %d/%d samples", plex_root, matched, missing_target)
             abort = True
 
     con.close()
@@ -988,7 +984,7 @@ def _cross_check_bindings():
 
 
 # ───────────────────────────────── OTHER CONSTANTS ──────────────────────────────────
-AUDIO_RE    = re.compile(r"\.(flac|ape|alac|wav|m4a|aac|mp3|ogg)$", re.I)
+AUDIO_RE    = re.compile(r"\.(flac|ape|alac|wav|m4a|aac|mp3|ogg|dsf|aif|aiff|wma|mp4|m4b|m4p|aifc)$", re.I)
 # Derive format scores from user preference order
 FMT_SCORE   = {ext: len(FORMAT_PREFERENCE)-i for i, ext in enumerate(FORMAT_PREFERENCE)}
 OVERLAP_MIN = 0.85  # 85% track-title overlap minimum
@@ -1132,6 +1128,92 @@ def set_cached_info(path: str, mtime: int, bit_rate: int, sample_rate: int, bit_
     con.close()
 
 init_cache_db()
+
+# ----- Run summary tracking ---------------------------------------------------
+def _count_rows(table: str) -> int:
+    con = sqlite3.connect(str(STATE_DB_FILE))
+    cur = con.cursor()
+    cur.execute(f"SELECT COUNT(*) FROM {table}")
+    n = cur.fetchone()[0]
+    con.close()
+    return n
+
+RUN_START_TS = time.time()
+RUN_BASELINE = {
+    "removed_dupes": get_stat("removed_dupes"),
+    "space_saved":  get_stat("space_saved"),
+    "best_rows":    0,
+    "loser_rows":   0,
+}
+try:
+    RUN_BASELINE["best_rows"]  = _count_rows("duplicates_best")
+    RUN_BASELINE["loser_rows"] = _count_rows("duplicates_loser")
+except Exception:
+    pass
+
+SUMMARY_EMITTED = False
+
+def emit_final_summary(reason: str = "normal"):
+    global SUMMARY_EMITTED
+    if SUMMARY_EMITTED:
+        return
+
+    # Compute duration and delta counters since start
+    duration  = max(0, int(time.time() - RUN_START_TS))
+    removed   = max(0, get_stat("removed_dupes") - RUN_BASELINE["removed_dupes"]) 
+    saved_mb  = max(0, get_stat("space_saved")  - RUN_BASELINE["space_saved"]) 
+    try:
+        new_groups = max(0, _count_rows("duplicates_best")  - RUN_BASELINE.get("best_rows", 0))
+        new_losers = max(0, _count_rows("duplicates_loser") - RUN_BASELINE.get("loser_rows", 0))
+    except Exception:
+        new_groups = new_losers = 0
+
+    # Try to compute library‑wide counts for the selected sections for extra context
+    def _library_counts() -> tuple[int, int]:
+        try:
+            con = plex_connect()
+            cur = con.cursor()
+            placeholders = ",".join("?" for _ in SECTION_IDS)
+            # Artists = metadata_type 8, Albums = metadata_type 9
+            cur.execute(f"""
+                SELECT
+                    (SELECT COUNT(DISTINCT id) FROM metadata_items WHERE metadata_type = 8 AND library_section_id IN ({placeholders})),
+                    (SELECT COUNT(DISTINCT id) FROM metadata_items WHERE metadata_type = 9 AND library_section_id IN ({placeholders}))
+            """, (*SECTION_IDS, *SECTION_IDS))
+            a, b = cur.fetchone()
+            con.close()
+            return int(a or 0), int(b or 0)
+        except Exception:
+            return 0, 0
+
+    total_artists, total_albums = _library_counts()
+
+    # Pretty banner with commas and consistent formatting
+    bar = "─" * 85
+    logging.info("\n%s", bar)
+    logging.info("FINAL SUMMARY")
+    logging.info("Total artists           : %s", f"{total_artists:,}" if total_artists else "n/a")
+    logging.info("Total albums            : %s", f"{total_albums:,}" if total_albums else "n/a")
+    logging.info("Albums with dupes       : %s", f"{new_groups:,}")
+    logging.info("Folders moved           : %s", f"{removed:,}")
+    logging.info("Total space reclaimed   : %s MB", f"{saved_mb:,}")
+    logging.info("Duration                : %s s", f"{duration:,}")
+    logging.info("%s\n", bar)
+
+    if DISCORD_WEBHOOK:
+        fields = [
+            {"name": "Artists",          "value": (f"{total_artists:,}" if total_artists else "n/a"), "inline": True},
+            {"name": "Albums",           "value": (f"{total_albums:,}" if total_albums else "n/a"), "inline": True},
+            {"name": "Groups",           "value": f"{new_groups:,}",                 "inline": True},
+            {"name": "Removed",          "value": f"{removed:,}",                    "inline": True},
+            {"name": "Reclaimed",        "value": f"{saved_mb:,} MB",               "inline": True},
+            {"name": "Duration",         "value": f"{duration:,} s",                "inline": True},
+        ]
+        notify_discord_embed("✅ PMDA – Final summary", "Run completed.", fields=fields)
+
+    SUMMARY_EMITTED = True
+
+atexit.register(emit_final_summary)
 
 # --- MusicBrainz cache helpers ---
 def get_cached_mb_info(mbid: str) -> dict | None:
@@ -1651,7 +1733,7 @@ def choose_best(editions: List[dict]) -> dict:
 
     # 2) If there is no AI cache, call OpenAI when possible
     used_ai = False
-    if OPENAI_API_KEY:
+    if OPENAI_API_KEY and openai_client:
         used_ai = True
         # Load prompt template from external file
         template = AI_PROMPT_FILE.read_text(encoding="utf-8")
@@ -1689,7 +1771,7 @@ def choose_best(editions: List[dict]) -> dict:
             "If there are no extra tracks leave the third field empty but keep the trailing pipe."
         )
         try:
-            resp = openai.chat.completions.create(
+            resp = openai_client.chat.completions.create(
                 model=OPENAI_MODEL,
                 messages=[
                     {"role": "system", "content": system_msg},
@@ -1890,23 +1972,20 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
             folder = first_part_path(db_conn, aid)
             if not folder:
                 continue
-            # Skip albums in configured skip folders
+            # Skip albums in configured skip folders (path-aware)
             logging.debug("Checking album %s at folder %s against skip prefixes %s", aid, folder, SKIP_FOLDERS)
-            if SKIP_FOLDERS and any(str(folder).startswith(skip) for skip in SKIP_FOLDERS):
+            folder_resolved = Path(folder).resolve()
+            if SKIP_FOLDERS and any(folder_resolved.is_relative_to(Path(s).resolve()) for s in SKIP_FOLDERS):
                 skip_count += 1
-                logging.info("Skipping album %s since folder %s matches skip prefixes %s", aid, folder, SKIP_FOLDERS)
+                logging.info("Skipping album %s since folder %s matches skip prefixes %s", aid, folder_resolved, SKIP_FOLDERS)
                 continue
             # count audio files once – we re‑use it later
             file_count = sum(1 for f in folder.rglob("*") if AUDIO_RE.search(f.name))
 
             # consider edition invalid when technical data are all zero OR no files found
-            is_invalid = ((br := 0) or True)  # placeholder, will be updated below
 
             # ─── audio‑format inspection ──────────────────────────────────────
             fmt_score, br, sr, bd = analyse_format(folder)
-
-            # Count of audio files
-            file_count = sum(1 for f in folder.rglob("*") if AUDIO_RE.search(f.name))
 
             # --- metadata tags (first track only) -----------------------------
             first_audio = next((p for p in folder.rglob("*") if AUDIO_RE.search(p.name)), None)
@@ -1915,15 +1994,22 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
             # Mark as invalid if file_count == 0 OR all tech data are zero
             is_invalid = (file_count == 0) or (br == 0 and sr == 0 and bd == 0)
 
-            # --- Skip & purge technically invalid editions immediately -------------
+            # --- Quick retry before purging to avoid false negatives -------------
             if is_invalid:
-                _purge_invalid_edition({
-                    "folder":   folder,
-                    "artist":   artist,
-                    "title_raw": album_title(db_conn, aid),
-                    "album_id": aid
-                })
-                continue            # do NOT add to the editions list
+                time.sleep(0.5)
+                fmt_score_retry, br_retry, sr_retry, bd_retry = analyse_format(folder)
+                file_count_retry = file_count or sum(1 for f in folder.rglob("*") if AUDIO_RE.search(f.name))
+                if (file_count_retry == 0) or (br_retry == 0 and sr_retry == 0 and bd_retry == 0):
+                    _purge_invalid_edition({
+                        "folder":   folder,
+                        "artist":   artist,
+                        "title_raw": album_title(db_conn, aid),
+                        "album_id": aid
+                    })
+                    continue            # do NOT add to the editions list
+                else:
+                    fmt_score, br, sr, bd = fmt_score_retry, br_retry, sr_retry, bd_retry
+                    is_invalid = False
 
             editions.append({
                 'album_id':  aid,
@@ -3788,7 +3874,7 @@ def dedupe_cli(
         """,
         tuple(SECTION_IDS),
     ).fetchone()[0]
-    logging.info("🔍 About to scan %,d albums…", total_albums_overall)
+    logging.info(f"🔍 About to scan {total_albums_overall:,} albums…")
 
     artists = cur.execute(
         """
@@ -3889,15 +3975,18 @@ def dedupe_cli(
                 size_mb = folder_size(src) // (1024 * 1024)
 
                 if dry:
-                    logging.info("    DRY-RUN – would move %s → %s  (%,d MB)", src, dst, size_mb)
+                    logging.info("    DRY-RUN – would move %s → %s  (%s MB)", src, dst, f"{size_mb:,}")
                 else:
-                    logging.info("    Moving %s → %s  (%,d MB)", src, dst, size_mb)
+                    logging.info("    Moving %s → %s  (%s MB)", src, dst, f"{size_mb:,}")
                     safe_move(str(src), str(dst))
 
                 space_freed_mb += size_mb
                 stats["total_dupes"] += 1
                 stats["total_moved_mb"] += size_mb
                 removed_this_artist += 1
+                # Keep global stats in sync for unified summary
+                increment_stat("removed_dupes", 1)
+                increment_stat("space_saved", size_mb)
 
                 # Plex metadata cleanup
                 if not (dry or safe):
@@ -3909,7 +3998,7 @@ def dedupe_cli(
                     except Exception as api_err:
                         logging.warning("Could not delete Plex metadata: %s", api_err)
 
-            logging.info("    ➜ Freed %,d MB in this group", space_freed_mb)
+            logging.info("    ➜ Freed %s MB in this group", f"{space_freed_mb:,}")
 
             # Optional extra-track tagging
             if tag_extra:
@@ -3939,22 +4028,39 @@ def dedupe_cli(
     db.close()
 
     # ------------------------------------------------------------------ #
-    #  FINAL SUMMARY
+    #  FINAL SUMMARY (unified)
     # ------------------------------------------------------------------ #
+    # Always emit a local summary banner so it shows up in docker logs -f
     summary_lines = [
         "",
-        "─" * 70,
+        "" + "─" * 69,
         "FINAL SUMMARY",
         f"Total artists           : {stats['total_artists']:,}",
         f"Total albums            : {stats['total_albums']:,}",
         f"Albums with dupes       : {stats['albums_with_dupes']:,}",
         f"Folders moved           : {stats['total_dupes']:,}",
         f"Total space reclaimed   : {stats['total_moved_mb']:,} MB",
-        "─" * 70,
+        "" + "─" * 69,
         "",
     ]
     for line in summary_lines:
         logging.info(line)
+
+    # Then, if a global emitter exists, call it (keeps Web UI/DB in sync)
+    emit = globals().get("emit_final_summary")
+    if callable(emit):
+        globals()["SUMMARY_EMITTED"] = True
+        try:
+            emit("cli")
+        except Exception as _e:
+            logging.debug("emit_final_summary('cli') failed: %s", _e)
+
+    # Flush handlers to force immediate appearance in logs
+    for _h in logging.getLogger().handlers:
+        try:
+            _h.flush()
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------ #
     #  Discord – always attempt to notify
@@ -3975,6 +4081,8 @@ def dedupe_cli(
         )
     except Exception as e:
         logging.warning("Discord summary failed: %s", e)
+    # Prevent duplicate summary emission by other components
+    globals()["SUMMARY_EMITTED"] = True
 
 # ───────────────────────────────── MAIN ───────────────────────────────────
 import os
