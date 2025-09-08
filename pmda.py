@@ -735,7 +735,7 @@ def _self_diag() -> bool:
             openai_client.chat.completions.create(
                 model=OPENAI_MODEL,
                 messages=[{"role": "user", "content": "ping"}],
-                max_completion_tokens=1,
+                max_completion_tokens=8,
             )
             logging.info("%s OpenAI API key valid – model **%s** reachable",
                          colour("✓", ANSI_GREEN), OPENAI_MODEL)
@@ -1759,7 +1759,7 @@ def choose_best(editions: List[dict]) -> dict:
 
         # Log concise OpenAI request summary
         logging.info(
-            "OpenAI request: model=%s, max_completion_tokens=64, candidate_editions=%d",
+            "OpenAI request: model=%s, max_completion_tokens=256, candidate_editions=%d",
             OPENAI_MODEL, len(editions)
         )
 
@@ -1776,7 +1776,7 @@ def choose_best(editions: List[dict]) -> dict:
                     {"role": "system", "content": system_msg},
                     {"role": "user",   "content": user_msg},
                 ],
-                max_completion_tokens=64,
+                max_completion_tokens=256,
             )
             txt = resp.choices[0].message.content.strip()
             logging.debug("AI raw response: %s", txt)
