@@ -1,15 +1,15 @@
-We have multiple rips of the *same* album. Choose exactly **one** edition as the "best". 
+We have multiple rips of the *same* album. Choose exactly **one** edition as the "best".
 Before deciding, classify the release as classical or not.
 
-Classification rule (write a tag in your rationale):
-- If the work is by a classical composer or the metadata looks classical (composer/conductor/orchestra/opus numbers, “Symphony”, “Concerto”, “Sonata”, BWV/K./Op., etc.), add **[CLASSICAL:YES]** to your first bullet.
+Classification rule (must appear as the FIRST bullet in your rationale):
+- If the work is by a classical composer or the metadata looks classical (composer/conductor/orchestra/opus numbers, “Symphony”, “Concerto”, “Sonata”, BWV/K./Op., etc.), add **[CLASSICAL:YES]**.
 - Otherwise add **[CLASSICAL:NO]**.
 
 If [CLASSICAL:YES], treat different interpretations as different releases:
 - Two editions are the *same interpretation* only if:
   (a) they share a MusicBrainz ID (release, release-group, or album MBID), OR
   (b) they have the same release year (from tags date/originaldate) AND the same total runtime (to the second).
-- If neither (a) nor (b) is true, they are NOT duplicates and you must still pick the technically best *within the same-interpretation cluster only*. If no same-interpretation cluster exists, pick the technically best but add a bullet **“different interpretation detected”**.
+- If neither (a) nor (b) is true, they are NOT duplicates. Pick the technically best *within the same-interpretation cluster only*. If no same-interpretation cluster exists, pick the technically best but add a bullet **“different interpretation detected”**.
 
 General priority rules (apply inside a valid cluster):
 1. Audio format: prefer lossless (FLAC/ALAC) over lossy (MP3/AAC).
@@ -28,18 +28,17 @@ General priority rules (apply inside a valid cluster):
 10. Release year: a newer remaster is preferred only if it offers better technical quality or extra tracks.
 
 Extra instructions:
-- Analyse **all editions**. If any **bonus/extra tracks** exist only in non-selected editions, list them to merge.
+- Analyse **all editions**.
+- If any **bonus/extra tracks** exist only in non-selected editions, list them in the final output after the last pipe.
 - Ignore “fuzzy” inference for non-ASCII/CJK titles; rely on explicit metadata only.
 
-Return your answer in this strict format:
-<chosen_index>|Winner has:
-- <bullet point explanation>   ← include [CLASSICAL:YES] or [CLASSICAL:NO] as the first bullet
-- <bullet point explanation>
-|<comma-separated list of bonus/extra tracks>
+⚠️ Output rules (must follow exactly):
+- Return **one single line only**.
+- The line must contain **exactly two "|" characters**.
+- Format: `<chosen_index>|<rationale>|<comma-separated list of bonus tracks>`
+- If no bonus tracks exist, still include the final pipe but leave it empty.
+- Do not add any explanations, comments, or extra lines.
 
-Example:
-1|Winner has:
-- [CLASSICAL:YES] same interpretation (shared MBID)
-- Best format (FLAC), 24-bit vs 16-bit
-- 9 tracks vs 7 in the other edition
-|Track 09 - Bonus movement (alternate take)
+Example of valid outputs:
+2|Winner has: - [CLASSICAL:NO] lossless FLAC, 24-bit, more tracks - Higher bitrate than 1|Track 12 - Live bonus
+1|Winner has: - [CLASSICAL:YES] same interpretation (shared MBID) - More complete edition, 9 vs 7 tracks|
