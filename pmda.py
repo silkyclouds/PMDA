@@ -21,8 +21,8 @@ no_file_streak_global = 0
 popup_displayed = False
 
 """
-v0.7.1
-- fix for gpt5 max token limit
+v0.7.2
+- If a model ain't reachable for whatever reason, PMDA will automatically switch to the next model in order of pricing
 """
 
 import argparse
@@ -594,6 +594,7 @@ if _level_num == logging.DEBUG:
     logging.debug("Full merged config:\n%s", json.dumps(scrubbed, indent=2))
 
 # (9) Initialise OpenAI if key present ----------------------------------------
+
 openai_client = None
 if OPENAI_API_KEY:
     # Ensure the environment variable is available to the SDK
@@ -604,6 +605,85 @@ if OPENAI_API_KEY:
         logging.warning("OpenAI client init failed: %s", e)
 else:
     logging.info("No OPENAI_API_KEY provided; AI-driven selection disabled.")
+
+# --- Resolve a working OpenAI model (with price-aware fallbacks) -------------
+RESOLVED_MODEL = OPENAI_MODEL
+# Param style for the resolved model: "mct" -> max_completion_tokens, "mt" -> max_tokens
+RESOLVED_PARAM_STYLE = "mct"
+
+def _probe_model(model_name: str) -> str | None:
+    """Return param style ("mct" or "mt") if a 1-line ping works, else None.
+    Tries `max_completion_tokens` first; on "unsupported_parameter" falls back to `max_tokens`.
+    """
+    if not (OPENAI_API_KEY and openai_client):
+        return None
+    # Try with max_completion_tokens
+    try:
+        openai_client.chat.completions.create(
+            model=model_name,
+            messages=[{"role": "user", "content": "ping"}],
+            max_completion_tokens=8,
+            stop=["\n"],
+        )
+        return "mct"
+    except Exception as e:
+        msg = str(e)
+        logging.debug("Model probe (mct) failed for %s: %s", model_name, msg)
+        if "max_completion_tokens" not in msg and "unsupported_parameter" not in msg.lower():
+            # Some other hard failure; still try mt just in case
+            pass
+    # Try legacy max_tokens
+    try:
+        openai_client.chat.completions.create(
+            model=model_name,
+            messages=[{"role": "user", "content": "ping"}],
+            max_tokens=8,
+            stop=["\n"],
+        )
+        return "mt"
+    except Exception as e2:
+        logging.debug("Model probe (mt) failed for %s: %s", model_name, e2)
+        return None
+
+# User-provided explicit fallbacks override everything (comma-separated)
+_user_fallbacks = [m.strip() for m in os.getenv("OPENAI_MODEL_FALLBACKS", "").split(",") if m.strip()]
+
+# Price ladders (cheapest → most expensive) so we "step up" only as needed
+MODEL_LADDERS = [
+    ["gpt-5-nano", "gpt-5-mini", "gpt-5"],
+    ["gpt-4.1-nano", "gpt-4.1-mini", "gpt-4.1"],
+    ["gpt-4o-mini", "gpt-4o"],
+]
+
+# Build candidate list: requested → next tiers upward in its ladder → user fallbacks → final safe defaults
+candidates: list[str] = []
+found = False
+for ladder in MODEL_LADDERS:
+    if OPENAI_MODEL in ladder:
+        found = True
+        start = ladder.index(OPENAI_MODEL)
+        candidates.extend(ladder[start:])  # step up in price within ladder
+        break
+if not found and OPENAI_MODEL:
+    candidates.append(OPENAI_MODEL)
+# Append user fallbacks, then a conservative default
+for m in _user_fallbacks:
+    if m not in candidates:
+        candidates.append(m)
+for m in ("gpt-4o-mini",):
+    if m not in candidates:
+        candidates.append(m)
+
+for cand in candidates:
+    style = _probe_model(cand)
+    if style:
+        RESOLVED_MODEL = cand
+        RESOLVED_PARAM_STYLE = style
+        if RESOLVED_MODEL != OPENAI_MODEL:
+            logging.warning("OPENAI_MODEL '%s' unavailable or unsuitable; falling back to '%s' (%s)", OPENAI_MODEL, RESOLVED_MODEL, RESOLVED_PARAM_STYLE)
+        else:
+            logging.info("Using requested OpenAI model '%s' (%s)", RESOLVED_MODEL, RESOLVED_PARAM_STYLE)
+        break
 
 # (10) Validate Plex connection ------------------------------------------------
 # (10) Validate Plex connection ------------------------------------------------
@@ -732,13 +812,18 @@ def _self_diag() -> bool:
     if OPENAI_API_KEY and openai_client:
         try:
             # a 1‑token "ping" to verify the key / model combination works
-            openai_client.chat.completions.create(
-                model=OPENAI_MODEL,
-                messages=[{"role": "user", "content": "ping"}],
-                max_completion_tokens=8,
-            )
+            _kwargs = {
+                "model": RESOLVED_MODEL,
+                "messages": [{"role": "user", "content": "ping"}],
+                "stop": ["\n"],
+            }
+            if RESOLVED_PARAM_STYLE == "mct":
+                _kwargs["max_completion_tokens"] = 8
+            else:
+                _kwargs["max_tokens"] = 8
+            openai_client.chat.completions.create(**_kwargs)
             logging.info("%s OpenAI API key valid – model **%s** reachable",
-                         colour("✓", ANSI_GREEN), OPENAI_MODEL)
+                         colour("✓", ANSI_GREEN), RESOLVED_MODEL)
             openai_ok = True
         except Exception as e:
             logging.warning("%s OpenAI API key present but failed: %s",
@@ -1770,8 +1855,8 @@ def choose_best(editions: List[dict]) -> dict:
 
         # Log concise OpenAI request summary
         logging.info(
-            "OpenAI request: model=%s, max_completion_tokens=256, candidate_editions=%d",
-            OPENAI_MODEL, len(editions)
+            "OpenAI request: model=%s, param=%s, max_out=256, candidate_editions=%d",
+            RESOLVED_MODEL, RESOLVED_PARAM_STYLE, len(editions)
         )
 
         system_msg = (
@@ -1787,15 +1872,19 @@ def choose_best(editions: List[dict]) -> dict:
             "1|Winner has: - [CLASSICAL:YES] same interpretation (shared MBID) - More complete edition, 9 vs 7 tracks|"
         )
         try:
-            resp = openai_client.chat.completions.create(
-                model=OPENAI_MODEL,
-                messages=[
+            _kwargs = {
+                "model": RESOLVED_MODEL,
+                "messages": [
                     {"role": "system", "content": system_msg},
                     {"role": "user",   "content": user_msg},
                 ],
-                max_completion_tokens=256,
-                stop=["\n"],
-            )
+                "stop": ["\n"],
+            }
+            if RESOLVED_PARAM_STYLE == "mct":
+                _kwargs["max_completion_tokens"] = 256
+            else:
+                _kwargs["max_tokens"] = 256
+            resp = openai_client.chat.completions.create(**_kwargs)
             txt = resp.choices[0].message.content.strip()
             logging.debug("AI raw response: %s", txt)
 
