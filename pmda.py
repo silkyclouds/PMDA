@@ -1775,10 +1775,16 @@ def choose_best(editions: List[dict]) -> dict:
         )
 
         system_msg = (
-            "You are an expert digital-music librarian. "
-            "Reply **only** with: <index>|<brief rationale>|<comma-separated extra tracks>. "
-            "Do not add anything before or after. "
-            "If there are no extra tracks leave the third field empty but keep the trailing pipe."
+            "You are an expert digital-music librarian.\n"
+            "OUTPUT RULES (must follow exactly):\n"
+            "- Return ONE single line only.\n"
+            "- The line must contain EXACTLY two '|' characters.\n"
+            "- Format: <index>|<brief rationale>|<comma-separated extra tracks>\n"
+            "- If there are no extra tracks, still include the final pipe but leave it empty.\n"
+            "- Do not add any other text, do not explain, do not add extra lines.\n"
+            "Example of valid outputs:\n"
+            "2|Winner has: - [CLASSICAL:NO] lossless FLAC, 24-bit, more tracks - Higher bitrate than 1|Track 12 - Live bonus\n"
+            "1|Winner has: - [CLASSICAL:YES] same interpretation (shared MBID) - More complete edition, 9 vs 7 tracks|"
         )
         try:
             resp = openai_client.chat.completions.create(
@@ -1788,15 +1794,37 @@ def choose_best(editions: List[dict]) -> dict:
                     {"role": "user",   "content": user_msg},
                 ],
                 max_completion_tokens=256,
+                stop=["\n"],
             )
             txt = resp.choices[0].message.content.strip()
             logging.debug("AI raw response: %s", txt)
-            parts = [part.strip() for part in txt.split("|")]
-            if len(parts) != 3:
-                raise ValueError(f"Invalid AI response format, expected 3 parts but got {len(parts)}")
-            idx = int(re.search(r"\d+", parts[0]).group())
-            rationale = parts[1]
-            merge_list = [t.strip() for t in parts[2].split(",") if t.strip()]
+
+            # --- sanitize: keep only first non-empty line, strip code fences / prefixes ---
+            lines = [l.strip() for l in txt.replace("```", "").splitlines() if l.strip()]
+            txt = lines[0] if lines else txt
+            txt = re.sub(r'^(answer|réponse)\s*:\s*', '', txt, flags=re.IGNORECASE).strip()
+
+            # --- try strict format: <index>|<rationale>|<extras> ---
+            m = re.match(r'^(\d+)\s*\|\s*(.*?)\s*\|\s*(.*)$', txt)
+            if m:
+                idx = int(m.group(1))
+                if not (0 <= idx < len(editions)):
+                    raise ValueError(f"AI index out of range: {idx} / {len(editions)}")
+                rationale = m.group(2).strip()
+                extras_raw = m.group(3).strip()
+                merge_list = [t.strip() for t in extras_raw.split(',') if t.strip()]
+            else:
+                # --- tolerant fallback: accept a lone index or any line containing a number ---
+                m_num = re.search(r'(\d+)', txt)
+                if not m_num:
+                    raise ValueError(f"Invalid AI response format (no index found) – got: {txt!r}")
+                idx = int(m_num.group(1))
+                if not (0 <= idx < len(editions)):
+                    raise ValueError(f"AI index out of range: {idx} / {len(editions)}")
+                rationale = "minimal AI reply; fallback parser used"
+                merge_list = []
+
+            logging.debug("AI parsed result -> idx=%s rationale=%r extras=%r", idx, rationale, merge_list)
 
             best = editions[idx]
             best.update({
