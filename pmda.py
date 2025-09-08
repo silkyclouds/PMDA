@@ -22,7 +22,7 @@ popup_displayed = False
 
 """
 v0.7.1
-- fixed GPT5 max tokens
+- fix for gpt5 max token limit
 """
 
 import argparse
@@ -898,6 +898,17 @@ def _cross_check_bindings():
         if not missing:
             logging.info("✓ Binding verified: %s → %s", plex_root, host_root)
             continue
+
+        # Diagnostic: show a few concrete sample mappings that failed
+        try:
+            for i, (src_path, rel) in enumerate(missing[:5], 1):
+                example_dst = os.path.join(host_root, rel)
+                logging.debug(
+                    "PATH CHECK example %d/%d: src=%s | rel=%s | dst=%s | exists(dst)=%s",
+                    i, len(missing), src_path, rel, example_dst, os.path.exists(example_dst)
+                )
+        except Exception as diag_e:
+            logging.debug("PATH CHECK example logging failed: %s", diag_e)
 
         logging.warning("Binding failed for %s → %s – attempting recursive search…", plex_root, host_root)
 
