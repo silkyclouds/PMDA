@@ -21,8 +21,8 @@ no_file_streak_global = 0
 popup_displayed = False
 
 """
-v0.7.0
-- improved the end of process sumarry
+v0.7.1
+- fixed GPT5 max tokens
 """
 
 import argparse
