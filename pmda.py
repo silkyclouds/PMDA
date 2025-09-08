@@ -736,7 +736,6 @@ def _self_diag() -> bool:
                 model=OPENAI_MODEL,
                 messages=[{"role": "user", "content": "ping"}],
                 max_completion_tokens=1,
-                temperature=0.0,
             )
             logging.info("%s OpenAI API key valid – model **%s** reachable",
                          colour("✓", ANSI_GREEN), OPENAI_MODEL)
@@ -1760,7 +1759,7 @@ def choose_best(editions: List[dict]) -> dict:
 
         # Log concise OpenAI request summary
         logging.info(
-            "OpenAI request: model=%s, max_tokens=64, temperature=0.0, candidate_editions=%d",
+            "OpenAI request: model=%s, max_completion_tokens=64, candidate_editions=%d",
             OPENAI_MODEL, len(editions)
         )
 
@@ -1777,7 +1776,6 @@ def choose_best(editions: List[dict]) -> dict:
                     {"role": "system", "content": system_msg},
                     {"role": "user",   "content": user_msg},
                 ],
-                temperature=0.0,
                 max_completion_tokens=64,
             )
             txt = resp.choices[0].message.content.strip()
@@ -1883,6 +1881,8 @@ def choose_best(editions: List[dict]) -> dict:
     return best
     # Check for any other literal uses of the French header and replace
     # (This is for the extremely rare case where it appears elsewhere in this function.)
+
+# --- Remove any other temperature=0.0 from openai_client.chat.completions.create calls in this file ---
 
 def scan_artist_duplicates(args):
     """
