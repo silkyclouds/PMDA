@@ -22,7 +22,8 @@ popup_displayed = False
 
 """
 v0.7.2
-- If a model ain't reachable for whatever reason, PMDA will automatically switch to the next model in order of pricing
+- fix for gpt5 max token limit
+- fix a rare empty folders issue
 """
 
 import argparse
@@ -45,6 +46,7 @@ from urllib.parse import quote_plus
 
 import logging
 import re
+import hashlib
 import xml.etree.ElementTree as ET
 
 import requests
@@ -79,32 +81,68 @@ def colour(txt: str, code: str) -> str:
 # ────────────────────── Robust cross‑device move helper ──────────────────────
 def safe_move(src: str, dst: str):
     """
-    Move *src* → *dst* even when they live on different mount points.
-
-    • First try the regular rename.
-    • On EXDEV (cross‑device) fall back to copytree → rmtree.
-    • If rmtree raises ENOTEMPTY (e.g. SMB latency) wait 1 s and retry once.
+    Move *src* → *dst* de façon robuste, y compris entre volumes (EXDEV).
+    - Try atomic same‑device rename first (os.replace).
+    - On EXDEV or other rename failures, copy (file or tree) then remove source with retries.
+    - Handles ENOTEMPTY/EBUSY during rmtree on slow NAS/SMB by retrying.
     """
+    src_path = Path(src)
+    dst_path = Path(dst)
+    dst_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # 1) Fast path: atomic rename when on same device
     try:
-        shutil.move(src, dst)
+        os.replace(src, dst)
         return
     except OSError as exc:
         if exc.errno != errno.EXDEV:
-            raise                                      #  not a cross‑device issue
-    # Fallback: copy then delete ― keep permissions/mtime
-    shutil.copytree(src, dst, dirs_exist_ok=True)
+            logging.warning("safe_move(): os.replace failed (%s) – falling back to copy", exc)
+        # continue to copy fallback
+
+    # 2) Choose a non‑clobbering destination (in case of leftovers)
+    final_dst = dst_path
+    if final_dst.exists():
+        base = final_dst.name
+        parent = final_dst.parent
+        n = 1
+        while (parent / f"{base} ({n})").exists():
+            n += 1
+        final_dst = parent / f"{base} ({n})"
+        logging.warning("safe_move(): destination exists, using %s", final_dst)
+
+    # 3) Copy (dir or single file)
     try:
-        shutil.rmtree(src)
-    except OSError as exc:
-        if exc.errno == errno.ENOTEMPTY:               # race: still busy, retry
-            logging.warning("safe_move(): ENOTEMPTY while deleting %s – retrying", src)
-            time.sleep(1.0)
-            shutil.rmtree(src, ignore_errors=True)
+        if src_path.is_dir():
+            shutil.copytree(src_path, final_dst, dirs_exist_ok=False)
         else:
+            shutil.copy2(src_path, final_dst)
+    except Exception as copy_err:
+        logging.error("safe_move(): copy failed %s → %s – %s", src_path, final_dst, copy_err)
+        raise
+
+    # 4) Remove source with retries (tolerate ENOTEMPTY/EBUSY on NAS)
+    for attempt in range(5):
+        try:
+            if src_path.is_dir():
+                shutil.rmtree(src_path)
+            else:
+                try:
+                    src_path.unlink()
+                except FileNotFoundError:
+                    pass
+            break
+        except OSError as e:
+            if e.errno in (errno.ENOTEMPTY, errno.EBUSY):
+                logging.warning("safe_move(): rmtree(%s) failed (%s) – retry %d/5", src, e, attempt + 1)
+                time.sleep(1.5)
+                continue
             raise
-    # Final safety‑net: if *anything* is still left behind, wipe it quietly
-    if os.path.exists(src):
+    else:
         logging.warning("safe_move(): forcing removal of residual files in %s", src)
+        shutil.rmtree(src_path, ignore_errors=True)
+
+    # 5) Final safety net
+    if os.path.exists(src):
         shutil.rmtree(src, ignore_errors=True)
 
 from queue import SimpleQueue
@@ -1419,15 +1457,31 @@ def score_format(ext: str) -> int:
 
 def norm_album(title: str) -> str:
     """
-    Strip any parenthetical or bracketed content, collapse whitespace,
-    lowercase, and trim.
-    e.g. "Album Name (Special Edition) [HD]" → "album name"
+    Normalise an album title for duplicate grouping.
+    • Remove parenthetical/bracketed content conservatively.
+    • Collapse whitespace and lowercase.
+    • If the result is empty or too short (<3), fall back to the raw title (lowercased).
+    • If still empty, return a unique placeholder so different unknown titles don't collide.
     """
+    raw = (title or "").strip()
     # Remove any content in parentheses or brackets
-    cleaned = re.sub(r"[\(\[][^\)\]]*[\)\]]", "", title)
-    # Collapse multiple spaces into one and strip leading/trailing whitespace
-    cleaned = " ".join(cleaned.split())
-    return cleaned.lower()
+    cleaned = re.sub(r"[\(\[][^(\)\]]*[\)\]]", "", raw)
+    cleaned = " ".join(cleaned.split()).lower()
+
+    if len(cleaned) >= 3:
+        return cleaned
+
+    # Fallback to raw (lowercased) if cleaning erased the useful bits
+    fallback = raw.lower()
+    fallback = " ".join(fallback.split())
+    if len(fallback) >= 3:
+        return fallback
+
+    # Last resort: avoid collapsing different untitled releases together
+    if raw:
+        h = hashlib.sha1(raw.encode("utf-8", "ignore")).hexdigest()[:8]
+        return f"__untitled__-{h}"
+    return "__untitled__"
 
 def get_primary_format(folder: Path) -> str:
     for f in folder.rglob("*"):
