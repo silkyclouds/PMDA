@@ -21,9 +21,8 @@ no_file_streak_global = 0
 popup_displayed = False
 
 """
-v0.7.2
-- fix for gpt5 max token limit
-- fix a rare empty folders issue
+v0.7.5
+- Improvement of the detection for albums with "no name" 
 """
 
 import argparse
@@ -41,7 +40,7 @@ import atexit
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import NamedTuple, List, Dict, Optional
+from typing import NamedTuple, List, Dict, Optional, Tuple
 from urllib.parse import quote_plus
 
 import logging
@@ -197,21 +196,13 @@ def _purge_invalid_edition(edition: dict):
             return                                                    # already gone
 
         # Destination under /dupes, keep relative path when possible
-        try:
-            base_real = next(iter(PATH_MAP.values()))
-            rel = src_folder.relative_to(base_real)
-        except Exception:
-            rel = src_folder.name
-        dst = DUPE_ROOT / rel
+        base_dst = build_dupe_destination(src_folder)
+        dst = base_dst
+        counter = 1
+        while dst.exists():                                            # avoid clashes
+            dst = base_dst.parent / f"{base_dst.name} ({counter})"
+            counter += 1
         dst.parent.mkdir(parents=True, exist_ok=True)
-
-        if dst.exists():                                              # avoid clashes
-            base_name = dst.name
-            parent_dir = dst.parent
-            counter = 1
-            while (parent_dir / f"{base_name} ({counter})").exists():
-                counter += 1
-            dst = parent_dir / f"{base_name} ({counter})"
 
         # Move (or copy‑then‑delete) the folder ----------------------
         try:
@@ -1449,6 +1440,45 @@ def container_to_host(p: str) -> Optional[Path]:
             return Path(real) / p[len(pre):].lstrip("/")
     return None
 
+def relative_path_under_known_roots(path: Path) -> Optional[Path]:
+    """
+    Return the relative path of *path* under any known PATH_MAP root (host or container).
+    Falls back to ``None`` when the path is outside every configured root.
+    """
+    try:
+        resolved = path.resolve()
+    except Exception:
+        resolved = path
+
+    roots: list[Path] = []
+    for value in PATH_MAP.values():
+        roots.append(Path(value))
+    for key in PATH_MAP.keys():
+        roots.append(Path(key))
+
+    for root in roots:
+        candidates = {root}
+        try:
+            candidates.add(root.resolve())
+        except Exception:
+            pass
+        for candidate in candidates:
+            try:
+                return resolved.relative_to(candidate)
+            except ValueError:
+                continue
+    return None
+
+def build_dupe_destination(src_folder: Path) -> Path:
+    """
+    Compute the destination path under DUPE_ROOT while preserving the relative
+    artist/album structure whenever possible.
+    """
+    rel = relative_path_under_known_roots(src_folder)
+    if rel is None or str(rel).strip() == "":
+        rel = Path(src_folder.name)
+    return DUPE_ROOT / rel
+
 def folder_size(p: Path) -> int:
     return sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
 
@@ -1482,6 +1512,29 @@ def norm_album(title: str) -> str:
         h = hashlib.sha1(raw.encode("utf-8", "ignore")).hexdigest()[:8]
         return f"__untitled__-{h}"
     return "__untitled__"
+
+def derive_album_title(plex_title: str, meta: Dict[str, str], folder: Path, album_id: int) -> Tuple[str, str]:
+    """
+    Pick the most trustworthy album title available and return (title, source).
+    Priority: Plex DB → embedded tags → folder name → unique placeholder.
+    """
+    if plex_title:
+        title = plex_title.strip()
+        if title:
+            return (title, "plex")
+
+    for key in ("album", "title", "release", "albumartist"):
+        candidate = meta.get(key, "")
+        if candidate:
+            title = candidate.strip()
+            if title:
+                return (title, f"tag:{key}")
+
+    folder_title = folder.name.replace("_", " ").strip()
+    if folder_title:
+        return (folder_title, "folder")
+
+    return (f"Untitled Album #{album_id}", "placeholder")
 
 def get_primary_format(folder: Path) -> str:
     for f in folder.rglob("*"):
@@ -1744,6 +1797,33 @@ def signature(tracks: List[Track]) -> tuple:
 
 def overlap(a: set, b: set) -> float:
     return len(a & b) / max(len(a), len(b))
+
+def editions_share_confident_signal(ed_list: List[dict]) -> bool:
+    """
+    Determine whether a potential duplicate group has enough evidence to be trusted.
+    Accept when at least two editions have high-confidence titles, all track
+    signatures match, or they share the same MusicBrainz release-group ID.
+    """
+    if len(ed_list) < 2:
+        return False
+
+    high_conf_prefixes = {"plex", "tag"}
+    high_conf_titles = sum(
+        1 for e in ed_list
+        if e.get("title_source", "").partition(":")[0] in high_conf_prefixes
+    )
+    if high_conf_titles >= 2:
+        return True
+
+    sigs = {e.get("sig") for e in ed_list if e.get("sig")}
+    if len(sigs) == 1 and sigs:
+        return True
+
+    rg_ids = {e.get("rg_info", {}).get("id") for e in ed_list if e.get("rg_info", {}).get("id")}
+    if len(rg_ids) == 1 and rg_ids:
+        return True
+
+    return False
 
 def fetch_mb_release_group_info(mbid: str) -> dict:
     """
@@ -2193,10 +2273,14 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
                     fmt_score, br, sr, bd = fmt_score_retry, br_retry, sr_retry, bd_retry
                     is_invalid = False
 
+            plex_title = album_title(db_conn, aid)
+            title_raw, title_source = derive_album_title(plex_title, meta_tags, folder, aid)
+            album_norm_value = norm_album(title_raw)
+
             editions.append({
                 'album_id':  aid,
-                'title_raw': album_title(db_conn, aid),
-                'album_norm': norm_album(album_title(db_conn, aid)),
+                'title_raw': title_raw,
+                'album_norm': album_norm_value,
                 'artist':    artist,
                 'folder':    folder,
                 'tracks':    tr,
@@ -2210,7 +2294,9 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
                 'bd':        bd,
                 'discs':     len({t.disc for t in tr}),
                 'meta':      meta_tags,
-                'invalid':   False
+                'invalid':   False,
+                'title_source': title_source,
+                'plex_title': plex_title or ""
             })
         except Exception as e:
             logging.error("Error processing album %s for artist %s: %s", aid, artist, e, exc_info=True)
@@ -2376,6 +2462,14 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
         if len(ed_list) < 2:
             continue
         logging.debug(f"[Artist {artist}] Exact group members: {[e['album_id'] for e in ed_list]}")
+
+        if not editions_share_confident_signal(ed_list):
+            logging.debug(
+                "[Artist %s] Skipping low-confidence exact group %s",
+                artist,
+                [e['album_id'] for e in ed_list]
+            )
+            continue
         # Choose best across all identical normalized titles
         best = choose_best(ed_list)
         losers = [e for e in ed_list if e['album_id'] != best['album_id']]
@@ -2410,6 +2504,13 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
         logging.debug(f"[Artist {artist}] Fuzzy group members: {[e['album_id'] for e in ed_list]}")
         # Only perform fuzzy grouping via AI; skip if no API key
         if not OPENAI_API_KEY:
+            continue
+        if not editions_share_confident_signal(ed_list):
+            logging.debug(
+                "[Artist %s] Skipping low-confidence fuzzy group %s",
+                artist,
+                [e['album_id'] for e in ed_list]
+            )
             continue
         # Force AI selection for fuzzy groups
         best = choose_best(ed_list)
@@ -2833,25 +2934,16 @@ def perform_dedupe(group: dict) -> List[dict]:
         if not src_folder.exists():
             logging.warning(f"perform_dedupe(): source folder missing – {src_folder}; skipping.")
             continue
-        try:
-            base_real = next(iter(PATH_MAP.values()))
-            rel = src_folder.relative_to(base_real)
-        except Exception:
-            rel = src_folder.name
-
-        dst = DUPE_ROOT / rel
+        base_dst = build_dupe_destination(src_folder)
+        dst = base_dst
+        counter = 1
+        while dst.exists():
+            candidate = base_dst.parent / f"{base_dst.name} ({counter})"
+            if not candidate.exists():
+                dst = candidate
+                break
+            counter += 1
         dst.parent.mkdir(parents=True, exist_ok=True)
-
-        if dst.exists():
-            base_name = dst.name
-            parent_dir = dst.parent
-            counter = 1
-            while True:
-                candidate = parent_dir / f"{base_name} ({counter})"
-                if not candidate.exists():
-                    dst = candidate
-                    break
-                counter += 1
 
         logging.info("Moving dupe: %s  →  %s", src_folder, dst)
         logging.debug("perform_dedupe(): moving %s → %s", src_folder, dst)
@@ -4140,19 +4232,13 @@ def dedupe_cli(
                     continue
 
                 # Build destination under /dupes
-                try:
-                    base_path = next(iter(PATH_MAP.values()))
-                    relative  = src.relative_to(base_path)
-                except Exception:
-                    relative = src.name
-                dst = DUPE_ROOT / relative
-                dst.parent.mkdir(parents=True, exist_ok=True)
-
-                # Avoid collisions with numbered suffixes
+                base_dst = build_dupe_destination(src)
+                dst = base_dst
                 counter = 1
                 while dst.exists():
-                    dst = dst.parent / f"{relative} ({counter})"
+                    dst = base_dst.parent / f"{base_dst.name} ({counter})"
                     counter += 1
+                dst.parent.mkdir(parents=True, exist_ok=True)
 
                 size_mb = folder_size(src) // (1024 * 1024)
 
