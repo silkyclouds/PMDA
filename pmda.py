@@ -355,6 +355,21 @@ with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
     conf: dict = json.load(fh)
 
 # ─── Auto‑generate PATH_MAP from Plex at *every* startup ────────────────────
+#
+# Design goal: avoid requiring users to manually configure PATH_MAP (Plex path → host path).
+# Flow:
+#   1) Discovery: Plex API returns all <Location> paths for the music section(s).
+#      We get the exact paths Plex uses (e.g. /music/matched, /music/unmatched).
+#   2) Merge: If the user provided a broader PATH_MAP in env/config (e.g. /music → /music/…),
+#      we apply it by prefix; otherwise we keep Plex path = container path (so Docker
+#      volume binds must match: -v /host/Music_matched:/music/matched).
+#   3) Cross-check: For each binding we sample CROSSCHECK_SAMPLES tracks from the DB,
+#      resolve their paths via PATH_MAP, and verify the files exist on disk. If they
+#      don’t, we try to find the correct host root (sibling dirs or rglob) and patch
+#      PATH_MAP + config.json. So even when paths differ (e.g. Plex says /music/unmatched
+#      but on host it’s /music/Music_dump), we auto-correct instead of failing.
+# Result: users only need to mount volumes; PMDA discovers Plex paths and validates
+# (and repairs) bindings so the same paths work for scan/dedupe.
 
 def _discover_path_map(plex_host: str, plex_token: str, section_id: int) -> dict[str, str]:
     """
@@ -1006,7 +1021,12 @@ def _cross_check_bindings():
         for src_path in rows:
             rel = src_path[len(plex_root):].lstrip("/")
             dst_path = os.path.join(host_root, rel)
-            if not Path(dst_path).exists():
+            try:
+                exists = Path(dst_path).exists()
+            except OSError as e:
+                logging.warning("PATH CHECK: I/O error checking %s – skipping sample: %s", dst_path, e)
+                continue
+            if not exists:
                 missing.append((src_path, rel))
 
         if not missing:
@@ -1428,11 +1448,17 @@ def notify_discord_embed(title: str, description: str, thumbnail_url: str = "", 
     except Exception as e:
         logging.warning("Discord embed failed: %s", e)
 
-# ─── Run connection check & self‑diagnostic only after helpers are defined ───
-_validate_plex_connection()
-if not _self_diag():
-    raise SystemExit("Self‑diagnostic failed – please fix the issues above and restart PMDA.")
-_cross_check_bindings()
+# ─── Run connection check & self‑diagnostic (called from main so WebUI can start first in serve mode) ───
+def run_startup_checks() -> None:
+    """Run Plex validation, self-diagnostic and path cross-check. Call after starting the WebUI server in serve mode."""
+    _validate_plex_connection()
+    if not _self_diag():
+        raise SystemExit("Self‑diagnostic failed – please fix the issues above and restart PMDA.")
+    if not _parse_bool(os.getenv("DISABLE_PATH_CROSSCHECK", "false")):
+        _cross_check_bindings()
+    else:
+        logging.info("PATH cross-check skipped (DISABLE_PATH_CROSSCHECK=true).")
+
 
 def container_to_host(p: str) -> Optional[Path]:
     for pre, real in PATH_MAP.items():
@@ -1537,9 +1563,12 @@ def derive_album_title(plex_title: str, meta: Dict[str, str], folder: Path, albu
     return (f"Untitled Album #{album_id}", "placeholder")
 
 def get_primary_format(folder: Path) -> str:
-    for f in folder.rglob("*"):
-        if AUDIO_RE.search(f.name):
-            return f.suffix[1:].upper()
+    try:
+        for f in folder.rglob("*"):
+            if AUDIO_RE.search(f.name):
+                return f.suffix[1:].upper()
+    except OSError as e:
+        logging.debug("get_primary_format I/O error for %s: %s", folder, e)
     return "UNKNOWN"
 
 def thumb_url(album_id: int) -> str:
@@ -3751,6 +3780,18 @@ HTML = """<!DOCTYPE html>
           if (j.deduping) dedupeTimer = setInterval(pollDedupe, 1000);
         });
 
+        // Initial load: fetch duplicate list so the table/grid populates (page is served with empty groups for fast first paint)
+        fetch("/api/duplicates")
+          .then(r => r.json())
+          .then(allGroups => {
+            renderDuplicates(allGroups);
+            const remBadge = document.getElementById("remainingDupes");
+            if (remBadge) remBadge.innerText = "Remaining Dupes: " + allGroups.length;
+            const nav = document.querySelector("nav .pagination");
+            if (nav) nav.style.display = "flex";
+          })
+          .catch(err => console.error("Failed to load duplicates:", err));
+
       /* ─── Client-side search filter ──────────────────────────────── */
     const searchInput = document.getElementById("search");
     if (searchInput) {
@@ -3829,20 +3870,16 @@ def _build_card_list(dup_dict) -> list[dict]:
 @app.get("/")
 def index():
     """
-    Main page: load duplicates from DB (if not already in memory),
-    gather stats, build card list and render the template.
+    Main page: return immediately with empty card list so the UI responds.
+    Stats are quick (DB counts); duplicate cards are loaded client-side via /api/duplicates.
     """
     with lock:
-        if not state["duplicates"]:
-            logging.debug("index(): loading scan results from DB into memory")
-            state["duplicates"] = load_scan_from_db()
         paused = scan_is_paused.is_set()
 
     space_saved   = get_stat("space_saved")
     removed_dupes = get_stat("removed_dupes")
 
     db_conn = plex_connect()
-    # Count across all configured sections
     placeholders   = ",".join("?" for _ in SECTION_IDS)
     section_params = tuple(SECTION_IDS)
     total_artists = db_conn.execute(
@@ -3857,33 +3894,19 @@ def index():
     ).fetchone()[0]
     db_conn.close()
 
-    # Build the card / row structures for the UI
-    with lock:
-        page = int(request.args.get("page", 1))
-        PER_PAGE = 100
-        cards_all = _build_card_list(state["duplicates"])
-        # Total number of duplicate groups
-        total_dup_groups = len(cards_all)
-        total_pages = (total_dup_groups + PER_PAGE - 1) // PER_PAGE
-        start = (page - 1) * PER_PAGE
-        end = start + PER_PAGE
-        cards = cards_all[start:end]
-        # The "Remaining Dupes" badge should show the total count, not just the current page
-        remaining_dupes = total_dup_groups
-
     return render_template_string(
         HTML,
         scanning=state["scanning"],
-        groups=cards,
+        groups=[],  # client fetches via /api/duplicates for fast first paint
         space_saved=space_saved,
         removed_dupes=removed_dupes,
         total_artists=total_artists,
         total_albums=total_albums,
-        remaining_dupes=remaining_dupes,
+        remaining_dupes=0,
         plex_host=PLEX_HOST,
         plex_token=PLEX_TOKEN,
-        page=page,
-        total_pages=total_pages,
+        page=1,
+        total_pages=1,
         paused=paused,
     )
 
@@ -3926,6 +3949,21 @@ def stop_scan():
     with lock:
         state["scanning"] = False
     return "", 204
+
+@app.get("/api/duplicates")
+def api_duplicates():
+    """
+    Return the full list of duplicate-group cards for the Web UI.
+    Loads from DB into state["duplicates"] on first call (or when empty).
+    Used by the initial page load and by search/polling.
+    """
+    with lock:
+        if not state["duplicates"]:
+            logging.debug("api_duplicates(): loading scan results from DB into memory")
+            state["duplicates"] = load_scan_from_db()
+        cards = _build_card_list(state["duplicates"])
+    return jsonify(cards)
+
 
 @app.get("/api/progress")
 def api_progress():
@@ -4420,10 +4458,20 @@ if __name__ == "__main__":
         logging.debug("Main: verbose mode enabled; root logger set to DEBUG")
 
     if args.serve:
-        # WebUI mode
-        app.run(host="0.0.0.0", port=WEBUI_PORT)
+        # WebUI mode: start the HTTP server first so the UI is reachable immediately,
+        # then run startup checks (diagnostic + cross-check) in main thread.
+        def run_server():
+            app.run(host="0.0.0.0", port=WEBUI_PORT, threaded=True, use_reloader=False)
+
+        server_thread = threading.Thread(target=run_server, daemon=False)
+        server_thread.start()
+        logging.info("WebUI listening on http://0.0.0.0:%s – startup checks running in background", WEBUI_PORT)
+        run_startup_checks()
+        logging.info("WebUI startup complete – you can open the interface now.")
+        server_thread.join()  # block forever (app.run never returns)
     else:
-        # CLI mode: full scan, then dedupe
+        # CLI mode: run checks then full scan and dedupe
+        run_startup_checks()
         logging.info("CLI mode: starting full library scan")
         # Temporarily disable Discord notifications during scan stage
         original_notify = globals().get("notify_discord")

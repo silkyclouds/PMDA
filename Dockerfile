@@ -14,6 +14,6 @@ COPY . /app
 
 RUN pip install --no-cache-dir -r requirements.txt
 
-EXPOSE 6000
+EXPOSE 5005
 
 ENTRYPOINT ["python", "pmda.py"]

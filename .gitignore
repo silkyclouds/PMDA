@@ -1,0 +1,26 @@
+# Local Cursor rules – never publish to GitHub
+.cursorrules
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+
+# Config / state (optional – uncomment if you don’t want config/cache in git)
+# config.json
+# state.db
+# cache.db
+# pmda.log
+# pmda.log.*
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+*.swp
+*.swo
