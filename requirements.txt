@@ -2,3 +2,5 @@ Flask>=2.0
 requests>=2.0
 openai>=0.27.0
 musicbrainzngs>=0.7.1
+anthropic>=0.18.0
+google-generativeai>=0.3.0

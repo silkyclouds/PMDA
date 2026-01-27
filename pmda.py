@@ -45,6 +45,8 @@ from urllib.parse import quote_plus
 
 import logging
 import re
+import socket
+import struct
 import hashlib
 import xml.etree.ElementTree as ET
 
@@ -57,7 +59,17 @@ musicbrainzngs.set_useragent(
     "0.6.6",              # application version (sync with header)
     "pmda@example.com"    # contact / support email
 )
+# Set rate limiting: 1 request per second (MusicBrainz limit without authentication)
+musicbrainzngs.set_rate_limit(limit_or_interval=1.0, new_requests=1)
 from openai import OpenAI
+try:
+    import anthropic
+except ImportError:
+    anthropic = None
+try:
+    import google.generativeai as genai
+except ImportError:
+    genai = None
 
 # ──────────────── ANSI colours for prettier logs ────────────────
 ANSI_RESET  = "\033[0m"
@@ -150,9 +162,21 @@ import random
 
 
 
-from flask import Flask, render_template_string, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 
 app = Flask(__name__)
+
+# Path to integrated frontend build (self-hosted: one container = backend + UI)
+_FRONTEND_DIST = os.path.join(os.path.dirname(os.path.abspath(__file__)), "frontend", "dist")
+_HAS_STATIC_UI = os.path.isdir(_FRONTEND_DIST)
+
+# CORS: allow frontend (e.g. dev server on port 3000 or 8080) to call the API
+@app.after_request
+def _cors_headers(response):
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    return response
 
 # Ensure LOG_LEVEL exists for initial logging setup
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -398,14 +422,21 @@ def _discover_path_map(plex_host: str, plex_token: str, section_id: int) -> dict
     except ET.ParseError as e:
         raise RuntimeError(f"Invalid XML returned by Plex: {e}") from None
 
-    locations: list[str] = []
+    seen: set[str] = set()
     for directory in root.iter("Directory"):
-        if directory.attrib.get("key") == str(section_id):
-            for loc in directory.iter("Location"):
-                path = loc.attrib.get("path")
-                if path:
-                    locations.append(path)
-            break  # only one matching section expected
+        if directory.attrib.get("key") != str(section_id):
+            continue
+        for loc in directory.iter("Location"):
+            path = (loc.attrib.get("path") or "").strip()
+            if not path:
+                continue
+            # Support path with comma- or semicolon-separated entries (some Plex versions)
+            for single in re.split(r"[,;]", path):
+                single = single.strip()
+                if single:
+                    seen.add(single)
+        # Do not break: some Plex versions return one Directory per Location; collect all.
+    locations = list(seen)
     logging.debug("PATH_MAP discovery: parsed %d <Location> paths -> %s", len(locations), locations)
     if not locations:
         raise RuntimeError("No <Location> elements found for this section")
@@ -414,93 +445,96 @@ def _discover_path_map(plex_host: str, plex_token: str, section_id: int) -> dict
     return {p: p for p in locations}
 
 # Always attempt discovery – even when PATH_MAP already exists – so the file
-# stays in sync with the Plex configuration.
+# stays in sync with the Plex configuration. If PLEX_HOST or PLEX_TOKEN is
+# missing, we start in "wizard" (unconfigured) mode and skip discovery.
+SECTION_IDS: list[int] = []
+SECTION_NAMES: dict[int, str] = {}
 try:
-    plex_host   = os.getenv("PLEX_HOST")   or conf.get("PLEX_HOST")
-    plex_token  = os.getenv("PLEX_TOKEN")  or conf.get("PLEX_TOKEN")
-    # Support multiple section IDs via SECTION_IDS or SECTION_ID (comma-separated)
-    # Read any user‑provided value first
-    raw_sections = (
-        os.getenv("SECTION_IDS")
-        or os.getenv("SECTION_ID")
-        or conf.get("SECTION_IDS")
-        or conf.get("SECTION_ID")
-    )
-
-    # Treat an empty string or whitespace‑only value as “not provided”
-    if raw_sections is not None and str(raw_sections).strip() == "":
-        raw_sections = None
-
-    logging.debug("SECTION_IDS raw input = %r", raw_sections)
-
-    if not raw_sections:
-        # Auto-detect all available sections from Plex
-        try:
-            resp = requests.get(f"{plex_host.rstrip('/')}/library/sections", headers={"X-Plex-Token": plex_token}, timeout=10)
-            root = ET.fromstring(resp.text)
-            SECTION_IDS = [int(d.attrib['key']) for d in root.iter("Directory") if d.attrib.get('type') == 'artist']
-            logging.info("Auto-detected SECTION_IDS from Plex: %s", SECTION_IDS)
-        except Exception as e:
-            logging.error("Failed to auto-detect SECTION_IDS: %s", e)
-            raise SystemExit("Could not auto-detect Plex sections")
+    plex_host   = (os.getenv("PLEX_HOST")   or conf.get("PLEX_HOST")) or ""
+    plex_token  = (os.getenv("PLEX_TOKEN")  or conf.get("PLEX_TOKEN")) or ""
+    plex_host   = plex_host.strip() if isinstance(plex_host, str) else ""
+    plex_token  = plex_token.strip() if isinstance(plex_token, str) else ""
+    # Require a URL-like host so we never call Plex API with empty/invalid base
+    if not plex_host or not plex_token or not str(plex_host).strip().startswith(("http://", "https://")):
+        logging.info("PLEX_HOST or PLEX_TOKEN missing or invalid – starting in unconfigured (wizard) mode")
     else:
-        # Split on commas, strip whitespace, parse ints
-        SECTION_IDS = []
-        for part in re.split(r'\s*,\s*', str(raw_sections)):
-            if part.strip().isdigit():
-                SECTION_IDS.append(int(part.strip()))
+        # Support multiple section IDs via SECTION_IDS or SECTION_ID (comma-separated)
+        # Read any user‑provided value first
+        raw_sections = (
+            os.getenv("SECTION_IDS")
+            or os.getenv("SECTION_ID")
+            or conf.get("SECTION_IDS")
+            or conf.get("SECTION_ID")
+        )
 
-    # ----- LIBRARY SECTIONS -----
-    try:
-        # fetch section names from Plex for friendly logging
-        resp = requests.get(f"{plex_host.rstrip('/')}/library/sections", headers={"X-Plex-Token": plex_token}, timeout=10)
-        root = ET.fromstring(resp.text)
-        SECTION_NAMES = {int(directory.attrib['key']): directory.attrib.get('title', '<unknown>') for directory in root.iter('Directory')}
-    except Exception:
-        SECTION_NAMES = {}
-    if SECTION_NAMES:
-        log_header("libraries")
-        for sid in SECTION_IDS:
-            name = SECTION_NAMES.get(sid, "<unknown>")
-            logging.info("  %s (ID %d)", name, sid)
-    else:
-        logging.info("Library section IDs: %s\n", SECTION_IDS)
-    auto_map = {}
-    for sid in SECTION_IDS:
-        part = _discover_path_map(plex_host, plex_token, sid)
-        auto_map.update(part)
-    log_header("path_map discovery")
-    logging.info("Auto‑generated raw PATH_MAP from Plex: %s", auto_map)
+        # Treat an empty string or whitespace‑only value as “not provided”
+        if raw_sections is not None and str(raw_sections).strip() == "":
+            raw_sections = None
 
-    # preserve any user‐specified base mappings from env/config
-    raw_env_map = _parse_path_map(os.getenv("PATH_MAP") or conf.get("PATH_MAP", {}))
-    logging.info("Raw PATH_MAP from env/config: %s", raw_env_map)
-    merged_map: dict[str, str] = {}
-    for cont_path, cont_val in auto_map.items():
-        # try to apply a broader host‐base mapping first
-        mapped = False
-        for prefix, host_base in sorted(raw_env_map.items(), key=lambda item: len(item[0]), reverse=True):
-            if cont_path.startswith(prefix):
-                suffix = cont_path[len(prefix):].lstrip("/")
-                merged_map[cont_path] = os.path.join(host_base, suffix)
-                mapped = True
-                break
-        if not mapped:
-            # fallback to container==host mapping
-            merged_map[cont_path] = cont_val
-    logging.info("Merged PATH_MAP for startup: %s", merged_map)
-    log_header("volume bindings (plex → pmda → host)")
-    logging.info("%-40s | %-30s | %s", "PLEX_PATH", "PMDA_PATH", "HOST_PATH")
-    for plex_path, host_path in merged_map.items():
-        # for now, treat host_path as both PMDA_PATH and HOST_PATH
-        pmda_path = host_path
-        logging.info("%-40s | %-30s | %s", plex_path, pmda_path, host_path)
-    conf["PATH_MAP"] = merged_map
-    with open(CONFIG_PATH, "w", encoding="utf-8") as fh_cfg:
-        json.dump(conf, fh_cfg, indent=2)
-    logging.info("🔄 Auto‑generated/updated PATH_MAP from Plex: %s", auto_map)
+        logging.debug("SECTION_IDS raw input = %r", raw_sections)
+
+        if not raw_sections:
+            try:
+                resp = requests.get(f"{plex_host.rstrip('/')}/library/sections", headers={"X-Plex-Token": plex_token}, timeout=10)
+                root = ET.fromstring(resp.text)
+                SECTION_IDS = [int(d.attrib['key']) for d in root.iter("Directory") if d.attrib.get('type') == 'artist']
+                logging.info("Auto-detected SECTION_IDS from Plex: %s", SECTION_IDS)
+            except Exception as e:
+                logging.error("Failed to auto-detect SECTION_IDS: %s", e)
+                SECTION_IDS = []
+        else:
+            if isinstance(raw_sections, list):
+                SECTION_IDS = [int(x) for x in raw_sections if str(x).strip().isdigit()]
+            else:
+                SECTION_IDS = []
+                for part in re.split(r'\s*,\s*', str(raw_sections)):
+                    if part.strip().isdigit():
+                        SECTION_IDS.append(int(part.strip()))
+
+        if SECTION_IDS:
+            try:
+                resp = requests.get(f"{plex_host.rstrip('/')}/library/sections", headers={"X-Plex-Token": plex_token}, timeout=10)
+                root = ET.fromstring(resp.text)
+                SECTION_NAMES.update({int(directory.attrib['key']): directory.attrib.get('title', '<unknown>') for directory in root.iter('Directory')})
+            except Exception:
+                pass
+            if SECTION_NAMES:
+                log_header("libraries")
+                for sid in SECTION_IDS:
+                    name = SECTION_NAMES.get(sid, "<unknown>")
+                    logging.info("  %s (ID %d)", name, sid)
+            auto_map = {}
+            for sid in SECTION_IDS:
+                part = _discover_path_map(plex_host, plex_token, sid)
+                auto_map.update(part)
+            log_header("path_map discovery")
+            logging.info("Auto‑generated raw PATH_MAP from Plex: %s", auto_map)
+            raw_env_map = _parse_path_map(os.getenv("PATH_MAP") or conf.get("PATH_MAP", {}))
+            logging.info("Raw PATH_MAP from env/config: %s", raw_env_map)
+            merged_map = {}
+            for cont_path, cont_val in auto_map.items():
+                mapped = False
+                for prefix, host_base in sorted(raw_env_map.items(), key=lambda item: len(item[0]), reverse=True):
+                    if cont_path.startswith(prefix):
+                        suffix = cont_path[len(prefix):].lstrip("/")
+                        merged_map[cont_path] = os.path.join(host_base, suffix)
+                        mapped = True
+                        break
+                if not mapped:
+                    merged_map[cont_path] = cont_val
+            logging.info("Merged PATH_MAP for startup: %s", merged_map)
+            log_header("volume bindings (plex → pmda → host)")
+            logging.info("%-40s | %-30s | %s", "PLEX_PATH", "PMDA_PATH", "HOST_PATH")
+            for plex_path, host_path in merged_map.items():
+                logging.info("%-40s | %-30s | %s", plex_path, host_path, host_path)
+            conf["PATH_MAP"] = merged_map
+            with open(CONFIG_PATH, "w", encoding="utf-8") as fh_cfg:
+                json.dump(conf, fh_cfg, indent=2)
+            logging.info("🔄 Auto‑generated/updated PATH_MAP from Plex: %s", auto_map)
 except Exception as e:
     logging.warning("⚠️  Failed to auto‑generate PATH_MAP – %s", e)
+    SECTION_IDS = []
+    SECTION_NAMES = {}
 
 # (4) Merge with environment variables ----------------------------------------
 ENV_SOURCES: dict[str, str] = {}
@@ -518,26 +552,26 @@ def _get(key: str, *, default=None, cast=lambda x: x):
         raw = default
     return cast(raw)
 
-# Validate we have at least one section ID before we start referencing it
-if not SECTION_IDS:
-    raise SystemExit(
-        "Auto‑discovery found no music sections. "
-        "Please set SECTION_IDS (comma‑separated) or SECTION_ID in your config/env."
-    )
-# Use first element of SECTION_IDS list for backward compatibility
+# PLEX_DB_PATH defaults to /database in container; no SystemExit if unconfigured.
 merged = {
-    "PLEX_DB_PATH":   _get("PLEX_DB_PATH",   default="",                                cast=str),
+    "PLEX_DB_PATH":   _get("PLEX_DB_PATH",   default="/database",                       cast=str),
     "PLEX_HOST":      _get("PLEX_HOST",      default="",                                cast=str),
     "PLEX_TOKEN":     _get("PLEX_TOKEN",     default="",                                cast=str),
-    # Use first element of SECTION_IDS list for backward compatibility
-    "SECTION_ID": SECTION_IDS[0],  # safe: we validated SECTION_IDS just above
+    "SECTION_ID": SECTION_IDS[0] if SECTION_IDS else 0,
     "SCAN_THREADS":   _get("SCAN_THREADS",   default=os.cpu_count() or 4,               cast=_parse_int),
     "PATH_MAP":       _parse_path_map(_get("PATH_MAP", default={})),
     "LOG_LEVEL":      _get("LOG_LEVEL",      default="INFO").upper(),
+    "AI_PROVIDER": _get("AI_PROVIDER", default="openai", cast=str),
     "OPENAI_API_KEY": _get("OPENAI_API_KEY", default="",                                cast=str),
     "OPENAI_MODEL":   _get("OPENAI_MODEL",   default="gpt-4",                           cast=str),
+    "ANTHROPIC_API_KEY": _get("ANTHROPIC_API_KEY", default="", cast=str),
+    "GOOGLE_API_KEY": _get("GOOGLE_API_KEY", default="", cast=str),
+    "OLLAMA_URL": _get("OLLAMA_URL", default="http://localhost:11434", cast=str),
     "DISCORD_WEBHOOK": _get("DISCORD_WEBHOOK", default="", cast=str),
     "USE_MUSICBRAINZ": _get("USE_MUSICBRAINZ", default=False, cast=_parse_bool),
+    "MUSICBRAINZ_API_KEY": _get("MUSICBRAINZ_API_KEY", default="", cast=str),
+    "MUSICBRAINZ_CLIENT_ID": _get("MUSICBRAINZ_CLIENT_ID", default="", cast=str),
+    "MUSICBRAINZ_CLIENT_SECRET": _get("MUSICBRAINZ_CLIENT_SECRET", default="", cast=str),
     "SKIP_FOLDERS": _get("SKIP_FOLDERS", default="", cast=lambda s: [p.strip() for p in str(s).split(",") if p.strip()]),
 }
 # Always use the auto‑generated PATH_MAP from config.json
@@ -555,27 +589,25 @@ CROSSCHECK_SAMPLES = int(os.getenv("CROSSCHECK_SAMPLES", 20))
 # ─────────────────────────────── Fixed container constants ───────────────────────────────
 # DB filename is always fixed under the Plex DB folder
 PLEX_DB_FILE = str(Path(merged["PLEX_DB_PATH"]) / "com.plexapp.plugins.library.db")
+PLEX_DB_EXISTS = Path(PLEX_DB_FILE).exists()
+# Fully configured only when we have host, token, sections, and readable DB
+PLEX_CONFIGURED = bool(
+    merged["PLEX_HOST"] and merged["PLEX_TOKEN"] and SECTION_IDS and PLEX_DB_EXISTS
+)
+if not PLEX_CONFIGURED:
+    logging.info(
+        "Starting in unconfigured (wizard) mode – configure Plex and mount the database at /database in Settings."
+    )
 # Duplicates always move to /dupes inside the container
 DUPE_ROOT = Path("/dupes")
 # WebUI always listens on container port 5005 inside the container
 WEBUI_PORT = 5005
 
-# (5) Validate critical values -------------------------------------------------
-if not merged["PLEX_DB_PATH"]:
-    raise SystemExit("Missing required config value: PLEX_DB_PATH")
-for key in ("PLEX_HOST", "PLEX_TOKEN"):
-    if not merged[key]:
-        raise SystemExit(f"Missing required config value: {key}")
-# Ensure at least one section was provided
-if not SECTION_IDS:
-    raise SystemExit("Missing required config value: SECTION_IDS")
-
 # (7) Export as module‑level constants ----------------------------------------
 PLEX_HOST      = merged["PLEX_HOST"]
 PLEX_TOKEN     = merged["PLEX_TOKEN"]
- # For backward compatibility, expose first section as SECTION_ID
 SECTION_IDS    = SECTION_IDS
-SECTION_ID     = SECTION_IDS[0]
+SECTION_ID     = SECTION_IDS[0] if SECTION_IDS else 0
 PATH_MAP       = merged["PATH_MAP"]
 import multiprocessing
 threads_env = os.getenv("SCAN_THREADS", "auto").strip().lower()
@@ -588,8 +620,12 @@ else:
         print(f"⚠️ Invalid SCAN_THREADS value: '{threads_env}', defaulting to 1")
         SCAN_THREADS = 1
 LOG_LEVEL      = merged["LOG_LEVEL"]
+AI_PROVIDER    = merged["AI_PROVIDER"]
 OPENAI_API_KEY = merged["OPENAI_API_KEY"]
 OPENAI_MODEL   = merged["OPENAI_MODEL"]
+ANTHROPIC_API_KEY = merged["ANTHROPIC_API_KEY"]
+GOOGLE_API_KEY = merged["GOOGLE_API_KEY"]
+OLLAMA_URL     = merged["OLLAMA_URL"]
 DISCORD_WEBHOOK = merged["DISCORD_WEBHOOK"]
 
 #
@@ -600,7 +636,7 @@ CACHE_DB_FILE = CONFIG_DIR / "cache.db"
 # File-format preference order (can be overridden in config.json)
 FORMAT_PREFERENCE = conf.get(
     "FORMAT_PREFERENCE",
-    ["dsf","aif","aiff","wav","flac","m4a","mp4","m4b","m4p","aifc","ogg","mp3","wma"]
+    ["dsf","aif","aiff","wav","flac","m4a","mp4","m4b","m4p","aifc","ogg","opus","mp3","wma"]
 )
 
  # Optional external log file (rotates @ 5 MB × 3)
@@ -637,18 +673,69 @@ if _level_num == logging.DEBUG:
                 for k, v in merged.items()}
     logging.debug("Full merged config:\n%s", json.dumps(scrubbed, indent=2))
 
-# (9) Initialise OpenAI if key present ----------------------------------------
+# (9) Initialise AI clients based on provider ----------------------------------------
 
 openai_client = None
-if OPENAI_API_KEY:
-    # Ensure the environment variable is available to the SDK
-    os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
-    try:
-        openai_client = OpenAI()
-    except Exception as e:
-        logging.warning("OpenAI client init failed: %s", e)
+anthropic_client = None
+google_client_configured = False
+ollama_url = None
+ai_provider_ready = False
+
+if AI_PROVIDER.lower() == "openai":
+    if OPENAI_API_KEY:
+        os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
+        try:
+            openai_client = OpenAI()
+            ai_provider_ready = True
+            logging.info("OpenAI client initialized")
+        except Exception as e:
+            logging.warning("OpenAI client init failed: %s", e)
+    else:
+        logging.info("No OPENAI_API_KEY provided; AI-driven selection disabled.")
+elif AI_PROVIDER.lower() == "anthropic":
+    if ANTHROPIC_API_KEY and anthropic:
+        try:
+            anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+            ai_provider_ready = True
+            logging.info("Anthropic client initialized")
+        except Exception as e:
+            logging.warning("Anthropic client init failed: %s", e)
+    else:
+        if not anthropic:
+            logging.warning("Anthropic SDK not installed. Install with: pip install anthropic")
+        else:
+            logging.info("No ANTHROPIC_API_KEY provided; AI-driven selection disabled.")
+elif AI_PROVIDER.lower() == "google":
+    if GOOGLE_API_KEY and genai:
+        try:
+            genai.configure(api_key=GOOGLE_API_KEY)
+            google_client_configured = True
+            ai_provider_ready = True
+            logging.info("Google Gemini client configured")
+        except Exception as e:
+            logging.warning("Google client configuration failed: %s", e)
+    else:
+        if not genai:
+            logging.warning("Google Generative AI SDK not installed. Install with: pip install google-generativeai")
+        else:
+            logging.info("No GOOGLE_API_KEY provided; AI-driven selection disabled.")
+elif AI_PROVIDER.lower() == "ollama":
+    if OLLAMA_URL:
+        ollama_url = OLLAMA_URL.rstrip("/")
+        # Test connection
+        try:
+            response = requests.get(f"{ollama_url}/api/tags", timeout=5)
+            if response.status_code == 200:
+                ai_provider_ready = True
+                logging.info("Ollama connection verified at %s", ollama_url)
+            else:
+                logging.warning("Ollama not accessible at %s (HTTP %d)", ollama_url, response.status_code)
+        except Exception as e:
+            logging.warning("Ollama connection test failed: %s", e)
+    else:
+        logging.info("No OLLAMA_URL provided; AI-driven selection disabled.")
 else:
-    logging.info("No OPENAI_API_KEY provided; AI-driven selection disabled.")
+    logging.warning("Unknown AI_PROVIDER: %s. Supported: openai, anthropic, google, ollama", AI_PROVIDER)
 
 # --- Resolve a working OpenAI model (with price-aware fallbacks) -------------
 RESOLVED_MODEL = OPENAI_MODEL
@@ -737,7 +824,11 @@ def _validate_plex_connection():
     server is reachable and the token is valid.  We only warn on failure so
     the application can still run in offline mode.
     """
-    url = f"{PLEX_HOST}/library/sections"
+    host = (PLEX_HOST or "").strip()
+    if not host.startswith(("http://", "https://")):
+        logging.debug("Skipping Plex connection check (no valid PLEX_HOST)")
+        return
+    url = f"{host.rstrip('/')}/library/sections"
     try:
         resp = requests.get(url, headers={"X-Plex-Token": PLEX_TOKEN}, timeout=10)
         if resp.status_code != 200:
@@ -897,18 +988,22 @@ def _self_diag() -> bool:
         logging.info("• Skipping MusicBrainz connectivity check (USE_MUSICBRAINZ=False).")
     else:
         try:
-            mb_resp = requests.get(
-                "https://musicbrainz.org/ws/2/?fmt=json",
-                timeout=5,
-                headers={"User-Agent": "PMDA/0.6.6 ( pmda@example.com )"}
-            )
-            if mb_resp.status_code == 200:
-                logging.info("✓ MusicBrainz reachable – status HTTP %s", mb_resp.status_code)
+            # Test with a real API call using musicbrainzngs (respects rate limiting)
+            # Use a well-known release-group ID for testing
+            test_mbid = "9162580e-5df4-32de-80cc-f45a8d8a9b1d"  # The Beatles - Abbey Road
+            result = musicbrainzngs.get_release_group_by_id(test_mbid, includes=[])
+            logging.info("✓ MusicBrainz reachable and working – tested with release-group %s", test_mbid)
+            client_id = merged.get("MUSICBRAINZ_CLIENT_ID", "")
+            client_secret = merged.get("MUSICBRAINZ_CLIENT_SECRET", "")
+            if client_id and client_secret:
+                logging.info("✓ MusicBrainz OAuth2 credentials configured (Client ID present)")
+            elif MUSICBRAINZ_API_KEY:
+                logging.warning("⚠️ MUSICBRAINZ_API_KEY is set but not used. OAuth2 authentication (Client ID/Secret) is required for higher rate limits.")
+        except musicbrainzngs.WebServiceError as e:
+            if "503" in str(e) or "rate" in str(e).lower():
+                logging.warning("⚠️ MusicBrainz rate limited – ensure rate limiting is configured (1 req/sec)")
             else:
-                logging.warning(
-                    "⚠️ MusicBrainz returned HTTP %s – check network or MusicBrainz uptime",
-                    mb_resp.status_code
-                )
+                logging.warning("⚠️ MusicBrainz API error – %s", e)
         except Exception as e:
             logging.warning("⚠️ MusicBrainz connectivity failed – %s", e)
 
@@ -972,6 +1067,255 @@ def _self_diag() -> bool:
     return True
 
 
+# SQL fragment used by both startup cross-check and /api/paths/verify (same logic)
+_PATH_VERIFY_EXTENSIONS = (
+    "mp.file LIKE '%.flac' OR mp.file LIKE '%.wav' OR mp.file LIKE '%.m4a' OR mp.file LIKE '%.mp3'"
+    " OR mp.file LIKE '%.ogg' OR mp.file LIKE '%.opus' OR mp.file LIKE '%.aac' OR mp.file LIKE '%.ape' OR mp.file LIKE '%.alac'"
+    " OR mp.file LIKE '%.dsf' OR mp.file LIKE '%.aif' OR mp.file LIKE '%.aiff' OR mp.file LIKE '%.wma'"
+    " OR mp.file LIKE '%.mp4' OR mp.file LIKE '%.m4b' OR mp.file LIKE '%.m4p' OR mp.file LIKE '%.aifc'"
+)
+
+
+def _run_path_verification(path_map: dict, db_file: str, samples: int):
+    """
+    Same logic as startup cross-check: for each PATH_MAP entry, sample audio files from Plex DB
+    and verify they exist on disk (container paths). Returns list of result dicts for API.
+    If 1 or 2 samples are missing (e.g. one file moved or encoding glitch), retry once with
+    a new random sample for that root to avoid false failures. Does not modify config or global state.
+    """
+    if not Path(db_file).exists():
+        return None
+    results = []
+    try:
+        con = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True, timeout=10)
+        con.text_factory = lambda b: b.decode("utf-8", "surrogateescape")
+        cur = con.cursor()
+        for plex_root, host_root in path_map.items():
+            def check_once():
+                cur.execute(
+                    f"""
+                    SELECT mp.file FROM media_parts mp
+                    WHERE mp.file LIKE ? AND ({_PATH_VERIFY_EXTENSIONS})
+                    ORDER BY RANDOM() LIMIT ?
+                    """,
+                    (f"{plex_root}/%", samples),
+                )
+                rows = [r[0] for r in cur.fetchall()]
+                if not rows:
+                    return 0, 0, None
+                missing = 0
+                for src_path in rows:
+                    rel = src_path[len(plex_root):].lstrip("/")
+                    dst_path = os.path.join(host_root, rel)
+                    if not Path(dst_path).exists():
+                        missing += 1
+                return len(rows), missing, rows
+            total, missing, _ = check_once()
+            if total == 0:
+                results.append({
+                    "plex_root": plex_root,
+                    "host_root": host_root,
+                    "status": "fail",
+                    "samples_checked": 0,
+                    "message": "No audio files found in DB under this path",
+                })
+                continue
+            if missing > 0 and missing <= 2:
+                total2, missing2, _ = check_once()
+                if total2 > 0 and missing2 == 0:
+                    total, missing = total2, 0
+            if missing == 0:
+                results.append({
+                    "plex_root": plex_root,
+                    "host_root": host_root,
+                    "status": "ok",
+                    "samples_checked": total,
+                    "message": "OK",
+                })
+            else:
+                results.append({
+                    "plex_root": plex_root,
+                    "host_root": host_root,
+                    "status": "fail",
+                    "samples_checked": total,
+                    "message": f"{missing}/{total} sample(s) missing on disk",
+                })
+        con.close()
+    except Exception as e:
+        logging.warning("Path verification failed: %s", e)
+        return None
+    return results
+
+
+def _discover_bindings_by_content(path_map: dict, db_file: str, music_root: str, samples: int):
+    """
+    For each plex_root in path_map, sample audio paths from Plex DB and find which subdir of
+    music_root actually contains those files (content-based match, ignores folder names).
+    Returns (discovered_map, results) where discovered_map is plex_root -> resolved host_root
+    and results is a list of { plex_root, host_root, status, samples_checked, message }.
+    Only adds to discovered_map when at least one file is found for that plex_root.
+    """
+    if not path_map:
+        return {}, []
+    music_path = Path(music_root)
+    if not music_path.exists() or not music_path.is_dir():
+        return None
+    if not Path(db_file).exists():
+        return None
+    discovered_map = {}
+    results = []
+    try:
+        con = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True, timeout=10)
+        con.text_factory = lambda b: b.decode("utf-8", "surrogateescape")
+        cur = con.cursor()
+        candidates_cache = None
+
+        for plex_root in path_map:
+            cur.execute(
+                f"""
+                SELECT mp.file FROM media_parts mp
+                WHERE mp.file LIKE ? AND ({_PATH_VERIFY_EXTENSIONS})
+                ORDER BY RANDOM() LIMIT ?
+                """,
+                (f"{plex_root}/%", max(1, samples)),
+            )
+            rows = [r[0] for r in cur.fetchall()]
+            if not rows:
+                results.append({
+                    "plex_root": plex_root,
+                    "host_root": path_map[plex_root],
+                    "status": "fail",
+                    "samples_checked": 0,
+                    "message": "No audio files found in DB under this path",
+                })
+                continue
+            rels = [r[len(plex_root):].lstrip("/") for r in rows]
+            if candidates_cache is None:
+                candidates_cache = sorted([d for d in music_path.iterdir() if d.is_dir()], key=lambda p: str(p))
+            candidates = candidates_cache
+
+            best_path = None
+            best_count = 0
+            total = len(rels)
+            for cand in candidates:
+                count = 0
+                for rel in rels:
+                    if (cand / rel).exists():
+                        count += 1
+                if count > best_count:
+                    best_count = count
+                    best_path = str(cand)
+                    if best_count == total:
+                        break
+            if best_count == 0:
+                results.append({
+                    "plex_root": plex_root,
+                    "host_root": path_map[plex_root],
+                    "status": "fail",
+                    "samples_checked": total,
+                    "message": "No matching folder under music root",
+                })
+                continue
+            discovered_map[plex_root] = best_path
+            status = "ok" if best_count == total else "fail"
+            msg = "OK" if best_count == total else f"{best_count}/{total} files found"
+            results.append({
+                "plex_root": plex_root,
+                "host_root": best_path,
+                "status": status,
+                "samples_checked": total,
+                "message": msg,
+            })
+        con.close()
+    except Exception as e:
+        logging.warning("Discover bindings by content failed: %s", e)
+        return None
+    return (discovered_map, results)
+
+
+def _discover_one_binding(plex_root: str, db_file: str, music_root: str, samples: int):
+    """
+    Resolve a single plex_root: find which subdir of music_root contains the sampled files.
+    Returns (host_root or None, result_dict) for API. Returns None if DB or music_root invalid.
+    """
+    music_path = Path(music_root)
+    if not music_path.exists() or not music_path.is_dir() or not Path(db_file).exists():
+        return None
+    try:
+        con = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True, timeout=10)
+        con.text_factory = lambda b: b.decode("utf-8", "surrogateescape")
+        cur = con.cursor()
+        cur.execute(
+            f"""
+            SELECT mp.file FROM media_parts mp
+            WHERE mp.file LIKE ? AND ({_PATH_VERIFY_EXTENSIONS})
+            ORDER BY RANDOM() LIMIT ?
+            """,
+            (f"{plex_root}/%", max(1, samples)),
+        )
+        rows = [r[0] for r in cur.fetchall()]
+        con.close()
+    except Exception as e:
+        logging.warning("Discover one failed for %s: %s", plex_root, e)
+        return None
+    if not rows:
+        return (None, {
+            "plex_root": plex_root,
+            "host_root": plex_root,
+            "status": "fail",
+            "samples_checked": 0,
+            "message": "No audio files found in DB under this path",
+        })
+    rels = [r[len(plex_root):].lstrip("/") for r in rows]
+    candidates = sorted([d for d in music_path.iterdir() if d.is_dir()], key=lambda p: str(p))
+    best_path = None
+    best_count = 0
+    total = len(rels)
+    for cand in candidates:
+        count = sum(1 for rel in rels if (cand / rel).exists())
+        if count > best_count:
+            best_count = count
+            best_path = str(cand)
+            if best_count == total:
+                break
+    if best_count == 0:
+        # Fallback: recursive search by filename (same idea as _cross_check_bindings repair)
+        logging.debug("Discover one: no match in immediate children of %s – trying recursive search", music_root)
+        candidate_counts: dict[str, int] = {}
+        for _, rel in enumerate(rels):
+            fname = os.path.basename(rel)
+            try:
+                for found in music_path.rglob(fname):
+                    # Infer host root: go up as many levels as rel has parts
+                    root = found
+                    for _ in Path(rel).parts:
+                        root = root.parent
+                    root_str = str(root)
+                    candidate_counts[root_str] = candidate_counts.get(root_str, 0) + 1
+            except OSError as e:
+                logging.debug("Discover one rglob for %s: %s", fname, e)
+        if candidate_counts:
+            best_path, best_count = max(candidate_counts.items(), key=lambda kv: kv[1])
+            logging.info("Discover one: recursive search found best root %s with %d/%d matches", best_path, best_count, total)
+        if best_count == 0:
+            return (None, {
+                "plex_root": plex_root,
+                "host_root": plex_root,
+                "status": "fail",
+                "samples_checked": total,
+                "message": "No matching folder under music root",
+            })
+    status = "ok" if best_count == total else "fail"
+    msg = "OK" if best_count == total else f"{best_count}/{total} files found"
+    return (best_path, {
+        "plex_root": plex_root,
+        "host_root": best_path,
+        "status": status,
+        "samples_checked": total,
+        "message": msg,
+    })
+
+
 # ──────────────────────────────── CROSS‑CHECK PATH BINDINGS ────────────────────────────────
 def _cross_check_bindings():
     """
@@ -994,15 +1338,12 @@ def _cross_check_bindings():
     abort = False
 
     for plex_root, host_root in PATH_MAP.items():
-        # 1) Pull a random sample of audio files
+        # 1) Pull a random sample of audio files (same SQL as _run_path_verification / api paths verify)
         cur.execute(
-            '''
-            SELECT mp.file
-            FROM   media_parts mp
-            WHERE  mp.file LIKE ?
-              AND (mp.file LIKE '%.flac' OR mp.file LIKE '%.wav' OR mp.file LIKE '%.m4a' OR mp.file LIKE '%.mp3' OR mp.file LIKE '%.ogg' OR mp.file LIKE '%.aac' OR mp.file LIKE '%.ape' OR mp.file LIKE '%.alac' OR mp.file LIKE '%.dsf' OR mp.file LIKE '%.aif' OR mp.file LIKE '%.aiff' OR mp.file LIKE '%.wma' OR mp.file LIKE '%.mp4' OR mp.file LIKE '%.m4b' OR mp.file LIKE '%.m4p' OR mp.file LIKE '%.aifc')
-            ORDER BY RANDOM()
-            LIMIT ?
+            f'''
+            SELECT mp.file FROM media_parts mp
+            WHERE mp.file LIKE ? AND ({_PATH_VERIFY_EXTENSIONS})
+            ORDER BY RANDOM() LIMIT ?
             ''',
             (f"{plex_root}/%", CROSSCHECK_SAMPLES)
         )
@@ -1128,7 +1469,7 @@ def _cross_check_bindings():
 
 
 # ───────────────────────────────── OTHER CONSTANTS ──────────────────────────────────
-AUDIO_RE    = re.compile(r"\.(flac|ape|alac|wav|m4a|aac|mp3|ogg|dsf|aif|aiff|wma|mp4|m4b|m4p|aifc)$", re.I)
+AUDIO_RE    = re.compile(r"\.(flac|ape|alac|wav|m4a|aac|mp3|ogg|opus|dsf|aif|aiff|wma|mp4|m4b|m4p|aifc)$", re.I)
 # Derive format scores from user preference order
 FMT_SCORE   = {ext: len(FORMAT_PREFERENCE)-i for i, ext in enumerate(FORMAT_PREFERENCE)}
 OVERLAP_MIN = 0.85  # 85% track-title overlap minimum
@@ -1189,6 +1530,13 @@ def init_state_db():
     # Initialize stats if missing
     for stat_key in ("space_saved", "removed_dupes"):
         cur.execute("INSERT OR IGNORE INTO stats(key, value) VALUES(?, 0)", (stat_key,))
+    # Table for persistent settings (wizard configuration)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key   TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
     con.commit()
     con.close()
 
@@ -1451,6 +1799,9 @@ def notify_discord_embed(title: str, description: str, thumbnail_url: str = "", 
 # ─── Run connection check & self‑diagnostic (called from main so WebUI can start first in serve mode) ───
 def run_startup_checks() -> None:
     """Run Plex validation, self-diagnostic and path cross-check. Call after starting the WebUI server in serve mode."""
+    if not PLEX_CONFIGURED:
+        logging.info("Skipping startup checks (Plex not configured – use Settings to configure).")
+        return
     _validate_plex_connection()
     if not _self_diag():
         raise SystemExit("Self‑diagnostic failed – please fix the issues above and restart PMDA.")
@@ -1465,6 +1816,25 @@ def container_to_host(p: str) -> Optional[Path]:
         if p.startswith(pre):
             return Path(real) / p[len(pre):].lstrip("/")
     return None
+
+def path_for_fs_access(p: Path) -> Path:
+    """
+    Return a path that the current process can read (e.g. container path when
+    running in Docker). If *p* exists, return it. Otherwise, if *p* matches
+    a PATH_MAP value (real/host side), convert it to the corresponding key
+    (plex/container side) so that safe_folder_size and similar can succeed.
+    """
+    try:
+        if p.exists():
+            return p
+    except Exception:
+        pass
+    sp = str(p)
+    for plex_prefix, real_prefix in PATH_MAP.items():
+        if sp.startswith(real_prefix):
+            suffix = sp[len(real_prefix):].lstrip("/")
+            return Path(plex_prefix) / suffix if suffix else Path(plex_prefix)
+    return p
 
 def relative_path_under_known_roots(path: Path) -> Optional[Path]:
     """
@@ -1507,6 +1877,15 @@ def build_dupe_destination(src_folder: Path) -> Path:
 
 def folder_size(p: Path) -> int:
     return sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
+
+def safe_folder_size(p: Path) -> int:
+    """Return folder size in bytes, or 0 if path missing or not readable."""
+    try:
+        if not p.exists() or not p.is_dir():
+            return 0
+        return folder_size(p)
+    except Exception:
+        return 0
 
 def score_format(ext: str) -> int:
     return FMT_SCORE.get(ext.lower(), 0)
@@ -1615,17 +1994,15 @@ def edition_details():
     album_id = int(request.args["album_id"])
     folder   = Path(request.args["folder"])
     tracks   = get_tracks(plex_connect(), album_id)
-    info = analyse_format(folder)
-    html = render_template_string(
-        "{% for t in tracks %}<div>{{'%02d' % t.idx}}. {{t.title}} – {{'%.2f' % (t.dur/60000)}} min</div>{% endfor %}"
-        "<hr><pre>{{info}}</pre>",
-        tracks=tracks,
-        info=info
-    )
-    return jsonify({"html": html})
+    info     = analyse_format(folder)
+    track_list = [{"idx": t.idx, "title": t.title, "dur": t.dur} for t in tracks]
+    return jsonify({"tracks": track_list, "info": info})
 
 @app.route("/api/dedupe_manual", methods=["POST"])
 def dedupe_manual():
+    r = _requires_config()
+    if r is not None:
+        return r
     req = request.get_json(force=True)
     for item in req:
         # reuse existing purge logic
@@ -1659,6 +2036,107 @@ def get_tracks(db_conn, album_id: int) -> List[Track]:
     rows = db_conn.execute(sql, (album_id,)).fetchall()
     return [Track(t.lower().strip(), i or 0, d or 1, dur or 0)
             for t, i, d, dur in rows]
+
+def _stream_columns(db_conn) -> tuple[str, str] | None:
+    """If media_streams exists with codec/bitrate, return (codec_col, bitrate_col) else None."""
+    try:
+        info = db_conn.execute("PRAGMA table_info(media_streams)").fetchall()
+        cols = {r[1].lower() for r in info}
+        if "codec" in cols and "bitrate" in cols:
+            return ("codec", "bitrate")
+        return None
+    except Exception:
+        return None
+
+def get_tracks_for_details(db_conn, album_id: int) -> List[dict]:
+    """
+    Return list of track dicts for API: name, title, idx, duration (seconds), dur (ms),
+    format (codec), bitrate (kbps), for use in /details editions.
+    """
+    has_parent = any(r[1] == "parent_index"
+                     for r in db_conn.execute("PRAGMA table_info(metadata_items)"))
+    stream_cols = _stream_columns(db_conn)
+    if stream_cols is None:
+        # No media_streams codec/bitrate: return basic track info (duration from part or metadata_items)
+        rows = db_conn.execute(f"""
+          SELECT tr.title, tr."index",
+                 {'tr.parent_index' if has_parent else 'NULL'} AS disc_no,
+                 COALESCE(mp.duration, tr.duration) AS duration, mp.file
+          FROM metadata_items tr
+          JOIN media_items mi ON mi.metadata_item_id = tr.id
+          JOIN media_parts mp ON mp.media_item_id = mi.id
+          WHERE tr.parent_id = ? AND tr.metadata_type = 10
+          ORDER BY tr."index"
+        """, (album_id,)).fetchall()
+        return [
+            {
+                "name": (t or "").strip(),
+                "title": (t or "").strip(),
+                "idx": i or 0,
+                "duration": (dur or 0) // 1000,
+                "dur": dur or 0,
+                "format": None,
+                "bitrate": None,
+                "path": (raw_path or "").strip() or None,
+            }
+            for t, i, _d, dur, raw_path in rows
+        ]
+    codec_col, bitrate_col = stream_cols
+    # stream_type_id 2 = audio in Plex; one row per track (pick stream with max bitrate if several)
+    sql = f"""
+      SELECT tr.title, tr."index",
+             {'tr.parent_index' if has_parent else 'NULL'} AS disc_no,
+             COALESCE(mp.duration, tr.duration), ms.{codec_col}, ms.{bitrate_col}, mp.file
+      FROM metadata_items tr
+      JOIN media_items mi ON mi.metadata_item_id = tr.id
+      JOIN media_parts mp ON mp.media_item_id = mi.id
+      LEFT JOIN media_streams ms ON ms.media_part_id = mp.id AND ms.stream_type_id = 2
+        AND ms.id = (
+          SELECT ms2.id FROM media_streams ms2
+          WHERE ms2.media_part_id = mp.id AND ms2.stream_type_id = 2
+          ORDER BY COALESCE(ms2.{bitrate_col}, 0) DESC LIMIT 1
+        )
+      WHERE tr.parent_id = ? AND tr.metadata_type = 10
+      ORDER BY tr."index"
+    """
+    try:
+        rows = db_conn.execute(sql, (album_id,)).fetchall()
+    except Exception as e:
+        logging.warning(
+            "get_tracks_for_details (streams) failed for album_id=%s: %s",
+            album_id, e
+        )
+        tracks = get_tracks(db_conn, album_id)
+        return [
+            {"name": t.title, "title": t.title, "idx": t.idx, "duration": t.dur // 1000, "dur": t.dur, "format": None, "bitrate": None, "path": None}
+            for t in tracks
+        ]
+    out = []
+    seen_index = set()
+    for row in rows:
+        t, i, _d, dur, codec, bitrate, raw_path = row
+        idx = i or 0
+        if idx in seen_index:
+            continue
+        seen_index.add(idx)
+        title = (t or "").strip()
+        dur_ms = dur or 0
+        # Plex DB: bitrate is in bps (e.g. 867234 -> 867 kbps)
+        br_kbps = None
+        if bitrate is not None:
+            b = int(bitrate)
+            br_kbps = b if b < 100000 else b // 1000
+        out.append({
+            "name": title,
+            "title": title,
+            "idx": idx,
+            "duration": dur_ms // 1000,
+            "dur": dur_ms,
+            "format": (codec or "").strip().upper() or None,
+            "bitrate": br_kbps,
+            "path": (raw_path or "").strip() or None,
+        })
+    return out
 
 def album_title(db_conn, album_id: int) -> str:
     row = db_conn.execute(
@@ -1871,7 +2349,16 @@ def fetch_mb_release_group_info(mbid: str) -> dict:
             includes=["releases", "media"]
         )["release-group"]
     except musicbrainzngs.WebServiceError as e:
-        raise RuntimeError(f"MusicBrainz lookup failed for {mbid}: {e}") from None
+        error_msg = str(e)
+        if "503" in error_msg or "rate" in error_msg.lower():
+            logging.warning("[MusicBrainz] Rate limited for MBID %s, will retry after delay", mbid)
+            time.sleep(1.5)  # Wait a bit longer than rate limit before retry
+            try:
+                result = musicbrainzngs.get_release_group_by_id(mbid, includes=["releases", "media"])["release-group"]
+            except musicbrainzngs.WebServiceError as e2:
+                raise RuntimeError(f"MusicBrainz lookup failed for {mbid} after retry: {e2}") from None
+        else:
+            raise RuntimeError(f"MusicBrainz lookup failed for {mbid}: {e}") from None
 
     primary = result.get("primary-type", "")
     secondary = result.get("secondary-types", [])
@@ -1958,9 +2445,89 @@ def search_mb_release_group_by_metadata(artist: str, album_norm: str, tracks: se
         logging.debug("[MusicBrainz Search Groups] failed for '%s' / '%s': %s", artist, album_norm, e)
     return None
 
+def call_ai_provider(provider: str, model: str, system_msg: str, user_msg: str, max_tokens: int = 256) -> str:
+    """
+    Call the appropriate AI provider with the given messages.
+    Returns the text response from the AI.
+    """
+    provider_lower = provider.lower()
+    
+    if provider_lower == "openai":
+        if not openai_client:
+            raise ValueError("OpenAI client not initialized")
+        _kwargs = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            "stop": ["\n"],
+        }
+        # Try max_completion_tokens first, fallback to max_tokens
+        try:
+            _kwargs["max_completion_tokens"] = max_tokens
+            resp = openai_client.chat.completions.create(**_kwargs)
+        except Exception:
+            _kwargs.pop("max_completion_tokens", None)
+            _kwargs["max_tokens"] = max_tokens
+            resp = openai_client.chat.completions.create(**_kwargs)
+        return resp.choices[0].message.content.strip()
+    
+    elif provider_lower == "anthropic":
+        if not anthropic_client:
+            raise ValueError("Anthropic client not initialized")
+        resp = anthropic_client.messages.create(
+            model=model,
+            max_tokens=max_tokens,
+            system=system_msg,
+            messages=[{"role": "user", "content": user_msg}],
+        )
+        return resp.content[0].text.strip()
+    
+    elif provider_lower == "google":
+        if not google_client_configured:
+            raise ValueError("Google client not configured")
+        # Google uses a different API structure
+        model_instance = genai.GenerativeModel(model)
+        prompt = f"{system_msg}\n\n{user_msg}"
+        response = model_instance.generate_content(
+            prompt,
+            generation_config=genai.types.GenerationConfig(
+                max_output_tokens=max_tokens,
+                stop_sequences=["\n"],
+            ),
+        )
+        return response.text.strip()
+    
+    elif provider_lower == "ollama":
+        if not ollama_url:
+            raise ValueError("Ollama URL not configured")
+        # Ollama uses REST API
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            "options": {
+                "num_predict": max_tokens,
+                "stop": ["\n"],
+            },
+            "stream": False,
+        }
+        response = requests.post(f"{ollama_url}/api/chat", json=payload, timeout=60)
+        if response.status_code != 200:
+            raise Exception(f"Ollama API error: {response.status_code} - {response.text}")
+        result = response.json()
+        return result.get("message", {}).get("content", "").strip()
+    
+    else:
+        raise ValueError(f"Unknown AI provider: {provider}")
+
+
 def choose_best(editions: List[dict]) -> dict:
     """
-    Selects the best edition either via OpenAI (when an API key is provided) or via a local heuristic, re‑using any existing AI cache first.
+    Selects the best edition either via AI provider (when configured) or via a local heuristic, re‑using any existing AI cache first.
     """
     import sqlite3, json
 
@@ -1989,9 +2556,9 @@ def choose_best(editions: List[dict]) -> dict:
         best["used_ai"]    = True
         return best
 
-    # 2) If there is no AI cache, call OpenAI when possible
+    # 2) If there is no AI cache, call AI provider when possible
     used_ai = False
-    if OPENAI_API_KEY and openai_client:
+    if ai_provider_ready:
         used_ai = True
         # Load prompt template from external file
         template = AI_PROMPT_FILE.read_text(encoding="utf-8")
@@ -2016,12 +2583,6 @@ def choose_best(editions: List[dict]) -> dict:
             except Exception as e:
                 logging.debug("MusicBrainz lookup failed for %s: %s", first_mbid, e)
 
-        # Log concise OpenAI request summary
-        logging.info(
-            "OpenAI request: model=%s, param=%s, max_out=256, candidate_editions=%d",
-            RESOLVED_MODEL, RESOLVED_PARAM_STYLE, len(editions)
-        )
-
         system_msg = (
             "You are an expert digital-music librarian.\n"
             "OUTPUT RULES (must follow exactly):\n"
@@ -2034,21 +2595,29 @@ def choose_best(editions: List[dict]) -> dict:
             "2|Winner has: - [CLASSICAL:NO] lossless FLAC, 24-bit, more tracks - Higher bitrate than 1|Track 12 - Live bonus\n"
             "1|Winner has: - [CLASSICAL:YES] same interpretation (shared MBID) - More complete edition, 9 vs 7 tracks|"
         )
-        try:
-            _kwargs = {
-                "model": RESOLVED_MODEL,
-                "messages": [
-                    {"role": "system", "content": system_msg},
-                    {"role": "user",   "content": user_msg},
-                ],
-                "stop": ["\n"],
-            }
-            if RESOLVED_PARAM_STYLE == "mct":
-                _kwargs["max_completion_tokens"] = 256
+        
+        # Determine model to use based on provider
+        # OPENAI_MODEL stores the selected model name regardless of provider
+        model_to_use = OPENAI_MODEL
+        if not model_to_use:
+            # Set defaults if no model selected
+            if AI_PROVIDER.lower() == "anthropic":
+                model_to_use = "claude-3-5-sonnet-20241022"
+            elif AI_PROVIDER.lower() == "google":
+                model_to_use = "gemini-1.5-pro"
+            elif AI_PROVIDER.lower() == "ollama":
+                model_to_use = "llama2"  # Common default Ollama model
             else:
-                _kwargs["max_tokens"] = 256
-            resp = openai_client.chat.completions.create(**_kwargs)
-            txt = resp.choices[0].message.content.strip()
+                model_to_use = "gpt-4o-mini"
+        
+        # Log concise AI request summary
+        logging.info(
+            "AI request (%s): model=%s, max_out=256, candidate_editions=%d",
+            AI_PROVIDER, model_to_use, len(editions)
+        )
+        
+        try:
+            txt = call_ai_provider(AI_PROVIDER, model_to_use, system_msg, user_msg, max_tokens=256)
             logging.debug("AI raw response: %s", txt)
 
             # --- sanitize: keep only first non-empty line, strip code fences / prefixes ---
@@ -3015,823 +3584,6 @@ def perform_dedupe(group: dict) -> List[dict]:
 
     return moved_items
 
-# ───────────────────────────────── HTML TEMPLATE ─────────────────────────────────
-HTML = """<!DOCTYPE html>
-<script>
-  const PLEX_HOST = "{{ plex_host }}";
-  const PLEX_TOKEN = "{{ plex_token }}";
-</script>
-<html lang="en">
-  <head>
-    <meta charset="utf-8">
-    <title>PMDA</title>
-    <link rel="icon" type="image/png" href="/static/P.png">
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&display=swap" rel="stylesheet">
-    <style>
-      body { font-family:Inter,Arial,sans-serif; background:#f5f7fa; margin:0; padding:2rem; }
-      h1 { font-weight:600; margin-bottom:1rem; }
-      button { cursor:pointer; border:none; border-radius:8px; padding:.5rem 1rem; font-weight:600; }
-      #all { background:#e63946; color:#fff; margin-right:1rem; }
-      #deleteSel { background:#d90429; color:#fff; margin-right:1rem; }
-      #modeswitch { background:#1d3557; color:#fff; }
-      #mergeAll { background:#e63946; color:#fff; margin-right:auto; }
-      .stats-panel { position:fixed; top:1rem; right:1rem; display:flex; gap:.5rem; }
-      .badge { background:#006f5f; color:#fff; padding:.4rem .8rem; border-radius:8px; font-size:.9rem; }
-      .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(260px,1fr)); gap:1.2rem; }
-      .card { background:#fff; padding:1rem; border-radius:12px; box-shadow:0 4px 14px rgba(0,0,0,.07);
-             position:relative; cursor:pointer; transition:box-shadow .2s; display:flex; flex-direction:column; }
-      .card:hover { box-shadow:0 6px 18px rgba(0,0,0,.12); }
-      .card img { width:100%; border-radius:8px; margin-bottom:.5rem; }
-      .tag { background:#eee; border-radius:6px; font-size:.7rem; padding:.1rem .4rem; margin-right:.3rem; }
-      .btn-dedup { background:#006f5f; color:#fff; border:none; border-radius:6px;
-                   font-size:.75rem; padding:.25rem .7rem; margin-top:.5rem; cursor:pointer; }
-      .checkbox-grid { position:absolute; top:8px; left:8px; transform:scale(1.2); }
-      .progress { width:100%; background:#ddd; border-radius:8px; overflow:hidden;
-                  height:18px; margin:1rem 0; display:none; }
-      .bar { background:#006f5f; height:100%; transition:width .3s; }
-      #dedupeBox { margin-top:1rem; }
-      #logo { display:block; margin:0 auto 1.5rem auto; max-width:400px; }
-      .modal { position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,.6);
-               display:none; align-items:center; justify-content:center; }
-      .modal-content { background:#fff; border-radius:12px; padding:1.2rem;
-                       width:600px; max-height:80%; overflow:auto; }
-      .close { float:right; font-weight:600; cursor:pointer; }
-      .ed-container { display:flex; flex-direction:column; gap:1rem; margin-top:1rem; }
-      .edition { display:flex; gap:1rem; align-items:center; background:#f9f9f9;
-                 border-radius:8px; padding:.6rem; font-size:.9rem; }
-      .edition img { width:80px; height:80px; object-fit:cover; border-radius:4px; }
-      #loadingSpinner { font-size:1rem; text-align:center; margin-top:2rem; }
-      .table-mode { display:none; margin-top:1rem; }
-      .table-mode table { width:100%; border-collapse:collapse; background:#fff;
-                          box-shadow:0 4px 14px rgba(0,0,0,.07); }
-      .table-mode th, .table-mode td { padding:.6rem; text-align:left; border-bottom:1px solid #ddd; }
-      .table-mode th { background:#f0f0f0; }
-      .table-row { cursor:pointer; }
-      .checkbox-col { width:40px; }
-      .cover-col img { width:50px; height:50px; object-fit:cover; border-radius:4px; }
-      .row-dedup-btn { background:#006f5f; color:#fff; border:none; border-radius:6px;
-                       font-size:.75rem; padding:.25rem .7rem; cursor:pointer; }
-    </style>
-    <style>
-      .pagination {
-        display: flex;
-        justify-content: center;
-        margin: 1rem 0;
-        list-style: none;
-        padding: 0;
-      }
-      .pagination li {
-        margin: 0 0.25rem;
-      }
-      .pagination a, .pagination span {
-        display: block;
-        padding: 0.5rem 0.75rem;
-        border: 1px solid #ccc;
-        border-radius: 4px;
-        text-decoration: none;
-        color: #333;
-      }
-      .pagination a:hover {
-        background-color: #f0f0f0;
-      }
-      .pagination .active {
-        background-color: #006f5f;
-        color: #fff;
-        border-color: #006f5f;
-      }
-    </style>
-  </head>
-  <body>
-
-    <img id="logo" src="/static/PMDA.png" alt="PMDA Logo"/>
-
-    <div class="stats-panel">
-      <!-- 1) Artists -->
-      <div class="badge" id="totalArtists">Artists: {{ total_artists }}</div>
-      <!-- 2) Albums -->
-      <div class="badge" id="totalAlbums">Albums: {{ total_albums }}</div>
-      <!-- 3) Removed dupes -->
-      <div class="badge" id="removedDupes">Removed dupes: {{ removed_dupes }}</div>
-      <!-- 4) Remaining Dupes -->
-      <div class="badge" id="remainingDupes">Remaining Dupes: {{ remaining_dupes }}</div>
-      <!-- 5) Space saved -->
-      <div class="badge" id="saved">Space saved: {{ space_saved }} MB</div>
-    </div>
-
-  <button id="deleteSel" onclick="submitSelected()" style="margin-right:.5rem;">
-    Deduplicate Selected Groups
-  </button>
-  <button id="all" onclick="submitAll()" style="margin-right:.5rem;">
-    Deduplicate ALL
-  </button>
-  <button id="mergeAll" onclick="submitMergeAll()">
-    Merge and Deduplicate ALL
-  </button>
-  <input id="search" type="text" placeholder="Search artist or album..."
-         style="padding:.4rem; border-radius:6px; border:1px solid #ccc;"/>
-</div>
-
-    <div id="scanBox" class="progress">
-      <div id="scanBar" class="bar" style="width:0%"></div>
-    </div>
-    <!-- the text element is always present but hidden by default -->
-    <div id="scanTxt" style="display:block; margin-top:0.5rem;">0 / 0 albums</div>
-    <div id="scanControls" style="margin-bottom:1rem; display:flex; align-items:center; gap:0.5rem;">
-      {% if scanning %}
-        <button onclick="fetch('/scan/pause', {method:'POST'})">⏸ Pause</button>
-      {% else %}
-        {% if remaining_dupes > 0 %}
-          <button onclick="scanLibrary()">▶️ Resume</button>
-        {% else %}
-          <button onclick="scanLibrary()">New Scan</button>
-        {% endif %}
-      {% endif %}
-      <span id="scanStatus">
-        Status:
-        {% if scanning and not paused %}running{% elif scanning and paused %}paused{% else %}stopped{% endif %}
-      </span>
-    </div>
-
-    <!-- ==== Grid Mode ==== -->
-    {% if total_pages > 1 %}
-    <nav>
-      <ul class="pagination">
-        {% if page > 1 %}
-          <li><a href="/?page=1">First</a></li>
-          <li><a href="/?page={{ page-1 }}">Previous</a></li>
-        {% endif %}
-        {# Calculate window boundaries #}
-        {% set start_page = page - 7 if page - 7 > 1 else 1 %}
-        {% set end_page = page + 7 if page + 7 < total_pages else total_pages %}
-        {% if start_page > 1 %}
-          <li><span>…</span></li>
-        {% endif %}
-        {% for p in range(start_page, end_page + 1) %}
-          <li>
-            {% if p == page %}
-              <span class="active">{{ p }}</span>
-            {% else %}
-              <a href="/?page={{ p }}">{{ p }}</a>
-            {% endif %}
-          </li>
-        {% endfor %}
-        {% if end_page < total_pages %}
-          <li><span>…</span></li>
-        {% endif %}
-        {% if page < total_pages %}
-          <li><a href="/?page={{ page+1 }}">Next</a></li>
-          <li><a href="/?page={{ total_pages }}">Last</a></li>
-        {% endif %}
-      </ul>
-    </nav>
-    {% endif %}
-    <div id="gridMode" class="grid">
-      {% for g in groups %}
-        <div class="card"
-             data-artist="{{ g.artist_key }}"
-             data-album-id="{{ g.album_id }}"
-             data-title="{{ g.best_title }}">
-          <input class="checkbox-grid" type="checkbox"
-                 name="selected" value="{{ g.artist_key }}||{{ g.album_id }}"
-                 onclick="event.stopPropagation();">
-          <img src="{{ g.best_thumb }}" alt="cover">
-          <div style="font-weight:600;">{{ g.artist }}</div>
-          <div style="margin-bottom:.3rem;">{{ g.best_title }}</div>
-          <div>
-            <span class="tag">versions {{ g.n }}</span>
-            <span class="tag">{{ g.best_fmt }}</span>
-          </div>
-          <button class="btn-dedup"
-                  onclick="event.stopPropagation();
-                           dedupeSingle({{ g.artist_key|tojson }},
-                                        {{ g.album_id }},
-                                        {{ g.best_title|tojson }});">
-            Deduplicate
-          </button>
-        </div>
-      {% endfor %}
-    </div>
-
-  <!-- ==== Table Mode ==== -->
-  <div id="tableMode" class="table-mode">
-    <table>
-      <thead>
-        <tr>
-          <th class="checkbox-col"></th>
-          <th class="cover-col"></th>
-          <th>Artist</th>
-          <th>Album</th>
-          <th># Versions</th>
-          <th>Detection Through</th>
-          <th>Formats</th>
-          <th></th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for g in groups %}
-          <tr class="table-row"
-              data-artist="{{ g.artist_key }}"
-              data-album-id="{{ g.album_id }}"
-              data-title="{{ g.best_title }}">
-            <td class="checkbox-col">
-              <input type="checkbox" name="selected"
-                     value="{{ g.artist_key }}||{{ g.album_id }}"
-                     onclick="event.stopPropagation();">
-            </td>
-            <td class="cover-col"><img src="{{ g.best_thumb }}" alt="cover"></td>
-            <td>{{ g.artist }}</td>
-            <td>{{ g.best_title }}</td>
-            <td>{{ g.n }}</td>
-            <td>{{ 'LLM' if g.used_ai else 'Signature Match' }}</td>
-            <td>
-              {{ g.formats|join(', ') }}
-            </td>
-            <td>
-             <button class="row-dedup-btn"
-                     onclick="event.stopPropagation();
-                              dedupeSingle({{ g.artist_key|tojson }},
-                                           {{ g.album_id }},
-                                           {{ g.best_title|tojson }});">
-               Deduplicate
-             </button>
-            </td>
-          </tr>
-        {% endfor %}
-      </tbody>
-    </table>
-  </div>
-    <!-- end always-show grid/table; removed server-side "no duplicates" branch -->
-
-    <!-- ==== Modal for Edition Details & Confirmations ==== -->
-    <div id="modal" class="modal">
-      <div class="modal-content">
-        <span class="close" onclick="closeModal()">&times;</span>
-        <div id="modalBody"></div>
-      </div>
-    </div>
-    <script>
-      // ────────────────────── timers & view mode ──────────────────────
-      let scanTimer   = null;
-      let dedupeTimer = null;
-
-      /*  true  → user last chose Table view
-          false → user last chose Grid  view (default)                  */
-      let inTableMode = (localStorage.getItem("pmdaViewMode") === "table");
-
-      /* ─── View helpers ─────────────────────────────────────────────── */
-      function setViewMode() {
-        const gridEl  = document.getElementById("gridMode");
-        const tableEl = document.getElementById("tableMode");
-
-        if (gridEl)  gridEl.style.display  = inTableMode ? "none"  : "grid";
-        if (tableEl) tableEl.style.display = inTableMode ? "block" : "none";
-
-        const switchBtn = document.getElementById("modeswitch");
-        if (switchBtn) {
-          switchBtn.innerText = inTableMode
-                                ? "Switch to Grid View"
-                                : "Switch to Table View";
-        }
-      }
-
-      function toggleMode() {
-        inTableMode = !inTableMode;
-        localStorage.setItem("pmdaViewMode", inTableMode ? "table" : "grid");
-        setViewMode();
-      }
-
-      /* ─── Scan progress polling ────────────────────────────────────── */
-      let currentDupTotal = 0;        // how many dup groups are on screen
-
-      /* build ONE card/row – shared by grid & table ----------------------- */
-      function dedupeCardHtml(g){
-        return `
-          <div class="card"
-               data-artist="${g.artist_key}"
-               data-album-id="${g.album_id}"
-               data-title="${g.best_title}">
-            <input class="checkbox-grid" type="checkbox"
-                   name="selected" value="${g.artist_key}||${g.album_id}"
-                   onclick="event.stopPropagation();">
-            <img src="${g.best_thumb}" alt="cover">
-            <div style="font-weight:600;">${g.artist}</div>
-            <div style="margin-bottom:.3rem;">${g.best_title}</div>
-            <div><span class="tag">versions ${g.n}</span>
-                 <span class="tag">${g.best_fmt}</span></div>
-            <button class="btn-dedup"
-                    onclick="event.stopPropagation();
-                             dedupeSingle('${g.artist_key}',
-                                          ${g.album_id},
-                                          ${JSON.stringify(g.best_title)});">
-              Deduplicate
-            </button>
-          </div>`;
-      }
-
-      /* redraw grid + (optionally) table ---------------------------------- */
-      function renderDuplicates(list){
-        // GRID
-        const grid = document.getElementById("gridMode");
-        if (grid){
-          grid.innerHTML = list.map(dedupeCardHtml).join("");
-          // re-attach click handlers to new cards
-          grid.querySelectorAll(".card").forEach(card=>{
-            card.addEventListener("click",()=>openModal(card.dataset.artist,
-                                                        card.dataset.albumId));
-          });
-        }
-        // TABLE (show only when in Table view)
-        const tbody = document.querySelector("#tableMode tbody");
-        if (tbody){
-          tbody.innerHTML = list.map(g=>`
-            <tr class="table-row"
-                data-artist="${g.artist_key}"
-                data-album-id="${g.album_id}"
-                data-title="${g.best_title}">
-              <td class="checkbox-col">
-                <input type="checkbox" name="selected"
-                       value="${g.artist_key}||${g.album_id}"
-                       onclick="event.stopPropagation();">
-              </td>
-              <td class="cover-col"><img src="${g.best_thumb}" alt="cover"></td>
-              <td>${g.artist}</td>
-              <td>${g.best_title}</td>
-              <td>${g.n}</td>
-              <td>${g.used_ai ? "LLM" : "Signature Match"}</td>
-              <td>${g.formats.join(", ")}</td>
-              <td><button class="row-dedup-btn"
-                          onclick="event.stopPropagation();
-                                   dedupeSingle('${g.artist_key}',
-                                                ${g.album_id},
-                                                ${JSON.stringify(g.best_title)});">
-                    Deduplicate</button></td></tr>`).join("");
-          tbody.querySelectorAll(".table-row").forEach(row=>{
-            row.addEventListener("click",()=>openModal(row.dataset.artist,
-                                                       row.dataset.albumId));
-          });
-        }
-      }
-
-    function pollScan() {
-    fetch("/api/progress")
-        .then(r => r.json())
-        .then(j => {
-        if (j.scanning) {
-            const scanBox = document.getElementById("scanBox");
-            if (scanBox) {
-            scanBox.style.display = "block";
-            }
-
-            const scanBar = document.getElementById("scanBar");
-            if (scanBar) {
-            const pct = j.total ? Math.round(100 * j.progress / j.total) : 0;
-            scanBar.style.width = pct + "%";
-            }
-
-            const scanTxt = document.getElementById("scanTxt");
-            if (scanTxt) {
-            scanTxt.innerText = `${j.progress} / ${j.total} albums`;
-            }
-
-            // Update status text
-            const statusEl = document.getElementById("scanStatus");
-            if (statusEl) {
-            statusEl.innerText = "Status: " + j.status;
-            }
-
-            // Update control buttons when paused
-            const controls = document.getElementById("scanControls");
-            if (controls && j.status === "paused") {
-            controls.innerHTML = `
-                <button onclick="fetch('/scan/resume', {method:'POST'}).then(()=>window.location.reload())">
-                ▶️ Resume
-                </button>
-                <span id="scanStatus">Status: paused</span>
-            `;
-            }
-
-            // live-refresh duplicate cards as they arrive
-            fetch("/api/duplicates")
-            .then(r => r.json())
-            .then(dups => {
-                if (dups.length !== currentDupTotal) {
-                currentDupTotal = dups.length;
-                renderDuplicates(dups);
-
-                // Update remaining dupes badge
-                const remBadge = document.getElementById("remainingDupes");
-                if (remBadge) {
-                    remBadge.innerText = `Remaining Dupes: ${dups.length}`;
-                }
-
-                // Auto-advance page when exceeding 100 dupes per page
-                const params = new URLSearchParams(window.location.search);
-                const page = parseInt(params.get("page") || "1", 10);
-                const PER_PAGE = 100;
-                if (dups.length > page * PER_PAGE) {
-                    params.set("page", page + 1);
-                    window.location.search = params.toString();
-                }
-                }
-            });
-
-        } else {
-            clearInterval(scanTimer);
-            // ─── Scan finished: refresh duplicates & UI ─────────────────────
-            fetch("/api/duplicates")
-              .then(r => r.json())
-              .then(list => {
-                currentDupTotal = list.length;
-                renderDuplicates(list);           // show all found groups
-
-                // update "Remaining Dupes" badge
-                const remBadge = document.getElementById("remainingDupes");
-                if (remBadge) {
-                  remBadge.innerText = `Remaining Dupes: ${list.length}`;
-                }
-              });
-
-            // force final progress text & status
-            const scanTxt = document.getElementById("scanTxt");
-            if (scanTxt) {
-            scanTxt.innerText = `${j.progress} / ${j.total} albums`;
-            }
-
-            const statusEl = document.getElementById("scanStatus");
-            if (statusEl) {
-            statusEl.innerText = "Status: stopped";
-            }
-
-            // rebuild control bar so the user can launch a new scan
-            const controls = document.getElementById("scanControls");
-            if (controls) {
-            controls.innerHTML = `
-                <button onclick="scanLibrary()">New Scan</button>
-                <span id="scanStatus">Status: stopped</span>
-            `;
-            }
-        }
-        })
-        .catch(err => console.error("pollScan() failed:", err));
-    }
-
-      function submitMergeAll() {
-        showLoadingModal("Merging all duplicates...");
-        fetch("/merge/all", { method: "POST" })
-          .then(() => {
-            showLoadingModal("Merging and deduplicating all duplicates...");
-            fetch("/dedupe/all", { method: "POST" })
-              .then(() => {
-                dedupeTimer = setInterval(pollDedupe, 1000);
-              });
-          });
-      }
-
-      /* ─── Start scan ───────────────────────────────────────────────── */
-      function scanLibrary() {
-        fetch('/scan/start', { method: 'POST' })
-          .then(() => {
-            // reload page to update UI buttons and start polling
-            window.location.reload();
-          })
-          .catch(err => console.error("Scan start failed:", err));
-      }
-
-      // keep backward compatibility for the old call
-      function startScan() { scanLibrary(); }
-
-      /* ─── Dedupe helpers & polling ─────────────────────────────────── */
-      function pollDedupe() {
-        fetch("/api/dedupe")
-          .then(r => r.json())
-          .then(j => {
-            if (!j.deduping) {
-              clearInterval(dedupeTimer);
-              showSimpleModal(`Moved ${j.saved} MB in total`);
-              setTimeout(() => location.reload(), 3000);
-            }
-          });
-      }
-
-      function submitAll() {
-        fetch("/dedupe/all", { method: "POST" }).then(() => {
-          showLoadingModal("Moving all duplicates…");
-          dedupeTimer = setInterval(pollDedupe, 1000);
-        });
-      }
-
-      function submitSelected() {
-        const checked = Array.from(
-          document.querySelectorAll("input[name='selected']:checked")
-        ).map(cb => cb.value);
-
-        if (!checked.length) {
-          showSimpleModal("No albums selected.");
-          return;
-        }
-
-        showLoadingModal("Moving selected duplicates…");
-        fetch("/dedupe/selected", {
-          method:  "POST",
-          headers: { "Content-Type": "application/json" },
-          body:    JSON.stringify({ selected: checked })
-        })
-        .then(r => r.json())
-        .then(resp => showConfirmation(resp.moved))
-        .catch(() => {
-          closeModal();
-          showSimpleModal("An error occurred during deduplication.");
-        });
-      }
-
-      function dedupeSingle(artist, albumId, title) {
-        showLoadingModal(`Moving duplicate for ${artist.replace(/_/g," ")} – ${title}`);
-        fetch(`/dedupe/artist/${artist}`, {
-          method:  "POST",
-          headers: { "Content-Type": "application/json" },
-          body:    JSON.stringify({ album_id: albumId })
-        })
-        .then(r => r.json())
-        .then(resp => showConfirmation(resp.moved))
-        .catch(() => {
-          closeModal();
-          showSimpleModal("An error occurred during single deduplication.");
-        });
-      }
-
-      /* ─── Modal helpers ─────────────────────────────────────────────── */
-      function showLoadingModal(text) {
-        const modalBody = document.getElementById("modalBody");
-        if (modalBody) modalBody.innerHTML = `<div id="loadingSpinner">${text}</div>`;
-        const modal = document.getElementById("modal");
-        if (modal) modal.style.display = "flex";
-      }
-
-      function showSimpleModal(msg) {
-        const modalBody = document.getElementById("modalBody");
-        if (modalBody) modalBody.innerHTML = `<h3>${msg}</h3>`;
-        const modal = document.getElementById("modal");
-        if (modal) modal.style.display = "flex";
-        setTimeout(closeModal, 3000);
-      }
-
-    function showConfirmation(moved) {
-    const defaultThumb =
-        'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAAQklEQVR42u3BAQ0AAADCIPunNscwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD8wDeQAAEmTWlUAAAAASUVORK5CYII=';
-    const modalBody = document.getElementById("modalBody");
-    const modal     = document.getElementById("modal");
-
-    // Build content
-    let html = `<h3>Moved Duplicates</h3>`;
-    if (moved.length === 0) {
-        html += `<p>No duplicates were moved.</p>`;
-    } else {
-        html += `<div class="ed-container">`;
-        moved.forEach(e => {
-        html += `
-            <div class="edition">
-            <img src="${e.thumb_data || defaultThumb}" alt="cover">
-            <div class="edition-info">
-                <strong>Duplicate</strong><br>
-                ${e.artist} — ${e.title_raw}<br>
-                ${e.size} MB · ${e.fmt} · ${e.br} kbps · ${e.sr} Hz · ${e.bd} bit
-            </div>
-            </div>`;
-        });
-        html += `</div>`;
-    }
-
-    // Close button
-    html += `
-        <div class="modal-actions" style="text-align:right; margin-top:1rem;">
-        <button id="modalCloseBtn" style="
-            background:#006f5f;color:#fff;border:none;
-            border-radius:6px;padding:.5rem 1rem;
-            cursor:pointer;
-        ">Close</button>
-        </div>`;
-
-    // Render & show
-    modalBody.innerHTML = html;
-    modal.style.display = "flex";
-
-    // Wire up Escape key and Close button
-    function closeHandler() {
-        closeModal();
-        document.removeEventListener("keydown", escHandler);
-    }
-    function escHandler(e) {
-        if (e.key === "Escape") closeHandler();
-    }
-    document.getElementById("modalCloseBtn").onclick = closeHandler;
-    document.addEventListener("keydown", escHandler);
-    }
-
-      function closeModal() {
-        const modal = document.getElementById("modal");
-        if (modal) modal.style.display = "none";
-      }
-
-      /* ─── Details modal ─────────────────────────────────────────────── */
-      function openModal(artist, albumId) {
-        showLoadingModal("Loading album details…");
-        fetch(`/details/${artist}/${albumId}`)
-          .then(r => { if (!r.ok) throw new Error("404"); return r.json(); })
-          .then(j => {
-            let html = `<h3>${j.artist} – ${j.album}</h3>`;
-            // Insert rationale as a numbered list if present
-            if (j.rationale) {
-              const items = j.rationale.split(";");
-              html += '<ul style="margin-left:1.2rem;list-style-type:disc;">';
-              items.forEach(it => { if (it.trim()) html += `<li>${it.trim()}</li>`; });
-              html += "</ul>";
-            }
-            // Only show merge section if there are extras
-            if (j.merge_list && j.merge_list.length > 0) {
-              html += `<div><strong>Detected extra tracks:</strong>`;
-              html += `<ul style="margin-left:1.2rem;list-style-type:disc;">`;
-              j.merge_list.forEach(function(track) {
-                html += `<li>${track}</li>`;
-              });
-              html += `</ul></div>`;
-            }
-            html += `<div class="ed-container">`;
-            j.editions.forEach((e, i) => {
-              html += `<div class="edition">`;
-              if (e.thumb_data) {
-                html += `<img src="${e.thumb_data}" alt="cover">`;
-              } else {
-                html += `<img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAAQklEQVR42u3BAQ0AAADCIPunNscwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD8wDeQAAEmTWlUAAAAASUVORK5CYII=" alt="no-cover">`;
-              }
-              html += `<div><b>${i === 0 ? "Best" : "Duplicate"}</b></div>`;
-              html += `<div>${j.artist}</div><div>${j.album}</div><div>${e.size} MB</div>`;
-              html += `<div>${e.fmt} • ${e.br} kbps • ${e.sr} Hz • ${e.bd} bit</div></div>`;
-            });
-            html += `</div><button id="modalDedup" style="background:#006f5f;color:#fff;border:none;border-radius:8px;padding:.4rem .9rem;cursor:pointer;margin-top:1rem;">Deduplicate</button>`;
-            // Only show merge/merge+dedup buttons if extras
-            if (j.merge_list && j.merge_list.length > 0) {
-              html += `<button id="modalMerge" style="background:#1d3557;color:#fff;border:none;border-radius:8px;padding:.4rem .9rem;cursor:pointer;margin-top:1rem;margin-left:1rem;">Merge Tracks</button>`;
-              html += `<button id="modalMergeDedup" style="background:#1d3557;color:#fff;border:none;border-radius:8px;padding:.4rem .9rem;cursor:pointer;margin-top:1rem;margin-left:1rem;">Merge and Deduplicate</button>`;
-            }
-
-            const modalBody = document.getElementById("modalBody");
-            if (modalBody) modalBody.innerHTML = html;
-            const modal = document.getElementById("modal");
-            if (modal) modal.style.display = "flex";
-
-            document.getElementById("modalDedup").onclick = () => {
-              showLoadingModal(`Moving duplicate for ${j.artist} – ${j.album}`);
-              fetch(`/dedupe/artist/${artist}`, {
-                method:  "POST",
-                headers: { "Content-Type": "application/json" },
-                body:    JSON.stringify({ album_id: albumId })
-              })
-              .then(r => r.json())
-              .then(resp => showConfirmation(resp.moved))
-              .catch(() => {
-                closeModal();
-                showSimpleModal("An error occurred during modal deduplication.");
-              });
-            };
-            if (j.merge_list && j.merge_list.length > 0) {
-              const mergeBtn = document.getElementById("modalMerge");
-              if (mergeBtn) {
-                mergeBtn.onclick = () => {
-                  // send merge request to backend
-                  fetch(`/merge/${artist}/${albumId}`, {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ merge_list: j.merge_list })
-                  })
-                  .then(r => r.json())
-                  .then(resp => showSimpleModal(resp.message))
-                  .catch(() => showSimpleModal("Merge failed."));
-                };
-              }
-              const mergeDedupBtn = document.getElementById("modalMergeDedup");
-              if (mergeDedupBtn) {
-                mergeDedupBtn.onclick = () => {
-                  // First merge tracks, then deduplicate
-                  fetch(`/merge/${artist}/${albumId}`, { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({merge_list:j.merge_list}) })
-                    .then(() => {
-                      showLoadingModal(`Merging tracks then deduplicating ${j.artist} – ${j.album}`);
-                      fetch(`/dedupe/artist/${artist}`, { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({album_id:albumId}) })
-                        .then(r => r.json()).then(resp => showSimpleModal(resp.message))
-                        .catch(() => showSimpleModal("Merge+Dedup failed."));
-                    })
-                    .catch(() => showSimpleModal("Merge failed."));
-                };
-              }
-            }
-          })
-          .catch(() => {
-            closeModal();
-            showSimpleModal("Could not load album details.");
-          });
-      }
-
-      /* ─── Startup ───────────────────────────────────────────────────── */
-      document.addEventListener("DOMContentLoaded", () => {
-        setViewMode();                          // restore view mode
-
-        // card / row click-throughs
-        document.querySelectorAll(".card").forEach(card => {
-          card.addEventListener("click", () => {
-            openModal(card.dataset.artist, card.dataset.albumId);
-          });
-        });
-        document.querySelectorAll(".table-row").forEach(row => {
-          row.addEventListener("click", () => {
-            openModal(row.dataset.artist, row.dataset.albumId);
-          });
-        });
-        document.querySelectorAll(
-          "input[type='checkbox'], .btn-dedup, .row-dedup-btn"
-        ).forEach(el => el.addEventListener("click", ev => ev.stopPropagation()));
-
-        // resume running tasks and init progress bar if a scan is already in flight
-        fetch("/api/progress")
-        .then(r => r.json())
-        .then(j => {
-            // Always show the progress bar/text if any scan ever started
-            const scanBox = document.getElementById("scanBox");
-            const scanBar = document.getElementById("scanBar");
-            const scanTxt = document.getElementById("scanTxt");
-            const statusEl = document.getElementById("scanStatus");
-
-            // Display progress UI
-            if (scanBox) scanBox.style.display = "block";
-            if (scanBar) {
-            const pct = j.total ? Math.round(100 * j.progress / j.total) : 0;
-            scanBar.style.width = pct + "%";
-            }
-            if (scanTxt) scanTxt.innerText = `${j.progress} / ${j.total} albums`;
-
-            // Update status text immediately
-            if (statusEl) statusEl.innerText = "Status: " + j.status;
-
-            // If scanning is true (running or paused), start the polling loop
-            if (j.scanning) {
-            scanTimer = setInterval(pollScan, 1000);
-            }
-        })
-        .catch(err => console.error("Failed to init scan status:", err));
-        fetch("/api/dedupe").then(r => r.json()).then(j => {
-          if (j.deduping) dedupeTimer = setInterval(pollDedupe, 1000);
-        });
-
-        // Initial load: fetch duplicate list so the table/grid populates (page is served with empty groups for fast first paint)
-        fetch("/api/duplicates")
-          .then(r => r.json())
-          .then(allGroups => {
-            renderDuplicates(allGroups);
-            const remBadge = document.getElementById("remainingDupes");
-            if (remBadge) remBadge.innerText = "Remaining Dupes: " + allGroups.length;
-            const nav = document.querySelector("nav .pagination");
-            if (nav) nav.style.display = "flex";
-          })
-          .catch(err => console.error("Failed to load duplicates:", err));
-
-      /* ─── Client-side search filter ──────────────────────────────── */
-    const searchInput = document.getElementById("search");
-    if (searchInput) {
-    searchInput.addEventListener("input", ev => {
-        const q = ev.target.value.trim().toLowerCase();
-
-        if (!q) {
-        // reset filter and restore full list with pagination
-        fetch("/api/duplicates")
-          .then(r => r.json())
-          .then(allGroups => {
-            renderDuplicates(allGroups);
-            document.querySelector("nav .pagination").style.display = "flex";
-          });
-        return;
-        }
-
-        fetch("/api/duplicates")
-        .then(r => r.json())
-        .then(allGroups => {
-            const filtered = allGroups.filter(g =>
-            g.artist.toLowerCase().includes(q) ||
-            g.best_title.toLowerCase().includes(q)
-            );
-            renderDuplicates(filtered);
-            // hide pagination during filtered search
-            document.querySelector("nav .pagination").style.display = "none";
-        });
-    });
-    }
-    });
-  // close modal on Escape
-  document.addEventListener('keydown', e => {
-    if (e.key === 'Escape') closeModal();
-  });
-</script>
-  </body>
-</html>
-"""
-
 
 # ────────────────────────── UI card helper ──────────────────────────
 def _build_card_list(dup_dict) -> list[dict]:
@@ -3840,79 +3592,60 @@ def _build_card_list(dup_dict) -> list[dict]:
     cards expected by both the main page and /api/duplicates.
     """
     cards = []
+    db_conn = None
+    try:
+        db_conn = plex_connect()
+    except Exception:
+        pass
     for artist, groups in dup_dict.items():
         for g in groups:
             best = g["best"]
-            best_fmt = best.get("fmt_text",
-                                get_primary_format(Path(best["folder"])))
+            folder_path = path_for_fs_access(Path(best["folder"]))
+            best_fmt = best.get("fmt_text", get_primary_format(folder_path))
             formats = [best_fmt] + [
-                loser.get("fmt",
-                          get_primary_format(Path(loser["folder"])))
+                loser.get("fmt", get_primary_format(path_for_fs_access(Path(loser["folder"]))))
                 for loser in g["losers"]
             ]
             display_title = best["album_norm"].title()
-            cards.append(
-                {
-                    "artist_key": artist.replace(" ", "_"),
-                    "artist": artist,
-                    "album_id": best["album_id"],
-                    "n": len(g["losers"]) + 1,
-                    "best_thumb": thumb_url(best["album_id"]),
-                    "best_title": display_title,
-                    "best_fmt": best_fmt,
-                    "formats": formats,
-                    "used_ai": best.get("used_ai", False),
-                }
-            )
+            size_bytes = safe_folder_size(folder_path)
+            size_mb = size_bytes // (1024 * 1024)
+            track_count = 0
+            if db_conn:
+                try:
+                    track_count = len(get_tracks(db_conn, best["album_id"]))
+                except Exception:
+                    pass
+            cards.append({
+                "artist_key": artist.replace(" ", "_"),
+                "artist": artist,
+                "album_id": best["album_id"],
+                "n": len(g["losers"]) + 1,
+                "best_thumb": thumb_url(best["album_id"]),
+                "best_title": display_title,
+                "best_fmt": best_fmt,
+                "formats": formats,
+                "used_ai": best.get("used_ai", False),
+                "size": size_bytes,
+                "size_mb": size_mb,
+                "track_count": track_count,
+                "path": str(folder_path),
+            })
+    if db_conn:
+        try:
+            db_conn.close()
+        except Exception:
+            pass
     return cards
-
-
-@app.get("/")
-def index():
-    """
-    Main page: return immediately with empty card list so the UI responds.
-    Stats are quick (DB counts); duplicate cards are loaded client-side via /api/duplicates.
-    """
-    with lock:
-        paused = scan_is_paused.is_set()
-
-    space_saved   = get_stat("space_saved")
-    removed_dupes = get_stat("removed_dupes")
-
-    db_conn = plex_connect()
-    placeholders   = ",".join("?" for _ in SECTION_IDS)
-    section_params = tuple(SECTION_IDS)
-    total_artists = db_conn.execute(
-        f"SELECT COUNT(*) FROM metadata_items "
-        f"WHERE metadata_type=8 AND library_section_id IN ({placeholders})",
-        section_params,
-    ).fetchone()[0]
-    total_albums = db_conn.execute(
-        f"SELECT COUNT(*) FROM metadata_items "
-        f"WHERE metadata_type=9 AND library_section_id IN ({placeholders})",
-        section_params,
-    ).fetchone()[0]
-    db_conn.close()
-
-    return render_template_string(
-        HTML,
-        scanning=state["scanning"],
-        groups=[],  # client fetches via /api/duplicates for fast first paint
-        space_saved=space_saved,
-        removed_dupes=removed_dupes,
-        total_artists=total_artists,
-        total_albums=total_albums,
-        remaining_dupes=0,
-        plex_host=PLEX_HOST,
-        plex_token=PLEX_TOKEN,
-        page=1,
-        total_pages=1,
-        paused=paused,
-    )
 
 
 # --- New scan control endpoints ---
 from flask import Response
+
+def _requires_config():
+    """Return 503 response when Plex is not configured (wizard-first mode)."""
+    if not PLEX_CONFIGURED:
+        return jsonify({"error": "Plex not configured", "requiresConfig": True}), 503
+    return None
 
 def start_background_scan():
     with lock:
@@ -3923,24 +3656,27 @@ def start_background_scan():
 
 @app.route("/scan/start", methods=["POST"])
 def start_scan():
+    r = _requires_config()
+    if r is not None:
+        return r
     scan_should_stop.clear()
     scan_is_paused.clear()
     start_background_scan()
-    return "Scan started"
+    return jsonify({"status": "ok"})
 
 @app.route("/scan/pause", methods=["POST"])
 def pause_scan():
     scan_is_paused.set()
     with lock:
         state["scanning"] = True   # still scanning, just paused
-    return "", 204
+    return jsonify({"status": "ok"})
 
 
 @app.route("/scan/resume", methods=["POST"])
 def resume_scan():
     scan_is_paused.clear()
     # no state change needed; polling loop will continue
-    return "", 204
+    return jsonify({"status": "ok"})
 
 
 @app.route("/scan/stop", methods=["POST"])
@@ -3948,15 +3684,1580 @@ def stop_scan():
     scan_should_stop.set()
     with lock:
         state["scanning"] = False
-    return "", 204
+    return jsonify({"status": "ok"})
+
+
+# ────────────────────────── Wizard / Web UI helpers ─────────────────────────
+
+@app.get("/api/plex/check")
+def api_plex_check_get():
+    """Test Plex connection using current server config (PLEX_HOST, PLEX_TOKEN)."""
+    return _do_plex_check(PLEX_HOST, PLEX_TOKEN)
+
+
+@app.post("/api/plex/check")
+def api_plex_check_post():
+    """Test Plex connection; optional body { PLEX_HOST, PLEX_TOKEN } to test before saving."""
+    data = request.get_json(silent=True) or {}
+    host = (data.get("PLEX_HOST") or "").strip() or PLEX_HOST
+    token = (data.get("PLEX_TOKEN") or "").strip() or PLEX_TOKEN
+    return _do_plex_check(host, token)
+
+
+def _do_plex_check(host: str, token: str):
+    if not host or not token:
+        return jsonify({"success": False, "message": "PLEX_HOST and PLEX_TOKEN are required"}), 400
+    host = host.strip().rstrip("/")
+    if host and not host.startswith(("http://", "https://")):
+        host = "http://" + host
+    url = f"{host}/library/sections"
+    try:
+        resp = requests.get(url, headers={"X-Plex-Token": token}, timeout=10)
+        if resp.status_code != 200:
+            return jsonify({"success": False, "message": f"Plex returned HTTP {resp.status_code}"})
+        return jsonify({"success": True, "message": "Connection successful"})
+    except requests.exceptions.ConnectionError as e:
+        return jsonify({"success": False, "message": "Connection refused or host unreachable. Check URL and that Plex is running."})
+    except requests.exceptions.Timeout:
+        return jsonify({"success": False, "message": "Connection timed out. Check URL and network."})
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)})
+
+
+# ─── Plex.tv PIN auth (Tautulli-style: no manual token) ─────────────────────
+PLEX_PIN_HEADERS = {
+    "X-Plex-Client-Identifier": "pmda-webui-1",
+    "X-Plex-Product": "PMDA",
+    "X-Plex-Version": "1.0",
+    "X-Plex-Device": "Web",
+    "X-Plex-Platform": "Web",
+    "Accept": "application/json",
+}
+
+
+@app.post("/api/plex/pin")
+def api_plex_pin_create():
+    """
+    Create a Plex.tv PIN for sign-in (like Tautulli "Fetch New Token").
+    User opens https://www.plex.tv/link, enters the returned code; we poll GET /api/plex/pin?id=... for the token.
+    No auth required. Returns { id, code, link_url }.
+    """
+    # strong=false (default) → 4-character code for plex.tv/link; strong=true → long code for other flows
+    url = "https://plex.tv/api/v2/pins"
+    try:
+        resp = requests.post(url, headers=PLEX_PIN_HEADERS, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        pin_id = data.get("id")
+        code = data.get("code", "")
+        if not pin_id:
+            return jsonify({"success": False, "message": "Plex did not return a PIN id"}), 502
+        return jsonify({
+            "success": True,
+            "id": pin_id,
+            "code": code,
+            "link_url": "https://www.plex.tv/link/",
+        })
+    except requests.exceptions.ConnectionError:
+        return jsonify({"success": False, "message": "Cannot reach plex.tv. Check network and DNS."}), 502
+    except requests.exceptions.Timeout:
+        return jsonify({"success": False, "message": "Request to plex.tv timed out."}), 502
+    except (requests.RequestException, ValueError) as e:
+        return jsonify({"success": False, "message": str(e)}), 502
+
+
+@app.get("/api/plex/pin")
+def api_plex_pin_poll():
+    """
+    Poll PIN status. Query param: id (pin id from POST /api/plex/pin).
+    Returns { status: 'waiting' } or { status: 'linked', token } when user has signed in on plex.tv/link.
+    """
+    pin_id = request.args.get("id", "").strip()
+    if not pin_id:
+        return jsonify({"success": False, "status": "error", "message": "Missing id"}), 400
+    url = f"https://plex.tv/api/v2/pins/{pin_id}"
+    try:
+        resp = requests.get(url, headers=PLEX_PIN_HEADERS, timeout=10)
+        if resp.status_code == 404:
+            return jsonify({"success": True, "status": "expired", "message": "PIN expired"})
+        resp.raise_for_status()
+        data = resp.json()
+        token = data.get("authToken")
+        if token:
+            return jsonify({"success": True, "status": "linked", "token": token})
+        return jsonify({"success": True, "status": "waiting"})
+    except requests.exceptions.ConnectionError:
+        return jsonify({"success": False, "status": "error", "message": "Cannot reach plex.tv"}), 502
+    except requests.exceptions.Timeout:
+        return jsonify({"success": False, "status": "error", "message": "Request timed out"}), 502
+    except (requests.RequestException, ValueError) as e:
+        return jsonify({"success": False, "status": "error", "message": str(e)}), 502
+
+
+def _is_lan_address(address: str) -> bool:
+    """True if address looks like a classic LAN IP (192.168.x.x or 10.x.x.x), not Docker (172.16-31)."""
+    if not address:
+        return False
+    parts = address.split(".")
+    if len(parts) != 4:
+        return False
+    try:
+        a, b, c, d = (int(x) for x in parts)
+        if 0 <= a <= 255 and 0 <= b <= 255 and 0 <= c <= 255 and 0 <= d <= 255:
+            if (a == 192 and b == 168) or (a == 10):
+                return True
+            if a == 172 and 16 <= b <= 31:  # Docker/private
+                return False
+    except (ValueError, TypeError):
+        pass
+    return False
+
+
+def _parse_plex_resources_xml(text: str) -> list:
+    """Parse plex.tv /api/resources XML (MediaContainer > Device > Connection). Same flow as Tautulli.
+    Returns list of { name, uri, address, port, scheme, localAddresses, machineIdentifier }.
+    One entry per Device; prefers LAN URL (192.168.x.x / 10.x.x.x) over Docker/plex.direct so the UI shows a reachable URL.
+    """
+    text = re.sub(r"&(?!(?:amp|lt|gt|quot|apos|#\d+|#x[0-9a-fA-F]+);)", "&amp;", text)
+    servers = []
+    try:
+        root = ET.fromstring(text)
+    except Exception:
+        return []
+    for device in root.iter("Device"):
+        attr = device.attrib
+        provides = (attr.get("provides") or "").strip().lower()
+        if "server" not in provides:
+            continue
+        owned = attr.get("owned", "0")
+        if owned != "1":
+            continue
+        name = attr.get("name", "Plex")
+        client_id = attr.get("clientIdentifier", "")
+        connections = []
+        for conn in device.iter("Connection"):
+            c = conn.attrib
+            uri = (c.get("uri") or "").strip()
+            if not uri or not uri.startswith("http"):
+                continue
+            address = (c.get("address") or "").strip()
+            port = (c.get("port") or "32400").strip()
+            if port == "0":
+                port = "32400"
+            scheme = "https" if uri.startswith("https") else "http"
+            is_local = (c.get("local") or "").strip() == "1"
+            is_lan = _is_lan_address(address)
+            # Prefer: (1) local + LAN IP, (2) local + not Docker, (3) LAN IP, (4) local, (5) any
+            if is_local and is_lan:
+                rank = 0
+            elif is_local and address and not (address.startswith("172.") and _is_private_172(address)):
+                rank = 1
+            elif is_lan:
+                rank = 2
+            elif is_local:
+                rank = 3
+            else:
+                rank = 4
+            connections.append((rank, address, port, scheme, uri))
+        if not connections:
+            continue
+        connections.sort(key=lambda x: (x[0], x[1] or "zzz"))
+        _, address, port, scheme, uri = connections[0]
+        # Build a clean URL with dots (not plex.direct with dashes) when we have a real IP
+        if address and re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", address):
+            display_uri = f"{scheme}://{address}:{port}"
+        else:
+            display_uri = uri
+        servers.append({
+            "name": name,
+            "uri": display_uri,
+            "address": address,
+            "port": port,
+            "scheme": scheme,
+            "localAddresses": address,
+            "machineIdentifier": client_id,
+        })
+    return servers
+
+
+def _is_private_172(address: str) -> bool:
+    """True if address is in 172.16.0.0/12 (e.g. Docker)."""
+    parts = address.split(".")
+    if len(parts) != 4:
+        return False
+    try:
+        a, b, *_ = (int(x) for x in parts)
+        return a == 172 and 16 <= b <= 31
+    except (ValueError, TypeError):
+        return False
+
+
+def _parse_plex_servers_xml(text: str) -> list:
+    """Parse plex.tv servers XML; fix unescaped & and extract Server elements. Returns list of dicts."""
+    text = re.sub(r"&(?!(?:amp|lt|gt|quot|apos|#\d+|#x[0-9a-fA-F]+);)", "&amp;", text)
+
+    def _extract_servers_regex() -> list:
+        servers = []
+        for m in re.finditer(r"<Server\s+([^>]+)/?>", text, re.DOTALL):
+            attrs_str = m.group(1)
+            attrs = {}
+            for a in re.finditer(r'(\w+)="([^"]*)"', attrs_str):
+                attrs[a.group(1)] = a.group(2).replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+            name = attrs.get("name", "Plex")
+            port = attrs.get("port", "32400")
+            if port == "0":
+                port = "32400"
+            scheme = attrs.get("scheme", "http")
+            address = (attrs.get("address") or "").strip()
+            local_addresses = (attrs.get("localAddresses") or "").strip()
+            if local_addresses:
+                first_local = local_addresses.split(",")[0].strip()
+                host = first_local or address or "localhost"
+            else:
+                host = address or "localhost"
+            uri = f"{scheme}://{host}:{port}" if host else ""
+            servers.append({
+                "name": name,
+                "uri": uri,
+                "address": address,
+                "port": port,
+                "scheme": scheme,
+                "localAddresses": local_addresses,
+                "machineIdentifier": attrs.get("machineIdentifier", ""),
+            })
+        return servers
+
+    try:
+        root = ET.fromstring(text)
+    except Exception:
+        return _extract_servers_regex()
+    servers = []
+    for server in root.iter("Server"):
+        attrs = server.attrib
+        name = attrs.get("name", "Plex")
+        port = attrs.get("port", "32400")
+        if port == "0":
+            port = "32400"
+        scheme = attrs.get("scheme", "http")
+        address = attrs.get("address", "").strip()
+        local_addresses = (attrs.get("localAddresses") or "").strip()
+        if local_addresses:
+            first_local = local_addresses.split(",")[0].strip()
+            host = first_local or address or "localhost"
+        else:
+            host = address or "localhost"
+        uri = f"{scheme}://{host}:{port}" if host else ""
+        servers.append({
+            "name": name,
+            "uri": uri,
+            "address": address,
+            "port": port,
+            "scheme": scheme,
+            "localAddresses": local_addresses,
+            "machineIdentifier": attrs.get("machineIdentifier", ""),
+        })
+    return servers
+
+
+@app.post("/api/plex/servers")
+def api_plex_servers():
+    """
+    List Plex servers for the current account (Tautulli-style).
+    Body: { "PLEX_TOKEN": "..." }. Returns list of { name, uri, localAddresses, port, ... }.
+    Tries plex.tv API v2 (JSON) first, then falls back to servers.xml (XML).
+    """
+    data = request.get_json(silent=True) or {}
+    token = (data.get("PLEX_TOKEN") or data.get("token") or "").strip()
+    if not token:
+        return jsonify({"success": False, "servers": [], "message": "PLEX_TOKEN is required"}), 400
+    headers = {"X-Plex-Token": token, "Accept": "application/json"}
+
+    def _build_servers_from_servers_json(data: dict) -> list:
+        """Build server list from Plex GET /servers JSON (MediaContainer.Server[]).
+        Docs: https://plexapi.dev/api-reference/server/get-server-list
+        """
+        servers = []
+        if not isinstance(data, dict):
+            return servers
+        media = data.get("MediaContainer", data.get("mediaContainer"))
+        if not isinstance(media, dict):
+            return servers
+        items = media.get("Server") or media.get("server") or []
+        if not isinstance(items, list):
+            items = [items] if items else []
+        for s in items:
+            if not isinstance(s, dict):
+                continue
+            def _g(k, default=None):
+                return s.get(k) or s.get(k[0].upper() + k[1:] if k else k) or default
+            name = _g("name", "Plex")
+            port = str(_g("port") or "32400")
+            if port == "0":
+                port = "32400"
+            scheme = (str(_g("scheme") or "http")).strip().lower()
+            if scheme not in ("http", "https"):
+                scheme = "http"
+            host = (str(_g("host") or _g("address") or "")).strip()
+            address = (str(_g("address") or host or "")).strip()
+            local_addresses = (str(_g("localAddresses") or address or "")).strip()
+            if local_addresses:
+                host = local_addresses.split(",")[0].strip() or host
+            if not host:
+                continue
+            uri = f"{scheme}://{host}:{port}"
+            servers.append({
+                "name": name,
+                "uri": uri,
+                "address": address,
+                "port": port,
+                "scheme": scheme,
+                "localAddresses": local_addresses,
+                "machineIdentifier": str(_g("machineIdentifier") or ""),
+            })
+        return servers
+
+    try:
+        seen_machine_ids: set[str] = set()
+        servers: list[dict] = []
+
+        # 1) servers.xml first — often returns all servers (including multiple instances on same host, e.g. :32400 + :32401)
+        resp_xml = requests.get(
+            f"https://plex.tv/servers.xml?includeLite=1&X-Plex-Token={requests.utils.quote(token, safe='')}",
+            headers={"X-Plex-Token": token},
+            timeout=15,
+        )
+        if resp_xml.status_code == 401:
+            return jsonify({"success": False, "servers": [], "message": "Invalid Plex token"}), 401
+        if resp_xml.ok:
+            try:
+                from_xml = _parse_plex_servers_xml(resp_xml.text)
+                for s in from_xml:
+                    mid = (s.get("machineIdentifier") or "").strip()
+                    if not mid or mid in seen_machine_ids:
+                        continue
+                    servers.append(s)
+                    seen_machine_ids.add(mid)
+            except Exception:
+                pass
+
+        # 2) GET https://plex.tv/api/resources?includeHttps=1 — merge in any device not yet listed (by machineIdentifier)
+        resp_resources = requests.get(
+            "https://plex.tv/api/resources?includeHttps=1",
+            headers={"X-Plex-Token": token},
+            timeout=15,
+        )
+        if resp_resources.status_code == 401:
+            return jsonify({"success": False, "servers": [], "message": "Invalid Plex token"}), 401
+        if resp_resources.ok:
+            from_resources = _parse_plex_resources_xml(resp_resources.text)
+            for s in from_resources:
+                mid = (s.get("machineIdentifier") or "").strip()
+                if not mid or mid in seen_machine_ids:
+                    continue
+                # Avoid duplicate by (name, port) in case machineIdentifier differs
+                if any(x.get("name") == s.get("name") and x.get("port") == s.get("port") for x in servers):
+                    continue
+                servers.append(s)
+                seen_machine_ids.add(mid)
+
+        # 3) GET https://plex.tv/servers (JSON or XML) — merge any remaining
+        resp = requests.get("https://plex.tv/servers", headers=headers, timeout=15)
+        if resp.status_code != 401 and resp.ok:
+            ct = (resp.headers.get("Content-Type") or "").lower()
+            if "json" in ct:
+                try:
+                    data = resp.json()
+                    for s in _build_servers_from_servers_json(data):
+                        mid = (s.get("machineIdentifier") or "").strip()
+                        if mid and mid not in seen_machine_ids:
+                            servers.append(s)
+                            seen_machine_ids.add(mid)
+                except (ValueError, TypeError, KeyError):
+                    pass
+            for s in _parse_plex_servers_xml(resp.text):
+                mid = (s.get("machineIdentifier") or "").strip()
+                if mid and mid not in seen_machine_ids:
+                    servers.append(s)
+                    seen_machine_ids.add(mid)
+
+        if servers:
+            return jsonify({"success": True, "servers": servers})
+        # Empty list: token accepted but no servers linked to account
+        return jsonify({
+            "success": True,
+            "servers": [],
+            "message": "No Plex servers found for this account. Link your server at plex.tv or check the token.",
+        })
+
+    except requests.exceptions.ConnectionError:
+        return jsonify({"success": False, "servers": [], "message": "Cannot reach plex.tv. Check network and DNS from the machine running PMDA (e.g. Docker has outbound internet)."}), 502
+    except requests.exceptions.Timeout:
+        return jsonify({"success": False, "servers": [], "message": "Request to plex.tv timed out. Check network."}), 502
+    except requests.RequestException as e:
+        return jsonify({"success": False, "servers": [], "message": str(e)}), 502
+
+
+# ─── Plex database path hints (official locations by platform / image) ─────────
+# Full paths to the folder containing com.plexapp.plugins.library.db (for wizard help)
+# Source: https://support.plex.tv/articles/202915258-where-is-the-plex-media-server-data-directory-located/
+PLEX_DATABASE_PATH_HINTS: list[dict] = [
+    {"platform": "Docker (generic)", "path": "<config_mount>/Library/Application Support/Plex Media Server/Plug-in Support/Databases", "note": "Mount the host path that maps to /config in the Plex container."},
+    {"platform": "plexinc/pms-docker", "path": "<config_volume>/Library/Application Support/Plex Media Server/Plug-in Support/Databases", "note": "Same as Docker generic; -v host_path:/config."},
+    {"platform": "linuxserver/plex", "path": "<config_volume>/Library/Application Support/Plex Media Server/Plug-in Support/Databases", "note": "Same as Docker generic."},
+    {"platform": "Debian / Ubuntu / Fedora / CentOS", "path": "/var/lib/plexmediaserver/Library/Application Support/Plex Media Server/Plug-in Support/Databases", "note": "Native Linux package."},
+    {"platform": "FreeBSD", "path": "/usr/local/plexdata/Plex Media Server/Plug-in Support/Databases", "note": "Native install."},
+    {"platform": "macOS", "path": "~/Library/Application Support/Plex Media Server/Plug-in Support/Databases", "note": "Expand ~ to your home."},
+    {"platform": "Windows", "path": "%LOCALAPPDATA%\\Plex Media Server\\Plug-in Support\\Databases", "note": "Per-user (account running Plex)."},
+    {"platform": "Synology DSM 7", "path": "/volume1/PlexMediaServer/AppData/Plex Media Server/Plug-in Support/Databases", "note": "Volume name may vary."},
+    {"platform": "Synology DSM 6", "path": "/volume1/Plex/Library/Application Support/Plex Media Server/Plug-in Support/Databases", "note": "Volume name may vary."},
+    {"platform": "QNAP", "path": "<Install_path>/Library/Plex Media Server/Plug-in Support/Databases", "note": "Install_path from: getcfg -f /etc/config/qpkg.conf PlexMediaServer Install_path."},
+    {"platform": "ASUSTOR", "path": "/volume1/Plex/Library/Plug-in Support/Databases", "note": "Under Plex data directory."},
+    {"platform": "FreeNAS 11.3+", "path": "${JAIL_ROOT}/Plex Media Server/Plug-in Support/Databases", "note": "JAIL_ROOT is the jail root."},
+    {"platform": "Snap", "path": "/var/snap/plexmediaserver/common/Library/Application Support/Plex Media Server/Plug-in Support/Databases", "note": "Snap package."},
+    {"platform": "ReadyNAS", "path": "/apps/plexmediaserver/MediaLibrary/Plex Media Server/Plug-in Support/Databases", "note": ""},
+    {"platform": "TerraMaster", "path": "/Volume1/Plex/Library/Application Support/Plex Media Server/Plug-in Support/Databases", "note": ""},
+]
+
+
+def _gdm_discover_servers(timeout_sec: float = 2.0) -> list[dict]:
+    """
+    Discover Plex Media Servers on the local network via GDM (Good Day Mate) multicast.
+    Sends M-SEARCH to 239.0.0.250:32414 and parses HTTP/1.0 200 OK responses.
+    Returns list of dicts with name, uri (http://ip:port), address, port.
+    """
+    gdm_ip, gdm_port = "239.0.0.250", 32414
+    msg = b"M-SEARCH * HTTP/1.0"
+    seen: set[str] = set()
+    result: list[dict] = []
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, struct.pack("B", 2))
+    sock.settimeout(0.5)
+    try:
+        sock.sendto(msg, (gdm_ip, gdm_port))
+        deadline = time.time() + timeout_sec
+        while time.time() < deadline:
+            try:
+                bdata, from_addr = sock.recvfrom(1024)
+            except socket.timeout:
+                continue
+            data = bdata.decode("utf-8", errors="replace")
+            lines = data.splitlines()
+            if not lines or "200 OK" not in lines[0]:
+                continue
+            ddata: dict[str, str] = {}
+            for line in lines[1:]:
+                if ":" in line:
+                    k, _, v = line.partition(":")
+                    ddata[k.strip()] = v.strip()
+            if ddata.get("Content-Type") != "plex/media-server":
+                continue
+            rid = ddata.get("Resource-Identifier") or ""
+            if rid in seen:
+                continue
+            seen.add(rid)
+            name = ddata.get("Name", "Plex Media Server")
+            port = ddata.get("Port", "32400")
+            from_ip = from_addr[0]
+            uri = f"http://{from_ip}:{port}"
+            result.append({
+                "name": name,
+                "uri": uri,
+                "address": from_ip,
+                "port": port,
+                "scheme": "http",
+                "localAddresses": from_ip,
+                "machineIdentifier": rid,
+            })
+    except Exception as e:
+        logging.warning("GDM discover failed: %s", e)
+    finally:
+        sock.close()
+    return result
+
+
+def _probe_plex_at(host: str, port: int) -> dict | None:
+    """
+    Probe a single host:port to see if Plex is listening (GET /identity).
+    Returns a server dict like GDM format, or None if not Plex / unreachable.
+    """
+    url = f"http://{host}:{port}/identity"
+    try:
+        resp = requests.get(url, timeout=2)
+        if resp.status_code != 200:
+            return None
+        root = ET.fromstring(resp.text)
+        if root.tag != "MediaContainer":
+            return None
+        rid = root.attrib.get("machineIdentifier", "")
+        version = root.attrib.get("version", "")
+        name = f"Plex Media Server ({host}:{port})"
+        uri = f"http://{host}:{port}"
+        return {
+            "name": name,
+            "uri": uri,
+            "address": host,
+            "port": str(port),
+            "scheme": "http",
+            "localAddresses": host,
+            "machineIdentifier": rid,
+        }
+    except Exception:
+        return None
+
+
+def _discover_via_host_fallback(host_str: str, extra_ports: list[int] | None = None) -> list[dict]:
+    """
+    When GDM fails (e.g. in Docker, multicast is not forwarded), try the host
+    the user used to reach PMDA (from Host header) and the Docker gateway (172.17.0.1).
+    Tries common Plex ports 32400, 32401, 32402 and any extra_ports.
+    """
+    ports = [32400, 32401, 32402]
+    if extra_ports:
+        ports = list(dict.fromkeys(ports + list(extra_ports)))
+    candidates: list[str] = []
+    host = (host_str or "").strip()
+    if host and not host.startswith("["):
+        if ":" in host:
+            host = host.rsplit(":", 1)[0]
+        if host and host not in ("localhost", "127.0.0.1"):
+            candidates.append(host)
+    # From inside Docker, the host is often reachable via the bridge gateway
+    candidates.append("172.17.0.1")
+    result: list[dict] = []
+    seen_uris: set[str] = set()
+    for h in candidates:
+        for port in ports:
+            entry = _probe_plex_at(h, port)
+            if entry and entry["uri"] not in seen_uris:
+                result.append(entry)
+                seen_uris.add(entry["uri"])
+    return result
+
+
+def _parse_port_from_url(url: str) -> int | None:
+    """Extract port from http(s)://host:port if present."""
+    if not url or not isinstance(url, str):
+        return None
+    url = url.strip()
+    for prefix in ("https://", "http://"):
+        if url.startswith(prefix):
+            url = url[len(prefix) :].split("/")[0]
+            break
+    if ":" in url:
+        try:
+            return int(url.rsplit(":", 1)[1])
+        except ValueError:
+            return None
+    return None
+
+
+def _subnet_ips_24(ip_str: str) -> list[str]:
+    """
+    Given an IPv4 address, return a list of all /24 host IPs (x.y.z.1 .. x.y.z.254).
+    Returns [] if the string is not a valid IPv4.
+    """
+    parts = ip_str.strip().split(".")
+    if len(parts) != 4:
+        return []
+    try:
+        a, b, c, _ = (int(p) for p in parts)
+        if not all(0 <= x <= 255 for x in (a, b, c)):
+            return []
+        return [f"{a}.{b}.{c}.{i}" for i in range(1, 255)]
+    except ValueError:
+        return []
+
+
+def _discover_via_subnet(client_ip: str, ports: list[int] | None = None) -> list[dict]:
+    """
+    Scan the client's /24 subnet for Plex (ports 32400, 32401, 32402 by default).
+    Uses a thread pool and short timeouts to complete in a few seconds.
+    """
+    if not client_ip or client_ip.startswith("127.") or client_ip == "::1":
+        return []
+    ips = _subnet_ips_24(client_ip)
+    if not ips:
+        return []
+    port_list = ports or [32400, 32401, 32402]
+    seen_uris: set[str] = set()
+    result: list[dict] = []
+    max_workers = 48
+
+    def probe(host: str, port: int) -> dict | None:
+        return _probe_plex_at(host, port)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {ex.submit(probe, ip, port): (ip, port) for ip in ips for port in port_list}
+        for future in as_completed(futures, timeout=60):
+            try:
+                entry = future.result()
+                if entry and entry["uri"] not in seen_uris:
+                    result.append(entry)
+                    seen_uris.add(entry["uri"])
+            except Exception:
+                pass
+    return result
+
+
+@app.get("/api/plex/client-ip")
+def api_plex_client_ip():
+    """
+    Return the IP address of the client that is viewing the WebUI.
+    Uses X-Forwarded-For (first hop) when behind a proxy, else request.remote_addr.
+    Allows the frontend to request a discovery scan of that client's subnet (same LAN).
+    """
+    forwarded = request.headers.get("X-Forwarded-For")
+    if forwarded:
+        client_ip = forwarded.split(",")[0].strip()
+    else:
+        client_ip = request.remote_addr or ""
+    return jsonify({"client_ip": client_ip})
+
+
+@app.get("/api/plex/discover")
+@app.post("/api/plex/discover")
+def api_plex_discover():
+    """
+    Discover Plex Media Servers: GDM multicast first, then fallback to probing
+    the host the user used to reach PMDA and Docker gateway 172.17.0.1 (ports 32400–32402).
+    POST body may include:
+      - "PLEX_HOST": "..." to add that URL's port to the probe list;
+      - "client_ip": "x.y.z.w" to scan the client's /24 subnet (same LAN as the machine viewing the WebUI).
+    No token required. Returns same shape as /api/plex/servers: { success, servers: [ { name, uri, ... } ] }.
+    """
+    servers = _gdm_discover_servers()
+    extra_ports: list[int] = []
+    client_ip: str | None = None
+    try:
+        data = request.get_json(silent=True) or {}
+        if data.get("PLEX_HOST"):
+            p = _parse_port_from_url(str(data.get("PLEX_HOST", "")))
+            if p and p not in (32400, 32401, 32402):
+                extra_ports.append(p)
+        client_ip = (data.get("client_ip") or "").strip() or None
+    except Exception:
+        pass
+    try:
+        host_header = request.headers.get("Host") or request.host or ""
+        fallback = _discover_via_host_fallback(host_header, extra_ports=extra_ports or None)
+        seen_uris = {s["uri"] for s in servers}
+        for s in fallback:
+            if s["uri"] not in seen_uris:
+                servers.append(s)
+                seen_uris.add(s["uri"])
+    except Exception as e:
+        logging.debug("Discover host fallback failed: %s", e)
+    if client_ip:
+        try:
+            subnet_servers = _discover_via_subnet(client_ip)
+            seen_uris = {s["uri"] for s in servers}
+            for s in subnet_servers:
+                if s["uri"] not in seen_uris:
+                    servers.append(s)
+                    seen_uris.add(s["uri"])
+        except Exception as e:
+            logging.debug("Discover subnet failed: %s", e)
+    return jsonify({"success": True, "servers": servers})
+
+
+@app.get("/api/plex/database-paths")
+def api_plex_database_paths():
+    """
+    Return common Plex database directory locations (by platform / image)
+    so the wizard can suggest where to mount or point to.
+    """
+    return jsonify({"success": True, "paths": PLEX_DATABASE_PATH_HINTS})
+
+
+@app.post("/api/autodetect/libraries")
+def api_autodetect_libraries():
+    """Return list of Plex libraries (sections) for the wizard. Uses config or optional body { PLEX_HOST, PLEX_TOKEN }."""
+    data = request.get_json(silent=True) or {}
+    host = (data.get("PLEX_HOST") or "").strip() or PLEX_HOST
+    token = (data.get("PLEX_TOKEN") or "").strip() or PLEX_TOKEN
+    if not host or not token:
+        return jsonify({"success": False, "libraries": [], "message": "PLEX_HOST and PLEX_TOKEN required"}), 400
+    url = f"{host.rstrip('/')}/library/sections"
+    try:
+        resp = requests.get(url, headers={"X-Plex-Token": token}, timeout=10)
+        resp.raise_for_status()
+        root = ET.fromstring(resp.text)
+        libraries = []
+        for d in root.iter("Directory"):
+            libraries.append({
+                "id": d.attrib.get("key", ""),
+                "name": d.attrib.get("title", ""),
+                "type": d.attrib.get("type", ""),
+            })
+        return jsonify({"success": True, "libraries": libraries})
+    except Exception as e:
+        logging.warning("Autodetect libraries failed: %s", e)
+        return jsonify({"success": False, "libraries": [], "message": str(e)})
+
+
+@app.post("/api/autodetect/paths")
+def api_autodetect_paths():
+    """Discover PATH_MAP from Plex for given sections. Uses config or optional body { PLEX_HOST, PLEX_TOKEN, SECTION_IDS }."""
+    data = request.get_json(silent=True) or {}
+    host = (data.get("PLEX_HOST") or "").strip() or PLEX_HOST
+    token = (data.get("PLEX_TOKEN") or "").strip() or PLEX_TOKEN
+    section_ids = data.get("SECTION_IDS")
+    if section_ids is None:
+        section_ids = list(SECTION_IDS)
+    elif isinstance(section_ids, str):
+        section_ids = [int(x.strip()) for x in section_ids.split(",") if x.strip()]
+    elif isinstance(section_ids, list):
+        section_ids = [int(x) for x in section_ids]
+    if not host or not token:
+        return jsonify({"success": False, "paths": {}, "message": "PLEX_HOST and PLEX_TOKEN required"}), 400
+    if not section_ids:
+        return jsonify({"success": False, "paths": {}, "message": "No SECTION_IDS provided"}), 400
+    paths = {}
+    try:
+        for sid in section_ids:
+            part = _discover_path_map(host, token, sid)
+            paths.update(part)
+        return jsonify({"success": True, "paths": paths})
+    except Exception as e:
+        logging.warning("Autodetect paths failed: %s", e)
+        return jsonify({"success": False, "paths": {}, "message": str(e)})
+
+
+def _path_map_from_verify_body(raw):
+    """Parse PATH_MAP from verify request: dict, or string with key=value lines or key:value pairs."""
+    if isinstance(raw, dict):
+        return {str(k): str(v) for k, v in raw.items()}
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return {}
+    if s.startswith("{"):
+        try:
+            data = json.loads(s)
+            return {str(k): str(v) for k, v in data.items()}
+        except json.JSONDecodeError:
+            pass
+    out = {}
+    for line in s.replace(",", "\n").splitlines():
+        line = line.strip()
+        if "=" in line:
+            k, _, v = line.partition("=")
+            if k.strip():
+                out[k.strip()] = v.strip()
+        elif ":" in line:
+            k, _, v = line.partition(":")
+            if k.strip():
+                out[k.strip()] = v.strip()
+    return out
+
+
+@app.post("/api/paths/discover")
+def api_paths_discover():
+    """
+    Discover actual container paths for each Plex library root by content matching: sample files
+    from Plex DB and find which subdir of MUSIC_PARENT_PATH contains them. Body: PATH_MAP
+    (required, e.g. from autodetect/paths), PLEX_DB_PATH?, MUSIC_PARENT_PATH?, CROSSCHECK_SAMPLES?.
+    Returns { success, paths: discovered map, results: list of result dicts }.
+    """
+    data = request.get_json(silent=True) or {}
+    path_map_raw = data.get("PATH_MAP")
+    path_map = _path_map_from_verify_body(path_map_raw) if path_map_raw is not None else {}
+    if not path_map:
+        return jsonify({
+            "success": False,
+            "paths": {},
+            "results": [],
+            "message": "PATH_MAP is required and must not be empty",
+        }), 400
+    db_path = (data.get("PLEX_DB_PATH") or "").strip() or merged.get("PLEX_DB_PATH") or ""
+    if not db_path:
+        db_path = "/database"
+    db_file = str(Path(db_path) / "com.plexapp.plugins.library.db")
+    music_root = (data.get("MUSIC_PARENT_PATH") or "").strip() or merged.get("MUSIC_PARENT_PATH") or "/music"
+    samples = max(1, int(data.get("CROSSCHECK_SAMPLES") or CROSSCHECK_SAMPLES or 15))
+    if not Path(db_file).exists():
+        return jsonify({
+            "success": False,
+            "paths": {},
+            "results": [],
+            "message": f"Plex DB not found: {db_file}",
+        }), 400
+    music_path = Path(music_root)
+    if not music_path.exists() or not music_path.is_dir():
+        return jsonify({
+            "success": False,
+            "paths": {},
+            "results": [],
+            "message": f"Music parent path not found or not a directory: {music_root}",
+        }), 400
+    out = _discover_bindings_by_content(path_map, db_file, music_root, samples)
+    if out is None:
+        return jsonify({
+            "success": False,
+            "paths": {},
+            "results": [],
+            "message": "Discover by content failed",
+        }), 500
+    discovered_map, results = out
+    return jsonify({
+        "success": True,
+        "paths": discovered_map,
+        "results": results,
+    })
+
+
+@app.post("/api/paths/discover-one")
+def api_paths_discover_one():
+    """
+    Discover the actual container path for a single Plex root by content matching.
+    Body: { plex_root (required), PLEX_DB_PATH?, MUSIC_PARENT_PATH?, CROSSCHECK_SAMPLES? }.
+    Returns { success, host_root?, result } so the UI can show progress per mapping.
+    """
+    data = request.get_json(silent=True) or {}
+    plex_root = (data.get("plex_root") or "").strip()
+    if not plex_root:
+        return jsonify({"success": False, "host_root": None, "result": None, "message": "plex_root is required"}), 400
+    db_path = (data.get("PLEX_DB_PATH") or "").strip() or merged.get("PLEX_DB_PATH") or ""
+    if not db_path:
+        db_path = "/database"
+    db_file = str(Path(db_path) / "com.plexapp.plugins.library.db")
+    music_root = (data.get("MUSIC_PARENT_PATH") or "").strip() or merged.get("MUSIC_PARENT_PATH") or "/music"
+    samples = max(1, int(data.get("CROSSCHECK_SAMPLES") or CROSSCHECK_SAMPLES or 15))
+    out = _discover_one_binding(plex_root, db_file, music_root, samples)
+    if out is None:
+        return jsonify({
+            "success": False,
+            "host_root": None,
+            "result": None,
+            "message": "Discover failed (DB or music root invalid)",
+        }), 500
+    host_root, result = out
+    return jsonify({
+        "success": True,
+        "host_root": host_root,
+        "result": result,
+    })
+
+
+@app.post("/api/paths/verify")
+def api_paths_verify():
+    """
+    Verify PATH_MAP bindings by sampling tracks from the Plex DB and checking file existence.
+    Body: { PATH_MAP?, PLEX_DB_PATH?, CROSSCHECK_SAMPLES? }. Returns list of { plex_root, host_root, status, samples_checked, message }.
+    Does not modify config.
+    """
+    raw_json = request.get_json(silent=True)
+    data = raw_json if isinstance(raw_json, dict) else {}
+    if raw_json is None:
+        logging.warning("Paths verify: request body is not valid JSON (Content-Type: %s)", request.content_type)
+    logging.info(
+        "Paths verify: request body keys=%s, PATH_MAP type=%s",
+        list(data.keys()), type(data.get("PATH_MAP")).__name__ if "PATH_MAP" in data else "missing",
+    )
+    path_map_raw = data.get("PATH_MAP")
+    path_map = _path_map_from_verify_body(path_map_raw)
+    if path_map is None:
+        path_map = dict(getattr(sys.modules[__name__], "PATH_MAP", {}))
+        logging.info("Paths verify: no PATH_MAP in body, using server config → %d entries", len(path_map))
+    elif not path_map and path_map_raw is not None:
+        path_map = dict(getattr(sys.modules[__name__], "PATH_MAP", {}))
+        logging.info(
+            "Paths verify: parsed PATH_MAP from body was empty (raw type=%s), using server config → %d entries",
+            type(path_map_raw).__name__, len(path_map),
+        )
+    if not path_map:
+        logging.warning(
+            "Paths verify: returning 400 – PATH_MAP is empty (body keys=%s)",
+            list(data.keys()),
+        )
+        return jsonify({"success": False, "results": [], "message": "PATH_MAP is empty"}), 400
+    db_path = (data.get("PLEX_DB_PATH") or "").strip() or merged.get("PLEX_DB_PATH") or ""
+    if not db_path:
+        db_path = "/database"
+    db_file = str(Path(db_path) / "com.plexapp.plugins.library.db")
+    samples = max(0, int(data.get("CROSSCHECK_SAMPLES") or CROSSCHECK_SAMPLES))
+    if not Path(db_file).exists():
+        logging.warning(
+            "Paths verify: returning 400 – Plex DB not found at %s (PLEX_DB_PATH=%s)",
+            db_file, db_path,
+        )
+        return jsonify({"success": False, "results": [], "message": f"Plex DB not found: {db_file}"}), 400
+    results = _run_path_verification(path_map, db_file, samples or CROSSCHECK_SAMPLES)
+    if results is None:
+        return jsonify({"success": False, "results": [], "message": "Path verification failed"}), 500
+    has_failures = any(r.get("status") == "fail" for r in results)
+    hint = None
+    if has_failures:
+        hint = (
+            "Files were not found inside the container. Start Docker with a volume mount from your "
+            "host music folder to the path shown above (e.g. -v /path/on/host/music:/music). "
+            "Use the same path as 'Path to parent folder (music root)' in this step."
+        )
+    out = {"success": True, "results": results}
+    if hint:
+        out["hint"] = hint
+    return jsonify(out)
+
+
+@app.post("/api/openai/check")
+def api_openai_check():
+    """Test OpenAI API key; optional body { OPENAI_API_KEY } to test before saving."""
+    data = request.get_json(silent=True) or {}
+    key = (data.get("OPENAI_API_KEY") or "").strip() or OPENAI_API_KEY
+    if not key:
+        return jsonify({"success": False, "message": "OPENAI_API_KEY is required"}), 400
+    
+    # Validate key format (should start with sk-)
+    if not key.startswith("sk-"):
+        return jsonify({"success": False, "message": "Invalid API key format. OpenAI keys start with 'sk-'"}), 400
+    
+    try:
+        client = OpenAI(api_key=key)
+        # Try with max_completion_tokens first (newer API)
+        try:
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": "OK"}],
+                max_completion_tokens=5,
+            )
+            # Verify we got a response
+            if response.choices and len(response.choices) > 0:
+                return jsonify({"success": True, "message": "OpenAI connection successful"})
+        except Exception as e1:
+            error_msg = str(e1)
+            # If max_completion_tokens is not supported, try max_tokens
+            if "max_completion_tokens" in error_msg or "unsupported_parameter" in error_msg.lower():
+                try:
+                    response = client.chat.completions.create(
+                        model="gpt-4o-mini",
+                        messages=[{"role": "user", "content": "OK"}],
+                        max_tokens=5,
+                    )
+                    if response.choices and len(response.choices) > 0:
+                        return jsonify({"success": True, "message": "OpenAI connection successful"})
+                except Exception as e2:
+                    # If both fail, check for authentication errors
+                    error_msg2 = str(e2)
+                    if "invalid_api_key" in error_msg2.lower() or "authentication" in error_msg2.lower() or "401" in error_msg2:
+                        return jsonify({"success": False, "message": "Invalid API key. Please check your key and try again."}), 401
+                    elif "insufficient_quota" in error_msg2.lower() or "quota" in error_msg2.lower():
+                        return jsonify({"success": False, "message": "API key has insufficient quota. Please check your OpenAI account billing."}), 402
+                    else:
+                        logging.warning("OpenAI check failed with max_tokens: %s", error_msg2)
+                        return jsonify({"success": False, "message": f"OpenAI API error: {error_msg2}"}), 500
+            else:
+                # Other error (auth, quota, etc.)
+                if "invalid_api_key" in error_msg.lower() or "authentication" in error_msg.lower() or "401" in error_msg:
+                    return jsonify({"success": False, "message": "Invalid API key. Please check your key and try again."}), 401
+                elif "insufficient_quota" in error_msg.lower() or "quota" in error_msg.lower():
+                    return jsonify({"success": False, "message": "API key has insufficient quota. Please check your OpenAI account billing."}), 402
+                else:
+                    logging.warning("OpenAI check failed: %s", error_msg)
+                    return jsonify({"success": False, "message": f"OpenAI API error: {error_msg}"}), 500
+    except Exception as e:
+        error_msg = str(e)
+        logging.error("OpenAI check exception: %s", error_msg)
+        # Catch network errors, etc.
+        if "connection" in error_msg.lower() or "timeout" in error_msg.lower():
+            return jsonify({"success": False, "message": "Connection to OpenAI API failed. Please check your internet connection."}), 503
+        return jsonify({"success": False, "message": f"Error: {error_msg}"}), 500
+
+
+@app.get("/api/musicbrainz/test")
+@app.post("/api/musicbrainz/test")
+def api_musicbrainz_test():
+    """Test MusicBrainz connectivity and rate limiting.
+    Returns success status and any error messages."""
+    if not USE_MUSICBRAINZ:
+        return jsonify({"success": False, "message": "MusicBrainz is disabled. Enable it first."}), 400
+    
+    try:
+        # Test with a well-known release-group ID
+        test_mbid = "9162580e-5df4-32de-80cc-f45a8d8a9b1d"  # The Beatles - Abbey Road
+        result = musicbrainzngs.get_release_group_by_id(test_mbid, includes=[])
+        if result and result.get("release-group"):
+            return jsonify({
+                "success": True,
+                "message": "MusicBrainz connection successful",
+                "tested_mbid": test_mbid
+            })
+        else:
+            return jsonify({"success": False, "message": "MusicBrainz returned empty response"}), 500
+    except musicbrainzngs.WebServiceError as e:
+        error_msg = str(e)
+        logging.warning("MusicBrainz WebServiceError: %s", error_msg)
+        # Check for specific error codes
+        if hasattr(e, 'code'):
+            error_code = str(e.code)
+            if error_code == "503" or "rate" in error_msg.lower():
+                return jsonify({
+                    "success": False,
+                    "message": "MusicBrainz rate limited. Please wait a moment and try again. Rate limit: 1 request per second."
+                }), 503
+            elif error_code == "404" or "404" in error_msg:
+                return jsonify({
+                    "success": False,
+                    "message": f"MusicBrainz returned 404 (Not Found). This may be a temporary issue. Error: {error_msg}"
+                }), 404
+            elif error_code == "503":
+                return jsonify({
+                    "success": False,
+                    "message": "MusicBrainz service temporarily unavailable (503). Please try again later."
+                }), 503
+        # Fallback to message-based detection
+        if "503" in error_msg or "rate" in error_msg.lower() or "service unavailable" in error_msg.lower():
+            return jsonify({
+                "success": False,
+                "message": "MusicBrainz rate limited or service unavailable. Please wait a moment and try again. Rate limit: 1 request per second."
+            }), 503
+        elif "404" in error_msg or "not found" in error_msg.lower():
+            return jsonify({
+                "success": False,
+                "message": f"MusicBrainz API returned 404. This may be a temporary issue or network problem. Error details: {error_msg}"
+            }), 404
+        else:
+            logging.warning("MusicBrainz test failed: %s", error_msg)
+            return jsonify({
+                "success": False,
+                "message": f"MusicBrainz API error: {error_msg}"
+            }), 500
+    except Exception as e:
+        error_msg = str(e)
+        logging.error("MusicBrainz test exception: %s", error_msg)
+        if "connection" in error_msg.lower() or "timeout" in error_msg.lower():
+            return jsonify({
+                "success": False,
+                "message": "Connection to MusicBrainz failed. Please check your internet connection."
+            }), 503
+        return jsonify({
+            "success": False,
+            "message": f"Error: {error_msg}"
+        }), 500
+
+
+@app.post("/api/musicbrainz/test-oauth2")
+def api_musicbrainz_test_oauth2():
+    """Test MusicBrainz OAuth2 credentials (Client ID/Secret).
+    Makes a request to the token endpoint with an invalid code to validate credentials.
+    Returns success status and any error messages."""
+    data = request.get_json(silent=True) or {}
+    client_id = (data.get("MUSICBRAINZ_CLIENT_ID") or "").strip()
+    client_secret = (data.get("MUSICBRAINZ_CLIENT_SECRET") or "").strip()
+    
+    if not client_id or not client_secret:
+        return jsonify({
+            "success": False,
+            "message": "Both Client ID and Client Secret are required"
+        }), 400
+    
+    try:
+        # Test credentials by attempting token exchange with invalid code
+        # If credentials are valid, we'll get "invalid_grant" (expected)
+        # If credentials are invalid, we'll get "invalid_client"
+        token_url = "https://musicbrainz.org/oauth2/token"
+        payload = {
+            "grant_type": "authorization_code",
+            "code": "invalid_test_code",
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "redirect_uri": "urn:ietf:wg:oauth:2.0:oob"
+        }
+        
+        response = requests.post(token_url, data=payload, timeout=10)
+        
+        if response.status_code == 400:
+            # Parse error response
+            try:
+                error_data = response.json()
+                error_type = error_data.get("error", "")
+                
+                if error_type == "invalid_client":
+                    return jsonify({
+                        "success": False,
+                        "message": "Invalid Client ID or Client Secret. Please check your credentials."
+                    }), 401
+                elif error_type == "invalid_grant":
+                    # This is expected - credentials are valid, but code is invalid
+                    return jsonify({
+                        "success": True,
+                        "message": "OAuth2 credentials are valid and ready to use"
+                    })
+                else:
+                    return jsonify({
+                        "success": False,
+                        "message": f"OAuth2 validation error: {error_type}"
+                    }), 400
+            except Exception:
+                return jsonify({
+                    "success": False,
+                    "message": "Failed to parse OAuth2 response"
+                }), 500
+        else:
+            return jsonify({
+                "success": False,
+                "message": f"Unexpected response from MusicBrainz: {response.status_code}"
+            }), response.status_code
+            
+    except requests.exceptions.Timeout:
+        return jsonify({
+            "success": False,
+            "message": "Connection to MusicBrainz timed out. Please check your internet connection."
+        }), 503
+    except requests.exceptions.ConnectionError:
+        return jsonify({
+            "success": False,
+            "message": "Failed to connect to MusicBrainz. Please check your internet connection."
+        }), 503
+    except Exception as e:
+        error_msg = str(e)
+        logging.error("MusicBrainz OAuth2 test exception: %s", error_msg)
+        return jsonify({
+            "success": False,
+            "message": f"Error testing OAuth2 credentials: {error_msg}"
+        }), 500
+
+
+@app.get("/api/openai/models")
+@app.post("/api/openai/models")
+def api_openai_models():
+    """Return list of OpenAI model IDs fetched directly from OpenAI API.
+    Requires OPENAI_API_KEY in POST body or in config.
+    Returns only chat completion models (gpt-*) available for the provided API key."""
+    # Try to get key from POST body first (for testing before saving), then from config
+    data = request.get_json(silent=True) or {}
+    key = (data.get("OPENAI_API_KEY") or "").strip() or OPENAI_API_KEY
+    
+    if not key:
+        return jsonify({"error": "OPENAI_API_KEY is required"}), 400
+    
+    # Validate key format
+    if not key.startswith("sk-"):
+        return jsonify({"error": "Invalid API key format. OpenAI keys start with 'sk-'"}), 400
+    
+    try:
+        client = OpenAI(api_key=key)
+        # Fetch all models from OpenAI API
+        models_response = client.models.list()
+        
+        # Filter for chat completion models only
+        # OpenAI chat models typically start with "gpt-" and are in the "chat" category
+        available_models = []
+        for model in models_response.data:
+            model_id = model.id
+            # Only include gpt-* models (chat completion models)
+            # Exclude instruct models, vision-only models, and other non-chat models
+            if (model_id.startswith("gpt-") and 
+                "instruct" not in model_id.lower() and
+                "vision" not in model_id.lower() and
+                "embedding" not in model_id.lower()):
+                available_models.append(model_id)
+        
+        if not available_models:
+            logging.warning("OpenAI API returned no chat completion models")
+            return jsonify({"error": "No chat completion models available for this API key"}), 404
+        
+        # Sort models: newer/better models first
+        def model_sort_key(name: str) -> tuple:
+            # Priority order: gpt-5 > gpt-4.1 > gpt-4o > gpt-4 > gpt-3.5
+            # Within each tier, sort by name (nano < mini < base)
+            if name.startswith("gpt-5"):
+                tier = 0
+            elif name.startswith("gpt-4.1"):
+                tier = 1
+            elif name.startswith("gpt-4o"):
+                tier = 2
+            elif name.startswith("gpt-4"):
+                tier = 3
+            elif name.startswith("gpt-3.5"):
+                tier = 4
+            else:
+                tier = 5
+            return (tier, name)
+        
+        available_models.sort(key=model_sort_key)
+        logging.info("Fetched %d chat completion models from OpenAI API", len(available_models))
+        return jsonify(available_models)
+        
+    except Exception as e:
+        error_msg = str(e)
+        logging.error("Failed to fetch models from OpenAI API: %s", error_msg)
+        
+        # Handle specific error types
+        if "invalid_api_key" in error_msg.lower() or "authentication" in error_msg.lower() or "401" in error_msg or "unauthorized" in error_msg.lower():
+            return jsonify({"error": "Invalid API key. Please check your key and try again."}), 401
+        elif "insufficient_quota" in error_msg.lower() or "quota" in error_msg.lower():
+            return jsonify({"error": "API key has insufficient quota. Please check your OpenAI account billing."}), 402
+        elif "connection" in error_msg.lower() or "timeout" in error_msg.lower() or "network" in error_msg.lower():
+            return jsonify({"error": "Connection to OpenAI API failed. Please check your internet connection."}), 503
+        else:
+            return jsonify({"error": f"Failed to fetch models: {error_msg}"}), 500
+
+
+@app.post("/api/anthropic/models")
+def api_anthropic_models():
+    """Return list of Anthropic model IDs available for the provided API key."""
+    data = request.get_json(silent=True) or {}
+    key = (data.get("ANTHROPIC_API_KEY") or "").strip() or ANTHROPIC_API_KEY
+    
+    if not key:
+        return jsonify({"error": "ANTHROPIC_API_KEY is required"}), 400
+    
+    if not anthropic:
+        return jsonify({"error": "Anthropic SDK not installed. Please install anthropic package."}), 500
+    
+    try:
+        client = anthropic.Anthropic(api_key=key)
+        # Anthropic has a fixed list of models, fetch available ones
+        # Test with a simple message to validate the key
+        try:
+            client.messages.create(
+                model="claude-3-5-sonnet-20241022",
+                max_tokens=1,
+                messages=[{"role": "user", "content": "test"}]
+            )
+        except anthropic.APIError as e:
+            if e.status_code == 401:
+                return jsonify({"error": "Invalid API key. Please check your key and try again."}), 401
+            elif e.status_code == 402:
+                return jsonify({"error": "API key has insufficient quota. Please check your Anthropic account billing."}), 402
+            # If it's not auth/quota, continue to return available models
+        
+        # Anthropic models list (as of 2024)
+        available_models = [
+            "claude-3-5-sonnet-20241022",
+            "claude-3-5-sonnet-20240620",
+            "claude-3-opus-20240229",
+            "claude-3-sonnet-20240229",
+            "claude-3-haiku-20240307",
+        ]
+        
+        logging.info("Fetched %d Anthropic models", len(available_models))
+        return jsonify(available_models)
+        
+    except Exception as e:
+        error_msg = str(e)
+        logging.error("Failed to fetch Anthropic models: %s", error_msg)
+        
+        if "invalid_api_key" in error_msg.lower() or "authentication" in error_msg.lower() or "401" in error_msg or "unauthorized" in error_msg.lower():
+            return jsonify({"error": "Invalid API key. Please check your key and try again."}), 401
+        elif "connection" in error_msg.lower() or "timeout" in error_msg.lower() or "network" in error_msg.lower():
+            return jsonify({"error": "Connection to Anthropic API failed. Please check your internet connection."}), 503
+        else:
+            return jsonify({"error": f"Failed to fetch models: {error_msg}"}), 500
+
+
+@app.post("/api/google/models")
+def api_google_models():
+    """Return list of Google Gemini model IDs available for the provided API key."""
+    data = request.get_json(silent=True) or {}
+    key = (data.get("GOOGLE_API_KEY") or "").strip() or GOOGLE_API_KEY
+    
+    if not key:
+        return jsonify({"error": "GOOGLE_API_KEY is required"}), 400
+    
+    if not genai:
+        return jsonify({"error": "Google Generative AI SDK not installed. Please install google-generativeai package."}), 500
+    
+    try:
+        genai.configure(api_key=key)
+        
+        # Test the key by listing models
+        try:
+            models_list = genai.list_models()
+        except Exception as e:
+            error_msg = str(e)
+            if "invalid_api_key" in error_msg.lower() or "authentication" in error_msg.lower() or "401" in error_msg or "unauthorized" in error_msg.lower():
+                return jsonify({"error": "Invalid API key. Please check your key and try again."}), 401
+            raise
+        
+        # Filter for chat completion models (gemini-*)
+        available_models = []
+        for model in models_list:
+            model_name = model.name
+            # Only include gemini models that support generateContent
+            if "gemini" in model_name.lower() and "generateContent" in str(model.supported_generation_methods):
+                # Extract model ID from full name (e.g., "models/gemini-pro" -> "gemini-pro")
+                model_id = model_name.split("/")[-1] if "/" in model_name else model_name
+                if model_id not in available_models:
+                    available_models.append(model_id)
+        
+        if not available_models:
+            logging.warning("Google API returned no chat completion models")
+            return jsonify({"error": "No chat completion models available for this API key"}), 404
+        
+        # Sort models: newer/better models first
+        def model_sort_key(name: str) -> tuple:
+            if "gemini-2.0" in name:
+                tier = 0
+            elif "gemini-1.5-pro" in name:
+                tier = 1
+            elif "gemini-1.5-flash" in name:
+                tier = 2
+            elif "gemini-pro" in name:
+                tier = 3
+            else:
+                tier = 4
+            return (tier, name)
+        
+        available_models.sort(key=model_sort_key)
+        logging.info("Fetched %d Google Gemini models", len(available_models))
+        return jsonify(available_models)
+        
+    except Exception as e:
+        error_msg = str(e)
+        logging.error("Failed to fetch Google models: %s", error_msg)
+        
+        if "invalid_api_key" in error_msg.lower() or "authentication" in error_msg.lower() or "401" in error_msg or "unauthorized" in error_msg.lower():
+            return jsonify({"error": "Invalid API key. Please check your key and try again."}), 401
+        elif "connection" in error_msg.lower() or "timeout" in error_msg.lower() or "network" in error_msg.lower():
+            return jsonify({"error": "Connection to Google API failed. Please check your internet connection."}), 503
+        else:
+            return jsonify({"error": f"Failed to fetch models: {error_msg}"}), 500
+
+
+@app.post("/api/ollama/models")
+def api_ollama_models():
+    """Return list of Ollama model IDs available at the provided URL."""
+    data = request.get_json(silent=True) or {}
+    url = (data.get("OLLAMA_URL") or "").strip() or OLLAMA_URL
+    
+    if not url:
+        return jsonify({"error": "OLLAMA_URL is required"}), 400
+    
+    # Normalize URL (remove trailing slash)
+    url = url.rstrip("/")
+    
+    try:
+        # Test connection and fetch models
+        models_endpoint = f"{url}/api/tags"
+        response = requests.get(models_endpoint, timeout=10)
+        
+        if response.status_code == 404:
+            return jsonify({"error": "Ollama API not found at this URL. Make sure Ollama is running and the URL is correct."}), 404
+        elif response.status_code != 200:
+            return jsonify({"error": f"Failed to connect to Ollama: HTTP {response.status_code}"}), response.status_code
+        
+        models_data = response.json()
+        available_models = []
+        
+        if "models" in models_data:
+            for model in models_data["models"]:
+                model_name = model.get("name", "")
+                if model_name:
+                    available_models.append(model_name)
+        
+        if not available_models:
+            logging.warning("Ollama returned no models")
+            return jsonify({"error": "No models available at this Ollama instance. Please pull some models first."}), 404
+        
+        # Sort models alphabetically
+        available_models.sort()
+        logging.info("Fetched %d Ollama models from %s", len(available_models), url)
+        return jsonify(available_models)
+        
+    except requests.exceptions.Timeout:
+        return jsonify({"error": "Connection to Ollama timed out. Make sure Ollama is running and accessible."}), 503
+    except requests.exceptions.ConnectionError:
+        return jsonify({"error": "Failed to connect to Ollama. Make sure Ollama is running and the URL is correct."}), 503
+    except Exception as e:
+        error_msg = str(e)
+        logging.error("Failed to fetch Ollama models: %s", error_msg)
+        return jsonify({"error": f"Failed to fetch models: {error_msg}"}), 500
+
+
+@app.post("/api/ai/models")
+def api_ai_models():
+    """Route to the appropriate AI provider's models endpoint based on AI_PROVIDER."""
+    data = request.get_json(silent=True) or {}
+    provider = (data.get("AI_PROVIDER") or "").strip().lower() or AI_PROVIDER.lower()
+    
+    if provider == "openai":
+        return api_openai_models()
+    elif provider == "anthropic":
+        return api_anthropic_models()
+    elif provider == "google":
+        return api_google_models()
+    elif provider == "ollama":
+        return api_ollama_models()
+    else:
+        return jsonify({"error": f"Unknown AI provider: {provider}"}), 400
+
+
+def _has_settings_in_db() -> bool:
+    """Check if settings exist in the database (wizard was completed)."""
+    try:
+        con = sqlite3.connect(str(STATE_DB_FILE))
+        cur = con.cursor()
+        cur.execute("SELECT COUNT(*) FROM settings")
+        count = cur.fetchone()[0]
+        con.close()
+        return count > 0
+    except Exception:
+        return False
+
+
+@app.get("/api/config")
+def api_config_get():
+    """Return current effective configuration for the Web UI (from env + config.json)."""
+    path_map = getattr(sys.modules[__name__], "PATH_MAP", {})
+    section_ids = getattr(sys.modules[__name__], "SECTION_IDS", [])
+    skip_folders = getattr(sys.modules[__name__], "SKIP_FOLDERS", [])
+    # Check if settings exist in DB (wizard was completed)
+    has_settings = _has_settings_in_db()
+    # Wizard should not show if settings exist in DB OR if Plex is configured
+    configured = has_settings or PLEX_CONFIGURED
+    return jsonify({
+        "configured": configured,
+        "PLEX_HOST": PLEX_HOST,
+        "PLEX_TOKEN": PLEX_TOKEN,
+        "PLEX_DB_PATH": merged["PLEX_DB_PATH"],
+        "PLEX_DB_FILE": "com.plexapp.plugins.library.db",
+        "SECTION_IDS": ",".join(str(s) for s in section_ids),
+        "PATH_MAP": path_map,
+        "DUPE_ROOT": str(DUPE_ROOT),
+        "PMDA_CONFIG_DIR": str(CONFIG_DIR),
+        "MUSIC_PARENT_PATH": merged.get("MUSIC_PARENT_PATH", ""),
+        "SCAN_THREADS": SCAN_THREADS if isinstance(SCAN_THREADS, int) else "auto",
+        "SKIP_FOLDERS": ",".join(skip_folders) if isinstance(skip_folders, list) else (skip_folders or ""),
+        "CROSS_LIBRARY_DEDUPE": CROSS_LIBRARY_DEDUPE,
+        "CROSSCHECK_SAMPLES": CROSSCHECK_SAMPLES,
+        "FORMAT_PREFERENCE": FORMAT_PREFERENCE,
+        "AI_PROVIDER": AI_PROVIDER,
+        "OPENAI_API_KEY": OPENAI_API_KEY,
+        "OPENAI_MODEL": OPENAI_MODEL,
+        "OPENAI_MODEL_FALLBACKS": os.getenv("OPENAI_MODEL_FALLBACKS", ""),
+        "ANTHROPIC_API_KEY": ANTHROPIC_API_KEY,
+        "GOOGLE_API_KEY": GOOGLE_API_KEY,
+        "OLLAMA_URL": OLLAMA_URL,
+        "USE_MUSICBRAINZ": USE_MUSICBRAINZ,
+        "MUSICBRAINZ_API_KEY": merged.get("MUSICBRAINZ_API_KEY", ""),
+        "MUSICBRAINZ_CLIENT_ID": merged.get("MUSICBRAINZ_CLIENT_ID", ""),
+        "MUSICBRAINZ_CLIENT_SECRET": merged.get("MUSICBRAINZ_CLIENT_SECRET", ""),
+        "DISCORD_WEBHOOK": DISCORD_WEBHOOK,
+        "LOG_LEVEL": LOG_LEVEL,
+        "LOG_FILE": LOG_FILE,
+    })
+
+
+def _restart_container():
+    """Attempt to restart the container. Tries docker socket first, then falls back to signal."""
+    import subprocess
+    import signal
+    import os
+    
+    def _do_restart():
+        """Perform restart in a separate thread to allow HTTP response to be sent first."""
+        time.sleep(2)  # Give time for HTTP response to be sent
+        # Try to restart via docker socket if available
+        docker_socket = Path("/var/run/docker.sock")
+        container_name = os.getenv("HOSTNAME", "PMDA_WEBUI")
+        
+        if docker_socket.exists():
+            try:
+                # Try to restart via docker command
+                result = subprocess.run(
+                    ["docker", "restart", container_name],
+                    capture_output=True,
+                    timeout=5,
+                )
+                if result.returncode == 0:
+                    logging.info("Container restart initiated via docker socket")
+                    return
+            except (subprocess.TimeoutExpired, FileNotFoundError, Exception) as e:
+                logging.debug("Docker restart failed: %s", e)
+        
+        # Fallback: use signal to trigger graceful shutdown (container manager will restart)
+        # This works if the container is managed by docker-compose, systemd, or has restart policy
+        try:
+            logging.info("Sending SIGTERM to trigger container restart")
+            os.kill(os.getpid(), signal.SIGTERM)
+        except Exception as e:
+            logging.warning("Failed to restart container: %s", e)
+    
+    # Start restart in background thread
+    restart_thread = threading.Thread(target=_do_restart, daemon=True)
+    restart_thread.start()
+    return True
+
+
+@app.put("/api/config")
+def api_config_put():
+    """Persist configuration updates to config.json and SQLite, then restart container."""
+    data = request.get_json() or {}
+    allowed = {
+        "PLEX_HOST", "PLEX_TOKEN", "PLEX_DB_PATH", "SECTION_IDS", "PATH_MAP",
+        "DUPE_ROOT", "PMDA_CONFIG_DIR", "MUSIC_PARENT_PATH",
+        "SCAN_THREADS", "LOG_LEVEL", "LOG_FILE", "AI_PROVIDER", "OPENAI_API_KEY", "OPENAI_MODEL",
+        "OPENAI_MODEL_FALLBACKS", "ANTHROPIC_API_KEY", "GOOGLE_API_KEY", "OLLAMA_URL",
+        "DISCORD_WEBHOOK", "USE_MUSICBRAINZ", "MUSICBRAINZ_API_KEY", "MUSICBRAINZ_CLIENT_ID", "MUSICBRAINZ_CLIENT_SECRET",
+        "SKIP_FOLDERS", "CROSS_LIBRARY_DEDUPE", "CROSSCHECK_SAMPLES",
+        "FORMAT_PREFERENCE",
+    }
+    updates = {k: v for k, v in data.items() if k in allowed}
+    if not updates:
+        return jsonify({"status": "ok", "message": "Nothing to save"})
+    if "SECTION_IDS" in updates:
+        raw = updates["SECTION_IDS"]
+        if isinstance(raw, str):
+            updates["SECTION_IDS"] = [int(x.strip()) for x in raw.split(",") if x.strip()]
+        elif isinstance(raw, list):
+            updates["SECTION_IDS"] = [int(x) for x in raw]
+    if "SKIP_FOLDERS" in updates and isinstance(updates["SKIP_FOLDERS"], str):
+        updates["SKIP_FOLDERS"] = [p.strip() for p in updates["SKIP_FOLDERS"].split(",") if p.strip()]
+    
+    # Serialize complex types for SQLite storage
+    updates_for_db = {}
+    for k, v in updates.items():
+        if isinstance(v, (dict, list)):
+            updates_for_db[k] = json.dumps(v)
+        else:
+            updates_for_db[k] = str(v) if v is not None else ""
+    
+    try:
+        # Save to SQLite
+        con = sqlite3.connect(str(STATE_DB_FILE))
+        cur = con.cursor()
+        for key, value in updates_for_db.items():
+            cur.execute("INSERT OR REPLACE INTO settings(key, value) VALUES(?, ?)", (key, value))
+        con.commit()
+        con.close()
+        logging.info("Settings saved to SQLite database")
+    except Exception as e:
+        logging.warning("Failed to save settings to SQLite: %s", e)
+        return jsonify({"status": "error", "message": f"Failed to save to database: {str(e)}"}), 500
+    
+    # Also save to config.json for compatibility
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            conf_write = json.load(f)
+        conf_write.update(updates)
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(conf_write, f, indent=2)
+        logging.info("Settings saved to config.json")
+    except Exception as e:
+        logging.warning("Failed to write config.json: %s", e)
+        # Don't fail if config.json write fails, SQLite is the source of truth
+    
+    # Restart container
+    restart_success = _restart_container()
+    if not restart_success:
+        logging.warning("Container restart may have failed, but settings were saved")
+    
+    return jsonify({"status": "ok", "restart_initiated": restart_success})
+
 
 @app.get("/api/duplicates")
 def api_duplicates():
     """
     Return the full list of duplicate-group cards for the Web UI.
     Loads from DB into state["duplicates"] on first call (or when empty).
-    Used by the initial page load and by search/polling.
+    When Plex is not configured, returns [] and header X-PMDA-Requires-Config: true.
     """
+    if not PLEX_CONFIGURED:
+        resp = jsonify([])
+        resp.headers["X-PMDA-Requires-Config"] = "true"
+        return resp
     with lock:
         if not state["duplicates"]:
             logging.debug("api_duplicates(): loading scan results from DB into memory")
@@ -3988,13 +5289,15 @@ def api_dedupe():
             deduping=state["deduping"],
             progress=state["dedupe_progress"],
             total=state["dedupe_total"],
-            saved=get_stat("space_saved")
+            saved=get_stat("space_saved"),
+            moved=get_stat("removed_dupes")
         )
 
 @app.get("/details/<artist>/<int:album_id>")
 def details(artist, album_id):
+    if not PLEX_CONFIGURED:
+        return jsonify({"error": "Plex not configured", "requiresConfig": True}), 503
     art = artist.replace("_", " ")
-    # Prefer in-memory duplicates (with full loser lists) during runtime, fallback to DB
     with lock:
         groups = state["duplicates"].get(art)
     if groups is None:
@@ -4002,53 +5305,163 @@ def details(artist, album_id):
     for g in groups:
         if g["album_id"] == album_id:
             editions = [g["best"]] + g["losers"]
+            best_album_id = g["best"]["album_id"]
+            artist_rating_key = None
+            try:
+                db_conn = plex_connect()
+                best_track_titles = {(t.title or "").strip().lower() for t in get_tracks(db_conn, best_album_id)}
+                # Plex Web: artist page = /library/metadata/{artist_id}; album's parent is the artist (metadata_type 9)
+                row = db_conn.execute(
+                    "SELECT parent_id FROM metadata_items WHERE id = ? AND metadata_type = 9",
+                    (best_album_id,),
+                ).fetchone()
+                if row and row[0]:
+                    artist_rating_key = int(row[0])
+            except Exception:
+                best_track_titles = set()
+                db_conn = None
+
             out = []
-            # Get rationale for best edition, if present
             rationale = g["best"].get("rationale", "")
-            for e in editions:
+            for i, e in enumerate(editions):
+                folder_path = path_for_fs_access(Path(e["folder"]))
+                is_best = i == 0
+                # Size: losers have size_mb in DB; best we compute (frontend expects bytes)
+                if is_best:
+                    size_mb = safe_folder_size(folder_path) // (1024 * 1024)
+                else:
+                    size_mb = e.get("size", 0) or (safe_folder_size(folder_path) // (1024 * 1024))
+                size_bytes = size_mb * (1024 * 1024)
+
+                track_list = []
+                if db_conn:
+                    try:
+                        for t in get_tracks_for_details(db_conn, e["album_id"]):
+                            title_norm = (t.get("title") or t.get("name") or "").strip().lower()
+                            is_bonus = not is_best and title_norm not in best_track_titles
+                            raw_path = t.get("path")
+                            track_path = str(path_for_fs_access(Path(raw_path))) if raw_path else None
+                            track_list.append({
+                                "idx": t.get("idx", 0),
+                                "title": t.get("title") or t.get("name"),
+                                "name": t.get("name") or t.get("title"),
+                                "dur": t.get("dur", 0),
+                                "duration": t.get("duration"),
+                                "format": t.get("format"),
+                                "bitrate": t.get("bitrate"),
+                                "is_bonus": is_bonus,
+                                "path": track_path,
+                            })
+                    except Exception as track_err:
+                        logging.warning(
+                            "details: tracks failed for edition album_id=%s: %s",
+                            e["album_id"], track_err
+                        )
+
                 thumb_data = fetch_cover_as_base64(e["album_id"])
                 out.append({
                     "thumb_data": thumb_data,
-                    "title_raw": e["title_raw"],
-                    "size": folder_size(Path(e["folder"])) // (1024 * 1024),
+                    "title_raw": e.get("title_raw") or "",
+                    "size": size_bytes,
                     "fmt": e.get("fmt_text", e.get("fmt", "")),
-                    "br": (e.get("br", 0) // 1000),
+                    "br": (e.get("br", 0) // 1000) if isinstance(e.get("br"), int) else 0,
                     "sr": e.get("sr", 0),
-                    "bd": e.get("bd", 0)
+                    "bd": e.get("bd", 0),
+                    "path": str(folder_path),
+                    "folder": str(folder_path),
+                    "album_id": e["album_id"],
+                    "track_count": len(track_list),
+                    "tracks": track_list,
                 })
+            if db_conn:
+                try:
+                    db_conn.close()
+                except Exception:
+                    pass
             return jsonify(
                 artist=art,
                 album=g["best"]["title_raw"],
+                artist_id=artist_rating_key,
                 editions=out,
                 rationale=rationale,
                 merge_list=g["best"].get("merge_list", []),
             )
     return jsonify({}), 404
 
+def _normalize_edition_as_best(edition: dict, artist: str) -> dict:
+    """Ensure an edition has the keys expected for group['best']."""
+    e = dict(edition)
+    if "title_raw" not in e or e["title_raw"] is None:
+        try:
+            db = plex_connect()
+            e["title_raw"] = album_title(db, e["album_id"])
+            db.close()
+        except Exception:
+            e["title_raw"] = ""
+    e.setdefault("album_norm", (e.get("title_raw") or "").lower())
+    e.setdefault("fmt_text", e.get("fmt", ""))
+    e.setdefault("br", 0)
+    e.setdefault("sr", 0)
+    e.setdefault("bd", 0)
+    e.setdefault("rationale", "")
+    e.setdefault("merge_list", [])
+    e.setdefault("used_ai", False)
+    e.setdefault("meta", {})
+    e.setdefault("dur", 0)
+    e.setdefault("discs", 1)
+    return e
+
+
 @app.post("/dedupe/artist/<artist>")
 def dedupe_artist(artist):
+    r = _requires_config()
+    if r is not None:
+        return r
     art = artist.replace("_", " ")
     data = request.get_json() or {}
     raw = data.get("album_id")
     album_id = int(raw) if raw is not None else None
+    keep_edition_album_id = data.get("keep_edition_album_id")
+    if keep_edition_album_id is not None:
+        keep_edition_album_id = int(keep_edition_album_id)
     moved_list: List[Dict] = []
 
     with lock:
         groups = state["duplicates"].get(art, [])
         for g in list(groups):
-            if g["album_id"] == album_id:
-                logging.debug(f"dedupe_artist(): processing artist '{art}', album_id={album_id}")
-                moved_list = perform_dedupe(g)
-                groups.remove(g)
-                if not groups:
-                    del state["duplicates"][art]
-                con = sqlite3.connect(str(STATE_DB_FILE))
-                cur = con.cursor()
-                cur.execute("DELETE FROM duplicates_best WHERE artist = ? AND album_id = ?", (art, album_id))
-                cur.execute("DELETE FROM duplicates_loser WHERE artist = ? AND album_id = ?", (art, album_id))
-                con.commit()
-                con.close()
-                break
+            if g["album_id"] != album_id:
+                continue
+            # Optional manual selection: keep one edition, treat others as losers
+            if keep_edition_album_id is not None:
+                editions = [g["best"]] + g["losers"]
+                kept = None
+                losers = []
+                for e in editions:
+                    aid = e.get("album_id")
+                    if aid == keep_edition_album_id:
+                        kept = e
+                    else:
+                        losers.append(e)
+                if kept is None or not losers:
+                    return jsonify({"error": "Invalid keep_edition_album_id or no editions to remove"}), 400
+                g = {
+                    "artist": art,
+                    "album_id": album_id,
+                    "best": _normalize_edition_as_best(kept, art),
+                    "losers": losers,
+                }
+            logging.debug(f"dedupe_artist(): processing artist '{art}', album_id={album_id}")
+            moved_list = perform_dedupe(g)
+            groups.remove(next(gr for gr in groups if gr["album_id"] == album_id))
+            if not groups:
+                del state["duplicates"][art]
+            con = sqlite3.connect(str(STATE_DB_FILE))
+            cur = con.cursor()
+            cur.execute("DELETE FROM duplicates_best WHERE artist = ? AND album_id = ?", (art, album_id))
+            cur.execute("DELETE FROM duplicates_loser WHERE artist = ? AND album_id = ?", (art, album_id))
+            con.commit()
+            con.close()
+            break
 
     removed_count = len(moved_list)
     total_mb = sum(item["size"] for item in moved_list)
@@ -4066,8 +5479,167 @@ def dedupe_artist(artist):
 
     return jsonify(moved=moved_list), 200
 
+
+# Allowed extensions for bonus track move (security)
+_MOVE_TRACK_EXTENSIONS = frozenset(
+    ".flac .wav .m4a .mp3 .ogg .opus .aac .ape .alac .dsf .aif .aiff .wma .mp4 .m4b .m4p .aifc".split()
+)
+
+
+def _merge_bonus_tracks_for_group(g: dict) -> None:
+    """
+    For one duplicate group, move bonus tracks (names in merge_list) from loser
+    editions into the best edition folder. Idempotent per track.
+    """
+    merge_list = g["best"].get("merge_list") or []
+    if not merge_list:
+        return
+    merge_set = {(t.strip().lower()): t.strip() for t in merge_list}
+    best_folder = path_for_fs_access(Path(g["best"]["folder"]))
+    db_conn = None
+    try:
+        db_conn = plex_connect()
+        for loser in g["losers"]:
+            source_folder = path_for_fs_access(Path(loser["folder"]))
+            for t in get_tracks_for_details(db_conn, loser["album_id"]):
+                title = (t.get("title") or t.get("name") or "").strip()
+                if not title or title.lower() not in merge_set:
+                    continue
+                raw_path = t.get("path")
+                if not raw_path:
+                    continue
+                track_path = Path(raw_path)
+                try:
+                    src_resolved = path_for_fs_access(track_path).resolve()
+                    base_resolved = source_folder.resolve()
+                except Exception:
+                    continue
+                if not src_resolved.is_file():
+                    continue
+                if src_resolved.suffix.lower() not in _MOVE_TRACK_EXTENSIONS:
+                    continue
+                try:
+                    if not src_resolved.is_relative_to(base_resolved):
+                        continue
+                except AttributeError:
+                    if not str(src_resolved).startswith(str(base_resolved)):
+                        continue
+                dest_file = best_folder / src_resolved.name
+                if dest_file.exists():
+                    stem, suf = dest_file.stem, dest_file.suffix
+                    n = 1
+                    while dest_file.exists():
+                        dest_file = best_folder / f"{stem} ({n}){suf}"
+                        n += 1
+                try:
+                    safe_move(str(src_resolved), str(dest_file))
+                    logging.info("merge_bonus: moved %s → %s", src_resolved.name, best_folder)
+                except Exception as e:
+                    logging.warning("merge_bonus: failed %s → %s: %s", src_resolved, dest_file, e)
+        try:
+            plex_path = g["best"]["folder"]
+            plex_api(f"/library/sections/{SECTION_ID}/refresh?path={plex_path}", method="GET")
+        except Exception as e:
+            logging.warning("merge_bonus: Plex refresh failed: %s", e)
+    finally:
+        if db_conn:
+            try:
+                db_conn.close()
+            except Exception:
+                pass
+
+
+@app.post("/dedupe/move-track/<artist>")
+def dedupe_move_track(artist):
+    """
+    Move a single bonus track file from one edition folder to the kept edition folder.
+    Body: { "album_id": "<group id>", "source_index": int, "track_path": str, "target_index": int }.
+    """
+    r = _requires_config()
+    if r is not None:
+        return r
+    art = artist.replace("_", " ")
+    data = request.get_json() or {}
+    raw_album_id = data.get("album_id")
+    album_id = int(raw_album_id) if raw_album_id is not None else None
+    source_index = data.get("source_index")
+    target_index = data.get("target_index")
+    track_path_raw = data.get("track_path")
+
+    if album_id is None or source_index is None or target_index is None or not track_path_raw:
+        return jsonify(success=False, message="Missing album_id, source_index, target_index or track_path"), 400
+
+    try:
+        source_index = int(source_index)
+        target_index = int(target_index)
+    except (TypeError, ValueError):
+        return jsonify(success=False, message="source_index and target_index must be integers"), 400
+
+    with lock:
+        groups = state["duplicates"].get(art)
+        if groups is None:
+            groups = load_scan_from_db().get(art, [])
+        g = next((gr for gr in groups if gr["album_id"] == album_id), None)
+
+    if g is None:
+        return jsonify(success=False, message="Duplicate group not found"), 404
+
+    editions = [g["best"]] + g["losers"]
+    if source_index < 0 or source_index >= len(editions) or target_index < 0 or target_index >= len(editions):
+        return jsonify(success=False, message="Invalid source_index or target_index"), 400
+    if source_index == target_index:
+        return jsonify(success=False, message="Source and target editions must differ"), 400
+
+    source_folder = path_for_fs_access(Path(editions[source_index]["folder"]))
+    target_folder = path_for_fs_access(Path(editions[target_index]["folder"]))
+
+    track_path = Path(track_path_raw)
+    try:
+        src_resolved = track_path.resolve()
+        base_resolved = source_folder.resolve()
+    except Exception as e:
+        return jsonify(success=False, message=f"Invalid path: {e}"), 400
+
+    if not src_resolved.is_file():
+        return jsonify(success=False, message="track_path is not a file"), 400
+    if src_resolved.suffix.lower() not in _MOVE_TRACK_EXTENSIONS:
+        return jsonify(success=False, message="File type not allowed for move"), 400
+    try:
+        if not src_resolved.is_relative_to(base_resolved):
+            return jsonify(success=False, message="Track must be inside the source edition folder"), 400
+    except AttributeError:
+        if not str(src_resolved).startswith(str(base_resolved)):
+            return jsonify(success=False, message="Track must be inside the source edition folder"), 400
+
+    dest_file = target_folder / src_resolved.name
+    if dest_file.exists():
+        stem, suf = dest_file.stem, dest_file.suffix
+        n = 1
+        while dest_file.exists():
+            dest_file = target_folder / f"{stem} ({n}){suf}"
+            n += 1
+
+    try:
+        safe_move(str(src_resolved), str(dest_file))
+    except Exception as e:
+        logging.exception("move-track: move failed %s → %s", src_resolved, dest_file)
+        return jsonify(success=False, message=str(e)), 500
+
+    # Ask Plex to rescan so the kept album sees the new file
+    try:
+        plex_path = editions[target_index]["folder"]
+        plex_api(f"/library/sections/{SECTION_ID}/refresh?path={plex_path}", method="GET")
+    except Exception as e:
+        logging.warning("move-track: Plex refresh failed: %s", e)
+
+    return jsonify(success=True, message="Track moved to kept edition"), 200
+
+
 @app.post("/dedupe/all")
 def dedupe_all():
+    r = _requires_config()
+    if r is not None:
+        return r
     with lock:
         all_groups = [g for lst in state["duplicates"].values() for g in lst]
         state["duplicates"].clear()
@@ -4080,8 +5652,41 @@ def dedupe_all():
     threading.Thread(target=background_dedupe, args=(all_groups,), daemon=True).start()
     return "", 204
 
+
+@app.post("/dedupe/merge-and-dedupe")
+def dedupe_merge_and_dedupe():
+    """
+    First merge bonus tracks (from merge_list) into the kept edition for every group
+    that has extra tracks, then run full dedupe (move loser folders, update Plex).
+    """
+    r = _requires_config()
+    if r is not None:
+        return r
+    with lock:
+        all_groups = [g for lst in state["duplicates"].values() for g in lst]
+        state["duplicates"].clear()
+        con = sqlite3.connect(str(STATE_DB_FILE))
+        cur = con.cursor()
+        cur.execute("DELETE FROM duplicates_loser")
+        con.commit()
+        con.close()
+        logging.debug("dedupe_merge_and_dedupe(): cleared in-memory and DB duplicates tables")
+
+    for g in all_groups:
+        if g["best"].get("merge_list"):
+            try:
+                _merge_bonus_tracks_for_group(g)
+            except Exception as e:
+                logging.warning("merge_and_dedupe: merge_bonus failed for %s: %s", g.get("artist"), e)
+
+    threading.Thread(target=background_dedupe, args=(all_groups,), daemon=True).start()
+    return "", 204
+
 @app.post("/dedupe/selected")
 def dedupe_selected():
+    r = _requires_config()
+    if r is not None:
+        return r
     data = request.get_json() or {}
     selected = data.get("selected", [])
     moved_list: List[Dict] = []
@@ -4128,6 +5733,28 @@ def dedupe_selected():
     logging.debug(f"dedupe_selected(): removed {removed_count} dupes, freed {total_moved} MB")
 
     return jsonify(moved=moved_list), 200
+
+
+# ─── Integrated frontend (self-hosted: serve SPA from same container) ─────────────
+if _HAS_STATIC_UI:
+    @app.get("/")
+    def serve_index():
+        return send_from_directory(_FRONTEND_DIST, "index.html")
+
+    @app.get("/assets/<path:path>")
+    def serve_assets(path):
+        return send_from_directory(os.path.join(_FRONTEND_DIST, "assets"), path)
+
+    @app.get("/<path:path>")
+    def serve_spa_fallback(path):
+        """SPA: serve static file from dist if present, else index.html for client-side routing."""
+        if request.path.startswith(("/api/", "/scan/", "/dedupe/", "/details/")):
+            return jsonify(error="Not found"), 404
+        path_obj = os.path.join(_FRONTEND_DIST, path)
+        if os.path.isfile(path_obj):
+            return send_from_directory(_FRONTEND_DIST, path)
+        return send_from_directory(_FRONTEND_DIST, "index.html")
+
 
 # ───────────────────────────────────── CLI MODE ───────────────────────────────────
 def dedupe_cli(

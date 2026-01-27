@@ -1,0 +1,26 @@
+---
+description: PMDA : l'API frontend doit cibler le serveur, pas le Mac en local (éviter de perdre la visu du scan)
+globs: frontend/**/*.ts,frontend/**/*.tsx,frontend/.env*
+alwaysApply: true
+---
+
+# PMDA – Backend API : toujours le serveur, jamais le Mac en local
+
+## Contexte
+
+- Les **données de scan** (doublons, progression, stats Moved/Saved) vivent côté **backend**, sur le **serveur** (ex. déploiement Docker sur 192.168.3.2:5005).
+- En **production** : l’UI est servie par le même conteneur que l’API → `API_BASE_URL` doit rester **vide** (same origin). C’est le cas dans `frontend/src/lib/api.ts` avec `import.meta.env.VITE_PMDA_API_URL ?? ''`.
+- En **dev local** (MacBook) : si `VITE_PMDA_API_URL` est vide ou pointe vers localhost, le front interroge le Mac, pas le serveur → **plus de visu sur le scan précédent**, liste vide, "No Duplicates Found".
+
+## Règles
+
+1. **Ne jamais** faire pointer l’API frontend vers `localhost`, `127.0.0.1` ou une URL locale par défaut dans le code ou les docs du projet (sauf si explicitement pour un backend de test local).  
+2. **Ne pas** ajouter de fallback du type `|| 'http://localhost:5005'` dans `api.ts` ou ailleurs : en dev, l’utilisateur doit **choisir** explicitement la cible (serveur ou vrai backend local).  
+3. Pour **tester l’UI avec les vrais données / le scan existant** sur la machine de dev :
+   - définir `VITE_PMDA_API_URL` vers le **serveur** (ex. `http://192.168.3.2:5005`) dans `.env` ou `.env.local`,  
+   - ou utiliser l’UI déployée sur le serveur (même origine).  
+4. Lors de changements touchant l’URL d’API, les variables d’env (ex. `VITE_PMDA_API_URL`) ou un proxy : vérifier que le scénario "utilisateur qui a déjà scanné sur le serveur" continue d’afficher les doublons et la progression, pas une vue vide type "interrogation du Mac en local".
+
+## Fichier concerné
+
+- `frontend/src/lib/api.ts` : `API_BASE_URL = import.meta.env.VITE_PMDA_API_URL ?? ''` → garder ce comportement (vide = same origin) ; ne pas introduire d’URL locale par défaut.

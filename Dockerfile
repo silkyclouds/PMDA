@@ -1,7 +1,16 @@
-# Dockerfile
+# ─── Stage 1: build frontend (React/Vite) ─────────────────────────────────────
+FROM node:20-alpine AS frontend-build
+WORKDIR /fe
+COPY frontend/package.json frontend/package-lock.json* ./
+RUN npm install
+COPY frontend/ ./
+RUN npm run build
+
+# ─── Stage 2: PMDA backend + integrated frontend ─────────────────────────────
 FROM python:3.11-slim
 
 ENV PMDA_CONFIG_DIR=/config
+ENV PMDA_DEFAULT_MODE=serve
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
@@ -11,6 +20,8 @@ RUN apt-get update && \
 
 WORKDIR /app
 COPY . /app
+# Override frontend dist with the built assets from stage 1
+COPY --from=frontend-build /fe/dist /app/frontend/dist
 
 RUN pip install --no-cache-dir -r requirements.txt
 

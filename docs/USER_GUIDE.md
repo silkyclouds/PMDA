@@ -27,18 +27,30 @@ PMDA (Plex Music Dedupe Assistant) scans your Plex Music library, finds duplicat
    `docker pull meaning/pmda:latest`  
    (or use your own build.)
 
-2. Set the required environment variables and mounts. Minimum:
+2. **Minimal run (wizard-first)** – no environment variables required. Use three mounts and the Web UI to configure Plex at first run:
+
+   ```bash
+   docker run --rm --name pmda \
+     -v "/path/to/store/config:/config:rw" \
+     -v "/path/to/plex/database:/database:ro" \
+     -v "/path/to/dupes:/dupes:rw" \
+     -p 5005:5005 \
+     meaning/pmda:latest
+   ```
+
+   Then open `http://localhost:5005` (or your host:5005), go to **Settings**, and complete the Plex setup (see [First run (wizard)](#first-run-wizard) below).
+
+3. **Classic run** – with environment variables set from the start:
    - `PLEX_HOST` – e.g. `http://192.168.1.10:32400`
    - `PLEX_TOKEN` – your Plex token
-   - `PLEX_DB_PATH` – path **inside the container** to the folder that contains the Plex DB file
-   - Mount the Plex DB folder into the container at `PLEX_DB_PATH`
-   - Mount your music root(s) so they match what Plex sees (see Configuration)
+   - `PLEX_DB_PATH` – path **inside the container** to the folder that contains the Plex DB file (default `/database`)
+   - Mount the Plex DB folder, config, and dupes (and music roots if needed; see Configuration).
 
-3. Choose the mode:
-   - **Web UI**: `PMDA_DEFAULT_MODE=serve` and expose the Web UI port (e.g. `-p 5005:5005`).
+4. Choose the mode:
+   - **Web UI**: default is `serve`; expose the Web UI port (e.g. `-p 5005:5005`).
    - **CLI (full scan + dedupe)**: `PMDA_DEFAULT_MODE=cli` (no port needed unless you use UI later).
 
-Example (simplified):
+Example (classic, with env vars):
 
 ```bash
 docker run --rm -it \
@@ -56,6 +68,20 @@ docker run --rm -it \
 ```
 
 Then open `http://localhost:5005` in your browser.
+
+#### First run (wizard)
+
+If you started the container with the **minimal** run (no `PLEX_HOST` / `PLEX_TOKEN`), configure Plex from the Web UI:
+
+1. Open the UI (e.g. `http://localhost:5005`) and go to **Settings**.
+2. **Plex Token**: enter your [Plex token](https://support.plex.tv/articles/204059436-finding-an-authentication-token-number/).
+3. **Plex Server**:
+   - Click **Fetch my servers** to list servers linked to your Plex account, then choose one from the dropdown; or
+   - Click **Discover on network** to find Plex servers on your LAN (no token needed for discovery), then choose one.
+4. The **Plex Server URL** field is filled when you select a server; you can change it manually if needed.
+5. Ensure the Plex database folder (containing `com.plexapp.plugins.library.db`) is mounted at `/database` in the container. If not, the UI will prompt you; then restart the container with the correct mount and save again.
+6. Click **Save** (and restart the container if you added or changed the database mount).
+7. Optionally use **Autodetect** for Section IDs (music libraries), then run a scan.
 
 ### Without Docker
 
@@ -122,7 +148,7 @@ Then open `http://localhost:5005` in your browser.
 | Problem | What to check |
 |--------|----------------|
 | “No files found” for artists | Volume bindings and `PATH_MAP`: paths Plex sees must be reachable from inside the container at the mapped paths. |
-| “Missing required config: PLEX_DB_PATH” | Set `PLEX_DB_PATH` (and mount that path) so the Plex DB file is readable. |
+| “Missing required config: PLEX_DB_PATH” / not configured | Mount the Plex DB folder at `/database` in the container and set Plex server + token in Settings (or use env vars). Restart after saving. |
 | Scan never finds duplicates | Ensure you have at least two “editions” of the same album (e.g. MP3 and FLAC). Check `SKIP_FOLDERS` and section IDs. |
 | Dedupe fails / permission denied | Write access on music folders and on `DUPE_ROOT`; same user/permissions as Plex if needed. |
 

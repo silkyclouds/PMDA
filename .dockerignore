@@ -1,0 +1,7 @@
+# Dont send host node_modules or local build into the image
+frontend/node_modules
+frontend/dist
+.git
+.cursor
+*.md
+.cursorrules

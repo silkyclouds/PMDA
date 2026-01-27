@@ -1,0 +1,13 @@
+{
+  "PLEX_DB_PATH": "",
+  "PLEX_HOST": "",
+  "PLEX_TOKEN": "",
+  "SCAN_THREADS": 16,
+  "LOG_LEVEL": "INFO",
+  "OPENAI_API_KEY": "",
+  "OPENAI_MODEL": "gpt-4.1-nano",
+  "DISCORD_WEBHOOK": "",
+  "PATH_MAP": {},
+  "USE_MUSICBRAINZ": false,
+  "SKIP_FOLDERS": []
+}

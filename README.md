@@ -76,6 +76,29 @@ PMDA uses OpenAI to determine the "best" version of an album — comparing forma
   Example of an album with extra tracks detected. Enabling a way to merge extra tracks to the winning edition folder. 
 </i></p>
 
+### 🐳 Minimal Docker run (wizard-first, no `-e` required)
+
+You can start PMDA with **only volume mounts and port**; configure Plex and paths at first run via the Web UI (Settings):
+
+```bash
+docker run --rm --name pmda \
+  -v "/path/to/store/config:/config:rw" \
+  -v "/path/to/plex/database:/database:ro" \
+  -v "/path/to/dupes:/dupes:rw" \
+  -v "/path/to/your/music:/music:ro" \
+  -p 5005:5005 \
+  meaning/pmda:latest
+```
+
+- **`/config`** – persistence for config, state, and cache.
+- **`/database`** – folder that contains `com.plexapp.plugins.library.db` (read-only).
+- **`/dupes`** – where removed duplicate albums are moved (read-write).
+- **`/music`** – your music library root on the host (e.g. the parent of `matched`, `unmatched`, `compilations`). Required so PMDA can verify path bindings and run scans; set "Path to parent folder (music root)" to `/music` in Settings.
+
+Then open `http://localhost:5005`, go to **Settings**, enter your **Plex token**, use **Fetch my servers**, choose your Plex server, then in the Paths step use **Autodetect** and **Verify bindings**. No environment variables are required for this flow.
+
+---
+
 ⚙️ Configuration
 ----------------
 
@@ -83,10 +106,10 @@ All config can be controlled either via `config.json` or environment variables (
 
 Supported variables:
 
-- `PLEX_DB_PATH` — Directory or full path to Plex DB
+- `PLEX_DB_PATH` — Directory inside the container for the Plex DB folder (default: `/database`). Optional at first run: configure via UI.
 - `PLEX_DB_FILE` — Plex DB filename (default: `com.plexapp.plugins.library.db`)
-- `PLEX_HOST` — Base URL to Plex (e.g. `http://192.168.3.2:32400`)
-- `PLEX_TOKEN` — Plex auth token
+- `PLEX_HOST` — Base URL to Plex (e.g. `http://192.168.3.2:32400`). Optional at first run: set via Settings (Fetch my servers / Discover on network).
+- `PLEX_TOKEN` — Plex auth token. Optional at first run: set via Settings.
 - `SECTION_ID` — Section ID for music library
 - `PATH_MAP` — Map container paths to host paths (e.g. `"/mnt:/host/path"`)
 - `DUPE_ROOT` — Folder to move removed duplicates
