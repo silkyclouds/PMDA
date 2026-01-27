@@ -1783,6 +1783,10 @@ state = {
     "scan_mb_used_count": 0,          # Nombre d'éditions enrichies avec MusicBrainz
     "scan_ai_enabled": False,         # Si l'IA est configurée et disponible
     "scan_mb_enabled": False,         # Si MusicBrainz est activé
+    "scan_audio_cache_hits": 0,       # Nombre de fichiers audio trouvés en cache
+    "scan_audio_cache_misses": 0,     # Nombre de fichiers audio nécessitant ffprobe
+    "scan_mb_cache_hits": 0,         # Nombre de requêtes MusicBrainz trouvées en cache
+    "scan_mb_cache_misses": 0,       # Nombre de requêtes MusicBrainz nécessitant API call
     # ETA tracking
     "scan_start_time": None,          # Timestamp du début du scan
     "scan_last_update_time": None,    # Dernière mise à jour pour calcul ETA
@@ -2288,7 +2292,8 @@ def analyse_format(folder: Path) -> tuple[int, int, int, int]:
         if cached and not (cached == (0, 0, 0) and ext == "flac"):
             br, sr, bd = cached
             if br or sr or bd:
-                return (score_format(ext), br, sr, bd)
+                # Track cache hit (will be aggregated in scan_duplicates)
+                return (score_format(ext), br, sr, bd, True)  # True = cache hit
 
         # ── 2) fresh ffprobe ───────────────────────────────────────────
         cmd = [
@@ -2336,11 +2341,11 @@ def analyse_format(folder: Path) -> tuple[int, int, int, int]:
         set_cached_info(fpath, mtime, br, sr, bd)
 
         if br or sr or bd:                 # success on this file → done
-            return (score_format(ext), br, sr, bd)
+            return (score_format(ext), br, sr, bd, False)  # False = cache miss
 
     # After probing up to 3 files and still nothing usable → treat as invalid
     first_ext = audio_files[0].suffix[1:].lower()
-    return (score_format(first_ext), 0, 0, 0)
+    return (score_format(first_ext), 0, 0, 0, False)
 
 # ───────────────────────────────── DUPLICATE DETECTION ─────────────────────────────────
 def signature(tracks: List[Track]) -> tuple:
@@ -2382,16 +2387,17 @@ def editions_share_confident_signal(ed_list: List[dict]) -> bool:
 
     return False
 
-def fetch_mb_release_group_info(mbid: str) -> dict:
+def fetch_mb_release_group_info(mbid: str) -> tuple[dict, bool]:
     """
     Fetch primary type, secondary-types, and media format summary from MusicBrainz release-group.
     Uses musicbrainzngs for proper rate-limiting and parsing.
+    Returns (info_dict, cache_hit) where cache_hit is True if found in cache.
     """
     # Attempt to reuse cached MusicBrainz release-group info
     cached = get_cached_mb_info(mbid)
     if cached:
         logging.debug("[MusicBrainz RG Info] using cached info for MBID %s", mbid)
-        return cached
+        return cached, True  # True = cache hit
     try:
         # Query release-group with all media details
         result = musicbrainzngs.get_release_group_by_id(
@@ -2439,7 +2445,7 @@ def fetch_mb_release_group_info(mbid: str) -> dict:
     }
     # Cache the lookup result
     set_cached_mb_info(mbid, info)
-    return info
+    return info, False  # False = cache miss
 
 # ──────────────────────────────── MusicBrainz search fallback ────────────────────────────────
 def search_mb_release_group_by_metadata(artist: str, album_norm: str, tracks: set[str]) -> dict | None:
@@ -2629,7 +2635,7 @@ def choose_best(editions: List[dict]) -> dict:
         first_mbid = editions[0].get("meta", {}).get("musicbrainz_albumid")
         if first_mbid:
             try:
-                rg_info = fetch_mb_release_group_info(first_mbid)
+                rg_info, _ = fetch_mb_release_group_info(first_mbid)
                 user_msg += f"Release group info: primary_type={rg_info['primary_type']}, formats={rg_info['format_summary']}\n"
             except Exception as e:
                 logging.debug("MusicBrainz lookup failed for %s: %s", first_mbid, e)
@@ -2903,7 +2909,7 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> tuple[List[di
             # consider edition invalid when technical data are all zero OR no files found
 
             # ─── audio‑format inspection ──────────────────────────────────────
-            fmt_score, br, sr, bd = analyse_format(folder)
+            fmt_score, br, sr, bd, audio_cache_hit = analyse_format(folder)
 
             # --- metadata tags (first track only) -----------------------------
             first_audio = next((p for p in folder.rglob("*") if AUDIO_RE.search(p.name)), None)
@@ -2915,7 +2921,7 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> tuple[List[di
             # --- Quick retry before purging to avoid false negatives -------------
             if is_invalid:
                 time.sleep(0.5)
-                fmt_score_retry, br_retry, sr_retry, bd_retry = analyse_format(folder)
+                fmt_score_retry, br_retry, sr_retry, bd_retry, audio_cache_hit_retry = analyse_format(folder)
                 file_count_retry = file_count or sum(1 for f in folder.rglob("*") if AUDIO_RE.search(f.name))
                 if (file_count_retry == 0) or (br_retry == 0 and sr_retry == 0 and bd_retry == 0):
                     _purge_invalid_edition({
@@ -2926,7 +2932,7 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> tuple[List[di
                     })
                     continue            # do NOT add to the editions list
                 else:
-                    fmt_score, br, sr, bd = fmt_score_retry, br_retry, sr_retry, bd_retry
+                    fmt_score, br, sr, bd, audio_cache_hit = fmt_score_retry, br_retry, sr_retry, bd_retry, audio_cache_hit_retry
                     is_invalid = False
 
             plex_title = album_title(db_conn, aid)
@@ -2952,7 +2958,8 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> tuple[List[di
                 'meta':      meta_tags,
                 'invalid':   False,
                 'title_source': title_source,
-                'plex_title': plex_title or ""
+                'plex_title': plex_title or "",
+                'audio_cache_hit': audio_cache_hit  # Track if this album used cache
             })
         except Exception as e:
             logging.error("Error processing album %s for artist %s: %s", aid, artist, e, exc_info=True)
@@ -2981,18 +2988,20 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> tuple[List[di
                 if not mbid:
                     continue
                 try:
+                    mb_cache_hit = False
                     if tag == 'musicbrainz_releasegroupid':
                         # direct lookup of release-group
-                        rg_info = fetch_mb_release_group_info(mbid)
+                        rg_info, mb_cache_hit = fetch_mb_release_group_info(mbid)
                         mbid_found = mbid
                         mbid_type = 'release-group'
                     else:
                         # lookup release to derive its release-group ID
                         rel = musicbrainzngs.get_release_by_id(mbid, includes=['release-group'])['release']
                         rgid = rel['release-group']['id']
-                        rg_info = fetch_mb_release_group_info(rgid)
+                        rg_info, mb_cache_hit = fetch_mb_release_group_info(rgid)
                         mbid_found = rgid  # Store the release-group ID (more useful for comparison)
                         mbid_type = 'release-group'
+                    e['mb_cache_hit'] = mb_cache_hit  # Track MB cache hit for this edition
                     logging.debug("[Artist %s] Edition %s RG info (via %s %s): %s", artist, e['album_id'], tag, mbid, rg_info)
                     break
                 except Exception as exc:
@@ -3013,9 +3022,14 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> tuple[List[di
                     if isinstance(rg_info, dict) and 'id' in rg_info:
                         e['musicbrainz_id'] = rg_info['id']
                         e['musicbrainz_type'] = 'release-group'
+                        # Check if this MBID was in cache
+                        mbid = rg_info['id']
+                        cached_mb = get_cached_mb_info(mbid)
+                        e['mb_cache_hit'] = cached_mb is not None
                     logging.debug("[Artist %s] Edition %s RG info (search fallback): %s", artist, e['album_id'], rg_info)
                 else:
                     logging.debug("[Artist %s] No RG info found via search for '%s'", artist, album_norm)
+                    e['mb_cache_hit'] = False
             if rg_info:
                 e['rg_info'] = rg_info
                 # Also store MBID from rg_info if not already set
@@ -3093,6 +3107,26 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> tuple[List[di
     raw_groups: dict[str, list[dict]] = defaultdict(list)
     for e in editions:
         raw_groups[e['album_norm']].append(e)
+    
+    # Filter out groups where all editions share the same folder (not real duplicates)
+    # This can happen if Plex has duplicate album entries pointing to the same folder
+    filtered_groups: dict[str, list[dict]] = {}
+    for norm, ed_list in raw_groups.items():
+        if len(ed_list) < 2:
+            filtered_groups[norm] = ed_list
+            continue
+        # Check if all editions have the same folder
+        folders = {str(e.get('folder', '')) for e in ed_list}
+        if len(folders) == 1:
+            # All editions in same folder - likely duplicate Plex entries, not real duplicates
+            logging.warning(
+                "[Artist %s] Skipping group '%s' - all %d editions share the same folder: %s. "
+                "This may indicate duplicate Plex album entries pointing to the same files.",
+                artist, norm, len(ed_list), list(folders)[0]
+            )
+            continue
+        filtered_groups[norm] = ed_list
+    raw_groups = filtered_groups
     # refine groups: for classical, split by year and first-track duration threshold
     exact_groups: dict[tuple, list[dict]] = {}
     for norm, ed_list in raw_groups.items():
@@ -3132,10 +3166,20 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> tuple[List[di
     # Track statistics
     mb_used_count = 0  # Editions enriched with MusicBrainz
     ai_used_count = 0  # Groups where AI was used
+    audio_cache_hits = 0  # Albums that used audio cache
+    audio_cache_misses = 0  # Albums that needed ffprobe
+    mb_cache_hits = 0  # MusicBrainz lookups from cache
+    mb_cache_misses = 0  # MusicBrainz lookups requiring API call
     
-    # Count MusicBrainz usage
+    # Count cache usage
+    audio_cache_hits = sum(1 for e in editions if e.get('audio_cache_hit', False))
+    audio_cache_misses = len(editions) - audio_cache_hits
+    
+    # Count MusicBrainz usage and cache hits
     if USE_MUSICBRAINZ:
         mb_used_count = sum(1 for e in editions if 'rg_info' in e)
+        mb_cache_hits = sum(1 for e in editions if e.get('mb_cache_hit', False))
+        mb_cache_misses = mb_used_count - mb_cache_hits
     
     for norm, ed_list in exact_groups.items():
         logging.debug(f"[Artist {artist}] Processing exact group for norm='{norm}' with albums {[e['album_id'] for e in ed_list]}")
@@ -3240,6 +3284,10 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> tuple[List[di
     stats = {
         "ai_used": ai_used_count,
         "mb_used": mb_used_count,
+        "audio_cache_hits": audio_cache_hits,
+        "audio_cache_misses": audio_cache_misses,
+        "mb_cache_hits": mb_cache_hits,
+        "mb_cache_misses": mb_cache_misses,
     }
     return out, stats
 
@@ -3490,6 +3538,11 @@ def background_scan():
             state["scan_last_update_time"] = start_time
             state["scan_last_progress"] = 0
             state["scan_active_artists"] = {}
+            # Initialize cache tracking
+            state["scan_audio_cache_hits"] = 0
+            state["scan_audio_cache_misses"] = 0
+            state["scan_mb_cache_hits"] = 0
+            state["scan_mb_cache_misses"] = 0
         
         # Create scan history entry
         import sqlite3
@@ -3569,6 +3622,10 @@ def background_scan():
                         state["scan_artists_processed"] += 1
                         state["scan_ai_used_count"] += stats.get("ai_used", 0)
                         state["scan_mb_used_count"] += stats.get("mb_used", 0)
+                        state["scan_audio_cache_hits"] += stats.get("audio_cache_hits", 0)
+                        state["scan_audio_cache_misses"] += stats.get("audio_cache_misses", 0)
+                        state["scan_mb_cache_hits"] += stats.get("mb_cache_hits", 0)
+                        state["scan_mb_cache_misses"] += stats.get("mb_cache_misses", 0)
                         # Remove artist from active tracking when done
                         if artist_name in state.get("scan_active_artists", {}):
                             del state["scan_active_artists"][artist_name]
@@ -5630,6 +5687,11 @@ def api_progress():
         mb_used_count=state.get("scan_mb_used_count", 0),
         ai_enabled=state.get("scan_ai_enabled", False),
         mb_enabled=state.get("scan_mb_enabled", False),
+        # Cache statistics
+        audio_cache_hits=state.get("scan_audio_cache_hits", 0),
+        audio_cache_misses=state.get("scan_audio_cache_misses", 0),
+        mb_cache_hits=state.get("scan_mb_cache_hits", 0),
+        mb_cache_misses=state.get("scan_mb_cache_misses", 0),
         # ETA
         eta_seconds=eta_seconds,
         threads_in_use=threads_in_use,
