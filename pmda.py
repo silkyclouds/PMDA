@@ -573,6 +573,7 @@ merged = {
     "MUSICBRAINZ_CLIENT_ID": _get("MUSICBRAINZ_CLIENT_ID", default="", cast=str),
     "MUSICBRAINZ_CLIENT_SECRET": _get("MUSICBRAINZ_CLIENT_SECRET", default="", cast=str),
     "SKIP_FOLDERS": _get("SKIP_FOLDERS", default="", cast=lambda s: [p.strip() for p in str(s).split(",") if p.strip()]),
+    "AUTO_MOVE_DUPES": _get("AUTO_MOVE_DUPES", default=False, cast=_parse_bool),
 }
 # Always use the auto‑generated PATH_MAP from config.json
 merged["PATH_MAP"] = conf.get("PATH_MAP", {})
@@ -580,6 +581,7 @@ merged["PATH_MAP"] = conf.get("PATH_MAP", {})
 
 SKIP_FOLDERS: list[str] = merged["SKIP_FOLDERS"]
 USE_MUSICBRAINZ: bool = bool(merged["USE_MUSICBRAINZ"])
+AUTO_MOVE_DUPES: bool = bool(merged["AUTO_MOVE_DUPES"])
 # Cross-library dedupe configuration
 CROSS_LIBRARY_DEDUPE = _parse_bool(os.getenv("CROSS_LIBRARY_DEDUPE", "true"))
 
@@ -1537,6 +1539,42 @@ def init_state_db():
             value TEXT
         )
     """)
+    # Table for scan history
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS scan_history (
+            scan_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            start_time REAL NOT NULL,
+            end_time REAL,
+            duration_seconds INTEGER,
+            albums_scanned INTEGER DEFAULT 0,
+            duplicates_found INTEGER DEFAULT 0,
+            artists_processed INTEGER DEFAULT 0,
+            artists_total INTEGER DEFAULT 0,
+            ai_used_count INTEGER DEFAULT 0,
+            mb_used_count INTEGER DEFAULT 0,
+            ai_enabled INTEGER DEFAULT 0,
+            mb_enabled INTEGER DEFAULT 0,
+            auto_move_enabled INTEGER DEFAULT 0,
+            space_saved_mb INTEGER DEFAULT 0,
+            albums_moved INTEGER DEFAULT 0,
+            status TEXT DEFAULT 'completed'
+        )
+    """)
+    # Table for scan moves (tracking file movements)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS scan_moves (
+            move_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scan_id INTEGER NOT NULL,
+            artist TEXT NOT NULL,
+            album_id INTEGER NOT NULL,
+            original_path TEXT NOT NULL,
+            moved_to_path TEXT NOT NULL,
+            size_mb INTEGER,
+            moved_at REAL NOT NULL,
+            restored INTEGER DEFAULT 0,
+            FOREIGN KEY (scan_id) REFERENCES scan_history(scan_id)
+        )
+    """)
     con.commit()
     con.close()
 
@@ -1745,6 +1783,11 @@ state = {
     "scan_mb_used_count": 0,          # Nombre d'éditions enrichies avec MusicBrainz
     "scan_ai_enabled": False,         # Si l'IA est configurée et disponible
     "scan_mb_enabled": False,         # Si MusicBrainz est activé
+    # ETA tracking
+    "scan_start_time": None,          # Timestamp du début du scan
+    "scan_last_update_time": None,    # Dernière mise à jour pour calcul ETA
+    "scan_last_progress": 0,          # Progression au dernier update
+    "scan_active_artists": {},        # Dict {artist_name: {"start_time": float, "total_albums": int, "albums_processed": int}}
 }
 lock = threading.Lock()
 
@@ -2799,6 +2842,11 @@ def scan_artist_duplicates(args):
         logging.debug("[Artist %s (ID %s)] Retrieved %d album IDs: %s", artist_name, artist_id, len(album_ids), album_ids)
         logging.debug("[Artist %s (ID %s)] Album list for scan: %s", artist_name, artist_id, album_ids)
 
+        # Update total_albums in active tracking
+        with lock:
+            if artist_name in state.get("scan_active_artists", {}):
+                state["scan_active_artists"][artist_name]["total_albums"] = len(album_ids)
+
         groups = []
         stats = {"ai_used": 0, "mb_used": 0}
         if album_ids:
@@ -3123,6 +3171,10 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> tuple[List[di
         }
         out.append(group_data)
         used_ids.update(e['album_id'] for e in ed_list)
+        # Update progress tracking periodically
+        with lock:
+            if artist in state.get("scan_active_artists", {}):
+                state["scan_active_artists"][artist]["albums_processed"] = len(used_ids)
 
     # Filter out editions already grouped exactly so fuzzy pass only sees the rest
     editions = [e for e in editions if e['album_id'] not in used_ids]
@@ -3166,6 +3218,11 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> tuple[List[di
             'fuzzy': True
         }
         out.append(group_data)
+        used_ids.update(e['album_id'] for e in ed_list)
+        # Update progress tracking periodically
+        with lock:
+            if artist in state.get("scan_active_artists", {}):
+                state["scan_active_artists"][artist]["albums_processed"] = len(used_ids)
         notify_discord_embed(
             title="Duplicate group (fuzzy) found",
             description=(
@@ -3417,6 +3474,7 @@ def background_scan():
         )
 
         # Reset live state
+        start_time = time.time()
         with lock:
             state.update(scanning=True, scan_progress=0, scan_total=total_albums)
             state["duplicates"].clear()
@@ -3427,6 +3485,36 @@ def background_scan():
             state["scan_mb_used_count"] = 0
             state["scan_ai_enabled"] = ai_provider_ready
             state["scan_mb_enabled"] = USE_MUSICBRAINZ
+            # Initialize ETA tracking
+            state["scan_start_time"] = start_time
+            state["scan_last_update_time"] = start_time
+            state["scan_last_progress"] = 0
+            state["scan_active_artists"] = {}
+        
+        # Create scan history entry
+        import sqlite3
+        con = sqlite3.connect(str(STATE_DB_FILE))
+        cur = con.cursor()
+        cur.execute("""
+            INSERT INTO scan_history 
+            (start_time, albums_scanned, artists_total, ai_enabled, mb_enabled, auto_move_enabled, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (
+            start_time,
+            total_albums,
+            total_artists,
+            1 if ai_provider_ready else 0,
+            1 if USE_MUSICBRAINZ else 0,
+            1 if AUTO_MOVE_DUPES else 0,
+            'running'
+        ))
+        scan_id = cur.lastrowid
+        con.commit()
+        con.close()
+        
+        # Store scan_id in state for linking moves
+        with lock:
+            state["scan_id"] = scan_id
 
         clear_db_on_new_scan()  # wipe previous duplicate tables
 
@@ -3440,6 +3528,13 @@ def background_scan():
                     "SELECT COUNT(*) FROM metadata_items WHERE metadata_type=9 AND parent_id=?",
                     (artist_id,)
                 ).fetchone()[0]
+                # Track artist before submitting
+                with lock:
+                    state["scan_active_artists"][artist_name] = {
+                        "start_time": time.time(),
+                        "total_albums": album_cnt,
+                        "albums_processed": 0
+                    }
                 fut = executor.submit(scan_artist_duplicates, (artist_id, artist_name))
                 futures.append(fut)
                 future_to_albums[fut] = album_cnt
@@ -3474,6 +3569,9 @@ def background_scan():
                         state["scan_artists_processed"] += 1
                         state["scan_ai_used_count"] += stats.get("ai_used", 0)
                         state["scan_mb_used_count"] += stats.get("mb_used", 0)
+                        # Remove artist from active tracking when done
+                        if artist_name in state.get("scan_active_artists", {}):
+                            del state["scan_active_artists"][artist_name]
                         if groups:
                             all_results[artist_name] = groups
                             state["duplicates"][artist_name] = groups
@@ -3484,12 +3582,64 @@ def background_scan():
 
         # Persist what we've found so far (even if some artists failed)
         save_scan_to_db(all_results)
+        
+        # Auto-move dupes if enabled
+        if AUTO_MOVE_DUPES and all_results:
+            logging.info("Auto-moving dupes enabled, starting automatic deduplication...")
+            background_dedupe(all_results)
 
     finally:
         # Make absolutely sure we leave the UI in a consistent state
+        end_time = time.time()
+        scan_id = None
         with lock:
             state["scan_progress"] = state["scan_total"]  # force 100 % before stopping
             state["scanning"] = False
+            scan_id = state.get("scan_id")
+            start_time = state.get("scan_start_time", end_time)
+        
+        # Update scan history entry
+        if scan_id:
+            import sqlite3
+            con = sqlite3.connect(str(STATE_DB_FILE))
+            cur = con.cursor()
+            duration = int(end_time - start_time) if start_time else None
+            with lock:
+                duplicates_found = sum(len(groups) for groups in all_results.values())
+                artists_processed = state.get("scan_artists_processed", 0)
+                ai_used_count = state.get("scan_ai_used_count", 0)
+                mb_used_count = state.get("scan_mb_used_count", 0)
+                space_saved = get_stat("space_saved")
+                albums_moved = get_stat("removed_dupes")
+            
+            status = 'cancelled' if scan_should_stop.is_set() else 'completed'
+            cur.execute("""
+                UPDATE scan_history
+                SET end_time = ?,
+                    duration_seconds = ?,
+                    duplicates_found = ?,
+                    artists_processed = ?,
+                    ai_used_count = ?,
+                    mb_used_count = ?,
+                    space_saved_mb = ?,
+                    albums_moved = ?,
+                    status = ?
+                WHERE scan_id = ?
+            """, (
+                end_time,
+                duration,
+                duplicates_found,
+                artists_processed,
+                ai_used_count,
+                mb_used_count,
+                space_saved,
+                albums_moved,
+                status,
+                scan_id
+            ))
+            con.commit()
+            con.close()
+        
         logging.debug("background_scan(): finished (flag cleared)")
         duration = time.perf_counter() - start_time
         groups_found = sum(len(v) for v in all_results.values()) if 'all_results' in locals() else 0
@@ -3638,6 +3788,35 @@ def perform_dedupe(group: dict) -> List[dict]:
             plex_api(f"/library/metadata/{loser_id}", method="DELETE")
         except Exception as e:
             logging.warning(f"perform_dedupe(): failed to delete Plex metadata for {loser_id}: {e}")
+
+        # Record move in scan_moves table
+        moved_at = time.time()
+        scan_id = None
+        with lock:
+            scan_id = state.get("scan_id")
+        
+        if scan_id:
+            import sqlite3
+            try:
+                con = sqlite3.connect(str(STATE_DB_FILE))
+                cur = con.cursor()
+                cur.execute("""
+                    INSERT INTO scan_moves
+                    (scan_id, artist, album_id, original_path, moved_to_path, size_mb, moved_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    scan_id,
+                    artist,
+                    loser_id,
+                    str(src_folder),
+                    str(dst),
+                    size_mb,
+                    moved_at
+                ))
+                con.commit()
+                con.close()
+            except Exception as e:
+                logging.warning(f"perform_dedupe(): failed to record move in scan_moves: {e}")
 
         moved_items.append({
             "artist":    artist,
@@ -5264,6 +5443,7 @@ def api_config_get():
         "DISCORD_WEBHOOK": DISCORD_WEBHOOK,
         "LOG_LEVEL": LOG_LEVEL,
         "LOG_FILE": LOG_FILE,
+        "AUTO_MOVE_DUPES": AUTO_MOVE_DUPES,
     })
 
 
@@ -5319,7 +5499,7 @@ def api_config_put():
         "OPENAI_MODEL_FALLBACKS", "ANTHROPIC_API_KEY", "GOOGLE_API_KEY", "OLLAMA_URL",
         "DISCORD_WEBHOOK", "USE_MUSICBRAINZ", "MUSICBRAINZ_API_KEY", "MUSICBRAINZ_CLIENT_ID", "MUSICBRAINZ_CLIENT_SECRET",
         "SKIP_FOLDERS", "CROSS_LIBRARY_DEDUPE", "CROSSCHECK_SAMPLES",
-        "FORMAT_PREFERENCE",
+        "FORMAT_PREFERENCE", "AUTO_MOVE_DUPES",
     }
     updates = {k: v for k, v in data.items() if k in allowed}
     if not updates:
@@ -5402,6 +5582,42 @@ def api_progress():
         status = "paused" if (scanning and scan_is_paused.is_set()) else ("running" if scanning else "stopped")
         progress = state["scan_progress"]
         total = state["scan_total"]
+        
+        # Calculate ETA
+        eta_seconds = None
+        threads_in_use = SCAN_THREADS
+        active_artists_list = []
+        
+        if scanning and state.get("scan_start_time") and progress > 0:
+            current_time = time.time()
+            start_time = state.get("scan_start_time")
+            last_update_time = state.get("scan_last_update_time", start_time)
+            last_progress = state.get("scan_last_progress", 0)
+            
+            # Update tracking if enough time has passed or significant progress made
+            if current_time - last_update_time >= 5.0 or (progress - last_progress) >= 100:
+                state["scan_last_update_time"] = current_time
+                state["scan_last_progress"] = progress
+            
+            # Calculate average speed (albums per second)
+            elapsed_time = current_time - start_time
+            if elapsed_time > 0:
+                speed = progress / elapsed_time
+                remaining = total - progress
+                if speed > 0 and remaining > 0:
+                    eta_seconds = int(remaining / speed)
+        
+        # Get active artists
+        active_artists_dict = state.get("scan_active_artists", {})
+        active_artists_list = [
+            {
+                "artist_name": name,
+                "total_albums": info.get("total_albums", 0),
+                "albums_processed": info.get("albums_processed", 0)
+            }
+            for name, info in active_artists_dict.items()
+        ]
+    
     return jsonify(
         scanning=scanning,
         progress=progress,
@@ -5414,7 +5630,203 @@ def api_progress():
         mb_used_count=state.get("scan_mb_used_count", 0),
         ai_enabled=state.get("scan_ai_enabled", False),
         mb_enabled=state.get("scan_mb_enabled", False),
+        # ETA
+        eta_seconds=eta_seconds,
+        threads_in_use=threads_in_use,
+        active_artists=active_artists_list,
     )
+
+@app.get("/api/scan-history")
+def api_scan_history():
+    """Return list of all scan history entries."""
+    import sqlite3
+    con = sqlite3.connect(str(STATE_DB_FILE))
+    cur = con.cursor()
+    cur.execute("""
+        SELECT scan_id, start_time, end_time, duration_seconds, albums_scanned,
+               duplicates_found, artists_processed, artists_total, ai_used_count,
+               mb_used_count, ai_enabled, mb_enabled, auto_move_enabled,
+               space_saved_mb, albums_moved, status
+        FROM scan_history
+        ORDER BY start_time DESC
+    """)
+    rows = cur.fetchall()
+    con.close()
+    
+    history = []
+    for row in rows:
+        history.append({
+            "scan_id": row[0],
+            "start_time": row[1],
+            "end_time": row[2],
+            "duration_seconds": row[3],
+            "albums_scanned": row[4] or 0,
+            "duplicates_found": row[5] or 0,
+            "artists_processed": row[6] or 0,
+            "artists_total": row[7] or 0,
+            "ai_used_count": row[8] or 0,
+            "mb_used_count": row[9] or 0,
+            "ai_enabled": bool(row[10]),
+            "mb_enabled": bool(row[11]),
+            "auto_move_enabled": bool(row[12]),
+            "space_saved_mb": row[13] or 0,
+            "albums_moved": row[14] or 0,
+            "status": row[15] or "completed",
+        })
+    
+    return jsonify(history)
+
+@app.get("/api/scan-history/<int:scan_id>")
+def api_scan_history_detail(scan_id):
+    """Return details of a specific scan."""
+    import sqlite3
+    con = sqlite3.connect(str(STATE_DB_FILE))
+    cur = con.cursor()
+    cur.execute("""
+        SELECT scan_id, start_time, end_time, duration_seconds, albums_scanned,
+               duplicates_found, artists_processed, artists_total, ai_used_count,
+               mb_used_count, ai_enabled, mb_enabled, auto_move_enabled,
+               space_saved_mb, albums_moved, status
+        FROM scan_history
+        WHERE scan_id = ?
+    """, (scan_id,))
+    row = cur.fetchone()
+    con.close()
+    
+    if not row:
+        return jsonify({"error": "Scan not found"}), 404
+    
+    return jsonify({
+        "scan_id": row[0],
+        "start_time": row[1],
+        "end_time": row[2],
+        "duration_seconds": row[3],
+        "albums_scanned": row[4] or 0,
+        "duplicates_found": row[5] or 0,
+        "artists_processed": row[6] or 0,
+        "artists_total": row[7] or 0,
+        "ai_used_count": row[8] or 0,
+        "mb_used_count": row[9] or 0,
+        "ai_enabled": bool(row[10]),
+        "mb_enabled": bool(row[11]),
+        "auto_move_enabled": bool(row[12]),
+        "space_saved_mb": row[13] or 0,
+        "albums_moved": row[14] or 0,
+        "status": row[15] or "completed",
+    })
+
+@app.get("/api/scan-history/<int:scan_id>/moves")
+def api_scan_history_moves(scan_id):
+    """Return all moves for a specific scan."""
+    import sqlite3
+    con = sqlite3.connect(str(STATE_DB_FILE))
+    cur = con.cursor()
+    cur.execute("""
+        SELECT move_id, scan_id, artist, album_id, original_path, moved_to_path,
+               size_mb, moved_at, restored
+        FROM scan_moves
+        WHERE scan_id = ?
+        ORDER BY moved_at DESC
+    """, (scan_id,))
+    rows = cur.fetchall()
+    con.close()
+    
+    moves = []
+    for row in rows:
+        moves.append({
+            "move_id": row[0],
+            "scan_id": row[1],
+            "artist": row[2],
+            "album_id": row[3],
+            "original_path": row[4],
+            "moved_to_path": row[5],
+            "size_mb": row[6] or 0,
+            "moved_at": row[7],
+            "restored": bool(row[8]),
+        })
+    
+    return jsonify(moves)
+
+@app.post("/api/scan-history/<int:scan_id>/restore")
+def api_scan_history_restore(scan_id):
+    """Restore moved files to their original location."""
+    data = request.get_json() or {}
+    move_ids = data.get("move_ids", [])
+    restore_all = data.get("all", False)
+    
+    import sqlite3
+    con = sqlite3.connect(str(STATE_DB_FILE))
+    cur = con.cursor()
+    
+    if restore_all:
+        cur.execute("""
+            SELECT move_id, original_path, moved_to_path, artist
+            FROM scan_moves
+            WHERE scan_id = ? AND restored = 0
+        """, (scan_id,))
+    else:
+        if not move_ids:
+            return jsonify({"error": "No move_ids provided"}), 400
+        placeholders = ",".join("?" * len(move_ids))
+        cur.execute(f"""
+            SELECT move_id, original_path, moved_to_path, artist
+            FROM scan_moves
+            WHERE scan_id = ? AND move_id IN ({placeholders}) AND restored = 0
+        """, (scan_id, *move_ids))
+    
+    rows = cur.fetchall()
+    if not rows:
+        con.close()
+        return jsonify({"error": "No moves found to restore"}), 404
+    
+    artists_to_refresh = set()
+    restored_count = 0
+    
+    for move_id, original_path, moved_to_path, artist in rows:
+        src = Path(moved_to_path)
+        dst = Path(original_path)
+        
+        if not src.exists():
+            logging.warning(f"Restore: source {src} does not exist, skipping")
+            continue
+        
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            safe_move(str(src), str(dst))
+            artists_to_refresh.add(artist)
+            restored_count += 1
+            
+            # Mark as restored
+            cur.execute("UPDATE scan_moves SET restored = 1 WHERE move_id = ?", (move_id,))
+        except Exception as e:
+            logging.error(f"Restore: failed to restore {src} → {dst}: {e}")
+            continue
+    
+    con.commit()
+    con.close()
+    
+    # Refresh Plex for affected artists
+    for artist in artists_to_refresh:
+        letter = quote_plus(artist[0].upper())
+        art_enc = quote_plus(artist)
+        try:
+            plex_api(f"/library/sections/{SECTION_ID}/refresh?path=/music/matched/{letter}/{art_enc}", method="GET")
+        except Exception as e:
+            logging.warning(f"Restore: plex refresh failed for {artist}: {e}")
+    
+    return jsonify({"restored": restored_count, "artists_refreshed": len(artists_to_refresh)})
+
+@app.post("/api/scan-history/<int:scan_id>/dedupe")
+def api_scan_history_dedupe(scan_id):
+    """Manually dedupe albums from a previous scan."""
+    # Load scan results from DB
+    scan_results = load_scan_from_db()
+    if not scan_results:
+        return jsonify({"error": "No scan results found for this scan"}), 404
+    
+    # Start deduplication
+    background_dedupe(scan_results)
+    return jsonify({"status": "ok", "message": "Deduplication started"})
 
 @app.get("/api/dedupe")
 def api_dedupe():
