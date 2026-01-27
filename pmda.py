@@ -6903,7 +6903,9 @@ def api_library_artists():
     # Build search filter
     if search_query:
         search_filter = "AND art.title LIKE ? ESCAPE '\\'"
-        search_args = [f"%{search_query.replace('%', '\\%').replace('_', '\\_')}%"]
+        # Escape special characters for SQL LIKE
+        escaped_query = search_query.replace('%', '\\%').replace('_', '\\_')
+        search_args = [f"%{escaped_query}%"]
     else:
         search_filter = ""
         search_args = []
