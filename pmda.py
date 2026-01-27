@@ -4668,8 +4668,19 @@ def api_openai_check():
 @app.post("/api/musicbrainz/test")
 def api_musicbrainz_test():
     """Test MusicBrainz connectivity and rate limiting.
-    Returns success status and any error messages."""
-    if not USE_MUSICBRAINZ:
+    Returns success status and any error messages.
+    Accepts USE_MUSICBRAINZ in request body (POST) to allow testing before config is saved."""
+    # Check if USE_MUSICBRAINZ is provided in request body (for POST) or use global config
+    data = request.get_json(silent=True) or {}
+    use_mb = data.get("USE_MUSICBRAINZ")
+    if use_mb is not None:
+        # Use value from request body if provided
+        use_mb_enabled = bool(use_mb)
+    else:
+        # Fall back to global config
+        use_mb_enabled = USE_MUSICBRAINZ
+    
+    if not use_mb_enabled:
         return jsonify({"success": False, "message": "MusicBrainz is disabled. Enable it first."}), 400
     
     try:
@@ -4764,7 +4775,19 @@ def api_musicbrainz_test_oauth2():
             "redirect_uri": "urn:ietf:wg:oauth:2.0:oob"
         }
         
-        response = requests.post(token_url, data=payload, timeout=10)
+        logging.info("Testing MusicBrainz OAuth2 credentials (Client ID: %s...)", client_id[:8] if len(client_id) > 8 else client_id)
+        
+        # Use proper headers as per MusicBrainz OAuth2 documentation
+        # Note: requests.post with data= automatically sets Content-Type to application/x-www-form-urlencoded
+        # But we explicitly set it to be sure
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": "PMDA/1.0"
+        }
+        
+        response = requests.post(token_url, data=payload, headers=headers, timeout=15, allow_redirects=False)
+        
+        logging.info("MusicBrainz OAuth2 test: Response status %d", response.status_code)
         
         if response.status_code == 400:
             # Parse error response
@@ -4783,31 +4806,67 @@ def api_musicbrainz_test_oauth2():
                         "success": True,
                         "message": "OAuth2 credentials are valid and ready to use"
                     })
+                elif error_type == "invalid_request":
+                    return jsonify({
+                        "success": False,
+                        "message": "Invalid OAuth2 request. Please verify your Client ID and Client Secret are correct and that your application is registered on MusicBrainz."
+                    }), 400
                 else:
                     return jsonify({
                         "success": False,
-                        "message": f"OAuth2 validation error: {error_type}"
+                        "message": f"OAuth2 validation error: {error_type}. Please check your Client ID and Client Secret."
                     }), 400
             except Exception:
                 return jsonify({
                     "success": False,
                     "message": "Failed to parse OAuth2 response"
                 }), 500
-        else:
+        elif response.status_code == 200:
+            # This shouldn't happen with an invalid code, but if it does, credentials might be valid
+            logging.warning("MusicBrainz OAuth2 test: Got 200 OK with invalid code (unexpected)")
+            try:
+                response_data = response.json()
+                if "access_token" in response_data:
+                    return jsonify({
+                        "success": True,
+                        "message": "OAuth2 credentials are valid (unexpected success with test code)"
+                    })
+            except Exception:
+                pass
             return jsonify({
                 "success": False,
-                "message": f"Unexpected response from MusicBrainz: {response.status_code}"
+                "message": "Unexpected response from MusicBrainz OAuth2 endpoint"
+            }), 500
+        else:
+            logging.warning("MusicBrainz OAuth2 test: Unexpected status code %d", response.status_code)
+            try:
+                error_data = response.json()
+                error_msg = error_data.get("error_description") or error_data.get("error") or response.text[:200]
+            except Exception:
+                error_msg = response.text[:200] if response.text else f"HTTP {response.status_code}"
+            return jsonify({
+                "success": False,
+                "message": f"Unexpected response from MusicBrainz: {error_msg}"
             }), response.status_code
             
     except requests.exceptions.Timeout:
+        logging.warning("MusicBrainz OAuth2 test: Request timed out after 15 seconds")
         return jsonify({
             "success": False,
-            "message": "Connection to MusicBrainz timed out. Please check your internet connection."
+            "message": "Connection to MusicBrainz timed out. Please check your internet connection and try again."
         }), 503
-    except requests.exceptions.ConnectionError:
+    except requests.exceptions.ConnectionError as e:
+        logging.warning("MusicBrainz OAuth2 test: Connection error - %s", str(e))
         return jsonify({
             "success": False,
             "message": "Failed to connect to MusicBrainz. Please check your internet connection."
+        }), 503
+    except requests.exceptions.RequestException as e:
+        error_msg = str(e)
+        logging.error("MusicBrainz OAuth2 test request exception: %s", error_msg)
+        return jsonify({
+            "success": False,
+            "message": f"Network error while testing OAuth2 credentials: {error_msg}"
         }), 503
     except Exception as e:
         error_msg = str(e)
