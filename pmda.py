@@ -2382,6 +2382,7 @@ def fetch_mb_release_group_info(mbid: str) -> dict:
     logging.debug("[MusicBrainz RG Info] raw response for MBID %s: %s", mbid, result)
     logging.debug("[MusicBrainz RG Info] parsed primary_type=%s, secondary_types=%s, format_summary=%s", primary, secondary, format_summary)
     info = {
+        "id": mbid,  # Include the MBID in the info dict
         "primary_type": primary,
         "secondary_types": secondary,
         "format_summary": format_summary
@@ -2916,6 +2917,8 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
         for e in editions:
             meta = e.get('meta', {})
             rg_info = None
+            mbid_found = None
+            mbid_type = None
             for tag in id_tags:
                 mbid = meta.get(tag)
                 if not mbid:
@@ -2924,17 +2927,24 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
                     if tag == 'musicbrainz_releasegroupid':
                         # direct lookup of release-group
                         rg_info = fetch_mb_release_group_info(mbid)
+                        mbid_found = mbid
+                        mbid_type = 'release-group'
                     else:
                         # lookup release to derive its release-group ID
                         rel = musicbrainzngs.get_release_by_id(mbid, includes=['release-group'])['release']
                         rgid = rel['release-group']['id']
                         rg_info = fetch_mb_release_group_info(rgid)
+                        mbid_found = rgid  # Store the release-group ID (more useful for comparison)
+                        mbid_type = 'release-group'
                     logging.debug("[Artist %s] Edition %s RG info (via %s %s): %s", artist, e['album_id'], tag, mbid, rg_info)
                     break
                 except Exception as exc:
                     logging.debug("[Artist %s] MusicBrainz lookup failed for %s (%s): %s", artist, tag, mbid, exc)
             if rg_info:
                 e['rg_info_source'] = tag
+                if mbid_found:
+                    e['musicbrainz_id'] = mbid_found
+                    e['musicbrainz_type'] = mbid_type
             # fallback: search by metadata if no ID tag yielded results
             album_norm = e['album_norm']
             tracks = {t.title for t in e['tracks']}
@@ -2942,11 +2952,19 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
                 rg_info = search_mb_release_group_by_metadata(artist, album_norm, tracks)
                 if rg_info:
                     e['rg_info_source'] = 'fallback'
+                    # Extract MBID from rg_info if available (it should have 'id' field)
+                    if isinstance(rg_info, dict) and 'id' in rg_info:
+                        e['musicbrainz_id'] = rg_info['id']
+                        e['musicbrainz_type'] = 'release-group'
                     logging.debug("[Artist %s] Edition %s RG info (search fallback): %s", artist, e['album_id'], rg_info)
                 else:
                     logging.debug("[Artist %s] No RG info found via search for '%s'", artist, album_norm)
             if rg_info:
                 e['rg_info'] = rg_info
+                # Also store MBID from rg_info if not already set
+                if 'musicbrainz_id' not in e and isinstance(rg_info, dict) and 'id' in rg_info:
+                    e['musicbrainz_id'] = rg_info['id']
+                    e['musicbrainz_type'] = 'release-group'
         # --- MusicBrainz enrichment summary ---
         direct = sum(1 for e in editions if 'rg_info' in e and e.get('rg_info_source') in id_tags)
         fallback = sum(1 for e in editions if 'rg_info' in e and e.get('rg_info_source') == 'fallback')
@@ -5431,6 +5449,7 @@ def details(artist, album_id):
                     "album_id": e["album_id"],
                     "track_count": len(track_list),
                     "tracks": track_list,
+                    "musicbrainz_id": e.get("musicbrainz_id"),  # Include MusicBrainz ID if available
                 })
             if db_conn:
                 try:
