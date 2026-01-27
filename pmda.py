@@ -1738,6 +1738,13 @@ state = {
     "dedupe_total": 0,
     # duplicates: { artist_name: [ { artist, album_id, best, losers } ] }
     "duplicates": {},
+    # Scan details tracking
+    "scan_artists_processed": 0,      # Nombre d'artistes traités
+    "scan_artists_total": 0,          # Total d'artistes
+    "scan_ai_used_count": 0,          # Nombre de groupes où l'IA a été utilisée
+    "scan_mb_used_count": 0,          # Nombre d'éditions enrichies avec MusicBrainz
+    "scan_ai_enabled": False,         # Si l'IA est configurée et disponible
+    "scan_mb_enabled": False,         # Si MusicBrainz est activé
 }
 lock = threading.Lock()
 
@@ -2748,12 +2755,13 @@ def choose_best(editions: List[dict]) -> dict:
 def scan_artist_duplicates(args):
     """
     ThreadPool worker: scan one artist for duplicate albums.
-    Returns (artist_name, list_of_groups, album_count).
+    Returns (artist_name, list_of_groups, album_count, stats_dict).
+    stats_dict contains: {"ai_used": count, "mb_used": count}
     """
     artist_id, artist_name = args
     try:
         if scan_should_stop.is_set():
-            return (artist_name, [], 0)
+            return (artist_name, [], 0, {"ai_used": 0, "mb_used": 0})
         while scan_is_paused.is_set() and not scan_should_stop.is_set():
             time.sleep(0.5)
         logging.info("Processing artist: %s", artist_name)
@@ -2792,22 +2800,23 @@ def scan_artist_duplicates(args):
         logging.debug("[Artist %s (ID %s)] Album list for scan: %s", artist_name, artist_id, album_ids)
 
         groups = []
+        stats = {"ai_used": 0, "mb_used": 0}
         if album_ids:
-            groups = scan_duplicates(db_conn, artist_name, album_ids)
+            groups, stats = scan_duplicates(db_conn, artist_name, album_ids)
         db_conn.close()
 
         logging.debug(
-            "scan_artist_duplicates(): done Artist %s (ID %s) – %d groups, %d albums",
-            artist_name, artist_id, len(groups), len(album_ids)
+            "scan_artist_duplicates(): done Artist %s (ID %s) – %d groups, %d albums, AI=%d, MB=%d",
+            artist_name, artist_id, len(groups), len(album_ids), stats.get("ai_used", 0), stats.get("mb_used", 0)
         )
-        return (artist_name, groups, len(album_ids))
+        return (artist_name, groups, len(album_ids), stats)
     except Exception as e:
         logging.error("Unexpected error scanning artist %s: %s", artist_name, e, exc_info=True)
         # On error, return no groups and zero albums so scan can continue
-        return (artist_name, [], 0)
+        return (artist_name, [], 0, {"ai_used": 0, "mb_used": 0})
 
 
-def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
+def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> tuple[List[dict], dict]:
     global no_file_streak_global, popup_displayed, gui
     logging.debug("[Artist %s] Starting duplicate scan for album IDs: %s", artist, album_ids)
     logging.debug("Verbose SKIP_FOLDERS: %s", SKIP_FOLDERS)
@@ -3003,7 +3012,7 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
         no_file_streak_global += 1
         if skip_count == len(album_ids):
             logging.info(f"[Artist {artist}] All {skip_count} albums skipped due to SKIP_FOLDERS {SKIP_FOLDERS}")
-            return []
+            return [], {"ai_used": 0, "mb_used": 0}
         else:
             logger = logging.getLogger()
             logger.error(f"[Artist {artist}] FOUND 0 valid file editions on filesystem! Checked SKIP_FOLDERS: {SKIP_FOLDERS}")
@@ -3020,9 +3029,9 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
                     )
                     popup_displayed = True
                 scan_should_stop.set()
-                return []
+                return [], {"ai_used": 0, "mb_used": 0}
             # Below threshold, do not show repeated popups -- let scan continue or fail silently
-            return []
+            return [], {"ai_used": 0, "mb_used": 0}
     for e in editions:
         logging.debug(
             f"[Artist {artist}] Edition {e['album_id']}: "
@@ -3072,6 +3081,14 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
 
     out: list[dict] = []
     used_ids: set[int] = set()
+    # Track statistics
+    mb_used_count = 0  # Editions enriched with MusicBrainz
+    ai_used_count = 0  # Groups where AI was used
+    
+    # Count MusicBrainz usage
+    if USE_MUSICBRAINZ:
+        mb_used_count = sum(1 for e in editions if 'rg_info' in e)
+    
     for norm, ed_list in exact_groups.items():
         logging.debug(f"[Artist {artist}] Processing exact group for norm='{norm}' with albums {[e['album_id'] for e in ed_list]}")
     for ed_list in exact_groups.values():
@@ -3092,6 +3109,10 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
         logging.debug(f"[Artist {artist}] Exact grouping selected best {best['album_id']}, losers { [e['album_id'] for e in losers] }")
         if not losers:
             continue
+
+        # Track AI usage
+        if best.get('used_ai', False):
+            ai_used_count += 1
 
         group_data = {
             "artist":  artist,
@@ -3132,6 +3153,11 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
         best = choose_best(ed_list)
         losers = [e for e in ed_list if e is not best]
         logging.debug(f"[Artist {artist}] Fuzzy grouping selected best {best['album_id']}, losers { [e['album_id'] for e in losers] }")
+        
+        # Track AI usage (fuzzy groups always use AI if available)
+        if best.get('used_ai', False):
+            ai_used_count += 1
+        
         group_data = {
             'artist': artist,
             'album_id': best['album_id'],
@@ -3152,7 +3178,13 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> List[dict]:
         )
     # Remove groups where every loser was discarded (e.g. only one valid edition)
     out = [g for g in out if g.get("losers")]
-    return out
+    
+    # Return groups and statistics
+    stats = {
+        "ai_used": ai_used_count,
+        "mb_used": mb_used_count,
+    }
+    return out, stats
 
 def save_scan_to_db(scan_results: Dict[str, List[dict]]):
     """
@@ -3388,6 +3420,13 @@ def background_scan():
         with lock:
             state.update(scanning=True, scan_progress=0, scan_total=total_albums)
             state["duplicates"].clear()
+            # Initialize scan details tracking
+            state["scan_artists_processed"] = 0
+            state["scan_artists_total"] = total_artists
+            state["scan_ai_used_count"] = 0
+            state["scan_mb_used_count"] = 0
+            state["scan_ai_enabled"] = ai_provider_ready
+            state["scan_mb_enabled"] = USE_MUSICBRAINZ
 
         clear_db_on_new_scan()  # wipe previous duplicate tables
 
@@ -3415,15 +3454,26 @@ def background_scan():
                     break
                 album_cnt = future_to_albums.get(future, 0)
                 artist_name = future_to_artist.get(future, "<unknown>")
+                stats = {"ai_used": 0, "mb_used": 0}
                 try:
-                    artist_name, groups, _ = future.result()
+                    result = future.result()
+                    if len(result) == 4:
+                        artist_name, groups, _, stats = result
+                    else:
+                        # Backward compatibility: old format without stats
+                        artist_name, groups, _ = result
+                        stats = {"ai_used": 0, "mb_used": 0}
                 except Exception as e:
                     logging.exception("Worker crash for artist %s: %s", artist_name, e)
                     worker_errors.put((artist_name, str(e)))
                     groups = []
+                    stats = {"ai_used": 0, "mb_used": 0}
                 finally:
                     with lock:
                         state["scan_progress"] += album_cnt
+                        state["scan_artists_processed"] += 1
+                        state["scan_ai_used_count"] += stats.get("ai_used", 0)
+                        state["scan_mb_used_count"] += stats.get("mb_used", 0)
                         if groups:
                             all_results[artist_name] = groups
                             state["duplicates"][artist_name] = groups
@@ -5357,6 +5407,13 @@ def api_progress():
         progress=progress,
         total=total,
         status=status,
+        # Scan details
+        artists_processed=state.get("scan_artists_processed", 0),
+        artists_total=state.get("scan_artists_total", 0),
+        ai_used_count=state.get("scan_ai_used_count", 0),
+        mb_used_count=state.get("scan_mb_used_count", 0),
+        ai_enabled=state.get("scan_ai_enabled", False),
+        mb_enabled=state.get("scan_mb_enabled", False),
     )
 
 @app.get("/api/dedupe")
