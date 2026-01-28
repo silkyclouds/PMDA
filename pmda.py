@@ -6125,7 +6125,9 @@ def api_openai_models():
     Requires OPENAI_API_KEY in POST body or in config.
     Returns only chat completion models (gpt-*) available for the provided API key."""
     # Try to get key from POST body first (for testing before saving), then from config
-    data = request.get_json(silent=True) or {}
+    # Check if data was passed from api_ai_models via Flask g context
+    from flask import g
+    data = getattr(g, 'ai_models_request_data', None) or request.get_json(silent=True) or {}
     key = (data.get("OPENAI_API_KEY") or "").strip() or OPENAI_API_KEY
     
     if not key:
@@ -6197,7 +6199,8 @@ def api_openai_models():
 @app.post("/api/anthropic/models")
 def api_anthropic_models():
     """Return list of Anthropic model IDs available for the provided API key."""
-    data = request.get_json(silent=True) or {}
+    from flask import g
+    data = getattr(g, 'ai_models_request_data', None) or request.get_json(silent=True) or {}
     key = (data.get("ANTHROPIC_API_KEY") or "").strip() or ANTHROPIC_API_KEY
     
     if not key:
@@ -6250,7 +6253,8 @@ def api_anthropic_models():
 @app.post("/api/google/models")
 def api_google_models():
     """Return list of Google Gemini model IDs available for the provided API key."""
-    data = request.get_json(silent=True) or {}
+    from flask import g
+    data = getattr(g, 'ai_models_request_data', None) or request.get_json(silent=True) or {}
     key = (data.get("GOOGLE_API_KEY") or "").strip() or GOOGLE_API_KEY
     
     if not key:
@@ -6319,7 +6323,8 @@ def api_google_models():
 @app.post("/api/ollama/models")
 def api_ollama_models():
     """Return list of Ollama model IDs available at the provided URL."""
-    data = request.get_json(silent=True) or {}
+    from flask import g
+    data = getattr(g, 'ai_models_request_data', None) or request.get_json(silent=True) or {}
     url = (data.get("OLLAMA_URL") or "").strip() or OLLAMA_URL
     
     if not url:
@@ -6371,6 +6376,11 @@ def api_ai_models():
     """Route to the appropriate AI provider's models endpoint based on AI_PROVIDER."""
     data = request.get_json(silent=True) or {}
     provider = (data.get("AI_PROVIDER") or "").strip().lower() or AI_PROVIDER.lower()
+    
+    # Store data in request context so sub-functions can access it
+    # (Flask request body can only be read once)
+    from flask import g
+    g.ai_models_request_data = data
     
     if provider == "openai":
         return api_openai_models()
@@ -6570,12 +6580,21 @@ def api_config_put():
         _configure_musicbrainz_useragent()
         logging.info("MusicBrainz User-Agent updated with new email: %s", MUSICBRAINZ_EMAIL)
     
-    # Restart container
-    restart_success = _restart_container()
-    if not restart_success:
-        logging.warning("Container restart may have failed, but settings were saved")
+    # Only restart container if this is the initial wizard setup (first time saving)
+    # After wizard is complete, settings are saved but container doesn't restart
+    has_settings = _has_settings_in_db()
+    restart_success = False
+    if not has_settings:
+        # First time saving (wizard), restart container
+        logging.info("First time configuration save detected, restarting container")
+        restart_success = _restart_container()
+        if not restart_success:
+            logging.warning("Container restart may have failed, but settings were saved")
+    else:
+        # Settings already exist, just save without restart
+        logging.info("Settings updated (wizard already completed), saving without restart")
     
-    return jsonify({"status": "ok", "restart_initiated": restart_success})
+    return jsonify({"status": "ok", "restart_initiated": restart_success, "message": "Settings saved successfully"})
 
 
 @app.get("/api/duplicates")
