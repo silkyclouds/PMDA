@@ -370,7 +370,8 @@ if not AI_PROMPT_FILE.exists():
     logging.info("ai_prompt.txt not found — default prompt created")
     shutil.copyfile(DEFAULT_PROMPT_PATH, AI_PROMPT_FILE)
 
-# (3) Load JSON config ---------------------------------------------------------
+# (3) Load config: JSON is only a fallback; at runtime effective config is
+#     env > SQLite (state.db/settings) > config.json > defaults. See _get() below.
 with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
     conf: dict = json.load(fh)
 
@@ -6443,53 +6444,96 @@ def _has_settings_in_db() -> bool:
         return False
 
 
+def _get_config_from_db(key: str, default_value=None):
+    """Get a config value from SQLite settings table, with fallback to default."""
+    try:
+        if STATE_DB_FILE.exists():
+            con = sqlite3.connect(str(STATE_DB_FILE), timeout=5)
+            cur = con.cursor()
+            cur.execute("SELECT value FROM settings WHERE key = ?", (key,))
+            row = cur.fetchone()
+            con.close()
+            if row and row[0]:
+                return row[0]
+    except Exception:
+        pass
+    return default_value
+
 @app.get("/api/config")
 def api_config_get():
-    """Return current effective configuration for the Web UI (from env + config.json)."""
+    """Return current effective configuration for the Web UI.
+    Loads from SQLite (settings table) first, then falls back to runtime variables.
+    SQLite is the single source of truth for all saved configuration.
+    """
+    # Load from SQLite first (source of truth), fallback to runtime variables
+    def get_setting(key: str, runtime_value, default=""):
+        db_value = _get_config_from_db(key)
+        if db_value is not None:
+            return db_value
+        return runtime_value if runtime_value is not None else default
+    
     path_map = getattr(sys.modules[__name__], "PATH_MAP", {})
     section_ids = getattr(sys.modules[__name__], "SECTION_IDS", [])
     skip_folders = getattr(sys.modules[__name__], "SKIP_FOLDERS", [])
+    
     # Check if settings exist in DB (wizard was completed)
     has_settings = _has_settings_in_db()
     # Wizard should not show if settings exist in DB OR if Plex is configured
     configured = has_settings or PLEX_CONFIGURED
+    
+    # Load SECTION_IDS from SQLite if available
+    section_ids_str = _get_config_from_db("SECTION_IDS")
+    if section_ids_str:
+        try:
+            section_ids = [int(x.strip()) for x in str(section_ids_str).split(",") if x.strip()]
+        except Exception:
+            pass
+    
+    # Load PATH_MAP from SQLite if available
+    path_map_str = _get_config_from_db("PATH_MAP")
+    if path_map_str:
+        try:
+            path_map = json.loads(path_map_str) if isinstance(path_map_str, str) else path_map_str
+        except Exception:
+            pass
+    
     return jsonify({
         "configured": configured,
-        "PLEX_HOST": PLEX_HOST,
-        "PLEX_TOKEN": PLEX_TOKEN,
-        "PLEX_DB_PATH": merged["PLEX_DB_PATH"],
+        "PLEX_HOST": get_setting("PLEX_HOST", PLEX_HOST),
+        "PLEX_TOKEN": get_setting("PLEX_TOKEN", PLEX_TOKEN),
+        "PLEX_DB_PATH": get_setting("PLEX_DB_PATH", merged.get("PLEX_DB_PATH", "/database")),
         "PLEX_DB_FILE": "com.plexapp.plugins.library.db",
         "SECTION_IDS": ",".join(str(s) for s in section_ids),
         "PATH_MAP": path_map,
         "DUPE_ROOT": str(DUPE_ROOT),
         "PMDA_CONFIG_DIR": str(CONFIG_DIR),
-        "MUSIC_PARENT_PATH": merged.get("MUSIC_PARENT_PATH", ""),
-        "SCAN_THREADS": SCAN_THREADS if isinstance(SCAN_THREADS, int) else "auto",
-        "SKIP_FOLDERS": ",".join(skip_folders) if isinstance(skip_folders, list) else (skip_folders or ""),
-        "CROSS_LIBRARY_DEDUPE": CROSS_LIBRARY_DEDUPE,
-        "CROSSCHECK_SAMPLES": CROSSCHECK_SAMPLES,
-        "FORMAT_PREFERENCE": FORMAT_PREFERENCE,
-        "AI_PROVIDER": AI_PROVIDER,
-        "OPENAI_API_KEY": OPENAI_API_KEY,
-        "OPENAI_MODEL": OPENAI_MODEL,
-        "OPENAI_MODEL_FALLBACKS": os.getenv("OPENAI_MODEL_FALLBACKS", ""),
-        "ANTHROPIC_API_KEY": ANTHROPIC_API_KEY,
-        "GOOGLE_API_KEY": GOOGLE_API_KEY,
-        "OLLAMA_URL": OLLAMA_URL,
-        "USE_MUSICBRAINZ": USE_MUSICBRAINZ,
-        "MUSICBRAINZ_EMAIL": MUSICBRAINZ_EMAIL,
-        "LIDARR_URL": merged.get("LIDARR_URL", ""),
-        "LIDARR_API_KEY": merged.get("LIDARR_API_KEY", ""),
-        "AUTOBRR_URL": merged.get("AUTOBRR_URL", ""),
-        "AUTOBRR_API_KEY": merged.get("AUTOBRR_API_KEY", ""),
-        "AUTO_FIX_BROKEN_ALBUMS": AUTO_FIX_BROKEN_ALBUMS,
-        "BROKEN_ALBUM_CONSECUTIVE_THRESHOLD": BROKEN_ALBUM_CONSECUTIVE_THRESHOLD,
-        "BROKEN_ALBUM_PERCENTAGE_THRESHOLD": BROKEN_ALBUM_PERCENTAGE_THRESHOLD,
-        "REQUIRED_TAGS": REQUIRED_TAGS,
-        "DISCORD_WEBHOOK": DISCORD_WEBHOOK,
-        "LOG_LEVEL": LOG_LEVEL,
-        "LOG_FILE": LOG_FILE,
-        "AUTO_MOVE_DUPES": AUTO_MOVE_DUPES,
+        "MUSIC_PARENT_PATH": get_setting("MUSIC_PARENT_PATH", merged.get("MUSIC_PARENT_PATH", "")),
+        "SCAN_THREADS": get_setting("SCAN_THREADS", SCAN_THREADS if isinstance(SCAN_THREADS, int) else "auto"),
+        "SKIP_FOLDERS": get_setting("SKIP_FOLDERS", ",".join(skip_folders) if isinstance(skip_folders, list) else (skip_folders or "")),
+        "CROSS_LIBRARY_DEDUPE": get_setting("CROSS_LIBRARY_DEDUPE", CROSS_LIBRARY_DEDUPE),
+        "CROSSCHECK_SAMPLES": get_setting("CROSSCHECK_SAMPLES", CROSSCHECK_SAMPLES),
+        "FORMAT_PREFERENCE": get_setting("FORMAT_PREFERENCE", FORMAT_PREFERENCE),
+        "AI_PROVIDER": get_setting("AI_PROVIDER", AI_PROVIDER),
+        "OPENAI_API_KEY": get_setting("OPENAI_API_KEY", OPENAI_API_KEY),
+        "OPENAI_MODEL": get_setting("OPENAI_MODEL", OPENAI_MODEL),
+        "OPENAI_MODEL_FALLBACKS": get_setting("OPENAI_MODEL_FALLBACKS", os.getenv("OPENAI_MODEL_FALLBACKS", "")),
+        "ANTHROPIC_API_KEY": get_setting("ANTHROPIC_API_KEY", ANTHROPIC_API_KEY),
+        "GOOGLE_API_KEY": get_setting("GOOGLE_API_KEY", GOOGLE_API_KEY),
+        "OLLAMA_URL": get_setting("OLLAMA_URL", OLLAMA_URL),
+        "USE_MUSICBRAINZ": get_setting("USE_MUSICBRAINZ", USE_MUSICBRAINZ),
+        "MUSICBRAINZ_EMAIL": get_setting("MUSICBRAINZ_EMAIL", MUSICBRAINZ_EMAIL),
+        "LIDARR_URL": get_setting("LIDARR_URL", merged.get("LIDARR_URL", "")),
+        "LIDARR_API_KEY": get_setting("LIDARR_API_KEY", merged.get("LIDARR_API_KEY", "")),
+        "AUTOBRR_URL": get_setting("AUTOBRR_URL", merged.get("AUTOBRR_URL", "")),
+        "AUTOBRR_API_KEY": get_setting("AUTOBRR_API_KEY", merged.get("AUTOBRR_API_KEY", "")),
+        "AUTO_FIX_BROKEN_ALBUMS": get_setting("AUTO_FIX_BROKEN_ALBUMS", AUTO_FIX_BROKEN_ALBUMS),
+        "BROKEN_ALBUM_CONSECUTIVE_THRESHOLD": get_setting("BROKEN_ALBUM_CONSECUTIVE_THRESHOLD", BROKEN_ALBUM_CONSECUTIVE_THRESHOLD),
+        "BROKEN_ALBUM_PERCENTAGE_THRESHOLD": get_setting("BROKEN_ALBUM_PERCENTAGE_THRESHOLD", BROKEN_ALBUM_PERCENTAGE_THRESHOLD),
+        "REQUIRED_TAGS": get_setting("REQUIRED_TAGS", REQUIRED_TAGS),
+        "DISCORD_WEBHOOK": get_setting("DISCORD_WEBHOOK", DISCORD_WEBHOOK),
+        "LOG_LEVEL": get_setting("LOG_LEVEL", LOG_LEVEL),
+        "LOG_FILE": get_setting("LOG_FILE", LOG_FILE),
+        "AUTO_MOVE_DUPES": get_setting("AUTO_MOVE_DUPES", AUTO_MOVE_DUPES),
     })
 
 
@@ -6536,7 +6580,9 @@ def _restart_container():
 
 @app.put("/api/config")
 def api_config_put():
-    """Persist configuration updates to config.json and SQLite, then restart container."""
+    """Persist configuration updates to SQLite (single source of truth).
+    Only updates keys present in the request; existing values in SQLite are preserved.
+    """
     data = request.get_json() or {}
     allowed = {
         "PLEX_HOST", "PLEX_TOKEN", "PLEX_DB_PATH", "SECTION_IDS", "PATH_MAP",
@@ -6549,6 +6595,8 @@ def api_config_put():
         "LIDARR_URL", "LIDARR_API_KEY", "AUTOBRR_URL", "AUTOBRR_API_KEY", "AUTO_FIX_BROKEN_ALBUMS",
         "BROKEN_ALBUM_CONSECUTIVE_THRESHOLD", "BROKEN_ALBUM_PERCENTAGE_THRESHOLD", "REQUIRED_TAGS",
     }
+    # Only process keys that are in the request AND in the allowed list
+    # This preserves existing values in SQLite for keys not in the request
     updates = {k: v for k, v in data.items() if k in allowed}
     if not updates:
         return jsonify({"status": "ok", "message": "Nothing to save"})
@@ -6582,32 +6630,32 @@ def api_config_put():
         if isinstance(v, (dict, list)):
             updates_for_db[k] = json.dumps(v)
         else:
+            # Preserve empty strings (they are valid values, e.g. empty webhook = disabled)
             updates_for_db[k] = str(v) if v is not None else ""
     
     try:
-        # Save to SQLite
+        # Save to SQLite (single source of truth)
         con = sqlite3.connect(str(STATE_DB_FILE))
         cur = con.cursor()
         for key, value in updates_for_db.items():
             cur.execute("INSERT OR REPLACE INTO settings(key, value) VALUES(?, ?)", (key, value))
         con.commit()
         con.close()
-        logging.info("Settings saved to SQLite database")
+        logging.info("Settings saved to SQLite database: %s", list(updates_for_db.keys()))
     except Exception as e:
         logging.warning("Failed to save settings to SQLite: %s", e)
         return jsonify({"status": "error", "message": f"Failed to save to database: {str(e)}"}), 500
     
-    # Also save to config.json for compatibility
+    # Optional mirror to config.json (backup/readability). SQLite is the single source of truth.
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             conf_write = json.load(f)
         conf_write.update(updates)
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:
             json.dump(conf_write, f, indent=2)
-        logging.info("Settings saved to config.json")
+        logging.info("Settings mirrored to config.json (SQLite remains source of truth)")
     except Exception as e:
-        logging.warning("Failed to write config.json: %s", e)
-        # Don't fail if config.json write fails, SQLite is the source of truth
+        logging.warning("Failed to write config.json: %s (ignored, SQLite is source of truth)", e)
     
     # Update global variables if MusicBrainz email changed
     if "MUSICBRAINZ_EMAIL" in updates:
