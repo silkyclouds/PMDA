@@ -543,6 +543,10 @@ def _get(key: str, *, default=None, cast=lambda x: x):
     elif key in conf:
         ENV_SOURCES[key] = "config"
         raw = conf[key]
+        # Treat empty strings as "not set" to use default instead
+        if isinstance(raw, str) and raw.strip() == "" and default is not None:
+            ENV_SOURCES[key] = "default"
+            raw = default
     else:
         ENV_SOURCES[key] = "default"
         raw = default
