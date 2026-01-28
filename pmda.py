@@ -536,20 +536,52 @@ except Exception as e:
 ENV_SOURCES: dict[str, str] = {}
 
 def _get(key: str, *, default=None, cast=lambda x: x):
-    """Return the merged value and remember where it came from."""
+    """Return the merged value and remember where it came from.
+    Priority: env > SQLite > config.json > default
+    """
+    # 1. Environment variables (highest priority)
     if (env_val := os.getenv(key)) is not None:
         ENV_SOURCES[key] = "env"
         raw = env_val
-    elif key in conf:
-        ENV_SOURCES[key] = "config"
-        raw = conf[key]
-        # Treat empty strings as "not set" to use default instead
-        if isinstance(raw, str) and raw.strip() == "" and default is not None:
+    # 2. SQLite database (settings table) - check if DB exists and has the key
+    else:
+        sqlite_val = None
+        try:
+            # STATE_DB_FILE is defined later, so we construct the path here
+            state_db_path = CONFIG_DIR / "state.db"
+            if state_db_path.exists():
+                con = sqlite3.connect(str(state_db_path), timeout=5)
+                cur = con.cursor()
+                cur.execute("SELECT value FROM settings WHERE key = ?", (key,))
+                row = cur.fetchone()
+                con.close()
+                if row and row[0]:
+                    sqlite_val = row[0]
+        except Exception:
+            # If SQLite read fails, fall through to config.json
+            pass
+        
+        if sqlite_val is not None:
+            ENV_SOURCES[key] = "sqlite"
+            raw = sqlite_val
+            # Treat empty strings as "not set" to use default instead
+            if isinstance(raw, str) and raw.strip() == "" and default is not None:
+                ENV_SOURCES[key] = "default"
+                raw = default
+            else:
+                return cast(raw)
+        # 3. config.json
+        elif key in conf:
+            ENV_SOURCES[key] = "config"
+            raw = conf[key]
+            # Treat empty strings as "not set" to use default instead
+            if isinstance(raw, str) and raw.strip() == "" and default is not None:
+                ENV_SOURCES[key] = "default"
+                raw = default
+        else:
+            # 4. Default value
             ENV_SOURCES[key] = "default"
             raw = default
-    else:
-        ENV_SOURCES[key] = "default"
-        raw = default
     return cast(raw)
 
 # PLEX_DB_PATH defaults to /database in container; no SystemExit if unconfigured.
