@@ -1,6 +1,11 @@
 # Local Cursor rules – never publish to GitHub
 .cursorrules
 
+# Never push to GitHub: Cursor IDE, docs, Markdown files
+.cursor/
+docs/
+*.md
+
 # Python
 __pycache__/
 *.py[cod]
