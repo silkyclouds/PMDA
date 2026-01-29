@@ -158,7 +158,7 @@ import random
 
 
 
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_from_directory, send_file
 
 app = Flask(__name__)
 
@@ -604,6 +604,14 @@ merged = {
     "USE_MUSICBRAINZ": _get("USE_MUSICBRAINZ", default=False, cast=_parse_bool),
     "MUSICBRAINZ_EMAIL": _get("MUSICBRAINZ_EMAIL", default="pmda@example.com", cast=str),
     "MB_QUEUE_ENABLED": _get("MB_QUEUE_ENABLED", default=True, cast=_parse_bool),
+    "USE_DISCOGS": _get("USE_DISCOGS", default=False, cast=_parse_bool),
+    "DISCOGS_USER_TOKEN": _get("DISCOGS_USER_TOKEN", default="", cast=str),
+    "DISCOGS_CONSUMER_KEY": _get("DISCOGS_CONSUMER_KEY", default="", cast=str),
+    "DISCOGS_CONSUMER_SECRET": _get("DISCOGS_CONSUMER_SECRET", default="", cast=str),
+    "USE_LASTFM": _get("USE_LASTFM", default=False, cast=_parse_bool),
+    "LASTFM_API_KEY": _get("LASTFM_API_KEY", default="", cast=str),
+    "LASTFM_API_SECRET": _get("LASTFM_API_SECRET", default="", cast=str),
+    "USE_BANDCAMP": _get("USE_BANDCAMP", default=False, cast=_parse_bool),
     "LIDARR_URL": _get("LIDARR_URL", default="", cast=str),
     "LIDARR_API_KEY": _get("LIDARR_API_KEY", default="", cast=str),
     "AUTOBRR_URL": _get("AUTOBRR_URL", default="", cast=str),
@@ -625,6 +633,14 @@ SKIP_FOLDERS: list[str] = merged["SKIP_FOLDERS"]
 USE_MUSICBRAINZ: bool = bool(merged["USE_MUSICBRAINZ"])
 MUSICBRAINZ_EMAIL: str = merged.get("MUSICBRAINZ_EMAIL", "pmda@example.com")
 MB_QUEUE_ENABLED: bool = bool(merged.get("MB_QUEUE_ENABLED", True))
+USE_DISCOGS: bool = bool(merged.get("USE_DISCOGS", False))
+DISCOGS_USER_TOKEN: str = merged.get("DISCOGS_USER_TOKEN", "")
+DISCOGS_CONSUMER_KEY: str = merged.get("DISCOGS_CONSUMER_KEY", "")
+DISCOGS_CONSUMER_SECRET: str = merged.get("DISCOGS_CONSUMER_SECRET", "")
+USE_LASTFM: bool = bool(merged.get("USE_LASTFM", False))
+LASTFM_API_KEY: str = merged.get("LASTFM_API_KEY", "")
+LASTFM_API_SECRET: str = merged.get("LASTFM_API_SECRET", "")
+USE_BANDCAMP: bool = bool(merged.get("USE_BANDCAMP", False))
 
 # Configure MusicBrainz User-Agent with user's email (if provided)
 def _configure_musicbrainz_useragent():
@@ -728,7 +744,7 @@ log_header("configuration")
 # Mask & dump effective config ------------------------------------------------
 for k, src in ENV_SOURCES.items():
     val = merged.get(k)
-    if k in {"PLEX_TOKEN", "OPENAI_API_KEY", "DISCORD_WEBHOOK"} and val:
+    if k in {"PLEX_TOKEN", "OPENAI_API_KEY", "DISCORD_WEBHOOK", "DISCOGS_USER_TOKEN", "DISCOGS_CONSUMER_SECRET", "LASTFM_API_SECRET"} and val:
         val = val[:4] + "…"  # keep first 4 chars, mask the rest
     logging.info("Config %-15s = %-30s (source: %s)", k, val, src)
 
@@ -739,7 +755,7 @@ else:
     logging.info("➡️  Duplicate detection mode: per-library only (no cross-library comparisons)")
 
 if _level_num == logging.DEBUG:
-    scrubbed = {k: ("***" if k in {"PLEX_TOKEN", "OPENAI_API_KEY", "DISCORD_WEBHOOK"} else v)
+    scrubbed = {k: ("***" if k in {"PLEX_TOKEN", "OPENAI_API_KEY", "DISCORD_WEBHOOK", "DISCOGS_USER_TOKEN", "DISCOGS_CONSUMER_SECRET", "LASTFM_API_SECRET"} else v)
                 for k, v in merged.items()}
     logging.debug("Full merged config:\n%s", json.dumps(scrubbed, indent=2))
 
@@ -1604,6 +1620,28 @@ def init_state_db():
             UNIQUE(artist_id)
         )
     """)
+    # Table for caching album titles from audio tags (for fast library browsing)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS album_titles_cache (
+            album_id INTEGER PRIMARY KEY,
+            title TEXT NOT NULL,
+            source TEXT,
+            updated_at INTEGER,
+            UNIQUE(album_id)
+        )
+    """)
+    try:
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_album_titles_cache_album_id ON album_titles_cache(album_id)")
+    except sqlite3.OperationalError:
+        pass
+    # Migration: add mbid column for MB-identified count (albums with MusicBrainz ID in tags or from MB lookup)
+    try:
+        cur.execute("PRAGMA table_info(album_titles_cache)")
+        atc_cols = [r[1] for r in cur.fetchall()]
+        if "mbid" not in atc_cols:
+            cur.execute("ALTER TABLE album_titles_cache ADD COLUMN mbid TEXT")
+    except sqlite3.OperationalError:
+        pass
     # Table for duplicate "loser" entries
     cur.execute("""
         CREATE TABLE IF NOT EXISTS duplicates_loser (
@@ -1705,6 +1743,24 @@ def init_state_db():
             moved_at REAL NOT NULL,
             restored INTEGER DEFAULT 0,
             FOREIGN KEY (scan_id) REFERENCES scan_history(scan_id)
+        )
+    """)
+    # Table for persisted artist analysis (Library page; filled by scan backfill or "Analyze" button)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS artist_analysis_cache (
+            artist_id INTEGER PRIMARY KEY,
+            data TEXT NOT NULL,
+            analyzed_at INTEGER NOT NULL
+        )
+    """)
+    # Table for albums with missing required tags (Tag Fixer; filled during scan)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS albums_missing_tags (
+            album_id INTEGER PRIMARY KEY,
+            artist_name TEXT NOT NULL,
+            album_title TEXT NOT NULL,
+            year INTEGER,
+            missing_tags TEXT NOT NULL
         )
     """)
     con.commit()
@@ -2062,8 +2118,31 @@ state = {
     "scan_last_update_time": None,    # Dernière mise à jour pour calcul ETA
     "scan_last_progress": 0,          # Progression au dernier update
     "scan_active_artists": {},        # Dict {artist_name: {"start_time": float, "total_albums": int, "albums_processed": int}}
+    # Improve All Albums: real-time progress (written by background thread, read by GET progress)
+    "improve_all": None,             # None when idle; dict when running or just finished (see _improve_all_progress_skeleton)
+    # Artist analysis cache and progress (for "analyze before display" flow)
+    "artist_analysis_cache": {},     # artist_id -> { artist_id, artist_name, artist_thumb, albums, total_albums, stats, analyzed_at }
+    "artist_analyze_progress": {},  # artist_id -> { running, current_album_index, total_albums, current_album_title, step, finished, error }
 }
 lock = threading.Lock()
+
+def _improve_all_progress_skeleton():
+    return {
+        "running": False,
+        "artist_id": None,
+        "artist_name": None,
+        "current_provider": None,
+        "provider_status": {"musicbrainz": "pending", "discogs": "pending", "lastfm": "pending", "bandcamp": "pending"},
+        "current_album": None,
+        "current_album_id": None,
+        "current_steps": [],
+        "album_log": [],
+        "total_albums": 0,
+        "albums_processed": 0,
+        "finished": False,
+        "error": None,
+        "result": None,
+    }
 
 
 
@@ -2242,24 +2321,55 @@ def norm_album(title: str) -> str:
         return f"__untitled__-{h}"
     return "__untitled__"
 
+
+# Known audio/medium format tokens to strip from album titles (e.g. "Nevermind (Mp3)" -> "Nevermind")
+_FORMAT_TOKENS = frozenset(
+    "mp3 flac wav ogg m4a aac alac ape wma cd vinyl lp 24bit 24-bit 320 320k lossless".split()
+)
+
+
+def strip_format_from_album_title(title: str) -> str:
+    """
+    Remove format indicators in parentheses from album title (e.g. (Mp3), (flac), (mp3 (flac))).
+    Returns the cleaned title with trailing whitespace stripped.
+    """
+    if not title or not title.strip():
+        return (title or "").strip()
+    s = title.strip()
+    # Repeatedly remove trailing parenthetical content that looks like format(s)
+    while True:
+        m = re.search(r"\s*\(([^()]+)\)\s*$", s)
+        if not m:
+            break
+        inner = m.group(1).strip().lower()
+        # Check if the whole parenthesis content is format-like (tokens separated by space/slash)
+        parts = re.split(r"[\s/]+", inner)
+        if all(p in _FORMAT_TOKENS for p in parts if p):
+            s = s[: m.start()].rstrip()
+        else:
+            break
+    return s.strip()
+
+
 def derive_album_title(plex_title: str, meta: Dict[str, str], folder: Path, album_id: int) -> Tuple[str, str]:
     """
     Pick the most trustworthy album title available and return (title, source).
     Priority: Plex DB → embedded tags → folder name → unique placeholder.
+    Format suffixes like (Mp3), (flac) are stripped to get the real album name.
     """
     if plex_title:
-        title = plex_title.strip()
+        title = strip_format_from_album_title(plex_title)
         if title:
             return (title, "plex")
 
     for key in ("album", "title", "release", "albumartist"):
         candidate = meta.get(key, "")
         if candidate:
-            title = candidate.strip()
+            title = strip_format_from_album_title(candidate)
             if title:
                 return (title, f"tag:{key}")
 
-    folder_title = folder.name.replace("_", " ").strip()
+    folder_title = strip_format_from_album_title(folder.name.replace("_", " "))
     if folder_title:
         return (folder_title, "folder")
 
@@ -2273,6 +2383,15 @@ def get_primary_format(folder: Path) -> str:
     except OSError as e:
         logging.debug("get_primary_format I/O error for %s: %s", folder, e)
     return "UNKNOWN"
+
+
+# Lossless audio formats (better than MP3/AAC); others are considered lossy or unknown
+_LOSSLESS_FORMATS = frozenset({"FLAC", "ALAC", "APE", "WV", "WAV", "AIFF", "DSF", "DFF", "TTA"})
+
+
+def is_lossless_format(ext: str) -> bool:
+    """Return True if the given extension is typically a lossless format (FLAC, etc.)."""
+    return (ext or "").upper() in _LOSSLESS_FORMATS
 
 def thumb_url(album_id: int) -> str:
     return f"{PLEX_HOST}/library/metadata/{album_id}/thumb?X-Plex-Token={PLEX_TOKEN}"
@@ -2384,7 +2503,7 @@ def get_tracks_for_details(db_conn, album_id: int) -> List[dict]:
     if stream_cols is None:
         # No media_streams codec/bitrate: return basic track info (duration from part or metadata_items)
         rows = db_conn.execute(f"""
-          SELECT tr.title, tr."index",
+          SELECT tr.id, tr.title, tr."index",
                  {'tr.parent_index' if has_parent else 'NULL'} AS disc_no,
                  COALESCE(mp.duration, tr.duration) AS duration, mp.file
           FROM metadata_items tr
@@ -2395,6 +2514,7 @@ def get_tracks_for_details(db_conn, album_id: int) -> List[dict]:
         """, (album_id,)).fetchall()
         return [
             {
+                "track_id": row_id,
                 "name": (t or "").strip(),
                 "title": (t or "").strip(),
                 "idx": i or 0,
@@ -2404,12 +2524,12 @@ def get_tracks_for_details(db_conn, album_id: int) -> List[dict]:
                 "bitrate": None,
                 "path": (raw_path or "").strip() or None,
             }
-            for t, i, _d, dur, raw_path in rows
+            for row_id, t, i, _d, dur, raw_path in rows
         ]
     codec_col, bitrate_col = stream_cols
     # stream_type_id 2 = audio in Plex; one row per track (pick stream with max bitrate if several)
     sql = f"""
-      SELECT tr.title, tr."index",
+      SELECT tr.id, tr.title, tr."index",
              {'tr.parent_index' if has_parent else 'NULL'} AS disc_no,
              COALESCE(mp.duration, tr.duration), ms.{codec_col}, ms.{bitrate_col}, mp.file
       FROM metadata_items tr
@@ -2431,19 +2551,37 @@ def get_tracks_for_details(db_conn, album_id: int) -> List[dict]:
             "get_tracks_for_details (streams) failed for album_id=%s: %s",
             album_id, e
         )
+        # Fallback: get track ids and basic info (zip with get_tracks for duration)
+        id_rows = db_conn.execute(
+            'SELECT id, title, "index" FROM metadata_items WHERE parent_id = ? AND metadata_type = 10 ORDER BY "index"',
+            (album_id,)
+        ).fetchall()
         tracks = get_tracks(db_conn, album_id)
-        return [
-            {"name": t.title, "title": t.title, "idx": t.idx, "duration": t.dur // 1000, "dur": t.dur, "format": None, "bitrate": None, "path": None}
-            for t in tracks
-        ]
+        fallback_out = []
+        for j, (rid, t, i) in enumerate(id_rows):
+            tr = tracks[j] if j < len(tracks) else None
+            title_str = (t or "").strip() or (tr.title if tr else "") or f"Track {i or 0}"
+            dur_ms = tr.dur if tr else 0
+            fallback_out.append({
+                "track_id": rid,
+                "name": title_str,
+                "title": title_str,
+                "idx": i or 0,
+                "duration": dur_ms // 1000,
+                "dur": dur_ms,
+                "format": None,
+                "bitrate": None,
+                "path": None,
+            })
+        return fallback_out
     out = []
-    seen_index = set()
+    seen_id = set()
     for row in rows:
-        t, i, _d, dur, codec, bitrate, raw_path = row
+        row_id, t, i, _d, dur, codec, bitrate, raw_path = row
         idx = i or 0
-        if idx in seen_index:
+        if row_id in seen_id:
             continue
-        seen_index.add(idx)
+        seen_id.add(row_id)
         title = (t or "").strip()
         dur_ms = dur or 0
         # Plex DB: bitrate is in bps (e.g. 867234 -> 867 kbps)
@@ -2452,6 +2590,7 @@ def get_tracks_for_details(db_conn, album_id: int) -> List[dict]:
             b = int(bitrate)
             br_kbps = b if b < 100000 else b // 1000
         out.append({
+            "track_id": row_id,
             "name": title,
             "title": title,
             "idx": idx,
@@ -2752,6 +2891,46 @@ def detect_broken_album(db_conn, album_id: int, tracks: List[Track], mb_release_
     
     return False, None, actual_count, []
 
+
+def _detect_incomplete_from_indices(track_indices: List[int]) -> tuple[bool, int | None, int, list]:
+    """
+    Same heuristic as detect_broken_album but takes a list of track indices (no DB).
+    Returns (is_broken, expected_track_count, actual_count, missing_indices_flat).
+    missing_indices_flat is a flat list of missing track numbers (e.g. gap (1,4) -> [2, 3]).
+    """
+    actual_count = len(track_indices)
+    if actual_count == 0:
+        return True, 0, 0, []
+
+    indices = sorted([i for i in track_indices if i is not None])
+    if not indices:
+        return True, 0, 0, []
+
+    gaps = []
+    for i in range(len(indices) - 1):
+        if indices[i + 1] - indices[i] > 1:
+            gaps.append((indices[i], indices[i + 1]))
+
+    if not gaps:
+        return False, None, actual_count, []
+
+    large_gaps = [g for g in gaps if g[1] - g[0] > BROKEN_ALBUM_CONSECUTIVE_THRESHOLD]
+    if large_gaps:
+        missing_flat = []
+        for a, b in gaps:
+            missing_flat.extend(range(a + 1, b))
+        return True, None, actual_count, missing_flat
+
+    total_missing = sum(g[1] - g[0] - 1 for g in gaps)
+    if total_missing > actual_count * BROKEN_ALBUM_PERCENTAGE_THRESHOLD:
+        missing_flat = []
+        for a, b in gaps:
+            missing_flat.extend(range(a + 1, b))
+        return True, None, actual_count, missing_flat
+
+    return False, None, actual_count, []
+
+
 def fetch_mb_release_group_info(mbid: str) -> tuple[dict, bool]:
     """
     Fetch primary type, secondary-types, and media format summary from MusicBrainz release-group.
@@ -2817,6 +2996,7 @@ def fetch_mb_release_group_info(mbid: str) -> tuple[dict, bool]:
     logging.debug("[MusicBrainz RG Info] parsed primary_type=%s, secondary_types=%s, format_summary=%s", primary, secondary, format_summary)
     info = {
         "id": mbid,  # Include the MBID in the info dict
+        "title": result.get("title", ""),  # Include the release-group title
         "primary_type": primary,
         "secondary_types": secondary,
         "format_summary": format_summary
@@ -2883,10 +3063,11 @@ def search_mb_release_group_by_metadata(artist: str, album_norm: str, tracks: se
                                 formats.add(f"{qty}×{fmt}")
                     logging.debug("[MusicBrainz Search] selected RG info: { 'id': %s, 'primary_type': %s, 'format_summary': %s }", rg['id'], info.get('primary-type'), ', '.join(sorted(formats)))
                     result_dict = {
+                        'id': rg['id'],
+                        'title': rg.get('title', '') or info.get('title', ''),  # Include the release-group title
                         'primary_type': info.get('primary-type', ''),
                         'secondary_types': info.get('secondary-types', []),
-                        'format_summary': ', '.join(sorted(formats)),
-                        'id': rg['id']
+                        'format_summary': ', '.join(sorted(formats))
                     }
                     # Cache fallback match
                     set_cached_mb_info(rg['id'], result_dict)
@@ -3498,6 +3679,20 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> tuple[List[di
             plex_title = album_title(db_conn, aid)
             title_raw, title_source = derive_album_title(plex_title, meta_tags, folder, aid)
             album_norm_value = norm_album(title_raw)
+            
+            # Always cache the title if we have a valid one (even if Plex title is empty)
+            if title_raw and title_raw.strip():
+                try:
+                    con_cache = sqlite3.connect(str(STATE_DB_FILE), timeout=30)
+                    cur_cache = con_cache.cursor()
+                    cur_cache.execute(
+                        "INSERT OR REPLACE INTO album_titles_cache (album_id, title, source, updated_at) VALUES (?, ?, ?, ?)",
+                        (aid, title_raw.strip(), "scan", int(time.time()))
+                    )
+                    con_cache.commit()
+                    con_cache.close()
+                except Exception as e:
+                    logging.debug(f"Failed to cache title for album {aid} during scan: {e}")
             
             # Update: album title extracted
             with lock:
@@ -4176,6 +4371,22 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> tuple[List[di
         missing_required = [tag for tag in REQUIRED_TAGS if not tag_checks.get(tag.lower(), False)]
         if missing_required:
             albums_without_complete_tags += 1
+            # Persist for Tag Fixer (unified scan)
+            try:
+                year_val = meta.get('year') or (meta.get('date') or "")[:4] if meta.get('date') else None
+                if year_val and isinstance(year_val, str) and year_val.isdigit():
+                    year_val = int(year_val)
+                title_raw = e.get('title_raw') or e.get('album_id', '')
+                con_mt = sqlite3.connect(str(STATE_DB_FILE), timeout=30)
+                cur_mt = con_mt.cursor()
+                cur_mt.execute(
+                    "INSERT OR REPLACE INTO albums_missing_tags (album_id, artist_name, album_title, year, missing_tags) VALUES (?, ?, ?, ?, ?)",
+                    (e['album_id'], artist, str(title_raw)[:500], year_val, json.dumps(missing_required))
+                )
+                con_mt.commit()
+                con_mt.close()
+            except Exception as mt_err:
+                logging.debug("Failed to insert albums_missing_tags for album %s: %s", e.get('album_id'), mt_err)
         
         # Check for album cover images
         folder = e.get('folder')
@@ -4506,10 +4717,20 @@ def background_scan():
 
         clear_db_on_new_scan()  # wipe previous duplicate tables
 
+        # Clear albums_missing_tags at scan start (Tag Fixer data from this run)
+        con_mt = sqlite3.connect(str(STATE_DB_FILE))
+        con_mt.execute("DELETE FROM albums_missing_tags")
+        con_mt.commit()
+        con_mt.close()
+
         all_results, futures = {}, []
         import concurrent.futures
         future_to_albums: dict[concurrent.futures.Future, int] = {}
         future_to_artist: dict[concurrent.futures.Future, str] = {}
+        future_to_artist_id: dict[concurrent.futures.Future, int] = {}
+        completed_artist_ids: set[int] = set()
+        with lock:
+            state["scan_phase"] = "duplicates"
         with ThreadPoolExecutor(max_workers=SCAN_THREADS) as executor:
             for artist_id, artist_name in artists:
                 album_cnt = db_conn.execute(
@@ -4527,16 +4748,20 @@ def background_scan():
                 futures.append(fut)
                 future_to_albums[fut] = album_cnt
                 future_to_artist[fut] = artist_name
+                future_to_artist_id[fut] = artist_id
             # close the shared connection; workers use their own
             db_conn.close()
 
             artists_processed = 0
+            with lock:
+                state["scan_phase"] = "metadata"
             for future in as_completed(futures):
                 # Allow stop/pause mid‑scan
                 if scan_should_stop.is_set():
                     break
                 album_cnt = future_to_albums.get(future, 0)
                 artist_name = future_to_artist.get(future, "<unknown>")
+                artist_id = future_to_artist_id.get(future)
                 stats = {"ai_used": 0, "mb_used": 0}
                 try:
                     result = future.result()
@@ -4552,6 +4777,8 @@ def background_scan():
                     groups = []
                     stats = {"ai_used": 0, "mb_used": 0}
                 finally:
+                    if artist_id is not None:
+                        completed_artist_ids.add(artist_id)
                     with lock:
                         state["scan_progress"] += album_cnt
                         state["scan_artists_processed"] += 1
@@ -4645,6 +4872,37 @@ def background_scan():
         missing_albums_total = 0
         with lock:
             state["scan_missing_albums_count"] = missing_albums_total
+
+        # Backfill artist analysis cache for all scanned artists (Library + Tag Fixer ready)
+        with lock:
+            state["scan_phase"] = "cache"
+        backfill_count = 0
+        for artist_id in completed_artist_ids:
+            if scan_should_stop.is_set():
+                break
+            try:
+                conn = plex_connect()
+                try:
+                    result = _build_artist_detail_response(artist_id, conn, None)
+                    if result:
+                        data_json = json.dumps(result)
+                        analyzed_at = time.time()
+                        state_db = sqlite3.connect(str(STATE_DB_FILE), timeout=30)
+                        state_db.execute(
+                            "INSERT OR REPLACE INTO artist_analysis_cache (artist_id, data, analyzed_at) VALUES (?, ?, ?)",
+                            (artist_id, data_json, analyzed_at),
+                        )
+                        state_db.commit()
+                        state_db.close()
+                        backfill_count += 1
+                        with lock:
+                            state.setdefault("artist_analysis_cache", {})[artist_id] = result
+                finally:
+                    conn.close()
+            except Exception as e:
+                logging.warning("Backfill artist_analysis_cache for artist_id %s: %s", artist_id, e)
+        if backfill_count:
+            logging.info("Backfill: persisted artist_analysis_cache for %s artists", backfill_count)
         
         # Persist what we've found so far (even if some artists failed)
         save_scan_to_db(all_results)
@@ -4661,6 +4919,7 @@ def background_scan():
         with lock:
             state["scan_progress"] = state["scan_total"]  # force 100 % before stopping
             state["scanning"] = False
+            state["scan_phase"] = None
             scan_id = state.get("scan_id")
             start_time = state.get("scan_start_time", end_time)
         
@@ -6003,7 +6262,37 @@ def api_paths_verify():
     out = {"success": True, "results": results}
     if hint:
         out["hint"] = hint
+    # Persist last verification so frontend can show status on next open
+    try:
+        con = sqlite3.connect(str(STATE_DB_FILE))
+        cur = con.cursor()
+        cur.execute(
+            "INSERT OR REPLACE INTO settings(key, value) VALUES(?, ?)",
+            ("path_verify_last", json.dumps({"results": results, "at": time.time()}))
+        )
+        con.commit()
+        con.close()
+    except Exception as e:
+        logging.warning("Failed to persist path verify result: %s", e)
     return jsonify(out)
+
+
+@app.get("/api/paths/verify/last")
+def api_paths_verify_last():
+    """Return the last path verification result (from settings) so UI can show status without re-running verify."""
+    try:
+        con = sqlite3.connect(str(STATE_DB_FILE))
+        cur = con.cursor()
+        cur.execute("SELECT value FROM settings WHERE key = ?", ("path_verify_last",))
+        row = cur.fetchone()
+        con.close()
+        if not row or not row[0]:
+            return jsonify({"results": None, "at": None})
+        data = json.loads(row[0])
+        return jsonify({"results": data.get("results"), "at": data.get("at")})
+    except Exception as e:
+        logging.warning("Failed to load path verify last: %s", e)
+        return jsonify({"results": None, "at": None})
 
 
 @app.post("/api/openai/check")
@@ -6522,6 +6811,14 @@ def api_config_get():
         "OLLAMA_URL": get_setting("OLLAMA_URL", OLLAMA_URL),
         "USE_MUSICBRAINZ": get_setting("USE_MUSICBRAINZ", USE_MUSICBRAINZ),
         "MUSICBRAINZ_EMAIL": get_setting("MUSICBRAINZ_EMAIL", MUSICBRAINZ_EMAIL),
+        "USE_DISCOGS": get_setting("USE_DISCOGS", USE_DISCOGS),
+        "DISCOGS_USER_TOKEN": get_setting("DISCOGS_USER_TOKEN", DISCOGS_USER_TOKEN),
+        "DISCOGS_CONSUMER_KEY": get_setting("DISCOGS_CONSUMER_KEY", DISCOGS_CONSUMER_KEY),
+        "DISCOGS_CONSUMER_SECRET": get_setting("DISCOGS_CONSUMER_SECRET", DISCOGS_CONSUMER_SECRET),
+        "USE_LASTFM": get_setting("USE_LASTFM", USE_LASTFM),
+        "LASTFM_API_KEY": get_setting("LASTFM_API_KEY", LASTFM_API_KEY),
+        "LASTFM_API_SECRET": get_setting("LASTFM_API_SECRET", LASTFM_API_SECRET),
+        "USE_BANDCAMP": get_setting("USE_BANDCAMP", USE_BANDCAMP),
         "LIDARR_URL": get_setting("LIDARR_URL", merged.get("LIDARR_URL", "")),
         "LIDARR_API_KEY": get_setting("LIDARR_API_KEY", merged.get("LIDARR_API_KEY", "")),
         "AUTOBRR_URL": get_setting("AUTOBRR_URL", merged.get("AUTOBRR_URL", "")),
@@ -6590,6 +6887,9 @@ def api_config_put():
         "SCAN_THREADS", "LOG_LEVEL", "LOG_FILE", "AI_PROVIDER", "OPENAI_API_KEY", "OPENAI_MODEL",
         "OPENAI_MODEL_FALLBACKS", "ANTHROPIC_API_KEY", "GOOGLE_API_KEY", "OLLAMA_URL",
         "DISCORD_WEBHOOK", "USE_MUSICBRAINZ", "MUSICBRAINZ_EMAIL",
+        "USE_DISCOGS", "DISCOGS_USER_TOKEN", "DISCOGS_CONSUMER_KEY", "DISCOGS_CONSUMER_SECRET",
+        "USE_LASTFM", "LASTFM_API_KEY", "LASTFM_API_SECRET",
+        "USE_BANDCAMP",
         "SKIP_FOLDERS", "CROSS_LIBRARY_DEDUPE", "CROSSCHECK_SAMPLES",
         "FORMAT_PREFERENCE", "AUTO_MOVE_DUPES",
         "LIDARR_URL", "LIDARR_API_KEY", "AUTOBRR_URL", "AUTOBRR_API_KEY", "AUTO_FIX_BROKEN_ALBUMS",
@@ -6767,12 +7067,14 @@ def api_progress():
         albums_without_complete_tags = state.get("scan_albums_without_complete_tags", 0)
         albums_without_mb_id = state.get("scan_albums_without_mb_id", 0)
         albums_without_artist_mb_id = state.get("scan_albums_without_artist_mb_id", 0)
+        phase = state.get("scan_phase")
     
     return jsonify(
         scanning=scanning,
         progress=progress,
         total=total,
         status=status,
+        phase=phase,
         # Scan details
         artists_processed=artists_processed,
         artists_total=artists_total,
@@ -7080,25 +7382,72 @@ def api_library_artists():
         "offset": offset
     })
 
-@app.get("/api/library/artist/<int:artist_id>")
-def api_library_artist_detail(artist_id):
-    """Return detailed information about an artist including all albums with images and types."""
+@app.get("/api/library/stats")
+def api_library_stats():
+    """Return library-wide counts (artists, albums) from Plex DB for Unduper page when no scan results."""
     if not PLEX_CONFIGURED:
         return jsonify({"error": "Plex not configured"}), 503
-    
-    import sqlite3
     db_conn = plex_connect()
-    
+    try:
+        if CROSS_LIBRARY_DEDUPE:
+            artists_row = db_conn.execute(
+                "SELECT COUNT(DISTINCT id) FROM metadata_items WHERE metadata_type = 8"
+            ).fetchone()
+            albums_row = db_conn.execute(
+                "SELECT COUNT(DISTINCT id) FROM metadata_items WHERE metadata_type = 9"
+            ).fetchone()
+        else:
+            placeholders = ",".join("?" for _ in SECTION_IDS)
+            artists_row = db_conn.execute(
+                f"SELECT COUNT(DISTINCT id) FROM metadata_items WHERE metadata_type = 8 AND library_section_id IN ({placeholders})",
+                SECTION_IDS,
+            ).fetchone()
+            albums_row = db_conn.execute(
+                f"SELECT COUNT(DISTINCT id) FROM metadata_items WHERE metadata_type = 9 AND library_section_id IN ({placeholders})",
+                SECTION_IDS,
+            ).fetchone()
+        artists = int(artists_row[0] or 0)
+        albums = int(albums_row[0] or 0)
+        return jsonify({"artists": artists, "albums": albums})
+    finally:
+        db_conn.close()
+
+
+@app.get("/api/library/missing-tags")
+def api_library_missing_tags():
+    """Return albums with missing required tags (Tag Fixer). Data from last Library Scan."""
+    import sqlite3
+    con = sqlite3.connect(str(STATE_DB_FILE))
+    cur = con.cursor()
+    cur.execute(
+        "SELECT album_id, artist_name, album_title, year, missing_tags FROM albums_missing_tags ORDER BY artist_name, album_title"
+    )
+    rows = cur.fetchall()
+    con.close()
+    albums = [
+        {
+            "album_id": row[0],
+            "artist_name": row[1],
+            "album_title": row[2],
+            "year": row[3],
+            "missing_tags": json.loads(row[4]) if row[4] else [],
+        }
+        for row in rows
+    ]
+    return jsonify({"albums": albums})
+
+
+def _build_artist_detail_response(artist_id, db_conn, progress_callback=None):
+    """Build artist detail dict (albums, stats). Uses db_conn and state DB. Does not close db_conn.
+    If progress_callback is set, call it as (current_album_index, total_albums, current_album_title, step)."""
+    import sqlite3
     # Get artist info
     artist_row = db_conn.execute(
         "SELECT id, title FROM metadata_items WHERE id = ? AND metadata_type = 8",
         (artist_id,)
     ).fetchone()
-    
     if not artist_row:
-        db_conn.close()
-        return jsonify({"error": "Artist not found"}), 404
-    
+        return None
     artist_name = artist_row[1]
     
     # Get artist thumb from Plex
@@ -7142,73 +7491,1344 @@ def api_library_artist_detail(artist_id):
     con = sqlite3.connect(str(STATE_DB_FILE), timeout=30)
     cur = con.cursor()
     
-    for album_row in album_rows:
-        album_id, title, year, date, track_count = album_row
+    # First pass: check cache, on-the-fly incomplete detection, and collect albums that need tag reading
+    albums_to_fetch = []
+    album_titles = {}
+    broken_albums_set = set()
+    album_data = {}  # Store all album data
+    on_the_fly_broken_detail = {}  # album_id -> {expected_track_count, actual_track_count, missing_indices}
+
+    if progress_callback:
+        progress_callback(0, len(album_rows), None, "Checking tracks and gaps")
+    for i, album_row in enumerate(album_rows):
+        album_id, title_from_query, year, date, track_count = album_row
+        # Use album_title() to be sure we get the title from the DB
+        plex_title = album_title(db_conn, album_id) or title_from_query or ""
+
         cur.execute("SELECT 1 FROM broken_albums WHERE artist = ? AND album_id = ?", (artist_name, album_id))
-        is_broken = cur.fetchone() is not None
-        
-        # Get album thumb
-        album_thumb = None
+        is_broken_from_db = cur.fetchone() is not None
+
+        # On-the-fly incomplete detection: query Plex for track indices and run same heuristic as scan
         try:
-            album_thumb = thumb_url(album_id)
+            index_rows = db_conn.execute(
+                'SELECT "index" FROM metadata_items WHERE parent_id = ? AND metadata_type = 10',
+                (album_id,)
+            ).fetchall()
+            indices = [r[0] for r in index_rows if r[0] is not None]
+            otf_broken, otf_expected, otf_actual, otf_missing_flat = _detect_incomplete_from_indices(indices)
+            if otf_broken:
+                is_broken = True
+                broken_albums_set.add(album_id)
+                on_the_fly_broken_detail[album_id] = {
+                    "expected_track_count": otf_expected,
+                    "actual_track_count": otf_actual,
+                    "missing_indices": otf_missing_flat,
+                }
+            else:
+                is_broken = is_broken_from_db
+                if is_broken:
+                    broken_albums_set.add(album_id)
+        except Exception as e:
+            logging.debug("[artist detail] on-the-fly incomplete check for album %s: %s", album_id, e)
+            is_broken = is_broken_from_db
+            if is_broken:
+                broken_albums_set.add(album_id)
+
+        album_data[album_id] = {
+            'title': plex_title,
+            'year': year,
+            'date': date,
+            'track_count': track_count,
+            'is_broken': is_broken
+        }
+        
+        # Always check cache first (title and mbid); include in tag-read pass if title missing or mbid missing
+        cached = cur.execute(
+            "SELECT title, mbid FROM album_titles_cache WHERE album_id = ?", (album_id,)
+        ).fetchone()
+        has_title = cached and cached[0] and not cached[0].strip().startswith("Untitled Album #")
+        has_mbid = bool(cached and len(cached) > 1 and cached[1] and str(cached[1]).strip())
+        if has_title:
+            album_titles[album_id] = cached[0]
+        need_fetch = (not has_title) or (not has_mbid)
+        if need_fetch:
+            albums_to_fetch.append((album_id, plex_title, artist_name))
+            if not has_title:
+                logging.info(f"[API] Album {album_id} needs title fix (plex_title={repr(plex_title)}, artist={artist_name})")
+        if progress_callback:
+            display_title = strip_format_from_album_title(title_from_query or "") or (title_from_query or "") or f"Album #{album_id}"
+            progress_callback(i + 1, len(album_rows), display_title, "Checking tracks and gaps")
+    
+    # Second pass: read tags in parallel for albums not in cache
+    if albums_to_fetch:
+        def fetch_title_from_tags(item):
+            album_id, plex_title, artist_name = item
+            # Create a new DB connection for this thread (SQLite doesn't allow sharing connections across threads)
+            thread_db_conn = None
+            try:
+                thread_db_conn = plex_connect()
+                folder = first_part_path(thread_db_conn, album_id)
+                if not folder:
+                    logging.info(f"[Album {album_id}] No folder found")
+                    return (album_id, None, None, None)
+                
+                # 1. Try audio tags first
+                first_audio = next((p for p in folder.rglob("*") if AUDIO_RE.search(p.name)), None)
+                meta = None
+                if first_audio:
+                    try:
+                        meta = extract_tags(first_audio)
+                        mbid_from_tags = (meta.get('musicbrainz_releasegroupid') or meta.get('musicbrainz_releaseid')) if meta else None
+                        for key in ("album", "title", "release"):
+                            candidate = meta.get(key, "")
+                            if candidate and candidate.strip() and candidate.strip() != artist_name:
+                                cleaned = strip_format_from_album_title(candidate) or candidate.strip()
+                                logging.info(f"[Album {album_id}] Found title '{cleaned}' from tag '{key}'")
+                                return (album_id, cleaned, mbid_from_tags, "tags")
+                    except Exception as e:
+                        logging.warning(f"[Album {album_id}] Failed to extract tags: {e}")
+                
+                # 2. Try MusicBrainz if available and if we have an MBID
+                if USE_MUSICBRAINZ and first_audio and meta:
+                    try:
+                        mbid = meta.get('musicbrainz_releasegroupid') or meta.get('musicbrainz_releaseid')
+                        if mbid:
+                            info, _ = fetch_mb_release_group_info(mbid)
+                            if info and info.get('title'):
+                                logging.info(f"[Album {album_id}] Found title '{info['title']}' from MusicBrainz")
+                                return (album_id, info['title'], mbid, "musicbrainz")
+                    except Exception as e:
+                        logging.debug(f"[Album {album_id}] MusicBrainz lookup failed: {e}")
+                
+                # 3. Fallback to folder name (strip format suffix)
+                folder_name = folder.parent.name if folder.parent else folder.name
+                if folder_name:
+                    cleaned = strip_format_from_album_title(folder_name.replace("_", " "))
+                    if cleaned and cleaned != artist_name:
+                        logging.info(f"[Album {album_id}] Using folder name '{cleaned}'")
+                        return (album_id, cleaned, None, "tags")
+                
+                logging.info(f"[Album {album_id}] No title found")
+                return (album_id, None, None, None)
+            except Exception as e:
+                logging.warning(f"[Album {album_id}] Error in fetch_title_from_tags: {e}")
+                return (album_id, None, None, None)
+            finally:
+                if thread_db_conn:
+                    try:
+                        thread_db_conn.close()
+                    except Exception:
+                        pass
+        
+        # Read tags in parallel (max 8 workers to avoid overload)
+        with ThreadPoolExecutor(max_workers=min(8, len(albums_to_fetch))) as executor:
+            futures = {executor.submit(fetch_title_from_tags, item): item for item in albums_to_fetch}
+            # Wait for ALL futures to complete before proceeding
+            for future in as_completed(futures):
+                try:
+                    result = future.result(timeout=15)
+                    album_id = result[0]
+                    fetched_title = result[1] if len(result) > 1 else None
+                    fetched_mbid = result[2] if len(result) > 2 else None
+                    fetched_source = result[3] if len(result) > 3 else "tags"
+                    if fetched_title:
+                        album_titles[album_id] = fetched_title
+                        # Cache the result (include mbid and source for MB-identified count)
+                        try:
+                            cur.execute(
+                                "INSERT OR REPLACE INTO album_titles_cache (album_id, title, source, updated_at, mbid) VALUES (?, ?, ?, ?, ?)",
+                                (album_id, fetched_title, fetched_source or "tags", int(time.time()), fetched_mbid or None)
+                            )
+                        except sqlite3.OperationalError:
+                            cur.execute(
+                                "INSERT OR REPLACE INTO album_titles_cache (album_id, title, source, updated_at) VALUES (?, ?, ?, ?)",
+                                (album_id, fetched_title, fetched_source or "tags", int(time.time()))
+                            )
+                except Exception as e:
+                    # Log error for debugging but continue
+                    logging.warning(f"Failed to fetch title for album {album_id}: {e}")
+                    pass
+        
+        con.commit()
+    if progress_callback:
+        progress_callback(len(album_rows), len(album_rows), None, "Reading tags")
+    
+    # Broken album details (expected/actual track count, missing indices) for display; DB wins if present
+    broken_detail_by_album = {}
+    cur.execute(
+        "SELECT album_id, expected_track_count, actual_track_count, missing_indices FROM broken_albums WHERE artist = ?",
+        (artist_name,)
+    )
+    for row in cur.fetchall():
+        aid, expected, actual, missing_json = row
+        try:
+            missing_list = json.loads(missing_json) if missing_json else []
+        except Exception:
+            missing_list = []
+        broken_detail_by_album[aid] = {
+            "expected_track_count": expected,
+            "actual_track_count": actual,
+            "missing_indices": missing_list,
+        }
+    for aid, detail in on_the_fly_broken_detail.items():
+        if aid not in broken_detail_by_album:
+            broken_detail_by_album[aid] = detail
+
+    # Duplicate count and set of album_ids in duplicate groups (before building album list)
+    duplicate_count = 0
+    duplicate_album_ids = set()
+    with lock:
+        if not state["duplicates"]:
+            state["duplicates"] = load_scan_from_db()
+        if artist_name in state.get("duplicates", {}):
+            groups = state["duplicates"][artist_name]
+            for group in groups:
+                editions = group.get("editions", [])
+                if len(editions) > 1:
+                    duplicate_count += len(editions) - 1
+                    for e in editions:
+                        duplicate_album_ids.add(e.get("album_id"))
+    if progress_callback:
+        progress_callback(len(album_rows), len(album_rows), None, "Checking duplicates")
+
+    # On-the-fly duplicate detection: group albums by (normalized title, year, track_count); mark groups with >1 as duplicates
+    def _norm_title(t):
+        if not t or not isinstance(t, str):
+            return ""
+        return " ".join((strip_format_from_album_title(t) or t).lower().split()).strip()
+    key_to_ids = {}
+    for album_id, data in album_data.items():
+        title = album_titles.get(album_id) or data.get("title") or ""
+        key = (_norm_title(title), data.get("year"), data.get("track_count") or 0)
+        key_to_ids.setdefault(key, []).append(album_id)
+    for ids in key_to_ids.values():
+        if len(ids) > 1:
+            duplicate_album_ids.update(ids)
+    
+    # Build final album list with corrected titles (strip format suffixes like (Mp3), (flac))
+    albums = []
+    for album_id, data in album_data.items():
+        title = data['title']
+
+        # Use cached/fetched title if available
+        if album_id in album_titles:
+            title = album_titles[album_id]
+        elif not title or not title.strip() or title.strip() == artist_name:
+            # Fallback to folder name if still needed
+            folder = first_part_path(db_conn, album_id)
+            if folder:
+                folder_name = folder.parent.name if folder.parent else folder.name
+                if folder_name and folder_name.replace("_", " ").strip() != artist_name:
+                    title = folder_name.replace("_", " ").strip()
+
+            # Last resort fallback
+            if not title or title.strip() == artist_name:
+                title = f"Untitled Album #{album_id}"
+        # Remove format indicators in parentheses (e.g. (Mp3), (flac))
+        title = strip_format_from_album_title(title) or title
+        if not title.strip():
+            title = f"Untitled Album #{album_id}"
+        
+        # Always send Plex thumb URL so the list can display covers (Plex serves /thumb even when DB thumb is empty, e.g. from folder art)
+        album_thumb = thumb_url(album_id) if (PLEX_HOST and PLEX_TOKEN) else None
+        thumb_empty_in_db = True
+        try:
+            thumb_row = db_conn.execute(
+                "SELECT thumb FROM metadata_items WHERE id = ? AND metadata_type = 9",
+                (album_id,)
+            ).fetchone()
+            # Consider "has cover" when DB has thumb OR we have a thumb URL (Plex can serve from folder art)
+            thumb_empty_in_db = not ((thumb_row and thumb_row[0]) or (album_thumb and str(album_thumb).strip()))
         except Exception:
             pass
         
-        # Determine album type from tags or MusicBrainz
-        album_type = "Album"  # Default
-        folder = first_part_path(db_conn, album_id)
-        if folder:
-            first_audio = next((p for p in folder.rglob("*") if AUDIO_RE.search(p.name)), None)
-            if first_audio:
-                meta = extract_tags(first_audio)
-                # Check for compilation tag
-                if meta.get('compilation') == '1' or meta.get('compilation') == 'true':
-                    album_type = "Compilation"
-                # Check MusicBrainz release type if available
-                elif USE_MUSICBRAINZ:
-                    mbid = meta.get('musicbrainz_releasegroupid') or meta.get('musicbrainz_releaseid')
-                    if mbid:
-                        try:
-                            result = musicbrainzngs.get_release_group_by_id(mbid, includes=["tags"])
-                            release_group = result.get("release-group", {})
-                            primary_type = release_group.get("primary-type", "")
-                            secondary_types = release_group.get("secondary-type-list", [])
-                            if primary_type:
-                                album_type = primary_type
-                            if "Compilation" in secondary_types:
-                                album_type = "Compilation"
-                            elif "Anthology" in secondary_types:
-                                album_type = "Anthology"
-                        except Exception:
-                            pass
-                # Heuristic: if track_count <= 3, likely a Single
-                if track_count <= 3 and album_type == "Album":
-                    album_type = "Single"
-                # Heuristic: if track_count <= 6, might be EP
-                elif track_count <= 6 and album_type == "Album":
-                    album_type = "EP"
+        # Fast type heuristic from track count only
+        track_count = data['track_count'] or 0
+        if track_count <= 3:
+            album_type = "Single"
+        elif track_count <= 6:
+            album_type = "EP"
+        else:
+            album_type = "Album"
         
-        albums.append({
+        # Primary audio format (MP3, FLAC, etc.) and whether we can improve (lossy or missing cover/broken)
+        folder_for_format = first_part_path(db_conn, album_id)
+        audio_format = get_primary_format(folder_for_format) if folder_for_format else "UNKNOWN"
+        is_lossless = is_lossless_format(audio_format)
+        can_improve = not is_lossless or thumb_empty_in_db or data['is_broken']
+
+        # Per-album MusicBrainz identified (for list/tile tags)
+        mb_identified_album = False
+        cached_mb = cur.execute(
+            "SELECT source, mbid FROM album_titles_cache WHERE album_id = ?",
+            (album_id,)
+        ).fetchone()
+        if cached_mb:
+            src = cached_mb[0] if len(cached_mb) > 0 else None
+            mbid_val = cached_mb[1] if len(cached_mb) > 1 else None
+            if src == "musicbrainz" or (mbid_val and str(mbid_val).strip()):
+                mb_identified_album = True
+        
+        album_entry = {
             "album_id": album_id,
             "title": title,
-            "year": year,
-            "date": date,
-            "track_count": track_count or 0,
-            "is_broken": is_broken,
+            "year": data['year'],
+            "date": data['date'],
+            "track_count": track_count,
+            "is_broken": data['is_broken'],
             "thumb": album_thumb,
-            "type": album_type
-        })
+            "thumb_empty": thumb_empty_in_db,
+            "type": album_type,
+            "format": audio_format,
+            "is_lossless": is_lossless,
+            "can_improve": can_improve,
+            "mb_identified": mb_identified_album,
+            "in_duplicate_group": album_id in duplicate_album_ids,
+        }
+        if data['is_broken'] and album_id in broken_detail_by_album:
+            album_entry["broken_detail"] = broken_detail_by_album[album_id]
+        albums.append(album_entry)
+    
+    # Remaining statistics
+    no_cover_count = 0
+    mb_identified_count = 0
+    broken_count = len(broken_albums_set)
+    
+    # Count albums without cover (Plex DB thumb column empty; we still send thumb URL so list can show art when Plex serves it)
+    for album in albums:
+        # Use thumb_empty from album_entry if we stored it; else fallback to no thumb URL
+        if album.get("thumb_empty", not album.get("thumb")):
+            no_cover_count += 1
+    
+    # Count albums identified via MusicBrainz: cache source='musicbrainz' or mbid present (from tags)
+    for album_id, data in album_data.items():
+        cached = cur.execute(
+            "SELECT source, mbid FROM album_titles_cache WHERE album_id = ?",
+            (album_id,)
+        ).fetchone()
+        if cached:
+            source_val = cached[0] if len(cached) > 0 else None
+            mbid_val = cached[1] if len(cached) > 1 else None
+            if source_val == "musicbrainz" or (mbid_val and str(mbid_val).strip()):
+                mb_identified_count += 1
+
+    if progress_callback:
+        progress_callback(len(album_rows), len(album_rows), None, "Done")
     
     con.close()
-    db_conn.close()
-    
-    return jsonify({
+    # Do not close db_conn; caller owns it
+    return {
         "artist_id": artist_id,
         "artist_name": artist_name,
         "artist_thumb": artist_thumb,
         "albums": albums,
-        "total_albums": len(albums)
+        "total_albums": len(albums),
+        "stats": {
+            "duplicates": duplicate_count,
+            "no_cover": no_cover_count,
+            "mb_identified": mb_identified_count,
+            "broken": broken_count
+        }
+    }
+
+
+@app.get("/api/library/artist/<int:artist_id>")
+def api_library_artist_detail(artist_id):
+    """Return detailed information about an artist. Uses cache if analysis was run; else runs on-the-fly."""
+    if not PLEX_CONFIGURED:
+        return jsonify({"error": "Plex not configured"}), 503
+    with lock:
+        cached = state.get("artist_analysis_cache", {}).get(artist_id)
+    if cached:
+        out = dict(cached)
+        out["analysis_cached"] = True
+        out["analyzed_at"] = cached.get("analyzed_at")
+        return jsonify(out)
+    # Check persisted artist_analysis_cache (SQLite)
+    try:
+        con = sqlite3.connect(str(STATE_DB_FILE))
+        cur = con.cursor()
+        cur.execute("SELECT data, analyzed_at FROM artist_analysis_cache WHERE artist_id = ?", (artist_id,))
+        row = cur.fetchone()
+        con.close()
+        if row:
+            data_str, analyzed_at = row[0], row[1]
+            out = json.loads(data_str)
+            out["analysis_cached"] = True
+            out["analyzed_at"] = analyzed_at
+            with lock:
+                state.setdefault("artist_analysis_cache", {})[artist_id] = out
+            return jsonify(out)
+    except Exception as e:
+        logging.warning("Failed to load artist_analysis_cache for artist %s: %s", artist_id, e)
+    db_conn = plex_connect()
+    try:
+        artist_row = db_conn.execute(
+            "SELECT id, title FROM metadata_items WHERE id = ? AND metadata_type = 8",
+            (artist_id,)
+        ).fetchone()
+        if not artist_row:
+            return jsonify({"error": "Artist not found"}), 404
+        result = _build_artist_detail_response(artist_id, db_conn, None)
+        if result is None:
+            return jsonify({"error": "Artist not found"}), 404
+        return jsonify({**result, "analysis_cached": False})
+    finally:
+        db_conn.close()
+
+
+def _run_artist_analyze(artist_id):
+    """Worker: run full artist analysis, update progress, then write result to artist_analysis_cache."""
+    db_conn = None
+    try:
+        db_conn = plex_connect()
+        artist_row = db_conn.execute(
+            "SELECT id, title FROM metadata_items WHERE id = ? AND metadata_type = 8",
+            (artist_id,)
+        ).fetchone()
+        if not artist_row:
+            with lock:
+                if state.get("artist_analyze_progress", {}).get(artist_id):
+                    state["artist_analyze_progress"][artist_id]["error"] = "Artist not found"
+                    state["artist_analyze_progress"][artist_id]["running"] = False
+                    state["artist_analyze_progress"][artist_id]["finished"] = True
+            return
+
+        def progress_cb(current, total_albums, album_title, step):
+            with lock:
+                prog = state.get("artist_analyze_progress", {}).get(artist_id)
+                if prog:
+                    prog["current_album_index"] = current
+                    prog["total_albums"] = total_albums
+                    prog["current_album_title"] = album_title
+                    prog["step"] = step
+
+        result = _build_artist_detail_response(artist_id, db_conn, progress_cb)
+        if result is None:
+            with lock:
+                if state.get("artist_analyze_progress", {}).get(artist_id):
+                    state["artist_analyze_progress"][artist_id]["error"] = "Artist not found"
+                    state["artist_analyze_progress"][artist_id]["running"] = False
+                    state["artist_analyze_progress"][artist_id]["finished"] = True
+            return
+        cache_entry = {**result, "analyzed_at": int(time.time())}
+        with lock:
+            state["artist_analysis_cache"][artist_id] = cache_entry
+            prog = state.get("artist_analyze_progress", {}).get(artist_id)
+            if prog:
+                prog["running"] = False
+                prog["finished"] = True
+                prog["step"] = "Done"
+        # Persist to SQLite so cache survives restart
+        try:
+            con = sqlite3.connect(str(STATE_DB_FILE))
+            cur = con.cursor()
+            cur.execute(
+                "INSERT OR REPLACE INTO artist_analysis_cache (artist_id, data, analyzed_at) VALUES (?, ?, ?)",
+                (artist_id, json.dumps(cache_entry), cache_entry["analyzed_at"])
+            )
+            con.commit()
+            con.close()
+        except Exception as persist_err:
+            logging.warning("Failed to persist artist_analysis_cache for artist %s: %s", artist_id, persist_err)
+    except Exception as e:
+        logging.exception("[Artist analyze] Worker error: %s", e)
+        with lock:
+            prog = state.get("artist_analyze_progress", {}).get(artist_id)
+            if prog:
+                prog["error"] = str(e)
+                prog["running"] = False
+                prog["finished"] = True
+    finally:
+        if db_conn:
+            try:
+                db_conn.close()
+            except Exception:
+                pass
+
+
+@app.post("/api/library/artist/<int:artist_id>/analyze")
+def api_library_artist_analyze(artist_id):
+    """Start background analysis for this artist. Frontend polls GET .../analyze/progress."""
+    if not PLEX_CONFIGURED:
+        return jsonify({"error": "Plex not configured"}), 503
+    db_conn = plex_connect()
+    try:
+        artist_row = db_conn.execute(
+            "SELECT id, title FROM metadata_items WHERE id = ? AND metadata_type = 8",
+            (artist_id,)
+        ).fetchone()
+        if not artist_row:
+            return jsonify({"error": "Artist not found"}), 404
+    finally:
+        db_conn.close()
+    with lock:
+        prog = state.get("artist_analyze_progress", {}).get(artist_id)
+        if prog and prog.get("running"):
+            return jsonify({"error": "Analysis already running for this artist"}), 409
+        state.setdefault("artist_analyze_progress", {})[artist_id] = {
+            "running": True,
+            "current_album_index": 0,
+            "total_albums": 0,
+            "current_album_title": None,
+            "step": "Starting…",
+            "finished": False,
+            "error": None,
+        }
+    thread = threading.Thread(target=_run_artist_analyze, args=(artist_id,), daemon=True)
+    thread.start()
+    return jsonify({"started": True})
+
+
+@app.get("/api/library/artist/<int:artist_id>/analyze/progress")
+def api_library_artist_analyze_progress(artist_id):
+    """Return current analysis progress for this artist."""
+    with lock:
+        prog = state.get("artist_analyze_progress", {}).get(artist_id)
+    if prog is None:
+        return jsonify({"running": False, "finished": False})
+    return jsonify(dict(prog))
+
+
+def _run_improve_all_albums(artist_id, artist_name, album_rows):
+    """Worker: run improve-all logic, update state['improve_all'] for real-time progress. Uses a thread-local Plex DB connection."""
+    def step(label, success):
+        return {"label": label, "success": success}
+
+    db_conn = None
+    try:
+        db_conn = plex_connect()
+    except Exception as e:
+        logging.exception("[Improve All] Worker failed to open Plex DB: %s", e)
+        with lock:
+            if state.get("improve_all"):
+                state["improve_all"]["error"] = str(e)
+                state["improve_all"]["running"] = False
+                state["improve_all"]["finished"] = True
+        return
+
+    results = {
+        "albums_processed": 0,
+        "albums_improved": 0,
+        "covers_downloaded": 0,
+        "tags_updated": 0,
+        "by_provider": {
+            "musicbrainz": {"identified": 0, "covers": 0, "tags": 0},
+            "discogs": {"identified": 0, "covers": 0, "tags": 0},
+            "lastfm": {"identified": 0, "covers": 0, "tags": 0},
+            "bandcamp": {"identified": 0, "covers": 0, "tags": 0}
+        },
+        "album_log": []
+    }
+    prov_status = {"musicbrainz": "pending", "discogs": "pending", "lastfm": "pending", "bandcamp": "pending"}
+
+    try:
+        for album_row in album_rows:
+            album_id, album_title, year, date = album_row
+            results["albums_processed"] += 1
+            display_title = strip_format_from_album_title(album_title or "") or (album_title or "") or f"Album #{album_id}"
+
+            with lock:
+                prog = state.get("improve_all")
+                if not prog:
+                    break
+                prog["current_album"] = display_title
+                prog["current_album_id"] = album_id
+                prog["current_steps"] = []
+                prog["provider_status"] = dict(prov_status)
+
+            folder = first_part_path(db_conn, album_id)
+            if not folder:
+                logging.warning("[Improve All] Album %s '%s' folder not found, skipping", album_id, display_title)
+                continue
+
+            album_metadata = {}
+            cover_art = None
+            identified = False
+            provider_hits = []
+            steps = []
+
+            if USE_MUSICBRAINZ:
+                with lock:
+                    if state.get("improve_all"):
+                        state["improve_all"]["current_provider"] = "musicbrainz"
+                steps.append(step("Querying MusicBrainz…", None))
+                try:
+                    mb_result = improve_album_with_musicbrainz(album_id, album_title, artist_name, year, folder)
+                    if mb_result:
+                        album_metadata.update(mb_result.get("metadata", {}))
+                        if mb_result.get("cover"):
+                            cover_art = mb_result["cover"]
+                    steps[-1]["success"] = True
+                    if mb_result.get("identified"):
+                        identified = True
+                        provider_hits.append("MB:id")
+                        steps.append(step("MusicBrainz: identified", True))
+                        results["by_provider"]["musicbrainz"]["identified"] += 1
+                    if mb_result.get("cover"):
+                        results["by_provider"]["musicbrainz"]["covers"] += 1
+                        provider_hits.append("MB:cover")
+                        steps.append(step("MusicBrainz: cover art found", True))
+                    if mb_result.get("metadata"):
+                        results["by_provider"]["musicbrainz"]["tags"] += 1
+                        provider_hits.append("MB:tags")
+                        steps.append(step("MusicBrainz: tags found", True))
+                    prov_status["musicbrainz"] = "ok"
+                except Exception as e:
+                    logging.warning("[Improve All] MusicBrainz failed for album %s '%s': %s", album_id, display_title, e)
+                    steps[-1]["success"] = False
+                    steps.append(step("MusicBrainz: failed", False))
+                    prov_status["musicbrainz"] = "fail"
+
+            if USE_DISCOGS and (not identified or not cover_art):
+                with lock:
+                    if state.get("improve_all"):
+                        state["improve_all"]["current_provider"] = "discogs"
+                steps.append(step("Querying Discogs…", None))
+                try:
+                    discogs_result = improve_album_with_discogs(album_id, album_title, artist_name, year, folder, album_metadata)
+                    if discogs_result:
+                        for key, value in discogs_result.get("metadata", {}).items():
+                            if not album_metadata.get(key):
+                                album_metadata[key] = value
+                        if not cover_art and discogs_result.get("cover"):
+                            cover_art = discogs_result["cover"]
+                        if discogs_result.get("identified"):
+                            identified = True
+                            provider_hits.append("Discogs:id")
+                            steps.append(step("Discogs: identified", True))
+                        results["by_provider"]["discogs"]["identified"] += 1
+                        if discogs_result.get("cover"):
+                            results["by_provider"]["discogs"]["covers"] += 1
+                            provider_hits.append("Discogs:cover")
+                            steps.append(step("Discogs: cover art found", True))
+                        if discogs_result.get("metadata"):
+                            results["by_provider"]["discogs"]["tags"] += 1
+                            provider_hits.append("Discogs:tags")
+                            steps.append(step("Discogs: tags found", True))
+                    steps[-1]["success"] = True
+                    prov_status["discogs"] = "ok"
+                except Exception as e:
+                    logging.warning("[Improve All] Discogs failed for album %s '%s': %s", album_id, display_title, e)
+                    steps[-1]["success"] = False
+                    steps.append(step("Discogs: failed", False))
+                    prov_status["discogs"] = "fail"
+
+            if USE_LASTFM and (not identified or not cover_art):
+                with lock:
+                    if state.get("improve_all"):
+                        state["improve_all"]["current_provider"] = "lastfm"
+                steps.append(step("Querying Last.fm…", None))
+                try:
+                    lastfm_result = improve_album_with_lastfm(album_id, album_title, artist_name, year, folder, album_metadata)
+                    if lastfm_result:
+                        for key, value in lastfm_result.get("metadata", {}).items():
+                            if not album_metadata.get(key):
+                                album_metadata[key] = value
+                        if not cover_art and lastfm_result.get("cover"):
+                            cover_art = lastfm_result["cover"]
+                        if lastfm_result.get("identified"):
+                            identified = True
+                            provider_hits.append("Lastfm:id")
+                            steps.append(step("Last.fm: identified", True))
+                        results["by_provider"]["lastfm"]["identified"] += 1
+                        if lastfm_result.get("cover"):
+                            results["by_provider"]["lastfm"]["covers"] += 1
+                            provider_hits.append("Lastfm:cover")
+                            steps.append(step("Last.fm: cover art found", True))
+                        if lastfm_result.get("metadata"):
+                            results["by_provider"]["lastfm"]["tags"] += 1
+                            provider_hits.append("Lastfm:tags")
+                            steps.append(step("Last.fm: tags found", True))
+                    steps[-1]["success"] = True
+                    prov_status["lastfm"] = "ok"
+                except Exception as e:
+                    logging.warning("[Improve All] Last.fm failed for album %s '%s': %s", album_id, display_title, e)
+                    steps[-1]["success"] = False
+                    steps.append(step("Last.fm: failed", False))
+                    prov_status["lastfm"] = "fail"
+
+            if USE_BANDCAMP and (not identified or not cover_art):
+                with lock:
+                    if state.get("improve_all"):
+                        state["improve_all"]["current_provider"] = "bandcamp"
+                steps.append(step("Querying Bandcamp…", None))
+                try:
+                    bandcamp_result = improve_album_with_bandcamp(album_id, album_title, artist_name, year, folder, album_metadata)
+                    if bandcamp_result:
+                        for key, value in bandcamp_result.get("metadata", {}).items():
+                            if not album_metadata.get(key):
+                                album_metadata[key] = value
+                        if not cover_art and bandcamp_result.get("cover"):
+                            cover_art = bandcamp_result["cover"]
+                        if bandcamp_result.get("identified"):
+                            identified = True
+                            provider_hits.append("Bandcamp:id")
+                            steps.append(step("Bandcamp: identified", True))
+                        results["by_provider"]["bandcamp"]["identified"] += 1
+                        if bandcamp_result.get("cover"):
+                            results["by_provider"]["bandcamp"]["covers"] += 1
+                            provider_hits.append("Bandcamp:cover")
+                            steps.append(step("Bandcamp: cover art found", True))
+                        if bandcamp_result.get("metadata"):
+                            results["by_provider"]["bandcamp"]["tags"] += 1
+                            provider_hits.append("Bandcamp:tags")
+                            steps.append(step("Bandcamp: tags found", True))
+                    steps[-1]["success"] = True
+                    prov_status["bandcamp"] = "ok"
+                except Exception as e:
+                    logging.warning("[Improve All] Bandcamp failed for album %s '%s': %s", album_id, display_title, e)
+                    steps[-1]["success"] = False
+                    steps.append(step("Bandcamp: failed", False))
+                    prov_status["bandcamp"] = "fail"
+
+            if album_metadata:
+                steps.append(step("Updating tags in files…", None))
+                try:
+                    write_tags_to_files(album_id, folder, album_metadata, artist_name)
+                    results["tags_updated"] += 1
+                    steps[-1]["success"] = True
+                    steps.append(step("Tags updated", True))
+                except Exception as e:
+                    logging.warning("[Improve All] Failed to write tags for album %s: %s", album_id, e)
+                    steps[-1]["success"] = False
+                    steps.append(step("Tags: failed", False))
+
+            if cover_art:
+                steps.append(step("Saving cover art…", None))
+                try:
+                    save_cover_art(album_id, folder, cover_art)
+                    results["covers_downloaded"] += 1
+                    steps[-1]["success"] = True
+                    steps.append(step("Cover saved", True))
+                except Exception as e:
+                    logging.warning("[Improve All] Failed to save cover for album %s: %s", album_id, e)
+                    steps[-1]["success"] = False
+                    steps.append(step("Cover: failed", False))
+
+            if album_metadata or cover_art:
+                results["albums_improved"] += 1
+
+            with lock:
+                prog = state.get("improve_all")
+                if prog:
+                    prog["current_steps"] = list(steps)
+                    prog["provider_status"] = dict(prov_status)
+                    prog["albums_processed"] = results["albums_processed"]
+                    prog["album_log"].append({
+                        "album_id": album_id,
+                        "title": display_title,
+                        "steps": list(steps),
+                        "provider_hits": provider_hits,
+                    })
+
+            logging.info("[Improve All] Album %s '%s' -> %s", album_id, display_title, ",".join(provider_hits) if provider_hits else "none")
+
+    except Exception as e:
+        logging.exception("[Improve All] Worker error: %s", e)
+        with lock:
+            if state.get("improve_all"):
+                state["improve_all"]["error"] = str(e)
+    finally:
+        if db_conn:
+            try:
+                db_conn.close()
+            except Exception:
+                pass
+        with lock:
+            if state.get("improve_all"):
+                state["improve_all"]["running"] = False
+                state["improve_all"]["finished"] = True
+                state["improve_all"]["current_provider"] = None
+                state["improve_all"]["current_album"] = None
+                state["improve_all"]["current_album_id"] = None
+                state["improve_all"]["current_steps"] = []
+                state["improve_all"]["result"] = {
+                    "message": f"Processed {results['albums_processed']} album(s), improved {results['albums_improved']} album(s)",
+                    **results,
+                }
+        logging.info("[Improve All] Finished for '%s': processed=%d improved=%d", artist_name, results["albums_processed"], results["albums_improved"])
+
+
+@app.get("/api/library/improve-all-albums/progress")
+def api_library_improve_all_albums_progress():
+    """Return current improve-all progress for real-time UI (polled by frontend)."""
+    with lock:
+        prog = state.get("improve_all")
+        if prog is None:
+            return jsonify({"running": False, "finished": False})
+        out = dict(prog)
+        out["album_log"] = list(prog.get("album_log") or [])
+        out["current_steps"] = list(prog.get("current_steps") or [])
+        out["provider_status"] = dict(prog.get("provider_status") or {})
+        if out.get("result"):
+            out["result"] = dict(out["result"])
+    return jsonify(out)
+
+
+@app.post("/api/library/improve-all-albums")
+def api_library_improve_all_albums():
+    """Start improve-all in background; frontend polls GET .../progress for real-time updates."""
+    if not PLEX_CONFIGURED:
+        return jsonify({"error": "Plex not configured"}), 503
+
+    data = request.get_json() or {}
+    artist_id = data.get("artist_id")
+    if not artist_id:
+        return jsonify({"error": "Missing artist_id"}), 400
+
+    with lock:
+        if state.get("improve_all") and state["improve_all"].get("running"):
+            return jsonify({"error": "Improve All is already running"}), 409
+        state["improve_all"] = _improve_all_progress_skeleton()
+        state["improve_all"]["running"] = True
+        state["improve_all"]["artist_id"] = artist_id
+
+    try:
+        from mutagen import File as MutagenFile
+        HAS_MUTAGEN = True
+    except ImportError:
+        HAS_MUTAGEN = False
+    if not HAS_MUTAGEN:
+        with lock:
+            state["improve_all"] = None
+        return jsonify({"error": "mutagen library not installed."}), 500
+
+    db_conn = plex_connect()
+    artist_row = db_conn.execute(
+        "SELECT title FROM metadata_items WHERE id = ? AND metadata_type = 8",
+        (artist_id,)
+    ).fetchone()
+    if not artist_row:
+        db_conn.close()
+        with lock:
+            state["improve_all"] = None
+        return jsonify({"error": "Artist not found"}), 404
+
+    artist_name = artist_row[0]
+    placeholders = ",".join("?" for _ in SECTION_IDS) if not CROSS_LIBRARY_DEDUPE else ""
+    if CROSS_LIBRARY_DEDUPE:
+        section_filter = ""
+        section_args = [artist_id]
+    else:
+        section_filter = f"AND alb.library_section_id IN ({placeholders})"
+        section_args = [artist_id] + list(SECTION_IDS)
+
+    album_rows = db_conn.execute(f"""
+        SELECT alb.id, alb.title, alb.year, alb.originally_available_at
+        FROM metadata_items alb
+        WHERE alb.parent_id = ? AND alb.metadata_type = 9 {section_filter}
+        ORDER BY alb.originally_available_at DESC, alb.title
+    """, section_args).fetchall()
+
+    db_conn.close()
+    db_conn = None
+
+    with lock:
+        state["improve_all"]["artist_name"] = artist_name
+        state["improve_all"]["total_albums"] = len(album_rows)
+
+    logging.info("[Improve All] Started for artist '%s' (id=%s), %d album(s)", artist_name, artist_id, len(album_rows))
+    thread = threading.Thread(
+        target=_run_improve_all_albums,
+        args=(artist_id, artist_name, album_rows),
+        daemon=True,
+    )
+    thread.start()
+    return jsonify({"started": True, "message": "Improve All started; poll GET /api/library/improve-all-albums/progress"})
+
+
+@app.post("/api/library/improve-album")
+def api_library_improve_album():
+    """Improve a single album (same logic as one iteration of improve-all). Returns steps for UI feedback."""
+    if not PLEX_CONFIGURED:
+        return jsonify({"error": "Plex not configured"}), 503
+    data = request.get_json() or {}
+    album_id = data.get("album_id")
+    if not album_id:
+        return jsonify({"error": "Missing album_id"}), 400
+    try:
+        from mutagen import File as MutagenFile
+        HAS_MUTAGEN = True
+    except ImportError:
+        HAS_MUTAGEN = False
+    if not HAS_MUTAGEN:
+        return jsonify({"error": "mutagen library not installed"}), 500
+    db_conn = plex_connect()
+    album_row = db_conn.execute(
+        "SELECT id, title, year, originally_available_at, parent_id FROM metadata_items WHERE id = ? AND metadata_type = 9",
+        (album_id,)
+    ).fetchone()
+    if not album_row:
+        db_conn.close()
+        return jsonify({"error": "Album not found"}), 404
+    _aid, album_title, year, date, artist_id = album_row
+    artist_row = db_conn.execute("SELECT title FROM metadata_items WHERE id = ? AND metadata_type = 8", (artist_id,)).fetchone()
+    artist_name = artist_row[0] if artist_row else "Unknown"
+    folder = first_part_path(db_conn, album_id)
+    db_conn.close()
+    if not folder:
+        return jsonify({"error": "Album folder not found"}), 404
+    display_title = strip_format_from_album_title(album_title or "") or (album_title or "") or f"Album #{album_id}"
+    album_metadata = {}
+    cover_art = None
+    identified = False
+    steps = []
+    # Run same provider chain as improve-all (one album)
+    if USE_MUSICBRAINZ:
+        steps.append("Querying MusicBrainz…")
+        try:
+            mb_result = improve_album_with_musicbrainz(album_id, album_title, artist_name, year, folder)
+            if mb_result:
+                album_metadata.update(mb_result.get("metadata", {}))
+                if mb_result.get("cover"):
+                    cover_art = mb_result["cover"]
+                if mb_result.get("identified"):
+                    identified = True
+                    steps.append("MusicBrainz: identified")
+                if mb_result.get("cover"):
+                    steps.append("MusicBrainz: cover art found")
+                if mb_result.get("metadata"):
+                    steps.append("MusicBrainz: tags found")
+        except Exception as e:
+            logging.warning("[Improve Album] MusicBrainz failed for album %s: %s", album_id, e)
+            steps.append("MusicBrainz: failed")
+    if USE_DISCOGS and (not identified or not cover_art):
+        steps.append("Querying Discogs…")
+        try:
+            discogs_result = improve_album_with_discogs(album_id, album_title, artist_name, year, folder, album_metadata)
+            if discogs_result:
+                for k, v in discogs_result.get("metadata", {}).items():
+                    if not album_metadata.get(k):
+                        album_metadata[k] = v
+                if not cover_art and discogs_result.get("cover"):
+                    cover_art = discogs_result["cover"]
+                if discogs_result.get("identified"):
+                    identified = True
+                    steps.append("Discogs: identified")
+                if discogs_result.get("cover"):
+                    steps.append("Discogs: cover art found")
+                if discogs_result.get("metadata"):
+                    steps.append("Discogs: tags found")
+        except Exception as e:
+            logging.warning("[Improve Album] Discogs failed for album %s: %s", album_id, e)
+            steps.append("Discogs: failed")
+    if USE_LASTFM and (not identified or not cover_art):
+        steps.append("Querying Last.fm…")
+        try:
+            lastfm_result = improve_album_with_lastfm(album_id, album_title, artist_name, year, folder, album_metadata)
+            if lastfm_result:
+                for k, v in lastfm_result.get("metadata", {}).items():
+                    if not album_metadata.get(k):
+                        album_metadata[k] = v
+                if not cover_art and lastfm_result.get("cover"):
+                    cover_art = lastfm_result["cover"]
+                if lastfm_result.get("identified"):
+                    identified = True
+                    steps.append("Last.fm: identified")
+                if lastfm_result.get("cover"):
+                    steps.append("Last.fm: cover art found")
+                if lastfm_result.get("metadata"):
+                    steps.append("Last.fm: tags found")
+        except Exception as e:
+            logging.warning("[Improve Album] Last.fm failed for album %s: %s", album_id, e)
+            steps.append("Last.fm: failed")
+    if USE_BANDCAMP and (not identified or not cover_art):
+        steps.append("Querying Bandcamp…")
+        try:
+            bandcamp_result = improve_album_with_bandcamp(album_id, album_title, artist_name, year, folder, album_metadata)
+            if bandcamp_result:
+                for k, v in bandcamp_result.get("metadata", {}).items():
+                    if not album_metadata.get(k):
+                        album_metadata[k] = v
+                if not cover_art and bandcamp_result.get("cover"):
+                    cover_art = bandcamp_result["cover"]
+                if bandcamp_result.get("identified"):
+                    identified = True
+                    steps.append("Bandcamp: identified")
+                if bandcamp_result.get("cover"):
+                    steps.append("Bandcamp: cover art found")
+                if bandcamp_result.get("metadata"):
+                    steps.append("Bandcamp: tags found")
+        except Exception as e:
+            logging.warning("[Improve Album] Bandcamp failed for album %s: %s", album_id, e)
+            steps.append("Bandcamp: failed")
+    tags_updated = False
+    cover_saved = False
+    if album_metadata:
+        steps.append("Updating tags in files…")
+        try:
+            write_tags_to_files(album_id, folder, album_metadata, artist_name)
+            tags_updated = True
+            steps.append("Tags updated")
+        except Exception as e:
+            logging.warning("[Improve Album] Failed to write tags for album %s: %s", album_id, e)
+            steps.append("Tags: failed")
+    if cover_art:
+        steps.append("Saving cover art…")
+        try:
+            save_cover_art(album_id, folder, cover_art)
+            cover_saved = True
+            steps.append("Cover saved")
+        except Exception as e:
+            logging.warning("[Improve Album] Failed to save cover for album %s: %s", album_id, e)
+            steps.append("Cover: failed")
+    summary_parts = []
+    if tags_updated:
+        summary_parts.append("tags updated")
+    if cover_saved:
+        summary_parts.append("cover saved")
+    summary = ", ".join(summary_parts) if summary_parts else "no changes (already complete or providers had nothing)"
+    return jsonify({
+        "success": True,
+        "album_id": album_id,
+        "title": display_title,
+        "steps": steps,
+        "summary": summary,
+        "tags_updated": tags_updated,
+        "cover_saved": cover_saved,
     })
+
+
+def improve_album_with_musicbrainz(album_id, album_title, artist_name, year, folder):
+    """Improve album metadata using MusicBrainz. Returns dict with metadata, cover, and identified flag."""
+    result = {"metadata": {}, "cover": None, "identified": False}
+    
+    if not USE_MUSICBRAINZ:
+        return result
+    
+    # Get tags from first audio file
+    first_audio = next((p for p in folder.rglob("*") if AUDIO_RE.search(p.name)), None)
+    if not first_audio:
+        return result
+    
+    current_tags = extract_tags(first_audio) if first_audio else {}
+    
+    # Try to find MusicBrainz release-group ID from existing tags
+    mbid = current_tags.get('musicbrainz_releasegroupid') or current_tags.get('musicbrainz_releaseid')
+    
+    # If no MBID in tags, search for it
+    if not mbid:
+        try:
+            # Normalize album title for search (strip format suffixes like (Mp3), (flac))
+            album_norm = strip_format_from_album_title(album_title or "") or (album_title or "").strip()
+            # Get track titles for better matching
+            audio_files = [p for p in folder.rglob("*") if AUDIO_RE.search(p.name)]
+            tracks = set()
+            for af in audio_files[:10]:  # Limit to first 10 tracks
+                try:
+                    tags = extract_tags(af)
+                    if tags.get('title'):
+                        tracks.add(tags['title'].strip().lower())
+                except Exception:
+                    pass
+            
+            # Use existing search function
+            mb_info = search_mb_release_group_by_metadata(artist_name, album_norm, tracks)
+            if mb_info and mb_info.get('id'):
+                mbid = mb_info['id']
+        except Exception as e:
+            logging.debug(f"[MB] Search failed for {album_title}: {e}")
+    
+    # Fetch release group info if we have an MBID
+    if mbid:
+        try:
+            mb_info, _ = fetch_mb_release_group_info(mbid)
+            if mb_info:
+                result["identified"] = True
+                result["metadata"]["musicbrainz_releasegroupid"] = mbid
+                
+                # Add title if missing or invalid
+                mb_title = mb_info.get('title', '')
+                if mb_title and (not album_title or album_title.strip().startswith("Untitled") or not album_title.strip()):
+                    result["metadata"]["album"] = mb_title
+                
+                # Add year if missing
+                if mb_info.get('first-release-date') and not year:
+                    try:
+                        date_str = mb_info['first-release-date']
+                        result["metadata"]["date"] = date_str[:4] if len(date_str) >= 4 else date_str
+                    except Exception:
+                        pass
+                
+                # Try to get cover art from Cover Art Archive
+                try:
+                    cover_url = f"https://coverartarchive.org/release-group/{mbid}/front-500"
+                    cover_response = requests.get(cover_url, timeout=10, allow_redirects=True)
+                    if cover_response.status_code == 200:
+                        result["cover"] = cover_response.content
+                        logging.debug(f"[MB] Fetched cover art for {mbid}")
+                except Exception as e:
+                    logging.debug(f"[MB] Cover art fetch failed for {mbid}: {e}")
+        except Exception as e:
+            logging.warning(f"[MB] Failed to fetch info for {mbid}: {e}")
+    
+    return result
+
+
+def write_tags_to_files(album_id, folder, metadata, artist_name):
+    """Write metadata tags to all audio files in the album folder."""
+    try:
+        from mutagen import File as MutagenFile
+        from mutagen.id3 import ID3, TIT2, TPE1, TALB, TDRC, TCON, APIC, TXXX
+        from mutagen.mp3 import MP3
+        from mutagen.flac import FLAC
+        from mutagen.mp4 import MP4
+        HAS_MUTAGEN = True
+    except ImportError:
+        logging.warning("[Improve All] mutagen not available, cannot write tags")
+        return
+    
+    audio_files = [p for p in folder.rglob("*") if AUDIO_RE.search(p.name)]
+    if not audio_files:
+        logging.warning(f"[Improve All] No audio files found in {folder}")
+        return
+    
+    for audio_file in audio_files:
+        try:
+            audio = MutagenFile(str(audio_file))
+            if audio is None:
+                continue
+            
+            # Update tags from metadata
+            if metadata.get("album"):
+                if isinstance(audio, (MP3, ID3)):
+                    audio.tags.add(TALB(encoding=3, text=metadata["album"]))
+                elif isinstance(audio, FLAC):
+                    audio["ALBUM"] = metadata["album"]
+                elif isinstance(audio, MP4):
+                    audio["\xa9alb"] = [metadata["album"]]
+            
+            if artist_name:
+                if isinstance(audio, (MP3, ID3)):
+                    audio.tags.add(TPE1(encoding=3, text=artist_name))
+                elif isinstance(audio, FLAC):
+                    audio["ARTIST"] = artist_name
+                    audio["ALBUMARTIST"] = artist_name
+                elif isinstance(audio, MP4):
+                    audio["\xa9ART"] = [artist_name]
+                    audio["aART"] = [artist_name]
+            
+            if metadata.get("date"):
+                year = metadata["date"][:4] if len(metadata["date"]) >= 4 else metadata["date"]
+                if isinstance(audio, (MP3, ID3)):
+                    audio.tags.add(TDRC(encoding=3, text=year))
+                elif isinstance(audio, FLAC):
+                    audio["DATE"] = year
+                elif isinstance(audio, MP4):
+                    audio["\xa9day"] = [year]
+            
+            if metadata.get("musicbrainz_releasegroupid"):
+                mbid = metadata["musicbrainz_releasegroupid"]
+                if isinstance(audio, FLAC):
+                    audio["MUSICBRAINZ_RELEASEGROUPID"] = mbid
+                elif isinstance(audio, MP4):
+                    audio["----:com.apple.iTunes:MusicBrainz Release Group Id"] = [mbid.encode('utf-8')]
+            
+            audio.save()
+            logging.debug(f"[Improve All] Updated tags for {audio_file.name}")
+        except Exception as e:
+            logging.warning(f"[Improve All] Failed to write tags to {audio_file}: {e}")
+
+
+def save_cover_art(album_id, folder, cover_data):
+    """Save cover art image to album folder."""
+    try:
+        # Check if cover already exists
+        existing_covers = [
+            f for f in folder.iterdir() 
+            if f.is_file() and f.name.lower().startswith(('cover', 'folder', 'album', 'artwork', 'front'))
+            and f.suffix.lower() in ['.jpg', '.jpeg', '.png', '.webp']
+        ]
+        
+        if existing_covers:
+            logging.debug(f"[Improve All] Cover already exists in {folder}, skipping")
+            return
+        
+        # Save as cover.jpg
+        cover_path = folder / "cover.jpg"
+        with open(cover_path, 'wb') as f:
+            f.write(cover_data)
+        logging.info(f"[Improve All] Saved cover art to {cover_path}")
+    except Exception as e:
+        logging.warning(f"[Improve All] Failed to save cover art: {e}")
+
+
+def improve_album_with_discogs(album_id, album_title, artist_name, year, folder, existing_metadata):
+    """Improve album metadata using Discogs. Returns dict with metadata, cover, and identified flag."""
+    result = {"metadata": {}, "cover": None, "identified": False}
+    
+    if not USE_DISCOGS:
+        return result
+    
+    try:
+        import discogs_client
+        
+        # Initialize Discogs client
+        user_agent = "PMDA/1.0 (https://github.com/meaning/PMDA)"
+        if DISCOGS_USER_TOKEN:
+            d = discogs_client.Client(user_agent, user_token=DISCOGS_USER_TOKEN)
+        elif DISCOGS_CONSUMER_KEY and DISCOGS_CONSUMER_SECRET:
+            d = discogs_client.Client(user_agent, consumer_key=DISCOGS_CONSUMER_KEY, consumer_secret=DISCOGS_CONSUMER_SECRET)
+        else:
+            # Unauthenticated (limited to 25 req/min, no images)
+            d = discogs_client.Client(user_agent)
+        
+        # Search for release (use stripped title without format suffix)
+        search_title = strip_format_from_album_title(album_title or "") or (album_title or "").strip()
+        search_query = f"{artist_name} {search_title}"
+        if year:
+            search_query += f" {year}"
+        
+        results = d.search(search_query, type='release', limit=5)
+        if not results or not results.page(1):
+            return result
+        
+        # Use first result
+        release = results.page(1)[0]
+        release_obj = d.release(release.id)
+        
+        result["identified"] = True
+        result["metadata"]["discogs_release_id"] = str(release.id)
+        
+        # Add title if missing (consider stripped Plex title)
+        if release_obj.title and (not search_title or search_title.startswith("Untitled")):
+            result["metadata"]["album"] = release_obj.title
+        
+        # Add year if missing
+        if release_obj.year and not year:
+            result["metadata"]["date"] = str(release_obj.year)
+        
+        # Add genres/styles if available
+        if release_obj.styles:
+            result["metadata"]["genre"] = ", ".join(release_obj.styles[:3])  # Limit to 3 styles
+        
+        # Try to get cover art (requires authentication)
+        if (DISCOGS_USER_TOKEN or (DISCOGS_CONSUMER_KEY and DISCOGS_CONSUMER_SECRET)):
+            try:
+                # Access images property (requires auth)
+                images = release_obj.images
+                if images:
+                    # Get primary image or first image
+                    primary_image = next((img for img in images if getattr(img, 'type', None) == 'primary'), images[0] if images else None)
+                    if primary_image:
+                        # Get image URI (could be uri or resource_url attribute)
+                        image_uri = getattr(primary_image, 'uri', None) or getattr(primary_image, 'resource_url', None)
+                        if image_uri:
+                            cover_response = requests.get(image_uri, timeout=10)
+                            if cover_response.status_code == 200:
+                                result["cover"] = cover_response.content
+                                logging.debug(f"[Discogs] Fetched cover art for release {release.id}")
+            except Exception as e:
+                logging.debug(f"[Discogs] Cover art fetch failed: {e}")
+        
+    except ImportError:
+        logging.warning("[Discogs] discogs_client library not installed. Install with: pip install discogs-client")
+    except Exception as e:
+        logging.warning(f"[Discogs] Failed to improve album {album_id}: {e}")
+    
+    return result
+
+
+def improve_album_with_lastfm(album_id, album_title, artist_name, year, folder, existing_metadata):
+    """Improve album metadata using Last.fm. Returns dict with metadata, cover, and identified flag."""
+    result = {"metadata": {}, "cover": None, "identified": False}
+    
+    if not USE_LASTFM or not LASTFM_API_KEY or not LASTFM_API_SECRET:
+        return result
+    
+    try:
+        import pylast
+        
+        # Initialize Last.fm network
+        network = pylast.LastFMNetwork(api_key=LASTFM_API_KEY, api_secret=LASTFM_API_SECRET)
+        
+        # Get album info (use stripped title for lookup)
+        search_title = strip_format_from_album_title(album_title or "") or (album_title or "").strip()
+        album = network.get_album(artist_name, search_title or album_title)
+        
+        if album:
+            result["identified"] = True
+            
+            # Add title if missing
+            if album.title and (not search_title or search_title.startswith("Untitled")):
+                result["metadata"]["album"] = album.title
+            
+            # Add year if available
+            try:
+                album_info = album.get_info()
+                if album_info and not year:
+                    # Last.fm doesn't always have year, but we can try
+                    pass
+            except Exception:
+                pass
+            
+            # Add tags/genres
+            try:
+                top_tags = album.get_top_tags()
+                if top_tags:
+                    genres = [tag.item.name for tag in top_tags[:3]]  # Top 3 tags
+                    if genres:
+                        result["metadata"]["genre"] = ", ".join(genres)
+            except Exception:
+                pass
+            
+            # Try to get cover art
+            try:
+                cover_url = album.get_cover_image()
+                if cover_url and cover_url != "" and cover_url != "None":
+                    # Last.fm cover URLs are already full URLs, try to get larger size if available
+                    # Replace size indicators in URL if present
+                    size_urls = [
+                        cover_url.replace("/174s/", "/extralarge/").replace("/64s/", "/extralarge/").replace("/300x300/", "/extralarge/"),
+                        cover_url.replace("/174s/", "/large/").replace("/64s/", "/large/").replace("/300x300/", "/large/"),
+                        cover_url  # Original URL as fallback
+                    ]
+                    for size_url in size_urls:
+                        try:
+                            cover_response = requests.get(size_url, timeout=10)
+                            if cover_response.status_code == 200 and len(cover_response.content) > 1000:  # Ensure it's a real image
+                                result["cover"] = cover_response.content
+                                logging.debug(f"[Last.fm] Fetched cover art")
+                                break
+                        except Exception:
+                            continue
+            except Exception as e:
+                logging.debug(f"[Last.fm] Cover art fetch failed: {e}")
+        
+    except ImportError:
+        logging.warning("[Last.fm] pylast library not installed. Install with: pip install pylast")
+    except Exception as e:
+        logging.warning(f"[Last.fm] Failed to improve album {album_id}: {e}")
+    
+    return result
+
+
+def improve_album_with_bandcamp(album_id, album_title, artist_name, year, folder, existing_metadata):
+    """Improve album metadata using Bandcamp (scraping). Returns dict with metadata, cover, and identified flag."""
+    result = {"metadata": {}, "cover": None, "identified": False}
+    
+    if not USE_BANDCAMP:
+        return result
+    
+    try:
+        from bandcamp_api import Bandcamp
+        
+        bc = Bandcamp()
+        
+        # Bandcamp requires a URL, so we can't easily search by artist/album
+        # This is a limitation - we'd need the Bandcamp URL to scrape
+        # For now, we'll skip this provider as it requires user input (URL)
+        # TODO: Could potentially search Bandcamp website, but that's complex scraping
+        logging.debug("[Bandcamp] Bandcamp provider requires album URL, skipping automatic improvement")
+        
+    except ImportError:
+        logging.warning("[Bandcamp] bandcamp-api library not installed. Install with: pip install bandcamp-api")
+    except Exception as e:
+        logging.warning(f"[Bandcamp] Failed to improve album {album_id}: {e}")
+    
+    return result
+
 
 @app.post("/api/lidarr/add-album")
 def api_lidarr_add_album():
@@ -7816,6 +9436,144 @@ def api_library_artist_images(artist_id):
         "images": image_urls
     })
 
+def get_tracks_for_playback(db_conn, album_id: int) -> List[dict]:
+    """Return one dict per track for playback: track_id, title, idx, duration (seconds). Dedupe by track id."""
+    rows = db_conn.execute("""
+        SELECT tr.id, tr.title, tr."index", COALESCE(mp.duration, tr.duration)
+        FROM metadata_items tr
+        JOIN media_items mi ON mi.metadata_item_id = tr.id
+        JOIN media_parts mp ON mp.media_item_id = mi.id
+        WHERE tr.parent_id = ? AND tr.metadata_type = 10
+        ORDER BY tr."index"
+    """, (album_id,)).fetchall()
+    seen = set()
+    out = []
+    for row in rows:
+        track_id, title, idx, dur = row
+        if track_id in seen:
+            continue
+        seen.add(track_id)
+        dur_ms = dur or 0
+        dur_sec = dur_ms // 1000 if isinstance(dur_ms, (int, float)) and dur_ms >= 1000 else int(dur_ms or 0)
+        if isinstance(dur_ms, (int, float)) and dur_ms < 1000 and dur_ms > 0:
+            dur_sec = int(dur_ms)
+        title_str = (title or "").strip()
+        if not title_str or title_str.lower() in ("track -1", "track-1"):
+            title_str = f"Track {idx if idx is not None and idx >= 0 else len(out) + 1}"
+        out.append({
+            "track_id": track_id,
+            "name": title_str,
+            "title": title_str,
+            "idx": idx if idx is not None and idx >= 0 else len(out) + 1,
+            "duration": dur_sec,
+            "dur": dur_ms,
+        })
+    return out
+
+
+@app.get("/api/library/album/<int:album_id>/tracks")
+def api_library_album_tracks(album_id):
+    """Get all tracks for an album with streaming URLs (Plex API)."""
+    if not PLEX_CONFIGURED:
+        return jsonify({"error": "Plex not configured"}), 503
+    
+    db_conn = plex_connect()
+    album_row = db_conn.execute(
+        "SELECT parent_id, title FROM metadata_items WHERE id = ? AND metadata_type = 9",
+        (album_id,)
+    ).fetchone()
+    if not album_row:
+        db_conn.close()
+        return jsonify({"error": "Album not found"}), 404
+    
+    artist_id = album_row[0]
+    album_title_str = album_row[1] or "Unknown"
+    artist_row = db_conn.execute(
+        "SELECT title FROM metadata_items WHERE id = ? AND metadata_type = 8",
+        (artist_id,)
+    ).fetchone()
+    artist_name = artist_row[0] if artist_row else "Unknown"
+    
+    track_list = get_tracks_for_playback(db_conn, album_id)
+    album_thumb_url = thumb_url(album_id) if album_id else None
+    tracks = []
+    for t in track_list:
+        track_id = t.get("track_id")
+        if not track_id:
+            continue
+        title_str = (t.get("title") or t.get("name") or "").strip()
+        if not title_str:
+            title_str = f"Track {t.get('idx', 0)}"
+        dur_sec = t.get("duration", 0) or 0
+        # get_tracks_for_details already returns duration in seconds
+        if isinstance(dur_sec, (int, float)) and dur_sec >= 1000:
+            dur_sec = int(dur_sec) // 1000
+        dur_sec = int(dur_sec)
+        idx = t.get("idx", 0) or 0
+        stream_url = f"/api/library/track/{track_id}/stream"
+        tracks.append({
+            "track_id": track_id,
+            "title": title_str,
+            "artist": artist_name,
+            "album": album_title_str,
+            "duration": int(dur_sec),
+            "index": idx,
+            "file_url": stream_url,
+        })
+    
+    db_conn.close()
+    return jsonify({"tracks": tracks, "album_thumb": album_thumb_url})
+
+
+def _audio_mimetype(path: Path) -> str:
+    """Return mimetype for common audio extensions."""
+    ext = (path.suffix or "").lower()
+    mime = {
+        ".mp3": "audio/mpeg",
+        ".flac": "audio/flac",
+        ".m4a": "audio/mp4",
+        ".aac": "audio/aac",
+        ".ogg": "audio/ogg",
+        ".wav": "audio/wav",
+        ".opus": "audio/opus",
+    }
+    return mime.get(ext, "application/octet-stream")
+
+
+@app.get("/api/library/track/<int:track_id>/stream")
+def api_library_track_stream(track_id):
+    """Stream a single track from the container filesystem (same-origin, no CORS)."""
+    if not PLEX_CONFIGURED:
+        return jsonify({"error": "Plex not configured"}), 503
+    db_conn = plex_connect()
+    file_rows = db_conn.execute("""
+        SELECT mp.file
+        FROM media_items mi
+        JOIN media_parts mp ON mp.media_item_id = mi.id
+        WHERE mi.metadata_item_id = ?
+        LIMIT 1
+    """, (track_id,)).fetchall()
+    db_conn.close()
+    if not file_rows:
+        return jsonify({"error": "Track or file not found"}), 404
+    raw_path = file_rows[0][0]
+    container_path = container_to_host(raw_path)
+    if not container_path or not container_path.exists():
+        logging.warning("Track stream: path not mapped or missing: %s -> %s", raw_path, container_path)
+        return jsonify({"error": "File not accessible in container"}), 404
+    try:
+        mimetype = _audio_mimetype(container_path)
+        return send_file(
+            str(container_path),
+            mimetype=mimetype,
+            as_attachment=False,
+            conditional=True,
+        )
+    except Exception as e:
+        logging.warning("Track stream failed for %s: %s", container_path, e)
+        return jsonify({"error": "Stream failed"}), 500
+
+
 @app.get("/api/library/album/<int:album_id>/tags")
 def api_library_album_tags(album_id):
     """Get current tags and MusicBrainz info for an album."""
@@ -7877,8 +9635,14 @@ def api_library_album_tags(album_id):
         except Exception as e:
             logging.warning("Failed to fetch MB info for album %s: %s", album_id, e)
     
+    thumb_url_val = None
+    try:
+        thumb_url_val = thumb_url(album_id)
+    except Exception:
+        pass
+
     db_conn.close()
-    
+
     return jsonify({
         "album_id": album_id,
         "album_title": album_title_str,
@@ -7886,7 +9650,8 @@ def api_library_album_tags(album_id):
         "current_tags": current_tags,
         "musicbrainz_id": mbid,
         "musicbrainz_info": mb_info,
-        "folder": str(folder)
+        "folder": str(folder),
+        "thumb_url": thumb_url_val,
     })
 
 @app.post("/api/musicbrainz/fix-artist-tags")
@@ -8097,19 +9862,110 @@ def api_musicbrainz_fix_artist_tags():
         "errors": errors[:10]  # Limit error messages
     })
 
+@app.post("/api/musicbrainz/suggest-album-tags")
+def api_musicbrainz_suggest_album_tags():
+    """Query MusicBrainz for an album (by album_id / Plex metadata or existing MBID) and return suggested tags for re-tagging."""
+    if not PLEX_CONFIGURED:
+        return jsonify({"error": "Plex not configured"}), 503
+    if not USE_MUSICBRAINZ:
+        return jsonify({"error": "MusicBrainz not enabled"}), 400
+
+    data = request.get_json() or {}
+    album_id = data.get("album_id")
+    if not album_id:
+        return jsonify({"error": "Missing album_id"}), 400
+
+    db_conn = plex_connect()
+    album_row = db_conn.execute(
+        "SELECT id, title, parent_id FROM metadata_items WHERE id = ? AND metadata_type = 9",
+        (int(album_id),),
+    ).fetchone()
+    if not album_row:
+        db_conn.close()
+        return jsonify({"error": "Album not found"}), 404
+    album_title_str = strip_format_from_album_title((album_row[1] or "").strip()) or (album_row[1] or "").strip()
+    artist_id = album_row[2]
+    artist_row = db_conn.execute(
+        "SELECT title FROM metadata_items WHERE id = ? AND metadata_type = 8",
+        (artist_id,),
+    ).fetchone()
+    artist_name = artist_row[0] if artist_row else "Unknown"
+
+    suggested = {}
+    mbid = None
+    folder = None
+    current_tags = {}
+    try:
+        folder = first_part_path(db_conn, int(album_id))
+        if folder:
+            first_audio = next((p for p in folder.rglob("*") if AUDIO_RE.search(p.name)), None)
+            if first_audio:
+                current_tags = extract_tags(first_audio)
+                mbid = current_tags.get("musicbrainz_releasegroupid") or current_tags.get("musicbrainz_releaseid")
+                # If Plex title is empty, try to get title from audio tags
+                if not album_title_str:
+                    album_title_str = current_tags.get("album", "") or current_tags.get("title", "") or ""
+                raw_title = (album_title_str or "").strip()
+                # Strip format suffixes like (Mp3), (flac) so search uses real album name
+                album_title_str = strip_format_from_album_title(raw_title) or raw_title
+    except Exception:
+        pass
+    finally:
+        try:
+            db_conn.close()
+        except Exception:
+            pass
+
+    if mbid:
+        try:
+            info, _ = fetch_mb_release_group_info(mbid)
+            if info:
+                suggested["musicbrainz_releasegroupid"] = info.get("id", mbid)
+                suggested["artist"] = artist_name
+                suggested["albumartist"] = artist_name
+                # Use MusicBrainz title if available, otherwise use Plex/tags title
+                suggested["album"] = info.get("title", "") or album_title_str
+                if info.get("primary_type"):
+                    suggested["genre"] = info.get("primary_type", "")
+        except Exception as e:
+            logging.warning("MB suggest tags (by MBID) failed for album %s: %s", album_id, e)
+    if not suggested:
+        try:
+            # Use title from audio tags or folder name for search (already stripped of format suffix)
+            search_title = (album_title_str or "").strip() or (folder.name.replace("_", " ") if folder else "")
+            search_title = strip_format_from_album_title(search_title) or search_title
+            rg = search_mb_release_group_by_metadata(artist_name, search_title.lower(), set())
+            if rg:
+                suggested["musicbrainz_releasegroupid"] = rg.get("id", "")
+                suggested["artist"] = artist_name
+                suggested["albumartist"] = artist_name
+                # Use title found by MusicBrainz
+                suggested["album"] = rg.get("title", "") or album_title_str
+                if rg.get("primary_type"):
+                    suggested["genre"] = rg.get("primary_type", "")
+        except Exception as e:
+            logging.warning("MB suggest tags (search) failed for album %s: %s", album_id, e)
+
+    return jsonify({
+        "success": bool(suggested),
+        "suggested_tags": suggested,
+        "message": "Suggested tags from MusicBrainz." if suggested else "No MusicBrainz match found for this album.",
+    })
+
+
 @app.post("/api/musicbrainz/fix-album-tags")
 def api_musicbrainz_fix_album_tags():
     """Fix tags for a single album using MusicBrainz data."""
     if not PLEX_CONFIGURED:
         return jsonify({"error": "Plex not configured"}), 503
-    
+
     data = request.get_json() or {}
     album_id = data.get("album_id")
     tags_to_apply = data.get("tags", {})
-    
+
     if not album_id:
         return jsonify({"error": "Missing album_id"}), 400
-    
+
     # For now, return success but don't actually write tags
     # Tag writing requires mutagen or similar library
     # This is a placeholder for future implementation
