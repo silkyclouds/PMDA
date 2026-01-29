@@ -16,8 +16,9 @@ venv/
 .venv/
 env/
 
-# Config / state (optional – uncomment if you don’t want config/cache in git)
-# config.json
+# Config / state – not needed at runtime (SQLite is source of truth)
+ai_prompt.txt
+config.json
 # state.db
 # cache.db
 # pmda.log
