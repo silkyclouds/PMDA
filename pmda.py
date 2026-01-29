@@ -291,8 +291,7 @@ scan_is_paused   = threading.Event()
 """
 Robust configuration helper:
 
-* Loads defaults from the baked‑in config.json shipped inside the Docker image.
-* Copies that file (and ai_prompt.txt) into the user‑writable config dir on first run.
+* Config is env > SQLite (state.db/settings) > optional config.json > defaults. No file copy on first run.
 * Overrides every value with an environment variable when present.
 * Falls back to sensible, documented defaults when neither file nor env provides a value.
 * Validates critical keys so we fail early instead of crashing later.
@@ -353,27 +352,82 @@ BASE_DIR   = Path(__file__).parent
 CONFIG_DIR = Path(os.getenv("PMDA_CONFIG_DIR", BASE_DIR))
 CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
-# Location of baked‑in template files (shipped inside the image)
+# Location of baked‑in config template (optional; SQLite is source of truth)
 DEFAULT_CONFIG_PATH  = BASE_DIR / "config.json"
-DEFAULT_PROMPT_PATH  = BASE_DIR / "ai_prompt.txt"
-
 CONFIG_PATH   = CONFIG_DIR / "config.json"
-AI_PROMPT_FILE = CONFIG_DIR / "ai_prompt.txt"
 
-# (1) Ensure config.json exists -----------------------------------------------
-if not CONFIG_PATH.exists():
-    logging.info("No config.json found — using default template from image")
-    shutil.copyfile(DEFAULT_CONFIG_PATH, CONFIG_PATH)
+# (1) Load config: optional. At runtime effective config is env > SQLite > config.json > defaults.
+if CONFIG_PATH.exists():
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
+            conf: dict = json.load(fh)
+    except Exception as e:
+        logging.warning("Failed to load config.json: %s — using empty config", e)
+        conf = {}
+else:
+    conf = {}
 
-# (2) Ensure ai_prompt.txt exists -------------------------------------------
-if not AI_PROMPT_FILE.exists():
-    logging.info("ai_prompt.txt not found — default prompt created")
-    shutil.copyfile(DEFAULT_PROMPT_PATH, AI_PROMPT_FILE)
 
-# (3) Load config: JSON is only a fallback; at runtime effective config is
-#     env > SQLite (state.db/settings) > config.json > defaults. See _get() below.
-with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
-    conf: dict = json.load(fh)
+def _save_setting_to_db(key: str, value: str):
+    """Write a single setting to SQLite (state.db). Creates DB and settings table if needed. No config.json."""
+    try:
+        path = CONFIG_DIR / "state.db"
+        con = sqlite3.connect(str(path), timeout=5)
+        cur = con.cursor()
+        cur.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
+        cur.execute("INSERT OR REPLACE INTO settings(key, value) VALUES(?, ?)", (key, value))
+        con.commit()
+        con.close()
+    except Exception as e:
+        logging.warning("Failed to save setting %s to SQLite: %s", key, e)
+
+
+# Default AI prompt (stored in SQLite when user customizes; no ai_prompt.txt file)
+DEFAULT_AI_PROMPT = """We have multiple rips of the *same* album. Choose exactly **one** edition as the "best".
+Before deciding, classify the release as classical or not.
+
+Classification rule (must appear as the FIRST bullet in your rationale):
+- If the work is by a classical composer or the metadata looks classical (composer/conductor/orchestra/opus numbers, "Symphony", "Concerto", "Sonata", BWV/K./Op., etc.), add **[CLASSICAL:YES]**.
+- Otherwise add **[CLASSICAL:NO]**.
+
+If [CLASSICAL:YES], treat different interpretations as different releases:
+- Two editions are the *same interpretation* only if:
+  (a) they share a MusicBrainz ID (release, release-group, or album MBID), OR
+  (b) they have the same release year (from tags date/originaldate) AND the same total runtime (to the second).
+- If neither (a) nor (b) is true, they are NOT duplicates. Pick the technically best *within the same-interpretation cluster only*. If no same-interpretation cluster exists, pick the technically best but add a bullet **"different interpretation detected"**.
+
+General priority rules (apply inside a valid cluster):
+1. Audio format: prefer lossless (FLAC/ALAC) over lossy (MP3/AAC).
+2. Bit depth: higher is better (24-bit > 16-bit).
+3. Track count: more complete editions win (bonus tracks included).
+4. File count: more audio files (multi-disc/extras) preferred.
+5. Bitrate: higher average is better.
+6. Track filenames: prefer meaningful names over generic numbering.
+7. Parentheses in titles:
+   - "feat./ft." does NOT create a new track version.
+   - "mix/remix/version/edit/rework": if remixer differs → treat as different; same remixer → can be considered duplicate.
+8. Singles/EPs: editions with same normalized title are duplicates; choose best by the rules above.
+9. MusicBrainz ID:
+   - Same MBID → same release.
+   - Different MBIDs → different releases unless everything else (track list, bit-depth, duration) is identical.
+10. Release year: a newer remaster is preferred only if it offers better technical quality or extra tracks.
+
+Extra instructions:
+- Analyse **all editions**.
+- If any **bonus/extra tracks** exist only in non-selected editions, list them in the final output after the last pipe.
+- Ignore "fuzzy" inference for non-ASCII/CJK titles; rely on explicit metadata only.
+
+⚠️ Output rules (must follow exactly):
+- Return **one single line only**.
+- The line must contain **exactly two "|" characters**.
+- Format: `<chosen_index>|<rationale>|<comma-separated list of bonus tracks>`
+- If no bonus tracks exist, still include the final pipe but leave it empty.
+- Do not add any explanations, comments, or extra lines.
+
+Example of valid outputs:
+2|Winner has: - [CLASSICAL:NO] lossless FLAC, 24-bit, more tracks - Higher bitrate than 1|Track 12 - Live bonus
+1|Winner has: - [CLASSICAL:YES] same interpretation (shared MBID) - More complete edition, 9 vs 7 tracks|
+"""
 
 # ─── Auto‑generate PATH_MAP from Plex at *every* startup ────────────────────
 #
@@ -387,7 +441,7 @@ with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
 #   3) Cross-check: For each binding we sample CROSSCHECK_SAMPLES tracks from the DB,
 #      resolve their paths via PATH_MAP, and verify the files exist on disk. If they
 #      don’t, we try to find the correct host root (sibling dirs or rglob) and patch
-#      PATH_MAP + config.json. So even when paths differ (e.g. Plex says /music/unmatched
+#      PATH_MAP + SQLite. So even when paths differ (e.g. Plex says /music/unmatched
 #      but on host it’s /music/Music_dump), we auto-correct instead of failing.
 # Result: users only need to mount volumes; PMDA discovers Plex paths and validates
 # (and repairs) bindings so the same paths work for scan/dedupe.
@@ -525,9 +579,8 @@ try:
             for plex_path, host_path in merged_map.items():
                 logging.info("%-40s | %-30s | %s", plex_path, host_path, host_path)
             conf["PATH_MAP"] = merged_map
-            with open(CONFIG_PATH, "w", encoding="utf-8") as fh_cfg:
-                json.dump(conf, fh_cfg, indent=2)
-            logging.info("🔄 Auto‑generated/updated PATH_MAP from Plex: %s", auto_map)
+            _save_setting_to_db("PATH_MAP", json.dumps(merged_map))
+            logging.info("🔄 Auto‑generated/updated PATH_MAP from Plex (saved to SQLite): %s", auto_map)
 except Exception as e:
     logging.warning("⚠️  Failed to auto‑generate PATH_MAP – %s", e)
     SECTION_IDS = []
@@ -585,6 +638,26 @@ def _get(key: str, *, default=None, cast=lambda x: x):
             raw = default
     return cast(raw)
 
+
+def _parse_format_preference(s) -> list:
+    """Parse FORMAT_PREFERENCE from SQLite (JSON list) or comma-separated string."""
+    default = ["dsf", "aif", "aiff", "wav", "flac", "m4a", "mp4", "m4b", "m4p", "aifc", "ogg", "opus", "mp3", "wma"]
+    if isinstance(s, list):
+        return [x.strip() for x in s if str(x).strip()]
+    if isinstance(s, str):
+        s = s.strip()
+        if not s:
+            return default
+        if s.startswith("["):
+            try:
+                out = json.loads(s)
+                return [x.strip() for x in out if str(x).strip()] if isinstance(out, list) else default
+            except Exception:
+                pass
+        return [x.strip() for x in s.split(",") if x.strip()]
+    return default
+
+
 # PLEX_DB_PATH defaults to /database in container; no SystemExit if unconfigured.
 merged = {
     "PLEX_DB_PATH":   _get("PLEX_DB_PATH",   default="/database",                       cast=str),
@@ -624,9 +697,13 @@ merged = {
     "AI_BATCH_SIZE": _get("AI_BATCH_SIZE", default=10, cast=int),
     "FFPROBE_POOL_SIZE": _get("FFPROBE_POOL_SIZE", default=4, cast=int),
     "AUTO_MOVE_DUPES": _get("AUTO_MOVE_DUPES", default=False, cast=_parse_bool),
+    "CROSS_LIBRARY_DEDUPE": _get("CROSS_LIBRARY_DEDUPE", default=True, cast=_parse_bool),
+    "CROSSCHECK_SAMPLES": _get("CROSSCHECK_SAMPLES", default=20, cast=int),
+    "FORMAT_PREFERENCE": _get("FORMAT_PREFERENCE", default="dsf,aif,aiff,wav,flac,m4a,mp4,m4b,m4p,aifc,ogg,opus,mp3,wma", cast=lambda s: _parse_format_preference(s)),
+    "LOG_FILE": _get("LOG_FILE", default="", cast=str),
 }
-# Always use the auto‑generated PATH_MAP from config.json
-merged["PATH_MAP"] = conf.get("PATH_MAP", {})
+# PATH_MAP: from conf if present, else keep value from _get() (SQLite/env/default)
+merged["PATH_MAP"] = conf.get("PATH_MAP", merged["PATH_MAP"]) if conf else merged["PATH_MAP"]
 
 
 SKIP_FOLDERS: list[str] = merged["SKIP_FOLDERS"]
@@ -666,11 +743,9 @@ REQUIRED_TAGS: list[str] = merged.get("REQUIRED_TAGS", ["artist", "album", "date
 AUTO_MOVE_DUPES: bool = bool(merged["AUTO_MOVE_DUPES"])
 AI_BATCH_SIZE: int = int(merged.get("AI_BATCH_SIZE", 10))
 FFPROBE_POOL_SIZE: int = int(merged.get("FFPROBE_POOL_SIZE", 4))
-# Cross-library dedupe configuration
-CROSS_LIBRARY_DEDUPE = _parse_bool(os.getenv("CROSS_LIBRARY_DEDUPE", "true"))
-
-# Number of sample tracks per Plex mount to verify; override with env CROSSCHECK_SAMPLES
-CROSSCHECK_SAMPLES = int(os.getenv("CROSSCHECK_SAMPLES", 20))
+# Cross-library dedupe and path verification (from SQLite/env/default)
+CROSS_LIBRARY_DEDUPE: bool = bool(merged.get("CROSS_LIBRARY_DEDUPE", True))
+CROSSCHECK_SAMPLES: int = int(merged.get("CROSSCHECK_SAMPLES", 20))
 
 # ─────────────────────────────── Fixed container constants ───────────────────────────────
 # DB filename is always fixed under the Plex DB folder
@@ -696,7 +771,8 @@ SECTION_IDS    = SECTION_IDS
 SECTION_ID     = SECTION_IDS[0] if SECTION_IDS else 0
 PATH_MAP       = merged["PATH_MAP"]
 import multiprocessing
-threads_env = os.getenv("SCAN_THREADS", "auto").strip().lower()
+# SCAN_THREADS: env overrides, else SQLite (saved from UI), else "auto"
+threads_env = (os.getenv("SCAN_THREADS") or str(merged.get("SCAN_THREADS", "auto"))).strip().lower()
 if threads_env in ("auto", "", "all"):
     SCAN_THREADS = multiprocessing.cpu_count()
 else:
@@ -719,14 +795,14 @@ DISCORD_WEBHOOK = merged["DISCORD_WEBHOOK"]
 STATE_DB_FILE = CONFIG_DIR / "state.db"
 CACHE_DB_FILE = CONFIG_DIR / "cache.db"
 
-# File-format preference order (can be overridden in config.json)
-FORMAT_PREFERENCE = conf.get(
+# File-format preference order (can be overridden in SQLite/env)
+FORMAT_PREFERENCE: list[str] = merged.get(
     "FORMAT_PREFERENCE",
     ["dsf","aif","aiff","wav","flac","m4a","mp4","m4b","m4p","aifc","ogg","opus","mp3","wma"]
 )
 
  # Optional external log file (rotates @ 5 MB × 3)
-LOG_FILE = os.getenv("LOG_FILE", str(CONFIG_DIR / "pmda.log"))
+LOG_FILE: str = merged.get("LOG_FILE") or str(CONFIG_DIR / "pmda.log")
 
 # Attach rotating file handler now that CONFIG_DIR / LOG_FILE are final
 try:
@@ -748,7 +824,7 @@ for k, src in ENV_SOURCES.items():
         val = val[:4] + "…"  # keep first 4 chars, mask the rest
     logging.info("Config %-15s = %-30s (source: %s)", k, val, src)
 
-logging.info("Config CROSS_LIBRARY_DEDUPE = %s (source: %s)", CROSS_LIBRARY_DEDUPE, "env" if "CROSS_LIBRARY_DEDUPE" in os.environ else "default")
+logging.info("Config CROSS_LIBRARY_DEDUPE = %s (from SQLite/env/default)", CROSS_LIBRARY_DEDUPE)
 if CROSS_LIBRARY_DEDUPE:
     logging.info("➡️  Duplicate detection mode: cross-library (editions compared across ALL libraries)")
 else:
@@ -1138,13 +1214,8 @@ def _self_diag() -> bool:
     logging.info("──────── diagnostic complete ─────────")
     if not had_warning:
         logging.info("%s ALL mapped folders contain albums – ALL GOOD!", colour("✓", ANSI_GREEN))
-    # ─── Log AI prompt for user review ─────────────────────────────────
-    try:
-        if logging.getLogger().isEnabledFor(logging.DEBUG):
-            prompt_text = AI_PROMPT_FILE.read_text(encoding="utf-8")
-            logging.debug("Using ai_prompt.txt:\n%s", prompt_text)
-    except Exception as e:
-        logging.warning("Could not read ai_prompt.txt: %s", e)
+    if logging.getLogger().isEnabledFor(logging.DEBUG):
+        logging.debug("Using AI prompt (from SQLite or default):\n%s", get_ai_prompt())
     return True
 
 
@@ -1407,7 +1478,7 @@ def _cross_check_bindings():
     • If all samples exist under the mapped host root, the binding is valid.
     • Otherwise performs a recursive search to locate the files; if they are
       all found under the same parent folder we treat that folder as the
-      correct host root and patch PATH_MAP (memory + config.json).
+      correct host root and patch PATH_MAP (memory + SQLite).
     • If any binding cannot be validated or repaired, the startup aborts
       with SystemExit to avoid destructive behaviour later on.
     """
@@ -1535,16 +1606,16 @@ def _cross_check_bindings():
     # Apply fixes
     if updates:
         PATH_MAP.update(updates)
-        conf['PATH_MAP'] = PATH_MAP
-        with open(CONFIG_PATH, 'w', encoding='utf-8') as fh:
-            json.dump(conf, fh, indent=2)
+        if conf is not None:
+            conf['PATH_MAP'] = dict(PATH_MAP)
+        _save_setting_to_db("PATH_MAP", json.dumps(dict(PATH_MAP)))
 
         msg = "\n".join(f"`{k}` → `{v}`" for k, v in updates.items())
         notify_discord_embed(
             title="🔄 PATH_MAP corrected",
             description=msg
         )
-        logging.info("Updated PATH_MAP in memory and config.json")
+        logging.info("Updated PATH_MAP in memory and saved to SQLite")
 
     logging.info("All PATH_MAP bindings verified OK.")
 
@@ -3291,8 +3362,7 @@ def choose_best(editions: List[dict], defer_ai: bool = False) -> dict | None:
             # Return None to indicate AI call is needed (will be processed in batch)
             return None
         used_ai = True
-        # Load prompt template from external file
-        template = AI_PROMPT_FILE.read_text(encoding="utf-8")
+        template = get_ai_prompt()
         user_msg = template + "\nCandidate editions:\n"
         for idx, e in enumerate(editions):
             user_msg += (
@@ -6748,6 +6818,14 @@ def _get_config_from_db(key: str, default_value=None):
         pass
     return default_value
 
+
+def get_ai_prompt() -> str:
+    """Return the AI prompt for duplicate selection. From SQLite (AI_PROMPT) or baked-in default. No file."""
+    val = _get_config_from_db("AI_PROMPT")
+    if val and isinstance(val, str) and val.strip():
+        return val.strip()
+    return DEFAULT_AI_PROMPT
+
 @app.get("/api/config")
 def api_config_get():
     """Return current effective configuration for the Web UI.
@@ -6831,6 +6909,10 @@ def api_config_get():
         "LOG_LEVEL": get_setting("LOG_LEVEL", LOG_LEVEL),
         "LOG_FILE": get_setting("LOG_FILE", LOG_FILE),
         "AUTO_MOVE_DUPES": get_setting("AUTO_MOVE_DUPES", AUTO_MOVE_DUPES),
+        "AI_PROMPT": get_ai_prompt(),
+        "MB_QUEUE_ENABLED": get_setting("MB_QUEUE_ENABLED", MB_QUEUE_ENABLED),
+        "AI_BATCH_SIZE": get_setting("AI_BATCH_SIZE", AI_BATCH_SIZE),
+        "FFPROBE_POOL_SIZE": get_setting("FFPROBE_POOL_SIZE", FFPROBE_POOL_SIZE),
     })
 
 
@@ -6886,12 +6968,13 @@ def api_config_put():
         "DUPE_ROOT", "PMDA_CONFIG_DIR", "MUSIC_PARENT_PATH",
         "SCAN_THREADS", "LOG_LEVEL", "LOG_FILE", "AI_PROVIDER", "OPENAI_API_KEY", "OPENAI_MODEL",
         "OPENAI_MODEL_FALLBACKS", "ANTHROPIC_API_KEY", "GOOGLE_API_KEY", "OLLAMA_URL",
-        "DISCORD_WEBHOOK", "USE_MUSICBRAINZ", "MUSICBRAINZ_EMAIL",
+        "AI_PROMPT",
+        "DISCORD_WEBHOOK", "USE_MUSICBRAINZ", "MUSICBRAINZ_EMAIL", "MB_QUEUE_ENABLED",
         "USE_DISCOGS", "DISCOGS_USER_TOKEN", "DISCOGS_CONSUMER_KEY", "DISCOGS_CONSUMER_SECRET",
         "USE_LASTFM", "LASTFM_API_KEY", "LASTFM_API_SECRET",
         "USE_BANDCAMP",
         "SKIP_FOLDERS", "CROSS_LIBRARY_DEDUPE", "CROSSCHECK_SAMPLES",
-        "FORMAT_PREFERENCE", "AUTO_MOVE_DUPES",
+        "FORMAT_PREFERENCE", "AUTO_MOVE_DUPES", "AI_BATCH_SIZE", "FFPROBE_POOL_SIZE",
         "LIDARR_URL", "LIDARR_API_KEY", "AUTOBRR_URL", "AUTOBRR_API_KEY", "AUTO_FIX_BROKEN_ALBUMS",
         "BROKEN_ALBUM_CONSECUTIVE_THRESHOLD", "BROKEN_ALBUM_PERCENTAGE_THRESHOLD", "REQUIRED_TAGS",
     }
@@ -6945,17 +7028,6 @@ def api_config_put():
     except Exception as e:
         logging.warning("Failed to save settings to SQLite: %s", e)
         return jsonify({"status": "error", "message": f"Failed to save to database: {str(e)}"}), 500
-    
-    # Optional mirror to config.json (backup/readability). SQLite is the single source of truth.
-    try:
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            conf_write = json.load(f)
-        conf_write.update(updates)
-        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump(conf_write, f, indent=2)
-        logging.info("Settings mirrored to config.json (SQLite remains source of truth)")
-    except Exception as e:
-        logging.warning("Failed to write config.json: %s (ignored, SQLite is source of truth)", e)
     
     # Update global variables if MusicBrainz email changed
     if "MUSICBRAINZ_EMAIL" in updates:
@@ -7704,6 +7776,7 @@ def _build_artist_detail_response(artist_id, db_conn, progress_callback=None):
     for ids in key_to_ids.values():
         if len(ids) > 1:
             duplicate_album_ids.update(ids)
+            duplicate_count += len(ids) - 1  # redundant copies (so summary stat matches per-album badges)
     
     # Build final album list with corrected titles (strip format suffixes like (Mp3), (flac))
     albums = []
@@ -7741,6 +7814,9 @@ def _build_artist_detail_response(artist_id, db_conn, progress_callback=None):
             thumb_empty_in_db = not ((thumb_row and thumb_row[0]) or (album_thumb and str(album_thumb).strip()))
         except Exception:
             pass
+        # Never mark as missing cover when we send a thumb URL (client can display it); prevents regression from stale cache
+        if album_thumb and str(album_thumb).strip():
+            thumb_empty_in_db = False
         
         # Fast type heuristic from track count only
         track_count = data['track_count'] or 0
@@ -7832,6 +7908,23 @@ def _build_artist_detail_response(artist_id, db_conn, progress_callback=None):
     }
 
 
+def _normalize_artist_detail_thumb_empty(out: dict) -> None:
+    """Fix thumb_empty and duplicates stat in cached artist detail (avoids regression from stale cache)."""
+    albums = out.get("albums") or []
+    for album in albums:
+        thumb = album.get("thumb")
+        if thumb and str(thumb).strip():
+            album["thumb_empty"] = False
+    stats = out.get("stats") or {}
+    no_cover = sum(1 for a in albums if a.get("thumb_empty", not a.get("thumb")))
+    stats["no_cover"] = no_cover
+    # Recompute duplicates from per-album in_duplicate_group so summary matches badges
+    dup_in_group = sum(1 for a in albums if a.get("in_duplicate_group"))
+    if dup_in_group > 0 and (stats.get("duplicates") or 0) == 0:
+        stats["duplicates"] = dup_in_group
+    out["stats"] = stats
+
+
 @app.get("/api/library/artist/<int:artist_id>")
 def api_library_artist_detail(artist_id):
     """Return detailed information about an artist. Uses cache if analysis was run; else runs on-the-fly."""
@@ -7843,6 +7936,7 @@ def api_library_artist_detail(artist_id):
         out = dict(cached)
         out["analysis_cached"] = True
         out["analyzed_at"] = cached.get("analyzed_at")
+        _normalize_artist_detail_thumb_empty(out)
         return jsonify(out)
     # Check persisted artist_analysis_cache (SQLite)
     try:
@@ -7856,6 +7950,7 @@ def api_library_artist_detail(artist_id):
             out = json.loads(data_str)
             out["analysis_cached"] = True
             out["analyzed_at"] = analyzed_at
+            _normalize_artist_detail_thumb_empty(out)
             with lock:
                 state.setdefault("artist_analysis_cache", {})[artist_id] = out
             return jsonify(out)
@@ -10286,41 +10381,56 @@ def dedupe_artist(artist):
     moved_list: List[Dict] = []
 
     with lock:
-        groups = state["duplicates"].get(art, [])
-        for g in list(groups):
-            if g["album_id"] != album_id:
-                continue
-            # Optional manual selection: keep one edition, treat others as losers
-            if keep_edition_album_id is not None:
-                editions = [g["best"]] + g["losers"]
-                kept = None
-                losers = []
-                for e in editions:
-                    aid = e.get("album_id")
-                    if aid == keep_edition_album_id:
-                        kept = e
-                    else:
-                        losers.append(e)
-                if kept is None or not losers:
-                    return jsonify({"error": "Invalid keep_edition_album_id or no editions to remove"}), 400
-                g = {
-                    "artist": art,
-                    "album_id": album_id,
-                    "best": _normalize_edition_as_best(kept, art),
-                    "losers": losers,
-                }
-            logging.debug(f"dedupe_artist(): processing artist '{art}', album_id={album_id}")
-            moved_list = perform_dedupe(g)
-            groups.remove(next(gr for gr in groups if gr["album_id"] == album_id))
-            if not groups:
+        groups = list(state["duplicates"].get(art, []))
+        # If no album_id: dedupe all groups for this artist
+        if album_id is None:
+            for g in groups:
+                logging.debug(f"dedupe_artist(): processing artist '{art}', album_id={g['album_id']} (all groups)")
+                moved_list.extend(perform_dedupe(g))
+            if art in state["duplicates"]:
                 del state["duplicates"][art]
             con = sqlite3.connect(str(STATE_DB_FILE))
             cur = con.cursor()
-            cur.execute("DELETE FROM duplicates_best WHERE artist = ? AND album_id = ?", (art, album_id))
-            cur.execute("DELETE FROM duplicates_loser WHERE artist = ? AND album_id = ?", (art, album_id))
+            cur.execute("DELETE FROM duplicates_best WHERE artist = ?", (art,))
+            cur.execute("DELETE FROM duplicates_loser WHERE artist = ?", (art,))
             con.commit()
             con.close()
-            break
+        else:
+            for g in list(groups):
+                if g["album_id"] != album_id:
+                    continue
+                # Optional manual selection: keep one edition, treat others as losers
+                if keep_edition_album_id is not None:
+                    editions = [g["best"]] + g["losers"]
+                    kept = None
+                    losers = []
+                    for e in editions:
+                        aid = e.get("album_id")
+                        if aid == keep_edition_album_id:
+                            kept = e
+                        else:
+                            losers.append(e)
+                    if kept is None or not losers:
+                        return jsonify({"error": "Invalid keep_edition_album_id or no editions to remove"}), 400
+                    g = {
+                        "artist": art,
+                        "album_id": album_id,
+                        "best": _normalize_edition_as_best(kept, art),
+                        "losers": losers,
+                    }
+                logging.debug(f"dedupe_artist(): processing artist '{art}', album_id={album_id}")
+                moved_list = perform_dedupe(g)
+                groups_ref = state["duplicates"].get(art, [])
+                groups_ref.remove(next(gr for gr in groups_ref if gr["album_id"] == album_id))
+                if not groups_ref:
+                    del state["duplicates"][art]
+                con = sqlite3.connect(str(STATE_DB_FILE))
+                cur = con.cursor()
+                cur.execute("DELETE FROM duplicates_best WHERE artist = ? AND album_id = ?", (art, album_id))
+                cur.execute("DELETE FROM duplicates_loser WHERE artist = ? AND album_id = ?", (art, album_id))
+                con.commit()
+                con.close()
+                break
 
     removed_count = len(moved_list)
     total_mb = sum(item["size"] for item in moved_list)
