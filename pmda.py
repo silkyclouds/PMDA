@@ -6109,6 +6109,190 @@ def save_scan_editions_to_db(scan_id: int, all_editions_by_artist: Dict[str, Lis
     con.close()
     logging.debug("save_scan_editions_to_db: scan_id=%s, %d edition rows", scan_id, row_count)
 
+
+def save_scan_artist_to_db(artist_name: str, groups: List[dict]) -> int:
+    """
+    Insert one artist's duplicate groups into duplicates_best and duplicates_loser.
+    Skips groups without best/losers (e.g. needs_ai not yet processed). Returns count of groups saved.
+    """
+    con = sqlite3.connect(str(STATE_DB_FILE), timeout=30)
+    cur = con.cursor()
+    saved_count = 0
+    for g in groups:
+        if "best" not in g or "losers" not in g:
+            continue
+        saved_count += 1
+        best = g["best"]
+        best_folder_path = path_for_fs_access(Path(best["folder"])) if best.get("folder") else None
+        best_size_mb = (safe_folder_size(best_folder_path) // (1024 * 1024)) if best_folder_path else 0
+        best_track_count = len(best.get("tracks", []))
+        used_ai = bool(best.get("used_ai", False))
+        ai_provider = best.get("ai_provider") or ""
+        ai_model = best.get("ai_model") or ""
+        if used_ai and (not ai_provider or not ai_model):
+            mod = sys.modules[__name__]
+            ai_provider = ai_provider or (getattr(mod, "AI_PROVIDER", None) or "")
+            ai_model = ai_model or (getattr(mod, "RESOLVED_MODEL", None) or getattr(mod, "OPENAI_MODEL", None) or "")
+        cur.execute("""
+            INSERT OR IGNORE INTO duplicates_best
+              (artist, album_id, title_raw, album_norm, folder,
+               fmt_text, br, sr, bd, dur, discs, rationale, merge_list, ai_used, meta_json, ai_provider, ai_model, size_mb, track_count, match_verified_by_ai)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            artist_name,
+            best["album_id"],
+            best["title_raw"],
+            best["album_norm"],
+            str(best["folder"]),
+            get_primary_format(Path(best["folder"])),
+            best["br"],
+            best["sr"],
+            best["bd"],
+            best["dur"],
+            best["discs"],
+            best.get("rationale", ""),
+            json.dumps(best.get("merge_list", [])),
+            int(used_ai),
+            json.dumps(best.get("meta", {})),
+            ai_provider,
+            ai_model,
+            best_size_mb,
+            best_track_count,
+            1 if best.get("match_verified_by_ai") else 0,
+        ))
+        for e in g["losers"]:
+            size_mb = folder_size(e["folder"]) // (1024 * 1024)
+            cur.execute("""
+                INSERT INTO duplicates_loser
+                  (artist, album_id, folder, fmt_text, br, sr, bd, size_mb)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                artist_name,
+                best["album_id"],
+                str(e["folder"]),
+                get_primary_format(e["folder"]),
+                e["br"],
+                e["sr"],
+                e["bd"],
+                size_mb,
+            ))
+    con.commit()
+    con.close()
+    return saved_count
+
+
+def save_scan_editions_artist_to_db(scan_id: int, artist_name: str, editions_list: List[dict]) -> int:
+    """
+    Insert one artist's editions into scan_editions (no DELETE). Returns row count inserted.
+    """
+    con = sqlite3.connect(str(STATE_DB_FILE), timeout=30)
+    cur = con.cursor()
+    row_count = 0
+    for e in editions_list:
+        folder = e.get("folder")
+        meta = e.get("meta", {})
+        has_cover = 0
+        if folder:
+            folder_path = Path(folder) if not isinstance(folder, Path) else folder
+            cover_patterns = ["cover.*", "folder.*", "album.*", "artwork.*", "front.*"]
+            for pattern in cover_patterns:
+                matches = list(folder_path.glob(pattern))
+                image_matches = [f for f in matches if f.suffix.lower() in [".jpg", ".jpeg", ".png", ".webp", ".gif"]]
+                if image_matches:
+                    has_cover = 1
+                    break
+        missing_required = _check_required_tags(meta, REQUIRED_TAGS, edition=e)
+        missing_required_json = json.dumps(missing_required) if missing_required else None
+        folder_str = str(folder) if folder else ""
+        fmt_text = get_primary_format(Path(folder_str)) if folder_str else ""
+        cur.execute("""
+            INSERT INTO scan_editions
+            (scan_id, artist, album_id, title_raw, folder, fmt_text, br, sr, bd, meta_json, musicbrainz_id,
+             is_broken, expected_track_count, actual_track_count, missing_indices, has_cover, missing_required_tags)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            scan_id,
+            artist_name,
+            e.get("album_id"),
+            e.get("title_raw", ""),
+            folder_str,
+            fmt_text,
+            e.get("br") or 0,
+            e.get("sr") or 0,
+            e.get("bd") or 0,
+            json.dumps(meta),
+            e.get("musicbrainz_id") or "",
+            1 if e.get("is_broken") else 0,
+            e.get("expected_track_count"),
+            e.get("actual_track_count") or len(e.get("tracks", [])),
+            json.dumps(e.get("missing_indices", [])),
+            has_cover,
+            missing_required_json,
+        ))
+        row_count += 1
+    con.commit()
+    con.close()
+    return row_count
+
+
+def update_scan_history_incremental(
+    scan_id: int,
+    artists_processed: int,
+    duplicates_found: int,
+    duplicate_groups_count: int,
+    total_duplicates_count: int,
+    broken_albums_count: int,
+    missing_albums_count: int = 0,
+    albums_without_artist_image: int = 0,
+    albums_without_album_image: int = 0,
+    albums_without_complete_tags: int = 0,
+    albums_without_mb_id: int = 0,
+    albums_without_artist_mb_id: int = 0,
+) -> None:
+    """
+    Update the running scan_history row with current counters so UI can show partial progress.
+    Only updates rows with status = 'running'.
+    """
+    try:
+        con = sqlite3.connect(str(STATE_DB_FILE), timeout=10)
+        cur = con.cursor()
+        cur.execute(
+            """
+            UPDATE scan_history
+            SET artists_processed = ?,
+                duplicates_found = ?,
+                duplicate_groups_count = ?,
+                total_duplicates_count = ?,
+                broken_albums_count = ?,
+                missing_albums_count = ?,
+                albums_without_artist_image = ?,
+                albums_without_album_image = ?,
+                albums_without_complete_tags = ?,
+                albums_without_mb_id = ?,
+                albums_without_artist_mb_id = ?
+            WHERE scan_id = ? AND status = 'running'
+            """,
+            (
+                artists_processed,
+                duplicates_found,
+                duplicate_groups_count,
+                total_duplicates_count,
+                broken_albums_count,
+                missing_albums_count,
+                albums_without_artist_image,
+                albums_without_album_image,
+                albums_without_complete_tags,
+                albums_without_mb_id,
+                albums_without_artist_mb_id,
+                scan_id,
+            ),
+        )
+        con.commit()
+        con.close()
+    except Exception as e:
+        logging.debug("update_scan_history_incremental failed: %s", e)
+
+
 def save_scan_to_db(scan_results: Dict[str, List[dict]]):
     """
     Given a dict of { artist_name: [group_dicts...] }, clear duplicates tables and re‐populate them.
@@ -6365,6 +6549,8 @@ def background_scan():
     start_time = time.perf_counter()
     all_results: Dict[str, List[dict]] = {}  # Always defined so finally can persist
     all_editions_by_artist: Dict[str, List[dict]] = {}  # For scan_editions (Library, Tag Fixer)
+    scan_incremental_queue = None
+    scan_incremental_writer_thread = None
 
     try:
         db_conn = plex_connect()
@@ -6550,10 +6736,46 @@ def background_scan():
         # Clear scan_editions for this scan_id so only the latest run's data is stored
         con = sqlite3.connect(str(STATE_DB_FILE))
         con.execute("DELETE FROM scan_editions WHERE scan_id = ?", (scan_id,))
+        con.execute("DELETE FROM duplicates_loser")
+        con.execute("DELETE FROM duplicates_best")
         con.commit()
         con.close()
 
         clear_db_on_new_scan()  # wipe previous duplicate tables
+
+        # Background writer for incremental persist (duplicates + scan_editions + scan_history)
+        scan_incremental_queue = Queue()
+        scan_incremental_writer_thread = None
+
+        def _scan_incremental_writer():
+            while True:
+                item = scan_incremental_queue.get()
+                if item is None:
+                    break
+                sid, aname, grps, eds = item
+                try:
+                    save_scan_artist_to_db(aname, grps)
+                    save_scan_editions_artist_to_db(sid, aname, eds)
+                    with lock:
+                        update_scan_history_incremental(
+                            sid,
+                            artists_processed=state.get("scan_artists_processed", 0),
+                            duplicates_found=sum(len(g) for g in state["duplicates"].values()),
+                            duplicate_groups_count=state.get("scan_duplicate_groups_count", 0),
+                            total_duplicates_count=state.get("scan_total_duplicates_count", 0),
+                            broken_albums_count=state.get("scan_broken_albums_count", 0),
+                            missing_albums_count=state.get("scan_missing_albums_count", 0),
+                            albums_without_artist_image=state.get("scan_albums_without_artist_image", 0),
+                            albums_without_album_image=state.get("scan_albums_without_album_image", 0),
+                            albums_without_complete_tags=state.get("scan_albums_without_complete_tags", 0),
+                            albums_without_mb_id=state.get("scan_albums_without_mb_id", 0),
+                            albums_without_artist_mb_id=state.get("scan_albums_without_artist_mb_id", 0),
+                        )
+                except Exception as e:
+                    logging.warning("Incremental scan persist failed for artist %s: %s", aname, e)
+
+        scan_incremental_writer_thread = threading.Thread(target=_scan_incremental_writer, daemon=True)
+        scan_incremental_writer_thread.start()
 
         futures = []
         import concurrent.futures
@@ -6631,6 +6853,8 @@ def background_scan():
                         if groups:
                             all_results[artist_name] = groups
                             state["duplicates"][artist_name] = groups
+                        # Enqueue for incremental persist (duplicates + scan_editions + scan_history)
+                        scan_incremental_queue.put((scan_id, artist_name, groups, all_editions_by_artist.get(artist_name, [])))
                     artists_processed += 1
                     # Log scan progress every 10 artists or if debug/verbose
                     if artists_processed % 10 == 0 or logging.getLogger().isEnabledFor(logging.DEBUG):
@@ -6758,7 +6982,12 @@ def background_scan():
         missing_albums_total = 0
         with lock:
             state["scan_missing_albums_count"] = missing_albums_total
-        
+
+        # Drain incremental writer queue so all artist data is persisted before final save_scan_to_db
+        if scan_incremental_writer_thread is not None and scan_incremental_queue is not None:
+            scan_incremental_queue.put(None)
+            scan_incremental_writer_thread.join(timeout=120)
+
         # Persist is done in finally so we always save (even on stop/exception); auto-move runs synchronously in finally after save.
 
     finally:
