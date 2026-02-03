@@ -2131,25 +2131,12 @@ def _discover_one_binding(plex_root: str, db_file: str, music_root: str, samples
     """
     Resolve a single plex_root: find which subdir of music_root contains the sampled files.
     Returns (host_root or None, result_dict) for API. Returns None if DB or music_root invalid.
-    When plex_root is already under music_root and exists in the container (e.g. /music/pmda_tests
-    with music_root /music), resolve to that path so PATH_MAP works without DB path matching.
+    Always uses DB + content-based discovery so the real folder (e.g. correct case like
+    /music/Compilations) is found even when a wrong/empty folder exists (e.g. /music/compilations).
     """
     music_path = Path(music_root)
     if not music_path.exists() or not music_path.is_dir():
         return None
-    # If plex_root is under music_root and exists, use it directly (container bind case)
-    try:
-        plex_path = Path(plex_root)
-        if plex_path.exists() and plex_path.is_dir() and str(plex_path.resolve()).startswith(str(music_path.resolve())):
-            return (plex_root, {
-                "plex_root": plex_root,
-                "host_root": plex_root,
-                "status": "ok",
-                "samples_checked": 0,
-                "message": "Path exists under music root (container bind)",
-            })
-    except Exception:
-        pass
     if not Path(db_file).exists():
         return None
     try:
