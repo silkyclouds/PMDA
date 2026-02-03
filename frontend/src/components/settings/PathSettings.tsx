@@ -326,7 +326,7 @@ export function PathSettings({ config, updateConfig, errors }: PathSettingsProps
         <div>
           <h3 className="font-medium">Paths & Mapping</h3>
           <p className="text-sm text-muted-foreground">
-            Configure directory paths for PMDA. Paths are detected and verified automatically.
+            Configure directory paths for PMDA. Use &quot;Re-detect and verify bindings&quot; to detect Plex paths, resolve container folders by content (names can differ from Plex), then verify.
           </p>
         </div>
       </div>
@@ -428,7 +428,7 @@ export function PathSettings({ config, updateConfig, errors }: PathSettingsProps
               <>
                 <p className="text-sm text-muted-foreground">
                   {Object.keys(pathMapObj).length} path mapping{Object.keys(pathMapObj).length !== 1 ? 's' : ''} configured.
-                  Re-detect below to verify bindings and refresh status.
+                  Use the button below to re-detect (resolve by content) and verify bindings.
                 </p>
                 {verifyHint && (
                   <p className="text-xs text-muted-foreground rounded-md bg-muted/50 p-2 border border-border">
@@ -534,7 +534,7 @@ export function PathSettings({ config, updateConfig, errors }: PathSettingsProps
               <>
                 {autoStep === 'error' && autoError ? null : (
                   <p className="text-sm text-muted-foreground">
-                    No path mappings yet. Click the button below to detect and verify bindings from Plex.
+                    No path mappings yet. Click below to detect Plex paths, resolve container folders by content, then verify.
                   </p>
                 )}
                 <Button
@@ -544,7 +544,7 @@ export function PathSettings({ config, updateConfig, errors }: PathSettingsProps
                   onClick={() => runAutoSequence()}
                   className="gap-1.5"
                 >
-                  <Wand2 className="w-3 h-3" />
+                  <RefreshCw className="w-3 h-3" />
                   Detect & verify bindings
                 </Button>
               </>

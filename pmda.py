@@ -4987,7 +4987,7 @@ def scan_artist_duplicates(args):
         return (artist_name, [], 0, {"ai_used": 0, "mb_used": 0, "timing": timing_stats}, [])
 
 
-def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> tuple[List[dict], dict]:
+def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> tuple[List[dict], dict, list]:
     global no_file_streak_global, popup_displayed, gui
     scan_start_time = time.perf_counter()
     logging.debug("[Artist %s] Starting duplicate scan for album IDs: %s", artist, album_ids)
@@ -5467,7 +5467,7 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> tuple[List[di
         no_file_streak_global += 1
         if skip_count == len(album_ids):
             logging.info(f"[Artist {artist}] All {skip_count} albums skipped due to SKIP_FOLDERS {SKIP_FOLDERS}")
-            return [], {"ai_used": 0, "mb_used": 0}
+            return [], {"ai_used": 0, "mb_used": 0}, []
         else:
             logger = logging.getLogger()
             logger.error(f"[Artist {artist}] FOUND 0 valid file editions on filesystem! Checked SKIP_FOLDERS: {SKIP_FOLDERS}")
@@ -5484,9 +5484,9 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> tuple[List[di
                     )
                     popup_displayed = True
                 scan_should_stop.set()
-                return [], {"ai_used": 0, "mb_used": 0}
+                return [], {"ai_used": 0, "mb_used": 0}, []
             # Below threshold, do not show repeated popups -- let scan continue or fail silently
-            return [], {"ai_used": 0, "mb_used": 0}
+            return [], {"ai_used": 0, "mb_used": 0}, []
     for e in editions:
         logging.debug(
             f"[Artist {artist}] Edition {e['album_id']}: "
@@ -8664,10 +8664,12 @@ def api_paths_discover_one():
             "message": "Discover failed (DB or music root invalid)",
         }), 500
     host_root, result = out
+    success = host_root is not None
     return jsonify({
-        "success": True,
+        "success": success,
         "host_root": host_root,
         "result": result,
+        "message": (result.get("message") or "") if not success and isinstance(result, dict) else None,
     })
 
 
@@ -13623,13 +13625,12 @@ if _HAS_STATIC_UI:
 import os
 
 if __name__ == "__main__":
-    # Web UI only: start HTTP server, then run startup checks in main thread.
+    # Web UI only: run startup checks first (resolve PATH_MAP by content), then start HTTP server.
     def run_server():
         app.run(host="0.0.0.0", port=WEBUI_PORT, threaded=True, use_reloader=False)
 
+    run_startup_checks()
+    logging.info("Startup checks complete – Web UI listening on http://0.0.0.0:%s", WEBUI_PORT)
     server_thread = threading.Thread(target=run_server, daemon=False)
     server_thread.start()
-    logging.info("Web UI listening on http://0.0.0.0:%s – startup checks running in background", WEBUI_PORT)
-    run_startup_checks()
-    logging.info("Web UI startup complete – you can open the interface now.")
     server_thread.join()  # block forever (app.run never returns)
