@@ -2950,8 +2950,9 @@ class MusicBrainzQueue:
         # Submit to queue
         self.queue.put((request_id, callback))
         
-        # Wait for result (with timeout to avoid hanging forever)
-        if event.wait(timeout=60):  # 1 minute timeout (was 5 min; reduces scan blockage on MB slowness)
+        # Batch fetch (fetch_rg_*) can take 100+ seconds (100 pages × 1 s rate limit). Single requests: 1 min.
+        timeout_seconds = 300 if (request_id.startswith("fetch_rg_")) else 60
+        if event.wait(timeout=timeout_seconds):
             with self._lock:
                 result, error = self.results.pop(request_id, (None, None))
                 if request_id in self.locks:
@@ -2966,7 +2967,7 @@ class MusicBrainzQueue:
             with self._lock:
                 if request_id in self.locks:
                     del self.locks[request_id]
-            raise TimeoutError(f"MusicBrainz request {request_id} timed out after 1 minute")
+            raise TimeoutError(f"MusicBrainz request {request_id} timed out after {timeout_seconds} seconds")
     
     def shutdown(self):
         """Shutdown the queue worker."""
@@ -4147,6 +4148,7 @@ def fetch_all_mb_release_groups_for_artist(artist_name: str) -> List[dict]:
             offset = 0
             limit = 100
             max_pages = 100
+            time.sleep(1.0)  # Rate limit: 1 req/s (avoid 2nd request right after search_artists)
             for _ in range(max_pages):
                 result = musicbrainzngs.browse_release_groups(artist=artist_mbid, limit=limit, offset=offset)
                 rg_list = result.get("release-group-list", [])
@@ -10228,6 +10230,7 @@ def api_progress():
         scan_ai_current_label = state.get("scan_ai_current_label")
         last_fix_all_by_provider = state.get("last_fix_all_by_provider")
         last_fix_all_total_albums = state.get("last_fix_all_total_albums", 0)
+        total_albums = state.get("scan_total_albums", 0)
         
         # Current micro-step (from first active artist with non-done status) for live indicators
         current_step = None
@@ -10367,6 +10370,7 @@ def api_progress():
         scan_ai_batch_total=scan_ai_batch_total,
         scan_ai_batch_processed=scan_ai_batch_processed,
         scan_ai_current_label=scan_ai_current_label,
+        total_albums=total_albums,
     )
 
 @app.get("/api/scan-history")

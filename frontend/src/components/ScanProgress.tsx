@@ -128,6 +128,7 @@ export function ScanProgress({
     scan_ai_batch_total = 0,
     scan_ai_batch_processed = 0,
     scan_ai_current_label = null,
+    total_albums = 0,
   } = safeProgress;
 
   // Stage badge: use backend phase (format_analysis | identification_tags | ia_analysis | finalizing | moving_dupes)
@@ -1099,54 +1100,62 @@ export function ScanProgress({
                     albums_without_album_image > 0 || albums_without_artist_image > 0) && (
                     <div className="pt-2 border-t border-border space-y-1.5">
                       <div className="text-muted-foreground font-medium mb-1">Findings so far</div>
-                      {duplicate_groups_count > 0 && (
-                        <div className="flex justify-between">
-                          <span className="flex items-center gap-1.5"><Package className="w-3 h-3 text-orange-500" /> Duplicate groups</span>
-                          <span className="font-medium">{duplicate_groups_count}</span>
-                        </div>
-                      )}
-                      {total_duplicates_count > 0 && (
-                        <div className="flex justify-between">
-                          <span className="flex items-center gap-1.5"><Music className="w-3 h-3 text-red-500" /> Total duplicates</span>
-                          <span className="font-medium">{total_duplicates_count}</span>
-                        </div>
-                      )}
-                      {broken_albums_count > 0 && (
-                        <div className="flex justify-between">
-                          <span className="flex items-center gap-1.5"><AlertTriangle className="w-3 h-3 text-red-500" /> Incomplete albums</span>
-                          <span className="font-medium text-red-600 dark:text-red-400">{broken_albums_count}</span>
-                        </div>
-                      )}
-                      {missing_albums_count > 0 && (
-                        <div className="flex justify-between">
-                          <span className="flex items-center gap-1.5"><Music className="w-3 h-3 text-yellow-500" /> Missing</span>
-                          <span className="font-medium">{missing_albums_count}</span>
-                        </div>
-                      )}
-                      {albums_without_mb_id > 0 && (
-                        <div className="flex justify-between">
-                          <span className="flex items-center gap-1.5"><Database className="w-3 h-3 text-blue-500" /> No MB ID</span>
-                          <span className="font-medium">{albums_without_mb_id}</span>
-                        </div>
-                      )}
-                      {albums_without_complete_tags > 0 && (
-                        <div className="flex justify-between">
-                          <span className="flex items-center gap-1.5"><Tag className="w-3 h-3 text-purple-500" /> Incomplete tags</span>
-                          <span className="font-medium">{albums_without_complete_tags}</span>
-                        </div>
-                      )}
-                      {albums_without_album_image > 0 && (
-                        <div className="flex justify-between">
-                          <span className="flex items-center gap-1.5"><Image className="w-3 h-3 text-gray-500" /> No album art</span>
-                          <span className="font-medium">{albums_without_album_image}</span>
-                        </div>
-                      )}
-                      {albums_without_artist_image > 0 && (
-                        <div className="flex justify-between">
-                          <span className="flex items-center gap-1.5"><Image className="w-3 h-3 text-gray-500" /> No artist art</span>
-                          <span className="font-medium">{albums_without_artist_image}</span>
-                        </div>
-                      )}
+                      {(() => {
+                        const nOfM = (n: number, tot: number) => (tot > 0 ? `${n.toLocaleString()} / ${tot.toLocaleString()}` : n.toLocaleString());
+                        const tot = total_albums ?? 0;
+                        return (
+                          <>
+                            {duplicate_groups_count > 0 && (
+                              <div className="flex justify-between">
+                                <span className="flex items-center gap-1.5"><Package className="w-3 h-3 text-orange-500" /> Duplicate groups</span>
+                                <span className="font-medium">{duplicate_groups_count}</span>
+                              </div>
+                            )}
+                            {total_duplicates_count > 0 && (
+                              <div className="flex justify-between">
+                                <span className="flex items-center gap-1.5"><Music className="w-3 h-3 text-red-500" /> Total duplicates</span>
+                                <span className="font-medium">{total_duplicates_count}</span>
+                              </div>
+                            )}
+                            {broken_albums_count > 0 && (
+                              <div className="flex justify-between">
+                                <span className="flex items-center gap-1.5"><AlertTriangle className="w-3 h-3 text-red-500" /> Incomplete albums</span>
+                                <span className="font-medium text-red-600 dark:text-red-400">{nOfM(broken_albums_count, tot)}</span>
+                              </div>
+                            )}
+                            {missing_albums_count > 0 && (
+                              <div className="flex justify-between">
+                                <span className="flex items-center gap-1.5"><Music className="w-3 h-3 text-yellow-500" /> Missing</span>
+                                <span className="font-medium">{nOfM(missing_albums_count, tot)}</span>
+                              </div>
+                            )}
+                            {albums_without_mb_id > 0 && (
+                              <div className="flex justify-between">
+                                <span className="flex items-center gap-1.5"><Database className="w-3 h-3 text-blue-500" /> No MB ID</span>
+                                <span className="font-medium">{nOfM(albums_without_mb_id, tot)}</span>
+                              </div>
+                            )}
+                            {albums_without_complete_tags > 0 && (
+                              <div className="flex justify-between">
+                                <span className="flex items-center gap-1.5"><Tag className="w-3 h-3 text-purple-500" /> Incomplete tags</span>
+                                <span className="font-medium">{nOfM(albums_without_complete_tags, tot)}</span>
+                              </div>
+                            )}
+                            {albums_without_album_image > 0 && (
+                              <div className="flex justify-between">
+                                <span className="flex items-center gap-1.5"><Image className="w-3 h-3 text-gray-500" /> No album art</span>
+                                <span className="font-medium">{nOfM(albums_without_album_image, tot)}</span>
+                              </div>
+                            )}
+                            {albums_without_artist_image > 0 && (
+                              <div className="flex justify-between">
+                                <span className="flex items-center gap-1.5"><Image className="w-3 h-3 text-gray-500" /> No artist art</span>
+                                <span className="font-medium">{nOfM(albums_without_artist_image, tot)}</span>
+                              </div>
+                            )}
+                          </>
+                        );
+                      })()}
                     </div>
                   )}
                 </div>

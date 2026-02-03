@@ -1,7 +1,8 @@
 import { useMemo, useState } from 'react';
-import { Loader2, BarChart2, Disc3, Trash2, HardDrive, Cpu, AlertCircle } from 'lucide-react';
+import { Loader2, BarChart2, Disc3, Trash2, HardDrive, Cpu, AlertCircle, PieChart } from 'lucide-react';
 import { useQuery } from '@tanstack/react-query';
 import { format, subHours, subDays } from 'date-fns';
+import type { ScanProgress } from '@/lib/api';
 import {
   Chart as ChartJS,
   CategoryScale,
@@ -72,6 +73,11 @@ export default function Statistics() {
   const { data: history = [], isLoading } = useQuery({
     queryKey: ['scan-history'],
     queryFn: api.getScanHistory,
+  });
+  const { data: scanProgress } = useQuery<ScanProgress>({
+    queryKey: ['scan-progress'],
+    queryFn: api.getScanProgress,
+    refetchInterval: (data) => (data?.scanning ? 2000 : false),
   });
 
   const filtered = useMemo(() => {
@@ -198,6 +204,91 @@ export default function Statistics() {
     };
   }, [scansOnly]);
 
+  // Live or last-scan album health for pie charts (updates during scan)
+  const liveAlbumHealth = useMemo(() => {
+    if (scanProgress?.scanning && (scanProgress.total_albums ?? 0) > 0) {
+      const total = scanProgress.total_albums ?? 0;
+      return {
+        total,
+        broken: scanProgress.broken_albums_count ?? 0,
+        noTags: scanProgress.albums_without_complete_tags ?? 0,
+        noArt: scanProgress.albums_without_album_image ?? 0,
+        isLive: true,
+      };
+    }
+    const summary = scanProgress?.last_scan_summary;
+    if (summary && (summary.albums_scanned ?? 0) > 0) {
+      const total = summary.albums_scanned ?? 0;
+      return {
+        total,
+        broken: summary.broken_albums_count ?? 0,
+        noTags: summary.albums_without_complete_tags ?? 0,
+        noArt: summary.albums_without_album_image ?? 0,
+        isLive: false,
+      };
+    }
+    const lastScan = scansOnly.length > 0 ? scansOnly[scansOnly.length - 1] : null;
+    if (lastScan && (lastScan.albums_scanned ?? 0) > 0) {
+      const total = lastScan.albums_scanned ?? 0;
+      return {
+        total,
+        broken: lastScan.broken_albums_count ?? 0,
+        noTags: lastScan.albums_without_complete_tags ?? 0,
+        noArt: lastScan.albums_without_album_image ?? 0,
+        isLive: false,
+      };
+    }
+    return null;
+  }, [scanProgress, scansOnly]);
+
+  const chartDataIncompleteAlbums = useMemo(() => {
+    if (!liveAlbumHealth || liveAlbumHealth.total === 0) return null;
+    const ok = Math.max(0, liveAlbumHealth.total - liveAlbumHealth.broken);
+    return {
+      labels: ['OK', 'Incomplete albums'],
+      datasets: [
+        {
+          data: [ok, liveAlbumHealth.broken],
+          backgroundColor: [transparentFill(COLORS.tertiary, 0.8), transparentFill('#ef4444', 0.8)],
+          borderWidth: 1,
+          borderColor: [COLORS.tertiary, '#ef4444'],
+        },
+      ],
+    };
+  }, [liveAlbumHealth]);
+
+  const chartDataIncompleteTags = useMemo(() => {
+    if (!liveAlbumHealth || liveAlbumHealth.total === 0) return null;
+    const ok = Math.max(0, liveAlbumHealth.total - liveAlbumHealth.noTags);
+    return {
+      labels: ['Complete tags', 'Incomplete tags'],
+      datasets: [
+        {
+          data: [ok, liveAlbumHealth.noTags],
+          backgroundColor: [transparentFill(COLORS.secondary, 0.8), transparentFill('#a855f7', 0.8)],
+          borderWidth: 1,
+          borderColor: [COLORS.secondary, '#a855f7'],
+        },
+      ],
+    };
+  }, [liveAlbumHealth]);
+
+  const chartDataNoAlbumArt = useMemo(() => {
+    if (!liveAlbumHealth || liveAlbumHealth.total === 0) return null;
+    const ok = Math.max(0, liveAlbumHealth.total - liveAlbumHealth.noArt);
+    return {
+      labels: ['With art', 'No album art'],
+      datasets: [
+        {
+          data: [ok, liveAlbumHealth.noArt],
+          backgroundColor: [transparentFill(COLORS.primary, 0.8), transparentFill(COLORS.muted, 0.8)],
+          borderWidth: 1,
+          borderColor: [COLORS.primary, COLORS.muted],
+        },
+      ],
+    };
+  }, [liveAlbumHealth]);
+
   const formatMb = (mb: number) => (mb >= 1024 ? `${(mb / 1024).toFixed(1)} GB` : `${mb.toFixed(0)} MB`);
 
   if (isLoading) {
@@ -310,6 +401,81 @@ export default function Statistics() {
             </CardContent>
           </Card>
         </div>
+
+        {liveAlbumHealth && (
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+            <Card className="md:col-span-3">
+              <CardHeader>
+                <CardTitle className="text-base flex items-center gap-1.5">
+                  <PieChart className="w-4 h-4" />
+                  Album health
+                  {liveAlbumHealth.isLive && (
+                    <span className="text-xs font-normal text-primary animate-pulse">Live</span>
+                  )}
+                </CardTitle>
+                <CardDescription>
+                  {liveAlbumHealth.isLive
+                    ? 'Updating during scan – incomplete albums, tags, and art vs total'
+                    : 'Last completed scan – incomplete albums, tags, and art vs total'}
+                </CardDescription>
+              </CardHeader>
+            </Card>
+            <Card>
+              <CardHeader>
+                <CardTitle className="text-sm">Incomplete albums</CardTitle>
+                <CardDescription>{liveAlbumHealth.total.toLocaleString()} total</CardDescription>
+              </CardHeader>
+              <CardContent>
+                <div className="h-[200px] flex items-center justify-center">
+                  {chartDataIncompleteAlbums && (chartDataIncompleteAlbums.datasets[0].data[0] > 0 || chartDataIncompleteAlbums.datasets[0].data[1] > 0) ? (
+                    <Doughnut
+                      data={chartDataIncompleteAlbums}
+                      options={{ ...chartOptions, cutout: '60%' }}
+                    />
+                  ) : (
+                    <p className="text-sm text-muted-foreground">No incomplete albums</p>
+                  )}
+                </div>
+              </CardContent>
+            </Card>
+            <Card>
+              <CardHeader>
+                <CardTitle className="text-sm">Incomplete tags</CardTitle>
+                <CardDescription>{liveAlbumHealth.total.toLocaleString()} total</CardDescription>
+              </CardHeader>
+              <CardContent>
+                <div className="h-[200px] flex items-center justify-center">
+                  {chartDataIncompleteTags && (chartDataIncompleteTags.datasets[0].data[0] > 0 || chartDataIncompleteTags.datasets[0].data[1] > 0) ? (
+                    <Doughnut
+                      data={chartDataIncompleteTags}
+                      options={{ ...chartOptions, cutout: '60%' }}
+                    />
+                  ) : (
+                    <p className="text-sm text-muted-foreground">All tags complete</p>
+                  )}
+                </div>
+              </CardContent>
+            </Card>
+            <Card>
+              <CardHeader>
+                <CardTitle className="text-sm">No album art</CardTitle>
+                <CardDescription>{liveAlbumHealth.total.toLocaleString()} total</CardDescription>
+              </CardHeader>
+              <CardContent>
+                <div className="h-[200px] flex items-center justify-center">
+                  {chartDataNoAlbumArt && (chartDataNoAlbumArt.datasets[0].data[0] > 0 || chartDataNoAlbumArt.datasets[0].data[1] > 0) ? (
+                    <Doughnut
+                      data={chartDataNoAlbumArt}
+                      options={{ ...chartOptions, cutout: '60%' }}
+                    />
+                  ) : (
+                    <p className="text-sm text-muted-foreground">All have art</p>
+                  )}
+                </div>
+              </CardContent>
+            </Card>
+          </div>
+        )}
 
         {filtered.length === 0 ? (
           <Card>

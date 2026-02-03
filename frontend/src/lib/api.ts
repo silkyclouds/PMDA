@@ -42,6 +42,8 @@ export interface ScanProgress {
   phase?: 'format_analysis' | 'identification_tags' | 'ia_analysis' | 'finalizing' | 'moving_dupes' | null;
   /** Micro-step for live indicators: analyzing_format | fetching_mb_id | searching_mb | comparing_versions | detecting_best | done */
   current_step?: string | null;
+  /** Total albums in this scan (for N/M display in findings) */
+  total_albums?: number;
   /** AI provider name (e.g. OpenAI) when AI is used */
   ai_provider?: string;
   /** AI model name (e.g. gpt-4o-mini) when AI is used */
