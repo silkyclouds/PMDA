@@ -10,7 +10,6 @@ RUN npm run build
 FROM python:3.11-slim
 
 ENV PMDA_CONFIG_DIR=/config
-ENV PMDA_DEFAULT_MODE=serve
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \

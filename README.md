@@ -17,8 +17,7 @@ docker run -d \
   -v /path/to/plex/databases:/database:ro \
   -v /path/to/music:/music:rw \
   -v /path/to/dupes:/dupes \
-  meaning/pmda:latest \
-  --serve
+  meaning/pmda:latest
 ```
 
 Replace the paths with your actual host paths:
@@ -52,7 +51,7 @@ npm install
 npm run build
 cd ..
 export PMDA_CONFIG_DIR=/path/to/config   # optional; defaults to current dir
-python pmda.py --serve
+python pmda.py
 ```
 
 Ensure the Plex database is reachable and your music paths match what Plex uses (see Settings in the UI for path mapping).
@@ -78,7 +77,7 @@ All configuration (Plex URL, token, section IDs, path map, AI keys) is stored in
 ┌─────────────────────┐     ┌─────────────────────┐     ┌─────────────────────┐
 │  Plex Media Server  │     │  PMDA (Docker)      │     │  Web UI             │
 │  Database + Music   │ ──▶ │  Backend + Frontend │ ──▶ │  localhost:5005     │
-│  (read / read-write)│     │  --serve            │     │  Scan, Unduper, etc.│
+│  (read / read-write)│     │  Web UI only         │     │  Scan, Unduper, etc.│
 └─────────────────────┘     └─────────────────────┘     └─────────────────────┘
                                       │
                                       │ (optional)

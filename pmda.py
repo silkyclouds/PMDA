@@ -25,7 +25,6 @@ v0.7.5
 - Improvement of the detection for albums with "no name" 
 """
 
-import argparse
 import base64
 import json
 import os
@@ -1959,71 +1958,81 @@ def _run_path_verification(path_map: dict, db_file: str, samples: int):
         con.text_factory = lambda b: b.decode("utf-8", "surrogateescape")
         cur = con.cursor()
         for plex_root, host_root in path_map.items():
-            def check_once():
-                cur.execute(
-                    f"""
-                    SELECT mp.file FROM media_parts mp
-                    WHERE mp.file LIKE ? AND ({_PATH_VERIFY_EXTENSIONS})
-                    ORDER BY RANDOM() LIMIT ?
-                    """,
-                    (f"{plex_root}/%", samples),
-                )
-                rows = [r[0] for r in cur.fetchall()]
-                if not rows:
-                    return 0, 0, None
-                missing = 0
-                for src_path in rows:
-                    rel = src_path[len(plex_root):].lstrip("/")
-                    dst_path = os.path.join(host_root, rel)
-                    if not Path(dst_path).exists():
-                        missing += 1
-                return len(rows), missing, rows
-            total, missing, _ = check_once()
-            if total == 0:
-                # Path may be valid (Plex uses it) but this DB has no rows (e.g. different Plex server).
-                # If the path exists in the container and has audio files, treat as OK.
-                try:
-                    p = Path(host_root)
-                    if p.exists() and p.is_dir():
-                        audio_count = sum(1 for _ in p.rglob("*") if AUDIO_RE.search(_.name))
-                        if audio_count > 0:
-                            results.append({
-                                "plex_root": plex_root,
-                                "host_root": host_root,
-                                "status": "ok",
-                                "samples_checked": 0,
-                                "message": "Path exists with audio files (no matching rows in this Plex DB)",
-                            })
-                            continue
-                except Exception:
-                    pass
+            try:
+                def check_once():
+                    cur.execute(
+                        f"""
+                        SELECT mp.file FROM media_parts mp
+                        WHERE mp.file LIKE ? AND ({_PATH_VERIFY_EXTENSIONS})
+                        ORDER BY RANDOM() LIMIT ?
+                        """,
+                        (f"{plex_root}/%", samples),
+                    )
+                    rows = [r[0] for r in cur.fetchall()]
+                    if not rows:
+                        return 0, 0, None
+                    missing = 0
+                    for src_path in rows:
+                        rel = src_path[len(plex_root):].lstrip("/")
+                        dst_path = os.path.join(host_root, rel)
+                        if not Path(dst_path).exists():
+                            missing += 1
+                    return len(rows), missing, rows
+                total, missing, _ = check_once()
+                if total == 0:
+                    # Path may be valid (Plex uses it) but this DB has no rows (e.g. different Plex server).
+                    # If the path exists in the container and has audio files, treat as OK.
+                    try:
+                        p = Path(host_root)
+                        if p.exists() and p.is_dir():
+                            audio_count = sum(1 for _ in p.rglob("*") if AUDIO_RE.search(_.name))
+                            if audio_count > 0:
+                                results.append({
+                                    "plex_root": plex_root,
+                                    "host_root": host_root,
+                                    "status": "ok",
+                                    "samples_checked": 0,
+                                    "message": "Path exists with audio files (no matching rows in this Plex DB)",
+                                })
+                                continue
+                    except Exception:
+                        pass
+                    results.append({
+                        "plex_root": plex_root,
+                        "host_root": host_root,
+                        "status": "fail",
+                        "samples_checked": 0,
+                        "message": "No audio files found in DB under this path",
+                    })
+                    continue
+                if missing > 0 and missing <= 2:
+                    total2, missing2, _ = check_once()
+                    if total2 > 0 and missing2 == 0:
+                        total, missing = total2, 0
+                if missing == 0:
+                    results.append({
+                        "plex_root": plex_root,
+                        "host_root": host_root,
+                        "status": "ok",
+                        "samples_checked": total,
+                        "message": "OK",
+                    })
+                else:
+                    results.append({
+                        "plex_root": plex_root,
+                        "host_root": host_root,
+                        "status": "fail",
+                        "samples_checked": total,
+                        "message": f"{missing}/{total} sample(s) missing on disk",
+                    })
+            except Exception as path_err:
+                logging.warning("Path verification failed for %s: %s", plex_root, path_err)
                 results.append({
                     "plex_root": plex_root,
                     "host_root": host_root,
                     "status": "fail",
                     "samples_checked": 0,
-                    "message": "No audio files found in DB under this path",
-                })
-                continue
-            if missing > 0 and missing <= 2:
-                total2, missing2, _ = check_once()
-                if total2 > 0 and missing2 == 0:
-                    total, missing = total2, 0
-            if missing == 0:
-                results.append({
-                    "plex_root": plex_root,
-                    "host_root": host_root,
-                    "status": "ok",
-                    "samples_checked": total,
-                    "message": "OK",
-                })
-            else:
-                results.append({
-                    "plex_root": plex_root,
-                    "host_root": host_root,
-                    "status": "fail",
-                    "samples_checked": total,
-                    "message": f"{missing}/{total} sample(s) missing on disk",
+                    "message": str(path_err) or "Verification error",
                 })
         con.close()
     except Exception as e:
@@ -8532,14 +8541,17 @@ def api_autodetect_paths():
     if not section_ids:
         return jsonify({"success": False, "paths": {}, "message": "No SECTION_IDS provided"}), 400
     paths = {}
-    try:
-        for sid in section_ids:
+    errors = []
+    for sid in section_ids:
+        try:
             part = _discover_path_map(host, token, sid)
             paths.update(part)
-        return jsonify({"success": True, "paths": paths})
-    except Exception as e:
-        logging.warning("Autodetect paths failed: %s", e)
-        return jsonify({"success": False, "paths": {}, "message": str(e)})
+        except Exception as e:
+            logging.warning("Autodetect paths failed for section %s: %s", sid, e)
+            errors.append(f"Section {sid}: {e}")
+    if not paths and errors:
+        return jsonify({"success": False, "paths": {}, "message": "; ".join(errors)})
+    return jsonify({"success": True, "paths": paths, "message": "; ".join(errors) if errors else None})
 
 
 def _path_map_from_verify_body(raw):
@@ -8714,7 +8726,11 @@ def api_paths_verify():
             db_file, db_path,
         )
         return jsonify({"success": False, "results": [], "message": f"Plex DB not found: {db_file}"}), 400
-    results = _run_path_verification(path_map, db_file, samples or CROSSCHECK_SAMPLES)
+    try:
+        results = _run_path_verification(path_map, db_file, samples or CROSSCHECK_SAMPLES)
+    except Exception as e:
+        logging.warning("Paths verify exception: %s", e)
+        return jsonify({"success": False, "results": [], "message": str(e) or "Path verification failed"}), 500
     if results is None:
         return jsonify({"success": False, "results": [], "message": "Path verification failed"}), 500
     _last_path_verify_result = list(results)
@@ -9301,7 +9317,6 @@ def api_config_get():
         "AUTO_MOVE_DUPES": get_setting_bool("AUTO_MOVE_DUPES", AUTO_MOVE_DUPES),
         "NORMALIZE_PARENTHETICAL_FOR_DEDUPE": get_setting_bool("NORMALIZE_PARENTHETICAL_FOR_DEDUPE", True),
         "DISABLE_PATH_CROSSCHECK": get_setting_bool("DISABLE_PATH_CROSSCHECK", DISABLE_PATH_CROSSCHECK),
-        "PMDA_DEFAULT_MODE": get_setting("PMDA_DEFAULT_MODE", "serve"),
         "USE_DISCOGS": get_setting_bool("USE_DISCOGS", USE_DISCOGS),
         "DISCOGS_USER_TOKEN": get_setting("DISCOGS_USER_TOKEN", DISCOGS_USER_TOKEN),
         "USE_LASTFM": get_setting_bool("USE_LASTFM", USE_LASTFM),
@@ -9528,9 +9543,6 @@ def _apply_settings_in_memory(updates: dict):
     if "OPENAI_MODEL_FALLBACKS" in updates:
         merged["OPENAI_MODEL_FALLBACKS"] = str(updates["OPENAI_MODEL_FALLBACKS"] or "").strip()
         logging.info("OPENAI_MODEL_FALLBACKS updated in memory")
-    if "PMDA_DEFAULT_MODE" in updates:
-        merged["PMDA_DEFAULT_MODE"] = str(updates["PMDA_DEFAULT_MODE"] or "serve").strip().lower()
-        logging.info("PMDA_DEFAULT_MODE updated in memory: %s", merged["PMDA_DEFAULT_MODE"])
 
     # Metadata fallback providers (Discogs, Last.fm, Bandcamp)
     if "USE_DISCOGS" in updates:
@@ -9582,7 +9594,7 @@ def api_config_put():
         "USE_AI_FOR_MB_MATCH", "USE_AI_FOR_MB_VERIFY",
         "USE_AI_VISION_FOR_COVER", "OPENAI_VISION_MODEL", "USE_WEB_SEARCH_FOR_MB", "SERPER_API_KEY",
         "SKIP_FOLDERS", "CROSS_LIBRARY_DEDUPE", "CROSSCHECK_SAMPLES", "DISABLE_PATH_CROSSCHECK",
-        "FORMAT_PREFERENCE", "AUTO_MOVE_DUPES", "NORMALIZE_PARENTHETICAL_FOR_DEDUPE", "PMDA_DEFAULT_MODE",
+        "FORMAT_PREFERENCE", "AUTO_MOVE_DUPES", "NORMALIZE_PARENTHETICAL_FOR_DEDUPE",
         "LIDARR_URL", "LIDARR_API_KEY", "AUTOBRR_URL", "AUTOBRR_API_KEY", "AUTO_FIX_BROKEN_ALBUMS",
         "BROKEN_ALBUM_CONSECUTIVE_THRESHOLD", "BROKEN_ALBUM_PERCENTAGE_THRESHOLD", "REQUIRED_TAGS",
         "USE_DISCOGS", "DISCOGS_USER_TOKEN", "USE_LASTFM", "LASTFM_API_KEY", "LASTFM_API_SECRET", "USE_BANDCAMP",
@@ -13607,357 +13619,17 @@ if _HAS_STATIC_UI:
         return send_from_directory(_FRONTEND_DIST, "index.html")
 
 
-# ───────────────────────────────────── CLI MODE ───────────────────────────────────
-def dedupe_cli(
-    dry: bool,
-    safe: bool,
-    tag_extra: bool,
-    verbose: bool,
-) -> None:
-    """
-    Command-line mode:
-    1. Scan every artist / album in the selected Plex sections.
-    2. Detect duplicate album groups.
-    3. Optionally move the “loser” folders and clean Plex metadata.
-
-    Parameters
-    ----------
-    dry       : Simulate actions only (no file moves / API calls).
-    safe      : Never delete Plex metadata, even when not dry-run.
-    tag_extra : Tag “(Extra Tracks)” on the best edition if it has
-                more tracks than the shortest one in the group.
-    verbose   : Enable DEBUG-level logging.
-    """
-    # ------------------------------------------------------------------ #
-    #  Logging & DB setup
-    # ------------------------------------------------------------------ #
-    log_level = logging.DEBUG if verbose else logging.INFO
-    logging.getLogger().setLevel(log_level)
-
-    db = plex_connect()
-    cur = db.cursor()
-
-    # ------------------------------------------------------------------ #
-    #  Statistics that we’ll summarise at the end
-    # ------------------------------------------------------------------ #
-    stats = dict.fromkeys(
-        (
-            "total_artists",
-            "total_albums",
-            "albums_with_dupes",
-            "total_dupes",
-            "total_moved_mb",
-        ),
-        0,
-    )
-
-    # ------------------------------------------------------------------ #
-    #  Pre-compute totals so we can show progress
-    # ------------------------------------------------------------------ #
-    placeholders = ",".join("?" for _ in SECTION_IDS)
-    total_albums_overall = cur.execute(
-        f"""
-        SELECT COUNT(*)
-        FROM   metadata_items
-        WHERE  metadata_type = 9
-          AND  library_section_id IN ({placeholders})
-        """,
-        tuple(SECTION_IDS),
-    ).fetchone()[0]
-    logging.info(f"🔍 About to scan {total_albums_overall:,} albums…")
-
-    artists = cur.execute(
-        """
-        SELECT id, title
-        FROM   metadata_items
-        WHERE  metadata_type = 8
-          AND  library_section_id = ?
-        """,
-        (SECTION_ID,),
-    ).fetchall()
-
-    processed_albums = 0  # for progress updates
-
-    # ------------------------------------------------------------------ #
-    #  Main artist loop
-    # ------------------------------------------------------------------ #
-    for artist_id, artist_name in artists:
-        stats["total_artists"] += 1
-
-        album_ids = [
-            row[0]
-            for row in cur.execute(
-                """
-                SELECT id
-                FROM   metadata_items
-                WHERE  metadata_type = 9
-                  AND  parent_id      = ?
-                """,
-                (artist_id,),
-            ).fetchall()
-        ]
-        stats["total_albums"] += len(album_ids)
-
-        # Progress ticker
-        for aid in album_ids:
-            processed_albums += 1
-            if processed_albums % 100 == 0 or verbose:
-                title = album_title(db, aid)
-                logging.info(
-                    "Progress: %s / %s – %s – %s",
-                    f"{processed_albums:,}",
-                    f"{total_albums_overall:,}",
-                    artist_name,
-                    title,
-                )
-
-        dup_groups = scan_duplicates(db, artist_name, album_ids)
-        if dup_groups:
-            stats["albums_with_dupes"] += len(dup_groups)
-
-        removed_this_artist = 0
-
-        # -------------------------------------------------------------- #
-        #  Handle each duplicate group
-        # -------------------------------------------------------------- #
-        for group in dup_groups:
-            best   = group["best"]
-            losers = group["losers"]
-
-            logging.info(
-                "🏷  Duplicate group: %s — %s  (versions: %d)",
-                artist_name,
-                best["title_raw"],
-                len(losers) + 1,
-            )
-            logging.info(
-                "    Selected BEST: %s, %d-bit, %d tracks",
-                get_primary_format(Path(best["folder"])),
-                best["bd"],
-                len(best["tracks"]),
-            )
-
-            # Accumulator for this group
-            space_freed_mb = 0
-
-            # Move every loser edition
-            for loser in losers:
-                src = Path(loser["folder"])
-                if not src.exists():
-                    logging.warning("Source missing (skipped): %s", src)
-                    continue
-
-                # Build destination under /dupes
-                base_dst = build_dupe_destination(src)
-                dst = base_dst
-                counter = 1
-                while dst.exists():
-                    dst = base_dst.parent / f"{base_dst.name} ({counter})"
-                    counter += 1
-                dst.parent.mkdir(parents=True, exist_ok=True)
-
-                size_mb = folder_size(src) // (1024 * 1024)
-
-                if dry:
-                    logging.info("    DRY-RUN – would move %s → %s  (%s MB)", src, dst, f"{size_mb:,}")
-                else:
-                    logging.info("    Moving %s → %s  (%s MB)", src, dst, f"{size_mb:,}")
-                    safe_move(str(src), str(dst))
-
-                space_freed_mb += size_mb
-                stats["total_dupes"] += 1
-                stats["total_moved_mb"] += size_mb
-                removed_this_artist += 1
-                # Keep global stats in sync for unified summary
-                increment_stat("removed_dupes", 1)
-                increment_stat("space_saved", size_mb)
-
-                # Plex metadata cleanup
-                if not (dry or safe):
-                    try:
-                        loser_id = loser["album_id"]
-                        plex_api(f"/library/metadata/{loser_id}/trash", method="PUT")
-                        time.sleep(0.3)
-                        plex_api(f"/library/metadata/{loser_id}", method="DELETE")
-                    except Exception as api_err:
-                        logging.warning("Could not delete Plex metadata: %s", api_err)
-
-            logging.info("    ➜ Freed %s MB in this group", f"{space_freed_mb:,}")
-
-            # Optional extra-track tagging
-            if tag_extra:
-                editions = losers + [best]
-                min_tracks = min(len(e["tracks"]) for e in editions)
-                if len(best["tracks"]) > min_tracks:
-                    try:
-                        plex_api(
-                            f"/library/metadata/{best['album_id']}"
-                            "?title.value=(Extra Tracks)&title.lock=1",
-                            method="PUT",
-                        )
-                        logging.info("    Tagged best edition with '(Extra Tracks)'")
-                    except Exception as err:
-                        logging.warning("Failed to tag edition: %s", err)
-
-        # Refresh Plex for this artist after processing all groups
-        if removed_this_artist and not dry:
-            try:
-                encoded_artist = quote_plus(artist_name)
-                prefix = f"/music/matched/{artist_name[0].upper()}/{encoded_artist}"
-                plex_api(f"/library/sections/{SECTION_ID}/refresh?path={prefix}")
-                plex_api(f"/library/sections/{SECTION_ID}/emptyTrash", method="PUT")
-            except Exception as refresh_err:
-                logging.warning("Plex refresh failed for %s: %s", artist_name, refresh_err)
-
-    db.close()
-
-    # ------------------------------------------------------------------ #
-    #  FINAL SUMMARY (unified)
-    # ------------------------------------------------------------------ #
-    # Always emit a local summary banner so it shows up in docker logs -f
-    summary_lines = [
-        "",
-        "" + "─" * 69,
-        "FINAL SUMMARY",
-        f"Total artists           : {stats['total_artists']:,}",
-        f"Total albums            : {stats['total_albums']:,}",
-        f"Albums with dupes       : {stats['albums_with_dupes']:,}",
-        f"Folders moved           : {stats['total_dupes']:,}",
-        f"Total space reclaimed   : {stats['total_moved_mb']:,} MB",
-        "" + "─" * 69,
-        "",
-    ]
-    for line in summary_lines:
-        logging.info(line)
-
-    # Then, if a global emitter exists, call it (keeps Web UI/DB in sync)
-    emit = globals().get("emit_final_summary")
-    if callable(emit):
-        globals()["SUMMARY_EMITTED"] = True
-        try:
-            emit("cli")
-        except Exception as _e:
-            logging.debug("emit_final_summary('cli') failed: %s", _e)
-
-    # Flush handlers to force immediate appearance in logs
-    for _h in logging.getLogger().handlers:
-        try:
-            _h.flush()
-        except Exception:
-            pass
-
-    # ------------------------------------------------------------------ #
-    #  Discord – always attempt to notify
-    # ------------------------------------------------------------------ #
-    try:
-        notify_discord(
-            "\n".join(
-                [
-                    "🟢 **PMDA CLI run finished**",
-                    f"Artists scanned: {stats['total_artists']:,}",
-                    f"Albums scanned: {stats['total_albums']:,}",
-                    f"Duplicate albums: {stats['albums_with_dupes']:,}",
-                    f"Folders moved: {stats['total_dupes']:,}",
-                    f"Space reclaimed: {stats['total_moved_mb']:,} MB",
-                    "(dry-run)" if dry else "",
-                ]
-            )
-        )
-    except Exception as e:
-        logging.warning("Discord summary failed: %s", e)
-    # Prevent duplicate summary emission by other components
-    globals()["SUMMARY_EMITTED"] = True
-
 # ───────────────────────────────── MAIN ───────────────────────────────────
 import os
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Scan & dedupe Plex Music duplicates (CLI or WebUI)."
-    )
+    # Web UI only: start HTTP server, then run startup checks in main thread.
+    def run_server():
+        app.run(host="0.0.0.0", port=WEBUI_PORT, threaded=True, use_reloader=False)
 
-    # Options for WebUI or CLI modes
-    sub = parser.add_argument_group("Options for WebUI or CLI modes")
-    sub.add_argument(
-        "--serve",
-        action="store_true",
-        help="Launch Flask web interface"
-    )
-    # Legacy alias for Unraid CA compatibility
-    sub.add_argument(
-        "--webui",
-        dest="serve",
-        action="store_true",
-        help="Alias for --serve (legacy compatibility)"
-    )
-
-    # CLI-only options
-    cli = parser.add_argument_group("CLI-only options (ignored with --serve)")
-    cli.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Simulate moves & deletes but do not actually move files or call API."
-    )
-    cli.add_argument(
-        "--safe-mode",
-        action="store_true",
-        help="Do not delete Plex metadata even if not dry-run."
-    )
-    cli.add_argument(
-        "--tag-extra",
-        action="store_true",
-        help="If an edition has extra tracks, tag 'Extra Tracks' on the best version."
-    )
-    cli.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Enable DEBUG-logging"
-    )
-
-    args = parser.parse_args()
-
-    # Require PMDA_DEFAULT_MODE when no flags provided (from SQLite only, default 'serve')
-    if not any([args.serve, args.dry_run, args.safe_mode, args.tag_extra, args.verbose]):
-        mode = str(_get_config_from_db("PMDA_DEFAULT_MODE") or "serve").strip().lower()
-        if mode == "serve":
-            args.serve = True
-        elif mode in ("cli", "run"):
-            # CLI mode: no serve flag
-            pass
-        else:
-            raise SystemExit(f"Invalid PMDA_DEFAULT_MODE: {mode}. Must be 'serve' or 'cli'")
-
-    # Early logging setup for verbose
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-        logging.debug("Main: verbose mode enabled; root logger set to DEBUG")
-
-    if args.serve:
-        # WebUI mode: start the HTTP server first so the UI is reachable immediately,
-        # then run startup checks (diagnostic + cross-check) in main thread.
-        def run_server():
-            app.run(host="0.0.0.0", port=WEBUI_PORT, threaded=True, use_reloader=False)
-
-        server_thread = threading.Thread(target=run_server, daemon=False)
-        server_thread.start()
-        logging.info("WebUI listening on http://0.0.0.0:%s – startup checks running in background", WEBUI_PORT)
-        run_startup_checks()
-        logging.info("WebUI startup complete – you can open the interface now.")
-        server_thread.join()  # block forever (app.run never returns)
-    else:
-        # CLI mode: run checks then full scan and dedupe
-        run_startup_checks()
-        logging.info("CLI mode: starting full library scan")
-        # Temporarily disable Discord notifications during scan stage
-        original_notify = globals().get("notify_discord")
-        globals()["notify_discord"] = lambda *args, **kwargs: None
-        background_scan()
-        # Restore Discord notification function
-        globals()["notify_discord"] = original_notify
-        logging.info("CLI mode: scan complete, starting dedupe")
-        dedupe_cli(
-            dry=args.dry_run,
-            safe=args.safe_mode,
-            tag_extra=args.tag_extra,
-            verbose=args.verbose
-        )
+    server_thread = threading.Thread(target=run_server, daemon=False)
+    server_thread.start()
+    logging.info("Web UI listening on http://0.0.0.0:%s – startup checks running in background", WEBUI_PORT)
+    run_startup_checks()
+    logging.info("Web UI startup complete – you can open the interface now.")
+    server_thread.join()  # block forever (app.run never returns)

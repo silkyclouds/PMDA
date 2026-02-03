@@ -15,6 +15,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table';
+import { Progress } from '@/components/ui/progress';
 import * as api from '@/lib/api';
 import type { PMDAConfig, PathVerifyResult } from '@/lib/api';
 import { cn } from '@/lib/utils';
@@ -47,6 +48,11 @@ export function PathSettings({ config, updateConfig, errors }: PathSettingsProps
   } | null>(null);
   const [reverifyingPlex, setReverifyingPlex] = useState<string | null>(null);
   const [resolvingPlex, setResolvingPlex] = useState<string | null>(null);
+  const [bindingProgress, setBindingProgress] = useState<{
+    phase: 'detecting' | 'resolving' | 'verifying';
+    current: number;
+    total: number;
+  } | null>(null);
   const lastAutoSectionIdsRef = useRef<string>('');
 
   const pathMapObj = config.PATH_MAP != null && typeof config.PATH_MAP === 'object' && !Array.isArray(config.PATH_MAP)
@@ -62,6 +68,7 @@ export function PathSettings({ config, updateConfig, errors }: PathSettingsProps
     const sectionIds = config.SECTION_IDS;
     if (!host || !token || !sectionIds) {
       setAutoStep('idle');
+      setBindingProgress(null);
       return;
     }
     setVerifyError(null);
@@ -69,59 +76,85 @@ export function PathSettings({ config, updateConfig, errors }: PathSettingsProps
     setAutoError(null);
     setVerifyResults(null);
     setDiscoveredList([]);
+    updateConfig({ PATH_MAP: {} });
 
-    setAutoStep('detecting');
-    const autodetect = await api.autodetectPaths({
-      PLEX_HOST: host,
-      PLEX_TOKEN: token,
-      SECTION_IDS: sectionIds,
-    });
-    if (!autodetect.success || !autodetect.paths || Object.keys(autodetect.paths).length === 0) {
-      setAutoStep('error');
-      setAutoError(autodetect.message || 'No paths detected from Plex.');
-      return;
-    }
-
-    setAutoStep('resolving');
-    const musicRoot = (config.MUSIC_PARENT_PATH ?? '').trim() || '/music';
-    const plexRoots = Object.keys(autodetect.paths);
-    const samples = config.CROSSCHECK_SAMPLES ?? 15;
-    const resolvedPaths: Record<string, string> = {};
-    const discovered: Array<{ plex: string; host: string }> = [];
-    for (let i = 0; i < plexRoots.length; i++) {
-      const plex = plexRoots[i];
-      setResolvingProgress({ current: i + 1, total: plexRoots.length, plex, host: '' });
-      const one = await api.discoverPathOne({
-        plex_root: plex,
-        PLEX_DB_PATH: config.PLEX_DB_PATH,
-        MUSIC_PARENT_PATH: musicRoot,
-        CROSSCHECK_SAMPLES: samples,
+    try {
+      setAutoStep('detecting');
+      setBindingProgress({ phase: 'detecting', current: 0, total: 1 });
+      const autodetect = await api.autodetectPaths({
+        PLEX_HOST: host,
+        PLEX_TOKEN: token,
+        SECTION_IDS: sectionIds,
       });
-      if (!one.success || !one.host_root) {
-        setResolvingProgress(null);
+      if (!autodetect.success || !autodetect.paths || Object.keys(autodetect.paths).length === 0) {
         setAutoStep('error');
-        setAutoError(one.message || `Could not resolve: ${plex}`);
+        setAutoError(autodetect.message || 'No paths detected from Plex.');
+        setBindingProgress(null);
         return;
       }
-      resolvedPaths[plex] = one.host_root;
-      discovered.push({ plex, host: one.host_root });
-      setDiscoveredList([...discovered]);
-      setResolvingProgress({ current: i + 1, total: plexRoots.length, plex, host: one.host_root });
-    }
-    setResolvingProgress(null);
-    updateConfig({ PATH_MAP: resolvedPaths });
 
-    setAutoStep('verifying');
-    const verify = await api.verifyPaths({
-      PATH_MAP: resolvedPaths,
-      PLEX_DB_PATH: config.PLEX_DB_PATH,
-      CROSSCHECK_SAMPLES: config.CROSSCHECK_SAMPLES ?? 15,
-    });
-    setVerifyResults(verify.results ?? null);
-    if (verify.message) setVerifyError(verify.message);
-    if (verify.hint) setVerifyHint(verify.hint);
-    if (!verify.success) setVerifyError(verify.message || 'Verification failed');
-    setAutoStep('done');
+      const plexRoots = Object.keys(autodetect.paths);
+      const N = plexRoots.length;
+      const totalSteps = 1 + N * 2;
+
+      setAutoStep('resolving');
+      const musicRoot = (config.MUSIC_PARENT_PATH ?? '').trim() || '/music';
+      const samples = config.CROSSCHECK_SAMPLES ?? 15;
+      const resolvedPaths: Record<string, string> = {};
+      const discovered: Array<{ plex: string; host: string }> = [];
+      for (let i = 0; i < plexRoots.length; i++) {
+        const plex = plexRoots[i];
+        setBindingProgress({ phase: 'resolving', current: i + 1, total: totalSteps });
+        setResolvingProgress({ current: i + 1, total: plexRoots.length, plex, host: '' });
+        const one = await api.discoverPathOne({
+          plex_root: plex,
+          PLEX_DB_PATH: config.PLEX_DB_PATH,
+          MUSIC_PARENT_PATH: musicRoot,
+          CROSSCHECK_SAMPLES: samples,
+        });
+        if (!one.success || !one.host_root) {
+          setResolvingProgress(null);
+          setBindingProgress(null);
+          setAutoStep('error');
+          setAutoError(one.message || `Could not resolve: ${plex}`);
+          return;
+        }
+        resolvedPaths[plex] = one.host_root;
+        discovered.push({ plex, host: one.host_root });
+        setDiscoveredList([...discovered]);
+        setResolvingProgress({ current: i + 1, total: plexRoots.length, plex, host: one.host_root });
+      }
+      setResolvingProgress(null);
+      updateConfig({ PATH_MAP: resolvedPaths });
+
+      setAutoStep('verifying');
+      const mergedResults: PathVerifyResult[] = [];
+      const samplesVerify = config.CROSSCHECK_SAMPLES ?? 15;
+      const entries = Object.entries(resolvedPaths);
+      for (let i = 0; i < entries.length; i++) {
+        setBindingProgress({ phase: 'verifying', current: 1 + N + i, total: totalSteps });
+        const [plex_root, host_root] = entries[i];
+        const verify = await api.verifyPaths({
+          PATH_MAP: { [plex_root]: host_root },
+          PLEX_DB_PATH: config.PLEX_DB_PATH,
+          CROSSCHECK_SAMPLES: samplesVerify,
+        });
+        const one = verify.results?.[0];
+        if (one) mergedResults.push(one);
+        if (verify.hint) setVerifyHint(verify.hint);
+      }
+      setVerifyResults(mergedResults.length > 0 ? mergedResults : null);
+      const hasFailures = mergedResults.some((r) => r.status === 'fail');
+      if (hasFailures) setVerifyError('Some bindings failed verification.');
+      setBindingProgress(null);
+      setAutoStep('done');
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Detect & verify failed';
+      setAutoStep('error');
+      setAutoError(message);
+      setResolvingProgress(null);
+      setBindingProgress(null);
+    }
   }, [config.PLEX_HOST, config.PLEX_TOKEN, config.SECTION_IDS, config.MUSIC_PARENT_PATH, config.PLEX_DB_PATH, config.CROSSCHECK_SAMPLES, updateConfig]);
 
   // Load last verification result when PATH_MAP is configured so Status/Samples/Message show without re-running verify
@@ -332,15 +365,35 @@ export function PathSettings({ config, updateConfig, errors }: PathSettingsProps
           </p>
         )}
 
+        {/* Progress bar: shown inside tile when detect/resolve/verify is running */}
+        {hasPlexConfig && bindingProgress && (
+          <div className="rounded-lg border border-border bg-muted/30 p-3 space-y-2">
+            <div className="flex items-center justify-between text-sm">
+              <span className="font-medium text-foreground/90">
+                {bindingProgress.phase === 'detecting' && 'Detecting path mappings…'}
+                {bindingProgress.phase === 'resolving' && (() => {
+                  const n = Math.floor((bindingProgress.total - 1) / 2);
+                  return `Resolving bindings (${Math.min(bindingProgress.current, n)}/${n})…`;
+                })()}
+                {bindingProgress.phase === 'verifying' && (() => {
+                  const n = Math.floor((bindingProgress.total - 1) / 2);
+                  const v = bindingProgress.current - n;
+                  return `Verifying bindings (${Math.min(v, n)}/${n})…`;
+                })()}
+              </span>
+              <span className="text-muted-foreground tabular-nums">
+                {bindingProgress.total > 0 ? Math.round((bindingProgress.current / bindingProgress.total) * 100) : 0}%
+              </span>
+            </div>
+            <Progress
+              value={bindingProgress.total > 0 ? (bindingProgress.current / bindingProgress.total) * 100 : 0}
+              className="h-2"
+            />
+          </div>
+        )}
+
         {hasPlexConfig && (
           <>
-            {/* Progress only when user clicked Re-detect */}
-            {autoStep === 'detecting' && (
-              <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                <Loader2 className="w-4 h-4 animate-spin" />
-                Detecting path mappings from Plex…
-              </div>
-            )}
             {autoStep === 'resolving' && resolvingProgress && (
               <div className="space-y-1.5">
                 <div className="flex items-center gap-2 text-sm text-muted-foreground">
@@ -364,13 +417,6 @@ export function PathSettings({ config, updateConfig, errors }: PathSettingsProps
                 )}
               </div>
             )}
-            {autoStep === 'verifying' && (
-              <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                <Loader2 className="w-4 h-4 animate-spin" />
-                Verifying bindings… please wait.
-              </div>
-            )}
-
             {autoStep === 'error' && autoError && (
               <div className="rounded-md border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive">
                 {autoError}
