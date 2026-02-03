@@ -43,7 +43,14 @@ export function useScanProgressShared(options: UseScanProgressSharedOptions = {}
 
   const isScanning = progress?.scanning ?? false;
   const isDeduping = dedupeProgress?.deduping ?? false;
-  const progressPercent = progress?.effective_progress ?? progress?.progress ?? 0;
+  // Bar progress: artist-based when scanning (option A), else step-based; always 0–100%
+  const artistsProcessed = progress?.artists_processed ?? 0;
+  const artistsTotal = progress?.artists_total ?? 0;
+  const stepProgress = progress?.progress ?? 0;
+  const stepTotal = progress?.total ?? 0;
+  const progressPercent = isScanning && artistsTotal > 0
+    ? Math.min(100, (artistsProcessed / artistsTotal) * 100)
+    : (stepTotal > 0 ? Math.min(100, (stepProgress / stepTotal) * 100) : 0);
   const status = progress?.status ?? 'idle';
   
   // Dedupe progress values

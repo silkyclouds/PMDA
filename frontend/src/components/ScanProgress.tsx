@@ -132,9 +132,9 @@ export function ScanProgress({
 
   // Stage badge: use backend phase (format_analysis | identification_tags | ia_analysis | finalizing | moving_dupes)
   const effectiveStage = phase ?? (finalizing ? 'finalizing' : (deduping ? 'moving_dupes' : 'format_analysis'));
-  // Backend sends step-based progress/total (3*albums+2 or +3); use as-is for bar and percentage
-  const displayProgress = current;
-  const displayTotal = total;
+  // Option A: bar and percentage based on artists when scanning; step-based when not
+  const displayProgress = scanning && artists_total > 0 ? artists_processed : current;
+  const displayTotal = scanning && artists_total > 0 ? artists_total : total;
   const percentageExact = displayTotal > 0 ? Math.min(100, (displayProgress / displayTotal) * 100) : 0;
   const percentage = Math.round(percentageExact);
 
@@ -150,12 +150,12 @@ export function ScanProgress({
     }
   }, [scanning, last_scan_summary]);
 
-  // Hide "Starting scan…" spinner as soon as progress bar is visible
+  // Hide "Starting scan…" spinner as soon as progress bar is visible (artists_total or step total)
   useEffect(() => {
-    if (waitingForProgress && scanning && total > 0) {
+    if (waitingForProgress && scanning && (artists_total > 0 || total > 0)) {
       setWaitingForProgress(false);
     }
-  }, [waitingForProgress, scanning, total]);
+  }, [waitingForProgress, scanning, artists_total, total]);
 
   // Poll improve-all and lidarr add-incomplete progress when not scanning
   useEffect(() => {
@@ -842,8 +842,10 @@ export function ScanProgress({
                 <div className="flex items-baseline gap-2 min-w-0">
                   <span className="text-2xl font-bold tabular-nums text-foreground">{percentage}%</span>
                   <span className="text-sm text-muted-foreground shrink-0">
-                    {total > 0
-                      ? `${displayProgress.toLocaleString()} / ${displayTotal.toLocaleString()} steps`
+                    {displayTotal > 0
+                      ? scanning && artists_total > 0
+                        ? `${displayProgress.toLocaleString()} / ${displayTotal.toLocaleString()} artists`
+                        : `${displayProgress.toLocaleString()} / ${displayTotal.toLocaleString()} steps`
                       : '—'}
                   </span>
                 </div>
@@ -853,7 +855,7 @@ export function ScanProgress({
                     ~{formatETA(eta_seconds)} left
                   </div>
                 )}
-                {scanning && (eta_seconds == null || eta_seconds <= 0) && total > 0 && (
+                {scanning && (eta_seconds == null || eta_seconds <= 0) && (artists_total > 0 || total > 0) && (
                   <span className="text-xs text-muted-foreground shrink-0">ETA calculating…</span>
                 )}
               </div>

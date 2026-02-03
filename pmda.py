@@ -4053,6 +4053,7 @@ def fetch_mb_release_group_info(mbid: str) -> tuple[dict, bool]:
     logging.debug("[MusicBrainz RG Info] parsed primary_type=%s, secondary_types=%s, format_summary=%s", primary, secondary, format_summary)
     info = {
         "id": mbid,  # Include the MBID in the info dict
+        "title": result.get("title", ""),
         "primary_type": primary,
         "secondary_types": secondary,
         "format_summary": format_summary
@@ -4124,6 +4125,78 @@ def _search_mb_rg_candidates(artist: str, release_query: str, strict: bool) -> L
     )
     logging.debug("[MusicBrainz Search] artist=%r release=%r strict=%s -> %d results", artist, release_query, strict, len(result.get('release-group-list', [])))
     return result.get('release-group-list', [])
+
+
+def fetch_all_mb_release_groups_for_artist(artist_name: str) -> List[dict]:
+    """
+    Fetch all release-groups for an artist from MusicBrainz (paginated browse).
+    Used to build a per-artist index so we avoid one search+browse per album.
+    Returns list of dicts with 'id' and 'title'; cap at 100 pages (10k RGs) for huge artists.
+    """
+    if not USE_MUSICBRAINZ:
+        return []
+
+    def _do_fetch() -> List[dict]:
+        try:
+            search_result = musicbrainzngs.search_artists(artist=artist_name, limit=1)
+            artist_list = search_result.get("artist-list", [])
+            if not artist_list:
+                return []
+            artist_mbid = artist_list[0]["id"]
+            all_rgs: List[dict] = []
+            offset = 0
+            limit = 100
+            max_pages = 100
+            for _ in range(max_pages):
+                result = musicbrainzngs.browse_release_groups(artist=artist_mbid, limit=limit, offset=offset)
+                rg_list = result.get("release-group-list", [])
+                for rg in rg_list:
+                    title = (rg.get("title") or "").strip()
+                    if title:
+                        all_rgs.append({"id": rg.get("id"), "title": title})
+                if len(rg_list) < limit:
+                    break
+                offset += limit
+                time.sleep(1.0)
+            logging.debug("[MusicBrainz] fetch_all_mb_release_groups_for_artist %r -> %d RGs", artist_name, len(all_rgs))
+            return all_rgs
+        except Exception as e:
+            logging.debug("[MusicBrainz] fetch_all_mb_release_groups_for_artist failed for %r: %s", artist_name, e)
+            return []
+
+    if MB_QUEUE_ENABLED and USE_MUSICBRAINZ:
+        safe_key = re.sub(r"[^a-zA-Z0-9_-]", "_", artist_name[:60])
+        return get_mb_queue().submit(f"fetch_rg_{safe_key}", _do_fetch)
+    return _do_fetch()
+
+
+def _build_mb_rg_index_for_artist(all_rgs: List[dict]) -> dict:
+    """Build norm_title -> [rg_dict, ...] for matching album_norm against pre-fetched RGs."""
+    index: dict = {}
+    for rg in all_rgs:
+        title = rg.get("title") or ""
+        if not title:
+            continue
+        key = norm_album(title)
+        index.setdefault(key, []).append(rg)
+    return index
+
+
+def _match_album_norm_to_mb_index(album_norm: str, index: dict) -> List[dict]:
+    """Return list of RG dicts (id, title) that match album_norm: exact then substring."""
+    if not index or not (album_norm or "").strip():
+        return []
+    album_norm = (album_norm or "").strip().lower()
+    exact = index.get(album_norm)
+    if exact:
+        return list(exact)
+    candidates = []
+    for key, rgs in index.items():
+        if not key:
+            continue
+        if album_norm in key or key in album_norm:
+            candidates.extend(rgs)
+    return candidates
 
 
 def _browse_mb_rg_by_artist(artist: str, album_norm: str) -> List[dict]:
@@ -5163,6 +5236,12 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> tuple[List[di
     else:
         # ─── MusicBrainz enrichment & Box Set handling ─────────────────────────────
         mb_start = time.perf_counter()
+        # Pre-fetch all release-groups for this artist (batch browse) to avoid one search+browse per album
+        artist_mb_rg_index = None
+        if editions:
+            all_rgs = fetch_all_mb_release_groups_for_artist(artist)
+            if all_rgs:
+                artist_mb_rg_index = _build_mb_rg_index_for_artist(all_rgs)
         # Enrich using any available MusicBrainz ID tags (in priority order)
         id_tags = [
             'musicbrainz_releasegroupid',
@@ -5294,7 +5373,7 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> tuple[List[di
                                 )
                         logging.debug("[Artist %s] Edition %s MBID from album lookup cache: %s", artist, e['album_id'], cached_mbid)
                 else:
-                    # Not in cache: run search and cache result
+                    # Not in cache: try pre-fetched artist index first, then search
                     with lock:
                         if artist in state.get("scan_active_artists", {}) and e['album_id'] == state["scan_active_artists"][artist].get("current_album", {}).get("album_id"):
                             state["scan_active_artists"][artist]["current_album"]["status"] = "searching_mb"
@@ -5303,7 +5382,55 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> tuple[List[di
                             state["scan_active_artists"][artist]["current_album"]["step_response"] = "MusicBrainz: querying by artist + album name…"
                     title_raw_mb = e.get("title_raw") or e.get("plex_title") or album_norm
                     album_folder_arg = e.get("folder")
-                    rg_info, match_verified_by_ai = search_mb_release_group_by_metadata(artist, album_norm, tracks, title_raw=title_raw_mb, album_folder=album_folder_arg)
+                    rg_info = None
+                    match_verified_by_ai = False
+                    if artist_mb_rg_index is not None:
+                        candidates = _match_album_norm_to_mb_index(album_norm, artist_mb_rg_index)
+                        if candidates:
+                            chosen_rg_id = None
+                            if len(candidates) == 1:
+                                chosen_rg_id = candidates[0].get("id")
+                            elif len(candidates) > 1 and getattr(sys.modules[__name__], "ai_provider_ready", False):
+                                letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                                choices = [f"{letters[i]}) {rg.get('title', '?')} (id={rg.get('id', '')})" for i, rg in enumerate(candidates[:20])]
+                                track_list_str = ", ".join((list(tracks)[:30] if tracks else [])) if tracks else "(none)"
+                                if tracks and len(tracks) > 30:
+                                    track_list_str += ", ..."
+                                prompt = (
+                                    f"Our album: artist={artist!r}, title_raw={title_raw_mb or album_norm!r}, normalized={album_norm!r}. "
+                                    f"Our track titles: [{track_list_str}].\n\n"
+                                    "MusicBrainz candidates (id + title only):\n" + "\n".join(choices) + "\n\n"
+                                    "Which candidate matches our album? Reply with only the letter (A, B, ...) or the MBID (UUID) or NONE if no match."
+                                )
+                                system_msg = "You reply with a single letter (A, B, C, ...) or an MBID (UUID) or the word NONE. No explanation."
+                                try:
+                                    provider = getattr(sys.modules[__name__], "AI_PROVIDER", "openai")
+                                    model = getattr(sys.modules[__name__], "RESOLVED_MODEL", None) or getattr(sys.modules[__name__], "OPENAI_MODEL", "gpt-4o-mini")
+                                    reply = call_ai_provider(provider, model, system_msg, prompt, max_tokens=30)
+                                    reply = (reply or "").strip().upper()
+                                    if reply and reply != "NONE":
+                                        letter = reply[:1]
+                                        idx = letters.find(letter)
+                                        if 0 <= idx < len(candidates):
+                                            chosen_rg_id = candidates[idx].get("id")
+                                        if not chosen_rg_id:
+                                            mbid_match = re.search(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}", reply)
+                                            if mbid_match:
+                                                chosen_rg_id = mbid_match.group(0)
+                                    if chosen_rg_id:
+                                        match_verified_by_ai = True
+                                except Exception:
+                                    chosen_rg_id = candidates[0].get("id") if candidates else None
+                            else:
+                                chosen_rg_id = candidates[0].get("id") if candidates else None
+                            if chosen_rg_id:
+                                try:
+                                    rg_info, _ = fetch_mb_release_group_info(chosen_rg_id)
+                                except Exception as _err:
+                                    logging.debug("[Artist %s] fetch_mb_release_group_info failed for %s (from index): %s", artist, chosen_rg_id, _err)
+                                    rg_info = None
+                    if not rg_info:
+                        rg_info, match_verified_by_ai = search_mb_release_group_by_metadata(artist, album_norm, tracks, title_raw=title_raw_mb, album_folder=album_folder_arg)
                     if rg_info:
                         set_cached_mb_album_lookup(artist_norm_key, album_norm, rg_info.get('id') or "", rg_info)
                     else:
@@ -6202,9 +6329,16 @@ def save_scan_editions_artist_to_db(scan_id: int, artist_name: str, editions_lis
                     has_cover = 1
                     break
         missing_required = _check_required_tags(meta, REQUIRED_TAGS, edition=e)
-        missing_required_json = json.dumps(missing_required) if missing_required else None
+        try:
+            missing_required_json = json.dumps(missing_required, default=str) if missing_required else None
+        except (TypeError, ValueError):
+            missing_required_json = None
         folder_str = str(folder) if folder else ""
         fmt_text = get_primary_format(Path(folder_str)) if folder_str else ""
+        try:
+            meta_json_str = json.dumps(meta, default=str)
+        except (TypeError, ValueError):
+            meta_json_str = "{}"
         cur.execute("""
             INSERT INTO scan_editions
             (scan_id, artist, album_id, title_raw, folder, fmt_text, br, sr, bd, meta_json, musicbrainz_id,
@@ -6220,7 +6354,7 @@ def save_scan_editions_artist_to_db(scan_id: int, artist_name: str, editions_lis
             e.get("br") or 0,
             e.get("sr") or 0,
             e.get("bd") or 0,
-            json.dumps(meta),
+            meta_json_str,
             e.get("musicbrainz_id") or "",
             1 if e.get("is_broken") else 0,
             e.get("expected_track_count"),
@@ -6756,6 +6890,10 @@ def background_scan():
                 try:
                     save_scan_artist_to_db(aname, grps)
                     save_scan_editions_artist_to_db(sid, aname, eds)
+                    logging.debug(
+                        "Incremental persist: %s (%d groups, %d editions)",
+                        aname, len(grps), len(eds),
+                    )
                     with lock:
                         update_scan_history_incremental(
                             sid,
@@ -9959,8 +10097,9 @@ def api_duplicates():
         resp.headers["X-PMDA-Requires-Config"] = "true"
         return resp
     with lock:
-        if not state["duplicates"]:
-            if not state.get("_api_duplicates_load_logged"):
+        # During scan, always reload from DB so incremental writer updates are visible
+        if state.get("scanning") or not state["duplicates"]:
+            if not state.get("_api_duplicates_load_logged") and not state.get("scanning"):
                 logging.debug("api_duplicates(): loading scan results from DB into memory")
                 state["_api_duplicates_load_logged"] = True
             state["duplicates"] = load_scan_from_db()

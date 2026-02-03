@@ -74,11 +74,11 @@ export default function Unduper() {
   const [selectedDuplicate, setSelectedDuplicate] = useState<DuplicateCardType | null>(null);
   const [dedupingId, setDedupingId] = useState<string | null>(null);
 
-  // Data hooks (refetch duplicates every 1s during dedupe so list shrinks as groups finish)
+  // Data hooks (refetch duplicates every 2s during scan so list grows as artists finish, 1s during dedupe)
   const { progress: scanProgress } = useScanProgress();
   const { data: dedupeProgress } = useDedupeProgress();
   const { data: duplicates = [], isLoading: loadingDuplicates } = useDuplicates({
-    refetchInterval: dedupeProgress?.deduping ? 1000 : 10000,
+    refetchInterval: scanProgress?.scanning ? 2000 : dedupeProgress?.deduping ? 1000 : 10000,
   });
   const { data: libraryStats, error: libraryStatsError } = useQuery({
     queryKey: ['library-stats'],
@@ -316,6 +316,24 @@ export default function Unduper() {
         {loadingDuplicates && (
           <div className="flex items-center justify-center py-12">
             <Loader2 className="w-8 h-8 animate-spin text-primary" />
+          </div>
+        )}
+
+        {/* Scan in progress (when list empty): show artists/dupe stats so user sees increment */}
+        {!loadingDuplicates && filteredDuplicates.length === 0 && (scanProgress?.scanning ?? false) && (
+          <div className="rounded-lg border border-primary/30 bg-primary/5 px-4 py-3 flex flex-wrap items-center gap-3 mb-6">
+            <Loader2 className="w-5 h-5 shrink-0 animate-spin text-primary" />
+            <div className="flex-1 min-w-0">
+              <p className="text-sm font-medium text-foreground">
+                Scan in progress…
+              </p>
+              <p className="text-xs text-muted-foreground mt-0.5 tabular-nums">
+                {(scanProgress?.artists_processed ?? 0).toLocaleString()} / {(scanProgress?.artists_total ?? 0).toLocaleString()} artists
+                {(scanProgress?.duplicate_groups_count ?? 0) > 0 && (
+                  <> · <span className="font-medium text-foreground">{(scanProgress?.duplicate_groups_count ?? 0).toLocaleString()} duplicate group(s) so far</span></>
+                )}
+              </p>
+            </div>
           </div>
         )}
 
