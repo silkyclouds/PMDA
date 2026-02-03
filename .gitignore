@@ -16,6 +16,9 @@ venv/
 .venv/
 env/
 
+# Generated test output (recreated by create_pmda_test_files.sh)
+scripts/fixtures/pmda_tests/
+
 # Config / state – not needed at runtime (SQLite is source of truth)
 ai_prompt.txt
 config.json

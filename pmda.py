@@ -57,6 +57,8 @@ import musicbrainzngs
 # (see _configure_musicbrainz_useragent function)
 # Set rate limiting: 1 request per second (MusicBrainz limit)
 musicbrainzngs.set_rate_limit(limit_or_interval=1.0, new_requests=1)
+# Reduce noise from musicbrainzngs XML parser (e.g. "in <ws2:release-group>, uncaught attribute type-id")
+logging.getLogger("musicbrainzngs").setLevel(logging.WARNING)
 from openai import OpenAI
 try:
     import anthropic
@@ -197,6 +199,32 @@ logging.getLogger("openai.api_requestor").setLevel(logging.INFO)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 
+
+# High-frequency polling routes: do not log each request (only real work / errors matter)
+_QUIET_REQUEST_PATHS = (
+    "/api/progress",
+    "/api/dedupe",
+    "/api/duplicates",
+    "/api/library/improve-all/progress",
+    "/api/lidarr/add-incomplete-albums/progress",
+)
+
+
+class _QuietPollingFilter(logging.Filter):
+    """Drop request log lines for high-frequency polling routes to keep logs readable."""
+    def filter(self, record):
+        try:
+            msg = record.getMessage()
+            for path in _QUIET_REQUEST_PATHS:
+                if path in msg:
+                    return False
+        except Exception:
+            pass
+        return True
+
+
+logging.getLogger("werkzeug").addFilter(_QuietPollingFilter())
+
 # ──────────────────────────── FFmpeg sanity-check ──────────────────────────────
 # Central store for worker exceptions
 worker_errors = SimpleQueue()
@@ -289,14 +317,9 @@ scan_is_paused   = threading.Event()
 #
 # ───────────────────────────────── CONFIGURATION LOADING ─────────────────────────────────
 """
-Robust configuration helper:
-
-* Loads defaults from the baked‑in config.json shipped inside the Docker image.
-* Copies that file (and ai_prompt.txt) into the user‑writable config dir on first run.
-* Overrides every value with an environment variable when present.
-* Falls back to sensible, documented defaults when neither file nor env provides a value.
-* Validates critical keys so we fail early instead of crashing later.
-* Logs where each value came from (env vs config vs default).
+Configuration is stored in SQLite (state.db, settings table) only. No config.json is used.
+* _get() reads from SQLite first, then falls back to hardcoded defaults.
+* Web UI and API save settings to SQLite via api_config_put().
 """
 
 import filecmp
@@ -371,26 +394,14 @@ def _get_from_sqlite(key: str, default=None):
     return default
 
 
-# Location of baked‑in template files (shipped inside the image)
-DEFAULT_CONFIG_PATH  = BASE_DIR / "config.json"
+# Location of baked‑in template for AI prompt (shipped inside the image)
 DEFAULT_PROMPT_PATH  = BASE_DIR / "ai_prompt.txt"
-
-CONFIG_PATH   = CONFIG_DIR / "config.json"
 AI_PROMPT_FILE = CONFIG_DIR / "ai_prompt.txt"
 
-# (1) Ensure config.json exists -----------------------------------------------
-if not CONFIG_PATH.exists():
-    logging.info("No config.json found — using default template from image")
-    shutil.copyfile(DEFAULT_CONFIG_PATH, CONFIG_PATH)
-
-# (2) Ensure ai_prompt.txt exists -------------------------------------------
+# Ensure ai_prompt.txt exists -------------------------------------------
 if not AI_PROMPT_FILE.exists():
     logging.info("ai_prompt.txt not found — default prompt created")
     shutil.copyfile(DEFAULT_PROMPT_PATH, AI_PROMPT_FILE)
-
-# (3) Load config: at runtime effective config is SQLite only > defaults. See _get() below.
-with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
-    conf: dict = json.load(fh)
 
 # ─── Auto‑generate PATH_MAP from Plex at *every* startup ────────────────────
 #
@@ -398,13 +409,13 @@ with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
 # Flow:
 #   1) Discovery: Plex API returns all <Location> paths for the music section(s).
 #      We get the exact paths Plex uses (e.g. /music/matched, /music/unmatched).
-#   2) Merge: If the user provided a broader PATH_MAP in env/config (e.g. /music → /music/…),
+#   2) Merge: If the user provided a broader PATH_MAP in SQLite (e.g. /music → /music/…),
 #      we apply it by prefix; otherwise we keep Plex path = container path (so Docker
 #      volume binds must match: -v /host/Music_matched:/music/matched).
 #   3) Cross-check: For each binding we sample CROSSCHECK_SAMPLES tracks from the DB,
 #      resolve their paths via PATH_MAP, and verify the files exist on disk. If they
 #      don’t, we try to find the correct host root (sibling dirs or rglob) and patch
-#      PATH_MAP + config.json. So even when paths differ (e.g. Plex says /music/unmatched
+#      PATH_MAP in memory and SQLite. So even when paths differ (e.g. Plex says /music/unmatched
 #      but on host it’s /music/Music_dump), we auto-correct instead of failing.
 # Result: users only need to mount volumes; PMDA discovers Plex paths and validates
 # (and repairs) bindings so the same paths work for scan/dedupe.
@@ -613,66 +624,109 @@ def _get(key: str, *, default=None, cast=lambda x: x):
     return cast(raw)
 
 
+# Old default that included MusicBrainz IDs (caused all albums to show as "incomplete" if no MB tags)
+_REQUIRED_TAGS_OLD_DEFAULT_SET = {"artist", "album", "date", "musicbrainz_release_group_id", "musicbrainz_artist_id"}
+
+
 def _parse_required_tags(val):
-    """Return REQUIRED_TAGS as a list of strings. Handles JSON array string from DB, comma-separated string, or list."""
-    default = ["artist", "album", "date", "musicbrainz_release_group_id", "musicbrainz_artist_id"]
+    """Return REQUIRED_TAGS as a list of strings. Handles JSON array string from DB, comma-separated string, or list.
+    Migrates old default (with musicbrainz_release_group_id, musicbrainz_artist_id) to new default (artist, album, date, genre, year)."""
+    default = ["artist", "album", "date", "genre", "year"]
     if val is None:
         return default
     if isinstance(val, list):
-        return [str(t).strip() for t in val if str(t).strip()] or default
-    s = str(val).strip()
-    if not s:
+        out = [str(t).strip().lower() for t in val if str(t).strip()]
+    else:
+        s = str(val).strip()
+        if not s:
+            return default
+        if s.startswith("["):
+            try:
+                parsed = json.loads(s)
+                if isinstance(parsed, list):
+                    out = [str(t).strip().lower() for t in parsed if str(t).strip()]
+                else:
+                    out = []
+            except (json.JSONDecodeError, TypeError):
+                out = [t.strip().lower() for t in s.split(",") if t.strip()]
+        else:
+            out = [t.strip().lower() for t in s.split(",") if t.strip()]
+    if not out:
         return default
-    if s.startswith("["):
-        try:
-            parsed = json.loads(s)
-            if isinstance(parsed, list):
-                return [str(t).strip() for t in parsed if str(t).strip()] or default
-        except (json.JSONDecodeError, TypeError):
-            pass
-    return [t.strip() for t in s.split(",") if t.strip()] or default
+    # Migrate old default so all albums are not reported as incomplete
+    if set(out) == _REQUIRED_TAGS_OLD_DEFAULT_SET:
+        return default
+    return out
 
 
-# PLEX_DB_PATH defaults to /database in container; no SystemExit if unconfigured.
-merged = {
-    "PLEX_DB_PATH":   _get("PLEX_DB_PATH",   default="/database",                       cast=str),
-    "PLEX_HOST":      _get("PLEX_HOST",      default="",                                cast=str),
-    "PLEX_TOKEN":     _get("PLEX_TOKEN",     default="",                                cast=str),
-    "SECTION_ID": SECTION_IDS[0] if SECTION_IDS else 0,
-    "SCAN_THREADS":   _get("SCAN_THREADS",   default=os.cpu_count() or 4,               cast=_parse_int),
-    "PATH_MAP":       _parse_path_map(_get("PATH_MAP", default={})),
-    "LOG_LEVEL":      _get("LOG_LEVEL",      default="INFO").upper(),
-    "AI_PROVIDER": _get("AI_PROVIDER", default="openai", cast=str),
-    "OPENAI_API_KEY": _get("OPENAI_API_KEY", default="",                                cast=str),
-    "OPENAI_MODEL":   _get("OPENAI_MODEL",   default="gpt-4",                           cast=str),
-    "ANTHROPIC_API_KEY": _get("ANTHROPIC_API_KEY", default="", cast=str),
-    "GOOGLE_API_KEY": _get("GOOGLE_API_KEY", default="", cast=str),
-    "OLLAMA_URL": _get("OLLAMA_URL", default="http://localhost:11434", cast=str),
-    "DISCORD_WEBHOOK": _get("DISCORD_WEBHOOK", default="", cast=str),
-    "USE_MUSICBRAINZ": _get("USE_MUSICBRAINZ", default=False, cast=_parse_bool),
-    "MUSICBRAINZ_EMAIL": _get("MUSICBRAINZ_EMAIL", default="pmda@example.com", cast=str),
-    "MB_QUEUE_ENABLED": _get("MB_QUEUE_ENABLED", default=True, cast=_parse_bool),
-    "LIDARR_URL": _get("LIDARR_URL", default="", cast=str),
-    "LIDARR_API_KEY": _get("LIDARR_API_KEY", default="", cast=str),
-    "AUTOBRR_URL": _get("AUTOBRR_URL", default="", cast=str),
-    "AUTOBRR_API_KEY": _get("AUTOBRR_API_KEY", default="", cast=str),
-    "AUTO_FIX_BROKEN_ALBUMS": _get("AUTO_FIX_BROKEN_ALBUMS", default=False, cast=_parse_bool),
-    "BROKEN_ALBUM_CONSECUTIVE_THRESHOLD": _get("BROKEN_ALBUM_CONSECUTIVE_THRESHOLD", default=2, cast=int),
-    "BROKEN_ALBUM_PERCENTAGE_THRESHOLD": _get("BROKEN_ALBUM_PERCENTAGE_THRESHOLD", default=0.20, cast=float),
-    "REQUIRED_TAGS": _get("REQUIRED_TAGS", default="artist,album,date,musicbrainz_release_group_id,musicbrainz_artist_id", cast=_parse_required_tags),
-    "SKIP_FOLDERS": _get("SKIP_FOLDERS", default="", cast=lambda s: [p.strip() for p in str(s).split(",") if p.strip()]),
-    "AI_BATCH_SIZE": _get("AI_BATCH_SIZE", default=10, cast=int),
-    "FFPROBE_POOL_SIZE": _get("FFPROBE_POOL_SIZE", default=4, cast=int),
-    "AUTO_MOVE_DUPES": _get("AUTO_MOVE_DUPES", default=False, cast=_parse_bool),
-    "USE_AI_FOR_MB_MATCH": _get("USE_AI_FOR_MB_MATCH", default=False, cast=_parse_bool),
-    "CROSS_LIBRARY_DEDUPE": _get("CROSS_LIBRARY_DEDUPE", default="true", cast=_parse_bool),
-    "CROSSCHECK_SAMPLES": _get("CROSSCHECK_SAMPLES", default=20, cast=lambda x: int(x) if x is not None and str(x).strip().isdigit() else 20),
-    "LOG_FILE": _get("LOG_FILE", default="", cast=str) or str(CONFIG_DIR / "pmda.log"),
-    "OPENAI_MODEL_FALLBACKS": _get("OPENAI_MODEL_FALLBACKS", default="", cast=str),
-    "DISABLE_PATH_CROSSCHECK": _get("DISABLE_PATH_CROSSCHECK", default="false", cast=_parse_bool),
-    "FORMAT_PREFERENCE": _get("FORMAT_PREFERENCE", default=None, cast=lambda v: _parse_format_preference_early(v)),
-}
-# PATH_MAP and all config from _get() (SQLite only > default)
+def _check_required_tags(meta: dict, required_tags: list, edition: dict | None = None) -> list:
+    """
+    Return the list of required tag names that are missing.
+    Uses REQUIRED_TAGS from Settings as the single source of truth.
+    meta: tags from first audio file (lowercase keys from ffprobe).
+    edition: optional edition dict with 'tracks' (Track NamedTuples or dicts with title, idx/index).
+    """
+    # Map config tag name (lowercase) -> meta keys to check (ffprobe returns lowercase)
+    TAG_META_KEYS = {
+        "artist": ["artist", "albumartist"],
+        "album": ["album"],
+        "date": ["date", "originaldate"],
+        "year": ["year", "date"],
+        "genre": ["genre"],
+        "musicbrainz_release_group_id": ["musicbrainz_releasegroupid", "musicbrainz_release_group_id"],
+        "musicbrainz_artist_id": ["musicbrainz_artistid", "musicbrainz_albumartistid", "musicbrainz_artist_id"],
+    }
+    missing = []
+    for tag in required_tags:
+        key = (tag or "").strip().lower()
+        if not key:
+            continue
+        if key == "tracks":
+            # Require every track to have a non-empty title and a valid index (from Plex/edition)
+            if not edition:
+                missing.append(tag)
+                continue
+            tracks = edition.get("tracks") or []
+            if not tracks:
+                missing.append(tag)
+                continue
+            def _track_ok(t):
+                title = getattr(t, "title", None) if hasattr(t, "title") else (t.get("title") if isinstance(t, dict) else None)
+                idx = getattr(t, "idx", None) if hasattr(t, "idx") else (t.get("idx") if isinstance(t, dict) else t.get("index"))
+                return bool(title and str(title).strip()) and idx is not None
+            if not all(_track_ok(t) for t in tracks):
+                missing.append(tag)
+            continue
+        meta_keys = TAG_META_KEYS.get(key, [key])
+        if not any((meta or {}).get(k) for k in meta_keys):
+            missing.append(tag)
+    return missing
+
+
+def _parse_skip_folders(val):
+    """Return SKIP_FOLDERS as a list of path strings. Handles JSON array from DB (or corrupted double-encoded),
+    comma-separated string, or list. Drops any element that looks like JSON (e.g. '[]') so corrupted values become []."""
+    if val is None:
+        return []
+    if isinstance(val, list):
+        raw = [str(p).strip() for p in val if str(p).strip()]
+    else:
+        s = str(val).strip()
+        if not s:
+            return []
+        if s.startswith("["):
+            try:
+                parsed = json.loads(s)
+                if isinstance(parsed, list):
+                    raw = [str(p).strip() for p in parsed if str(p).strip()]
+                else:
+                    raw = []
+            except (json.JSONDecodeError, TypeError):
+                raw = [p.strip() for p in s.split(",") if p.strip()]
+        else:
+            raw = [p.strip() for p in s.split(",") if p.strip()]
+    # Drop corrupted entries: paths must not look like JSON (e.g. "[]", '["[]"]')
+    return [p for p in raw if p and not p.startswith("[")]
 
 
 def _parse_format_preference_early(val):
@@ -696,10 +750,129 @@ def _parse_format_preference_early(val):
         return parts if parts else _default
     return _default
 
+
+# ─── Plex DB auto-discovery from base path (one-shot, persisted to SQLite) ───
+PLEX_DB_FILENAME = "com.plexapp.plugins.library.db"
+# Known relative paths under Plex config root (Linux/Docker/macOS, then Windows-style)
+_PLEX_DB_RELATIVE_PATHS = [
+    "Library/Application Support/Plex Media Server/Plug-in Support/Databases",
+    os.path.join("Plex Media Server", "Plug-in Support", "Databases"),
+]
+
+
+def _resolve_plex_db_from_base(base_path: str) -> str | None:
+    """
+    Find the directory containing com.plexapp.plugins.library.db under base_path.
+    Tries known relative paths first, then recursive search (max depth 10).
+    Returns the directory path (str) or None if not found.
+    """
+    base = Path(base_path).resolve()
+    if not base.exists() or not base.is_dir():
+        return None
+    # Step 1: known relative paths
+    for rel in _PLEX_DB_RELATIVE_PATHS:
+        candidate = base / rel
+        if (candidate / PLEX_DB_FILENAME).exists():
+            return str(candidate)
+    # Step 2: recursive search with max depth 10
+    max_depth = 10
+    base_str = str(base)
+    for root, _dirs, files in os.walk(base, topdown=True):
+        try:
+            depth = len(Path(root).relative_to(base).parts) if root != base_str else 0
+        except ValueError:
+            continue
+        if depth > max_depth:
+            _dirs.clear()
+            continue
+        if PLEX_DB_FILENAME in files:
+            return root
+    return None
+
+
+def _ensure_plex_db_path_resolved() -> str | None:
+    """
+    If PLEX_DB_PATH is already in SQLite and the DB file exists, return it.
+    Otherwise resolve from PLEX_BASE_PATH (or /database), persist to SQLite if found, and return.
+    Called before building merged so _get("PLEX_DB_PATH") can read the persisted value.
+    """
+    db_path = _get_from_sqlite("PLEX_DB_PATH")
+    if db_path and (Path(db_path) / PLEX_DB_FILENAME).exists():
+        return str(db_path).strip()
+    base = (_get_from_sqlite("PLEX_BASE_PATH") or "").strip() or "/database"
+    resolved = _resolve_plex_db_from_base(base)
+    if resolved:
+        try:
+            if STATE_DB_FILE.exists():
+                con = sqlite3.connect(str(STATE_DB_FILE), timeout=5)
+                con.execute("INSERT OR REPLACE INTO settings(key, value) VALUES(?, ?)", ("PLEX_DB_PATH", resolved))
+                con.commit()
+                con.close()
+                logging.info("Plex DB discovered at %s (saved to SQLite)", resolved)
+        except Exception as e:
+            logging.debug("Could not persist PLEX_DB_PATH to SQLite: %s", e)
+        return resolved
+    return None
+
+
+# PLEX_DB_PATH defaults to /database in container; no SystemExit if unconfigured.
+merged = {
+    "PLEX_DB_PATH":   (_ensure_plex_db_path_resolved() or _get("PLEX_DB_PATH",   default="/database", cast=str)),
+    "PLEX_HOST":      _get("PLEX_HOST",      default="",                                cast=str),
+    "PLEX_TOKEN":     _get("PLEX_TOKEN",     default="",                                cast=str),
+    "SECTION_ID": SECTION_IDS[0] if SECTION_IDS else 0,
+    "SCAN_THREADS":   _get("SCAN_THREADS",   default=os.cpu_count() or 4,               cast=_parse_int),
+    "PATH_MAP":       _parse_path_map(_get("PATH_MAP", default={})),
+    "LOG_LEVEL":      _get("LOG_LEVEL",      default="INFO").upper(),
+    "AI_PROVIDER": _get("AI_PROVIDER", default="openai", cast=str),
+    "OPENAI_API_KEY": _get("OPENAI_API_KEY", default="",                                cast=str),
+    "OPENAI_MODEL":   _get("OPENAI_MODEL",   default="gpt-4",                           cast=str),
+    "ANTHROPIC_API_KEY": _get("ANTHROPIC_API_KEY", default="", cast=str),
+    "GOOGLE_API_KEY": _get("GOOGLE_API_KEY", default="", cast=str),
+    "OLLAMA_URL": _get("OLLAMA_URL", default="http://localhost:11434", cast=str),
+    "DISCORD_WEBHOOK": _get("DISCORD_WEBHOOK", default="", cast=str),
+    "USE_MUSICBRAINZ": _get("USE_MUSICBRAINZ", default=False, cast=_parse_bool),
+    "MUSICBRAINZ_EMAIL": _get("MUSICBRAINZ_EMAIL", default="pmda@example.com", cast=str),
+    "MB_QUEUE_ENABLED": _get("MB_QUEUE_ENABLED", default=True, cast=_parse_bool),
+    "MB_RETRY_NOT_FOUND": _get("MB_RETRY_NOT_FOUND", default=False, cast=_parse_bool),
+    "LIDARR_URL": _get("LIDARR_URL", default="", cast=str),
+    "LIDARR_API_KEY": _get("LIDARR_API_KEY", default="", cast=str),
+    "AUTOBRR_URL": _get("AUTOBRR_URL", default="", cast=str),
+    "AUTOBRR_API_KEY": _get("AUTOBRR_API_KEY", default="", cast=str),
+    "AUTO_FIX_BROKEN_ALBUMS": _get("AUTO_FIX_BROKEN_ALBUMS", default=False, cast=_parse_bool),
+    "BROKEN_ALBUM_CONSECUTIVE_THRESHOLD": _get("BROKEN_ALBUM_CONSECUTIVE_THRESHOLD", default=2, cast=int),
+    "BROKEN_ALBUM_PERCENTAGE_THRESHOLD": _get("BROKEN_ALBUM_PERCENTAGE_THRESHOLD", default=0.20, cast=float),
+    "REQUIRED_TAGS": _get("REQUIRED_TAGS", default="artist,album,date,genre,year", cast=_parse_required_tags),
+    "SKIP_FOLDERS": _get("SKIP_FOLDERS", default="", cast=_parse_skip_folders),
+    "AI_BATCH_SIZE": _get("AI_BATCH_SIZE", default=10, cast=int),
+    "FFPROBE_POOL_SIZE": _get("FFPROBE_POOL_SIZE", default=4, cast=int),
+    "AUTO_MOVE_DUPES": _get("AUTO_MOVE_DUPES", default=False, cast=_parse_bool),
+    "USE_AI_FOR_MB_MATCH": _get("USE_AI_FOR_MB_MATCH", default=False, cast=_parse_bool),
+    "USE_AI_FOR_MB_VERIFY": _get("USE_AI_FOR_MB_VERIFY", default=False, cast=_parse_bool),
+    "USE_AI_VISION_FOR_COVER": _get("USE_AI_VISION_FOR_COVER", default=False, cast=_parse_bool),
+    "OPENAI_VISION_MODEL": _get("OPENAI_VISION_MODEL", default="", cast=str),
+    "USE_WEB_SEARCH_FOR_MB": _get("USE_WEB_SEARCH_FOR_MB", default=False, cast=_parse_bool),
+    "SERPER_API_KEY": _get("SERPER_API_KEY", default="", cast=str),
+    "CROSS_LIBRARY_DEDUPE": _get("CROSS_LIBRARY_DEDUPE", default="true", cast=_parse_bool),
+    "CROSSCHECK_SAMPLES": _get("CROSSCHECK_SAMPLES", default=20, cast=lambda x: int(x) if x is not None and str(x).strip().isdigit() else 20),
+    "LOG_FILE": _get("LOG_FILE", default="", cast=str) or str(CONFIG_DIR / "pmda.log"),
+    "OPENAI_MODEL_FALLBACKS": _get("OPENAI_MODEL_FALLBACKS", default="", cast=str),
+    "DISABLE_PATH_CROSSCHECK": _get("DISABLE_PATH_CROSSCHECK", default="false", cast=_parse_bool),
+    "FORMAT_PREFERENCE": _get("FORMAT_PREFERENCE", default=None, cast=lambda v: _parse_format_preference_early(v)),
+    "USE_DISCOGS": _get("USE_DISCOGS", default=False, cast=_parse_bool),
+    "DISCOGS_USER_TOKEN": _get("DISCOGS_USER_TOKEN", default="", cast=str),
+    "USE_LASTFM": _get("USE_LASTFM", default=False, cast=_parse_bool),
+    "LASTFM_API_KEY": _get("LASTFM_API_KEY", default="", cast=str),
+    "LASTFM_API_SECRET": _get("LASTFM_API_SECRET", default="", cast=str),
+    "USE_BANDCAMP": _get("USE_BANDCAMP", default=False, cast=_parse_bool),
+}
+# PATH_MAP and all config from _get() (SQLite only > default)
+
 SKIP_FOLDERS: list[str] = merged["SKIP_FOLDERS"]
 USE_MUSICBRAINZ: bool = bool(merged["USE_MUSICBRAINZ"])
 MUSICBRAINZ_EMAIL: str = merged.get("MUSICBRAINZ_EMAIL", "pmda@example.com")
 MB_QUEUE_ENABLED: bool = bool(merged.get("MB_QUEUE_ENABLED", True))
+MB_RETRY_NOT_FOUND: bool = bool(merged.get("MB_RETRY_NOT_FOUND", False))
 
 # Configure MusicBrainz User-Agent with user's email (if provided)
 def _configure_musicbrainz_useragent():
@@ -724,6 +897,11 @@ BROKEN_ALBUM_PERCENTAGE_THRESHOLD: float = float(merged.get("BROKEN_ALBUM_PERCEN
 REQUIRED_TAGS: list[str] = merged.get("REQUIRED_TAGS", ["artist", "album", "date"])
 AUTO_MOVE_DUPES: bool = bool(merged["AUTO_MOVE_DUPES"])
 USE_AI_FOR_MB_MATCH: bool = bool(merged.get("USE_AI_FOR_MB_MATCH", False))
+USE_AI_FOR_MB_VERIFY: bool = bool(merged.get("USE_AI_FOR_MB_VERIFY", False))
+USE_AI_VISION_FOR_COVER: bool = bool(merged.get("USE_AI_VISION_FOR_COVER", False))
+OPENAI_VISION_MODEL: str = str(merged.get("OPENAI_VISION_MODEL", "") or "").strip()
+USE_WEB_SEARCH_FOR_MB: bool = bool(merged.get("USE_WEB_SEARCH_FOR_MB", False))
+SERPER_API_KEY: str = str(merged.get("SERPER_API_KEY", "") or "").strip()
 AI_BATCH_SIZE: int = int(merged.get("AI_BATCH_SIZE", 10))
 FFPROBE_POOL_SIZE: int = int(merged.get("FFPROBE_POOL_SIZE", 4))
 # Cross-library dedupe configuration (from SQLite only)
@@ -734,6 +912,14 @@ CROSSCHECK_SAMPLES = merged["CROSSCHECK_SAMPLES"]
 
 # Skip PATH cross-check at startup when set (from SQLite only)
 DISABLE_PATH_CROSSCHECK = merged["DISABLE_PATH_CROSSCHECK"]
+
+# Metadata fallback providers (Improve Album)
+USE_DISCOGS: bool = bool(merged.get("USE_DISCOGS", False))
+DISCOGS_USER_TOKEN: str = str(merged.get("DISCOGS_USER_TOKEN", "") or "")
+USE_LASTFM: bool = bool(merged.get("USE_LASTFM", False))
+LASTFM_API_KEY: str = str(merged.get("LASTFM_API_KEY", "") or "")
+LASTFM_API_SECRET: str = str(merged.get("LASTFM_API_SECRET", "") or "")
+USE_BANDCAMP: bool = bool(merged.get("USE_BANDCAMP", False))
 
 # ─────────────────────────────── Fixed container constants ───────────────────────────────
 # DB filename is always fixed under the Plex DB folder
@@ -751,6 +937,74 @@ if not PLEX_CONFIGURED:
 DUPE_ROOT = Path("/dupes")
 # WebUI always listens on container port 5005 inside the container
 WEBUI_PORT = 5005
+
+
+def _paths_rw_status() -> dict:
+    """
+    Check that music paths (PATH_MAP values, or /music when PATH_MAP empty) and DUPE_ROOT are readable and writable.
+    Uses the same logic as _container_mounts_status() so Settings "Path access" matches the welcome modal.
+    Returns dict with music_rw, dupes_rw (bool) and optional messages for UI.
+    """
+    path_map = getattr(sys.modules[__name__], "PATH_MAP", {})
+    dupe_root = getattr(sys.modules[__name__], "DUPE_ROOT", Path("/dupes"))
+    music_rw = True
+    dupes_rw = dupe_root.exists() and os.access(dupe_root, os.R_OK) and os.access(dupe_root, os.W_OK)
+    if path_map:
+        for dest in path_map.values():
+            p = Path(dest)
+            if not p.exists():
+                logging.debug("_paths_rw_status: music path %s does not exist", p)
+                music_rw = False
+                break
+            if not os.access(p, os.R_OK) or not os.access(p, os.W_OK):
+                logging.debug("_paths_rw_status: music path %s not R+W (R=%s W=%s)", p, os.access(p, os.R_OK), os.access(p, os.W_OK))
+                music_rw = False
+                break
+    else:
+        # Same fallback as _container_mounts_status(): check /music when no PATH_MAP yet
+        default_music = Path("/music")
+        music_rw = default_music.exists() and os.access(default_music, os.R_OK) and os.access(default_music, os.W_OK)
+        if not music_rw:
+            logging.debug("_paths_rw_status: default /music exists=%s R=%s W=%s",
+                          default_music.exists(), os.access(default_music, os.R_OK) if default_music.exists() else False, os.access(default_music, os.W_OK) if default_music.exists() else False)
+    return {"music_rw": music_rw, "dupes_rw": dupes_rw}
+
+
+def _container_mounts_status() -> dict:
+    """
+    Check that all container mounts PMDA needs are present and have the expected access.
+    Used for the fresh-config welcome message so users see at a glance if bindings are OK.
+    Returns dict with config_rw, plex_db_ro, music_rw, dupes_rw (all bool).
+    """
+    config_dir = getattr(sys.modules[__name__], "CONFIG_DIR", Path("/config"))
+    plex_db_path = getattr(sys.modules[__name__], "PLEX_DB_PATH", "/database")
+    path_map = getattr(sys.modules[__name__], "PATH_MAP", {})
+    dupe_root = getattr(sys.modules[__name__], "DUPE_ROOT", Path("/dupes"))
+
+    config_rw = config_dir.exists() and os.access(config_dir, os.R_OK) and os.access(config_dir, os.W_OK)
+    plex_db_path_p = Path(plex_db_path)
+    plex_db_ro = plex_db_path_p.exists() and os.access(plex_db_path_p, os.R_OK)
+
+    # When PATH_MAP is empty (fresh config), check the standard container mount /music (parent music folder)
+    music_rw = True
+    if path_map:
+        for dest in path_map.values():
+            p = Path(dest)
+            if not p.exists() or not os.access(p, os.R_OK) or not os.access(p, os.W_OK):
+                logging.debug("_container_mounts_status: music path %s exists=%s R=%s W=%s", p, p.exists(), os.access(p, os.R_OK) if p.exists() else False, os.access(p, os.W_OK) if p.exists() else False)
+                music_rw = False
+                break
+    else:
+        # No PATH_MAP yet: verify the typical bind mount /music (parent music folder) is RW
+        default_music = Path("/music")
+        music_rw = default_music.exists() and os.access(default_music, os.R_OK) and os.access(default_music, os.W_OK)
+        if not music_rw:
+            logging.debug("_container_mounts_status: default /music exists=%s R=%s W=%s",
+                          default_music.exists(), os.access(default_music, os.R_OK) if default_music.exists() else False, os.access(default_music, os.W_OK) if default_music.exists() else False)
+
+    dupes_rw = dupe_root.exists() and os.access(dupe_root, os.R_OK) and os.access(dupe_root, os.W_OK)
+
+    return {"config_rw": config_rw, "plex_db_ro": plex_db_ro, "music_rw": music_rw, "dupes_rw": dupes_rw}
 
 # (7) Export as module‑level constants ----------------------------------------
 PLEX_HOST      = merged["PLEX_HOST"]
@@ -878,7 +1132,7 @@ else:
 def _reinit_ai_from_globals():
     """Re-initialize AI clients from current module globals (after settings save). No restart needed."""
     global openai_client, anthropic_client, google_client_configured, ollama_url, ai_provider_ready
-    global RESOLVED_MODEL, RESOLVED_PARAM_STYLE
+    global RESOLVED_MODEL, RESOLVED_PARAM_STYLE, RESOLVED_STOP_OK, AI_FUNCTIONAL_ERROR_MSG
     mod = sys.modules[__name__]
     provider = (getattr(mod, "AI_PROVIDER", "") or "openai").strip().lower()
     openai_key = getattr(mod, "OPENAI_API_KEY", "") or ""
@@ -886,6 +1140,8 @@ def _reinit_ai_from_globals():
     google_key = getattr(mod, "GOOGLE_API_KEY", "") or ""
     ollama_u = (getattr(mod, "OLLAMA_URL", "") or "").strip().rstrip("/")
     openai_model = getattr(mod, "OPENAI_MODEL", "gpt-4") or "gpt-4"
+    _merged = getattr(mod, "merged", None) or {}
+    user_fallbacks = [m.strip() for m in (_merged.get("OPENAI_MODEL_FALLBACKS") or "").split(",") if m and m.strip()]
 
     openai_client = None
     anthropic_client = None
@@ -902,6 +1158,56 @@ def _reinit_ai_from_globals():
                 logging.info("OpenAI client re-initialized (settings applied)")
             except Exception as e:
                 logging.warning("OpenAI client re-init failed: %s", e)
+        if openai_client:
+            compatible_set = set(getattr(mod, "OPENAI_COMPATIBLE_MODELS", []))
+            reinit_candidates = []
+            for ladder in getattr(mod, "MODEL_LADDERS", []):
+                if openai_model in ladder:
+                    start = ladder.index(openai_model)
+                    reinit_candidates.extend(ladder[start:])
+                    break
+            if not reinit_candidates and openai_model and openai_model in compatible_set:
+                reinit_candidates = [openai_model]
+            for m in user_fallbacks:
+                if m and m not in reinit_candidates and m in compatible_set:
+                    reinit_candidates.append(m)
+            for m in ("gpt-4o-mini",):
+                if m not in reinit_candidates:
+                    reinit_candidates.append(m)
+            for cand in reinit_candidates:
+                style = _probe_model(cand)
+                if not style:
+                    continue
+                if not _probe_ai_choose_best_response(cand):
+                    logging.warning("OpenAI model '%s' failed functional probe (empty or unparseable choose_best response); trying next candidate", cand)
+                    continue
+                RESOLVED_MODEL = cand
+                RESOLVED_PARAM_STYLE = style
+                AI_FUNCTIONAL_ERROR_MSG = None
+                if RESOLVED_MODEL != openai_model:
+                    logging.warning("OPENAI_MODEL '%s' unavailable or unsuitable; falling back to '%s' (%s, stop_ok=%s)", openai_model, RESOLVED_MODEL, RESOLVED_PARAM_STYLE, RESOLVED_STOP_OK)
+                else:
+                    logging.info("Using requested OpenAI model '%s' (%s, stop_ok=%s)", RESOLVED_MODEL, RESOLVED_PARAM_STYLE, RESOLVED_STOP_OK)
+                break
+            else:
+                ai_provider_ready = False
+                if getattr(sys.modules[__name__], "OPENAI_LAST_PROBE_401", False):
+                    AI_FUNCTIONAL_ERROR_MSG = (
+                        "OpenAI API key is invalid or expired (401 Unauthorized). "
+                        "Check your key in Settings → AI and try again."
+                    )
+                else:
+                    tried = ", ".join(reinit_candidates[:5])
+                    if len(reinit_candidates) > 5:
+                        tried += ", ..."
+                    AI_FUNCTIONAL_ERROR_MSG = (
+                        f"No OpenAI model returned a valid edition-choice response (tried: {tried}). "
+                        "Models that return empty or unparseable output are rejected. Use a working model (e.g. gpt-4o-mini) in Settings."
+                    )
+                RESOLVED_MODEL = openai_model
+                RESOLVED_PARAM_STYLE = "mct"
+                RESOLVED_STOP_OK = True
+                logging.warning("OpenAI model probe failed for all candidates; AI disabled. %s", AI_FUNCTIONAL_ERROR_MSG)
         else:
             logging.info("No OPENAI_API_KEY; AI-driven selection disabled.")
     elif provider == "anthropic":
@@ -942,22 +1248,51 @@ def _reinit_ai_from_globals():
     else:
         logging.warning("Unknown AI_PROVIDER: %s", provider)
 
-    RESOLVED_MODEL = openai_model
-    RESOLVED_PARAM_STYLE = "mct"
+
+def _reload_ai_config_and_reinit():
+    """Load AI config from DB and run _reinit_ai_from_globals(). Used at scan start and preflight."""
+    mod = sys.modules[__name__]
+    ai_config_keys = ("AI_PROVIDER", "OPENAI_API_KEY", "OPENAI_MODEL", "OPENAI_MODEL_FALLBACKS",
+                      "ANTHROPIC_API_KEY", "GOOGLE_API_KEY", "OLLAMA_URL")
+    try:
+        if STATE_DB_FILE.exists():
+            con = sqlite3.connect(str(STATE_DB_FILE), timeout=5)
+            cur = con.cursor()
+            placeholders = ",".join("?" for _ in ai_config_keys)
+            cur.execute(
+                f"SELECT key, value FROM settings WHERE key IN ({placeholders})",
+                ai_config_keys,
+            )
+            for key, value in cur.fetchall():
+                setattr(mod, key, (value or ""))
+            con.close()
+        _reinit_ai_from_globals()
+    except Exception as e:
+        logging.warning("_reload_ai_config_and_reinit failed: %s", e)
 
 
 # --- Resolve a working OpenAI model (with price-aware fallbacks) -------------
 RESOLVED_MODEL = OPENAI_MODEL
 # Param style for the resolved model: "mct" -> max_completion_tokens, "mt" -> max_tokens
 RESOLVED_PARAM_STYLE = "mct"
+# Some models (e.g. reasoning/o-series) do not accept "stop"; when False, call_ai_provider omits stop.
+RESOLVED_STOP_OK = True
+# When no OpenAI candidate passes probe, set by _reinit_ai_from_globals for 503 / preflight message.
+AI_FUNCTIONAL_ERROR_MSG = None
+# Set by _probe_model when last failure was 401 so we can show a clear message.
+OPENAI_LAST_PROBE_401 = False
 
 def _probe_model(model_name: str) -> str | None:
     """Return param style ("mct" or "mt") if a 1-line ping works, else None.
-    Tries `max_completion_tokens` first; on "unsupported_parameter" falls back to `max_tokens`.
+    Tries max_completion_tokens first, then max_tokens; each with stop.
+    If both fail with unsupported_parameter, retries without stop (some models do not accept stop).
+    Sets global RESOLVED_STOP_OK to False when the model only works without stop.
     """
+    global RESOLVED_STOP_OK, OPENAI_LAST_PROBE_401
+    OPENAI_LAST_PROBE_401 = False
     if not (OPENAI_API_KEY and openai_client):
         return None
-    # Try with max_completion_tokens
+    # Try with max_completion_tokens + stop
     try:
         openai_client.chat.completions.create(
             model=model_name,
@@ -965,14 +1300,14 @@ def _probe_model(model_name: str) -> str | None:
             max_completion_tokens=8,
             stop=["\n"],
         )
+        RESOLVED_STOP_OK = True
         return "mct"
     except Exception as e:
         msg = str(e)
-        logging.debug("Model probe (mct) failed for %s: %s", model_name, msg)
-        if "max_completion_tokens" not in msg and "unsupported_parameter" not in msg.lower():
-            # Some other hard failure; still try mt just in case
-            pass
-    # Try legacy max_tokens
+        if "401" in msg or "unauthorized" in msg.lower():
+            OPENAI_LAST_PROBE_401 = True
+        logging.debug("Model probe (mct+stop) failed for %s: %s", model_name, msg)
+    # Try legacy max_tokens + stop
     try:
         openai_client.chat.completions.create(
             model=model_name,
@@ -980,35 +1315,352 @@ def _probe_model(model_name: str) -> str | None:
             max_tokens=8,
             stop=["\n"],
         )
+        RESOLVED_STOP_OK = True
         return "mt"
     except Exception as e2:
-        logging.debug("Model probe (mt) failed for %s: %s", model_name, e2)
+        msg2 = str(e2)
+        if "401" in msg2 or "unauthorized" in msg2.lower():
+            OPENAI_LAST_PROBE_401 = True
+        logging.debug("Model probe (mt+stop) failed for %s: %s", model_name, msg2)
+    # If both failed with unsupported_parameter, try without stop (some reasoning models reject stop)
+    if "unsupported_parameter" not in msg.lower() and "unsupported_parameter" not in msg2.lower():
         return None
+    try:
+        openai_client.chat.completions.create(
+            model=model_name,
+            messages=[{"role": "user", "content": "ping"}],
+            max_completion_tokens=8,
+        )
+        RESOLVED_STOP_OK = False
+        logging.debug("Model probe: %s works with max_completion_tokens, without stop", model_name)
+        return "mct"
+    except Exception:
+        pass
+    try:
+        openai_client.chat.completions.create(
+            model=model_name,
+            messages=[{"role": "user", "content": "ping"}],
+            max_tokens=8,
+        )
+        RESOLVED_STOP_OK = False
+        logging.debug("Model probe: %s works with max_tokens, without stop", model_name)
+        return "mt"
+    except Exception:
+        return None
+
+
+def call_ai_provider(provider: str, model: str, system_msg: str, user_msg: str, max_tokens: int = 256) -> str:
+    """
+    Call the appropriate AI provider with the given messages.
+    Returns the text response from the AI.
+    For OpenAI, uses RESOLVED_PARAM_STYLE (mct or mt) and RESOLVED_STOP_OK; on 400 unsupported
+    parameter, retries with the other param or without stop.
+    """
+    provider_lower = provider.lower()
+
+    if provider_lower == "openai":
+        if not openai_client:
+            raise ValueError("OpenAI client not initialized")
+        param_style = getattr(sys.modules[__name__], "RESOLVED_PARAM_STYLE", "mct")
+        stop_ok = getattr(sys.modules[__name__], "RESOLVED_STOP_OK", True)
+        _kwargs = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+        }
+        if stop_ok:
+            _kwargs["stop"] = ["\n"]
+        if param_style == "mct":
+            _kwargs["max_completion_tokens"] = max_tokens
+        else:
+            _kwargs["max_tokens"] = max_tokens
+        try:
+            resp = openai_client.chat.completions.create(**_kwargs)
+            return (resp.choices[0].message.content or "").strip()
+        except Exception as e:
+            err_msg = str(e).lower()
+            # On 400 unsupported parameter, retry with the other param or without stop
+            if "unsupported_parameter" not in err_msg and "400" not in err_msg:
+                raise
+            if "max_tokens" in err_msg and "max_completion_tokens" in err_msg:
+                _kwargs.pop("max_tokens", None)
+                _kwargs["max_completion_tokens"] = max_tokens
+                try:
+                    resp = openai_client.chat.completions.create(**_kwargs)
+                    return (resp.choices[0].message.content or "").strip()
+                except Exception:
+                    raise e
+            if "max_completion_tokens" in err_msg and ("max_tokens" in err_msg or "use" in err_msg):
+                _kwargs.pop("max_completion_tokens", None)
+                _kwargs["max_tokens"] = max_tokens
+                try:
+                    resp = openai_client.chat.completions.create(**_kwargs)
+                    return (resp.choices[0].message.content or "").strip()
+                except Exception:
+                    raise e
+            if "stop" in err_msg or "unsupported" in err_msg:
+                _kwargs.pop("stop", None)
+                try:
+                    resp = openai_client.chat.completions.create(**_kwargs)
+                    return (resp.choices[0].message.content or "").strip()
+                except Exception:
+                    raise e
+            raise
+
+    elif provider_lower == "anthropic":
+        if not anthropic_client:
+            raise ValueError("Anthropic client not initialized")
+        resp = anthropic_client.messages.create(
+            model=model,
+            max_tokens=max_tokens,
+            system=system_msg,
+            messages=[{"role": "user", "content": user_msg}],
+        )
+        return resp.content[0].text.strip()
+
+    elif provider_lower == "google":
+        if not google_client_configured:
+            raise ValueError("Google client not configured")
+        model_instance = genai.GenerativeModel(model)
+        prompt = f"{system_msg}\n\n{user_msg}"
+        response = model_instance.generate_content(
+            prompt,
+            generation_config=genai.types.GenerationConfig(
+                max_output_tokens=max_tokens,
+                stop_sequences=["\n"],
+            ),
+        )
+        return response.text.strip()
+
+    elif provider_lower == "ollama":
+        if not ollama_url:
+            raise ValueError("Ollama URL not configured")
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            "options": {
+                "num_predict": max_tokens,
+                "stop": ["\n"],
+            },
+            "stream": False,
+        }
+        response = requests.post(f"{ollama_url}/api/chat", json=payload, timeout=60)
+        if response.status_code != 200:
+            raise Exception(f"Ollama API error: {response.status_code} - {response.text}")
+        result = response.json()
+        return result.get("message", {}).get("content", "").strip()
+
+    else:
+        raise ValueError(f"Unknown AI provider: {provider}")
+
+
+def call_ai_provider_vision(
+    provider: str,
+    model: str,
+    system_msg: str,
+    user_msg: str,
+    image_urls: Optional[List[str]] = None,
+    image_base64: Optional[List[dict]] = None,
+    max_tokens: int = 32,
+) -> str:
+    """
+    Call AI with optional images (vision). Used for cover comparison: "Do these two covers represent the same album? Yes/No."
+    image_urls: list of image URLs (e.g. Cover Art Archive, or PMDA-served local cover).
+    image_base64: list of {"type": "image_url", "image_url": {"url": "data:image/...;base64,..."}} or provider-specific.
+    Returns the text response. Only OpenAI is supported for vision; other providers fall back to text-only.
+    """
+    provider_lower = provider.lower()
+    if provider_lower != "openai" or not openai_client:
+        # Fallback: call without images
+        return call_ai_provider(provider, model, system_msg, user_msg, max_tokens=max_tokens)
+    content: List[dict] = [{"type": "text", "text": user_msg}]
+    if image_urls:
+        for url in image_urls[:10]:
+            if url:
+                content.append({"type": "image_url", "image_url": {"url": url}})
+    if image_base64:
+        for img in image_base64[:10]:
+            if isinstance(img, dict) and img.get("type") == "image_url" and img.get("image_url", {}).get("url"):
+                content.append(img)
+    param_style = getattr(sys.modules[__name__], "RESOLVED_PARAM_STYLE", "mct")
+    stop_ok = getattr(sys.modules[__name__], "RESOLVED_STOP_OK", True)
+    _kwargs = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": content},
+        ],
+    }
+    if stop_ok:
+        _kwargs["stop"] = ["\n"]
+    if param_style == "mct":
+        _kwargs["max_completion_tokens"] = max_tokens
+    else:
+        _kwargs["max_tokens"] = max_tokens
+    try:
+        resp = openai_client.chat.completions.create(**_kwargs)
+        return (resp.choices[0].message.content or "").strip()
+    except Exception as e:
+        logging.debug("[AI Vision] OpenAI vision call failed: %s", e)
+        raise
+
+
+def ai_verify_mb_match(
+    artist: str,
+    title_raw: Optional[str],
+    title_norm: str,
+    track_titles: Optional[List[str]],
+    track_count: int,
+    candidates: List[tuple],
+    has_cover: bool = False,
+    extra_sources: Optional[List[dict]] = None,
+) -> Optional[tuple]:
+    """
+    Ask the AI to pick which MusicBrainz candidate matches our album (or NONE).
+    candidates: list of (rg, result_dict) where rg has 'title','id', result_dict has 'id','track_count'.
+    extra_sources: optional list of {"source": "Discogs"|"Last.fm"|"Bandcamp", "title": ..., "artist": ...} for disambiguation.
+    Returns (rg, result_dict) for the chosen candidate or None.
+    """
+    if not getattr(sys.modules[__name__], "USE_AI_FOR_MB_VERIFY", False):
+        return None
+    if not getattr(sys.modules[__name__], "ai_provider_ready", False):
+        return None
+    if not candidates:
+        return None
+    letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    choices = []
+    for i, (rg, result_dict) in enumerate(candidates[:20]):
+        tc = result_dict.get("track_count", "?")
+        line = f"{letters[i]}: {rg.get('title', 'Unknown')} (id={rg.get('id', '')}, {tc} tracks)"
+        mb_tracks = result_dict.get("track_titles")
+        if mb_tracks:
+            track_preview = ", ".join(mb_tracks[:15]) + ("..." if len(mb_tracks) > 15 else "")
+            line += f" — tracks: [{track_preview}]"
+        choices.append(line)
+    track_list_str = ", ".join((track_titles or [])[:30]) if track_titles else "(none)"
+    if track_titles and len(track_titles) > 30:
+        track_list_str += ", ..."
+    user_msg = (
+        f"Our album: artist={artist!r}, title_raw={title_raw or title_norm!r}, normalized={title_norm!r}, "
+        f"track_count={track_count}, track_titles=[{track_list_str}]. "
+        f"Cover present: {has_cover}.\n\n"
+        "MusicBrainz candidates:\n" + "\n".join(choices)
+    )
+    if extra_sources:
+        other_lines = []
+        for s in extra_sources:
+            src = s.get("source", "?")
+            t = s.get("title") or s.get("album") or "?"
+            a = s.get("artist") or s.get("artist_name") or "?"
+            other_lines.append(f"  {src}: {t!r} (artist: {a!r})")
+        user_msg += "\n\nOther sources (for disambiguation):\n" + "\n".join(other_lines)
+    user_msg += (
+        "\n\nWhich candidate is the same release? Consider title variants (e.g. Volume I = volume i). "
+        "Reply with only the letter (A, B, ...) or NONE if no candidate matches."
+    )
+    system_msg = "You reply with a single letter (A, B, C, ...) or the word NONE. No explanation."
+    try:
+        model = getattr(sys.modules[__name__], "RESOLVED_MODEL", None) or getattr(sys.modules[__name__], "OPENAI_MODEL", "gpt-4")
+        provider = getattr(sys.modules[__name__], "AI_PROVIDER", "openai")
+        reply = call_ai_provider(provider, model, system_msg, user_msg, max_tokens=10)
+        reply = (reply or "").strip().upper()
+        if reply == "NONE":
+            return None
+        letter = reply[:1]
+        idx = letters.find(letter)
+        if 0 <= idx < len(candidates):
+            logging.info("[MusicBrainz Verify] AI selected candidate %s: %s", letter, candidates[idx][0].get("title"))
+            return candidates[idx]
+        return None
+    except Exception as e:
+        logging.debug("[MusicBrainz Verify] AI verify failed: %s", e)
+        return None
+
+
+def _probe_ai_choose_best_response(model_name: str) -> bool:
+    """
+    Verify the model returns a parseable choose_best-style response (index|rationale|extras).
+    If the model returns empty or unparseable output, scan would show Heuristic fallbacks.
+    Return True only if we get a valid response so we block scan when AI would fail.
+    """
+    if not (OPENAI_API_KEY and openai_client and AI_PROVIDER and getattr(sys.modules[__name__], "AI_PROVIDER", "").strip().lower() == "openai"):
+        return True  # Skip functional probe for non-OpenAI
+    system_msg = (
+        "You are an expert digital-music librarian.\n"
+        "OUTPUT RULES (must follow exactly):\n"
+        "- Return ONE single line only.\n"
+        "- The line must contain EXACTLY two '|' characters.\n"
+        "- Format: <index>|<brief rationale>|<comma-separated extra tracks>\n"
+        "- If there are no extra tracks, still include the final pipe but leave it empty.\n"
+        "- Do not add any other text, do not explain, do not add extra lines.\n"
+        "Example of valid outputs:\n"
+        "0|Preferred lossless|"
+    )
+    user_msg = "Candidate editions:\n0: fmt_score=1, bd=24, tracks=10, size_mb=200\n1: fmt_score=0, bd=16, tracks=10, size_mb=100\n"
+    try:
+        txt = call_ai_provider(AI_PROVIDER, model_name, system_msg, user_msg, max_tokens=256)
+        if not txt:
+            logging.debug("Functional probe: model %s returned empty response", model_name)
+            return False
+        lines = [l.strip() for l in txt.replace("```", "").splitlines() if l.strip()]
+        txt = lines[0] if lines else txt
+        txt = re.sub(r"^(answer|réponse)\s*:\s*", "", txt, flags=re.IGNORECASE).strip()
+        m = re.match(r"^(\d+)\s*\|\s*(.*?)\s*\|\s*(.*)$", txt)
+        if m:
+            idx = int(m.group(1))
+            if 0 <= idx <= 1:
+                logging.debug("Functional probe: model %s returned parseable response (index=%s)", model_name, idx)
+                return True
+        logging.debug("Functional probe: model %s response not parseable: %r", model_name, txt[:80])
+        return False
+    except Exception as e:
+        logging.debug("Functional probe failed for %s: %s", model_name, e)
+        return False
+
 
 # User-provided explicit fallbacks override everything (comma-separated) (from SQLite only)
 _user_fallbacks = [m.strip() for m in (merged.get("OPENAI_MODEL_FALLBACKS") or "").split(",") if m.strip()]
 
-# Price ladders (cheapest → most expensive) so we "step up" only as needed
-MODEL_LADDERS = [
-    ["gpt-5-nano", "gpt-5-mini", "gpt-5"],
-    ["gpt-4.1-nano", "gpt-4.1-mini", "gpt-4.1"],
-    ["gpt-4o-mini", "gpt-4o"],
+# Curated list of OpenAI Chat Completions models known to work with PMDA (parseable index|rationale|extras).
+# Excludes models that return empty or use different API (e.g. gpt-5-nano). Only these are shown in Settings.
+OPENAI_COMPATIBLE_MODELS = [
+    "gpt-4o-mini",
+    "gpt-4o",
+    "gpt-4.1",
+    "gpt-4.1-mini",
+    "gpt-4.1-nano",
+    "gpt-4-turbo",
+    "gpt-4",
+    "gpt-3.5-turbo",
 ]
 
-# Build candidate list: requested → next tiers upward in its ladder → user fallbacks → final safe defaults
+# Price ladders (cheapest → most expensive) – only models from OPENAI_COMPATIBLE_MODELS (no gpt-5-nano etc.)
+MODEL_LADDERS = [
+    ["gpt-4.1-nano", "gpt-4.1-mini", "gpt-4.1"],
+    ["gpt-4o-mini", "gpt-4o"],
+    ["gpt-4-turbo", "gpt-4"],
+    ["gpt-3.5-turbo"],
+]
+
+# Build candidate list: requested → next tiers upward in its ladder → user fallbacks (only if compatible) → safe default
 candidates: list[str] = []
+compatible_set = set(OPENAI_COMPATIBLE_MODELS)
 found = False
 for ladder in MODEL_LADDERS:
     if OPENAI_MODEL in ladder:
         found = True
         start = ladder.index(OPENAI_MODEL)
-        candidates.extend(ladder[start:])  # step up in price within ladder
+        candidates.extend(ladder[start:])
         break
-if not found and OPENAI_MODEL:
+if not found and OPENAI_MODEL and OPENAI_MODEL in compatible_set:
     candidates.append(OPENAI_MODEL)
-# Append user fallbacks, then a conservative default
 for m in _user_fallbacks:
-    if m not in candidates:
+    if m not in candidates and m in compatible_set:
         candidates.append(m)
 for m in ("gpt-4o-mini",):
     if m not in candidates:
@@ -1016,7 +1668,7 @@ for m in ("gpt-4o-mini",):
 
 for cand in candidates:
     style = _probe_model(cand)
-    if style:
+    if style and _probe_ai_choose_best_response(cand):
         RESOLVED_MODEL = cand
         RESOLVED_PARAM_STYLE = style
         if RESOLVED_MODEL != OPENAI_MODEL:
@@ -1024,6 +1676,18 @@ for cand in candidates:
         else:
             logging.info("Using requested OpenAI model '%s' (%s)", RESOLVED_MODEL, RESOLVED_PARAM_STYLE)
         break
+else:
+    # No candidate passed both param probe and functional (choose_best) probe
+    if openai_client and candidates:
+        ai_provider_ready = False
+        tried = ", ".join(candidates[:5])
+        if len(candidates) > 5:
+            tried += ", ..."
+        AI_FUNCTIONAL_ERROR_MSG = (
+            f"No OpenAI model returned a valid edition-choice response (tried: {tried}). "
+            "Use a working model (e.g. gpt-4o-mini) in Settings."
+        )
+        logging.warning("OpenAI: all candidates failed functional probe; AI disabled. %s", AI_FUNCTIONAL_ERROR_MSG)
 
 # (10) Validate Plex connection ------------------------------------------------
 # (10) Validate Plex connection ------------------------------------------------
@@ -1564,7 +2228,7 @@ def _cross_check_bindings():
     • If all samples exist under the mapped host root, the binding is valid.
     • Otherwise performs a recursive search to locate the files; if they are
       all found under the same parent folder we treat that folder as the
-      correct host root and patch PATH_MAP (memory + config.json).
+      correct host root and patch PATH_MAP (memory + SQLite).
     • If any binding cannot be validated or repaired, the startup aborts
       with SystemExit to avoid destructive behaviour later on.
     """
@@ -1751,6 +2415,12 @@ def init_state_db():
         cur.execute("ALTER TABLE duplicates_best ADD COLUMN ai_provider TEXT")
     if "ai_model" not in cols:
         cur.execute("ALTER TABLE duplicates_best ADD COLUMN ai_model TEXT")
+    if "size_mb" not in cols:
+        cur.execute("ALTER TABLE duplicates_best ADD COLUMN size_mb INTEGER")
+    if "track_count" not in cols:
+        cur.execute("ALTER TABLE duplicates_best ADD COLUMN track_count INTEGER")
+    if "match_verified_by_ai" not in cols:
+        cur.execute("ALTER TABLE duplicates_best ADD COLUMN match_verified_by_ai INTEGER DEFAULT 0")
     # Add indexes for faster lookups
     try:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_duplicates_best_artist ON duplicates_best(artist)")
@@ -1868,6 +2538,8 @@ def init_state_db():
         ("albums_without_complete_tags", "INTEGER DEFAULT 0"),
         ("albums_without_mb_id", "INTEGER DEFAULT 0"),
         ("albums_without_artist_mb_id", "INTEGER DEFAULT 0"),
+        ("summary_json", "TEXT"),
+        ("entry_type", "TEXT DEFAULT 'scan'"),
     ]
     for col_name, col_type in new_cols:
         if col_name not in cols:
@@ -1887,6 +2559,12 @@ def init_state_db():
             FOREIGN KEY (scan_id) REFERENCES scan_history(scan_id)
         )
     """)
+    # Migrate scan_moves: add album_title and fmt_text if missing
+    cur.execute("PRAGMA table_info(scan_moves)")
+    move_cols = [r[1] for r in cur.fetchall()]
+    for col_name, col_type in [("album_title", "TEXT"), ("fmt_text", "TEXT")]:
+        if col_name not in move_cols:
+            cur.execute(f"ALTER TABLE scan_moves ADD COLUMN {col_name} {col_type}")
     # Table for per-edition scan truth (Library, Tag Fixer read from here when available)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS scan_editions (
@@ -1930,11 +2608,14 @@ def set_stat(key: str, value: int):
     con.close()
 
 def increment_stat(key: str, delta: int):
-    """Atomically add *delta* to a stat counter."""
+    """Atomically add *delta* to a stat counter. Creates the row if it does not exist (upsert)."""
     con = sqlite3.connect(str(STATE_DB_FILE), timeout=30)
     con.execute("PRAGMA busy_timeout=30000;")
     cur = con.cursor()
-    cur.execute("UPDATE stats SET value = value + ? WHERE key = ?", (delta, key))
+    cur.execute(
+        "INSERT INTO stats(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = value + ?",
+        (key, delta, delta),
+    )
     con.commit()
     con.close()
 
@@ -1952,11 +2633,72 @@ def get_last_completed_scan_id() -> Optional[int]:
     except (ValueError, TypeError):
         return None
 
+
+def ensure_dedupe_scan_id() -> None:
+    """If state has no scan_id, create a 'dedupe' scan_history row so moves are recorded. Used when user dedupes without a prior scan."""
+    with lock:
+        if state.get("scan_id") is not None:
+            return
+        start_time = time.time()
+        con = sqlite3.connect(str(STATE_DB_FILE))
+        cur = con.cursor()
+        cur.execute("PRAGMA table_info(scan_history)")
+        cols = [r[1] for r in cur.fetchall()]
+        if "entry_type" in cols:
+            cur.execute("""
+                INSERT INTO scan_history
+                (start_time, albums_scanned, artists_total, ai_enabled, mb_enabled, auto_move_enabled, status, entry_type)
+                VALUES (?, 0, 0, 0, 0, 0, 'running', 'dedupe')
+            """, (start_time,))
+        else:
+            cur.execute("""
+                INSERT INTO scan_history
+                (start_time, albums_scanned, artists_total, ai_enabled, mb_enabled, auto_move_enabled, status)
+                VALUES (?, 0, 0, 0, 0, 0, 'running')
+            """, (start_time,))
+        scan_id = cur.lastrowid
+        con.commit()
+        con.close()
+        state["scan_id"] = scan_id
+
+
+def update_dedupe_scan_summary(scan_id: int, space_saved_mb: int, albums_moved: int) -> None:
+    """Update a dedupe-only scan_history row with end time and stats. No-op if row is not entry_type='dedupe'."""
+    con = sqlite3.connect(str(STATE_DB_FILE))
+    cur = con.cursor()
+    cur.execute("PRAGMA table_info(scan_history)")
+    cols = [r[1] for r in cur.fetchall()]
+    if "entry_type" not in cols:
+        con.close()
+        return
+    cur.execute("SELECT entry_type FROM scan_history WHERE scan_id = ?", (scan_id,))
+    row = cur.fetchone()
+    if not row or row[0] != "dedupe":
+        con.close()
+        return
+    end_time = time.time()
+    cur.execute(
+        "SELECT start_time FROM scan_history WHERE scan_id = ?", (scan_id,)
+    )
+    start_row = cur.fetchone()
+    duration_seconds = int(end_time - start_row[0]) if start_row else 0
+    cur.execute("""
+        UPDATE scan_history
+        SET end_time = ?, duration_seconds = ?, space_saved_mb = ?, albums_moved = ?, status = 'completed'
+        WHERE scan_id = ?
+    """, (end_time, duration_seconds, space_saved_mb, albums_moved, scan_id))
+    con.commit()
+    con.close()
+
+
 init_state_db()
 
 # ───────────────────────────────── CACHE DB SETUP ──────────────────────────────────
 def init_cache_db():
     con = sqlite3.connect(str(CACHE_DB_FILE))
+    # Enable WAL mode for concurrent reads/writes (same as state.db)
+    con.execute("PRAGMA journal_mode=WAL;")
+    con.commit()
     cur = con.cursor()
     cur.execute("""
         CREATE TABLE IF NOT EXISTS audio_cache (
@@ -1967,7 +2709,7 @@ def init_cache_db():
             bit_depth  INTEGER
         )
     """)
-    # Table for caching MusicBrainz release-group info
+    # Table for caching MusicBrainz release-group info (by MBID)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS musicbrainz_cache (
             mbid       TEXT PRIMARY KEY,
@@ -1975,11 +2717,23 @@ def init_cache_db():
             created_at INTEGER
         )
     """)
+    # Table for caching "artist+album -> MBID or not_found" so we don't re-search every scan
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS musicbrainz_album_lookup (
+            artist_norm TEXT NOT NULL,
+            album_norm  TEXT NOT NULL,
+            mbid        TEXT,
+            info_json   TEXT,
+            created_at  INTEGER,
+            PRIMARY KEY (artist_norm, album_norm)
+        )
+    """)
     
     # Add indexes for faster lookups
     try:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_audio_cache_path ON audio_cache(path)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_mb_cache_mbid ON musicbrainz_cache(mbid)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_mb_album_lookup_key ON musicbrainz_album_lookup(artist_norm, album_norm)")
     except sqlite3.OperationalError:
         # Indexes may already exist, ignore
         pass
@@ -2197,7 +2951,7 @@ class MusicBrainzQueue:
         self.queue.put((request_id, callback))
         
         # Wait for result (with timeout to avoid hanging forever)
-        if event.wait(timeout=300):  # 5 minute timeout
+        if event.wait(timeout=60):  # 1 minute timeout (was 5 min; reduces scan blockage on MB slowness)
             with self._lock:
                 result, error = self.results.pop(request_id, (None, None))
                 if request_id in self.locks:
@@ -2212,7 +2966,7 @@ class MusicBrainzQueue:
             with self._lock:
                 if request_id in self.locks:
                     del self.locks[request_id]
-            raise TimeoutError(f"MusicBrainz request {request_id} timed out after 5 minutes")
+            raise TimeoutError(f"MusicBrainz request {request_id} timed out after 1 minute")
     
     def shutdown(self):
         """Shutdown the queue worker."""
@@ -2254,6 +3008,43 @@ def set_cached_mb_info(mbid: str, info: dict):
     con.commit()
     con.close()
 
+
+def get_cached_mb_album_lookup(artist_norm: str, album_norm: str) -> tuple[str | None, dict | None]:
+    """
+    Return (mbid, info) for artist+album lookup cache.
+    - (None, None) = not in cache
+    - ("", None) = cached as "no MusicBrainz ID found"
+    - (mbid, info_dict) = cached as found (info_dict may be None if only mbid was stored)
+    """
+    con = sqlite3.connect(str(CACHE_DB_FILE), timeout=30)
+    cur = con.cursor()
+    cur.execute(
+        "SELECT mbid, info_json FROM musicbrainz_album_lookup WHERE artist_norm = ? AND album_norm = ?",
+        (artist_norm, album_norm),
+    )
+    row = cur.fetchone()
+    con.close()
+    if row is None:
+        return (None, None)
+    mbid_val, info_json = row[0], row[1]
+    if mbid_val is None or mbid_val == "":
+        return ("", None)
+    info = json.loads(info_json) if info_json else None
+    return (mbid_val, info)
+
+
+def set_cached_mb_album_lookup(artist_norm: str, album_norm: str, mbid: str | None, info: dict | None):
+    """Cache result of artist+album lookup. mbid None or '' = not found."""
+    con = sqlite3.connect(str(CACHE_DB_FILE), timeout=30)
+    cur = con.cursor()
+    cur.execute(
+        """INSERT OR REPLACE INTO musicbrainz_album_lookup (artist_norm, album_norm, mbid, info_json, created_at)
+           VALUES (?, ?, ?, ?, ?)""",
+        (artist_norm, album_norm, mbid or "", json.dumps(info) if info else None, int(time.time())),
+    )
+    con.commit()
+    con.close()
+
 # ───────────────────────────────── STATE IN MEMORY ──────────────────────────────────
 state = {
     "scanning": False,
@@ -2262,6 +3053,10 @@ state = {
     "deduping": False,
     "dedupe_progress": 0,
     "dedupe_total": 0,
+    "dedupe_start_time": None,
+    "dedupe_saved_this_run": 0,
+    "dedupe_current_group": None,
+    "dedupe_last_write": None,  # {"path": str, "at": float} after each move to /dupes
     # duplicates: { artist_name: [ { artist, album_id, best, losers } ] }
     "duplicates": {},
     # Scan details tracking
@@ -2281,8 +3076,15 @@ state = {
     "scan_last_progress": 0,          # Progression au dernier update
     "scan_format_done_count": 0,     # Albums that completed format (FFprobe) step
     "scan_mb_done_count": 0,         # Albums that completed MusicBrainz lookup step
+    "scan_step_total": 0,            # Total steps for progress bar (3*albums + 2 or +3 if move)
+    "scan_step_progress": 0,         # Steps completed (format + MB + compare + AI + finalize + move)
     "scan_active_artists": {},       # Dict {artist_name: {"start_time": float, "total_albums": int, "albums_processed": int}}
     "improve_all": None,              # { "running": bool, "artist_id": int, "current": int, "total": int, "log": [], "result": {}, "error": str } or None
+    "last_fix_all_by_provider": None, # { "musicbrainz": {identified,covers,tags}, "discogs": ..., "lastfm": ..., "bandcamp": ... } from last global fix-all run
+    "last_fix_all_total_albums": 0,   # Total albums processed in that run (for N/M match display)
+    "lidarr_add_incomplete": None,    # { "running": bool, "current": int, "total": int, "current_album": str, "current_artist": str, "added": int, "failed": int, "result": {} } or None
+    "last_lidarr_add_added": 0,
+    "last_lidarr_add_failed": 0,
 }
 lock = threading.Lock()
 
@@ -2460,6 +3262,44 @@ def norm_album(title: str) -> str:
     # Last resort: avoid collapsing different untitled releases together
     if raw:
         h = hashlib.sha1(raw.encode("utf-8", "ignore")).hexdigest()[:8]
+        return f"__untitled__-{h}"
+    return "__untitled__"
+
+
+# Regex for format/version parenthetical suffixes: (flac), (mp3), (EP), (flac, EP), etc.
+_PARENTHETICAL_SUFFIX_RE = re.compile(r"(?:\s*\([\w\s,]+\))+$", re.IGNORECASE)
+
+
+def strip_parenthetical_suffixes(s: str) -> str:
+    """
+    Remove trailing parenthetical format/version segments from a string.
+    Examples: "Album (flac)" -> "Album", "Album (flac) (EP)" -> "Album", "Album (flac, EP)" -> "Album".
+    """
+    if not s or not s.strip():
+        return (s or "").strip()
+    out = _PARENTHETICAL_SUFFIX_RE.sub("", (s or "").strip())
+    return out.strip()
+
+
+def norm_album_for_dedup(title: str, normalize_parenthetical: bool) -> str:
+    """
+    Normalise an album title for duplicate grouping, with optional parenthetical handling.
+    When normalize_parenthetical is True: strip format/version parentheticals (flac), (mp3), (EP), etc.
+    so that "Lemodie (Flac)" and "Lemodie" group together. When False, do not strip them
+    (treat "Lemodie (Flac)" and "Lemodie" as different).
+    """
+    raw = (title or "").strip()
+    if normalize_parenthetical:
+        raw = strip_parenthetical_suffixes(raw) or raw
+    cleaned = " ".join(raw.split()).lower()
+    if len(cleaned) >= 3:
+        return cleaned
+    fallback = (title or "").strip().lower()
+    fallback = " ".join(fallback.split())
+    if len(fallback) >= 3:
+        return fallback
+    if raw or (title or "").strip():
+        h = hashlib.sha1((raw or title or "").encode("utf-8", "ignore")).hexdigest()[:8]
         return f"__untitled__-{h}"
     return "__untitled__"
 
@@ -2730,6 +3570,26 @@ def first_part_path(db_conn, album_id: int) -> Optional[Path]:
 
     return host_loc.parent
 
+
+def _album_path_under_dupes(db_conn, album_id: int) -> bool:
+    """Return True if the album's path is under DUPE_ROOT (already moved). Used to skip library-only groups that were already deduped."""
+    sql = """
+      SELECT mp.file FROM metadata_items tr
+      JOIN media_items mi ON mi.metadata_item_id = tr.id
+      JOIN media_parts mp ON mp.media_item_id = mi.id
+      WHERE tr.parent_id = ? LIMIT 1
+    """
+    row = db_conn.execute(sql, (album_id,)).fetchone()
+    if not row or not row[0]:
+        return False
+    raw = (row[0] or "").replace("\\", "/")
+    if str(DUPE_ROOT) in raw or raw.strip().startswith("/dupes") or "/dupes/" in raw:
+        return True
+    if "dupes" in raw.lower() and ("/dupes" in raw or "Music_dupes" in raw or "dupes/" in raw):
+        return True
+    return False
+
+
 # Cover filenames we consider "has cover" (same as create_pmda_test_files.sh)
 _COVER_NAMES = (
     "cover.jpg", "cover.png", "cover.jpeg",
@@ -2748,6 +3608,46 @@ def album_folder_has_cover(folder: Path) -> bool:
         return False
     except OSError:
         return False
+
+
+def _first_cover_path(folder: Path) -> Optional[Path]:
+    """Return the path of the first existing cover file in the folder, or None."""
+    if not folder or not folder.is_dir():
+        return None
+    try:
+        for name in _COVER_NAMES:
+            p = folder / name
+            if p.is_file():
+                return p
+        return None
+    except OSError:
+        return None
+
+
+_MAX_COVER_SIZE_BYTES = 5 * 1024 * 1024  # 5 MB for vision API
+
+
+def _encode_local_cover_to_data_uri(cover_path: Path) -> Optional[str]:
+    """
+    Read the cover file, encode as base64 data URI. Skips if file > 5 MB.
+    Returns data:image/jpeg;base64,... or data:image/png;base64,... etc.
+    """
+    if not cover_path or not cover_path.is_file():
+        return None
+    try:
+        stat = cover_path.stat()
+        if stat.st_size > _MAX_COVER_SIZE_BYTES:
+            logging.debug("[Vision] Skipping cover %s: size %d > %d", cover_path, stat.st_size, _MAX_COVER_SIZE_BYTES)
+            return None
+        raw = cover_path.read_bytes()
+        b64 = base64.b64encode(raw).decode("ascii")
+        suffix = cover_path.suffix.lower()
+        mime_map = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".gif": "image/gif", ".webp": "image/webp"}
+        mime = mime_map.get(suffix, "image/jpeg")
+        return f"data:{mime};base64,{b64}"
+    except Exception as e:
+        logging.debug("[Vision] Failed to encode cover %s: %s", cover_path, e)
+        return None
 
 def extract_tags(audio_path: Path) -> dict[str, str]:
     """
@@ -3049,10 +3949,42 @@ def _detect_gaps_in_indices(indices: list) -> tuple[bool, int, list]:
     return False, actual_count, []
 
 
+def resolve_mbid_to_release_group(mbid: str, tag_source: str = "", use_queue: bool = True) -> Optional[str]:
+    """
+    Return a MusicBrainz release-group ID for use with get_release_group_by_id / fetch_mb_release_group_info.
+    - If tag_source is 'musicbrainz_releasegroupid', mbid is already a release-group ID: return it.
+    - If tag_source is 'musicbrainz_releaseid' or 'musicbrainz_albumid' (or empty/unknown), mbid is a release ID:
+      fetch the release, extract release-group id, return it. On API error, log and return None.
+    - use_queue: if False, call API directly (required when already inside MB queue worker to avoid deadlock).
+    """
+    if not mbid or not mbid.strip():
+        return None
+    mbid = mbid.strip()
+    if tag_source == "musicbrainz_releasegroupid":
+        return mbid
+    # Release ID (musicbrainz_releaseid, musicbrainz_albumid) or unknown: resolve via get_release_by_id
+    # MusicBrainz API expects "release-groups" (plural) for release lookup includes
+    try:
+        def _fetch_release():
+            return musicbrainzngs.get_release_by_id(mbid, includes=["release-groups"])["release"]
+        if use_queue and MB_QUEUE_ENABLED and USE_MUSICBRAINZ:
+            rel = get_mb_queue().submit(f"rel_{mbid}", _fetch_release)
+        else:
+            rel = _fetch_release()
+        rg = rel.get("release-group")
+        if rg and isinstance(rg.get("id"), str):
+            return rg["id"]
+        return None
+    except Exception as e:
+        logging.debug("resolve_mbid_to_release_group: failed for mbid=%s tag_source=%s: %s", mbid, tag_source, e)
+        return None
+
+
 def fetch_mb_release_group_info(mbid: str) -> tuple[dict, bool]:
     """
-    Fetch primary type, secondary-types, and media format summary from MusicBrainz release-group.
-    Uses musicbrainzngs for proper rate-limiting and parsing.
+    Fetch primary type, secondary-types, and optional format summary from MusicBrainz release-group.
+    Uses musicbrainzngs for proper rate-limiting. Only inc=releases is used (inc=media is not valid
+    for release-group and causes 400); format_summary may be empty unless releases include media.
     Returns (info_dict, cache_hit) where cache_hit is True if found in cache.
     """
     # Attempt to reuse cached MusicBrainz release-group info
@@ -3062,26 +3994,33 @@ def fetch_mb_release_group_info(mbid: str) -> tuple[dict, bool]:
         return cached, True  # True = cache hit
     
     # Use queue for rate-limited API call
+    # Note: for release-group, only inc=releases is valid; inc=media applies to release, not release-group (400 if used).
     def _fetch():
         try:
-            # Query release-group with all media details
             result = musicbrainzngs.get_release_group_by_id(
                 mbid,
-                includes=["releases", "media"]
+                includes=["releases"]
             )["release-group"]
             return result
         except musicbrainzngs.WebServiceError as e:
             error_msg = str(e)
             if "503" in error_msg or "rate" in error_msg.lower():
                 logging.warning("[MusicBrainz] Rate limited for MBID %s, will retry after delay", mbid)
-                time.sleep(1.5)  # Wait a bit longer than rate limit before retry
+                time.sleep(1.5)
                 try:
-                    result = musicbrainzngs.get_release_group_by_id(mbid, includes=["releases", "media"])["release-group"]
+                    result = musicbrainzngs.get_release_group_by_id(mbid, includes=["releases"])["release-group"]
                     return result
                 except musicbrainzngs.WebServiceError as e2:
                     raise RuntimeError(f"MusicBrainz lookup failed for {mbid} after retry: {e2}") from None
-            else:
-                raise RuntimeError(f"MusicBrainz lookup failed for {mbid}: {e}") from None
+            if "404" in error_msg:
+                # mbid may be a release ID; resolve to release-group and retry
+                resolved = resolve_mbid_to_release_group(mbid, "")
+                if resolved and resolved != mbid:
+                    result = musicbrainzngs.get_release_group_by_id(
+                        resolved, includes=["releases"]
+                    )["release-group"]
+                    return result
+            raise RuntimeError(f"MusicBrainz lookup failed for {mbid}: {e}") from None
     
     try:
         if MB_QUEUE_ENABLED and USE_MUSICBRAINZ:
@@ -3123,15 +4062,67 @@ def fetch_mb_release_group_info(mbid: str) -> tuple[dict, bool]:
     return info, False  # False = cache miss
 
 # ──────────────────────────────── MusicBrainz search fallback ────────────────────────────────
-def _search_mb_rg_candidates(artist: str, album_norm: str, strict: bool) -> List[dict]:
-    """Run MusicBrainz search_release_groups; return list of release-group dicts (no details)."""
+def _extract_track_titles_from_mb_release(release_response: dict) -> List[str]:
+    """Extract track titles from a MusicBrainz release response (get_release_by_id with includes=['recordings'])."""
+    titles: List[str] = []
+    try:
+        release = release_response.get("release") if isinstance(release_response.get("release"), dict) else release_response
+        for medium in release.get("medium-list", []):
+            for track in medium.get("track-list", []):
+                rec = track.get("recording") or {}
+                t = rec.get("title") if isinstance(rec, dict) else None
+                if t:
+                    titles.append(str(t))
+    except Exception:
+        pass
+    return titles
+
+
+def _mb_track_count_from_rg_info(info: dict) -> int:
+    """
+    Return total track count from release-group info (release-list / medium-list / track-count).
+    When the API returns no medium-list (track count 0) but we have release-list, fetch the first
+    release with includes=['recordings'] to get the real count (release-group lookup often omits media).
+    Tolerates both "release-list"/"medium-list" and "releases"/"media" key names (musicbrainzngs/API variants).
+    """
+    releases = info.get("release-list") or info.get("releases") or []
+    count = 0
+    for release in releases:
+        media = release.get("medium-list") or release.get("media") or []
+        for medium in media:
+            count += int(medium.get("track-count", 0) or 0)
+    if count > 0:
+        return count
+    if not releases:
+        return 0
+    first_id = releases[0].get("id")
+    if not first_id:
+        return 0
+    try:
+        rel_resp = musicbrainzngs.get_release_by_id(first_id, includes=["recordings"])
+        release = rel_resp.get("release") if isinstance(rel_resp.get("release"), dict) else rel_resp
+        n = 0
+        for medium in release.get("medium-list") or release.get("media") or []:
+            track_list = medium.get("track-list") or medium.get("tracks") or []
+            if track_list:
+                n += len(track_list)
+            else:
+                n += int(medium.get("track-count", 0) or 0)
+        return n
+    except Exception:
+        return 0
+
+
+def _search_mb_rg_candidates(artist: str, release_query: str, strict: bool) -> List[dict]:
+    """Run MusicBrainz search_release_groups; return list of release-group dicts (no details).
+    release_query can be normalized title or raw title (e.g. 'Isolette') for better API match."""
     result = musicbrainzngs.search_release_groups(
         artist=artist,
-        release=album_norm,
-        limit=5,
+        release=release_query,
+        limit=15,
         strict=strict
     )
-    logging.debug("[MusicBrainz Search] artist=%r release=%r strict=%s -> %d results", artist, album_norm, strict, len(result.get('release-group-list', [])))
+    logging.debug("[MusicBrainz Search] artist=%r release=%r strict=%s -> %d results", artist, release_query, strict, len(result.get('release-group-list', [])))
     return result.get('release-group-list', [])
 
 
@@ -3162,19 +4153,43 @@ def _browse_mb_rg_by_artist(artist: str, album_norm: str) -> List[dict]:
         return []
 
 
-def search_mb_release_group_by_metadata(artist: str, album_norm: str, tracks: set[str]) -> dict | None:
+def search_mb_release_group_by_metadata(
+    artist: str,
+    album_norm: str,
+    tracks: set[str],
+    title_raw: Optional[str] = None,
+    album_folder: Optional[Path] = None,
+) -> tuple[dict | None, bool]:
     """
     Fallback search on MusicBrainz by artist name, normalized album title, and optional track titles.
-    Tries: (1) search with strict=True, (2) search with strict=False, (3) browse by artist and match title.
+    Tries: (1) search with strict=True, (2) search with strict=False, (3) browse by artist and match title,
+    (4) if still no candidates and title_raw differs from album_norm, retry search/browse with title_raw (e.g. "Isolette").
     If multiple candidates and USE_AI_FOR_MB_MATCH, uses AI to pick best match.
-    Returns the release-group info dict or None if not found.
+    When USE_AI_VISION_FOR_COVER and album_folder are set, compares local cover to Cover Art Archive (vision).
+    When 0 candidates or AI returns NONE, can use Bandcamp + web search (Serper) + AI to suggest MBID.
+    Returns (release-group info dict or None, verified_by_ai: bool). verified_by_ai is True when match was chosen by USE_AI_FOR_MB_VERIFY.
     """
+    if album_folder is not None and not isinstance(album_folder, Path):
+        album_folder = Path(album_folder) if album_folder else None
     def _fetch_rg_details(rg_id: str):
-        """Fetch release group details by ID."""
-        info = musicbrainzngs.get_release_group_by_id(
-            rg_id, includes=['media']
-        )['release-group']
-        return info
+        """Fetch release group details by ID. On 404, try treating rg_id as a release ID and resolve to release-group."""
+        try:
+            info = musicbrainzngs.get_release_group_by_id(
+                rg_id, includes=["releases"]
+            )["release-group"]
+            return info
+        except musicbrainzngs.WebServiceError as e:
+            if "404" not in str(e):
+                raise
+            # API returned 404: rg_id may be a release ID (search/browse can occasionally return release refs)
+            # use_queue=False to avoid deadlock (we are already inside the MB queue worker)
+            resolved = resolve_mbid_to_release_group(rg_id, "musicbrainz_releaseid", use_queue=False)
+            if resolved and resolved != rg_id:
+                info = musicbrainzngs.get_release_group_by_id(
+                    resolved, includes=["releases"]
+                )["release-group"]
+                return info
+            raise
 
     seen_ids: set[str] = set()
     candidates: List[dict] = []
@@ -3186,25 +4201,94 @@ def search_mb_release_group_by_metadata(artist: str, album_norm: str, tracks: se
                 seen_ids.add(rg_id)
                 candidates.append(rg)
 
-    try:
-        # 1) Search with strict=True
+    def _run_search_and_browse(release_query: str) -> None:
         if MB_QUEUE_ENABLED and USE_MUSICBRAINZ:
-            _collect_candidates(get_mb_queue().submit(f"search_{artist}_{album_norm}_1", lambda: _search_mb_rg_candidates(artist, album_norm, True)))
+            _collect_candidates(get_mb_queue().submit(f"search_{artist}_{release_query}_1", lambda: _search_mb_rg_candidates(artist, release_query, True)))
+            _collect_candidates(get_mb_queue().submit(f"search_{artist}_{release_query}_0", lambda: _search_mb_rg_candidates(artist, release_query, False)))
         else:
-            _collect_candidates(_search_mb_rg_candidates(artist, album_norm, True))
-
-        # 2) Search with strict=False for more results
-        if MB_QUEUE_ENABLED and USE_MUSICBRAINZ:
-            _collect_candidates(get_mb_queue().submit(f"search_{artist}_{album_norm}_0", lambda: _search_mb_rg_candidates(artist, album_norm, False)))
-        else:
-            _collect_candidates(_search_mb_rg_candidates(artist, album_norm, False))
-
-        # 3) If no candidates, browse by artist
+            _collect_candidates(_search_mb_rg_candidates(artist, release_query, True))
+            _collect_candidates(_search_mb_rg_candidates(artist, release_query, False))
         if not candidates:
-            browse_list = _browse_mb_rg_by_artist(artist, album_norm)
+            browse_list = _browse_mb_rg_by_artist(artist, release_query)
             _collect_candidates(browse_list)
 
-        matching: List[tuple] = []
+    try:
+        # 1–3) Search (strict, non-strict) and browse by artist with normalized title
+        _run_search_and_browse(album_norm)
+
+        # 4) If still no candidates, try with raw title (e.g. "Isolette") — MusicBrainz may match exact casing
+        if not candidates and title_raw and (title_raw.strip() != album_norm):
+            raw_clean = title_raw.strip()
+            if raw_clean:
+                _run_search_and_browse(raw_clean)
+
+        all_fetched: List[tuple] = []
+
+        # IA-first: ask AI to pick one candidate from titles only, then fetch only that one (reduces MB requests)
+        if USE_AI_FOR_MB_VERIFY and getattr(sys.modules[__name__], "ai_provider_ready", False) and candidates:
+            letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+            choices = [f"{letters[i]}) {rg.get('title', '?')} (id={rg.get('id', '')})" for i, rg in enumerate(candidates[:20])]
+            track_list_str = ", ".join((list(tracks)[:30] if tracks else [])) if tracks else "(none)"
+            if tracks and len(tracks) > 30:
+                track_list_str += ", ..."
+            prompt = (
+                f"Our album: artist={artist!r}, title_raw={title_raw or album_norm!r}, normalized={album_norm!r}. "
+                f"Our track titles: [{track_list_str}].\n\n"
+                "MusicBrainz candidates (id + title only):\n" + "\n".join(choices) + "\n\n"
+                "Which candidate matches our album? Consider title variants (e.g. Volume I = volume i). "
+                "Reply with only the letter (A, B, ...) or the MBID (UUID) or NONE if no match."
+            )
+            system_msg = "You reply with a single letter (A, B, C, ...) or an MBID (UUID) or the word NONE. No explanation."
+            try:
+                provider = getattr(sys.modules[__name__], "AI_PROVIDER", "openai")
+                model = getattr(sys.modules[__name__], "RESOLVED_MODEL", None) or getattr(sys.modules[__name__], "OPENAI_MODEL", "gpt-4o-mini")
+                reply = call_ai_provider(provider, model, system_msg, prompt, max_tokens=30)
+                reply = (reply or "").strip().upper()
+                chosen_rg_id = None
+                if reply and reply != "NONE":
+                    letter = reply[:1]
+                    idx = letters.find(letter)
+                    if 0 <= idx < len(candidates):
+                        chosen_rg_id = candidates[idx].get("id")
+                    if not chosen_rg_id:
+                        mbid_match = re.search(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}", reply)
+                        if mbid_match:
+                            chosen_rg_id = mbid_match.group(0)
+                if chosen_rg_id:
+                    try:
+                        info = _fetch_rg_details(chosen_rg_id)
+                        mb_track_count = _mb_track_count_from_rg_info(info)
+                        # Sanity check: reject if local track count differs too much from MB
+                        local_count = len(tracks) if tracks else 0
+                        if abs(local_count - mb_track_count) > 2:
+                            logging.debug("[MusicBrainz] AI-first chosen %s rejected: track count mismatch (local=%d, mb=%d)", chosen_rg_id, local_count, mb_track_count)
+                            # Fall through to full flow; if still no match, scan will try Discogs/Last.fm/Bandcamp for this album
+                        else:
+                            formats = set()
+                            for release in info.get("release-list", []):
+                                for medium in release.get("medium-list", []):
+                                    fmt = medium.get("format")
+                                    qty = medium.get("track-count", 1)
+                                    if fmt:
+                                        formats.add(f"{qty}×{fmt}")
+                            rg_id_final = info.get("id", chosen_rg_id)
+                            result_dict = {
+                                "primary_type": info.get("primary-type", ""),
+                                "secondary_types": info.get("secondary-types", []),
+                                "format_summary": ", ".join(sorted(formats)),
+                                "id": rg_id_final,
+                                "track_count": mb_track_count,
+                                "cover_url": f"https://coverartarchive.org/release-group/{rg_id_final}/front",
+                            }
+                            set_cached_mb_info(rg_id_final, result_dict)
+                            logging.info("[MusicBrainz] Match chosen by AI (title-only) for artist=%r album=%r: %s", artist, album_norm, rg_id_final)
+                            return (result_dict, True)
+                    except musicbrainzngs.WebServiceError as e:
+                        logging.debug("[MusicBrainz] AI-first fetch failed for %s: %s", chosen_rg_id, e)
+            except Exception as e:
+                logging.debug("[MusicBrainz] AI-first path failed: %s", e)
+            # Fall through to full flow (fetch all candidates, then ai_verify_mb_match)
+
         for rg in candidates:
             try:
                 rg_id = rg['id']
@@ -3212,34 +4296,239 @@ def search_mb_release_group_by_metadata(artist: str, album_norm: str, tracks: se
                     info = get_mb_queue().submit(f"rg_{rg_id}", lambda rid=rg_id: _fetch_rg_details(rid))
                 else:
                     info = _fetch_rg_details(rg_id)
-                mb_track_count = sum(
-                    medium.get('track-count', 0)
-                    for release in rg.get('release-list', [])
-                    for medium in release.get('medium-list', [])
-                )
-                if not tracks or abs(len(tracks) - mb_track_count) <= 1:
-                    formats = set()
-                    for release in rg.get('release-list', []):
-                        for medium in release.get('medium-list', []):
-                            fmt = medium.get('format')
-                            qty = medium.get('track-count', 1)
-                            if fmt:
-                                formats.add(f"{qty}×{fmt}")
-                    result_dict = {
-                        'primary_type': info.get('primary-type', ''),
-                        'secondary_types': info.get('secondary-types', []),
-                        'format_summary': ', '.join(sorted(formats)),
-                        'id': rg['id']
-                    }
-                    matching.append((rg, result_dict))
+                mb_track_count = _mb_track_count_from_rg_info(info)
+                formats = set()
+                for release in info.get('release-list', []):
+                    for medium in release.get('medium-list', []):
+                        fmt = medium.get('format')
+                        qty = medium.get('track-count', 1)
+                        if fmt:
+                            formats.add(f"{qty}×{fmt}")
+                rg_id_final = info.get('id', rg['id'])
+                result_dict = {
+                    'primary_type': info.get('primary-type', ''),
+                    'secondary_types': info.get('secondary-types', []),
+                    'format_summary': ', '.join(sorted(formats)),
+                    'id': rg_id_final,
+                    'track_count': mb_track_count,
+                    # Phase 4: Cover Art Archive URL for optional vision comparison
+                    'cover_url': f"https://coverartarchive.org/release-group/{rg_id_final}/front",
+                }
+                # Phase 2: optionally fetch track titles from one release for AI verify prompt
+                if USE_AI_FOR_MB_VERIFY and info.get('release-list'):
+                    first_release_id = info['release-list'][0].get('id')
+                    if first_release_id:
+                        try:
+                            def _fetch_release_recordings(rel_id: str):
+                                return musicbrainzngs.get_release_by_id(rel_id, includes=["recordings"])
+                            if MB_QUEUE_ENABLED and USE_MUSICBRAINZ:
+                                rel_resp = get_mb_queue().submit(f"rel_rec_{first_release_id}", lambda rid=first_release_id: _fetch_release_recordings(rid))
+                            else:
+                                rel_resp = _fetch_release_recordings(first_release_id)
+                            result_dict['track_titles'] = _extract_track_titles_from_mb_release(rel_resp)
+                        except musicbrainzngs.WebServiceError:
+                            pass
+                all_fetched.append((rg, result_dict))
             except musicbrainzngs.WebServiceError:
                 continue
 
+        # Partie 2+3: When no MusicBrainz candidates, try Bandcamp + web search + AI to suggest MBID
+        if not all_fetched and getattr(sys.modules[__name__], "ai_provider_ready", False):
+            title_for_zero = (title_raw or album_norm or "").strip()
+            bandcamp_text = ""
+            if USE_BANDCAMP and title_for_zero:
+                try:
+                    bc = _fetch_bandcamp_album_info(artist, title_for_zero)
+                    if bc:
+                        bandcamp_text = f"Bandcamp: title={bc.get('title')}, artist={bc.get('artist_name')}"
+                except Exception:
+                    pass
+            web_snippets = ""
+            if USE_WEB_SEARCH_FOR_MB and SERPER_API_KEY.strip() and title_for_zero:
+                q = f"{artist} {title_for_zero} album"
+                web_results = _web_search_serper(q, num=10)
+                if web_results:
+                    parts = [f"Web {i+1}) {r.get('title')} — {r.get('snippet')} ({r.get('link')})" for i, r in enumerate(web_results[:10])]
+                    web_snippets = "\n".join(parts)
+            if bandcamp_text or web_snippets:
+                prompt = f"Our album: artist={artist}, title={title_for_zero}. No MusicBrainz candidates.\n"
+                if bandcamp_text:
+                    prompt += bandcamp_text + "\n"
+                if web_snippets:
+                    prompt += "Web results:\n" + web_snippets + "\n"
+                prompt += "Suggest a MusicBrainz release group ID (MBID, UUID format) if you can identify it from the above, or reply exactly NONE."
+                try:
+                    provider = getattr(sys.modules[__name__], "AI_PROVIDER", "openai")
+                    model = getattr(sys.modules[__name__], "RESOLVED_MODEL", None) or getattr(sys.modules[__name__], "OPENAI_MODEL", "gpt-4o-mini")
+                    reply = call_ai_provider(provider, model, "You reply with a single MBID (UUID) or the word NONE.", prompt, max_tokens=60)
+                    reply = (reply or "").strip().upper()
+                    if reply and reply != "NONE":
+                        mbid_match = re.search(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}", reply)
+                        if mbid_match:
+                            suggested_mbid = mbid_match.group(0)
+                            try:
+                                info = _fetch_rg_details(suggested_mbid)
+                                mb_track_count = _mb_track_count_from_rg_info(info)
+                                formats = set()
+                                for release in info.get("release-list", []):
+                                    for medium in release.get("medium-list", []):
+                                        fmt = medium.get("format")
+                                        qty = medium.get("track-count", 1)
+                                        if fmt:
+                                            formats.add(f"{qty}×{fmt}")
+                                rg_id_final = info.get("id", suggested_mbid)
+                                result_dict = {
+                                    "primary_type": info.get("primary-type", ""),
+                                    "secondary_types": info.get("secondary-types", []),
+                                    "format_summary": ", ".join(sorted(formats)),
+                                    "id": rg_id_final,
+                                    "track_count": mb_track_count,
+                                    "cover_url": f"https://coverartarchive.org/release-group/{rg_id_final}/front",
+                                }
+                                set_cached_mb_info(rg_id_final, result_dict)
+                                logging.info("[MusicBrainz] MBID suggested by AI from Bandcamp/web for artist=%r album=%r: %s", artist, album_norm, rg_id_final)
+                                return (result_dict, True)
+                            except musicbrainzngs.WebServiceError:
+                                logging.debug("[MusicBrainz] AI-suggested MBID %s invalid or 404", suggested_mbid)
+                except Exception as e:
+                    logging.debug("[MusicBrainz] Bandcamp/web AI suggestion failed: %s", e)
+            return (None, False)
+
+        matching: List[tuple] = [
+            x for x in all_fetched
+            if not tracks or abs(len(tracks) - x[1].get('track_count', 0)) <= 1
+        ]
+
+        if USE_AI_FOR_MB_VERIFY and all_fetched:
+            # Phase 3: optional Discogs/Last.fm/Bandcamp for AI disambiguation
+            extra_sources: List[dict] = []
+            title_for_fetch = (title_raw or album_norm or "").strip()
+            if title_for_fetch:
+                try:
+                    discogs_info = _fetch_discogs_release(artist, title_for_fetch)
+                    if discogs_info:
+                        extra_sources.append({"source": "Discogs", "title": discogs_info.get("title"), "artist_name": discogs_info.get("artist_name")})
+                except Exception:
+                    pass
+                try:
+                    lastfm_info = _fetch_lastfm_album_info(artist, title_for_fetch)
+                    if lastfm_info:
+                        extra_sources.append({"source": "Last.fm", "title": lastfm_info.get("title"), "artist": lastfm_info.get("artist")})
+                except Exception:
+                    pass
+                try:
+                    bandcamp_info = _fetch_bandcamp_album_info(artist, title_for_fetch)
+                    if bandcamp_info:
+                        extra_sources.append({"source": "Bandcamp", "title": bandcamp_info.get("title"), "artist_name": bandcamp_info.get("artist_name")})
+                except Exception:
+                    pass
+            chosen = ai_verify_mb_match(
+                artist, title_raw, album_norm,
+                list(tracks) if tracks else None,
+                len(tracks) if tracks else 0,
+                all_fetched,
+                has_cover=False,
+                extra_sources=extra_sources or None,
+            )
+            if chosen:
+                # Partie 1: Optional vision check (local cover vs Cover Art Archive)
+                use_vision = getattr(sys.modules[__name__], "USE_AI_VISION_FOR_COVER", False) and album_folder
+                if use_vision:
+                    cover_path = _first_cover_path(Path(album_folder) if not isinstance(album_folder, Path) else album_folder)
+                    local_data_uri = _encode_local_cover_to_data_uri(cover_path) if cover_path else None
+                    mb_cover_url = chosen[1].get("cover_url")
+                    if local_data_uri and mb_cover_url:
+                        try:
+                            vision_model = getattr(sys.modules[__name__], "OPENAI_VISION_MODEL", "") or getattr(sys.modules[__name__], "RESOLVED_MODEL", "gpt-4o-mini")
+                            sys_msg = "You reply with exactly Yes or No."
+                            user_msg = "Image 1 is the local album cover. Image 2 is the MusicBrainz Cover Art Archive cover. Do they represent the same album? Reply only: Yes or No."
+                            resp = call_ai_provider_vision(
+                                getattr(sys.modules[__name__], "AI_PROVIDER", "openai"),
+                                vision_model,
+                                sys_msg,
+                                user_msg,
+                                image_urls=[mb_cover_url],
+                                image_base64=[{"type": "image_url", "image_url": {"url": local_data_uri}}],
+                                max_tokens=10,
+                            )
+                            if resp and "NO" in (resp.strip().upper()):
+                                chosen = None
+                                logging.info("[MusicBrainz Vision] Cover mismatch: rejecting AI-chosen match for artist=%r album=%r", artist, album_norm)
+                        except Exception as e:
+                            logging.debug("[MusicBrainz Vision] Vision check failed: %s", e)
+                if chosen:
+                    set_cached_mb_info(chosen[1]['id'], chosen[1])
+                    logging.info("[MusicBrainz Verify] Match verified by AI for artist=%r album=%r", artist, album_norm)
+                    return (chosen[1], True)
+            # Partie 2 Cas 2: AI said NONE but we have candidates; try web search + one more AI call
+            if chosen is None and all_fetched and USE_WEB_SEARCH_FOR_MB and SERPER_API_KEY.strip():
+                title_for_web = (title_raw or album_norm or "").strip()
+                if title_for_web:
+                    q = f"{artist} {title_for_web} album"
+                    web_results = _web_search_serper(q, num=10)
+                    if web_results:
+                        web_snippets = "\n".join([f"Web {i+1}) {r.get('title')} — {r.get('snippet')} ({r.get('link')})" for i, r in enumerate(web_results[:10])])
+                        letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                        choices = [f"{letters[i]}: {all_fetched[i][0].get('title', '?')} (MBID: {all_fetched[i][1].get('id')})" for i in range(min(len(all_fetched), 10))]
+                        prompt = f"Artist: {artist}. Album: {title_for_web}. We had MusicBrainz candidates but none matched. Web results:\n{web_snippets}\n\nCandidates: " + " | ".join(choices)
+                        prompt += "\nReply with the letter (A/B/...) of the correct candidate, or an MBID (UUID) if you find one in web results, or NONE."
+                        try:
+                            provider = getattr(sys.modules[__name__], "AI_PROVIDER", "openai")
+                            model = getattr(sys.modules[__name__], "RESOLVED_MODEL", None) or getattr(sys.modules[__name__], "OPENAI_MODEL", "gpt-4o-mini")
+                            reply = call_ai_provider(provider, model, "You reply with a single letter, or an MBID (UUID), or NONE.", prompt, max_tokens=60)
+                            reply = (reply or "").strip().upper()
+                            if reply and reply != "NONE":
+                                letter = reply[:1]
+                                idx = letters.find(letter)
+                                if 0 <= idx < len(all_fetched):
+                                    set_cached_mb_info(all_fetched[idx][1]['id'], all_fetched[idx][1])
+                                    logging.info("[MusicBrainz Verify] Web+AI chose candidate %s for artist=%r album=%r", letter, artist, album_norm)
+                                    return (all_fetched[idx][1], True)
+                                mbid_match = re.search(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}", reply)
+                                if mbid_match:
+                                    suggested_mbid = mbid_match.group(0)
+                                    try:
+                                        info = _fetch_rg_details(suggested_mbid)
+                                        mb_track_count = _mb_track_count_from_rg_info(info)
+                                        formats = set()
+                                        for release in info.get("release-list", []):
+                                            for medium in release.get("medium-list", []):
+                                                fmt, qty = medium.get("format"), medium.get("track-count", 1)
+                                                if fmt:
+                                                    formats.add(f"{qty}×{fmt}")
+                                        rg_id_final = info.get("id", suggested_mbid)
+                                        result_dict = {"primary_type": info.get("primary-type", ""), "secondary_types": info.get("secondary-types", []), "format_summary": ", ".join(sorted(formats)), "id": rg_id_final, "track_count": mb_track_count, "cover_url": f"https://coverartarchive.org/release-group/{rg_id_final}/front"}
+                                        set_cached_mb_info(rg_id_final, result_dict)
+                                        logging.info("[MusicBrainz] Web+AI suggested MBID %s for artist=%r album=%r", rg_id_final, artist, album_norm)
+                                        return (result_dict, True)
+                                    except musicbrainzngs.WebServiceError:
+                                        pass
+                        except Exception as e:
+                            logging.debug("[MusicBrainz] Web+AI second call failed: %s", e)
+            if not matching:
+                if candidates:
+                    detail = ", ".join(f"{rg.get('title', '?')} ({rg.get('id', '')})" for rg in candidates[:10])
+                    if len(candidates) > 10:
+                        detail += f" ... and {len(candidates) - 10} more"
+                    logging.debug(
+                        "[MusicBrainz Search] artist=%r release=%r: AI said NONE or failed, no track-count match: %s",
+                        artist, album_norm, detail,
+                    )
+                return (None, False)
+
         if not matching:
-            return None
+            if candidates:
+                detail = ", ".join(f"{rg.get('title', '?')} ({rg.get('id', '')})" for rg in candidates[:10])
+                if len(candidates) > 10:
+                    detail += f" ... and {len(candidates) - 10} more"
+                logging.debug(
+                    "[MusicBrainz Search] artist=%r release=%r: %d candidate(s) but none matched (track count or fetch failed): %s",
+                    artist, album_norm, len(candidates), detail,
+                )
+            return (None, False)
         if len(matching) == 1:
             set_cached_mb_info(matching[0][1]['id'], matching[0][1])
-            return matching[0][1]
+            return (matching[0][1], False)
 
         if len(matching) >= 2 and USE_AI_FOR_MB_MATCH:
             letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -3251,94 +4540,15 @@ def search_mb_release_group_by_metadata(artist: str, album_norm: str, tracks: se
                 idx = letters.find(letter)
                 if 0 <= idx < len(matching):
                     set_cached_mb_info(matching[idx][1]['id'], matching[idx][1])
-                    return matching[idx][1]
+                    return (matching[idx][1], False)
             except Exception as e:
                 logging.debug("[MusicBrainz Search] AI pick failed: %s", e)
 
         set_cached_mb_info(matching[0][1]['id'], matching[0][1])
-        return matching[0][1]
+        return (matching[0][1], False)
     except Exception as e:
         logging.debug("[MusicBrainz Search Groups] failed for '%s' / '%s': %s", artist, album_norm, e)
-    return None
-
-def call_ai_provider(provider: str, model: str, system_msg: str, user_msg: str, max_tokens: int = 256) -> str:
-    """
-    Call the appropriate AI provider with the given messages.
-    Returns the text response from the AI.
-    """
-    provider_lower = provider.lower()
-    
-    if provider_lower == "openai":
-        if not openai_client:
-            raise ValueError("OpenAI client not initialized")
-        _kwargs = {
-            "model": model,
-            "messages": [
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": user_msg},
-            ],
-            "stop": ["\n"],
-        }
-        # Try max_completion_tokens first, fallback to max_tokens
-        try:
-            _kwargs["max_completion_tokens"] = max_tokens
-            resp = openai_client.chat.completions.create(**_kwargs)
-        except Exception:
-            _kwargs.pop("max_completion_tokens", None)
-            _kwargs["max_tokens"] = max_tokens
-            resp = openai_client.chat.completions.create(**_kwargs)
-        return resp.choices[0].message.content.strip()
-    
-    elif provider_lower == "anthropic":
-        if not anthropic_client:
-            raise ValueError("Anthropic client not initialized")
-        resp = anthropic_client.messages.create(
-            model=model,
-            max_tokens=max_tokens,
-            system=system_msg,
-            messages=[{"role": "user", "content": user_msg}],
-        )
-        return resp.content[0].text.strip()
-    
-    elif provider_lower == "google":
-        if not google_client_configured:
-            raise ValueError("Google client not configured")
-        # Google uses a different API structure
-        model_instance = genai.GenerativeModel(model)
-        prompt = f"{system_msg}\n\n{user_msg}"
-        response = model_instance.generate_content(
-            prompt,
-            generation_config=genai.types.GenerationConfig(
-                max_output_tokens=max_tokens,
-                stop_sequences=["\n"],
-            ),
-        )
-        return response.text.strip()
-    
-    elif provider_lower == "ollama":
-        if not ollama_url:
-            raise ValueError("Ollama URL not configured")
-        # Ollama uses REST API
-        payload = {
-            "model": model,
-            "messages": [
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": user_msg},
-            ],
-            "options": {
-                "num_predict": max_tokens,
-                "stop": ["\n"],
-            },
-            "stream": False,
-        }
-        response = requests.post(f"{ollama_url}/api/chat", json=payload, timeout=60)
-        if response.status_code != 200:
-            raise Exception(f"Ollama API error: {response.status_code} - {response.text}")
-        result = response.json()
-        return result.get("message", {}).get("content", "").strip()
-    
-    else:
-        raise ValueError(f"Unknown AI provider: {provider}")
+    return (None, False)
 
 
 def process_ai_groups_batch(ai_groups: List[dict], max_workers: int = None) -> List[dict]:
@@ -3378,41 +4588,41 @@ def process_ai_groups_batch(ai_groups: List[dict], max_workers: int = None) -> L
             }
         except Exception as e:
             logging.error(f"[AI Batch] Error processing group for {artist}: {e}", exc_info=True)
-            # Fallback to heuristic on error (force heuristic by disabling AI temporarily)
-            logging.warning(f"[AI Batch] AI failed for {artist}, falling back to heuristic")
-            # Use heuristic selection directly
-            from operator import itemgetter
-            # Simple heuristic: prefer higher format score, then bit depth, then track count
-            best_heuristic = max(editions, key=lambda e: (
-                e.get('fmt_score', 0),
-                e.get('bd', 0),
-                len(e.get('tracks', [])),
-                e.get('br', 0)
-            ))
-            losers = [e for e in editions if e['album_id'] != best_heuristic['album_id']]
-            best_heuristic["used_ai"] = False
-            best_heuristic["rationale"] = "Heuristic fallback (AI failed)"
-            best_heuristic["merge_list"] = []
-            return {
-                "artist": artist,
-                "album_id": best_heuristic["album_id"],
-                "best": best_heuristic,
-                "losers": losers,
-                "fuzzy": fuzzy,
-                "needs_ai": False,
-            }
+            group_label = f"{artist} – {editions[0].get('title_raw', editions[0].get('album_norm', ''))}" if editions else artist
+            with lock:
+                state.setdefault("scan_ai_errors", []).append({"message": str(e), "group": group_label})
+                if len(state["scan_ai_errors"]) > 100:
+                    state["scan_ai_errors"] = state["scan_ai_errors"][-80:]
+            # No heuristic fallback: AI-only. Skip this group so it does not appear as "Heuristic".
+            return None
+
+    def group_label(g):
+        if not g.get("editions"):
+            return g.get("artist", "")
+        return f"{g['artist']} – {g['editions'][0].get('title_raw', g['editions'][0].get('album_norm', ''))}"
     
     results = []
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(process_group, group): group for group in ai_groups}
-        for future in as_completed(futures):
-            try:
-                result = future.result()
-                if result:
-                    results.append(result)
-            except Exception as e:
+        try:
+            for future in as_completed(futures, timeout=900):
                 group = futures[future]
-                logging.error(f"[AI Batch] Failed to process group for {group['artist']}: {e}", exc_info=True)
+                label = group_label(group)
+                try:
+                    result = future.result(timeout=60)
+                    if result:
+                        results.append(result)
+                except Exception as e:
+                    logging.error(f"[AI Batch] Failed to process group for {group['artist']}: {e}", exc_info=True)
+                    with lock:
+                        state.setdefault("scan_ai_errors", []).append({"message": str(e), "group": label})
+                        if len(state["scan_ai_errors"]) > 100:
+                            state["scan_ai_errors"] = state["scan_ai_errors"][-80:]
+                with lock:
+                    state["scan_ai_batch_processed"] = state.get("scan_ai_batch_processed", 0) + 1
+                    state["scan_ai_current_label"] = label
+        except TimeoutError:
+            logging.warning("[AI Batch] Timeout waiting for all groups; saving partial results.")
     
     return results
 
@@ -3481,9 +4691,12 @@ def choose_best(editions: List[dict], defer_ai: bool = False) -> dict | None:
         template = AI_PROMPT_FILE.read_text(encoding="utf-8")
         user_msg = template + "\nCandidate editions:\n"
         for idx, e in enumerate(editions):
+            track_count = len(e.get("tracks", []))
+            folder_path = path_for_fs_access(Path(e["folder"])) if e.get("folder") else None
+            size_mb = (safe_folder_size(folder_path) // (1024 * 1024)) if folder_path else 0
             user_msg += (
                 f"{idx}: fmt_score={e['fmt_score']}, bitdepth={e['bd']}, "
-                f"tracks={len(e['tracks'])}, files={e['file_count']}, "
+                f"tracks={track_count}, track_count={track_count}, size_mb={size_mb}, files={e['file_count']}, "
                 f"bitrate={e['br']}, samplerate={e['sr']}, duration={e['dur']}"
             )
             # Add year and mbid tags from meta
@@ -3492,13 +4705,34 @@ def choose_best(editions: List[dict], defer_ai: bool = False) -> dict | None:
             user_msg += f" year={year} mbid={mbid}\n"
 
         # --- Append MusicBrainz release-group info to AI prompt ---
-        first_mbid = editions[0].get("meta", {}).get("musicbrainz_albumid")
-        if first_mbid:
-            try:
-                rg_info, _ = fetch_mb_release_group_info(first_mbid)
-                user_msg += f"Release group info: primary_type={rg_info['primary_type']}, formats={rg_info['format_summary']}\n"
-            except Exception as e:
-                logging.debug("MusicBrainz lookup failed for %s: %s", first_mbid, e)
+        rg_info = None
+        for e in editions:
+            if e.get("rg_info"):
+                rg_info = e["rg_info"]
+                break
+        if not rg_info:
+            first = editions[0]
+            rgid = first.get("musicbrainz_id")
+            meta = first.get("meta", {})
+            if not rgid:
+                rgid = meta.get("musicbrainz_releasegroupid")
+            if rgid:
+                try:
+                    rg_info, _ = fetch_mb_release_group_info(rgid)
+                except Exception as e:
+                    logging.debug("MusicBrainz lookup failed for rgid %s: %s", rgid, e)
+            if not rgid:
+                release_mbid = meta.get("musicbrainz_albumid") or meta.get("musicbrainz_releaseid")
+                tag_src = "musicbrainz_albumid" if meta.get("musicbrainz_albumid") else "musicbrainz_releaseid"
+                if release_mbid:
+                    rgid = resolve_mbid_to_release_group(release_mbid, tag_src)
+                    if rgid:
+                        try:
+                            rg_info, _ = fetch_mb_release_group_info(rgid)
+                        except Exception as e:
+                            logging.debug("MusicBrainz lookup failed for resolved rgid %s: %s", rgid, e)
+        if rg_info:
+            user_msg += f"Release group info: primary_type={rg_info.get('primary_type', '')}, formats={rg_info.get('format_summary', '')}\n"
 
         system_msg = (
             "You are an expert digital-music librarian.\n"
@@ -3514,8 +4748,9 @@ def choose_best(editions: List[dict], defer_ai: bool = False) -> dict | None:
         )
         
         # Determine model to use based on provider
-        # OPENAI_MODEL stores the selected model name regardless of provider
-        model_to_use = OPENAI_MODEL
+        # Use RESOLVED_MODEL for OpenAI (the one that passed functional probe); fallback to OPENAI_MODEL only if unset
+        mod = sys.modules[__name__]
+        model_to_use = getattr(mod, "RESOLVED_MODEL", None) or OPENAI_MODEL
         if not model_to_use:
             # Set defaults if no model selected
             if AI_PROVIDER.lower() == "anthropic":
@@ -3574,55 +4809,33 @@ def choose_best(editions: List[dict], defer_ai: bool = False) -> dict | None:
                 "ai_model":   (model_display or ""),
             })
         except Exception as e:
-            logging.warning("AI failed (%s); falling back to heuristic selection", e)
-            used_ai = False
+            logging.warning("AI failed (%s); no heuristic fallback (AI required). Skipping group.", e)
+            group_label = f"{artist} – {editions[0].get('title_raw', editions[0].get('album_norm', ''))}" if editions else (artist or "")
+            with lock:
+                state.setdefault("scan_ai_errors", []).append({"message": str(e), "group": group_label})
+                if len(state["scan_ai_errors"]) > 100:
+                    state["scan_ai_errors"] = state["scan_ai_errors"][-80:]
+            return None
 
-    # 3) Heuristic selection (or fallback when AI is disabled / failed)
+    # 3) AI is required; no heuristic path. If we reach here without used_ai, AI was not configured.
     if not used_ai:
         logging.info(
-            "[choose_best] Using heuristic (ai_provider_ready=%s, artist=%s, %d editions)",
-            ai_provider_ready, artist, len(editions),
+            "[choose_best] AI required but not ready (artist=%s, %d editions); skipping group.",
+            artist, len(editions),
         )
-        best = max(
-            editions,
-            key=lambda e: (
-                e["fmt_score"],
-                e["bd"],
-                len(e["tracks"]),
-                e["file_count"],
-                e["br"],
-            ),
-        )
-        best["used_ai"] = False
-
-        # brief-rationale
-        others = [e for e in editions if e is not best]
-        reasons = []
-        if any(best["fmt_score"] > o["fmt_score"] for o in others):
-            reasons.append("lossless format preferred")
-        if any(best["bd"] > o["bd"] for o in others):
-            reasons.append(f"bit-depth {best['bd']} bit higher")
-        if any(len(best["tracks"]) > len(o["tracks"]) for o in others):
-            reasons.append(f"{len(best['tracks'])} tracks (most)")
-        if any(best["file_count"] > o["file_count"] for o in others):
-            reasons.append("more audio files")
-        if any(best["br"] > o["br"] for o in others):
-            reasons.append(f"bitrate {best['br']//1000} kbps higher")
-        best["rationale"] = "; ".join(reasons)
-
-        # detect bonus tracks
-        all_titles = best["titles"]
-        extras = sorted({t for o in others for t in o["titles"] if t not in all_titles})
-        best["merge_list"] = extras
+        return None
 
     # 4) Persist choice to DB (INSERT OR IGNORE so we never overwrite an existing cache)
+    best_folder_path = path_for_fs_access(Path(best["folder"])) if best.get("folder") else None
+    best_size_mb = (safe_folder_size(best_folder_path) // (1024 * 1024)) if best_folder_path else 0
+    best_track_count = len(best.get("tracks", []))
     con = sqlite3.connect(str(STATE_DB_FILE))
     cur = con.cursor()
     cur.execute("""
         INSERT OR IGNORE INTO duplicates_best
           (artist, album_id, title_raw, album_norm, folder, fmt_text,
-           br, sr, bd, dur, discs, rationale, merge_list, ai_used, meta_json, ai_provider, ai_model)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           br, sr, bd, dur, discs, rationale, merge_list, ai_used, meta_json, ai_provider, ai_model, size_mb, track_count, match_verified_by_ai)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         best["artist"],
         best["album_id"],
@@ -3641,6 +4854,9 @@ def choose_best(editions: List[dict], defer_ai: bool = False) -> dict | None:
         json.dumps(best.get("meta", {})),
         best.get("ai_provider", ""),
         best.get("ai_model", ""),
+        best_size_mb,
+        best_track_count,
+        1 if best.get("match_verified_by_ai") else 0,
     ))
     con.commit()
     # Persist loser editions so details modal can show all versions after restart
@@ -3877,7 +5093,8 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> tuple[List[di
 
             plex_title = album_title(db_conn, aid)
             title_raw, title_source = derive_album_title(plex_title, meta_tags, folder, aid)
-            album_norm_value = norm_album(title_raw)
+            normalize_parenthetical = bool(_parse_bool(_get_config_from_db("NORMALIZE_PARENTHETICAL_FOR_DEDUPE") or "true"))
+            album_norm_value = norm_album_for_dedup(title_raw, normalize_parenthetical)
             
             # Update: album title + FFprobe result (low-level summary for UI)
             with lock:
@@ -3894,9 +5111,10 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> tuple[List[di
                         + (" (from cache)" if audio_cache_hit else "")
                     )
                     state["scan_format_done_count"] = state.get("scan_format_done_count", 0) + 1
+                    state["scan_step_progress"] = state.get("scan_step_progress", 0) + 1
 
             # Plex-normalized title: same key as get_duplicate_groups_from_library so scan groups match library
-            plex_norm_value = norm_album(plex_title or "") if plex_title else album_norm_value
+            plex_norm_value = norm_album_for_dedup(plex_title or "", normalize_parenthetical) if plex_title else album_norm_value
             editions.append({
                 'album_id':  aid,
                 'title_raw': title_raw,
@@ -3969,109 +5187,222 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> tuple[List[di
             rg_info = None
             mbid_found = None
             mbid_type = None
-            for tag in id_tags:
-                mbid = meta.get(tag)
-                if not mbid:
-                    continue
-                try:
-                    mb_cache_hit = False
-                    if tag == 'musicbrainz_releasegroupid':
-                        # direct lookup of release-group
-                        rg_info, mb_cache_hit = fetch_mb_release_group_info(mbid)
-                        mbid_found = mbid
-                        mbid_type = 'release-group'
-                    else:
-                        # lookup release to derive its release-group ID
-                        def _fetch_release():
-                            return musicbrainzngs.get_release_by_id(mbid, includes=['release-group'])['release']
-                        
-                        if MB_QUEUE_ENABLED and USE_MUSICBRAINZ:
-                            rel = get_mb_queue().submit(f"rel_{mbid}", _fetch_release)
-                        else:
-                            rel = _fetch_release()
-                        rgid = rel['release-group']['id']
-                        rg_info, mb_cache_hit = fetch_mb_release_group_info(rgid)
-                        mbid_found = rgid  # Store the release-group ID (more useful for comparison)
-                        mbid_type = 'release-group'
-                    e['mb_cache_hit'] = mb_cache_hit  # Track MB cache hit for this edition
-                    
-                    # Update: MusicBrainz ID found
-                    with lock:
-                        if artist in state.get("scan_active_artists", {}) and e['album_id'] == state["scan_active_artists"][artist].get("current_album", {}).get("album_id"):
-                            cache_text = " (cached)" if mb_cache_hit else ""
-                            state["scan_active_artists"][artist]["current_album"]["status"] = "searching_mb"
-                            state["scan_active_artists"][artist]["current_album"]["status_details"] = f"MusicBrainz ID fetched{cache_text}"
-                            rg_title = (rg_info.get("title") or "") if isinstance(rg_info, dict) else ""
-                            state["scan_active_artists"][artist]["current_album"]["step_summary"] = (
-                                f"MusicBrainz: release group \"{rg_title}\" (id: {mbid_found}){cache_text}"
-                            )
-                            state["scan_active_artists"][artist]["current_album"]["step_response"] = (
-                                f"MusicBrainz: from tags ({tag}). Release group \"{rg_title}\" (id: {mbid_found}){cache_text}"
-                            )
-                    
-                    logging.debug("[Artist %s] Edition %s RG info (via %s %s): %s", artist, e['album_id'], tag, mbid, rg_info)
-                    break
-                except Exception as exc:
-                    logging.debug("[Artist %s] MusicBrainz lookup failed for %s (%s): %s", artist, tag, mbid, exc)
-            if rg_info:
-                e['rg_info_source'] = tag
-                e['rg_info'] = rg_info
-                if mbid_found:
-                    e['musicbrainz_id'] = mbid_found
-                    e['musicbrainz_type'] = mbid_type
-            # fallback: search by metadata if no ID tag yielded results
-            album_norm = e['album_norm']
-            tracks = {t.title for t in e['tracks']}
-            if not rg_info:
-                # Update: searching MusicBrainz
+            tag_used = None
+
+            # Already identified: album has release-group ID in tags — use cache only, no API
+            existing_rgid = meta.get('musicbrainz_releasegroupid')
+            if existing_rgid:
+                rg_info = get_cached_mb_info(existing_rgid)
+                mb_cache_hit = rg_info is not None
+                mbid_found = existing_rgid
+                mbid_type = 'release-group'
+                tag_used = 'musicbrainz_releasegroupid'
+                e['mb_cache_hit'] = mb_cache_hit
+                e['rg_info_source'] = tag_used
+                if rg_info:
+                    e['rg_info'] = rg_info
+                e['musicbrainz_id'] = mbid_found
+                e['musicbrainz_type'] = mbid_type
                 with lock:
                     if artist in state.get("scan_active_artists", {}) and e['album_id'] == state["scan_active_artists"][artist].get("current_album", {}).get("album_id"):
+                        cache_text = " (cached)" if mb_cache_hit else " (from tags, no API)"
                         state["scan_active_artists"][artist]["current_album"]["status"] = "searching_mb"
-                        state["scan_active_artists"][artist]["current_album"]["status_details"] = "searching MusicBrainz"
-                        state["scan_active_artists"][artist]["current_album"]["step_summary"] = "Searching by artist + album name…"
-                        state["scan_active_artists"][artist]["current_album"]["step_response"] = "MusicBrainz: querying by artist + album name…"
-                
-                rg_info = search_mb_release_group_by_metadata(artist, album_norm, tracks)
-                if rg_info:
-                    e['rg_info_source'] = 'fallback'
-                    e['rg_info'] = rg_info
-                    # Extract MBID from rg_info if available (it should have 'id' field)
-                    if isinstance(rg_info, dict) and 'id' in rg_info:
-                        e['musicbrainz_id'] = rg_info['id']
-                        e['musicbrainz_type'] = 'release-group'
-                        # Check if this MBID was in cache
-                        mbid = rg_info['id']
-                        cached_mb = get_cached_mb_info(mbid)
-                        e['mb_cache_hit'] = cached_mb is not None
-                        
-                        # Update: MusicBrainz found via search
+                        state["scan_active_artists"][artist]["current_album"]["status_details"] = f"MusicBrainz ID from tags{cache_text}"
+                        rg_title = (rg_info.get("title") or "") if isinstance(rg_info, dict) else ""
+                        state["scan_active_artists"][artist]["current_album"]["step_summary"] = (
+                            f"MusicBrainz: release group \"{rg_title}\" (id: {mbid_found}){cache_text}"
+                        )
+                        state["scan_active_artists"][artist]["current_album"]["step_response"] = (
+                            f"MusicBrainz: from tags. Release group \"{rg_title}\" (id: {mbid_found}){cache_text}"
+                        )
+                logging.debug("[Artist %s] Edition %s already has MBID in tags, cache_hit=%s", artist, e['album_id'], mb_cache_hit)
+            else:
+                # No release-group ID in tags: try other ID tags (release ID etc.) or search
+                for tag in id_tags:
+                    mbid = meta.get(tag)
+                    if not mbid:
+                        continue
+                    try:
+                        mb_cache_hit = False
+                        if tag == 'musicbrainz_releasegroupid':
+                            rg_info, mb_cache_hit = fetch_mb_release_group_info(mbid)
+                            mbid_found = mbid
+                            mbid_type = 'release-group'
+                        else:
+                            def _fetch_release():
+                                return musicbrainzngs.get_release_by_id(mbid, includes=["release-groups"])["release"]
+                            if MB_QUEUE_ENABLED and USE_MUSICBRAINZ:
+                                rel = get_mb_queue().submit(f"rel_{mbid}", _fetch_release)
+                            else:
+                                rel = _fetch_release()
+                            rgid = rel['release-group']['id']
+                            rg_info, mb_cache_hit = fetch_mb_release_group_info(rgid)
+                            mbid_found = rgid
+                            mbid_type = 'release-group'
+                        e['mb_cache_hit'] = mb_cache_hit
+                        tag_used = tag
                         with lock:
                             if artist in state.get("scan_active_artists", {}) and e['album_id'] == state["scan_active_artists"][artist].get("current_album", {}).get("album_id"):
-                                cache_text = " (cached)" if cached_mb else ""
-                                state["scan_active_artists"][artist]["current_album"]["status_details"] = f"MusicBrainz found{cache_text}"
+                                cache_text = " (cached)" if mb_cache_hit else ""
+                                state["scan_active_artists"][artist]["current_album"]["status"] = "searching_mb"
+                                state["scan_active_artists"][artist]["current_album"]["status_details"] = f"MusicBrainz ID fetched{cache_text}"
                                 rg_title = (rg_info.get("title") or "") if isinstance(rg_info, dict) else ""
                                 state["scan_active_artists"][artist]["current_album"]["step_summary"] = (
-                                    f"MusicBrainz: found \"{rg_title}\" (id: {mbid}){cache_text}"
+                                    f"MusicBrainz: release group \"{rg_title}\" (id: {mbid_found}){cache_text}"
                                 )
                                 state["scan_active_artists"][artist]["current_album"]["step_response"] = (
-                                    f"MusicBrainz: found release group \"{rg_title}\" (id: {mbid}){cache_text}"
+                                    f"MusicBrainz: from tags ({tag}). Release group \"{rg_title}\" (id: {mbid_found}){cache_text}"
                                 )
-                    
-                    logging.debug("[Artist %s] Edition %s RG info (search fallback): %s", artist, e['album_id'], rg_info)
+                        logging.debug("[Artist %s] Edition %s RG info (via %s %s): %s", artist, e['album_id'], tag, mbid, rg_info)
+                        break
+                    except Exception as exc:
+                        logging.debug("[Artist %s] MusicBrainz lookup failed for %s (%s): %s", artist, tag, mbid, exc)
+                if rg_info:
+                    e['rg_info_source'] = tag_used
+                    e['rg_info'] = rg_info
+                    if mbid_found:
+                        e['musicbrainz_id'] = mbid_found
+                        e['musicbrainz_type'] = mbid_type
+
+            # Fallback: search by metadata if no ID tag yielded results
+            album_norm = e['album_norm']
+            tracks = {t.title for t in e['tracks']}
+            artist_norm_key = artist.lower().strip()
+            if not rg_info:
+                # Check cache for "artist+album -> MBID". We only skip the API when we have a positive cache.
+                # Cached "not found" is never used to skip: we always re-query MusicBrainz so that transient
+                # failures or improved data on MusicBrainz can be picked up on the next scan.
+                cached_mbid, cached_rg_info = get_cached_mb_album_lookup(artist_norm_key, album_norm)
+                if cached_mbid and cached_mbid != "":
+                    # Cached: found MBID for this artist+album — use it, no API search
+                    rg_info = cached_rg_info or get_cached_mb_info(cached_mbid)
+                    if rg_info:
+                        e['rg_info_source'] = 'fallback'
+                        e['rg_info'] = rg_info
+                        e['musicbrainz_id'] = cached_mbid
+                        e['musicbrainz_type'] = 'release-group'
+                        e['mb_cache_hit'] = True
+                        with lock:
+                            if artist in state.get("scan_active_artists", {}) and e['album_id'] == state["scan_active_artists"][artist].get("current_album", {}).get("album_id"):
+                                rg_title = (rg_info.get("title") or "") if isinstance(rg_info, dict) else ""
+                                state["scan_active_artists"][artist]["current_album"]["status_details"] = "MusicBrainz found (cached)"
+                                state["scan_active_artists"][artist]["current_album"]["step_summary"] = (
+                                    f"MusicBrainz: found \"{rg_title}\" (id: {cached_mbid}) (cached)"
+                                )
+                                state["scan_active_artists"][artist]["current_album"]["step_response"] = (
+                                    f"MusicBrainz: found release group \"{rg_title}\" (id: {cached_mbid}) (cached)"
+                                )
+                        logging.debug("[Artist %s] Edition %s MBID from album lookup cache: %s", artist, e['album_id'], cached_mbid)
                 else:
-                    logging.debug("[Artist %s] No RG info found via search for '%s'", artist, album_norm)
-                    e['mb_cache_hit'] = False
+                    # Not in cache: run search and cache result
                     with lock:
                         if artist in state.get("scan_active_artists", {}) and e['album_id'] == state["scan_active_artists"][artist].get("current_album", {}).get("album_id"):
-                            state["scan_active_artists"][artist]["current_album"]["step_summary"] = (
-                                f"MusicBrainz: no release group found for \"{album_norm}\""
-                            )
-                            state["scan_active_artists"][artist]["current_album"]["step_response"] = (
-                                f"MusicBrainz: no release group found for \"{album_norm}\""
-                            )
+                            state["scan_active_artists"][artist]["current_album"]["status"] = "searching_mb"
+                            state["scan_active_artists"][artist]["current_album"]["status_details"] = "searching MusicBrainz"
+                            state["scan_active_artists"][artist]["current_album"]["step_summary"] = "Searching by artist + album name…"
+                            state["scan_active_artists"][artist]["current_album"]["step_response"] = "MusicBrainz: querying by artist + album name…"
+                    title_raw_mb = e.get("title_raw") or e.get("plex_title") or album_norm
+                    album_folder_arg = e.get("folder")
+                    rg_info, match_verified_by_ai = search_mb_release_group_by_metadata(artist, album_norm, tracks, title_raw=title_raw_mb, album_folder=album_folder_arg)
+                    if rg_info:
+                        set_cached_mb_album_lookup(artist_norm_key, album_norm, rg_info.get('id') or "", rg_info)
+                    else:
+                        set_cached_mb_album_lookup(artist_norm_key, album_norm, "", None)
+                    if rg_info:
+                        e['rg_info_source'] = 'fallback'
+                        e['rg_info'] = rg_info
+                        e['match_verified_by_ai'] = bool(match_verified_by_ai)
+                        if isinstance(rg_info, dict) and 'id' in rg_info:
+                            e['musicbrainz_id'] = rg_info['id']
+                            e['musicbrainz_type'] = 'release-group'
+                            mbid = rg_info['id']
+                            cached_mb = get_cached_mb_info(mbid)
+                            e['mb_cache_hit'] = cached_mb is not None
+                            with lock:
+                                if artist in state.get("scan_active_artists", {}) and e['album_id'] == state["scan_active_artists"][artist].get("current_album", {}).get("album_id"):
+                                    cache_text = " (cached)" if cached_mb else ""
+                                    ai_text = " (match verified by AI)" if match_verified_by_ai else ""
+                                    state["scan_active_artists"][artist]["current_album"]["status_details"] = f"MusicBrainz found{cache_text}{ai_text}"
+                                    rg_title = (rg_info.get("title") or "") if isinstance(rg_info, dict) else ""
+                                    state["scan_active_artists"][artist]["current_album"]["step_summary"] = (
+                                        f"MusicBrainz: found \"{rg_title}\" (id: {mbid}){cache_text}{ai_text}"
+                                    )
+                                    state["scan_active_artists"][artist]["current_album"]["step_response"] = (
+                                        f"MusicBrainz: found release group \"{rg_title}\" (id: {mbid}){cache_text}{ai_text}"
+                                    )
+                        logging.debug("[Artist %s] Edition %s RG info (search fallback)%s: %s", artist, e['album_id'], " (verified by AI)" if match_verified_by_ai else "", rg_info)
+                    else:
+                        logging.debug("[Artist %s] No RG info found via search for '%s'", artist, album_norm)
+                        e['mb_cache_hit'] = False
+                        with lock:
+                            if artist in state.get("scan_active_artists", {}) and e['album_id'] == state["scan_active_artists"][artist].get("current_album", {}).get("album_id"):
+                                state["scan_active_artists"][artist]["current_album"]["step_summary"] = (
+                                    f"MusicBrainz: no release group found for \"{album_norm}\""
+                                )
+                                state["scan_active_artists"][artist]["current_album"]["step_response"] = (
+                                    f"MusicBrainz: no release group found for \"{album_norm}\""
+                                )
+            # Fallback when MusicBrainz found nothing: try Discogs, Last.fm, Bandcamp for metadata (and optionally MB ID from Last.fm)
+            title_raw = e.get("title_raw") or e.get("plex_title") or album_norm
+            if not rg_info:
+                fallback_sources = []
+                if USE_DISCOGS:
+                    try:
+                        discogs_info = _fetch_discogs_release(artist, title_raw)
+                        if discogs_info:
+                            e["fallback_discogs"] = discogs_info
+                            with lock:
+                                state["scan_discogs_matched"] = state.get("scan_discogs_matched", 0) + 1
+                            fallback_sources.append("Discogs")
+                    except Exception as discogs_exc:
+                        logging.debug("[Artist %s] Discogs fallback failed for %s: %s", artist, title_raw, discogs_exc)
+                if USE_LASTFM:
+                    try:
+                        lastfm_info = _fetch_lastfm_album_info(artist, title_raw)
+                        if lastfm_info:
+                            e["fallback_lastfm"] = lastfm_info
+                            with lock:
+                                state["scan_lastfm_matched"] = state.get("scan_lastfm_matched", 0) + 1
+                            fallback_sources.append("Last.fm")
+                            lfm_mbid = (lastfm_info.get("mbid") or "").strip()
+                            if lfm_mbid:
+                                try:
+                                    rg_info, _ = fetch_mb_release_group_info(lfm_mbid)
+                                    if rg_info:
+                                        e["rg_info"] = rg_info
+                                        e["musicbrainz_id"] = lfm_mbid
+                                        e["rg_info_source"] = "lastfm_fallback"
+                                        with lock:
+                                            if artist in state.get("scan_active_artists", {}) and e["album_id"] == state["scan_active_artists"][artist].get("current_album", {}).get("album_id"):
+                                                state["scan_active_artists"][artist]["current_album"]["status_details"] = "MusicBrainz ID from Last.fm"
+                                                state["scan_active_artists"][artist]["current_album"]["step_summary"] = (
+                                                    f"Last.fm: MusicBrainz release group (id: {lfm_mbid})"
+                                                )
+                                        logging.debug("[Artist %s] Edition %s MB ID from Last.fm mbid: %s", artist, e["album_id"], lfm_mbid)
+                                except Exception:
+                                    pass
+                    except Exception as lastfm_exc:
+                        logging.debug("[Artist %s] Last.fm fallback failed for %s: %s", artist, title_raw, lastfm_exc)
+                if not rg_info and USE_BANDCAMP:
+                    try:
+                        bandcamp_info = _fetch_bandcamp_album_info(artist, title_raw)
+                        if bandcamp_info:
+                            e["fallback_bandcamp"] = bandcamp_info
+                            with lock:
+                                state["scan_bandcamp_matched"] = state.get("scan_bandcamp_matched", 0) + 1
+                            fallback_sources.append("Bandcamp")
+                    except Exception as bandcamp_exc:
+                        logging.debug("[Artist %s] Bandcamp fallback failed for %s: %s", artist, title_raw, bandcamp_exc)
+                if fallback_sources and artist in state.get("scan_active_artists", {}) and e["album_id"] == state["scan_active_artists"][artist].get("current_album", {}).get("album_id"):
+                    with lock:
+                        state["scan_active_artists"][artist]["current_album"]["step_response"] = (
+                            state["scan_active_artists"][artist]["current_album"].get("step_response", "")
+                            + ("; fallback: " + ", ".join(fallback_sources) if fallback_sources else "")
+                        )
             # Increment MB-done count for this edition (whether we found rg_info or not)
             with lock:
                 state["scan_mb_done_count"] = state.get("scan_mb_done_count", 0) + 1
+                state["scan_step_progress"] = state.get("scan_step_progress", 0) + 1
             # Also store MBID from rg_info if not already set
             if e.get('rg_info') and 'musicbrainz_id' not in e and isinstance(e['rg_info'], dict) and 'id' in e['rg_info']:
                 e['musicbrainz_id'] = e['rg_info']['id']
@@ -4558,8 +5889,9 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> tuple[List[di
             "needs_ai": False,
             "same_folder": True,
         })
-    # Remove groups where every loser was discarded (e.g. only one valid edition)
-    out = [g for g in out if g.get("losers")]
+    # Keep groups that have losers (resolved) or need AI (will be resolved in batch).
+    # Do not drop needs_ai groups: they have "editions" but no "losers" yet.
+    out = [g for g in out if g.get("losers") or g.get("needs_ai")]
     
     # Calculate total scan time
     scan_total_time = time.perf_counter() - scan_start_time
@@ -4575,7 +5907,7 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> tuple[List[di
         "duplicate_groups_count": len(out),
         "total_duplicates_count": sum(len(g.get("losers", [])) for g in out),
         "broken_albums_count": sum(1 for e in all_editions_for_stats if e.get('is_broken', False)),
-        "albums_without_mb_id": sum(1 for e in all_editions_for_stats if not e.get('meta', {}).get('musicbrainz_releasegroupid') and not e.get('meta', {}).get('musicbrainz_releaseid')),
+        "albums_without_mb_id": sum(1 for e in all_editions_for_stats if (not e.get('meta', {}).get('musicbrainz_releasegroupid') and not e.get('meta', {}).get('musicbrainz_releaseid') and not e.get('musicbrainz_id'))),
         "albums_without_artist_mb_id": sum(1 for e in all_editions_for_stats if not e.get('meta', {}).get('musicbrainz_albumartistid') and not e.get('meta', {}).get('musicbrainz_artistid')),
         "albums_without_complete_tags": 0,  # Will be calculated below
         "albums_without_album_image": 0,  # Will be calculated below
@@ -4588,18 +5920,10 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> tuple[List[di
         }
     }
     
-    # Calculate albums without complete tags/images
+    # Calculate albums without complete tags/images (REQUIRED_TAGS from Settings = source of truth)
     for e in editions:
         meta = e.get('meta', {})
-        # Check for complete tags
-        tag_checks = {
-            'artist': bool(meta.get('artist') or meta.get('albumartist')),
-            'album': bool(meta.get('album')),
-            'date': bool(meta.get('date') or meta.get('originaldate')),
-            'genre': bool(meta.get('genre')),
-            'year': bool(meta.get('year') or meta.get('date')),
-        }
-        missing_required = [tag for tag in REQUIRED_TAGS if not tag_checks.get(tag.lower(), False)]
+        missing_required = _check_required_tags(meta, REQUIRED_TAGS, edition=e)
         if missing_required:
             stats["albums_without_complete_tags"] += 1
         
@@ -4668,7 +5992,8 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> tuple[List[di
     duplicate_groups_count = len(out)
     total_duplicates_count = sum(len(g.get("losers", [])) for g in out)
     broken_albums_count = sum(1 for e in editions if e.get('is_broken', False))
-    
+    mb_verified_by_ai = sum(1 for e in editions if e.get('match_verified_by_ai'))
+
     # Count albums with missing tags/images
     albums_without_mb_id = 0
     albums_without_artist_mb_id = 0
@@ -4678,22 +6003,14 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> tuple[List[di
     
     for e in editions:
         meta = e.get('meta', {})
-        # Check MusicBrainz IDs
-        if not meta.get('musicbrainz_releasegroupid') and not meta.get('musicbrainz_releaseid'):
+        # Check MusicBrainz IDs (include e.get('musicbrainz_id') so scan/IA matches count as "with MBID")
+        if (not meta.get('musicbrainz_releasegroupid') and not meta.get('musicbrainz_releaseid') and not e.get('musicbrainz_id')):
             albums_without_mb_id += 1
         if not meta.get('musicbrainz_albumartistid') and not meta.get('musicbrainz_artistid'):
             albums_without_artist_mb_id += 1
-        
-        # Check for complete tags (using configurable required tags)
-        tag_checks = {
-            'artist': bool(meta.get('artist') or meta.get('albumartist')),
-            'album': bool(meta.get('album')),
-            'date': bool(meta.get('date') or meta.get('originaldate')),
-            'genre': bool(meta.get('genre')),
-            'year': bool(meta.get('year') or meta.get('date')),
-        }
-        # Check if all required tags are present
-        missing_required = [tag for tag in REQUIRED_TAGS if not tag_checks.get(tag.lower(), False)]
+
+        # Check for complete tags (REQUIRED_TAGS from Settings = source of truth)
+        missing_required = _check_required_tags(meta, REQUIRED_TAGS, edition=e)
         if missing_required:
             albums_without_complete_tags += 1
         
@@ -4717,6 +6034,7 @@ def scan_duplicates(db_conn, artist: str, album_ids: List[int]) -> tuple[List[di
     stats = {
         "ai_used": ai_used_count,
         "mb_used": mb_used_count,
+        "mb_verified_by_ai": mb_verified_by_ai,
         "audio_cache_hits": audio_cache_hits,
         "audio_cache_misses": audio_cache_misses,
         "mb_cache_hits": mb_cache_hits,
@@ -4757,15 +6075,8 @@ def save_scan_editions_to_db(scan_id: int, all_editions_by_artist: Dict[str, Lis
                     if image_matches:
                         has_cover = 1
                         break
-            # missing_required_tags
-            tag_checks = {
-                'artist': bool(meta.get('artist') or meta.get('albumartist')),
-                'album': bool(meta.get('album')),
-                'date': bool(meta.get('date') or meta.get('originaldate')),
-                'genre': bool(meta.get('genre')),
-                'year': bool(meta.get('year') or meta.get('date')),
-            }
-            missing_required = [tag for tag in REQUIRED_TAGS if not tag_checks.get(tag.lower(), False)]
+            # missing_required_tags (REQUIRED_TAGS from Settings = source of truth)
+            missing_required = _check_required_tags(meta, REQUIRED_TAGS, edition=e)
             missing_required_json = json.dumps(missing_required) if missing_required else None
             folder_str = str(folder) if folder else ""
             fmt_text = get_primary_format(Path(folder_str)) if folder_str else ""
@@ -4815,6 +6126,7 @@ def save_scan_to_db(scan_results: Dict[str, List[dict]]):
     # 2) Re-insert all scan results (skip groups that have no best/losers, e.g. needs_ai not yet processed)
     saved_count = 0
     skipped_count = 0
+    saved_with_ai = 0
     for artist, groups in scan_results.items():
         for g in groups:
             if "best" not in g or "losers" not in g:
@@ -4823,19 +6135,33 @@ def save_scan_to_db(scan_results: Dict[str, List[dict]]):
                 continue
             saved_count += 1
             best = g["best"]
+            if best.get("used_ai"):
+                saved_with_ai += 1
+            # Persist size_mb and track_count so Unduper shows them after reload
+            best_folder_path = path_for_fs_access(Path(best["folder"])) if best.get("folder") else None
+            best_size_mb = (safe_folder_size(best_folder_path) // (1024 * 1024)) if best_folder_path else 0
+            best_track_count = len(best.get("tracks", []))
+            # When used_ai, ensure ai_provider/ai_model are set (e.g. from cache they may be empty)
+            used_ai = bool(best.get("used_ai", False))
+            ai_provider = best.get("ai_provider") or ""
+            ai_model = best.get("ai_model") or ""
+            if used_ai and (not ai_provider or not ai_model):
+                mod = sys.modules[__name__]
+                ai_provider = ai_provider or (getattr(mod, "AI_PROVIDER", None) or "")
+                ai_model = ai_model or (getattr(mod, "RESOLVED_MODEL", None) or getattr(mod, "OPENAI_MODEL", None) or "")
             # Best edition
             cur.execute("""
                 INSERT OR IGNORE INTO duplicates_best
                   (artist, album_id, title_raw, album_norm, folder,
-                   fmt_text, br, sr, bd, dur, discs, rationale, merge_list, ai_used, meta_json, ai_provider, ai_model)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   fmt_text, br, sr, bd, dur, discs, rationale, merge_list, ai_used, meta_json, ai_provider, ai_model, size_mb, track_count, match_verified_by_ai)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 artist,
                 best['album_id'],
                 best['title_raw'],
                 best['album_norm'],
                 str(best['folder']),
-                get_primary_format(best['folder']),
+                get_primary_format(Path(best['folder'])),
                 best['br'],
                 best['sr'],
                 best['bd'],
@@ -4843,10 +6169,13 @@ def save_scan_to_db(scan_results: Dict[str, List[dict]]):
                 best['discs'],
                 best.get('rationale', ''),
                 json.dumps(best.get('merge_list', [])),
-                int(best.get('used_ai', False)),
+                int(used_ai),
                 json.dumps(best.get('meta', {})),
-                best.get('ai_provider', ''),
-                best.get('ai_model', ''),
+                ai_provider,
+                ai_model,
+                best_size_mb,
+                best_track_count,
+                1 if best.get('match_verified_by_ai') else 0,
             ))
 
             # All "loser" editions
@@ -4871,7 +6200,25 @@ def save_scan_to_db(scan_results: Dict[str, List[dict]]):
     con.commit()
     con.close()
     if saved_count or skipped_count:
-        logging.info("save_scan_to_db: saved %d group(s), skipped %d group(s) without best/losers", saved_count, skipped_count)
+        logging.info(
+            "save_scan_to_db: saved %d group(s) (%d with AI), skipped %d without best/losers",
+            saved_count, saved_with_ai, skipped_count,
+        )
+
+
+def _remove_dedupe_group_from_db(artist: str, best_album_id: int, loser_album_ids: List[int]) -> None:
+    """Remove one duplicate group from DB after it has been successfully moved to /dupes."""
+    try:
+        con = sqlite3.connect(str(STATE_DB_FILE))
+        cur = con.cursor()
+        cur.execute("DELETE FROM duplicates_best WHERE artist = ? AND album_id = ?", (artist, best_album_id))
+        for aid in loser_album_ids:
+            cur.execute("DELETE FROM duplicates_loser WHERE artist = ? AND album_id = ?", (artist, aid))
+        con.commit()
+        con.close()
+    except Exception as e:
+        logging.warning("_remove_dedupe_group_from_db failed for %s / %s: %s", artist, best_album_id, e)
+
 
 def load_scan_from_db() -> Dict[str, List[dict]]:
     """
@@ -4888,11 +6235,15 @@ def load_scan_from_db() -> Dict[str, List[dict]]:
     cur = con.cursor()
 
     # ---- 1) Best editions -----------------------------------------------------
+    cur.execute("PRAGMA table_info(duplicates_best)")
+    best_cols = {r[1] for r in cur.fetchall()}
+    has_match_verified = "match_verified_by_ai" in best_cols
     cur.execute(
         """
         SELECT artist, album_id, title_raw, album_norm, folder,
                fmt_text, br, sr, bd, dur, discs, rationale, merge_list, ai_used, meta_json,
-               ai_provider, ai_model
+               ai_provider, ai_model, size_mb, track_count
+        """ + (", match_verified_by_ai" if has_match_verified else "") + """
         FROM   duplicates_best
         """
     )
@@ -4932,6 +6283,9 @@ def load_scan_from_db() -> Dict[str, List[dict]]:
          rationale, merge_list_json, ai_used, meta_json) = row[:15]
         ai_provider = (row[15] or "") if len(row) > 15 else ""
         ai_model = (row[16] or "") if len(row) > 16 else ""
+        size_mb = row[17] if len(row) > 17 else None
+        track_count = row[18] if len(row) > 18 else None
+        match_verified_by_ai = bool(row[19]) if has_match_verified and len(row) > 19 else False
 
         best_entry = {
             "album_id": aid,
@@ -4950,6 +6304,9 @@ def load_scan_from_db() -> Dict[str, List[dict]]:
             "meta": json.loads(meta_json or "{}"),
             "ai_provider": ai_provider,
             "ai_model": ai_model,
+            "size_mb": size_mb,
+            "track_count": track_count,
+            "match_verified_by_ai": match_verified_by_ai,
         }
 
         losers = loser_map.get((artist, aid), [])
@@ -4993,15 +6350,18 @@ def background_scan():
     the whole scan, and `state["scanning"]` is **always** cleared even when
     an unexpected error occurs, so the front‑end never hangs in "running".
     """
-    # Reload SECTION_IDS from DB so the scan uses the library selection
-    # currently saved in Settings (e.g. section 5 = pmda_tests)
+    # Reload SECTION_IDS and PATH_MAP from DB so the scan uses the library selection
+    # and path bindings currently saved in Settings (e.g. after Detect & verify)
     _reload_section_ids_from_db()
+    _reload_path_map_from_db()
     if not SECTION_IDS:
         logging.warning("background_scan(): SECTION_IDS is empty after reload; aborting scan")
         with lock:
             state["scanning"] = False
         return
-    logging.debug(f"background_scan(): SECTION_IDS=%s, opening Plex DB at {PLEX_DB_FILE}", SECTION_IDS)
+    if not PATH_MAP:
+        logging.warning("background_scan(): PATH_MAP is empty after reload; albums will not resolve to container paths. Run Detect & verify in Settings.")
+    logging.debug(f"background_scan(): SECTION_IDS=%s, PATH_MAP keys=%s, opening Plex DB at {PLEX_DB_FILE}", SECTION_IDS, list(PATH_MAP.keys()))
     start_time = time.perf_counter()
     all_results: Dict[str, List[dict]] = {}  # Always defined so finally can persist
     all_editions_by_artist: Dict[str, List[dict]] = {}  # For scan_editions (Library, Tag Fixer)
@@ -5055,6 +6415,11 @@ def background_scan():
                 )
 
         total_artists = len(artists_merged)
+        logging.info(
+            "Scan scope: %d artist(s), %d album(s). Section ID(s): %s. "
+            "If this is smaller than expected, check Settings → Libraries (SECTION_IDS) and PATH_MAP.",
+            total_artists, total_albums, SECTION_IDS
+        )
 
         # --- Discord: announce scan start ---
         notify_discord_embed(
@@ -5069,44 +6434,24 @@ def background_scan():
             f"background_scan(): {len(artists_merged)} artists (merged by name), {total_albums} albums total"
         )
 
-        # Reload AI config from DB so scan uses current API key/provider (no restart needed)
-        mod = sys.modules[__name__]
-        ai_config_keys = ("AI_PROVIDER", "OPENAI_API_KEY", "OPENAI_MODEL", "OPENAI_MODEL_FALLBACKS",
-                          "ANTHROPIC_API_KEY", "GOOGLE_API_KEY", "OLLAMA_URL")
-        keys_loaded = []
-        try:
-            if STATE_DB_FILE.exists():
-                con = sqlite3.connect(str(STATE_DB_FILE), timeout=5)
-                cur = con.cursor()
-                placeholders = ",".join("?" for _ in ai_config_keys)
-                cur.execute(
-                    f"SELECT key, value FROM settings WHERE key IN ({placeholders})",
-                    ai_config_keys,
-                )
-                for key, value in cur.fetchall():
-                    setattr(mod, key, (value or ""))
-                    keys_loaded.append(key)
-                con.close()
-            if keys_loaded:
-                _reinit_ai_from_globals()
-                logging.info(
-                    "Scan: AI config reloaded from DB. Keys loaded: %s. ai_provider_ready=%s",
-                    keys_loaded,
-                    ai_provider_ready,
-                )
-            else:
-                logging.info(
-                    "Scan: No AI keys found in DB (keys checked: %s). ai_provider_ready=%s",
-                    list(ai_config_keys),
-                    ai_provider_ready,
-                )
-        except Exception as e:
-            logging.warning("Scan: Failed to reload AI config from DB: %s. ai_provider_ready=%s", e, ai_provider_ready)
+        # Reload AI config from DB and run functional check (probe/ladder for OpenAI)
+        _reload_ai_config_and_reinit()
+        logging.debug("Scan: AI reload/reinit done. ai_provider_ready=%s", ai_provider_ready)
 
-        # Reset live state
+        if not ai_provider_ready:
+            logging.warning("background_scan(): AI not configured or functional check failed; aborting scan.")
+            with lock:
+                state["scanning"] = False
+                state["scan_ai_preflight_error"] = getattr(sys.modules[__name__], "AI_FUNCTIONAL_ERROR_MSG", None) or "Configure the AI provider in Settings."
+            return
+
+        # Reset live state. Step-based progress: total_steps = 3*albums + 2 (+1 if auto-move).
         start_time = time.time()
         with lock:
-            state.update(scanning=True, scan_progress=0, scan_total=total_albums)
+            state.update(scanning=True, scan_progress=0, scan_total=total_albums + 2)
+            state["scan_total_albums"] = total_albums
+            state["scan_step_progress"] = 0
+            # scan_step_total set after _reload_auto_move_from_db() so AUTO_MOVE_DUPES is current
             state["duplicates"].clear()
             # Initialize scan details tracking
             state["scan_artists_processed"] = 0
@@ -5137,27 +6482,63 @@ def background_scan():
             state["scan_albums_without_complete_tags"] = 0
             state["scan_albums_without_mb_id"] = 0
             state["scan_albums_without_artist_mb_id"] = 0
+            state["scan_mb_verified_by_ai_count"] = 0
+            state["scan_discogs_matched"] = 0
+            state["scan_lastfm_matched"] = 0
+            state["scan_bandcamp_matched"] = 0
+            state["scan_ai_errors"] = []
+            # Preflight: store MB and AI connection status for end-of-scan summary
+            mb_ok, ai_ok = _run_preflight_checks()
+            state["scan_mb_connection_ok"] = mb_ok
+            state["scan_ai_connection_ok"] = ai_ok
         
+        # Reload AUTO_MOVE_DUPES from DB so scan uses current setting (UI may have toggled it)
+        _reload_auto_move_from_db()
+        with lock:
+            # Step-based progress: 3 steps per album (format, MB, compare) + 1 AI + 1 finalize + (1 if move)
+            state["scan_step_total"] = 3 * total_albums + 2 + (1 if AUTO_MOVE_DUPES else 0)
+
         # Create scan history entry
         con = sqlite3.connect(str(STATE_DB_FILE))
         cur = con.cursor()
-        cur.execute("""
-            INSERT INTO scan_history 
-            (start_time, albums_scanned, artists_total, ai_enabled, mb_enabled, auto_move_enabled, status,
-             duplicate_groups_count, total_duplicates_count, broken_albums_count, missing_albums_count,
-             albums_without_artist_image, albums_without_album_image, albums_without_complete_tags,
-             albums_without_mb_id, albums_without_artist_mb_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            start_time,
-            total_albums,
-            total_artists,
-            1 if ai_provider_ready else 0,
-            1 if USE_MUSICBRAINZ else 0,
-            1 if AUTO_MOVE_DUPES else 0,
-            'running',
-            0, 0, 0, 0, 0, 0, 0, 0, 0  # Initialize all detailed stats to 0
-        ))
+        cur.execute("PRAGMA table_info(scan_history)")
+        scan_cols = [r[1] for r in cur.fetchall()]
+        if "entry_type" in scan_cols:
+            cur.execute("""
+                INSERT INTO scan_history 
+                (start_time, albums_scanned, artists_total, ai_enabled, mb_enabled, auto_move_enabled, status,
+                 duplicate_groups_count, total_duplicates_count, broken_albums_count, missing_albums_count,
+                 albums_without_artist_image, albums_without_album_image, albums_without_complete_tags,
+                 albums_without_mb_id, albums_without_artist_mb_id, entry_type)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'scan')
+            """, (
+                start_time,
+                total_albums,
+                total_artists,
+                1 if ai_provider_ready else 0,
+                1 if USE_MUSICBRAINZ else 0,
+                1 if AUTO_MOVE_DUPES else 0,
+                'running',
+                0, 0, 0, 0, 0, 0, 0, 0, 0  # Initialize all detailed stats to 0
+            ))
+        else:
+            cur.execute("""
+                INSERT INTO scan_history 
+                (start_time, albums_scanned, artists_total, ai_enabled, mb_enabled, auto_move_enabled, status,
+                 duplicate_groups_count, total_duplicates_count, broken_albums_count, missing_albums_count,
+                 albums_without_artist_image, albums_without_album_image, albums_without_complete_tags,
+                 albums_without_mb_id, albums_without_artist_mb_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                start_time,
+                total_albums,
+                total_artists,
+                1 if ai_provider_ready else 0,
+                1 if USE_MUSICBRAINZ else 0,
+                1 if AUTO_MOVE_DUPES else 0,
+                'running',
+                0, 0, 0, 0, 0, 0, 0, 0, 0  # Initialize all detailed stats to 0
+            ))
         scan_id = cur.lastrowid
         con.commit()
         con.close()
@@ -5226,6 +6607,7 @@ def background_scan():
                 finally:
                     with lock:
                         state["scan_progress"] += album_cnt
+                        state["scan_step_progress"] = state.get("scan_step_progress", 0) + album_cnt  # compare step: 1 per album
                         state["scan_artists_processed"] += 1
                         state["scan_ai_used_count"] += stats.get("ai_used", 0)
                         state["scan_mb_used_count"] += stats.get("mb_used", 0)
@@ -5239,6 +6621,7 @@ def background_scan():
                         state["scan_broken_albums_count"] += stats.get("broken_albums_count", 0)
                         state["scan_albums_without_mb_id"] += stats.get("albums_without_mb_id", 0)
                         state["scan_albums_without_artist_mb_id"] += stats.get("albums_without_artist_mb_id", 0)
+                        state["scan_mb_verified_by_ai_count"] += stats.get("mb_verified_by_ai", 0)
                         state["scan_albums_without_complete_tags"] += stats.get("albums_without_complete_tags", 0)
                         state["scan_albums_without_album_image"] += stats.get("albums_without_album_image", 0)
                         state["scan_albums_without_artist_image"] += stats.get("albums_without_artist_image", 0)
@@ -5253,15 +6636,21 @@ def background_scan():
                     if artists_processed % 10 == 0 or logging.getLogger().isEnabledFor(logging.DEBUG):
                         logging.info(f"Scanning artist {artists_processed} / {total_artists}: {artist_name}")
 
-        # Collect all groups requiring AI processing
+        # Collect all groups requiring AI processing (must be kept in scan_duplicates output, not filtered by "losers")
         ai_groups_to_process = []
-        ai_group_positions = {}  # Track position of each AI group for replacement
+        ai_group_positions = {}  # Track position of each AI group for replacement (key = artist + sorted edition ids)
         for artist_name, groups in all_results.items():
             for i, group in enumerate(groups):
                 if group.get("needs_ai", False):
                     ai_groups_to_process.append(group)
-                    key = (artist_name, tuple(sorted(e['album_id'] for e in group.get("editions", []))))
+                    # Normalize to sorted ints so key matches when merging ai_result (same type/order)
+                    key = (artist_name, tuple(sorted(int(e['album_id']) for e in group.get("editions", []))))
                     ai_group_positions[key] = (artist_name, i)
+        logging.info(
+            "Collected %d group(s) requiring AI (from %d artist(s) with duplicates)",
+            len(ai_groups_to_process),
+            sum(1 for a, grps in all_results.items() if any(g.get("needs_ai") for g in grps)),
+        )
         
         # Process AI groups in parallel batch
         if ai_groups_to_process and ai_provider_ready:
@@ -5272,45 +6661,72 @@ def background_scan():
                     "total_groups": len(ai_groups_to_process),
                     "groups_processed": 0
                 }
+                state["scan_ai_batch_total"] = len(ai_groups_to_process)
+                state["scan_ai_batch_processed"] = 0
+                state["scan_ai_current_label"] = None
             
             ai_results = process_ai_groups_batch(ai_groups_to_process, max_workers=AI_BATCH_SIZE)
+            logging.info("AI batch returned %d result(s) for %d group(s)", len(ai_results), len(ai_groups_to_process))
             
-            # Update all_results with AI-processed groups
+            # Update all_results with AI-processed groups; ensure used_ai/ai_provider/ai_model so Unduper shows "AI"
+            mod = sys.modules[__name__]
             for ai_result in ai_results:
-                artist_name = ai_result["artist"]
-                result_edition_ids = tuple(sorted(e['album_id'] for e in [ai_result["best"]] + ai_result["losers"]))
-                key = (artist_name, result_edition_ids)
-                
-                if key in ai_group_positions:
-                    # Replace the group at the tracked position
-                    target_artist, target_index = ai_group_positions[key]
-                    if target_artist in all_results and target_index < len(all_results[target_artist]):
-                        all_results[target_artist][target_index] = ai_result
+                try:
+                    artist_name = ai_result.get("artist")
+                    best = ai_result.get("best")
+                    losers = ai_result.get("losers")
+                    if not artist_name or best is None or not isinstance(losers, list):
+                        continue
+                    best.setdefault("used_ai", True)
+                    if not best.get("ai_provider"):
+                        best["ai_provider"] = getattr(mod, "AI_PROVIDER", None) or ""
+                    if not best.get("ai_model"):
+                        best["ai_model"] = getattr(mod, "RESOLVED_MODEL", None) or getattr(mod, "OPENAI_MODEL", None) or ""
+                    # Normalize to sorted ints to match ai_group_positions key
+                    result_edition_ids = tuple(sorted(int(e.get("album_id") or 0) for e in [best] + losers))
+                    key = (artist_name, result_edition_ids)
+                    
+                    if key in ai_group_positions:
+                        target_artist, target_index = ai_group_positions[key]
+                        if target_artist in all_results and target_index < len(all_results[target_artist]):
+                            all_results[target_artist][target_index] = ai_result
+                        else:
+                            if target_artist not in all_results:
+                                all_results[target_artist] = []
+                            all_results[target_artist].append(ai_result)
                     else:
-                        # Position invalid, append instead
-                        if target_artist not in all_results:
-                            all_results[target_artist] = []
-                        all_results[target_artist].append(ai_result)
-                else:
-                    # Group not found in tracking, append to artist's groups
-                    if artist_name not in all_results:
-                        all_results[artist_name] = []
-                    all_results[artist_name].append(ai_result)
+                        if artist_name not in all_results:
+                            all_results[artist_name] = []
+                        all_results[artist_name].append(ai_result)
+                except Exception as merge_err:
+                    logging.warning("Skipping malformed AI result: %s", merge_err)
             
-            # Update state
-            ai_batch_time = time.perf_counter() - (state.get("scan_active_artists", {}).get("_ai_batch", {}).get("start_time", time.perf_counter()))
+            # Update state (start_time was stored with time.time(), so use time.time() for duration)
+            _ai_batch = state.get("scan_active_artists", {}).get("_ai_batch", {})
+            ai_batch_start = _ai_batch.get("start_time", time.time())
+            ai_batch_time = time.time() - ai_batch_start
             with lock:
                 if "_ai_batch" in state.get("scan_active_artists", {}):
                     del state["scan_active_artists"]["_ai_batch"]
+                state.pop("scan_ai_batch_total", None)
+                state.pop("scan_ai_batch_processed", None)
+                state.pop("scan_ai_current_label", None)
                 state["scan_ai_used_count"] += len(ai_results)
                 # Update duplicates in state
                 state["duplicates"] = all_results
+                # Progress: step 2/3 done (albums + AI batch); bar shows e.g. 39/40 until finalize
+                state["scan_progress"] = state["scan_total"] - 1
+                state["scan_step_progress"] = state.get("scan_step_progress", 0) + 1  # AI batch step done
             logging.info(
                 f"AI batch processing completed: {len(ai_results)}/{len(ai_groups_to_process)} groups processed successfully "
                 f"in {ai_batch_time:.2f}s (avg {ai_batch_time/max(len(ai_groups_to_process), 1):.2f}s per group)"
             )
+        else:
+            # No AI batch run (no groups or no provider): still count the AI step so progress reaches step_total
+            with lock:
+                state["scan_step_progress"] = state.get("scan_step_progress", 0) + 1
         
-        # Fallback: any group still with needs_ai and no best/losers (e.g. AI batch failed/skipped) -> use heuristic
+        # Final pass: any group still with needs_ai and no best/losers -> run AI (no heuristic fallback)
         fallback_count = 0
         for artist_name, groups in list(all_results.items()):
             for i, g in enumerate(groups):
@@ -5330,8 +6746,9 @@ def background_scan():
                             }
                             fallback_count += 1
         if fallback_count:
-            logging.info("Fallback: applied heuristic selection to %d group(s) that had no best/losers.", fallback_count)
+            logging.info("Final pass: applied AI selection to %d group(s) that had no best/losers.", fallback_count)
             with lock:
+                state["scan_ai_used_count"] = state.get("scan_ai_used_count", 0) + fallback_count
                 state["duplicates"] = all_results
         
         # Calculate missing albums count (compare Plex albums with MusicBrainz)
@@ -5342,35 +6759,53 @@ def background_scan():
         with lock:
             state["scan_missing_albums_count"] = missing_albums_total
         
-        # Persist is done in finally so we always save (even on stop/exception)
-        
-        # Auto-move dupes if enabled
-        if AUTO_MOVE_DUPES and all_results:
-            logging.info("Auto-moving dupes enabled, starting automatic deduplication...")
-            background_dedupe(all_results)
+        # Persist is done in finally so we always save (even on stop/exception); auto-move runs synchronously in finally after save.
 
     finally:
-        # Persist whatever results we have (even on early stop or exception) so Unduper shows them
+        # "Finalizing": persist to DB and update scan_history before marking scan done.
+        # UI shows "Finalizing" until this is complete; only then scanning=False and stats appear.
+        with lock:
+            state["scan_finalizing"] = True
+            state["last_dedupe_moved_count"] = 0
+            state["last_dedupe_saved_mb"] = 0
+            # Progress: ensure we're at step 2/3 (e.g. 39/40) during finalize; if there was no AI batch we were still at 38
+            state["scan_progress"] = max(state["scan_progress"], state["scan_total"] - 1)
+            state["scan_step_progress"] = state.get("scan_step_progress", 0) + 1  # finalize step started
         try:
             save_scan_to_db(all_results)
+            with lock:
+                state["duplicates"] = all_results
         except Exception as e:
             logging.warning("save_scan_to_db in finally failed: %s", e)
         try:
             _scan_id = state.get("scan_id")
             if _scan_id and all_editions_by_artist is not None:
                 save_scan_editions_to_db(_scan_id, all_editions_by_artist)
+                # So Library always shows last run's editions (even if scan was stopped)
+                con = sqlite3.connect(str(STATE_DB_FILE), timeout=5)
+                con.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('last_completed_scan_id', ?)", (str(_scan_id),))
+                con.commit()
+                con.close()
         except Exception as e:
             logging.warning("save_scan_editions_to_db in finally failed: %s", e)
-        # Make absolutely sure we leave the UI in a consistent state
+        # Auto-move dupes synchronously so UI shows "Moving dupes" and scan_history gets correct albums_moved/space_saved
+        if AUTO_MOVE_DUPES and all_results:
+            flat_groups = [g for groups in all_results.values() for g in groups]
+            if flat_groups:
+                logging.info("Auto-moving dupes enabled, running automatic deduplication (synchronous)...")
+                try:
+                    background_dedupe(flat_groups)
+                except Exception as e:
+                    logging.warning("background_dedupe in finally failed: %s", e)
         end_time = time.time()
         scan_id = None
         with lock:
             state["scan_progress"] = state["scan_total"]  # force 100 % before stopping
-            state["scanning"] = False
+            state["scan_step_progress"] = state.get("scan_step_total", state["scan_step_progress"])  # ensure 100% for steps
             scan_id = state.get("scan_id")
             start_time = state.get("scan_start_time", end_time)
         
-        # Update scan history entry
+        # Update scan history entry (summary_json etc.); only then mark scan done
         if scan_id:
             con = sqlite3.connect(str(STATE_DB_FILE))
             cur = con.cursor()
@@ -5381,7 +6816,6 @@ def background_scan():
                 ai_used_count = state.get("scan_ai_used_count", 0)
                 mb_used_count = state.get("scan_mb_used_count", 0)
                 space_saved = get_stat("space_saved")
-                albums_moved = get_stat("removed_dupes")
                 # Get detailed statistics
                 duplicate_groups_count = state.get("scan_duplicate_groups_count", 0)
                 total_duplicates_count = state.get("scan_total_duplicates_count", 0)
@@ -5392,8 +6826,91 @@ def background_scan():
                 albums_without_complete_tags = state.get("scan_albums_without_complete_tags", 0)
                 albums_without_mb_id = state.get("scan_albums_without_mb_id", 0)
                 albums_without_artist_mb_id = state.get("scan_albums_without_artist_mb_id", 0)
+                # When auto-move ran this scan (in finally), these are set by background_dedupe
+                dupes_moved_this_scan = state.get("last_dedupe_moved_count", 0)
+                space_saved_mb_this_scan = state.get("last_dedupe_saved_mb", 0)
+                albums_moved_this_scan = state.get("last_dedupe_moved_count", 0)
             
             status = 'cancelled' if scan_should_stop.is_set() else 'completed'
+            # Build summary_json for end-of-scan summary (FFmpeg formats, MB, AI)
+            mb_conn_ok = state.get("scan_mb_connection_ok", False)
+            ai_conn_ok = state.get("scan_ai_connection_ok", False)
+            mb_done = state.get("scan_mb_done_count", 0)
+            mb_used = state.get("scan_mb_used_count", 0)
+            ai_groups = state.get("scan_ai_used_count", 0)
+            mb_verified_by_ai = state.get("scan_mb_verified_by_ai_count", 0)
+            cur.execute(
+                "SELECT fmt_text, COUNT(*) FROM scan_editions WHERE scan_id = ? GROUP BY fmt_text",
+                (scan_id,),
+            )
+            ffmpeg_formats = {row[0] or "?": row[1] for row in cur.fetchall()}
+            ai_errors_raw = state.get("scan_ai_errors", [])
+            # Deduplicate by message, keep last occurrence; limit to 20 for summary
+            seen_msg = set()
+            ai_errors_dedup = []
+            for entry in reversed(ai_errors_raw):
+                msg = entry.get("message", "")
+                if msg and msg not in seen_msg:
+                    seen_msg.add(msg)
+                    ai_errors_dedup.append(entry)
+                if len(ai_errors_dedup) >= 20:
+                    break
+            ai_errors_dedup.reverse()
+            # Last-scan-only stats for "Last scan summary" UI (only this scan's numbers)
+            artists_total = state.get("scan_artists_total", 0)
+            albums_scanned = state.get("scan_total_albums", state.get("scan_total", 0))
+            scan_discogs_matched = state.get("scan_discogs_matched", 0)
+            scan_lastfm_matched = state.get("scan_lastfm_matched", 0)
+            scan_bandcamp_matched = state.get("scan_bandcamp_matched", 0)
+            audio_hits = state.get("scan_audio_cache_hits", 0)
+            audio_misses = state.get("scan_audio_cache_misses", 0)
+            mb_hits = state.get("scan_mb_cache_hits", 0)
+            mb_misses = state.get("scan_mb_cache_misses", 0)
+            albums_without_mb = state.get("scan_albums_without_mb_id", 0)
+            albums_with_mb = max(0, albums_scanned - albums_without_mb) if albums_scanned else mb_used
+            # Lossy vs lossless from ffmpeg_formats (lossless: FLAC, ALAC, WAV, AIFF, etc.)
+            lossless_keys = {"FLAC", "ALAC", "WAV", "AIFF", "APE", "WV", "TAK"}
+            lossless_count = sum(c for fmt, c in ffmpeg_formats.items() if (fmt or "").upper().strip() in lossless_keys)
+            lossy_count = max(0, sum(ffmpeg_formats.values()) - lossless_count)
+            summary = {
+                "ffmpeg_formats": ffmpeg_formats,
+                "mb_connection_ok": mb_conn_ok,
+                "mb_albums_verified": mb_done,
+                "mb_albums_identified": mb_used,
+                "ai_connection_ok": ai_conn_ok,
+                "ai_groups_count": ai_groups,
+                "mb_verified_by_ai": mb_verified_by_ai,
+                "ai_errors": ai_errors_dedup,
+                # Last-scan-only stats for "Last scan summary" UI
+                "duration_seconds": duration,
+                "artists_total": artists_total,
+                "albums_scanned": albums_scanned,
+                "duplicate_groups_count": duplicate_groups_count,
+                "total_duplicates_count": total_duplicates_count,
+                "broken_albums_count": broken_albums_count,
+                "missing_albums_count": missing_albums_count,
+                "albums_without_artist_image": albums_without_artist_image,
+                "albums_without_album_image": albums_without_album_image,
+                "albums_without_complete_tags": albums_without_complete_tags,
+                "albums_without_mb_id": albums_without_mb_id,
+                "albums_without_artist_mb_id": albums_without_artist_mb_id,
+                "audio_cache_hits": audio_hits,
+                "audio_cache_misses": audio_misses,
+                "mb_cache_hits": mb_hits,
+                "mb_cache_misses": mb_misses,
+                "lossy_count": lossy_count,
+                "lossless_count": lossless_count,
+                "albums_with_mb_id": albums_with_mb,
+                "albums_without_mb_id": albums_without_mb,
+                # When auto-move ran this scan
+                "dupes_moved_this_scan": dupes_moved_this_scan,
+                "space_saved_mb_this_scan": space_saved_mb_this_scan,
+                # Fallback sources during scan (when MusicBrainz found nothing)
+                "scan_discogs_matched": scan_discogs_matched,
+                "scan_lastfm_matched": scan_lastfm_matched,
+                "scan_bandcamp_matched": scan_bandcamp_matched,
+            }
+            summary_json_str = json.dumps(summary)
             cur.execute("""
                 UPDATE scan_history
                 SET end_time = ?,
@@ -5413,7 +6930,8 @@ def background_scan():
                     albums_without_album_image = ?,
                     albums_without_complete_tags = ?,
                     albums_without_mb_id = ?,
-                    albums_without_artist_mb_id = ?
+                    albums_without_artist_mb_id = ?,
+                    summary_json = ?
                 WHERE scan_id = ?
             """, (
                 end_time,
@@ -5422,8 +6940,8 @@ def background_scan():
                 artists_processed,
                 ai_used_count,
                 mb_used_count,
-                space_saved,
-                albums_moved,
+                space_saved_mb_this_scan,
+                albums_moved_this_scan,
                 status,
                 duplicate_groups_count,
                 total_duplicates_count,
@@ -5434,6 +6952,7 @@ def background_scan():
                 albums_without_complete_tags,
                 albums_without_mb_id,
                 albums_without_artist_mb_id,
+                summary_json_str,
                 scan_id
             ))
             if status == 'completed':
@@ -5444,6 +6963,9 @@ def background_scan():
             con.commit()
             con.close()
         
+        with lock:
+            state["scan_finalizing"] = False
+            state["scanning"] = False
         logging.debug("background_scan(): finished (flag cleared)")
         duration = time.perf_counter() - start_time
         groups_found = sum(len(v) for v in all_results.values()) if 'all_results' in locals() else 0
@@ -5478,27 +7000,72 @@ def background_dedupe(all_groups: List[dict]):
     """
     Processes deduplication of all groups in a background thread.
     Updates stats in DB and in-memory state.
+    Sets dedupe_current_group so the UI can show artist, album, winner, losers, destination.
     """
+    ensure_dedupe_scan_id()
+    dupe_root = getattr(sys.modules[__name__], "DUPE_ROOT", Path("/dupes"))
     with lock:
-        state.update(deduping=True, dedupe_progress=0, dedupe_total=len(all_groups))
+        state.update(
+            deduping=True,
+            dedupe_progress=0,
+            dedupe_total=len(all_groups),
+            dedupe_start_time=time.time(),
+            dedupe_saved_this_run=0,
+            dedupe_current_group=None,
+            dedupe_last_write=None,
+        )
 
     total_moved = 0
     removed_count = 0
     artists_to_refresh = set()
 
     for g in all_groups:
+        best = g.get("best", {})
+        losers = g.get("losers", [])
+        artist = g["artist"]
+        album_title = best.get("title_raw", "")
+        num_dupes = 1 + len(losers)
+        # Ensure folder values are str for JSON (edition dict may store Path)
+        current_group = {
+            "artist": artist,
+            "album": album_title,
+            "num_dupes": num_dupes,
+            "winner": {
+                "title_raw": best.get("title_raw", ""),
+                "album_id": best.get("album_id"),
+                "folder": str(best.get("folder") or ""),
+            },
+            "losers": [
+                {"title_raw": e.get("title_raw", ""), "album_id": e.get("album_id"), "folder": str(e.get("folder") or "")}
+                for e in losers
+            ],
+            "destination": str(dupe_root),
+            "status": "moving",
+        }
+        with lock:
+            state["dedupe_current_group"] = current_group
+
         moved = perform_dedupe(g)
         removed_count += len(g["losers"])
-        total_moved += sum(item["size"] for item in moved)
+        group_saved = sum(item["size"] for item in moved)
+        total_moved += group_saved
         artists_to_refresh.add(g["artist"])
+
         with lock:
             state["dedupe_progress"] += 1
-            logging.debug(f"background_dedupe(): processed group for '{g['artist']}|{g['best']['title_raw']}', dedupe_progress={state['dedupe_progress']}/{state['dedupe_total']}")
-            # Remove this group from in-memory state
-            if g["artist"] in state["duplicates"]:
-                state["duplicates"][g["artist"]].remove(g)
-                if not state["duplicates"][g["artist"]]:
-                    del state["duplicates"][g["artist"]]
+            state["dedupe_saved_this_run"] = state.get("dedupe_saved_this_run", 0) + group_saved
+            state["dedupe_current_group"] = None
+            logging.debug(f"background_dedupe(): processed group for '{artist}|{album_title}', dedupe_progress={state['dedupe_progress']}/{state['dedupe_total']}")
+            # Remove this group from in-memory state so the list shrinks on next /api/duplicates
+            if artist in state["duplicates"]:
+                state["duplicates"][artist].remove(g)
+                if not state["duplicates"][artist]:
+                    del state["duplicates"][artist]
+        # Remove from DB so /api/duplicates (and reload) shows shrinking list
+        best_album_id = best.get("album_id")
+        loser_album_ids = [e.get("album_id") for e in losers if e.get("album_id") is not None]
+        if best_album_id is not None:
+            _remove_dedupe_group_from_db(artist, best_album_id, loser_album_ids)
 
     # Update stats in DB
     increment_stat("space_saved", total_moved)
@@ -5509,18 +7076,30 @@ def background_dedupe(all_groups: List[dict]):
     )
     logging.debug(f"background_dedupe(): updated stats: space_saved += {total_moved}, removed_dupes += {removed_count}")
 
-    # Refresh Plex for all affected artists
+    # Refresh Plex for all affected artists (each section in SECTION_IDS)
+    section_ids = getattr(sys.modules[__name__], "SECTION_IDS", []) or []
     for artist in artists_to_refresh:
         letter = quote_plus(artist[0].upper())
         art_enc = quote_plus(artist)
-        try:
-            plex_api(f"/library/sections/{SECTION_ID}/refresh?path=/music/matched/{letter}/{art_enc}", method="GET")
-            plex_api(f"/library/sections/{SECTION_ID}/emptyTrash", method="PUT")
-        except Exception as e:
-            logging.warning(f"background_dedupe(): plex refresh/emptyTrash failed for {artist}: {e}")
+        for sid in section_ids:
+            try:
+                plex_api(f"/library/sections/{sid}/refresh?path=/music/matched/{letter}/{art_enc}", method="GET")
+                plex_api(f"/library/sections/{sid}/emptyTrash", method="PUT")
+            except Exception as e:
+                logging.warning(f"background_dedupe(): plex refresh/emptyTrash failed for artist={artist} section={sid}: {e}")
 
     with lock:
+        scan_id = state.get("scan_id")
         state["deduping"] = False
+        state["dedupe_current_group"] = None
+        state["dedupe_last_write"] = None
+        state["dedupe_start_time"] = None
+        state["dedupe_saved_this_run"] = 0
+        # For "Last scan summary": dupes moved and space saved in this run (when auto-move was used)
+        state["last_dedupe_moved_count"] = removed_count
+        state["last_dedupe_saved_mb"] = total_moved
+    if scan_id is not None:
+        update_dedupe_scan_summary(scan_id, total_moved, removed_count)
     logging.debug("background_dedupe(): deduping completed")
 
 # ─────────────────────────────────── SUPPORT FUNCTIONS ──────────────────────────────────
@@ -5542,13 +7121,14 @@ def perform_dedupe(group: dict) -> List[dict]:
     """
     Move each "loser" folder out to DUPE_ROOT, delete metadata in Plex,
     and return a list of dicts describing each moved item.
+    Cover is fetched after moves so the first group does not block on Plex API (avoids stuck 1/N).
     """
     moved_items: List[dict] = []
     artist = group["artist"]
     best_title = group["best"]["title_raw"]
-    cover_data = fetch_cover_as_base64(group["best"]["album_id"])
 
-    for loser in group["losers"]:
+    num_losers = len(group["losers"])
+    for idx, loser in enumerate(group["losers"], 1):
         src_folder = Path(loser["folder"])
         # Skip if the source folder is absent (e.g. already moved or path mapping issue)
         if not src_folder.exists():
@@ -5565,10 +7145,13 @@ def perform_dedupe(group: dict) -> List[dict]:
             counter += 1
         dst.parent.mkdir(parents=True, exist_ok=True)
 
-        logging.info("Moving dupe: %s  →  %s", src_folder, dst)
+        logging.info("Moving dupe %s/%s: %s  →  %s", idx, num_losers, src_folder, dst)
         logging.debug("perform_dedupe(): moving %s → %s", src_folder, dst)
         try:
             safe_move(str(src_folder), str(dst))
+            with lock:
+                state["dedupe_last_write"] = {"path": str(dst), "at": time.time()}
+            logging.info("Moved to /dupes: %s", dst)
         except Exception as move_err:
             logging.error("perform_dedupe(): move failed for %s → %s – %s",
                           src_folder, dst, move_err)
@@ -5603,19 +7186,38 @@ def perform_dedupe(group: dict) -> List[dict]:
             try:
                 con = sqlite3.connect(str(STATE_DB_FILE))
                 cur = con.cursor()
-                cur.execute("""
-                    INSERT INTO scan_moves
-                    (scan_id, artist, album_id, original_path, moved_to_path, size_mb, moved_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    scan_id,
-                    artist,
-                    loser_id,
-                    str(src_folder),
-                    str(dst),
-                    size_mb,
-                    moved_at
-                ))
+                cur.execute("PRAGMA table_info(scan_moves)")
+                move_cols = [r[1] for r in cur.fetchall()]
+                if "album_title" in move_cols and "fmt_text" in move_cols:
+                    cur.execute("""
+                        INSERT INTO scan_moves
+                        (scan_id, artist, album_id, original_path, moved_to_path, size_mb, moved_at, album_title, fmt_text)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        scan_id,
+                        artist,
+                        loser_id,
+                        str(src_folder),
+                        str(dst),
+                        size_mb,
+                        moved_at,
+                        best_title or "",
+                        fmt_text or ""
+                    ))
+                else:
+                    cur.execute("""
+                        INSERT INTO scan_moves
+                        (scan_id, artist, album_id, original_path, moved_to_path, size_mb, moved_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        scan_id,
+                        artist,
+                        loser_id,
+                        str(src_folder),
+                        str(dst),
+                        size_mb,
+                        moved_at
+                    ))
                 con.commit()
                 con.close()
             except Exception as e:
@@ -5629,8 +7231,13 @@ def perform_dedupe(group: dict) -> List[dict]:
             "br":        br_kbps,
             "sr":        sr,
             "bd":        bd,
-            "thumb_data": cover_data
+            "thumb_data": None
         })
+
+    # Fetch cover after moves so we do not block the first group on Plex API (fixes stuck 1/N dedupe).
+    cover_data = fetch_cover_as_base64(group["best"]["album_id"]) if group.get("best", {}).get("album_id") else None
+    for m in moved_items:
+        m["thumb_data"] = cover_data
 
     return moved_items
 
@@ -5659,14 +7266,30 @@ def _build_card_list(dup_dict) -> list[dict]:
                 for loser in g["losers"]
             ]
             display_title = best["album_norm"].title()
-            size_bytes = safe_folder_size(folder_path)
-            size_mb = size_bytes // (1024 * 1024)
-            track_count = 0
-            if db_conn:
-                try:
-                    track_count = len(get_tracks(db_conn, best["album_id"]))
-                except Exception:
-                    pass
+            # Ensure used_ai groups have provider/model for METHOD column (backfill from globals if missing)
+            used_ai = best.get("used_ai", False)
+            ai_provider = best.get("ai_provider") or ""
+            ai_model = best.get("ai_model") or ""
+            if used_ai and (not ai_provider or not ai_model):
+                mod = sys.modules[__name__]
+                ai_provider = ai_provider or (getattr(mod, "AI_PROVIDER", None) or "")
+                ai_model = ai_model or (getattr(mod, "RESOLVED_MODEL", None) or getattr(mod, "OPENAI_MODEL", None) or "")
+            # Use persisted size_mb/track_count when available (so Unduper shows data after reload)
+            if best.get("size_mb") is not None:
+                size_mb = int(best["size_mb"])
+                size_bytes = size_mb * (1024 * 1024)
+            else:
+                size_bytes = safe_folder_size(folder_path)
+                size_mb = size_bytes // (1024 * 1024)
+            if best.get("track_count") is not None:
+                track_count = int(best["track_count"])
+            else:
+                track_count = 0
+                if db_conn:
+                    try:
+                        track_count = len(get_tracks(db_conn, best["album_id"]))
+                    except Exception:
+                        pass
             cards.append({
                 "artist_key": artist.replace(" ", "_"),
                 "artist": artist,
@@ -5676,14 +7299,15 @@ def _build_card_list(dup_dict) -> list[dict]:
                 "best_title": display_title,
                 "best_fmt": best_fmt,
                 "formats": formats,
-                "used_ai": best.get("used_ai", False),
-                "ai_provider": best.get("ai_provider", ""),
-                "ai_model": best.get("ai_model", ""),
+                "used_ai": used_ai,
+                "ai_provider": ai_provider,
+                "ai_model": ai_model,
                 "size": size_bytes,
                 "size_mb": size_mb,
                 "track_count": track_count,
                 "path": str(folder_path),
                 "no_move": False,
+                "match_verified_by_ai": bool(best.get("match_verified_by_ai", False)),
             })
     if db_conn:
         try:
@@ -5703,57 +7327,339 @@ def _requires_config():
     return None
 
 def start_background_scan():
+    if not ai_provider_ready:
+        logging.warning("start_background_scan(): AI not configured; scan not started")
+        return
     with lock:
         if not state["scanning"]:
-            state.update(scanning=True, scan_progress=0, scan_total=0)
+            state.update(scanning=True, scan_progress=0, scan_total=0, scan_step_progress=0, scan_step_total=0)
+            state["scan_ai_enabled"] = True
+            state["scan_mb_enabled"] = USE_MUSICBRAINZ
             logging.debug("start_scan(): launching background_scan() thread")
             threading.Thread(target=background_scan, daemon=True).start()
 
-@app.get("/api/scan/preflight")
-def scan_preflight():
-    """Check MusicBrainz and AI provider connectivity before starting a scan. Returns clear ok/error for UI."""
-    musicbrainz = {"ok": False, "message": ""}
-    ai_provider = {"ok": False, "message": "", "provider": ""}
+def _run_preflight_checks():
+    """Run MusicBrainz and AI connectivity checks. Returns (mb_ok: bool, ai_ok: bool).
+    For AI, ai_ok reflects ai_provider_ready (functional check is done by _reload_ai_config_and_reinit)."""
+    mb_ok = False
     if USE_MUSICBRAINZ:
         try:
             test_mbid = "9162580e-5df4-32de-80cc-f45a8d8a9b1d"
             musicbrainzngs.get_release_group_by_id(test_mbid, includes=[])
-            musicbrainz = {"ok": True, "message": "MusicBrainz reachable"}
-        except musicbrainzngs.WebServiceError as e:
-            musicbrainz = {"ok": False, "message": str(e)}
-        except Exception as e:
-            musicbrainz = {"ok": False, "message": str(e)}
-    else:
-        musicbrainz = {"ok": False, "message": "MusicBrainz disabled in settings"}
-    # AI: minimal live check (OpenAI or configured provider)
-    provider_name = getattr(sys.modules[__name__], "AI_PROVIDER", None) or "OpenAI"
-    ai_provider["provider"] = provider_name
-    if OPENAI_API_KEY and openai_client:
-        model = getattr(sys.modules[__name__], "RESOLVED_MODEL", None) or OPENAI_MODEL or "gpt-4o-mini"
-        try:
-            openai_client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": "ping"}],
-                max_completion_tokens=2,
-                stop=["\n"],
-            )
-            ai_provider = {"ok": True, "message": f"{provider_name} reachable", "provider": provider_name}
-        except Exception as e:
+            mb_ok = True
+        except Exception:
+            pass
+    ai_ok = bool(ai_provider_ready)
+    return mb_ok, ai_ok
+
+
+def _run_discogs_preflight() -> tuple[bool, str]:
+    """Test Discogs API connectivity. Returns (ok, message)."""
+    if not USE_DISCOGS or not (getattr(sys.modules[__name__], "DISCOGS_USER_TOKEN", "") or "").strip():
+        return False, "Disabled (no token)"
+    try:
+        import discogs_client
+        token = (getattr(sys.modules[__name__], "DISCOGS_USER_TOKEN", "") or "").strip()
+        d = discogs_client.Client("PMDA/0.6.6", user_token=token)
+        d.identity()
+        return True, "Discogs reachable"
+    except Exception as e:
+        return False, f"Discogs unreachable: {e}"
+
+
+def _run_lastfm_preflight() -> tuple[bool, str]:
+    """Test Last.fm API connectivity. Returns (ok, message)."""
+    if not USE_LASTFM or not (getattr(sys.modules[__name__], "LASTFM_API_KEY", "") or "").strip():
+        return False, "Disabled (no API key)"
+    try:
+        api_key = (getattr(sys.modules[__name__], "LASTFM_API_KEY", "") or "").strip()
+        resp = requests.get(
+            "https://ws.audioscrobbler.com/2.0/",
+            params={"method": "album.getInfo", "artist": "Cher", "album": "Believe", "api_key": api_key, "format": "json"},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            if "error" in data and data.get("error") != 0:
+                return False, f"Last.fm API error: {data.get('message', 'Unknown')}"
+            return True, "Last.fm reachable"
+        return False, f"Last.fm HTTP {resp.status_code}"
+    except Exception as e:
+        return False, f"Last.fm unreachable: {e}"
+
+
+def _fetch_discogs_release(artist_name: str, album_title: str) -> Optional[dict]:
+    """
+    Search Discogs for a release by artist + album. Returns dict with title, year, cover_url, artist_name, or None.
+    Requires USE_DISCOGS and DISCOGS_USER_TOKEN.
+    Search can return Masters first; d.release(master_id) would 404. We collect candidate release IDs (from
+    type=release or from master.main_release). main_release is a Release object in discogs_client, so we must
+    use its .id for d.release(). We try each candidate until one succeeds.
+    """
+    if not USE_DISCOGS:
+        return None
+    token = (getattr(sys.modules[__name__], "DISCOGS_USER_TOKEN", "") or "").strip()
+    if not token:
+        return None
+    def _page_to_candidate_ids(d_client, page_list: list) -> list:
+        out = []
+        for item in page_list or []:
+            item_id = getattr(item, "id", None) or (getattr(item, "data", None) or {}).get("id")
+            if item_id is None:
+                continue
+            item_type = getattr(item, "type", None) or (getattr(item, "data", None) or {}).get("type", "release")
+            if item_type == "release":
+                rid = getattr(item_id, "id", item_id) if not isinstance(item_id, int) else item_id
+                out.append(int(rid))
+            elif item_type == "master":
+                try:
+                    master = d_client.master(int(item_id))
+                    main = getattr(master, "main_release", None) or (getattr(master, "data", None) or {}).get("main_release")
+                    if main is not None:
+                        rid = getattr(main, "id", main) if not isinstance(main, int) else main
+                        out.append(int(rid))
+                except Exception:
+                    continue
+        return out
+
+    try:
+        import discogs_client
+        from discogs_client.exceptions import HTTPError
+        d = discogs_client.Client("PMDA/0.6.6", user_token=token)
+        album_norm = norm_album(album_title) or album_title
+        results = d.search(album_norm, artist=artist_name, type="release")
+        page = results.page(1)
+        candidate_ids = _page_to_candidate_ids(d, page)
+        if not candidate_ids:
+            combined = f"{artist_name} {album_title}".strip()
+            if combined:
+                results = d.search(combined, type="release")
+                page = results.page(1)
+                candidate_ids = _page_to_candidate_ids(d, page)
+        seen = set()
+        unique_ids = [x for x in candidate_ids if x not in seen and not seen.add(x)]
+        for release_id in unique_ids:
             try:
-                openai_client.chat.completions.create(
-                    model=model,
-                    messages=[{"role": "user", "content": "ping"}],
-                    max_tokens=2,
-                    stop=["\n"],
-                )
-                ai_provider = {"ok": True, "message": f"{provider_name} reachable", "provider": provider_name}
-            except Exception as e2:
-                ai_provider = {"ok": False, "message": str(e2) or str(e), "provider": provider_name}
-    elif ai_provider_ready:
-        ai_provider = {"ok": True, "message": f"{provider_name} configured", "provider": provider_name}
+                full_release = d.release(release_id)
+                title = getattr(full_release, "title", None) or (full_release.data.get("title") if getattr(full_release, "data", None) else album_title)
+                year = getattr(full_release, "year", None) or (full_release.data.get("year") if getattr(full_release, "data", None) else "")
+                cover_url = None
+                if getattr(full_release, "images", None) and len(full_release.images) > 0:
+                    img = full_release.images[0]
+                    cover_url = img.get("uri") or img.get("resource_url")
+                artist_str = artist_name
+                if getattr(full_release, "artists", None) and full_release.artists:
+                    artist_str = getattr(full_release.artists[0], "name", None) or artist_name
+                return {"title": title, "year": str(year) if year else "", "cover_url": cover_url, "artist_name": artist_str}
+            except HTTPError as he:
+                if getattr(he, "status_code", None) == 404:
+                    continue
+                raise
+        return None
+    except Exception as e:
+        logging.warning("Discogs fetch failed for %s / %s: %s", artist_name, album_title, e)
+        return None
+
+
+def _fetch_lastfm_album_info(artist_name: str, album_title: str, mbid: Optional[str] = None) -> Optional[dict]:
+    """
+    Call Last.fm album.getInfo. Returns dict with cover_url, toptags (list of str), title, artist, or None.
+    """
+    if not USE_LASTFM:
+        return None
+    api_key = (getattr(sys.modules[__name__], "LASTFM_API_KEY", "") or "").strip()
+    if not api_key:
+        return None
+    try:
+        params = {"method": "album.getInfo", "artist": artist_name, "album": album_title, "api_key": api_key, "format": "json"}
+        if mbid:
+            params["mbid"] = mbid
+        resp = requests.get("https://ws.audioscrobbler.com/2.0/", params=params, timeout=10)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        if data.get("error") and data.get("error") != 0:
+            search_params = {"method": "album.search", "album": f"{artist_name} {album_title}".strip(), "api_key": api_key, "format": "json"}
+            search_resp = requests.get("https://ws.audioscrobbler.com/2.0/", params=search_params, timeout=10)
+            if search_resp.status_code == 200:
+                search_data = search_resp.json()
+                matches = (search_data.get("results") or {}).get("albummatches") or {}
+                album_list = matches.get("album") or []
+                if isinstance(album_list, dict):
+                    album_list = [album_list]
+                if album_list:
+                    first = album_list[0]
+                    search_artist = (first.get("artist") or "").strip() or artist_name
+                    search_album = (first.get("name") or "").strip() or album_title
+                    params2 = {"method": "album.getInfo", "artist": search_artist, "album": search_album, "api_key": api_key, "format": "json"}
+                    resp2 = requests.get("https://ws.audioscrobbler.com/2.0/", params=params2, timeout=10)
+                    if resp2.status_code == 200:
+                        data = resp2.json()
+                        if not (data.get("error") and data.get("error") != 0):
+                            album_title = search_album
+                            artist_name = search_artist
+            if data.get("error") and data.get("error") != 0:
+                return None
+        album = data.get("album") or {}
+        images = album.get("image") or []
+        cover_url = None
+        for img in images:
+            if img.get("size") == "extralarge" or img.get("#text"):
+                cover_url = img.get("#text") or cover_url
+        if not cover_url and images:
+            cover_url = images[-1].get("#text")
+        toptags = []
+        for t in (album.get("toptags", {}).get("tag") or []):
+            name = t.get("name") if isinstance(t, dict) else str(t)
+            if name:
+                toptags.append(name)
+        mbid = (album.get("mbid") or "").strip()
+        return {
+            "cover_url": cover_url,
+            "toptags": toptags,
+            "title": album.get("name") or album_title,
+            "artist": album.get("artist", {}).get("name") if isinstance(album.get("artist"), dict) else artist_name,
+            "mbid": mbid,
+        }
+    except Exception as e:
+        logging.warning("Last.fm fetch failed for %s / %s: %s", artist_name, album_title, e)
+        return None
+
+
+_last_bandcamp_request = 0.0
+_bandcamp_lock = threading.Lock()
+
+
+def _fetch_bandcamp_album_info(artist_name: str, album_title: str) -> Optional[dict]:
+    """
+    Search Bandcamp for an album by artist + title. Returns dict with title, artist_name, year, cover_url, or None.
+    Uses scraping; no public API. Rate-limited (5s between calls). User-Agent identifies PMDA.
+    Use at your own risk regarding Bandcamp ToS.
+    """
+    if not USE_BANDCAMP:
+        return None
+    global _last_bandcamp_request
+    with _bandcamp_lock:
+        now = time.time()
+        wait = 5.0 - (now - _last_bandcamp_request)
+        if wait > 0:
+            time.sleep(wait)
+        _last_bandcamp_request = time.time()
+    headers = {"User-Agent": "PMDA/1.0 (metadata fallback; https://github.com/silkyclouds/PMDA)"}
+    try:
+        q = quote_plus(f"{artist_name} {album_title}".strip())
+        search_url = f"https://bandcamp.com/search?q={q}"
+        resp = requests.get(search_url, headers=headers, timeout=15)
+        if resp.status_code != 200:
+            return None
+        html = resp.text
+        album_clean = (norm_album(album_title) or album_title).lower().replace(" ", "").replace("-", "")
+        all_album_links = re.findall(r'href="(https?://[^"]*bandcamp\.com/album/([^"?]+))', html)
+        album_url = None
+        for full_url, slug in all_album_links:
+            slug_clean = (slug or "").lower().replace("-", "").replace("_", "")
+            if album_clean and (album_clean in slug_clean or slug_clean in album_clean):
+                album_url = full_url.split("?")[0]
+                break
+        if not album_url and all_album_links:
+            album_url = all_album_links[0][0].split("?")[0]
+        if not album_url:
+            return None
+        album_resp = requests.get(album_url, headers=headers, timeout=15)
+        if album_resp.status_code != 200:
+            return None
+        page = album_resp.text
+        title = None
+        cover_url = None
+        og_title = re.search(r'<meta\s+property="og:title"\s+content="([^"]+)"', page)
+        if og_title:
+            title = og_title.group(1).strip()
+        og_image = re.search(r'<meta\s+property="og:image"\s+content="([^"]+)"', page)
+        if og_image:
+            cover_url = og_image.group(1).strip()
+        # Artist often in og:title as "Album Title, by Artist Name" or in itemprop
+        artist_str = artist_name
+        if title and " by " in title:
+            parts = title.split(" by ", 1)
+            title = parts[0].strip()
+            if len(parts) > 1:
+                artist_str = parts[1].strip()
+        if not title:
+            title = album_title
+        year = ""
+        year_m = re.search(r'released\s+(\w+\s+\d{1,2},?\s+\d{4})', page)
+        if year_m:
+            year = year_m.group(1)
+        return {"title": title, "artist_name": artist_str, "year": year, "cover_url": cover_url}
+    except Exception as e:
+        logging.warning("Bandcamp fetch failed for %s / %s: %s", artist_name, album_title, e)
+        return None
+
+
+def _web_search_serper(query: str, num: int = 10) -> List[dict]:
+    """
+    Run a web search via Serper.dev API. Returns list of {"title", "link", "snippet"}.
+    Empty list if no API key, or on network/API error.
+    """
+    key = getattr(sys.modules[__name__], "SERPER_API_KEY", "") or ""
+    if not key.strip():
+        return []
+    url = "https://google.serper.dev/search"
+    headers = {"X-API-KEY": key, "Content-Type": "application/json"}
+    body = {"q": query, "num": num}
+    try:
+        resp = requests.post(url, json=body, headers=headers, timeout=10)
+        if resp.status_code != 200:
+            logging.debug("[Serper] HTTP %s: %s", resp.status_code, resp.text[:200])
+            return []
+        data = resp.json()
+        organic = data.get("organic") or []
+        out = []
+        for item in organic:
+            if isinstance(item, dict):
+                out.append({
+                    "title": item.get("title") or "",
+                    "link": item.get("link") or "",
+                    "snippet": item.get("snippet") or "",
+                })
+        return out
+    except Exception as e:
+        logging.debug("[Serper] Request failed: %s", e)
+        return []
+
+
+@app.get("/api/scan/preflight")
+def scan_preflight():
+    """Check MusicBrainz, AI, Discogs, Last.fm and Bandcamp. Returns clear ok/error for UI."""
+    _reload_ai_config_and_reinit()
+    mb_ok, ai_ok = _run_preflight_checks()
+    provider_name = getattr(sys.modules[__name__], "AI_PROVIDER", None) or "OpenAI"
+    resolved_model = getattr(sys.modules[__name__], "RESOLVED_MODEL", None)
+    ai_func_err = getattr(sys.modules[__name__], "AI_FUNCTIONAL_ERROR_MSG", None)
+    if not USE_MUSICBRAINZ:
+        mb_msg = "MusicBrainz disabled in settings"
+    elif mb_ok:
+        mb_msg = "MusicBrainz reachable"
     else:
-        ai_provider = {"ok": False, "message": "No API key or provider configured", "provider": provider_name}
-    return jsonify(musicbrainz=musicbrainz, ai=ai_provider)
+        mb_msg = "MusicBrainz unreachable"
+    musicbrainz = {"ok": mb_ok, "message": mb_msg}
+    if ai_ok:
+        ai_msg = f"{provider_name} reachable" + (f", model {resolved_model} (params verified)" if resolved_model else "") if (OPENAI_API_KEY and openai_client) else f"{provider_name} configured"
+    else:
+        ai_msg = ai_func_err or "No API key or provider configured"
+    ai_provider = {"ok": ai_ok, "message": ai_msg, "provider": provider_name}
+
+    discogs_ok, discogs_msg = _run_discogs_preflight()
+    discogs = {"ok": discogs_ok, "message": discogs_msg}
+    lastfm_ok, lastfm_msg = _run_lastfm_preflight()
+    lastfm = {"ok": lastfm_ok, "message": lastfm_msg}
+    if USE_BANDCAMP:
+        bandcamp = {"ok": True, "message": "Configured (fallback ultime, no connection test)"}
+    else:
+        bandcamp = {"ok": False, "message": "Disabled"}
+
+    paths = _paths_rw_status()
+    return jsonify(musicbrainz=musicbrainz, ai=ai_provider, discogs=discogs, lastfm=lastfm, bandcamp=bandcamp, paths=paths)
 
 
 @app.route("/scan/start", methods=["POST"])
@@ -5761,6 +7667,18 @@ def start_scan():
     r = _requires_config()
     if r is not None:
         return r
+    _reload_ai_config_and_reinit()
+    if not ai_provider_ready:
+        func_msg = getattr(sys.modules[__name__], "AI_FUNCTIONAL_ERROR_MSG", None)
+        if func_msg:
+            return jsonify({
+                "error": func_msg,
+                "aiFunctionalFailure": True,
+            }), 503
+        return jsonify({
+            "error": "Configure the AI provider in Settings to run a scan",
+            "requiresAiConfig": True,
+        }), 503
     scan_should_stop.clear()
     scan_is_paused.clear()
     start_background_scan()
@@ -5792,7 +7710,8 @@ def stop_scan():
 @app.route("/api/scan/clear", methods=["POST"])
 def clear_scan():
     """
-    Clear all scan results from the database (duplicates_best, duplicates_loser).
+    Clear all scan results from the database: duplicates, broken albums,
+    scan editions (Tag Fixer), and last completed scan id.
     Optionally clear audio and MusicBrainz caches.
     """
     import sqlite3
@@ -5801,13 +7720,22 @@ def clear_scan():
     clear_mb_cache = data.get("clear_mb_cache", False)
     
     try:
-        # Clear scan results
+        # Clear all scan-derived data so Unduper, Tag Fixer, Incomplete Albums show nothing
         con = sqlite3.connect(str(STATE_DB_FILE))
         cur = con.cursor()
         cur.execute("DELETE FROM duplicates_loser")
         deleted_losers = cur.rowcount
         cur.execute("DELETE FROM duplicates_best")
         deleted_best = cur.rowcount
+        cur.execute("DELETE FROM broken_albums")
+        deleted_broken = cur.rowcount
+        cur.execute("DELETE FROM scan_editions")
+        deleted_editions = cur.rowcount
+        cur.execute("DELETE FROM settings WHERE key = 'last_completed_scan_id'")
+        # Clear last scan summary so "Last scan summary" UI disappears until next scan
+        cur.execute(
+            "UPDATE scan_history SET summary_json = NULL WHERE scan_id = (SELECT scan_id FROM scan_history WHERE status = 'completed' AND end_time IS NOT NULL ORDER BY end_time DESC LIMIT 1)"
+        )
         con.commit()
         con.close()
         
@@ -5821,7 +7749,9 @@ def clear_scan():
             "message": "Scan results cleared successfully",
             "cleared": {
                 "duplicates_best": deleted_best,
-                "duplicates_loser": deleted_losers
+                "duplicates_loser": deleted_losers,
+                "broken_albums": deleted_broken,
+                "scan_editions": deleted_editions,
             }
         }
         
@@ -5842,10 +7772,13 @@ def clear_scan():
             cur = con.cursor()
             cur.execute("DELETE FROM musicbrainz_cache")
             mb_cache_deleted = cur.rowcount
+            cur.execute("DELETE FROM musicbrainz_album_lookup")
+            mb_album_lookup_deleted = cur.rowcount
             con.commit()
             con.close()
             result["cleared"]["musicbrainz_cache"] = mb_cache_deleted
-            result["message"] += f", {mb_cache_deleted} MusicBrainz cache entries cleared"
+            result["cleared"]["musicbrainz_album_lookup"] = mb_album_lookup_deleted
+            result["message"] += f", {mb_cache_deleted} MB cache + {mb_album_lookup_deleted} album lookup cache cleared"
         
         logging.info("Scan results cleared: %s", result)
         return jsonify(result)
@@ -6536,6 +8469,25 @@ def api_plex_database_paths():
     return jsonify({"success": True, "paths": PLEX_DATABASE_PATH_HINTS})
 
 
+@app.get("/api/plex/verify-db")
+def api_plex_verify_db():
+    """
+    Verify that the current Plex DB file exists and is readable (e.g. open read-only and run a trivial query).
+    Returns { success: true } or { success: false, message: "..." }.
+    """
+    if not Path(PLEX_DB_FILE).exists():
+        return jsonify({"success": False, "message": "Plex database file not found at " + PLEX_DB_FILE}), 200
+    try:
+        con = sqlite3.connect(f"file:{PLEX_DB_FILE}?mode=ro", uri=True, timeout=5)
+        con.execute("SELECT 1 FROM metadata_items LIMIT 1")
+        con.close()
+    except sqlite3.OperationalError as e:
+        return jsonify({"success": False, "message": "Plex database not readable or invalid: " + str(e)}), 200
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)}), 200
+    return jsonify({"success": True})
+
+
 @app.post("/api/autodetect/libraries")
 def api_autodetect_libraries():
     """Return list of Plex libraries (sections) for the wizard. Uses config or optional body { PLEX_HOST, PLEX_TOKEN }."""
@@ -6933,152 +8885,116 @@ def api_musicbrainz_test():
 @app.get("/api/openai/models")
 @app.post("/api/openai/models")
 def api_openai_models():
-    """Return list of OpenAI model IDs fetched directly from OpenAI API.
-    Requires OPENAI_API_KEY in POST body or in config.
-    Returns only chat completion models (gpt-*) available for the provided API key."""
-    # Try to get key from POST body first (for testing before saving), then from config
-    # Check if data was passed from api_ai_models via Flask g context
+    """Return only OpenAI model IDs that are compatible with PMDA (Chat Completions, parseable output).
+    Uses a curated list so we never show models that return empty or fail (e.g. gpt-5-nano)."""
     from flask import g
     data = getattr(g, 'ai_models_request_data', None) or request.get_json(silent=True) or {}
     key = (data.get("OPENAI_API_KEY") or "").strip() or OPENAI_API_KEY
-    
+
     if not key:
         return jsonify({"error": "OPENAI_API_KEY is required"}), 400
-    
-    # Validate key format
+
     if not key.startswith("sk-"):
         return jsonify({"error": "Invalid API key format. OpenAI keys start with 'sk-'"}), 400
-    
+
     try:
         client = OpenAI(api_key=key)
-        # Fetch all models from OpenAI API
-        models_response = client.models.list()
-        
-        # Filter for chat completion models only
-        # OpenAI chat models typically start with "gpt-" and are in the "chat" category
-        available_models = []
-        for model in models_response.data:
-            model_id = model.id
-            # Only include gpt-* models (chat completion models)
-            # Exclude instruct models, vision-only models, and other non-chat models
-            if (model_id.startswith("gpt-") and 
-                "instruct" not in model_id.lower() and
-                "vision" not in model_id.lower() and
-                "embedding" not in model_id.lower()):
-                available_models.append(model_id)
-        
-        if not available_models:
-            logging.warning("OpenAI API returned no chat completion models")
-            return jsonify({"error": "No chat completion models available for this API key"}), 404
-        
-        # Sort models: newer/better models first
-        def model_sort_key(name: str) -> tuple:
-            # Priority order: gpt-5 > gpt-4.1 > gpt-4o > gpt-4 > gpt-3.5
-            # Within each tier, sort by name (nano < mini < base)
-            if name.startswith("gpt-5"):
-                tier = 0
-            elif name.startswith("gpt-4.1"):
-                tier = 1
-            elif name.startswith("gpt-4o"):
-                tier = 2
-            elif name.startswith("gpt-4"):
-                tier = 3
-            elif name.startswith("gpt-3.5"):
-                tier = 4
-            else:
-                tier = 5
-            return (tier, name)
-        
-        available_models.sort(key=model_sort_key)
-        logging.info("Fetched %d chat completion models from OpenAI API", len(available_models))
+        # Return only curated compatible models (no API list fetch – we never show incompatible models)
+        available_models = list(OPENAI_COMPATIBLE_MODELS)
+        logging.info("Returning %d compatible OpenAI models for Settings", len(available_models))
         return jsonify(available_models)
-        
     except Exception as e:
         error_msg = str(e)
-        logging.error("Failed to fetch models from OpenAI API: %s", error_msg)
-        
-        # Handle specific error types
+        logging.error("OpenAI client init for models list: %s", error_msg)
         if "invalid_api_key" in error_msg.lower() or "authentication" in error_msg.lower() or "401" in error_msg or "unauthorized" in error_msg.lower():
             return jsonify({"error": "Invalid API key. Please check your key and try again."}), 401
-        elif "insufficient_quota" in error_msg.lower() or "quota" in error_msg.lower():
-            return jsonify({"error": "API key has insufficient quota. Please check your OpenAI account billing."}), 402
-        elif "connection" in error_msg.lower() or "timeout" in error_msg.lower() or "network" in error_msg.lower():
-            return jsonify({"error": "Connection to OpenAI API failed. Please check your internet connection."}), 503
-        else:
-            return jsonify({"error": f"Failed to fetch models: {error_msg}"}), 500
+        return jsonify({"error": f"Failed to initialize OpenAI client: {error_msg}"}), 500
+
+
+# Curated list of Anthropic Claude models compatible with Messages API and text output (PMDA format).
+ANTHROPIC_COMPATIBLE_MODELS = [
+    "claude-sonnet-4-5",
+    "claude-haiku-4-5",
+    "claude-opus-4-5",
+    "claude-3-5-sonnet-20241022",
+    "claude-3-5-sonnet-20240620",
+    "claude-3-opus-20240229",
+    "claude-3-sonnet-20240229",
+    "claude-3-haiku-20240307",
+]
 
 
 @app.post("/api/anthropic/models")
 def api_anthropic_models():
-    """Return list of Anthropic model IDs available for the provided API key."""
+    """Return only Anthropic model IDs compatible with PMDA (Messages API, parseable output)."""
     from flask import g
     data = getattr(g, 'ai_models_request_data', None) or request.get_json(silent=True) or {}
     key = (data.get("ANTHROPIC_API_KEY") or "").strip() or ANTHROPIC_API_KEY
-    
+
     if not key:
         return jsonify({"error": "ANTHROPIC_API_KEY is required"}), 400
-    
+
     if not anthropic:
         return jsonify({"error": "Anthropic SDK not installed. Please install anthropic package."}), 500
-    
+
     try:
         client = anthropic.Anthropic(api_key=key)
-        # Anthropic has a fixed list of models, fetch available ones
-        # Test with a simple message to validate the key
         try:
             client.messages.create(
                 model="claude-3-5-sonnet-20241022",
                 max_tokens=1,
-                messages=[{"role": "user", "content": "test"}]
+                messages=[{"role": "user", "content": "test"}],
             )
         except anthropic.APIError as e:
             if e.status_code == 401:
                 return jsonify({"error": "Invalid API key. Please check your key and try again."}), 401
             elif e.status_code == 402:
                 return jsonify({"error": "API key has insufficient quota. Please check your Anthropic account billing."}), 402
-            # If it's not auth/quota, continue to return available models
-        
-        # Anthropic models list (as of 2024)
-        available_models = [
-            "claude-3-5-sonnet-20241022",
-            "claude-3-5-sonnet-20240620",
-            "claude-3-opus-20240229",
-            "claude-3-sonnet-20240229",
-            "claude-3-haiku-20240307",
-        ]
-        
-        logging.info("Fetched %d Anthropic models", len(available_models))
+
+        available_models = list(ANTHROPIC_COMPATIBLE_MODELS)
+        logging.info("Returning %d compatible Anthropic models for Settings", len(available_models))
         return jsonify(available_models)
-        
     except Exception as e:
         error_msg = str(e)
         logging.error("Failed to fetch Anthropic models: %s", error_msg)
-        
         if "invalid_api_key" in error_msg.lower() or "authentication" in error_msg.lower() or "401" in error_msg or "unauthorized" in error_msg.lower():
             return jsonify({"error": "Invalid API key. Please check your key and try again."}), 401
         elif "connection" in error_msg.lower() or "timeout" in error_msg.lower() or "network" in error_msg.lower():
             return jsonify({"error": "Connection to Anthropic API failed. Please check your internet connection."}), 503
-        else:
-            return jsonify({"error": f"Failed to fetch models: {error_msg}"}), 500
+        return jsonify({"error": f"Failed to fetch models: {error_msg}"}), 500
+
+
+# Curated list of Google Gemini model IDs compatible with generateContent and text output (PMDA format).
+GOOGLE_COMPATIBLE_MODELS = [
+    "gemini-3-pro-preview",
+    "gemini-3-flash-preview",
+    "gemini-2.5-flash",
+    "gemini-2.5-pro",
+    "gemini-2.5-flash-lite",
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-lite",
+    "gemini-1.5-pro",
+    "gemini-1.5-flash",
+    "gemini-1.5-flash-8b",
+    "gemini-pro",
+]
 
 
 @app.post("/api/google/models")
 def api_google_models():
-    """Return list of Google Gemini model IDs available for the provided API key."""
+    """Return only Google Gemini model IDs compatible with PMDA (generateContent, text output)."""
     from flask import g
     data = getattr(g, 'ai_models_request_data', None) or request.get_json(silent=True) or {}
     key = (data.get("GOOGLE_API_KEY") or "").strip() or GOOGLE_API_KEY
-    
+
     if not key:
         return jsonify({"error": "GOOGLE_API_KEY is required"}), 400
-    
+
     if not genai:
         return jsonify({"error": "Google Generative AI SDK not installed. Please install google-generativeai package."}), 500
-    
+
     try:
         genai.configure(api_key=key)
-        
-        # Test the key by listing models
         try:
             models_list = genai.list_models()
         except Exception as e:
@@ -7086,50 +9002,45 @@ def api_google_models():
             if "invalid_api_key" in error_msg.lower() or "authentication" in error_msg.lower() or "401" in error_msg or "unauthorized" in error_msg.lower():
                 return jsonify({"error": "Invalid API key. Please check your key and try again."}), 401
             raise
-        
-        # Filter for chat completion models (gemini-*)
+
+        compatible_set = set(GOOGLE_COMPATIBLE_MODELS)
         available_models = []
         for model in models_list:
             model_name = model.name
-            # Only include gemini models that support generateContent
-            if "gemini" in model_name.lower() and "generateContent" in str(model.supported_generation_methods):
-                # Extract model ID from full name (e.g., "models/gemini-pro" -> "gemini-pro")
-                model_id = model_name.split("/")[-1] if "/" in model_name else model_name
+            model_id = model_name.split("/")[-1] if "/" in model_name else model_name
+            if model_id in compatible_set and "generateContent" in str(getattr(model, "supported_generation_methods", [])):
                 if model_id not in available_models:
                     available_models.append(model_id)
-        
+
         if not available_models:
-            logging.warning("Google API returned no chat completion models")
-            return jsonify({"error": "No chat completion models available for this API key"}), 404
-        
-        # Sort models: newer/better models first
+            available_models = list(GOOGLE_COMPATIBLE_MODELS)
+
         def model_sort_key(name: str) -> tuple:
-            if "gemini-2.0" in name:
+            if "gemini-3" in name:
                 tier = 0
-            elif "gemini-1.5-pro" in name:
+            elif "gemini-2.5" in name:
                 tier = 1
-            elif "gemini-1.5-flash" in name:
+            elif "gemini-2.0" in name:
                 tier = 2
-            elif "gemini-pro" in name:
+            elif "gemini-1.5" in name:
                 tier = 3
-            else:
+            elif "gemini-pro" in name:
                 tier = 4
+            else:
+                tier = 5
             return (tier, name)
-        
+
         available_models.sort(key=model_sort_key)
-        logging.info("Fetched %d Google Gemini models", len(available_models))
+        logging.info("Returning %d compatible Google Gemini models for Settings", len(available_models))
         return jsonify(available_models)
-        
     except Exception as e:
         error_msg = str(e)
         logging.error("Failed to fetch Google models: %s", error_msg)
-        
         if "invalid_api_key" in error_msg.lower() or "authentication" in error_msg.lower() or "401" in error_msg or "unauthorized" in error_msg.lower():
             return jsonify({"error": "Invalid API key. Please check your key and try again."}), 401
         elif "connection" in error_msg.lower() or "timeout" in error_msg.lower() or "network" in error_msg.lower():
             return jsonify({"error": "Connection to Google API failed. Please check your internet connection."}), 503
-        else:
-            return jsonify({"error": f"Failed to fetch models: {error_msg}"}), 500
+        return jsonify({"error": f"Failed to fetch models: {error_msg}"}), 500
 
 
 @app.post("/api/ollama/models")
@@ -7235,6 +9146,15 @@ def _get_config_from_db(key: str, default_value=None):
     return default_value
 
 
+def _reload_auto_move_from_db():
+    """Reload AUTO_MOVE_DUPES from SQLite so the current scan uses the value saved in Settings (UI)."""
+    global AUTO_MOVE_DUPES
+    val = _get_config_from_db("AUTO_MOVE_DUPES")
+    if val is not None:
+        AUTO_MOVE_DUPES = bool(_parse_bool(val))
+        logging.debug("AUTO_MOVE_DUPES reloaded from DB: %s", AUTO_MOVE_DUPES)
+
+
 def _reload_section_ids_from_db():
     """Reload SECTION_IDS from SQLite so library APIs use latest saved selection."""
     global SECTION_IDS, SECTION_ID
@@ -7252,6 +9172,18 @@ def _reload_section_ids_from_db():
         SECTION_ID = SECTION_IDS[0] if SECTION_IDS else 0
     except Exception:
         pass
+
+
+def _reload_path_map_from_db():
+    """Reload PATH_MAP from SQLite so scan/dedupe use latest saved bindings (e.g. after Detect & verify)."""
+    global PATH_MAP
+    path_map_val = _get_config_from_db("PATH_MAP")
+    if path_map_val is None:
+        return
+    parsed = _parse_path_map(path_map_val)
+    if parsed:
+        PATH_MAP = parsed
+        logging.info("PATH_MAP reloaded from SQLite at scan start (%d entries)", len(PATH_MAP))
 
 
 def _parse_format_preference(val):
@@ -7287,6 +9219,11 @@ def api_config_get():
         if db_value is not None:
             return db_value
         return runtime_value if runtime_value is not None else default
+
+    def get_setting_bool(key: str, runtime_value):
+        """Return config value as a real boolean for JSON (so frontend toggles work)."""
+        raw = get_setting(key, runtime_value)
+        return bool(_parse_bool(raw)) if raw not in (None, "") else bool(_parse_bool(str(runtime_value)))
     
     path_map = getattr(sys.modules[__name__], "PATH_MAP", {})
     section_ids = getattr(sys.modules[__name__], "SECTION_IDS", [])
@@ -7321,6 +9258,7 @@ def api_config_get():
         "configured": configured,
         "PLEX_HOST": get_setting("PLEX_HOST", PLEX_HOST),
         "PLEX_TOKEN": get_setting("PLEX_TOKEN", PLEX_TOKEN),
+        "PLEX_BASE_PATH": get_setting("PLEX_BASE_PATH", "/database"),
         "PLEX_DB_PATH": get_setting("PLEX_DB_PATH", merged.get("PLEX_DB_PATH", "/database")),
         "PLEX_DB_FILE": "com.plexapp.plugins.library.db",
         "SECTION_IDS": ",".join(str(s) for s in section_ids),
@@ -7330,7 +9268,7 @@ def api_config_get():
         "MUSIC_PARENT_PATH": get_setting("MUSIC_PARENT_PATH", merged.get("MUSIC_PARENT_PATH", "")),
         "SCAN_THREADS": get_setting("SCAN_THREADS", SCAN_THREADS if isinstance(SCAN_THREADS, int) else "auto"),
         "SKIP_FOLDERS": get_setting("SKIP_FOLDERS", ",".join(skip_folders) if isinstance(skip_folders, list) else (skip_folders or "")),
-        "CROSS_LIBRARY_DEDUPE": get_setting("CROSS_LIBRARY_DEDUPE", CROSS_LIBRARY_DEDUPE),
+        "CROSS_LIBRARY_DEDUPE": get_setting_bool("CROSS_LIBRARY_DEDUPE", CROSS_LIBRARY_DEDUPE),
         "CROSSCHECK_SAMPLES": get_setting("CROSSCHECK_SAMPLES", CROSSCHECK_SAMPLES),
         "FORMAT_PREFERENCE": _parse_format_preference(get_setting("FORMAT_PREFERENCE", FORMAT_PREFERENCE)),
         "AI_PROVIDER": get_setting("AI_PROVIDER", AI_PROVIDER),
@@ -7340,22 +9278,38 @@ def api_config_get():
         "ANTHROPIC_API_KEY": get_setting("ANTHROPIC_API_KEY", ANTHROPIC_API_KEY),
         "GOOGLE_API_KEY": get_setting("GOOGLE_API_KEY", GOOGLE_API_KEY),
         "OLLAMA_URL": get_setting("OLLAMA_URL", OLLAMA_URL),
-        "USE_MUSICBRAINZ": get_setting("USE_MUSICBRAINZ", USE_MUSICBRAINZ),
+        "USE_MUSICBRAINZ": get_setting_bool("USE_MUSICBRAINZ", USE_MUSICBRAINZ),
         "MUSICBRAINZ_EMAIL": get_setting("MUSICBRAINZ_EMAIL", MUSICBRAINZ_EMAIL),
+        "MB_RETRY_NOT_FOUND": get_setting_bool("MB_RETRY_NOT_FOUND", MB_RETRY_NOT_FOUND),
+        "USE_AI_FOR_MB_MATCH": get_setting_bool("USE_AI_FOR_MB_MATCH", USE_AI_FOR_MB_MATCH),
+        "USE_AI_FOR_MB_VERIFY": get_setting_bool("USE_AI_FOR_MB_VERIFY", USE_AI_FOR_MB_VERIFY),
+        "USE_AI_VISION_FOR_COVER": get_setting_bool("USE_AI_VISION_FOR_COVER", USE_AI_VISION_FOR_COVER),
+        "OPENAI_VISION_MODEL": get_setting("OPENAI_VISION_MODEL", OPENAI_VISION_MODEL),
+        "USE_WEB_SEARCH_FOR_MB": get_setting_bool("USE_WEB_SEARCH_FOR_MB", USE_WEB_SEARCH_FOR_MB),
+        "SERPER_API_KEY": get_setting("SERPER_API_KEY", SERPER_API_KEY),
         "LIDARR_URL": get_setting("LIDARR_URL", merged.get("LIDARR_URL", "")),
         "LIDARR_API_KEY": get_setting("LIDARR_API_KEY", merged.get("LIDARR_API_KEY", "")),
         "AUTOBRR_URL": get_setting("AUTOBRR_URL", merged.get("AUTOBRR_URL", "")),
         "AUTOBRR_API_KEY": get_setting("AUTOBRR_API_KEY", merged.get("AUTOBRR_API_KEY", "")),
-        "AUTO_FIX_BROKEN_ALBUMS": get_setting("AUTO_FIX_BROKEN_ALBUMS", AUTO_FIX_BROKEN_ALBUMS),
+        "AUTO_FIX_BROKEN_ALBUMS": get_setting_bool("AUTO_FIX_BROKEN_ALBUMS", AUTO_FIX_BROKEN_ALBUMS),
         "BROKEN_ALBUM_CONSECUTIVE_THRESHOLD": get_setting("BROKEN_ALBUM_CONSECUTIVE_THRESHOLD", BROKEN_ALBUM_CONSECUTIVE_THRESHOLD),
         "BROKEN_ALBUM_PERCENTAGE_THRESHOLD": get_setting("BROKEN_ALBUM_PERCENTAGE_THRESHOLD", BROKEN_ALBUM_PERCENTAGE_THRESHOLD),
         "REQUIRED_TAGS": _parse_required_tags(get_setting("REQUIRED_TAGS", ",".join(REQUIRED_TAGS))),
         "DISCORD_WEBHOOK": get_setting("DISCORD_WEBHOOK", DISCORD_WEBHOOK),
         "LOG_LEVEL": get_setting("LOG_LEVEL", LOG_LEVEL),
         "LOG_FILE": get_setting("LOG_FILE", LOG_FILE),
-        "AUTO_MOVE_DUPES": get_setting("AUTO_MOVE_DUPES", AUTO_MOVE_DUPES),
-        "DISABLE_PATH_CROSSCHECK": get_setting("DISABLE_PATH_CROSSCHECK", DISABLE_PATH_CROSSCHECK),
+        "AUTO_MOVE_DUPES": get_setting_bool("AUTO_MOVE_DUPES", AUTO_MOVE_DUPES),
+        "NORMALIZE_PARENTHETICAL_FOR_DEDUPE": get_setting_bool("NORMALIZE_PARENTHETICAL_FOR_DEDUPE", True),
+        "DISABLE_PATH_CROSSCHECK": get_setting_bool("DISABLE_PATH_CROSSCHECK", DISABLE_PATH_CROSSCHECK),
         "PMDA_DEFAULT_MODE": get_setting("PMDA_DEFAULT_MODE", "serve"),
+        "USE_DISCOGS": get_setting_bool("USE_DISCOGS", USE_DISCOGS),
+        "DISCOGS_USER_TOKEN": get_setting("DISCOGS_USER_TOKEN", DISCOGS_USER_TOKEN),
+        "USE_LASTFM": get_setting_bool("USE_LASTFM", USE_LASTFM),
+        "LASTFM_API_KEY": get_setting("LASTFM_API_KEY", LASTFM_API_KEY),
+        "LASTFM_API_SECRET": get_setting("LASTFM_API_SECRET", LASTFM_API_SECRET),
+        "USE_BANDCAMP": get_setting_bool("USE_BANDCAMP", USE_BANDCAMP),
+        "paths_status": _paths_rw_status(),
+        "container_mounts": _container_mounts_status(),
     })
 
 
@@ -7402,16 +9356,53 @@ def _restart_container():
 
 def _apply_settings_in_memory(updates: dict):
     """Apply saved settings to in-memory globals so they take effect without restart."""
+    global PLEX_CONFIGURED  # declared once so it can be set in any of the Plex blocks below
     mod = sys.modules[__name__]
     ai_keys = {"AI_PROVIDER", "OPENAI_API_KEY", "OPENAI_MODEL", "OPENAI_MODEL_FALLBACKS",
                "ANTHROPIC_API_KEY", "GOOGLE_API_KEY", "OLLAMA_URL"}
     need_ai_reinit = bool(ai_keys & set(updates.keys()))
 
+    if "PLEX_HOST" in updates:
+        global PLEX_HOST
+        PLEX_HOST = str(updates["PLEX_HOST"] or "").strip()
+        logging.info("PLEX_HOST updated in memory")
+    if "PLEX_TOKEN" in updates:
+        v = str(updates["PLEX_TOKEN"] or "").strip()
+        if v != "***":
+            global PLEX_TOKEN
+            PLEX_TOKEN = v
+            logging.info("PLEX_TOKEN updated in memory")
+    if "PLEX_BASE_PATH" in updates:
+        base = str(updates["PLEX_BASE_PATH"] or "").strip() or "/database"
+        resolved = _resolve_plex_db_from_base(base)
+        if resolved:
+            updates = dict(updates)
+            updates["PLEX_DB_PATH"] = resolved
+            logging.info("PLEX_DB_PATH resolved from PLEX_BASE_PATH: %s", resolved)
+    if "PLEX_DB_PATH" in updates:
+        global PLEX_DB_FILE, PLEX_DB_EXISTS, PLEX_CONFIGURED
+        db_path = str(updates["PLEX_DB_PATH"] or "").strip() or "/database"
+        PLEX_DB_FILE = str(Path(db_path) / PLEX_DB_FILENAME)
+        PLEX_DB_EXISTS = Path(PLEX_DB_FILE).exists()
+        PLEX_CONFIGURED = bool(
+            getattr(mod, "PLEX_HOST", "") and getattr(mod, "PLEX_TOKEN", "") and getattr(mod, "SECTION_IDS", []) and PLEX_DB_EXISTS
+        )
+        logging.info("PLEX_DB_PATH updated in memory: %s (exists=%s)", PLEX_DB_FILE, PLEX_DB_EXISTS)
     if "SECTION_IDS" in updates:
         global SECTION_IDS, SECTION_ID
         SECTION_IDS = list(updates["SECTION_IDS"])
         SECTION_ID = SECTION_IDS[0] if SECTION_IDS else 0
         logging.info("SECTION_IDS updated in memory: %s", SECTION_IDS)
+    # Recompute PLEX_CONFIGURED whenever any Plex-related setting was updated
+    plex_keys = {"PLEX_HOST", "PLEX_TOKEN", "SECTION_IDS", "PLEX_DB_PATH"}
+    if plex_keys & set(updates.keys()):
+        PLEX_CONFIGURED = bool(
+            getattr(mod, "PLEX_HOST", "") and getattr(mod, "PLEX_TOKEN", "")
+            and getattr(mod, "SECTION_IDS", []) and getattr(mod, "PLEX_DB_EXISTS", False)
+        )
+        logging.info("PLEX_CONFIGURED recomputed: %s (host=%s, token=%s, sections=%s, db_exists=%s)",
+                     PLEX_CONFIGURED, bool(getattr(mod, "PLEX_HOST", "")), bool(getattr(mod, "PLEX_TOKEN", "")),
+                     len(getattr(mod, "SECTION_IDS", [])), getattr(mod, "PLEX_DB_EXISTS", False))
     if "MUSICBRAINZ_EMAIL" in updates:
         global MUSICBRAINZ_EMAIL
         MUSICBRAINZ_EMAIL = str(updates["MUSICBRAINZ_EMAIL"] or "")
@@ -7420,20 +9411,50 @@ def _apply_settings_in_memory(updates: dict):
     if "USE_MUSICBRAINZ" in updates:
         global USE_MUSICBRAINZ
         USE_MUSICBRAINZ = bool(_parse_bool(updates["USE_MUSICBRAINZ"]))
+    if "MB_RETRY_NOT_FOUND" in updates:
+        global MB_RETRY_NOT_FOUND
+        MB_RETRY_NOT_FOUND = bool(_parse_bool(updates["MB_RETRY_NOT_FOUND"]))
+    if "USE_AI_FOR_MB_MATCH" in updates:
+        global USE_AI_FOR_MB_MATCH
+        USE_AI_FOR_MB_MATCH = bool(_parse_bool(updates["USE_AI_FOR_MB_MATCH"]))
+    if "USE_AI_FOR_MB_VERIFY" in updates:
+        global USE_AI_FOR_MB_VERIFY
+        USE_AI_FOR_MB_VERIFY = bool(_parse_bool(updates["USE_AI_FOR_MB_VERIFY"]))
+    if "USE_AI_VISION_FOR_COVER" in updates:
+        global USE_AI_VISION_FOR_COVER
+        USE_AI_VISION_FOR_COVER = bool(_parse_bool(updates["USE_AI_VISION_FOR_COVER"]))
+    if "OPENAI_VISION_MODEL" in updates:
+        global OPENAI_VISION_MODEL
+        OPENAI_VISION_MODEL = str(updates.get("OPENAI_VISION_MODEL") or "").strip()
+    if "USE_WEB_SEARCH_FOR_MB" in updates:
+        global USE_WEB_SEARCH_FOR_MB
+        USE_WEB_SEARCH_FOR_MB = bool(_parse_bool(updates["USE_WEB_SEARCH_FOR_MB"]))
+    if "SERPER_API_KEY" in updates:
+        global SERPER_API_KEY
+        v = str(updates.get("SERPER_API_KEY") or "").strip()
+        if v != "***":
+            SERPER_API_KEY = v
     if "SCAN_THREADS" in updates:
         global SCAN_THREADS
-        try:
-            SCAN_THREADS = max(1, int(updates["SCAN_THREADS"]))
-        except (ValueError, TypeError):
-            pass
+        v = updates["SCAN_THREADS"]
+        if isinstance(v, str) and str(v).strip().lower() == "auto":
+            SCAN_THREADS = max(1, os.cpu_count() or 4)
+        else:
+            try:
+                SCAN_THREADS = max(1, int(v))
+            except (ValueError, TypeError):
+                pass
+        logging.info("SCAN_THREADS updated in memory: %s", SCAN_THREADS)
     if "LOG_LEVEL" in updates:
         global LOG_LEVEL
         LOG_LEVEL = str(updates["LOG_LEVEL"] or "INFO").upper()
         root_logger = logging.getLogger()
         root_logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
     if "DISCORD_WEBHOOK" in updates:
-        global DISCORD_WEBHOOK
-        DISCORD_WEBHOOK = str(updates["DISCORD_WEBHOOK"] or "")
+        v = str(updates["DISCORD_WEBHOOK"] or "").strip()
+        if v != "***":
+            global DISCORD_WEBHOOK
+            DISCORD_WEBHOOK = v
     if "SKIP_FOLDERS" in updates:
         global SKIP_FOLDERS
         v = updates["SKIP_FOLDERS"]
@@ -7473,12 +9494,65 @@ def _apply_settings_in_memory(updates: dict):
     if "DISABLE_PATH_CROSSCHECK" in updates:
         global DISABLE_PATH_CROSSCHECK
         DISABLE_PATH_CROSSCHECK = bool(_parse_bool(updates["DISABLE_PATH_CROSSCHECK"]))
+    if "PATH_MAP" in updates:
+        global PATH_MAP
+        PATH_MAP = _parse_path_map(updates["PATH_MAP"])
+        logging.info("PATH_MAP updated in memory (%d entries)", len(PATH_MAP))
+    if "DUPE_ROOT" in updates:
+        global DUPE_ROOT
+        DUPE_ROOT = Path(str(updates["DUPE_ROOT"] or "").strip() or "/dupes")
+        logging.info("DUPE_ROOT updated in memory: %s", DUPE_ROOT)
+    if "MUSIC_PARENT_PATH" in updates:
+        merged["MUSIC_PARENT_PATH"] = str(updates["MUSIC_PARENT_PATH"] or "").strip() or ""
+        logging.info("MUSIC_PARENT_PATH updated in memory")
+    if "LOG_FILE" in updates:
+        global LOG_FILE
+        LOG_FILE = str(updates["LOG_FILE"] or "").strip() or str(CONFIG_DIR / "pmda.log")
+        logging.info("LOG_FILE updated in memory: %s", LOG_FILE)
+    if "CROSS_LIBRARY_DEDUPE" in updates:
+        global CROSS_LIBRARY_DEDUPE
+        CROSS_LIBRARY_DEDUPE = bool(_parse_bool(updates["CROSS_LIBRARY_DEDUPE"]))
+        logging.info("CROSS_LIBRARY_DEDUPE updated in memory: %s", CROSS_LIBRARY_DEDUPE)
+    if "CROSSCHECK_SAMPLES" in updates:
+        global CROSSCHECK_SAMPLES
+        try:
+            CROSSCHECK_SAMPLES = max(0, int(updates["CROSSCHECK_SAMPLES"]))
+        except (ValueError, TypeError):
+            CROSSCHECK_SAMPLES = 20
+        logging.info("CROSSCHECK_SAMPLES updated in memory: %s", CROSSCHECK_SAMPLES)
+    if "FORMAT_PREFERENCE" in updates:
+        global FORMAT_PREFERENCE, FMT_SCORE
+        FORMAT_PREFERENCE = _parse_format_preference_early(updates["FORMAT_PREFERENCE"])
+        FMT_SCORE = {ext: len(FORMAT_PREFERENCE) - i for i, ext in enumerate(FORMAT_PREFERENCE)}
+        logging.info("FORMAT_PREFERENCE updated in memory (%d formats)", len(FORMAT_PREFERENCE))
+    if "OPENAI_MODEL_FALLBACKS" in updates:
+        merged["OPENAI_MODEL_FALLBACKS"] = str(updates["OPENAI_MODEL_FALLBACKS"] or "").strip()
+        logging.info("OPENAI_MODEL_FALLBACKS updated in memory")
+    if "PMDA_DEFAULT_MODE" in updates:
+        merged["PMDA_DEFAULT_MODE"] = str(updates["PMDA_DEFAULT_MODE"] or "serve").strip().lower()
+        logging.info("PMDA_DEFAULT_MODE updated in memory: %s", merged["PMDA_DEFAULT_MODE"])
+
+    # Metadata fallback providers (Discogs, Last.fm, Bandcamp)
+    if "USE_DISCOGS" in updates:
+        mod.USE_DISCOGS = bool(_parse_bool(updates["USE_DISCOGS"]))
+    if "DISCOGS_USER_TOKEN" in updates:
+        mod.DISCOGS_USER_TOKEN = str(updates["DISCOGS_USER_TOKEN"] or "").strip()
+    if "USE_LASTFM" in updates:
+        mod.USE_LASTFM = bool(_parse_bool(updates["USE_LASTFM"]))
+    if "LASTFM_API_KEY" in updates:
+        mod.LASTFM_API_KEY = str(updates["LASTFM_API_KEY"] or "").strip()
+    if "LASTFM_API_SECRET" in updates:
+        mod.LASTFM_API_SECRET = str(updates["LASTFM_API_SECRET"] or "").strip()
+    if "USE_BANDCAMP" in updates:
+        mod.USE_BANDCAMP = bool(_parse_bool(updates["USE_BANDCAMP"]))
 
     # AI-related: update globals then reinit clients
     if "AI_PROVIDER" in updates:
         mod.AI_PROVIDER = str(updates["AI_PROVIDER"] or "openai").strip().lower()
     if "OPENAI_API_KEY" in updates:
-        mod.OPENAI_API_KEY = str(updates["OPENAI_API_KEY"] or "")
+        v = str(updates["OPENAI_API_KEY"] or "").strip()
+        if v != "***":
+            mod.OPENAI_API_KEY = v
     if "OPENAI_MODEL" in updates:
         mod.OPENAI_MODEL = str(updates["OPENAI_MODEL"] or "gpt-4")
     if "ANTHROPIC_API_KEY" in updates:
@@ -7500,21 +9574,27 @@ def api_config_put():
     """
     data = request.get_json() or {}
     allowed = {
-        "PLEX_HOST", "PLEX_TOKEN", "PLEX_DB_PATH", "SECTION_IDS", "PATH_MAP",
+        "PLEX_HOST", "PLEX_TOKEN", "PLEX_BASE_PATH", "PLEX_DB_PATH", "SECTION_IDS", "PATH_MAP",
         "DUPE_ROOT", "PMDA_CONFIG_DIR", "MUSIC_PARENT_PATH",
         "SCAN_THREADS", "LOG_LEVEL", "LOG_FILE", "AI_PROVIDER", "OPENAI_API_KEY", "OPENAI_MODEL",
         "OPENAI_MODEL_FALLBACKS", "ANTHROPIC_API_KEY", "GOOGLE_API_KEY", "OLLAMA_URL",
-        "DISCORD_WEBHOOK", "USE_MUSICBRAINZ", "MUSICBRAINZ_EMAIL",
+        "DISCORD_WEBHOOK", "USE_MUSICBRAINZ", "MUSICBRAINZ_EMAIL", "MB_RETRY_NOT_FOUND",
+        "USE_AI_FOR_MB_MATCH", "USE_AI_FOR_MB_VERIFY",
+        "USE_AI_VISION_FOR_COVER", "OPENAI_VISION_MODEL", "USE_WEB_SEARCH_FOR_MB", "SERPER_API_KEY",
         "SKIP_FOLDERS", "CROSS_LIBRARY_DEDUPE", "CROSSCHECK_SAMPLES", "DISABLE_PATH_CROSSCHECK",
-        "FORMAT_PREFERENCE", "AUTO_MOVE_DUPES", "PMDA_DEFAULT_MODE",
+        "FORMAT_PREFERENCE", "AUTO_MOVE_DUPES", "NORMALIZE_PARENTHETICAL_FOR_DEDUPE", "PMDA_DEFAULT_MODE",
         "LIDARR_URL", "LIDARR_API_KEY", "AUTOBRR_URL", "AUTOBRR_API_KEY", "AUTO_FIX_BROKEN_ALBUMS",
         "BROKEN_ALBUM_CONSECUTIVE_THRESHOLD", "BROKEN_ALBUM_PERCENTAGE_THRESHOLD", "REQUIRED_TAGS",
+        "USE_DISCOGS", "DISCOGS_USER_TOKEN", "USE_LASTFM", "LASTFM_API_KEY", "LASTFM_API_SECRET", "USE_BANDCAMP",
     }
     # Only process keys that are in the request AND in the allowed list
     # This preserves existing values in SQLite for keys not in the request
     updates = {k: v for k, v in data.items() if k in allowed}
     if not updates:
         return jsonify({"status": "ok", "message": "Nothing to save"})
+    # When PLEX_BASE_PATH is updated, clear PLEX_DB_PATH so next startup re-discovers
+    if "PLEX_BASE_PATH" in updates:
+        updates["PLEX_DB_PATH"] = ""
     if "SECTION_IDS" in updates:
         raw = updates["SECTION_IDS"]
         if isinstance(raw, str):
@@ -7536,12 +9616,23 @@ def api_config_put():
         except (ValueError, TypeError):
             updates["BROKEN_ALBUM_PERCENTAGE_THRESHOLD"] = 0.20
     
-    # Serialize complex types for SQLite storage
+    # Serialize complex types for SQLite storage. Do not overwrite secret keys with mask (e.g. "***").
+    MASKED_SECRETS = (
+        "OPENAI_API_KEY", "PLEX_TOKEN", "DISCORD_WEBHOOK",
+        "ANTHROPIC_API_KEY", "GOOGLE_API_KEY",
+        "DISCOGS_USER_TOKEN", "LASTFM_API_KEY", "LASTFM_API_SECRET",
+        "LIDARR_API_KEY", "AUTOBRR_API_KEY",
+    )
     updates_for_db = {}
     for k, v in updates.items():
+        if k in MASKED_SECRETS and str(v).strip() == "***":
+            continue  # Do not overwrite real key with mask
         if k == "SECTION_IDS" and isinstance(v, list):
             # Store SECTION_IDS as comma-separated string so GET /api/config can parse it consistently
             updates_for_db[k] = ",".join(str(x) for x in v) if v else ""
+        elif k == "SKIP_FOLDERS" and isinstance(v, list):
+            # Store as comma-separated string; load uses _parse_skip_folders (accepts JSON or CSV)
+            updates_for_db[k] = ",".join(str(p).strip() for p in v if str(p).strip()) if v else ""
         elif isinstance(v, (dict, list)):
             updates_for_db[k] = json.dumps(v)
         else:
@@ -7609,7 +9700,8 @@ def get_duplicate_groups_from_library():
                     ).fetchone()
                     artist_cache[parent_id] = (r[0] or "").strip() if r else ""
                 artist_name = artist_cache[parent_id]
-            norm = norm_album(title or "")
+            normalize_parenthetical = bool(_parse_bool(_get_config_from_db("NORMALIZE_PARENTHETICAL_FOR_DEDUPE") or "true"))
+            norm = norm_album_for_dedup(title or "", normalize_parenthetical)
             key = (artist_name, norm)
             norm_to_albums.setdefault(key, []).append(album_id)
         out = []
@@ -7634,83 +9726,96 @@ def api_duplicates():
         return resp
     with lock:
         if not state["duplicates"]:
-            logging.debug("api_duplicates(): loading scan results from DB into memory")
+            if not state.get("_api_duplicates_load_logged"):
+                logging.debug("api_duplicates(): loading scan results from DB into memory")
+                state["_api_duplicates_load_logged"] = True
             state["duplicates"] = load_scan_from_db()
         cards = _build_card_list(state["duplicates"])
         scan_keys = set()
         for artist, groups in state["duplicates"].items():
             for g in groups:
+                if "best" not in g:
+                    continue
                 norm = (g["best"].get("album_norm") or "").strip().lower()
                 if norm:
                     scan_keys.add((artist, norm))
-    library_groups = get_duplicate_groups_from_library()
-    for lg in library_groups:
-        artist, norm_title = lg["artist"], (lg["norm_title"] or "").strip().lower()
-        if (artist, norm_title) in scan_keys:
-            continue
-        album_ids = lg["album_ids"]
-        first_id = album_ids[0]
-        n = len(album_ids)
-        display_title = (norm_title or "").title() or "Unknown"
-        cards.append({
-            "artist_key": artist.replace(" ", "_"),
-            "artist": artist,
-            "album_id": first_id,
-            "n": n,
-            "best_thumb": thumb_url(first_id),
-            "best_title": display_title,
-            "best_fmt": "—",
-            "formats": ["—"] * n,
-            "used_ai": False,
-            "ai_provider": "",
-            "ai_model": "",
-            "size": 0,
-            "size_mb": 0,
-            "track_count": 0,
-            "path": "",
-            "no_move": True,
-        })
+        # Only add library-only groups when there is at least one scan result (so "Clear results" shows nothing)
+        if cards or scan_keys:
+            library_groups = get_duplicate_groups_from_library()
+            db_plex = None
+            try:
+                db_plex = plex_connect()
+            except Exception:
+                pass
+            for lg in library_groups:
+                artist, norm_title = lg["artist"], (lg["norm_title"] or "").strip().lower()
+                if (artist, norm_title) in scan_keys:
+                    continue
+                album_ids = lg["album_ids"]
+                # Skip group if any edition is already under /dupes (already deduped by auto-move or manual)
+                if db_plex:
+                    if any(_album_path_under_dupes(db_plex, aid) for aid in album_ids):
+                        continue
+                first_id = album_ids[0]
+                n = len(album_ids)
+                display_title = (norm_title or "").title() or "Unknown"
+                cards.append({
+                    "artist_key": artist.replace(" ", "_"),
+                    "artist": artist,
+                    "album_id": first_id,
+                    "n": n,
+                    "best_thumb": thumb_url(first_id),
+                    "best_title": display_title,
+                    "best_fmt": "—",
+                    "formats": ["—"] * n,
+                    "used_ai": False,
+                    "ai_provider": "",
+                    "ai_model": "",
+                    "size": 0,
+                    "size_mb": 0,
+                    "track_count": 0,
+                    "path": "",
+                    "no_move": True,
+                })
+            if db_plex:
+                try:
+                    db_plex.close()
+                except Exception:
+                    pass
     return jsonify(cards)
 
 
 @app.get("/api/progress")
 def api_progress():
     with lock:
-        if state["scan_total"] and state["scan_progress"] >= state["scan_total"]:
-            state["scanning"] = False
+        # Do NOT set scanning=False here when progress >= total. The scan thread still runs
+        # the AI batch and finally block (save_scan_to_db, scan_history) after progress hits
+        # 100%; only that thread must set scanning=False so the UI does not show "finished"
+        # while the scan is still running.
         scanning = state["scanning"]
         status = "paused" if (scanning and scan_is_paused.is_set()) else ("running" if scanning else "stopped")
-        progress = state["scan_progress"]
-        total = state["scan_total"]
+        # Step-based progress for bar: progress/total = steps done / step total (3*albums+2 or +3)
+        progress = state.get("scan_step_progress", 0)
+        total = state.get("scan_step_total", 0) or state["scan_total"]
         format_done_count = state.get("scan_format_done_count", 0)
         mb_done_count = state.get("scan_mb_done_count", 0)
         
-        # Get active artists (for current step display only). Progress = only fully completed albums (format + MB + dupes), so bar reaches 100% only when scan is truly done.
+        # Keep scan_progress for effective_progress / legacy; bar uses step progress
         active_artists_dict = state.get("scan_active_artists", {})
-        effective_progress = progress  # Do not add albums_processed: that would make the bar hit 100% after FFprobe; we want 100% only when everything is finished.
+        effective_progress = state.get("scan_progress", 0)
         
-        # ETA: use same "steps" as frontend so ETA appears as soon as first step completes (e.g. first FFprobe)
+        # ETA from step progress
         eta_seconds = None
         threads_in_use = SCAN_THREADS
         if scanning and state.get("scan_start_time") and total > 0:
             current_time = time.time()
             start_time = state["scan_start_time"]
             elapsed_time = current_time - start_time
-            if elapsed_time > 0:
-                # Phase "duplicates": 3 steps per album (format, MB, compare)
-                steps_total = 3 * total
-                steps_done = format_done_count + mb_done_count + progress
-                if steps_done > 0:
-                    speed = steps_done / elapsed_time
-                    remaining_steps = steps_total - steps_done
-                    if speed > 0 and remaining_steps > 0:
-                        eta_seconds = int(remaining_steps / speed)
-                # Throttle state updates for last_progress (kept for any future use)
-                last_update_time = state.get("scan_last_update_time", start_time)
-                last_progress = state.get("scan_last_progress", 0)
-                if current_time - last_update_time >= 5.0 or (progress - last_progress) >= 100:
-                    state["scan_last_update_time"] = current_time
-                    state["scan_last_progress"] = progress
+            if elapsed_time > 0 and progress > 0:
+                speed = progress / elapsed_time
+                remaining_steps = total - progress
+                if speed > 0 and remaining_steps > 0:
+                    eta_seconds = int(remaining_steps / speed)
         
         active_artists_list = [
             {
@@ -7745,6 +9850,11 @@ def api_progress():
         albums_without_artist_mb_id = state.get("scan_albums_without_artist_mb_id", 0)
         format_done_count = state.get("scan_format_done_count", 0)
         mb_done_count = state.get("scan_mb_done_count", 0)
+        scan_ai_batch_total = state.get("scan_ai_batch_total", 0)
+        scan_ai_batch_processed = state.get("scan_ai_batch_processed", 0)
+        scan_ai_current_label = state.get("scan_ai_current_label")
+        last_fix_all_by_provider = state.get("last_fix_all_by_provider")
+        last_fix_all_total_albums = state.get("last_fix_all_total_albums", 0)
         
         # Current micro-step (from first active artist with non-done status) for live indicators
         current_step = None
@@ -7756,12 +9866,81 @@ def api_progress():
                     if s and s != "done":
                         current_step = s
                         break
-        # Phase: scan only does "duplicates" for now
-        phase = "duplicates" if scanning else None
+        finalizing = state.get("scan_finalizing", False)
+        deduping = state.get("deduping", False)
+        dedupe_progress = state.get("dedupe_progress", 0)
+        dedupe_total = state.get("dedupe_total", 0)
+        dedupe_current_group = state.get("dedupe_current_group")
+        auto_move_enabled = getattr(sys.modules[__name__], "AUTO_MOVE_DUPES", False)
+        # Phase: derive from current_step and flags for UI (format_analysis | identification_tags | ia_analysis | finalizing | moving_dupes)
+        if not scanning:
+            phase = None
+        elif deduping:
+            phase = "moving_dupes"
+        elif finalizing:
+            phase = "finalizing"
+        elif current_step in ("comparing_versions", "detecting_best") or "_ai_batch" in active_artists_dict:
+            phase = "ia_analysis"
+        elif current_step == "searching_mb":
+            phase = "identification_tags"
+        elif current_step == "analyzing_format":
+            phase = "format_analysis"
+        else:
+            phase = "format_analysis"
     
     # AI provider/model for display (read outside lock)
     ai_provider_display = AI_PROVIDER or ""
     ai_model_display = getattr(sys.modules[__name__], "RESOLVED_MODEL", None) or OPENAI_MODEL or ""
+    
+    # When not scanning, attach last completed scan summary for "Scan complete – Summary" UI
+    last_scan_summary = None
+    if not scanning:
+        try:
+            con = sqlite3.connect(str(STATE_DB_FILE), timeout=2)
+            cur = con.cursor()
+            cur.execute(
+                "SELECT summary_json FROM scan_history WHERE status = 'completed' AND end_time IS NOT NULL ORDER BY end_time DESC LIMIT 1"
+            )
+            row = cur.fetchone()
+            con.close()
+            if row and row[0]:
+                last_scan_summary = json.loads(row[0])
+                # Merge mb_match (from scan) and discogs/lastfm/bandcamp match (from scan fallback or last fix-all run) for chart-ready summary
+                aw = last_scan_summary.get("albums_with_mb_id") or 0
+                awo = last_scan_summary.get("albums_without_mb_id") or 0
+                total_mb = aw + awo
+                last_scan_summary["mb_match"] = {"matched": aw, "total": total_mb} if total_mb else {"matched": 0, "total": 0}
+                albums_scanned = last_scan_summary.get("albums_scanned") or 0
+                # Prefer scan fallback stats when present (Discogs/Last.fm/Bandcamp during scan when MB found nothing)
+                scan_discogs = last_scan_summary.get("scan_discogs_matched")
+                scan_lastfm = last_scan_summary.get("scan_lastfm_matched")
+                scan_bandcamp = last_scan_summary.get("scan_bandcamp_matched")
+                if scan_discogs is not None and albums_scanned:
+                    last_scan_summary["discogs_match"] = {"matched": scan_discogs, "total": albums_scanned}
+                elif last_fix_all_total_albums:
+                    bp = (last_fix_all_by_provider or {}).get("discogs", {})
+                    identified = (bp.get("identified") or 0) if isinstance(bp, dict) else 0
+                    last_scan_summary["discogs_match"] = {"matched": identified, "total": last_fix_all_total_albums}
+                else:
+                    last_scan_summary["discogs_match"] = {"matched": 0, "total": 0}
+                if scan_lastfm is not None and albums_scanned:
+                    last_scan_summary["lastfm_match"] = {"matched": scan_lastfm, "total": albums_scanned}
+                elif last_fix_all_total_albums:
+                    bp = (last_fix_all_by_provider or {}).get("lastfm", {})
+                    identified = (bp.get("identified") or 0) if isinstance(bp, dict) else 0
+                    last_scan_summary["lastfm_match"] = {"matched": identified, "total": last_fix_all_total_albums}
+                else:
+                    last_scan_summary["lastfm_match"] = {"matched": 0, "total": 0}
+                if scan_bandcamp is not None and albums_scanned:
+                    last_scan_summary["bandcamp_match"] = {"matched": scan_bandcamp, "total": albums_scanned}
+                elif last_fix_all_total_albums:
+                    bp = (last_fix_all_by_provider or {}).get("bandcamp", {})
+                    identified = (bp.get("identified") or 0) if isinstance(bp, dict) else 0
+                    last_scan_summary["bandcamp_match"] = {"matched": identified, "total": last_fix_all_total_albums}
+                else:
+                    last_scan_summary["bandcamp_match"] = {"matched": 0, "total": 0}
+        except Exception as e:
+            logging.debug("api_progress: could not load last_scan_summary: %s", e)
     
     return jsonify(
         scanning=scanning,
@@ -7797,10 +9976,24 @@ def api_progress():
         albums_without_artist_mb_id=albums_without_artist_mb_id,
         format_done_count=format_done_count,
         mb_done_count=mb_done_count,
+        # Settings visible in scanner (e.g. link to configure)
+        mb_retry_not_found=getattr(sys.modules[__name__], "MB_RETRY_NOT_FOUND", False),
         # ETA
         eta_seconds=eta_seconds,
         threads_in_use=threads_in_use,
         active_artists=active_artists_list,
+        last_scan_summary=last_scan_summary,
+        finalizing=finalizing,
+        deduping=deduping,
+        dedupe_progress=dedupe_progress,
+        dedupe_total=dedupe_total,
+        dedupe_current_group=dedupe_current_group,
+        auto_move_enabled=auto_move_enabled,
+        paths_status=_paths_rw_status(),
+        # IA analysis step: current group label and N/M progress
+        scan_ai_batch_total=scan_ai_batch_total,
+        scan_ai_batch_processed=scan_ai_batch_processed,
+        scan_ai_current_label=scan_ai_current_label,
     )
 
 @app.get("/api/scan-history")
@@ -7809,23 +10002,68 @@ def api_scan_history():
     import sqlite3
     con = sqlite3.connect(str(STATE_DB_FILE))
     cur = con.cursor()
-    cur.execute("""
-        SELECT scan_id, start_time, end_time, duration_seconds, albums_scanned,
-               duplicates_found, artists_processed, artists_total, ai_used_count,
-               mb_used_count, ai_enabled, mb_enabled, auto_move_enabled,
-               space_saved_mb, albums_moved, status,
-               duplicate_groups_count, total_duplicates_count, broken_albums_count,
-               missing_albums_count, albums_without_artist_image, albums_without_album_image,
-               albums_without_complete_tags, albums_without_mb_id, albums_without_artist_mb_id
-        FROM scan_history
-        ORDER BY start_time DESC
-    """)
+    cur.execute("PRAGMA table_info(scan_history)")
+    cols_info = [r[1] for r in cur.fetchall()]
+    has_entry_type = "entry_type" in cols_info
+    has_summary_json = "summary_json" in cols_info
+    if has_entry_type and has_summary_json:
+        cur.execute("""
+            SELECT scan_id, start_time, end_time, duration_seconds, albums_scanned,
+                   duplicates_found, artists_processed, artists_total, ai_used_count,
+                   mb_used_count, ai_enabled, mb_enabled, auto_move_enabled,
+                   space_saved_mb, albums_moved, status,
+                   duplicate_groups_count, total_duplicates_count, broken_albums_count,
+                   missing_albums_count, albums_without_artist_image, albums_without_album_image,
+                   albums_without_complete_tags, albums_without_mb_id, albums_without_artist_mb_id,
+                   entry_type, summary_json
+            FROM scan_history
+            ORDER BY start_time DESC
+        """)
+    elif has_entry_type:
+        cur.execute("""
+            SELECT scan_id, start_time, end_time, duration_seconds, albums_scanned,
+                   duplicates_found, artists_processed, artists_total, ai_used_count,
+                   mb_used_count, ai_enabled, mb_enabled, auto_move_enabled,
+                   space_saved_mb, albums_moved, status,
+                   duplicate_groups_count, total_duplicates_count, broken_albums_count,
+                   missing_albums_count, albums_without_artist_image, albums_without_album_image,
+                   albums_without_complete_tags, albums_without_mb_id, albums_without_artist_mb_id,
+                   entry_type
+            FROM scan_history
+            ORDER BY start_time DESC
+        """)
+    elif has_summary_json:
+        cur.execute("""
+            SELECT scan_id, start_time, end_time, duration_seconds, albums_scanned,
+                   duplicates_found, artists_processed, artists_total, ai_used_count,
+                   mb_used_count, ai_enabled, mb_enabled, auto_move_enabled,
+                   space_saved_mb, albums_moved, status,
+                   duplicate_groups_count, total_duplicates_count, broken_albums_count,
+                   missing_albums_count, albums_without_artist_image, albums_without_album_image,
+                   albums_without_complete_tags, albums_without_mb_id, albums_without_artist_mb_id,
+                   summary_json
+            FROM scan_history
+            ORDER BY start_time DESC
+        """)
+    else:
+        cur.execute("""
+            SELECT scan_id, start_time, end_time, duration_seconds, albums_scanned,
+                   duplicates_found, artists_processed, artists_total, ai_used_count,
+                   mb_used_count, ai_enabled, mb_enabled, auto_move_enabled,
+                   space_saved_mb, albums_moved, status,
+                   duplicate_groups_count, total_duplicates_count, broken_albums_count,
+                   missing_albums_count, albums_without_artist_image, albums_without_album_image,
+                   albums_without_complete_tags, albums_without_mb_id, albums_without_artist_mb_id
+            FROM scan_history
+            ORDER BY start_time DESC
+        """)
     rows = cur.fetchall()
     con.close()
-    
+
     history = []
     for row in rows:
-        history.append({
+        base = 25 if has_entry_type else 24
+        entry = {
             "scan_id": row[0],
             "start_time": row[1],
             "end_time": row[2],
@@ -7842,7 +10080,6 @@ def api_scan_history():
             "space_saved_mb": row[13] or 0,
             "albums_moved": row[14] or 0,
             "status": row[15] or "completed",
-            # Detailed statistics
             "duplicate_groups_count": row[16] or 0 if len(row) > 16 else 0,
             "total_duplicates_count": row[17] or 0 if len(row) > 17 else 0,
             "broken_albums_count": row[18] or 0 if len(row) > 18 else 0,
@@ -7852,9 +10089,37 @@ def api_scan_history():
             "albums_without_complete_tags": row[22] or 0 if len(row) > 22 else 0,
             "albums_without_mb_id": row[23] or 0 if len(row) > 23 else 0,
             "albums_without_artist_mb_id": row[24] or 0 if len(row) > 24 else 0,
-        })
-    
+        }
+        if has_entry_type and len(row) > 25:
+            entry["entry_type"] = row[25] or "scan"
+        else:
+            entry["entry_type"] = "scan"
+        if has_summary_json and len(row) > base + 1:
+            try:
+                raw = row[base + 1]
+                entry["summary_json"] = json.loads(raw) if raw else None
+            except (TypeError, ValueError):
+                entry["summary_json"] = None
+        else:
+            entry["summary_json"] = None
+        history.append(entry)
+
     return jsonify(history)
+
+@app.delete("/api/scan-history")
+def api_scan_history_clear():
+    """Delete all scan history entries (and related scan_editions). Requires confirmation from client."""
+    import sqlite3
+    con = sqlite3.connect(str(STATE_DB_FILE))
+    cur = con.cursor()
+    try:
+        cur.execute("DELETE FROM scan_editions")
+        cur.execute("DELETE FROM scan_history")
+        con.commit()
+        deleted = cur.rowcount if hasattr(cur, "rowcount") else 0
+    finally:
+        con.close()
+    return jsonify({"status": "ok", "message": "Scan history cleared."})
 
 def add_broken_album_to_lidarr(artist_name: str, album_id: int, musicbrainz_release_group_id: str, album_title: str) -> bool:
     """
@@ -8035,6 +10300,101 @@ def api_library_stats():
     albums = (album_count_row[0] if album_count_row else 0) or 0
     db_conn.close()
     return jsonify({"artists": artists, "albums": albums})
+
+
+@app.get("/api/library/albums-with-parenthetical-names")
+def api_library_albums_with_parenthetical_names():
+    """Return albums whose folder name (or Plex title) has removable parenthetical suffixes like (flac), (mp3), (EP)."""
+    _reload_section_ids_from_db()
+    _reload_path_map_from_db()
+    if not PLEX_CONFIGURED or not SECTION_IDS:
+        return jsonify({"albums": []})
+    ph = ",".join("?" for _ in SECTION_IDS)
+    db_conn = plex_connect()
+    try:
+        rows = db_conn.execute(f"""
+            SELECT alb.id, alb.title, alb.parent_id
+            FROM metadata_items alb
+            WHERE alb.metadata_type = 9 AND alb.library_section_id IN ({ph})
+        """, list(SECTION_IDS)).fetchall()
+        artist_cache = {}
+        out = []
+        for album_id, title, parent_id in rows:
+            artist_name = ""
+            if parent_id:
+                if parent_id not in artist_cache:
+                    r = db_conn.execute("SELECT title FROM metadata_items WHERE id = ?", (parent_id,)).fetchone()
+                    artist_cache[parent_id] = (r[0] or "").strip() if r else ""
+                artist_name = artist_cache[parent_id]
+            folder = first_part_path(db_conn, album_id)
+            if not folder or not folder.exists():
+                continue
+            current_name = folder.name
+            proposed_name = strip_parenthetical_suffixes(current_name)
+            if not proposed_name or proposed_name == current_name:
+                continue
+            proposed_path = folder.parent / proposed_name
+            if proposed_path == folder:
+                continue
+            out.append({
+                "album_id": album_id,
+                "artist": artist_name,
+                "title": title or current_name,
+                "current_path": str(folder),
+                "proposed_path": str(proposed_path),
+                "current_name": current_name,
+                "proposed_name": proposed_name,
+            })
+        return jsonify({"albums": out})
+    finally:
+        db_conn.close()
+
+
+@app.post("/api/library/normalize-album-names")
+def api_library_normalize_album_names():
+    """Rename album folders by removing parenthetical format/version suffixes (e.g. (flac), (EP)). Body: { album_ids: number[] } or empty for all from GET list."""
+    _reload_path_map_from_db()
+    data = request.get_json() or {}
+    album_ids = data.get("album_ids")
+    if album_ids is not None and not isinstance(album_ids, list):
+        return jsonify({"error": "album_ids must be an array"}), 400
+    _reload_section_ids_from_db()
+    if not PLEX_CONFIGURED or not SECTION_IDS:
+        return jsonify({"error": "Plex not configured"}), 503
+    db_conn = plex_connect()
+    try:
+        if not album_ids:
+            ph = ",".join("?" for _ in SECTION_IDS)
+            rows = db_conn.execute(f"""
+                SELECT id FROM metadata_items
+                WHERE metadata_type = 9 AND library_section_id IN ({ph})
+            """, list(SECTION_IDS)).fetchall()
+            album_ids = [r[0] for r in rows]
+        renamed = []
+        errors = []
+        for album_id in album_ids:
+            folder = first_part_path(db_conn, album_id)
+            if not folder or not folder.exists():
+                errors.append({"album_id": album_id, "message": "Folder not found"})
+                continue
+            current_name = folder.name
+            proposed_name = strip_parenthetical_suffixes(current_name)
+            if not proposed_name or proposed_name == current_name:
+                continue
+            proposed_path = folder.parent / proposed_name
+            if proposed_path == folder:
+                continue
+            if proposed_path.exists():
+                errors.append({"album_id": album_id, "path": str(proposed_path), "message": "Target path already exists"})
+                continue
+            try:
+                folder.rename(proposed_path)
+                renamed.append({"album_id": album_id, "from": str(folder), "to": str(proposed_path)})
+            except OSError as e:
+                errors.append({"album_id": album_id, "message": str(e)})
+        return jsonify({"renamed": renamed, "errors": errors})
+    finally:
+        db_conn.close()
 
 
 @app.get("/api/library/artists")
@@ -8273,12 +10633,15 @@ def api_library_artist_detail(artist_id):
         album_id, title, year, date, track_count = album_row
         se = scan_editions_by_album.get(album_id)
         in_duplicate_group = (album_id in dup_album_ids_from_scan) if dup_album_ids_from_scan else False
+        musicbrainz_release_group_id = None
 
         if se:
             # Use scan_editions as source of truth
             format_str = se.get("fmt_text") or None
             is_lossless = bool(format_str and format_str.upper() in lossless_formats)
             mb_identified = bool(se.get("musicbrainz_id"))
+            if se.get("musicbrainz_id"):
+                musicbrainz_release_group_id = se.get("musicbrainz_id")
             thumb_empty = not (se.get("has_cover"))
             is_broken = bool(se.get("is_broken"))
             missing_raw = se.get("missing_indices")
@@ -8339,19 +10702,26 @@ def api_library_artist_detail(artist_id):
                     elif USE_MUSICBRAINZ:
                         mbid = meta.get("musicbrainz_releasegroupid") or meta.get("musicbrainz_releaseid")
                         if mbid:
-                            try:
-                                result = musicbrainzngs.get_release_group_by_id(mbid, includes=["tags"])
-                                release_group = result.get("release-group", {})
-                                primary_type = release_group.get("primary-type", "")
-                                secondary_types = release_group.get("secondary-type-list", [])
-                                if primary_type:
-                                    album_type = primary_type
-                                if "Compilation" in secondary_types:
-                                    album_type = "Compilation"
-                                elif "Anthology" in secondary_types:
-                                    album_type = "Anthology"
-                            except Exception:
-                                pass
+                            if meta.get("musicbrainz_releasegroupid"):
+                                musicbrainz_release_group_id = meta.get("musicbrainz_releasegroupid")
+                            tag_src = "musicbrainz_releasegroupid" if meta.get("musicbrainz_releasegroupid") else "musicbrainz_releaseid"
+                            rgid = resolve_mbid_to_release_group(mbid, tag_src)
+                            if rgid:
+                                if not musicbrainz_release_group_id:
+                                    musicbrainz_release_group_id = rgid
+                                try:
+                                    result = musicbrainzngs.get_release_group_by_id(rgid, includes=["tags"])
+                                    release_group = result.get("release-group", {})
+                                    primary_type = release_group.get("primary-type", "")
+                                    secondary_types = release_group.get("secondary-type-list", [])
+                                    if primary_type:
+                                        album_type = primary_type
+                                    if "Compilation" in secondary_types:
+                                        album_type = "Compilation"
+                                    elif "Anthology" in secondary_types:
+                                        album_type = "Anthology"
+                                except Exception:
+                                    pass
                     if (track_count or 0) <= 3 and album_type == "Album":
                         album_type = "Single"
                     elif (track_count or 0) <= 6 and album_type == "Album":
@@ -8377,6 +10747,7 @@ def api_library_artist_detail(artist_id):
             "is_lossless": is_lossless,
             "thumb_empty": thumb_empty,
             "mb_identified": mb_identified,
+            "musicbrainz_release_group_id": musicbrainz_release_group_id,
             "in_duplicate_group": in_duplicate_group,
             "can_improve": can_improve,
             "broken_detail": broken_detail,
@@ -8457,59 +10828,10 @@ def api_library_missing_tags():
                         "missing_tags": missing_tags,
                     })
             return jsonify({"albums": results})
+        return jsonify({"albums": []})
 
-    # Fallback: iterate Plex albums and extract tags from files
-    required_tags_raw = _get_config_from_db("REQUIRED_TAGS")
-    required_tags = _parse_required_tags(required_tags_raw) if required_tags_raw is not None else REQUIRED_TAGS
-    placeholders = ",".join("?" for _ in SECTION_IDS)
-    db_conn = plex_connect()
-    album_rows = db_conn.execute(
-        f"""
-        SELECT alb.id, alb.title, alb.parent_id
-        FROM metadata_items alb
-        WHERE alb.metadata_type = 9 AND alb.library_section_id IN ({placeholders})
-        ORDER BY alb.title
-        """,
-        list(SECTION_IDS),
-    ).fetchall()
-    artist_cache = {}
-    results = []
-    for album_id, album_title_val, parent_id in album_rows:
-        artist_name = ""
-        if parent_id:
-            if parent_id not in artist_cache:
-                r = db_conn.execute("SELECT title FROM metadata_items WHERE id = ?", (parent_id,)).fetchone()
-                artist_cache[parent_id] = r[0] if r else ""
-            artist_name = artist_cache[parent_id]
-        folder = first_part_path(db_conn, album_id)
-        if not folder:
-            continue
-        first_audio = next((p for p in folder.rglob("*") if AUDIO_RE.search(p.name)), None)
-        meta = extract_tags(first_audio) if first_audio else {}
-        tag_checks = {
-            "artist": bool(meta.get("artist") or meta.get("albumartist")),
-            "album": bool(meta.get("album")),
-            "date": bool(meta.get("date") or meta.get("originaldate") or meta.get("year")),
-            "genre": bool(meta.get("genre")),
-            "year": bool(meta.get("year") or meta.get("date") or meta.get("originaldate")),
-            "musicbrainz_release_group_id": bool(meta.get("musicbrainz_releasegroupid") or meta.get("musicbrainz_releaseid")),
-            "musicbrainz_artist_id": bool(meta.get("musicbrainz_albumartistid") or meta.get("musicbrainz_artistid")),
-        }
-        missing_tags = []
-        for t in required_tags:
-            key = t.lower()
-            if not tag_checks.get(key, False):
-                missing_tags.append(t)
-        if not missing_tags:
-            continue
-        results.append({
-            "artist_name": artist_name,
-            "album_id": album_id,
-            "album_title": album_title_val or "",
-            "missing_tags": missing_tags,
-        })
-    db_conn.close()
-    return jsonify({"albums": results})
+    # No completed scan (e.g. after Clear results): show nothing until next scan
+    return jsonify({"albums": []})
 
 
 @app.get("/api/library/album/<int:album_id>/tracks")
@@ -8637,6 +10959,122 @@ def api_lidarr_add_album():
         return jsonify({"success": True, "message": f"Album '{album_title}' added to Lidarr"})
     else:
         return jsonify({"success": False, "message": "Failed to add album to Lidarr"}), 500
+
+
+def _run_lidarr_add_incomplete_albums(rows: List[tuple]):
+    """Background worker: add each incomplete (broken) album to Lidarr. rows: (artist, album_id, musicbrainz_release_group_id, album_title)."""
+    total = len(rows)
+    added = 0
+    failed = 0
+    with lock:
+        state["lidarr_add_incomplete"] = {
+            "running": True,
+            "current": 0,
+            "total": total,
+            "current_album": None,
+            "current_artist": None,
+            "added": 0,
+            "failed": 0,
+            "result": None,
+        }
+    con = sqlite3.connect(str(STATE_DB_FILE), timeout=30)
+    try:
+        for i, (artist_name, album_id, mbid, album_title) in enumerate(rows):
+            with lock:
+                if state.get("lidarr_add_incomplete") and state["lidarr_add_incomplete"].get("running"):
+                    state["lidarr_add_incomplete"]["current"] = i
+                    state["lidarr_add_incomplete"]["current_album"] = album_title
+                    state["lidarr_add_incomplete"]["current_artist"] = artist_name
+            success = add_broken_album_to_lidarr(artist_name, album_id, mbid or "", album_title)
+            if success:
+                added += 1
+                cur = con.cursor()
+                cur.execute("UPDATE broken_albums SET sent_to_lidarr = 1 WHERE artist = ? AND album_id = ?", (artist_name, album_id))
+                con.commit()
+            else:
+                failed += 1
+            with lock:
+                if state.get("lidarr_add_incomplete") and state["lidarr_add_incomplete"].get("running"):
+                    state["lidarr_add_incomplete"]["current"] = i + 1
+                    state["lidarr_add_incomplete"]["added"] = added
+                    state["lidarr_add_incomplete"]["failed"] = failed
+        with lock:
+            if state.get("lidarr_add_incomplete"):
+                state["lidarr_add_incomplete"]["running"] = False
+                state["lidarr_add_incomplete"]["result"] = {
+                    "added": added,
+                    "failed": failed,
+                    "total": total,
+                    "skipped": total - added - failed,
+                }
+            state["last_lidarr_add_added"] = added
+            state["last_lidarr_add_failed"] = failed
+    except Exception as e:
+        logging.exception("lidarr add-incomplete-albums failed: %s", e)
+        with lock:
+            if state.get("lidarr_add_incomplete"):
+                state["lidarr_add_incomplete"]["running"] = False
+                state["lidarr_add_incomplete"]["result"] = {"error": str(e)}
+    finally:
+        con.close()
+
+
+@app.post("/api/lidarr/add-incomplete-albums")
+def api_lidarr_add_incomplete_albums():
+    """Start adding all incomplete (broken) albums that are not yet sent to Lidarr."""
+    if not LIDARR_URL or not LIDARR_API_KEY:
+        return jsonify({"error": "Lidarr not configured (URL and API Key required)", "started": False}), 503
+    with lock:
+        if state.get("lidarr_add_incomplete") and state["lidarr_add_incomplete"].get("running"):
+            return jsonify({"error": "Add incomplete albums already running", "started": False}), 409
+    con = sqlite3.connect(str(STATE_DB_FILE), timeout=30)
+    try:
+        cur = con.cursor()
+        cur.execute(
+            "SELECT artist, album_id, musicbrainz_release_group_id FROM broken_albums WHERE sent_to_lidarr = 0"
+        )
+        raw_rows = cur.fetchall()
+    finally:
+        con.close()
+    # Resolve album titles from Plex for display
+    rows = []
+    db_conn = None
+    try:
+        db_conn = plex_connect()
+        for (artist_name, album_id, mbid) in raw_rows:
+            title = album_title(db_conn, album_id) if db_conn else f"Album {album_id}"
+            rows.append((artist_name, album_id, mbid, title))
+    except Exception:
+        rows = [(r[0], r[1], r[2], f"Album {r[1]}") for r in raw_rows]
+    finally:
+        if db_conn:
+            db_conn.close()
+    if not rows:
+        return jsonify({"error": "No incomplete albums to add (or all already sent to Lidarr)", "started": False}), 404
+    thread = threading.Thread(target=_run_lidarr_add_incomplete_albums, args=(rows,), daemon=True)
+    thread.start()
+    return jsonify({"started": True, "total": len(rows)})
+
+
+@app.get("/api/lidarr/add-incomplete-albums/progress")
+def api_lidarr_add_incomplete_albums_progress():
+    """Return current add-incomplete-albums-to-Lidarr job progress."""
+    with lock:
+        prog = state.get("lidarr_add_incomplete")
+    if prog is None:
+        return jsonify({"running": False, "finished": False})
+    return jsonify({
+        "running": prog.get("running", False),
+        "current": prog.get("current", 0),
+        "total": prog.get("total", 0),
+        "current_album": prog.get("current_album"),
+        "current_artist": prog.get("current_artist"),
+        "added": prog.get("added", 0),
+        "failed": prog.get("failed", 0),
+        "finished": not prog.get("running", True) and prog.get("result") is not None,
+        "result": prog.get("result"),
+    })
+
 
 def get_artist_albums(db_conn, artist_id: int) -> List[dict]:
     """Get all albums for an artist from Plex DB (selected sections only — SECTION_IDS)."""
@@ -9106,10 +11544,83 @@ def api_library_artist_similar(artist_id):
         return jsonify({"error": "Could not find MusicBrainz ID for artist"}), 404
     
     similar = get_similar_artists_mb(mbid)
+    # Partie 4.2: Last.fm fallback for similar artists
+    if USE_LASTFM and LASTFM_API_KEY.strip():
+        try:
+            params = {"method": "artist.getSimilar", "artist": artist_name, "api_key": LASTFM_API_KEY, "format": "json"}
+            resp = requests.get("https://ws.audioscrobbler.com/2.0/", params=params, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                lf_artists = data.get("similarartists", {}).get("artist") or []
+                if isinstance(lf_artists, dict):
+                    lf_artists = [lf_artists]
+                seen_mbids = {s.get("mbid") for s in similar if s.get("mbid")}
+                seen_names = {s.get("name", "").lower() for s in similar}
+                for a in lf_artists[:15]:
+                    name = (a.get("name") or "").strip()
+                    lf_mbid = (a.get("mbid") or "").strip()
+                    if not name:
+                        continue
+                    if lf_mbid and lf_mbid in seen_mbids:
+                        continue
+                    if name.lower() in seen_names:
+                        continue
+                    similar.append({"name": name, "mbid": lf_mbid or "", "type": "Last.fm"})
+                    if lf_mbid:
+                        seen_mbids.add(lf_mbid)
+                    seen_names.add(name.lower())
+                    if len(similar) >= 20:
+                        break
+        except Exception as e:
+            logging.debug("[Similar artists] Last.fm fallback failed: %s", e)
     return jsonify({
         "artist_mbid": mbid,
-        "similar_artists": similar
+        "similar_artists": similar[:20]
     })
+
+@app.get("/api/library/release-group/<mbid>/labels")
+def api_library_release_group_labels(mbid):
+    """Get labels for a MusicBrainz release-group (from first release)."""
+    if not PLEX_CONFIGURED:
+        return jsonify({"error": "Plex not configured"}), 503
+    if not USE_MUSICBRAINZ:
+        return jsonify({"error": "MusicBrainz not enabled"}), 400
+    mbid = (mbid or "").strip()
+    if not mbid or len(mbid) != 36:
+        return jsonify({"error": "Invalid release-group MBID"}), 400
+    try:
+        if MB_QUEUE_ENABLED and USE_MUSICBRAINZ:
+            rg_data = get_mb_queue().submit(f"rg_labels_{mbid}", lambda: musicbrainzngs.get_release_group_by_id(mbid, includes=["releases"]))
+        else:
+            rg_data = musicbrainzngs.get_release_group_by_id(mbid, includes=["releases"])
+        rg = rg_data.get("release-group", {})
+        releases = rg.get("release-list") or []
+        if not releases:
+            return jsonify({"labels": []})
+        first_release_id = releases[0].get("id")
+        if not first_release_id:
+            return jsonify({"labels": []})
+        if MB_QUEUE_ENABLED and USE_MUSICBRAINZ:
+            rel_data = get_mb_queue().submit(f"rel_labels_{first_release_id}", lambda: musicbrainzngs.get_release_by_id(first_release_id, includes=["labels"]))
+        else:
+            rel_data = musicbrainzngs.get_release_by_id(first_release_id, includes=["labels"])
+        release = rel_data.get("release", {})
+        label_list = release.get("label-list") or []
+        labels = []
+        for lb in label_list:
+            label = lb.get("label", {}) if isinstance(lb.get("label"), dict) else {}
+            name = label.get("name") or lb.get("name") or ""
+            lid = label.get("id") or lb.get("id") or ""
+            if name or lid:
+                labels.append({"name": name, "id": lid})
+        return jsonify({"labels": labels})
+    except musicbrainzngs.WebServiceError as e:
+        if "404" in str(e):
+            return jsonify({"error": "Release group not found"}), 404
+        raise
+    except Exception as e:
+        logging.exception("Failed to get labels for release-group %s", mbid)
+        return jsonify({"error": str(e)}), 500
 
 @app.get("/api/library/artist/<int:artist_id>/monitored")
 def api_library_artist_monitored(artist_id):
@@ -9145,6 +11656,149 @@ def get_artist_images_mb(artist_mbid: str) -> List[str]:
     except Exception as e:
         logging.error("Failed to get artist images for MBID %s: %s", artist_mbid, e)
         return []
+
+
+def _artist_folder_has_image(artist_folder: Path) -> bool:
+    """Return True if the artist folder already has an artist/folder image file."""
+    if not artist_folder or not artist_folder.is_dir():
+        return False
+    names = ("artist.jpg", "artist.jpeg", "artist.png", "folder.jpg", "folder.jpeg", "folder.png")
+    return any((artist_folder / n).is_file() for n in names)
+
+
+def _fetch_and_save_artist_image_mb(artist_mbid: str, artist_folder: Path) -> bool:
+    """Fetch first artist image from MusicBrainz/Wikimedia and save to artist_folder/artist.jpg. Returns True if saved."""
+    urls = get_artist_images_mb(artist_mbid)
+    for url in urls:
+        try:
+            resp = requests.get(url, timeout=10, allow_redirects=True)
+            if resp.status_code != 200:
+                continue
+            ct = resp.headers.get("content-type", "").lower()
+            if "image/" in ct:
+                ext = ".jpg"
+                if "png" in ct:
+                    ext = ".png"
+                out = artist_folder / f"artist{ext}"
+                out.write_bytes(resp.content)
+                logging.info("Saved artist image from MusicBrainz to %s", out)
+                return True
+            # If HTML (e.g. Commons page), try og:image
+            if "text/html" in ct:
+                m = re.search(r'<meta\s+property="og:image"\s+content="([^"]+)"', resp.text)
+                if m:
+                    img_url = m.group(1).strip()
+                    img_resp = requests.get(img_url, timeout=10, allow_redirects=True)
+                    if img_resp.status_code == 200 and "image/" in img_resp.headers.get("content-type", "").lower():
+                        (artist_folder / "artist.jpg").write_bytes(img_resp.content)
+                        logging.info("Saved artist image from Wikimedia to %s", artist_folder / "artist.jpg")
+                        return True
+        except Exception as e:
+            logging.warning("Artist image fetch (MB) failed for %s: %s", url, e)
+    return False
+
+
+def _fetch_artist_image_lastfm(artist_name: str) -> Optional[str]:
+    """Get largest artist image URL from Last.fm artist.getInfo. Returns URL or None."""
+    if not USE_LASTFM:
+        return None
+    api_key = (getattr(sys.modules[__name__], "LASTFM_API_KEY", "") or "").strip()
+    if not api_key:
+        return None
+    try:
+        resp = requests.get(
+            "https://ws.audioscrobbler.com/2.0/",
+            params={"method": "artist.getInfo", "artist": artist_name, "api_key": api_key, "format": "json"},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        if data.get("error"):
+            return None
+        artist = data.get("artist", {})
+        images = artist.get("image") or []
+        url = None
+        for img in images:
+            if isinstance(img, dict) and img.get("#text"):
+                url = img.get("#text")
+                if img.get("size") == "extralarge":
+                    return url
+        return url
+    except Exception as e:
+        logging.warning("Last.fm artist.getInfo failed for %s: %s", artist_name, e)
+        return None
+
+
+def _fetch_artist_image_discogs(artist_name: str) -> Optional[str]:
+    """Get artist image URL from Discogs (search artist, first result). Returns URL or None."""
+    if not USE_DISCOGS:
+        return None
+    token = (getattr(sys.modules[__name__], "DISCOGS_USER_TOKEN", "") or "").strip()
+    if not token:
+        return None
+    try:
+        import discogs_client
+        d = discogs_client.Client("PMDA/0.6.6", user_token=token)
+        results = d.search(artist_name, type="artist")
+        page = results.page(1)
+        if not page:
+            return None
+        artist = page[0]
+        artist_id = getattr(artist, "id", None) or (artist.data.get("id") if getattr(artist, "data", None) else None)
+        if not artist_id:
+            return None
+        full_artist = d.artist(artist_id)
+        images = getattr(full_artist, "images", None)
+        if images and len(images) > 0:
+            img = images[0]
+            return img.get("uri") or img.get("resource_url")
+        return None
+    except Exception as e:
+        logging.warning("Discogs artist image fetch failed for %s: %s", artist_name, e)
+        return None
+
+
+def _fetch_and_save_artist_image(artist_name: str, artist_folder: Path, artist_mbid: Optional[str] = None) -> bool:
+    """
+    Fetch artist image from MB, then Last.fm, then Discogs and save to artist_folder (artist.jpg).
+    Skips if artist_folder already has an artist/folder image. Returns True if saved.
+    """
+    if not artist_folder or not artist_folder.is_dir():
+        return False
+    if _artist_folder_has_image(artist_folder):
+        return False
+    if not USE_MUSICBRAINZ and not USE_LASTFM and not USE_DISCOGS:
+        return False
+    # Try MusicBrainz first (if we have MBID)
+    if artist_mbid and USE_MUSICBRAINZ:
+        if _fetch_and_save_artist_image_mb(artist_mbid, artist_folder):
+            return True
+    # Last.fm
+    if USE_LASTFM:
+        url = _fetch_artist_image_lastfm(artist_name)
+        if url:
+            try:
+                resp = requests.get(url, timeout=10, allow_redirects=True)
+                if resp.status_code == 200 and resp.content:
+                    (artist_folder / "artist.jpg").write_bytes(resp.content)
+                    logging.info("Saved artist image from Last.fm to %s", artist_folder / "artist.jpg")
+                    return True
+            except Exception as e:
+                logging.warning("Artist image download (Last.fm) failed: %s", e)
+    # Discogs
+    if USE_DISCOGS:
+        url = _fetch_artist_image_discogs(artist_name)
+        if url:
+            try:
+                resp = requests.get(url, timeout=10, allow_redirects=True)
+                if resp.status_code == 200 and resp.content:
+                    (artist_folder / "artist.jpg").write_bytes(resp.content)
+                    logging.info("Saved artist image from Discogs to %s", artist_folder / "artist.jpg")
+                    return True
+            except Exception as e:
+                logging.warning("Artist image download (Discogs) failed: %s", e)
+    return False
 
 @app.get("/api/library/artist/<int:artist_id>/images")
 def api_library_artist_images(artist_id):
@@ -9257,7 +11911,7 @@ def api_library_album_tags(album_id):
             else:
                 # Get release-group from release
                 def _fetch_release():
-                    return musicbrainzngs.get_release_by_id(mbid, includes=['release-group'])['release']
+                    return musicbrainzngs.get_release_by_id(mbid, includes=["release-groups"])["release"]
                 
                 if MB_QUEUE_ENABLED and USE_MUSICBRAINZ:
                     rel = get_mb_queue().submit(f"rel_{mbid}", _fetch_release)
@@ -9282,21 +11936,76 @@ def api_library_album_tags(album_id):
     })
 
 
-def _improve_single_album(album_id: int, db_conn) -> dict:
+def _embed_cover_in_audio_files(cover_path: Path, audio_files: list) -> None:
     """
-    Improve one album: resolve MusicBrainz ID (from tags or search), update tags on all audio files, fetch cover if missing.
-    Returns dict with steps (list of str), summary (str), tags_updated (bool), cover_saved (bool).
+    Embed the cover image from cover_path into all audio files (MP3, FLAC, MP4).
+    Logs errors per file but does not raise.
+    """
+    if not cover_path or not cover_path.is_file():
+        return
+    try:
+        from mutagen import File as MutagenFile
+        from mutagen.id3 import ID3, APIC
+        from mutagen.mp3 import MP3
+        from mutagen.flac import FLAC, Picture
+        from mutagen.mp4 import MP4, MP4Cover
+    except ImportError:
+        logging.warning("improve-album: mutagen not available for embedding cover")
+        return
+    data = cover_path.read_bytes()
+    suffix = cover_path.suffix.lower()
+    if suffix in (".png",):
+        mime = "image/png"
+        mp4_fmt = MP4Cover.FORMAT_PNG
+    else:
+        mime = "image/jpeg"
+        mp4_fmt = MP4Cover.FORMAT_JPEG
+    for audio_file in audio_files:
+        try:
+            audio = MutagenFile(str(audio_file))
+            if audio is None:
+                continue
+            if isinstance(audio, MP3):
+                if audio.tags is None:
+                    audio.add_tags(ID3())
+                audio.tags.add(APIC(encoding=3, mime=mime, type=3, desc="Cover", data=data))
+            elif isinstance(audio, FLAC):
+                pic = Picture()
+                pic.type = 3
+                pic.mime = mime
+                pic.desc = "front cover"
+                pic.data = data
+                audio.add_picture(pic)
+            elif isinstance(audio, MP4):
+                if audio.tags is None:
+                    from mutagen.mp4 import MP4Tags
+                    audio.add_tags(MP4Tags())
+                audio.tags["covr"] = [MP4Cover(data, mp4_fmt)]
+            else:
+                continue
+            audio.save()
+        except Exception as e:
+            logging.error("improve-album: embed cover failed for %s: %s", audio_file, e)
+
+
+def _improve_single_album(album_id: int, db_conn, known_release_group_id: Optional[str] = None) -> dict:
+    """
+    Improve one album: resolve MusicBrainz ID (from known_release_group_id, tags, or search), update tags on all audio files, fetch cover if missing.
+    known_release_group_id: optional MBID from last scan (scan_editions); when set, used instead of tags/search.
+    Fallback: Discogs then Last.fm when MB does not provide tags or cover.
+    Returns dict with steps (list of str), summary (str), tags_updated (bool), cover_saved (bool), provider_used (str|None).
     """
     steps: List[str] = []
     tags_updated = False
     cover_saved = False
+    provider_used: Optional[str] = None
 
     album_row = db_conn.execute(
         "SELECT id, title, parent_id FROM metadata_items WHERE id = ? AND metadata_type = 9",
         (album_id,)
     ).fetchone()
     if not album_row:
-        return {"steps": ["Album not found"], "summary": "Album not found.", "tags_updated": False, "cover_saved": False}
+        return {"steps": ["Album not found"], "summary": "Album not found.", "tags_updated": False, "cover_saved": False, "provider_used": None}
 
     album_title_str = album_row[1]
     artist_id = album_row[2]
@@ -9308,15 +12017,15 @@ def _improve_single_album(album_id: int, db_conn) -> dict:
 
     folder = first_part_path(db_conn, album_id)
     if not folder:
-        return {"steps": ["Album folder not found"], "summary": "Album folder not found.", "tags_updated": False, "cover_saved": False}
+        return {"steps": ["Album folder not found"], "summary": "Album folder not found.", "tags_updated": False, "cover_saved": False, "provider_used": None}
 
     audio_files = [p for p in folder.rglob("*") if AUDIO_RE.search(p.name)]
     if not audio_files:
-        return {"steps": ["No audio files in album folder"], "summary": "No audio files found.", "tags_updated": False, "cover_saved": False}
+        return {"steps": ["No audio files in album folder"], "summary": "No audio files found.", "tags_updated": False, "cover_saved": False, "provider_used": None}
 
     first_audio = audio_files[0]
     current_tags = extract_tags(first_audio)
-    release_mbid = current_tags.get("musicbrainz_releasegroupid") or current_tags.get("musicbrainz_releaseid")
+    release_mbid = known_release_group_id or current_tags.get("musicbrainz_releasegroupid") or current_tags.get("musicbrainz_releaseid")
 
     if not release_mbid and USE_MUSICBRAINZ:
         album_norm = norm_album(album_title_str)
@@ -9329,12 +12038,14 @@ def _improve_single_album(album_id: int, db_conn) -> dict:
                     tracks.add(t)
         except Exception:
             pass
-        rg_info = search_mb_release_group_by_metadata(artist_name, album_norm, tracks)
+        rg_info, _verified_by_ai = search_mb_release_group_by_metadata(artist_name, album_norm, tracks, title_raw=album_title_str)
         if rg_info and isinstance(rg_info.get("id"), str):
             release_mbid = rg_info["id"]
             steps.append("Found MusicBrainz release group via search")
     if release_mbid:
-        if not steps:
+        if known_release_group_id:
+            steps.append("Using MusicBrainz ID from scan")
+        elif not steps:
             steps.append("Using existing MusicBrainz ID")
 
     try:
@@ -9353,15 +12064,22 @@ def _improve_single_album(album_id: int, db_conn) -> dict:
             "summary": "Cannot update tags: mutagen library not installed.",
             "tags_updated": False,
             "cover_saved": cover_saved,
+            "provider_used": None,
         }
 
     mb_release_info = None
     if release_mbid:
+        release_group_id = release_mbid
+        tag_src = "musicbrainz_releasegroupid" if current_tags.get("musicbrainz_releasegroupid") else ("musicbrainz_releaseid" if current_tags.get("musicbrainz_releaseid") else "")
+        if tag_src:
+            resolved = resolve_mbid_to_release_group(release_mbid, tag_src)
+            if resolved:
+                release_group_id = resolved
         try:
-            result = musicbrainzngs.get_release_group_by_id(release_mbid, includes=["releases"])
+            result = musicbrainzngs.get_release_group_by_id(release_group_id, includes=["releases"])
             mb_release_info = result.get("release-group", {})
         except Exception as e:
-            logging.warning("improve-album: failed to fetch release group %s: %s", release_mbid, e)
+            logging.warning("improve-album: failed to fetch release group %s: %s", release_group_id, e)
             steps.append(f"MusicBrainz lookup failed: {e}")
 
     artist_mbid = current_tags.get("musicbrainz_albumartistid") or current_tags.get("musicbrainz_artistid")
@@ -9372,6 +12090,16 @@ def _improve_single_album(album_id: int, db_conn) -> dict:
                 artist_mbid = search_result["artist-list"][0]["id"]
         except Exception as e:
             logging.warning("improve-album: artist search failed for '%s': %s", artist_name, e)
+
+    # Log what we retrieved and from where (for fix-all visibility)
+    if mb_release_info and artist_mbid:
+        date_str = mb_release_info.get("first-release-date", "")
+        year_str = date_str.split("-")[0] if (date_str and "-" in date_str) else (date_str or "")
+        logging.info(
+            "Fix-all [album_id=%s] source=MusicBrainz tags: ARTIST=%s ALBUM=%s DATE=%s MUSICBRAINZ_ARTISTID=%s MUSICBRAINZ_RELEASEGROUPID=%s -> injecting into %d file(s) in %s",
+            album_id, artist_name, mb_release_info.get("title", album_title_str), year_str or "(none)",
+            artist_mbid, release_mbid or "(none)", len(audio_files), folder,
+        )
 
     files_updated = 0
     for audio_file in audio_files:
@@ -9409,6 +12137,7 @@ def _improve_single_album(album_id: int, db_conn) -> dict:
                         audio["----:com.apple.iTunes:MusicBrainz Release Group Id"] = [release_mbid.encode("utf-8")]
                 audio.save()
                 files_updated += 1
+                logging.info("Fix-all: injected MusicBrainz tags into %s", audio_file)
         except Exception as e:
             logging.error("improve-album: error updating %s: %s", audio_file, e)
             steps.append(f"Error updating {audio_file.name}: {e}")
@@ -9431,13 +12160,147 @@ def _improve_single_album(album_id: int, db_conn) -> dict:
                 with open(cover_path, "wb") as f:
                     f.write(cover_resp.content)
                 cover_saved = True
+                logging.info("Fix-all [album_id=%s] source=Cover Art Archive saved cover to %s", album_id, cover_path)
                 steps.append("Fetched and saved cover art")
+                _embed_cover_in_audio_files(cover_path, audio_files)
         except Exception as e:
             logging.warning("improve-album: cover fetch failed: %s", e)
             steps.append("Cover fetch failed")
 
+    if tags_updated or cover_saved:
+        provider_used = "musicbrainz"
+
+    def _apply_fallback_tags(artist_str: str, album_str: str, year_str: str, source: str = "fallback") -> int:
+        """Write artist, album, date to all audio files. Returns number of files updated."""
+        logging.info(
+            "Fix-all [album_id=%s] source=%s tags: ARTIST=%s ALBUM=%s DATE=%s -> injecting into %d file(s) in %s",
+            album_id, source, artist_str, album_str, year_str or "(none)", len(audio_files), folder,
+        )
+        count = 0
+        for audio_file in audio_files:
+            try:
+                audio = MutagenFile(str(audio_file))
+                if audio is None:
+                    continue
+                if isinstance(audio, (MP3, ID3)):
+                    audio.tags.add(TPE1(encoding=3, text=artist_str))
+                    audio.tags.add(TALB(encoding=3, text=album_str))
+                    if year_str:
+                        audio.tags.add(TDRC(encoding=3, text=year_str))
+                elif isinstance(audio, FLAC):
+                    audio["ARTIST"] = artist_str
+                    audio["ALBUM"] = album_str
+                    if year_str:
+                        audio["DATE"] = year_str
+                elif isinstance(audio, MP4):
+                    audio["\xa9ART"] = [artist_str]
+                    audio["\xa9alb"] = [album_str]
+                    if year_str:
+                        audio["\xa9day"] = [year_str]
+                audio.save()
+                count += 1
+                logging.info("Fix-all: injected %s tags into %s", source, audio_file)
+            except Exception as e:
+                logging.error("improve-album: fallback tag error %s: %s", audio_file, e)
+        return count
+
+    # Fallback: Discogs then Last.fm when MB did not provide tags or cover
+    has_cover_now = has_cover or cover_saved
+    if (not tags_updated or not has_cover_now) and not provider_used and USE_DISCOGS:
+        discogs_info = _fetch_discogs_release(artist_name, album_title_str)
+        if discogs_info:
+            artist_str = discogs_info.get("artist_name") or artist_name
+            album_str = discogs_info.get("title") or album_title_str
+            year_str = (discogs_info.get("year") or "").strip()
+            if not tags_updated and (album_str or artist_str):
+                n = _apply_fallback_tags(artist_str, album_str, year_str, "Discogs")
+                if n > 0:
+                    tags_updated = True
+                    files_updated = n
+                    steps.append(f"Updated tags from Discogs on {n} file(s)")
+            if not has_cover_now and discogs_info.get("cover_url"):
+                try:
+                    cover_resp = requests.get(discogs_info["cover_url"], timeout=10, allow_redirects=True)
+                    if cover_resp.status_code == 200:
+                        cover_path = folder / "cover.jpg"
+                        with open(cover_path, "wb") as f:
+                            f.write(cover_resp.content)
+                        cover_saved = True
+                        has_cover_now = True
+                        logging.info("Fix-all [album_id=%s] source=Discogs saved cover to %s", album_id, cover_path)
+                        steps.append("Fetched and saved cover art from Discogs")
+                        _embed_cover_in_audio_files(cover_path, audio_files)
+                except Exception as e:
+                    logging.warning("improve-album: Discogs cover fetch failed: %s", e)
+            if tags_updated or cover_saved:
+                provider_used = "discogs"
+
+    if (not tags_updated or not has_cover_now) and not provider_used and USE_LASTFM:
+        lastfm_info = _fetch_lastfm_album_info(artist_name, album_title_str, release_mbid)
+        if lastfm_info:
+            artist_str = lastfm_info.get("artist") or artist_name
+            album_str = lastfm_info.get("title") or album_title_str
+            year_str = ""
+            if not tags_updated and (album_str or artist_str):
+                n = _apply_fallback_tags(artist_str, album_str, year_str, "Last.fm")
+                if n > 0:
+                    tags_updated = True
+                    files_updated = n
+                    steps.append(f"Updated tags from Last.fm on {n} file(s)")
+            if not has_cover_now and lastfm_info.get("cover_url"):
+                try:
+                    cover_resp = requests.get(lastfm_info["cover_url"], timeout=10, allow_redirects=True)
+                    if cover_resp.status_code == 200:
+                        cover_path = folder / "cover.jpg"
+                        with open(cover_path, "wb") as f:
+                            f.write(cover_resp.content)
+                        cover_saved = True
+                        has_cover_now = True
+                        logging.info("Fix-all [album_id=%s] source=Last.fm saved cover to %s", album_id, cover_path)
+                        steps.append("Fetched and saved cover art from Last.fm")
+                        _embed_cover_in_audio_files(cover_path, audio_files)
+                except Exception as e:
+                    logging.warning("improve-album: Last.fm cover fetch failed: %s", e)
+            if tags_updated or cover_saved:
+                provider_used = "lastfm"
+
+    # Bandcamp: ultimate fallback when still missing tags or cover
+    if (not tags_updated or not has_cover_now) and not provider_used and USE_BANDCAMP:
+        bandcamp_info = _fetch_bandcamp_album_info(artist_name, album_title_str)
+        if bandcamp_info:
+            artist_str = bandcamp_info.get("artist_name") or artist_name
+            album_str = bandcamp_info.get("title") or album_title_str
+            year_str = (bandcamp_info.get("year") or "").strip()
+            if not tags_updated and (album_str or artist_str):
+                n = _apply_fallback_tags(artist_str, album_str, year_str, "Bandcamp")
+                if n > 0:
+                    tags_updated = True
+                    files_updated = n
+                    steps.append(f"Updated tags from Bandcamp on {n} file(s)")
+            if not has_cover_now and bandcamp_info.get("cover_url"):
+                try:
+                    cover_resp = requests.get(bandcamp_info["cover_url"], headers={"User-Agent": "PMDA/1.0 (metadata fallback)"}, timeout=10, allow_redirects=True)
+                    if cover_resp.status_code == 200:
+                        cover_path = folder / "cover.jpg"
+                        with open(cover_path, "wb") as f:
+                            f.write(cover_resp.content)
+                        cover_saved = True
+                        logging.info("Fix-all [album_id=%s] source=Bandcamp saved cover to %s", album_id, cover_path)
+                        steps.append("Fetched and saved cover art from Bandcamp")
+                        _embed_cover_in_audio_files(cover_path, audio_files)
+                except Exception as e:
+                    logging.warning("improve-album: Bandcamp cover fetch failed: %s", e)
+            if tags_updated or cover_saved:
+                provider_used = "bandcamp"
+
+    # Fetch and save artist image to artist folder if missing (MB, Last.fm, Discogs)
+    if tags_updated or cover_saved:
+        artist_folder = folder.parent
+        if _fetch_and_save_artist_image(artist_name, artist_folder, artist_mbid):
+            steps.append("Fetched and saved artist image")
+
     summary = f"Updated tags on {files_updated} file(s)." + (" Fetched cover art." if cover_saved else "")
-    return {"steps": steps, "summary": summary, "tags_updated": tags_updated, "cover_saved": cover_saved}
+    return {"steps": steps, "summary": summary, "tags_updated": tags_updated, "cover_saved": cover_saved, "provider_used": provider_used}
 
 
 @app.post("/api/library/improve-album")
@@ -9461,22 +12324,121 @@ def api_library_improve_album():
         db_conn.close()
 
 
+def _run_improve_all_albums_global(best_albums_list: List[dict]):
+    """Background worker: improve each 'best' album from duplicate groups (global fix-all). Saves last_fix_all_by_provider for summary/chart."""
+    total = len(best_albums_list)
+    albums_improved = 0
+    tags_updated_count = 0
+    covers_downloaded = 0
+    album_log = []
+    providers = ["musicbrainz", "discogs", "lastfm", "bandcamp"]
+    by_provider = {p: {"identified": 0, "covers": 0, "tags": 0} for p in providers}
+    with lock:
+        state["improve_all"] = {
+            "running": True,
+            "global": True,
+            "artist_id": None,
+            "current": 0,
+            "total": total,
+            "current_album_id": None,
+            "current_album": None,
+            "current_artist": None,
+            "current_provider": "musicbrainz",
+            "provider_status": {p: "pending" for p in providers},
+            "log": [],
+            "result": None,
+            "error": None,
+        }
+    try:
+        for i, item in enumerate(best_albums_list):
+            album_id = item.get("album_id")
+            artist_name = item.get("artist", "Unknown")
+            album_title = item.get("album_title", f"Album {album_id}")
+            with lock:
+                if state.get("improve_all") and state["improve_all"].get("running"):
+                    state["improve_all"]["current_album_id"] = album_id
+                    state["improve_all"]["current_album"] = album_title
+                    state["improve_all"]["current_artist"] = artist_name
+                    state["improve_all"]["current_provider"] = "musicbrainz"
+                    state["improve_all"]["provider_status"] = {p: ("ok" if p == "musicbrainz" else "pending") for p in providers}
+            db_conn = plex_connect()
+            try:
+                known_mbid = item.get("musicbrainz_id") if isinstance(item.get("musicbrainz_id"), str) and (item.get("musicbrainz_id") or "").strip() else None
+                result = _improve_single_album(album_id, db_conn, known_release_group_id=known_mbid)
+                prov = result.get("provider_used") or "musicbrainz"
+                if prov in by_provider:
+                    if result.get("tags_updated") or result.get("cover_saved"):
+                        by_provider[prov]["identified"] += 1
+                    if result.get("cover_saved"):
+                        by_provider[prov]["covers"] += 1
+                    if result.get("tags_updated"):
+                        by_provider[prov]["tags"] += 1
+                if result.get("tags_updated"):
+                    tags_updated_count += 1
+                if result.get("cover_saved"):
+                    covers_downloaded += 1
+                if result.get("tags_updated") or result.get("cover_saved"):
+                    albums_improved += 1
+                steps_raw = result.get("steps", [])
+                steps = [{"label": s if isinstance(s, str) else s.get("label", str(s)), "success": True} for s in steps_raw]
+                with lock:
+                    if state.get("improve_all"):
+                        state["improve_all"]["provider_status"] = {p: "ok" for p in providers}
+                album_log.append({
+                    "album_id": album_id,
+                    "title": album_title,
+                    "artist": artist_name,
+                    "summary": result.get("summary", ""),
+                    "steps": steps,
+                })
+            finally:
+                db_conn.close()
+            with lock:
+                if state.get("improve_all") and state["improve_all"].get("running"):
+                    state["improve_all"]["current"] = i + 1
+                    state["improve_all"]["log"] = list(album_log)
+                    state["improve_all"]["current_steps"] = steps
+        with lock:
+            if state.get("improve_all"):
+                state["improve_all"]["running"] = False
+                state["improve_all"]["result"] = {
+                    "message": f"Processed {total} album(s). Tags updated on {tags_updated_count} album(s), {covers_downloaded} cover(s) saved.",
+                    "albums_processed": total,
+                    "albums_improved": albums_improved,
+                    "covers_downloaded": covers_downloaded,
+                    "tags_updated": tags_updated_count,
+                    "by_provider": by_provider,
+                    "album_log": album_log,
+                }
+            state["last_fix_all_by_provider"] = by_provider
+            state["last_fix_all_total_albums"] = total
+    except Exception as e:
+        logging.exception("improve-all (global) failed: %s", e)
+        with lock:
+            if state.get("improve_all"):
+                state["improve_all"]["running"] = False
+                state["improve_all"]["error"] = str(e)
+
+
 def _run_improve_all_albums(artist_id: int, album_ids: list, album_titles: dict):
     """Background worker: improve each album for an artist and update state."""
     total = len(album_ids)
     albums_improved = 0
-    tags_updated = 0
+    tags_updated_count = 0
     covers_downloaded = 0
     album_log = []
     providers = ["musicbrainz", "discogs", "lastfm", "bandcamp"]
+    by_provider = {p: {"identified": 0, "covers": 0, "tags": 0} for p in providers}
     with lock:
         state["improve_all"] = {
             "running": True,
+            "global": False,
             "artist_id": artist_id,
             "current": 0,
             "total": total,
             "current_album_id": None,
             "current_album": None,
+            "current_artist": None,
             "current_provider": "musicbrainz",
             "provider_status": {p: "pending" for p in providers},
             "log": [],
@@ -9495,8 +12457,16 @@ def _run_improve_all_albums(artist_id: int, album_ids: list, album_titles: dict)
             db_conn = plex_connect()
             try:
                 result = _improve_single_album(album_id, db_conn)
+                prov = result.get("provider_used") or "musicbrainz"
+                if prov in by_provider:
+                    if result.get("tags_updated") or result.get("cover_saved"):
+                        by_provider[prov]["identified"] += 1
+                    if result.get("cover_saved"):
+                        by_provider[prov]["covers"] += 1
+                    if result.get("tags_updated"):
+                        by_provider[prov]["tags"] += 1
                 if result.get("tags_updated"):
-                    tags_updated += 1
+                    tags_updated_count += 1
                 if result.get("cover_saved"):
                     covers_downloaded += 1
                 if result.get("tags_updated") or result.get("cover_saved"):
@@ -9505,7 +12475,6 @@ def _run_improve_all_albums(artist_id: int, album_ids: list, album_titles: dict)
                 steps = [{"label": s if isinstance(s, str) else s.get("label", str(s)), "success": True} for s in steps_raw]
                 with lock:
                     if state.get("improve_all"):
-                        # mark all providers as "ok" for now (we only implemented MB, but UI expects status)
                         state["improve_all"]["provider_status"] = {p: "ok" for p in providers}
                 album_log.append({
                     "album_id": album_id,
@@ -9524,21 +12493,12 @@ def _run_improve_all_albums(artist_id: int, album_ids: list, album_titles: dict)
             if state.get("improve_all"):
                 state["improve_all"]["running"] = False
                 state["improve_all"]["result"] = {
-                    "message": f"Processed {total} album(s). Tags updated on {tags_updated} album(s), {covers_downloaded} cover(s) saved.",
+                    "message": f"Processed {total} album(s). Tags updated on {tags_updated_count} album(s), {covers_downloaded} cover(s) saved.",
                     "albums_processed": total,
                     "albums_improved": albums_improved,
                     "covers_downloaded": covers_downloaded,
-                    "tags_updated": tags_updated,
-                    "by_provider": {
-                        "musicbrainz": {
-                            "identified": albums_improved,
-                            "covers": covers_downloaded,
-                            "tags": tags_updated,
-                        },
-                        "discogs": {"identified": 0, "covers": 0, "tags": 0},
-                        "lastfm": {"identified": 0, "covers": 0, "tags": 0},
-                        "bandcamp": {"identified": 0, "covers": 0, "tags": 0},
-                    },
+                    "tags_updated": tags_updated_count,
+                    "by_provider": by_provider,
                     "album_log": album_log,
                 }
     except Exception as e:
@@ -9592,21 +12552,83 @@ def api_library_improve_all_albums():
     return jsonify({"started": True, "total": len(album_ids)})
 
 
+@app.post("/api/library/improve-all")
+def api_library_improve_all():
+    """Start global 'Fix all albums': improve each 'best' edition from duplicate groups + all albums from last scan that have a MusicBrainz match (tags + cover + artist image from MB → Discogs → Last.fm → Bandcamp)."""
+    if not PLEX_CONFIGURED:
+        return jsonify({"error": "Plex not configured"}), 503
+    with lock:
+        if state.get("improve_all") and state["improve_all"].get("running"):
+            return jsonify({"error": "Improve-all already running", "started": False}), 409
+        if not state["duplicates"]:
+            state["duplicates"] = load_scan_from_db()
+        best_albums = []
+        seen_ids = set()
+        for artist_name, groups in state["duplicates"].items():
+            for g in groups:
+                best = g.get("best")
+                if not best:
+                    continue
+                album_id = best.get("album_id")
+                if album_id is None or album_id in seen_ids:
+                    continue
+                seen_ids.add(album_id)
+                best_albums.append({
+                    "artist": artist_name,
+                    "album_id": album_id,
+                    "album_title": best.get("title_raw") or best.get("album_norm") or f"Album {album_id}",
+                    "musicbrainz_id": best.get("musicbrainz_id"),
+                })
+        # Also include all albums from last scan that have a MusicBrainz match (e.g. Volume 2, Volume 3 without duplicate)
+        scan_id = get_last_completed_scan_id()
+        if scan_id is not None:
+            con = sqlite3.connect(str(STATE_DB_FILE))
+            cur = con.cursor()
+            try:
+                cur.execute(
+                    "SELECT artist, album_id, title_raw, musicbrainz_id FROM scan_editions WHERE scan_id = ? AND musicbrainz_id IS NOT NULL AND trim(musicbrainz_id) != ''",
+                    (scan_id,),
+                )
+                for row in cur.fetchall():
+                    artist_name, album_id, title_raw, mbid = row[0], row[1], row[2] or "", row[3] or ""
+                    if album_id in seen_ids or not mbid.strip():
+                        continue
+                    seen_ids.add(album_id)
+                    best_albums.append({
+                        "artist": artist_name,
+                        "album_id": album_id,
+                        "album_title": (title_raw or "").strip() or f"Album {album_id}",
+                        "musicbrainz_id": mbid.strip(),
+                    })
+            except Exception as e:
+                logging.debug("Fix-all: could not load scan_editions for extra albums: %s", e)
+            finally:
+                con.close()
+    if not best_albums:
+        return jsonify({"error": "No albums to fix (no duplicate groups and no scan with MusicBrainz matches). Run a scan first.", "started": False}), 404
+    thread = threading.Thread(target=_run_improve_all_albums_global, args=(best_albums,), daemon=True)
+    thread.start()
+    return jsonify({"started": True, "total": len(best_albums)})
+
+
 @app.get("/api/library/improve-all-albums/progress")
+@app.get("/api/library/improve-all/progress")
 def api_library_improve_all_progress():
-    """Return current improve-all-albums job progress (running, current, total, result, error)."""
+    """Return current improve-all job progress (per-artist or global: running, current, total, result, error)."""
     with lock:
         prog = state.get("improve_all")
     if prog is None:
         return jsonify({"running": False, "finished": False})
     out = {
         "running": prog.get("running", False),
+        "global": prog.get("global", False),
         "current": prog.get("current", 0),
         "total": prog.get("total", 0),
         "albums_processed": prog.get("current", 0),
         "total_albums": prog.get("total", 0),
         "current_album_id": prog.get("current_album_id"),
         "current_album": prog.get("current_album"),
+        "current_artist": prog.get("current_artist"),
         "current_provider": prog.get("current_provider"),
         "provider_status": prog.get("provider_status", {}),
         "current_steps": prog.get("current_steps", []),
@@ -9724,11 +12746,15 @@ def api_musicbrainz_fix_artist_tags():
             first_audio = audio_files[0]
             current_tags = extract_tags(first_audio)
             release_mbid = current_tags.get('musicbrainz_releasegroupid') or current_tags.get('musicbrainz_releaseid')
+            release_group_id = None
+            if release_mbid:
+                tag_src = "musicbrainz_releasegroupid" if current_tags.get("musicbrainz_releasegroupid") else "musicbrainz_releaseid"
+                release_group_id = resolve_mbid_to_release_group(release_mbid, tag_src) or release_mbid
             
             mb_release_info = None
-            if release_mbid:
+            if release_group_id:
                 try:
-                    result = musicbrainzngs.get_release_group_by_id(release_mbid, includes=["releases"])
+                    result = musicbrainzngs.get_release_group_by_id(release_group_id, includes=["releases"])
                     mb_release_info = result.get("release-group", {})
                 except Exception:
                     pass
@@ -9774,13 +12800,13 @@ def api_musicbrainz_fix_artist_tags():
                         if isinstance(audio, FLAC):
                             audio["MUSICBRAINZ_ARTISTID"] = mbid
                             audio["MUSICBRAINZ_ALBUMARTISTID"] = mbid
-                            if release_mbid:
-                                audio["MUSICBRAINZ_RELEASEGROUPID"] = release_mbid
+                            if release_group_id:
+                                audio["MUSICBRAINZ_RELEASEGROUPID"] = release_group_id
                         elif isinstance(audio, MP4):
                             audio["----:com.apple.iTunes:MusicBrainz Artist Id"] = [mbid.encode('utf-8')]
                             audio["----:com.apple.iTunes:MusicBrainz Album Artist Id"] = [mbid.encode('utf-8')]
-                            if release_mbid:
-                                audio["----:com.apple.iTunes:MusicBrainz Release Group Id"] = [release_mbid.encode('utf-8')]
+                            if release_group_id:
+                                audio["----:com.apple.iTunes:MusicBrainz Release Group Id"] = [release_group_id.encode('utf-8')]
                     
                     audio.save()
                     albums_updated += 1
@@ -9790,10 +12816,10 @@ def api_musicbrainz_fix_artist_tags():
                               and f.suffix.lower() in ['.jpg', '.jpeg', '.png', '.webp'] 
                               for f in folder.iterdir() if f.is_file()):
                         # Try to get cover from MusicBrainz
-                        if release_mbid:
+                        if release_group_id:
                             try:
                                 # Get cover art from MusicBrainz Cover Art Archive
-                                cover_url = f"http://coverartarchive.org/release-group/{release_mbid}/front"
+                                cover_url = f"http://coverartarchive.org/release-group/{release_group_id}/front"
                                 cover_resp = requests.get(cover_url, timeout=5, allow_redirects=True)
                                 if cover_resp.status_code == 200:
                                     cover_path = folder / "cover.jpg"
@@ -9846,28 +12872,45 @@ def api_musicbrainz_fix_album_tags():
 
 @app.get("/api/scan-history/<int:scan_id>")
 def api_scan_history_detail(scan_id):
-    """Return details of a specific scan."""
+    """Return details of a specific scan or dedupe entry."""
     import sqlite3
     con = sqlite3.connect(str(STATE_DB_FILE))
     cur = con.cursor()
-    cur.execute("""
-        SELECT scan_id, start_time, end_time, duration_seconds, albums_scanned,
-               duplicates_found, artists_processed, artists_total, ai_used_count,
-               mb_used_count, ai_enabled, mb_enabled, auto_move_enabled,
-               space_saved_mb, albums_moved, status,
-               duplicate_groups_count, total_duplicates_count, broken_albums_count,
-               missing_albums_count, albums_without_artist_image, albums_without_album_image,
-               albums_without_complete_tags, albums_without_mb_id, albums_without_artist_mb_id
-        FROM scan_history
-        WHERE scan_id = ?
-    """, (scan_id,))
+    cur.execute("PRAGMA table_info(scan_history)")
+    cols_info = [r[1] for r in cur.fetchall()]
+    has_entry_type = "entry_type" in cols_info
+    if has_entry_type:
+        cur.execute("""
+            SELECT scan_id, start_time, end_time, duration_seconds, albums_scanned,
+                   duplicates_found, artists_processed, artists_total, ai_used_count,
+                   mb_used_count, ai_enabled, mb_enabled, auto_move_enabled,
+                   space_saved_mb, albums_moved, status,
+                   duplicate_groups_count, total_duplicates_count, broken_albums_count,
+                   missing_albums_count, albums_without_artist_image, albums_without_album_image,
+                   albums_without_complete_tags, albums_without_mb_id, albums_without_artist_mb_id,
+                   entry_type
+            FROM scan_history
+            WHERE scan_id = ?
+        """, (scan_id,))
+    else:
+        cur.execute("""
+            SELECT scan_id, start_time, end_time, duration_seconds, albums_scanned,
+                   duplicates_found, artists_processed, artists_total, ai_used_count,
+                   mb_used_count, ai_enabled, mb_enabled, auto_move_enabled,
+                   space_saved_mb, albums_moved, status,
+                   duplicate_groups_count, total_duplicates_count, broken_albums_count,
+                   missing_albums_count, albums_without_artist_image, albums_without_album_image,
+                   albums_without_complete_tags, albums_without_mb_id, albums_without_artist_mb_id
+            FROM scan_history
+            WHERE scan_id = ?
+        """, (scan_id,))
     row = cur.fetchone()
     con.close()
-    
+
     if not row:
         return jsonify({"error": "Scan not found"}), 404
-    
-    return jsonify({
+
+    out = {
         "scan_id": row[0],
         "start_time": row[1],
         "end_time": row[2],
@@ -9884,7 +12927,6 @@ def api_scan_history_detail(scan_id):
         "space_saved_mb": row[13] or 0,
         "albums_moved": row[14] or 0,
         "status": row[15] or "completed",
-        # Detailed statistics
         "duplicate_groups_count": row[16] or 0 if len(row) > 16 else 0,
         "total_duplicates_count": row[17] or 0 if len(row) > 17 else 0,
         "broken_albums_count": row[18] or 0 if len(row) > 18 else 0,
@@ -9894,7 +12936,12 @@ def api_scan_history_detail(scan_id):
         "albums_without_complete_tags": row[22] or 0 if len(row) > 22 else 0,
         "albums_without_mb_id": row[23] or 0 if len(row) > 23 else 0,
         "albums_without_artist_mb_id": row[24] or 0 if len(row) > 24 else 0,
-    })
+    }
+    if has_entry_type and len(row) > 25:
+        out["entry_type"] = row[25] or "scan"
+    else:
+        out["entry_type"] = "scan"
+    return jsonify(out)
 
 @app.get("/api/scan-history/<int:scan_id>/moves")
 def api_scan_history_moves(scan_id):
@@ -9902,19 +12949,31 @@ def api_scan_history_moves(scan_id):
     import sqlite3
     con = sqlite3.connect(str(STATE_DB_FILE))
     cur = con.cursor()
-    cur.execute("""
-        SELECT move_id, scan_id, artist, album_id, original_path, moved_to_path,
-               size_mb, moved_at, restored
-        FROM scan_moves
-        WHERE scan_id = ?
-        ORDER BY moved_at DESC
-    """, (scan_id,))
+    cur.execute("PRAGMA table_info(scan_moves)")
+    move_cols = [r[1] for r in cur.fetchall()]
+    has_extra = "album_title" in move_cols and "fmt_text" in move_cols
+    if has_extra:
+        cur.execute("""
+            SELECT move_id, scan_id, artist, album_id, original_path, moved_to_path,
+                   size_mb, moved_at, restored, album_title, fmt_text
+            FROM scan_moves
+            WHERE scan_id = ?
+            ORDER BY moved_at DESC
+        """, (scan_id,))
+    else:
+        cur.execute("""
+            SELECT move_id, scan_id, artist, album_id, original_path, moved_to_path,
+                   size_mb, moved_at, restored
+            FROM scan_moves
+            WHERE scan_id = ?
+            ORDER BY moved_at DESC
+        """, (scan_id,))
     rows = cur.fetchall()
     con.close()
     
     moves = []
     for row in rows:
-        moves.append({
+        m = {
             "move_id": row[0],
             "scan_id": row[1],
             "artist": row[2],
@@ -9924,7 +12983,11 @@ def api_scan_history_moves(scan_id):
             "size_mb": row[6] or 0,
             "moved_at": row[7],
             "restored": bool(row[8]),
-        })
+        }
+        if has_extra and len(row) >= 11:
+            m["album_title"] = row[9] or ""
+            m["fmt_text"] = row[10] or ""
+        moves.append(m)
     
     return jsonify(moves)
 
@@ -9962,6 +13025,7 @@ def api_scan_history_restore(scan_id):
     
     artists_to_refresh = set()
     restored_count = 0
+    restored_paths: List[dict] = []
     
     for move_id, original_path, moved_to_path, artist in rows:
         src = Path(moved_to_path)
@@ -9976,6 +13040,7 @@ def api_scan_history_restore(scan_id):
             safe_move(str(src), str(dst))
             artists_to_refresh.add(artist)
             restored_count += 1
+            restored_paths.append({"from": moved_to_path, "to": original_path})
             
             # Mark as restored
             cur.execute("UPDATE scan_moves SET restored = 1 WHERE move_id = ?", (move_id,))
@@ -9995,30 +13060,59 @@ def api_scan_history_restore(scan_id):
         except Exception as e:
             logging.warning(f"Restore: plex refresh failed for {artist}: {e}")
     
-    return jsonify({"restored": restored_count, "artists_refreshed": len(artists_to_refresh)})
+    return jsonify({
+        "restored": restored_count,
+        "artists_refreshed": len(artists_to_refresh),
+        "restored_paths": restored_paths,
+    })
 
 @app.post("/api/scan-history/<int:scan_id>/dedupe")
 def api_scan_history_dedupe(scan_id):
     """Manually dedupe albums from a previous scan."""
-    # Load scan results from DB
+    # Load scan results from DB (dict artist -> list of groups)
     scan_results = load_scan_from_db()
     if not scan_results:
         return jsonify({"error": "No scan results found for this scan"}), 404
     
+    flat_groups = [g for groups in scan_results.values() for g in groups]
+    if not flat_groups:
+        return jsonify({"error": "No duplicate groups to dedupe"}), 404
+    
     # Start deduplication
-    background_dedupe(scan_results)
+    background_dedupe(flat_groups)
     return jsonify({"status": "ok", "message": "Deduplication started"})
 
 @app.get("/api/dedupe")
 def api_dedupe():
     with lock:
-        return jsonify(
-            deduping=state["deduping"],
-            progress=state["dedupe_progress"],
-            total=state["dedupe_total"],
-            saved=get_stat("space_saved"),
-            moved=get_stat("removed_dupes")
-        )
+        deduping = state["deduping"]
+        progress = state["dedupe_progress"]
+        total = state["dedupe_total"]
+        start_time = state.get("dedupe_start_time")
+        saved_this_run = state.get("dedupe_saved_this_run", 0)
+        current_group = state.get("dedupe_current_group")
+        last_write = state.get("dedupe_last_write")
+
+    percent = round(100 * progress / total, 1) if total else 0
+    eta_seconds = None
+    if start_time and total and progress > 0:
+        elapsed = time.time() - start_time
+        avg_per_group = elapsed / progress
+        remaining = total - progress
+        eta_seconds = max(0, int(remaining * avg_per_group))
+
+    return jsonify(
+        deduping=deduping,
+        progress=progress,
+        total=total,
+        saved=get_stat("space_saved"),
+        saved_this_run=saved_this_run,
+        moved=get_stat("removed_dupes"),
+        percent=percent,
+        eta_seconds=eta_seconds,
+        current_group=current_group,
+        last_write=last_write,
+    )
 
 @app.get("/details/<artist>/<int:album_id>")
 def details(artist, album_id):
@@ -10030,9 +13124,10 @@ def details(artist, album_id):
     if groups is None:
         groups = load_scan_from_db().get(art, [])
     for g in groups:
-        if g["album_id"] == album_id:
+        best_album_id_in_g = g.get("album_id") or (g.get("best", {}).get("album_id") if g.get("best") else None)
+        if best_album_id_in_g == album_id:
             editions = [g["best"]] + g["losers"]
-            best_album_id = g["best"]["album_id"]
+            best_album_id = best_album_id_in_g
             artist_rating_key = None
             try:
                 db_conn = plex_connect()
@@ -10100,6 +13195,7 @@ def details(artist, album_id):
                     "track_count": len(track_list),
                     "tracks": track_list,
                     "musicbrainz_id": e.get("musicbrainz_id"),  # Include MusicBrainz ID if available
+                    "match_verified_by_ai": bool(e.get("match_verified_by_ai", False)),
                 })
             if db_conn:
                 try:
@@ -10140,11 +13236,58 @@ def _normalize_edition_as_best(edition: dict, artist: str) -> dict:
     return e
 
 
+def _run_dedupe_artist_one(art: str, album_id: int, keep_edition_album_id: Optional[int], group_copy: dict) -> None:
+    """Run dedupe for one group in a background thread. Updates state and DB."""
+    with lock:
+        state["deduping"] = True
+        state["dedupe_progress"] = 0
+        state["dedupe_total"] = 1
+    try:
+        moved_list = perform_dedupe(group_copy)
+        removed_count = len(moved_list)
+        total_mb = sum(item["size"] for item in moved_list)
+        increment_stat("removed_dupes", removed_count)
+        increment_stat("space_saved", total_mb)
+        logging.debug(f"dedupe_artist(): removed {removed_count} dupes, freed {total_mb} MB")
+
+        letter = quote_plus(art[0].upper())
+        art_enc = quote_plus(art)
+        try:
+            plex_api(f"/library/sections/{SECTION_ID}/refresh?path=/music/matched/{letter}/{art_enc}", method="GET")
+            plex_api(f"/library/sections/{SECTION_ID}/emptyTrash", method="PUT")
+        except Exception as e:
+            logging.warning(f"dedupe_artist(): plex refresh/emptyTrash failed: {e}")
+
+        with lock:
+            groups = state["duplicates"].get(art, [])
+            groups[:] = [gr for gr in groups if gr["album_id"] != album_id]
+            if not groups:
+                state["duplicates"].pop(art, None)
+            con = sqlite3.connect(str(STATE_DB_FILE))
+            cur = con.cursor()
+            cur.execute("DELETE FROM duplicates_best WHERE artist = ? AND album_id = ?", (art, album_id))
+            cur.execute("DELETE FROM duplicates_loser WHERE artist = ? AND album_id = ?", (art, album_id))
+            con.commit()
+            con.close()
+            sid = state.get("scan_id")
+            state["dedupe_progress"] = 1
+            state["deduping"] = False
+        if sid is not None:
+            update_dedupe_scan_summary(sid, total_mb, removed_count)
+    except Exception as e:
+        logging.exception("dedupe_artist background: %s", e)
+        with lock:
+            state["deduping"] = False
+            state["dedupe_progress"] = 0
+            state["dedupe_total"] = 0
+
+
 @app.post("/dedupe/artist/<artist>")
 def dedupe_artist(artist):
     r = _requires_config()
     if r is not None:
         return r
+    ensure_dedupe_scan_id()
     art = artist.replace("_", " ")
     data = request.get_json() or {}
     raw = data.get("album_id")
@@ -10152,14 +13295,13 @@ def dedupe_artist(artist):
     keep_edition_album_id = data.get("keep_edition_album_id")
     if keep_edition_album_id is not None:
         keep_edition_album_id = int(keep_edition_album_id)
-    moved_list: List[Dict] = []
 
+    group_copy = None
     with lock:
         groups = state["duplicates"].get(art, [])
         for g in list(groups):
             if g["album_id"] != album_id:
                 continue
-            # Optional manual selection: keep one edition, treat others as losers
             if keep_edition_album_id is not None:
                 editions = [g["best"]] + g["losers"]
                 kept = None
@@ -10172,40 +13314,22 @@ def dedupe_artist(artist):
                         losers.append(e)
                 if kept is None or not losers:
                     return jsonify({"error": "Invalid keep_edition_album_id or no editions to remove"}), 400
-                g = {
+                group_copy = {
                     "artist": art,
                     "album_id": album_id,
                     "best": _normalize_edition_as_best(kept, art),
                     "losers": losers,
                 }
-            logging.debug(f"dedupe_artist(): processing artist '{art}', album_id={album_id}")
-            moved_list = perform_dedupe(g)
-            groups.remove(next(gr for gr in groups if gr["album_id"] == album_id))
-            if not groups:
-                del state["duplicates"][art]
-            con = sqlite3.connect(str(STATE_DB_FILE))
-            cur = con.cursor()
-            cur.execute("DELETE FROM duplicates_best WHERE artist = ? AND album_id = ?", (art, album_id))
-            cur.execute("DELETE FROM duplicates_loser WHERE artist = ? AND album_id = ?", (art, album_id))
-            con.commit()
-            con.close()
+            else:
+                import copy
+                group_copy = copy.deepcopy(g)
             break
 
-    removed_count = len(moved_list)
-    total_mb = sum(item["size"] for item in moved_list)
-    increment_stat("removed_dupes", removed_count)
-    increment_stat("space_saved", total_mb)
-    logging.debug(f"dedupe_artist(): removed {removed_count} dupes, freed {total_mb} MB")
+    if group_copy is None:
+        return jsonify({"error": "Group not found"}), 404
 
-    letter  = quote_plus(art[0].upper())
-    art_enc = quote_plus(art)
-    try:
-        plex_api(f"/library/sections/{SECTION_ID}/refresh?path=/music/matched/{letter}/{art_enc}", method="GET")
-        plex_api(f"/library/sections/{SECTION_ID}/emptyTrash", method="PUT")
-    except Exception as e:
-        logging.warning(f"dedupe_artist(): plex refresh/emptyTrash failed: {e}")
-
-    return jsonify(moved=moved_list), 200
+    threading.Thread(target=_run_dedupe_artist_one, args=(art, album_id, keep_edition_album_id, group_copy), daemon=True).start()
+    return jsonify(status="started", message="Deduplication started", moved=[]), 202
 
 
 # Allowed extensions for bonus track move (security)
@@ -10370,13 +13494,11 @@ def dedupe_all():
         return r
     with lock:
         all_groups = [g for lst in state["duplicates"].values() for g in lst]
-        state["duplicates"].clear()
-        con = sqlite3.connect(str(STATE_DB_FILE))
-        cur = con.cursor()
-        cur.execute("DELETE FROM duplicates_loser")
-        con.commit()
-        con.close()
-        logging.debug("dedupe_all(): cleared in-memory and DB duplicates tables")
+        if not state["duplicates"]:
+            state["duplicates"] = load_scan_from_db()
+        all_groups = [g for lst in state["duplicates"].values() for g in lst]
+    if not all_groups:
+        return "", 204
     threading.Thread(target=background_dedupe, args=(all_groups,), daemon=True).start()
     return "", 204
 
@@ -10391,14 +13513,9 @@ def dedupe_merge_and_dedupe():
     if r is not None:
         return r
     with lock:
+        if not state["duplicates"]:
+            state["duplicates"] = load_scan_from_db()
         all_groups = [g for lst in state["duplicates"].values() for g in lst]
-        state["duplicates"].clear()
-        con = sqlite3.connect(str(STATE_DB_FILE))
-        cur = con.cursor()
-        cur.execute("DELETE FROM duplicates_loser")
-        con.commit()
-        con.close()
-        logging.debug("dedupe_merge_and_dedupe(): cleared in-memory and DB duplicates tables")
 
     for g in all_groups:
         if g["best"].get("merge_list"):
@@ -10415,6 +13532,7 @@ def dedupe_selected():
     r = _requires_config()
     if r is not None:
         return r
+    ensure_dedupe_scan_id()
     data = request.get_json() or {}
     selected = data.get("selected", [])
     moved_list: List[Dict] = []
@@ -10459,6 +13577,11 @@ def dedupe_selected():
     increment_stat("removed_dupes", removed_count)
     increment_stat("space_saved", total_moved)
     logging.debug(f"dedupe_selected(): removed {removed_count} dupes, freed {total_moved} MB")
+
+    with lock:
+        sid = state.get("scan_id")
+    if sid is not None:
+        update_dedupe_scan_summary(sid, total_moved, removed_count)
 
     return jsonify(moved=moved_list), 200
 
