@@ -1,5 +1,7 @@
 # PMDA
 
+<img width="1024" height="1024" alt="PMDA_logo" src="https://github.com/user-attachments/assets/87c83f19-2ffc-4232-868a-e35a7b5f6a79" />
+
 **Plex Music Deduplication Assistant** — Find duplicate albums, fix tags, and manage your Plex music library from a single web UI.
 
 ---
