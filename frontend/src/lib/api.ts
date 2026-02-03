@@ -1,0 +1,1181 @@
+// PMDA API Client
+// Empty = same origin (e.g. when served from the same Docker container). Set VITE_PMDA_API_URL for dev (must be full URL, e.g. http://192.168.3.2:5005).
+const _raw = import.meta.env.VITE_PMDA_API_URL ?? '';
+const API_BASE_URL = typeof _raw === 'string' && (_raw.startsWith('http://') || _raw.startsWith('https://')) ? _raw : '';
+
+// Types
+export interface DuplicateCard {
+  artist_key: string;
+  artist: string;
+  album_id: string;
+  best_thumb: string;
+  best_title: string;
+  best_fmt: string;
+  formats: string[];
+  n: number;
+  used_ai: boolean;
+  /** AI provider name when used_ai (e.g. OpenAI, Anthropic). */
+  ai_provider?: string;
+  /** AI model name when used_ai (e.g. gpt-4o-mini). */
+  ai_model?: string;
+  // New fields for detailed view
+  size?: number;
+  track_count?: number;
+  path?: string;
+  br?: number;
+  sr?: number;
+  bd?: number;
+  /** True when group is from Library (same name) but scan has no best/loser — run scan to dedupe */
+  no_move?: boolean;
+  /** True when MusicBrainz match was chosen by AI verify (USE_AI_FOR_MB_VERIFY). */
+  match_verified_by_ai?: boolean;
+}
+
+export interface ScanProgress {
+  scanning: boolean;
+  progress: number;
+  total: number;
+  /** Progress including in-progress artist albums (so bar moves during scan) */
+  effective_progress?: number;
+  status: 'running' | 'paused' | 'stopped' | 'idle';
+  /** Current scan phase: format_analysis | identification_tags | ia_analysis | finalizing | moving_dupes */
+  phase?: 'format_analysis' | 'identification_tags' | 'ia_analysis' | 'finalizing' | 'moving_dupes' | null;
+  /** Micro-step for live indicators: analyzing_format | fetching_mb_id | searching_mb | comparing_versions | detecting_best | done */
+  current_step?: string | null;
+  /** AI provider name (e.g. OpenAI) when AI is used */
+  ai_provider?: string;
+  /** AI model name (e.g. gpt-4o-mini) when AI is used */
+  ai_model?: string;
+  // Scan details
+  artists_processed?: number;
+  artists_total?: number;
+  ai_used_count?: number;
+  mb_used_count?: number;
+  ai_enabled?: boolean;
+  mb_enabled?: boolean;
+  // ETA
+  eta_seconds?: number;
+  threads_in_use?: number;
+  active_artists?: Array<{
+    artist_name: string;
+    total_albums: number;
+    albums_processed: number;
+    current_album?: {
+      album_id: number;
+      album_title: string;
+      status: string;
+      status_details: string;
+      /** Low-level step summary (action). */
+      step_summary?: string;
+      /** Tool response (FFprobe/MusicBrainz/AI result). */
+      step_response?: string;
+    };
+  }>;
+  /** Albums that completed format (FFprobe) step — for 33% progress during phase duplicates */
+  format_done_count?: number;
+  /** Albums that completed MusicBrainz lookup — for 33% progress during phase duplicates */
+  mb_done_count?: number;
+  // Cache statistics
+  audio_cache_hits?: number;
+  audio_cache_misses?: number;
+  mb_cache_hits?: number;
+  mb_cache_misses?: number;
+  // Detailed statistics
+  duplicate_groups_count?: number;
+  total_duplicates_count?: number;
+  broken_albums_count?: number;
+  missing_albums_count?: number;
+  albums_without_artist_image?: number;
+  albums_without_album_image?: number;
+  albums_without_complete_tags?: number;
+  albums_without_mb_id?: number;
+  albums_without_artist_mb_id?: number;
+  /** Re-check MusicBrainz for albums previously not found (from Settings) */
+  mb_retry_not_found?: boolean;
+  /** End-of-scan summary (FFmpeg formats, MusicBrainz, AI) when scan just completed */
+  last_scan_summary?: LastScanSummary | null;
+  /** Saving results to DB (Unduper + stats); scan not "done" until this is false */
+  finalizing?: boolean;
+  /** Auto-move dupes is enabled (show step 4 when applicable) */
+  auto_move_enabled?: boolean;
+  /** Currently moving duplicate folders to /dupes */
+  deduping?: boolean;
+  dedupe_progress?: number;
+  dedupe_total?: number;
+  dedupe_current_group?: { artist: string; album: string; num_dupes?: number; winner?: { title_raw?: string }; losers?: Array<{ title_raw?: string }>; destination?: string; status?: string } | null;
+  /** Paths RW status from backend (music + dupes folders) */
+  paths_status?: { music_rw: boolean; dupes_rw: boolean };
+  /** IA analysis step: total duplicate groups to process */
+  scan_ai_batch_total?: number;
+  /** IA analysis step: groups processed so far */
+  scan_ai_batch_processed?: number;
+  /** IA analysis step: artist – album of the group currently or last processed */
+  scan_ai_current_label?: string | null;
+}
+
+export interface LastScanSummary {
+  ffmpeg_formats: Record<string, number>;
+  mb_connection_ok: boolean;
+  mb_albums_verified: number;
+  mb_albums_identified: number;
+  ai_connection_ok: boolean;
+  ai_groups_count: number;
+  /** Number of metadata (MB) matches verified by AI this scan. */
+  mb_verified_by_ai?: number;
+  /** AI errors during the scan (e.g. provider 400/429); shown in summary. */
+  ai_errors?: { message: string; group?: string }[];
+  /** Last-scan-only stats for "Last scan summary" UI */
+  duration_seconds?: number;
+  artists_total?: number;
+  albums_scanned?: number;
+  duplicate_groups_count?: number;
+  total_duplicates_count?: number;
+  broken_albums_count?: number;
+  missing_albums_count?: number;
+  albums_without_artist_image?: number;
+  albums_without_album_image?: number;
+  albums_without_complete_tags?: number;
+  albums_without_mb_id?: number;
+  albums_without_artist_mb_id?: number;
+  audio_cache_hits?: number;
+  audio_cache_misses?: number;
+  mb_cache_hits?: number;
+  mb_cache_misses?: number;
+  lossy_count?: number;
+  lossless_count?: number;
+  albums_with_mb_id?: number;
+  /** When auto-move ran this scan: number of duplicate albums moved. */
+  dupes_moved_this_scan?: number;
+  /** When auto-move ran this scan: MB reclaimed. */
+  space_saved_mb_this_scan?: number;
+  /** Match stats per source (chart-ready): matched / total */
+  mb_match?: { matched: number; total: number };
+  discogs_match?: { matched: number; total: number };
+  lastfm_match?: { matched: number; total: number };
+  bandcamp_match?: { matched: number; total: number };
+}
+
+/** Current group being moved (for live dedupe UI). */
+export interface DedupeCurrentGroup {
+  artist: string;
+  album: string;
+  num_dupes: number;
+  winner: { title_raw: string; album_id?: number; folder?: string };
+  losers: Array<{ title_raw: string; album_id?: number; folder?: string }>;
+  destination: string;
+  status: string;
+}
+
+export interface DedupeProgress {
+  deduping: boolean;
+  progress: number;
+  total: number;
+  saved: number;
+  /** Global count of albums/folders moved (from DB). */
+  moved?: number;
+  /** MB saved in this run (so far). */
+  saved_this_run?: number;
+  /** 0–100. */
+  percent?: number;
+  /** Estimated seconds until completion. */
+  eta_seconds?: number | null;
+  /** Group currently being moved (artist, album, winner, losers, destination). */
+  current_group?: DedupeCurrentGroup | null;
+  /** Last folder written to /dupes (path + timestamp) so UI can confirm writes. */
+  last_write?: { path: string; at: number } | null;
+}
+
+export interface Track {
+  name: string;
+  duration?: number;
+  format?: string;
+  bitrate?: number;
+  is_bonus?: boolean;
+  path?: string;
+}
+
+export interface Edition {
+  thumb_data: string;
+  title_raw: string;
+  size: number;
+  fmt: string;
+  br: number;
+  sr: number;
+  bd: number;
+  path?: string;
+  folder?: string;
+  album_id?: number;
+  track_count?: number;
+  tracks?: Track[];
+  musicbrainz_id?: string;  // MusicBrainz release-group ID
+  /** True when MusicBrainz match was chosen by AI verify (USE_AI_FOR_MB_VERIFY). */
+  match_verified_by_ai?: boolean;
+}
+
+export interface DuplicateDetails {
+  artist: string;
+  album: string;
+  /** Plex rating key of the artist (for "Open in Plex" → artist page) */
+  artist_id?: number;
+  editions: Edition[];
+  rationale: string;
+  merge_list: string[];
+}
+
+export interface MovedItem {
+  thumb_data: string;
+  artist: string;
+  title_raw: string;
+  size: number;
+  fmt: string;
+  br: number;
+  sr: number;
+  bd: number;
+}
+
+export interface DedupeResult {
+  moved: MovedItem[];
+  /** When backend runs dedupe in background: "started" and moved=[] */
+  status?: string;
+  message?: string;
+}
+
+export interface PMDAConfig {
+  // Plex
+  PLEX_HOST: string;
+  PLEX_TOKEN: string;
+  PLEX_BASE_PATH?: string;
+  PLEX_DB_PATH: string;
+  PLEX_DB_FILE: string;
+  SECTION_IDS: string;
+  
+  // Paths
+  PATH_MAP: Record<string, string>;
+  DUPE_ROOT: string;
+  PMDA_CONFIG_DIR: string;
+  MUSIC_PARENT_PATH: string;
+  /** RW status for music folder(s) and dupes folder (from backend) */
+  paths_status?: { music_rw: boolean; dupes_rw: boolean };
+  /** Container mounts status for fresh-config welcome message */
+  container_mounts?: { config_rw: boolean; plex_db_ro: boolean; music_rw: boolean; dupes_rw: boolean };
+  
+  // Scan
+  SCAN_THREADS: number | 'auto';
+  SKIP_FOLDERS: string;
+  CROSS_LIBRARY_DEDUPE: boolean;
+  CROSSCHECK_SAMPLES: number;
+  /** Skip path binding verification at startup */
+  DISABLE_PATH_CROSSCHECK?: boolean;
+  /** When true, treat album titles like "Lemodie (Flac)" and "Lemodie" as the same for duplicate detection (strip format/version in parentheses). */
+  NORMALIZE_PARENTHETICAL_FOR_DEDUPE?: boolean;
+  FORMAT_PREFERENCE: string[];
+  
+  // AI Provider
+  AI_PROVIDER: 'openai' | 'anthropic' | 'google' | 'ollama';
+  OPENAI_API_KEY: string;
+  OPENAI_MODEL: string;
+  OPENAI_MODEL_FALLBACKS: string;
+  ANTHROPIC_API_KEY: string;
+  GOOGLE_API_KEY: string;
+  OLLAMA_URL: string;
+  /** Custom AI prompt for duplicate selection (advanced). Empty = use default. */
+  AI_PROMPT?: string;
+  
+  // MusicBrainz & Notifications
+  USE_MUSICBRAINZ: boolean;
+  MUSICBRAINZ_EMAIL: string;
+  /** Re-query MusicBrainz for albums previously cached as "not found" on each scan */
+  MB_RETRY_NOT_FOUND?: boolean;
+  /** Use AI to choose among multiple MusicBrainz candidates (title-only prompt). */
+  USE_AI_FOR_MB_MATCH?: boolean;
+  /** Use AI to verify MusicBrainz match (artist, title, track count/titles). Can recover e.g. "Volume I" vs "volume i". */
+  USE_AI_FOR_MB_VERIFY?: boolean;
+  /** After AI text match, compare local cover to Cover Art Archive (vision). Reject match if "No". */
+  USE_AI_VISION_FOR_COVER?: boolean;
+  /** Model for vision (e.g. gpt-4o-mini). Empty = use main model. */
+  OPENAI_VISION_MODEL?: string;
+  /** When no MB candidate or AI says NONE, use web search (Serper) + AI to suggest MBID. */
+  USE_WEB_SEARCH_FOR_MB?: boolean;
+  /** Serper.dev API key for web search. */
+  SERPER_API_KEY?: string;
+  // Metadata Providers
+  USE_DISCOGS: boolean;
+  DISCOGS_USER_TOKEN: string;
+  DISCOGS_CONSUMER_KEY: string;
+  DISCOGS_CONSUMER_SECRET: string;
+  USE_LASTFM: boolean;
+  LASTFM_API_KEY: string;
+  LASTFM_API_SECRET: string;
+  USE_BANDCAMP: boolean;
+  DISCORD_WEBHOOK: string;
+  LOG_LEVEL: 'DEBUG' | 'INFO' | 'WARNING' | 'ERROR';
+  LOG_FILE: string;
+  AUTO_MOVE_DUPES: boolean;
+  /** Default run mode (e.g. serve). */
+  PMDA_DEFAULT_MODE?: string;
+  // Integrations
+  LIDARR_URL: string;
+  LIDARR_API_KEY: string;
+  AUTOBRR_URL: string;
+  AUTOBRR_API_KEY: string;
+  AUTO_FIX_BROKEN_ALBUMS: boolean;
+  // Broken album detection thresholds
+  BROKEN_ALBUM_CONSECUTIVE_THRESHOLD: number;
+  BROKEN_ALBUM_PERCENTAGE_THRESHOLD: number;
+  // Incomplete album definition
+  REQUIRED_TAGS: string[];
+}
+
+export interface ScanHistoryEntry {
+  scan_id: number;
+  start_time: number;
+  end_time?: number;
+  duration_seconds?: number;
+  albums_scanned: number;
+  duplicates_found: number;
+  artists_processed: number;
+  artists_total: number;
+  ai_used_count: number;
+  mb_used_count: number;
+  ai_enabled: boolean;
+  mb_enabled: boolean;
+  auto_move_enabled: boolean;
+  space_saved_mb: number;
+  albums_moved: number;
+  status: string;
+  /** 'scan' | 'dedupe' – type of history entry for unified History view */
+  entry_type?: 'scan' | 'dedupe';
+  // Detailed statistics
+  duplicate_groups_count?: number;
+  total_duplicates_count?: number;
+  broken_albums_count?: number;
+  missing_albums_count?: number;
+  albums_without_artist_image?: number;
+  albums_without_album_image?: number;
+  albums_without_complete_tags?: number;
+  albums_without_mb_id?: number;
+  albums_without_artist_mb_id?: number;
+  /** Parsed summary from scan (formats, cache, AI/MB stats, etc.) when available */
+  summary_json?: ScanHistorySummaryJson | null;
+}
+
+export interface ScanHistorySummaryJson {
+  ffmpeg_formats?: Record<string, number>;
+  mb_connection_ok?: boolean;
+  mb_albums_verified?: number;
+  mb_albums_identified?: number;
+  ai_connection_ok?: boolean;
+  ai_groups_count?: number;
+  mb_verified_by_ai?: number;
+  duration_seconds?: number;
+  artists_total?: number;
+  albums_scanned?: number;
+  duplicate_groups_count?: number;
+  total_duplicates_count?: number;
+  broken_albums_count?: number;
+  missing_albums_count?: number;
+  albums_without_artist_image?: number;
+  albums_without_album_image?: number;
+  albums_without_complete_tags?: number;
+  albums_without_mb_id?: number;
+  albums_without_artist_mb_id?: number;
+  audio_cache_hits?: number;
+  audio_cache_misses?: number;
+  mb_cache_hits?: number;
+  mb_cache_misses?: number;
+  lossy_count?: number;
+  lossless_count?: number;
+  albums_with_mb_id?: number;
+  dupes_moved_this_scan?: number;
+  space_saved_mb_this_scan?: number;
+  scan_discogs_matched?: number;
+  scan_lastfm_matched?: number;
+  scan_bandcamp_matched?: number;
+}
+
+export interface ScanHistoryEntryOld {
+  scan_id: number;
+  start_time: number;
+  end_time?: number;
+  duration_seconds?: number;
+  albums_scanned: number;
+  duplicates_found: number;
+  artists_processed: number;
+  artists_total: number;
+  ai_used_count: number;
+  mb_used_count: number;
+  ai_enabled: boolean;
+  mb_enabled: boolean;
+  auto_move_enabled: boolean;
+  space_saved_mb: number;
+  albums_moved: number;
+  status: 'completed' | 'failed' | 'cancelled';
+  // Detailed statistics
+  duplicate_groups_count?: number;
+  total_duplicates_count?: number;
+  broken_albums_count?: number;
+  missing_albums_count?: number;
+  albums_without_artist_image?: number;
+  albums_without_album_image?: number;
+  albums_without_complete_tags?: number;
+  albums_without_mb_id?: number;
+  albums_without_artist_mb_id?: number;
+}
+
+export interface ScanMove {
+  move_id: number;
+  scan_id: number;
+  artist: string;
+  album_id: number;
+  original_path: string;
+  moved_to_path: string;
+  size_mb: number;
+  moved_at: number;
+  restored: boolean;
+  /** Album title (moved edition) when available */
+  album_title?: string;
+  /** Format description (e.g. FLAC 24/96) when available */
+  fmt_text?: string;
+}
+
+// API Functions
+async function fetchApi<T>(endpoint: string, options?: RequestInit): Promise<T> {
+  const response = await fetch(`${API_BASE_URL}${endpoint}`, {
+    ...options,
+    headers: {
+      'Content-Type': 'application/json',
+      ...options?.headers,
+    },
+  });
+  
+  if (!response.ok) {
+    const error: any = new Error(`API Error: ${response.status} ${response.statusText}`);
+    error.response = response;
+    try {
+      const data = await response.json();
+      error.body = data;
+    } catch {
+      error.body = {};
+    }
+    throw error;
+  }
+
+  if (response.status === 204) {
+    return undefined as T;
+  }
+  const ct = response.headers.get('content-type');
+  if (ct?.includes('application/json')) {
+    return response.json();
+  }
+  return undefined as T;
+}
+
+// Library stats (for Unduper when no scan results)
+export interface LibraryStats {
+  artists: number;
+  albums: number;
+}
+
+export async function getLibraryStats(): Promise<LibraryStats> {
+  return fetchApi<LibraryStats>('/api/library/stats');
+}
+
+export interface AlbumWithParentheticalName {
+  album_id: number;
+  artist: string;
+  title: string;
+  current_path: string;
+  proposed_path: string;
+  current_name: string;
+  proposed_name: string;
+}
+
+export async function getAlbumsWithParentheticalNames(): Promise<{ albums: AlbumWithParentheticalName[] }> {
+  return fetchApi<{ albums: AlbumWithParentheticalName[] }>('/api/library/albums-with-parenthetical-names');
+}
+
+export async function normalizeAlbumNames(albumIds?: number[]): Promise<{ renamed: { album_id: number; from: string; to: string }[]; errors: { album_id?: number; message: string; path?: string }[] }> {
+  return fetchApi<{ renamed: { album_id: number; from: string; to: string }[]; errors: { album_id?: number; message: string; path?: string }[] }>(
+    '/api/library/normalize-album-names',
+    { method: 'POST', body: JSON.stringify(albumIds != null ? { album_ids: albumIds } : {}) }
+  );
+}
+
+// Duplicates
+export async function getDuplicates(): Promise<DuplicateCard[]> {
+  return fetchApi<DuplicateCard[]>('/api/duplicates');
+}
+
+export async function getDuplicateDetails(artist: string, albumId: string): Promise<DuplicateDetails> {
+  const safeArtist = encodeURIComponent(artist.replace(/\s+/g, '_'));
+  return fetchApi<DuplicateDetails>(`/details/${safeArtist}/${albumId}`);
+}
+
+// Scan
+export async function getScanProgress(): Promise<ScanProgress> {
+  return fetchApi<ScanProgress>('/api/progress');
+}
+
+export interface ScanPreflightResult {
+  musicbrainz: { ok: boolean; message: string };
+  ai: { ok: boolean; message: string; provider: string };
+  discogs?: { ok: boolean; message: string };
+  lastfm?: { ok: boolean; message: string };
+  bandcamp?: { ok: boolean; message: string };
+  paths?: { music_rw: boolean; dupes_rw: boolean };
+}
+
+export async function getScanPreflight(): Promise<ScanPreflightResult> {
+  return fetchApi<ScanPreflightResult>('/api/scan/preflight');
+}
+
+export async function startScan(): Promise<void> {
+  await fetchApi('/scan/start', { method: 'POST' });
+}
+
+export async function pauseScan(): Promise<void> {
+  await fetchApi('/scan/pause', { method: 'POST' });
+}
+
+export async function resumeScan(): Promise<void> {
+  await fetchApi('/scan/resume', { method: 'POST' });
+}
+
+export async function stopScan(): Promise<void> {
+  await fetchApi('/scan/stop', { method: 'POST' });
+}
+
+export interface ClearScanOptions {
+  clear_audio_cache?: boolean;
+  clear_mb_cache?: boolean;
+}
+
+export interface ClearScanResult {
+  status: string;
+  message: string;
+  cleared: {
+    duplicates_best: number;
+    duplicates_loser: number;
+    audio_cache?: number;
+    musicbrainz_cache?: number;
+  };
+}
+
+export async function clearScan(options: ClearScanOptions = {}): Promise<ClearScanResult> {
+  return fetchApi<ClearScanResult>('/api/scan/clear', {
+    method: 'POST',
+    body: JSON.stringify(options),
+  });
+}
+
+// Dedupe
+export async function getDedupeProgress(): Promise<DedupeProgress> {
+  return fetchApi<DedupeProgress>('/api/dedupe');
+}
+
+export async function dedupeAll(): Promise<{ started: boolean; total?: number }> {
+  return fetchApi<{ started: boolean; total?: number }>('/dedupe/all', { method: 'POST' });
+}
+
+export interface ImproveAllProgress {
+  running: boolean;
+  global?: boolean;
+  current: number;
+  total: number;
+  current_album?: string;
+  current_artist?: string;
+  result?: { albums_processed?: number; albums_improved?: number; by_provider?: Record<string, { identified: number; covers: number; tags: number }> };
+  error?: string;
+  finished?: boolean;
+}
+
+export async function improveAll(): Promise<{ started: boolean; total: number }> {
+  return fetchApi<{ started: boolean; total: number }>('/api/library/improve-all', { method: 'POST' });
+}
+
+export async function getImproveAllProgress(): Promise<ImproveAllProgress> {
+  return fetchApi<ImproveAllProgress>('/api/library/improve-all/progress');
+}
+
+export interface LidarrAddIncompleteProgress {
+  running: boolean;
+  current: number;
+  total: number;
+  current_album?: string;
+  current_artist?: string;
+  added: number;
+  failed: number;
+  result?: { added?: number; failed?: number; total?: number; error?: string };
+  finished?: boolean;
+}
+
+export async function addIncompleteAlbumsToLidarr(): Promise<{ started: boolean; total: number }> {
+  return fetchApi<{ started: boolean; total: number }>('/api/lidarr/add-incomplete-albums', { method: 'POST' });
+}
+
+export async function getLidarrAddIncompleteProgress(): Promise<LidarrAddIncompleteProgress> {
+  return fetchApi<LidarrAddIncompleteProgress>('/api/lidarr/add-incomplete-albums/progress');
+}
+
+export async function dedupeArtist(
+  artist: string,
+  albumId?: string,
+  options?: { keep_edition_album_id?: number }
+): Promise<DedupeResult> {
+  const safeArtist = encodeURIComponent(artist.replace(/\s+/g, '_'));
+  const body: { album_id?: string; keep_edition_album_id?: number } = {};
+  if (albumId != null) body.album_id = albumId;
+  if (options?.keep_edition_album_id != null) body.keep_edition_album_id = options.keep_edition_album_id;
+  return fetchApi<DedupeResult>(`/dedupe/artist/${safeArtist}`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+}
+
+export async function dedupeSelected(selected: string[]): Promise<DedupeResult> {
+  return fetchApi<DedupeResult>('/dedupe/selected', {
+    method: 'POST',
+    body: JSON.stringify({ selected }),
+  });
+  }
+
+/** Merge bonus tracks into kept editions for all groups, then run full dedupe. */
+export async function dedupeMergeAndDedupe(): Promise<void> {
+  await fetchApi<undefined>('/dedupe/merge-and-dedupe', { method: 'POST' });
+}
+
+// Manual dedupe with custom selection
+export async function dedupeManual(artist: string, albumId: string, keepEditionIndex: number): Promise<DedupeResult> {
+  const safeArtist = encodeURIComponent(artist.replace(/\s+/g, '_'));
+  return fetchApi<DedupeResult>(`/dedupe/manual/${safeArtist}`, {
+    method: 'POST',
+    body: JSON.stringify({ album_id: albumId, keep_index: keepEditionIndex }),
+  });
+}
+
+// Move bonus track to kept edition
+export async function moveBonusTrack(
+  artist: string,
+  albumId: string,
+  sourceEditionIndex: number,
+  trackPath: string,
+  targetEditionIndex: number
+): Promise<{ success: boolean; message: string }> {
+  const safeArtist = encodeURIComponent(artist.replace(/\s+/g, '_'));
+  try {
+    return await fetchApi(`/dedupe/move-track/${safeArtist}`, {
+      method: 'POST',
+      body: JSON.stringify({
+        album_id: albumId,
+        source_index: sourceEditionIndex,
+        track_path: trackPath,
+        target_index: targetEditionIndex,
+      }),
+    });
+  } catch {
+    return { success: false, message: 'Backend does not support bonus track moving yet' };
+  }
+}
+
+// Config
+/** Config response includes backend-only field configured (wizard-first). */
+export type ConfigResponse = Partial<PMDAConfig> & { configured?: boolean };
+
+export async function getConfig(): Promise<ConfigResponse> {
+  try {
+    return await fetchApi<ConfigResponse>('/api/config');
+  } catch {
+    return {};
+  }
+}
+
+export async function saveConfig(config: Partial<PMDAConfig>): Promise<{ status: string; restart_initiated?: boolean; message?: string }> {
+  return fetchApi<{ status: string; restart_initiated?: boolean; message?: string }>('/api/config', {
+    method: 'PUT',
+    body: JSON.stringify(config),
+  });
+}
+
+/** Test Plex connection. Pass current form values to test before saving. */
+export async function checkPlexConnection(host?: string, token?: string): Promise<{ success: boolean; message: string; libraries?: Array<{ id: string; name: string }> }> {
+  try {
+    const body = host != null || token != null ? { PLEX_HOST: host ?? '', PLEX_TOKEN: token ?? '' } : undefined;
+    return await fetchApi<{ success: boolean; message: string; libraries?: Array<{ id: string; name: string }> }>(
+      '/api/plex/check',
+      body ? { method: 'POST', body: JSON.stringify(body) } : undefined
+    );
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : 'Failed to connect to Plex server';
+    return { success: false, message: msg };
+  }
+}
+
+/** Create a Plex.tv PIN for sign-in (user goes to plex.tv/link and enters code). */
+export async function createPlexPin(): Promise<{ success: boolean; id?: number; code?: string; link_url?: string; message?: string }> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/api/plex/pin`, { method: 'POST' });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) return { success: false, message: (data as { message?: string }).message || 'Failed to create PIN' };
+    return { success: true, id: (data as { id?: number }).id, code: (data as { code?: string }).code, link_url: (data as { link_url?: string }).link_url };
+  } catch (e) {
+    return { success: false, message: e instanceof Error ? e.message : 'Failed to create PIN' };
+  }
+}
+
+/** Poll PIN status; when user has linked on plex.tv/link, returns { status: 'linked', token }. */
+export async function pollPlexPin(pinId: number): Promise<{ success: boolean; status: string; token?: string; message?: string }> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/api/plex/pin?id=${encodeURIComponent(pinId)}`);
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) return { success: false, status: 'error', message: (data as { message?: string }).message };
+    return { success: true, status: (data as { status?: string }).status ?? 'waiting', token: (data as { token?: string }).token, message: (data as { message?: string }).message };
+  } catch (e) {
+    return { success: false, status: 'error', message: e instanceof Error ? e.message : 'Poll failed' };
+  }
+}
+
+/** Plex server entry returned by GET plex.tv/servers (Tautulli-style). */
+export interface PlexServerEntry {
+  name: string;
+  uri: string;
+  address?: string;
+  port?: string;
+  scheme?: string;
+  localAddresses?: string;
+  machineIdentifier?: string;
+}
+
+/** List Plex servers for the given token (Plex.tv API). */
+export async function getPlexServers(token: string): Promise<{ success: boolean; servers: PlexServerEntry[]; message?: string }> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/api/plex/servers`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ PLEX_TOKEN: token }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      return { success: false, servers: [], message: (data as { message?: string }).message || res.statusText || 'Failed to fetch Plex servers' };
+    }
+    const payload = data as { success?: boolean; servers?: PlexServerEntry[]; message?: string };
+    return payload.success !== false
+      ? { success: true, servers: payload.servers ?? [], message: payload.message }
+      : { success: false, servers: [], message: payload.message };
+  } catch (error) {
+    return { success: false, servers: [], message: error instanceof Error ? error.message : 'Failed to fetch Plex servers' };
+  }
+}
+
+/** Get the client IP (browser machine) so we can ask the backend to scan that subnet for Plex. */
+export async function getPlexClientIp(): Promise<{ client_ip: string }> {
+  const res = await fetchApi<{ client_ip: string }>('/api/plex/client-ip');
+  return res ?? { client_ip: '' };
+}
+
+/** Discover Plex servers: GDM, host fallback, and optionally subnet scan from client IP.
+ *  - clientIp: scan the /24 of the machine viewing the WebUI (no URL needed).
+ *  - plexHostHint: also probe the port from this URL if non-standard.
+ */
+export async function getPlexDiscover(options?: { clientIp?: string; plexHostHint?: string }): Promise<{ success: boolean; servers: PlexServerEntry[]; message?: string }> {
+  try {
+    const body: { client_ip?: string; PLEX_HOST?: string } = {};
+    if (options?.clientIp) body.client_ip = options.clientIp;
+    if (options?.plexHostHint) body.PLEX_HOST = options.plexHostHint;
+    const res = await fetchApi<{ success: boolean; servers: PlexServerEntry[]; message?: string }>(
+      '/api/plex/discover',
+      Object.keys(body).length ? { method: 'POST', body: JSON.stringify(body) } : undefined
+    );
+    return res ?? { success: false, servers: [] };
+  } catch (error) {
+    return { success: false, servers: [], message: 'Discovery failed' };
+  }
+}
+
+export interface PlexDatabasePathHint {
+  platform: string;
+  path: string;
+  note: string;
+}
+
+/** Common Plex database directory locations by platform (for wizard help). */
+export async function getPlexDatabasePaths(): Promise<{ success: boolean; paths: PlexDatabasePathHint[] }> {
+  try {
+    const res = await fetchApi<{ success: boolean; paths: PlexDatabasePathHint[] }>('/api/plex/database-paths');
+    return res ?? { success: false, paths: [] };
+  } catch {
+    return { success: false, paths: [] };
+  }
+}
+
+/** Verify that PMDA has read access to the Plex database (current config). */
+export async function verifyPlexDb(): Promise<{ success: boolean; message?: string }> {
+  try {
+    const res = await fetchApi<{ success: boolean; message?: string }>('/api/plex/verify-db');
+    return res ?? { success: false, message: 'Request failed' };
+  } catch (e) {
+    return { success: false, message: e instanceof Error ? e.message : 'Request failed' };
+  }
+}
+
+export async function testMusicBrainz(useMusicBrainz?: boolean): Promise<{ success: boolean; message: string }> {
+  try {
+    const body = useMusicBrainz !== undefined ? { USE_MUSICBRAINZ: useMusicBrainz } : undefined;
+    const response = await fetch(`${API_BASE_URL}/api/musicbrainz/test`, {
+      method: body ? 'POST' : 'GET',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    const data = await response.json().catch(() => ({ success: false, message: 'Invalid response from server' }));
+    if (!response.ok) {
+      return { success: false, message: data.message || data.error || `MusicBrainz test failed: ${response.statusText}` };
+    }
+    return data;
+  } catch (error: any) {
+    return { success: false, message: error?.message || 'Failed to test MusicBrainz connection' };
+  }
+}
+
+
+export async function checkOpenAI(apiKey?: string): Promise<{ success: boolean; message: string }> {
+  try {
+    const body = apiKey ? { OPENAI_API_KEY: apiKey } : undefined;
+    return await fetchApi('/api/openai/check', { 
+      method: 'POST',
+      body: body ? JSON.stringify(body) : undefined,
+    });
+  } catch (error) {
+    return { success: false, message: 'Failed to verify OpenAI connection' };
+  }
+}
+
+export async function getOpenAIModels(apiKey: string): Promise<string[]> {
+  if (!apiKey?.trim()) {
+    throw new Error('API key is required to fetch models');
+  }
+  try {
+    const body = { OPENAI_API_KEY: apiKey.trim() };
+    return await fetchApi<string[]>('/api/openai/models', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    });
+  } catch (error) {
+    // Re-throw the error so the UI can handle it properly
+    throw error;
+  }
+}
+
+export async function getAIModels(
+  provider: 'openai' | 'anthropic' | 'google' | 'ollama',
+  credentials: { apiKey?: string; url?: string }
+): Promise<string[]> {
+  try {
+    const body: any = { AI_PROVIDER: provider };
+    if (provider === 'ollama') {
+      if (!credentials.url?.trim()) {
+        throw new Error('Ollama URL is required');
+      }
+      body.OLLAMA_URL = credentials.url.trim();
+    } else {
+      if (!credentials.apiKey?.trim()) {
+        throw new Error('API key is required');
+      }
+      if (provider === 'openai') {
+        body.OPENAI_API_KEY = credentials.apiKey.trim();
+      } else if (provider === 'anthropic') {
+        body.ANTHROPIC_API_KEY = credentials.apiKey.trim();
+      } else if (provider === 'google') {
+        body.GOOGLE_API_KEY = credentials.apiKey.trim();
+      }
+    }
+    return await fetchApi<string[]>('/api/ai/models', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    });
+  } catch (error: any) {
+    // Re-throw with better error message
+    if (error?.response) {
+      const data = await error.response.json().catch(() => ({}));
+      throw new Error(data.error || error.message || 'Failed to fetch models');
+    }
+    throw error;
+  }
+}
+
+// Autodetection (pass config so backend uses wizard values)
+export async function autodetectPaths(body?: {
+  PLEX_HOST?: string;
+  PLEX_TOKEN?: string;
+  SECTION_IDS?: string;
+}): Promise<{ success: boolean; paths: Record<string, string>; message?: string }> {
+  try {
+    return await fetchApi('/api/autodetect/paths', {
+      method: 'POST',
+      body: JSON.stringify(body ?? {}),
+    });
+  } catch {
+    return { success: false, paths: {}, message: 'Failed to autodetect paths' };
+  }
+}
+
+export async function discoverPaths(body: {
+  PATH_MAP: Record<string, string>;
+  PLEX_DB_PATH?: string;
+  MUSIC_PARENT_PATH?: string;
+  CROSSCHECK_SAMPLES?: number;
+}): Promise<{ success: boolean; paths: Record<string, string>; results: PathVerifyResult[]; message?: string }> {
+  try {
+    const response = await fetch(`${API_BASE_URL}/api/paths/discover`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = (await response.json().catch(() => ({}))) as {
+      success?: boolean;
+      paths?: Record<string, string>;
+      results?: PathVerifyResult[];
+      message?: string;
+    };
+    if (!response.ok) {
+      return {
+        success: false,
+        paths: data.paths ?? {},
+        results: data.results ?? [],
+        message: data.message ?? `Discover failed (${response.status})`,
+      };
+    }
+    return {
+      success: true,
+      paths: data.paths ?? {},
+      results: data.results ?? [],
+      message: data.message,
+    };
+  } catch (e) {
+    return {
+      success: false,
+      paths: {},
+      results: [],
+      message: e instanceof Error ? e.message : 'Discover failed',
+    };
+  }
+}
+
+export async function discoverPathOne(body: {
+  plex_root: string;
+  PLEX_DB_PATH?: string;
+  MUSIC_PARENT_PATH?: string;
+  CROSSCHECK_SAMPLES?: number;
+}): Promise<{ success: boolean; host_root: string | null; result: PathVerifyResult | null; message?: string }> {
+  try {
+    const response = await fetch(`${API_BASE_URL}/api/paths/discover-one`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = (await response.json().catch(() => ({}))) as {
+      success?: boolean;
+      host_root?: string | null;
+      result?: PathVerifyResult | null;
+      message?: string;
+    };
+    if (!response.ok) {
+      return {
+        success: false,
+        host_root: null,
+        result: null,
+        message: data.message ?? `Discover failed (${response.status})`,
+      };
+    }
+    return {
+      success: data.success ?? true,
+      host_root: data.host_root ?? null,
+      result: data.result ?? null,
+      message: data.message,
+    };
+  } catch (e) {
+    return {
+      success: false,
+      host_root: null,
+      result: null,
+      message: e instanceof Error ? e.message : 'Discover failed',
+    };
+  }
+}
+
+export interface PathVerifyResult {
+  plex_root: string;
+  host_root: string;
+  status: 'ok' | 'fail';
+  samples_checked: number;
+  message: string;
+}
+
+export async function getPathVerifyLast(): Promise<{ results: PathVerifyResult[] | null; at: number | null }> {
+  try {
+    const response = await fetch(`${API_BASE_URL}/api/paths/verify/last`);
+    const data = (await response.json().catch(() => ({}))) as { results?: PathVerifyResult[] | null; at?: number | null };
+    return { results: data.results ?? null, at: data.at ?? null };
+  } catch {
+    return { results: null, at: null };
+  }
+}
+
+export async function verifyPaths(body: {
+  PATH_MAP?: Record<string, string>;
+  PLEX_DB_PATH?: string;
+  CROSSCHECK_SAMPLES?: number;
+}): Promise<{ success: boolean; results: PathVerifyResult[]; message?: string; hint?: string }> {
+  try {
+    const response = await fetch(`${API_BASE_URL}/api/paths/verify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = (await response.json().catch(() => ({}))) as { success?: boolean; results?: PathVerifyResult[]; message?: string; hint?: string };
+    if (!response.ok) {
+      return {
+        success: false,
+        results: data.results ?? [],
+        message: data.message ?? `Verification failed (${response.status})`,
+        hint: data.hint,
+      };
+    }
+    return data as { success: boolean; results: PathVerifyResult[]; message?: string; hint?: string };
+  } catch (e) {
+    return { success: false, results: [], message: e instanceof Error ? e.message : 'Verification failed' };
+  }
+}
+
+export async function autodetectLibraries(plexHost?: string, plexToken?: string): Promise<{ success: boolean; libraries: Array<{ id: string; name: string; type?: string }>; message?: string }> {
+  try {
+    const body: Record<string, string> = {};
+    if (plexHost?.trim()) body.PLEX_HOST = plexHost.trim();
+    if (plexToken?.trim()) body.PLEX_TOKEN = plexToken.trim();
+    return await fetchApi('/api/autodetect/libraries', { method: 'POST', body: JSON.stringify(body) });
+  } catch {
+    return { success: false, libraries: [], message: 'Failed to autodetect libraries' };
+  }
+}
+
+// Stats calculation helper
+export function calculateStats(duplicates: DuplicateCard[], dedupeProgress: DedupeProgress) {
+  const artists = new Set(duplicates.map(d => d.artist)).size;
+  const albums = duplicates.length;
+  const remainingDupes = duplicates.reduce((sum, d) => sum + (d.no_move ? 0 : d.n - 1), 0);
+  
+  const baseSaved = dedupeProgress.saved || 0;
+  const savedThisRun = dedupeProgress.deduping ? (dedupeProgress.saved_this_run ?? 0) : 0;
+  return {
+    artists,
+    albums,
+    remainingDupes,
+    removedDupes: dedupeProgress.moved ?? dedupeProgress.progress ?? 0,
+    spaceSaved: baseSaved + savedThisRun,
+  };
+}
+
+// Scan History API
+export async function getScanHistory(): Promise<ScanHistoryEntry[]> {
+  return fetchApi<ScanHistoryEntry[]>(`/api/scan-history`);
+}
+
+export async function clearScanHistory(): Promise<{ status: string; message: string }> {
+  return fetchApi<{ status: string; message: string }>(`/api/scan-history`, { method: 'DELETE' });
+}
+
+export async function getScanDetails(scanId: number): Promise<ScanHistoryEntry> {
+  return fetchApi<ScanHistoryEntry>(`/api/scan-history/${scanId}`);
+}
+
+export async function getScanMoves(scanId: number): Promise<ScanMove[]> {
+  return fetchApi<ScanMove[]>(`/api/scan-history/${scanId}/moves`);
+}
+
+export interface RestoreMovesResult {
+  restored: number;
+  artists_refreshed: number;
+  /** Paths restored: from (dupe folder) -> to (original location) */
+  restored_paths?: { from: string; to: string }[];
+}
+
+export async function restoreMoves(scanId: number, moveIds?: number[], all?: boolean): Promise<RestoreMovesResult> {
+  return fetchApi<RestoreMovesResult>(`/api/scan-history/${scanId}/restore`, {
+    method: 'POST',
+    body: JSON.stringify({ move_ids: moveIds, all }),
+  });
+}
+
+export async function dedupeScan(scanId: number): Promise<{ status: string; message: string }> {
+  return fetchApi<{ status: string; message: string }>(`/api/scan-history/${scanId}/dedupe`, {
+    method: 'POST',
+  });
+}
+
+// Broken Albums API
+export interface BrokenAlbum {
+  artist: string;
+  album_id: number;
+  album_title: string;
+  expected_track_count?: number;
+  actual_track_count: number;
+  missing_indices: Array<[number, number]>;
+  musicbrainz_release_group_id?: string;
+  detected_at: number;
+  sent_to_lidarr: boolean;
+}
+
+export interface LidarrConfig {
+  LIDARR_URL?: string;
+  LIDARR_API_KEY?: string;
+}
+
+export async function testLidarr(url: string, apiKey: string): Promise<{ success: boolean; message: string }> {
+  const response = await fetch(`${API_BASE_URL}/api/lidarr/test`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url, api_key: apiKey }),
+  });
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({ message: 'Failed to test Lidarr connection' }));
+    throw new Error(error.message || 'Failed to test Lidarr connection');
+  }
+  return response.json();
+}
+
+export async function testAutobrr(url: string, apiKey: string): Promise<{ success: boolean; message: string }> {
+  const response = await fetch(`${API_BASE_URL}/api/autobrr/test`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url, api_key: apiKey }),
+  });
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({ message: 'Failed to test Autobrr connection' }));
+    throw new Error(error.message || 'Failed to test Autobrr connection');
+  }
+  return response.json();
+}
+
+export async function getBrokenAlbums(): Promise<BrokenAlbum[]> {
+  const response = await fetch(`${API_BASE_URL}/api/broken-albums`);
+  if (!response.ok) throw new Error('Failed to fetch broken albums');
+  return response.json();
+}
+
+export async function addAlbumToLidarr(album: BrokenAlbum): Promise<{ success: boolean; message: string }> {
+  const response = await fetch(`${API_BASE_URL}/api/lidarr/add-album`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      artist_name: album.artist,
+      album_id: album.album_id,
+      musicbrainz_release_group_id: album.musicbrainz_release_group_id,
+      album_title: album.album_title,
+    }),
+  });
+  if (!response.ok) {
+    const error = await response.json();
+    throw new Error(error.message || 'Failed to add album to Lidarr');
+  }
+  return response.json();
+}

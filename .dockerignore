@@ -1,4 +1,4 @@
-# Dont send host node_modules or local build into the image
+# Only runtime-needed files go into the image
 frontend/node_modules
 frontend/dist
 .git
@@ -6,3 +6,7 @@ frontend/dist
 docs
 *.md
 .cursorrules
+local-test-config
+scripts
+static
+frontend/.git

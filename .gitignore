@@ -1,10 +1,11 @@
 # Local Cursor rules – never publish to GitHub
 .cursorrules
 
-# Never push to GitHub: Cursor IDE, docs, Markdown files
+# Never push to GitHub: Cursor IDE, docs (README.md is allowed)
 .cursor/
 docs/
 *.md
+!README.md
 
 # Python
 __pycache__/
@@ -16,8 +17,13 @@ venv/
 .venv/
 env/
 
-# Generated test output (recreated by create_pmda_test_files.sh)
-scripts/fixtures/pmda_tests/
+# Test / dev only – not for GitHub or production image
+local-test-config/
+scripts/
+static/
+frontend/.git
+frontend/node_modules
+frontend/dist
 
 # Config / state – not needed at runtime (SQLite is source of truth)
 ai_prompt.txt

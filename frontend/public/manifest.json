@@ -1,0 +1,27 @@
+{
+  "name": "PMDA - Plex Music Dedupe Assistant",
+  "short_name": "PMDA",
+  "description": "Analyze and deduplicate your Plex music library with AI-powered detection",
+  "start_url": "/",
+  "display": "standalone",
+  "theme_color": "#14b8a6",
+  "background_color": "#18181b",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    },
+    {
+      "src": "/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}

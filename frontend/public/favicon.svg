@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none">
+  <!-- Background circle -->
+  <circle cx="256" cy="256" r="240" fill="#14b8a6"/>
+  
+  <!-- Duplicate shadow P (offset) - represents dedupe concept -->
+  <path d="M200 136h100c55.23 0 100 44.77 100 100s-44.77 100-100 100h-60v80c0 11.05-8.95 20-20 20s-20-8.95-20-20V156c0-11.05 8.95-20 20-20z" 
+        fill="#0d9488" 
+        transform="translate(12, 12)"/>
+  
+  <!-- Main P -->
+  <path d="M188 124h100c55.23 0 100 44.77 100 100s-44.77 100-100 100h-60v80c0 11.05-8.95 20-20 20s-20-8.95-20-20V144c0-11.05 8.95-20 20-20z" 
+        fill="white"/>
+  <path d="M228 164v120h60c33.14 0 60-26.86 60-60s-26.86-60-60-60h-60z" 
+        fill="#14b8a6"/>
+</svg>
