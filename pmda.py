@@ -2228,7 +2228,7 @@ def _discover_one_binding(plex_root: str, db_file: str, music_root: str, samples
 
 
 # ──────────────────────────────── CROSS‑CHECK PATH BINDINGS ────────────────────────────────
-def _cross_check_bindings():
+def _cross_check_bindings(raise_on_abort: bool = True):
     """
     Verify that every PATH_MAP binding actually resolves to real audio
     files on the host.
@@ -2238,8 +2238,9 @@ def _cross_check_bindings():
     • Otherwise performs a recursive search to locate the files; if they are
       all found under the same parent folder we treat that folder as the
       correct host root and patch PATH_MAP (memory + SQLite).
-    • If any binding cannot be validated or repaired, the startup aborts
-      with SystemExit to avoid destructive behaviour later on.
+    • If any binding cannot be validated or repaired and raise_on_abort is True,
+      raises SystemExit. When raise_on_abort is False (e.g. background thread),
+      logs the error and returns without raising.
     """
     log_header("cross‑check path bindings")
 
@@ -2360,7 +2361,10 @@ def _cross_check_bindings():
 
     if abort:
         notify_discord("❌ PMDA startup aborted: PATH_MAP bindings failed cross‑check.")
-        raise SystemExit("Cross‑check PATH_MAP failed")
+        if raise_on_abort:
+            raise SystemExit("Cross‑check PATH_MAP failed")
+        logging.error("PATH_MAP cross-check failed (running in background – check bindings in Settings).")
+        return
 
     # Apply fixes
     if updates:
@@ -13625,12 +13629,29 @@ if _HAS_STATIC_UI:
 import os
 
 if __name__ == "__main__":
-    # Web UI only: run startup checks first (resolve PATH_MAP by content), then start HTTP server.
+    # Web UI only: start server first so UI is available immediately, then run startup checks (cross-check in background).
     def run_server():
         app.run(host="0.0.0.0", port=WEBUI_PORT, threaded=True, use_reloader=False)
 
-    run_startup_checks()
-    logging.info("Startup checks complete – Web UI listening on http://0.0.0.0:%s", WEBUI_PORT)
+    # Fast checks before server (can SystemExit)
+    if PLEX_CONFIGURED:
+        _validate_plex_connection()
+        if not _self_diag():
+            raise SystemExit("Self‑diagnostic failed – please fix the issues above and restart PMDA.")
+    else:
+        logging.info("Skipping startup checks (Plex not configured – use Settings to configure).")
+
     server_thread = threading.Thread(target=run_server, daemon=False)
     server_thread.start()
+    logging.info("Web UI listening on http://0.0.0.0:%s – startup path cross-check running in background", WEBUI_PORT)
+
+    def run_cross_check_background():
+        if PLEX_CONFIGURED and not DISABLE_PATH_CROSSCHECK:
+            _cross_check_bindings(raise_on_abort=False)
+        elif DISABLE_PATH_CROSSCHECK:
+            logging.info("PATH cross-check skipped (DISABLE_PATH_CROSSCHECK=true).")
+
+    cross_check_thread = threading.Thread(target=run_cross_check_background, daemon=True)
+    cross_check_thread.start()
+
     server_thread.join()  # block forever (app.run never returns)

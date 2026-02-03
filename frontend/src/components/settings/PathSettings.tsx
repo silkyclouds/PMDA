@@ -39,7 +39,7 @@ export function PathSettings({ config, updateConfig, errors }: PathSettingsProps
 
   const [autoStep, setAutoStep] = useState<AutoStep>('idle');
   const [autoError, setAutoError] = useState<string | null>(null);
-  const [discoveredList, setDiscoveredList] = useState<Array<{ plex: string; host: string }>>([]);
+  const [discoveredList, setDiscoveredList] = useState<Array<{ plex: string; host: string; message?: string }>>([]);
   const [resolvingProgress, setResolvingProgress] = useState<{
     current: number;
     total: number;
@@ -101,7 +101,7 @@ export function PathSettings({ config, updateConfig, errors }: PathSettingsProps
       const musicRoot = (config.MUSIC_PARENT_PATH ?? '').trim() || '/music';
       const samples = config.CROSSCHECK_SAMPLES ?? 15;
       const resolvedPaths: Record<string, string> = {};
-      const discovered: Array<{ plex: string; host: string }> = [];
+      const discovered: Array<{ plex: string; host: string; message?: string }> = [];
       for (let i = 0; i < plexRoots.length; i++) {
         const plex = plexRoots[i];
         setBindingProgress({ phase: 'resolving', current: i + 1, total: totalSteps });
@@ -120,7 +120,8 @@ export function PathSettings({ config, updateConfig, errors }: PathSettingsProps
           return;
         }
         resolvedPaths[plex] = one.host_root;
-        discovered.push({ plex, host: one.host_root });
+        const message = one.result?.message ?? undefined;
+        discovered.push({ plex, host: one.host_root, message });
         setDiscoveredList([...discovered]);
         setResolvingProgress({ current: i + 1, total: plexRoots.length, plex, host: one.host_root });
       }
@@ -407,10 +408,13 @@ export function PathSettings({ config, updateConfig, errors }: PathSettingsProps
                   </p>
                 )}
                 {discoveredList.length > 0 && (
-                  <ul className="text-xs text-muted-foreground pl-6 list-disc list-inside">
-                    {Array.isArray(discoveredList) && discoveredList.map(({ plex, host }) => (
+                  <ul className="text-xs text-muted-foreground pl-6 list-disc list-inside space-y-0.5">
+                    {Array.isArray(discoveredList) && discoveredList.map(({ plex, host, message }) => (
                       <li key={plex}>
                         <span className="font-mono text-foreground">{plex}</span> → <span className="font-mono text-foreground">{host}</span>
+                        {message != null && message !== '' && (
+                          <span className="ml-1 text-muted-foreground">({message})</span>
+                        )}
                       </li>
                     ))}
                   </ul>
