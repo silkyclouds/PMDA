@@ -6,6 +6,7 @@
 docs/
 *.md
 !README.md
+frontend/README.md
 
 # Python
 __pycache__/
