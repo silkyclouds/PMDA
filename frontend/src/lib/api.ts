@@ -554,6 +554,80 @@ export async function getLibraryStats(): Promise<LibraryStats> {
   return fetchApi<LibraryStats>('/api/library/stats');
 }
 
+export type LibrarySearchItemType = 'artist' | 'album' | 'track';
+
+export interface LibrarySearchSuggestionItem {
+  type: LibrarySearchItemType;
+  title: string;
+  subtitle?: string;
+  thumb?: string | null;
+  artist_id?: number;
+  album_id?: number;
+  track_id?: number;
+  duration_sec?: number;
+  track_num?: number;
+}
+
+export interface LibrarySearchSuggestResponse {
+  query: string;
+  items: LibrarySearchSuggestionItem[];
+}
+
+export async function getLibrarySearchSuggest(query: string, limit = 12): Promise<LibrarySearchSuggestResponse> {
+  if (!query.trim()) return { query: '', items: [] };
+  return fetchApi<LibrarySearchSuggestResponse>(
+    `/api/library/search/suggest?q=${encodeURIComponent(query.trim())}&limit=${Math.max(1, Math.min(40, limit))}`
+  );
+}
+
+export type RecoEventType = 'play_start' | 'play_partial' | 'play_complete' | 'skip' | 'stop' | 'like' | 'dislike';
+
+export interface RecoTrack {
+  track_id: number;
+  title: string;
+  artist_id: number;
+  artist_name: string;
+  album_id: number;
+  album_title: string;
+  duration_sec: number;
+  track_num: number;
+  score: number;
+  reasons: string[];
+  thumb?: string | null;
+  file_url: string;
+}
+
+export interface RecoForYouResponse {
+  session_id: string;
+  tracks: RecoTrack[];
+  session_event_count?: number;
+  algorithm?: string;
+}
+
+export async function getRecommendationsForYou(
+  sessionId: string,
+  limit = 12,
+  excludeTrackId?: number
+): Promise<RecoForYouResponse> {
+  const q = new URLSearchParams();
+  if (sessionId) q.set('session_id', sessionId);
+  q.set('limit', String(Math.max(1, Math.min(40, limit))));
+  if (excludeTrackId && excludeTrackId > 0) q.set('exclude_track_id', String(excludeTrackId));
+  return fetchApi<RecoForYouResponse>(`/api/library/reco/for-you?${q.toString()}`);
+}
+
+export async function postRecommendationEvent(payload: {
+  session_id: string;
+  track_id: number;
+  event_type: RecoEventType;
+  played_seconds?: number;
+}): Promise<{ ok: boolean; session_id: string; track_id: number; event_type: string }> {
+  return fetchApi('/api/library/reco/event', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
 export interface AlbumWithParentheticalName {
   album_id: number;
   artist: string;

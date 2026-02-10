@@ -10,6 +10,7 @@ import { GlobalStatusBar } from '@/components/GlobalStatusBar';
 import { MobileNav } from '@/components/MobileNav';
 import { Badge } from '@/components/ui/badge';
 import { Logo } from '@/components/Logo';
+import { GlobalSearch } from '@/components/GlobalSearch';
 import * as api from '@/lib/api';
 
 function RebootCountdown({ onComplete, onProgress }: { onComplete: () => void; onProgress: (countdown: number, progress: number) => void }) {
@@ -146,6 +147,8 @@ export function Header() {
                 <span>Statistics</span>
               </NavLink>
             </nav>
+
+            <GlobalSearch />
 
             {/* Right actions */}
             <div className="flex items-center gap-2">

@@ -11,6 +11,7 @@ export interface PlaybackSession {
 
 interface PlaybackContextValue {
   session: PlaybackSession | null;
+  recommendationSessionId: string;
   startPlayback: (albumId: number, albumTitle: string, albumThumb: string | null, tracks: TrackInfo[]) => void;
   setCurrentTrack: (track: TrackInfo) => void;
   closePlayer: () => void;
@@ -20,6 +21,17 @@ const PlaybackContext = createContext<PlaybackContextValue | null>(null);
 
 export function PlaybackProvider({ children }: { children: ReactNode }) {
   const [session, setSession] = useState<PlaybackSession | null>(null);
+  const [recommendationSessionId] = useState<string>(() => {
+    try {
+      const existing = localStorage.getItem('pmda_reco_session_id');
+      if (existing && existing.length >= 6) return existing;
+      const generated = `pmda-${crypto.randomUUID()}`;
+      localStorage.setItem('pmda_reco_session_id', generated);
+      return generated;
+    } catch {
+      return `pmda-${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`;
+    }
+  });
 
   const startPlayback = useCallback(
     (albumId: number, albumTitle: string, albumThumb: string | null, tracks: TrackInfo[]) => {
@@ -50,6 +62,7 @@ export function PlaybackProvider({ children }: { children: ReactNode }) {
     <PlaybackContext.Provider
       value={{
         session,
+        recommendationSessionId,
         startPlayback,
         setCurrentTrack,
         closePlayer,

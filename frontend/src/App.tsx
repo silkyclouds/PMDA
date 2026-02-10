@@ -21,7 +21,7 @@ import { ScanFinishedInvalidator } from "./components/ScanFinishedInvalidator";
 const queryClient = new QueryClient();
 
 function AppRoutesWithPlayer() {
-  const { session, setCurrentTrack, closePlayer } = usePlayback();
+  const { session, setCurrentTrack, closePlayer, recommendationSessionId } = usePlayback();
   return (
     <>
       <ScanFinishedInvalidator />
@@ -45,6 +45,7 @@ function AppRoutesWithPlayer() {
           albumThumb={session.albumThumb}
           tracks={session.tracks}
           currentTrack={session.currentTrack}
+          recommendationSessionId={recommendationSessionId}
           onTrackSelect={setCurrentTrack}
           onClose={closePlayer}
         />

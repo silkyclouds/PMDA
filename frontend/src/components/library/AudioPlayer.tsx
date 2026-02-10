@@ -1,9 +1,10 @@
 import { useState, useRef, useEffect } from 'react';
-import { Play, Pause, SkipBack, SkipForward, Volume2, VolumeX, List, X, Music } from 'lucide-react';
+import { Play, Pause, SkipBack, SkipForward, Volume2, VolumeX, List, X, Music, ThumbsUp, ThumbsDown } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Slider } from '@/components/ui/slider';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { cn } from '@/lib/utils';
+import * as api from '@/lib/api';
 
 export interface TrackInfo {
   track_id: number;
@@ -20,6 +21,7 @@ interface AudioPlayerProps {
   albumTitle: string;
   /** Plex or local URL for album cover */
   albumThumb?: string | null;
+  recommendationSessionId?: string | null;
   tracks: TrackInfo[];
   currentTrack: TrackInfo | null;
   onTrackSelect: (track: TrackInfo) => void;
@@ -37,6 +39,7 @@ export function AudioPlayer({
   albumId,
   albumTitle,
   albumThumb,
+  recommendationSessionId,
   tracks,
   currentTrack,
   onTrackSelect,
@@ -52,13 +55,55 @@ export function AudioPlayer({
   const [coverError, setCoverError] = useState(false);
   const audioRef = useRef<HTMLAudioElement>(null);
   const lastTrackLoadTimeRef = useRef<number>(0);
+  const activeTrackRef = useRef<TrackInfo | null>(null);
+  const playedSecondsRef = useRef(0);
+  const finalizedTrackIdRef = useRef<number | null>(null);
 
   const currentIndex = currentTrack ? tracks.findIndex((t) => t.track_id === currentTrack.track_id) : -1;
   const displayDuration = duration > 0 ? duration : (currentTrack?.duration ?? 0);
 
+  const sendRecoEvent = (eventType: api.RecoEventType, track: TrackInfo | null, playedSeconds?: number) => {
+    if (!track || !recommendationSessionId) return;
+    void api.postRecommendationEvent({
+      session_id: recommendationSessionId,
+      track_id: track.track_id,
+      event_type: eventType,
+      played_seconds: Math.max(0, Math.floor(playedSeconds ?? 0)),
+    }).catch(() => {
+      // Non-blocking telemetry path.
+    });
+  };
+
+  const finalizeCurrentTrack = (reason: 'switch' | 'ended' | 'close') => {
+    const track = activeTrackRef.current;
+    if (!track) return;
+    if (finalizedTrackIdRef.current === track.track_id) return;
+    const played = Math.max(0, Math.floor(playedSecondsRef.current));
+    const completeThreshold = Math.max(30, Math.floor((track.duration || 0) * 0.85));
+    let eventType: api.RecoEventType = 'skip';
+    if (reason === 'ended' || played >= completeThreshold) {
+      eventType = 'play_complete';
+    } else if (played >= 12) {
+      eventType = 'play_partial';
+    } else if (reason === 'close') {
+      eventType = 'stop';
+    } else {
+      eventType = 'skip';
+    }
+    sendRecoEvent(eventType, track, played);
+    finalizedTrackIdRef.current = track.track_id;
+  };
+
   // When currentTrack changes: set src, reset time, and start playing (user already clicked Play on album)
   useEffect(() => {
+    if (activeTrackRef.current && (!currentTrack || activeTrackRef.current.track_id !== currentTrack.track_id)) {
+      finalizeCurrentTrack('switch');
+    }
     if (!currentTrack || !audioRef.current) return;
+    activeTrackRef.current = currentTrack;
+    finalizedTrackIdRef.current = null;
+    playedSecondsRef.current = 0;
+    sendRecoEvent('play_start', currentTrack, 0);
     lastTrackLoadTimeRef.current = Date.now();
     setCurrentTime(0);
     setDuration(currentTrack.duration || 0);
@@ -93,6 +138,7 @@ export function AudioPlayer({
   const handleTimeUpdate = () => {
     if (audioRef.current) {
       setCurrentTime(audioRef.current.currentTime);
+      playedSecondsRef.current = audioRef.current.currentTime;
       if (duration === 0 && !isNaN(audioRef.current.duration)) {
         setDuration(audioRef.current.duration);
       }
@@ -113,6 +159,7 @@ export function AudioPlayer({
   };
 
   const handleEnded = () => {
+    finalizeCurrentTrack('ended');
     if (currentIndex >= 0 && currentIndex < tracks.length - 1) {
       onTrackSelect(tracks[currentIndex + 1]);
     } else {
@@ -141,6 +188,11 @@ export function AudioPlayer({
 
   const nextTrack = () => {
     if (currentIndex >= 0 && currentIndex < tracks.length - 1) onTrackSelect(tracks[currentIndex + 1]);
+  };
+
+  const handleClosePlayer = () => {
+    finalizeCurrentTrack('close');
+    onClose();
   };
 
   if (tracks.length === 0) return null;
@@ -226,6 +278,26 @@ export function AudioPlayer({
               <SkipForward className="h-5 w-5" />
             </Button>
           </div>
+          <div className="flex items-center gap-1">
+            <Button
+              variant="ghost"
+              size="icon"
+              className="h-8 w-8 text-white hover:bg-zinc-700"
+              onClick={() => sendRecoEvent('like', currentTrack, playedSecondsRef.current)}
+              title="Like"
+            >
+              <ThumbsUp className="h-4 w-4" />
+            </Button>
+            <Button
+              variant="ghost"
+              size="icon"
+              className="h-8 w-8 text-white hover:bg-zinc-700"
+              onClick={() => sendRecoEvent('dislike', currentTrack, playedSecondsRef.current)}
+              title="Dislike"
+            >
+              <ThumbsDown className="h-4 w-4" />
+            </Button>
+          </div>
           <div className="flex items-center gap-2 text-xs text-zinc-400 tabular-nums min-w-[100px] justify-center">
             <span>{formatDuration(currentTime)}</span>
             <span>/</span>
@@ -258,7 +330,7 @@ export function AudioPlayer({
           <Button variant="ghost" size="icon" className="h-8 w-8 text-white hover:bg-zinc-700" onClick={() => setShowList((s) => !s)} title="Track list">
             <List className="h-4 w-4" />
           </Button>
-          <Button variant="ghost" size="icon" className="h-8 w-8 text-white hover:bg-zinc-700" onClick={onClose} title="Close">
+          <Button variant="ghost" size="icon" className="h-8 w-8 text-white hover:bg-zinc-700" onClick={handleClosePlayer} title="Close">
             <X className="h-4 w-4" />
           </Button>
         </div>

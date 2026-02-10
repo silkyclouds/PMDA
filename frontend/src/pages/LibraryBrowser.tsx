@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { Search, Music, Star, Loader2, Edit, Image as ImageIcon, RefreshCw, LayoutGrid, List, Sparkles, Play, Check, X, Circle, CopyMinus, Wrench, FolderInput } from 'lucide-react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import { Header } from '@/components/Header';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
@@ -268,6 +268,7 @@ function useDebounce<T>(value: T, delay: number): T {
 
 export default function LibraryBrowser() {
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
   const [artists, setArtists] = useState<ArtistInfo[]>([]);
   const [loading, setLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
@@ -317,7 +318,10 @@ export default function LibraryBrowser() {
   } | null>(null);
   const improveAllPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [totalArtists, setTotalArtists] = useState(0);
-  const { startPlayback } = usePlayback();
+  const { startPlayback, setCurrentTrack, recommendationSessionId, session } = usePlayback();
+  const [recommendations, setRecommendations] = useState<api.RecoTrack[]>([]);
+  const [loadingRecommendations, setLoadingRecommendations] = useState(false);
+  const [recommendationsError, setRecommendationsError] = useState<string | null>(null);
   const artistsListRef = useRef<HTMLDivElement>(null);
   const { toast } = useToast();
   const [showAnalyzeChoiceModal, setShowAnalyzeChoiceModal] = useState(false);
@@ -366,6 +370,26 @@ export default function LibraryBrowser() {
   useEffect(() => {
     loadArtists(debouncedSearch);
   }, [debouncedSearch, loadArtists]);
+
+  const loadRecommendations = useCallback(async () => {
+    if (!recommendationSessionId) return;
+    try {
+      setLoadingRecommendations(true);
+      setRecommendationsError(null);
+      const excludeTrackId = session?.currentTrack?.track_id;
+      const data = await api.getRecommendationsForYou(recommendationSessionId, 12, excludeTrackId);
+      setRecommendations(Array.isArray(data.tracks) ? data.tracks : []);
+    } catch {
+      setRecommendations([]);
+      setRecommendationsError('Failed to load recommendations');
+    } finally {
+      setLoadingRecommendations(false);
+    }
+  }, [recommendationSessionId, session?.currentTrack?.track_id]);
+
+  useEffect(() => {
+    loadRecommendations();
+  }, [loadRecommendations]);
 
   const loadArtistDetails = async (artistId: number) => {
     setDetailsLoadError(null);
@@ -420,6 +444,15 @@ export default function LibraryBrowser() {
     loadArtistDetails(artistId);
     checkMonitoredStatus(artistId);
   };
+
+  useEffect(() => {
+    const artistParamRaw = searchParams.get('artist');
+    const artistParam = artistParamRaw ? Number(artistParamRaw) : 0;
+    if (!artistParam || !Number.isFinite(artistParam) || artistParam <= 0) return;
+    if (selectedArtist === artistParam) return;
+    handleArtistClick(artistParam);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchParams, selectedArtist]);
 
   const checkMonitoredStatus = async (artistId: number) => {
     try {
@@ -490,6 +523,30 @@ export default function LibraryBrowser() {
       toast({
         title: 'Error',
         description: error instanceof Error ? error.message : 'Failed to load tracks',
+        variant: 'destructive',
+      });
+    }
+  };
+
+  const handlePlayRecommendedTrack = async (rec: api.RecoTrack) => {
+    try {
+      const response = await fetch(`/api/library/album/${rec.album_id}/tracks`);
+      if (!response.ok) throw new Error('Failed to load tracks');
+      const data = await response.json();
+      const tracksList: TrackInfo[] = data.tracks || [];
+      if (!tracksList.length) {
+        toast({ title: 'No tracks', description: 'This recommendation has no playable tracks.', variant: 'destructive' });
+        return;
+      }
+      startPlayback(rec.album_id, rec.album_title || 'Album', rec.thumb || null, tracksList);
+      const target = tracksList.find((t) => t.track_id === rec.track_id);
+      if (target) {
+        setCurrentTrack(target);
+      }
+    } catch (error) {
+      toast({
+        title: 'Error',
+        description: error instanceof Error ? error.message : 'Failed to play recommendation',
         variant: 'destructive',
       });
     }
@@ -695,6 +752,67 @@ export default function LibraryBrowser() {
           </div>
           <NormalizeAlbumNamesButton onDone={() => { if (selectedArtist) loadArtistDetails(selectedArtist); }} />
         </div>
+
+        <Card className="mb-6 border-border/70">
+          <CardHeader className="pb-3">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <CardTitle className="text-base">For You</CardTitle>
+                <CardDescription>Session-aware recommendations (embedding + behavior ranking)</CardDescription>
+              </div>
+              <Button variant="outline" size="sm" onClick={loadRecommendations} disabled={loadingRecommendations} className="gap-1.5">
+                {loadingRecommendations ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
+                Refresh
+              </Button>
+            </div>
+          </CardHeader>
+          <CardContent>
+            {loadingRecommendations && recommendations.length === 0 ? (
+              <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                <Loader2 className="w-4 h-4 animate-spin" />
+                Building recommendations...
+              </div>
+            ) : recommendations.length === 0 ? (
+              <p className="text-sm text-muted-foreground">
+                {recommendationsError ?? 'Start listening to tracks to personalize this feed.'}
+              </p>
+            ) : (
+              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+                {recommendations.map((rec) => (
+                  <button
+                    key={`rec-${rec.track_id}`}
+                    type="button"
+                    onClick={() => handlePlayRecommendedTrack(rec)}
+                    className="group rounded-lg border border-border/70 bg-card p-3 text-left hover:border-primary/40 hover:bg-accent/30 transition-colors"
+                  >
+                    <div className="flex items-start gap-3">
+                      <div className="w-12 h-12 rounded-md bg-muted overflow-hidden shrink-0 flex items-center justify-center">
+                        {rec.thumb ? (
+                          <img src={rec.thumb} alt={rec.album_title} className="w-full h-full object-cover" />
+                        ) : (
+                          <Music className="w-5 h-5 text-muted-foreground" />
+                        )}
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <p className="font-medium text-sm truncate">{rec.title}</p>
+                        <p className="text-xs text-muted-foreground truncate mt-0.5">
+                          {rec.artist_name} · {rec.album_title}
+                        </p>
+                        <div className="flex items-center gap-2 mt-2">
+                          <Badge variant="outline" className="text-[10px]">score {(rec.score ?? 0).toFixed(2)}</Badge>
+                          {Array.isArray(rec.reasons) && rec.reasons.length > 0 && (
+                            <span className="text-[10px] text-muted-foreground truncate">{rec.reasons.join(' · ')}</span>
+                          )}
+                        </div>
+                      </div>
+                      <Play className="w-4 h-4 text-muted-foreground group-hover:text-primary shrink-0 mt-0.5" />
+                    </div>
+                  </button>
+                ))}
+              </div>
+            )}
+          </CardContent>
+        </Card>
 
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
           {/* Artists List */}

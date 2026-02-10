@@ -48,6 +48,7 @@ import re
 import socket
 import struct
 import hashlib
+import math
 import xml.etree.ElementTree as ET
 
 import requests
@@ -542,8 +543,10 @@ PMDA_REDIS_HOST = (os.getenv("PMDA_REDIS_HOST", "127.0.0.1") or "127.0.0.1").str
 PMDA_REDIS_PORT = int((os.getenv("PMDA_REDIS_PORT", "6379") or "6379").strip())
 PMDA_REDIS_DB = int((os.getenv("PMDA_REDIS_DB", "0") or "0").strip())
 PMDA_REDIS_PASSWORD = os.getenv("PMDA_REDIS_PASSWORD", "") or ""
-FILES_CACHE_PREFIX = "pmda:files:v1:"
+FILES_CACHE_PREFIX = "pmda:files:v2:"
 PMDA_MEDIA_CACHE_ROOT = (os.getenv("PMDA_MEDIA_CACHE_ROOT", "") or "").strip()
+RECO_EMBED_DIM = 64
+RECO_EMBED_SOURCE = "pmda_hash_v1"
 
 
 def _get_from_sqlite(key: str, default=None):
@@ -3349,6 +3352,46 @@ def _files_pg_init_schema() -> bool:
                 )
             """)
             cur.execute("""
+                CREATE TABLE IF NOT EXISTS files_track_embeddings (
+                    track_id BIGINT PRIMARY KEY REFERENCES files_tracks(id) ON DELETE CASCADE,
+                    embed_json TEXT NOT NULL,
+                    norm REAL NOT NULL DEFAULT 1.0,
+                    source TEXT NOT NULL DEFAULT 'pmda_hash_v1',
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS files_reco_track_stats (
+                    track_id BIGINT PRIMARY KEY REFERENCES files_tracks(id) ON DELETE CASCADE,
+                    play_count BIGINT NOT NULL DEFAULT 0,
+                    completion_count BIGINT NOT NULL DEFAULT 0,
+                    partial_count BIGINT NOT NULL DEFAULT 0,
+                    skip_count BIGINT NOT NULL DEFAULT 0,
+                    last_event_at TIMESTAMPTZ,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS files_reco_events (
+                    id BIGSERIAL PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    track_id BIGINT NOT NULL REFERENCES files_tracks(id) ON DELETE CASCADE,
+                    album_id BIGINT REFERENCES files_albums(id) ON DELETE CASCADE,
+                    artist_id BIGINT REFERENCES files_artists(id) ON DELETE CASCADE,
+                    event_type TEXT NOT NULL,
+                    played_seconds INTEGER NOT NULL DEFAULT 0,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS files_reco_sessions (
+                    session_id TEXT PRIMARY KEY,
+                    last_event_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    total_events BIGINT NOT NULL DEFAULT 0
+                )
+            """)
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS files_artist_profiles (
                     name_norm TEXT PRIMARY KEY,
                     artist_name TEXT NOT NULL,
@@ -3377,13 +3420,21 @@ def _files_pg_init_schema() -> bool:
             cur.execute("CREATE INDEX IF NOT EXISTS idx_files_albums_artist_id ON files_albums(artist_id)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_files_albums_title ON files_albums(title)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_files_albums_title_norm ON files_albums(title_norm)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_files_albums_genre ON files_albums(genre)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_files_tracks_album_id ON files_tracks(album_id)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_files_tracks_title ON files_tracks(title)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_files_tracks_order ON files_tracks(album_id, disc_num, track_num, id)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_files_track_embeddings_updated_at ON files_track_embeddings(updated_at DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_files_reco_events_session_time ON files_reco_events(session_id, created_at DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_files_reco_events_track_time ON files_reco_events(track_id, created_at DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_files_reco_track_stats_score ON files_reco_track_stats(play_count DESC, completion_count DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_files_reco_sessions_last_event ON files_reco_sessions(last_event_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_files_artist_profiles_updated_at ON files_artist_profiles(updated_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_files_album_profiles_updated_at ON files_album_profiles(updated_at DESC)")
             try:
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_files_artists_name_trgm ON files_artists USING gin (name gin_trgm_ops)")
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_files_albums_title_trgm ON files_albums USING gin (title gin_trgm_ops)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_files_tracks_title_trgm ON files_tracks USING gin (title gin_trgm_ops)")
             except Exception:
                 pass
         _FILES_PG_SCHEMA_READY = True
@@ -3451,6 +3502,151 @@ def _files_cache_invalidate_all() -> None:
             cli.delete(*keys)
     except Exception:
         pass
+
+
+def _tokenize_reco_text(raw: str) -> list[str]:
+    txt = (raw or "").strip().lower()
+    if not txt:
+        return []
+    tokens = re.findall(r"[a-z0-9]+", txt)
+    out = [t for t in tokens if len(t) >= 2]
+    # Add bigrams for a light semantic boost on short names.
+    for i in range(max(0, len(out) - 1)):
+        out.append(f"{out[i]}_{out[i+1]}")
+    return out
+
+
+def _build_hashed_embedding(text: str, dims: int = RECO_EMBED_DIM) -> tuple[list[float], float]:
+    vec = [0.0] * max(8, int(dims or RECO_EMBED_DIM))
+    tokens = _tokenize_reco_text(text)
+    if not tokens:
+        return vec, 0.0
+    for tok in tokens:
+        digest = hashlib.sha1(tok.encode("utf-8", errors="ignore")).digest()
+        idx = int.from_bytes(digest[:2], "big") % len(vec)
+        sign = 1.0 if (digest[2] & 1) == 0 else -1.0
+        # Slightly higher weight for longer tokens, capped.
+        weight = min(2.5, 1.0 + (len(tok) / 12.0))
+        vec[idx] += sign * weight
+    norm = math.sqrt(sum(v * v for v in vec))
+    if norm > 0.0:
+        inv = 1.0 / norm
+        vec = [v * inv for v in vec]
+    return vec, norm
+
+
+def _load_embedding_json(raw: str) -> list[float]:
+    if not raw:
+        return []
+    try:
+        arr = json.loads(raw)
+    except Exception:
+        return []
+    if not isinstance(arr, list):
+        return []
+    out: list[float] = []
+    for v in arr[:RECO_EMBED_DIM]:
+        try:
+            out.append(float(v))
+        except Exception:
+            out.append(0.0)
+    if len(out) < RECO_EMBED_DIM:
+        out.extend([0.0] * (RECO_EMBED_DIM - len(out)))
+    return out
+
+
+def _vec_cosine(a: list[float], b: list[float]) -> float:
+    if not a or not b:
+        return 0.0
+    n = min(len(a), len(b))
+    if n <= 0:
+        return 0.0
+    return float(sum((a[i] * b[i]) for i in range(n)))
+
+
+def _reco_event_weight(event_type: str, played_seconds: int) -> float:
+    et = (event_type or "").strip().lower()
+    played = max(0, int(played_seconds or 0))
+    if et == "like":
+        return 1.8
+    if et == "dislike":
+        return -2.0
+    if et == "play_complete":
+        return 1.0
+    if et == "play_partial":
+        return 0.45
+    if et == "play_start":
+        return 0.25 if played >= 15 else 0.1
+    if et == "skip":
+        return -0.9
+    if et == "stop":
+        return 0.12 if played >= 20 else -0.25
+    return 0.0
+
+
+def _reco_build_track_embeddings(conn) -> int:
+    """Rebuild deterministic per-track embeddings used for recommendation ranking."""
+    inserted = 0
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM files_track_embeddings")
+        cur.execute(
+            """
+            SELECT
+                tr.id,
+                tr.title,
+                COALESCE(alb.title, ''),
+                COALESCE(alb.genre, ''),
+                COALESCE(ar.name, ''),
+                COALESCE(alb.year::text, ''),
+                COALESCE(tr.format, ''),
+                COALESCE(alb.tags_json, '[]')
+            FROM files_tracks tr
+            JOIN files_albums alb ON alb.id = tr.album_id
+            JOIN files_artists ar ON ar.id = alb.artist_id
+            ORDER BY tr.id ASC
+            """
+        )
+        while True:
+            rows = cur.fetchmany(2000)
+            if not rows:
+                break
+            batch: list[tuple] = []
+            for row in rows:
+                track_id = int(row[0])
+                title = row[1] or ""
+                album_title = row[2] or ""
+                genre = row[3] or ""
+                artist = row[4] or ""
+                year_text = row[5] or ""
+                fmt = row[6] or ""
+                tags_json = row[7] or "[]"
+                try:
+                    tags_list = json.loads(tags_json) if tags_json else []
+                except Exception:
+                    tags_list = []
+                tags_part = " ".join(str(t or "").strip() for t in tags_list[:12] if str(t or "").strip())
+                text = " ".join(
+                    p for p in [artist, album_title, title, genre, tags_part, year_text, fmt] if p
+                )
+                vec, norm = _build_hashed_embedding(text, RECO_EMBED_DIM)
+                if norm <= 0:
+                    continue
+                batch.append((track_id, json.dumps(vec, separators=(",", ":")), float(norm), RECO_EMBED_SOURCE))
+            if batch:
+                cur.executemany(
+                    """
+                    INSERT INTO files_track_embeddings(track_id, embed_json, norm, source, updated_at)
+                    VALUES (%s, %s, %s, %s, NOW())
+                    ON CONFLICT (track_id) DO UPDATE
+                    SET embed_json = EXCLUDED.embed_json,
+                        norm = EXCLUDED.norm,
+                        source = EXCLUDED.source,
+                        updated_at = NOW()
+                    """,
+                    batch,
+                )
+                inserted += len(batch)
+    return inserted
 
 
 def _files_index_set_state(**updates) -> None:
@@ -3743,6 +3939,7 @@ def _rebuild_files_library_index(reason: str = "manual", wait_if_running: bool =
 
         artists_map: dict[str, dict] = {}
         albums_payload: list[dict] = []
+        reco_embeddings_count = 0
 
         for idx, (folder, files) in enumerate(folders, start=1):
             _files_index_set_state(folders_processed=idx, current_folder=str(folder))
@@ -4004,6 +4201,10 @@ def _rebuild_files_library_index(reason: str = "manual", wait_if_running: bool =
                     _files_index_write_meta(cur, "artists", str(len(artists_map)))
                     _files_index_write_meta(cur, "albums", str(len(albums_payload)))
                     _files_index_write_meta(cur, "tracks", str(total_tracks))
+                _files_index_set_state(phase="embeddings")
+                reco_embeddings_count = _reco_build_track_embeddings(conn)
+                with conn.cursor() as cur:
+                    _files_index_write_meta(cur, "track_embeddings", str(reco_embeddings_count))
         finally:
             conn.close()
 
@@ -4022,11 +4223,12 @@ def _rebuild_files_library_index(reason: str = "manual", wait_if_running: bool =
             error=None,
         )
         logging.info(
-            "Files library index rebuilt (%s): %d artist(s), %d album(s), %d track(s) in %.2fs (cached covers=%d, artist images=%d)",
+            "Files library index rebuilt (%s): %d artist(s), %d album(s), %d track(s), %d embedding(s) in %.2fs (cached covers=%d, artist images=%d)",
             reason,
             len(artists_map),
             len(albums_payload),
             sum(len(a["tracks"]) for a in albums_payload),
+            reco_embeddings_count,
             elapsed,
             covers_cached,
             artists_cached,
@@ -4036,6 +4238,7 @@ def _rebuild_files_library_index(reason: str = "manual", wait_if_running: bool =
             "artists": len(artists_map),
             "albums": len(albums_payload),
             "tracks": sum(len(a["tracks"]) for a in albums_payload),
+            "track_embeddings": reco_embeddings_count,
             "cached_covers": covers_cached,
             "cached_artist_images": artists_cached,
             "duration_sec": elapsed,
@@ -4360,6 +4563,410 @@ def _enqueue_files_profile_enrichment(artist_name: str, artist_norm: str, albums
         name=f"profile-enrich-{artist_norm[:24]}",
     ).start()
     return True
+
+
+def _reco_genre_tokens(raw_genre: str) -> list[str]:
+    tokens = []
+    for part in re.split(r"[;,/|]+", (raw_genre or "").lower()):
+        txt = re.sub(r"\s+", " ", (part or "").strip())
+        if txt:
+            tokens.append(txt)
+    return tokens[:12]
+
+
+def _reco_fetch_embeddings_map(conn, track_ids: list[int]) -> dict[int, list[float]]:
+    if not track_ids:
+        return {}
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT track_id, embed_json
+            FROM files_track_embeddings
+            WHERE track_id = ANY(%s)
+            """,
+            (track_ids,),
+        )
+        rows = cur.fetchall()
+    out: dict[int, list[float]] = {}
+    for track_id, embed_json in rows:
+        out[int(track_id)] = _load_embedding_json(embed_json or "")
+    return out
+
+
+def _reco_build_session_profile(conn, session_id: str) -> dict:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                e.id,
+                e.event_type,
+                e.track_id,
+                e.played_seconds,
+                EXTRACT(EPOCH FROM (NOW() - e.created_at))::DOUBLE PRECISION AS age_sec,
+                COALESCE(e.artist_id, 0),
+                COALESCE(e.album_id, 0),
+                COALESCE(alb.genre, '')
+            FROM files_reco_events e
+            LEFT JOIN files_albums alb ON alb.id = e.album_id
+            WHERE e.session_id = %s
+            ORDER BY e.created_at DESC
+            LIMIT 400
+            """,
+            (session_id,),
+        )
+        rows = cur.fetchall()
+    profile = {
+        "has_data": bool(rows),
+        "recent_track_ids": [],
+        "negative_track_ids": set(),
+        "artist_weights": defaultdict(float),
+        "genre_weights": defaultdict(float),
+        "track_weights": defaultdict(float),
+        "session_event_count": len(rows),
+    }
+    if not rows:
+        profile["centroid"] = []
+        return profile
+
+    recent_limit = 40
+    seen_recent = set()
+    for idx, row in enumerate(rows):
+        _event_id = int(row[0] or 0)
+        event_type = str(row[1] or "").strip().lower()
+        track_id = int(row[2] or 0)
+        played_seconds = int(row[3] or 0)
+        age_sec = max(0.0, float(row[4] or 0.0))
+        artist_id = int(row[5] or 0)
+        album_genre = str(row[7] or "")
+        decay = math.exp(-(age_sec / (72.0 * 3600.0)))
+        weight = _reco_event_weight(event_type, played_seconds) * decay
+
+        if track_id > 0 and track_id not in seen_recent and len(profile["recent_track_ids"]) < recent_limit:
+            profile["recent_track_ids"].append(track_id)
+            seen_recent.add(track_id)
+        if track_id > 0 and weight < -0.4:
+            profile["negative_track_ids"].add(track_id)
+        if track_id > 0 and abs(weight) > 0.01:
+            profile["track_weights"][track_id] += weight
+        if artist_id > 0 and abs(weight) > 0.01:
+            profile["artist_weights"][artist_id] += weight
+        for gt in _reco_genre_tokens(album_genre):
+            profile["genre_weights"][gt] += weight
+
+        # Extra recency emphasis on first events in the list.
+        if idx < 6 and track_id > 0:
+            profile["track_weights"][track_id] += 0.12
+
+    # Normalize artist and genre affinity to approximately [-1, 1].
+    for key in ("artist_weights", "genre_weights"):
+        mapping = profile[key]
+        if not mapping:
+            continue
+        max_abs = max(abs(v) for v in mapping.values()) or 1.0
+        for mk in list(mapping.keys()):
+            mapping[mk] = float(mapping[mk]) / float(max_abs)
+
+    positive_track_ids = [int(tid) for tid, w in profile["track_weights"].items() if w > 0.03]
+    emb_map = _reco_fetch_embeddings_map(conn, positive_track_ids)
+    centroid = [0.0] * RECO_EMBED_DIM
+    total_w = 0.0
+    for tid, weight in profile["track_weights"].items():
+        if weight <= 0.03:
+            continue
+        emb = emb_map.get(int(tid)) or []
+        if not emb:
+            continue
+        w = float(weight)
+        for i in range(min(RECO_EMBED_DIM, len(emb))):
+            centroid[i] += emb[i] * w
+        total_w += w
+    norm = math.sqrt(sum(v * v for v in centroid))
+    if norm > 0:
+        inv = 1.0 / norm
+        centroid = [v * inv for v in centroid]
+    profile["centroid"] = centroid
+    profile["positive_track_ids"] = positive_track_ids
+
+    # Keep top affinities for SQL filtering.
+    sorted_artists = sorted(
+        ((int(k), float(v)) for k, v in profile["artist_weights"].items() if v > 0.08),
+        key=lambda x: x[1],
+        reverse=True,
+    )
+    sorted_genres = sorted(
+        ((str(k), float(v)) for k, v in profile["genre_weights"].items() if v > 0.08),
+        key=lambda x: x[1],
+        reverse=True,
+    )
+    profile["top_artist_ids"] = [aid for aid, _ in sorted_artists[:12]]
+    profile["top_genres"] = [g for g, _ in sorted_genres[:10]]
+    return profile
+
+
+def _reco_fetch_candidates(conn, profile: dict, limit: int) -> list[dict]:
+    limit = max(100, min(5000, int(limit or 500)))
+    recent_track_ids = [int(x) for x in (profile.get("recent_track_ids") or []) if int(x) > 0]
+    top_artist_ids = [int(x) for x in (profile.get("top_artist_ids") or []) if int(x) > 0]
+    top_genres = [str(x or "").strip() for x in (profile.get("top_genres") or []) if str(x or "").strip()]
+
+    where_parts = ["1=1"]
+    params: list = []
+    if recent_track_ids:
+        where_parts.append("t.id <> ALL(%s)")
+        params.append(recent_track_ids[:120])
+
+    pref_parts = []
+    if top_artist_ids:
+        pref_parts.append("ar.id = ANY(%s)")
+        params.append(top_artist_ids[:24])
+    if top_genres:
+        for g in top_genres[:8]:
+            pref_parts.append("alb.genre ILIKE %s")
+            params.append(f"%{g}%")
+    if pref_parts:
+        where_parts.append("(" + " OR ".join(pref_parts) + ")")
+
+    sql = f"""
+        SELECT
+            t.id,
+            t.title,
+            t.duration_sec,
+            t.track_num,
+            alb.id AS album_id,
+            alb.title AS album_title,
+            COALESCE(alb.genre, '') AS album_genre,
+            COALESCE(alb.year, 0) AS album_year,
+            ar.id AS artist_id,
+            ar.name AS artist_name,
+            alb.has_cover,
+            COALESCE(st.play_count, 0) AS play_count,
+            COALESCE(st.completion_count, 0) AS completion_count,
+            COALESCE(st.skip_count, 0) AS skip_count,
+            COALESCE(emb.embed_json, '[]') AS embed_json
+        FROM files_tracks t
+        JOIN files_albums alb ON alb.id = t.album_id
+        JOIN files_artists ar ON ar.id = alb.artist_id
+        LEFT JOIN files_reco_track_stats st ON st.track_id = t.id
+        LEFT JOIN files_track_embeddings emb ON emb.track_id = t.id
+        WHERE {" AND ".join(where_parts)}
+        ORDER BY COALESCE(st.play_count, 0) DESC, COALESCE(alb.year, 0) DESC, t.id DESC
+        LIMIT %s
+    """
+    params.append(limit)
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+
+    # If strict preferences yielded too few tracks, widen the net.
+    if len(rows) < min(30, limit // 4):
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    t.id,
+                    t.title,
+                    t.duration_sec,
+                    t.track_num,
+                    alb.id AS album_id,
+                    alb.title AS album_title,
+                    COALESCE(alb.genre, '') AS album_genre,
+                    COALESCE(alb.year, 0) AS album_year,
+                    ar.id AS artist_id,
+                    ar.name AS artist_name,
+                    alb.has_cover,
+                    COALESCE(st.play_count, 0) AS play_count,
+                    COALESCE(st.completion_count, 0) AS completion_count,
+                    COALESCE(st.skip_count, 0) AS skip_count,
+                    COALESCE(emb.embed_json, '[]') AS embed_json
+                FROM files_tracks t
+                JOIN files_albums alb ON alb.id = t.album_id
+                JOIN files_artists ar ON ar.id = alb.artist_id
+                LEFT JOIN files_reco_track_stats st ON st.track_id = t.id
+                LEFT JOIN files_track_embeddings emb ON emb.track_id = t.id
+                ORDER BY COALESCE(st.play_count, 0) DESC, COALESCE(alb.year, 0) DESC, t.id DESC
+                LIMIT %s
+                """,
+                (limit,),
+            )
+            rows = cur.fetchall()
+
+    out = []
+    for row in rows:
+        out.append(
+            {
+                "track_id": int(row[0]),
+                "title": row[1] or "",
+                "duration_sec": int(row[2] or 0),
+                "track_num": int(row[3] or 0),
+                "album_id": int(row[4] or 0),
+                "album_title": row[5] or "",
+                "album_genre": row[6] or "",
+                "album_year": int(row[7] or 0),
+                "artist_id": int(row[8] or 0),
+                "artist_name": row[9] or "",
+                "has_cover": bool(row[10]),
+                "play_count": int(row[11] or 0),
+                "completion_count": int(row[12] or 0),
+                "skip_count": int(row[13] or 0),
+                "embedding": _load_embedding_json(row[14] or "[]"),
+            }
+        )
+    return out
+
+
+def _reco_rank_candidates(profile: dict, candidates: list[dict], limit: int) -> list[dict]:
+    limit = max(1, min(100, int(limit or 20)))
+    if not candidates:
+        return []
+    centroid = profile.get("centroid") or []
+    artist_weights = profile.get("artist_weights") or {}
+    genre_weights = profile.get("genre_weights") or {}
+    negative_track_ids = set(profile.get("negative_track_ids") or set())
+    recent_track_ids = set(profile.get("recent_track_ids") or [])
+
+    max_play_count = max((int(c.get("play_count") or 0) for c in candidates), default=0)
+    log_den = math.log1p(max_play_count) if max_play_count > 0 else 1.0
+    year_values = [int(c.get("album_year") or 0) for c in candidates if int(c.get("album_year") or 0) > 0]
+    max_year = max(year_values) if year_values else 0
+    min_year = min(year_values) if year_values else 0
+    year_span = max(1, max_year - min_year) if max_year > 0 else 1
+
+    scored: list[dict] = []
+    for c in candidates:
+        track_id = int(c.get("track_id") or 0)
+        artist_id = int(c.get("artist_id") or 0)
+        play_count = int(c.get("play_count") or 0)
+        completion_count = int(c.get("completion_count") or 0)
+        skip_count = int(c.get("skip_count") or 0)
+
+        emb = c.get("embedding") or []
+        emb_score = _vec_cosine(centroid, emb) if centroid and emb else 0.0
+        artist_affinity = float(artist_weights.get(artist_id, 0.0))
+        genre_affinity = 0.0
+        for gt in _reco_genre_tokens(c.get("album_genre") or ""):
+            genre_affinity += float(genre_weights.get(gt, 0.0))
+        genre_affinity = max(-1.0, min(1.0, genre_affinity))
+
+        pop_score = (math.log1p(play_count) / log_den) if play_count > 0 and log_den > 0 else 0.0
+        completion_rate = (float(completion_count) / float(play_count)) if play_count > 0 else 0.0
+        skip_rate = float(skip_count) / float(max(1, play_count + skip_count))
+
+        year_val = int(c.get("album_year") or 0)
+        recency = ((year_val - min_year) / year_span) if year_val > 0 and max_year > min_year else 0.0
+
+        score = (
+            0.58 * emb_score
+            + 0.18 * artist_affinity
+            + 0.12 * genre_affinity
+            + 0.06 * pop_score
+            + 0.03 * completion_rate
+            + 0.03 * recency
+            - 0.20 * skip_rate
+        )
+        if track_id in recent_track_ids:
+            score -= 0.95
+        if track_id in negative_track_ids:
+            score -= 1.25
+
+        reasons: list[str] = []
+        if emb_score >= 0.40:
+            reasons.append("embedding match")
+        if artist_affinity >= 0.20:
+            reasons.append("artist affinity")
+        if genre_affinity >= 0.20:
+            reasons.append("genre affinity")
+        if pop_score >= 0.55:
+            reasons.append("popular")
+        c["score"] = float(score)
+        c["reasons"] = reasons[:3]
+        scored.append(c)
+
+    scored.sort(key=lambda x: float(x.get("score", 0.0)), reverse=True)
+
+    # Simple diversity pass to avoid too many tracks from the same album/artist.
+    selected: list[dict] = []
+    album_seen: dict[int, int] = defaultdict(int)
+    artist_seen: dict[int, int] = defaultdict(int)
+    for cand in scored:
+        album_id = int(cand.get("album_id") or 0)
+        artist_id = int(cand.get("artist_id") or 0)
+        adjusted = float(cand.get("score") or 0.0)
+        adjusted -= 0.10 * float(album_seen.get(album_id, 0))
+        adjusted -= 0.05 * float(artist_seen.get(artist_id, 0))
+        cand["score"] = adjusted
+        if adjusted < -0.9:
+            continue
+        selected.append(cand)
+        album_seen[album_id] += 1
+        artist_seen[artist_id] += 1
+        if len(selected) >= limit:
+            break
+
+    selected.sort(key=lambda x: float(x.get("score", 0.0)), reverse=True)
+    return selected[:limit]
+
+
+def _reco_record_event(conn, session_id: str, track_id: int, event_type: str, played_seconds: int = 0) -> tuple[bool, str]:
+    et = str(event_type or "").strip().lower()
+    allowed = {"play_start", "play_partial", "play_complete", "skip", "stop", "like", "dislike"}
+    if et not in allowed:
+        return False, "unsupported event_type"
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT t.id, t.album_id, alb.artist_id
+            FROM files_tracks t
+            JOIN files_albums alb ON alb.id = t.album_id
+            WHERE t.id = %s
+            """,
+            (int(track_id or 0),),
+        )
+        row = cur.fetchone()
+        if not row:
+            return False, "track not found"
+        resolved_track_id = int(row[0] or 0)
+        album_id = int(row[1] or 0)
+        artist_id = int(row[2] or 0)
+
+        cur.execute(
+            """
+            INSERT INTO files_reco_events(session_id, track_id, album_id, artist_id, event_type, played_seconds, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, NOW())
+            """,
+            (session_id, resolved_track_id, album_id, artist_id, et, max(0, int(played_seconds or 0))),
+        )
+
+        play_inc = 1 if et in {"play_complete", "like"} else 0
+        completion_inc = 1 if et in {"play_complete", "like"} else 0
+        partial_inc = 1 if et in {"play_partial", "play_start", "stop"} else 0
+        skip_inc = 1 if et in {"skip", "dislike"} else 0
+        cur.execute(
+            """
+            INSERT INTO files_reco_track_stats(
+                track_id, play_count, completion_count, partial_count, skip_count, last_event_at, updated_at
+            )
+            VALUES (%s, %s, %s, %s, %s, NOW(), NOW())
+            ON CONFLICT (track_id) DO UPDATE
+            SET play_count = files_reco_track_stats.play_count + EXCLUDED.play_count,
+                completion_count = files_reco_track_stats.completion_count + EXCLUDED.completion_count,
+                partial_count = files_reco_track_stats.partial_count + EXCLUDED.partial_count,
+                skip_count = files_reco_track_stats.skip_count + EXCLUDED.skip_count,
+                last_event_at = NOW(),
+                updated_at = NOW()
+            """,
+            (resolved_track_id, play_inc, completion_inc, partial_inc, skip_inc),
+        )
+        cur.execute(
+            """
+            INSERT INTO files_reco_sessions(session_id, last_event_at, created_at, total_events)
+            VALUES (%s, NOW(), NOW(), 1)
+            ON CONFLICT (session_id) DO UPDATE
+            SET last_event_at = NOW(),
+                total_events = files_reco_sessions.total_events + 1
+            """,
+            (session_id,),
+        )
+    return True, "ok"
 
 # ----- Run summary tracking ---------------------------------------------------
 def _count_rows(table: str) -> int:
@@ -15872,6 +16479,350 @@ def api_library_artists_suggest():
                 }
                 for r in rows
             ],
+        }
+        _files_cache_set_json(cache_key, payload, ttl=20)
+        return jsonify(payload)
+    finally:
+        conn.close()
+
+
+@app.get("/api/library/search/suggest")
+def api_library_search_suggest():
+    """Unified typeahead search across artists, albums and tracks (Files mode)."""
+    query = (request.args.get("q") or "").strip()
+    limit = max(1, min(40, _parse_int_loose(request.args.get("limit"), 12)))
+    if not query:
+        return jsonify({"query": "", "items": []})
+    if _get_library_mode() != "files":
+        return jsonify({"query": query, "items": []})
+
+    cache_key = f"library:search:suggest:{query.lower()}:{limit}"
+    cached = _files_cache_get_json(cache_key)
+    if cached is not None:
+        return jsonify(cached)
+
+    ok, err = _ensure_files_index_ready()
+    if not ok:
+        return jsonify({"query": query, "items": [], "error": err or "Files index unavailable"}), 503
+    conn = _files_pg_connect()
+    if conn is None:
+        return jsonify({"query": query, "items": [], "error": "PostgreSQL unavailable"}), 503
+
+    like = f"%{query}%"
+    per_kind = max(8, min(120, limit * 4))
+    base_url = request.url_root.rstrip("/")
+    merged: list[dict] = []
+    try:
+        with conn.cursor() as cur:
+            # Artists
+            try:
+                cur.execute(
+                    """
+                    SELECT
+                        a.id,
+                        a.name,
+                        a.album_count,
+                        a.has_image,
+                        similarity(a.name, %s) AS score,
+                        CASE WHEN lower(a.name) LIKE lower(%s) || '%%' THEN 0 ELSE 1 END AS prefix_rank
+                    FROM files_artists a
+                    WHERE a.name ILIKE %s
+                    ORDER BY prefix_rank ASC, score DESC, a.album_count DESC, a.name ASC
+                    LIMIT %s
+                    """,
+                    (query, query, like, per_kind),
+                )
+            except Exception:
+                cur.execute(
+                    """
+                    SELECT id, name, album_count, has_image, 0.0 AS score, 1 AS prefix_rank
+                    FROM files_artists
+                    WHERE name ILIKE %s
+                    ORDER BY album_count DESC, name ASC
+                    LIMIT %s
+                    """,
+                    (like, per_kind),
+                )
+            for row in cur.fetchall():
+                artist_id = int(row[0] or 0)
+                merged.append(
+                    {
+                        "type": "artist",
+                        "artist_id": artist_id,
+                        "title": row[1] or "",
+                        "subtitle": f"{int(row[2] or 0)} album(s)",
+                        "thumb": f"{base_url}/api/library/files/artist/{artist_id}/image?size=96" if bool(row[3]) else None,
+                        "_score": float(row[4] or 0.0),
+                        "_prefix": int(row[5] or 1),
+                        "_rank": 0,
+                    }
+                )
+
+            # Albums
+            try:
+                cur.execute(
+                    """
+                    SELECT
+                        alb.id,
+                        alb.title,
+                        ar.id AS artist_id,
+                        ar.name AS artist_name,
+                        COALESCE(alb.year, 0) AS year,
+                        alb.has_cover,
+                        (similarity(alb.title, %s) * 0.78 + similarity(ar.name, %s) * 0.22) AS score,
+                        CASE
+                            WHEN lower(alb.title) LIKE lower(%s) || '%%' THEN 0
+                            WHEN lower(ar.name) LIKE lower(%s) || '%%' THEN 1
+                            ELSE 2
+                        END AS prefix_rank
+                    FROM files_albums alb
+                    JOIN files_artists ar ON ar.id = alb.artist_id
+                    WHERE alb.title ILIKE %s OR ar.name ILIKE %s
+                    ORDER BY prefix_rank ASC, score DESC, alb.track_count DESC, alb.title ASC
+                    LIMIT %s
+                    """,
+                    (query, query, query, query, like, like, per_kind),
+                )
+            except Exception:
+                cur.execute(
+                    """
+                    SELECT
+                        alb.id,
+                        alb.title,
+                        ar.id AS artist_id,
+                        ar.name AS artist_name,
+                        COALESCE(alb.year, 0) AS year,
+                        alb.has_cover,
+                        0.0 AS score,
+                        2 AS prefix_rank
+                    FROM files_albums alb
+                    JOIN files_artists ar ON ar.id = alb.artist_id
+                    WHERE alb.title ILIKE %s OR ar.name ILIKE %s
+                    ORDER BY alb.track_count DESC, alb.title ASC
+                    LIMIT %s
+                    """,
+                    (like, like, per_kind),
+                )
+            for row in cur.fetchall():
+                album_id = int(row[0] or 0)
+                artist_id = int(row[2] or 0)
+                year = int(row[4] or 0)
+                merged.append(
+                    {
+                        "type": "album",
+                        "album_id": album_id,
+                        "artist_id": artist_id,
+                        "title": row[1] or "",
+                        "subtitle": f"{row[3] or ''}{' · ' + str(year) if year > 0 else ''}",
+                        "thumb": f"{base_url}/api/library/files/album/{album_id}/cover?size=96" if bool(row[5]) else None,
+                        "_score": float(row[6] or 0.0),
+                        "_prefix": int(row[7] or 2),
+                        "_rank": 1,
+                    }
+                )
+
+            # Tracks
+            try:
+                cur.execute(
+                    """
+                    SELECT
+                        tr.id,
+                        tr.title,
+                        tr.duration_sec,
+                        tr.track_num,
+                        alb.id AS album_id,
+                        alb.title AS album_title,
+                        ar.id AS artist_id,
+                        ar.name AS artist_name,
+                        alb.has_cover,
+                        COALESCE(st.play_count, 0) AS play_count,
+                        (
+                            similarity(tr.title, %s) * 0.70 +
+                            similarity(alb.title, %s) * 0.15 +
+                            similarity(ar.name, %s) * 0.15
+                        ) AS score,
+                        CASE
+                            WHEN lower(tr.title) LIKE lower(%s) || '%%' THEN 0
+                            WHEN lower(alb.title) LIKE lower(%s) || '%%' THEN 1
+                            WHEN lower(ar.name) LIKE lower(%s) || '%%' THEN 2
+                            ELSE 3
+                        END AS prefix_rank
+                    FROM files_tracks tr
+                    JOIN files_albums alb ON alb.id = tr.album_id
+                    JOIN files_artists ar ON ar.id = alb.artist_id
+                    LEFT JOIN files_reco_track_stats st ON st.track_id = tr.id
+                    WHERE tr.title ILIKE %s OR alb.title ILIKE %s OR ar.name ILIKE %s
+                    ORDER BY prefix_rank ASC, score DESC, play_count DESC, tr.id DESC
+                    LIMIT %s
+                    """,
+                    (query, query, query, query, query, query, like, like, like, per_kind),
+                )
+            except Exception:
+                cur.execute(
+                    """
+                    SELECT
+                        tr.id,
+                        tr.title,
+                        tr.duration_sec,
+                        tr.track_num,
+                        alb.id AS album_id,
+                        alb.title AS album_title,
+                        ar.id AS artist_id,
+                        ar.name AS artist_name,
+                        alb.has_cover,
+                        0 AS play_count,
+                        0.0 AS score,
+                        3 AS prefix_rank
+                    FROM files_tracks tr
+                    JOIN files_albums alb ON alb.id = tr.album_id
+                    JOIN files_artists ar ON ar.id = alb.artist_id
+                    WHERE tr.title ILIKE %s OR alb.title ILIKE %s OR ar.name ILIKE %s
+                    ORDER BY tr.id DESC
+                    LIMIT %s
+                    """,
+                    (like, like, like, per_kind),
+                )
+            for row in cur.fetchall():
+                track_id = int(row[0] or 0)
+                album_id = int(row[4] or 0)
+                artist_id = int(row[6] or 0)
+                merged.append(
+                    {
+                        "type": "track",
+                        "track_id": track_id,
+                        "album_id": album_id,
+                        "artist_id": artist_id,
+                        "title": row[1] or "",
+                        "subtitle": f"{row[7] or ''} · {row[5] or ''}",
+                        "duration_sec": int(row[2] or 0),
+                        "track_num": int(row[3] or 0),
+                        "thumb": f"{base_url}/api/library/files/album/{album_id}/cover?size=96" if bool(row[8]) else None,
+                        "_score": float(row[10] or 0.0),
+                        "_prefix": int(row[11] or 3),
+                        "_rank": 2,
+                    }
+                )
+
+        merged.sort(
+            key=lambda x: (
+                int(x.get("_prefix", 9)),
+                -float(x.get("_score", 0.0)),
+                int(x.get("_rank", 9)),
+                str(x.get("title", "")).lower(),
+            )
+        )
+        items = []
+        for item in merged[:limit]:
+            clean = dict(item)
+            clean.pop("_score", None)
+            clean.pop("_prefix", None)
+            clean.pop("_rank", None)
+            items.append(clean)
+        payload = {"query": query, "items": items}
+        _files_cache_set_json(cache_key, payload, ttl=20)
+        return jsonify(payload)
+    finally:
+        conn.close()
+
+
+@app.post("/api/library/reco/event")
+def api_library_reco_event():
+    """Record a playback/session event for recommendation ranking (Files mode)."""
+    if _get_library_mode() != "files":
+        return jsonify({"error": "Files mode required"}), 400
+    ok, err = _ensure_files_index_ready()
+    if not ok:
+        return jsonify({"error": err or "Files index unavailable"}), 503
+    data = request.get_json() or {}
+    session_id = str(data.get("session_id") or "").strip()
+    track_id = _parse_int_loose(data.get("track_id"), 0)
+    event_type = str(data.get("event_type") or "").strip().lower()
+    played_seconds = _parse_int_loose(data.get("played_seconds"), 0)
+    if not session_id:
+        return jsonify({"error": "session_id is required"}), 400
+    if not re.match(r"^[a-zA-Z0-9._:-]{6,128}$", session_id):
+        return jsonify({"error": "Invalid session_id format"}), 400
+    if track_id <= 0:
+        return jsonify({"error": "track_id is required"}), 400
+    conn = _files_pg_connect()
+    if conn is None:
+        return jsonify({"error": "PostgreSQL unavailable"}), 503
+    try:
+        with conn:
+            success, message = _reco_record_event(conn, session_id, track_id, event_type, played_seconds)
+        if not success:
+            status = 404 if "track not found" in message else 400
+            return jsonify({"error": message}), status
+        return jsonify({"ok": True, "session_id": session_id, "track_id": track_id, "event_type": event_type})
+    finally:
+        conn.close()
+
+
+@app.get("/api/library/reco/for-you")
+def api_library_reco_for_you():
+    """Return personalized track recommendations for the active session (Files mode)."""
+    if _get_library_mode() != "files":
+        return jsonify({"session_id": "", "tracks": []})
+    ok, err = _ensure_files_index_ready()
+    if not ok:
+        return jsonify({"session_id": "", "tracks": [], "error": err or "Files index unavailable"}), 503
+
+    session_id = str(request.args.get("session_id") or "").strip()
+    limit = max(1, min(40, _parse_int_loose(request.args.get("limit"), 12)))
+    exclude_track_id = _parse_int_loose(request.args.get("exclude_track_id"), 0)
+    if session_id and not re.match(r"^[a-zA-Z0-9._:-]{6,128}$", session_id):
+        return jsonify({"error": "Invalid session_id format"}), 400
+
+    conn = _files_pg_connect()
+    if conn is None:
+        return jsonify({"session_id": session_id, "tracks": [], "error": "PostgreSQL unavailable"}), 503
+    try:
+        with conn.cursor() as cur:
+            if session_id:
+                cur.execute("SELECT COALESCE(MAX(id), 0) FROM files_reco_events WHERE session_id = %s", (session_id,))
+            else:
+                cur.execute("SELECT COALESCE(MAX(id), 0) FROM files_reco_events")
+            token = int((cur.fetchone() or [0])[0] or 0)
+        cache_key = f"library:reco:for_you:{session_id or 'global'}:{limit}:{exclude_track_id}:{token}"
+        cached = _files_cache_get_json(cache_key)
+        if cached is not None:
+            return jsonify(cached)
+
+        profile = _reco_build_session_profile(conn, session_id) if session_id else {"has_data": False}
+        candidate_limit = max(220, min(4000, limit * 90))
+        candidates = _reco_fetch_candidates(conn, profile, candidate_limit)
+        if exclude_track_id > 0:
+            candidates = [c for c in candidates if int(c.get("track_id") or 0) != int(exclude_track_id)]
+        ranked = _reco_rank_candidates(profile, candidates, limit)
+        base_url = request.url_root.rstrip("/")
+        tracks = []
+        for c in ranked:
+            track_id = int(c.get("track_id") or 0)
+            album_id = int(c.get("album_id") or 0)
+            artist_id = int(c.get("artist_id") or 0)
+            if track_id <= 0:
+                continue
+            tracks.append(
+                {
+                    "track_id": track_id,
+                    "title": c.get("title") or "",
+                    "artist_id": artist_id,
+                    "artist_name": c.get("artist_name") or "",
+                    "album_id": album_id,
+                    "album_title": c.get("album_title") or "",
+                    "duration_sec": int(c.get("duration_sec") or 0),
+                    "track_num": int(c.get("track_num") or 0),
+                    "score": round(float(c.get("score") or 0.0), 4),
+                    "reasons": c.get("reasons") or [],
+                    "thumb": f"{base_url}/api/library/files/album/{album_id}/cover?size=96" if bool(c.get("has_cover")) else None,
+                    "file_url": f"{base_url}/api/library/track/{track_id}/stream",
+                }
+            )
+        payload = {
+            "session_id": session_id,
+            "tracks": tracks,
+            "session_event_count": int(profile.get("session_event_count") or 0),
+            "algorithm": RECO_EMBED_SOURCE,
         }
         _files_cache_set_json(cache_key, payload, ttl=20)
         return jsonify(payload)
