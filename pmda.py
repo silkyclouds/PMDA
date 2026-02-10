@@ -912,6 +912,62 @@ def _parse_skip_folders(val):
     return [p for p in raw if p and not p.startswith("[")]
 
 
+def _parse_files_roots(val) -> list[str]:
+    """
+    Return FILES_ROOTS as a normalized list of directory strings.
+    Handles:
+    - list/tuple values
+    - CSV strings
+    - JSON array strings
+    - corrupted double-encoded JSON strings (e.g. "[\"[\\\"/music\\\"]\"]")
+    """
+    out: list[str] = []
+    queue: list = [val]
+    seen: set[str] = set()
+
+    while queue:
+        item = queue.pop(0)
+        if item is None:
+            continue
+        if isinstance(item, (list, tuple, set)):
+            queue.extend(list(item))
+            continue
+
+        if isinstance(item, str):
+            s = item.strip()
+            if not s:
+                continue
+
+            # Try JSON decode first (works for arrays and quoted strings).
+            if s[0] in {'[', '"'}:
+                try:
+                    parsed = json.loads(s)
+                except (json.JSONDecodeError, TypeError):
+                    parsed = None
+                if parsed is not None and parsed is not item:
+                    queue.append(parsed)
+                    continue
+
+            # CSV fallback for plain strings.
+            if "," in s:
+                parts = [p.strip() for p in s.split(",") if p.strip()]
+                if len(parts) > 1:
+                    queue.extend(parts)
+                    continue
+
+            if s and s not in seen and not s.startswith("["):
+                seen.add(s)
+                out.append(s)
+            continue
+
+        s = str(item).strip()
+        if s and s not in seen and not s.startswith("["):
+            seen.add(s)
+            out.append(s)
+
+    return out
+
+
 def _parse_format_preference_early(val):
     """Parse FORMAT_PREFERENCE for use in merged (before _parse_format_preference is defined)."""
     _default = ["dsf", "aif", "aiff", "wav", "flac", "m4a", "mp4", "m4b", "m4p", "aifc", "ogg", "opus", "mp3", "wma"]
@@ -1081,7 +1137,7 @@ merged = {
     "REPROCESS_INCOMPLETE_ALBUMS": _get("REPROCESS_INCOMPLETE_ALBUMS", default="true", cast=_parse_bool),
     # Library backend & file-library settings
     "LIBRARY_MODE": _get("LIBRARY_MODE", default="plex", cast=str),
-    "FILES_ROOTS": _get("FILES_ROOTS", default="", cast=_parse_skip_folders),
+    "FILES_ROOTS": _get("FILES_ROOTS", default="", cast=_parse_files_roots),
     "EXPORT_ROOT": _get("EXPORT_ROOT", default="", cast=str),
     "EXPORT_NAMING_TEMPLATE": _get("EXPORT_NAMING_TEMPLATE", default="", cast=str),
     "EXPORT_LINK_STRATEGY": _get("EXPORT_LINK_STRATEGY", default="hardlink", cast=str),
@@ -1095,6 +1151,8 @@ FILES_ROOTS: list[str] = merged.get("FILES_ROOTS", []) or []
 EXPORT_ROOT: str = str(merged.get("EXPORT_ROOT", "") or "").strip()
 EXPORT_NAMING_TEMPLATE: str = str(merged.get("EXPORT_NAMING_TEMPLATE", "") or "").strip()
 EXPORT_LINK_STRATEGY: str = str(merged.get("EXPORT_LINK_STRATEGY", "hardlink") or "hardlink").strip().lower()
+if EXPORT_LINK_STRATEGY not in {"hardlink", "symlink", "copy", "move"}:
+    EXPORT_LINK_STRATEGY = "hardlink"
 MEDIA_CACHE_ROOT: str = str(merged.get("MEDIA_CACHE_ROOT", PMDA_MEDIA_CACHE_ROOT or str(CONFIG_DIR / "media_cache")) or str(CONFIG_DIR / "media_cache")).strip()
 USE_MUSICBRAINZ: bool = bool(merged["USE_MUSICBRAINZ"])
 MUSICBRAINZ_EMAIL: str = merged.get("MUSICBRAINZ_EMAIL", "pmda@example.com")
@@ -3847,6 +3905,76 @@ def _parse_float_loose(value, default: float = 0.0) -> float:
             return default
 
 
+def _parse_duration_seconds_loose(value, default: float = 0.0) -> float:
+    """
+    Parse duration expressed either as seconds (float/int string) or clock style
+    strings like MM:SS / HH:MM:SS(.mmm). Returns seconds.
+    """
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    txt = str(value).strip()
+    if not txt:
+        return default
+
+    # Fast path for plain numeric values.
+    try:
+        return float(txt)
+    except Exception:
+        pass
+
+    if ":" in txt:
+        parts = [p.strip() for p in txt.split(":")]
+        try:
+            nums = [float(p) for p in parts]
+        except Exception:
+            nums = []
+        if nums:
+            if len(nums) == 3:
+                h, m, s = nums
+                return (h * 3600.0) + (m * 60.0) + s
+            if len(nums) == 2:
+                m, s = nums
+                return (m * 60.0) + s
+            if len(nums) == 1:
+                return nums[0]
+
+    return _parse_float_loose(txt, default)
+
+
+def _parse_disc_track_loose(tags: dict | None, fallback_disc: int = 1, fallback_track: int = 0) -> tuple[int, int]:
+    """
+    Parse disc/track numbers from tags while tolerating vinyl-style values (A, B1, C-2).
+    Returns (disc, track) with provided numeric fallbacks when parsing is impossible.
+    """
+    tags = tags or {}
+    raw_disc = tags.get("disc") or tags.get("discnumber")
+    raw_track = tags.get("track") or tags.get("tracknumber")
+
+    disc = _parse_int_loose(raw_disc, 0)
+    track = _parse_int_loose(raw_track, 0)
+
+    track_txt = str(raw_track or "").strip().upper()
+    if track_txt:
+        # Accept values like A, A1, B-2, C_03, etc.
+        m = re.match(r"^([A-Z])(?:\s*[-_.]?\s*(\d+))?$", track_txt)
+        if m:
+            if disc <= 0:
+                disc = (ord(m.group(1)) - ord("A")) + 1
+            if track <= 0:
+                # Side-only markers (e.g. "A") become track 1 on that side.
+                track = _parse_int_loose(m.group(2), 1)
+
+    if disc <= 0:
+        disc = fallback_disc
+    if track <= 0:
+        track = fallback_track
+
+    return disc, track
+
+
 def _split_genre_values(raw_value: str) -> list[str]:
     if not raw_value:
         return []
@@ -6153,6 +6281,7 @@ def _iter_audio_files_under_roots(roots: list[str]) -> list[Path]:
     This helper is backend‑agnostic and only cares about AUDIO_RE matches.
     """
     out: list[Path] = []
+    seen_paths: set[str] = set()
     for root in roots:
         if not root:
             continue
@@ -6163,6 +6292,10 @@ def _iter_audio_files_under_roots(roots: list[str]) -> list[Path]:
         for p in base.rglob("*"):
             try:
                 if p.is_file() and AUDIO_RE.search(p.name):
+                    sp = str(p)
+                    if sp in seen_paths:
+                        continue
+                    seen_paths.add(sp)
                     out.append(p)
             except (OSError, PermissionError):
                 continue
@@ -10302,8 +10435,7 @@ def _build_files_editions() -> tuple[list[tuple[int, str, list[int]]], int, dict
         paths_sorted: list[Path] = []
         for p in paths:
             t = extract_tags(p)
-            disc = int(t.get("disc") or t.get("discnumber") or "1")
-            trk = int(t.get("track") or t.get("tracknumber") or "0")
+            disc, trk = _parse_disc_track_loose(t, fallback_disc=1, fallback_track=0)
             paths_sorted.append((disc, trk, p))
         paths_sorted.sort(key=lambda x: (x[0], x[1], str(x[2])))
         ordered_paths = [x[2] for x in paths_sorted]
@@ -10320,9 +10452,9 @@ def _build_files_editions() -> tuple[list[tuple[int, str, list[int]]], int, dict
         for i, p in enumerate(ordered_paths):
             t = extract_tags(p)
             title = (t.get("title") or t.get("name") or p.stem or "").strip() or f"Track {i+1}"
-            disc = int(t.get("disc") or t.get("discnumber") or "1")
-            trk = int(t.get("track") or t.get("tracknumber") or str(i + 1))
-            dur_ms = int((float(t.get("duration") or 0) * 1000) or 0)
+            disc, trk = _parse_disc_track_loose(t, fallback_disc=1, fallback_track=(i + 1))
+            duration_s = _parse_duration_seconds_loose(t.get("duration") or t.get("length"), 0.0)
+            dur_ms = int(max(0.0, duration_s) * 1000.0)
             tracks.append(Track(title=title, idx=trk, disc=disc, dur=dur_ms))
 
         if not tracks:
@@ -10484,17 +10616,18 @@ def analyse_directory_structure(roots: list[str], max_samples: int = 300) -> dic
 
 
 def _run_export_library() -> None:
-    """Background worker: build export library from Files editions (hardlinks/symlinks/copies)."""
+    """Background worker: build export library from Files editions (hardlinks/symlinks/copies/moves)."""
     export_root = (EXPORT_ROOT or "").strip()
     if not export_root:
         with lock:
             state["export_progress"] = {"running": False, "error": "EXPORT_ROOT is not configured", "tracks_done": 0, "total_tracks": 0, "albums_done": 0, "total_albums": 0}
         return
     template = (EXPORT_NAMING_TEMPLATE or "").strip()
-    if not template:
-        template = "{letter}/{artist}/{album} ({year}, {format})/{track}_{artist}_{title}{ext}"
+    legacy_template = "{letter}/{artist}/{album} ({year}, {format})/{track}_{artist}_{title}{ext}"
+    if not template or template == legacy_template:
+        template = "{letter}/{artist}/{album} ({year}, {format})/{track} - {artist} - {title}{ext}"
     strategy = (EXPORT_LINK_STRATEGY or "hardlink").strip().lower()
-    if strategy not in ("hardlink", "symlink", "copy"):
+    if strategy not in ("hardlink", "symlink", "copy", "move"):
         strategy = "hardlink"
     with lock:
         state["export_progress"] = {"running": True, "tracks_done": 0, "total_tracks": 0, "albums_done": 0, "total_albums": 0, "error": None}
@@ -10540,6 +10673,9 @@ def _run_export_library() -> None:
                             shutil.copy2(src, tgt)
                     elif strategy == "symlink":
                         tgt.symlink_to(src)
+                    elif strategy == "move":
+                        if src.resolve() != tgt.resolve():
+                            shutil.move(str(src), str(tgt))
                     else:
                         import shutil
                         shutil.copy2(src, tgt)
@@ -10652,11 +10788,13 @@ def background_scan():
     if _get_library_mode() == "plex" and not PATH_MAP:
         logging.warning("background_scan(): PATH_MAP is empty after reload; albums will not resolve to container paths. Run Detect & verify in Settings.")
     logging.debug(f"background_scan(): SECTION_IDS=%s, PATH_MAP keys=%s, opening Plex DB at {PLEX_DB_FILE}", SECTION_IDS, list(PATH_MAP.keys()))
-    start_time = time.perf_counter()
+    scan_perf_start = time.perf_counter()
     all_results: Dict[str, List[dict]] = {}  # Always defined so finally can persist
     all_editions_by_artist: Dict[str, List[dict]] = {}  # For scan_editions (Library, Tag Fixer)
     scan_incremental_queue = None
     scan_incremental_writer_thread = None
+    files_live_index_last_trigger = 0.0
+    files_live_index_interval_sec = 45.0
 
     try:
         # Log cache behavior for this run so logs show whether existing cache is being used
@@ -10672,6 +10810,11 @@ def background_scan():
         # 1) Build the scan plan from the active library backend (currently Plex-only)
         artists_merged, total_albums = _build_scan_plan()
         total_artists = len(artists_merged)
+        if _get_library_mode() == "files":
+            files_live_index_last_trigger = time.time()
+            if _trigger_files_index_rebuild_async(reason="scan_started"):
+                files_live_index_last_trigger = time.time()
+                logging.info("Files library live sync: initial index rebuild started")
         log_scan(
             "SCAN %d artist(s), %d album(s)%s",
             total_artists,
@@ -10704,7 +10847,7 @@ def background_scan():
             return
 
         # Reset live state. Step-based progress: total_steps = 3*albums + 2 (+1 if auto-move).
-        start_time = time.time()
+        scan_start_epoch = time.time()
         with lock:
             state.update(scanning=True, scan_progress=0, scan_total=total_albums + 2)
             state["scan_total_albums"] = total_albums
@@ -10719,8 +10862,8 @@ def background_scan():
             state["scan_ai_enabled"] = ai_provider_ready
             state["scan_mb_enabled"] = USE_MUSICBRAINZ
             # Initialize ETA tracking
-            state["scan_start_time"] = start_time
-            state["scan_last_update_time"] = start_time
+            state["scan_start_time"] = scan_start_epoch
+            state["scan_last_update_time"] = scan_start_epoch
             state["scan_last_progress"] = 0
             state["scan_format_done_count"] = 0
             state["scan_mb_done_count"] = 0
@@ -10776,7 +10919,7 @@ def background_scan():
                  albums_without_mb_id, albums_without_artist_mb_id, entry_type)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'scan')
             """, (
-                start_time,
+                scan_start_epoch,
                 total_albums,
                 total_artists,
                 1 if ai_provider_ready else 0,
@@ -10794,7 +10937,7 @@ def background_scan():
                  albums_without_mb_id, albums_without_artist_mb_id)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                start_time,
+                scan_start_epoch,
                 total_albums,
                 total_artists,
                 1 if ai_provider_ready else 0,
@@ -10949,6 +11092,16 @@ def background_scan():
                         # Enqueue for incremental persist (duplicates + scan_editions + scan_history)
                         scan_incremental_queue.put((scan_id, artist_name, groups, all_editions_by_artist.get(artist_name, [])))
                     artists_processed += 1
+                    if _get_library_mode() == "files":
+                        now_ts = time.time()
+                        if (now_ts - files_live_index_last_trigger) >= files_live_index_interval_sec:
+                            files_live_index_last_trigger = now_ts
+                            if _trigger_files_index_rebuild_async(reason=f"scan_live_sync_{artists_processed}"):
+                                logging.debug(
+                                    "Files library live sync: triggered rebuild after %d/%d artist(s)",
+                                    artists_processed,
+                                    total_artists,
+                                )
                     # Log scan progress every 10 artists or if debug/verbose, using a tree-style line
                     if artists_processed % 10 == 0 or logging.getLogger().isEnabledFor(logging.DEBUG):
                         log_scan(
@@ -11170,13 +11323,13 @@ def background_scan():
             state["scan_progress"] = state["scan_total"]  # force 100 % before stopping
             state["scan_step_progress"] = state.get("scan_step_total", state["scan_step_progress"])  # ensure 100% for steps
             scan_id = state.get("scan_id")
-            start_time = state.get("scan_start_time", end_time)
+            scan_start_epoch = state.get("scan_start_time") or end_time
         
         # Update scan history entry (summary_json etc.); only then mark scan done
         if scan_id:
             con = sqlite3.connect(str(STATE_DB_FILE))
             cur = con.cursor()
-            duration = int(end_time - start_time) if start_time else None
+            duration = int(end_time - scan_start_epoch) if scan_start_epoch else None
             with lock:
                 duplicates_found = sum(len(groups) for groups in all_results.values())
                 artists_processed = state.get("scan_artists_processed", 0)
@@ -11575,7 +11728,7 @@ def background_scan():
                 else:
                     logging.info("Run improve after scan: no albums to improve (no scan_editions with MBID or duplicate best)")
         logging.debug("background_scan(): finished (flag cleared)")
-        duration = time.perf_counter() - start_time
+        duration = time.perf_counter() - scan_perf_start
         groups_found = sum(len(v) for v in all_results.values()) if 'all_results' in locals() else 0
         removed_dupes = get_stat("removed_dupes")
         space_saved   = get_stat("space_saved")
@@ -14523,7 +14676,14 @@ def api_config_get():
         "INCOMPLETE_ALBUMS_TARGET_DIR": get_setting("INCOMPLETE_ALBUMS_TARGET_DIR", "/dupes/incomplete_albums"),
         # Library backend and file-library settings
         "LIBRARY_MODE": get_setting("LIBRARY_MODE", LIBRARY_MODE),
-        "FILES_ROOTS": get_setting("FILES_ROOTS", ",".join(FILES_ROOTS) if isinstance(FILES_ROOTS, list) else (FILES_ROOTS or "")),
+        "FILES_ROOTS": ", ".join(
+            _parse_files_roots(
+                get_setting(
+                    "FILES_ROOTS",
+                    ",".join(FILES_ROOTS) if isinstance(FILES_ROOTS, list) else (FILES_ROOTS or ""),
+                )
+            )
+        ),
         "EXPORT_ROOT": get_setting("EXPORT_ROOT", EXPORT_ROOT),
         "EXPORT_NAMING_TEMPLATE": get_setting("EXPORT_NAMING_TEMPLATE", EXPORT_NAMING_TEMPLATE),
         "EXPORT_LINK_STRATEGY": get_setting("EXPORT_LINK_STRATEGY", EXPORT_LINK_STRATEGY),
@@ -14732,13 +14892,7 @@ def _apply_settings_in_memory(updates: dict):
             if mode == "files":
                 _trigger_files_index_rebuild_async(reason="settings_library_mode_files")
     if "FILES_ROOTS" in updates:
-        roots_val = updates["FILES_ROOTS"]
-        if isinstance(roots_val, str):
-            roots = [p.strip() for p in roots_val.split(",") if p.strip()]
-        elif isinstance(roots_val, list):
-            roots = [str(p).strip() for p in roots_val if str(p).strip()]
-        else:
-            roots = []
+        roots = _parse_files_roots(updates["FILES_ROOTS"])
         global FILES_ROOTS
         FILES_ROOTS = roots
         mod.merged["FILES_ROOTS"] = roots
@@ -14759,8 +14913,8 @@ def _apply_settings_in_memory(updates: dict):
         logging.info("EXPORT_NAMING_TEMPLATE updated in memory")
     if "EXPORT_LINK_STRATEGY" in updates:
         strat = str(updates["EXPORT_LINK_STRATEGY"] or "hardlink").strip().lower()
-        if strat not in {"hardlink", "symlink", "copy"}:
-            logging.warning("Ignoring invalid EXPORT_LINK_STRATEGY '%s' (expected hardlink/symlink/copy)", strat)
+        if strat not in {"hardlink", "symlink", "copy", "move"}:
+            logging.warning("Ignoring invalid EXPORT_LINK_STRATEGY '%s' (expected hardlink/symlink/copy/move)", strat)
         else:
             global EXPORT_LINK_STRATEGY
             EXPORT_LINK_STRATEGY = strat
@@ -14973,8 +15127,11 @@ def api_config_put():
             updates["SECTION_IDS"] = [int(x) for x in raw]
     if "SKIP_FOLDERS" in updates and isinstance(updates["SKIP_FOLDERS"], str):
         updates["SKIP_FOLDERS"] = [p.strip() for p in updates["SKIP_FOLDERS"].split(",") if p.strip()]
-    if "FILES_ROOTS" in updates and isinstance(updates["FILES_ROOTS"], str):
-        updates["FILES_ROOTS"] = [p.strip() for p in updates["FILES_ROOTS"].split(",") if p.strip()]
+    if "FILES_ROOTS" in updates:
+        updates["FILES_ROOTS"] = _parse_files_roots(updates["FILES_ROOTS"])
+    if "EXPORT_LINK_STRATEGY" in updates:
+        strategy = str(updates["EXPORT_LINK_STRATEGY"] or "hardlink").strip().lower()
+        updates["EXPORT_LINK_STRATEGY"] = strategy if strategy in {"hardlink", "symlink", "copy", "move"} else "hardlink"
     if "REQUIRED_TAGS" in updates:
         updates["REQUIRED_TAGS"] = _parse_required_tags(updates["REQUIRED_TAGS"])
     if "BROKEN_ALBUM_CONSECUTIVE_THRESHOLD" in updates:
@@ -15004,6 +15161,9 @@ def api_config_put():
             updates_for_db[k] = ",".join(str(x) for x in v) if v else ""
         elif k == "SKIP_FOLDERS" and isinstance(v, list):
             # Store as comma-separated string; load uses _parse_skip_folders (accepts JSON or CSV)
+            updates_for_db[k] = ",".join(str(p).strip() for p in v if str(p).strip()) if v else ""
+        elif k == "FILES_ROOTS" and isinstance(v, list):
+            # Store as comma-separated string to avoid double-encoded JSON values.
             updates_for_db[k] = ",".join(str(p).strip() for p in v if str(p).strip()) if v else ""
         elif isinstance(v, (dict, list)):
             updates_for_db[k] = json.dumps(v)
@@ -15047,7 +15207,7 @@ def api_config_put():
 
 @app.post("/api/files/export/rebuild")
 def api_files_export_rebuild():
-    """Start rebuilding the export library (hardlinks/symlinks/copies) in the background. Files mode only."""
+    """Start rebuilding the export library (hardlinks/symlinks/copies/moves) in the background. Files mode only."""
     if _get_library_mode() != "files":
         return jsonify({"status": "error", "message": "Export is only available in Files library mode"}), 400
     with lock:
@@ -15086,6 +15246,85 @@ def api_files_structure_overview():
         return jsonify({"templates": [], "metrics": {}, "samples": [], "sample_count": 0})
     data = analyse_directory_structure(roots)
     return jsonify(data)
+
+
+@app.get("/api/fs/list")
+def api_fs_list():
+    """
+    List subdirectories for folder navigation in the Settings UI.
+    Returns container-visible paths.
+    """
+    path_raw = str(request.args.get("path") or "").strip()
+    if not path_raw:
+        roots = _parse_files_roots(FILES_ROOTS)
+        path_raw = roots[0] if roots else "/"
+    include_hidden = bool(_parse_bool(request.args.get("hidden") or False))
+    try:
+        limit = max(20, min(1000, int(request.args.get("limit") or 300)))
+    except (TypeError, ValueError):
+        limit = 300
+
+    path_obj = Path(path_raw)
+    if not path_obj.is_absolute():
+        return jsonify({"error": "Path must be absolute"}), 400
+    path_obj = path_for_fs_access(path_obj)
+    if not path_obj.exists():
+        return jsonify({"error": "Path does not exist", "path": str(path_obj)}), 404
+    if not path_obj.is_dir():
+        return jsonify({"error": "Path is not a directory", "path": str(path_obj)}), 400
+
+    directories = []
+    truncated = False
+    try:
+        children = sorted(path_obj.iterdir(), key=lambda p: p.name.lower())
+    except PermissionError:
+        return jsonify({"error": "Permission denied", "path": str(path_obj)}), 403
+    except OSError as e:
+        return jsonify({"error": str(e), "path": str(path_obj)}), 500
+
+    for child in children:
+        try:
+            if not child.is_dir():
+                continue
+            if not include_hidden and child.name.startswith("."):
+                continue
+            directories.append({
+                "name": child.name,
+                "path": str(child),
+                "writable": bool(os.access(child, os.W_OK)),
+            })
+            if len(directories) >= limit:
+                truncated = True
+                break
+        except OSError:
+            continue
+
+    common_roots: list[str] = []
+    for candidate in [
+        *(_parse_files_roots(FILES_ROOTS) or []),
+        (EXPORT_ROOT or "").strip(),
+        (MEDIA_CACHE_ROOT or "").strip(),
+        "/music",
+        "/config",
+        "/",
+    ]:
+        c = str(candidate or "").strip()
+        if not c or c in common_roots:
+            continue
+        common_roots.append(c)
+
+    parent = None
+    if path_obj.parent != path_obj:
+        parent = str(path_obj.parent)
+
+    return jsonify({
+        "path": str(path_obj),
+        "parent": parent,
+        "writable": bool(os.access(path_obj, os.W_OK)),
+        "directories": directories,
+        "truncated": truncated,
+        "roots": common_roots,
+    })
 
 
 @app.post("/api/library/files-index/rebuild")
@@ -20675,7 +20914,7 @@ def _run_improve_all_albums_global(best_albums_list: List[dict]):
             state["last_fix_all_total_albums"] = total
             msg = state["improve_all"]["result"].get("message", "")
             logging.info("Improve-all (Magic): finished. %s", msg)
-        # Auto-export: rebuild Files hardlink library after Magic when enabled
+        # Auto-export: rebuild Files export library after Magic when enabled
         try:
             if _get_library_mode() == "files" and getattr(sys.modules[__name__], "AUTO_EXPORT_LIBRARY", False):
                 logging.info("Auto-export: rebuilding Files library after Magic run (AUTO_EXPORT_LIBRARY=True).")
