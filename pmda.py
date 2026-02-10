@@ -3587,9 +3587,10 @@ def _reco_event_weight(event_type: str, played_seconds: int) -> float:
 def _reco_build_track_embeddings(conn) -> int:
     """Rebuild deterministic per-track embeddings used for recommendation ranking."""
     inserted = 0
-    with conn.cursor() as cur:
-        cur.execute("DELETE FROM files_track_embeddings")
-        cur.execute(
+    with conn.cursor() as write_cur:
+        write_cur.execute("DELETE FROM files_track_embeddings")
+    with conn.cursor() as read_cur, conn.cursor() as write_cur:
+        read_cur.execute(
             """
             SELECT
                 tr.id,
@@ -3607,7 +3608,7 @@ def _reco_build_track_embeddings(conn) -> int:
             """
         )
         while True:
-            rows = cur.fetchmany(2000)
+            rows = read_cur.fetchmany(2000)
             if not rows:
                 break
             batch: list[tuple] = []
@@ -3633,7 +3634,7 @@ def _reco_build_track_embeddings(conn) -> int:
                     continue
                 batch.append((track_id, json.dumps(vec, separators=(",", ":")), float(norm), RECO_EMBED_SOURCE))
             if batch:
-                cur.executemany(
+                write_cur.executemany(
                     """
                     INSERT INTO files_track_embeddings(track_id, embed_json, norm, source, updated_at)
                     VALUES (%s, %s, %s, %s, NOW())
@@ -4369,6 +4370,8 @@ def _ensure_files_index_ready() -> tuple[bool, Optional[str]]:
         track_count, embedding_count = _files_index_read_track_and_embedding_counts()
         min_expected = max(1, int(track_count * 0.85)) if track_count > 0 else 0
         if track_count > 0 and embedding_count < min_expected:
+            if files_index_lock.locked():
+                return True, None
             logging.info(
                 "Files reco embeddings below threshold (%d/%d). Rebuilding embeddings...",
                 embedding_count,
