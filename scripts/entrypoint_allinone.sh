@@ -13,6 +13,35 @@ PMDA_REDIS_HOST="${PMDA_REDIS_HOST:-127.0.0.1}"
 PMDA_REDIS_PORT="${PMDA_REDIS_PORT:-6379}"
 PMDA_REDIS_DB="${PMDA_REDIS_DB:-0}"
 PMDA_REDIS_PASSWORD="${PMDA_REDIS_PASSWORD:-}"
+PMDA_PID=""
+PMDA_CLEANED_UP=0
+
+cleanup_services() {
+  if [ "${PMDA_CLEANED_UP}" = "1" ]; then
+    return
+  fi
+  PMDA_CLEANED_UP=1
+
+  set +e
+  if [ -n "${PMDA_REDIS_PASSWORD}" ]; then
+    redis-cli -h "${PMDA_REDIS_HOST}" -p "${PMDA_REDIS_PORT}" -a "${PMDA_REDIS_PASSWORD}" shutdown nosave >/dev/null 2>&1 || true
+  else
+    redis-cli -h "${PMDA_REDIS_HOST}" -p "${PMDA_REDIS_PORT}" shutdown nosave >/dev/null 2>&1 || true
+  fi
+  su -s /bin/sh postgres -c "pg_ctl -D '${PMDA_PGDATA}' -m fast stop" >/dev/null 2>&1 || true
+}
+
+forward_signal() {
+  if [ -n "${PMDA_PID}" ] && kill -0 "${PMDA_PID}" >/dev/null 2>&1; then
+    kill -TERM "${PMDA_PID}" >/dev/null 2>&1 || true
+    wait "${PMDA_PID}" >/dev/null 2>&1 || true
+  fi
+  cleanup_services
+  exit 0
+}
+
+trap forward_signal INT TERM
+trap cleanup_services EXIT
 
 if [ ! -d "/usr/lib/postgresql/${PMDA_PG_VERSION}/bin" ]; then
   DETECTED_PG_VERSION="$(ls -1 /usr/lib/postgresql 2>/dev/null | sort -V | tail -n 1 || true)"
@@ -70,4 +99,6 @@ redis-server "${REDIS_ARGS[@]}"
 export PMDA_PGDATA PMDA_PG_HOST PMDA_PG_PORT PMDA_PG_DB PMDA_PG_USER PMDA_PG_PASSWORD
 export PMDA_REDIS_HOST PMDA_REDIS_PORT PMDA_REDIS_DB PMDA_REDIS_PASSWORD
 
-exec python /app/pmda.py
+python /app/pmda.py &
+PMDA_PID="$!"
+wait "${PMDA_PID}"
