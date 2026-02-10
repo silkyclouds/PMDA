@@ -3632,7 +3632,11 @@ def _rebuild_files_library_index(reason: str = "manual", wait_if_running: bool =
                 (first_tags.get("musicbrainz_releasegroupid") or "").strip()
                 or (first_tags.get("musicbrainz_releaseid") or "").strip()
             )
-            missing_required = _check_required_tags(first_tags or {}, REQUIRED_TAGS)
+            missing_required = _check_required_tags(
+                first_tags or {},
+                REQUIRED_TAGS,
+                edition={"tracks": [{"title": t.get("title"), "index": t.get("track_num")} for t in track_entries]},
+            )
 
             albums_payload.append({
                 "artist_norm": artist_norm,
