@@ -5,5 +5,7 @@ musicbrainzngs>=0.7.1
 anthropic>=0.18.0
 google-generativeai>=0.3.0
 mutagen>=1.47.0
+Pillow>=9.0.0
 discogs-client>=2.3.0
 pylast>=5.1.0
+pyacoustid>=1.2.0

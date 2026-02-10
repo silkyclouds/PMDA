@@ -9466,6 +9466,55 @@ def background_scan():
             )
             summary["steps_executed"] = steps_executed
             summary["scan_steps_log"] = state.get("scan_steps_log") or []
+
+            # Emit a compact end-of-scan stats block in logs for quick troubleshooting.
+            def _pct(n: int, d: int) -> str:
+                return "n/a" if d <= 0 else f"{(100.0 * float(n) / float(d)):.1f}%"
+
+            albums_with_complete_tags = max(0, albums_scanned - albums_without_complete_tags)
+            albums_with_cover = max(0, albums_scanned - albums_without_album_image)
+            albums_with_artist_image = max(0, albums_scanned - albums_without_artist_image)
+            bar = "─" * 85
+            logging.info("%s", bar)
+            logging.info("SCAN SUMMARY [scan_id=%s, status=%s]", scan_id, status)
+            logging.info("Artists processed        : %s / %s", artists_processed, artists_total)
+            logging.info("Albums scanned           : %s", albums_scanned)
+            logging.info(
+                "Albums with all tags     : %s / %s (%s)",
+                albums_with_complete_tags, albums_scanned, _pct(albums_with_complete_tags, albums_scanned)
+            )
+            logging.info(
+                "Albums with cover art    : %s / %s (%s)",
+                albums_with_cover, albums_scanned, _pct(albums_with_cover, albums_scanned)
+            )
+            logging.info(
+                "Albums with artist image : %s / %s (%s)",
+                albums_with_artist_image, albums_scanned, _pct(albums_with_artist_image, albums_scanned)
+            )
+            logging.info(
+                "MB coverage              : %s / %s (%s)",
+                albums_with_mb, albums_scanned, _pct(albums_with_mb, albums_scanned)
+            )
+            logging.info(
+                "Fallback matches         : Discogs=%s Last.fm=%s Bandcamp=%s",
+                scan_discogs_matched, scan_lastfm_matched, scan_bandcamp_matched
+            )
+            logging.info(
+                "Duplicates               : groups=%s editions=%s moved=%s",
+                duplicate_groups_count, total_duplicates_count, albums_moved_this_scan
+            )
+            logging.info("Space saved (this scan)  : %s MB", space_saved_mb_this_scan)
+            logging.info(
+                "Cover sources            : MB=%s Discogs=%s Last.fm=%s Bandcamp=%s Web=%s",
+                cover_from_mb, cover_from_discogs, cover_from_lastfm, cover_from_bandcamp, cover_from_web
+            )
+            logging.info(
+                "Cache hit/miss           : audio=%s/%s MB=%s/%s",
+                audio_hits, audio_misses, mb_hits, mb_misses
+            )
+            logging.info("Duration                 : %ss", duration if duration is not None else "n/a")
+            logging.info("%s", bar)
+
             summary_json_str = json.dumps(summary)
             cur.execute("""
                 UPDATE scan_history

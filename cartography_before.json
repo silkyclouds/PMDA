@@ -1,0 +1,827 @@
+{
+  "root": "/music/pmda_tests",
+  "album_count": 48,
+  "albums": [
+    {
+      "path": "/music/pmda_tests/Ochre/A Midsummer Nice Dream (Flac,  Album)  (15th Anniversary Edition (streaming release with different barcode))",
+      "artist": "Ochre",
+      "album": "A Midsummer Nice Dream (Flac,  Album)  (15th Anniversary Edition (streaming release with different barcode))",
+      "track_count": 16,
+      "has_cover_file": true,
+      "has_embedded_cover": true,
+      "tags": {
+        "artist": "Ochre",
+        "album": "A Midsummer Nice Dream",
+        "date": "2019",
+        "musicbrainz_releasegroupid": "610a2c93-c64f-3658-b566-ba26b7d99a77",
+        "musicbrainz_releaseid": "",
+        "musicbrainz_albumartistid": "8c40eedf-e858-4208-bcc7-05e45bc76646"
+      },
+      "first_file": "Ochre - A Midsummer Nice Dream - 01 - Yugen.flac"
+    },
+    {
+      "path": "/music/pmda_tests/Ochre/An Eye To Windward (Flac,  Album)",
+      "artist": "Ochre",
+      "album": "An Eye To Windward (Flac,  Album)",
+      "track_count": 10,
+      "has_cover_file": true,
+      "has_embedded_cover": true,
+      "tags": {
+        "artist": "Ochre",
+        "album": "An Eye To Windward",
+        "date": "2021",
+        "musicbrainz_releasegroupid": "68a4eb8b-503b-4bfb-bae8-9bcb5faf5b0f",
+        "musicbrainz_releaseid": "",
+        "musicbrainz_albumartistid": "8c40eedf-e858-4208-bcc7-05e45bc76646"
+      },
+      "first_file": "Ochre - An Eye To Windward - 01 - First Builders.flac"
+    },
+    {
+      "path": "/music/pmda_tests/Ochre/AudioMicroDevice (Mp3,  Album)",
+      "artist": "Ochre",
+      "album": "AudioMicroDevice (Mp3,  Album)",
+      "track_count": 11,
+      "has_cover_file": true,
+      "has_embedded_cover": true,
+      "tags": {
+        "artist": "Ochre",
+        "album": "AudioMicroDevice",
+        "date": "2008",
+        "musicbrainz_releasegroupid": "",
+        "musicbrainz_releaseid": "",
+        "musicbrainz_albumartistid": ""
+      },
+      "first_file": "Ochre - AudioMicroDevice - 01 - Low Grav Freefall.mp3"
+    },
+    {
+      "path": "/music/pmda_tests/Ochre/AudioNanoDevice (Flac,  EP)",
+      "artist": "Ochre",
+      "album": "AudioNanoDevice (Flac,  EP)",
+      "track_count": 3,
+      "has_cover_file": true,
+      "has_embedded_cover": true,
+      "tags": {
+        "artist": "Ochre",
+        "album": "AudioNanoDevice",
+        "date": "2001",
+        "musicbrainz_releasegroupid": "af62534b-790c-4d5c-bafa-ddc7f270499a",
+        "musicbrainz_releaseid": "",
+        "musicbrainz_albumartistid": "8c40eedf-e858-4208-bcc7-05e45bc76646"
+      },
+      "first_file": "Ochre - AudioNanoDevice - 01 - Low Grav Freefall (High Altitude mix).flac"
+    },
+    {
+      "path": "/music/pmda_tests/Ochre/Auratic Artefacts (Flac,  EP)",
+      "artist": "Ochre",
+      "album": "Auratic Artefacts (Flac,  EP)",
+      "track_count": 4,
+      "has_cover_file": true,
+      "has_embedded_cover": true,
+      "tags": {
+        "artist": "Ochre",
+        "album": "Auratic Artefacts",
+        "date": "2017",
+        "musicbrainz_releasegroupid": "f2424266-d68e-4a25-987f-f128adb23bbb",
+        "musicbrainz_releaseid": "",
+        "musicbrainz_albumartistid": "8c40eedf-e858-4208-bcc7-05e45bc76646"
+      },
+      "first_file": "Ochre - Auratic Artefacts - 01 - Awaiting the Green Morning.flac"
+    },
+    {
+      "path": "/music/pmda_tests/Ochre/Awakenings (Flac,  EP)",
+      "artist": "Ochre",
+      "album": "Awakenings (Flac,  EP)",
+      "track_count": 6,
+      "has_cover_file": true,
+      "has_embedded_cover": true,
+      "tags": {
+        "artist": "Ochre",
+        "album": "Awakenings",
+        "date": "2001",
+        "musicbrainz_releasegroupid": "b9440a7a-6fdc-4e1d-830a-3661d26a1e20",
+        "musicbrainz_releaseid": "",
+        "musicbrainz_albumartistid": "1419e5c1-bc72-4065-a966-1ec0658aec12"
+      },
+      "first_file": "Ochre - Awakenings - 01 - Witness.flac"
+    },
+    {
+      "path": "/music/pmda_tests/Ochre/Beyond the Outer Loop (Mp3,  Album)  (Web Release with Bonus Tracks)",
+      "artist": "Ochre",
+      "album": "Beyond the Outer Loop (Mp3,  Album)  (Web Release with Bonus Tracks)",
+      "track_count": 15,
+      "has_cover_file": true,
+      "has_embedded_cover": true,
+      "tags": {
+        "artist": "Ochre",
+        "album": "Beyond the Outer Loop",
+        "date": "2017",
+        "musicbrainz_releasegroupid": "",
+        "musicbrainz_releaseid": "",
+        "musicbrainz_albumartistid": ""
+      },
+      "first_file": "Ochre - Beyond the Outer Loop - 01 - Anaphora.mp3"
+    },
+    {
+      "path": "/music/pmda_tests/Ochre/Early Learning (Flac,  Album Compilation)",
+      "artist": "Ochre",
+      "album": "Early Learning (Flac,  Album Compilation)",
+      "track_count": 14,
+      "has_cover_file": true,
+      "has_embedded_cover": true,
+      "tags": {
+        "artist": "Ochre",
+        "album": "Early Learning",
+        "date": "2011",
+        "musicbrainz_releasegroupid": "1134a451-f25f-490b-aa9d-d0c12c44abe3",
+        "musicbrainz_releaseid": "",
+        "musicbrainz_albumartistid": "8c40eedf-e858-4208-bcc7-05e45bc76646"
+      },
+      "first_file": "Ochre - Early Learning - 01 - Low Grav Freefall.flac"
+    },
+    {
+      "path": "/music/pmda_tests/Ochre/Horizon (Flac,  EP)",
+      "artist": "Ochre",
+      "album": "Horizon (Flac,  EP)",
+      "track_count": 5,
+      "has_cover_file": true,
+      "has_embedded_cover": true,
+      "tags": {
+        "artist": "Ochre",
+        "album": "Horizon",
+        "date": "2002",
+        "musicbrainz_releasegroupid": "aa062c8f-5865-4914-8401-6ecfccc3ce70",
+        "musicbrainz_releaseid": "",
+        "musicbrainz_albumartistid": "1419e5c1-bc72-4065-a966-1ec0658aec12"
+      },
+      "first_file": "Ochre - Horizon - 01 - Accept Control.flac"
+    },
+    {
+      "path": "/music/pmda_tests/Ochre/Isolette (Mp3,  EP)",
+      "artist": "Ochre",
+      "album": "Isolette (Mp3,  EP)",
+      "track_count": 7,
+      "has_cover_file": true,
+      "has_embedded_cover": true,
+      "tags": {
+        "artist": "Ochre",
+        "album": "Isolette",
+        "date": "2015",
+        "musicbrainz_releasegroupid": "",
+        "musicbrainz_releaseid": "",
+        "musicbrainz_albumartistid": ""
+      },
+      "first_file": "Ochre - Isolette - 01 - Paper Unicorn.mp3"
+    },
+    {
+      "path": "/music/pmda_tests/Ochre/Like Dust of the Balance (Flac,  Album)",
+      "artist": "Ochre",
+      "album": "Like Dust of the Balance (Flac,  Album)",
+      "track_count": 10,
+      "has_cover_file": true,
+      "has_embedded_cover": true,
+      "tags": {
+        "artist": "Ochre",
+        "album": "Like Dust of the Balance",
+        "date": "2009",
+        "musicbrainz_releasegroupid": "70eedf6c-957a-4b0b-928a-bd0667f293b5",
+        "musicbrainz_releaseid": "",
+        "musicbrainz_albumartistid": "8c40eedf-e858-4208-bcc7-05e45bc76646"
+      },
+      "first_file": "Ochre - Like Dust of the Balance - 01 - Circadies.flac"
+    },
+    {
+      "path": "/music/pmda_tests/Ochre/Live At Delectronica (London, 2005) (Flac,  Other Live)",
+      "artist": "Ochre",
+      "album": "Live At Delectronica (London, 2005) (Flac,  Other Live)",
+      "track_count": 18,
+      "has_cover_file": true,
+      "has_embedded_cover": true,
+      "tags": {
+        "artist": "Ochre",
+        "album": "Live At Delectronica (London, 2005)",
+        "date": "2017",
+        "musicbrainz_releasegroupid": "",
+        "musicbrainz_releaseid": "",
+        "musicbrainz_albumartistid": ""
+      },
+      "first_file": "Ochre - Live At Delectronica (London, 2005) - 01 - [Intro].flac"
+    },
+    {
+      "path": "/music/pmda_tests/Ochre/Live At IXMAE (London, 2006) (1) (Flac,  Other Live)",
+      "artist": "Ochre",
+      "album": "Live At IXMAE (London, 2006) (1) (Flac,  Other Live)",
+      "track_count": 7,
+      "has_cover_file": true,
+      "has_embedded_cover": true,
+      "tags": {
+        "artist": "Ochre",
+        "album": "Live At IXMAE (London, 2006)",
+        "date": "2017",
+        "musicbrainz_releasegroupid": "",
+        "musicbrainz_releaseid": "",
+        "musicbrainz_albumartistid": ""
+      },
+      "first_file": "Ochre - Live At IXMAE (London, 2006) - 01 - Beneath Fleeting Visions.flac"
+    },
+    {
+      "path": "/music/pmda_tests/Ochre/Live At Mindcamp (Utrecht, 2014) (Flac,  Other Live)",
+      "artist": "Ochre",
+      "album": "Live At Mindcamp (Utrecht, 2014) (Flac,  Other Live)",
+      "track_count": 13,
+      "has_cover_file": true,
+      "has_embedded_cover": true,
+      "tags": {
+        "artist": "Ochre",
+        "album": "Live At Mindcamp (Utrecht, 2014)",
+        "date": "2017",
+        "musicbrainz_releasegroupid": "",
+        "musicbrainz_releaseid": "",
+        "musicbrainz_albumartistid": ""
+      },
+      "first_file": "Ochre - Live At Mindcamp (Utrecht, 2014) - 01 - Paper Unicorn.flac"
+    },
+    {
+      "path": "/music/pmda_tests/Ochre/Live At Prototype (Aarhus, 2007) (1) (Flac,  Other Live)",
+      "artist": "Ochre",
+      "album": "Live At Prototype (Aarhus, 2007) (1) (Flac,  Other Live)",
+      "track_count": 13,
+      "has_cover_file": true,
+      "has_embedded_cover": true,
+      "tags": {
+        "artist": "Ochre",
+        "album": "Live At Prototype (Aarhus, 2007)",
+        "date": "2017",
+        "musicbrainz_releasegroupid": "",
+        "musicbrainz_releaseid": "",
+        "musicbrainz_albumartistid": ""
+      },
+      "first_file": "Ochre - Live At Prototype (Aarhus, 2007) - 01 - Beneath Fleeting Visions.flac"
+    },
+    {
+      "path": "/music/pmda_tests/Ochre/Live At STFU (Manchester, 2005) (Flac,  Other Live)",
+      "artist": "Ochre",
+      "album": "Live At STFU (Manchester, 2005) (Flac,  Other Live)",
+      "track_count": 13,
+      "has_cover_file": true,
+      "has_embedded_cover": true,
+      "tags": {
+        "artist": "Ochre",
+        "album": "Live At STFU (Manchester, 2005)",
+        "date": "2017",
+        "musicbrainz_releasegroupid": "",
+        "musicbrainz_releaseid": "",
+        "musicbrainz_albumartistid": ""
+      },
+      "first_file": "Ochre - Live At STFU (Manchester, 2005) - 01 - Copacetia.flac"
+    },
+    {
+      "path": "/music/pmda_tests/Ochre/National Ignition (Mp3,  Album)",
+      "artist": "Ochre",
+      "album": "National Ignition (Mp3,  Album)",
+      "track_count": 10,
+      "has_cover_file": true,
+      "has_embedded_cover": true,
+      "tags": {
+        "artist": "Ochre",
+        "album": "National Ignition",
+        "date": "2013",
+        "musicbrainz_releasegroupid": "",
+        "musicbrainz_releaseid": "",
+        "musicbrainz_albumartistid": ""
+      },
+      "first_file": "Ochre - National Ignition - 01 - Blue Hours.mp3"
+    },
+    {
+      "path": "/music/pmda_tests/Ochre/Night Cycle (Flac,  Album)",
+      "artist": "Ochre",
+      "album": "Night Cycle (Flac,  Album)",
+      "track_count": 4,
+      "has_cover_file": false,
+      "has_embedded_cover": true,
+      "tags": {
+        "artist": "Ochre",
+        "album": "Night Cycle",
+        "date": "2025",
+        "musicbrainz_releasegroupid": "",
+        "musicbrainz_releaseid": "",
+        "musicbrainz_albumartistid": "8c40eedf-e858-4208-bcc7-05e45bc76646"
+      },
+      "first_file": "Ochre - Night Cycle - 01 - Night Cycle.flac"
+    },
+    {
+      "path": "/music/pmda_tests/Ochre/Petl EP (Flac,  EP)",
+      "artist": "Ochre",
+      "album": "Petl EP (Flac,  EP)",
+      "track_count": 4,
+      "has_cover_file": true,
+      "has_embedded_cover": true,
+      "tags": {
+        "artist": "Ochre",
+        "album": "Petl EP",
+        "date": "2009",
+        "musicbrainz_releasegroupid": "37732e3a-ec17-4fa9-897e-db3e4e07c117",
+        "musicbrainz_releaseid": "",
+        "musicbrainz_albumartistid": "8c40eedf-e858-4208-bcc7-05e45bc76646"
+      },
+      "first_file": "Ochre - Petl EP - 01 - Petl.flac"
+    },
+    {
+      "path": "/music/pmda_tests/Ochre/Sound System Bangers, Volume 01 (Flac,  EP)",
+      "artist": "Ochre",
+      "album": "Sound System Bangers, Volume 01 (Flac,  EP)",
+      "track_count": 5,
+      "has_cover_file": true,
+      "has_embedded_cover": true,
+      "tags": {
+        "artist": "Ochre",
+        "album": "Sound System Bangers, Volume 01",
+        "date": "2003",
+        "musicbrainz_releasegroupid": "fd56e2ec-f783-3d03-9a94-3575db059e78",
+        "musicbrainz_releaseid": "",
+        "musicbrainz_albumartistid": "8c40eedf-e858-4208-bcc7-05e45bc76646"
+      },
+      "first_file": "Ochre - Sound System Bangers, Volume 01 - 01 - Low Grav Freefall.flac"
+    },
+    {
+      "path": "/music/pmda_tests/Ochre/Understory (Flac,  EP)",
+      "artist": "Ochre",
+      "album": "Understory (Flac,  EP)",
+      "track_count": 7,
+      "has_cover_file": true,
+      "has_embedded_cover": true,
+      "tags": {
+        "artist": "Ochre",
+        "album": "Understory",
+        "date": "2020",
+        "musicbrainz_releasegroupid": "4b7743d2-c414-4b49-8a55-e76ebc02012f",
+        "musicbrainz_releaseid": "",
+        "musicbrainz_albumartistid": "8c40eedf-e858-4208-bcc7-05e45bc76646"
+      },
+      "first_file": "Ochre - Understory - 01 - Penfield Mishap.flac"
+    },
+    {
+      "path": "/music/pmda_tests/Ochre/Volume I (Mp3,  Album Compilation)",
+      "artist": "Ochre",
+      "album": "Volume I (Mp3,  Album Compilation)",
+      "track_count": 10,
+      "has_cover_file": true,
+      "has_embedded_cover": true,
+      "tags": {
+        "artist": "Ochre",
+        "album": "Volume I",
+        "date": "2008",
+        "musicbrainz_releasegroupid": "",
+        "musicbrainz_releaseid": "",
+        "musicbrainz_albumartistid": ""
+      },
+      "first_file": "Ochre - Volume I - 01 - Ourcade.mp3"
+    },
+    {
+      "path": "/music/pmda_tests/Ochre/Volume II (Mp3,  Album Compilation)",
+      "artist": "Ochre",
+      "album": "Volume II (Mp3,  Album Compilation)",
+      "track_count": 9,
+      "has_cover_file": true,
+      "has_embedded_cover": true,
+      "tags": {
+        "artist": "Ochre",
+        "album": "Volume II",
+        "date": "2008",
+        "musicbrainz_releasegroupid": "",
+        "musicbrainz_releaseid": "",
+        "musicbrainz_albumartistid": ""
+      },
+      "first_file": "Ochre - Volume II - 01 - Flexenbend.mp3"
+    },
+    {
+      "path": "/music/pmda_tests/Ochre/Volume III (Mp3,  Album Compilation)",
+      "artist": "Ochre",
+      "album": "Volume III (Mp3,  Album Compilation)",
+      "track_count": 8,
+      "has_cover_file": true,
+      "has_embedded_cover": true,
+      "tags": {
+        "artist": "Ochre",
+        "album": "Volume III",
+        "date": "2008",
+        "musicbrainz_releasegroupid": "",
+        "musicbrainz_releaseid": "",
+        "musicbrainz_albumartistid": ""
+      },
+      "first_file": "Ochre - Volume III - 01 - Piano No. 2.mp3"
+    },
+    {
+      "path": "/music/pmda_tests/Ochre2/A Midsummer Nice Dream (Flac,  Album)  (15th Anniversary Edition (streaming release with different barcode))",
+      "artist": "Ochre2",
+      "album": "A Midsummer Nice Dream (Flac,  Album)  (15th Anniversary Edition (streaming release with different barcode))",
+      "track_count": 16,
+      "has_cover_file": true,
+      "has_embedded_cover": true,
+      "tags": {
+        "artist": "Ochre",
+        "album": "A Midsummer Nice Dream",
+        "date": "2019",
+        "musicbrainz_releasegroupid": "610a2c93-c64f-3658-b566-ba26b7d99a77",
+        "musicbrainz_releaseid": "",
+        "musicbrainz_albumartistid": "8c40eedf-e858-4208-bcc7-05e45bc76646"
+      },
+      "first_file": "Ochre - A Midsummer Nice Dream - 01 - Yugen.flac"
+    },
+    {
+      "path": "/music/pmda_tests/Ochre2/An Eye To Windward (Flac,  Album)",
+      "artist": "Ochre2",
+      "album": "An Eye To Windward (Flac,  Album)",
+      "track_count": 10,
+      "has_cover_file": true,
+      "has_embedded_cover": true,
+      "tags": {
+        "artist": "Ochre",
+        "album": "An Eye To Windward",
+        "date": "2021",
+        "musicbrainz_releasegroupid": "68a4eb8b-503b-4bfb-bae8-9bcb5faf5b0f",
+        "musicbrainz_releaseid": "",
+        "musicbrainz_albumartistid": "8c40eedf-e858-4208-bcc7-05e45bc76646"
+      },
+      "first_file": "Ochre - An Eye To Windward - 01 - First Builders.flac"
+    },
+    {
+      "path": "/music/pmda_tests/Ochre2/AudioMicroDevice (Mp3,  Album)",
+      "artist": "Ochre2",
+      "album": "AudioMicroDevice (Mp3,  Album)",
+      "track_count": 11,
+      "has_cover_file": true,
+      "has_embedded_cover": true,
+      "tags": {
+        "artist": "Ochre",
+        "album": "AudioMicroDevice",
+        "date": "2008",
+        "musicbrainz_releasegroupid": "",
+        "musicbrainz_releaseid": "",
+        "musicbrainz_albumartistid": ""
+      },
+      "first_file": "Ochre - AudioMicroDevice - 01 - Low Grav Freefall.mp3"
+    },
+    {
+      "path": "/music/pmda_tests/Ochre2/AudioNanoDevice (Flac,  EP)",
+      "artist": "Ochre2",
+      "album": "AudioNanoDevice (Flac,  EP)",
+      "track_count": 3,
+      "has_cover_file": true,
+      "has_embedded_cover": true,
+      "tags": {
+        "artist": "Ochre",
+        "album": "AudioNanoDevice",
+        "date": "2001",
+        "musicbrainz_releasegroupid": "af62534b-790c-4d5c-bafa-ddc7f270499a",
+        "musicbrainz_releaseid": "",
+        "musicbrainz_albumartistid": "8c40eedf-e858-4208-bcc7-05e45bc76646"
+      },
+      "first_file": "Ochre - AudioNanoDevice - 01 - Low Grav Freefall (High Altitude mix).flac"
+    },
+    {
+      "path": "/music/pmda_tests/Ochre2/Auratic Artefacts (Flac,  EP)",
+      "artist": "Ochre2",
+      "album": "Auratic Artefacts (Flac,  EP)",
+      "track_count": 4,
+      "has_cover_file": true,
+      "has_embedded_cover": true,
+      "tags": {
+        "artist": "Ochre",
+        "album": "Auratic Artefacts",
+        "date": "2017",
+        "musicbrainz_releasegroupid": "f2424266-d68e-4a25-987f-f128adb23bbb",
+        "musicbrainz_releaseid": "",
+        "musicbrainz_albumartistid": "8c40eedf-e858-4208-bcc7-05e45bc76646"
+      },
+      "first_file": "Ochre - Auratic Artefacts - 01 - Awaiting the Green Morning.flac"
+    },
+    {
+      "path": "/music/pmda_tests/Ochre2/Awakenings (Flac,  EP)",
+      "artist": "Ochre2",
+      "album": "Awakenings (Flac,  EP)",
+      "track_count": 6,
+      "has_cover_file": true,
+      "has_embedded_cover": true,
+      "tags": {
+        "artist": "Ochre",
+        "album": "Awakenings",
+        "date": "2001",
+        "musicbrainz_releasegroupid": "b9440a7a-6fdc-4e1d-830a-3661d26a1e20",
+        "musicbrainz_releaseid": "",
+        "musicbrainz_albumartistid": "1419e5c1-bc72-4065-a966-1ec0658aec12"
+      },
+      "first_file": "Ochre - Awakenings - 01 - Witness.flac"
+    },
+    {
+      "path": "/music/pmda_tests/Ochre2/Beyond the Outer Loop (Mp3,  Album)  (Web Release with Bonus Tracks)",
+      "artist": "Ochre2",
+      "album": "Beyond the Outer Loop (Mp3,  Album)  (Web Release with Bonus Tracks)",
+      "track_count": 15,
+      "has_cover_file": true,
+      "has_embedded_cover": true,
+      "tags": {
+        "artist": "Ochre",
+        "album": "Beyond the Outer Loop",
+        "date": "2017",
+        "musicbrainz_releasegroupid": "",
+        "musicbrainz_releaseid": "",
+        "musicbrainz_albumartistid": ""
+      },
+      "first_file": "Ochre - Beyond the Outer Loop - 01 - Anaphora.mp3"
+    },
+    {
+      "path": "/music/pmda_tests/Ochre2/Early Learning (Flac,  Album Compilation)",
+      "artist": "Ochre2",
+      "album": "Early Learning (Flac,  Album Compilation)",
+      "track_count": 14,
+      "has_cover_file": true,
+      "has_embedded_cover": true,
+      "tags": {
+        "artist": "Ochre",
+        "album": "Early Learning",
+        "date": "2011",
+        "musicbrainz_releasegroupid": "1134a451-f25f-490b-aa9d-d0c12c44abe3",
+        "musicbrainz_releaseid": "",
+        "musicbrainz_albumartistid": "8c40eedf-e858-4208-bcc7-05e45bc76646"
+      },
+      "first_file": "Ochre - Early Learning - 01 - Low Grav Freefall.flac"
+    },
+    {
+      "path": "/music/pmda_tests/Ochre2/Horizon (Flac,  EP)",
+      "artist": "Ochre2",
+      "album": "Horizon (Flac,  EP)",
+      "track_count": 5,
+      "has_cover_file": true,
+      "has_embedded_cover": true,
+      "tags": {
+        "artist": "Ochre",
+        "album": "Horizon",
+        "date": "2002",
+        "musicbrainz_releasegroupid": "aa062c8f-5865-4914-8401-6ecfccc3ce70",
+        "musicbrainz_releaseid": "",
+        "musicbrainz_albumartistid": "1419e5c1-bc72-4065-a966-1ec0658aec12"
+      },
+      "first_file": "Ochre - Horizon - 01 - Accept Control.flac"
+    },
+    {
+      "path": "/music/pmda_tests/Ochre2/Isolette (Mp3,  EP)",
+      "artist": "Ochre2",
+      "album": "Isolette (Mp3,  EP)",
+      "track_count": 7,
+      "has_cover_file": true,
+      "has_embedded_cover": true,
+      "tags": {
+        "artist": "Ochre",
+        "album": "Isolette",
+        "date": "2015",
+        "musicbrainz_releasegroupid": "",
+        "musicbrainz_releaseid": "",
+        "musicbrainz_albumartistid": ""
+      },
+      "first_file": "Ochre - Isolette - 01 - Paper Unicorn.mp3"
+    },
+    {
+      "path": "/music/pmda_tests/Ochre2/Like Dust of the Balance (Flac,  Album)",
+      "artist": "Ochre2",
+      "album": "Like Dust of the Balance (Flac,  Album)",
+      "track_count": 10,
+      "has_cover_file": true,
+      "has_embedded_cover": true,
+      "tags": {
+        "artist": "Ochre",
+        "album": "Like Dust of the Balance",
+        "date": "2009",
+        "musicbrainz_releasegroupid": "70eedf6c-957a-4b0b-928a-bd0667f293b5",
+        "musicbrainz_releaseid": "",
+        "musicbrainz_albumartistid": "8c40eedf-e858-4208-bcc7-05e45bc76646"
+      },
+      "first_file": "Ochre - Like Dust of the Balance - 01 - Circadies.flac"
+    },
+    {
+      "path": "/music/pmda_tests/Ochre2/Live At Delectronica (London, 2005) (Flac,  Other Live)",
+      "artist": "Ochre2",
+      "album": "Live At Delectronica (London, 2005) (Flac,  Other Live)",
+      "track_count": 18,
+      "has_cover_file": true,
+      "has_embedded_cover": true,
+      "tags": {
+        "artist": "Ochre",
+        "album": "Live At Delectronica (London, 2005)",
+        "date": "2017",
+        "musicbrainz_releasegroupid": "",
+        "musicbrainz_releaseid": "",
+        "musicbrainz_albumartistid": ""
+      },
+      "first_file": "Ochre - Live At Delectronica (London, 2005) - 01 - [Intro].flac"
+    },
+    {
+      "path": "/music/pmda_tests/Ochre2/Live At IXMAE (London, 2006) (1) (Flac,  Other Live)",
+      "artist": "Ochre2",
+      "album": "Live At IXMAE (London, 2006) (1) (Flac,  Other Live)",
+      "track_count": 7,
+      "has_cover_file": true,
+      "has_embedded_cover": true,
+      "tags": {
+        "artist": "Ochre",
+        "album": "Live At IXMAE (London, 2006)",
+        "date": "2017",
+        "musicbrainz_releasegroupid": "",
+        "musicbrainz_releaseid": "",
+        "musicbrainz_albumartistid": ""
+      },
+      "first_file": "Ochre - Live At IXMAE (London, 2006) - 01 - Beneath Fleeting Visions.flac"
+    },
+    {
+      "path": "/music/pmda_tests/Ochre2/Live At Mindcamp (Utrecht, 2014) (Flac,  Other Live)",
+      "artist": "Ochre2",
+      "album": "Live At Mindcamp (Utrecht, 2014) (Flac,  Other Live)",
+      "track_count": 13,
+      "has_cover_file": true,
+      "has_embedded_cover": true,
+      "tags": {
+        "artist": "Ochre",
+        "album": "Live At Mindcamp (Utrecht, 2014)",
+        "date": "2017",
+        "musicbrainz_releasegroupid": "",
+        "musicbrainz_releaseid": "",
+        "musicbrainz_albumartistid": ""
+      },
+      "first_file": "Ochre - Live At Mindcamp (Utrecht, 2014) - 01 - Paper Unicorn.flac"
+    },
+    {
+      "path": "/music/pmda_tests/Ochre2/Live At Prototype (Aarhus, 2007) (1) (Flac,  Other Live)",
+      "artist": "Ochre2",
+      "album": "Live At Prototype (Aarhus, 2007) (1) (Flac,  Other Live)",
+      "track_count": 13,
+      "has_cover_file": true,
+      "has_embedded_cover": true,
+      "tags": {
+        "artist": "Ochre",
+        "album": "Live At Prototype (Aarhus, 2007)",
+        "date": "2017",
+        "musicbrainz_releasegroupid": "",
+        "musicbrainz_releaseid": "",
+        "musicbrainz_albumartistid": ""
+      },
+      "first_file": "Ochre - Live At Prototype (Aarhus, 2007) - 01 - Beneath Fleeting Visions.flac"
+    },
+    {
+      "path": "/music/pmda_tests/Ochre2/Live At STFU (Manchester, 2005) (Flac,  Other Live)",
+      "artist": "Ochre2",
+      "album": "Live At STFU (Manchester, 2005) (Flac,  Other Live)",
+      "track_count": 13,
+      "has_cover_file": true,
+      "has_embedded_cover": true,
+      "tags": {
+        "artist": "Ochre",
+        "album": "Live At STFU (Manchester, 2005)",
+        "date": "2017",
+        "musicbrainz_releasegroupid": "",
+        "musicbrainz_releaseid": "",
+        "musicbrainz_albumartistid": ""
+      },
+      "first_file": "Ochre - Live At STFU (Manchester, 2005) - 01 - Copacetia.flac"
+    },
+    {
+      "path": "/music/pmda_tests/Ochre2/National Ignition (Mp3,  Album)",
+      "artist": "Ochre2",
+      "album": "National Ignition (Mp3,  Album)",
+      "track_count": 10,
+      "has_cover_file": true,
+      "has_embedded_cover": true,
+      "tags": {
+        "artist": "Ochre",
+        "album": "National Ignition",
+        "date": "2013",
+        "musicbrainz_releasegroupid": "",
+        "musicbrainz_releaseid": "",
+        "musicbrainz_albumartistid": ""
+      },
+      "first_file": "Ochre - National Ignition - 01 - Blue Hours.mp3"
+    },
+    {
+      "path": "/music/pmda_tests/Ochre2/Night Cycle (Flac,  Album)",
+      "artist": "Ochre2",
+      "album": "Night Cycle (Flac,  Album)",
+      "track_count": 4,
+      "has_cover_file": false,
+      "has_embedded_cover": true,
+      "tags": {
+        "artist": "Ochre",
+        "album": "Night Cycle",
+        "date": "2025",
+        "musicbrainz_releasegroupid": "",
+        "musicbrainz_releaseid": "",
+        "musicbrainz_albumartistid": "8c40eedf-e858-4208-bcc7-05e45bc76646"
+      },
+      "first_file": "Ochre - Night Cycle - 01 - Night Cycle.flac"
+    },
+    {
+      "path": "/music/pmda_tests/Ochre2/Petl EP (Flac,  EP)",
+      "artist": "Ochre2",
+      "album": "Petl EP (Flac,  EP)",
+      "track_count": 4,
+      "has_cover_file": true,
+      "has_embedded_cover": true,
+      "tags": {
+        "artist": "Ochre",
+        "album": "Petl EP",
+        "date": "2009",
+        "musicbrainz_releasegroupid": "37732e3a-ec17-4fa9-897e-db3e4e07c117",
+        "musicbrainz_releaseid": "",
+        "musicbrainz_albumartistid": "8c40eedf-e858-4208-bcc7-05e45bc76646"
+      },
+      "first_file": "Ochre - Petl EP - 01 - Petl.flac"
+    },
+    {
+      "path": "/music/pmda_tests/Ochre2/Sound System Bangers, Volume 01 (Flac,  EP)",
+      "artist": "Ochre2",
+      "album": "Sound System Bangers, Volume 01 (Flac,  EP)",
+      "track_count": 5,
+      "has_cover_file": true,
+      "has_embedded_cover": true,
+      "tags": {
+        "artist": "Ochre",
+        "album": "Sound System Bangers, Volume 01",
+        "date": "2003",
+        "musicbrainz_releasegroupid": "fd56e2ec-f783-3d03-9a94-3575db059e78",
+        "musicbrainz_releaseid": "",
+        "musicbrainz_albumartistid": "8c40eedf-e858-4208-bcc7-05e45bc76646"
+      },
+      "first_file": "Ochre - Sound System Bangers, Volume 01 - 01 - Low Grav Freefall.flac"
+    },
+    {
+      "path": "/music/pmda_tests/Ochre2/Understory (Flac,  EP)",
+      "artist": "Ochre2",
+      "album": "Understory (Flac,  EP)",
+      "track_count": 7,
+      "has_cover_file": true,
+      "has_embedded_cover": true,
+      "tags": {
+        "artist": "Ochre",
+        "album": "Understory",
+        "date": "2020",
+        "musicbrainz_releasegroupid": "4b7743d2-c414-4b49-8a55-e76ebc02012f",
+        "musicbrainz_releaseid": "",
+        "musicbrainz_albumartistid": "8c40eedf-e858-4208-bcc7-05e45bc76646"
+      },
+      "first_file": "Ochre - Understory - 01 - Penfield Mishap.flac"
+    },
+    {
+      "path": "/music/pmda_tests/Ochre2/Volume I (Mp3,  Album Compilation)",
+      "artist": "Ochre2",
+      "album": "Volume I (Mp3,  Album Compilation)",
+      "track_count": 10,
+      "has_cover_file": true,
+      "has_embedded_cover": true,
+      "tags": {
+        "artist": "Ochre",
+        "album": "Volume I",
+        "date": "2008",
+        "musicbrainz_releasegroupid": "",
+        "musicbrainz_releaseid": "",
+        "musicbrainz_albumartistid": ""
+      },
+      "first_file": "Ochre - Volume I - 01 - Ourcade.mp3"
+    },
+    {
+      "path": "/music/pmda_tests/Ochre2/Volume II (Mp3,  Album Compilation)",
+      "artist": "Ochre2",
+      "album": "Volume II (Mp3,  Album Compilation)",
+      "track_count": 9,
+      "has_cover_file": true,
+      "has_embedded_cover": true,
+      "tags": {
+        "artist": "Ochre",
+        "album": "Volume II",
+        "date": "2008",
+        "musicbrainz_releasegroupid": "",
+        "musicbrainz_releaseid": "",
+        "musicbrainz_albumartistid": ""
+      },
+      "first_file": "Ochre - Volume II - 01 - Flexenbend.mp3"
+    },
+    {
+      "path": "/music/pmda_tests/Ochre2/Volume III (Mp3,  Album Compilation)",
+      "artist": "Ochre2",
+      "album": "Volume III (Mp3,  Album Compilation)",
+      "track_count": 8,
+      "has_cover_file": true,
+      "has_embedded_cover": true,
+      "tags": {
+        "artist": "Ochre",
+        "album": "Volume III",
+        "date": "2008",
+        "musicbrainz_releasegroupid": "",
+        "musicbrainz_releaseid": "",
+        "musicbrainz_albumartistid": ""
+      },
+      "first_file": "Ochre - Volume III - 01 - Piano No. 2.mp3"
+    }
+  ],
+  "summary": {
+    "with_cover_file": 46,
+    "without_cover_file": 2,
+    "with_mbid": 22
+  }
+}

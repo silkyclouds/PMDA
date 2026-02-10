@@ -126,6 +126,23 @@ export function ScanSettings({ config, updateConfig, errors }: ScanSettingsProps
           />
         </div>
 
+        <div className="flex items-start justify-between p-4 rounded-lg bg-muted/50">
+          <div className="space-y-0.5 flex-1">
+            <div className="flex items-center gap-1.5">
+              <Label>Ignore caches during scan</Label>
+              <FieldTooltip content="When enabled, each scan ignores existing audio and metadata caches and re-runs the full analysis flow for every album. This is slower but guarantees fresh results for debugging or one-off deep scans." />
+            </div>
+            <p className="text-xs text-muted-foreground">
+              Force full analysis on every scan (no cache shortcuts). Audio format and MusicBrainz caches are still refreshed with new results.
+            </p>
+          </div>
+          <Switch
+            checked={config.SCAN_DISABLE_CACHE ?? false}
+            onCheckedChange={(checked) => updateConfig({ SCAN_DISABLE_CACHE: checked })}
+            className="mt-1"
+          />
+        </div>
+
         <div className="flex items-center justify-between p-4 rounded-lg bg-muted/50">
           <div className="space-y-0.5">
             <div className="flex items-center gap-1.5">
@@ -155,6 +172,51 @@ export function ScanSettings({ config, updateConfig, errors }: ScanSettingsProps
           <Switch
             checked={config.AUTO_MOVE_DUPES ?? false}
             onCheckedChange={(checked) => updateConfig({ AUTO_MOVE_DUPES: checked })}
+            className="mt-1"
+          />
+        </div>
+
+        <div className="space-y-2">
+          <div className="flex items-center gap-1.5">
+            <Label>Backup before fix</Label>
+            <FieldTooltip content="When improving an album (tags, cover, artist image), copy the album folder to /dupes/original_version first so you can recover the original." />
+          </div>
+          <p className="text-xs text-muted-foreground">
+            Copy each album to /dupes/original_version before applying tags, cover, and artist image.
+          </p>
+          <Switch
+            checked={config.BACKUP_BEFORE_FIX ?? false}
+            onCheckedChange={(checked) => updateConfig({ BACKUP_BEFORE_FIX: checked })}
+            className="mt-1"
+          />
+        </div>
+
+        <div className="space-y-2">
+          <div className="flex items-center gap-1.5">
+            <Label>Magic mode</Label>
+            <FieldTooltip content="At the end of each scan: automatically run dedupe (move losers to dupes) then improve-all (tags, covers, artist images) so everything is fixed without manual steps." />
+          </div>
+          <p className="text-xs text-muted-foreground">
+            At the end of the scan: automatic dedupe then correction of tags, covers, and artist images.
+          </p>
+          <Switch
+            checked={config.MAGIC_MODE ?? false}
+            onCheckedChange={(checked) => updateConfig({ MAGIC_MODE: checked })}
+            className="mt-1"
+          />
+        </div>
+
+        <div className="space-y-2">
+          <div className="flex items-center gap-1.5">
+            <Label>Re-process incomplete albums in future runs</Label>
+            <FieldTooltip content="When improve-all runs (Magic or Run Magic): if on (default), re-run tags/covers/artist image for albums that PMDA has already processed but not fully completed. If off, albums already touched by PMDA are not retried automatically when they are still missing some metadata." />
+          </div>
+          <p className="text-xs text-muted-foreground">
+            Off = do not retry albums already processed by PMDA but not 100% complete. On = keep improving incomplete albums on future runs.
+          </p>
+          <Switch
+            checked={config.REPROCESS_INCOMPLETE_ALBUMS ?? true}
+            onCheckedChange={(checked) => updateConfig({ REPROCESS_INCOMPLETE_ALBUMS: checked })}
             className="mt-1"
           />
         </div>
@@ -241,6 +303,44 @@ export function ScanSettings({ config, updateConfig, errors }: ScanSettingsProps
 
             <div className="space-y-2">
               <div className="flex items-center gap-1.5">
+                <Label htmlFor="ffprobe-pool">FFprobe pool size</Label>
+                <FieldTooltip content="Number of parallel ffprobe workers for audio analysis during scan. Higher values (e.g. 8–16) speed up scan on multi-core systems." />
+              </div>
+              <Input
+                id="ffprobe-pool"
+                type="number"
+                min={1}
+                max={64}
+                placeholder="8"
+                value={config.FFPROBE_POOL_SIZE ?? 8}
+                onChange={(e) => {
+                  const v = parseInt(e.target.value, 10);
+                  if (!Number.isNaN(v)) updateConfig({ FFPROBE_POOL_SIZE: Math.max(1, Math.min(64, v)) });
+                }}
+              />
+            </div>
+
+            <div className="space-y-2">
+              <div className="flex items-center gap-1.5">
+                <Label htmlFor="improve-workers">Improve-all workers</Label>
+                <FieldTooltip content="Number of albums to improve in parallel during Fix all (1 = sequential). Higher (2–4) speeds up when using Discogs/Last.fm/Bandcamp; MusicBrainz stays rate-limited." />
+              </div>
+              <Input
+                id="improve-workers"
+                type="number"
+                min={1}
+                max={8}
+                placeholder="1"
+                value={config.IMPROVE_ALL_WORKERS ?? 1}
+                onChange={(e) => {
+                  const v = parseInt(e.target.value, 10);
+                  if (!Number.isNaN(v)) updateConfig({ IMPROVE_ALL_WORKERS: Math.max(1, Math.min(8, v)) });
+                }}
+              />
+            </div>
+
+            <div className="space-y-2">
+              <div className="flex items-center gap-1.5">
                 <Label htmlFor="skip-folders">Skip Folders</Label>
                 <FieldTooltip content="Comma-separated path prefixes to skip during scan (e.g. /music/samples,/music/temp). Albums in these folders will be ignored." />
               </div>
@@ -301,20 +401,6 @@ export function ScanSettings({ config, updateConfig, errors }: ScanSettingsProps
               </div>
             </div>
 
-            <div className="pt-2 border-t border-border space-y-2">
-              <div className="flex items-center justify-between gap-4">
-                <div className="flex items-center gap-1.5">
-                  <Label htmlFor="pmda-default-mode">Default mode</Label>
-                  <FieldTooltip content="Default run mode for the container. Usually 'serve' to run the web UI. Leave as serve unless you know otherwise." />
-                </div>
-                <Input
-                  id="pmda-default-mode"
-                  placeholder="serve"
-                  value={config.PMDA_DEFAULT_MODE ?? 'serve'}
-                  onChange={(e) => updateConfig({ PMDA_DEFAULT_MODE: e.target.value || 'serve' })}
-                />
-              </div>
-            </div>
           </CollapsibleContent>
         </Collapsible>
       </div>

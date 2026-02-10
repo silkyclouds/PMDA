@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect, useMemo } from 'react';
 import { Link } from 'react-router-dom';
 import { Play, Pause, Square, RefreshCw, Loader2, ChevronDown, ChevronUp, Sparkles, Database, Music, Cpu, Zap, AlertTriangle, Image, Tag, Package, Trash2, Clock, FolderInput } from 'lucide-react';
 import { Button } from '@/components/ui/button';
@@ -12,6 +12,7 @@ import {
   type ScanPreflightResult,
   dedupeAll,
   improveAll,
+  getDedupeProgress,
   getImproveAllProgress,
   addIncompleteAlbumsToLidarr,
   getLidarrAddIncompleteProgress,
@@ -30,11 +31,14 @@ function formatETA(seconds: number | undefined): string {
   return parts.join(' ');
 }
 
+export type ScanType = 'full' | 'incomplete_only';
+
 interface ScanProgressProps {
   progress: ScanProgressType;
   /** Real-time duplicate count from useDuplicates - used to determine card visibility */
   currentDuplicateCount?: number;
-  onStart: () => void;
+  /** Called when user starts a scan. Options: scan_type (full | incomplete_only), run_improve_after (only for full). */
+  onStart: (options?: { scan_type?: ScanType; run_improve_after?: boolean }) => void;
   onPause: () => void;
   onResume: () => void;
   onStop: () => void;
@@ -45,6 +49,13 @@ interface ScanProgressProps {
   isStopping?: boolean;
   isClearing?: boolean;
   className?: string;
+  /** Scan type: full (default) or incomplete_only */
+  scanType?: ScanType;
+  /** After full scan: automatically run improve-all (tags + covers). Only used when scanType is full. */
+  runImproveAfter?: boolean;
+  /** Callbacks to update scan options from the component (optional; if not provided, options are internal state) */
+  onScanTypeChange?: (t: ScanType) => void;
+  onRunImproveAfterChange?: (v: boolean) => void;
 }
 
 export function ScanProgress({
@@ -61,6 +72,10 @@ export function ScanProgress({
   isStopping,
   isClearing,
   className,
+  scanType: scanTypeProp,
+  runImproveAfter: runImproveAfterProp,
+  onScanTypeChange,
+  onRunImproveAfterChange,
 }: ScanProgressProps) {
   const [expanded, setExpanded] = useState(false);
   const [showClearDialog, setShowClearDialog] = useState(false);
@@ -70,12 +85,16 @@ export function ScanProgress({
   const [preflightPaths, setPreflightPaths] = useState<{ music_rw: boolean; dupes_rw: boolean } | null>(null);
   const [waitingForProgress, setWaitingForProgress] = useState(false);
   const hasToastedAiErrors = useRef(false);
-  const [postScanDedupe, setPostScanDedupe] = useState(true);
-  const [postScanFixAll, setPostScanFixAll] = useState(true);
-  const [postScanLidarr, setPostScanLidarr] = useState(true);
+  const [scanTypeInternal, setScanTypeInternal] = useState<ScanType>('full');
+  const [runImproveAfterInternal, setRunImproveAfterInternal] = useState(false);
+  const scanType = scanTypeProp ?? scanTypeInternal;
+  const setScanType = onScanTypeChange ?? setScanTypeInternal;
+  const runImproveAfter = runImproveAfterProp ?? runImproveAfterInternal;
+  const setRunImproveAfter = onRunImproveAfterChange ?? setRunImproveAfterInternal;
   const [improveAllProgressData, setImproveAllProgressData] = useState<Awaited<ReturnType<typeof getImproveAllProgress>> | null>(null);
   const [lidarrAddProgressData, setLidarrAddProgressData] = useState<Awaited<ReturnType<typeof getLidarrAddIncompleteProgress>> | null>(null);
   const [postScanRunning, setPostScanRunning] = useState(false);
+  const [magicRunning, setMagicRunning] = useState(false);
 
   const safeProgress = progress || {
     scanning: false,
@@ -129,6 +148,7 @@ export function ScanProgress({
     scan_ai_batch_processed = 0,
     scan_ai_current_label = null,
     total_albums = 0,
+    scan_steps_log = [],
   } = safeProgress;
 
   // Stage badge: use backend phase (format_analysis | identification_tags | ia_analysis | finalizing | moving_dupes)
@@ -151,9 +171,16 @@ export function ScanProgress({
     }
   }, [scanning, last_scan_summary]);
 
-  // Hide "Starting scan…" spinner as soon as progress bar is visible (artists_total or step total)
+  // Hide "Starting scan…" spinner as soon as we either see progress or the scan ends.
+  // This prevents the UI from getting stuck on the spinner if the scan is very fast
+  // and the frontend never observes a (scanning && total > 0) state.
   useEffect(() => {
-    if (waitingForProgress && scanning && (artists_total > 0 || total > 0)) {
+    if (!waitingForProgress) return;
+    if (!scanning) {
+      setWaitingForProgress(false);
+      return;
+    }
+    if (artists_total > 0 || total > 0) {
       setWaitingForProgress(false);
     }
   }, [waitingForProgress, scanning, artists_total, total]);
@@ -188,6 +215,13 @@ export function ScanProgress({
     ? (active_artists[0].current_album!.status_details || active_artists[0].current_album!.status || 'processing')
     : '';
 
+  const workflowStage = useMemo<'undupe' | 'fix' | 'lidarr' | 'done'>(() => {
+    const broken = last_scan_summary?.broken_albums_count ?? 0;
+    if (canDedupe && !dupesAlreadyAllMoved) return 'undupe';
+    if (!improveAllRunning) return broken > 0 ? 'lidarr' : 'fix';
+    return 'fix';
+  }, [canDedupe, dupesAlreadyAllMoved, improveAllRunning, last_scan_summary?.broken_albums_count]);
+
   return (
     <div className={cn("rounded-xl bg-card border border-border overflow-hidden", className)}>
       {/* ─── Idle: clean CTA ───────────────────────────────────────────────── */}
@@ -204,6 +238,21 @@ export function ScanProgress({
           {/* Last scan summary – 3-tier hierarchy */}
           {last_scan_summary && (
             <div className="space-y-6">
+              {/* Show when fix-all is still running after scan so user sees process is not fully done */}
+              {improveAllRunning && improveAllProgressData && (
+                <div className="flex items-center gap-3 rounded-xl border-2 border-primary/40 bg-primary/10 p-4">
+                  <Loader2 className="w-5 h-5 text-primary animate-spin shrink-0" />
+                  <div>
+                    <p className="font-medium text-foreground">Fixing tags and covers…</p>
+                    <p className="text-sm text-muted-foreground">
+                      {improveAllProgressData.current}/{improveAllProgressData.total} albums
+                      {improveAllProgressData.current_artist && improveAllProgressData.current_album && (
+                        <span> — {improveAllProgressData.current_artist} · {improveAllProgressData.current_album}</span>
+                      )}
+                    </p>
+                  </div>
+                </div>
+              )}
               {/* Tier 1: Hero Metrics - Most important stats with mini charts */}
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
                 {/* Duplicates Found - with mini bar chart */}
@@ -312,13 +361,16 @@ export function ScanProgress({
 
               {/* Tier 2: Key Stats - Secondary important info */}
               <div className="flex flex-wrap gap-2">
-                {/* MusicBrainz match */}
-                <div className={cn(
-                  "inline-flex items-center gap-2 px-3 py-2 rounded-lg border",
-                  (last_scan_summary.mb_match?.matched ?? last_scan_summary.albums_with_mb_id ?? 0) > 0
-                    ? "bg-success/10 border-success/30 text-success"
-                    : "bg-muted/50 border-border text-muted-foreground"
-                )}>
+                {/* MusicBrainz match (during scan; run Fix Albums to write MBID to file tags) */}
+                <div
+                  className={cn(
+                    "inline-flex items-center gap-2 px-3 py-2 rounded-lg border",
+                    (last_scan_summary.mb_match?.matched ?? last_scan_summary.albums_with_mb_id ?? 0) > 0
+                      ? "bg-success/10 border-success/30 text-success"
+                      : "bg-muted/50 border-border text-muted-foreground"
+                  )}
+                  title="Matched during scan. Run Fix Albums to write MusicBrainz IDs to file tags on kept editions."
+                >
                   <Database className="w-4 h-4" />
                   <span className="text-sm font-medium">
                     MusicBrainz {last_scan_summary.mb_match 
@@ -470,198 +522,212 @@ export function ScanProgress({
               )}
             </div>
           )}
-          {/* Action Cards - What to do next */}
+          {/* Post-scan workflow (sequential) */}
           {last_scan_summary && (
-          <div className="space-y-4">
-            {/* No duplicates message - when there are no duplicates */}
-            {!hasDuplicates && !dupesAlreadyAllMoved && (
-              <div className="rounded-xl border border-success/30 bg-success/5 p-4 flex items-center gap-3">
-                <Package className="w-5 h-5 text-success shrink-0" />
-                <p className="text-sm text-success">
-                  No duplicates found. Your library is clean!
+            <div className="space-y-4">
+              <div className="rounded-xl border border-border bg-card p-4">
+                <h3 className="text-base font-semibold text-foreground">Post-scan workflow</h3>
+                <p className="text-sm text-muted-foreground mt-1">
+                  Resolve actions in order: Undupe → Fix Albums → Send incomplete to Lidarr.
+                </p>
+                <p className="text-xs text-muted-foreground mt-2">
+                  Current step: <span className="font-medium text-foreground capitalize">{workflowStage}</span>
                 </p>
               </div>
-            )}
 
-            {/* Primary action - Undupe (only if duplicates found) */}
-            {hasDuplicates && canDedupe && !dupesAlreadyAllMoved && (
-              <div className="rounded-xl border-2 border-warning/40 bg-gradient-to-r from-warning/10 via-warning/5 to-transparent p-5">
-                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-                  <div className="space-y-1.5">
-                    <div className="flex items-center gap-2">
-                      <Package className="w-5 h-5 text-warning" />
-                      <h3 className="text-lg font-semibold text-foreground">
-                        {actualDuplicateCount} duplicates found
-                      </h3>
+              <div className="grid grid-cols-1 gap-3">
+                <div className="rounded-xl border border-border bg-card p-4">
+                  <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+                    <div>
+                      <p className="text-xs uppercase tracking-wider text-muted-foreground">Step 1</p>
+                      <h4 className="text-sm font-semibold text-foreground">Undupe duplicates</h4>
+                      <p className="text-xs text-muted-foreground mt-1">
+                        {hasDuplicates
+                          ? `${actualDuplicateCount} duplicate group(s) detected.`
+                          : 'No duplicates detected in the last scan.'}
+                      </p>
                     </div>
-                    <p className="text-sm text-muted-foreground">
-                      Review and remove duplicate albums to free up space. The best edition will be kept.
-                    </p>
-                  </div>
-                  <div className="flex items-center gap-2 shrink-0">
-                    <Link to="/unduper">
-                      <Button variant="outline" size="sm" className="gap-1.5">
-                        Review first
+                    <div className="flex items-center gap-2">
+                      <Link to="/unduper">
+                        <Button variant="outline" size="sm">Review</Button>
+                      </Link>
+                      <Button
+                        size="sm"
+                        onClick={async () => {
+                          setPostScanRunning(true);
+                          try {
+                            await dedupeAll();
+                            toast.success('Undupe started');
+                          } catch {
+                            toast.error('Failed to start undupe');
+                          } finally {
+                            setPostScanRunning(false);
+                          }
+                        }}
+                        disabled={postScanRunning || deduping || !canDedupe}
+                        className="gap-1.5"
+                      >
+                        {(postScanRunning || deduping) ? <Loader2 className="w-4 h-4 animate-spin" /> : <Trash2 className="w-4 h-4" />}
+                        {canDedupe ? 'Run undupe' : 'Completed'}
                       </Button>
-                    </Link>
-                    <Button 
+                    </div>
+                  </div>
+                </div>
+
+                <div className="rounded-xl border border-border bg-card p-4">
+                  <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+                    <div>
+                      <p className="text-xs uppercase tracking-wider text-muted-foreground">Step 2</p>
+                      <h4 className="text-sm font-semibold text-foreground">Fix albums metadata</h4>
+                      <p className="text-xs text-muted-foreground mt-1">
+                        Update tags, covers and artist images on kept editions.
+                      </p>
+                    </div>
+                    <Button
+                      size="sm"
                       onClick={async () => {
+                        if (improveAllRunning) return;
                         setPostScanRunning(true);
                         try {
-                          await dedupeAll();
-                          toast.success('Undupe started');
+                          await improveAll();
+                          toast.success('Fix all albums started');
                         } catch {
-                          toast.error('Failed to start undupe');
+                          toast.error('Failed to start');
                         } finally {
                           setPostScanRunning(false);
                         }
                       }}
-                      disabled={postScanRunning || deduping}
-                      className="gap-1.5 bg-warning text-warning-foreground hover:bg-warning/90"
+                      disabled={postScanRunning || improveAllRunning || canDedupe || deduping}
+                      className="gap-1.5"
                     >
-                      {(postScanRunning || deduping) ? <Loader2 className="w-4 h-4 animate-spin" /> : <Trash2 className="w-4 h-4" />}
-                      Undupe Now
+                      {improveAllRunning ? <Loader2 className="w-4 h-4 animate-spin" /> : <Tag className="w-4 h-4" />}
+                      {improveAllRunning ? 'Fix in progress…' : 'Run fix'}
                     </Button>
                   </div>
-                </div>
-              </div>
-            )}
-
-            {/* Dupes already moved message */}
-            {dupesAlreadyAllMoved && (
-              <div className="rounded-xl border border-success/30 bg-success/5 p-4 flex items-center gap-3">
-                <Package className="w-5 h-5 text-success shrink-0" />
-                <p className="text-sm text-success">
-                  All {last_scan_summary.dupes_moved_this_scan} duplicates were automatically moved during the scan!
-                </p>
-              </div>
-            )}
-
-            {/* Secondary actions grid */}
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-              {/* Fix all albums */}
-              <button
-                onClick={async () => {
-                  if (improveAllRunning) return;
-                  setPostScanRunning(true);
-                  try {
-                    await improveAll();
-                    toast.success('Fix all albums started');
-                  } catch {
-                    toast.error('Failed to start');
-                  } finally {
-                    setPostScanRunning(false);
-                  }
-                }}
-                disabled={postScanRunning || improveAllRunning}
-                className={cn(
-                  "flex flex-col items-start gap-2 p-4 rounded-xl border border-border bg-card text-left transition-all",
-                  "hover:border-primary/50 hover:bg-accent/50 disabled:opacity-60 disabled:cursor-not-allowed",
-                  improveAllRunning && "border-primary/50 bg-primary/5"
-                )}
-              >
-                <div className="flex items-center gap-2 w-full">
-                  {improveAllRunning ? (
-                    <Loader2 className="w-4 h-4 text-primary animate-spin" />
-                  ) : (
-                    <Tag className="w-4 h-4 text-muted-foreground" />
-                  )}
-                  <span className="font-medium text-foreground">Fix Albums</span>
                   {improveAllRunning && improveAllProgressData && (
-                    <span className="ml-auto text-xs text-primary tabular-nums">
+                    <p className="text-xs text-muted-foreground mt-2">
                       {improveAllProgressData.current}/{improveAllProgressData.total}
-                    </span>
+                      {(improveAllProgressData.current_artist || improveAllProgressData.current_album) && (
+                        <span> — {improveAllProgressData.current_artist} · {improveAllProgressData.current_album}</span>
+                      )}
+                    </p>
                   )}
                 </div>
-                <p className="text-xs text-muted-foreground">
-                  Update tags and covers from MusicBrainz, Discogs, Last.fm
-                </p>
-              </button>
 
-              {/* Add incomplete to Lidarr */}
-              {(last_scan_summary.broken_albums_count ?? 0) > 0 && (
-                <button
-                  onClick={async () => {
-                    if (lidarrAddRunning) return;
-                    setPostScanRunning(true);
-                    try {
-                      await addIncompleteAlbumsToLidarr();
-                      toast.success('Add incomplete to Lidarr started');
-                    } catch {
-                      toast.error('Failed to start');
-                    } finally {
-                      setPostScanRunning(false);
-                    }
-                  }}
-                  disabled={postScanRunning || lidarrAddRunning}
-                  className={cn(
-                    "flex flex-col items-start gap-2 p-4 rounded-xl border border-border bg-card text-left transition-all",
-                    "hover:border-primary/50 hover:bg-accent/50 disabled:opacity-60 disabled:cursor-not-allowed",
-                    lidarrAddRunning && "border-primary/50 bg-primary/5"
-                  )}
-                >
-                  <div className="flex items-center gap-2 w-full">
-                    {lidarrAddRunning ? (
-                      <Loader2 className="w-4 h-4 text-primary animate-spin" />
-                    ) : (
-                      <AlertTriangle className="w-4 h-4 text-destructive" />
-                    )}
-                    <span className="font-medium text-foreground">Send to Lidarr</span>
-                    {lidarrAddRunning && lidarrAddProgressData && (
-                      <span className="ml-auto text-xs text-primary tabular-nums">
-                        {lidarrAddProgressData.current}/{lidarrAddProgressData.total}
-                      </span>
-                    )}
-                  </div>
-                  <p className="text-xs text-muted-foreground">
-                    {last_scan_summary.broken_albums_count} incomplete albums → re-download
-                  </p>
-                </button>
-              )}
-            </div>
-
-            {/* Progress indicators for running operations */}
-            {(deduping || improveAllRunning || lidarrAddRunning) && (
-              <div className="space-y-2 rounded-lg border-l-4 border-primary/80 bg-primary/5 p-3 text-sm">
-                {deduping && (
-                  <div className="flex items-center gap-2">
-                    <Loader2 className="w-3 h-3 animate-spin text-primary shrink-0" />
-                    <span className="font-medium text-muted-foreground">Dedupe: </span>
-                    <span className="tabular-nums">{dedupe_progress}/{dedupe_total}</span>
-                    {safeProgress.dedupe_current_group && (
-                      <span className="text-muted-foreground truncate">— {safeProgress.dedupe_current_group.artist} – {safeProgress.dedupe_current_group.album}</span>
-                    )}
-                  </div>
-                )}
-                {improveAllRunning && improveAllProgressData && (
-                  <div className="flex items-center gap-2">
-                    <Loader2 className="w-3 h-3 animate-spin text-primary shrink-0" />
-                    <span className="font-medium text-muted-foreground">Fix all: </span>
-                    <span className="tabular-nums">{improveAllProgressData.current}/{improveAllProgressData.total}</span>
-                    {(improveAllProgressData.current_artist || improveAllProgressData.current_album) && (
-                      <span className="text-muted-foreground truncate">— {improveAllProgressData.current_artist} – {improveAllProgressData.current_album}</span>
-                    )}
-                  </div>
-                )}
-                {lidarrAddRunning && lidarrAddProgressData && (
-                  <div className="flex items-center gap-2">
-                    <Loader2 className="w-3 h-3 animate-spin text-primary shrink-0" />
-                    <span className="font-medium text-muted-foreground">Lidarr: </span>
-                    <span className="tabular-nums">{lidarrAddProgressData.current}/{lidarrAddProgressData.total}</span>
-                    <span className="text-success text-xs">+{lidarrAddProgressData.added}</span>
-                    {lidarrAddProgressData.failed > 0 && <span className="text-destructive text-xs">−{lidarrAddProgressData.failed}</span>}
+                {(last_scan_summary.broken_albums_count ?? 0) > 0 && (
+                  <div className="rounded-xl border border-border bg-card p-4">
+                    <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+                      <div>
+                        <p className="text-xs uppercase tracking-wider text-muted-foreground">Step 3</p>
+                        <h4 className="text-sm font-semibold text-foreground">Send incomplete to Lidarr</h4>
+                        <p className="text-xs text-muted-foreground mt-1">
+                          {last_scan_summary.broken_albums_count} incomplete album(s) available.
+                        </p>
+                      </div>
+                      <Button
+                        size="sm"
+                        onClick={async () => {
+                          if (lidarrAddRunning) return;
+                          setPostScanRunning(true);
+                          try {
+                            await addIncompleteAlbumsToLidarr();
+                            toast.success('Add incomplete to Lidarr started');
+                          } catch {
+                            toast.error('Failed to start');
+                          } finally {
+                            setPostScanRunning(false);
+                          }
+                        }}
+                        disabled={postScanRunning || lidarrAddRunning || canDedupe || deduping || improveAllRunning}
+                        className="gap-1.5"
+                      >
+                        {lidarrAddRunning ? <Loader2 className="w-4 h-4 animate-spin" /> : <AlertTriangle className="w-4 h-4" />}
+                        {lidarrAddRunning ? 'Sending…' : 'Send to Lidarr'}
+                      </Button>
+                    </div>
                   </div>
                 )}
               </div>
-            )}
-          </div>
+
+              <Collapsible>
+                <CollapsibleTrigger className="flex items-center gap-2 text-sm text-muted-foreground hover:text-foreground transition-colors w-full justify-between group">
+                  <span className="font-medium">Advanced post-scan actions</span>
+                  <ChevronDown className="w-4 h-4 group-data-[state=open]:rotate-180 transition-transform" />
+                </CollapsibleTrigger>
+                <CollapsibleContent className="pt-3">
+                  <div className="rounded-xl border border-primary/30 bg-primary/5 p-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+                    <div>
+                      <h4 className="text-sm font-semibold text-foreground">Run Magic</h4>
+                      <p className="text-xs text-muted-foreground mt-1">
+                        One-click sequence: dedupe first, then fix albums.
+                      </p>
+                    </div>
+                    <Button
+                      onClick={async () => {
+                        if (magicRunning || deduping || improveAllRunning) return;
+                        setMagicRunning(true);
+                        try {
+                          await dedupeAll();
+                          const maxWaitMs = 600000;
+                          const pollMs = 2000;
+                          const start = Date.now();
+                          while (Date.now() - start < maxWaitMs) {
+                            const prog = await getDedupeProgress();
+                            if (!prog.deduping) break;
+                            await new Promise((r) => setTimeout(r, pollMs));
+                          }
+                          await improveAll();
+                          toast.success('Magic started: dedupe done, fixing albums…');
+                        } catch (e) {
+                          toast.error(e instanceof Error ? e.message : 'Magic failed');
+                        } finally {
+                          setMagicRunning(false);
+                        }
+                      }}
+                      disabled={magicRunning || deduping || improveAllRunning}
+                      className="gap-1.5 shrink-0"
+                    >
+                      {(magicRunning || deduping) ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
+                      {magicRunning || deduping ? 'Dedupe in progress…' : improveAllRunning ? 'Fix in progress…' : 'Run Magic'}
+                    </Button>
+                  </div>
+                </CollapsibleContent>
+              </Collapsible>
+            </div>
           )}
 
-          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 pt-4 border-t border-border">
+          <div className="flex flex-col gap-3 pt-4 border-t border-border">
+            <div className="flex flex-wrap items-center gap-4">
+              <div className="flex items-center gap-2">
+                <span className="text-sm font-medium text-foreground">Scan type</span>
+                <select
+                  className="rounded-md border border-input bg-background px-2 py-1.5 text-sm"
+                  value={scanType}
+                  onChange={(e) => setScanType(e.target.value as ScanType)}
+                  disabled={scanning}
+                >
+                  <option value="full">Full scan (duplicates + incomplete)</option>
+                  <option value="incomplete_only">Incomplete albums only</option>
+                </select>
+              </div>
+              {scanType === 'full' && (
+                <label className="flex items-center gap-2 text-sm cursor-pointer">
+                  <Checkbox
+                    checked={runImproveAfter}
+                    onCheckedChange={(v) => setRunImproveAfter(v === true)}
+                    disabled={scanning}
+                  />
+                  <span className="text-muted-foreground">After scan: correct tags and covers</span>
+                </label>
+              )}
+            </div>
+          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
             <div>
               <h3 className="text-base font-semibold text-foreground">Ready to scan</h3>
               <p className="text-sm text-muted-foreground mt-1">
-                One scan analyzes duplicates, metadata, and tags. Results appear in Unduper, Library, and Tag Fixer.
+                {scanType === 'incomplete_only'
+                  ? 'Scan only for incomplete albums (missing tracks). Results appear in Incomplete albums.'
+                  : 'One scan analyzes duplicates, metadata, and tags. Results appear in Unduper, Library, and Tag Fixer.'}
               </p>
             </div>
             <div className="flex items-center gap-2 shrink-0">
@@ -734,8 +800,20 @@ export function ScanProgress({
                       {preflightResult.bandcamp.ok ? "Bandcamp: OK" : `Bandcamp: ${preflightResult.bandcamp.message || "—"}`}
                     </div>
                   )}
+                  {preflightResult.serper != null && (
+                    <div className={cn("flex items-center gap-2", preflightResult.serper.ok ? "text-green-600 dark:text-green-400" : "text-muted-foreground")}>
+                      <Database className="w-4 h-4 shrink-0" />
+                      {preflightResult.serper.ok ? "Serper: OK" : `Serper: ${preflightResult.serper.message || "—"}`}
+                    </div>
+                  )}
+                  {preflightResult.acoustid != null && (
+                    <div className={cn("flex items-center gap-2", preflightResult.acoustid.ok ? "text-green-600 dark:text-green-400" : "text-muted-foreground")}>
+                      <Database className="w-4 h-4 shrink-0" />
+                      {preflightResult.acoustid.ok ? "AcousticID: OK" : `AcousticID: ${preflightResult.acoustid.message || "—"}`}
+                    </div>
+                  )}
                   {!preflightResult.musicbrainz.ok && preflightResult.ai.ok && (
-                    <Button size="sm" variant="secondary" className="w-full mt-1" onClick={() => { setPreflightVerifiedAtStart(false); onStart(); setPreflightResult(null); }} disabled={isStarting}>
+                    <Button size="sm" variant="secondary" className="w-full mt-1" onClick={() => { setPreflightVerifiedAtStart(false); onStart({ scan_type: scanType, run_improve_after: scanType === 'full' ? runImproveAfter : false }); setPreflightResult(null); }} disabled={isStarting}>
                       {isStarting ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
                       Start scan anyway
                     </Button>
@@ -748,6 +826,12 @@ export function ScanProgress({
                 className="gap-2"
                 onClick={async () => {
                   if (preflightLoading || isStarting) return;
+                  const startOptions = { scan_type: scanType, run_improve_after: scanType === 'full' ? runImproveAfter : false };
+                  if (scanType === 'incomplete_only') {
+                    setWaitingForProgress(true);
+                    onStart(startOptions);
+                    return;
+                  }
                   setWaitingForProgress(true);
                   setPreflightLoading(true);
                   setPreflightResult(null);
@@ -757,8 +841,7 @@ export function ScanProgress({
                     if (res.musicbrainz.ok && res.ai.ok) {
                       setPreflightVerifiedAtStart(true);
                       setPreflightPaths(res.paths ?? null);
-                      onStart();
-                      // Keep preflightResult so "Services verified at start" shows Discogs, Last.fm, Bandcamp during scan
+                      onStart(startOptions);
                     } else {
                       setWaitingForProgress(false);
                       if (!res.ai.ok) {
@@ -774,6 +857,8 @@ export function ScanProgress({
                       discogs: { ok: false, message: "—" },
                       lastfm: { ok: false, message: "—" },
                       bandcamp: { ok: false, message: "—" },
+                      serper: { ok: false, message: "—" },
+                      acoustid: { ok: false, message: "—" },
                     });
                   } finally {
                     setPreflightLoading(false);
@@ -784,6 +869,7 @@ export function ScanProgress({
                 Start scan
               </Button>
             </div>
+          </div>
           </div>
           </> )}
         </div>
@@ -985,6 +1071,29 @@ export function ScanProgress({
               </div>
             )}
 
+            {/* ─── Activity log: per-artist summary lines (latest first) ──────── */}
+            {Array.isArray(scan_steps_log) && scan_steps_log.length > 0 && (
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">
+                    Activity log
+                  </span>
+                  <span className="text-[10px] text-muted-foreground">
+                    Showing last {Math.min(8, scan_steps_log.length)} entr{scan_steps_log.length === 1 ? 'y' : 'ies'}
+                  </span>
+                </div>
+                <div className="rounded-lg border border-border bg-muted/40 max-h-32 overflow-y-auto">
+                  <ul className="px-3 py-2 space-y-0.5 text-[11px] font-mono text-muted-foreground/90">
+                    {scan_steps_log.slice(-8).map((line, idx) => (
+                      <li key={idx} className="truncate" title={line}>
+                        {line}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              </div>
+            )}
+
             {/* ─── Services verified at start (when preflight passed) ─────────── */}
             {scanning && preflightVerifiedAtStart && (
               <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
@@ -1013,6 +1122,18 @@ export function ScanProgress({
                   <span className={cn("inline-flex items-center gap-1.5", preflightResult.bandcamp.ok ? "text-green-600 dark:text-green-400" : "text-muted-foreground")} title={preflightResult.bandcamp.message ?? undefined}>
                     <Database className="w-3.5 h-3.5" />
                     Bandcamp {preflightResult.bandcamp.ok ? "✓" : "—"}
+                  </span>
+                )}
+                {preflightResult?.serper != null && (
+                  <span className={cn("inline-flex items-center gap-1.5", preflightResult.serper.ok ? "text-green-600 dark:text-green-400" : "text-muted-foreground")} title={preflightResult.serper.message ?? undefined}>
+                    <Database className="w-3.5 h-3.5" />
+                    Serper {preflightResult.serper.ok ? "✓" : "—"}
+                  </span>
+                )}
+                {preflightResult?.acoustid != null && (
+                  <span className={cn("inline-flex items-center gap-1.5", preflightResult.acoustid.ok ? "text-green-600 dark:text-green-400" : "text-muted-foreground")} title={preflightResult.acoustid.message ?? undefined}>
+                    <Database className="w-3.5 h-3.5" />
+                    AcousticID {preflightResult.acoustid.ok ? "✓" : "—"}
                   </span>
                 )}
                 {(preflightPaths ?? progressPathsStatus) && (

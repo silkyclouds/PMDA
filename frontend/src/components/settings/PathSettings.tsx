@@ -580,6 +580,19 @@ export function PathSettings({ config, updateConfig, errors }: PathSettingsProps
 
             <div className="space-y-2">
               <div className="flex items-center gap-1.5">
+                <Label htmlFor="incomplete-target-dir">Quarantine folder for incomplete albums</Label>
+                <FieldTooltip content="Folder where incomplete albums (missing tracks) will be moved when you use Move selected from the incomplete scan results (e.g. /dupes/incomplete_albums)." />
+              </div>
+              <Input
+                id="incomplete-target-dir"
+                placeholder="/dupes/incomplete_albums"
+                value={config.INCOMPLETE_ALBUMS_TARGET_DIR ?? ''}
+                onChange={(e) => updateConfig({ INCOMPLETE_ALBUMS_TARGET_DIR: e.target.value || undefined })}
+              />
+            </div>
+
+            <div className="space-y-2">
+              <div className="flex items-center gap-1.5">
                 <Label htmlFor="music-parent-path">Path to parent folder (music root)</Label>
                 <FieldTooltip content="Parent directory that contains your music library folders (e.g. /music). Used for path mapping verification. In Docker, mount this path so PMDA can validate bindings." />
               </div>

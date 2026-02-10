@@ -113,6 +113,8 @@ export interface ScanProgress {
   scan_ai_batch_processed?: number;
   /** IA analysis step: artist – album of the group currently or last processed */
   scan_ai_current_label?: string | null;
+  /** Rolling per-artist log of steps executed during the current scan (for activity log UI). */
+  scan_steps_log?: string[];
 }
 
 export interface LastScanSummary {
@@ -254,6 +256,8 @@ export interface PMDAConfig {
   // Paths
   PATH_MAP: Record<string, string>;
   DUPE_ROOT: string;
+  /** Quarantine folder for incomplete albums (e.g. /dupes/incomplete_albums). Used when moving from "Incomplete scan results". */
+  INCOMPLETE_ALBUMS_TARGET_DIR?: string;
   PMDA_CONFIG_DIR: string;
   MUSIC_PARENT_PATH: string;
   /** RW status for music folder(s) and dupes folder (from backend) */
@@ -266,11 +270,25 @@ export interface PMDAConfig {
   SKIP_FOLDERS: string;
   CROSS_LIBRARY_DEDUPE: boolean;
   CROSSCHECK_SAMPLES: number;
+  /** When true, ignore all existing caches during scans (audio+metadata). */
+  SCAN_DISABLE_CACHE?: boolean;
   /** Skip path binding verification at startup */
   DISABLE_PATH_CROSSCHECK?: boolean;
   /** When true, treat album titles like "Lemodie (Flac)" and "Lemodie" as the same for duplicate detection (strip format/version in parentheses). */
   NORMALIZE_PARENTHETICAL_FOR_DEDUPE?: boolean;
   FORMAT_PREFERENCE: string[];
+  /** Library backend mode: plex (default) or files. */
+  LIBRARY_MODE?: 'plex' | 'files';
+  /** File-library roots (comma-separated string in UI). */
+  FILES_ROOTS?: string;
+  /** Root folder for the clean export library. */
+  EXPORT_ROOT?: string;
+  /** Naming template used when exporting via hardlinks/symlinks/copies. */
+  EXPORT_NAMING_TEMPLATE?: string;
+  /** Link strategy for export: hardlink | symlink | copy. */
+  EXPORT_LINK_STRATEGY?: 'hardlink' | 'symlink' | 'copy';
+  /** When true (Files mode), rebuild the hardlink library automatically after a Magic scan. */
+  AUTO_EXPORT_LIBRARY?: boolean;
   
   // AI Provider
   AI_PROVIDER: 'openai' | 'anthropic' | 'google' | 'ollama';
@@ -286,16 +304,40 @@ export interface PMDAConfig {
   // MusicBrainz & Notifications
   USE_MUSICBRAINZ: boolean;
   MUSICBRAINZ_EMAIL: string;
+  /** How to apply MusicBrainz artist credits to tags and grouping. */
+  ARTIST_CREDIT_MODE?: 'album_artist_strict' | 'musicbrainz_full_credit' | 'picard_like_default';
   /** Re-query MusicBrainz for albums previously cached as "not found" on each scan */
   MB_RETRY_NOT_FOUND?: boolean;
+  /** Advanced: ignore MusicBrainz cache and stored MBIDs, forcing a full lookup every scan (slower; for testing). */
+  MB_DISABLE_CACHE?: boolean;
   /** Use AI to choose among multiple MusicBrainz candidates (title-only prompt). */
   USE_AI_FOR_MB_MATCH?: boolean;
   /** Use AI to verify MusicBrainz match (artist, title, track count/titles). Can recover e.g. "Volume I" vs "volume i". */
   USE_AI_FOR_MB_VERIFY?: boolean;
   /** After AI text match, compare local cover to Cover Art Archive (vision). Reject match if "No". */
   USE_AI_VISION_FOR_COVER?: boolean;
+  /** Minimum AI confidence (0–100). Below this, reject match and try other sources. 0 = accept all. */
+  AI_CONFIDENCE_MIN?: number;
   /** Model for vision (e.g. gpt-4o-mini). Empty = use main model. */
   OPENAI_VISION_MODEL?: string;
+  /** Before saving/embedding a fetched cover (improve), verify via vision that it matches the album. */
+  USE_AI_VISION_BEFORE_COVER_INJECT?: boolean;
+  /** Copy each album to /dupes/original_version before applying tags, cover, and artist image. */
+  BACKUP_BEFORE_FIX?: boolean;
+  /** After each scan: automatic dedupe then improve-all (tags, covers, artist images). */
+  MAGIC_MODE?: boolean;
+  /** When true (default), improve-all will re-run on albums that PMDA has processed but not fully completed (missing tags/cover/artist image). When false, albums already touched by PMDA but not 100% complete are skipped in subsequent improve-all runs. */
+  REPROCESS_INCOMPLETE_ALBUMS?: boolean;
+  /** Number of albums to improve in parallel during improve-all (1–8). 1 = sequential; higher speeds up fix-all when Discogs/Last.fm/Bandcamp are used. MusicBrainz calls remain rate-limited. */
+  IMPROVE_ALL_WORKERS?: number;
+  /** Number of parallel ffprobe workers for audio analysis during scan. Higher values speed up scan on multi-core systems. */
+  FFPROBE_POOL_SIZE?: number;
+  /** Identify albums by acoustic fingerprint (AcoustID) when tags are missing. */
+  USE_ACOUSTID?: boolean;
+  /** AcoustID API key (from acoustid.org). Required if USE_ACOUSTID is on. */
+  ACOUSTID_API_KEY?: string;
+  /** When false (default), skip AcousticID lookup for albums that already have MusicBrainz release-group ID in tags (saves API calls). */
+  USE_ACOUSTID_WHEN_TAGGED?: boolean;
   /** When no MB candidate or AI says NONE, use web search (Serper) + AI to suggest MBID. */
   USE_WEB_SEARCH_FOR_MB?: boolean;
   /** Serper.dev API key for web search. */
@@ -309,12 +351,18 @@ export interface PMDAConfig {
   LASTFM_API_KEY: string;
   LASTFM_API_SECRET: string;
   USE_BANDCAMP: boolean;
+  /** Skip MusicBrainz lookup and tagging for albums detected as live (folder/title heuristics). */
+  SKIP_MB_FOR_LIVE_ALBUMS?: boolean;
+  /** Minimum tracklist match ratio (0–1) to accept a release; below this the match is rejected. */
+  TRACKLIST_MATCH_MIN?: number | string;
+  /** For live albums: only assign an MB release-group if it has secondary type "Live". */
+  LIVE_ALBUMS_MB_STRICT?: boolean;
+  /** Safety mode for live albums dedupe heuristics. */
+  LIVE_DEDUPE_MODE?: 'safe' | 'aggressive';
   DISCORD_WEBHOOK: string;
   LOG_LEVEL: 'DEBUG' | 'INFO' | 'WARNING' | 'ERROR';
   LOG_FILE: string;
   AUTO_MOVE_DUPES: boolean;
-  /** Default run mode (e.g. serve). */
-  PMDA_DEFAULT_MODE?: string;
   // Integrations
   LIDARR_URL: string;
   LIDARR_API_KEY: string;
@@ -346,7 +394,7 @@ export interface ScanHistoryEntry {
   albums_moved: number;
   status: string;
   /** 'scan' | 'dedupe' – type of history entry for unified History view */
-  entry_type?: 'scan' | 'dedupe';
+  entry_type?: 'scan' | 'dedupe' | 'incomplete';
   // Detailed statistics
   duplicate_groups_count?: number;
   total_duplicates_count?: number;
@@ -359,9 +407,13 @@ export interface ScanHistoryEntry {
   albums_without_artist_mb_id?: number;
   /** Parsed summary from scan (formats, cache, AI/MB stats, etc.) when available */
   summary_json?: ScanHistorySummaryJson | null;
+  /** Human-readable list of steps executed during the scan (from summary_json.steps_executed) */
+  steps_executed?: string[];
 }
 
 export interface ScanHistorySummaryJson {
+  /** Human-readable list of metadata steps executed (MusicBrainz, AI, vision, fallbacks, etc.) */
+  steps_executed?: string[];
   ffmpeg_formats?: Record<string, number>;
   mb_connection_ok?: boolean;
   mb_albums_verified?: number;
@@ -369,6 +421,15 @@ export interface ScanHistorySummaryJson {
   ai_connection_ok?: boolean;
   ai_groups_count?: number;
   mb_verified_by_ai?: number;
+  // Duplicate decision telemetry
+  duplicate_groups_total?: number;
+  duplicate_groups_saved?: number;
+  duplicate_groups_ai_decided?: number;
+  duplicate_groups_skipped?: number;
+  duplicate_groups_ai_failed_total?: number;
+  duplicate_groups_ai_failed_then_recovered?: number;
+  duplicate_groups_ai_failed_unresolved?: number;
+  ai_errors?: { message: string; group?: string }[];
   duration_seconds?: number;
   artists_total?: number;
   albums_scanned?: number;
@@ -393,6 +454,15 @@ export interface ScanHistorySummaryJson {
   scan_discogs_matched?: number;
   scan_lastfm_matched?: number;
   scan_bandcamp_matched?: number;
+  cover_from_mb?: number;
+  cover_from_discogs?: number;
+  cover_from_lastfm?: number;
+  cover_from_bandcamp?: number;
+  // PMDA album-level stats for this scan (albums touched by PMDA during this run)
+  pmda_albums_processed?: number;
+  pmda_albums_complete?: number;
+  pmda_albums_with_cover?: number;
+  pmda_albums_with_artist_image?: number;
 }
 
 export interface ScanHistoryEntryOld {
@@ -503,9 +573,10 @@ export async function normalizeAlbumNames(albumIds?: number[]): Promise<{ rename
   );
 }
 
-// Duplicates
-export async function getDuplicates(): Promise<DuplicateCard[]> {
-  return fetchApi<DuplicateCard[]>('/api/duplicates');
+// Duplicates (scan-only by default; use source=all for scan + library-only groups on large libraries)
+export async function getDuplicates(options?: { source?: 'scan' | 'all' }): Promise<DuplicateCard[]> {
+  const source = options?.source ?? 'scan';
+  return fetchApi<DuplicateCard[]>(`/api/duplicates?source=${source}`);
 }
 
 export async function getDuplicateDetails(artist: string, albumId: string): Promise<DuplicateDetails> {
@@ -524,6 +595,8 @@ export interface ScanPreflightResult {
   discogs?: { ok: boolean; message: string };
   lastfm?: { ok: boolean; message: string };
   bandcamp?: { ok: boolean; message: string };
+  serper?: { ok: boolean; message: string };
+  acoustid?: { ok: boolean; message: string };
   paths?: { music_rw: boolean; dupes_rw: boolean };
 }
 
@@ -531,8 +604,64 @@ export async function getScanPreflight(): Promise<ScanPreflightResult> {
   return fetchApi<ScanPreflightResult>('/api/scan/preflight');
 }
 
-export async function startScan(): Promise<void> {
-  await fetchApi('/scan/start', { method: 'POST' });
+export interface StartScanOptions {
+  scan_type?: 'full' | 'incomplete_only';
+  run_improve_after?: boolean;
+}
+
+export async function startScan(options?: StartScanOptions): Promise<{ status: string; scan_type?: string; run_improve_after?: boolean }> {
+  return fetchApi('/scan/start', {
+    method: 'POST',
+    body: options ? JSON.stringify(options) : undefined,
+    headers: options ? { 'Content-Type': 'application/json' } : undefined,
+  });
+}
+
+export interface IncompleteScanProgress {
+  running: boolean;
+  run_id: number | null;
+  progress: number;
+  total: number;
+  current_artist: string;
+  current_album: string;
+  count: number;
+  error: string | null;
+}
+
+export async function getIncompleteScanProgress(): Promise<IncompleteScanProgress> {
+  return fetchApi<IncompleteScanProgress>('/api/incomplete-albums/scan/progress');
+}
+
+export interface IncompleteAlbumItem {
+  artist: string;
+  album_id: number;
+  title_raw: string;
+  folder: string;
+  classification: string;
+  missing_in_plex: number[];
+  missing_on_disk: string[];
+  expected_track_count: number;
+  actual_track_count: number;
+  detected_at: number;
+}
+
+export async function getIncompleteAlbumsResults(runId?: number): Promise<{ run_id: number | null; items: IncompleteAlbumItem[] }> {
+  const url = runId != null ? `/api/incomplete-albums/results?run_id=${runId}` : '/api/incomplete-albums/results';
+  return fetchApi(url);
+}
+
+export async function moveIncompleteAlbums(runId: number, items: Array<{ artist: string; album_id: number; title_raw?: string }>): Promise<{ moved: Array<{ artist: string; album_id: number; moved_to: string }> }> {
+  return fetchApi('/api/incomplete-albums/move', {
+    method: 'POST',
+    body: JSON.stringify({ run_id: runId, items }),
+    headers: { 'Content-Type': 'application/json' },
+  });
+}
+
+/** Returns the URL to download export (JSON or CSV). Call with fetch or window.open. */
+export function getIncompleteAlbumsExportUrl(runId: number, format: 'json' | 'csv' = 'json'): string {
+  const base = API_BASE_URL || '';
+  return `${base}/api/incomplete-albums/export/${runId}?format=${format}`;
 }
 
 export async function pauseScan(): Promise<void> {
@@ -576,7 +705,7 @@ export async function getDedupeProgress(): Promise<DedupeProgress> {
 }
 
 export async function dedupeAll(): Promise<{ started: boolean; total?: number }> {
-  return fetchApi<{ started: boolean; total?: number }>('/dedupe/all', { method: 'POST' });
+  return fetchApi<{ started: boolean; total?: number }>('/api/dedupe/all', { method: 'POST' });
 }
 
 export interface ImproveAllProgress {
@@ -597,6 +726,41 @@ export async function improveAll(): Promise<{ started: boolean; total: number }>
 
 export async function getImproveAllProgress(): Promise<ImproveAllProgress> {
   return fetchApi<ImproveAllProgress>('/api/library/improve-all/progress');
+}
+
+/** Result of drop/improve (improve album by path from uploaded files). */
+export interface ImproveDropResult {
+  steps: string[];
+  summary: string;
+  tags_updated: boolean;
+  cover_saved: boolean;
+  provider_used: string | null;
+  dupes_in_folder: Array<{ track: number; paths: string[] }>;
+  files_updated: number;
+  error?: string;
+}
+
+/** Upload audio files and run improve-by-path (identify, tag, cover). Uses multipart form. */
+export async function improveDroppedAlbum(files: File[], folderName?: string): Promise<ImproveDropResult> {
+  const formData = new FormData();
+  files.forEach((f) => formData.append('files', f));
+  if (folderName != null && folderName !== '') formData.append('folder_name', folderName);
+  const base = API_BASE_URL ? API_BASE_URL.replace(/\/$/, '') : '';
+  const url = `${base}/api/drop/improve`;
+  const res = await fetch(url, { method: 'POST', body: formData });
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(data.error || data.detail || `HTTP ${res.status}`);
+  }
+  return {
+    steps: Array.isArray(data.steps) ? data.steps : [],
+    summary: data.summary ?? '',
+    tags_updated: Boolean(data.tags_updated),
+    cover_saved: Boolean(data.cover_saved),
+    provider_used: data.provider_used ?? null,
+    dupes_in_folder: Array.isArray(data.dupes_in_folder) ? data.dupes_in_folder : [],
+    files_updated: Number(data.files_updated) || 0,
+  };
 }
 
 export interface LidarrAddIncompleteProgress {
@@ -696,6 +860,35 @@ export async function saveConfig(config: Partial<PMDAConfig>): Promise<{ status:
     method: 'PUT',
     body: JSON.stringify(config),
   });
+}
+
+/** Files backend: start rebuild of export library (hardlinks/symlinks/copies). */
+export async function postFilesExportRebuild(): Promise<{ status: string; message?: string }> {
+  return fetchApi<{ status: string; message?: string }>('/api/files/export/rebuild', { method: 'POST' });
+}
+
+/** Files backend: export progress (running, tracks_done, total_tracks, albums_done, total_albums, error). */
+export interface FilesExportStatus {
+  running: boolean;
+  tracks_done: number;
+  total_tracks: number;
+  albums_done: number;
+  total_albums: number;
+  error: string | null;
+}
+export async function getFilesExportStatus(): Promise<FilesExportStatus> {
+  return fetchApi<FilesExportStatus>('/api/files/export/status');
+}
+
+/** Files backend: structure overview (templates, metrics, samples). */
+export interface FilesStructureOverview {
+  templates: Array<{ name: string; example: string }>;
+  metrics: { sample_count?: number; total_files_estimate?: number; average_path_depth?: number; paths_with_artist_tag?: number; paths_with_album_tag?: number };
+  samples: Array<{ path: string; artist?: string; album?: string; year?: string; ext?: string }>;
+  sample_count: number;
+}
+export async function getFilesStructureOverview(): Promise<FilesStructureOverview> {
+  return fetchApi<FilesStructureOverview>('/api/files/structure/overview');
 }
 
 /** Test Plex connection. Pass current form values to test before saving. */

@@ -1,8 +1,20 @@
 import { useMemo, useState } from 'react';
-import { Loader2, BarChart2, Disc3, Trash2, HardDrive, Cpu, AlertCircle, PieChart } from 'lucide-react';
+import type { ReactNode } from 'react';
+import {
+  Loader2,
+  BarChart3,
+  Database,
+  Sparkles,
+  Image,
+  Tag,
+  HardDrive,
+  Clock,
+  Gauge,
+  Layers,
+  AlertCircle,
+} from 'lucide-react';
 import { useQuery } from '@tanstack/react-query';
-import { format, subHours, subDays } from 'date-fns';
-import type { ScanProgress } from '@/lib/api';
+import { format } from 'date-fns';
 import {
   Chart as ChartJS,
   CategoryScale,
@@ -11,15 +23,17 @@ import {
   LineElement,
   PointElement,
   ArcElement,
-  Title,
+  Filler,
   Tooltip,
   Legend,
-  Filler,
 } from 'chart.js';
 import { Bar, Line, Doughnut } from 'react-chartjs-2';
+import type { ScanHistoryEntry, ScanProgress } from '@/lib/api';
 import { Header } from '@/components/Header';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
+import { Badge } from '@/components/ui/badge';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import * as api from '@/lib/api';
 
 ChartJS.register(
@@ -29,267 +43,446 @@ ChartJS.register(
   LineElement,
   PointElement,
   ArcElement,
-  Title,
+  Filler,
   Tooltip,
   Legend,
-  Filler
 );
 
 const PERIODS = [
   { key: 'daily', label: 'Daily', hours: 24 },
   { key: 'weekly', label: 'Weekly', hours: 24 * 7 },
   { key: 'monthly', label: 'Monthly', hours: 24 * 30 },
+  { key: 'last', label: 'Last scan', hours: 0 },
   { key: 'forever', label: 'Forever', hours: 0 },
 ] as const;
 
 type PeriodKey = (typeof PERIODS)[number]['key'];
+type StatsTab = 'overview' | 'metadata' | 'quality' | 'operations';
+
+interface ScanSnapshot {
+  scanId: number;
+  startTime: number;
+  albumsScanned: number;
+  duplicatesFound: number;
+  spaceSavedMb: number;
+  albumsMoved: number;
+  durationSeconds: number;
+  mode: string;
+  matchedAlbums: number;
+  albumsWithMbId: number;
+  mbVerifiedByAi: number;
+  discogsMatches: number;
+  lastfmMatches: number;
+  bandcampMatches: number;
+  withTags: number;
+  withCover: number;
+  withArtistImage: number;
+  fullyComplete: number;
+  withoutTags: number;
+  withoutCover: number;
+  withoutArtistImage: number;
+  brokenAlbums: number;
+  audioCacheHits: number;
+  audioCacheMisses: number;
+  mbCacheHits: number;
+  mbCacheMisses: number;
+}
+
+interface AggregateStats {
+  scans: number;
+  albumsScanned: number;
+  duplicatesFound: number;
+  spaceSavedMb: number;
+  albumsMoved: number;
+  durationSeconds: number;
+  matchedAlbums: number;
+  albumsWithMbId: number;
+  mbVerifiedByAi: number;
+  discogsMatches: number;
+  lastfmMatches: number;
+  bandcampMatches: number;
+  withTags: number;
+  withCover: number;
+  withArtistImage: number;
+  fullyComplete: number;
+  withoutTags: number;
+  withoutCover: number;
+  withoutArtistImage: number;
+  brokenAlbums: number;
+  audioCacheHits: number;
+  audioCacheMisses: number;
+  mbCacheHits: number;
+  mbCacheMisses: number;
+}
+
+function n(value: number | null | undefined): number {
+  return value ?? 0;
+}
+
+function formatMb(mb: number): string {
+  if (mb >= 1024) return `${(mb / 1024).toFixed(1)} GB`;
+  return `${mb.toFixed(0)} MB`;
+}
+
+function formatPercent(value: number, total: number): string {
+  if (total <= 0) return 'N/A';
+  return `${((value / total) * 100).toFixed(1)}%`;
+}
+
+function formatDuration(seconds: number): string {
+  if (seconds <= 0) return '0s';
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = seconds % 60;
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m ${s}s`;
+  return `${s}s`;
+}
 
 const chartOptions = {
   responsive: true,
   maintainAspectRatio: false,
-  animation: { duration: 600 },
   plugins: {
     legend: { position: 'top' as const },
   },
 };
 
-const transparentFill = (hex: string, alpha: number) => {
-  const r = parseInt(hex.slice(1, 3), 16);
-  const g = parseInt(hex.slice(3, 5), 16);
-  const b = parseInt(hex.slice(5, 7), 16);
-  return `rgba(${r},${g},${b},${alpha})`;
-};
+function normalizeScan(entry: ScanHistoryEntry): ScanSnapshot {
+  const summary = entry.summary_json ?? null;
+  const albumsScanned = n(summary?.albums_scanned ?? entry.albums_scanned);
+  const withoutTags = n(summary?.albums_without_complete_tags ?? entry.albums_without_complete_tags);
+  const withoutCover = n(summary?.albums_without_album_image ?? entry.albums_without_album_image);
+  const withoutArtistImage = n(summary?.albums_without_artist_image ?? entry.albums_without_artist_image);
+  const albumsWithMbId = n(
+    summary?.albums_with_mb_id ?? Math.max(0, albumsScanned - n(summary?.albums_without_mb_id ?? entry.albums_without_mb_id)),
+  );
 
-const COLORS = {
-  primary: '#8884d8',
-  secondary: '#82ca9d',
-  tertiary: '#22c55e',
-  quaternary: '#f59e0b',
-  muted: '#94a3b8',
-};
+  const discogsMatches = n(summary?.scan_discogs_matched);
+  const lastfmMatches = n(summary?.scan_lastfm_matched);
+  const bandcampMatches = n(summary?.scan_bandcamp_matched);
+
+  const matchedAlbums = Math.min(
+    albumsScanned,
+    Math.max(0, albumsWithMbId + discogsMatches + lastfmMatches + bandcampMatches),
+  );
+
+  return {
+    scanId: entry.scan_id,
+    startTime: n(entry.start_time),
+    albumsScanned,
+    duplicatesFound: n(summary?.duplicate_groups_count ?? entry.duplicate_groups_count ?? entry.duplicates_found),
+    spaceSavedMb: n(summary?.space_saved_mb_this_scan ?? entry.space_saved_mb),
+    albumsMoved: n(summary?.dupes_moved_this_scan ?? entry.albums_moved),
+    durationSeconds: n(summary?.duration_seconds ?? entry.duration_seconds),
+    mode: String((summary as { library_mode?: string } | null)?.library_mode || 'unknown'),
+    matchedAlbums,
+    albumsWithMbId,
+    mbVerifiedByAi: n(summary?.mb_verified_by_ai),
+    discogsMatches,
+    lastfmMatches,
+    bandcampMatches,
+    withTags: Math.max(0, albumsScanned - withoutTags),
+    withCover: Math.max(0, albumsScanned - withoutCover),
+    withArtistImage: Math.max(0, albumsScanned - withoutArtistImage),
+    fullyComplete: Math.max(0, albumsScanned - Math.max(withoutTags, withoutCover, withoutArtistImage)),
+    withoutTags,
+    withoutCover,
+    withoutArtistImage,
+    brokenAlbums: n(summary?.broken_albums_count ?? entry.broken_albums_count),
+    audioCacheHits: n(summary?.audio_cache_hits),
+    audioCacheMisses: n(summary?.audio_cache_misses),
+    mbCacheHits: n(summary?.mb_cache_hits),
+    mbCacheMisses: n(summary?.mb_cache_misses),
+  };
+}
+
+function aggregate(scans: ScanSnapshot[]): AggregateStats {
+  return scans.reduce<AggregateStats>(
+    (acc, scan) => {
+      acc.scans += 1;
+      acc.albumsScanned += scan.albumsScanned;
+      acc.duplicatesFound += scan.duplicatesFound;
+      acc.spaceSavedMb += scan.spaceSavedMb;
+      acc.albumsMoved += scan.albumsMoved;
+      acc.durationSeconds += scan.durationSeconds;
+      acc.matchedAlbums += scan.matchedAlbums;
+      acc.albumsWithMbId += scan.albumsWithMbId;
+      acc.mbVerifiedByAi += scan.mbVerifiedByAi;
+      acc.discogsMatches += scan.discogsMatches;
+      acc.lastfmMatches += scan.lastfmMatches;
+      acc.bandcampMatches += scan.bandcampMatches;
+      acc.withTags += scan.withTags;
+      acc.withCover += scan.withCover;
+      acc.withArtistImage += scan.withArtistImage;
+      acc.fullyComplete += scan.fullyComplete;
+      acc.withoutTags += scan.withoutTags;
+      acc.withoutCover += scan.withoutCover;
+      acc.withoutArtistImage += scan.withoutArtistImage;
+      acc.brokenAlbums += scan.brokenAlbums;
+      acc.audioCacheHits += scan.audioCacheHits;
+      acc.audioCacheMisses += scan.audioCacheMisses;
+      acc.mbCacheHits += scan.mbCacheHits;
+      acc.mbCacheMisses += scan.mbCacheMisses;
+      return acc;
+    },
+    {
+      scans: 0,
+      albumsScanned: 0,
+      duplicatesFound: 0,
+      spaceSavedMb: 0,
+      albumsMoved: 0,
+      durationSeconds: 0,
+      matchedAlbums: 0,
+      albumsWithMbId: 0,
+      mbVerifiedByAi: 0,
+      discogsMatches: 0,
+      lastfmMatches: 0,
+      bandcampMatches: 0,
+      withTags: 0,
+      withCover: 0,
+      withArtistImage: 0,
+      fullyComplete: 0,
+      withoutTags: 0,
+      withoutCover: 0,
+      withoutArtistImage: 0,
+      brokenAlbums: 0,
+      audioCacheHits: 0,
+      audioCacheMisses: 0,
+      mbCacheHits: 0,
+      mbCacheMisses: 0,
+    },
+  );
+}
+
+function DeltaPill({
+  current,
+  previous,
+  positiveIsGood = true,
+  suffix = '',
+}: {
+  current: number;
+  previous: number;
+  positiveIsGood?: boolean;
+  suffix?: string;
+}) {
+  const diff = current - previous;
+  if (diff === 0) {
+    return <span className="text-xs text-muted-foreground">vs prev: 0{suffix}</span>;
+  }
+  const good = diff > 0 ? positiveIsGood : !positiveIsGood;
+  const sign = diff > 0 ? '+' : '';
+  return (
+    <span className={good ? 'text-xs text-emerald-600' : 'text-xs text-red-500'}>
+      vs prev: {sign}{diff.toFixed(Math.abs(diff) < 10 ? 1 : 0)}{suffix}
+    </span>
+  );
+}
+
+function StatCard({
+  title,
+  value,
+  description,
+  icon,
+  delta,
+}: {
+  title: string;
+  value: string;
+  description?: string;
+  icon: ReactNode;
+  delta?: ReactNode;
+}) {
+  return (
+    <Card>
+      <CardHeader className="pb-2">
+        <CardTitle className="text-caption font-medium flex items-center gap-1.5 text-muted-foreground uppercase tracking-wider">
+          {icon}
+          {title}
+        </CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-1">
+        <p className="text-display font-bold text-foreground tabular-nums">{value}</p>
+        {description && <p className="text-caption text-muted-foreground">{description}</p>}
+        {delta}
+      </CardContent>
+    </Card>
+  );
+}
 
 export default function Statistics() {
-  const [period, setPeriod] = useState<PeriodKey>('forever');
+  const [period, setPeriod] = useState<PeriodKey>('last');
+  const [activeTab, setActiveTab] = useState<StatsTab>('overview');
+
   const { data: history = [], isLoading } = useQuery({
     queryKey: ['scan-history'],
     queryFn: api.getScanHistory,
   });
+
   const { data: scanProgress } = useQuery<ScanProgress>({
     queryKey: ['scan-progress'],
     queryFn: api.getScanProgress,
     refetchInterval: (data) => (data?.scanning ? 2000 : false),
   });
 
-  const filtered = useMemo(() => {
-    if (period === 'forever') return history;
+  const completedScans = useMemo(() => {
+    const entries = history
+      .filter((entry) => entry.entry_type === 'scan' && entry.status === 'completed' && Boolean(entry.end_time))
+      .sort((a, b) => n(b.start_time) - n(a.start_time));
+    return entries.map(normalizeScan);
+  }, [history]);
+
+  const selectedScans = useMemo(() => {
+    if (period === 'last') {
+      return completedScans.length > 0 ? [completedScans[0]] : [];
+    }
+    if (period === 'forever') {
+      return completedScans;
+    }
     const hours = PERIODS.find((p) => p.key === period)?.hours ?? 0;
     const cutoff = Date.now() / 1000 - hours * 3600;
-    return history.filter((e) => (e.start_time ?? 0) >= cutoff);
-  }, [history, period]);
+    return completedScans.filter((scan) => scan.startTime >= cutoff);
+  }, [completedScans, period]);
 
-  const withEndTime = useMemo(() => filtered.filter((e) => e.end_time), [filtered]);
-  const scansOnly = useMemo(() => withEndTime.filter((e) => e.entry_type !== 'dedupe'), [withEndTime]);
+  const baselineScans = useMemo(() => {
+    if (selectedScans.length === 0) return [];
+    const selectedIds = new Set(selectedScans.map((s) => s.scanId));
+    return completedScans.filter((s) => !selectedIds.has(s.scanId)).slice(0, selectedScans.length);
+  }, [completedScans, selectedScans]);
 
-  const kpis = useMemo(() => {
-    const scans = withEndTime.filter((e) => e.entry_type === 'scan').length;
-    const dedupes = withEndTime.filter((e) => e.entry_type === 'dedupe').length;
-    const albumsScanned = scansOnly.reduce((s, e) => s + (e.albums_scanned ?? 0), 0);
-    const duplicatesFound = scansOnly.reduce((s, e) => s + (e.duplicates_found ?? 0), 0);
-    const spaceSavedMb = withEndTime.reduce((s, e) => s + (e.space_saved_mb ?? 0), 0);
-    const albumsMoved = withEndTime.reduce((s, e) => s + (e.albums_moved ?? 0), 0);
-    return { scans, dedupes, albumsScanned, duplicatesFound, spaceSavedMb, albumsMoved };
-  }, [withEndTime, scansOnly]);
+  const current = useMemo(() => aggregate(selectedScans), [selectedScans]);
+  const previous = useMemo(() => aggregate(baselineScans), [baselineScans]);
 
-  const chartDataScans = useMemo(() => {
-    const ordered = [...scansOnly].reverse();
+  const latestSelected = selectedScans[0] ?? null;
+  const modeSummary = useMemo(() => {
+    const counts: Record<string, number> = {};
+    for (const scan of selectedScans) {
+      const key = scan.mode || 'unknown';
+      counts[key] = (counts[key] ?? 0) + 1;
+    }
+    return Object.entries(counts)
+      .map(([mode, count]) => `${mode}:${count}`)
+      .join(' · ');
+  }, [selectedScans]);
+
+  const sourceLabel = useMemo(() => {
+    if (!latestSelected) return 'No completed scan in this period';
+    if (period === 'last') {
+      return `source = scan #${latestSelected.scanId} (${format(new Date(latestSelected.startTime * 1000), 'yyyy-MM-dd HH:mm')})`;
+    }
+    return `source = ${selectedScans.length} scan(s) aggregated (${modeSummary || 'unknown'})`;
+  }, [latestSelected, modeSummary, period, selectedScans.length]);
+
+  const throughputAlbumsPerMin =
+    current.durationSeconds > 0 ? (current.albumsScanned / current.durationSeconds) * 60 : 0;
+  const averageDuration = current.scans > 0 ? current.durationSeconds / current.scans : 0;
+
+  const audioCacheTotal = current.audioCacheHits + current.audioCacheMisses;
+  const mbCacheTotal = current.mbCacheHits + current.mbCacheMisses;
+  const audioCacheHitRate = audioCacheTotal > 0 ? (current.audioCacheHits / audioCacheTotal) * 100 : 0;
+  const mbCacheHitRate = mbCacheTotal > 0 ? (current.mbCacheHits / mbCacheTotal) * 100 : 0;
+
+  const scansChrono = useMemo(
+    () => [...selectedScans].sort((a, b) => a.startTime - b.startTime),
+    [selectedScans],
+  );
+
+  const scanTrendData = useMemo(() => {
     return {
-      labels: ordered.map((e) => format(new Date((e.start_time ?? 0) * 1000), 'MMM d HH:mm')),
+      labels: scansChrono.map((scan) => format(new Date(scan.startTime * 1000), 'MM-dd HH:mm')),
       datasets: [
         {
           label: 'Albums scanned',
-          data: ordered.map((e) => e.albums_scanned ?? 0),
-          borderColor: COLORS.primary,
-          backgroundColor: transparentFill(COLORS.primary, 0.2),
-          fill: true,
+          data: scansChrono.map((scan) => scan.albumsScanned),
+          borderColor: '#3b82f6',
+          backgroundColor: 'rgba(59,130,246,0.2)',
           tension: 0.3,
-        },
-        {
-          label: 'Duplicates found',
-          data: ordered.map((e) => e.duplicates_found ?? 0),
-          borderColor: COLORS.secondary,
-          backgroundColor: transparentFill(COLORS.secondary, 0.2),
           fill: true,
+        },
+        {
+          label: 'Duplicate groups',
+          data: scansChrono.map((scan) => scan.duplicatesFound),
+          borderColor: '#f59e0b',
+          backgroundColor: 'rgba(245,158,11,0.2)',
           tension: 0.3,
-        },
-      ],
-    };
-  }, [scansOnly]);
-
-  const chartDataSpaceSaved = useMemo(() => {
-    const ordered = [...withEndTime].reverse();
-    return {
-      labels: ordered.map((e) => format(new Date((e.start_time ?? 0) * 1000), 'MMM d HH:mm')),
-      datasets: [
-        {
-          label: 'Space saved (MB)',
-          data: ordered.map((e) => e.space_saved_mb ?? 0),
-          backgroundColor: ordered.map((_, i) => transparentFill(COLORS.primary, 0.6 - (i * 0.1) / Math.max(ordered.length, 1))),
-          borderColor: COLORS.primary,
-          borderWidth: 1,
-        },
-      ],
-    };
-  }, [withEndTime]);
-
-  const chartDataCumulative = useMemo(() => {
-    const ordered = [...withEndTime].reverse();
-    let cum = 0;
-    const cumulative = ordered.map((e) => {
-      cum += e.space_saved_mb ?? 0;
-      return cum;
-    });
-    return {
-      labels: ordered.map((e) => format(new Date((e.start_time ?? 0) * 1000), 'MMM d HH:mm')),
-      datasets: [
-        {
-          label: 'Cumulative space saved (MB)',
-          data: cumulative,
-          borderColor: COLORS.tertiary,
-          backgroundColor: transparentFill(COLORS.tertiary, 0.15),
           fill: true,
-          tension: 0.3,
         },
       ],
     };
-  }, [withEndTime]);
+  }, [scansChrono]);
 
-  const chartDataAiMb = useMemo(() => {
-    const aiTotal = scansOnly.reduce((s, e) => s + (e.ai_used_count ?? 0), 0);
-    const mbTotal = scansOnly.reduce((s, e) => s + (e.mb_used_count ?? 0), 0);
-    const other = Math.max(0, kpis.albumsScanned - aiTotal - mbTotal);
+  const metadataProvidersData = useMemo(() => {
     return {
-      labels: ['AI used', 'MusicBrainz used', 'Other'],
+      labels: ['MusicBrainz', 'Discogs', 'Last.fm', 'Bandcamp'],
       datasets: [
         {
-          data: [aiTotal, mbTotal, other],
-          backgroundColor: [transparentFill(COLORS.quaternary, 0.8), transparentFill(COLORS.primary, 0.8), transparentFill(COLORS.muted, 0.5)],
+          data: [
+            current.albumsWithMbId,
+            current.discogsMatches,
+            current.lastfmMatches,
+            current.bandcampMatches,
+          ],
+          backgroundColor: [
+            'rgba(59,130,246,0.85)',
+            'rgba(34,197,94,0.85)',
+            'rgba(249,115,22,0.85)',
+            'rgba(168,85,247,0.85)',
+          ],
+          borderColor: ['#2563eb', '#16a34a', '#ea580c', '#9333ea'],
           borderWidth: 1,
-          borderColor: ['#f59e0b', '#8884d8', '#94a3b8'],
         },
       ],
     };
-  }, [scansOnly, kpis.albumsScanned]);
+  }, [current.albumsWithMbId, current.discogsMatches, current.lastfmMatches, current.bandcampMatches]);
 
-  const chartDataProblems = useMemo(() => {
-    const ordered = [...scansOnly].slice(-15).reverse();
+  const qualityCoverageData = useMemo(() => {
     return {
-      labels: ordered.map((e) => format(new Date((e.start_time ?? 0) * 1000), 'MMM d')),
+      labels: ['Tags', 'Cover', 'Artist image', 'Fully complete'],
       datasets: [
         {
-          label: 'Broken albums',
-          data: ordered.map((e) => e.broken_albums_count ?? 0),
-          backgroundColor: transparentFill('#ef4444', 0.6),
-        },
-        {
-          label: 'Missing albums',
-          data: ordered.map((e) => e.missing_albums_count ?? 0),
-          backgroundColor: transparentFill('#f59e0b', 0.6),
-        },
-        {
-          label: 'Without MBID',
-          data: ordered.map((e) => e.albums_without_mb_id ?? 0),
-          backgroundColor: transparentFill(COLORS.muted, 0.6),
-        },
-      ],
-    };
-  }, [scansOnly]);
-
-  // Live or last-scan album health for pie charts (updates during scan)
-  const liveAlbumHealth = useMemo(() => {
-    if (scanProgress?.scanning && (scanProgress.total_albums ?? 0) > 0) {
-      const total = scanProgress.total_albums ?? 0;
-      return {
-        total,
-        broken: scanProgress.broken_albums_count ?? 0,
-        noTags: scanProgress.albums_without_complete_tags ?? 0,
-        noArt: scanProgress.albums_without_album_image ?? 0,
-        isLive: true,
-      };
-    }
-    const summary = scanProgress?.last_scan_summary;
-    if (summary && (summary.albums_scanned ?? 0) > 0) {
-      const total = summary.albums_scanned ?? 0;
-      return {
-        total,
-        broken: summary.broken_albums_count ?? 0,
-        noTags: summary.albums_without_complete_tags ?? 0,
-        noArt: summary.albums_without_album_image ?? 0,
-        isLive: false,
-      };
-    }
-    const lastScan = scansOnly.length > 0 ? scansOnly[scansOnly.length - 1] : null;
-    if (lastScan && (lastScan.albums_scanned ?? 0) > 0) {
-      const total = lastScan.albums_scanned ?? 0;
-      return {
-        total,
-        broken: lastScan.broken_albums_count ?? 0,
-        noTags: lastScan.albums_without_complete_tags ?? 0,
-        noArt: lastScan.albums_without_album_image ?? 0,
-        isLive: false,
-      };
-    }
-    return null;
-  }, [scanProgress, scansOnly]);
-
-  const chartDataIncompleteAlbums = useMemo(() => {
-    if (!liveAlbumHealth || liveAlbumHealth.total === 0) return null;
-    const ok = Math.max(0, liveAlbumHealth.total - liveAlbumHealth.broken);
-    return {
-      labels: ['OK', 'Incomplete albums'],
-      datasets: [
-        {
-          data: [ok, liveAlbumHealth.broken],
-          backgroundColor: [transparentFill(COLORS.tertiary, 0.8), transparentFill('#ef4444', 0.8)],
+          label: 'Coverage (%)',
+          data: [
+            current.albumsScanned > 0 ? (current.withTags / current.albumsScanned) * 100 : 0,
+            current.albumsScanned > 0 ? (current.withCover / current.albumsScanned) * 100 : 0,
+            current.albumsScanned > 0 ? (current.withArtistImage / current.albumsScanned) * 100 : 0,
+            current.albumsScanned > 0 ? (current.fullyComplete / current.albumsScanned) * 100 : 0,
+          ],
+          backgroundColor: [
+            'rgba(59,130,246,0.8)',
+            'rgba(34,197,94,0.8)',
+            'rgba(14,165,233,0.8)',
+            'rgba(16,185,129,0.8)',
+          ],
+          borderColor: ['#2563eb', '#16a34a', '#0284c7', '#059669'],
           borderWidth: 1,
-          borderColor: [COLORS.tertiary, '#ef4444'],
         },
       ],
     };
-  }, [liveAlbumHealth]);
+  }, [current.albumsScanned, current.withCover, current.withTags, current.withArtistImage, current.fullyComplete]);
 
-  const chartDataIncompleteTags = useMemo(() => {
-    if (!liveAlbumHealth || liveAlbumHealth.total === 0) return null;
-    const ok = Math.max(0, liveAlbumHealth.total - liveAlbumHealth.noTags);
+  const operationsTrendData = useMemo(() => {
     return {
-      labels: ['Complete tags', 'Incomplete tags'],
+      labels: scansChrono.map((scan) => format(new Date(scan.startTime * 1000), 'MM-dd HH:mm')),
       datasets: [
         {
-          data: [ok, liveAlbumHealth.noTags],
-          backgroundColor: [transparentFill(COLORS.secondary, 0.8), transparentFill('#a855f7', 0.8)],
-          borderWidth: 1,
-          borderColor: [COLORS.secondary, '#a855f7'],
+          label: 'Duration (s)',
+          data: scansChrono.map((scan) => scan.durationSeconds),
+          borderColor: '#ef4444',
+          backgroundColor: 'rgba(239,68,68,0.2)',
+          yAxisID: 'y',
+          tension: 0.25,
         },
-      ],
-    };
-  }, [liveAlbumHealth]);
-
-  const chartDataNoAlbumArt = useMemo(() => {
-    if (!liveAlbumHealth || liveAlbumHealth.total === 0) return null;
-    const ok = Math.max(0, liveAlbumHealth.total - liveAlbumHealth.noArt);
-    return {
-      labels: ['With art', 'No album art'],
-      datasets: [
         {
-          data: [ok, liveAlbumHealth.noArt],
-          backgroundColor: [transparentFill(COLORS.primary, 0.8), transparentFill(COLORS.muted, 0.8)],
-          borderWidth: 1,
-          borderColor: [COLORS.primary, COLORS.muted],
+          label: 'Throughput (albums/min)',
+          data: scansChrono.map((scan) =>
+            scan.durationSeconds > 0 ? (scan.albumsScanned / scan.durationSeconds) * 60 : 0,
+          ),
+          borderColor: '#22c55e',
+          backgroundColor: 'rgba(34,197,94,0.2)',
+          yAxisID: 'y1',
+          tension: 0.25,
         },
       ],
     };
-  }, [liveAlbumHealth]);
-
-  const formatMb = (mb: number) => (mb >= 1024 ? `${(mb / 1024).toFixed(1)} GB` : `${mb.toFixed(0)} MB`);
+  }, [scansChrono]);
 
   if (isLoading) {
     return (
@@ -306,10 +499,10 @@ export default function Statistics() {
     <>
       <Header />
       <div className="container mx-auto p-6 space-y-6">
-        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+        <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
           <div>
             <h1 className="text-display text-foreground">Statistics</h1>
-            <p className="text-small text-muted-foreground mt-1">Scan and undupe metrics over time</p>
+            <p className="text-small text-muted-foreground mt-1">Single source of truth from completed scans</p>
           </div>
           <div className="flex rounded-lg border border-border p-0.5 bg-muted/30">
             {PERIODS.map((p) => (
@@ -326,298 +519,283 @@ export default function Statistics() {
           </div>
         </div>
 
-        {/* KPI cards - differentiated with semantic colors */}
-        <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
-          <Card className="border-l-4 border-l-primary">
-            <CardHeader className="pb-2">
-              <CardTitle className="text-caption font-medium flex items-center gap-1.5 text-muted-foreground uppercase tracking-wider">
-                <BarChart2 className="w-4 h-4 text-primary" />
-                Scans
-              </CardTitle>
-            </CardHeader>
-            <CardContent>
-              <p className="text-display font-bold text-foreground tabular-nums">{kpis.scans}</p>
-              <p className="text-caption text-muted-foreground mt-1">Total runs</p>
-            </CardContent>
-          </Card>
-          <Card className="border-l-4 border-l-secondary">
-            <CardHeader className="pb-2">
-              <CardTitle className="text-caption font-medium flex items-center gap-1.5 text-muted-foreground uppercase tracking-wider">
-                <Trash2 className="w-4 h-4 text-secondary" />
-                Undupes
-              </CardTitle>
-            </CardHeader>
-            <CardContent>
-              <p className="text-display font-bold text-foreground tabular-nums">{kpis.dedupes}</p>
-              <p className="text-caption text-muted-foreground mt-1">Cleanup sessions</p>
-            </CardContent>
-          </Card>
-          <Card className="border-l-4 border-l-info">
-            <CardHeader className="pb-2">
-              <CardTitle className="text-caption font-medium flex items-center gap-1.5 text-muted-foreground uppercase tracking-wider">
-                <Disc3 className="w-4 h-4 text-info" />
-                Albums
-              </CardTitle>
-            </CardHeader>
-            <CardContent>
-              <p className="text-display font-bold text-foreground tabular-nums">{kpis.albumsScanned.toLocaleString()}</p>
-              <p className="text-caption text-muted-foreground mt-1">Scanned</p>
-            </CardContent>
-          </Card>
-          <Card className="border-l-4 border-l-warning">
-            <CardHeader className="pb-2">
-              <CardTitle className="text-caption font-medium flex items-center gap-1.5 text-muted-foreground uppercase tracking-wider">
-                <AlertCircle className="w-4 h-4 text-warning" />
-                Duplicates
-              </CardTitle>
-            </CardHeader>
-            <CardContent>
-              <p className="text-display font-bold text-warning tabular-nums">{kpis.duplicatesFound.toLocaleString()}</p>
-              <p className="text-caption text-muted-foreground mt-1">Found</p>
-            </CardContent>
-          </Card>
-          <Card className="border-l-4 border-l-success">
-            <CardHeader className="pb-2">
-              <CardTitle className="text-caption font-medium flex items-center gap-1.5 text-muted-foreground uppercase tracking-wider">
-                <HardDrive className="w-4 h-4 text-success" />
-                Space
-              </CardTitle>
-            </CardHeader>
-            <CardContent>
-              <p className="text-display font-bold text-success tabular-nums">{formatMb(kpis.spaceSavedMb)}</p>
-              <p className="text-caption text-muted-foreground mt-1">Saved</p>
-            </CardContent>
-          </Card>
-          <Card className="border-l-4 border-l-muted-foreground">
-            <CardHeader className="pb-2">
-              <CardTitle className="text-caption font-medium flex items-center gap-1.5 text-muted-foreground uppercase tracking-wider">
-                <Cpu className="w-4 h-4" />
-                Moved
-              </CardTitle>
-            </CardHeader>
-            <CardContent>
-              <p className="text-display font-bold text-foreground tabular-nums">{kpis.albumsMoved.toLocaleString()}</p>
-              <p className="text-caption text-muted-foreground mt-1">Albums</p>
-            </CardContent>
-          </Card>
+        <div className="flex flex-wrap items-center gap-2">
+          <Badge variant="outline">{sourceLabel}</Badge>
+          {scanProgress?.scanning && <Badge variant="secondary">Live scan in progress</Badge>}
+          {baselineScans.length > 0 && <Badge variant="outline">delta baseline = previous {baselineScans.length} scan(s)</Badge>}
         </div>
 
-        {liveAlbumHealth && (
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-            <Card className="md:col-span-3">
-              <CardHeader>
-                <CardTitle className="text-base flex items-center gap-1.5">
-                  <PieChart className="w-4 h-4" />
-                  Album health
-                  {liveAlbumHealth.isLive && (
-                    <span className="text-xs font-normal text-primary animate-pulse">Live</span>
-                  )}
-                </CardTitle>
-                <CardDescription>
-                  {liveAlbumHealth.isLive
-                    ? 'Updating during scan – incomplete albums, tags, and art vs total'
-                    : 'Last completed scan – incomplete albums, tags, and art vs total'}
-                </CardDescription>
-              </CardHeader>
-            </Card>
-            <Card>
-              <CardHeader>
-                <CardTitle className="text-sm">Incomplete albums</CardTitle>
-                <CardDescription>{liveAlbumHealth.total.toLocaleString()} total</CardDescription>
-              </CardHeader>
-              <CardContent>
-                <div className="h-[200px] flex items-center justify-center">
-                  {chartDataIncompleteAlbums && (chartDataIncompleteAlbums.datasets[0].data[0] > 0 || chartDataIncompleteAlbums.datasets[0].data[1] > 0) ? (
-                    <Doughnut
-                      data={chartDataIncompleteAlbums}
-                      options={{ ...chartOptions, cutout: '60%' }}
-                    />
-                  ) : (
-                    <p className="text-sm text-muted-foreground">No incomplete albums</p>
-                  )}
-                </div>
-              </CardContent>
-            </Card>
-            <Card>
-              <CardHeader>
-                <CardTitle className="text-sm">Incomplete tags</CardTitle>
-                <CardDescription>{liveAlbumHealth.total.toLocaleString()} total</CardDescription>
-              </CardHeader>
-              <CardContent>
-                <div className="h-[200px] flex items-center justify-center">
-                  {chartDataIncompleteTags && (chartDataIncompleteTags.datasets[0].data[0] > 0 || chartDataIncompleteTags.datasets[0].data[1] > 0) ? (
-                    <Doughnut
-                      data={chartDataIncompleteTags}
-                      options={{ ...chartOptions, cutout: '60%' }}
-                    />
-                  ) : (
-                    <p className="text-sm text-muted-foreground">All tags complete</p>
-                  )}
-                </div>
-              </CardContent>
-            </Card>
-            <Card>
-              <CardHeader>
-                <CardTitle className="text-sm">No album art</CardTitle>
-                <CardDescription>{liveAlbumHealth.total.toLocaleString()} total</CardDescription>
-              </CardHeader>
-              <CardContent>
-                <div className="h-[200px] flex items-center justify-center">
-                  {chartDataNoAlbumArt && (chartDataNoAlbumArt.datasets[0].data[0] > 0 || chartDataNoAlbumArt.datasets[0].data[1] > 0) ? (
-                    <Doughnut
-                      data={chartDataNoAlbumArt}
-                      options={{ ...chartOptions, cutout: '60%' }}
-                    />
-                  ) : (
-                    <p className="text-sm text-muted-foreground">All have art</p>
-                  )}
-                </div>
-              </CardContent>
-            </Card>
-          </div>
-        )}
-
-        {filtered.length === 0 ? (
+        {current.scans === 0 ? (
           <Card>
-            <CardContent className="py-12 text-center text-muted-foreground">
-              No data for the selected period. Run a scan or choose &quot;Forever&quot;.
-            </CardContent>
+            <CardHeader>
+              <CardTitle className="text-base flex items-center gap-2">
+                <AlertCircle className="w-4 h-4 text-muted-foreground" />
+                No data
+              </CardTitle>
+              <CardDescription>Run at least one completed scan to populate statistics.</CardDescription>
+            </CardHeader>
           </Card>
         ) : (
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-            {/* Albums scanned & duplicates */}
-            <Card>
-              <CardHeader>
-                <CardTitle className="text-base">Albums scanned & duplicates found</CardTitle>
-                <CardDescription>Per scan (scans only)</CardDescription>
-              </CardHeader>
-              <CardContent>
-                <div className="h-[280px]">
-                  {chartDataScans.datasets[0].data.length > 0 ? (
-                    <Line
-                      data={chartDataScans}
-                      options={{
-                        ...chartOptions,
-                        scales: {
-                          x: { display: true, ticks: { maxTicksLimit: 8 } },
-                          y: { beginAtZero: true },
-                        },
-                      }}
-                    />
-                  ) : (
-                    <p className="text-sm text-muted-foreground flex items-center justify-center h-full">No scan data</p>
-                  )}
-                </div>
-              </CardContent>
-            </Card>
+          <Tabs value={activeTab} onValueChange={(v) => setActiveTab(v as StatsTab)}>
+            <TabsList className="grid grid-cols-2 md:grid-cols-4 w-full md:w-auto">
+              <TabsTrigger value="overview">Overview</TabsTrigger>
+              <TabsTrigger value="metadata">Metadata</TabsTrigger>
+              <TabsTrigger value="quality">Quality</TabsTrigger>
+              <TabsTrigger value="operations">Operations</TabsTrigger>
+            </TabsList>
 
-            {/* Space saved per scan */}
-            <Card>
-              <CardHeader>
-                <CardTitle className="text-base">Space saved (MB) per scan</CardTitle>
-                <CardDescription>Each bar = one scan or dedupe</CardDescription>
-              </CardHeader>
-              <CardContent>
-                <div className="h-[280px]">
-                  {chartDataSpaceSaved.datasets[0].data.some((v) => v > 0) ? (
+            <TabsContent value="overview" className="space-y-4">
+              <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4">
+                <StatCard
+                  title="Scans"
+                  icon={<Layers className="w-4 h-4 text-primary" />}
+                  value={current.scans.toLocaleString()}
+                  delta={<DeltaPill current={current.scans} previous={previous.scans} />}
+                />
+                <StatCard
+                  title="Albums Scanned"
+                  icon={<BarChart3 className="w-4 h-4 text-info" />}
+                  value={current.albumsScanned.toLocaleString()}
+                  delta={<DeltaPill current={current.albumsScanned} previous={previous.albumsScanned} />}
+                />
+                <StatCard
+                  title="Duplicates"
+                  icon={<AlertCircle className="w-4 h-4 text-warning" />}
+                  value={current.duplicatesFound.toLocaleString()}
+                  description="Duplicate groups detected"
+                  delta={<DeltaPill current={current.duplicatesFound} previous={previous.duplicatesFound} positiveIsGood={false} />}
+                />
+                <StatCard
+                  title="Space Saved"
+                  icon={<HardDrive className="w-4 h-4 text-success" />}
+                  value={formatMb(current.spaceSavedMb)}
+                  delta={<DeltaPill current={current.spaceSavedMb} previous={previous.spaceSavedMb} suffix=" MB" />}
+                />
+                <StatCard
+                  title="Matched Albums"
+                  icon={<Database className="w-4 h-4 text-primary" />}
+                  value={`${current.matchedAlbums.toLocaleString()} / ${current.albumsScanned.toLocaleString()}`}
+                  description={`${formatPercent(current.matchedAlbums, current.albumsScanned)} matched via MB/fallbacks`}
+                  delta={<DeltaPill current={current.matchedAlbums} previous={previous.matchedAlbums} />}
+                />
+                <StatCard
+                  title="Fully Complete"
+                  icon={<Sparkles className="w-4 h-4 text-emerald-500" />}
+                  value={`${current.fullyComplete.toLocaleString()} / ${current.albumsScanned.toLocaleString()}`}
+                  description={`${formatPercent(current.fullyComplete, current.albumsScanned)} tags + cover + artist image`}
+                  delta={<DeltaPill current={current.fullyComplete} previous={previous.fullyComplete} />}
+                />
+              </div>
+              <Card>
+                <CardHeader>
+                  <CardTitle className="text-sm">Scan trend</CardTitle>
+                  <CardDescription>Albums scanned and duplicates over selected scans.</CardDescription>
+                </CardHeader>
+                <CardContent>
+                  <div className="h-[260px]">
+                    <Line data={scanTrendData} options={chartOptions} />
+                  </div>
+                </CardContent>
+              </Card>
+            </TabsContent>
+
+            <TabsContent value="metadata" className="space-y-4">
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                <StatCard
+                  title="MB Coverage"
+                  icon={<Database className="w-4 h-4 text-primary" />}
+                  value={`${current.albumsWithMbId.toLocaleString()} / ${current.albumsScanned.toLocaleString()}`}
+                  description={formatPercent(current.albumsWithMbId, current.albumsScanned)}
+                  delta={<DeltaPill current={current.albumsWithMbId} previous={previous.albumsWithMbId} />}
+                />
+                <StatCard
+                  title="AI-Assisted MB"
+                  icon={<Sparkles className="w-4 h-4 text-info" />}
+                  value={current.mbVerifiedByAi.toLocaleString()}
+                  description="MB matches confirmed by AI"
+                  delta={<DeltaPill current={current.mbVerifiedByAi} previous={previous.mbVerifiedByAi} />}
+                />
+                <Card>
+                  <CardHeader className="pb-2">
+                    <CardTitle className="text-caption font-medium flex items-center gap-1.5 text-muted-foreground uppercase tracking-wider">
+                      <Database className="w-4 h-4 text-secondary" />
+                      Fallback Providers
+                    </CardTitle>
+                  </CardHeader>
+                  <CardContent className="space-y-2 text-sm">
+                    <div className="flex items-center justify-between">
+                      <span className="text-muted-foreground">Discogs</span>
+                      <span className="font-medium tabular-nums">{current.discogsMatches.toLocaleString()}</span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <span className="text-muted-foreground">Last.fm</span>
+                      <span className="font-medium tabular-nums">{current.lastfmMatches.toLocaleString()}</span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <span className="text-muted-foreground">Bandcamp</span>
+                      <span className="font-medium tabular-nums">{current.bandcampMatches.toLocaleString()}</span>
+                    </div>
+                  </CardContent>
+                </Card>
+              </div>
+              <Card>
+                <CardHeader>
+                  <CardTitle className="text-sm">Metadata source share</CardTitle>
+                  <CardDescription>Distribution of album matches by provider.</CardDescription>
+                </CardHeader>
+                <CardContent>
+                  <div className="h-[260px] flex items-center justify-center">
+                    <Doughnut data={metadataProvidersData} options={{ ...chartOptions, cutout: '60%' }} />
+                  </div>
+                </CardContent>
+              </Card>
+            </TabsContent>
+
+            <TabsContent value="quality" className="space-y-4">
+              <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
+                <StatCard
+                  title="All Tags"
+                  icon={<Tag className="w-4 h-4 text-primary" />}
+                  value={`${current.withTags.toLocaleString()} / ${current.albumsScanned.toLocaleString()}`}
+                  description={formatPercent(current.withTags, current.albumsScanned)}
+                  delta={<DeltaPill current={current.withTags} previous={previous.withTags} />}
+                />
+                <StatCard
+                  title="Cover Art"
+                  icon={<Image className="w-4 h-4 text-secondary" />}
+                  value={`${current.withCover.toLocaleString()} / ${current.albumsScanned.toLocaleString()}`}
+                  description={formatPercent(current.withCover, current.albumsScanned)}
+                  delta={<DeltaPill current={current.withCover} previous={previous.withCover} />}
+                />
+                <StatCard
+                  title="Artist Image"
+                  icon={<Image className="w-4 h-4 text-info" />}
+                  value={`${current.withArtistImage.toLocaleString()} / ${current.albumsScanned.toLocaleString()}`}
+                  description={formatPercent(current.withArtistImage, current.albumsScanned)}
+                  delta={<DeltaPill current={current.withArtistImage} previous={previous.withArtistImage} />}
+                />
+                <StatCard
+                  title="Fully Complete"
+                  icon={<Sparkles className="w-4 h-4 text-emerald-500" />}
+                  value={`${current.fullyComplete.toLocaleString()} / ${current.albumsScanned.toLocaleString()}`}
+                  description={formatPercent(current.fullyComplete, current.albumsScanned)}
+                  delta={<DeltaPill current={current.fullyComplete} previous={previous.fullyComplete} />}
+                />
+              </div>
+              <Card>
+                <CardHeader>
+                  <CardTitle className="text-sm">Missing counts</CardTitle>
+                  <CardDescription>Use this to target the next fix pass.</CardDescription>
+                </CardHeader>
+                <CardContent className="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">
+                  <div className="rounded-lg border border-border p-3">
+                    <p className="text-muted-foreground">Missing tags</p>
+                    <p className="text-xl font-semibold tabular-nums">{current.withoutTags.toLocaleString()}</p>
+                  </div>
+                  <div className="rounded-lg border border-border p-3">
+                    <p className="text-muted-foreground">Missing cover</p>
+                    <p className="text-xl font-semibold tabular-nums">{current.withoutCover.toLocaleString()}</p>
+                  </div>
+                  <div className="rounded-lg border border-border p-3">
+                    <p className="text-muted-foreground">Missing artist image</p>
+                    <p className="text-xl font-semibold tabular-nums">{current.withoutArtistImage.toLocaleString()}</p>
+                  </div>
+                  <div className="rounded-lg border border-border p-3">
+                    <p className="text-muted-foreground">Broken albums</p>
+                    <p className="text-xl font-semibold tabular-nums">{current.brokenAlbums.toLocaleString()}</p>
+                  </div>
+                </CardContent>
+              </Card>
+              <Card>
+                <CardHeader>
+                  <CardTitle className="text-sm">Quality coverage</CardTitle>
+                  <CardDescription>Coverage rate by quality dimension.</CardDescription>
+                </CardHeader>
+                <CardContent>
+                  <div className="h-[260px]">
                     <Bar
-                      data={chartDataSpaceSaved}
+                      data={qualityCoverageData}
                       options={{
                         ...chartOptions,
                         scales: {
-                          x: { display: true, ticks: { maxTicksLimit: 8 } },
-                          y: { beginAtZero: true },
+                          y: {
+                            beginAtZero: true,
+                            max: 100,
+                            ticks: { callback: (value) => `${value}%` },
+                          },
                         },
                       }}
                     />
-                  ) : (
-                    <p className="text-sm text-muted-foreground flex items-center justify-center h-full">No space saved in period</p>
-                  )}
-                </div>
-              </CardContent>
-            </Card>
+                  </div>
+                </CardContent>
+              </Card>
+            </TabsContent>
 
-            {/* Cumulative space saved */}
-            <Card className="lg:col-span-2">
-              <CardHeader>
-                <CardTitle className="text-base">Cumulative space saved (MB)</CardTitle>
-                <CardDescription>Running total over the selected period</CardDescription>
-              </CardHeader>
-              <CardContent>
-                <div className="h-[280px]">
-                  {chartDataCumulative.datasets[0].data.some((v) => v > 0) ? (
+            <TabsContent value="operations" className="space-y-4">
+              <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4">
+                <StatCard
+                  title="Total Duration"
+                  icon={<Clock className="w-4 h-4 text-primary" />}
+                  value={formatDuration(current.durationSeconds)}
+                />
+                <StatCard
+                  title="Avg Duration"
+                  icon={<Clock className="w-4 h-4 text-info" />}
+                  value={formatDuration(Math.round(averageDuration))}
+                  description="Average duration per scan"
+                />
+                <StatCard
+                  title="Throughput"
+                  icon={<Gauge className="w-4 h-4 text-success" />}
+                  value={`${throughputAlbumsPerMin.toFixed(1)} albums/min`}
+                />
+                <StatCard
+                  title="Moved"
+                  icon={<Layers className="w-4 h-4 text-warning" />}
+                  value={current.albumsMoved.toLocaleString()}
+                  description="Albums moved to dupes"
+                  delta={<DeltaPill current={current.albumsMoved} previous={previous.albumsMoved} />}
+                />
+                <StatCard
+                  title="Audio Cache Hit Rate"
+                  icon={<Gauge className="w-4 h-4 text-primary" />}
+                  value={audioCacheTotal > 0 ? `${audioCacheHitRate.toFixed(1)}%` : 'N/A'}
+                  description={`${current.audioCacheHits.toLocaleString()} hits / ${audioCacheTotal.toLocaleString()} req`}
+                />
+                <StatCard
+                  title="MB Cache Hit Rate"
+                  icon={<Gauge className="w-4 h-4 text-secondary" />}
+                  value={mbCacheTotal > 0 ? `${mbCacheHitRate.toFixed(1)}%` : 'N/A'}
+                  description={`${current.mbCacheHits.toLocaleString()} hits / ${mbCacheTotal.toLocaleString()} req`}
+                />
+              </div>
+              <Card>
+                <CardHeader>
+                  <CardTitle className="text-sm">Operations trend</CardTitle>
+                  <CardDescription>Scan duration vs throughput over time.</CardDescription>
+                </CardHeader>
+                <CardContent>
+                  <div className="h-[260px]">
                     <Line
-                      data={chartDataCumulative}
+                      data={operationsTrendData}
                       options={{
                         ...chartOptions,
                         scales: {
-                          x: { display: true, ticks: { maxTicksLimit: 10 } },
-                          y: { beginAtZero: true },
+                          y: { type: 'linear', position: 'left', beginAtZero: true },
+                          y1: {
+                            type: 'linear',
+                            position: 'right',
+                            beginAtZero: true,
+                            grid: { drawOnChartArea: false },
+                          },
                         },
                       }}
                     />
-                  ) : (
-                    <p className="text-sm text-muted-foreground flex items-center justify-center h-full">No cumulative data</p>
-                  )}
-                </div>
-              </CardContent>
-            </Card>
-
-            {/* AI vs MusicBrainz */}
-            <Card>
-              <CardHeader>
-                <CardTitle className="text-base flex items-center gap-1.5">
-                  <Cpu className="w-4 h-4" />
-                  AI & MusicBrainz usage
-                </CardTitle>
-                <CardDescription>Albums identified by AI vs MB (scans)</CardDescription>
-              </CardHeader>
-              <CardContent>
-                <div className="h-[240px] flex items-center justify-center">
-                  {(chartDataAiMb.datasets[0].data[0] > 0 || chartDataAiMb.datasets[0].data[1] > 0) ? (
-                    <Doughnut
-                      data={chartDataAiMb}
-                      options={{
-                        ...chartOptions,
-                        cutout: '60%',
-                      }}
-                    />
-                  ) : (
-                    <p className="text-sm text-muted-foreground">No AI/MB data in period</p>
-                  )}
-                </div>
-              </CardContent>
-            </Card>
-
-            {/* Problems detected */}
-            <Card>
-              <CardHeader>
-                <CardTitle className="text-base flex items-center gap-1.5">
-                  <AlertCircle className="w-4 h-4" />
-                  Issues detected
-                </CardTitle>
-                <CardDescription>Broken, missing, without MBID (last 15 scans)</CardDescription>
-              </CardHeader>
-              <CardContent>
-                <div className="h-[240px]">
-                  {chartDataProblems.datasets.some((d) => d.data.some((v) => v > 0)) ? (
-                    <Bar
-                      data={chartDataProblems}
-                      options={{
-                        ...chartOptions,
-                        scales: {
-                          x: { display: true, stacked: true, ticks: { maxTicksLimit: 8 } },
-                          y: { stacked: true, beginAtZero: true },
-                        },
-                      }}
-                    />
-                  ) : (
-                    <p className="text-sm text-muted-foreground flex items-center justify-center h-full">No issues in period</p>
-                  )}
-                </div>
-              </CardContent>
-            </Card>
-          </div>
+                  </div>
+                </CardContent>
+              </Card>
+            </TabsContent>
+          </Tabs>
         )}
       </div>
     </>

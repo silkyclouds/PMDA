@@ -284,7 +284,6 @@ export function SettingsWizard({ onClose, onRebootStart }: SettingsWizardProps) 
                   <div className="p-2 rounded bg-muted/50"><span className="font-medium">Auto-move dupes:</span> {config.AUTO_MOVE_DUPES ? 'Enabled' : 'Disabled'}</div>
                   <div className="p-2 rounded bg-muted/50"><span className="font-medium">Scan threads:</span> {config.SCAN_THREADS ?? 'auto'}</div>
                   <div className="p-2 rounded bg-muted/50"><span className="font-medium">Skip folders:</span> {config.SKIP_FOLDERS || 'None'}</div>
-                  <div className="p-2 rounded bg-muted/50"><span className="font-medium">Default mode:</span> {config.PMDA_DEFAULT_MODE || 'serve'}</div>
                 </div>
                 <h4 className="font-medium text-foreground">AI</h4>
                 <div className="grid gap-2 pl-2">

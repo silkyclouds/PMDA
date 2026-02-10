@@ -11,10 +11,12 @@ FROM python:3.11-slim
 
 ENV PMDA_CONFIG_DIR=/config
 
+# libchromaprint-tools provides fpcalc for pyacoustid (AcousticID fingerprinting)
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
       ffmpeg \
       sqlite3 \
+      libchromaprint-tools \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

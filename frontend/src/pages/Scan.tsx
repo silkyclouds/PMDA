@@ -1,7 +1,12 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
+import { ChevronDown } from 'lucide-react';
 import { Header } from '@/components/Header';
 import { ScanProgress } from '@/components/ScanProgress';
+import { DropAlbumZone } from '@/components/DropAlbumZone';
+import { IncompleteResultsPanel } from '@/components/incomplete-results/IncompleteResultsPanel';
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
+import { Button } from '@/components/ui/button';
 import { useScanProgress, useScanControls, useDuplicates } from '@/hooks/usePMDA';
 import type { ScanProgress as ScanProgressType } from '@/lib/api';
 
@@ -66,7 +71,7 @@ export default function Scan() {
       <main className="container py-6 space-y-6">
         <div>
           <h1 className="text-display text-foreground">Library Scan</h1>
-          <p className="text-small text-muted-foreground mt-1">Analyze your Plex music library for duplicates and metadata issues</p>
+          <p className="text-small text-muted-foreground mt-1">Run scans, then resolve duplicates and metadata in a clear workflow</p>
         </div>
 
         <ScanProgress
@@ -83,6 +88,21 @@ export default function Scan() {
           isStopping={scanControls.isStopping}
           isClearing={scanControls.isClearing}
         />
+
+        <Collapsible>
+          <div className="rounded-xl border border-border bg-card">
+            <CollapsibleTrigger asChild>
+              <Button variant="ghost" className="w-full justify-between rounded-xl">
+                <span>Advanced scan tools</span>
+                <ChevronDown className="w-4 h-4 transition-transform data-[state=open]:rotate-180" />
+              </Button>
+            </CollapsibleTrigger>
+            <CollapsibleContent className="space-y-6 p-4 pt-0">
+              <DropAlbumZone />
+              <IncompleteResultsPanel />
+            </CollapsibleContent>
+          </div>
+        </Collapsible>
       </main>
     </div>
   );

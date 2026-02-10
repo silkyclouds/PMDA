@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Save, Loader2, Check } from 'lucide-react';
+import { Save, Loader2, Check, FolderOutput, RefreshCw } from 'lucide-react';
 import { Header } from '@/components/Header';
 import { Button } from '@/components/ui/button';
 import { toast } from 'sonner';
@@ -16,6 +16,10 @@ import type { PMDAConfig } from '@/lib/api';
 import { normalizeConfigForUI } from '@/lib/configUtils';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Separator } from '@/components/ui/separator';
+import { Label } from '@/components/ui/label';
+import { Input } from '@/components/ui/input';
+import { Switch } from '@/components/ui/switch';
+import { FieldTooltip } from '@/components/ui/field-tooltip';
 
 const SETTINGS_SECTIONS: { id: string; label: string }[] = [
   { id: 'settings-plex', label: 'Plex' },
@@ -33,10 +37,26 @@ function SettingsPage() {
   const [isLoading, setIsLoading] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
   const [errors, setErrors] = useState<Record<string, string>>({});
+  const [exportRebuilding, setExportRebuilding] = useState(false);
+  const [exportStatus, setExportStatus] = useState<api.FilesExportStatus | null>(null);
+  const exportPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
     loadConfig();
   }, []);
+
+  useEffect(() => {
+    if (!exportStatus?.running) return;
+    const t = setInterval(async () => {
+      try {
+        const s = await api.getFilesExportStatus();
+        setExportStatus(s);
+      } catch {
+        // ignore
+      }
+    }, 2000);
+    return () => clearInterval(t);
+  }, [exportStatus?.running]);
 
   const loadConfig = async () => {
     setIsLoading(true);
@@ -203,6 +223,146 @@ function SettingsPage() {
           </nav>
 
           <div className="min-w-0 flex-1 space-y-6">
+            {/* Library source (Plex vs Files) */}
+            <Card id="settings-library-source" className="scroll-mt-24">
+              <CardHeader>
+                <CardTitle>Library source</CardTitle>
+                <CardDescription>Use Plex if you have it; otherwise use Folders only and set your music and library paths below.</CardDescription>
+              </CardHeader>
+              <CardContent>
+                <div className="space-y-3">
+                  <div className="flex flex-wrap gap-2">
+                    <Button
+                      type="button"
+                      variant={(config.LIBRARY_MODE ?? 'plex') === 'plex' ? 'default' : 'outline'}
+                      size="sm"
+                      onClick={() => updateConfig({ LIBRARY_MODE: 'plex' })}
+                    >
+                      Plex
+                    </Button>
+                    <Button
+                      type="button"
+                      variant={(config.LIBRARY_MODE ?? 'plex') === 'files' ? 'default' : 'outline'}
+                      size="sm"
+                      onClick={() => updateConfig({ LIBRARY_MODE: 'files' })}
+                    >
+                      Folders only
+                    </Button>
+                  </div>
+                  {(config.LIBRARY_MODE ?? 'plex') === 'files' && (
+                    <p className="text-xs text-muted-foreground">
+                      Set your music folder and library folder below, then click Build library. Duplicates go to /dupes.
+                    </p>
+                  )}
+                </div>
+              </CardContent>
+            </Card>
+
+            {(config.LIBRARY_MODE ?? 'plex') === 'files' && (
+              <>
+                <Card id="settings-files-export" className="scroll-mt-24">
+                  <CardHeader>
+                    <CardTitle className="flex items-center gap-2">
+                      <FolderOutput className="w-5 h-5" />
+                      Folders
+                    </CardTitle>
+                    <CardDescription>
+                      Set where your music is, where to build the clean library (hardlinks), and where duplicates go. PMDA does the rest.
+                    </CardDescription>
+                  </CardHeader>
+                  <CardContent className="space-y-4">
+                    <div className="space-y-2">
+                      <Label htmlFor="music-folder">Music folder</Label>
+                      <p className="text-xs text-muted-foreground">
+                        Where your music files are (container path, e.g. /music).
+                      </p>
+                      <Input
+                        id="music-folder"
+                        value={typeof config.FILES_ROOTS === 'string' ? config.FILES_ROOTS : (Array.isArray(config.FILES_ROOTS) ? (config.FILES_ROOTS as string[]).join(', ') : '')}
+                        onChange={(e) => updateConfig({ FILES_ROOTS: e.target.value.trim() || '/music' })}
+                        placeholder="/music"
+                        className="font-mono"
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <Label htmlFor="library-folder">Library folder</Label>
+                      <p className="text-xs text-muted-foreground">
+                        Where PMDA will create a clean, organized copy using hardlinks (no extra space). Use a subfolder or a separate mount, e.g. /music/library.
+                      </p>
+                      <Input
+                        id="library-folder"
+                        value={config.EXPORT_ROOT ?? ''}
+                        onChange={(e) => updateConfig({ EXPORT_ROOT: e.target.value.trim() })}
+                        placeholder="/music/library"
+                        className="font-mono"
+                      />
+                    </div>
+                    <div className="flex items-center justify-between gap-4">
+                      <div className="space-y-1">
+                        <Label>Build library automatically</Label>
+                        <p className="text-xs text-muted-foreground">
+                          After a Magic scan in Folders mode, rebuild the hardlink library in the folder above.
+                        </p>
+                      </div>
+                      <Switch
+                        checked={Boolean(config.AUTO_EXPORT_LIBRARY)}
+                        onCheckedChange={(checked) => updateConfig({ AUTO_EXPORT_LIBRARY: checked })}
+                        aria-label="Build library automatically after Magic scan"
+                      />
+                    </div>
+                    <div className="space-y-1">
+                      <Label className="text-muted-foreground">Duplicates folder</Label>
+                      <p className="text-xs text-muted-foreground">
+                        Duplicates are moved to <span className="font-mono">/dupes</span> (set by your Docker volume). No need to configure.
+                      </p>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-3 pt-2 border-t pt-4">
+                      <Button
+                        type="button"
+                        variant="default"
+                        disabled={exportRebuilding}
+                        onClick={async () => {
+                          setExportRebuilding(true);
+                          setExportStatus(null);
+                          try {
+                            const res = await api.postFilesExportRebuild();
+                            if (res.status === 'already_running') {
+                              toast.info('Build already in progress');
+                              const s = await api.getFilesExportStatus();
+                              setExportStatus(s);
+                            } else if (res.status === 'started') {
+                              toast.success('Building library…');
+                              const s = await api.getFilesExportStatus();
+                              setExportStatus(s);
+                            } else {
+                              toast.error(res.message ?? 'Failed to start');
+                            }
+                          } catch (e) {
+                            toast.error('Failed to start');
+                          } finally {
+                            setExportRebuilding(false);
+                          }
+                        }}
+                        className="gap-2"
+                      >
+                        {exportRebuilding ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
+                        Build library
+                      </Button>
+                      {exportStatus && (exportStatus.running || exportStatus.error) && (
+                        <span className="text-sm text-muted-foreground">
+                          {exportStatus.running
+                            ? `${exportStatus.tracks_done}/${exportStatus.total_tracks} tracks`
+                            : exportStatus.error ?? 'Done'}
+                        </span>
+                      )}
+                    </div>
+                  </CardContent>
+                </Card>
+              </>
+            )}
+
+            <Separator />
+
             {/* Plex Settings */}
             <Card id="settings-plex" className="scroll-mt-24">
               <CardHeader>

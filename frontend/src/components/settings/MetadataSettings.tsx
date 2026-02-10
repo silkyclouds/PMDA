@@ -7,6 +7,13 @@ import { Checkbox } from '@/components/ui/checkbox';
 import { Switch } from '@/components/ui/switch';
 import { PasswordInput } from '@/components/ui/password-input';
 import { FieldTooltip } from '@/components/ui/field-tooltip';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
 import * as api from '@/lib/api';
 import type { PMDAConfig } from '@/lib/api';
 import { toast } from 'sonner';
@@ -209,6 +216,19 @@ export function MetadataSettings({ config, updateConfig, errors }: MetadataSetti
                   </div>
                   <div className="flex items-center justify-between rounded-lg border border-border p-3">
                     <div className="space-y-0.5">
+                      <Label htmlFor="mb-disable-cache" className="text-sm font-medium">Ignore MusicBrainz cache (advanced)</Label>
+                      <p className="text-xs text-muted-foreground">
+                        When enabled, PMDA ignores cached MusicBrainz results and stored MBIDs when scanning, forcing a full lookup for every album. This is much slower and intended for debugging or testing only.
+                      </p>
+                    </div>
+                    <Switch
+                      id="mb-disable-cache"
+                      checked={config.MB_DISABLE_CACHE ?? false}
+                      onCheckedChange={(checked) => updateConfig({ MB_DISABLE_CACHE: checked })}
+                    />
+                  </div>
+                  <div className="flex items-center justify-between rounded-lg border border-border p-3">
+                    <div className="space-y-0.5">
                       <Label htmlFor="use-ai-mb-match" className="text-sm font-medium">Use AI to choose among multiple MusicBrainz candidates</Label>
                       <p className="text-xs text-muted-foreground">
                         When several release-groups match (e.g. same title, different editions), use AI to pick the best one from titles only.
@@ -237,16 +257,16 @@ export function MetadataSettings({ config, updateConfig, errors }: MetadataSetti
                     <div className="space-y-0.5">
                       <Label htmlFor="use-ai-vision-cover" className="text-sm font-medium">Use AI vision for cover comparison</Label>
                       <p className="text-xs text-muted-foreground">
-                        After AI picks a MusicBrainz candidate, compare local cover image to Cover Art Archive. Reject match if they differ.
+                        After AI picks a MusicBrainz candidate, compare local cover image to Cover Art Archive. Reject match if they differ (e.g. artist photo vs album art).
                       </p>
                     </div>
                     <Switch
                       id="use-ai-vision-cover"
-                      checked={config.USE_AI_VISION_FOR_COVER ?? false}
+                      checked={config.USE_AI_VISION_FOR_COVER ?? true}
                       onCheckedChange={(checked) => updateConfig({ USE_AI_VISION_FOR_COVER: checked })}
                     />
                   </div>
-                  {(config.USE_AI_VISION_FOR_COVER ?? false) && (
+                  {(config.USE_AI_VISION_FOR_COVER ?? true) && (
                     <div className="space-y-2 pl-3 border-l-2 border-border">
                       <Label htmlFor="openai-vision-model" className="text-sm">Vision model (optional)</Label>
                       <Input
@@ -257,6 +277,39 @@ export function MetadataSettings({ config, updateConfig, errors }: MetadataSetti
                       />
                     </div>
                   )}
+                  <div className="flex items-center justify-between rounded-lg border border-border p-3">
+                    <div className="space-y-0.5">
+                      <Label htmlFor="ai-confidence-min" className="text-sm font-medium">AI confidence minimum (0–100)</Label>
+                      <p className="text-xs text-muted-foreground">
+                        When AI returns a confidence score below this, reject the match and try other sources (web search, Discogs, etc.). 0 = accept all.
+                      </p>
+                    </div>
+                    <Input
+                      id="ai-confidence-min"
+                      type="number"
+                      min={0}
+                      max={100}
+                      className="w-20"
+                      value={config.AI_CONFIDENCE_MIN ?? 50}
+                      onChange={(e) => {
+                        const v = e.target.value === '' ? 50 : Math.min(100, Math.max(0, parseInt(e.target.value, 10) || 0));
+                        updateConfig({ AI_CONFIDENCE_MIN: v });
+                      }}
+                    />
+                  </div>
+                  <div className="flex items-center justify-between rounded-lg border border-border p-3">
+                    <div className="space-y-0.5">
+                      <Label htmlFor="use-ai-vision-before-inject" className="text-sm font-medium">Verify cover with AI before saving</Label>
+                      <p className="text-xs text-muted-foreground">
+                        When fetching a cover (CAA, Discogs, etc.), ask vision AI if the image matches the album before saving and embedding. Rejected covers are not written.
+                      </p>
+                    </div>
+                    <Switch
+                      id="use-ai-vision-before-inject"
+                      checked={config.USE_AI_VISION_BEFORE_COVER_INJECT ?? false}
+                      onCheckedChange={(checked) => updateConfig({ USE_AI_VISION_BEFORE_COVER_INJECT: checked })}
+                    />
+                  </div>
                   <div className="flex items-center justify-between rounded-lg border border-border p-3">
                     <div className="space-y-0.5">
                       <Label htmlFor="use-web-search-mb" className="text-sm font-medium">Use web search for MusicBrainz</Label>
@@ -284,6 +337,53 @@ export function MetadataSettings({ config, updateConfig, errors }: MetadataSetti
                       </p>
                     </div>
                   )}
+                  <div className="flex items-center justify-between rounded-lg border border-border p-3">
+                    <div className="space-y-0.5">
+                      <Label htmlFor="skip-mb-live" className="text-sm font-medium">Skip MusicBrainz for live albums</Label>
+                      <p className="text-xs text-muted-foreground">
+                        When on, albums detected as live (e.g. &quot;Live at …&quot;, &quot;(Other Live)&quot;) do not get a MusicBrainz ID from PMDA. Avoids wrong tags when the live is not in MB. Fallback (Discogs, Last.fm, Bandcamp) still runs.
+                      </p>
+                    </div>
+                    <Switch
+                      id="skip-mb-live"
+                      checked={config.SKIP_MB_FOR_LIVE_ALBUMS ?? true}
+                      onCheckedChange={(checked) => updateConfig({ SKIP_MB_FOR_LIVE_ALBUMS: checked })}
+                    />
+                  </div>
+                  <div className="flex items-center justify-between rounded-lg border border-border p-3">
+                    <div className="space-y-0.5">
+                      <Label htmlFor="live-mb-strict" className="text-sm font-medium">Only assign MB for live albums when MB says &quot;Live&quot;</Label>
+                      <p className="text-xs text-muted-foreground">
+                        When on, for albums detected as live we only accept a MusicBrainz release-group if it has secondary type Live. Otherwise we do not assign and try fallback.
+                      </p>
+                    </div>
+                    <Switch
+                      id="live-mb-strict"
+                      checked={config.LIVE_ALBUMS_MB_STRICT ?? false}
+                      onCheckedChange={(checked) => updateConfig({ LIVE_ALBUMS_MB_STRICT: checked })}
+                    />
+                  </div>
+                  <div className="flex items-center justify-between rounded-lg border border-border p-3">
+                    <div className="space-y-0.5">
+                      <Label htmlFor="tracklist-match-min" className="text-sm font-medium">Tracklist match minimum (0–1)</Label>
+                      <p className="text-xs text-muted-foreground">
+                        Minimum fraction of local tracks that must match the release tracklist to accept a match. E.g. 0.8 = 80%. Below this we reject the candidate and try fallback.
+                      </p>
+                    </div>
+                    <Input
+                      id="tracklist-match-min"
+                      type="number"
+                      min={0}
+                      max={1}
+                      step={0.05}
+                      className="w-20"
+                      value={config.TRACKLIST_MATCH_MIN ?? 0.8}
+                      onChange={(e) => {
+                        const v = e.target.value === '' ? 0.8 : Math.min(1, Math.max(0, parseFloat(e.target.value) || 0.8));
+                        updateConfig({ TRACKLIST_MATCH_MIN: v });
+                      }}
+                    />
+                  </div>
                   <div className="p-3 rounded-lg bg-blue-500/5 border border-blue-500/20 space-y-2">
                     <p className="text-sm font-medium text-blue-600 dark:text-blue-400">Contact Email (Optional)</p>
                     <p className="text-xs text-muted-foreground">
@@ -323,6 +423,86 @@ export function MetadataSettings({ config, updateConfig, errors }: MetadataSetti
               </div>
             </div>
           )}
+
+          {/* Artist credit mode */}
+          <div className="space-y-3 pt-2 border-t border-border">
+            <div className="space-y-1.5">
+              <div className="flex items-center gap-1.5">
+                <Label htmlFor="artist-credit-mode" className="text-sm font-medium">
+                  Artist credit mode
+                </Label>
+                <FieldTooltip content="Control how MusicBrainz artist credits are applied to your tags. This affects how album vs track artists are written, but never splits albums when set to keep album as single artist." />
+              </div>
+              <p className="text-xs text-muted-foreground">
+                Choose how PMDA writes album and track artists when using MusicBrainz, especially for albums with guests or featuring artists.
+              </p>
+            </div>
+            <Select
+              value={config.ARTIST_CREDIT_MODE ?? 'album_artist_strict'}
+              onValueChange={(value) =>
+                updateConfig({ ARTIST_CREDIT_MODE: value as PMDAConfig['ARTIST_CREDIT_MODE'] })
+              }
+            >
+              <SelectTrigger id="artist-credit-mode" className="w-full sm:w-80">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="album_artist_strict">
+                  Keep album as single artist (recommended)
+                </SelectItem>
+                <SelectItem value="picard_like_default">
+                  Picard-like (fixed album artist, track artist with credits)
+                </SelectItem>
+                <SelectItem value="musicbrainz_full_credit">
+                  Full MusicBrainz credits per track (advanced)
+                </SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+
+        {/* AcousticID Section - always visible, independent of MusicBrainz */}
+        <div className="space-y-4 p-4 rounded-lg border border-border">
+          <div className="flex items-center justify-between">
+            <div className="space-y-0.5 flex-1">
+              <Label htmlFor="use-acoustid" className="text-sm font-medium">Identify and verify albums by AcousticID</Label>
+              <p className="text-xs text-muted-foreground">
+                Fingerprint and store AcousticID for all tracks of all albums. AcousticID runs first to identify and verify the release group; MusicBrainz, Discogs, Last.fm and Bandcamp are then used as fallback or when score is low. Ensures the correct album is matched and can identify albums with missing metadata. Requires Chromaprint/fpcalc.
+              </p>
+            </div>
+            <Switch
+              id="use-acoustid"
+              checked={config.USE_ACOUSTID ?? false}
+              onCheckedChange={(checked) => updateConfig({ USE_ACOUSTID: checked })}
+            />
+          </div>
+          {(config.USE_ACOUSTID ?? false) && (
+            <div className="space-y-3 pl-3 border-t border-border pt-3">
+              <Label htmlFor="acoustid-api-key" className="text-sm font-medium">AcoustID API key (required)</Label>
+              <PasswordInput
+                id="acoustid-api-key"
+                placeholder="Get a free key at acoustid.org"
+                value={config.ACOUSTID_API_KEY || ''}
+                onChange={(e) => updateConfig({ ACOUSTID_API_KEY: e.target.value })}
+              />
+              <p className="text-xs text-muted-foreground">
+                Free at <a href="https://acoustid.org/new-application" target="_blank" rel="noopener noreferrer" className="text-primary hover:underline">acoustid.org</a>. Fingerprints are cached in DB during scan.
+              </p>
+              <div className="flex items-center justify-between pt-2">
+                <div className="space-y-0.5 flex-1">
+                  <Label htmlFor="use-acoustid-when-tagged" className="text-sm font-medium">Run AcousticID when album has MB ID in tags</Label>
+                  <p className="text-xs text-muted-foreground">
+                    If off (default), albums that already have MusicBrainz release-group ID in tags skip AcousticID lookup — no re-fingerprinting and no AcoustID API calls. Turn on to verify every album with AcousticID even when tagged.
+                  </p>
+                </div>
+                <Switch
+                  id="use-acoustid-when-tagged"
+                  checked={config.USE_ACOUSTID_WHEN_TAGGED ?? false}
+                  onCheckedChange={(checked) => updateConfig({ USE_ACOUSTID_WHEN_TAGGED: checked })}
+                />
+              </div>
+            </div>
+          )}
+        </div>
 
         {/* Discogs Section */}
         <div className="space-y-4 p-4 rounded-lg border border-border">

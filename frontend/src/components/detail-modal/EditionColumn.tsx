@@ -99,7 +99,7 @@ export function EditionColumn({ edition, index, isSelected, totalEditions }: Edi
           )}
         </div>
 
-        {/* Technical specs */}
+        {/* Technical specs: backend always sends real values (derived from tracks/ffprobe when needed) */}
         <div className="flex flex-wrap gap-x-2 gap-y-1 text-xs text-muted-foreground">
           <span className="font-medium">{formatSize(edition.size)}</span>
           <span>{edition.br} kbps</span>

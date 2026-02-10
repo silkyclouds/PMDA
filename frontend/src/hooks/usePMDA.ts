@@ -34,18 +34,45 @@ export function useScanProgress() {
   const fetchProgress = useCallback(async () => {
     try {
       const data = await api.getScanProgress();
-      // Ensure we always have a valid object, merge with defaults if needed
+      let inc: api.IncompleteScanProgress | null = null;
+      try {
+        inc = await api.getIncompleteScanProgress();
+      } catch {
+        // Ignore: incomplete endpoint may not be available or may fail
+      }
+      // If main scan is running, use it
+      if (data && typeof data === 'object' && data.scanning) {
+        setProgress({ ...DEFAULT_SCAN_PROGRESS, ...data });
+        return data;
+      }
+      // If incomplete-only scan is running, build synthetic progress so UI shows "scanning"
+      if (inc?.running) {
+        const synthetic: ScanProgress = {
+          ...DEFAULT_SCAN_PROGRESS,
+          scanning: true,
+          progress: inc.progress ?? 0,
+          total: inc.total ?? 0,
+          status: 'running',
+          phase: 'format_analysis',
+          current_step: 'incomplete_scan',
+          active_artists: inc.current_artist ? [{
+            artist_name: inc.current_artist,
+            total_albums: inc.total ?? 0,
+            albums_processed: inc.progress ?? 0,
+            current_album: inc.current_album ? { album_id: 0, album_title: inc.current_album, status: 'running', status_details: '', step_summary: '', step_response: '' } : undefined,
+          }] : undefined,
+        };
+        setProgress(synthetic);
+        return synthetic;
+      }
+      // Normal: use main progress
       if (data && typeof data === 'object') {
         setProgress({ ...DEFAULT_SCAN_PROGRESS, ...data });
         return data;
       }
-      // If API returns invalid data, keep defaults
       setProgress(DEFAULT_SCAN_PROGRESS);
       return DEFAULT_SCAN_PROGRESS;
     } catch {
-      // Do not log: when server is busy (e.g. long dedupe) or user navigates away,
-      // fetch fails repeatedly and would spam the console (TypeError: Failed to fetch).
-      // Keep current progress so UI shows last known state.
       return null;
     }
   }, []);
@@ -91,10 +118,14 @@ export function useScanControls() {
   };
 
   const startMutation = useMutation({
-    mutationFn: api.startScan,
+    mutationFn: (options?: api.StartScanOptions) => api.startScan(options),
     onSuccess: invalidateQueries,
     onError: (error: any) => {
       const msg = error?.body?.error;
+      if (error?.response?.status === 409) {
+        toast.error(msg || 'A scan is already running.');
+        return;
+      }
       if (error?.body?.requiresConfig) {
         toast.error(msg || 'Plex is not configured. Go to Settings to set up Plex and your music library.');
       } else if (error?.body?.aiFunctionalFailure) {

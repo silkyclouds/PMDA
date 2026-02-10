@@ -753,7 +753,15 @@ export default function LibraryBrowser() {
                           <CardContent className="p-4">
                             <div className="flex items-center gap-3">
                               <div className="w-12 h-12 rounded-full bg-muted flex items-center justify-center shrink-0 overflow-hidden">
-                                <Music className="w-6 h-6 text-muted-foreground" />
+                                {artistDetails && artistDetails.artist_id === artist.artist_id && artistDetails.artist_thumb ? (
+                                  <img
+                                    src={artistDetails.artist_thumb}
+                                    alt={artist.artist_name}
+                                    className="w-12 h-12 object-cover"
+                                  />
+                                ) : (
+                                  <Music className="w-6 h-6 text-muted-foreground" />
+                                )}
                               </div>
                               <div className="flex-1 min-w-0">
                                 <div className="font-medium truncate">{artist.artist_name}</div>

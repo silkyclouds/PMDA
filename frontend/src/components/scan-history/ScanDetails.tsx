@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { format } from 'date-fns';
-import { Loader2, RotateCcw, Trash2, CheckSquare, Square, Package, AlertTriangle, Image, Tag, Database, Music } from 'lucide-react';
+import { Loader2, RotateCcw, Trash2, CheckSquare, Square, Package, AlertTriangle, Image, Tag, Database, Music, Sparkles } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { toast } from 'sonner';
 import * as api from '@/lib/api';
@@ -110,7 +110,8 @@ export function ScanDetails({ scanId, onRestore }: ScanDetailsProps) {
   }
 
   const formatDuration = (seconds?: number) => {
-    if (!seconds) return 'N/A';
+    if (seconds == null || seconds === undefined) return 'N/A';
+    if (seconds === 0) return '0s';
     const hours = Math.floor(seconds / 3600);
     const minutes = Math.floor((seconds % 3600) / 60);
     const secs = seconds % 60;
@@ -120,6 +121,47 @@ export function ScanDetails({ scanId, onRestore }: ScanDetailsProps) {
   };
 
   const isDedupe = scan.entry_type === 'dedupe';
+  const summary = scan.summary_json ?? {};
+  const albumsScanned =
+    (summary.albums_scanned as number | undefined) ?? scan.albums_scanned ?? 0;
+  const albumsWithoutAlbumImage =
+    (summary.albums_without_album_image as number | undefined) ??
+    scan.albums_without_album_image ??
+    0;
+  const albumsWithoutArtistImage =
+    (summary.albums_without_artist_image as number | undefined) ??
+    scan.albums_without_artist_image ??
+    0;
+  const albumsWithoutCompleteTags =
+    (summary.albums_without_complete_tags as number | undefined) ??
+    scan.albums_without_complete_tags ??
+    0;
+  const withCover = Math.max(0, albumsScanned - albumsWithoutAlbumImage);
+  const withArtistImage = Math.max(0, albumsScanned - albumsWithoutArtistImage);
+  const incompleteAny = Math.max(
+    albumsWithoutCompleteTags || 0,
+    albumsWithoutAlbumImage || 0,
+    albumsWithoutArtistImage || 0
+  );
+  const completeAlbums = Math.max(0, albumsScanned - incompleteAny);
+  const mbAlbums = (summary.albums_with_mb_id as number | undefined) ?? 0;
+  const discogsMatches = (summary.scan_discogs_matched as number | undefined) ?? 0;
+  const lastfmMatches = (summary.scan_lastfm_matched as number | undefined) ?? 0;
+  const bandcampMatches = (summary.scan_bandcamp_matched as number | undefined) ?? 0;
+  const matchedAlbums = Math.min(
+    albumsScanned,
+    Math.max(0, mbAlbums + discogsMatches + lastfmMatches + bandcampMatches)
+  );
+  const duplicateSummaryAvailable =
+    typeof summary.duplicate_groups_total === 'number' ||
+    typeof summary.duplicate_groups_ai_decided === 'number';
+  const hasProviderSummary =
+    (summary.mb_albums_identified ?? 0) > 0 ||
+    (summary.scan_discogs_matched ?? 0) > 0 ||
+    (summary.scan_lastfm_matched ?? 0) > 0 ||
+    (summary.scan_bandcamp_matched ?? 0) > 0;
+  const formatPercent = (num: number, denom: number) =>
+    denom > 0 ? `${((num / denom) * 100).toFixed(1)}%` : 'N/A';
 
   return (
     <div className="rounded-lg border bg-card">
@@ -263,6 +305,233 @@ export function ScanDetails({ scanId, onRestore }: ScanDetailsProps) {
                 </div>
               )}
             </div>
+          </div>
+        )}
+
+        {/* Metadata & AI summary (full scan only) */}
+        {!isDedupe && scan.entry_type !== 'incomplete' && (hasProviderSummary || duplicateSummaryAvailable) && (
+          <div>
+            <h3 className="text-sm font-semibold mb-3">Metadata & AI Summary</h3>
+            <div className="grid grid-cols-1 md:grid-cols-4 gap-3 text-sm">
+              {/* PMDA album health */}
+              {albumsScanned > 0 && (
+                <div className="rounded-lg border border-border bg-muted/40 p-3 space-y-1.5">
+                  <div className="flex items-center gap-2">
+                    <Sparkles className="w-4 h-4 text-emerald-500" />
+                    <span className="font-medium text-foreground text-sm">PMDA album health</span>
+                  </div>
+                  <ul className="text-xs text-muted-foreground space-y-0.5">
+                    <li>
+                      Matched albums:{' '}
+                      <span className="font-medium text-foreground">
+                        {matchedAlbums.toLocaleString()} / {albumsScanned.toLocaleString()} (
+                        {formatPercent(matchedAlbums, albumsScanned)})
+                      </span>
+                    </li>
+                    <li>
+                      With cover art:{' '}
+                      <span className="font-medium text-foreground">
+                        {withCover.toLocaleString()} / {albumsScanned.toLocaleString()} (
+                        {formatPercent(withCover, albumsScanned)})
+                      </span>
+                    </li>
+                    <li>
+                      With artist image:{' '}
+                      <span className="font-medium text-foreground">
+                        {withArtistImage.toLocaleString()} / {albumsScanned.toLocaleString()} (
+                        {formatPercent(withArtistImage, albumsScanned)})
+                      </span>
+                    </li>
+                    <li>
+                      Fully complete (tags + cover + artist):{' '}
+                      <span className="font-medium text-foreground">
+                        {completeAlbums.toLocaleString()} / {albumsScanned.toLocaleString()} (
+                        {formatPercent(completeAlbums, albumsScanned)})
+                      </span>
+                    </li>
+                  </ul>
+                </div>
+              )}
+
+              {hasProviderSummary && (
+                <div className="rounded-lg border border-border bg-muted/40 p-3 space-y-1.5">
+                  <div className="flex items-center gap-2">
+                    <Database className="w-4 h-4 text-blue-500" />
+                    <span className="font-medium text-foreground text-sm">Metadata sources</span>
+                  </div>
+                  <ul className="text-xs text-muted-foreground space-y-0.5">
+                    <li>
+                      MusicBrainz:{' '}
+                      <span className="font-medium text-foreground">
+                        {summary.mb_albums_identified ?? 0} album(s)
+                        {matchedAlbums > 0 && (
+                          <> ({formatPercent(summary.mb_albums_identified ?? 0, matchedAlbums)})</>
+                        )}
+                      </span>
+                    </li>
+                    <li>
+                      Discogs:{' '}
+                      <span className="font-medium text-foreground">
+                        {summary.scan_discogs_matched ?? 0} album(s)
+                        {matchedAlbums > 0 && (
+                          <> ({formatPercent(summary.scan_discogs_matched ?? 0, matchedAlbums)})</>
+                        )}
+                      </span>
+                    </li>
+                    <li>
+                      Last.fm:{' '}
+                      <span className="font-medium text-foreground">
+                        {summary.scan_lastfm_matched ?? 0} album(s)
+                        {matchedAlbums > 0 && (
+                          <> ({formatPercent(summary.scan_lastfm_matched ?? 0, matchedAlbums)})</>
+                        )}
+                      </span>
+                    </li>
+                    <li>
+                      Bandcamp:{' '}
+                      <span className="font-medium text-foreground">
+                        {summary.scan_bandcamp_matched ?? 0} album(s)
+                        {matchedAlbums > 0 && (
+                          <> ({formatPercent(summary.scan_bandcamp_matched ?? 0, matchedAlbums)})</>
+                        )}
+                      </span>
+                    </li>
+                  </ul>
+                </div>
+              )}
+
+              {duplicateSummaryAvailable && (
+                <div className="rounded-lg border border-border bg-muted/40 p-3 space-y-1.5">
+                  <div className="flex items-center gap-2">
+                    <Package className="w-4 h-4 text-orange-500" />
+                    <span className="font-medium text-foreground text-sm">Duplicate decisions</span>
+                  </div>
+                  <ul className="text-xs text-muted-foreground space-y-0.5">
+                    <li>
+                      Groups (saved):{' '}
+                      <span className="font-medium text-foreground">
+                        {summary.duplicate_groups_saved ?? summary.duplicate_groups_total ?? scan.duplicate_groups_count ?? 0}
+                      </span>
+                    </li>
+                    <li>
+                      AI-decided groups:{' '}
+                      <span className="font-medium text-foreground">
+                        {summary.duplicate_groups_ai_decided ?? 0}
+                      </span>
+                    </li>
+                    <li>
+                      AI errors:{' '}
+                      <span className="font-medium text-foreground">
+                        {summary.duplicate_groups_ai_failed_total ?? 0}
+                      </span>
+                      {summary.duplicate_groups_ai_failed_then_recovered != null && (
+                        <> (recovered: {summary.duplicate_groups_ai_failed_then_recovered}, unresolved: {summary.duplicate_groups_ai_failed_unresolved ?? 0})</>
+                      )}
+                    </li>
+                  </ul>
+                </div>
+              )}
+
+              {(summary.cover_from_mb ?? 0) + (summary.cover_from_discogs ?? 0) + (summary.cover_from_lastfm ?? 0) + (summary.cover_from_bandcamp ?? 0) > 0 && (
+                <div className="rounded-lg border border-border bg-muted/40 p-3 space-y-1.5">
+                  <div className="flex items-center gap-2">
+                    <Image className="w-4 h-4 text-teal-500" />
+                    <span className="font-medium text-foreground text-sm">Covers fetched</span>
+                  </div>
+                  <ul className="text-xs text-muted-foreground space-y-0.5">
+                    <li>
+                      MusicBrainz / CAA:{' '}
+                      <span className="font-medium text-foreground">
+                        {summary.cover_from_mb ?? 0}
+                        {' '}
+                        {formatPercent(
+                          summary.cover_from_mb ?? 0,
+                          (summary.cover_from_mb ?? 0) +
+                            (summary.cover_from_discogs ?? 0) +
+                            (summary.cover_from_lastfm ?? 0) +
+                            (summary.cover_from_bandcamp ?? 0)
+                        )}
+                      </span>
+                    </li>
+                    <li>
+                      Discogs:{' '}
+                      <span className="font-medium text-foreground">
+                        {summary.cover_from_discogs ?? 0}
+                        {' '}
+                        {formatPercent(
+                          summary.cover_from_discogs ?? 0,
+                          (summary.cover_from_mb ?? 0) +
+                            (summary.cover_from_discogs ?? 0) +
+                            (summary.cover_from_lastfm ?? 0) +
+                            (summary.cover_from_bandcamp ?? 0)
+                        )}
+                      </span>
+                    </li>
+                    <li>
+                      Last.fm:{' '}
+                      <span className="font-medium text-foreground">
+                        {summary.cover_from_lastfm ?? 0}
+                        {' '}
+                        {formatPercent(
+                          summary.cover_from_lastfm ?? 0,
+                          (summary.cover_from_mb ?? 0) +
+                            (summary.cover_from_discogs ?? 0) +
+                            (summary.cover_from_lastfm ?? 0) +
+                            (summary.cover_from_bandcamp ?? 0)
+                        )}
+                      </span>
+                    </li>
+                    <li>
+                      Bandcamp:{' '}
+                      <span className="font-medium text-foreground">
+                        {summary.cover_from_bandcamp ?? 0}
+                        {' '}
+                        {formatPercent(
+                          summary.cover_from_bandcamp ?? 0,
+                          (summary.cover_from_mb ?? 0) +
+                            (summary.cover_from_discogs ?? 0) +
+                            (summary.cover_from_lastfm ?? 0) +
+                            (summary.cover_from_bandcamp ?? 0)
+                        )}
+                      </span>
+                    </li>
+                  </ul>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Steps executed (full scan only) */}
+        {!isDedupe && scan.entry_type !== 'incomplete' && Array.isArray(scan.steps_executed) && scan.steps_executed.length > 0 && (
+          <div>
+            <h3 className="text-sm font-semibold mb-3">Steps Executed</h3>
+            <ul className="list-decimal list-inside space-y-1.5 text-sm text-muted-foreground">
+              {scan.steps_executed.map((step, i) => (
+                <li key={i} className="leading-snug">{step}</li>
+              ))}
+            </ul>
+            {Array.isArray(summary.ai_errors) && summary.ai_errors.length > 0 && (
+              <div className="mt-3 rounded-md border border-amber-300/70 bg-amber-50 dark:bg-amber-950/30 p-3">
+                <div className="flex items-center gap-2 mb-1.5">
+                  <Sparkles className="w-4 h-4 text-amber-500" />
+                  <p className="text-xs font-semibold text-amber-700 dark:text-amber-300">
+                    AI diagnostics
+                  </p>
+                </div>
+                <ul className="space-y-0.5 text-[11px] text-amber-800 dark:text-amber-200">
+                  {summary.ai_errors.slice(0, 3).map((err, idx) => (
+                    <li key={idx} className="leading-snug">
+                      {err.group ? <span className="font-medium">{err.group}:</span> : null}{' '}
+                      {err.message}
+                    </li>
+                  ))}
+                  {summary.ai_errors.length > 3 && (
+                    <li className="opacity-80">… and {summary.ai_errors.length - 3} more AI warning(s)</li>
+                  )}
+                </ul>
+              </div>
+            )}
           </div>
         )}
 
