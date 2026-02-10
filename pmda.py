@@ -9553,6 +9553,7 @@ def background_scan():
                             "title_raw": best.get("title_raw", ""),
                             "album_title": best.get("title_raw") or best.get("album_norm") or f"Album {best['album_id']}",
                             "musicbrainz_id": mbid or "",
+                            "folder": (best.get("folder") or "").strip(),
                         })
             # Include all albums from last scan that have MusicBrainz match (so improve-all runs even when no duplicate groups)
             scan_id = get_last_completed_scan_id()
@@ -9563,11 +9564,11 @@ def background_scan():
                     # Include all albums from last completed scan so improve-all can enrich tags/covers
                     # even when there is no MusicBrainz ID yet (e.g. Bandcamp/Last.fm-only matches, or new REQUIRED_TAGS like \"genre\").
                     cur.execute(
-                        "SELECT artist, album_id, title_raw, musicbrainz_id FROM scan_editions WHERE scan_id = ?",
+                        "SELECT artist, album_id, title_raw, musicbrainz_id, folder FROM scan_editions WHERE scan_id = ?",
                         (scan_id,),
                     )
                     for row in cur.fetchall():
-                        artist_name, album_id, title_raw, mbid = row[0], row[1], row[2] or "", (row[3] or "").strip()
+                        artist_name, album_id, title_raw, mbid, folder = row[0], row[1], row[2] or "", (row[3] or "").strip(), row[4] or ""
                         if album_id in seen_ids:
                             continue
                         seen_ids.add(album_id)
@@ -9577,6 +9578,7 @@ def background_scan():
                             "title_raw": (title_raw or "").strip(),
                             "album_title": (title_raw or "").strip() or f"Album {album_id}",
                             "musicbrainz_id": mbid or "",
+                            "folder": (folder or "").strip(),
                         })
                     con.close()
                 except Exception as e:
@@ -9587,10 +9589,10 @@ def background_scan():
                     con = sqlite3.connect(str(STATE_DB_FILE))
                     cur = con.cursor()
                     cur.execute(
-                        "SELECT artist, album_id, title_raw, album_norm, meta_json FROM duplicates_best"
+                        "SELECT artist, album_id, title_raw, album_norm, folder, meta_json FROM duplicates_best"
                     )
                     for row in cur.fetchall():
-                        artist_name, album_id, title_raw, album_norm, meta_json = row[0], row[1], row[2] or "", row[3] or "", row[4] or ""
+                        artist_name, album_id, title_raw, album_norm, folder, meta_json = row[0], row[1], row[2] or "", row[3] or "", row[4] or "", row[5] or ""
                         if album_id in seen_ids:
                             continue
                         seen_ids.add(album_id)
@@ -9607,6 +9609,7 @@ def background_scan():
                             "title_raw": (title_raw or "").strip(),
                             "album_title": (title_raw or "").strip() or (album_norm or "").strip() or f"Album {album_id}",
                             "musicbrainz_id": mbid or "",
+                            "folder": (folder or "").strip(),
                         })
                     con.close()
                     if best_albums:
@@ -17245,6 +17248,13 @@ def _improve_one_album_item(item: dict) -> tuple:
     artist_name = item.get("artist", "Unknown")
     album_title = item.get("album_title", f"Album {album_id}")
     known_mbid = item.get("musicbrainz_id") if isinstance(item.get("musicbrainz_id"), str) and (item.get("musicbrainz_id") or "").strip() else None
+    folder_path_raw = (item.get("folder") or "").strip() if isinstance(item.get("folder"), str) else ""
+    # Files mode: improve by folder path from scan_editions (album_id is not a Plex metadata_items id).
+    if _get_library_mode() == "files" and folder_path_raw:
+        result = _improve_folder_by_path(Path(folder_path_raw))
+        steps_raw = result.get("steps", [])
+        steps = [{"label": s if isinstance(s, str) else s.get("label", str(s)), "success": True} for s in steps_raw]
+        return (idx, album_id, album_title, artist_name, result, steps)
     db_conn = plex_connect()
     try:
         result = _improve_single_album(album_id, db_conn, known_release_group_id=known_mbid)
@@ -17583,6 +17593,7 @@ def api_library_improve_all():
                     "album_id": album_id,
                     "album_title": best.get("title_raw") or best.get("album_norm") or f"Album {album_id}",
                     "musicbrainz_id": best.get("musicbrainz_id"),
+                    "folder": (best.get("folder") or "").strip(),
                 })
         # Also include all albums from last scan so improve-all can enrich tags/covers
         # even when there is no MusicBrainz ID yet (e.g. Bandcamp/Last.fm-only matches, or new REQUIRED_TAGS like "genre").
@@ -17593,12 +17604,12 @@ def api_library_improve_all():
             try:
                 # 1) Albums avec MBID (comportement historique)
                 cur.execute(
-                    "SELECT artist, album_id, title_raw, musicbrainz_id FROM scan_editions WHERE scan_id = ?",
+                    "SELECT artist, album_id, title_raw, musicbrainz_id, folder FROM scan_editions WHERE scan_id = ?",
                     (scan_id,),
                 )
                 rows = cur.fetchall()
                 for row in rows:
-                    artist_name, album_id, title_raw, mbid = row[0], row[1], row[2] or "", (row[3] or "").strip()
+                    artist_name, album_id, title_raw, mbid, folder = row[0], row[1], row[2] or "", (row[3] or "").strip(), row[4] or ""
                     if album_id in seen_ids:
                         continue
                     # Inclure tous les albums du dernier scan, même sans MBID, pour permettre l'enrichissement via Discogs/Last.fm/Bandcamp
@@ -17608,6 +17619,7 @@ def api_library_improve_all():
                         "album_id": album_id,
                         "album_title": (title_raw or "").strip() or f"Album {album_id}",
                         "musicbrainz_id": mbid or "",
+                        "folder": (folder or "").strip(),
                     })
             except Exception as e:
                 logging.debug("Fix-all: could not load scan_editions for extra albums: %s", e)
