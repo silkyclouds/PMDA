@@ -3670,7 +3670,7 @@ def _rebuild_files_library_index(reason: str = "manual", wait_if_running: bool =
                 with conn.cursor() as cur:
                     cur.execute("TRUNCATE TABLE files_tracks, files_albums, files_artists RESTART IDENTITY CASCADE")
                     artist_rows = [
-                        (data["name"], norm, int(data["has_image"]), data.get("image_path") or "")
+                        (data["name"], norm, bool(data["has_image"]), data.get("image_path") or "")
                         for norm, data in artists_map.items()
                     ]
                     if artist_rows:
@@ -3700,14 +3700,14 @@ def _rebuild_files_library_index(reason: str = "manual", wait_if_running: bool =
                                 album["genre"],
                                 album["tags_json"],
                                 album["format"],
-                                int(album["is_lossless"]),
-                                int(album["has_cover"]),
+                                bool(album["is_lossless"]),
+                                bool(album["has_cover"]),
                                 album["cover_path"],
-                                int(album["mb_identified"]),
+                                bool(album["mb_identified"]),
                                 album["musicbrainz_release_group_id"],
                                 album["track_count"],
                                 album["total_duration_sec"],
-                                int(album["is_broken"]),
+                                bool(album["is_broken"]),
                                 album["expected_track_count"],
                                 album["actual_track_count"],
                                 album["missing_indices_json"],
