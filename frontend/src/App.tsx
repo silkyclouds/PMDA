@@ -9,6 +9,7 @@ import Unduper from "./pages/Unduper";
 import ScanHistory from "./pages/ScanHistory";
 import Statistics from "./pages/Statistics";
 import LibraryBrowser from "./pages/LibraryBrowser";
+import ArtistPage from "./pages/ArtistPage";
 import TagFixer from "./pages/TagFixer";
 import Settings from "./pages/Settings";
 import NotFound from "./pages/NotFound";
@@ -30,6 +31,7 @@ function AppRoutesWithPlayer() {
         <Route path="/history" element={<ScanHistory />} />
         <Route path="/statistics" element={<Statistics />} />
         <Route path="/library" element={<LibraryBrowser />} />
+        <Route path="/library/artist/:artistId" element={<ArtistPage />} />
         <Route path="/tag-fixer" element={<TagFixer />} />
         <Route path="/broken-albums" element={<BrokenAlbumsList />} />
         <Route path="/settings" element={<Settings />} />

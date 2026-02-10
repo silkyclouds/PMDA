@@ -70,7 +70,9 @@ export function MobileNav({ duplicateCount, onSettingsClick }: MobileNavProps) {
         <nav className="flex flex-col p-2">
           {itemsWithBadges.map((item) => {
             const Icon = item.icon;
-            const isActive = location.pathname === item.to;
+            const isActive = item.to === '/library'
+              ? location.pathname === '/library' || location.pathname.startsWith('/library/')
+              : location.pathname === item.to;
             
             return (
               <button
@@ -135,7 +137,9 @@ export function MobileBottomNav({ duplicateCount }: { duplicateCount?: number })
       <div className="flex items-center justify-around py-2">
         {bottomItems.map((item) => {
           const Icon = item.icon;
-          const isActive = location.pathname === item.to;
+          const isActive = item.to === '/library'
+            ? location.pathname === '/library' || location.pathname.startsWith('/library/')
+            : location.pathname === item.to;
           
           return (
             <button

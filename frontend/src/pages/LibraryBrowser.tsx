@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { Search, Music, Star, Loader2, Edit, Image as ImageIcon, RefreshCw, LayoutGrid, List, Sparkles, Play, Check, X, Circle, CopyMinus, Wrench, FolderInput } from 'lucide-react';
+import { useNavigate } from 'react-router-dom';
 import { Header } from '@/components/Header';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
@@ -32,6 +33,7 @@ interface ArtistInfo {
   artist_name: string;
   album_count: number;
   broken_albums_count: number;
+  artist_thumb?: string | null;
 }
 
 interface AlbumInfo {
@@ -265,10 +267,11 @@ function useDebounce<T>(value: T, delay: number): T {
 }
 
 export default function LibraryBrowser() {
+  const navigate = useNavigate();
   const [artists, setArtists] = useState<ArtistInfo[]>([]);
   const [loading, setLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
-  const debouncedSearch = useDebounce(searchQuery, 300);
+  const debouncedSearch = useDebounce(searchQuery, 120);
   const [selectedArtist, setSelectedArtist] = useState<number | null>(null);
   const [artistDetails, setArtistDetails] = useState<ArtistDetails | null>(null);
   const [loadingDetails, setLoadingDetails] = useState(false);
@@ -339,17 +342,16 @@ export default function LibraryBrowser() {
   const loadArtists = useCallback(async (search: string = '') => {
     try {
       setLoading(true);
-      const params = new URLSearchParams();
-      if (search) {
-        params.set('search', search);
-      }
-      params.set('limit', '100');
-      
-      const response = await fetch(`/api/library/artists?${params.toString()}`);
+      const q = (search || '').trim();
+      const response = await fetch(
+        q
+          ? `/api/library/artists/suggest?q=${encodeURIComponent(q)}&limit=100`
+          : '/api/library/artists?limit=100&offset=0'
+      );
       if (!response.ok) throw new Error('Failed to load artists');
       const data = await response.json();
       setArtists(data.artists || []);
-      setTotalArtists(data.total || 0);
+      setTotalArtists((typeof data.total === 'number' ? data.total : (data.artists || []).length) || 0);
     } catch (error) {
       toast({
         title: 'Error',
@@ -704,6 +706,11 @@ export default function LibraryBrowser() {
                   placeholder="Search artists..."
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' && artists.length > 0) {
+                      navigate(`/library/artist/${artists[0].artist_id}`);
+                    }
+                  }}
                   className="pl-9"
                 />
               </div>
@@ -753,9 +760,9 @@ export default function LibraryBrowser() {
                           <CardContent className="p-4">
                             <div className="flex items-center gap-3">
                               <div className="w-12 h-12 rounded-full bg-muted flex items-center justify-center shrink-0 overflow-hidden">
-                                {artistDetails && artistDetails.artist_id === artist.artist_id && artistDetails.artist_thumb ? (
+                                {artist.artist_thumb ? (
                                   <img
-                                    src={artistDetails.artist_thumb}
+                                    src={artist.artist_thumb}
                                     alt={artist.artist_name}
                                     className="w-12 h-12 object-cover"
                                   />
@@ -774,6 +781,17 @@ export default function LibraryBrowser() {
                                       {artist.broken_albums_count} incomplete
                                     </Badge>
                                   )}
+                                  <Button
+                                    variant="ghost"
+                                    size="sm"
+                                    className="h-6 px-2 text-[11px]"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      navigate(`/library/artist/${artist.artist_id}`);
+                                    }}
+                                  >
+                                    Open
+                                  </Button>
                                 </div>
                               </div>
                             </div>
@@ -909,6 +927,14 @@ export default function LibraryBrowser() {
                                 <Sparkles className="w-4 h-4" />
                               )}
                               Fix All Albums
+                            </Button>
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              onClick={() => navigate(`/library/artist/${selectedArtist}`)}
+                              className="gap-1.5"
+                            >
+                              Artist Page
                             </Button>
                         </div>
                       </div>

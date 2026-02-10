@@ -543,6 +543,7 @@ PMDA_REDIS_PORT = int((os.getenv("PMDA_REDIS_PORT", "6379") or "6379").strip())
 PMDA_REDIS_DB = int((os.getenv("PMDA_REDIS_DB", "0") or "0").strip())
 PMDA_REDIS_PASSWORD = os.getenv("PMDA_REDIS_PASSWORD", "") or ""
 FILES_CACHE_PREFIX = "pmda:files:v1:"
+PMDA_MEDIA_CACHE_ROOT = (os.getenv("PMDA_MEDIA_CACHE_ROOT", "") or "").strip()
 
 
 def _get_from_sqlite(key: str, default=None):
@@ -1081,6 +1082,7 @@ merged = {
     "EXPORT_ROOT": _get("EXPORT_ROOT", default="", cast=str),
     "EXPORT_NAMING_TEMPLATE": _get("EXPORT_NAMING_TEMPLATE", default="", cast=str),
     "EXPORT_LINK_STRATEGY": _get("EXPORT_LINK_STRATEGY", default="hardlink", cast=str),
+    "MEDIA_CACHE_ROOT": _get("MEDIA_CACHE_ROOT", default=PMDA_MEDIA_CACHE_ROOT or str(CONFIG_DIR / "media_cache"), cast=str),
 }
 # PATH_MAP and all config from _get() (SQLite only > default)
 
@@ -1090,6 +1092,7 @@ FILES_ROOTS: list[str] = merged.get("FILES_ROOTS", []) or []
 EXPORT_ROOT: str = str(merged.get("EXPORT_ROOT", "") or "").strip()
 EXPORT_NAMING_TEMPLATE: str = str(merged.get("EXPORT_NAMING_TEMPLATE", "") or "").strip()
 EXPORT_LINK_STRATEGY: str = str(merged.get("EXPORT_LINK_STRATEGY", "hardlink") or "hardlink").strip().lower()
+MEDIA_CACHE_ROOT: str = str(merged.get("MEDIA_CACHE_ROOT", PMDA_MEDIA_CACHE_ROOT or str(CONFIG_DIR / "media_cache")) or str(CONFIG_DIR / "media_cache")).strip()
 USE_MUSICBRAINZ: bool = bool(merged["USE_MUSICBRAINZ"])
 MUSICBRAINZ_EMAIL: str = merged.get("MUSICBRAINZ_EMAIL", "pmda@example.com")
 MB_QUEUE_ENABLED: bool = bool(merged.get("MB_QUEUE_ENABLED", True))
@@ -3326,12 +3329,39 @@ def _files_pg_init_schema() -> bool:
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS files_artist_profiles (
+                    name_norm TEXT PRIMARY KEY,
+                    artist_name TEXT NOT NULL,
+                    bio TEXT,
+                    short_bio TEXT,
+                    tags_json TEXT NOT NULL DEFAULT '[]',
+                    similar_json TEXT NOT NULL DEFAULT '[]',
+                    source TEXT,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS files_album_profiles (
+                    artist_norm TEXT NOT NULL,
+                    title_norm TEXT NOT NULL,
+                    album_title TEXT NOT NULL,
+                    description TEXT,
+                    short_description TEXT,
+                    tags_json TEXT NOT NULL DEFAULT '[]',
+                    source TEXT,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (artist_norm, title_norm)
+                )
+            """)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_files_artists_name ON files_artists(name)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_files_albums_artist_id ON files_albums(artist_id)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_files_albums_title ON files_albums(title)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_files_albums_title_norm ON files_albums(title_norm)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_files_tracks_album_id ON files_tracks(album_id)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_files_tracks_order ON files_tracks(album_id, disc_num, track_num, id)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_files_artist_profiles_updated_at ON files_artist_profiles(updated_at DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_files_album_profiles_updated_at ON files_album_profiles(updated_at DESC)")
             try:
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_files_artists_name_trgm ON files_artists USING gin (name gin_trgm_ops)")
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_files_albums_title_trgm ON files_albums USING gin (title gin_trgm_ops)")
@@ -3414,6 +3444,152 @@ def _files_index_set_state(**updates) -> None:
 def _files_index_get_state() -> dict:
     with lock:
         return dict(state.get("files_index") or {})
+
+
+_MEDIA_CACHE_SIZES = (96, 320, 640)
+
+
+def _media_cache_root_dir() -> Path:
+    root = Path((MEDIA_CACHE_ROOT or "").strip() or str(CONFIG_DIR / "media_cache"))
+    return root
+
+
+def _ensure_media_cache_dirs() -> None:
+    root = _media_cache_root_dir()
+    try:
+        (root / "album").mkdir(parents=True, exist_ok=True)
+        (root / "artist").mkdir(parents=True, exist_ok=True)
+        (root / "embedded").mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        logging.debug("Unable to initialize media cache directories at %s: %s", root, e)
+
+
+def _image_ext_from_mime(mime: str) -> str:
+    m = (mime or "").lower()
+    if "png" in m:
+        return ".png"
+    if "webp" in m:
+        return ".webp"
+    return ".jpg"
+
+
+def _media_cache_key_for_path(source_path: Path, kind: str, max_px: int) -> Optional[str]:
+    try:
+        st = source_path.stat()
+    except OSError:
+        return None
+    payload = f"{kind}|{max_px}|{str(source_path)}|{int(st.st_mtime_ns)}|{int(st.st_size)}|v2"
+    return hashlib.sha1(payload.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def _media_cache_path_for_key(key: str, kind: str, ext: str = ".webp") -> Path:
+    root = _media_cache_root_dir()
+    return root / kind / key[:2] / key[2:4] / f"{key}{ext}"
+
+
+def _ensure_cached_image_for_path(source_path: Path, *, kind: str, max_px: int = 320) -> Optional[Path]:
+    if not source_path or not source_path.exists() or not source_path.is_file():
+        return None
+    key = _media_cache_key_for_path(source_path, kind, max_px)
+    if not key:
+        return None
+    target = _media_cache_path_for_key(key, kind, ".webp")
+    if target.exists() and target.is_file():
+        return target
+    try:
+        from PIL import Image
+    except ImportError:
+        return source_path
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with Image.open(source_path) as img:
+            if img.mode not in ("RGB", "L"):
+                img = img.convert("RGB")
+            img.thumbnail((max_px, max_px), Image.Resampling.LANCZOS)
+            img.save(target, format="WEBP", quality=85, method=6)
+        return target
+    except Exception as e:
+        logging.debug("Media cache generation failed for %s: %s", source_path, e)
+        return source_path
+
+
+def _ensure_cached_image_from_bytes(
+    raw: bytes,
+    mime: str,
+    *,
+    kind: str,
+    cache_key_hint: str,
+    max_px: int = 320,
+) -> Optional[Path]:
+    if not raw:
+        return None
+    try:
+        digest = hashlib.sha1(
+            f"{kind}|{max_px}|{cache_key_hint}|{len(raw)}|v2".encode("utf-8", errors="ignore")
+        ).hexdigest()
+    except Exception:
+        return None
+    target = _media_cache_path_for_key(digest, kind, ".webp")
+    if target.exists() and target.is_file():
+        return target
+    try:
+        from io import BytesIO
+        from PIL import Image
+    except ImportError:
+        ext = _image_ext_from_mime(mime)
+        target = _media_cache_path_for_key(digest, kind, ext)
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(raw)
+            return target
+        except Exception:
+            return None
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        img = Image.open(BytesIO(raw))
+        if img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
+        img.thumbnail((max_px, max_px), Image.Resampling.LANCZOS)
+        img.save(target, format="WEBP", quality=85, method=6)
+        return target
+    except Exception as e:
+        logging.debug("Embedded media cache generation failed: %s", e)
+        return None
+
+
+def _precache_files_media_assets(artists_map: dict[str, dict], albums_payload: list[dict]) -> tuple[int, int]:
+    _ensure_media_cache_dirs()
+    cover_paths: list[Path] = []
+    artist_paths: list[Path] = []
+    for album in albums_payload:
+        raw = str(album.get("cover_path") or "").strip()
+        if raw:
+            p = path_for_fs_access(Path(raw))
+            if p.exists() and p.is_file():
+                cover_paths.append(p)
+    for data in artists_map.values():
+        raw = str((data or {}).get("image_path") or "").strip()
+        if raw:
+            p = path_for_fs_access(Path(raw))
+            if p.exists() and p.is_file():
+                artist_paths.append(p)
+    cover_paths = list(dict.fromkeys(cover_paths))
+    artist_paths = list(dict.fromkeys(artist_paths))
+
+    covers_done = 0
+    artists_done = 0
+
+    for p in cover_paths:
+        for size in _MEDIA_CACHE_SIZES:
+            out = _ensure_cached_image_for_path(p, kind="album", max_px=size)
+            if out:
+                covers_done += 1
+    for p in artist_paths:
+        for size in _MEDIA_CACHE_SIZES:
+            out = _ensure_cached_image_for_path(p, kind="artist", max_px=size)
+            if out:
+                artists_done += 1
+    return covers_done, artists_done
 
 
 def _parse_int_loose(value, default: int = 0) -> int:
@@ -3812,6 +3988,8 @@ def _rebuild_files_library_index(reason: str = "manual", wait_if_running: bool =
         finally:
             conn.close()
 
+        _files_index_set_state(phase="media_cache")
+        covers_cached, artists_cached = _precache_files_media_assets(artists_map, albums_payload)
         _files_cache_invalidate_all()
         elapsed = round(time.time() - started_at, 2)
         _files_index_set_state(
@@ -3825,18 +4003,22 @@ def _rebuild_files_library_index(reason: str = "manual", wait_if_running: bool =
             error=None,
         )
         logging.info(
-            "Files library index rebuilt (%s): %d artist(s), %d album(s), %d track(s) in %.2fs",
+            "Files library index rebuilt (%s): %d artist(s), %d album(s), %d track(s) in %.2fs (cached covers=%d, artist images=%d)",
             reason,
             len(artists_map),
             len(albums_payload),
             sum(len(a["tracks"]) for a in albums_payload),
             elapsed,
+            covers_cached,
+            artists_cached,
         )
         return {
             "ok": True,
             "artists": len(artists_map),
             "albums": len(albums_payload),
             "tracks": sum(len(a["tracks"]) for a in albums_payload),
+            "cached_covers": covers_cached,
+            "cached_artist_images": artists_cached,
             "duration_sec": elapsed,
         }
     except Exception as e:
@@ -3878,6 +4060,287 @@ def _ensure_files_index_ready() -> tuple[bool, Optional[str]]:
     if not result.get("ok"):
         return False, str(result.get("error") or "Files index build failed")
     return True, None
+
+
+_FILES_PROFILE_MAX_AGE_SEC = 30 * 24 * 3600
+_files_profile_jobs_lock = threading.Lock()
+_files_profile_jobs_active: set[str] = set()
+
+
+def _dt_to_epoch(value) -> float:
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    if hasattr(value, "timestamp"):
+        try:
+            return float(value.timestamp())
+        except Exception:
+            return 0.0
+    return 0.0
+
+
+def _is_profile_stale(updated_at) -> bool:
+    ts = _dt_to_epoch(updated_at)
+    if ts <= 0:
+        return True
+    return (time.time() - ts) > _FILES_PROFILE_MAX_AGE_SEC
+
+
+def _files_get_artist_profile_cached(artist_name: str, artist_norm: str) -> dict:
+    if not artist_norm:
+        return {}
+    cache_key = f"library:artist_profile:{artist_norm}"
+    cached = _files_cache_get_json(cache_key)
+    if isinstance(cached, dict):
+        return cached
+    conn = _files_pg_connect()
+    if conn is None:
+        return {}
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT bio, short_bio, tags_json, similar_json, source, updated_at
+                FROM files_artist_profiles
+                WHERE name_norm = %s
+                """,
+                (artist_norm,),
+            )
+            row = cur.fetchone()
+        if not row:
+            return {}
+        try:
+            tags = json.loads(row[2] or "[]") if row[2] else []
+        except Exception:
+            tags = []
+        try:
+            similar = json.loads(row[3] or "[]") if row[3] else []
+        except Exception:
+            similar = []
+        payload = {
+            "artist_name": artist_name,
+            "bio": row[0] or "",
+            "short_bio": row[1] or "",
+            "tags": tags if isinstance(tags, list) else [],
+            "similar_artists": similar if isinstance(similar, list) else [],
+            "source": row[4] or "",
+            "updated_at": int(_dt_to_epoch(row[5])) if row[5] else 0,
+            "stale": _is_profile_stale(row[5]),
+        }
+        _files_cache_set_json(cache_key, payload, ttl=1800)
+        return payload
+    except Exception:
+        return {}
+    finally:
+        conn.close()
+
+
+def _files_get_album_profiles_cached(artist_norm: str, title_norms: list[str]) -> dict[str, dict]:
+    if not artist_norm or not title_norms:
+        return {}
+    cache_key = f"library:album_profiles:{artist_norm}:{hashlib.sha1('|'.join(sorted(set(title_norms))).encode('utf-8', errors='ignore')).hexdigest()}"
+    cached = _files_cache_get_json(cache_key)
+    if isinstance(cached, dict):
+        return cached
+    conn = _files_pg_connect()
+    if conn is None:
+        return {}
+    try:
+        title_norms_clean = [t for t in title_norms if t]
+        if not title_norms_clean:
+            return {}
+        placeholders = ",".join(["%s"] * len(title_norms_clean))
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT title_norm, description, short_description, tags_json, source, updated_at
+                FROM files_album_profiles
+                WHERE artist_norm = %s AND title_norm IN ({placeholders})
+                """,
+                [artist_norm, *title_norms_clean],
+            )
+            rows = cur.fetchall()
+        out: dict[str, dict] = {}
+        for row in rows:
+            try:
+                tags = json.loads(row[3] or "[]") if row[3] else []
+            except Exception:
+                tags = []
+            out[str(row[0] or "")] = {
+                "description": row[1] or "",
+                "short_description": row[2] or "",
+                "tags": tags if isinstance(tags, list) else [],
+                "source": row[4] or "",
+                "updated_at": int(_dt_to_epoch(row[5])) if row[5] else 0,
+                "stale": _is_profile_stale(row[5]),
+            }
+        _files_cache_set_json(cache_key, out, ttl=1800)
+        return out
+    except Exception:
+        return {}
+    finally:
+        conn.close()
+
+
+def _files_upsert_artist_profile(conn, artist_norm: str, artist_name: str, profile: dict) -> None:
+    tags_json = json.dumps((profile or {}).get("tags") or [])
+    similar_json = json.dumps((profile or {}).get("similar") or (profile or {}).get("similar_artists") or [])
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO files_artist_profiles(name_norm, artist_name, bio, short_bio, tags_json, similar_json, source, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
+            ON CONFLICT (name_norm) DO UPDATE
+            SET artist_name = EXCLUDED.artist_name,
+                bio = EXCLUDED.bio,
+                short_bio = EXCLUDED.short_bio,
+                tags_json = EXCLUDED.tags_json,
+                similar_json = EXCLUDED.similar_json,
+                source = EXCLUDED.source,
+                updated_at = NOW()
+            """,
+            (
+                artist_norm,
+                artist_name or "",
+                (profile or {}).get("bio") or "",
+                (profile or {}).get("short_bio") or "",
+                tags_json,
+                similar_json,
+                (profile or {}).get("source") or "",
+            ),
+        )
+
+
+def _files_upsert_album_profile(conn, artist_norm: str, title_norm: str, album_title: str, profile: dict) -> None:
+    tags_json = json.dumps((profile or {}).get("tags") or [])
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO files_album_profiles(artist_norm, title_norm, album_title, description, short_description, tags_json, source, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
+            ON CONFLICT (artist_norm, title_norm) DO UPDATE
+            SET album_title = EXCLUDED.album_title,
+                description = EXCLUDED.description,
+                short_description = EXCLUDED.short_description,
+                tags_json = EXCLUDED.tags_json,
+                source = EXCLUDED.source,
+                updated_at = NOW()
+            """,
+            (
+                artist_norm,
+                title_norm,
+                album_title or "",
+                (profile or {}).get("description") or "",
+                (profile or {}).get("short_description") or "",
+                tags_json,
+                (profile or {}).get("source") or "",
+            ),
+        )
+
+
+def _run_files_profile_enrichment_job(
+    *,
+    job_key: str,
+    artist_name: str,
+    artist_norm: str,
+    albums: list[tuple[str, str]],
+) -> None:
+    try:
+        conn = _files_pg_connect()
+        if conn is None:
+            return
+        try:
+            existing_profile = _files_get_artist_profile_cached(artist_name, artist_norm)
+            should_refresh_artist = not bool(existing_profile.get("short_bio")) or bool(existing_profile.get("stale"))
+
+            artist_profile = None
+            if should_refresh_artist:
+                artist_profile = _fetch_lastfm_artist_info(artist_name) or {}
+                if (not artist_profile.get("similar")) and USE_MUSICBRAINZ:
+                    try:
+                        search_result = musicbrainzngs.search_artists(artist=artist_name, limit=1)
+                        artist_list = search_result.get("artist-list") or []
+                        mbid = ""
+                        if artist_list and isinstance(artist_list[0], dict):
+                            mbid = (artist_list[0].get("id") or "").strip()
+                    except Exception:
+                        mbid = ""
+                    if mbid:
+                        try:
+                            mb_similar = get_similar_artists_mb(mbid)
+                            if mb_similar:
+                                artist_profile["similar"] = mb_similar[:20]
+                                artist_profile["source"] = (artist_profile.get("source") or "musicbrainz").strip()
+                        except Exception:
+                            pass
+                if artist_profile:
+                    with conn:
+                        _files_upsert_artist_profile(conn, artist_norm, artist_name, artist_profile)
+
+            # Album descriptions: fill missing/stale entries progressively.
+            album_pairs = [(str(title or ""), str(norm or "")) for title, norm in albums if str(norm or "").strip()]
+            if album_pairs:
+                with conn.cursor() as cur:
+                    placeholders = ",".join(["%s"] * len(album_pairs))
+                    norms = [norm for _, norm in album_pairs]
+                    cur.execute(
+                        f"""
+                        SELECT title_norm, updated_at
+                        FROM files_album_profiles
+                        WHERE artist_norm = %s AND title_norm IN ({placeholders})
+                        """,
+                        [artist_norm, *norms],
+                    )
+                    existing = {str(r[0] or ""): r[1] for r in cur.fetchall()}
+                to_fetch: list[tuple[str, str]] = []
+                for title, norm in album_pairs:
+                    if norm not in existing or _is_profile_stale(existing.get(norm)):
+                        to_fetch.append((title, norm))
+                for title, norm in to_fetch[:120]:
+                    info = _fetch_lastfm_album_info(artist_name, title) or {}
+                    if not info:
+                        continue
+                    full_desc = _strip_html_text((info.get("wiki_content") or info.get("wiki_summary") or "").strip())
+                    short_desc = _truncate_text(info.get("wiki_summary") or full_desc, max_chars=280)
+                    profile = {
+                        "description": full_desc,
+                        "short_description": short_desc,
+                        "tags": info.get("toptags") or [],
+                        "source": "lastfm",
+                    }
+                    with conn:
+                        _files_upsert_album_profile(conn, artist_norm, norm, title, profile)
+        finally:
+            conn.close()
+        _files_cache_invalidate_all()
+    except Exception as e:
+        logging.debug("Artist profile enrichment failed for %s: %s", artist_name, e)
+    finally:
+        with _files_profile_jobs_lock:
+            _files_profile_jobs_active.discard(job_key)
+
+
+def _enqueue_files_profile_enrichment(artist_name: str, artist_norm: str, albums: list[tuple[str, str]]) -> bool:
+    if not artist_norm:
+        return False
+    job_key = f"{artist_norm}"
+    with _files_profile_jobs_lock:
+        if job_key in _files_profile_jobs_active:
+            return True
+        _files_profile_jobs_active.add(job_key)
+    threading.Thread(
+        target=_run_files_profile_enrichment_job,
+        kwargs={
+            "job_key": job_key,
+            "artist_name": artist_name,
+            "artist_norm": artist_norm,
+            "albums": albums,
+        },
+        daemon=True,
+        name=f"profile-enrich-{artist_norm[:24]}",
+    ).start()
+    return True
 
 # ----- Run summary tracking ---------------------------------------------------
 def _count_rows(table: str) -> int:
@@ -11122,6 +11585,9 @@ def _fetch_lastfm_album_info(artist_name: str, album_title: str, mbid: Optional[
             name = t.get("name") if isinstance(t, dict) else str(t)
             if name:
                 toptags.append(name)
+        wiki = album.get("wiki") or {}
+        wiki_summary = wiki.get("summary") if isinstance(wiki, dict) else ""
+        wiki_content = wiki.get("content") if isinstance(wiki, dict) else ""
         mbid = (album.get("mbid") or "").strip()
         return {
             "cover_url": cover_url,
@@ -11129,9 +11595,82 @@ def _fetch_lastfm_album_info(artist_name: str, album_title: str, mbid: Optional[
             "title": album.get("name") or album_title,
             "artist": album.get("artist", {}).get("name") if isinstance(album.get("artist"), dict) else artist_name,
             "mbid": mbid,
+            "wiki_summary": wiki_summary or "",
+            "wiki_content": wiki_content or "",
         }
     except Exception as e:
         logging.warning("Last.fm fetch failed for %s / %s: %s", artist_name, album_title, e)
+        return None
+
+
+def _strip_html_text(value: str) -> str:
+    txt = str(value or "")
+    if not txt:
+        return ""
+    txt = re.sub(r"<[^>]+>", " ", txt)
+    txt = txt.replace("&amp;", "&").replace("&quot;", '"').replace("&#39;", "'")
+    txt = re.sub(r"\s+", " ", txt).strip()
+    return txt
+
+
+def _truncate_text(value: str, max_chars: int = 420) -> str:
+    txt = _strip_html_text(value)
+    if len(txt) <= max_chars:
+        return txt
+    clipped = txt[:max_chars].rsplit(" ", 1)[0].strip()
+    return f"{clipped}..." if clipped else txt[:max_chars]
+
+
+def _fetch_lastfm_artist_info(artist_name: str) -> Optional[dict]:
+    """
+    Call Last.fm artist.getInfo. Returns dict with bio/tags/similar artists or None.
+    """
+    if not USE_LASTFM:
+        return None
+    api_key = (getattr(sys.modules[__name__], "LASTFM_API_KEY", "") or "").strip()
+    if not api_key:
+        return None
+    try:
+        params = {"method": "artist.getInfo", "artist": artist_name, "api_key": api_key, "format": "json", "autocorrect": 1}
+        resp = requests.get("https://ws.audioscrobbler.com/2.0/", params=params, timeout=10)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        if data.get("error") and data.get("error") != 0:
+            return None
+        artist = data.get("artist") or {}
+        bio = artist.get("bio") or {}
+        summary = _strip_html_text((bio.get("summary") if isinstance(bio, dict) else "") or "")
+        content = _strip_html_text((bio.get("content") if isinstance(bio, dict) else "") or "")
+        tags_raw = (artist.get("tags") or {}).get("tag") or []
+        if isinstance(tags_raw, dict):
+            tags_raw = [tags_raw]
+        tags = []
+        for t in tags_raw:
+            name = (t.get("name") if isinstance(t, dict) else str(t) or "").strip()
+            if name:
+                tags.append(name)
+        similar_raw = (artist.get("similar") or {}).get("artist") or []
+        if isinstance(similar_raw, dict):
+            similar_raw = [similar_raw]
+        similar = []
+        for item in similar_raw:
+            if not isinstance(item, dict):
+                continue
+            name = (item.get("name") or "").strip()
+            mbid = (item.get("mbid") or "").strip()
+            if not name:
+                continue
+            similar.append({"name": name, "mbid": mbid, "type": "Last.fm"})
+        return {
+            "bio": content or summary,
+            "short_bio": _truncate_text(summary or content, max_chars=460),
+            "tags": _dedupe_keep_order(tags)[:20],
+            "similar": similar[:20],
+            "source": "lastfm",
+        }
+    except Exception as e:
+        logging.debug("Last.fm artist profile fetch failed for %s: %s", artist_name, e)
         return None
 
 
@@ -13256,6 +13795,7 @@ def api_config_get():
         "EXPORT_ROOT": get_setting("EXPORT_ROOT", EXPORT_ROOT),
         "EXPORT_NAMING_TEMPLATE": get_setting("EXPORT_NAMING_TEMPLATE", EXPORT_NAMING_TEMPLATE),
         "EXPORT_LINK_STRATEGY": get_setting("EXPORT_LINK_STRATEGY", EXPORT_LINK_STRATEGY),
+        "MEDIA_CACHE_ROOT": get_setting("MEDIA_CACHE_ROOT", MEDIA_CACHE_ROOT),
         "AUTO_EXPORT_LIBRARY": get_setting_bool("AUTO_EXPORT_LIBRARY", AUTO_EXPORT_LIBRARY),
         "paths_status": _paths_rw_status(),
         "container_mounts": _container_mounts_status(),
@@ -13494,6 +14034,17 @@ def _apply_settings_in_memory(updates: dict):
             EXPORT_LINK_STRATEGY = strat
             mod.merged["EXPORT_LINK_STRATEGY"] = strat
             logging.info("EXPORT_LINK_STRATEGY updated in memory: %s", EXPORT_LINK_STRATEGY)
+    if "MEDIA_CACHE_ROOT" in updates:
+        root = str(updates["MEDIA_CACHE_ROOT"] or "").strip() or str(CONFIG_DIR / "media_cache")
+        global MEDIA_CACHE_ROOT
+        MEDIA_CACHE_ROOT = root
+        mod.merged["MEDIA_CACHE_ROOT"] = root
+        try:
+            (Path(MEDIA_CACHE_ROOT) / "album").mkdir(parents=True, exist_ok=True)
+            (Path(MEDIA_CACHE_ROOT) / "artist").mkdir(parents=True, exist_ok=True)
+            logging.info("MEDIA_CACHE_ROOT updated in memory: %s", MEDIA_CACHE_ROOT)
+        except Exception as e:
+            logging.warning("Could not initialize MEDIA_CACHE_ROOT=%s: %s", MEDIA_CACHE_ROOT, e)
     if "IMPROVE_ALL_WORKERS" in updates:
         global IMPROVE_ALL_WORKERS
         try:
@@ -13672,7 +14223,7 @@ def api_config_put():
         "INCOMPLETE_ALBUMS_TARGET_DIR",
         "SCAN_DISABLE_CACHE",
         # Library backend & file-library settings
-        "LIBRARY_MODE", "FILES_ROOTS", "EXPORT_ROOT", "EXPORT_NAMING_TEMPLATE", "EXPORT_LINK_STRATEGY", "AUTO_EXPORT_LIBRARY",
+        "LIBRARY_MODE", "FILES_ROOTS", "EXPORT_ROOT", "EXPORT_NAMING_TEMPLATE", "EXPORT_LINK_STRATEGY", "MEDIA_CACHE_ROOT", "AUTO_EXPORT_LIBRARY",
     }
     # Only process keys that are in the request AND in the allowed list
     # This preserves existing values in SQLite for keys not in the request
@@ -15081,29 +15632,44 @@ def api_library_artists():
                         (like,),
                     )
                     total = int(cur.fetchone()[0] or 0)
-                    cur.execute(
-                        """
-                        SELECT id, name, album_count, broken_albums_count
-                        FROM files_artists
-                        WHERE name ILIKE %s
-                        ORDER BY name ASC
-                        LIMIT %s OFFSET %s
-                        """,
-                        (like, limit, offset),
-                    )
+                    try:
+                        cur.execute(
+                            """
+                            SELECT id, name, album_count, broken_albums_count, has_image,
+                                   similarity(name, %s) AS score,
+                                   CASE WHEN lower(name) LIKE lower(%s) || '%%' THEN 0 ELSE 1 END AS prefix_rank
+                            FROM files_artists
+                            WHERE name ILIKE %s
+                            ORDER BY prefix_rank ASC, score DESC, album_count DESC, name ASC
+                            LIMIT %s OFFSET %s
+                            """,
+                            (search_query, search_query, like, limit, offset),
+                        )
+                    except Exception:
+                        cur.execute(
+                            """
+                            SELECT id, name, album_count, broken_albums_count, has_image
+                            FROM files_artists
+                            WHERE name ILIKE %s
+                            ORDER BY album_count DESC, name ASC
+                            LIMIT %s OFFSET %s
+                            """,
+                            (like, limit, offset),
+                        )
                 else:
                     cur.execute("SELECT COUNT(*) FROM files_artists")
                     total = int(cur.fetchone()[0] or 0)
                     cur.execute(
                         """
-                        SELECT id, name, album_count, broken_albums_count
+                        SELECT id, name, album_count, broken_albums_count, has_image
                         FROM files_artists
-                        ORDER BY name ASC
+                        ORDER BY album_count DESC, name ASC
                         LIMIT %s OFFSET %s
                         """,
                         (limit, offset),
                     )
                 rows = cur.fetchall()
+            base_url = request.url_root.rstrip("/")
             payload = {
                 "artists": [
                     {
@@ -15111,6 +15677,7 @@ def api_library_artists():
                         "artist_name": r[1] or "",
                         "album_count": int(r[2] or 0),
                         "broken_albums_count": int(r[3] or 0),
+                        "artist_thumb": f"{base_url}/api/library/files/artist/{int(r[0])}/image?size=96" if bool(r[4]) else None,
                     }
                     for r in rows
                 ],
@@ -15225,6 +15792,74 @@ def api_library_artists():
         "offset": offset
     })
 
+
+@app.get("/api/library/artists/suggest")
+def api_library_artists_suggest():
+    """Ultra-fast artist suggestions for typeahead search."""
+    query = (request.args.get("q") or "").strip()
+    limit = max(1, min(50, _parse_int_loose(request.args.get("limit"), 12)))
+    if not query:
+        return jsonify({"query": "", "artists": []})
+    if _get_library_mode() != "files":
+        return jsonify({"query": query, "artists": []})
+    cache_key = f"library:artists:suggest:{query.lower()}:{limit}"
+    cached = _files_cache_get_json(cache_key)
+    if cached is not None:
+        return jsonify(cached)
+    ok, err = _ensure_files_index_ready()
+    if not ok:
+        return jsonify({"query": query, "artists": [], "error": err or "Files index unavailable"}), 503
+    conn = _files_pg_connect()
+    if conn is None:
+        return jsonify({"query": query, "artists": [], "error": "PostgreSQL unavailable"}), 503
+    try:
+        with conn.cursor() as cur:
+            like = f"%{query}%"
+            try:
+                cur.execute(
+                    """
+                    SELECT id, name, album_count, broken_albums_count, has_image,
+                           similarity(name, %s) AS score,
+                           CASE WHEN lower(name) LIKE lower(%s) || '%%' THEN 0 ELSE 1 END AS prefix_rank
+                    FROM files_artists
+                    WHERE name ILIKE %s
+                    ORDER BY prefix_rank ASC, score DESC, album_count DESC, name ASC
+                    LIMIT %s
+                    """,
+                    (query, query, like, limit),
+                )
+            except Exception:
+                cur.execute(
+                    """
+                    SELECT id, name, album_count, broken_albums_count, has_image
+                    FROM files_artists
+                    WHERE name ILIKE %s
+                    ORDER BY album_count DESC, name ASC
+                    LIMIT %s
+                    """,
+                    (like, limit),
+                )
+            rows = cur.fetchall()
+        base_url = request.url_root.rstrip("/")
+        payload = {
+            "query": query,
+            "artists": [
+                {
+                    "artist_id": int(r[0]),
+                    "artist_name": r[1] or "",
+                    "album_count": int(r[2] or 0),
+                    "broken_albums_count": int(r[3] or 0),
+                    "artist_thumb": f"{base_url}/api/library/files/artist/{int(r[0])}/image?size=96" if bool(r[4]) else None,
+                }
+                for r in rows
+            ],
+        }
+        _files_cache_set_json(cache_key, payload, ttl=20)
+        return jsonify(payload)
+    finally:
+        conn.close()
+
+
 @app.get("/api/library/artist/<int:artist_id>")
 def api_library_artist_detail(artist_id):
     """Return detailed information about an artist including all albums with images and types."""
@@ -15249,12 +15884,13 @@ def api_library_artist_detail(artist_id):
                 if not artist_row:
                     return jsonify({"error": "Artist not found"}), 404
                 artist_name = artist_row[1] or ""
+                artist_norm = " ".join((artist_name or "").split()).lower()
                 has_artist_image = bool(artist_row[2])
                 artist_image_path = (artist_row[3] or "").strip()
                 cur.execute(
                     """
                     SELECT
-                        id, title, year, date_text, track_count, is_broken, format, is_lossless,
+                        id, title, title_norm, year, date_text, track_count, is_broken, format, is_lossless,
                         has_cover, mb_identified, musicbrainz_release_group_id,
                         expected_track_count, actual_track_count, missing_indices_json,
                         COUNT(*) OVER (PARTITION BY title_norm) AS dup_count
@@ -15266,6 +15902,15 @@ def api_library_artist_detail(artist_id):
                 )
                 rows = cur.fetchall()
 
+            artist_profile = _files_get_artist_profile_cached(artist_name, artist_norm)
+            title_norms = [str(r[2] or "") for r in rows if str(r[2] or "").strip()]
+            album_profile_map = _files_get_album_profiles_cached(artist_norm, title_norms)
+            profile_enriching = _enqueue_files_profile_enrichment(
+                artist_name,
+                artist_norm,
+                [(str(r[1] or ""), str(r[2] or "")) for r in rows],
+            )
+
             albums = []
             stats_duplicates = 0
             stats_no_cover = 0
@@ -15273,17 +15918,19 @@ def api_library_artist_detail(artist_id):
             stats_broken = 0
             for row in rows:
                 album_id = int(row[0])
-                track_count = int(row[4] or 0)
-                is_broken = bool(row[5])
-                fmt = (row[6] or "").strip() or None
-                is_lossless = bool(row[7])
-                has_cover = bool(row[8])
-                mb_identified = bool(row[9])
-                mbid = (row[10] or "").strip() or None
-                expected_track_count = row[11]
-                actual_track_count = row[12]
-                missing_indices_raw = row[13] or "[]"
-                dup_count = int(row[14] or 0)
+                title_norm = str(row[2] or "")
+                track_count = int(row[5] or 0)
+                is_broken = bool(row[6])
+                fmt = (row[7] or "").strip() or None
+                is_lossless = bool(row[8])
+                has_cover = bool(row[9])
+                mb_identified = bool(row[10])
+                mbid = (row[11] or "").strip() or None
+                expected_track_count = row[12]
+                actual_track_count = row[13]
+                missing_indices_raw = row[14] or "[]"
+                dup_count = int(row[15] or 0)
+                album_profile = album_profile_map.get(title_norm, {}) if title_norm else {}
 
                 if dup_count > 1:
                     stats_duplicates += 1
@@ -15318,11 +15965,11 @@ def api_library_artist_detail(artist_id):
                 albums.append({
                     "album_id": album_id,
                     "title": row[1] or "",
-                    "year": row[2],
-                    "date": row[3] or "",
+                    "year": row[3],
+                    "date": row[4] or "",
                     "track_count": track_count,
                     "is_broken": is_broken,
-                    "thumb": thumb_url_files,
+                    "thumb": f"{thumb_url_files}?size=320" if thumb_url_files else None,
                     "type": album_type,
                     "format": fmt,
                     "is_lossless": is_lossless,
@@ -15332,15 +15979,20 @@ def api_library_artist_detail(artist_id):
                     "in_duplicate_group": dup_count > 1,
                     "can_improve": can_improve,
                     "broken_detail": broken_detail,
+                    "description": album_profile.get("description"),
+                    "short_description": album_profile.get("short_description"),
+                    "description_source": album_profile.get("source"),
                 })
 
             artist_thumb = None
             if has_artist_image and artist_image_path:
-                artist_thumb = f"{request.url_root.rstrip('/')}/api/library/files/artist/{artist_id}/image"
+                artist_thumb = f"{request.url_root.rstrip('/')}/api/library/files/artist/{artist_id}/image?size=320"
             payload = {
                 "artist_id": artist_id,
                 "artist_name": artist_name,
                 "artist_thumb": artist_thumb,
+                "artist_profile": artist_profile,
+                "profile_enriching": profile_enriching,
                 "albums": albums,
                 "total_albums": len(albums),
                 "stats": {
@@ -15639,6 +16291,66 @@ def api_library_artist_detail(artist_id):
     })
 
 
+@app.get("/api/library/artist/<int:artist_id>/profile")
+def api_library_artist_profile(artist_id: int):
+    """Return cached artist profile (bio/tags/similar) and trigger async enrichment when missing/stale."""
+    if _get_library_mode() != "files":
+        return jsonify({"error": "Artist profile endpoint is available in Files mode only"}), 400
+    ok, err = _ensure_files_index_ready()
+    if not ok:
+        return jsonify({"error": err or "Files index unavailable"}), 503
+    conn = _files_pg_connect()
+    if conn is None:
+        return jsonify({"error": "PostgreSQL unavailable"}), 503
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, name, name_norm
+                FROM files_artists
+                WHERE id = %s
+                """,
+                (artist_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return jsonify({"error": "Artist not found"}), 404
+            artist_name = row[1] or ""
+            artist_norm = row[2] or " ".join((artist_name or "").split()).lower()
+            cur.execute(
+                """
+                SELECT title, title_norm
+                FROM files_albums
+                WHERE artist_id = %s
+                ORDER BY COALESCE(year, 0) DESC, title ASC
+                LIMIT 180
+                """,
+                (artist_id,),
+            )
+            albums = [(str(r[0] or ""), str(r[1] or "")) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+    profile = _files_get_artist_profile_cached(artist_name, artist_norm)
+    force_refresh = str(request.args.get("refresh", "")).strip().lower() in {"1", "true", "yes"}
+    should_enrich = force_refresh or (not bool(profile.get("short_bio"))) or bool(profile.get("stale"))
+    enriching = False
+    if should_enrich:
+        enriching = _enqueue_files_profile_enrichment(artist_name, artist_norm, albums)
+
+    album_profiles = _files_get_album_profiles_cached(artist_norm, [norm for _, norm in albums if norm])
+    return jsonify(
+        {
+            "artist_id": artist_id,
+            "artist_name": artist_name,
+            "artist_norm": artist_norm,
+            "profile": profile,
+            "album_profiles": album_profiles,
+            "enriching": enriching,
+        }
+    )
+
+
 @app.get("/api/library/missing-tags")
 def api_library_missing_tags():
     """Return albums in selected sections that have missing MusicBrainz or required tags.
@@ -15771,7 +16483,7 @@ def api_library_album_tracks(album_id):
                 }
                 for r in rows
             ]
-            album_thumb = f"{base_url}/api/library/files/album/{album_id}/cover" if has_cover else None
+            album_thumb = f"{base_url}/api/library/files/album/{album_id}/cover?size=320" if has_cover else None
             return jsonify({"tracks": tracks, "album_thumb": album_thumb})
         finally:
             conn.close()
@@ -15894,6 +16606,7 @@ def api_library_files_album_cover(album_id):
     """Serve album cover from files-library index (files mode)."""
     if _get_library_mode() != "files":
         return jsonify({"error": "Files mode required"}), 400
+    size = max(64, min(2048, _parse_int_loose(request.args.get("size"), 320)))
     ok, err = _ensure_files_index_ready()
     if not ok:
         return jsonify({"error": err or "Files index unavailable"}), 503
@@ -15908,7 +16621,9 @@ def api_library_files_album_cover(album_id):
             if cover_raw:
                 cover_path = path_for_fs_access(Path(cover_raw))
                 if cover_path.exists() and cover_path.is_file():
-                    return send_file(str(cover_path), as_attachment=False, conditional=True)
+                    cached = _ensure_cached_image_for_path(cover_path, kind="album", max_px=size)
+                    to_send = cached or cover_path
+                    return send_file(str(to_send), as_attachment=False, conditional=True)
             # Fallback to embedded cover from first track
             cur.execute(
                 """
@@ -15926,6 +16641,15 @@ def api_library_files_album_cover(album_id):
             embedded = _extract_embedded_cover_from_audio(first_track)
             if embedded:
                 raw, mime = embedded
+                cached = _ensure_cached_image_from_bytes(
+                    raw,
+                    mime,
+                    kind="embedded",
+                    cache_key_hint=f"album-{album_id}",
+                    max_px=size,
+                )
+                if cached and cached.exists():
+                    return send_file(str(cached), as_attachment=False, conditional=True)
                 return Response(raw, headers={"Content-Type": mime})
         return jsonify({"error": "Cover not found"}), 404
     finally:
@@ -15937,6 +16661,7 @@ def api_library_files_artist_image(artist_id):
     """Serve artist image from files-library index (files mode)."""
     if _get_library_mode() != "files":
         return jsonify({"error": "Files mode required"}), 400
+    size = max(64, min(2048, _parse_int_loose(request.args.get("size"), 320)))
     ok, err = _ensure_files_index_ready()
     if not ok:
         return jsonify({"error": err or "Files index unavailable"}), 503
@@ -15952,7 +16677,9 @@ def api_library_files_artist_image(artist_id):
         img_path = path_for_fs_access(Path(row[0]))
         if not img_path.exists() or not img_path.is_file():
             return jsonify({"error": "Artist image missing"}), 404
-        return send_file(str(img_path), as_attachment=False, conditional=True)
+        cached = _ensure_cached_image_for_path(img_path, kind="artist", max_px=size)
+        to_send = cached or img_path
+        return send_file(str(to_send), as_attachment=False, conditional=True)
     finally:
         conn.close()
 

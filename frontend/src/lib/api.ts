@@ -287,6 +287,8 @@ export interface PMDAConfig {
   EXPORT_NAMING_TEMPLATE?: string;
   /** Link strategy for export: hardlink | symlink | copy. */
   EXPORT_LINK_STRATEGY?: 'hardlink' | 'symlink' | 'copy';
+  /** NVMe-friendly media cache root for pre-rendered artwork thumbnails (album/artist). */
+  MEDIA_CACHE_ROOT?: string;
   /** When true (Files mode), rebuild the hardlink library automatically after a Magic scan. */
   AUTO_EXPORT_LIBRARY?: boolean;
   
