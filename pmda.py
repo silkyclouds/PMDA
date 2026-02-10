@@ -10708,6 +10708,7 @@ def _build_scan_plan() -> tuple[list[tuple[int, str, list[int]]], int]:
     if mode == "files":
         if not FILES_ROOTS:
             raise RuntimeError("FILES_ROOTS is empty – configure at least one music root for files library mode.")
+        log_scan("FILES mode source roots: %s", ", ".join(str(r) for r in FILES_ROOTS))
         artists_merged, total_albums, files_editions_by_album_id = _build_files_editions()
         with lock:
             state["files_editions_by_album_id"] = files_editions_by_album_id
@@ -10776,8 +10777,9 @@ def background_scan():
     the whole scan, and `state["scanning"]` is **always** cleared even when
     an unexpected error occurs, so the front‑end never hangs in "running".
     """
-    # Reload SECTION_IDS and PATH_MAP from DB so the scan uses the library selection
-    # and path bindings currently saved in Settings (e.g. after Detect & verify)
+    # Reload library backend settings (mode + files roots) and Plex selectors/path map
+    # so scan always uses the latest saved sources from Settings.
+    _reload_library_mode_and_files_roots_from_db()
     _reload_section_ids_from_db()
     _reload_path_map_from_db()
     if _get_library_mode() == "plex" and not SECTION_IDS:
@@ -10795,6 +10797,7 @@ def background_scan():
     scan_incremental_writer_thread = None
     files_live_index_last_trigger = 0.0
     files_live_index_interval_sec = 45.0
+    scan_status = "failed"
 
     try:
         # Log cache behavior for this run so logs show whether existing cache is being used
@@ -11270,11 +11273,6 @@ def background_scan():
             _scan_id = state.get("scan_id")
             if _scan_id and all_editions_by_artist is not None:
                 save_scan_editions_to_db(_scan_id, all_editions_by_artist)
-                # So Library always shows last run's editions (even if scan was stopped)
-                con = sqlite3.connect(str(STATE_DB_FILE), timeout=5)
-                con.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('last_completed_scan_id', ?)", (str(_scan_id),))
-                con.commit()
-                con.close()
         except Exception as e:
             logging.warning("save_scan_editions_to_db in finally failed: %s", e)
         # Auto-move dupes synchronously so UI shows "Moving dupes" and scan_history gets correct albums_moved/space_saved
@@ -11351,7 +11349,7 @@ def background_scan():
                 space_saved_mb_this_scan = state.get("last_dedupe_saved_mb", 0)
                 albums_moved_this_scan = state.get("last_dedupe_moved_count", 0)
             
-            status = 'cancelled' if scan_should_stop.is_set() else 'completed'
+            scan_status = 'cancelled' if scan_should_stop.is_set() else 'completed'
             # Build summary_json for end-of-scan summary (FFmpeg formats, MB, AI)
             mb_conn_ok = state.get("scan_mb_connection_ok", False)
             ai_conn_ok = state.get("scan_ai_connection_ok", False)
@@ -11527,7 +11525,7 @@ def background_scan():
             albums_with_artist_image = max(0, albums_scanned - albums_without_artist_image)
             bar = "─" * 85
             logging.info("%s", bar)
-            logging.info("SCAN SUMMARY [scan_id=%s, status=%s]", scan_id, status)
+            logging.info("SCAN SUMMARY [scan_id=%s, status=%s]", scan_id, scan_status)
             logging.info("Artists processed        : %s / %s", artists_processed, artists_total)
             logging.info("Albums scanned           : %s", albums_scanned)
             logging.info(
@@ -11598,7 +11596,7 @@ def background_scan():
                 mb_used_count,
                 space_saved_mb_this_scan,
                 albums_moved_this_scan,
-                status,
+                scan_status,
                 duplicate_groups_count,
                 total_duplicates_count,
                 broken_albums_count,
@@ -11611,7 +11609,7 @@ def background_scan():
                 summary_json_str,
                 scan_id
             ))
-            if status == 'completed':
+            if scan_status == 'completed':
                 cur.execute(
                     "INSERT OR REPLACE INTO settings (key, value) VALUES ('last_completed_scan_id', ?)",
                     (str(scan_id),),
@@ -11623,8 +11621,14 @@ def background_scan():
             state["scan_finalizing"] = False
             state["scanning"] = False
             run_improve_after = state.pop("run_improve_after", False)
-        # Magic / run-improve-after: always run improve-all (tags, covers, artist images)
-        if run_improve_after or MAGIC_MODE:
+        # Magic / run-improve-after: run improve-all only for a completed scan.
+        should_request_improve = run_improve_after or MAGIC_MODE
+        if should_request_improve and scan_status != "completed":
+            logging.info(
+                "Skipping post-scan improve-all because current scan status is '%s' (only 'completed' is eligible).",
+                scan_status,
+            )
+        if should_request_improve and scan_status == "completed":
             best_albums = []
             seen_ids = set()
             seen_group_keys = set()  # One best per (artist, set of edition ids) when from duplicate groups
@@ -11655,17 +11659,17 @@ def background_scan():
                             "musicbrainz_id": mbid or "",
                             "folder": (best.get("folder") or "").strip(),
                         })
-            # Include all albums from last scan that have MusicBrainz match (so improve-all runs even when no duplicate groups)
-            scan_id = get_last_completed_scan_id()
-            if scan_id is not None:
+            # Include albums from the CURRENT scan only (never from previous scans).
+            scan_id_for_improve = scan_id
+            if scan_id_for_improve is not None:
                 try:
                     con = sqlite3.connect(str(STATE_DB_FILE))
                     cur = con.cursor()
-                    # Include all albums from last completed scan so improve-all can enrich tags/covers
-                    # even when there is no MusicBrainz ID yet (e.g. Bandcamp/Last.fm-only matches, or new REQUIRED_TAGS like \"genre\").
+                    # Include all albums from the current scan so improve-all can enrich tags/covers
+                    # even when there is no MusicBrainz ID yet (e.g. Bandcamp/Last.fm-only matches, or new REQUIRED_TAGS like "genre").
                     cur.execute(
                         "SELECT artist, album_id, title_raw, musicbrainz_id, folder FROM scan_editions WHERE scan_id = ?",
-                        (scan_id,),
+                        (scan_id_for_improve,),
                     )
                     for row in cur.fetchall():
                         artist_name, album_id, title_raw, mbid, folder = row[0], row[1], row[2] or "", (row[3] or "").strip(), row[4] or ""
@@ -11682,9 +11686,10 @@ def background_scan():
                         })
                     con.close()
                 except Exception as e:
-                    logging.debug("Post-scan improve: could not load scan_editions for extra albums: %s", e)
-            # Fallback: if still empty, build from duplicates_best (kept editions after dedupe) so improve-all always runs
-            if not best_albums:
+                    logging.debug("Post-scan improve: could not load current scan_editions for extra albums: %s", e)
+            current_mode = _get_library_mode()
+            # Fallback to duplicates_best only in Plex mode.
+            if not best_albums and current_mode != "files":
                 try:
                     con = sqlite3.connect(str(STATE_DB_FILE))
                     cur = con.cursor()
@@ -11724,9 +11729,9 @@ def background_scan():
                 threading.Thread(target=_run_improve_all_albums_global, args=(best_albums,), daemon=True).start()
             else:
                 if MAGIC_MODE:
-                    logging.info("Magic mode: dedupe done; no albums to improve (no scan_editions with MBID or duplicate best)")
+                    logging.info("Magic mode: dedupe done; no albums to improve from current scan.")
                 else:
-                    logging.info("Run improve after scan: no albums to improve (no scan_editions with MBID or duplicate best)")
+                    logging.info("Run improve after scan: no albums to improve from current scan.")
         logging.debug("background_scan(): finished (flag cleared)")
         duration = time.perf_counter() - scan_perf_start
         groups_found = sum(len(v) for v in all_results.values()) if 'all_results' in locals() else 0
@@ -14534,6 +14539,34 @@ def _reload_path_map_from_db():
     if parsed:
         PATH_MAP = parsed
         logging.info("PATH_MAP reloaded from SQLite at scan start (%d entries)", len(PATH_MAP))
+
+
+def _reload_library_mode_and_files_roots_from_db():
+    """
+    Reload LIBRARY_MODE and FILES_ROOTS from SQLite so each scan uses the
+    latest source selection saved in Settings.
+    """
+    global LIBRARY_MODE, FILES_ROOTS
+    mod = sys.modules[__name__]
+
+    mode_raw = _get_config_from_db("LIBRARY_MODE")
+    if mode_raw is not None:
+        mode = str(mode_raw).strip().lower()
+        if mode in {"plex", "files"}:
+            LIBRARY_MODE = mode
+            mod.merged["LIBRARY_MODE"] = mode
+
+    roots_raw = _get_config_from_db("FILES_ROOTS")
+    if roots_raw is not None:
+        FILES_ROOTS = _parse_files_roots(roots_raw)
+        mod.merged["FILES_ROOTS"] = FILES_ROOTS
+
+    if LIBRARY_MODE == "files":
+        logging.info(
+            "Files mode scan sources reloaded: %d root(s): %s",
+            len(FILES_ROOTS or []),
+            FILES_ROOTS or [],
+        )
 
 
 def _parse_format_preference(val):
