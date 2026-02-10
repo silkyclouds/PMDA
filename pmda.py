@@ -10648,11 +10648,38 @@ def _fetch_bandcamp_album_info(artist_name: str, album_title: str) -> Optional[d
             track_title_data = re.findall(r'data-item-title="([^"]+)"', page)
             if track_title_data:
                 tracklist = [t.strip() for t in track_title_data if t.strip()]
-        # Tags (Bandcamp "Tags" section; each tag is usually an <a> with rel="tag")
+        # Tags (Bandcamp "Tags" section). Some pages use rel="tag", others only class="tag".
+        # Fallback to JSON-LD keywords when HTML anchors are not present.
         tags: List[str] = []
         try:
-            tag_matches = re.findall(r'rel="tag">([^<]+)</a>', page)
+            tag_matches = re.findall(r'rel="tag"[^>]*>([^<]+)</a>', page, flags=re.IGNORECASE)
+            if not tag_matches:
+                tag_matches = re.findall(
+                    r'<a[^>]*class="[^"]*\btag\b[^"]*"[^>]*>([^<]+)</a>',
+                    page,
+                    flags=re.IGNORECASE,
+                )
             tags = [t.strip() for t in tag_matches if isinstance(t, str) and t.strip()]
+            if not tags:
+                jsonld_blocks = re.findall(
+                    r'<script[^>]+type="application/ld\+json"[^>]*>\s*(.*?)\s*</script>',
+                    page,
+                    flags=re.IGNORECASE | re.DOTALL,
+                )
+                for block in jsonld_blocks:
+                    try:
+                        data = json.loads(block)
+                    except Exception:
+                        continue
+                    if isinstance(data, dict):
+                        keywords = data.get("keywords")
+                        if isinstance(keywords, list):
+                            tags.extend(
+                                [str(x).strip() for x in keywords if str(x).strip()]
+                            )
+                    if tags:
+                        break
+            tags = _dedupe_keep_order([t for t in tags if isinstance(t, str) and t.strip()])
         except Exception:
             tags = []
         return {
