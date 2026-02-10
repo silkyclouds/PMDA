@@ -3975,6 +3975,65 @@ def _parse_disc_track_loose(tags: dict | None, fallback_disc: int = 1, fallback_
     return disc, track
 
 
+def _normalize_meta_text(value) -> str:
+    """Normalize loose metadata strings from tags (trim + collapse spaces)."""
+    if value is None:
+        return ""
+    txt = str(value).strip()
+    if not txt:
+        return ""
+    return re.sub(r"\s+", " ", txt)
+
+
+def _pick_weighted_metadata_value(candidates: list[tuple[object, int]]) -> str:
+    """
+    Pick the most representative value from weighted metadata candidates.
+    Higher score wins; ties keep first-seen value.
+    """
+    scores: dict[str, int] = {}
+    first_seen: dict[str, int] = {}
+    display: dict[str, str] = {}
+    pos = 0
+    for raw_value, weight in candidates:
+        value = _normalize_meta_text(raw_value)
+        if not value:
+            continue
+        key = value.casefold()
+        scores[key] = scores.get(key, 0) + max(1, int(weight))
+        if key not in first_seen:
+            first_seen[key] = pos
+            display[key] = value
+        pos += 1
+    if not scores:
+        return ""
+    best_key = min(scores.keys(), key=lambda k: (-scores[k], first_seen[k]))
+    return display.get(best_key, "")
+
+
+def _pick_album_artist_from_tag_dicts(tag_dicts: list[dict], default: str = "Unknown Artist") -> str:
+    """Choose album-level artist from tags, preferring albumartist over per-track artist."""
+    candidates: list[tuple[object, int]] = []
+    for tags in tag_dicts or []:
+        if not isinstance(tags, dict):
+            continue
+        candidates.append((tags.get("albumartist"), 4))
+        candidates.append((tags.get("artist"), 1))
+    picked = _pick_weighted_metadata_value(candidates)
+    return picked or default
+
+
+def _pick_album_title_from_tag_dicts(tag_dicts: list[dict], fallback: str = "Unknown Album") -> str:
+    """Choose album title from tags (consensus), with fallback when missing."""
+    candidates: list[tuple[object, int]] = []
+    for tags in tag_dicts or []:
+        if not isinstance(tags, dict):
+            continue
+        candidates.append((tags.get("album"), 4))
+        candidates.append((tags.get("release"), 1))
+    picked = _pick_weighted_metadata_value(candidates)
+    return picked or (_normalize_meta_text(fallback) or "Unknown Album")
+
+
 def _split_genre_values(raw_value: str) -> list[str]:
     if not raw_value:
         return []
@@ -4095,6 +4154,7 @@ def _rebuild_files_library_index(reason: str = "manual", wait_if_running: bool =
                 continue
 
             track_entries: list[dict] = []
+            tag_dicts: list[dict] = []
             raw_genres: list[str] = []
             fmt_counts: dict[str, int] = defaultdict(int)
             first_tags: dict = {}
@@ -4102,6 +4162,7 @@ def _rebuild_files_library_index(reason: str = "manual", wait_if_running: bool =
 
             for p in files:
                 tags = extract_tags(p) or {}
+                tag_dicts.append(tags)
                 if not first_tags:
                     first_tags = tags
                 title = (
@@ -4140,15 +4201,10 @@ def _rebuild_files_library_index(reason: str = "manual", wait_if_running: bool =
             if not track_entries:
                 continue
 
-            artist_name = (
-                (first_tags.get("albumartist") or first_tags.get("artist") or "").strip()
-                or folder.parent.name.replace("_", " ").strip()
-                or "Unknown Artist"
-            )
-            album_title = (
-                (first_tags.get("album") or "").strip()
-                or folder.name.replace("_", " ").strip()
-                or "Unknown Album"
+            artist_name = _pick_album_artist_from_tag_dicts(tag_dicts, default="Unknown Artist")
+            album_title = _pick_album_title_from_tag_dicts(
+                tag_dicts,
+                fallback=folder.name.replace("_", " ").strip() or "Unknown Album",
             )
             artist_norm = " ".join((artist_name or "").split()).lower() or "unknown artist"
             title_norm = norm_album_for_dedup(album_title, normalize_parenthetical=True)
@@ -10431,26 +10487,26 @@ def _build_files_editions() -> tuple[list[tuple[int, str, list[int]]], int, dict
             except (ValueError, OSError):
                 pass
 
-        # One representative tags for album/artist/year; per-file tags for track order and Track list
-        paths_sorted: list[Path] = []
+        # Cache tags per file once: used for ordering, metadata, and track list.
+        paths_sorted: list[tuple[int, int, Path]] = []
+        tags_by_path: dict[Path, dict] = {}
         for p in paths:
-            t = extract_tags(p)
+            t = extract_tags(p) or {}
+            tags_by_path[p] = t
             disc, trk = _parse_disc_track_loose(t, fallback_disc=1, fallback_track=0)
             paths_sorted.append((disc, trk, p))
         paths_sorted.sort(key=lambda x: (x[0], x[1], str(x[2])))
         ordered_paths = [x[2] for x in paths_sorted]
+        tag_dicts = [tags_by_path.get(p, {}) for p in ordered_paths]
 
-        first_tags = extract_tags(ordered_paths[0]) if ordered_paths else {}
-        artist_name = (
-            (first_tags.get("albumartist") or first_tags.get("artist") or "").strip()
-            or "Unknown Artist"
-        )
-        album_title_tag = (first_tags.get("album") or "").strip() or folder.name.replace("_", " ")
+        first_tags = tags_by_path.get(ordered_paths[0], {}) if ordered_paths else {}
+        artist_name = _pick_album_artist_from_tag_dicts(tag_dicts, default="Unknown Artist")
+        album_title_tag = _pick_album_title_from_tag_dicts(tag_dicts, fallback=folder.name.replace("_", " "))
         year_tag = (first_tags.get("date") or first_tags.get("year") or "").strip()[:4] or ""
 
         tracks: list[Track] = []
         for i, p in enumerate(ordered_paths):
-            t = extract_tags(p)
+            t = tags_by_path.get(p, {})
             title = (t.get("title") or t.get("name") or p.stem or "").strip() or f"Track {i+1}"
             disc, trk = _parse_disc_track_loose(t, fallback_disc=1, fallback_track=(i + 1))
             duration_s = _parse_duration_seconds_loose(t.get("duration") or t.get("length"), 0.0)
@@ -10465,7 +10521,8 @@ def _build_files_editions() -> tuple[list[tuple[int, str, list[int]]], int, dict
         format_ext = max(set(exts), key=exts.count).upper() if exts else "UNKNOWN"
         fmt_score = FMT_SCORE.get(format_ext.lower(), 0)
         same_album = all(
-            (extract_tags(p).get("album") or "").strip() == album_title_tag for p in ordered_paths[1:]
+            _normalize_meta_text(tags_by_path.get(p, {}).get("album")) == _normalize_meta_text(album_title_tag)
+            for p in ordered_paths[1:]
         )
         confidence = 0.5 + (0.3 if same_album else 0) + (0.2 if len(ordered_paths) >= 3 else 0)
 
