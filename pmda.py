@@ -3892,6 +3892,25 @@ def _files_index_read_counts() -> tuple[int, int, int]:
         conn.close()
 
 
+def _files_index_read_track_and_embedding_counts() -> tuple[int, int]:
+    if not _files_pg_init_schema():
+        return (0, 0)
+    conn = _files_pg_connect()
+    if conn is None:
+        return (0, 0)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM files_tracks")
+            tracks = int((cur.fetchone() or [0])[0] or 0)
+            cur.execute("SELECT COUNT(*) FROM files_track_embeddings")
+            embeddings = int((cur.fetchone() or [0])[0] or 0)
+            return (tracks, embeddings)
+    except Exception:
+        return (0, 0)
+    finally:
+        conn.close()
+
+
 def _files_index_write_meta(cur, key: str, value: str) -> None:
     cur.execute(
         """
@@ -4268,6 +4287,76 @@ def _trigger_files_index_rebuild_async(reason: str = "manual") -> bool:
     return True
 
 
+def _rebuild_files_reco_embeddings(reason: str = "manual", wait_if_running: bool = False) -> dict:
+    if _get_library_mode() != "files":
+        return {"ok": False, "error": "LIBRARY_MODE is not 'files'"}
+    if not _files_pg_init_schema():
+        return {"ok": False, "error": "PostgreSQL schema unavailable"}
+
+    acquired = files_index_lock.acquire(blocking=wait_if_running)
+    if not acquired:
+        return {"ok": False, "running": True, "error": "Files index rebuild already running"}
+    try:
+        started_at = time.time()
+        _files_index_set_state(
+            running=True,
+            started_at=started_at,
+            finished_at=None,
+            phase="embeddings",
+            current_folder=None,
+            error=None,
+        )
+        conn = _files_pg_connect()
+        if conn is None:
+            raise RuntimeError("PostgreSQL connection unavailable during embedding rebuild")
+        try:
+            with conn:
+                embedding_count = _reco_build_track_embeddings(conn)
+                with conn.cursor() as cur:
+                    _files_index_write_meta(cur, "track_embeddings", str(embedding_count))
+                    _files_index_write_meta(cur, "track_embeddings_source", RECO_EMBED_SOURCE)
+                    _files_index_write_meta(cur, "track_embeddings_reason", reason)
+                    _files_index_write_meta(cur, "track_embeddings_ts", str(int(time.time())))
+        finally:
+            conn.close()
+        _files_cache_invalidate_all()
+        artists, albums, tracks = _files_index_read_counts()
+        _files_index_set_state(
+            running=False,
+            finished_at=time.time(),
+            phase="done",
+            current_folder=None,
+            artists=artists,
+            albums=albums,
+            tracks=tracks,
+            error=None,
+        )
+        elapsed = round(time.time() - started_at, 2)
+        logging.info(
+            "Files reco embeddings rebuilt (%s): %d embedding(s) in %.2fs",
+            reason,
+            embedding_count,
+            elapsed,
+        )
+        return {
+            "ok": True,
+            "track_embeddings": embedding_count,
+            "duration_sec": elapsed,
+        }
+    except Exception as e:
+        logging.exception("Files reco embedding rebuild failed: %s", e)
+        _files_index_set_state(
+            running=False,
+            finished_at=time.time(),
+            phase="error",
+            current_folder=None,
+            error=str(e),
+        )
+        return {"ok": False, "error": str(e)}
+    finally:
+        files_index_lock.release()
+
+
 def _ensure_files_index_ready() -> tuple[bool, Optional[str]]:
     if _get_library_mode() != "files":
         return False, "LIBRARY_MODE is not 'files'"
@@ -4277,6 +4366,20 @@ def _ensure_files_index_ready() -> tuple[bool, Optional[str]]:
         return False, "PostgreSQL is unavailable"
     artists, albums, tracks = _files_index_read_counts()
     if albums > 0 and tracks > 0:
+        track_count, embedding_count = _files_index_read_track_and_embedding_counts()
+        min_expected = max(1, int(track_count * 0.85)) if track_count > 0 else 0
+        if track_count > 0 and embedding_count < min_expected:
+            logging.info(
+                "Files reco embeddings below threshold (%d/%d). Rebuilding embeddings...",
+                embedding_count,
+                track_count,
+            )
+            result = _rebuild_files_reco_embeddings(
+                reason="auto_backfill_missing_embeddings",
+                wait_if_running=True,
+            )
+            if not result.get("ok"):
+                logging.warning("Files reco embedding auto-backfill failed: %s", result.get("error"))
         return True, None
     result = _rebuild_files_library_index(reason="auto_bootstrap", wait_if_running=True)
     if not result.get("ok"):
