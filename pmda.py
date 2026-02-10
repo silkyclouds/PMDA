@@ -1289,11 +1289,30 @@ except Exception as e:
 
 
 log_header("configuration")
+
+
+def _is_sensitive_config_key(key: str) -> bool:
+    """Return True for config keys that must never be logged in clear text."""
+    k = (key or "").upper()
+    sensitive_markers = ("TOKEN", "API_KEY", "SECRET", "PASSWORD", "WEBHOOK")
+    return any(marker in k for marker in sensitive_markers)
+
+
+def _mask_secret_value(value) -> str:
+    """Mask secret values while keeping a short prefix for troubleshooting."""
+    txt = str(value or "")
+    if not txt:
+        return ""
+    if len(txt) <= 4:
+        return "****"
+    return txt[:4] + "…"
+
+
 # Mask & dump effective config ------------------------------------------------
 for k, src in ENV_SOURCES.items():
     val = merged.get(k)
-    if k in {"PLEX_TOKEN", "OPENAI_API_KEY", "DISCORD_WEBHOOK"} and val:
-        val = val[:4] + "…"  # keep first 4 chars, mask the rest
+    if _is_sensitive_config_key(k) and val:
+        val = _mask_secret_value(val)
     logging.info("Config %-15s = %-30s (source: %s)", k, val, src)
 
 logging.info("Config CROSS_LIBRARY_DEDUPE = %s (source: %s)", CROSS_LIBRARY_DEDUPE, ENV_SOURCES.get("CROSS_LIBRARY_DEDUPE", "default"))
@@ -1303,7 +1322,7 @@ else:
     logging.info("➡️  Duplicate detection mode: per-library only (no cross-library comparisons)")
 
 if _level_num == logging.DEBUG:
-    scrubbed = {k: ("***" if k in {"PLEX_TOKEN", "OPENAI_API_KEY", "DISCORD_WEBHOOK"} else v)
+    scrubbed = {k: ("***" if _is_sensitive_config_key(k) else v)
                 for k, v in merged.items()}
     logging.debug("Full merged config:\n%s", json.dumps(scrubbed, indent=2))
 
