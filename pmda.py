@@ -161,6 +161,14 @@ from queue import SimpleQueue, Queue
 import sys
 import random
 
+try:
+    import psycopg
+except ImportError:
+    psycopg = None
+try:
+    import redis as redis_lib
+except ImportError:
+    redis_lib = None
 
 
 from flask import Flask, request, jsonify, send_from_directory, redirect, Response, send_file
@@ -523,6 +531,18 @@ SETTINGS_DB_FILE = CONFIG_DIR / "settings.db"
 DROP_ALBUMS_BASE = CONFIG_DIR / "drop_albums"
 DROP_MAX_FILES = 50
 DROP_MAX_BYTES = 500 * 1024 * 1024  # 500 MB
+
+# Files-mode all-in-one data services (embedded in container entrypoint)
+PMDA_PG_HOST = (os.getenv("PMDA_PG_HOST", "127.0.0.1") or "127.0.0.1").strip()
+PMDA_PG_PORT = int((os.getenv("PMDA_PG_PORT", "5432") or "5432").strip())
+PMDA_PG_DB = (os.getenv("PMDA_PG_DB", "pmda") or "pmda").strip()
+PMDA_PG_USER = (os.getenv("PMDA_PG_USER", "pmda") or "pmda").strip()
+PMDA_PG_PASSWORD = os.getenv("PMDA_PG_PASSWORD", "pmda") or "pmda"
+PMDA_REDIS_HOST = (os.getenv("PMDA_REDIS_HOST", "127.0.0.1") or "127.0.0.1").strip()
+PMDA_REDIS_PORT = int((os.getenv("PMDA_REDIS_PORT", "6379") or "6379").strip())
+PMDA_REDIS_DB = int((os.getenv("PMDA_REDIS_DB", "0") or "0").strip())
+PMDA_REDIS_PASSWORD = os.getenv("PMDA_REDIS_PASSWORD", "") or ""
+FILES_CACHE_PREFIX = "pmda:files:v1:"
 
 
 def _get_from_sqlite(key: str, default=None):
@@ -3190,6 +3210,661 @@ def set_cached_acoustid(path: str, duration: float, fingerprint: str):
 
 init_cache_db()
 
+# ───────────────────── Files Library Index (PostgreSQL + Redis) ─────────────────────
+_FILES_PG_SCHEMA_READY = False
+_FILES_REDIS_CLIENT = None
+
+_LOSSLESS_FORMATS = {"FLAC", "ALAC", "APE", "WV", "WAV", "AIFF", "DSF"}
+_ARTIST_IMAGE_NAMES = ("artist.jpg", "artist.jpeg", "artist.png", "folder.jpg", "folder.jpeg", "folder.png")
+
+
+def _files_pg_dsn() -> str:
+    return (
+        f"host={PMDA_PG_HOST} port={PMDA_PG_PORT} dbname={PMDA_PG_DB} "
+        f"user={PMDA_PG_USER} password={PMDA_PG_PASSWORD} connect_timeout=5"
+    )
+
+
+def _files_pg_connect(*, autocommit: bool = False):
+    if psycopg is None:
+        return None
+    try:
+        return psycopg.connect(_files_pg_dsn(), autocommit=autocommit)
+    except Exception as e:
+        logging.warning("Files PG connection failed: %s", e)
+        return None
+
+
+def _files_pg_init_schema() -> bool:
+    global _FILES_PG_SCHEMA_READY
+    if _FILES_PG_SCHEMA_READY:
+        return True
+    conn = _files_pg_connect(autocommit=True)
+    if conn is None:
+        return False
+    try:
+        with conn.cursor() as cur:
+            try:
+                cur.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+            except Exception as e:
+                logging.debug("pg_trgm extension unavailable (continuing without it): %s", e)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS files_index_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS files_artists (
+                    id BIGSERIAL PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    name_norm TEXT NOT NULL UNIQUE,
+                    album_count INTEGER NOT NULL DEFAULT 0,
+                    track_count INTEGER NOT NULL DEFAULT 0,
+                    broken_albums_count INTEGER NOT NULL DEFAULT 0,
+                    has_image BOOLEAN NOT NULL DEFAULT FALSE,
+                    image_path TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS files_albums (
+                    id BIGSERIAL PRIMARY KEY,
+                    artist_id BIGINT NOT NULL REFERENCES files_artists(id) ON DELETE CASCADE,
+                    title TEXT NOT NULL,
+                    title_norm TEXT NOT NULL,
+                    folder_path TEXT NOT NULL UNIQUE,
+                    year INTEGER,
+                    date_text TEXT,
+                    genre TEXT,
+                    tags_json TEXT NOT NULL DEFAULT '[]',
+                    format TEXT,
+                    is_lossless BOOLEAN NOT NULL DEFAULT FALSE,
+                    has_cover BOOLEAN NOT NULL DEFAULT FALSE,
+                    cover_path TEXT,
+                    mb_identified BOOLEAN NOT NULL DEFAULT FALSE,
+                    musicbrainz_release_group_id TEXT,
+                    track_count INTEGER NOT NULL DEFAULT 0,
+                    total_duration_sec INTEGER NOT NULL DEFAULT 0,
+                    is_broken BOOLEAN NOT NULL DEFAULT FALSE,
+                    expected_track_count INTEGER,
+                    actual_track_count INTEGER,
+                    missing_indices_json TEXT NOT NULL DEFAULT '[]',
+                    missing_required_tags_json TEXT NOT NULL DEFAULT '[]',
+                    primary_tags_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS files_tracks (
+                    id BIGSERIAL PRIMARY KEY,
+                    album_id BIGINT NOT NULL REFERENCES files_albums(id) ON DELETE CASCADE,
+                    file_path TEXT NOT NULL UNIQUE,
+                    title TEXT NOT NULL,
+                    disc_num INTEGER NOT NULL DEFAULT 1,
+                    track_num INTEGER NOT NULL DEFAULT 0,
+                    duration_sec INTEGER NOT NULL DEFAULT 0,
+                    format TEXT,
+                    bitrate INTEGER,
+                    sample_rate INTEGER,
+                    bit_depth INTEGER,
+                    file_size_bytes BIGINT NOT NULL DEFAULT 0,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_files_artists_name ON files_artists(name)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_files_albums_artist_id ON files_albums(artist_id)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_files_albums_title ON files_albums(title)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_files_albums_title_norm ON files_albums(title_norm)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_files_tracks_album_id ON files_tracks(album_id)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_files_tracks_order ON files_tracks(album_id, disc_num, track_num, id)")
+            try:
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_files_artists_name_trgm ON files_artists USING gin (name gin_trgm_ops)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_files_albums_title_trgm ON files_albums USING gin (title gin_trgm_ops)")
+            except Exception:
+                pass
+        _FILES_PG_SCHEMA_READY = True
+        return True
+    except Exception as e:
+        logging.exception("Failed to initialize files PG schema: %s", e)
+        return False
+    finally:
+        conn.close()
+
+
+def _files_redis_client():
+    global _FILES_REDIS_CLIENT
+    if redis_lib is None:
+        return None
+    if _FILES_REDIS_CLIENT is not None:
+        return _FILES_REDIS_CLIENT
+    try:
+        _FILES_REDIS_CLIENT = redis_lib.Redis(
+            host=PMDA_REDIS_HOST,
+            port=PMDA_REDIS_PORT,
+            db=PMDA_REDIS_DB,
+            password=(PMDA_REDIS_PASSWORD or None),
+            decode_responses=True,
+            socket_connect_timeout=0.3,
+            socket_timeout=0.3,
+        )
+        _FILES_REDIS_CLIENT.ping()
+    except Exception as e:
+        logging.debug("Redis cache unavailable for files library: %s", e)
+        _FILES_REDIS_CLIENT = None
+    return _FILES_REDIS_CLIENT
+
+
+def _files_cache_get_json(cache_key: str):
+    cli = _files_redis_client()
+    if cli is None:
+        return None
+    try:
+        raw = cli.get(FILES_CACHE_PREFIX + cache_key)
+        if not raw:
+            return None
+        return json.loads(raw)
+    except Exception:
+        return None
+
+
+def _files_cache_set_json(cache_key: str, payload, ttl: int = 60) -> None:
+    cli = _files_redis_client()
+    if cli is None:
+        return
+    try:
+        cli.setex(FILES_CACHE_PREFIX + cache_key, ttl, json.dumps(payload))
+    except Exception:
+        pass
+
+
+def _files_cache_invalidate_all() -> None:
+    cli = _files_redis_client()
+    if cli is None:
+        return
+    try:
+        keys = list(cli.scan_iter(f"{FILES_CACHE_PREFIX}*"))
+        if keys:
+            cli.delete(*keys)
+    except Exception:
+        pass
+
+
+def _files_index_set_state(**updates) -> None:
+    with lock:
+        st = dict(state.get("files_index") or {})
+        st.update(updates)
+        state["files_index"] = st
+
+
+def _files_index_get_state() -> dict:
+    with lock:
+        return dict(state.get("files_index") or {})
+
+
+def _parse_int_loose(value, default: int = 0) -> int:
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return int(value)
+    txt = str(value).strip()
+    if not txt:
+        return default
+    if "/" in txt:
+        txt = txt.split("/", 1)[0]
+    m = re.search(r"-?\d+", txt)
+    if not m:
+        return default
+    try:
+        return int(m.group(0))
+    except Exception:
+        return default
+
+
+def _parse_float_loose(value, default: float = 0.0) -> float:
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return float(value)
+    txt = str(value).strip()
+    if not txt:
+        return default
+    try:
+        return float(txt)
+    except Exception:
+        m = re.search(r"-?\d+(?:\.\d+)?", txt)
+        if not m:
+            return default
+        try:
+            return float(m.group(0))
+        except Exception:
+            return default
+
+
+def _split_genre_values(raw_value: str) -> list[str]:
+    if not raw_value:
+        return []
+    parts = re.split(r"[;,/|]", str(raw_value))
+    out = []
+    for p in parts:
+        v = re.sub(r"\s+", " ", (p or "").strip())
+        if v:
+            out.append(v)
+    return out
+
+
+def _first_artist_image_path(artist_folder: Path) -> Optional[Path]:
+    if not artist_folder or not artist_folder.is_dir():
+        return None
+    try:
+        for name in _ARTIST_IMAGE_NAMES:
+            p = artist_folder / name
+            if p.is_file():
+                return p
+    except OSError:
+        return None
+    return None
+
+
+def _files_index_read_counts() -> tuple[int, int, int]:
+    if not _files_pg_init_schema():
+        return (0, 0, 0)
+    conn = _files_pg_connect()
+    if conn is None:
+        return (0, 0, 0)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM files_artists")
+            artists = int(cur.fetchone()[0] or 0)
+            cur.execute("SELECT COUNT(*) FROM files_albums")
+            albums = int(cur.fetchone()[0] or 0)
+            cur.execute("SELECT COUNT(*) FROM files_tracks")
+            tracks = int(cur.fetchone()[0] or 0)
+            return (artists, albums, tracks)
+    except Exception:
+        return (0, 0, 0)
+    finally:
+        conn.close()
+
+
+def _files_index_write_meta(cur, key: str, value: str) -> None:
+    cur.execute(
+        """
+        INSERT INTO files_index_meta(key, value, updated_at)
+        VALUES (%s, %s, NOW())
+        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
+        """,
+        (key, value),
+    )
+
+
+def _rebuild_files_library_index(reason: str = "manual", wait_if_running: bool = False) -> dict:
+    if _get_library_mode() != "files":
+        return {"ok": False, "error": "LIBRARY_MODE is not 'files'"}
+    if not FILES_ROOTS:
+        return {"ok": False, "error": "FILES_ROOTS is empty"}
+    if not _files_pg_init_schema():
+        return {"ok": False, "error": "PostgreSQL schema unavailable"}
+
+    acquired = files_index_lock.acquire(blocking=wait_if_running)
+    if not acquired:
+        return {"ok": False, "running": True, "error": "Files index rebuild already running"}
+    try:
+        started_at = time.time()
+        _files_index_set_state(
+            running=True,
+            started_at=started_at,
+            finished_at=None,
+            phase="discovering",
+            current_folder=None,
+            folders_processed=0,
+            total_folders=0,
+            artists=0,
+            albums=0,
+            tracks=0,
+            error=None,
+        )
+
+        audio_files = _iter_audio_files_under_roots(FILES_ROOTS)
+        by_folder: dict[Path, list[Path]] = defaultdict(list)
+        for p in audio_files:
+            by_folder[p.parent].append(p)
+        folders = sorted(by_folder.items(), key=lambda x: str(x[0]).lower())
+        _files_index_set_state(total_folders=len(folders), phase="parsing")
+
+        artists_map: dict[str, dict] = {}
+        albums_payload: list[dict] = []
+
+        for idx, (folder, files) in enumerate(folders, start=1):
+            _files_index_set_state(folders_processed=idx, current_folder=str(folder))
+            if not files:
+                continue
+
+            track_entries: list[dict] = []
+            raw_genres: list[str] = []
+            fmt_counts: dict[str, int] = defaultdict(int)
+            first_tags: dict = {}
+            total_duration_sec = 0
+
+            for p in files:
+                tags = extract_tags(p) or {}
+                if not first_tags:
+                    first_tags = tags
+                title = (
+                    (tags.get("title") or tags.get("name") or p.stem or "").strip()
+                    or p.stem
+                    or "Unknown Track"
+                )
+                disc_num = _parse_int_loose(tags.get("disc") or tags.get("discnumber"), 1) or 1
+                track_num = _parse_int_loose(tags.get("track") or tags.get("tracknumber"), 0)
+                duration_sec = int(max(0.0, _parse_float_loose(tags.get("duration"), 0.0)))
+                bitrate = _parse_int_loose(tags.get("bitrate") or tags.get("bit_rate"), 0)
+                sample_rate = _parse_int_loose(tags.get("sample_rate") or tags.get("samplerate"), 0)
+                bit_depth = _parse_int_loose(tags.get("bit_depth") or tags.get("bits_per_sample"), 0)
+                fmt = (p.suffix.lower().lstrip(".") or "UNKNOWN").upper()
+                fmt_counts[fmt] += 1
+                total_duration_sec += duration_sec
+                raw_genres.extend(_split_genre_values(tags.get("genre") or ""))
+                try:
+                    file_size = int(p.stat().st_size)
+                except OSError:
+                    file_size = 0
+                track_entries.append({
+                    "file_path": str(p),
+                    "title": title,
+                    "disc_num": disc_num,
+                    "track_num": track_num,
+                    "duration_sec": duration_sec,
+                    "format": fmt,
+                    "bitrate": bitrate,
+                    "sample_rate": sample_rate,
+                    "bit_depth": bit_depth,
+                    "file_size_bytes": file_size,
+                })
+
+            track_entries.sort(key=lambda t: (t["disc_num"], t["track_num"], t["file_path"]))
+            if not track_entries:
+                continue
+
+            artist_name = (
+                (first_tags.get("albumartist") or first_tags.get("artist") or "").strip()
+                or folder.parent.name.replace("_", " ").strip()
+                or "Unknown Artist"
+            )
+            album_title = (
+                (first_tags.get("album") or "").strip()
+                or folder.name.replace("_", " ").strip()
+                or "Unknown Album"
+            )
+            artist_norm = " ".join((artist_name or "").split()).lower() or "unknown artist"
+            title_norm = norm_album_for_dedup(album_title, normalize_parenthetical=True)
+            date_text = (first_tags.get("date") or first_tags.get("year") or "").strip()
+            year = _parse_int_loose((date_text[:4] if date_text else first_tags.get("year")), 0) or None
+            dominant_format = max(fmt_counts.items(), key=lambda x: x[1])[0] if fmt_counts else "UNKNOWN"
+            is_lossless = dominant_format in _LOSSLESS_FORMATS
+            cover_path = _first_cover_path(folder)
+            has_cover = bool(cover_path and cover_path.is_file())
+            artist_image_path = _first_artist_image_path(folder.parent)
+            if artist_norm not in artists_map:
+                artists_map[artist_norm] = {
+                    "name": artist_name,
+                    "image_path": str(artist_image_path) if artist_image_path else None,
+                    "has_image": bool(artist_image_path and artist_image_path.is_file()),
+                }
+
+            indices = [t["track_num"] for t in track_entries if t["track_num"] > 0]
+            is_broken = False
+            expected_track_count = None
+            missing_indices: list[int] = []
+            if indices:
+                is_broken, _actual_count_from_indices, gaps = _detect_gaps_in_indices(indices)
+                expected_track_count = max(indices)
+                for start_i, end_i in gaps:
+                    missing_indices.extend(list(range(start_i + 1, end_i)))
+            actual_track_count = len(track_entries)
+
+            inferred_genre = _infer_genre_from_bandcamp_tags(raw_genres) if raw_genres else None
+            mbid = (
+                (first_tags.get("musicbrainz_releasegroupid") or "").strip()
+                or (first_tags.get("musicbrainz_releaseid") or "").strip()
+            )
+            missing_required = _check_required_tags(first_tags or {}, REQUIRED_TAGS)
+
+            albums_payload.append({
+                "artist_norm": artist_norm,
+                "title": album_title,
+                "title_norm": title_norm,
+                "folder_path": str(folder),
+                "year": year,
+                "date_text": date_text[:32] if date_text else "",
+                "genre": inferred_genre or "",
+                "tags_json": json.dumps(raw_genres[:20]),
+                "format": dominant_format,
+                "is_lossless": bool(is_lossless),
+                "has_cover": bool(has_cover),
+                "cover_path": str(cover_path) if cover_path else "",
+                "mb_identified": bool(mbid),
+                "musicbrainz_release_group_id": mbid,
+                "track_count": actual_track_count,
+                "total_duration_sec": total_duration_sec,
+                "is_broken": bool(is_broken),
+                "expected_track_count": expected_track_count,
+                "actual_track_count": actual_track_count,
+                "missing_indices_json": json.dumps(missing_indices),
+                "missing_required_tags_json": json.dumps(missing_required),
+                "primary_tags_json": json.dumps(first_tags or {}),
+                "tracks": track_entries,
+            })
+
+        _files_index_set_state(phase="writing", artists=len(artists_map), albums=len(albums_payload))
+
+        conn = _files_pg_connect()
+        if conn is None:
+            raise RuntimeError("PostgreSQL connection unavailable during rebuild")
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute("TRUNCATE TABLE files_tracks, files_albums, files_artists RESTART IDENTITY CASCADE")
+                    artist_rows = [
+                        (data["name"], norm, int(data["has_image"]), data.get("image_path") or "")
+                        for norm, data in artists_map.items()
+                    ]
+                    if artist_rows:
+                        cur.executemany(
+                            """
+                            INSERT INTO files_artists (name, name_norm, has_image, image_path, created_at, updated_at)
+                            VALUES (%s, %s, %s, %s, NOW(), NOW())
+                            """,
+                            artist_rows,
+                        )
+                    cur.execute("SELECT id, name_norm FROM files_artists")
+                    artist_id_by_norm = {str(r[1]): int(r[0]) for r in cur.fetchall()}
+
+                    album_rows = []
+                    for album in albums_payload:
+                        artist_id = artist_id_by_norm.get(album["artist_norm"])
+                        if not artist_id:
+                            continue
+                        album_rows.append(
+                            (
+                                artist_id,
+                                album["title"],
+                                album["title_norm"],
+                                album["folder_path"],
+                                album["year"],
+                                album["date_text"],
+                                album["genre"],
+                                album["tags_json"],
+                                album["format"],
+                                int(album["is_lossless"]),
+                                int(album["has_cover"]),
+                                album["cover_path"],
+                                int(album["mb_identified"]),
+                                album["musicbrainz_release_group_id"],
+                                album["track_count"],
+                                album["total_duration_sec"],
+                                int(album["is_broken"]),
+                                album["expected_track_count"],
+                                album["actual_track_count"],
+                                album["missing_indices_json"],
+                                album["missing_required_tags_json"],
+                                album["primary_tags_json"],
+                            )
+                        )
+                    if album_rows:
+                        cur.executemany(
+                            """
+                            INSERT INTO files_albums (
+                                artist_id, title, title_norm, folder_path, year, date_text, genre, tags_json,
+                                format, is_lossless, has_cover, cover_path, mb_identified, musicbrainz_release_group_id,
+                                track_count, total_duration_sec, is_broken, expected_track_count, actual_track_count,
+                                missing_indices_json, missing_required_tags_json, primary_tags_json,
+                                created_at, updated_at
+                            ) VALUES (
+                                %s, %s, %s, %s, %s, %s, %s, %s,
+                                %s, %s, %s, %s, %s, %s,
+                                %s, %s, %s, %s, %s,
+                                %s, %s, %s,
+                                NOW(), NOW()
+                            )
+                            """,
+                            album_rows,
+                        )
+                    cur.execute("SELECT id, folder_path FROM files_albums")
+                    album_id_by_folder = {str(r[1]): int(r[0]) for r in cur.fetchall()}
+
+                    total_tracks = 0
+                    for album in albums_payload:
+                        album_id = album_id_by_folder.get(album["folder_path"])
+                        if not album_id:
+                            continue
+                        track_rows = [
+                            (
+                                album_id,
+                                t["file_path"],
+                                t["title"],
+                                t["disc_num"],
+                                t["track_num"],
+                                t["duration_sec"],
+                                t["format"],
+                                t["bitrate"],
+                                t["sample_rate"],
+                                t["bit_depth"],
+                                t["file_size_bytes"],
+                            )
+                            for t in album["tracks"]
+                        ]
+                        if track_rows:
+                            cur.executemany(
+                                """
+                                INSERT INTO files_tracks (
+                                    album_id, file_path, title, disc_num, track_num, duration_sec, format,
+                                    bitrate, sample_rate, bit_depth, file_size_bytes, created_at, updated_at
+                                ) VALUES (
+                                    %s, %s, %s, %s, %s, %s, %s,
+                                    %s, %s, %s, %s, NOW(), NOW()
+                                )
+                                """,
+                                track_rows,
+                            )
+                            total_tracks += len(track_rows)
+
+                    cur.execute("""
+                        UPDATE files_artists a
+                        SET album_count = s.album_count,
+                            track_count = s.track_count,
+                            broken_albums_count = s.broken_albums_count,
+                            updated_at = NOW()
+                        FROM (
+                            SELECT
+                                artist_id,
+                                COUNT(*) AS album_count,
+                                COALESCE(SUM(track_count), 0) AS track_count,
+                                COALESCE(SUM(CASE WHEN is_broken THEN 1 ELSE 0 END), 0) AS broken_albums_count
+                            FROM files_albums
+                            GROUP BY artist_id
+                        ) s
+                        WHERE a.id = s.artist_id
+                    """)
+                    _files_index_write_meta(cur, "last_reason", reason)
+                    _files_index_write_meta(cur, "last_build_ts", str(int(time.time())))
+                    _files_index_write_meta(cur, "artists", str(len(artists_map)))
+                    _files_index_write_meta(cur, "albums", str(len(albums_payload)))
+                    _files_index_write_meta(cur, "tracks", str(total_tracks))
+        finally:
+            conn.close()
+
+        _files_cache_invalidate_all()
+        elapsed = round(time.time() - started_at, 2)
+        _files_index_set_state(
+            running=False,
+            finished_at=time.time(),
+            phase="done",
+            current_folder=None,
+            artists=len(artists_map),
+            albums=len(albums_payload),
+            tracks=sum(len(a["tracks"]) for a in albums_payload),
+            error=None,
+        )
+        logging.info(
+            "Files library index rebuilt (%s): %d artist(s), %d album(s), %d track(s) in %.2fs",
+            reason,
+            len(artists_map),
+            len(albums_payload),
+            sum(len(a["tracks"]) for a in albums_payload),
+            elapsed,
+        )
+        return {
+            "ok": True,
+            "artists": len(artists_map),
+            "albums": len(albums_payload),
+            "tracks": sum(len(a["tracks"]) for a in albums_payload),
+            "duration_sec": elapsed,
+        }
+    except Exception as e:
+        logging.exception("Files index rebuild failed: %s", e)
+        _files_index_set_state(
+            running=False,
+            finished_at=time.time(),
+            phase="error",
+            current_folder=None,
+            error=str(e),
+        )
+        return {"ok": False, "error": str(e)}
+    finally:
+        files_index_lock.release()
+
+
+def _trigger_files_index_rebuild_async(reason: str = "manual") -> bool:
+    if files_index_lock.locked():
+        return False
+
+    def _runner():
+        _rebuild_files_library_index(reason=reason, wait_if_running=False)
+
+    threading.Thread(target=_runner, name="files-index-rebuild", daemon=True).start()
+    return True
+
+
+def _ensure_files_index_ready() -> tuple[bool, Optional[str]]:
+    if _get_library_mode() != "files":
+        return False, "LIBRARY_MODE is not 'files'"
+    if not FILES_ROOTS:
+        return False, "FILES_ROOTS is empty"
+    if not _files_pg_init_schema():
+        return False, "PostgreSQL is unavailable"
+    artists, albums, tracks = _files_index_read_counts()
+    if albums > 0 and tracks > 0:
+        return True, None
+    result = _rebuild_files_library_index(reason="auto_bootstrap", wait_if_running=True)
+    if not result.get("ok"):
+        return False, str(result.get("error") or "Files index build failed")
+    return True, None
+
 # ----- Run summary tracking ---------------------------------------------------
 def _count_rows(table: str) -> int:
     con = sqlite3.connect(str(STATE_DB_FILE))
@@ -3507,8 +4182,22 @@ state = {
     "incomplete_scan": None,           # { "running": bool, "run_id": int, "progress": int, "total": int, "current_artist": str, "current_album": str, "count": int, "error": str } or None
     "files_editions_by_album_id": {},  # Populated by _build_scan_plan in Files mode for workers and export
     "export_progress": None,           # { "running": bool, "tracks_done": int, "total_tracks": int, "albums_done": int, "total_albums": int, "error": str } or None
+    "files_index": {
+        "running": False,
+        "started_at": None,
+        "finished_at": None,
+        "phase": None,
+        "current_folder": None,
+        "folders_processed": 0,
+        "total_folders": 0,
+        "artists": 0,
+        "albums": 0,
+        "tracks": 0,
+        "error": None,
+    },
 }
 lock = threading.Lock()
+files_index_lock = threading.Lock()
 
 
 
@@ -9705,6 +10394,9 @@ def background_scan():
             f"Duplicates removed so far: {removed_dupes}\n"
             f"Space saved: {space_saved}  MB"
         )
+        if _get_library_mode() == "files":
+            # Keep files-library browsing in sync after each completed scan.
+            _trigger_files_index_rebuild_async(reason="scan_completed")
 
 def background_dedupe(all_groups: List[dict]):
     """
@@ -12751,6 +13443,8 @@ def _apply_settings_in_memory(updates: dict):
             LIBRARY_MODE = mode
             mod.merged["LIBRARY_MODE"] = mode
             logging.info("LIBRARY_MODE updated in memory: %s", mode)
+            if mode == "files":
+                _trigger_files_index_rebuild_async(reason="settings_library_mode_files")
     if "FILES_ROOTS" in updates:
         roots_val = updates["FILES_ROOTS"]
         if isinstance(roots_val, str):
@@ -12763,6 +13457,8 @@ def _apply_settings_in_memory(updates: dict):
         FILES_ROOTS = roots
         mod.merged["FILES_ROOTS"] = roots
         logging.info("FILES_ROOTS updated in memory: %s", FILES_ROOTS)
+        if _get_library_mode() == "files":
+            _trigger_files_index_rebuild_async(reason="settings_files_roots")
     if "EXPORT_ROOT" in updates:
         root = str(updates["EXPORT_ROOT"] or "").strip()
         global EXPORT_ROOT
@@ -13093,6 +13789,30 @@ def api_files_structure_overview():
         return jsonify({"templates": [], "metrics": {}, "samples": [], "sample_count": 0})
     data = analyse_directory_structure(roots)
     return jsonify(data)
+
+
+@app.post("/api/library/files-index/rebuild")
+def api_library_files_index_rebuild():
+    """Trigger a full files-library index rebuild in PostgreSQL."""
+    if _get_library_mode() != "files":
+        return jsonify({"status": "error", "message": "Files index rebuild is only available in Files library mode"}), 400
+    if _trigger_files_index_rebuild_async(reason="api_rebuild"):
+        return jsonify({"status": "started"})
+    st = _files_index_get_state()
+    return jsonify({"status": "already_running", "progress": st}), 409
+
+
+@app.get("/api/library/files-index/status")
+def api_library_files_index_status():
+    """Return current files-library index build status."""
+    st = _files_index_get_state()
+    if not st:
+        st = {"running": False, "phase": None, "error": None}
+    artists, albums, tracks = _files_index_read_counts()
+    st["indexed_artists"] = artists
+    st["indexed_albums"] = albums
+    st["indexed_tracks"] = tracks
+    return jsonify(st)
 
 
 def get_duplicate_groups_from_library():
@@ -14071,6 +14791,31 @@ def api_incomplete_albums_export(run_id):
 @app.get("/api/library/stats")
 def api_library_stats():
     """Return library stats (artists count, albums count) for selected sections. Used by Unduper and others."""
+    if _get_library_mode() == "files":
+        cache_key = "library:stats"
+        cached = _files_cache_get_json(cache_key)
+        if cached is not None:
+            return jsonify(cached)
+        ok, err = _ensure_files_index_ready()
+        if not ok:
+            return jsonify({"error": err or "Files index unavailable"}), 503
+        conn = _files_pg_connect()
+        if conn is None:
+            return jsonify({"error": "PostgreSQL unavailable"}), 503
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM files_artists")
+                artists = int(cur.fetchone()[0] or 0)
+                cur.execute("SELECT COUNT(*) FROM files_albums")
+                albums = int(cur.fetchone()[0] or 0)
+                cur.execute("SELECT COUNT(*) FROM files_tracks")
+                tracks = int(cur.fetchone()[0] or 0)
+            payload = {"artists": artists, "albums": albums, "tracks": tracks}
+            _files_cache_set_json(cache_key, payload, ttl=30)
+            return jsonify(payload)
+        finally:
+            conn.close()
+
     _reload_section_ids_from_db()
     if not PLEX_CONFIGURED:
         return jsonify({"error": "Plex not configured"}), 503
@@ -14106,6 +14851,47 @@ def api_library_stats():
 @app.get("/api/library/albums-with-parenthetical-names")
 def api_library_albums_with_parenthetical_names():
     """Return albums whose folder name (or Plex title) has removable parenthetical suffixes like (flac), (mp3), (EP)."""
+    if _get_library_mode() == "files":
+        ok, err = _ensure_files_index_ready()
+        if not ok:
+            return jsonify({"albums": [], "error": err or "Files index unavailable"}), 503
+        conn = _files_pg_connect()
+        if conn is None:
+            return jsonify({"albums": [], "error": "PostgreSQL unavailable"}), 503
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT alb.id, alb.title, alb.folder_path, art.name
+                    FROM files_albums alb
+                    JOIN files_artists art ON art.id = alb.artist_id
+                    ORDER BY art.name, alb.title
+                    """
+                )
+                rows = cur.fetchall()
+            out = []
+            for album_id, title, folder_path_raw, artist_name in rows:
+                if not folder_path_raw:
+                    continue
+                folder = path_for_fs_access(Path(folder_path_raw))
+                current_name = folder.name
+                proposed_name = strip_parenthetical_suffixes(current_name)
+                if not proposed_name or proposed_name == current_name:
+                    continue
+                proposed_path = folder.parent / proposed_name
+                out.append({
+                    "album_id": int(album_id),
+                    "artist": artist_name or "",
+                    "title": title or current_name,
+                    "current_path": str(folder),
+                    "proposed_path": str(proposed_path),
+                    "current_name": current_name,
+                    "proposed_name": proposed_name,
+                })
+            return jsonify({"albums": out})
+        finally:
+            conn.close()
+
     _reload_section_ids_from_db()
     _reload_path_map_from_db()
     if not PLEX_CONFIGURED or not SECTION_IDS:
@@ -14154,6 +14940,61 @@ def api_library_albums_with_parenthetical_names():
 @app.post("/api/library/normalize-album-names")
 def api_library_normalize_album_names():
     """Rename album folders by removing parenthetical format/version suffixes (e.g. (flac), (EP)). Body: { album_ids: number[] } or empty for all from GET list."""
+    if _get_library_mode() == "files":
+        data = request.get_json() or {}
+        album_ids = data.get("album_ids")
+        if album_ids is not None and not isinstance(album_ids, list):
+            return jsonify({"error": "album_ids must be an array"}), 400
+        ok, err = _ensure_files_index_ready()
+        if not ok:
+            return jsonify({"error": err or "Files index unavailable"}), 503
+        conn = _files_pg_connect()
+        if conn is None:
+            return jsonify({"error": "PostgreSQL unavailable"}), 503
+        try:
+            with conn.cursor() as cur:
+                if album_ids:
+                    placeholders = ",".join(["%s"] * len(album_ids))
+                    cur.execute(
+                        f"""
+                        SELECT id, folder_path
+                        FROM files_albums
+                        WHERE id IN ({placeholders})
+                        """,
+                        tuple(int(x) for x in album_ids),
+                    )
+                else:
+                    cur.execute("SELECT id, folder_path FROM files_albums")
+                rows = cur.fetchall()
+        finally:
+            conn.close()
+
+        renamed = []
+        errors = []
+        for album_id, folder_path_raw in rows:
+            if not folder_path_raw:
+                continue
+            folder = path_for_fs_access(Path(folder_path_raw))
+            if not folder.exists():
+                errors.append({"album_id": int(album_id), "message": "Folder not found"})
+                continue
+            current_name = folder.name
+            proposed_name = strip_parenthetical_suffixes(current_name)
+            if not proposed_name or proposed_name == current_name:
+                continue
+            proposed_path = folder.parent / proposed_name
+            if proposed_path.exists():
+                errors.append({"album_id": int(album_id), "path": str(proposed_path), "message": "Target path already exists"})
+                continue
+            try:
+                folder.rename(proposed_path)
+                renamed.append({"album_id": int(album_id), "from": str(folder), "to": str(proposed_path)})
+            except OSError as e:
+                errors.append({"album_id": int(album_id), "message": str(e)})
+        if renamed:
+            _trigger_files_index_rebuild_async(reason="normalize_album_names")
+        return jsonify({"renamed": renamed, "errors": errors})
+
     _reload_path_map_from_db()
     data = request.get_json() or {}
     album_ids = data.get("album_ids")
@@ -14203,6 +15044,71 @@ def api_library_artists():
     """Return list of artists with statistics. Supports search and pagination.
     Always restricted to SECTION_IDS (selected libraries) — CROSS_LIBRARY_DEDUPE only affects duplicate detection, not which artists are listed.
     """
+    if _get_library_mode() == "files":
+        search_query = request.args.get("search", "").strip()
+        limit = max(1, min(500, _parse_int_loose(request.args.get("limit"), 100)))
+        offset = max(0, _parse_int_loose(request.args.get("offset"), 0))
+        cache_key = f"library:artists:{search_query.lower()}:{limit}:{offset}"
+        cached = _files_cache_get_json(cache_key)
+        if cached is not None:
+            return jsonify(cached)
+        ok, err = _ensure_files_index_ready()
+        if not ok:
+            return jsonify({"error": err or "Files index unavailable"}), 503
+        conn = _files_pg_connect()
+        if conn is None:
+            return jsonify({"error": "PostgreSQL unavailable"}), 503
+        try:
+            with conn.cursor() as cur:
+                if search_query:
+                    like = f"%{search_query}%"
+                    cur.execute(
+                        "SELECT COUNT(*) FROM files_artists WHERE name ILIKE %s",
+                        (like,),
+                    )
+                    total = int(cur.fetchone()[0] or 0)
+                    cur.execute(
+                        """
+                        SELECT id, name, album_count, broken_albums_count
+                        FROM files_artists
+                        WHERE name ILIKE %s
+                        ORDER BY name ASC
+                        LIMIT %s OFFSET %s
+                        """,
+                        (like, limit, offset),
+                    )
+                else:
+                    cur.execute("SELECT COUNT(*) FROM files_artists")
+                    total = int(cur.fetchone()[0] or 0)
+                    cur.execute(
+                        """
+                        SELECT id, name, album_count, broken_albums_count
+                        FROM files_artists
+                        ORDER BY name ASC
+                        LIMIT %s OFFSET %s
+                        """,
+                        (limit, offset),
+                    )
+                rows = cur.fetchall()
+            payload = {
+                "artists": [
+                    {
+                        "artist_id": int(r[0]),
+                        "artist_name": r[1] or "",
+                        "album_count": int(r[2] or 0),
+                        "broken_albums_count": int(r[3] or 0),
+                    }
+                    for r in rows
+                ],
+                "total": total,
+                "limit": limit,
+                "offset": offset,
+            }
+            _files_cache_set_json(cache_key, payload, ttl=30)
+            return jsonify(payload)
+        finally:
+            conn.close()
+
     _reload_section_ids_from_db()
     if not PLEX_CONFIGURED:
         return jsonify({"error": "Plex not configured"}), 503
@@ -14308,6 +15214,133 @@ def api_library_artists():
 @app.get("/api/library/artist/<int:artist_id>")
 def api_library_artist_detail(artist_id):
     """Return detailed information about an artist including all albums with images and types."""
+    if _get_library_mode() == "files":
+        cache_key = f"library:artist:{artist_id}"
+        cached = _files_cache_get_json(cache_key)
+        if cached is not None:
+            return jsonify(cached)
+        ok, err = _ensure_files_index_ready()
+        if not ok:
+            return jsonify({"error": err or "Files index unavailable"}), 503
+        conn = _files_pg_connect()
+        if conn is None:
+            return jsonify({"error": "PostgreSQL unavailable"}), 503
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, name, has_image, image_path FROM files_artists WHERE id = %s",
+                    (artist_id,),
+                )
+                artist_row = cur.fetchone()
+                if not artist_row:
+                    return jsonify({"error": "Artist not found"}), 404
+                artist_name = artist_row[1] or ""
+                has_artist_image = bool(artist_row[2])
+                artist_image_path = (artist_row[3] or "").strip()
+                cur.execute(
+                    """
+                    SELECT
+                        id, title, year, date_text, track_count, is_broken, format, is_lossless,
+                        has_cover, mb_identified, musicbrainz_release_group_id,
+                        expected_track_count, actual_track_count, missing_indices_json,
+                        COUNT(*) OVER (PARTITION BY title_norm) AS dup_count
+                    FROM files_albums
+                    WHERE artist_id = %s
+                    ORDER BY COALESCE(year, 0) DESC, title ASC
+                    """,
+                    (artist_id,),
+                )
+                rows = cur.fetchall()
+
+            albums = []
+            stats_duplicates = 0
+            stats_no_cover = 0
+            stats_mb = 0
+            stats_broken = 0
+            for row in rows:
+                album_id = int(row[0])
+                track_count = int(row[4] or 0)
+                is_broken = bool(row[5])
+                fmt = (row[6] or "").strip() or None
+                is_lossless = bool(row[7])
+                has_cover = bool(row[8])
+                mb_identified = bool(row[9])
+                mbid = (row[10] or "").strip() or None
+                expected_track_count = row[11]
+                actual_track_count = row[12]
+                missing_indices_raw = row[13] or "[]"
+                dup_count = int(row[14] or 0)
+
+                if dup_count > 1:
+                    stats_duplicates += 1
+                if not has_cover:
+                    stats_no_cover += 1
+                if mb_identified:
+                    stats_mb += 1
+                if is_broken:
+                    stats_broken += 1
+
+                album_type = "Album"
+                if track_count <= 3:
+                    album_type = "Single"
+                elif track_count <= 6:
+                    album_type = "EP"
+
+                try:
+                    missing_indices = json.loads(missing_indices_raw) if missing_indices_raw else []
+                except (TypeError, ValueError):
+                    missing_indices = []
+
+                broken_detail = None
+                if is_broken:
+                    broken_detail = {
+                        "expected_track_count": int(expected_track_count or track_count),
+                        "actual_track_count": int(actual_track_count or track_count),
+                        "missing_indices": missing_indices if isinstance(missing_indices, list) else [],
+                    }
+
+                thumb_url_files = f"{request.url_root.rstrip('/')}/api/library/files/album/{album_id}/cover" if has_cover else None
+                can_improve = (not is_lossless) or (not has_cover) or (not mb_identified) or is_broken
+                albums.append({
+                    "album_id": album_id,
+                    "title": row[1] or "",
+                    "year": row[2],
+                    "date": row[3] or "",
+                    "track_count": track_count,
+                    "is_broken": is_broken,
+                    "thumb": thumb_url_files,
+                    "type": album_type,
+                    "format": fmt,
+                    "is_lossless": is_lossless,
+                    "thumb_empty": not has_cover,
+                    "mb_identified": mb_identified,
+                    "musicbrainz_release_group_id": mbid,
+                    "in_duplicate_group": dup_count > 1,
+                    "can_improve": can_improve,
+                    "broken_detail": broken_detail,
+                })
+
+            artist_thumb = None
+            if has_artist_image and artist_image_path:
+                artist_thumb = f"{request.url_root.rstrip('/')}/api/library/files/artist/{artist_id}/image"
+            payload = {
+                "artist_id": artist_id,
+                "artist_name": artist_name,
+                "artist_thumb": artist_thumb,
+                "albums": albums,
+                "total_albums": len(albums),
+                "stats": {
+                    "duplicates": stats_duplicates,
+                    "no_cover": stats_no_cover,
+                    "mb_identified": stats_mb,
+                    "broken": stats_broken,
+                },
+            }
+            _files_cache_set_json(cache_key, payload, ttl=30)
+            return jsonify(payload)
+        finally:
+            conn.close()
+
     _reload_section_ids_from_db()
     if not PLEX_CONFIGURED:
         return jsonify({"error": "Plex not configured"}), 503
@@ -14596,6 +15629,45 @@ def api_library_artist_detail(artist_id):
 def api_library_missing_tags():
     """Return albums in selected sections that have missing MusicBrainz or required tags.
     Prefer scan_editions from last completed scan when available."""
+    if _get_library_mode() == "files":
+        ok, err = _ensure_files_index_ready()
+        if not ok:
+            return jsonify({"albums": [], "error": err or "Files index unavailable"}), 503
+        conn = _files_pg_connect()
+        if conn is None:
+            return jsonify({"albums": [], "error": "PostgreSQL unavailable"}), 503
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT a.name, alb.id, alb.title, alb.missing_required_tags_json
+                    FROM files_albums alb
+                    JOIN files_artists a ON a.id = alb.artist_id
+                    WHERE alb.missing_required_tags_json IS NOT NULL
+                      AND alb.missing_required_tags_json <> ''
+                      AND alb.missing_required_tags_json <> '[]'
+                    ORDER BY a.name, alb.title
+                    """
+                )
+                rows = cur.fetchall()
+            out = []
+            for artist_name, album_id, album_title, missing_json in rows:
+                try:
+                    missing_tags = json.loads(missing_json) if missing_json else []
+                except (TypeError, ValueError):
+                    missing_tags = []
+                if not missing_tags:
+                    continue
+                out.append({
+                    "artist_name": artist_name or "",
+                    "album_id": int(album_id),
+                    "album_title": album_title or "",
+                    "missing_tags": missing_tags,
+                })
+            return jsonify({"albums": out})
+        finally:
+            conn.close()
+
     _reload_section_ids_from_db()
     if not PLEX_CONFIGURED:
         return jsonify({"albums": []})
@@ -14638,6 +15710,58 @@ def api_library_missing_tags():
 @app.get("/api/library/album/<int:album_id>/tracks")
 def api_library_album_tracks(album_id):
     """Return track list for an album for playback (track_id, title, duration, file_url)."""
+    if _get_library_mode() == "files":
+        ok, err = _ensure_files_index_ready()
+        if not ok:
+            return jsonify({"error": err or "Files index unavailable"}), 503
+        conn = _files_pg_connect()
+        if conn is None:
+            return jsonify({"error": "PostgreSQL unavailable"}), 503
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT alb.title, art.name, alb.has_cover
+                    FROM files_albums alb
+                    JOIN files_artists art ON art.id = alb.artist_id
+                    WHERE alb.id = %s
+                    """,
+                    (album_id,),
+                )
+                album_row = cur.fetchone()
+                if not album_row:
+                    return jsonify({"error": "Album not found"}), 404
+                album_title = album_row[0] or ""
+                artist_name = album_row[1] or ""
+                has_cover = bool(album_row[2])
+                cur.execute(
+                    """
+                    SELECT id, title, duration_sec, track_num
+                    FROM files_tracks
+                    WHERE album_id = %s
+                    ORDER BY disc_num ASC, track_num ASC, id ASC
+                    """,
+                    (album_id,),
+                )
+                rows = cur.fetchall()
+            base_url = request.url_root.rstrip("/")
+            tracks = [
+                {
+                    "track_id": int(r[0]),
+                    "title": r[1] or "",
+                    "artist": artist_name,
+                    "album": album_title,
+                    "duration": int(r[2] or 0),
+                    "index": int(r[3] or 0),
+                    "file_url": f"{base_url}/api/library/track/{int(r[0])}/stream",
+                }
+                for r in rows
+            ]
+            album_thumb = f"{base_url}/api/library/files/album/{album_id}/cover" if has_cover else None
+            return jsonify({"tracks": tracks, "album_thumb": album_thumb})
+        finally:
+            conn.close()
+
     if not PLEX_CONFIGURED:
         return jsonify({"error": "Plex not configured"}), 503
     db_conn = plex_connect()
@@ -14699,6 +15823,26 @@ def _track_file_path(db_conn, track_id: int) -> Optional[Path]:
 @app.get("/api/library/track/<int:track_id>/stream")
 def api_library_track_stream(track_id):
     """Stream a track from local file when possible, else proxy from Plex (avoids 502 when Plex URL unreachable from container)."""
+    if _get_library_mode() == "files":
+        ok, err = _ensure_files_index_ready()
+        if not ok:
+            return jsonify({"error": err or "Files index unavailable"}), 503
+        conn = _files_pg_connect()
+        if conn is None:
+            return jsonify({"error": "PostgreSQL unavailable"}), 503
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT file_path FROM files_tracks WHERE id = %s", (track_id,))
+                row = cur.fetchone()
+            if not row or not (row[0] or "").strip():
+                return jsonify({"error": "Track not found"}), 404
+            local_path = path_for_fs_access(Path(row[0]))
+            if not local_path.exists() or not local_path.is_file():
+                return jsonify({"error": "Track file missing"}), 404
+            return send_file(str(local_path), as_attachment=False, conditional=True)
+        finally:
+            conn.close()
+
     if not PLEX_CONFIGURED:
         return jsonify({"error": "Plex not configured"}), 503
     db_conn = plex_connect()
@@ -14729,6 +15873,74 @@ def api_library_track_stream(track_id):
     except requests.RequestException as e:
         logging.warning("track stream proxy failed for track %s: %s", track_id, e)
         return jsonify({"error": "Stream failed"}), 502
+
+
+@app.get("/api/library/files/album/<int:album_id>/cover")
+def api_library_files_album_cover(album_id):
+    """Serve album cover from files-library index (files mode)."""
+    if _get_library_mode() != "files":
+        return jsonify({"error": "Files mode required"}), 400
+    ok, err = _ensure_files_index_ready()
+    if not ok:
+        return jsonify({"error": err or "Files index unavailable"}), 503
+    conn = _files_pg_connect()
+    if conn is None:
+        return jsonify({"error": "PostgreSQL unavailable"}), 503
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT cover_path FROM files_albums WHERE id = %s", (album_id,))
+            row = cur.fetchone()
+            cover_raw = (row[0] or "").strip() if row else ""
+            if cover_raw:
+                cover_path = path_for_fs_access(Path(cover_raw))
+                if cover_path.exists() and cover_path.is_file():
+                    return send_file(str(cover_path), as_attachment=False, conditional=True)
+            # Fallback to embedded cover from first track
+            cur.execute(
+                """
+                SELECT file_path
+                FROM files_tracks
+                WHERE album_id = %s
+                ORDER BY disc_num ASC, track_num ASC, id ASC
+                LIMIT 1
+                """,
+                (album_id,),
+            )
+            tr_row = cur.fetchone()
+        if tr_row and (tr_row[0] or "").strip():
+            first_track = path_for_fs_access(Path(tr_row[0]))
+            embedded = _extract_embedded_cover_from_audio(first_track)
+            if embedded:
+                raw, mime = embedded
+                return Response(raw, headers={"Content-Type": mime})
+        return jsonify({"error": "Cover not found"}), 404
+    finally:
+        conn.close()
+
+
+@app.get("/api/library/files/artist/<int:artist_id>/image")
+def api_library_files_artist_image(artist_id):
+    """Serve artist image from files-library index (files mode)."""
+    if _get_library_mode() != "files":
+        return jsonify({"error": "Files mode required"}), 400
+    ok, err = _ensure_files_index_ready()
+    if not ok:
+        return jsonify({"error": err or "Files index unavailable"}), 503
+    conn = _files_pg_connect()
+    if conn is None:
+        return jsonify({"error": "PostgreSQL unavailable"}), 503
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT image_path FROM files_artists WHERE id = %s", (artist_id,))
+            row = cur.fetchone()
+        if not row or not (row[0] or "").strip():
+            return jsonify({"error": "Artist image not found"}), 404
+        img_path = path_for_fs_access(Path(row[0]))
+        if not img_path.exists() or not img_path.is_file():
+            return jsonify({"error": "Artist image missing"}), 404
+        return send_file(str(img_path), as_attachment=False, conditional=True)
+    finally:
+        conn.close()
 
 
 @app.post("/api/lidarr/add-album")
@@ -15265,6 +16477,37 @@ def get_similar_artists_mb(artist_mbid: str) -> List[dict]:
 @app.get("/api/library/artist/<int:artist_id>/similar")
 def api_library_artist_similar(artist_id):
     """Get similar artists for a given artist via MusicBrainz."""
+    if _get_library_mode() == "files":
+        if not USE_MUSICBRAINZ:
+            return jsonify({"error": "MusicBrainz not enabled"}), 400
+        ok, err = _ensure_files_index_ready()
+        if not ok:
+            return jsonify({"error": err or "Files index unavailable"}), 503
+        conn = _files_pg_connect()
+        if conn is None:
+            return jsonify({"error": "PostgreSQL unavailable"}), 503
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT name FROM files_artists WHERE id = %s", (artist_id,))
+                row = cur.fetchone()
+            if not row:
+                return jsonify({"error": "Artist not found"}), 404
+            artist_name = row[0] or ""
+        finally:
+            conn.close()
+        mbid = None
+        try:
+            search_result = musicbrainzngs.search_artists(artist=artist_name, limit=1)
+            if search_result.get("artist-list"):
+                mbid = search_result["artist-list"][0]["id"]
+        except Exception as e:
+            logging.warning("Failed to search MusicBrainz for artist '%s': %s", artist_name, e)
+            return jsonify({"error": "Could not find MusicBrainz ID for artist"}), 404
+        if not mbid:
+            return jsonify({"error": "Could not find MusicBrainz ID for artist"}), 404
+        similar = get_similar_artists_mb(mbid)
+        return jsonify({"artist_mbid": mbid, "similar_artists": similar[:20]})
+
     if not PLEX_CONFIGURED:
         return jsonify({"error": "Plex not configured"}), 503
     
@@ -15426,6 +16669,10 @@ def api_library_release_group_labels(mbid):
 @app.get("/api/library/artist/<int:artist_id>/monitored")
 def api_library_artist_monitored(artist_id):
     """Check if an artist is monitored in Lidarr."""
+    if _get_library_mode() == "files":
+        # files-library artist IDs are internal to the index and may change after rebuilds;
+        # keep this endpoint deterministic in files mode.
+        return jsonify({"monitored": False})
     import sqlite3
     con = sqlite3.connect(str(STATE_DB_FILE), timeout=30)
     cur = con.cursor()
@@ -15668,6 +16915,37 @@ def _fetch_and_save_artist_image(artist_name: str, artist_folder: Path, artist_m
 @app.get("/api/library/artist/<int:artist_id>/images")
 def api_library_artist_images(artist_id):
     """Get artist images from MusicBrainz/Wikimedia."""
+    if _get_library_mode() == "files":
+        if not USE_MUSICBRAINZ:
+            return jsonify({"error": "MusicBrainz not enabled"}), 400
+        ok, err = _ensure_files_index_ready()
+        if not ok:
+            return jsonify({"error": err or "Files index unavailable"}), 503
+        conn = _files_pg_connect()
+        if conn is None:
+            return jsonify({"error": "PostgreSQL unavailable"}), 503
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT name FROM files_artists WHERE id = %s", (artist_id,))
+                row = cur.fetchone()
+            if not row:
+                return jsonify({"error": "Artist not found"}), 404
+            artist_name = row[0] or ""
+        finally:
+            conn.close()
+        mbid = None
+        try:
+            search_result = musicbrainzngs.search_artists(artist=artist_name, limit=1)
+            if search_result.get("artist-list"):
+                mbid = search_result["artist-list"][0]["id"]
+        except Exception as e:
+            logging.warning("Failed to search MusicBrainz for artist '%s': %s", artist_name, e)
+            return jsonify({"error": "Could not find MusicBrainz ID for artist"}), 404
+        if not mbid:
+            return jsonify({"error": "Could not find MusicBrainz ID for artist"}), 404
+        image_urls = get_artist_images_mb(mbid)
+        return jsonify({"artist_mbid": mbid, "images": image_urls})
+
     if not PLEX_CONFIGURED:
         return jsonify({"error": "Plex not configured"}), 503
     
@@ -15730,6 +17008,60 @@ def api_library_artist_images(artist_id):
 @app.get("/api/library/album/<int:album_id>/tags")
 def api_library_album_tags(album_id):
     """Get current tags and MusicBrainz info for an album."""
+    if _get_library_mode() == "files":
+        ok, err = _ensure_files_index_ready()
+        if not ok:
+            return jsonify({"error": err or "Files index unavailable"}), 503
+        conn = _files_pg_connect()
+        if conn is None:
+            return jsonify({"error": "PostgreSQL unavailable"}), 503
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        alb.id,
+                        alb.title,
+                        art.name,
+                        alb.folder_path,
+                        alb.primary_tags_json,
+                        alb.musicbrainz_release_group_id,
+                        alb.has_cover
+                    FROM files_albums alb
+                    JOIN files_artists art ON art.id = alb.artist_id
+                    WHERE alb.id = %s
+                    """,
+                    (album_id,),
+                )
+                row = cur.fetchone()
+            if not row:
+                return jsonify({"error": "Album not found"}), 404
+            folder_path = path_for_fs_access(Path(row[3]))
+            current_tags = {}
+            try:
+                current_tags = json.loads(row[4]) if row[4] else {}
+            except (TypeError, ValueError):
+                current_tags = {}
+            if not current_tags:
+                first_audio = next((p for p in folder_path.rglob("*") if AUDIO_RE.search(p.name)), None)
+                current_tags = extract_tags(first_audio) if first_audio else {}
+            thumb_url_files = (
+                f"{request.url_root.rstrip('/')}/api/library/files/album/{album_id}/cover"
+                if bool(row[6]) else None
+            )
+            return jsonify({
+                "album_id": int(row[0]),
+                "album_title": row[1] or "",
+                "artist_name": row[2] or "",
+                "folder": str(folder_path),
+                "current_tags": current_tags or {},
+                "musicbrainz_id": (row[5] or "").strip(),
+                "mb_info": None,
+                "thumb_url": thumb_url_files,
+            })
+        finally:
+            conn.close()
+
     if not PLEX_CONFIGURED:
         return jsonify({"error": "Plex not configured"}), 503
     
@@ -17239,6 +18571,36 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
 @app.post("/api/library/improve-album")
 def api_library_improve_album():
     """Improve a single album: query MusicBrainz for tags, update files, fetch cover if missing. Used by Fix column."""
+    if _get_library_mode() == "files":
+        data = request.get_json() or {}
+        album_id = data.get("album_id")
+        if not album_id:
+            return jsonify({"error": "Missing album_id"}), 400
+        try:
+            album_id = int(album_id)
+        except (TypeError, ValueError):
+            return jsonify({"error": "Invalid album_id"}), 400
+        ok, err = _ensure_files_index_ready()
+        if not ok:
+            return jsonify({"error": err or "Files index unavailable"}), 503
+        conn = _files_pg_connect()
+        if conn is None:
+            return jsonify({"error": "PostgreSQL unavailable"}), 503
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT folder_path FROM files_albums WHERE id = %s", (album_id,))
+                row = cur.fetchone()
+            if not row or not (row[0] or "").strip():
+                return jsonify({"error": "Album not found"}), 404
+            folder_path = path_for_fs_access(Path(row[0]))
+        finally:
+            conn.close()
+        if not folder_path.exists() or not folder_path.is_dir():
+            return jsonify({"error": "Album folder not found on disk"}), 404
+        result = _improve_folder_by_path(folder_path)
+        _trigger_files_index_rebuild_async(reason="improve_album")
+        return jsonify(result)
+
     if not PLEX_CONFIGURED:
         return jsonify({"error": "Plex not configured"}), 503
     data = request.get_json() or {}
@@ -17503,6 +18865,8 @@ def _run_improve_all_albums_global(best_albums_list: List[dict]):
                 _run_export_library()
         except Exception as e:
             logging.exception("Auto-export library after Magic failed: %s", e)
+        if _get_library_mode() == "files":
+            _trigger_files_index_rebuild_async(reason="improve_all_completed")
     except Exception as e:
         logging.exception("improve-all (global) failed: %s", e)
         with lock:
@@ -17603,7 +18967,7 @@ def _run_improve_all_albums(artist_id: int, album_ids: list, album_titles: dict)
 @app.post("/api/library/improve-all-albums")
 def api_library_improve_all_albums():
     """Start improving all albums for an artist (MusicBrainz tags + cover)."""
-    if not PLEX_CONFIGURED:
+    if _get_library_mode() == "plex" and not PLEX_CONFIGURED:
         return jsonify({"error": "Plex not configured"}), 503
     data = request.get_json() or {}
     artist_id = data.get("artist_id")
@@ -17616,6 +18980,52 @@ def api_library_improve_all_albums():
     with lock:
         if state.get("improve_all") and state["improve_all"].get("running"):
             return jsonify({"error": "Improve-all already running", "started": False}), 409
+    if _get_library_mode() == "files":
+        ok, err = _ensure_files_index_ready()
+        if not ok:
+            return jsonify({"error": err or "Files index unavailable", "started": False}), 503
+        conn = _files_pg_connect()
+        if conn is None:
+            return jsonify({"error": "PostgreSQL unavailable", "started": False}), 503
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT name FROM files_artists WHERE id = %s", (artist_id,))
+                arow = cur.fetchone()
+                if not arow:
+                    return jsonify({"error": "Artist not found", "started": False}), 404
+                artist_name = arow[0] or ""
+                cur.execute(
+                    """
+                    SELECT id, title, folder_path, musicbrainz_release_group_id
+                    FROM files_albums
+                    WHERE artist_id = %s
+                    ORDER BY title ASC
+                    """,
+                    (artist_id,),
+                )
+                rows = cur.fetchall()
+        finally:
+            conn.close()
+        if not rows:
+            return jsonify({"error": "No albums found for this artist", "started": False}), 404
+        items = [
+            {
+                "artist": artist_name,
+                "album_id": int(r[0]),
+                "album_title": (r[1] or "").strip() or f"Album {int(r[0])}",
+                "folder": (r[2] or "").strip(),
+                "musicbrainz_id": (r[3] or "").strip(),
+            }
+            for r in rows
+        ]
+        thread = threading.Thread(
+            target=_run_improve_all_albums_global,
+            args=(items,),
+            daemon=True,
+        )
+        thread.start()
+        return jsonify({"started": True, "total": len(items)})
+
     db_conn = plex_connect()
     try:
         if not SECTION_IDS:
@@ -17646,7 +19056,7 @@ def api_library_improve_all_albums():
 @app.post("/api/library/improve-all")
 def api_library_improve_all():
     """Start global 'Fix all albums': improve each 'best' edition from duplicate groups + all albums from last scan that have a MusicBrainz match (tags + cover + artist image from MB → Discogs → Last.fm → Bandcamp)."""
-    if not PLEX_CONFIGURED:
+    if _get_library_mode() == "plex" and not PLEX_CONFIGURED:
         return jsonify({"error": "Plex not configured"}), 503
     with lock:
         if state.get("improve_all") and state["improve_all"].get("running"):
@@ -17948,6 +19358,71 @@ def api_musicbrainz_fix_artist_tags():
 @app.post("/api/musicbrainz/fix-album-tags")
 def api_musicbrainz_fix_album_tags():
     """Fix tags for a single album using MusicBrainz data."""
+    if _get_library_mode() == "files":
+        data = request.get_json() or {}
+        album_id = data.get("album_id")
+        tags_to_apply = data.get("tags", {}) or {}
+        if not album_id:
+            return jsonify({"error": "Missing album_id"}), 400
+        try:
+            album_id = int(album_id)
+        except (TypeError, ValueError):
+            return jsonify({"error": "Invalid album_id"}), 400
+        ok, err = _ensure_files_index_ready()
+        if not ok:
+            return jsonify({"error": err or "Files index unavailable"}), 503
+        conn = _files_pg_connect()
+        if conn is None:
+            return jsonify({"error": "PostgreSQL unavailable"}), 503
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT folder_path FROM files_albums WHERE id = %s", (album_id,))
+                row = cur.fetchone()
+            if not row or not (row[0] or "").strip():
+                return jsonify({"error": "Album not found"}), 404
+            folder_path = path_for_fs_access(Path(row[0]))
+        finally:
+            conn.close()
+        if not folder_path.exists() or not folder_path.is_dir():
+            return jsonify({"error": "Album folder not found"}), 404
+
+        album_artist = (tags_to_apply.get("albumartist") or tags_to_apply.get("artist") or "").strip()
+        track_artist = (tags_to_apply.get("artist") or tags_to_apply.get("albumartist") or "").strip()
+        album_title = (tags_to_apply.get("album") or "").strip()
+        year_val = (tags_to_apply.get("year") or tags_to_apply.get("date") or "").strip()
+        if year_val and len(year_val) >= 4:
+            year_val = year_val[:4]
+        genre_val = (tags_to_apply.get("genre") or "").strip()
+        from mutagen import File as MutagenFile
+
+        audio_files = [p for p in folder_path.rglob("*") if AUDIO_RE.search(p.name)]
+        updated = 0
+        errors = []
+        for p in audio_files:
+            try:
+                audio = MutagenFile(str(p))
+                if audio is None:
+                    continue
+                _apply_artist_album_tags_to_audio(
+                    audio,
+                    album_artist=album_artist,
+                    track_artist=track_artist or album_artist,
+                    album_title=album_title,
+                    year_str=year_val,
+                    genre_str=genre_val or None,
+                )
+                audio.save()
+                updated += 1
+            except Exception as e:
+                errors.append(f"{p.name}: {e}")
+        _trigger_files_index_rebuild_async(reason="manual_tag_fix")
+        return jsonify({
+            "success": True,
+            "message": f"Updated tags on {updated} file(s).",
+            "files_updated": updated,
+            "errors": errors[:20],
+        })
+
     if not PLEX_CONFIGURED:
         return jsonify({"error": "Plex not configured"}), 503
     
@@ -18788,5 +20263,14 @@ if __name__ == "__main__":
 
     cross_check_thread = threading.Thread(target=run_cross_check_background, daemon=True)
     cross_check_thread.start()
+
+    if _get_library_mode() == "files":
+        def run_files_index_bootstrap():
+            ok, err = _ensure_files_index_ready()
+            if ok:
+                logging.info("Files library index is ready.")
+            else:
+                logging.warning("Files library index bootstrap failed: %s", err)
+        threading.Thread(target=run_files_index_bootstrap, daemon=True, name="files-index-bootstrap").start()
 
     server_thread.join()  # block forever (app.run never returns)
