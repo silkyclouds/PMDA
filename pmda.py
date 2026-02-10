@@ -860,8 +860,18 @@ def _check_required_tags(meta: dict, required_tags: list, edition: dict | None =
                 missing.append(tag)
                 continue
             def _track_ok(t):
-                title = getattr(t, "title", None) if hasattr(t, "title") else (t.get("title") if isinstance(t, dict) else None)
-                idx = getattr(t, "idx", None) if hasattr(t, "idx") else (t.get("idx") if isinstance(t, dict) else t.get("index"))
+                if isinstance(t, dict):
+                    title = t.get("title")
+                    idx = t.get("idx")
+                    if idx is None:
+                        idx = t.get("index")
+                    if idx is None:
+                        idx = t.get("track_num")
+                else:
+                    title = getattr(t, "title", None)
+                    idx = getattr(t, "idx", None)
+                    if idx is None:
+                        idx = getattr(t, "index", None)
                 return bool(title and str(title).strip()) and idx is not None
             if not all(_track_ok(t) for t in tracks):
                 missing.append(tag)
