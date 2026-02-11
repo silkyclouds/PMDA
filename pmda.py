@@ -3010,15 +3010,95 @@ def init_state_db():
             updated_at REAL NOT NULL
         )
     """)
+    # Progressive files-library publication state (source for live Files index rebuilds during scan).
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS files_library_published_albums (
+            folder_path TEXT PRIMARY KEY,
+            scan_id INTEGER,
+            artist_name TEXT NOT NULL,
+            artist_norm TEXT NOT NULL,
+            album_title TEXT NOT NULL,
+            title_norm TEXT NOT NULL,
+            year INTEGER,
+            date_text TEXT,
+            genre TEXT,
+            tags_json TEXT NOT NULL DEFAULT '[]',
+            format TEXT,
+            is_lossless INTEGER NOT NULL DEFAULT 0,
+            has_cover INTEGER NOT NULL DEFAULT 0,
+            cover_path TEXT,
+            has_artist_image INTEGER NOT NULL DEFAULT 0,
+            artist_image_path TEXT,
+            mb_identified INTEGER NOT NULL DEFAULT 0,
+            musicbrainz_release_group_id TEXT,
+            discogs_release_id TEXT,
+            lastfm_album_mbid TEXT,
+            bandcamp_album_url TEXT,
+            primary_metadata_source TEXT,
+            track_count INTEGER NOT NULL DEFAULT 0,
+            total_duration_sec INTEGER NOT NULL DEFAULT 0,
+            is_broken INTEGER NOT NULL DEFAULT 0,
+            expected_track_count INTEGER,
+            actual_track_count INTEGER,
+            missing_indices_json TEXT NOT NULL DEFAULT '[]',
+            missing_required_tags_json TEXT NOT NULL DEFAULT '[]',
+            primary_tags_json TEXT NOT NULL DEFAULT '{}',
+            tracks_json TEXT NOT NULL DEFAULT '[]',
+            fingerprint TEXT,
+            updated_at REAL NOT NULL
+        )
+    """)
     # Backward-compatible schema evolution for files_album_scan_cache.
     cur.execute("PRAGMA table_info(files_album_scan_cache)")
     files_cache_cols = {r[1] for r in cur.fetchall()}
     if "musicbrainz_id" not in files_cache_cols:
         cur.execute("ALTER TABLE files_album_scan_cache ADD COLUMN musicbrainz_id TEXT")
+    # Backward-compatible schema evolution for files_library_published_albums.
+    cur.execute("PRAGMA table_info(files_library_published_albums)")
+    files_published_cols = {r[1] for r in cur.fetchall()}
+    files_published_new_cols = [
+        ("scan_id", "INTEGER"),
+        ("artist_name", "TEXT NOT NULL DEFAULT ''"),
+        ("artist_norm", "TEXT NOT NULL DEFAULT ''"),
+        ("album_title", "TEXT NOT NULL DEFAULT ''"),
+        ("title_norm", "TEXT NOT NULL DEFAULT ''"),
+        ("year", "INTEGER"),
+        ("date_text", "TEXT"),
+        ("genre", "TEXT"),
+        ("tags_json", "TEXT NOT NULL DEFAULT '[]'"),
+        ("format", "TEXT"),
+        ("is_lossless", "INTEGER NOT NULL DEFAULT 0"),
+        ("has_cover", "INTEGER NOT NULL DEFAULT 0"),
+        ("cover_path", "TEXT"),
+        ("has_artist_image", "INTEGER NOT NULL DEFAULT 0"),
+        ("artist_image_path", "TEXT"),
+        ("mb_identified", "INTEGER NOT NULL DEFAULT 0"),
+        ("musicbrainz_release_group_id", "TEXT"),
+        ("discogs_release_id", "TEXT"),
+        ("lastfm_album_mbid", "TEXT"),
+        ("bandcamp_album_url", "TEXT"),
+        ("primary_metadata_source", "TEXT"),
+        ("track_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("total_duration_sec", "INTEGER NOT NULL DEFAULT 0"),
+        ("is_broken", "INTEGER NOT NULL DEFAULT 0"),
+        ("expected_track_count", "INTEGER"),
+        ("actual_track_count", "INTEGER"),
+        ("missing_indices_json", "TEXT NOT NULL DEFAULT '[]'"),
+        ("missing_required_tags_json", "TEXT NOT NULL DEFAULT '[]'"),
+        ("primary_tags_json", "TEXT NOT NULL DEFAULT '{}'"),
+        ("tracks_json", "TEXT NOT NULL DEFAULT '[]'"),
+        ("fingerprint", "TEXT"),
+        ("updated_at", "REAL NOT NULL DEFAULT 0"),
+    ]
+    for col_name, col_type in files_published_new_cols:
+        if col_name not in files_published_cols:
+            cur.execute(f"ALTER TABLE files_library_published_albums ADD COLUMN {col_name} {col_type}")
     try:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_scan_resume_runs_source ON scan_resume_runs(source_signature, updated_at DESC)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_scan_resume_artists_run_status ON scan_resume_artists(run_id, status)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_files_album_scan_cache_updated ON files_album_scan_cache(updated_at DESC)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_files_published_artist_norm ON files_library_published_albums(artist_norm)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_files_published_updated ON files_library_published_albums(updated_at DESC)")
     except sqlite3.OperationalError:
         pass
     con.commit()
@@ -3433,6 +3513,10 @@ def _files_pg_init_schema() -> bool:
                     cover_path TEXT,
                     mb_identified BOOLEAN NOT NULL DEFAULT FALSE,
                     musicbrainz_release_group_id TEXT,
+                    discogs_release_id TEXT,
+                    lastfm_album_mbid TEXT,
+                    bandcamp_album_url TEXT,
+                    metadata_source TEXT,
                     track_count INTEGER NOT NULL DEFAULT 0,
                     total_duration_sec INTEGER NOT NULL DEFAULT 0,
                     is_broken BOOLEAN NOT NULL DEFAULT FALSE,
@@ -3445,6 +3529,17 @@ def _files_pg_init_schema() -> bool:
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
             """)
+            # Backward-compatible schema evolution for files_albums.
+            for col_name, col_sql in [
+                ("discogs_release_id", "TEXT"),
+                ("lastfm_album_mbid", "TEXT"),
+                ("bandcamp_album_url", "TEXT"),
+                ("metadata_source", "TEXT"),
+            ]:
+                try:
+                    cur.execute(f"ALTER TABLE files_albums ADD COLUMN IF NOT EXISTS {col_name} {col_sql}")
+                except Exception:
+                    pass
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS files_tracks (
                     id BIGSERIAL PRIMARY KEY,
@@ -4191,138 +4286,165 @@ def _rebuild_files_library_index(reason: str = "manual", wait_if_running: bool =
             error=None,
         )
 
-        audio_files = _iter_audio_files_under_roots(FILES_ROOTS)
-        by_folder: dict[Path, list[Path]] = defaultdict(list)
-        for p in audio_files:
-            by_folder[p.parent].append(p)
-        folders = sorted(by_folder.items(), key=lambda x: str(x[0]).lower())
-        _files_index_set_state(total_folders=len(folders), phase="parsing")
-
         artists_map: dict[str, dict] = {}
         albums_payload: list[dict] = []
         reco_embeddings_count = 0
+        published_artists, published_albums, published_count = _load_files_library_published_payload()
+        with lock:
+            files_scan_running = bool(state.get("scanning")) and _get_library_mode() == "files"
+        use_published_payload = bool(published_count > 0 or files_scan_running)
+        payload_source = "published_rows" if use_published_payload else "filesystem_roots"
 
-        for idx, (folder, files) in enumerate(folders, start=1):
-            _files_index_set_state(folders_processed=idx, current_folder=str(folder))
-            if not files:
-                continue
+        if use_published_payload:
+            artists_map = published_artists
+            albums_payload = published_albums
+            _files_index_set_state(
+                total_folders=max(published_count, 0),
+                folders_processed=max(published_count, 0),
+                phase="parsing",
+                current_folder="published_scan_rows",
+            )
+        else:
+            audio_files = _iter_audio_files_under_roots(FILES_ROOTS)
+            by_folder: dict[Path, list[Path]] = defaultdict(list)
+            for p in audio_files:
+                by_folder[p.parent].append(p)
+            folders = sorted(by_folder.items(), key=lambda x: str(x[0]).lower())
+            _files_index_set_state(total_folders=len(folders), phase="parsing")
 
-            track_entries: list[dict] = []
-            tag_dicts: list[dict] = []
-            raw_genres: list[str] = []
-            fmt_counts: dict[str, int] = defaultdict(int)
-            first_tags: dict = {}
-            total_duration_sec = 0
+            for idx, (folder, files) in enumerate(folders, start=1):
+                _files_index_set_state(folders_processed=idx, current_folder=str(folder))
+                if not files:
+                    continue
 
-            for p in files:
-                tags = extract_tags(p) or {}
-                tag_dicts.append(tags)
-                if not first_tags:
-                    first_tags = tags
-                title = (
-                    (tags.get("title") or tags.get("name") or p.stem or "").strip()
-                    or p.stem
-                    or "Unknown Track"
+                track_entries: list[dict] = []
+                tag_dicts: list[dict] = []
+                raw_genres: list[str] = []
+                fmt_counts: dict[str, int] = defaultdict(int)
+                first_tags: dict = {}
+                total_duration_sec = 0
+
+                for p in files:
+                    tags = extract_tags(p) or {}
+                    tag_dicts.append(tags)
+                    if not first_tags:
+                        first_tags = tags
+                    title = (
+                        (tags.get("title") or tags.get("name") or p.stem or "").strip()
+                        or p.stem
+                        or "Unknown Track"
+                    )
+                    disc_num = _parse_int_loose(tags.get("disc") or tags.get("discnumber"), 1) or 1
+                    track_num = _parse_int_loose(tags.get("track") or tags.get("tracknumber"), 0)
+                    duration_sec = int(max(0.0, _parse_float_loose(tags.get("duration"), 0.0)))
+                    bitrate = _parse_int_loose(tags.get("bitrate") or tags.get("bit_rate"), 0)
+                    sample_rate = _parse_int_loose(tags.get("sample_rate") or tags.get("samplerate"), 0)
+                    bit_depth = _parse_int_loose(tags.get("bit_depth") or tags.get("bits_per_sample"), 0)
+                    fmt = (p.suffix.lower().lstrip(".") or "UNKNOWN").upper()
+                    fmt_counts[fmt] += 1
+                    total_duration_sec += duration_sec
+                    raw_genres.extend(_split_genre_values(tags.get("genre") or ""))
+                    try:
+                        file_size = int(p.stat().st_size)
+                    except OSError:
+                        file_size = 0
+                    track_entries.append(
+                        {
+                            "file_path": str(p),
+                            "title": title,
+                            "disc_num": disc_num,
+                            "track_num": track_num,
+                            "duration_sec": duration_sec,
+                            "format": fmt,
+                            "bitrate": bitrate,
+                            "sample_rate": sample_rate,
+                            "bit_depth": bit_depth,
+                            "file_size_bytes": file_size,
+                        }
+                    )
+
+                track_entries.sort(key=lambda t: (t["disc_num"], t["track_num"], t["file_path"]))
+                if not track_entries:
+                    continue
+
+                artist_name = _pick_album_artist_from_tag_dicts(tag_dicts, default="Unknown Artist")
+                album_title = _pick_album_title_from_tag_dicts(
+                    tag_dicts,
+                    fallback=folder.name.replace("_", " ").strip() or "Unknown Album",
                 )
-                disc_num = _parse_int_loose(tags.get("disc") or tags.get("discnumber"), 1) or 1
-                track_num = _parse_int_loose(tags.get("track") or tags.get("tracknumber"), 0)
-                duration_sec = int(max(0.0, _parse_float_loose(tags.get("duration"), 0.0)))
-                bitrate = _parse_int_loose(tags.get("bitrate") or tags.get("bit_rate"), 0)
-                sample_rate = _parse_int_loose(tags.get("sample_rate") or tags.get("samplerate"), 0)
-                bit_depth = _parse_int_loose(tags.get("bit_depth") or tags.get("bits_per_sample"), 0)
-                fmt = (p.suffix.lower().lstrip(".") or "UNKNOWN").upper()
-                fmt_counts[fmt] += 1
-                total_duration_sec += duration_sec
-                raw_genres.extend(_split_genre_values(tags.get("genre") or ""))
-                try:
-                    file_size = int(p.stat().st_size)
-                except OSError:
-                    file_size = 0
-                track_entries.append({
-                    "file_path": str(p),
-                    "title": title,
-                    "disc_num": disc_num,
-                    "track_num": track_num,
-                    "duration_sec": duration_sec,
-                    "format": fmt,
-                    "bitrate": bitrate,
-                    "sample_rate": sample_rate,
-                    "bit_depth": bit_depth,
-                    "file_size_bytes": file_size,
-                })
+                artist_norm = " ".join((artist_name or "").split()).lower() or "unknown artist"
+                title_norm = norm_album_for_dedup(album_title, normalize_parenthetical=True)
+                date_text = (first_tags.get("date") or first_tags.get("year") or "").strip()
+                year = _parse_int_loose((date_text[:4] if date_text else first_tags.get("year")), 0) or None
+                dominant_format = max(fmt_counts.items(), key=lambda x: x[1])[0] if fmt_counts else "UNKNOWN"
+                is_lossless = dominant_format in _LOSSLESS_FORMATS
+                cover_path = _first_cover_path(folder)
+                has_cover = bool(cover_path and cover_path.is_file())
+                artist_image_path = _first_artist_image_path(folder.parent)
+                artist_has_image = bool(artist_image_path and artist_image_path.is_file())
+                if artist_norm not in artists_map:
+                    artists_map[artist_norm] = {
+                        "name": artist_name,
+                        "image_path": str(artist_image_path) if artist_image_path else None,
+                        "has_image": artist_has_image,
+                    }
+                elif artist_has_image and not artists_map[artist_norm].get("has_image"):
+                    artists_map[artist_norm]["image_path"] = str(artist_image_path)
+                    artists_map[artist_norm]["has_image"] = True
 
-            track_entries.sort(key=lambda t: (t["disc_num"], t["track_num"], t["file_path"]))
-            if not track_entries:
-                continue
+                indices = [t["track_num"] for t in track_entries if t["track_num"] > 0]
+                is_broken = False
+                expected_track_count = None
+                missing_indices: list[int] = []
+                if indices:
+                    is_broken, _actual_count_from_indices, gaps = _detect_gaps_in_indices(indices)
+                    expected_track_count = max(indices)
+                    for start_i, end_i in gaps:
+                        missing_indices.extend(list(range(start_i + 1, end_i)))
+                actual_track_count = len(track_entries)
 
-            artist_name = _pick_album_artist_from_tag_dicts(tag_dicts, default="Unknown Artist")
-            album_title = _pick_album_title_from_tag_dicts(
-                tag_dicts,
-                fallback=folder.name.replace("_", " ").strip() or "Unknown Album",
-            )
-            artist_norm = " ".join((artist_name or "").split()).lower() or "unknown artist"
-            title_norm = norm_album_for_dedup(album_title, normalize_parenthetical=True)
-            date_text = (first_tags.get("date") or first_tags.get("year") or "").strip()
-            year = _parse_int_loose((date_text[:4] if date_text else first_tags.get("year")), 0) or None
-            dominant_format = max(fmt_counts.items(), key=lambda x: x[1])[0] if fmt_counts else "UNKNOWN"
-            is_lossless = dominant_format in _LOSSLESS_FORMATS
-            cover_path = _first_cover_path(folder)
-            has_cover = bool(cover_path and cover_path.is_file())
-            artist_image_path = _first_artist_image_path(folder.parent)
-            if artist_norm not in artists_map:
-                artists_map[artist_norm] = {
-                    "name": artist_name,
-                    "image_path": str(artist_image_path) if artist_image_path else None,
-                    "has_image": bool(artist_image_path and artist_image_path.is_file()),
-                }
+                inferred_genre = _infer_genre_from_bandcamp_tags(raw_genres) if raw_genres else None
+                mbid = (
+                    (first_tags.get("musicbrainz_releasegroupid") or "").strip()
+                    or (first_tags.get("musicbrainz_releaseid") or "").strip()
+                )
+                missing_required = _check_required_tags(
+                    first_tags or {},
+                    REQUIRED_TAGS,
+                    edition={"tracks": [{"title": t.get("title"), "index": t.get("track_num")} for t in track_entries]},
+                )
 
-            indices = [t["track_num"] for t in track_entries if t["track_num"] > 0]
-            is_broken = False
-            expected_track_count = None
-            missing_indices: list[int] = []
-            if indices:
-                is_broken, _actual_count_from_indices, gaps = _detect_gaps_in_indices(indices)
-                expected_track_count = max(indices)
-                for start_i, end_i in gaps:
-                    missing_indices.extend(list(range(start_i + 1, end_i)))
-            actual_track_count = len(track_entries)
-
-            inferred_genre = _infer_genre_from_bandcamp_tags(raw_genres) if raw_genres else None
-            mbid = (
-                (first_tags.get("musicbrainz_releasegroupid") or "").strip()
-                or (first_tags.get("musicbrainz_releaseid") or "").strip()
-            )
-            missing_required = _check_required_tags(
-                first_tags or {},
-                REQUIRED_TAGS,
-                edition={"tracks": [{"title": t.get("title"), "index": t.get("track_num")} for t in track_entries]},
-            )
-
-            albums_payload.append({
-                "artist_norm": artist_norm,
-                "title": album_title,
-                "title_norm": title_norm,
-                "folder_path": str(folder),
-                "year": year,
-                "date_text": date_text[:32] if date_text else "",
-                "genre": inferred_genre or "",
-                "tags_json": json.dumps(raw_genres[:20]),
-                "format": dominant_format,
-                "is_lossless": bool(is_lossless),
-                "has_cover": bool(has_cover),
-                "cover_path": str(cover_path) if cover_path else "",
-                "mb_identified": bool(mbid),
-                "musicbrainz_release_group_id": mbid,
-                "track_count": actual_track_count,
-                "total_duration_sec": total_duration_sec,
-                "is_broken": bool(is_broken),
-                "expected_track_count": expected_track_count,
-                "actual_track_count": actual_track_count,
-                "missing_indices_json": json.dumps(missing_indices),
-                "missing_required_tags_json": json.dumps(missing_required),
-                "primary_tags_json": json.dumps(first_tags or {}),
-                "tracks": track_entries,
-            })
+                albums_payload.append(
+                    {
+                        "artist_norm": artist_norm,
+                        "title": album_title,
+                        "title_norm": title_norm,
+                        "folder_path": str(folder),
+                        "year": year,
+                        "date_text": date_text[:32] if date_text else "",
+                        "genre": inferred_genre or "",
+                        "tags_json": json.dumps(raw_genres[:20]),
+                        "format": dominant_format,
+                        "is_lossless": bool(is_lossless),
+                        "has_cover": bool(has_cover),
+                        "cover_path": str(cover_path) if cover_path else "",
+                        "mb_identified": bool(mbid),
+                        "musicbrainz_release_group_id": mbid,
+                        "track_count": actual_track_count,
+                        "total_duration_sec": total_duration_sec,
+                        "is_broken": bool(is_broken),
+                        "expected_track_count": expected_track_count,
+                        "actual_track_count": actual_track_count,
+                        "missing_indices_json": json.dumps(missing_indices),
+                        "missing_required_tags_json": json.dumps(missing_required),
+                        "primary_tags_json": json.dumps(first_tags or {}),
+                        "tracks": track_entries,
+                        "discogs_release_id": "",
+                        "lastfm_album_mbid": "",
+                        "bandcamp_album_url": "",
+                        "metadata_source": "",
+                    }
+                )
 
         _files_index_set_state(phase="writing", artists=len(artists_map), albums=len(albums_payload))
 
@@ -4369,6 +4491,10 @@ def _rebuild_files_library_index(reason: str = "manual", wait_if_running: bool =
                                 album["cover_path"],
                                 bool(album["mb_identified"]),
                                 album["musicbrainz_release_group_id"],
+                                album.get("discogs_release_id") or "",
+                                album.get("lastfm_album_mbid") or "",
+                                album.get("bandcamp_album_url") or "",
+                                album.get("metadata_source") or "",
                                 album["track_count"],
                                 album["total_duration_sec"],
                                 bool(album["is_broken"]),
@@ -4385,12 +4511,14 @@ def _rebuild_files_library_index(reason: str = "manual", wait_if_running: bool =
                             INSERT INTO files_albums (
                                 artist_id, title, title_norm, folder_path, year, date_text, genre, tags_json,
                                 format, is_lossless, has_cover, cover_path, mb_identified, musicbrainz_release_group_id,
+                                discogs_release_id, lastfm_album_mbid, bandcamp_album_url, metadata_source,
                                 track_count, total_duration_sec, is_broken, expected_track_count, actual_track_count,
                                 missing_indices_json, missing_required_tags_json, primary_tags_json,
                                 created_at, updated_at
                             ) VALUES (
                                 %s, %s, %s, %s, %s, %s, %s, %s,
                                 %s, %s, %s, %s, %s, %s,
+                                %s, %s, %s, %s,
                                 %s, %s, %s, %s, %s,
                                 %s, %s, %s,
                                 NOW(), NOW()
@@ -4459,6 +4587,7 @@ def _rebuild_files_library_index(reason: str = "manual", wait_if_running: bool =
                     _files_index_write_meta(cur, "artists", str(len(artists_map)))
                     _files_index_write_meta(cur, "albums", str(len(albums_payload)))
                     _files_index_write_meta(cur, "tracks", str(total_tracks))
+                    _files_index_write_meta(cur, "source", payload_source)
                 _files_index_set_state(phase="embeddings")
                 reco_embeddings_count = _reco_build_track_embeddings(conn)
                 with conn.cursor() as cur:
@@ -4481,8 +4610,9 @@ def _rebuild_files_library_index(reason: str = "manual", wait_if_running: bool =
             error=None,
         )
         logging.info(
-            "Files library index rebuilt (%s): %d artist(s), %d album(s), %d track(s), %d embedding(s) in %.2fs (cached covers=%d, artist images=%d)",
+            "Files library index rebuilt (%s, source=%s): %d artist(s), %d album(s), %d track(s), %d embedding(s) in %.2fs (cached covers=%d, artist images=%d)",
             reason,
+            payload_source,
             len(artists_map),
             len(albums_payload),
             sum(len(a["tracks"]) for a in albums_payload),
@@ -4500,6 +4630,7 @@ def _rebuild_files_library_index(reason: str = "manual", wait_if_running: bool =
             "cached_covers": covers_cached,
             "cached_artist_images": artists_cached,
             "duration_sec": elapsed,
+            "source": payload_source,
         }
     except Exception as e:
         logging.exception("Files index rebuild failed: %s", e)
@@ -4603,7 +4734,13 @@ def _ensure_files_index_ready() -> tuple[bool, Optional[str]]:
         return False, "FILES_ROOTS is empty"
     if not _files_pg_init_schema():
         return False, "PostgreSQL is unavailable"
+    with lock:
+        files_scan_running = bool(state.get("scanning")) and _get_library_mode() == "files"
     artists, albums, tracks = _files_index_read_counts()
+    if files_scan_running and (albums == 0 or tracks == 0):
+        # During a running Files scan, the live index may be intentionally empty
+        # before first artist publication. Do not force a full bootstrap rebuild.
+        return True, None
     if albums > 0 and tracks > 0:
         track_count, embedding_count = _files_index_read_track_and_embedding_counts()
         min_expected = max(1, int(track_count * 0.85)) if track_count > 0 else 0
@@ -5627,6 +5764,15 @@ state = {
     "scan_post_done": 0,             # Albums processed in post-processing
     "scan_post_current_artist": None,
     "scan_post_current_album": None,
+    # Files mode discovery counters (source walk before artist workers start).
+    "scan_discovery_running": False,
+    "scan_discovery_current_root": None,
+    "scan_discovery_roots_done": 0,
+    "scan_discovery_roots_total": 0,
+    "scan_discovery_files_found": 0,
+    "scan_discovery_folders_found": 0,
+    "scan_discovery_albums_found": 0,
+    "scan_discovery_artists_found": 0,
     "improve_all": None,              # { "running": bool, "artist_id": int, "current": int, "total": int, "log": [], "result": {}, "error": str } or None
     "last_fix_all_by_provider": None, # { "musicbrainz": {identified,covers,tags}, "discogs": ..., "lastfm": ..., "bandcamp": ... } from last global fix-all run
     "last_fix_all_total_albums": 0,   # Total albums processed in that run (for N/M match display)
@@ -6392,19 +6538,41 @@ def extract_tags(audio_path: Path) -> dict[str, str]:
         return {}
 
 
-def _iter_audio_files_under_roots(roots: list[str]) -> list[Path]:
+def _iter_audio_files_under_roots(
+    roots: list[str],
+    *,
+    progress_cb=None,
+    progress_every: int = 250,
+) -> list[Path]:
     """
     Return a list of audio files under the given filesystem roots.
     This helper is backend‑agnostic and only cares about AUDIO_RE matches.
     """
     out: list[Path] = []
     seen_paths: set[str] = set()
+    files_found = 0
+    roots_total = len([r for r in (roots or []) if r])
+    roots_done = 0
     for root in roots:
         if not root:
             continue
         base = Path(root)
         if not base.exists():
             logging.debug("FILES_ROOTS entry %s does not exist; skipping", root)
+            roots_done += 1
+            if callable(progress_cb):
+                try:
+                    progress_cb(
+                        {
+                            "root": str(base),
+                            "roots_done": roots_done,
+                            "roots_total": roots_total,
+                            "files_found": files_found,
+                            "done": roots_done >= roots_total,
+                        }
+                    )
+                except Exception:
+                    pass
             continue
         for p in base.rglob("*"):
             try:
@@ -6414,8 +6582,36 @@ def _iter_audio_files_under_roots(roots: list[str]) -> list[Path]:
                         continue
                     seen_paths.add(sp)
                     out.append(p)
+                    files_found += 1
+                    if callable(progress_cb) and progress_every > 0 and (files_found % progress_every == 0):
+                        try:
+                            progress_cb(
+                                {
+                                    "root": str(base),
+                                    "roots_done": roots_done,
+                                    "roots_total": roots_total,
+                                    "files_found": files_found,
+                                    "done": False,
+                                }
+                            )
+                        except Exception:
+                            pass
             except (OSError, PermissionError):
                 continue
+        roots_done += 1
+        if callable(progress_cb):
+            try:
+                progress_cb(
+                    {
+                        "root": str(base),
+                        "roots_done": roots_done,
+                        "roots_total": roots_total,
+                        "files_found": files_found,
+                        "done": roots_done >= roots_total,
+                    }
+                )
+            except Exception:
+                pass
     return out
 
 # Global ffprobe pool for parallel processing
@@ -10732,11 +10928,14 @@ def _refresh_files_album_scan_cache_from_editions(editions: list[dict], scan_id:
         computed_fingerprint = _compute_album_fingerprint(ordered_paths)
         fingerprint = computed_fingerprint or (e.get("fingerprint") or "").strip()
         tags = dict(e.get("meta") or {})
-        if not tags and ordered_paths:
+        if ordered_paths:
             try:
-                tags = extract_tags(ordered_paths[0]) or {}
+                live_tags = extract_tags(ordered_paths[0]) or {}
+                if live_tags:
+                    tags.update(live_tags)
             except Exception:
-                tags = {}
+                if not tags:
+                    tags = {}
         edition_for_required = e
         if not (edition_for_required.get("tracks") or []):
             # Keep incremental cache healthy when caller does not provide tracks:
@@ -10768,6 +10967,496 @@ def _refresh_files_album_scan_cache_from_editions(editions: list[dict], scan_id:
             }
         )
     _upsert_files_album_scan_cache_rows(rows)
+
+
+def _files_collect_ordered_audio_paths(folder: Path, ordered_paths_raw: list | None = None) -> list[Path]:
+    out: list[Path] = []
+    seen: set[str] = set()
+    for raw in (ordered_paths_raw or []):
+        try:
+            p = path_for_fs_access(Path(raw))
+        except Exception:
+            continue
+        try:
+            if p.exists() and p.is_file() and AUDIO_RE.search(p.name):
+                sp = str(p.resolve())
+                if sp in seen:
+                    continue
+                seen.add(sp)
+                out.append(p)
+        except Exception:
+            continue
+    if out:
+        return out
+    try:
+        discovered = [p for p in folder.rglob("*") if p.is_file() and AUDIO_RE.search(p.name)]
+    except Exception:
+        discovered = []
+    return sorted(discovered, key=lambda p: str(p))
+
+
+def _files_track_value(track_obj, attr: str, fallback=None):
+    if track_obj is None:
+        return fallback
+    if isinstance(track_obj, dict):
+        if attr in track_obj:
+            return track_obj.get(attr)
+        if attr == "idx":
+            return (
+                track_obj.get("idx")
+                or track_obj.get("index")
+                or track_obj.get("track_num")
+                or track_obj.get("track")
+            )
+        if attr == "disc":
+            return track_obj.get("disc") or track_obj.get("disc_num")
+        if attr == "dur":
+            return (
+                track_obj.get("dur")
+                or track_obj.get("duration")
+                or track_obj.get("duration_ms")
+                or track_obj.get("duration_sec")
+            )
+        return fallback
+    return getattr(track_obj, attr, fallback)
+
+
+def _files_build_track_entries_from_item(item: dict, folder: Path) -> list[dict]:
+    ordered_paths = _files_collect_ordered_audio_paths(folder, item.get("ordered_paths") or [])
+    fallback_tracks = list(item.get("tracks") or [])
+    br = _parse_int_loose(item.get("br"), 0)
+    sr = _parse_int_loose(item.get("sr"), 0)
+    bd = _parse_int_loose(item.get("bd"), 0)
+    out: list[dict] = []
+    for idx, p in enumerate(ordered_paths):
+        track_obj = fallback_tracks[idx] if idx < len(fallback_tracks) else None
+        title = (_files_track_value(track_obj, "title", "") or "").strip() or p.stem or f"Track {idx + 1}"
+        disc_num = _parse_int_loose(_files_track_value(track_obj, "disc", 1), 1) or 1
+        track_num = _parse_int_loose(_files_track_value(track_obj, "idx", idx + 1), idx + 1) or (idx + 1)
+        raw_dur = _files_track_value(track_obj, "dur", 0)
+        dur_sec = 0
+        try:
+            dur_num = float(raw_dur or 0)
+            # Track helper uses milliseconds internally; accept seconds when obviously small.
+            dur_sec = int(dur_num / 1000.0) if dur_num > 5000 else int(dur_num)
+        except Exception:
+            dur_sec = int(max(0.0, _parse_duration_seconds_loose(raw_dur, 0.0)))
+        fmt = (p.suffix.lower().lstrip(".") or "UNKNOWN").upper()
+        try:
+            file_size = int(p.stat().st_size)
+        except OSError:
+            file_size = 0
+        out.append(
+            {
+                "file_path": str(p),
+                "title": title,
+                "disc_num": disc_num,
+                "track_num": track_num,
+                "duration_sec": max(0, dur_sec),
+                "format": fmt,
+                "bitrate": br,
+                "sample_rate": sr,
+                "bit_depth": bd,
+                "file_size_bytes": file_size,
+            }
+        )
+    out.sort(key=lambda t: (int(t.get("disc_num") or 1), int(t.get("track_num") or 0), str(t.get("file_path") or "")))
+    return out
+
+
+def _clear_files_library_published_rows() -> int:
+    try:
+        con = sqlite3.connect(str(STATE_DB_FILE), timeout=20)
+        cur = con.cursor()
+        cur.execute("DELETE FROM files_library_published_albums")
+        deleted = int(cur.rowcount or 0)
+        con.commit()
+        con.close()
+        return deleted
+    except Exception:
+        logging.debug("Failed to clear files_library_published_albums", exc_info=True)
+        return 0
+
+
+def _reset_files_live_index_for_scan() -> None:
+    """
+    Start a fresh progressive Files library for a new full scan:
+    - clear published rows in state.db
+    - clear indexed artists/albums/tracks in PostgreSQL
+    """
+    deleted = _clear_files_library_published_rows()
+    if not _files_pg_init_schema():
+        logging.warning("Files live index reset: PostgreSQL schema unavailable")
+        return
+    acquired = files_index_lock.acquire(blocking=True)
+    if not acquired:
+        return
+    try:
+        conn = _files_pg_connect()
+        if conn is None:
+            logging.warning("Files live index reset: PostgreSQL unavailable")
+            return
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute("TRUNCATE TABLE files_tracks, files_albums, files_artists RESTART IDENTITY CASCADE")
+                    _files_index_write_meta(cur, "artists", "0")
+                    _files_index_write_meta(cur, "albums", "0")
+                    _files_index_write_meta(cur, "tracks", "0")
+                    _files_index_write_meta(cur, "last_reason", "scan_full_reset")
+                    _files_index_write_meta(cur, "last_build_ts", str(int(time.time())))
+        finally:
+            conn.close()
+        _files_cache_invalidate_all()
+        _files_index_set_state(
+            running=False,
+            started_at=None,
+            finished_at=time.time(),
+            phase="idle",
+            current_folder=None,
+            folders_processed=0,
+            total_folders=0,
+            artists=0,
+            albums=0,
+            tracks=0,
+            error=None,
+        )
+        logging.info("Files live index reset for new scan: cleared %d published row(s) and truncated PG index tables", deleted)
+    except Exception as e:
+        logging.warning("Files live index reset failed: %s", e)
+    finally:
+        files_index_lock.release()
+
+
+def _upsert_files_library_published_rows(rows: list[dict]) -> int:
+    if not rows:
+        return 0
+    filtered = [r for r in rows if (r.get("folder_path") or "").strip()]
+    if not filtered:
+        return 0
+    try:
+        con = sqlite3.connect(str(STATE_DB_FILE), timeout=30)
+        cur = con.cursor()
+        cur.executemany(
+            """
+            INSERT INTO files_library_published_albums (
+                folder_path, scan_id, artist_name, artist_norm, album_title, title_norm,
+                year, date_text, genre, tags_json, format, is_lossless,
+                has_cover, cover_path, has_artist_image, artist_image_path,
+                mb_identified, musicbrainz_release_group_id, discogs_release_id, lastfm_album_mbid,
+                bandcamp_album_url, primary_metadata_source, track_count, total_duration_sec,
+                is_broken, expected_track_count, actual_track_count, missing_indices_json,
+                missing_required_tags_json, primary_tags_json, tracks_json, fingerprint, updated_at
+            ) VALUES (
+                ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?,
+                ?, ?, ?, ?,
+                ?, ?, ?, ?,
+                ?, ?, ?, ?,
+                ?, ?, ?, ?, ?
+            )
+            ON CONFLICT(folder_path) DO UPDATE SET
+                scan_id=excluded.scan_id,
+                artist_name=excluded.artist_name,
+                artist_norm=excluded.artist_norm,
+                album_title=excluded.album_title,
+                title_norm=excluded.title_norm,
+                year=excluded.year,
+                date_text=excluded.date_text,
+                genre=excluded.genre,
+                tags_json=excluded.tags_json,
+                format=excluded.format,
+                is_lossless=excluded.is_lossless,
+                has_cover=excluded.has_cover,
+                cover_path=excluded.cover_path,
+                has_artist_image=excluded.has_artist_image,
+                artist_image_path=excluded.artist_image_path,
+                mb_identified=excluded.mb_identified,
+                musicbrainz_release_group_id=excluded.musicbrainz_release_group_id,
+                discogs_release_id=excluded.discogs_release_id,
+                lastfm_album_mbid=excluded.lastfm_album_mbid,
+                bandcamp_album_url=excluded.bandcamp_album_url,
+                primary_metadata_source=excluded.primary_metadata_source,
+                track_count=excluded.track_count,
+                total_duration_sec=excluded.total_duration_sec,
+                is_broken=excluded.is_broken,
+                expected_track_count=excluded.expected_track_count,
+                actual_track_count=excluded.actual_track_count,
+                missing_indices_json=excluded.missing_indices_json,
+                missing_required_tags_json=excluded.missing_required_tags_json,
+                primary_tags_json=excluded.primary_tags_json,
+                tracks_json=excluded.tracks_json,
+                fingerprint=excluded.fingerprint,
+                updated_at=excluded.updated_at
+            """,
+            [
+                (
+                    r.get("folder_path") or "",
+                    r.get("scan_id"),
+                    r.get("artist_name") or "Unknown Artist",
+                    r.get("artist_norm") or "unknown artist",
+                    r.get("album_title") or "Unknown Album",
+                    r.get("title_norm") or "unknown album",
+                    r.get("year"),
+                    r.get("date_text") or "",
+                    r.get("genre") or "",
+                    r.get("tags_json") or "[]",
+                    r.get("format") or "",
+                    1 if r.get("is_lossless") else 0,
+                    1 if r.get("has_cover") else 0,
+                    r.get("cover_path") or "",
+                    1 if r.get("has_artist_image") else 0,
+                    r.get("artist_image_path") or "",
+                    1 if r.get("mb_identified") else 0,
+                    r.get("musicbrainz_release_group_id") or "",
+                    r.get("discogs_release_id") or "",
+                    r.get("lastfm_album_mbid") or "",
+                    r.get("bandcamp_album_url") or "",
+                    r.get("primary_metadata_source") or "",
+                    int(r.get("track_count") or 0),
+                    int(r.get("total_duration_sec") or 0),
+                    1 if r.get("is_broken") else 0,
+                    r.get("expected_track_count"),
+                    int(r.get("actual_track_count") or 0),
+                    r.get("missing_indices_json") or "[]",
+                    r.get("missing_required_tags_json") or "[]",
+                    r.get("primary_tags_json") or "{}",
+                    r.get("tracks_json") or "[]",
+                    r.get("fingerprint") or "",
+                    float(r.get("updated_at") or time.time()),
+                )
+                for r in filtered
+            ],
+        )
+        con.commit()
+        con.close()
+        return len(filtered)
+    except Exception:
+        logging.debug("Failed to upsert files_library_published_albums rows", exc_info=True)
+        return 0
+
+
+def _publish_files_library_artist_from_items(
+    artist_name: str,
+    items: list[dict],
+    *,
+    scan_id: int | None = None,
+    results_by_album_id: dict[int, dict] | None = None,
+) -> int:
+    """
+    Publish artist albums to files_library_published_albums after full per-artist flow.
+    These rows are used as the source for progressive Files index rebuilds.
+    """
+    if not items:
+        return 0
+    rows: list[dict] = []
+    now = time.time()
+    results_by_album_id = results_by_album_id or {}
+    for item in items:
+        folder_raw = (item.get("folder") or "").strip()
+        if not folder_raw:
+            continue
+        folder = path_for_fs_access(Path(folder_raw))
+        if not folder.exists() or not folder.is_dir():
+            continue
+        track_entries = _files_build_track_entries_from_item(item, folder)
+        if not track_entries:
+            continue
+        first_audio = None
+        try:
+            first_audio = path_for_fs_access(Path(track_entries[0]["file_path"]))
+        except Exception:
+            first_audio = None
+        tags = dict(item.get("meta") or {})
+        if first_audio and first_audio.exists():
+            live_tags = extract_tags(first_audio) or {}
+            if live_tags:
+                tags.update(live_tags)
+        title_fallback = (
+            (item.get("album_title") or "").strip()
+            or (item.get("title_raw") or "").strip()
+            or folder.name.replace("_", " ").strip()
+            or "Unknown Album"
+        )
+        artist_fallback = (item.get("artist") or "").strip() or (artist_name or "").strip() or "Unknown Artist"
+        artist_resolved = _pick_album_artist_from_tag_dicts([tags], default=artist_fallback)
+        album_resolved = _pick_album_title_from_tag_dicts([tags], fallback=title_fallback)
+        artist_norm = " ".join((artist_resolved or "").split()).lower() or "unknown artist"
+        title_norm = norm_album_for_dedup(album_resolved, normalize_parenthetical=True) or "unknown album"
+        date_text = (tags.get("date") or tags.get("year") or "").strip()
+        year = _parse_int_loose((date_text[:4] if date_text else tags.get("year")), 0) or None
+        raw_genres = _split_genre_values(tags.get("genre") or "")
+        inferred_genre = _infer_genre_from_bandcamp_tags(raw_genres) if raw_genres else None
+        genre = inferred_genre if inferred_genre else ("; ".join(raw_genres[:6]) if raw_genres else "")
+        fmt_counts: dict[str, int] = defaultdict(int)
+        total_duration_sec = 0
+        for tr in track_entries:
+            fmt_counts[(tr.get("format") or "UNKNOWN").upper()] += 1
+            total_duration_sec += int(tr.get("duration_sec") or 0)
+        dominant_format = max(fmt_counts.items(), key=lambda x: x[1])[0] if fmt_counts else "UNKNOWN"
+        cover_path = _first_cover_path(folder)
+        has_cover = bool(cover_path and cover_path.is_file())
+        artist_image_path = _first_artist_image_path(folder.parent)
+        has_artist_image = bool(artist_image_path and artist_image_path.is_file())
+        indices = [int(t.get("track_num") or 0) for t in track_entries if int(t.get("track_num") or 0) > 0]
+        is_broken = False
+        expected_track_count = None
+        missing_indices: list[int] = []
+        if indices:
+            is_broken, _actual_count_from_indices, gaps = _detect_gaps_in_indices(indices)
+            expected_track_count = max(indices)
+            for start_i, end_i in gaps:
+                missing_indices.extend(list(range(start_i + 1, end_i)))
+        actual_track_count = len(track_entries)
+        mbid = (
+            (item.get("musicbrainz_id") or "").strip()
+            or _extract_musicbrainz_id_from_meta(tags)
+            or ""
+        )
+        missing_required = _check_required_tags(
+            tags,
+            REQUIRED_TAGS,
+            edition={"tracks": [{"title": t.get("title"), "index": t.get("track_num")} for t in track_entries]},
+        )
+        album_id = _parse_int_loose(item.get("album_id"), 0)
+        result = results_by_album_id.get(album_id, {})
+        pmda_provider = (tags.get(PMDA_MATCH_PROVIDER_TAG) or "").strip()
+        rows.append(
+            {
+                "folder_path": _album_folder_cache_key(folder),
+                "scan_id": scan_id,
+                "artist_name": artist_resolved,
+                "artist_norm": artist_norm,
+                "album_title": album_resolved,
+                "title_norm": title_norm,
+                "year": year,
+                "date_text": date_text[:32] if date_text else "",
+                "genre": genre or "",
+                "tags_json": json.dumps(raw_genres[:20]),
+                "format": dominant_format,
+                "is_lossless": dominant_format in _LOSSLESS_FORMATS,
+                "has_cover": has_cover,
+                "cover_path": str(cover_path) if cover_path else "",
+                "has_artist_image": has_artist_image,
+                "artist_image_path": str(artist_image_path) if artist_image_path else "",
+                "mb_identified": bool(mbid),
+                "musicbrainz_release_group_id": mbid,
+                "discogs_release_id": (result.get("discogs_release_id") or "").strip(),
+                "lastfm_album_mbid": (result.get("lastfm_album_mbid") or "").strip(),
+                "bandcamp_album_url": (result.get("bandcamp_album_url") or "").strip(),
+                "primary_metadata_source": (
+                    (result.get("provider_used") or result.get("pmda_match_provider") or pmda_provider or "").strip()
+                ),
+                "track_count": actual_track_count,
+                "total_duration_sec": total_duration_sec,
+                "is_broken": bool(is_broken),
+                "expected_track_count": expected_track_count,
+                "actual_track_count": actual_track_count,
+                "missing_indices_json": json.dumps(missing_indices),
+                "missing_required_tags_json": json.dumps(missing_required),
+                "primary_tags_json": json.dumps(tags, default=str),
+                "tracks_json": json.dumps(track_entries),
+                "fingerprint": (item.get("fingerprint") or "").strip(),
+                "updated_at": now,
+            }
+        )
+    inserted = _upsert_files_library_published_rows(rows)
+    if inserted:
+        logging.debug("Published %d album(s) for artist '%s' to files_library_published_albums", inserted, artist_name)
+    return inserted
+
+
+def _load_files_library_published_payload() -> tuple[dict[str, dict], list[dict], int]:
+    """Load published albums from state.db as payload for Files PG index rebuild."""
+    artists_map: dict[str, dict] = {}
+    albums_payload: list[dict] = []
+    try:
+        con = sqlite3.connect(str(STATE_DB_FILE), timeout=20)
+        cur = con.cursor()
+        cur.execute(
+            """
+            SELECT
+                folder_path, artist_name, artist_norm, album_title, title_norm,
+                year, date_text, genre, tags_json, format, is_lossless,
+                has_cover, cover_path, has_artist_image, artist_image_path,
+                mb_identified, musicbrainz_release_group_id, track_count, total_duration_sec,
+                is_broken, expected_track_count, actual_track_count, missing_indices_json,
+                missing_required_tags_json, primary_tags_json, tracks_json,
+                discogs_release_id, lastfm_album_mbid, bandcamp_album_url, primary_metadata_source
+            FROM files_library_published_albums
+            ORDER BY lower(artist_name), lower(album_title), folder_path
+            """
+        )
+        rows = cur.fetchall()
+        con.close()
+    except Exception:
+        logging.debug("Failed to load files_library_published_albums", exc_info=True)
+        return artists_map, albums_payload, 0
+
+    for row in rows:
+        folder_path = (row[0] or "").strip()
+        if not folder_path:
+            continue
+        artist_name = (row[1] or "").strip() or "Unknown Artist"
+        artist_norm = (row[2] or "").strip() or " ".join(artist_name.split()).lower() or "unknown artist"
+        album_title = (row[3] or "").strip() or "Unknown Album"
+        image_path = (row[14] or "").strip()
+        has_image = bool(row[13]) and bool(image_path)
+        if artist_norm not in artists_map:
+            artists_map[artist_norm] = {
+                "name": artist_name,
+                "image_path": image_path or None,
+                "has_image": has_image,
+            }
+        else:
+            if has_image and not artists_map[artist_norm].get("has_image"):
+                artists_map[artist_norm]["image_path"] = image_path
+                artists_map[artist_norm]["has_image"] = True
+        try:
+            tags_json = json.loads(row[8] or "[]") if row[8] else []
+            if not isinstance(tags_json, list):
+                tags_json = []
+        except Exception:
+            tags_json = []
+        try:
+            tracks = json.loads(row[25] or "[]") if row[25] else []
+            if not isinstance(tracks, list):
+                tracks = []
+        except Exception:
+            tracks = []
+        albums_payload.append(
+            {
+                "artist_norm": artist_norm,
+                "title": album_title,
+                "title_norm": (row[4] or "").strip() or norm_album_for_dedup(album_title, normalize_parenthetical=True),
+                "folder_path": folder_path,
+                "year": row[5],
+                "date_text": (row[6] or "").strip(),
+                "genre": (row[7] or "").strip(),
+                "tags_json": json.dumps(tags_json),
+                "format": (row[9] or "").strip(),
+                "is_lossless": bool(row[10]),
+                "has_cover": bool(row[11]),
+                "cover_path": (row[12] or "").strip(),
+                "mb_identified": bool(row[15]),
+                "musicbrainz_release_group_id": (row[16] or "").strip(),
+                "track_count": int(row[17] or 0),
+                "total_duration_sec": int(row[18] or 0),
+                "is_broken": bool(row[19]),
+                "expected_track_count": row[20],
+                "actual_track_count": int(row[21] or 0),
+                "missing_indices_json": row[22] or "[]",
+                "missing_required_tags_json": row[23] or "[]",
+                "primary_tags_json": row[24] or "{}",
+                "tracks": tracks,
+                "discogs_release_id": (row[26] or "").strip(),
+                "lastfm_album_mbid": (row[27] or "").strip(),
+                "bandcamp_album_url": (row[28] or "").strip(),
+                "metadata_source": (row[29] or "").strip(),
+            }
+        )
+    return artists_map, albums_payload, len(albums_payload)
 
 
 def _compute_scan_source_signature(mode: str, scan_type: str) -> str:
@@ -11011,14 +11700,48 @@ def _build_files_editions(scan_type: str = "full") -> tuple[list[tuple[int, str,
 
     roots = [Path(r) for r in (FILES_ROOTS or []) if r]
     if not roots:
+        with lock:
+            state["scan_discovery_running"] = False
+            state["scan_discovery_current_root"] = None
+            state["scan_discovery_roots_done"] = 0
+            state["scan_discovery_roots_total"] = 0
+            state["scan_discovery_files_found"] = 0
+            state["scan_discovery_folders_found"] = 0
+            state["scan_discovery_albums_found"] = 0
+            state["scan_discovery_artists_found"] = 0
         return [], 0, {}
 
     skip_list = list(SKIP_FOLDERS or [])
     cache_map = _load_files_album_scan_cache_map()
-    audio_files = _iter_audio_files_under_roots(FILES_ROOTS)
+    with lock:
+        state["scan_discovery_running"] = True
+        state["scan_discovery_current_root"] = None
+        state["scan_discovery_roots_done"] = 0
+        state["scan_discovery_roots_total"] = len(roots)
+        state["scan_discovery_files_found"] = 0
+        state["scan_discovery_folders_found"] = 0
+        state["scan_discovery_albums_found"] = 0
+        state["scan_discovery_artists_found"] = 0
+
+    def _on_discovery_progress(payload: dict) -> None:
+        try:
+            with lock:
+                state["scan_discovery_running"] = not bool(payload.get("done"))
+                state["scan_discovery_current_root"] = payload.get("root")
+                state["scan_discovery_roots_done"] = int(payload.get("roots_done") or 0)
+                state["scan_discovery_roots_total"] = int(payload.get("roots_total") or len(roots))
+                state["scan_discovery_files_found"] = int(payload.get("files_found") or 0)
+        except Exception:
+            pass
+
+    audio_files = _iter_audio_files_under_roots(FILES_ROOTS, progress_cb=_on_discovery_progress, progress_every=250)
     by_folder: dict[Path, list[Path]] = defaultdict(list)
     for p in audio_files:
         by_folder[p.parent].append(p)
+    with lock:
+        state["scan_discovery_files_found"] = len(audio_files)
+        state["scan_discovery_folders_found"] = len(by_folder)
+        state["scan_discovery_running"] = False
 
     files_editions_by_album_id: dict[int, dict] = {}
     artist_to_album_ids: dict[str, list[int]] = defaultdict(list)
@@ -11134,11 +11857,20 @@ def _build_files_editions(scan_type: str = "full") -> tuple[list[tuple[int, str,
             "skip_heavy_processing": fast_skip_heavy,
         }
         artist_to_album_ids[artist_name].append(album_id)
+        if (album_id % 25) == 0:
+            with lock:
+                state["scan_discovery_albums_found"] = next_album_id - 1
+                state["scan_discovery_artists_found"] = len(artist_to_album_ids)
         if fast_skip_heavy:
             fast_skip_marked += 1
     # Build artists_merged: (artist_id, artist_name, album_ids). For Files we use 0 as artist_id.
     artists_merged = [(0, name, ids) for name, ids in sorted(artist_to_album_ids.items(), key=lambda x: x[0].lower())]
     total_albums = next_album_id - 1
+    with lock:
+        state["scan_discovery_running"] = False
+        state["scan_discovery_current_root"] = None
+        state["scan_discovery_albums_found"] = total_albums
+        state["scan_discovery_artists_found"] = len(artists_merged)
     log_scan(
         "FILES backend: discovered %d artist(s), %d album(s) from %d audio file(s)%s%s",
         len(artists_merged),
@@ -11465,6 +12197,27 @@ def background_scan():
     if scan_type not in {"full", "changed_only"}:
         scan_type = "full"
 
+    # Mark scan as running immediately so UI can show early source-discovery activity.
+    with lock:
+        state["scanning"] = True
+        state["scan_type"] = scan_type
+        state["scan_progress"] = 0
+        state["scan_total"] = 0
+        state["scan_step_progress"] = 0
+        state["scan_step_total"] = 0
+        state["scan_artists_processed"] = 0
+        state["scan_artists_total"] = 0
+        state["scan_active_artists"] = {}
+        state["scan_finalizing"] = False
+        state["scan_discovery_running"] = (_get_library_mode() == "files")
+        state["scan_discovery_current_root"] = None
+        state["scan_discovery_roots_done"] = 0
+        state["scan_discovery_roots_total"] = 0
+        state["scan_discovery_files_found"] = 0
+        state["scan_discovery_folders_found"] = 0
+        state["scan_discovery_albums_found"] = 0
+        state["scan_discovery_artists_found"] = 0
+
     try:
         # Log cache behavior for this run so logs show whether existing cache is being used
         if SCAN_DISABLE_CACHE:
@@ -11500,6 +12253,8 @@ def background_scan():
                 resume_skipped_albums,
             )
         if _get_library_mode() == "files":
+            if scan_type == "full" and resume_skipped_artists == 0:
+                _reset_files_live_index_for_scan()
             files_live_index_last_trigger = time.time()
             if _trigger_files_index_rebuild_async(reason="scan_started"):
                 files_live_index_last_trigger = time.time()
@@ -11593,6 +12348,14 @@ def background_scan():
             state["scan_post_done"] = 0
             state["scan_post_current_artist"] = None
             state["scan_post_current_album"] = None
+            state["scan_discovery_running"] = False
+            state["scan_discovery_current_root"] = None
+            state["scan_discovery_roots_done"] = 0
+            state["scan_discovery_roots_total"] = 0
+            state["scan_discovery_files_found"] = 0
+            state["scan_discovery_folders_found"] = 0
+            state["scan_discovery_albums_found"] = 0
+            state["scan_discovery_artists_found"] = 0
             # Preflight: store MB and AI connection status for end-of-scan summary
             mb_ok, ai_ok = _run_preflight_checks()
             state["scan_mb_connection_ok"] = mb_ok
@@ -11726,6 +12489,7 @@ def background_scan():
                         scan_post_queue.task_done()
                         break
                     artist_name_for_batch, items = payload
+                    batch_results: dict[int, dict] = {}
                     try:
                         for item in items:
                             if scan_should_stop.is_set():
@@ -11735,6 +12499,10 @@ def background_scan():
                             except Exception as post_err:
                                 logging.warning("Post-process worker failed for artist %s item: %s", artist_name_for_batch, post_err)
                                 continue
+                            try:
+                                batch_results[int(album_id)] = dict(result or {})
+                            except Exception:
+                                pass
 
                             prov = result.get("provider_used") or "musicbrainz"
                             if prov in by_provider:
@@ -11787,6 +12555,19 @@ def background_scan():
                                 )
                     finally:
                         if _get_library_mode() == "files":
+                            try:
+                                _publish_files_library_artist_from_items(
+                                    artist_name_for_batch,
+                                    items,
+                                    scan_id=scan_id,
+                                    results_by_album_id=batch_results,
+                                )
+                            except Exception:
+                                logging.debug(
+                                    "Files publication failed for artist %s in post worker",
+                                    artist_name_for_batch,
+                                    exc_info=True,
+                                )
                             _trigger_files_index_rebuild_async(reason=f"scan_artist_ready_{artist_name_for_batch}")
                         scan_post_queue.task_done()
 
@@ -11899,6 +12680,12 @@ def background_scan():
                             all_editions_by_artist.get(artist_name, []),
                             scan_id=scan_id,
                         )
+                    publish_items: list[dict] = []
+                    if _get_library_mode() == "files":
+                        publish_items = _build_improve_items_from_editions(
+                            artist_name,
+                            all_editions_by_artist.get(artist_name, []),
+                        )
                     _set_resume_artist_status(
                         resume_run_id,
                         artist_name,
@@ -11906,12 +12693,19 @@ def background_scan():
                         error=artist_error,
                     )
                     if scan_stream_post_by_artist and scan_post_queue is not None:
-                        improve_items = _build_improve_items_from_editions(
-                            artist_name,
-                            all_editions_by_artist.get(artist_name, []),
-                        )
-                        if improve_items:
-                            scan_post_queue.put((artist_name, improve_items))
+                        if publish_items:
+                            scan_post_queue.put((artist_name, publish_items))
+                    elif _get_library_mode() == "files" and publish_items:
+                        try:
+                            _publish_files_library_artist_from_items(
+                                artist_name,
+                                publish_items,
+                                scan_id=scan_id,
+                                results_by_album_id={},
+                            )
+                        except Exception:
+                            logging.debug("Files publication failed for artist %s", artist_name, exc_info=True)
+                        _trigger_files_index_rebuild_async(reason=f"scan_artist_ready_{artist_name}")
                     artists_processed += 1
                     if _get_library_mode() == "files":
                         now_ts = time.time()
@@ -12601,6 +13395,8 @@ def background_scan():
             state["scan_post_processing"] = False
             state["scan_post_current_artist"] = None
             state["scan_post_current_album"] = None
+            state["scan_discovery_running"] = False
+            state["scan_discovery_current_root"] = None
             state["scan_resume_run_id"] = None
             state["scanning"] = False
         logging.debug("background_scan(): finished (flag cleared)")
@@ -13271,7 +14067,26 @@ def _fetch_discogs_release(artist_name: str, album_title: str) -> Optional[dict]
                     t_title = getattr(tr, "title", None) or (getattr(tr, "data", None) or {}).get("title")
                     if t_title:
                         tracklist.append(str(t_title))
-                return {"title": title, "year": str(year) if year else "", "cover_url": cover_url, "artist_name": artist_str, "tracklist": tracklist}
+                try:
+                    release_id = str(getattr(full_release, "id", "") or "")
+                except Exception:
+                    release_id = ""
+                master_id = ""
+                try:
+                    master_obj = getattr(full_release, "master", None)
+                    if master_obj is not None:
+                        master_id = str(getattr(master_obj, "id", "") or "")
+                except Exception:
+                    master_id = ""
+                return {
+                    "title": title,
+                    "year": str(year) if year else "",
+                    "cover_url": cover_url,
+                    "artist_name": artist_str,
+                    "tracklist": tracklist,
+                    "release_id": release_id,
+                    "master_id": master_id,
+                }
             except HTTPError as he:
                 if getattr(he, "status_code", None) == 404:
                     continue
@@ -13751,6 +14566,7 @@ def _fetch_bandcamp_album_info(artist_name: str, album_title: str) -> Optional[d
             "cover_candidates": cover_candidates,
             "tracklist": tracklist,
             "tags": tags,
+            "album_url": album_url,
         }
     except Exception as e:
         logging.warning("Bandcamp fetch failed for %s / %s: %s", artist_name, album_title, e)
@@ -13916,6 +14732,8 @@ def clear_scan():
         deleted_broken = cur.rowcount
         cur.execute("DELETE FROM scan_editions")
         deleted_editions = cur.rowcount
+        cur.execute("DELETE FROM files_library_published_albums")
+        deleted_published = cur.rowcount
         cur.execute("DELETE FROM settings WHERE key = 'last_completed_scan_id'")
         # Clear last scan summary so "Last scan summary" UI disappears until next scan
         cur.execute(
@@ -13937,9 +14755,12 @@ def clear_scan():
                 "duplicates_loser": deleted_losers,
                 "broken_albums": deleted_broken,
                 "scan_editions": deleted_editions,
+                "files_library_published_albums": deleted_published,
             }
         }
-        
+        if _get_library_mode() == "files":
+            _reset_files_live_index_for_scan()
+
         # Optionally clear audio cache
         if clear_audio_cache:
             con = sqlite3.connect(str(CACHE_DB_FILE))
@@ -16463,6 +17284,14 @@ def api_progress():
         scan_post_done = int(state.get("scan_post_done") or 0)
         scan_post_current_artist = state.get("scan_post_current_artist")
         scan_post_current_album = state.get("scan_post_current_album")
+        scan_discovery_running = bool(state.get("scan_discovery_running"))
+        scan_discovery_current_root = state.get("scan_discovery_current_root")
+        scan_discovery_roots_done = int(state.get("scan_discovery_roots_done") or 0)
+        scan_discovery_roots_total = int(state.get("scan_discovery_roots_total") or 0)
+        scan_discovery_files_found = int(state.get("scan_discovery_files_found") or 0)
+        scan_discovery_folders_found = int(state.get("scan_discovery_folders_found") or 0)
+        scan_discovery_albums_found = int(state.get("scan_discovery_albums_found") or 0)
+        scan_discovery_artists_found = int(state.get("scan_discovery_artists_found") or 0)
         if improve_all_running:
             scan_post_total = max(scan_post_total, int(improve_all_state.get("total") or 0))
             scan_post_done = max(scan_post_done, int(improve_all_state.get("current") or 0))
@@ -16620,6 +17449,14 @@ def api_progress():
         post_processing_total=scan_post_total,
         post_processing_current_artist=scan_post_current_artist,
         post_processing_current_album=scan_post_current_album,
+        scan_discovery_running=scan_discovery_running,
+        scan_discovery_current_root=scan_discovery_current_root,
+        scan_discovery_roots_done=scan_discovery_roots_done,
+        scan_discovery_roots_total=scan_discovery_roots_total,
+        scan_discovery_files_found=scan_discovery_files_found,
+        scan_discovery_folders_found=scan_discovery_folders_found,
+        scan_discovery_albums_found=scan_discovery_albums_found,
+        scan_discovery_artists_found=scan_discovery_artists_found,
     )
 
 
@@ -18184,6 +19021,7 @@ def api_library_artist_detail(artist_id):
                     SELECT
                         id, title, title_norm, year, date_text, track_count, is_broken, format, is_lossless,
                         has_cover, mb_identified, musicbrainz_release_group_id,
+                        discogs_release_id, lastfm_album_mbid, bandcamp_album_url, metadata_source,
                         expected_track_count, actual_track_count, missing_indices_json,
                         COUNT(*) OVER (PARTITION BY title_norm) AS dup_count
                     FROM files_albums
@@ -18218,10 +19056,14 @@ def api_library_artist_detail(artist_id):
                 has_cover = bool(row[9])
                 mb_identified = bool(row[10])
                 mbid = (row[11] or "").strip() or None
-                expected_track_count = row[12]
-                actual_track_count = row[13]
-                missing_indices_raw = row[14] or "[]"
-                dup_count = int(row[15] or 0)
+                discogs_release_id = (row[12] or "").strip() or None
+                lastfm_album_mbid = (row[13] or "").strip() or None
+                bandcamp_album_url = (row[14] or "").strip() or None
+                metadata_source = (row[15] or "").strip() or None
+                expected_track_count = row[16]
+                actual_track_count = row[17]
+                missing_indices_raw = row[18] or "[]"
+                dup_count = int(row[19] or 0)
                 album_profile = album_profile_map.get(title_norm, {}) if title_norm else {}
 
                 if dup_count > 1:
@@ -18268,6 +19110,10 @@ def api_library_artist_detail(artist_id):
                     "thumb_empty": not has_cover,
                     "mb_identified": mb_identified,
                     "musicbrainz_release_group_id": mbid,
+                    "discogs_release_id": discogs_release_id,
+                    "lastfm_album_mbid": lastfm_album_mbid,
+                    "bandcamp_album_url": bandcamp_album_url,
+                    "metadata_source": metadata_source,
                     "in_duplicate_group": dup_count > 1,
                     "can_improve": can_improve,
                     "broken_detail": broken_detail,
@@ -20575,6 +21421,9 @@ def _improve_single_album(album_id: int, db_conn, known_release_group_id: Option
     tags_updated = False
     cover_saved = False
     provider_used: Optional[str] = None
+    discogs_release_id = ""
+    lastfm_album_mbid = ""
+    bandcamp_album_url = ""
 
     album_row = db_conn.execute(
         "SELECT id, title, parent_id FROM metadata_items WHERE id = ? AND metadata_type = 9",
@@ -20893,6 +21742,7 @@ def _improve_single_album(album_id: int, db_conn, known_release_group_id: Option
     if USE_DISCOGS and (not tags_updated or not has_cover_now):
         discogs_info = _fetch_discogs_release(artist_name, album_title_str)
         if discogs_info:
+            discogs_release_id = str(discogs_info.get("release_id") or "").strip() or discogs_release_id
             artist_str = discogs_info.get("artist_name") or artist_name
             album_str = discogs_info.get("title") or album_title_str
             year_str = (discogs_info.get("year") or "").strip()
@@ -20950,6 +21800,9 @@ def _improve_single_album(album_id: int, db_conn, known_release_group_id: Option
     if USE_LASTFM and ((not tags_updated or not has_cover_now) or ("genre" in missing_required)):
         lastfm_info = _fetch_lastfm_album_info(artist_name, album_title_str, release_mbid)
         if lastfm_info:
+            lfm_mbid_val = str(lastfm_info.get("mbid") or "").strip()
+            if lfm_mbid_val:
+                lastfm_album_mbid = lfm_mbid_val
             artist_str = lastfm_info.get("artist") or artist_name
             album_str = lastfm_info.get("title") or album_title_str
             year_str = ""
@@ -21014,6 +21867,7 @@ def _improve_single_album(album_id: int, db_conn, known_release_group_id: Option
     if USE_BANDCAMP and ((not tags_updated or not has_cover_now) or ("genre" in missing_required)):
         bandcamp_info = _fetch_bandcamp_album_info(artist_name, album_title_str)
         if bandcamp_info:
+            bandcamp_album_url = str(bandcamp_info.get("album_url") or "").strip() or bandcamp_album_url
             artist_str = bandcamp_info.get("artist_name") or artist_name
             album_str = bandcamp_info.get("title") or album_title_str
             year_raw = (bandcamp_info.get("year") or "").strip()
@@ -21199,6 +22053,9 @@ def _improve_single_album(album_id: int, db_conn, known_release_group_id: Option
         "pmda_match_provider": pmda_match_provider,
         "pmda_cover_provider": pmda_cover_provider,
         "pmda_artist_provider": pmda_artist_provider,
+        "discogs_release_id": discogs_release_id,
+        "lastfm_album_mbid": lastfm_album_mbid,
+        "bandcamp_album_url": bandcamp_album_url,
     }
 
 
@@ -21255,6 +22112,9 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
     provider_used: Optional[str] = None
     files_updated = 0
     dupes_in_folder: List[dict] = []
+    discogs_release_id = ""
+    lastfm_album_mbid = ""
+    bandcamp_album_url = ""
 
     if not folder_path.is_dir():
         return {"steps": ["Not a directory"], "summary": "Invalid path.", "tags_updated": False, "cover_saved": False, "provider_used": None, "dupes_in_folder": [], "files_updated": 0}
@@ -21377,6 +22237,8 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
             if audio is None:
                 continue
             if mb_release_info and artist_mbid:
+                if pmda_match_provider is None:
+                    pmda_match_provider = "musicbrainz"
                 mb_title = mb_release_info.get("title", album_title_str)
                 date_str = mb_release_info.get("first-release-date", "")
                 year = date_str.split("-")[0] if (date_str and "-" in date_str) else (date_str or "")
@@ -21434,6 +22296,7 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
                         with open(cover_path, "wb") as f:
                             f.write(content)
                         cover_saved = True
+                        pmda_cover_provider = "musicbrainz"
                         steps.append("Fetched and saved cover art")
                         _embed_cover_in_audio_files(cover_path, audio_files)
                 else:
@@ -21441,6 +22304,7 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
                     with open(cover_path, "wb") as f:
                         f.write(content)
                     cover_saved = True
+                    pmda_cover_provider = "musicbrainz"
                     steps.append("Fetched and saved cover art")
                     _embed_cover_in_audio_files(cover_path, audio_files)
         except Exception as e:
@@ -21452,6 +22316,7 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
     if USE_DISCOGS and (not tags_updated or not has_cover_now):
         discogs_info = _fetch_discogs_release(artist_name, album_title_str)
         if discogs_info:
+            discogs_release_id = str(discogs_info.get("release_id") or "").strip() or discogs_release_id
             artist_str = discogs_info.get("artist_name") or artist_name
             album_str = discogs_info.get("title") or album_title_str
             year_str = (discogs_info.get("year") or "").strip()
@@ -21476,6 +22341,7 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
                                     f.write(content)
                                 cover_saved = True
                                 has_cover_now = True
+                                pmda_cover_provider = "discogs"
                                 _embed_cover_in_audio_files(cover_path, audio_files)
                                 steps.append("Fetched and saved cover art from Discogs")
                         else:
@@ -21484,6 +22350,7 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
                                 f.write(content)
                             cover_saved = True
                             has_cover_now = True
+                            pmda_cover_provider = "discogs"
                             _embed_cover_in_audio_files(cover_path, audio_files)
                             steps.append("Fetched and saved cover art from Discogs")
                 except Exception as e:
@@ -21496,6 +22363,9 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
     if USE_LASTFM and ((not tags_updated or not has_cover_now) or ("genre" in missing_required)):
         lastfm_info = _fetch_lastfm_album_info(artist_name, album_title_str, release_mbid)
         if lastfm_info:
+            lfm_mbid_val = str(lastfm_info.get("mbid") or "").strip()
+            if lfm_mbid_val:
+                lastfm_album_mbid = lfm_mbid_val
             artist_str = lastfm_info.get("artist") or artist_name
             album_str = lastfm_info.get("title") or album_title_str
             year_str = ""
@@ -21526,6 +22396,7 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
                                     f.write(content)
                                 cover_saved = True
                                 has_cover_now = True
+                                pmda_cover_provider = "lastfm"
                                 _embed_cover_in_audio_files(cover_path, audio_files)
                                 steps.append("Fetched and saved cover art from Last.fm")
                         else:
@@ -21534,6 +22405,7 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
                                 f.write(content)
                             cover_saved = True
                             has_cover_now = True
+                            pmda_cover_provider = "lastfm"
                             _embed_cover_in_audio_files(cover_path, audio_files)
                             steps.append("Fetched and saved cover art from Last.fm")
                 except Exception as e:
@@ -21544,6 +22416,7 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
     if USE_BANDCAMP and ((not tags_updated or not has_cover_now) or ("genre" in missing_required)):
         bandcamp_info = _fetch_bandcamp_album_info(artist_name, album_title_str)
         if bandcamp_info:
+            bandcamp_album_url = str(bandcamp_info.get("album_url") or "").strip() or bandcamp_album_url
             artist_str = bandcamp_info.get("artist_name") or artist_name
             album_str = bandcamp_info.get("title") or album_title_str
             year_raw = (bandcamp_info.get("year") or "").strip()
@@ -21577,6 +22450,7 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
                                     f.write(content)
                                 cover_saved = True
                                 has_cover_now = True
+                                pmda_cover_provider = "bandcamp"
                                 _embed_cover_in_audio_files(cover_path, audio_files)
                                 steps.append("Fetched and saved cover art from Bandcamp")
                         else:
@@ -21585,6 +22459,7 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
                                 f.write(content)
                             cover_saved = True
                             has_cover_now = True
+                            pmda_cover_provider = "bandcamp"
                             _embed_cover_in_audio_files(cover_path, audio_files)
                             steps.append("Fetched and saved cover art from Bandcamp")
                 except Exception as e:
@@ -21592,13 +22467,64 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
             if tags_updated or cover_saved:
                 provider_used = "bandcamp"
 
+    artist_folder = folder_path.parent
+    artist_provider = None
+    had_artist_image = bool(_first_artist_image_path(artist_folder))
     if tags_updated or cover_saved:
-        artist_folder = folder_path.parent
-        if _fetch_and_save_artist_image(artist_name, artist_folder, artist_mbid):
+        artist_provider = _fetch_and_save_artist_image(artist_name, artist_folder, artist_mbid)
+        if artist_provider:
+            pmda_artist_provider = artist_provider
             steps.append("Fetched and saved artist image")
+    has_artist_image_now = bool(_first_artist_image_path(artist_folder))
+    pmda_matched = bool(tags_updated)
+    pmda_cover = bool(cover_saved or has_cover_now)
+    pmda_artist_image = has_artist_image_now
+    pmda_complete = pmda_matched and pmda_cover and pmda_artist_image
+
+    if pmda_matched and not pmda_match_provider:
+        pmda_match_provider = provider_used or ("musicbrainz" if release_mbid else None)
+    if pmda_cover and not pmda_cover_provider:
+        if provider_used in {"musicbrainz", "discogs", "lastfm", "bandcamp"}:
+            pmda_cover_provider = provider_used
+        elif has_cover_now:
+            pmda_cover_provider = "local"
+    if pmda_artist_image and not pmda_artist_provider:
+        pmda_artist_provider = artist_provider or ("local" if had_artist_image else None)
+    pmda_id = (current_tags.get(PMDA_ID_TAG) or "").strip() or None
+    if pmda_matched or pmda_cover or pmda_artist_image or pmda_complete:
+        _write_pmda_album_tags(
+            folder_path,
+            audio_files,
+            pmda_id=pmda_id,
+            match_provider=pmda_match_provider,
+            cover_provider=pmda_cover_provider,
+            artist_provider=pmda_artist_provider,
+            matched=pmda_matched,
+            cover=pmda_cover,
+            artist_image=pmda_artist_image,
+            complete=pmda_complete,
+        )
 
     summary = f"Updated tags on {files_updated} file(s)." + (" Fetched cover art." if cover_saved else "")
-    return {"steps": steps, "summary": summary, "tags_updated": tags_updated, "cover_saved": cover_saved, "provider_used": provider_used, "dupes_in_folder": dupes_in_folder, "files_updated": files_updated}
+    return {
+        "steps": steps,
+        "summary": summary,
+        "tags_updated": tags_updated,
+        "cover_saved": cover_saved,
+        "provider_used": provider_used,
+        "dupes_in_folder": dupes_in_folder,
+        "files_updated": files_updated,
+        "pmda_matched": pmda_matched,
+        "pmda_cover": pmda_cover,
+        "pmda_artist_image": pmda_artist_image,
+        "pmda_complete": pmda_complete,
+        "pmda_match_provider": pmda_match_provider,
+        "pmda_cover_provider": pmda_cover_provider,
+        "pmda_artist_provider": pmda_artist_provider,
+        "discogs_release_id": discogs_release_id,
+        "lastfm_album_mbid": lastfm_album_mbid,
+        "bandcamp_album_url": bandcamp_album_url,
+    }
 
 
 @app.post("/api/library/improve-album")
@@ -21773,6 +22699,9 @@ def _build_improve_items_from_editions(artist_name: str, editions: list[dict]) -
                 "meta": dict(e.get("meta") or {}),
                 "ordered_paths": list(e.get("ordered_paths") or []),
                 "fingerprint": e.get("fingerprint") or "",
+                "br": e.get("br") or 0,
+                "sr": e.get("sr") or 0,
+                "bd": e.get("bd") or 0,
             }
         )
     return items

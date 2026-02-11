@@ -158,6 +158,14 @@ export function ScanProgress({
     post_processing_total = 0,
     post_processing_current_artist = null,
     post_processing_current_album = null,
+    scan_discovery_running = false,
+    scan_discovery_current_root = null,
+    scan_discovery_roots_done = 0,
+    scan_discovery_roots_total = 0,
+    scan_discovery_files_found = 0,
+    scan_discovery_folders_found = 0,
+    scan_discovery_albums_found = 0,
+    scan_discovery_artists_found = 0,
   } = safeProgress;
 
   // Stage badge: use backend phase (format_analysis | identification_tags | ia_analysis | finalizing | moving_dupes | post_processing)
@@ -244,6 +252,12 @@ export function ScanProgress({
   const canDedupe = hasDuplicates && (last_scan_summary?.dupes_moved_this_scan ?? 0) < actualDuplicateCount;
   const dupesAlreadyAllMoved = (last_scan_summary?.duplicate_groups_count ?? 0) > 0 && (last_scan_summary?.dupes_moved_this_scan ?? 0) >= (last_scan_summary?.duplicate_groups_count ?? 0);
   const showPostProcessingStep = post_processing || (post_processing_total ?? 0) > 0;
+  const showDiscovery =
+    scanning &&
+    (scan_discovery_running ||
+      scan_discovery_files_found > 0 ||
+      scan_discovery_folders_found > 0 ||
+      (artists_total === 0 && scan_discovery_albums_found > 0));
   const currentStepLabel = hasActiveStep
     ? (active_artists[0].current_album!.status_details || active_artists[0].current_album!.status || 'processing')
     : '';
@@ -989,6 +1003,32 @@ export function ScanProgress({
                 />
               </div>
             </div>
+
+            {showDiscovery && (
+              <div className="rounded-lg border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+                <span className="font-medium text-foreground/80">Discovery</span>
+                <span className="mx-1">•</span>
+                {scan_discovery_files_found.toLocaleString()} files
+                <span className="mx-1">•</span>
+                {scan_discovery_folders_found.toLocaleString()} folders
+                <span className="mx-1">•</span>
+                {scan_discovery_albums_found.toLocaleString()} albums
+                <span className="mx-1">•</span>
+                {scan_discovery_artists_found.toLocaleString()} artists
+                {scan_discovery_roots_total > 0 && (
+                  <>
+                    <span className="mx-1">•</span>
+                    roots {scan_discovery_roots_done}/{scan_discovery_roots_total}
+                  </>
+                )}
+                {scan_discovery_current_root ? (
+                  <div className="mt-1 truncate font-mono text-[11px]" title={scan_discovery_current_root}>
+                    {scan_discovery_running ? 'Scanning root: ' : 'Last root: '}
+                    {scan_discovery_current_root}
+                  </div>
+                ) : null}
+              </div>
+            )}
 
             {/* ─── Phase stepper (compact): highlight stage from backend phase ─── */}
             {(phase || auto_move_enabled || showPostProcessingStep) && (

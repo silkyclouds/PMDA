@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Save, Loader2, Check, FolderOutput, RefreshCw } from 'lucide-react';
+import { Save, Loader2, Check, FolderOutput, RefreshCw, Plus, X } from 'lucide-react';
 import { Header } from '@/components/Header';
 import { Button } from '@/components/ui/button';
 import { toast } from 'sonner';
@@ -17,9 +17,10 @@ import { normalizeConfigForUI } from '@/lib/configUtils';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Separator } from '@/components/ui/separator';
 import { Label } from '@/components/ui/label';
-import { Input } from '@/components/ui/input';
 import { Switch } from '@/components/ui/switch';
 import { FieldTooltip } from '@/components/ui/field-tooltip';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { FolderBrowserInput } from '@/components/settings/FolderBrowserInput';
 
 const SETTINGS_SECTIONS: { id: string; label: string }[] = [
   { id: 'settings-plex', label: 'Plex' },
@@ -31,6 +32,59 @@ const SETTINGS_SECTIONS: { id: string; label: string }[] = [
   { id: 'settings-integrations', label: 'Integrations' },
   { id: 'settings-notifications', label: 'Notifications' },
 ];
+
+function parsePathListValue(value: unknown): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const queue: unknown[] = [value];
+
+  while (queue.length > 0) {
+    const item = queue.shift();
+    if (item == null) continue;
+    if (Array.isArray(item)) {
+      queue.push(...item);
+      continue;
+    }
+    if (typeof item === 'string') {
+      const s = item.trim();
+      if (!s) continue;
+      if (s.startsWith('[') || s.startsWith('"')) {
+        try {
+          const parsed = JSON.parse(s) as unknown;
+          if (parsed !== item) {
+            queue.push(parsed);
+            continue;
+          }
+        } catch {
+          // Fall back to CSV split.
+        }
+      }
+      if (s.includes(',')) {
+        const parts = s.split(',').map((p) => p.trim()).filter(Boolean);
+        if (parts.length > 1) {
+          queue.push(...parts);
+          continue;
+        }
+      }
+      if (!seen.has(s) && !s.startsWith('[')) {
+        seen.add(s);
+        out.push(s);
+      }
+      continue;
+    }
+    const s = String(item).trim();
+    if (s && !seen.has(s) && !s.startsWith('[')) {
+      seen.add(s);
+      out.push(s);
+    }
+  }
+
+  return out;
+}
+
+function serializePathList(paths: string[]): string {
+  return paths.map((p) => p.trim()).filter(Boolean).join(', ');
+}
 
 function SettingsPage() {
   const [config, setConfig] = useState<Partial<PMDAConfig>>({});
@@ -104,6 +158,31 @@ function SettingsPage() {
       flushSave();
     }, 350);
   }, [flushSave]);
+  const filesRoots = parsePathListValue(config.FILES_ROOTS);
+
+  const setFilesRoots = useCallback((roots: string[]) => {
+    updateConfig({ FILES_ROOTS: serializePathList(roots) });
+  }, [updateConfig]);
+
+  const addFilesRoot = useCallback((path: string) => {
+    const clean = path.trim();
+    if (!clean) return;
+    const current = parsePathListValue(config.FILES_ROOTS);
+    if (current.includes(clean)) return;
+    setFilesRoots([...current, clean]);
+  }, [config.FILES_ROOTS, setFilesRoots]);
+
+  const removeFilesRoot = useCallback((path: string) => {
+    const current = parsePathListValue(config.FILES_ROOTS);
+    setFilesRoots(current.filter((p) => p !== path));
+  }, [config.FILES_ROOTS, setFilesRoots]);
+  const [pendingFilesRoot, setPendingFilesRoot] = useState('/music');
+
+  useEffect(() => {
+    if (!pendingFilesRoot.trim()) {
+      setPendingFilesRoot(filesRoots[0] ?? '/music');
+    }
+  }, [filesRoots, pendingFilesRoot]);
 
   useEffect(() => {
     return () => {
@@ -251,7 +330,7 @@ function SettingsPage() {
                   </div>
                   {(config.LIBRARY_MODE ?? 'plex') === 'files' && (
                     <p className="text-xs text-muted-foreground">
-                      Set your music folder and library folder below, then click Build library. Duplicates go to /dupes.
+                      Set source folders and destination library below, then click Build library. Duplicates go to /dupes.
                     </p>
                   )}
                 </div>
@@ -267,54 +346,109 @@ function SettingsPage() {
                       Folders
                     </CardTitle>
                     <CardDescription>
-                      Set where your music is, where to build the clean library (hardlinks), and where duplicates go. PMDA does the rest.
+                      Configure source folders, destination library, media cache, and export strategy (hardlink/symlink/copy/move).
                     </CardDescription>
                   </CardHeader>
                   <CardContent className="space-y-4">
                     <div className="space-y-2">
-                      <Label htmlFor="music-folder">Music folder</Label>
+                      <Label>Music folders</Label>
                       <p className="text-xs text-muted-foreground">
-                        Where your music files are (container path, e.g. /music).
+                        Add one or more source folders to scan (container paths).
                       </p>
-                      <Input
-                        id="music-folder"
-                        value={typeof config.FILES_ROOTS === 'string' ? config.FILES_ROOTS : (Array.isArray(config.FILES_ROOTS) ? (config.FILES_ROOTS as string[]).join(', ') : '')}
-                        onChange={(e) => updateConfig({ FILES_ROOTS: e.target.value.trim() || '/music' })}
-                        placeholder="/music"
-                        className="font-mono"
-                      />
+                      <div className="space-y-2">
+                        {filesRoots.length === 0 ? (
+                          <p className="text-xs text-muted-foreground border rounded-md px-3 py-2">
+                            No source folder configured.
+                          </p>
+                        ) : (
+                          <div className="space-y-2">
+                            {filesRoots.map((rootPath) => (
+                              <div key={rootPath} className="flex items-center justify-between gap-2 border rounded-md px-3 py-2">
+                                <span className="font-mono text-sm truncate" title={rootPath}>{rootPath}</span>
+                                <Button
+                                  type="button"
+                                  variant="ghost"
+                                  size="icon"
+                                  onClick={() => removeFilesRoot(rootPath)}
+                                  aria-label={`Remove ${rootPath}`}
+                                >
+                                  <X className="w-4 h-4" />
+                                </Button>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                        <div className="flex items-center gap-2">
+                          <div className="flex-1">
+                            <FolderBrowserInput
+                              value={pendingFilesRoot}
+                              onChange={setPendingFilesRoot}
+                              placeholder="/music"
+                              selectLabel="Add music source folder"
+                            />
+                          </div>
+                          <Button
+                            type="button"
+                            variant="outline"
+                            className="gap-2 shrink-0"
+                            onClick={() => addFilesRoot(pendingFilesRoot)}
+                            disabled={!pendingFilesRoot.trim()}
+                          >
+                            <Plus className="w-4 h-4" />
+                            Add
+                          </Button>
+                        </div>
+                      </div>
                     </div>
                     <div className="space-y-2">
-                      <Label htmlFor="library-folder">Library folder</Label>
+                      <Label>Library folder</Label>
                       <p className="text-xs text-muted-foreground">
-                        Where PMDA will create a clean, organized copy using hardlinks (no extra space). Use a subfolder or a separate mount, e.g. /music/library.
+                        Destination folder for exported files (clean structure), e.g. `/music_matched`.
                       </p>
-                      <Input
-                        id="library-folder"
-                        value={config.EXPORT_ROOT ?? ''}
-                        onChange={(e) => updateConfig({ EXPORT_ROOT: e.target.value.trim() })}
+                      <FolderBrowserInput
+                        value={config.EXPORT_ROOT ?? '/music/library'}
+                        onChange={(path) => updateConfig({ EXPORT_ROOT: path })}
                         placeholder="/music/library"
-                        className="font-mono"
+                        selectLabel="Select library destination folder"
                       />
                     </div>
                     <div className="space-y-2">
-                      <Label htmlFor="media-cache-folder">Media cache folder</Label>
+                      <Label>Media cache folder</Label>
                       <p className="text-xs text-muted-foreground">
                         NVMe cache for instant artist/album artwork rendering (thumbnails pre-generated by PMDA).
                       </p>
-                      <Input
-                        id="media-cache-folder"
+                      <FolderBrowserInput
                         value={config.MEDIA_CACHE_ROOT ?? '/config/media_cache'}
-                        onChange={(e) => updateConfig({ MEDIA_CACHE_ROOT: e.target.value.trim() || '/config/media_cache' })}
+                        onChange={(path) => updateConfig({ MEDIA_CACHE_ROOT: path || '/config/media_cache' })}
                         placeholder="/config/media_cache"
-                        className="font-mono"
+                        selectLabel="Select media cache folder"
                       />
+                    </div>
+                    <div className="space-y-2">
+                      <Label>Export strategy</Label>
+                      <p className="text-xs text-muted-foreground">
+                        Choose how PMDA writes files to the library folder.
+                      </p>
+                      <Select
+                        value={(config.EXPORT_LINK_STRATEGY as 'hardlink' | 'symlink' | 'copy' | 'move' | undefined) ?? 'hardlink'}
+                        onValueChange={(value: 'hardlink' | 'symlink' | 'copy' | 'move') => updateConfig({ EXPORT_LINK_STRATEGY: value })}
+                      >
+                        <SelectTrigger className="w-full md:w-[320px]">
+                          <SelectValue placeholder="Select strategy" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="hardlink">Hardlink (fast, no extra space)</SelectItem>
+                          <SelectItem value="symlink">Symlink (keeps original files)</SelectItem>
+                          <SelectItem value="copy">Copy (duplicates files)</SelectItem>
+                          <SelectItem value="move">Move (relocate files)</SelectItem>
+                        </SelectContent>
+                      </Select>
                     </div>
                     <div className="flex items-center justify-between gap-4">
                       <div className="space-y-1">
                         <Label>Build library automatically</Label>
                         <p className="text-xs text-muted-foreground">
-                          After a Magic scan in Folders mode, rebuild the hardlink library in the folder above.
+                          After a Magic scan in Folders mode, rebuild the library in the folder above.
                         </p>
                       </div>
                       <Switch

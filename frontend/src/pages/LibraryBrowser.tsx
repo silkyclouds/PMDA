@@ -57,6 +57,11 @@ interface AlbumInfo {
   mb_identified?: boolean;
   /** MusicBrainz release-group ID when available (for link to MusicBrainz) */
   musicbrainz_release_group_id?: string;
+  /** Fallback provider IDs/links when MBID is missing */
+  discogs_release_id?: string;
+  lastfm_album_mbid?: string;
+  bandcamp_album_url?: string;
+  metadata_source?: string;
   /** True when album is in a duplicate group (from scan) */
   in_duplicate_group?: boolean;
   /** When is_broken: expected/actual track count and missing indices */
@@ -211,6 +216,12 @@ function NormalizeAlbumNamesButton({ onDone }: { onDone?: () => void }) {
 function IssueBadges({ album, className }: { album: AlbumInfo; className?: string }) {
   const hasThumb = album.thumb != null && String(album.thumb).trim() !== '';
   const noCover = album.thumb_empty && !hasThumb;
+  const hasMbId = Boolean(album.musicbrainz_release_group_id);
+  const hasFallbackSource = Boolean(
+    (album.discogs_release_id && album.discogs_release_id.trim()) ||
+      (album.lastfm_album_mbid && album.lastfm_album_mbid.trim()) ||
+      (album.bandcamp_album_url && album.bandcamp_album_url.trim())
+  );
   return (
     <div className={cn('flex flex-wrap items-center gap-1', className)}>
       {noCover && (
@@ -218,7 +229,7 @@ function IssueBadges({ album, className }: { album: AlbumInfo; className?: strin
           No cover
         </Badge>
       )}
-      {album.musicbrainz_release_group_id ? (
+      {hasMbId ? (
         <a
           href={`https://musicbrainz.org/release-group/${album.musicbrainz_release_group_id}`}
           target="_blank"
@@ -230,6 +241,48 @@ function IssueBadges({ album, className }: { album: AlbumInfo; className?: strin
             MBID
           </Badge>
         </a>
+      ) : hasFallbackSource ? (
+        <>
+          {album.discogs_release_id ? (
+            <a
+              href={`https://www.discogs.com/release/${encodeURIComponent(album.discogs_release_id)}`}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <Badge className="text-xs bg-emerald-500/20 text-emerald-700 dark:bg-emerald-500/30 dark:text-emerald-300 border-emerald-500/30 hover:underline cursor-pointer">
+                Discogs
+              </Badge>
+            </a>
+          ) : null}
+          {album.lastfm_album_mbid ? (
+            <Badge
+              className="text-xs bg-blue-500/20 text-blue-700 dark:bg-blue-500/30 dark:text-blue-300 border-blue-500/30"
+              title={`Last.fm MBID: ${album.lastfm_album_mbid}`}
+            >
+              Last.fm
+            </Badge>
+          ) : null}
+          {album.bandcamp_album_url ? (
+            <a
+              href={album.bandcamp_album_url}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <Badge className="text-xs bg-fuchsia-500/20 text-fuchsia-700 dark:bg-fuchsia-500/30 dark:text-fuchsia-300 border-fuchsia-500/30 hover:underline cursor-pointer">
+                Bandcamp
+              </Badge>
+            </a>
+          ) : null}
+          {!album.discogs_release_id && !album.lastfm_album_mbid && !album.bandcamp_album_url && album.metadata_source ? (
+            <Badge className="text-xs bg-zinc-500/20 text-zinc-700 dark:bg-zinc-500/30 dark:text-zinc-300 border-zinc-500/30">
+              {album.metadata_source}
+            </Badge>
+          ) : null}
+        </>
       ) : album.mb_identified === false && (
         <Badge className="text-xs bg-amber-500/20 text-amber-700 dark:bg-amber-500/30 dark:text-amber-300 border-amber-500/30">
           No MBID
@@ -325,6 +378,7 @@ export default function LibraryBrowser() {
   const artistsListRef = useRef<HTMLDivElement>(null);
   const { toast } = useToast();
   const [showAnalyzeChoiceModal, setShowAnalyzeChoiceModal] = useState(false);
+  const [scanRunning, setScanRunning] = useState(false);
   const [analyzeProgress, setAnalyzeProgress] = useState<{
     running: boolean;
     current_album_index?: number;
@@ -367,9 +421,50 @@ export default function LibraryBrowser() {
     }
   }, [toast]);
 
+  const refreshArtistsQuietly = useCallback(async (search: string = '') => {
+    try {
+      const q = (search || '').trim();
+      const response = await fetch(
+        q
+          ? `/api/library/artists/suggest?q=${encodeURIComponent(q)}&limit=100`
+          : '/api/library/artists?limit=100&offset=0'
+      );
+      if (!response.ok) return;
+      const data = await response.json();
+      setArtists(data.artists || []);
+      setTotalArtists((typeof data.total === 'number' ? data.total : (data.artists || []).length) || 0);
+    } catch {
+      // Ignore transient refresh errors while scan is running.
+    }
+  }, []);
+
   useEffect(() => {
     loadArtists(debouncedSearch);
   }, [debouncedSearch, loadArtists]);
+
+  useEffect(() => {
+    let active = true;
+    const poll = async () => {
+      try {
+        const progress = await api.getScanProgress();
+        if (!active) return;
+        const running = Boolean(progress?.scanning);
+        setScanRunning(running);
+        if (running) {
+          await refreshArtistsQuietly(debouncedSearch);
+        }
+      } catch {
+        if (!active) return;
+        setScanRunning(false);
+      }
+    };
+    poll();
+    const timer = setInterval(poll, 4000);
+    return () => {
+      active = false;
+      clearInterval(timer);
+    };
+  }, [debouncedSearch, refreshArtistsQuietly]);
 
   const loadRecommendations = useCallback(async () => {
     if (!recommendationSessionId) return;
@@ -749,6 +844,11 @@ export default function LibraryBrowser() {
             <p className="text-sm text-muted-foreground mt-1">
               {totalArtists > 0 ? `${totalArtists.toLocaleString()} artist${totalArtists !== 1 ? 's' : ''}` : 'Browse your music library by artist'}
             </p>
+            {scanRunning && (
+              <p className="text-xs text-emerald-500 mt-1">
+                Live refresh enabled while scan is running.
+              </p>
+            )}
           </div>
           <NormalizeAlbumNamesButton onDone={() => { if (selectedArtist) loadArtistDetails(selectedArtist); }} />
         </div>

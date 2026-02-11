@@ -123,6 +123,15 @@ export interface ScanProgress {
   post_processing_total?: number;
   post_processing_current_artist?: string | null;
   post_processing_current_album?: string | null;
+  /** Files-mode discovery counters before full artist plan is ready */
+  scan_discovery_running?: boolean;
+  scan_discovery_current_root?: string | null;
+  scan_discovery_roots_done?: number;
+  scan_discovery_roots_total?: number;
+  scan_discovery_files_found?: number;
+  scan_discovery_folders_found?: number;
+  scan_discovery_albums_found?: number;
+  scan_discovery_artists_found?: number;
 }
 
 export interface LogTailResponse {

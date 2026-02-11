@@ -8,6 +8,55 @@ function toBool(v: unknown): boolean {
   return s === '1' || s === 'true' || s === 'yes' || s === 'on';
 }
 
+function parsePathList(value: unknown): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const queue: unknown[] = [value];
+
+  while (queue.length > 0) {
+    const item = queue.shift();
+    if (item == null) continue;
+    if (Array.isArray(item)) {
+      queue.push(...item);
+      continue;
+    }
+    if (typeof item === 'string') {
+      const s = item.trim();
+      if (!s) continue;
+      if (s.startsWith('[') || s.startsWith('"')) {
+        try {
+          const parsed = JSON.parse(s) as unknown;
+          if (parsed !== item) {
+            queue.push(parsed);
+            continue;
+          }
+        } catch {
+          // Fall through to CSV handling.
+        }
+      }
+      if (s.includes(',')) {
+        const parts = s.split(',').map((p) => p.trim()).filter(Boolean);
+        if (parts.length > 1) {
+          queue.push(...parts);
+          continue;
+        }
+      }
+      if (!seen.has(s) && !s.startsWith('[')) {
+        seen.add(s);
+        out.push(s);
+      }
+      continue;
+    }
+    const s = String(item).trim();
+    if (s && !seen.has(s) && !s.startsWith('[')) {
+      seen.add(s);
+      out.push(s);
+    }
+  }
+
+  return out;
+}
+
 /** Ensure config values used with .map/.join in UI are safe (array/string/object). Used by Settings page and SettingsWizard. */
 export function normalizeConfigForUI(raw: Partial<PMDAConfig>): Partial<PMDAConfig> {
   const out = { ...raw };
@@ -46,8 +95,9 @@ export function normalizeConfigForUI(raw: Partial<PMDAConfig>): Partial<PMDAConf
       out.PATH_MAP = {};
     }
   }
-  if (out.FILES_ROOTS != null && Array.isArray(out.FILES_ROOTS)) {
-    out.FILES_ROOTS = (out.FILES_ROOTS as unknown as string[]).join(', ');
+  if (out.FILES_ROOTS != null) {
+    const roots = parsePathList(out.FILES_ROOTS as unknown);
+    out.FILES_ROOTS = roots.join(', ');
   }
   return out;
 }
