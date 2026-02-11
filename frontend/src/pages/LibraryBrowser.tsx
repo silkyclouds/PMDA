@@ -217,10 +217,30 @@ function IssueBadges({ album, className }: { album: AlbumInfo; className?: strin
   const hasThumb = album.thumb != null && String(album.thumb).trim() !== '';
   const noCover = album.thumb_empty && !hasThumb;
   const hasMbId = Boolean(album.musicbrainz_release_group_id);
+  const metadataSourceRaw = (album.metadata_source || '').trim();
+  const metadataSource = metadataSourceRaw.toLowerCase();
+  const metadataFallbackLabel =
+    metadataSource === 'discogs'
+      ? 'Discogs'
+      : metadataSource === 'lastfm'
+        ? 'Last.fm'
+        : metadataSource === 'bandcamp'
+          ? 'Bandcamp'
+          : metadataSourceRaw || null;
+  const hasProviderFromMetadata = Boolean(metadataFallbackLabel && metadataSource !== 'musicbrainz');
+  const metadataProviderBadgeClass =
+    metadataSource === 'discogs'
+      ? 'text-xs bg-emerald-500/20 text-emerald-700 dark:bg-emerald-500/30 dark:text-emerald-300 border-emerald-500/30'
+      : metadataSource === 'lastfm'
+        ? 'text-xs bg-blue-500/20 text-blue-700 dark:bg-blue-500/30 dark:text-blue-300 border-blue-500/30'
+        : metadataSource === 'bandcamp'
+          ? 'text-xs bg-fuchsia-500/20 text-fuchsia-700 dark:bg-fuchsia-500/30 dark:text-fuchsia-300 border-fuchsia-500/30'
+          : 'text-xs bg-zinc-500/20 text-zinc-700 dark:bg-zinc-500/30 dark:text-zinc-300 border-zinc-500/30';
   const hasFallbackSource = Boolean(
     (album.discogs_release_id && album.discogs_release_id.trim()) ||
       (album.lastfm_album_mbid && album.lastfm_album_mbid.trim()) ||
-      (album.bandcamp_album_url && album.bandcamp_album_url.trim())
+      (album.bandcamp_album_url && album.bandcamp_album_url.trim()) ||
+      hasProviderFromMetadata
   );
   return (
     <div className={cn('flex flex-wrap items-center gap-1', className)}>
@@ -277,9 +297,9 @@ function IssueBadges({ album, className }: { album: AlbumInfo; className?: strin
               </Badge>
             </a>
           ) : null}
-          {!album.discogs_release_id && !album.lastfm_album_mbid && !album.bandcamp_album_url && album.metadata_source ? (
-            <Badge className="text-xs bg-zinc-500/20 text-zinc-700 dark:bg-zinc-500/30 dark:text-zinc-300 border-zinc-500/30">
-              {album.metadata_source}
+          {!album.discogs_release_id && !album.lastfm_album_mbid && !album.bandcamp_album_url && hasProviderFromMetadata && metadataFallbackLabel ? (
+            <Badge className={metadataProviderBadgeClass}>
+              {metadataFallbackLabel}
             </Badge>
           ) : null}
         </>

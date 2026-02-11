@@ -1207,8 +1207,8 @@ export function ScanProgress({
                     Showing last {Math.min(8, scan_steps_log.length)} entr{scan_steps_log.length === 1 ? 'y' : 'ies'}
                   </span>
                 </div>
-                <div className="rounded-lg border border-border bg-muted/40 max-h-32 overflow-y-auto">
-                  <ul className="px-3 py-2 space-y-0.5 text-[11px] font-mono text-muted-foreground/90">
+                <div className="rounded-lg border border-border bg-muted/40 h-40 overflow-hidden">
+                  <ul className="h-full px-3 py-2 space-y-0.5 text-[11px] leading-4 font-mono text-muted-foreground/90">
                     {scan_steps_log.slice(-8).map((line, idx) => (
                       <li key={idx} className="truncate" title={line}>
                         {line}

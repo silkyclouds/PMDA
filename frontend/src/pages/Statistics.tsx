@@ -374,17 +374,19 @@ export default function Statistics() {
     queryKey: ['scan-progress'],
     queryFn: api.getScanProgress,
     refetchInterval: 2000,
+    refetchIntervalInBackground: true,
   });
+  const isLiveRunActive = Boolean(scanProgress?.scanning || scanProgress?.post_processing);
 
   useEffect(() => {
-    if (scanProgress?.scanning) {
+    if (isLiveRunActive) {
       if (scanProgress.scan_start_time) {
         liveScanStartRef.current = n(scanProgress.scan_start_time);
       }
       return;
     }
     liveScanStartRef.current = Math.floor(Date.now() / 1000);
-  }, [scanProgress?.scanning, scanProgress?.scan_start_time]);
+  }, [isLiveRunActive, scanProgress?.scan_start_time]);
 
   const completedScans = useMemo(() => {
     const entries = history
@@ -394,9 +396,9 @@ export default function Statistics() {
   }, [history]);
 
   const liveScan = useMemo(() => {
-    if (!scanProgress?.scanning) return null;
+    if (!scanProgress || !isLiveRunActive) return null;
     return normalizeLiveScan(scanProgress, liveScanStartRef.current);
-  }, [scanProgress]);
+  }, [isLiveRunActive, scanProgress]);
 
   const historicalSelectedScans = useMemo(() => {
     if (period === 'last') {
@@ -438,10 +440,10 @@ export default function Statistics() {
   }, [selectedScans]);
 
   const sourceLabel = useMemo(() => {
-    if (liveScan && period === 'last') {
+    if (isLiveRunActive && period === 'last') {
       return 'source = live scan (updates every 2s)';
     }
-    if (liveScan) {
+    if (isLiveRunActive) {
       return `source = live scan + ${historicalSelectedScans.length} completed scan(s)`;
     }
     if (!latestSelected) return 'No completed scan in this period';
@@ -449,7 +451,7 @@ export default function Statistics() {
       return `source = scan #${latestSelected.scanId} (${format(new Date(latestSelected.startTime * 1000), 'yyyy-MM-dd HH:mm')})`;
     }
     return `source = ${selectedScans.length} scan(s) aggregated (${modeSummary || 'unknown'})`;
-  }, [historicalSelectedScans.length, latestSelected, liveScan, modeSummary, period, selectedScans.length]);
+  }, [historicalSelectedScans.length, isLiveRunActive, latestSelected, modeSummary, period, selectedScans.length]);
 
   const throughputAlbumsPerMin =
     current.durationSeconds > 0 ? (current.albumsScanned / current.durationSeconds) * 60 : 0;
@@ -667,11 +669,11 @@ export default function Statistics() {
 
         <div className="flex flex-wrap items-center gap-2">
           <Badge variant="outline">{sourceLabel}</Badge>
-          {scanProgress?.scanning && <Badge variant="secondary">Live scan in progress</Badge>}
+          {isLiveRunActive && <Badge variant="secondary">Live scan in progress</Badge>}
           {baselineScans.length > 0 && <Badge variant="outline">delta baseline = previous {baselineScans.length} scan(s)</Badge>}
         </div>
 
-        {scanProgress?.scanning && (
+        {isLiveRunActive && scanProgress && (
           <Card className="border-primary/30 bg-primary/5">
             <CardHeader className="pb-3">
               <CardTitle className="text-sm flex items-center gap-2">
@@ -707,7 +709,7 @@ export default function Statistics() {
           </Card>
         )}
 
-        {current.scans === 0 ? (
+        {current.scans === 0 && !isLiveRunActive ? (
           <Card>
             <CardHeader>
               <CardTitle className="text-base flex items-center gap-2">
