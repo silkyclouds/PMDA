@@ -11638,6 +11638,35 @@ def _prepare_resume_scan_artists(
     return run_id, artists_to_scan, skipped_artists, skipped_albums
 
 
+def _has_unfinished_resume_run(mode: str, scan_type: str) -> bool:
+    """
+    Return True if there is a non-completed resume run for the current source signature.
+    Used to avoid clearing progressive Files index when the user is resuming an interrupted scan.
+    """
+    source_signature = _compute_scan_source_signature(mode, scan_type)
+    try:
+        con = sqlite3.connect(str(STATE_DB_FILE), timeout=15)
+        cur = con.cursor()
+        cur.execute(
+            """
+            SELECT status
+            FROM scan_resume_runs
+            WHERE source_signature = ? AND mode = ? AND scan_type = ?
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+            (source_signature, mode, scan_type),
+        )
+        row = cur.fetchone()
+        con.close()
+        if not row:
+            return False
+        return (row[0] or "").strip().lower() != "completed"
+    except Exception:
+        logging.debug("Failed to check unfinished resume runs", exc_info=True)
+        return False
+
+
 def _set_resume_artist_status(run_id: str | None, artist_name: str, status: str, error: str | None = None) -> None:
     """Update one artist status for a resume run."""
     if not run_id or not artist_name:
@@ -12191,6 +12220,7 @@ def background_scan():
     run_improve_after_requested = False
     scan_stream_post_by_artist = False
     streamed_post_process_done = False
+    files_live_index_precleared = False
     with lock:
         run_improve_after_requested = bool(state.get("run_improve_after", False))
         scan_type = (state.get("scan_type") or "full").strip().lower()
@@ -12219,6 +12249,13 @@ def background_scan():
         state["scan_discovery_artists_found"] = 0
 
     try:
+        if _get_library_mode() == "files" and scan_type == "full":
+            if _has_unfinished_resume_run("files", scan_type):
+                log_scan("Files full scan: unfinished resume run detected, keeping current live library index.")
+            else:
+                _reset_files_live_index_for_scan()
+                files_live_index_precleared = True
+
         # Log cache behavior for this run so logs show whether existing cache is being used
         if SCAN_DISABLE_CACHE:
             log_scan(
@@ -12253,7 +12290,7 @@ def background_scan():
                 resume_skipped_albums,
             )
         if _get_library_mode() == "files":
-            if scan_type == "full" and resume_skipped_artists == 0:
+            if scan_type == "full" and resume_skipped_artists == 0 and not files_live_index_precleared:
                 _reset_files_live_index_for_scan()
             files_live_index_last_trigger = time.time()
             if _trigger_files_index_rebuild_async(reason="scan_started"):
