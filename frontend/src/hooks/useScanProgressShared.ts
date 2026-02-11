@@ -43,14 +43,24 @@ export function useScanProgressShared(options: UseScanProgressSharedOptions = {}
 
   const isScanning = progress?.scanning ?? false;
   const isDeduping = dedupeProgress?.deduping ?? false;
-  // Bar progress: artist-based when scanning (option A), else step-based; always 0–100%
+  // Bar progress: include post-processing when present so 100% means truly finished.
   const artistsProcessed = progress?.artists_processed ?? 0;
   const artistsTotal = progress?.artists_total ?? 0;
+  const postDone = progress?.post_processing_done ?? 0;
+  const postTotal = progress?.post_processing_total ?? 0;
+  const hasPostWork = isScanning && (Boolean(progress?.post_processing) || postTotal > 0);
   const stepProgress = progress?.progress ?? 0;
   const stepTotal = progress?.total ?? 0;
-  const progressPercent = isScanning && artistsTotal > 0
-    ? Math.min(100, (artistsProcessed / artistsTotal) * 100)
-    : (stepTotal > 0 ? Math.min(100, (stepProgress / stepTotal) * 100) : 0);
+  const clampedArtistsDone = Math.max(0, Math.min(artistsProcessed, artistsTotal));
+  const clampedPostDone = Math.max(0, Math.min(postDone, postTotal));
+  const compositeDone = clampedArtistsDone + clampedPostDone;
+  const compositeTotal = Math.max(0, artistsTotal) + Math.max(0, postTotal);
+  const rawPercent = hasPostWork
+    ? (compositeTotal > 0 ? Math.min(100, (compositeDone / compositeTotal) * 100) : 0)
+    : (isScanning && artistsTotal > 0
+      ? Math.min(100, (artistsProcessed / artistsTotal) * 100)
+      : (stepTotal > 0 ? Math.min(100, (stepProgress / stepTotal) * 100) : 0));
+  const progressPercent = isScanning ? Math.min(99, rawPercent) : rawPercent;
   const status = progress?.status ?? 'idle';
   
   // Dedupe progress values

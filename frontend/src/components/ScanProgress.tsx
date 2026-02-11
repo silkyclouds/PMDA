@@ -170,11 +170,24 @@ export function ScanProgress({
 
   // Stage badge: use backend phase (format_analysis | identification_tags | ia_analysis | finalizing | moving_dupes | post_processing)
   const effectiveStage = phase ?? (post_processing ? 'post_processing' : (finalizing ? 'finalizing' : (deduping ? 'moving_dupes' : 'format_analysis')));
-  // Option A: bar and percentage based on artists when scanning; step-based when not
-  const displayProgress = scanning && artists_total > 0 ? artists_processed : current;
-  const displayTotal = scanning && artists_total > 0 ? artists_total : total;
+  // Progress bar must reflect real end-to-end work.
+  // During scan, include post-processing when present, otherwise use artist progress.
+  const hasPostWork = scanning && (post_processing || post_processing_total > 0);
+  const scanUnitsDone = Math.max(0, Math.min(artists_processed, artists_total));
+  const scanUnitsTotal = Math.max(0, artists_total);
+  const postUnitsDone = Math.max(0, Math.min(post_processing_done, post_processing_total));
+  const postUnitsTotal = Math.max(0, post_processing_total);
+  const compositeDone = scanUnitsDone + postUnitsDone;
+  const compositeTotal = scanUnitsTotal + postUnitsTotal;
+  const displayProgress = hasPostWork
+    ? compositeDone
+    : (scanning && artists_total > 0 ? artists_processed : current);
+  const displayTotal = hasPostWork
+    ? compositeTotal
+    : (scanning && artists_total > 0 ? artists_total : total);
   const percentageExact = displayTotal > 0 ? Math.min(100, (displayProgress / displayTotal) * 100) : 0;
-  const percentage = Math.round(percentageExact);
+  // Never show 100% while backend still reports scanning=true.
+  const percentage = scanning ? Math.min(99, Math.floor(percentageExact)) : Math.round(percentageExact);
 
   // Toast once when scan finishes with AI errors
   useEffect(() => {
@@ -980,9 +993,11 @@ export function ScanProgress({
                   <span className="text-2xl font-bold tabular-nums text-foreground">{percentage}%</span>
                   <span className="text-sm text-muted-foreground shrink-0">
                     {displayTotal > 0
-                      ? scanning && artists_total > 0
-                        ? `${displayProgress.toLocaleString()} / ${displayTotal.toLocaleString()} artists`
-                        : `${displayProgress.toLocaleString()} / ${displayTotal.toLocaleString()} steps`
+                      ? hasPostWork
+                        ? `${scanUnitsDone.toLocaleString()} / ${scanUnitsTotal.toLocaleString()} artists · ${postUnitsDone.toLocaleString()} / ${postUnitsTotal.toLocaleString()} post`
+                        : scanning && artists_total > 0
+                          ? `${displayProgress.toLocaleString()} / ${displayTotal.toLocaleString()} artists`
+                          : `${displayProgress.toLocaleString()} / ${displayTotal.toLocaleString()} steps`
                       : '—'}
                   </span>
                 </div>
