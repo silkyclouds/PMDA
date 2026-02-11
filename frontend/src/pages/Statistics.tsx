@@ -12,6 +12,8 @@ import {
   Gauge,
   Layers,
   AlertCircle,
+  Server,
+  RefreshCw,
 } from 'lucide-react';
 import { useQuery } from '@tanstack/react-query';
 import { format } from 'date-fns';
@@ -28,7 +30,7 @@ import {
   Legend,
 } from 'chart.js';
 import { Bar, Line, Doughnut, Pie } from 'react-chartjs-2';
-import type { ScanHistoryEntry, ScanProgress } from '@/lib/api';
+import type { CacheControlMetrics, ScanHistoryEntry, ScanProgress } from '@/lib/api';
 import { Header } from '@/components/Header';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -122,6 +124,18 @@ function n(value: number | null | undefined): number {
 function formatMb(mb: number): string {
   if (mb >= 1024) return `${(mb / 1024).toFixed(1)} GB`;
   return `${mb.toFixed(0)} MB`;
+}
+
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let idx = 0;
+  let val = bytes;
+  while (val >= 1024 && idx < units.length - 1) {
+    val /= 1024;
+    idx += 1;
+  }
+  return `${val.toFixed(val >= 100 || idx === 0 ? 0 : 1)} ${units[idx]}`;
 }
 
 function formatPercent(value: number, total: number): string {
@@ -374,6 +388,16 @@ export default function Statistics() {
     queryKey: ['scan-progress'],
     queryFn: api.getScanProgress,
     refetchInterval: 2000,
+    refetchIntervalInBackground: true,
+  });
+  const {
+    data: cacheControl,
+    refetch: refetchCacheControl,
+    isFetching: cacheControlRefreshing,
+  } = useQuery<CacheControlMetrics>({
+    queryKey: ['stats-cache-control'],
+    queryFn: () => api.getCacheControlMetrics(false),
+    refetchInterval: (scanProgress?.scanning || scanProgress?.post_processing) ? 5000 : 15000,
     refetchIntervalInBackground: true,
   });
   const isLiveRunActive = Boolean(scanProgress?.scanning || scanProgress?.post_processing);
@@ -651,6 +675,103 @@ export default function Statistics() {
       ],
     };
   }, [current.audioCacheHits, current.audioCacheMisses, current.mbCacheHits, current.mbCacheMisses]);
+
+  const redisUsedBytes = n(cacheControl?.redis?.used_memory_bytes);
+  const redisMaxBytes = n(cacheControl?.redis?.maxmemory_bytes);
+  const redisHeadroomBytes = Math.max(0, redisMaxBytes - redisUsedBytes);
+  const redisHitRateLive = cacheControl?.redis?.keyspace_hit_rate_pct ?? null;
+  const processRssBytes = n(cacheControl?.runtime?.process_rss_bytes);
+  const containerMemoryUsed = n(cacheControl?.runtime?.container_memory?.current_bytes);
+  const containerMemoryLimit = n(cacheControl?.runtime?.container_memory?.limit_bytes);
+  const containerMemoryUsedPct = cacheControl?.runtime?.container_memory?.used_pct ?? null;
+
+  const sqliteCacheDbBytes = n(cacheControl?.sqlite_cache_db?.db_bytes)
+    + n(cacheControl?.sqlite_cache_db?.wal_bytes)
+    + n(cacheControl?.sqlite_cache_db?.shm_bytes);
+  const sqliteStateDbBytes = n(cacheControl?.sqlite_state_db?.db_bytes)
+    + n(cacheControl?.sqlite_state_db?.wal_bytes)
+    + n(cacheControl?.sqlite_state_db?.shm_bytes);
+  const mediaCacheBytes = n(cacheControl?.media_cache?.total?.bytes_total);
+  const postgresDbBytes = n(cacheControl?.postgres?.db_size_bytes);
+
+  const cacheStorageData = useMemo(() => {
+    return {
+      labels: ['Redis RAM', 'PostgreSQL', 'Media cache', 'SQLite cache.db', 'SQLite state.db'],
+      datasets: [
+        {
+          data: [
+            redisUsedBytes,
+            postgresDbBytes,
+            mediaCacheBytes,
+            sqliteCacheDbBytes,
+            sqliteStateDbBytes,
+          ],
+          backgroundColor: [
+            'rgba(249,115,22,0.82)',
+            'rgba(59,130,246,0.82)',
+            'rgba(34,197,94,0.82)',
+            'rgba(168,85,247,0.82)',
+            'rgba(14,165,233,0.82)',
+          ],
+          borderColor: ['#ea580c', '#2563eb', '#16a34a', '#9333ea', '#0284c7'],
+          borderWidth: 1,
+        },
+      ],
+    };
+  }, [mediaCacheBytes, postgresDbBytes, redisUsedBytes, sqliteCacheDbBytes, sqliteStateDbBytes]);
+
+  const cacheEntriesBarData = useMemo(() => {
+    return {
+      labels: ['Audio cache', 'MB RG cache', 'MB album lookup', 'Files scan cache', 'Watcher queue', 'Redis PMDA keys'],
+      datasets: [
+        {
+          label: 'Entries',
+          data: [
+            n(cacheControl?.sqlite_cache_db?.audio_cache_rows),
+            n(cacheControl?.sqlite_cache_db?.musicbrainz_cache_rows),
+            n(cacheControl?.sqlite_cache_db?.musicbrainz_album_lookup_rows),
+            n(cacheControl?.sqlite_state_db?.files_album_scan_cache_rows),
+            n(cacheControl?.sqlite_state_db?.files_pending_changes_rows),
+            n(cacheControl?.redis?.pmda_prefix_keys),
+          ],
+          backgroundColor: [
+            'rgba(34,197,94,0.78)',
+            'rgba(59,130,246,0.78)',
+            'rgba(14,165,233,0.78)',
+            'rgba(168,85,247,0.78)',
+            'rgba(249,115,22,0.78)',
+            'rgba(239,68,68,0.78)',
+          ],
+          borderColor: ['#16a34a', '#2563eb', '#0284c7', '#9333ea', '#ea580c', '#dc2626'],
+          borderWidth: 1,
+        },
+      ],
+    };
+  }, [
+    cacheControl?.redis?.pmda_prefix_keys,
+    cacheControl?.sqlite_cache_db?.audio_cache_rows,
+    cacheControl?.sqlite_cache_db?.musicbrainz_album_lookup_rows,
+    cacheControl?.sqlite_cache_db?.musicbrainz_cache_rows,
+    cacheControl?.sqlite_state_db?.files_album_scan_cache_rows,
+    cacheControl?.sqlite_state_db?.files_pending_changes_rows,
+  ]);
+
+  const redisMemoryData = useMemo(() => {
+    const hasMax = redisMaxBytes > 0;
+    return {
+      labels: hasMax ? ['Used', 'Headroom'] : ['Used'],
+      datasets: [
+        {
+          data: hasMax ? [redisUsedBytes, redisHeadroomBytes] : [redisUsedBytes],
+          backgroundColor: hasMax
+            ? ['rgba(249,115,22,0.84)', 'rgba(34,197,94,0.28)']
+            : ['rgba(249,115,22,0.84)'],
+          borderColor: hasMax ? ['#ea580c', '#16a34a'] : ['#ea580c'],
+          borderWidth: 1,
+        },
+      ],
+    };
+  }, [redisHeadroomBytes, redisMaxBytes, redisUsedBytes]);
 
   if (isLoading) {
     return (
@@ -1033,6 +1154,106 @@ export default function Statistics() {
                 />
               </div>
               <Card>
+                <CardHeader className="pb-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <CardTitle className="text-sm flex items-center gap-2">
+                        <Server className="w-4 h-4 text-primary" />
+                        Cache Control Center
+                      </CardTitle>
+                      <CardDescription>
+                        Redis/PostgreSQL/SQLite/media cache telemetry with live runtime memory.
+                      </CardDescription>
+                    </div>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      className="gap-1.5"
+                      onClick={() => {
+                        void refetchCacheControl();
+                      }}
+                      disabled={cacheControlRefreshing}
+                    >
+                      {cacheControlRefreshing ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
+                      Refresh
+                    </Button>
+                  </div>
+                </CardHeader>
+                <CardContent className="space-y-2">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Badge variant={cacheControl?.cache_policies?.scan_disable_cache ? 'destructive' : 'secondary'}>
+                      SCAN_DISABLE_CACHE: {cacheControl?.cache_policies?.scan_disable_cache ? 'ON' : 'OFF'}
+                    </Badge>
+                    <Badge variant={cacheControl?.cache_policies?.mb_disable_cache ? 'destructive' : 'secondary'}>
+                      MB_DISABLE_CACHE: {cacheControl?.cache_policies?.mb_disable_cache ? 'ON' : 'OFF'}
+                    </Badge>
+                    <Badge variant={cacheControl?.redis?.available ? 'secondary' : 'outline'}>
+                      Redis: {cacheControl?.redis?.available ? 'connected' : 'offline'}
+                    </Badge>
+                    <Badge variant={cacheControl?.postgres?.available ? 'secondary' : 'outline'}>
+                      PostgreSQL: {cacheControl?.postgres?.available ? 'connected' : 'offline'}
+                    </Badge>
+                    <Badge variant={cacheControl?.files_watcher?.running ? 'secondary' : 'outline'}>
+                      Watcher: {cacheControl?.files_watcher?.running ? 'running' : 'stopped'}
+                    </Badge>
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    Last update: {cacheControl?.generated_at ? format(new Date(cacheControl.generated_at * 1000), 'yyyy-MM-dd HH:mm:ss') : 'n/a'}
+                  </p>
+                </CardContent>
+              </Card>
+              <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
+                <StatCard
+                  title="Container RAM"
+                  icon={<HardDrive className="w-4 h-4 text-warning" />}
+                  value={containerMemoryLimit > 0 ? `${formatBytes(containerMemoryUsed)} / ${formatBytes(containerMemoryLimit)}` : formatBytes(containerMemoryUsed)}
+                  description={containerMemoryUsedPct != null ? `${containerMemoryUsedPct.toFixed(1)}% used` : 'No cgroup limit detected'}
+                />
+                <StatCard
+                  title="PMDA Process RSS"
+                  icon={<Gauge className="w-4 h-4 text-info" />}
+                  value={formatBytes(processRssBytes)}
+                  description="Backend process resident memory"
+                />
+                <StatCard
+                  title="Redis Memory"
+                  icon={<Database className="w-4 h-4 text-primary" />}
+                  value={formatBytes(redisUsedBytes)}
+                  description={redisMaxBytes > 0 ? `${formatBytes(redisHeadroomBytes)} headroom` : 'No maxmemory configured'}
+                />
+                <StatCard
+                  title="PostgreSQL Size"
+                  icon={<Database className="w-4 h-4 text-secondary" />}
+                  value={formatBytes(postgresDbBytes)}
+                  description={cacheControl?.postgres?.db_cache_hit_rate_pct != null ? `DB cache hit ${cacheControl.postgres.db_cache_hit_rate_pct.toFixed(1)}%` : 'DB cache hit n/a'}
+                />
+                <StatCard
+                  title="Media Cache"
+                  icon={<Image className="w-4 h-4 text-success" />}
+                  value={formatBytes(mediaCacheBytes)}
+                  description={`${n(cacheControl?.media_cache?.total?.file_count).toLocaleString()} files`}
+                />
+                <StatCard
+                  title="Files Scan Cache"
+                  icon={<Layers className="w-4 h-4 text-primary" />}
+                  value={n(cacheControl?.sqlite_state_db?.files_album_scan_cache_rows).toLocaleString()}
+                  description={`${n(cacheControl?.sqlite_state_db?.files_album_scan_cache_healthy_rows).toLocaleString()} healthy rows`}
+                />
+                <StatCard
+                  title="Watcher Queue"
+                  icon={<AlertCircle className="w-4 h-4 text-warning" />}
+                  value={n(cacheControl?.sqlite_state_db?.files_pending_changes_rows).toLocaleString()}
+                  description={`${n(cacheControl?.files_watcher?.dirty_count).toLocaleString()} events since boot`}
+                />
+                <StatCard
+                  title="Redis PMDA Keys"
+                  icon={<Database className="w-4 h-4 text-destructive" />}
+                  value={n(cacheControl?.redis?.pmda_prefix_keys).toLocaleString()}
+                  description={cacheControl?.redis?.pmda_prefix_scan_truncated ? 'Prefix count capped for safety' : `${n(cacheControl?.redis?.db_keys).toLocaleString()} keys in DB`}
+                />
+              </div>
+              <Card>
                 <CardHeader>
                   <CardTitle className="text-sm">Operations trend</CardTitle>
                   <CardDescription>Scan duration vs throughput over time.</CardDescription>
@@ -1071,6 +1292,68 @@ export default function Statistics() {
                         scales: {
                           x: { stacked: true },
                           y: { stacked: true, beginAtZero: true },
+                        },
+                      }}
+                    />
+                  </div>
+                </CardContent>
+              </Card>
+              <div className="grid grid-cols-1 xl:grid-cols-3 gap-4">
+                <Card className="xl:col-span-2">
+                  <CardHeader>
+                    <CardTitle className="text-sm">Cache footprint by layer</CardTitle>
+                    <CardDescription>Combined memory/storage footprint across Redis, PostgreSQL, media cache, and SQLite files.</CardDescription>
+                  </CardHeader>
+                  <CardContent>
+                    <div className="h-[260px]">
+                      <Bar
+                        data={cacheStorageData}
+                        options={{
+                          ...chartOptions,
+                          plugins: { ...chartOptions.plugins, legend: { display: false } },
+                          scales: {
+                            y: {
+                              beginAtZero: true,
+                              ticks: {
+                                callback: (value) => formatBytes(Number(value)),
+                              },
+                            },
+                          },
+                        }}
+                      />
+                    </div>
+                  </CardContent>
+                </Card>
+                <Card>
+                  <CardHeader>
+                    <CardTitle className="text-sm">Redis memory usage</CardTitle>
+                    <CardDescription>
+                      {redisHitRateLive != null
+                        ? `Keyspace hit rate ${redisHitRateLive.toFixed(1)}%`
+                        : 'Keyspace hit rate unavailable'}
+                    </CardDescription>
+                  </CardHeader>
+                  <CardContent>
+                    <div className="h-[260px] flex items-center justify-center">
+                      <Doughnut data={redisMemoryData} options={{ ...chartOptions, cutout: '62%' }} />
+                    </div>
+                  </CardContent>
+                </Card>
+              </div>
+              <Card>
+                <CardHeader>
+                  <CardTitle className="text-sm">Cache entries by subsystem</CardTitle>
+                  <CardDescription>How many objects are currently indexed in each cache layer.</CardDescription>
+                </CardHeader>
+                <CardContent>
+                  <div className="h-[280px]">
+                    <Bar
+                      data={cacheEntriesBarData}
+                      options={{
+                        ...chartOptions,
+                        plugins: { ...chartOptions.plugins, legend: { display: false } },
+                        scales: {
+                          y: { beginAtZero: true },
                         },
                       }}
                     />

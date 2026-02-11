@@ -553,6 +553,9 @@ FILES_CACHE_PREFIX = "pmda:files:v2:"
 PMDA_MEDIA_CACHE_ROOT = (os.getenv("PMDA_MEDIA_CACHE_ROOT", "") or "").strip()
 PMDA_FILES_WATCHER_ENABLED = _parse_bool(os.getenv("PMDA_FILES_WATCHER_ENABLED", "true"))
 PMDA_FILES_WATCHER_LOG_COOLDOWN_SEC = float(os.getenv("PMDA_FILES_WATCHER_LOG_COOLDOWN_SEC", "10") or "10")
+PMDA_CACHE_TELEMETRY_TTL_SEC = float(os.getenv("PMDA_CACHE_TELEMETRY_TTL_SEC", "15") or "15")
+PMDA_CACHE_TELEMETRY_MAX_WALK_FILES = int(os.getenv("PMDA_CACHE_TELEMETRY_MAX_WALK_FILES", "400000") or "400000")
+PMDA_CACHE_TELEMETRY_MAX_REDIS_SCAN_KEYS = int(os.getenv("PMDA_CACHE_TELEMETRY_MAX_REDIS_SCAN_KEYS", "200000") or "200000")
 RECO_EMBED_DIM = 64
 RECO_EMBED_SOURCE = "pmda_hash_v1"
 
@@ -3475,6 +3478,8 @@ init_cache_db()
 # ───────────────────── Files Library Index (PostgreSQL + Redis) ─────────────────────
 _FILES_PG_SCHEMA_READY = False
 _FILES_REDIS_CLIENT = None
+_CACHE_TELEMETRY_SNAPSHOT = {"ts": 0.0, "payload": None}
+_CACHE_TELEMETRY_LOCK = threading.Lock()
 
 _LOSSLESS_FORMATS = {"FLAC", "ALAC", "APE", "WV", "WAV", "AIFF", "DSF"}
 _ARTIST_IMAGE_NAMES = ("artist.jpg", "artist.jpeg", "artist.png", "folder.jpg", "folder.jpeg", "folder.png")
@@ -3744,6 +3749,432 @@ def _files_cache_invalidate_all() -> None:
             cli.delete(*keys)
     except Exception:
         pass
+
+
+def _safe_int(value, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _read_first_int(paths: list[str]) -> Optional[int]:
+    for raw in paths:
+        p = Path(raw)
+        if not p.exists():
+            continue
+        try:
+            txt = p.read_text(encoding="utf-8", errors="ignore").strip()
+        except Exception:
+            continue
+        if not txt:
+            continue
+        if txt.lower() == "max":
+            return None
+        try:
+            return int(txt)
+        except Exception:
+            continue
+    return None
+
+
+def _current_process_rss_bytes() -> int:
+    # Linux fast path.
+    statm = Path("/proc/self/statm")
+    if statm.exists():
+        try:
+            txt = statm.read_text(encoding="utf-8", errors="ignore").strip()
+            parts = txt.split()
+            if len(parts) >= 2:
+                rss_pages = int(parts[1])
+                page_size = os.sysconf("SC_PAGE_SIZE")
+                return max(0, rss_pages * int(page_size))
+        except Exception:
+            pass
+    return 0
+
+
+def _read_container_memory_stats() -> dict:
+    # cgroup v2 first.
+    current = _read_first_int(
+        [
+            "/sys/fs/cgroup/memory.current",
+            "/sys/fs/cgroup/memory/memory.usage_in_bytes",  # cgroup v1 fallback
+        ]
+    )
+    limit = _read_first_int(
+        [
+            "/sys/fs/cgroup/memory.max",
+            "/sys/fs/cgroup/memory/memory.limit_in_bytes",  # cgroup v1 fallback
+        ]
+    )
+    # Some runtimes expose huge sentinel values when unlimited.
+    if limit is not None and limit >= (1 << 60):
+        limit = None
+    used_pct = None
+    if current is not None and limit and limit > 0:
+        used_pct = round((float(current) / float(limit)) * 100.0, 2)
+    return {
+        "current_bytes": int(current or 0),
+        "limit_bytes": int(limit or 0) if limit else 0,
+        "used_pct": used_pct,
+    }
+
+
+def _path_size_bytes(path: Path) -> int:
+    try:
+        return int(path.stat().st_size)
+    except Exception:
+        return 0
+
+
+def _sqlite_table_exists(cur, table_name: str) -> bool:
+    cur.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ? LIMIT 1",
+        (table_name,),
+    )
+    return cur.fetchone() is not None
+
+
+def _sqlite_scalar(cur, sql: str, args: tuple = ()) -> int:
+    cur.execute(sql, args)
+    row = cur.fetchone()
+    if not row:
+        return 0
+    return _safe_int(row[0], 0)
+
+
+def _scan_dir_usage(root: Path, max_files: int = 400000) -> dict:
+    if not root.exists():
+        return {
+            "exists": False,
+            "bytes_total": 0,
+            "file_count": 0,
+            "dir_count": 0,
+            "walk_truncated": False,
+            "walk_errors": 0,
+        }
+    total_bytes = 0
+    file_count = 0
+    dir_count = 0
+    walk_errors = 0
+    walk_truncated = False
+    stack = [str(root)]
+    max_files = max(10000, int(max_files or 400000))
+    while stack:
+        cur = stack.pop()
+        try:
+            with os.scandir(cur) as it:
+                for entry in it:
+                    try:
+                        if entry.is_file(follow_symlinks=False):
+                            file_count += 1
+                            try:
+                                total_bytes += int(entry.stat(follow_symlinks=False).st_size)
+                            except Exception:
+                                walk_errors += 1
+                            if file_count >= max_files:
+                                walk_truncated = True
+                                break
+                        elif entry.is_dir(follow_symlinks=False):
+                            dir_count += 1
+                            stack.append(entry.path)
+                    except Exception:
+                        walk_errors += 1
+        except Exception:
+            walk_errors += 1
+        if walk_truncated:
+            break
+    return {
+        "exists": True,
+        "bytes_total": int(total_bytes),
+        "file_count": int(file_count),
+        "dir_count": int(dir_count),
+        "walk_truncated": bool(walk_truncated),
+        "walk_errors": int(walk_errors),
+    }
+
+
+def _read_media_cache_usage() -> dict:
+    root = _media_cache_root_dir()
+    album_root = root / "album"
+    artist_root = root / "artist"
+    total = _scan_dir_usage(root, max_files=PMDA_CACHE_TELEMETRY_MAX_WALK_FILES)
+    album = _scan_dir_usage(album_root, max_files=PMDA_CACHE_TELEMETRY_MAX_WALK_FILES)
+    artist = _scan_dir_usage(artist_root, max_files=PMDA_CACHE_TELEMETRY_MAX_WALK_FILES)
+    return {
+        "root": str(root),
+        "total": total,
+        "album": album,
+        "artist": artist,
+    }
+
+
+def _read_sqlite_cache_metrics() -> dict:
+    cache_db_wal = Path(str(CACHE_DB_FILE) + "-wal")
+    cache_db_shm = Path(str(CACHE_DB_FILE) + "-shm")
+    out = {
+        "db_path": str(CACHE_DB_FILE),
+        "db_bytes": _path_size_bytes(CACHE_DB_FILE),
+        "wal_bytes": _path_size_bytes(cache_db_wal),
+        "shm_bytes": _path_size_bytes(cache_db_shm),
+        "audio_cache_rows": 0,
+        "musicbrainz_cache_rows": 0,
+        "musicbrainz_album_lookup_rows": 0,
+        "musicbrainz_album_lookup_not_found_rows": 0,
+    }
+    if not CACHE_DB_FILE.exists():
+        return out
+    try:
+        con = sqlite3.connect(str(CACHE_DB_FILE), timeout=5)
+        cur = con.cursor()
+        if _sqlite_table_exists(cur, "audio_cache"):
+            out["audio_cache_rows"] = _sqlite_scalar(cur, "SELECT COUNT(*) FROM audio_cache")
+        if _sqlite_table_exists(cur, "musicbrainz_cache"):
+            out["musicbrainz_cache_rows"] = _sqlite_scalar(cur, "SELECT COUNT(*) FROM musicbrainz_cache")
+        if _sqlite_table_exists(cur, "musicbrainz_album_lookup"):
+            out["musicbrainz_album_lookup_rows"] = _sqlite_scalar(cur, "SELECT COUNT(*) FROM musicbrainz_album_lookup")
+            out["musicbrainz_album_lookup_not_found_rows"] = _sqlite_scalar(
+                cur,
+                """
+                SELECT COUNT(*)
+                FROM musicbrainz_album_lookup
+                WHERE mbid IS NULL OR TRIM(COALESCE(mbid, '')) = ''
+                """,
+            )
+        con.close()
+    except Exception:
+        logging.debug("Failed reading cache.db telemetry", exc_info=True)
+    return out
+
+
+def _read_state_cache_metrics() -> dict:
+    state_db_wal = Path(str(STATE_DB_FILE) + "-wal")
+    state_db_shm = Path(str(STATE_DB_FILE) + "-shm")
+    out = {
+        "db_path": str(STATE_DB_FILE),
+        "db_bytes": _path_size_bytes(STATE_DB_FILE),
+        "wal_bytes": _path_size_bytes(state_db_wal),
+        "shm_bytes": _path_size_bytes(state_db_shm),
+        "files_album_scan_cache_rows": 0,
+        "files_album_scan_cache_healthy_rows": 0,
+        "files_pending_changes_rows": 0,
+        "files_library_published_rows": 0,
+        "scan_resume_pending_artists_rows": 0,
+    }
+    if not STATE_DB_FILE.exists():
+        return out
+    try:
+        con = sqlite3.connect(str(STATE_DB_FILE), timeout=5)
+        cur = con.cursor()
+        if _sqlite_table_exists(cur, "files_album_scan_cache"):
+            out["files_album_scan_cache_rows"] = _sqlite_scalar(cur, "SELECT COUNT(*) FROM files_album_scan_cache")
+            out["files_album_scan_cache_healthy_rows"] = _sqlite_scalar(
+                cur,
+                """
+                SELECT COUNT(*)
+                FROM files_album_scan_cache
+                WHERE has_cover = 1
+                  AND has_artist_image = 1
+                  AND has_complete_tags = 1
+                  AND has_identity = 1
+                """,
+            )
+        if _sqlite_table_exists(cur, "files_pending_changes"):
+            out["files_pending_changes_rows"] = _sqlite_scalar(cur, "SELECT COUNT(*) FROM files_pending_changes")
+        if _sqlite_table_exists(cur, "files_library_published_albums"):
+            out["files_library_published_rows"] = _sqlite_scalar(cur, "SELECT COUNT(*) FROM files_library_published_albums")
+        if _sqlite_table_exists(cur, "scan_resume_artists"):
+            out["scan_resume_pending_artists_rows"] = _sqlite_scalar(
+                cur,
+                "SELECT COUNT(*) FROM scan_resume_artists WHERE status IN ('pending', 'running', 'failed')",
+            )
+        con.close()
+    except Exception:
+        logging.debug("Failed reading state.db telemetry", exc_info=True)
+    return out
+
+
+def _read_redis_cache_metrics() -> dict:
+    out = {
+        "available": False,
+        "host": PMDA_REDIS_HOST,
+        "port": PMDA_REDIS_PORT,
+        "db": PMDA_REDIS_DB,
+        "db_keys": 0,
+        "pmda_prefix_keys": 0,
+        "pmda_prefix_scan_truncated": False,
+        "used_memory_bytes": 0,
+        "used_memory_peak_bytes": 0,
+        "maxmemory_bytes": 0,
+        "evicted_keys": 0,
+        "keyspace_hits": 0,
+        "keyspace_misses": 0,
+        "keyspace_hit_rate_pct": None,
+    }
+    cli = _files_redis_client()
+    if cli is None:
+        return out
+    out["available"] = True
+    try:
+        out["db_keys"] = _safe_int(cli.dbsize(), 0)
+    except Exception:
+        pass
+    try:
+        info_memory = cli.info("memory") or {}
+        out["used_memory_bytes"] = _safe_int(info_memory.get("used_memory"), 0)
+        out["used_memory_peak_bytes"] = _safe_int(info_memory.get("used_memory_peak"), 0)
+        out["maxmemory_bytes"] = _safe_int(info_memory.get("maxmemory"), 0)
+    except Exception:
+        pass
+    try:
+        info_stats = cli.info("stats") or {}
+        hits = _safe_int(info_stats.get("keyspace_hits"), 0)
+        misses = _safe_int(info_stats.get("keyspace_misses"), 0)
+        out["keyspace_hits"] = hits
+        out["keyspace_misses"] = misses
+        out["evicted_keys"] = _safe_int(info_stats.get("evicted_keys"), 0)
+        total = hits + misses
+        if total > 0:
+            out["keyspace_hit_rate_pct"] = round((hits / total) * 100.0, 2)
+    except Exception:
+        pass
+    try:
+        max_scan = max(1000, int(PMDA_CACHE_TELEMETRY_MAX_REDIS_SCAN_KEYS or 200000))
+        k = 0
+        truncated = False
+        for _ in cli.scan_iter(f"{FILES_CACHE_PREFIX}*"):
+            k += 1
+            if k >= max_scan:
+                truncated = True
+                break
+        out["pmda_prefix_keys"] = int(k)
+        out["pmda_prefix_scan_truncated"] = bool(truncated)
+    except Exception:
+        pass
+    return out
+
+
+def _read_pg_cache_metrics() -> dict:
+    out = {
+        "available": False,
+        "db_size_bytes": 0,
+        "db_cache_hit_rate_pct": None,
+        "numbackends": 0,
+        "table_estimated_rows": {},
+        "table_total_bytes": {},
+    }
+    if not _files_pg_init_schema():
+        return out
+    conn = _files_pg_connect()
+    if conn is None:
+        return out
+    out["available"] = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_database_size(current_database())")
+            out["db_size_bytes"] = _safe_int((cur.fetchone() or [0])[0], 0)
+            cur.execute(
+                """
+                SELECT numbackends, blks_hit, blks_read
+                FROM pg_stat_database
+                WHERE datname = current_database()
+                """
+            )
+            row = cur.fetchone()
+            if row:
+                numbackends = _safe_int(row[0], 0)
+                blks_hit = _safe_int(row[1], 0)
+                blks_read = _safe_int(row[2], 0)
+                out["numbackends"] = numbackends
+                total_blks = blks_hit + blks_read
+                if total_blks > 0:
+                    out["db_cache_hit_rate_pct"] = round((blks_hit / total_blks) * 100.0, 2)
+            table_names = [
+                "files_artists",
+                "files_albums",
+                "files_tracks",
+                "files_track_embeddings",
+                "files_reco_events",
+                "files_reco_sessions",
+            ]
+            cur.execute(
+                """
+                SELECT c.relname,
+                       GREATEST(COALESCE(c.reltuples, 0), 0)::BIGINT AS est_rows,
+                       pg_total_relation_size(c.oid) AS total_bytes
+                FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname = 'public'
+                  AND c.relname = ANY(%s)
+                """,
+                (table_names,),
+            )
+            row_map = {}
+            size_map = {}
+            for relname, est_rows, total_bytes in cur.fetchall():
+                row_map[str(relname)] = _safe_int(est_rows, 0)
+                size_map[str(relname)] = _safe_int(total_bytes, 0)
+            out["table_estimated_rows"] = row_map
+            out["table_total_bytes"] = size_map
+    except Exception:
+        logging.debug("Failed reading PostgreSQL telemetry", exc_info=True)
+    finally:
+        conn.close()
+    return out
+
+
+def _collect_cache_control_metrics(force: bool = False) -> dict:
+    now = time.time()
+    ttl = max(2.0, float(PMDA_CACHE_TELEMETRY_TTL_SEC or 15.0))
+    with _CACHE_TELEMETRY_LOCK:
+        cached_payload = _CACHE_TELEMETRY_SNAPSHOT.get("payload")
+        cached_ts = float(_CACHE_TELEMETRY_SNAPSHOT.get("ts") or 0.0)
+        if not force and cached_payload is not None and (now - cached_ts) < ttl:
+            return dict(cached_payload)
+
+    with lock:
+        files_watcher_state = dict(state.get("files_watcher") or {})
+        scan_audio_hits = _safe_int(state.get("scan_audio_cache_hits"), 0)
+        scan_audio_misses = _safe_int(state.get("scan_audio_cache_misses"), 0)
+        scan_mb_hits = _safe_int(state.get("scan_mb_cache_hits"), 0)
+        scan_mb_misses = _safe_int(state.get("scan_mb_cache_misses"), 0)
+
+    payload = {
+        "generated_at": int(now),
+        "cache_policies": {
+            "scan_disable_cache": bool(SCAN_DISABLE_CACHE),
+            "mb_disable_cache": bool(MB_DISABLE_CACHE),
+        },
+        "runtime": {
+            "library_mode": _get_library_mode(),
+            "process_rss_bytes": _current_process_rss_bytes(),
+            "container_memory": _read_container_memory_stats(),
+        },
+        "redis": _read_redis_cache_metrics(),
+        "postgres": _read_pg_cache_metrics(),
+        "sqlite_cache_db": _read_sqlite_cache_metrics(),
+        "sqlite_state_db": _read_state_cache_metrics(),
+        "media_cache": _read_media_cache_usage(),
+        "scan_cache_counters_live": {
+            "audio_hits": scan_audio_hits,
+            "audio_misses": scan_audio_misses,
+            "mb_hits": scan_mb_hits,
+            "mb_misses": scan_mb_misses,
+        },
+        "files_watcher": {
+            "running": bool(files_watcher_state.get("running")),
+            "roots": list(files_watcher_state.get("roots") or []),
+            "dirty_count": _safe_int(files_watcher_state.get("dirty_count"), 0),
+            "last_event_at": files_watcher_state.get("last_event_at"),
+            "last_event_path": files_watcher_state.get("last_event_path"),
+        },
+    }
+
+    with _CACHE_TELEMETRY_LOCK:
+        _CACHE_TELEMETRY_SNAPSHOT["ts"] = now
+        _CACHE_TELEMETRY_SNAPSHOT["payload"] = dict(payload)
+    return payload
 
 
 def _normalize_identity_provider(value: str | None) -> str:
@@ -18758,6 +19189,13 @@ def api_logs_tail():
         path=str(log_path),
         lines=_tail_log_lines(log_path, lines=lines),
     )
+
+
+@app.get("/api/statistics/cache-control")
+def api_statistics_cache_control():
+    """Return cache/runtime telemetry for the Statistics Cache Control Center."""
+    force = _parse_bool(request.args.get("force", "false"))
+    return jsonify(_collect_cache_control_metrics(force=force))
 
 
 @app.get("/api/scan-history")

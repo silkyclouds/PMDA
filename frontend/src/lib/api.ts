@@ -146,6 +146,108 @@ export interface ScanProgress {
   scan_start_time?: number | null;
 }
 
+export interface CacheControlMetrics {
+  generated_at: number;
+  cache_policies: {
+    scan_disable_cache: boolean;
+    mb_disable_cache: boolean;
+  };
+  runtime: {
+    library_mode: string;
+    process_rss_bytes: number;
+    container_memory: {
+      current_bytes: number;
+      limit_bytes: number;
+      used_pct?: number | null;
+    };
+  };
+  redis: {
+    available: boolean;
+    host: string;
+    port: number;
+    db: number;
+    db_keys: number;
+    pmda_prefix_keys: number;
+    pmda_prefix_scan_truncated: boolean;
+    used_memory_bytes: number;
+    used_memory_peak_bytes: number;
+    maxmemory_bytes: number;
+    evicted_keys: number;
+    keyspace_hits: number;
+    keyspace_misses: number;
+    keyspace_hit_rate_pct?: number | null;
+  };
+  postgres: {
+    available: boolean;
+    db_size_bytes: number;
+    db_cache_hit_rate_pct?: number | null;
+    numbackends: number;
+    table_estimated_rows: Record<string, number>;
+    table_total_bytes: Record<string, number>;
+  };
+  sqlite_cache_db: {
+    db_path: string;
+    db_bytes: number;
+    wal_bytes: number;
+    shm_bytes: number;
+    audio_cache_rows: number;
+    musicbrainz_cache_rows: number;
+    musicbrainz_album_lookup_rows: number;
+    musicbrainz_album_lookup_not_found_rows: number;
+  };
+  sqlite_state_db: {
+    db_path: string;
+    db_bytes: number;
+    wal_bytes: number;
+    shm_bytes: number;
+    files_album_scan_cache_rows: number;
+    files_album_scan_cache_healthy_rows: number;
+    files_pending_changes_rows: number;
+    files_library_published_rows: number;
+    scan_resume_pending_artists_rows: number;
+  };
+  media_cache: {
+    root: string;
+    total: {
+      exists: boolean;
+      bytes_total: number;
+      file_count: number;
+      dir_count: number;
+      walk_truncated: boolean;
+      walk_errors: number;
+    };
+    album: {
+      exists: boolean;
+      bytes_total: number;
+      file_count: number;
+      dir_count: number;
+      walk_truncated: boolean;
+      walk_errors: number;
+    };
+    artist: {
+      exists: boolean;
+      bytes_total: number;
+      file_count: number;
+      dir_count: number;
+      walk_truncated: boolean;
+      walk_errors: number;
+    };
+  };
+  scan_cache_counters_live: {
+    audio_hits: number;
+    audio_misses: number;
+    mb_hits: number;
+    mb_misses: number;
+  };
+  files_watcher: {
+    running: boolean;
+    roots: string[];
+    dirty_count: number;
+    last_event_at?: number | null;
+    last_event_path?: string | null;
+  };
+}
+
 export interface LogTailResponse {
   path: string;
   lines: string[];
@@ -697,6 +799,10 @@ export async function getDuplicateDetails(artist: string, albumId: string): Prom
 // Scan
 export async function getScanProgress(): Promise<ScanProgress> {
   return fetchApi<ScanProgress>('/api/progress');
+}
+
+export async function getCacheControlMetrics(force: boolean = false): Promise<CacheControlMetrics> {
+  return fetchApi<CacheControlMetrics>(`/api/statistics/cache-control${force ? '?force=true' : ''}`);
 }
 
 export async function getScanLogsTail(lines: number = 180): Promise<LogTailResponse> {
