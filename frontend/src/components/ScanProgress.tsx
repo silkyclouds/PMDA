@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useMemo } from 'react';
 import { Link } from 'react-router-dom';
-import { Play, Pause, Square, RefreshCw, Loader2, ChevronDown, ChevronUp, Sparkles, Database, Music, Cpu, Zap, AlertTriangle, Image, Tag, Package, Trash2, Clock, FolderInput } from 'lucide-react';
+import { Play, Pause, Square, RefreshCw, Loader2, ChevronDown, ChevronUp, Sparkles, Database, Music, Cpu, Zap, AlertTriangle, Image, Tag, Package, Trash2, Clock, FolderInput, Terminal } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
@@ -14,6 +14,7 @@ import {
   improveAll,
   getDedupeProgress,
   getImproveAllProgress,
+  getScanLogsTail,
   addIncompleteAlbumsToLidarr,
   getLidarrAddIncompleteProgress,
 } from '@/lib/api';
@@ -31,13 +32,13 @@ function formatETA(seconds: number | undefined): string {
   return parts.join(' ');
 }
 
-export type ScanType = 'full' | 'incomplete_only';
+export type ScanType = 'full' | 'changed_only' | 'incomplete_only';
 
 interface ScanProgressProps {
   progress: ScanProgressType;
   /** Real-time duplicate count from useDuplicates - used to determine card visibility */
   currentDuplicateCount?: number;
-  /** Called when user starts a scan. Options: scan_type (full | incomplete_only), run_improve_after (only for full). */
+  /** Called when user starts a scan. Options: scan_type (full | changed_only | incomplete_only), run_improve_after (except incomplete_only). */
   onStart: (options?: { scan_type?: ScanType; run_improve_after?: boolean }) => void;
   onPause: () => void;
   onResume: () => void;
@@ -49,9 +50,9 @@ interface ScanProgressProps {
   isStopping?: boolean;
   isClearing?: boolean;
   className?: string;
-  /** Scan type: full (default) or incomplete_only */
+  /** Scan type: full (default), changed_only, or incomplete_only */
   scanType?: ScanType;
-  /** After full scan: automatically run improve-all (tags + covers). Only used when scanType is full. */
+  /** After scan: automatically run improve-all (tags + covers). Not used for incomplete_only. */
   runImproveAfter?: boolean;
   /** Callbacks to update scan options from the component (optional; if not provided, options are internal state) */
   onScanTypeChange?: (t: ScanType) => void;
@@ -84,6 +85,9 @@ export function ScanProgress({
   const [preflightVerifiedAtStart, setPreflightVerifiedAtStart] = useState(false);
   const [preflightPaths, setPreflightPaths] = useState<{ music_rw: boolean; dupes_rw: boolean } | null>(null);
   const [waitingForProgress, setWaitingForProgress] = useState(false);
+  const [liveLogLines, setLiveLogLines] = useState<string[]>([]);
+  const [liveLogPath, setLiveLogPath] = useState('');
+  const [showRawLogs, setShowRawLogs] = useState(false);
   const hasToastedAiErrors = useRef(false);
   const [scanTypeInternal, setScanTypeInternal] = useState<ScanType>('full');
   const [runImproveAfterInternal, setRunImproveAfterInternal] = useState(false);
@@ -149,10 +153,15 @@ export function ScanProgress({
     scan_ai_current_label = null,
     total_albums = 0,
     scan_steps_log = [],
+    post_processing = false,
+    post_processing_done = 0,
+    post_processing_total = 0,
+    post_processing_current_artist = null,
+    post_processing_current_album = null,
   } = safeProgress;
 
-  // Stage badge: use backend phase (format_analysis | identification_tags | ia_analysis | finalizing | moving_dupes)
-  const effectiveStage = phase ?? (finalizing ? 'finalizing' : (deduping ? 'moving_dupes' : 'format_analysis'));
+  // Stage badge: use backend phase (format_analysis | identification_tags | ia_analysis | finalizing | moving_dupes | post_processing)
+  const effectiveStage = phase ?? (post_processing ? 'post_processing' : (finalizing ? 'finalizing' : (deduping ? 'moving_dupes' : 'format_analysis')));
   // Option A: bar and percentage based on artists when scanning; step-based when not
   const displayProgress = scanning && artists_total > 0 ? artists_processed : current;
   const displayTotal = scanning && artists_total > 0 ? artists_total : total;
@@ -202,6 +211,29 @@ export function ScanProgress({
     return () => clearInterval(id);
   }, [scanning]);
 
+  // Power-user live backend logs while scan/post-processing is active.
+  useEffect(() => {
+    if (!scanning && !post_processing) return;
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        const data = await getScanLogsTail(220);
+        if (!cancelled) {
+          setLiveLogLines(Array.isArray(data?.lines) ? data.lines : []);
+          setLiveLogPath(data?.path ?? '');
+        }
+      } catch {
+        // ignore transient log polling errors
+      }
+    };
+    tick();
+    const id = setInterval(tick, 2000);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [scanning, post_processing]);
+
   const hasActiveStep = scanning && active_artists.length > 0 && active_artists[0]?.current_album && active_artists[0].current_album.status !== 'done';
   const improveAllRunning = improveAllProgressData?.running ?? false;
   const lidarrAddRunning = lidarrAddProgressData?.running ?? false;
@@ -211,6 +243,7 @@ export function ScanProgress({
   const hasDuplicates = actualDuplicateCount > 0;
   const canDedupe = hasDuplicates && (last_scan_summary?.dupes_moved_this_scan ?? 0) < actualDuplicateCount;
   const dupesAlreadyAllMoved = (last_scan_summary?.duplicate_groups_count ?? 0) > 0 && (last_scan_summary?.dupes_moved_this_scan ?? 0) >= (last_scan_summary?.duplicate_groups_count ?? 0);
+  const showPostProcessingStep = post_processing || (post_processing_total ?? 0) > 0;
   const currentStepLabel = hasActiveStep
     ? (active_artists[0].current_album!.status_details || active_artists[0].current_album!.status || 'processing')
     : '';
@@ -707,17 +740,18 @@ export function ScanProgress({
                   disabled={scanning}
                 >
                   <option value="full">Full scan (duplicates + incomplete)</option>
+                  <option value="changed_only">Changed only (new/modified albums)</option>
                   <option value="incomplete_only">Incomplete albums only</option>
                 </select>
               </div>
-              {scanType === 'full' && (
+              {scanType !== 'incomplete_only' && (
                 <label className="flex items-center gap-2 text-sm cursor-pointer">
                   <Checkbox
                     checked={runImproveAfter}
                     onCheckedChange={(v) => setRunImproveAfter(v === true)}
                     disabled={scanning}
                   />
-                  <span className="text-muted-foreground">After scan: correct tags and covers</span>
+                <span className="text-muted-foreground">After scan: correct tags and covers</span>
                 </label>
               )}
             </div>
@@ -727,6 +761,8 @@ export function ScanProgress({
               <p className="text-sm text-muted-foreground mt-1">
                 {scanType === 'incomplete_only'
                   ? 'Scan only for incomplete albums (missing tracks). Results appear in Incomplete albums.'
+                  : scanType === 'changed_only'
+                    ? 'Scan only new/modified albums. Unchanged and already-complete albums are skipped.'
                   : 'One scan analyzes duplicates, metadata, and tags. Results appear in Unduper, Library, and Tag Fixer.'}
               </p>
             </div>
@@ -813,7 +849,7 @@ export function ScanProgress({
                     </div>
                   )}
                   {!preflightResult.musicbrainz.ok && preflightResult.ai.ok && (
-                    <Button size="sm" variant="secondary" className="w-full mt-1" onClick={() => { setPreflightVerifiedAtStart(false); onStart({ scan_type: scanType, run_improve_after: scanType === 'full' ? runImproveAfter : false }); setPreflightResult(null); }} disabled={isStarting}>
+                    <Button size="sm" variant="secondary" className="w-full mt-1" onClick={() => { setPreflightVerifiedAtStart(false); onStart({ scan_type: scanType, run_improve_after: scanType !== 'incomplete_only' ? runImproveAfter : false }); setPreflightResult(null); }} disabled={isStarting}>
                       {isStarting ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
                       Start scan anyway
                     </Button>
@@ -826,7 +862,7 @@ export function ScanProgress({
                 className="gap-2"
                 onClick={async () => {
                   if (preflightLoading || isStarting) return;
-                  const startOptions = { scan_type: scanType, run_improve_after: scanType === 'full' ? runImproveAfter : false };
+                  const startOptions = { scan_type: scanType, run_improve_after: scanType !== 'incomplete_only' ? runImproveAfter : false };
                   if (scanType === 'incomplete_only') {
                     setWaitingForProgress(true);
                     onStart(startOptions);
@@ -955,7 +991,7 @@ export function ScanProgress({
             </div>
 
             {/* ─── Phase stepper (compact): highlight stage from backend phase ─── */}
-            {(phase || auto_move_enabled) && (
+            {(phase || auto_move_enabled || showPostProcessingStep) && (
               <div className="flex flex-wrap items-center gap-2 text-xs">
                 <span className={cn(
                   "flex items-center gap-1.5 px-2.5 py-1 rounded-full font-medium",
@@ -1005,11 +1041,28 @@ export function ScanProgress({
                     </span>
                   </>
                 )}
+                {showPostProcessingStep && (
+                  <>
+                    <span className="text-muted-foreground/60">→</span>
+                    <span className={cn(
+                      "flex items-center gap-1.5 px-2.5 py-1 rounded-full font-medium",
+                      effectiveStage === 'post_processing' ? "bg-primary/15 text-primary ring-1 ring-primary/30" : "bg-muted/60 text-muted-foreground"
+                    )}>
+                      {effectiveStage === 'post_processing' && <Loader2 className="w-3 h-3 animate-spin shrink-0" />}
+                      {auto_move_enabled ? '6. Post-processing' : '5. Post-processing'}
+                      {post_processing_total > 0 && (
+                        <span className="tabular-nums">
+                          ({post_processing_done}/{post_processing_total})
+                        </span>
+                      )}
+                    </span>
+                  </>
+                )}
               </div>
             )}
 
-            {/* ─── Current step (visible when running, finalizing, or moving dupes) ─────────── */}
-            {(hasActiveStep || finalizing || deduping || (effectiveStage === 'ia_analysis' && scanning)) && (
+            {/* ─── Current step (visible when running, finalizing, moving dupes, or post-processing) ─────────── */}
+            {(hasActiveStep || finalizing || deduping || post_processing || (effectiveStage === 'ia_analysis' && scanning)) && (
               <div className="flex items-center gap-2 px-3 py-2.5 rounded-lg border-l-4 border-primary/80 bg-primary/5">
                 {finalizing ? (
                   <>
@@ -1029,6 +1082,23 @@ export function ScanProgress({
                       <div className="text-sm font-medium text-foreground">
                         Moving dupes… {dedupe_total > 0 ? `(${dedupe_progress}/${dedupe_total})` : ''}
                       </div>
+                    </div>
+                  </>
+                ) : post_processing ? (
+                  <>
+                    <Loader2 className="w-4 h-4 text-primary shrink-0 mt-0.5 animate-spin" />
+                    <div className="min-w-0 flex-1 space-y-1.5">
+                      <span className="text-xs font-medium text-muted-foreground uppercase tracking-wide">Now</span>
+                      <div className="text-sm font-medium text-foreground truncate">
+                        {post_processing_current_artist && post_processing_current_album
+                          ? `Fixing: ${post_processing_current_artist} — ${post_processing_current_album}`
+                          : 'Fixing metadata / covers…'}
+                      </div>
+                      {post_processing_total > 0 && (
+                        <div className="text-xs text-muted-foreground tabular-nums">
+                          {post_processing_done}/{post_processing_total} album(s)
+                        </div>
+                      )}
                     </div>
                   </>
                 ) : effectiveStage === 'ia_analysis' && scanning ? (
@@ -1091,6 +1161,49 @@ export function ScanProgress({
                     ))}
                   </ul>
                 </div>
+              </div>
+            )}
+
+            {/* ─── Live backend logs (power users) ───────────────────────────── */}
+            {(scanning || post_processing) && (
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-semibold text-muted-foreground uppercase tracking-wide flex items-center gap-1.5">
+                    <Terminal className="w-3.5 h-3.5" />
+                    Live backend log
+                  </span>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    className="h-6 px-2 text-[11px]"
+                    onClick={() => setShowRawLogs((v) => !v)}
+                  >
+                    {showRawLogs ? 'Hide' : 'Show'}
+                  </Button>
+                </div>
+                {showRawLogs && (
+                  <div className="rounded-lg border border-border bg-black/90 text-[11px] font-mono max-h-56 overflow-y-auto">
+                    {liveLogPath && (
+                      <div className="px-3 py-1.5 text-[10px] text-emerald-400/80 border-b border-white/10 truncate" title={liveLogPath}>
+                        {liveLogPath}
+                      </div>
+                    )}
+                    <div className="px-3 py-2 space-y-0.5">
+                      {(liveLogLines.length > 0 ? liveLogLines.slice(-180) : ['(no logs yet)']).map((line, idx) => (
+                        <div
+                          key={`${idx}-${line.slice(0, 12)}`}
+                          className={cn(
+                            "whitespace-pre-wrap break-words",
+                            /\bERROR\b/.test(line) ? "text-red-300" : /\bWARNING\b/.test(line) ? "text-amber-200" : "text-zinc-200"
+                          )}
+                        >
+                          {line}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
               </div>
             )}
 

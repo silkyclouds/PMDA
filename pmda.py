@@ -2967,6 +2967,60 @@ def init_state_db():
             FOREIGN KEY (scan_id) REFERENCES scan_history(scan_id)
         )
     """)
+    # Persistent resume state for interrupted scans (artist-level status machine).
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS scan_resume_runs (
+            run_id TEXT PRIMARY KEY,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            mode TEXT NOT NULL,
+            scan_type TEXT NOT NULL,
+            source_signature TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'running',
+            scan_id INTEGER
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS scan_resume_artists (
+            run_id TEXT NOT NULL,
+            artist_name TEXT NOT NULL,
+            artist_signature TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            album_count INTEGER NOT NULL DEFAULT 0,
+            updated_at REAL NOT NULL,
+            error TEXT,
+            PRIMARY KEY (run_id, artist_name),
+            FOREIGN KEY (run_id) REFERENCES scan_resume_runs(run_id) ON DELETE CASCADE
+        )
+    """)
+    # Fast incremental cache (folder fingerprint + quality flags) used by changed-only scans.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS files_album_scan_cache (
+            folder_path TEXT PRIMARY KEY,
+            fingerprint TEXT NOT NULL,
+            artist_name TEXT,
+            album_title TEXT,
+            has_cover INTEGER NOT NULL DEFAULT 0,
+            has_artist_image INTEGER NOT NULL DEFAULT 0,
+            has_complete_tags INTEGER NOT NULL DEFAULT 0,
+            has_mbid INTEGER NOT NULL DEFAULT 0,
+            musicbrainz_id TEXT,
+            missing_required_tags TEXT NOT NULL DEFAULT '[]',
+            last_scan_id INTEGER,
+            updated_at REAL NOT NULL
+        )
+    """)
+    # Backward-compatible schema evolution for files_album_scan_cache.
+    cur.execute("PRAGMA table_info(files_album_scan_cache)")
+    files_cache_cols = {r[1] for r in cur.fetchall()}
+    if "musicbrainz_id" not in files_cache_cols:
+        cur.execute("ALTER TABLE files_album_scan_cache ADD COLUMN musicbrainz_id TEXT")
+    try:
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_scan_resume_runs_source ON scan_resume_runs(source_signature, updated_at DESC)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_scan_resume_artists_run_status ON scan_resume_artists(run_id, status)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_files_album_scan_cache_updated ON files_album_scan_cache(updated_at DESC)")
+    except sqlite3.OperationalError:
+        pass
     con.commit()
     con.close()
 
@@ -5535,6 +5589,8 @@ def set_cached_mb_album_lookup(artist_norm: str, album_norm: str, mbid: str | No
 # ───────────────────────────────── STATE IN MEMORY ──────────────────────────────────
 state = {
     "scanning": False,
+    "scan_type": "full",
+    "scan_resume_run_id": None,
     "scan_progress": 0,
     "scan_total": 0,
     "deduping": False,
@@ -5566,6 +5622,11 @@ state = {
     "scan_step_total": 0,            # Total steps for progress bar (3*albums + 2 or +3 if move)
     "scan_step_progress": 0,         # Steps completed (format + MB + compare + AI + finalize + move)
     "scan_active_artists": {},       # Dict {artist_name: {"start_time": float, "total_albums": int, "albums_processed": int}}
+    "scan_post_processing": False,   # True while post-scan/post-artist metadata fixing is running
+    "scan_post_total": 0,            # Total albums scheduled for post-processing
+    "scan_post_done": 0,             # Albums processed in post-processing
+    "scan_post_current_artist": None,
+    "scan_post_current_album": None,
     "improve_all": None,              # { "running": bool, "artist_id": int, "current": int, "total": int, "log": [], "result": {}, "error": str } or None
     "last_fix_all_by_provider": None, # { "musicbrainz": {identified,covers,tags}, "discogs": ..., "lastfm": ..., "bandcamp": ... } from last global fix-all run
     "last_fix_all_total_albums": 0,   # Total albums processed in that run (for N/M match display)
@@ -8426,6 +8487,14 @@ def scan_artist_duplicates(args):
                     "title_source": "tag:album",
                     "plex_title": title_raw,
                     "audio_cache_hit": audio_cache_hit,
+                    "ordered_paths": fe.get("ordered_paths") or [],
+                    "fingerprint": fe.get("fingerprint"),
+                    "skip_heavy_processing": bool(fe.get("skip_heavy_processing")),
+                    "has_cover": bool(fe.get("has_cover")),
+                    "has_artist_image": bool(fe.get("has_artist_image")),
+                    "missing_required_tags": list(fe.get("missing_required_tags") or []),
+                    "has_mbid": bool(fe.get("has_mbid")),
+                    "musicbrainz_id": (fe.get("musicbrainz_id") or "").strip(),
                 })
             prebuilt_editions = editions_for_artist
         else:
@@ -8736,6 +8805,22 @@ def scan_duplicates(
                         "step_summary": "Looking up release group from tags…",
                         "step_response": "",
                     }
+            if e.get("skip_heavy_processing"):
+                mbid_quick = (e.get("musicbrainz_id") or _extract_musicbrainz_id_from_meta(e.get("meta") or {}) or "").strip()
+                if mbid_quick:
+                    e["musicbrainz_id"] = mbid_quick
+                    e["musicbrainz_type"] = "release-group"
+                e["rg_info_source"] = "incremental_skip"
+                e["is_broken"] = False
+                with lock:
+                    if artist in state.get("scan_active_artists", {}) and e["album_id"] == state["scan_active_artists"][artist].get("current_album", {}).get("album_id"):
+                        state["scan_active_artists"][artist]["current_album"]["status"] = "searching_mb"
+                        state["scan_active_artists"][artist]["current_album"]["status_details"] = "unchanged and complete (fast-skip)"
+                        state["scan_active_artists"][artist]["current_album"]["step_summary"] = "Skipped heavy MB/provider lookup"
+                        state["scan_active_artists"][artist]["current_album"]["step_response"] = "Incremental fast-skip: unchanged album already complete."
+                    state["scan_mb_done_count"] = state.get("scan_mb_done_count", 0) + 1
+                    state["scan_step_progress"] = state.get("scan_step_progress", 0) + 1
+                continue
             skip_live_mb = getattr(sys.modules[__name__], "SKIP_MB_FOR_LIVE_ALBUMS", True) and _is_likely_live_album(
                 e.get("folder"), e.get("title_raw") or e.get("plex_title")
             )
@@ -9207,13 +9292,15 @@ def scan_duplicates(
         # --- MusicBrainz enrichment summary ---
         direct = sum(1 for e in editions if 'rg_info' in e and e.get('rg_info_source') in id_tags)
         fallback = sum(1 for e in editions if 'rg_info' in e and e.get('rg_info_source') == 'fallback')
+        incremental_skipped = sum(1 for e in editions if e.get("rg_info_source") == "incremental_skip")
         missing = sum(1 for e in editions if 'rg_info' not in e)
         log_mb(
-            "[Artist %s] enrichment summary: direct=%d, fallback=%d, missing=%d "
+            "[Artist %s] enrichment summary: direct=%d, fallback=%d, fast-skip=%d, missing=%d "
             "(elapsed %.2fs)",
             artist,
             direct,
             fallback,
+            incremental_skipped,
             missing,
             mb_lookup_time,
         )
@@ -9850,6 +9937,11 @@ def scan_duplicates(
     con.close()
     
     # Collect detailed statistics
+    mb_used_count = sum(
+        1
+        for e in all_editions_for_stats
+        if e.get("musicbrainz_id") or (isinstance(e.get("rg_info"), dict) and e["rg_info"].get("id"))
+    )
     duplicate_groups_count = len(out)
     total_duplicates_count = sum(len(g.get("losers", [])) for g in out)
     broken_albums_count = sum(1 for e in editions if e.get('is_broken', False))
@@ -10452,7 +10544,447 @@ def _get_library_mode() -> str:
     return mode
 
 
-def _build_files_editions() -> tuple[list[tuple[int, str, list[int]]], int, dict]:
+def _extract_musicbrainz_id_from_meta(meta: dict | None) -> str:
+    """Return normalized MBID-like string from tag/meta dict (empty string when absent)."""
+    m = meta or {}
+    for key in (
+        "musicbrainz_releasegroupid",
+        "musicbrainz_release_group_id",
+        "musicbrainz_releaseid",
+        "musicbrainz_release_id",
+        "musicbrainz_id",
+        "musicbrainz_albumid",
+    ):
+        v = m.get(key)
+        if v is None:
+            continue
+        s = str(v).strip()
+        if s:
+            return s
+    return ""
+
+
+def _album_folder_cache_key(folder: Path | str) -> str:
+    """Stable key used by files_album_scan_cache for one album folder."""
+    p = Path(folder)
+    try:
+        return str(p.resolve())
+    except (OSError, RuntimeError):
+        return str(p)
+
+
+def _compute_album_fingerprint(paths: list[Path]) -> str:
+    """
+    Lightweight album fingerprint from path/name/size/mtime.
+    Used by changed-only scans and fast incremental skip.
+    """
+    h = hashlib.blake2b(digest_size=20)
+    for p in sorted(paths, key=lambda x: str(x)):
+        try:
+            st = p.stat()
+            h.update(str(p.name).encode("utf-8", "replace"))
+            h.update(b"|")
+            h.update(str(int(st.st_size)).encode("ascii"))
+            h.update(b"|")
+            h.update(str(int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)))).encode("ascii"))
+            h.update(b"\n")
+        except OSError:
+            h.update(str(p).encode("utf-8", "replace"))
+            h.update(b"|missing\n")
+    return h.hexdigest()
+
+
+def _load_files_album_scan_cache_map() -> dict[str, dict]:
+    """Load files album cache rows keyed by folder path."""
+    out: dict[str, dict] = {}
+    try:
+        con = sqlite3.connect(str(STATE_DB_FILE), timeout=20)
+        cur = con.cursor()
+        cur.execute("PRAGMA table_info(files_album_scan_cache)")
+        cols = {r[1] for r in cur.fetchall()}
+        has_mbid_col = "musicbrainz_id" in cols
+        if has_mbid_col:
+            cur.execute(
+                """
+                SELECT folder_path, fingerprint, has_cover, has_artist_image,
+                       has_complete_tags, has_mbid, musicbrainz_id, missing_required_tags,
+                       updated_at, artist_name, album_title
+                FROM files_album_scan_cache
+                """
+            )
+        else:
+            cur.execute(
+                """
+                SELECT folder_path, fingerprint, has_cover, has_artist_image,
+                       has_complete_tags, has_mbid, '' as musicbrainz_id, missing_required_tags,
+                       updated_at, artist_name, album_title
+                FROM files_album_scan_cache
+                """
+            )
+        for row in cur.fetchall():
+            folder_path = row[0] or ""
+            if not folder_path:
+                continue
+            try:
+                missing_required = json.loads(row[7] or "[]")
+                if not isinstance(missing_required, list):
+                    missing_required = []
+            except Exception:
+                missing_required = []
+            out[folder_path] = {
+                "fingerprint": row[1] or "",
+                "has_cover": bool(row[2]),
+                "has_artist_image": bool(row[3]),
+                "has_complete_tags": bool(row[4]),
+                "has_mbid": bool(row[5]),
+                "musicbrainz_id": (row[6] or "").strip(),
+                "missing_required_tags": missing_required,
+                "updated_at": float(row[8] or 0),
+                "artist_name": row[9] or "",
+                "album_title": row[10] or "",
+            }
+        con.close()
+    except Exception:
+        logging.debug("Failed to load files album scan cache", exc_info=True)
+    return out
+
+
+def _upsert_files_album_scan_cache_rows(rows: list[dict]) -> None:
+    """Upsert rows into files_album_scan_cache."""
+    if not rows:
+        return
+    try:
+        con = sqlite3.connect(str(STATE_DB_FILE), timeout=30)
+        cur = con.cursor()
+        cur.executemany(
+            """
+            INSERT INTO files_album_scan_cache
+            (folder_path, fingerprint, artist_name, album_title,
+             has_cover, has_artist_image, has_complete_tags, has_mbid, musicbrainz_id,
+             missing_required_tags, last_scan_id, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(folder_path) DO UPDATE SET
+              fingerprint=excluded.fingerprint,
+              artist_name=excluded.artist_name,
+              album_title=excluded.album_title,
+              has_cover=excluded.has_cover,
+              has_artist_image=excluded.has_artist_image,
+              has_complete_tags=excluded.has_complete_tags,
+              has_mbid=excluded.has_mbid,
+              musicbrainz_id=excluded.musicbrainz_id,
+              missing_required_tags=excluded.missing_required_tags,
+              last_scan_id=excluded.last_scan_id,
+              updated_at=excluded.updated_at
+            """,
+            [
+                (
+                    r.get("folder_path") or "",
+                    r.get("fingerprint") or "",
+                    r.get("artist_name") or "",
+                    r.get("album_title") or "",
+                    1 if r.get("has_cover") else 0,
+                    1 if r.get("has_artist_image") else 0,
+                    1 if r.get("has_complete_tags") else 0,
+                    1 if r.get("has_mbid") else 0,
+                    r.get("musicbrainz_id") or "",
+                    json.dumps(r.get("missing_required_tags") or []),
+                    r.get("last_scan_id"),
+                    float(r.get("updated_at") or time.time()),
+                )
+                for r in rows
+                if (r.get("folder_path") or "").strip()
+            ],
+        )
+        con.commit()
+        con.close()
+    except Exception:
+        logging.debug("Failed to upsert files album scan cache rows", exc_info=True)
+
+
+def _refresh_files_album_scan_cache_from_editions(editions: list[dict], scan_id: int | None = None) -> None:
+    """
+    Refresh incremental files cache from a set of scanned editions.
+    Called after each artist to keep changed-only scans accurate.
+    """
+    if not editions:
+        return
+    rows: list[dict] = []
+    now = time.time()
+    for e in editions:
+        folder_raw = e.get("folder")
+        if not folder_raw:
+            continue
+        folder = path_for_fs_access(Path(folder_raw))
+        if not folder or not folder.exists():
+            continue
+        folder_key = _album_folder_cache_key(folder)
+        ordered_paths = [Path(p) for p in (e.get("ordered_paths") or []) if Path(p).exists()]
+        if not ordered_paths:
+            try:
+                ordered_paths = sorted(
+                    [p for p in folder.rglob("*") if p.is_file() and AUDIO_RE.search(p.name)],
+                    key=lambda x: str(x),
+                )
+            except Exception:
+                ordered_paths = []
+        fingerprint = (e.get("fingerprint") or "").strip() or _compute_album_fingerprint(ordered_paths)
+        tags = dict(e.get("meta") or {})
+        if not tags and ordered_paths:
+            try:
+                tags = extract_tags(ordered_paths[0]) or {}
+            except Exception:
+                tags = {}
+        missing_required = _check_required_tags(tags, REQUIRED_TAGS, edition=e)
+        has_cover = album_folder_has_cover(folder)
+        has_artist_image = _artist_folder_has_image(folder.parent if folder.parent else folder)
+        mbid = (e.get("musicbrainz_id") or _extract_musicbrainz_id_from_meta(tags) or "").strip()
+        rows.append(
+            {
+                "folder_path": folder_key,
+                "fingerprint": fingerprint,
+                "artist_name": e.get("artist") or e.get("artist_name") or "",
+                "album_title": e.get("title_raw") or e.get("album_title") or folder.name,
+                "has_cover": has_cover,
+                "has_artist_image": has_artist_image,
+                "has_complete_tags": len(missing_required) == 0,
+                "has_mbid": bool(mbid),
+                "musicbrainz_id": mbid,
+                "missing_required_tags": missing_required,
+                "last_scan_id": scan_id,
+                "updated_at": now,
+            }
+        )
+    _upsert_files_album_scan_cache_rows(rows)
+
+
+def _compute_scan_source_signature(mode: str, scan_type: str) -> str:
+    """Build a stable signature describing the scan source and scope."""
+    if mode == "files":
+        roots = []
+        for r in (FILES_ROOTS or []):
+            if not r:
+                continue
+            try:
+                roots.append(str(Path(r).resolve()))
+            except (OSError, RuntimeError):
+                roots.append(str(r))
+        skips = []
+        for s in (SKIP_FOLDERS or []):
+            if not s:
+                continue
+            try:
+                skips.append(str(Path(s).resolve()))
+            except (OSError, RuntimeError):
+                skips.append(str(s))
+        payload = {
+            "mode": "files",
+            "scan_type": scan_type,
+            "roots": sorted(roots),
+            "skip_folders": sorted(skips),
+        }
+    else:
+        payload = {
+            "mode": "plex",
+            "scan_type": scan_type,
+            "section_ids": sorted(int(x) for x in (SECTION_IDS or [])),
+            "path_map": sorted((k, str(v)) for k, v in (PATH_MAP or {}).items()),
+        }
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _compute_artist_signature(
+    mode: str,
+    artist_name: str,
+    album_ids: list[int],
+    files_editions_by_album_id: dict[int, dict] | None = None,
+) -> str:
+    """Compute artist signature so resume can detect new/changed albums."""
+    parts: list[str] = []
+    if mode == "files":
+        files_map = files_editions_by_album_id or {}
+        for aid in sorted(album_ids):
+            fe = files_map.get(aid) or {}
+            folder = fe.get("folder")
+            folder_key = _album_folder_cache_key(folder) if folder else str(aid)
+            fp = (fe.get("fingerprint") or "").strip()
+            parts.append(f"{folder_key}|{fp}")
+    else:
+        parts = [str(int(a)) for a in sorted(album_ids)]
+    payload = {
+        "artist": (artist_name or "").strip().lower(),
+        "album_count": len(album_ids),
+        "parts": parts,
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _prepare_resume_scan_artists(
+    mode: str,
+    scan_type: str,
+    artists_merged: list[tuple[int, str, list[int]]],
+    files_editions_by_album_id: dict[int, dict] | None = None,
+) -> tuple[str, list[tuple[int, str, list[int]]], int, int]:
+    """
+    Create/reuse a persistent resume run and return artists that still need processing.
+    Returns: (run_id, artists_to_scan, skipped_artists, skipped_albums).
+    """
+    now = time.time()
+    source_signature = _compute_scan_source_signature(mode, scan_type)
+    artist_signatures: dict[str, str] = {}
+    for _aid, artist_name, album_ids in artists_merged:
+        artist_signatures[artist_name] = _compute_artist_signature(
+            mode,
+            artist_name,
+            album_ids,
+            files_editions_by_album_id=files_editions_by_album_id,
+        )
+
+    run_id: str | None = None
+    artists_to_scan: list[tuple[int, str, list[int]]] = []
+    skipped_artists = 0
+    skipped_albums = 0
+
+    con = sqlite3.connect(str(STATE_DB_FILE), timeout=30)
+    cur = con.cursor()
+    cur.execute(
+        """
+        SELECT run_id, status
+        FROM scan_resume_runs
+        WHERE source_signature = ? AND mode = ? AND scan_type = ?
+        ORDER BY updated_at DESC
+        LIMIT 1
+        """,
+        (source_signature, mode, scan_type),
+    )
+    prev = cur.fetchone()
+    if prev and (prev[1] or "").strip().lower() != "completed":
+        run_id = prev[0]
+        cur.execute(
+            "SELECT artist_name, artist_signature, status FROM scan_resume_artists WHERE run_id = ?",
+            (run_id,),
+        )
+        prev_artists = {
+            (r[0] or ""): {
+                "artist_signature": (r[1] or ""),
+                "status": (r[2] or "pending").strip().lower(),
+            }
+            for r in cur.fetchall()
+        }
+        for artist_id, artist_name, album_ids in artists_merged:
+            sig = artist_signatures.get(artist_name, "")
+            prev_row = prev_artists.get(artist_name)
+            is_done_same_signature = bool(
+                prev_row
+                and prev_row.get("status") == "done"
+                and prev_row.get("artist_signature") == sig
+            )
+            if is_done_same_signature:
+                skipped_artists += 1
+                skipped_albums += len(album_ids)
+                continue
+            artists_to_scan.append((artist_id, artist_name, album_ids))
+            cur.execute(
+                """
+                INSERT INTO scan_resume_artists
+                (run_id, artist_name, artist_signature, status, album_count, updated_at, error)
+                VALUES (?, ?, ?, 'pending', ?, ?, NULL)
+                ON CONFLICT(run_id, artist_name) DO UPDATE SET
+                  artist_signature=excluded.artist_signature,
+                  status='pending',
+                  album_count=excluded.album_count,
+                  updated_at=excluded.updated_at,
+                  error=NULL
+                """,
+                (run_id, artist_name, sig, len(album_ids), now),
+            )
+        cur.execute(
+            "UPDATE scan_resume_runs SET updated_at = ?, status = 'running' WHERE run_id = ?",
+            (now, run_id),
+        )
+    else:
+        run_id = uuid.uuid4().hex
+        cur.execute(
+            """
+            INSERT INTO scan_resume_runs
+            (run_id, created_at, updated_at, mode, scan_type, source_signature, status, scan_id)
+            VALUES (?, ?, ?, ?, ?, ?, 'running', NULL)
+            """,
+            (run_id, now, now, mode, scan_type, source_signature),
+        )
+        artists_to_scan = list(artists_merged)
+        cur.executemany(
+            """
+            INSERT INTO scan_resume_artists
+            (run_id, artist_name, artist_signature, status, album_count, updated_at, error)
+            VALUES (?, ?, ?, 'pending', ?, ?, NULL)
+            """,
+            [
+                (
+                    run_id,
+                    artist_name,
+                    artist_signatures.get(artist_name, ""),
+                    len(album_ids),
+                    now,
+                )
+                for _artist_id, artist_name, album_ids in artists_merged
+            ],
+        )
+    con.commit()
+    con.close()
+    return run_id, artists_to_scan, skipped_artists, skipped_albums
+
+
+def _set_resume_artist_status(run_id: str | None, artist_name: str, status: str, error: str | None = None) -> None:
+    """Update one artist status for a resume run."""
+    if not run_id or not artist_name:
+        return
+    now = time.time()
+    try:
+        con = sqlite3.connect(str(STATE_DB_FILE), timeout=15)
+        cur = con.cursor()
+        cur.execute(
+            """
+            UPDATE scan_resume_artists
+            SET status = ?, updated_at = ?, error = ?
+            WHERE run_id = ? AND artist_name = ?
+            """,
+            ((status or "pending").strip().lower(), now, error, run_id, artist_name),
+        )
+        cur.execute(
+            "UPDATE scan_resume_runs SET updated_at = ? WHERE run_id = ?",
+            (now, run_id),
+        )
+        con.commit()
+        con.close()
+    except Exception:
+        logging.debug("Failed to update resume artist status for %s", artist_name, exc_info=True)
+
+
+def _set_resume_run_status(run_id: str | None, status: str, scan_id: int | None = None) -> None:
+    """Finalize resume run status."""
+    if not run_id:
+        return
+    now = time.time()
+    try:
+        con = sqlite3.connect(str(STATE_DB_FILE), timeout=15)
+        cur = con.cursor()
+        cur.execute(
+            """
+            UPDATE scan_resume_runs
+            SET status = ?, updated_at = ?, scan_id = COALESCE(?, scan_id)
+            WHERE run_id = ?
+            """,
+            ((status or "failed").strip().lower(), now, scan_id, run_id),
+        )
+        con.commit()
+        con.close()
+    except Exception:
+        logging.debug("Failed to finalize resume run %s", run_id, exc_info=True)
+
+
+def _build_files_editions(scan_type: str = "full") -> tuple[list[tuple[int, str, list[int]]], int, dict]:
     """
     Scan FILES_ROOTS, group audio files by parent folder (album candidate), infer
     artist/album/tracklist from tags, and return (artists_merged, total_albums, files_editions_by_album_id).
@@ -10460,11 +10992,16 @@ def _build_files_editions() -> tuple[list[tuple[int, str, list[int]]], int, dict
     """
     from collections import defaultdict
 
+    scan_type = (scan_type or "full").strip().lower()
+    if scan_type not in {"full", "changed_only", "incomplete_only"}:
+        scan_type = "full"
+
     roots = [Path(r) for r in (FILES_ROOTS or []) if r]
     if not roots:
         return [], 0, {}
 
     skip_list = list(SKIP_FOLDERS or [])
+    cache_map = _load_files_album_scan_cache_map()
     audio_files = _iter_audio_files_under_roots(FILES_ROOTS)
     by_folder: dict[Path, list[Path]] = defaultdict(list)
     for p in audio_files:
@@ -10473,6 +11010,8 @@ def _build_files_editions() -> tuple[list[tuple[int, str, list[int]]], int, dict
     files_editions_by_album_id: dict[int, dict] = {}
     artist_to_album_ids: dict[str, list[int]] = defaultdict(list)
     next_album_id = 1
+    skipped_unchanged_complete = 0
+    fast_skip_marked = 0
 
     for folder, paths in sorted(by_folder.items(), key=lambda x: str(x[0])):
         try:
@@ -10502,7 +11041,6 @@ def _build_files_editions() -> tuple[list[tuple[int, str, list[int]]], int, dict
         first_tags = tags_by_path.get(ordered_paths[0], {}) if ordered_paths else {}
         artist_name = _pick_album_artist_from_tag_dicts(tag_dicts, default="Unknown Artist")
         album_title_tag = _pick_album_title_from_tag_dicts(tag_dicts, fallback=folder.name.replace("_", " "))
-        year_tag = (first_tags.get("date") or first_tags.get("year") or "").strip()[:4] or ""
 
         tracks: list[Track] = []
         for i, p in enumerate(ordered_paths):
@@ -10528,6 +11066,36 @@ def _build_files_editions() -> tuple[list[tuple[int, str, list[int]]], int, dict
 
         normalize_parenthetical = bool(_parse_bool(_get_config_from_db("NORMALIZE_PARENTHETICAL_FOR_DEDUPE") or "true"))
         album_norm = norm_album_for_dedup(album_title_tag, normalize_parenthetical)
+        fingerprint = _compute_album_fingerprint(ordered_paths)
+        folder_key = _album_folder_cache_key(folder_resolved)
+        missing_required_now = _check_required_tags(first_tags, REQUIRED_TAGS, edition={"tracks": tracks})
+        has_cover_now = album_folder_has_cover(folder_resolved)
+        has_artist_image_now = _artist_folder_has_image(folder_resolved.parent if folder_resolved.parent else folder_resolved)
+        mbid_now = _extract_musicbrainz_id_from_meta(first_tags)
+        has_mbid_now = bool(mbid_now)
+
+        cached = cache_map.get(folder_key) or {}
+        cached_missing = cached.get("missing_required_tags") or []
+        cached_healthy = bool(
+            cached
+            and cached.get("has_cover")
+            and cached.get("has_artist_image")
+            and cached.get("has_complete_tags")
+            and cached.get("has_mbid")
+            and not cached_missing
+        )
+        unchanged = bool(cached and (cached.get("fingerprint") == fingerprint))
+        current_healthy = bool(
+            has_cover_now
+            and has_artist_image_now
+            and has_mbid_now
+            and not missing_required_now
+        )
+        fast_skip_heavy = unchanged and cached_healthy and current_healthy
+
+        if scan_type == "changed_only" and fast_skip_heavy:
+            skipped_unchanged_complete += 1
+            continue
 
         album_id = next_album_id
         next_album_id += 1
@@ -10543,16 +11111,28 @@ def _build_files_editions() -> tuple[list[tuple[int, str, list[int]]], int, dict
             "confidence_score": confidence,
             "file_count": len(ordered_paths),
             "ordered_paths": ordered_paths,
+            "fingerprint": fingerprint,
+            "folder_key": folder_key,
+            "missing_required_tags": missing_required_now,
+            "has_cover": has_cover_now,
+            "has_artist_image": has_artist_image_now,
+            "has_mbid": has_mbid_now,
+            "musicbrainz_id": mbid_now,
+            "skip_heavy_processing": fast_skip_heavy,
         }
         artist_to_album_ids[artist_name].append(album_id)
+        if fast_skip_heavy:
+            fast_skip_marked += 1
     # Build artists_merged: (artist_id, artist_name, album_ids). For Files we use 0 as artist_id.
     artists_merged = [(0, name, ids) for name, ids in sorted(artist_to_album_ids.items(), key=lambda x: x[0].lower())]
     total_albums = next_album_id - 1
     log_scan(
-        "FILES backend: discovered %d artist(s), %d album(s) from %d audio file(s)",
+        "FILES backend: discovered %d artist(s), %d album(s) from %d audio file(s)%s%s",
         len(artists_merged),
         total_albums,
         len(audio_files),
+        f"; changed-only skipped {skipped_unchanged_complete} unchanged+healthy album(s)" if scan_type == "changed_only" else "",
+        f"; fast-skip candidates {fast_skip_marked}" if fast_skip_marked else "",
     )
     return artists_merged, total_albums, files_editions_by_album_id
 
@@ -10689,7 +11269,7 @@ def _run_export_library() -> None:
     with lock:
         state["export_progress"] = {"running": True, "tracks_done": 0, "total_tracks": 0, "albums_done": 0, "total_albums": 0, "error": None}
     try:
-        _, _, editions_by_id = _build_files_editions()
+        _, _, editions_by_id = _build_files_editions(scan_type="full")
         total_tracks = sum(len(e.get("ordered_paths") or []) for e in editions_by_id.values())
         total_albums = len(editions_by_id)
         with lock:
@@ -10754,7 +11334,7 @@ def _run_export_library() -> None:
             state["export_progress"]["error"] = str(e)
 
 
-def _build_scan_plan() -> tuple[list[tuple[int, str, list[int]]], int]:
+def _build_scan_plan(scan_type: str = "full") -> tuple[list[tuple[int, str, list[int]]], int]:
     """
     Build the list of artists/albums to scan and return (artists_merged, total_albums).
 
@@ -10762,14 +11342,18 @@ def _build_scan_plan() -> tuple[list[tuple[int, str, list[int]]], int]:
     will dispatch to a filesystem-based backend when LIBRARY_MODE == 'files'.
     """
     mode = _get_library_mode()
+    scan_type = (scan_type or "full").strip().lower()
     if mode == "files":
         if not FILES_ROOTS:
             raise RuntimeError("FILES_ROOTS is empty – configure at least one music root for files library mode.")
         log_scan("FILES mode source roots: %s", ", ".join(str(r) for r in FILES_ROOTS))
-        artists_merged, total_albums, files_editions_by_album_id = _build_files_editions()
+        artists_merged, total_albums, files_editions_by_album_id = _build_files_editions(scan_type=scan_type)
         with lock:
             state["files_editions_by_album_id"] = files_editions_by_album_id
         return artists_merged, total_albums
+
+    if scan_type == "changed_only":
+        logging.info("Scan type 'changed_only' is only optimized in Files mode; using full scan plan for Plex mode.")
 
     # Plex-backed scan plan (current behaviour)
     db_conn = plex_connect()
@@ -10855,6 +11439,18 @@ def background_scan():
     files_live_index_last_trigger = 0.0
     files_live_index_interval_sec = 45.0
     scan_status = "failed"
+    scan_type = "full"
+    resume_run_id = None
+    scan_post_queue = None
+    scan_post_worker_thread = None
+    run_improve_after_requested = False
+    scan_stream_post_by_artist = False
+    streamed_post_process_done = False
+    with lock:
+        run_improve_after_requested = bool(state.get("run_improve_after", False))
+        scan_type = (state.get("scan_type") or "full").strip().lower()
+    if scan_type not in {"full", "changed_only"}:
+        scan_type = "full"
 
     try:
         # Log cache behavior for this run so logs show whether existing cache is being used
@@ -10867,16 +11463,37 @@ def background_scan():
                 "Background scan started with SCAN_DISABLE_CACHE=False – using audio and metadata caches when available"
             )
 
-        # 1) Build the scan plan from the active library backend (currently Plex-only)
-        artists_merged, total_albums = _build_scan_plan()
+        # 1) Build the scan plan from the active library backend.
+        artists_merged, total_albums = _build_scan_plan(scan_type=scan_type)
         total_artists = len(artists_merged)
+        files_editions_for_resume = {}
+        if _get_library_mode() == "files":
+            with lock:
+                files_editions_for_resume = dict(state.get("files_editions_by_album_id") or {})
+        resume_run_id, artists_merged, resume_skipped_artists, resume_skipped_albums = _prepare_resume_scan_artists(
+            _get_library_mode(),
+            scan_type,
+            artists_merged,
+            files_editions_by_album_id=files_editions_for_resume,
+        )
+        total_artists = len(artists_merged)
+        total_albums = sum(len(ids) for _a, _n, ids in artists_merged)
+        with lock:
+            state["scan_resume_run_id"] = resume_run_id
+        if resume_skipped_artists:
+            log_scan(
+                "Resume: skipped %d already-done artist(s), %d album(s) unchanged since last interrupted run.",
+                resume_skipped_artists,
+                resume_skipped_albums,
+            )
         if _get_library_mode() == "files":
             files_live_index_last_trigger = time.time()
             if _trigger_files_index_rebuild_async(reason="scan_started"):
                 files_live_index_last_trigger = time.time()
                 logging.info("Files library live sync: initial index rebuild started")
         log_scan(
-            "SCAN %d artist(s), %d album(s)%s",
+            "SCAN [%s] %d artist(s), %d album(s)%s",
+            scan_type,
             total_artists,
             total_albums,
             f" – Section ID(s): {SECTION_IDS}" if _get_library_mode() == "plex" else " (Files backend)",
@@ -10901,15 +11518,19 @@ def background_scan():
 
         if not ai_provider_ready:
             logging.warning("background_scan(): AI not configured or functional check failed; aborting scan.")
+            _set_resume_run_status(resume_run_id, "failed")
             with lock:
                 state["scanning"] = False
                 state["scan_ai_preflight_error"] = getattr(sys.modules[__name__], "AI_FUNCTIONAL_ERROR_MSG", None) or "Configure the AI provider in Settings."
+                state["scan_resume_run_id"] = resume_run_id
             return
 
         # Reset live state. Step-based progress: total_steps = 3*albums + 2 (+1 if auto-move).
         scan_start_epoch = time.time()
         with lock:
             state.update(scanning=True, scan_progress=0, scan_total=total_albums + 2)
+            state["scan_type"] = scan_type
+            state["scan_resume_run_id"] = resume_run_id
             state["scan_total_albums"] = total_albums
             state["scan_step_progress"] = 0
             # scan_step_total set after _reload_auto_move_from_db() so AUTO_MOVE_DUPES is current
@@ -10954,6 +11575,11 @@ def background_scan():
             state["scan_pmda_albums_with_artist_image"] = 0
             state["scan_ai_errors"] = []
             state["scan_steps_log"] = []  # Per-step log for "what was done" (append after each artist)
+            state["scan_post_processing"] = False
+            state["scan_post_total"] = 0
+            state["scan_post_done"] = 0
+            state["scan_post_current_artist"] = None
+            state["scan_post_current_album"] = None
             # Preflight: store MB and AI connection status for end-of-scan summary
             mb_ok, ai_ok = _run_preflight_checks()
             state["scan_mb_connection_ok"] = mb_ok
@@ -11013,6 +11639,7 @@ def background_scan():
         # Store scan_id in state for linking moves
         with lock:
             state["scan_id"] = scan_id
+        _set_resume_run_status(resume_run_id, "running", scan_id=scan_id)
 
         # Clear scan_editions for this scan_id so only the latest run's data is stored
         con = sqlite3.connect(str(STATE_DB_FILE))
@@ -11062,6 +11689,98 @@ def background_scan():
         scan_incremental_writer_thread = threading.Thread(target=_scan_incremental_writer, daemon=True)
         scan_incremental_writer_thread.start()
 
+        should_request_improve = run_improve_after_requested or MAGIC_MODE
+        if should_request_improve and _get_library_mode() == "files":
+            # Files mode: run metadata fix/covers artist-by-artist during the scan so
+            # Library updates are progressive instead of "all at end".
+            scan_stream_post_by_artist = True
+            streamed_post_process_done = True
+            scan_post_queue = Queue()
+
+            def _scan_postprocess_worker():
+                providers = ["musicbrainz", "discogs", "lastfm", "bandcamp"]
+                by_provider = {p: {"identified": 0, "covers": 0, "tags": 0} for p in providers}
+                post_done = 0
+                with lock:
+                    state["scan_post_processing"] = True
+                    state["scan_post_total"] = total_albums
+                    state["scan_post_done"] = 0
+                    state["scan_post_current_artist"] = None
+                    state["scan_post_current_album"] = None
+                while True:
+                    payload = scan_post_queue.get()
+                    if payload is None:
+                        scan_post_queue.task_done()
+                        break
+                    artist_name_for_batch, items = payload
+                    try:
+                        for item in items:
+                            if scan_should_stop.is_set():
+                                break
+                            try:
+                                _idx, album_id, album_title, artist_name, result, _steps = _improve_one_album_item(item)
+                            except Exception as post_err:
+                                logging.warning("Post-process worker failed for artist %s item: %s", artist_name_for_batch, post_err)
+                                continue
+
+                            prov = result.get("provider_used") or "musicbrainz"
+                            if prov in by_provider:
+                                if result.get("tags_updated") or result.get("cover_saved"):
+                                    by_provider[prov]["identified"] += 1
+                                if result.get("cover_saved"):
+                                    by_provider[prov]["covers"] += 1
+                                if result.get("tags_updated"):
+                                    by_provider[prov]["tags"] += 1
+
+                            post_done += 1
+                            with lock:
+                                state["scan_post_done"] = post_done
+                                state["scan_post_current_artist"] = artist_name
+                                state["scan_post_current_album"] = album_title
+                                if result.get("pmda_matched") or result.get("pmda_cover") or result.get("pmda_artist_image"):
+                                    state["scan_pmda_albums_processed"] = state.get("scan_pmda_albums_processed", 0) + 1
+                                if result.get("pmda_cover"):
+                                    state["scan_pmda_albums_with_cover"] = state.get("scan_pmda_albums_with_cover", 0) + 1
+                                if result.get("pmda_artist_image"):
+                                    state["scan_pmda_albums_with_artist_image"] = state.get("scan_pmda_albums_with_artist_image", 0) + 1
+                                if result.get("pmda_complete"):
+                                    state["scan_pmda_albums_complete"] = state.get("scan_pmda_albums_complete", 0) + 1
+                                step_log = state.get("scan_steps_log") or []
+                                step_log.append(
+                                    f"[post] {artist_name} — {album_title}: "
+                                    f"{'tags' if result.get('tags_updated') else 'no-tags'} / "
+                                    f"{'cover' if result.get('cover_saved') else 'no-cover'}"
+                                )
+                                if len(step_log) > 200:
+                                    step_log = step_log[-200:]
+                                state["scan_steps_log"] = step_log
+                            if _get_library_mode() == "files":
+                                _refresh_files_album_scan_cache_from_editions(
+                                    [
+                                        {
+                                            "folder": item.get("folder"),
+                                            "artist": artist_name,
+                                            "title_raw": album_title,
+                                            "musicbrainz_id": item.get("musicbrainz_id") or result.get("musicbrainz_id"),
+                                        }
+                                    ],
+                                    scan_id=scan_id,
+                                )
+                    finally:
+                        if _get_library_mode() == "files":
+                            _trigger_files_index_rebuild_async(reason=f"scan_artist_ready_{artist_name_for_batch}")
+                        scan_post_queue.task_done()
+
+                with lock:
+                    state["scan_post_processing"] = False
+                    state["scan_post_current_artist"] = None
+                    state["scan_post_current_album"] = None
+                    state["last_fix_all_by_provider"] = by_provider
+                    state["last_fix_all_total_albums"] = post_done
+
+            scan_post_worker_thread = threading.Thread(target=_scan_postprocess_worker, daemon=True)
+            scan_post_worker_thread.start()
+
         futures = []
         import concurrent.futures
         future_to_albums: dict[concurrent.futures.Future, int] = {}
@@ -11076,6 +11795,7 @@ def background_scan():
                         "total_albums": album_cnt,
                         "albums_processed": 0
                     }
+                _set_resume_artist_status(resume_run_id, artist_name, "running")
                 # Pass (artist_id, artist_name, album_ids) so worker uses combined albums (merged by name)
                 fut = executor.submit(scan_artist_duplicates, (primary_id, artist_name, album_ids_list))
                 futures.append(fut)
@@ -11090,6 +11810,8 @@ def background_scan():
                 album_cnt = future_to_albums.get(future, 0)
                 artist_name = future_to_artist.get(future, "<unknown>")
                 stats = {"ai_used": 0, "mb_used": 0}
+                artist_failed = False
+                artist_error = None
                 try:
                     result = future.result()
                     if len(result) == 5:
@@ -11106,6 +11828,8 @@ def background_scan():
                 except Exception as e:
                     logging.exception("Worker crash for artist %s: %s", artist_name, e)
                     worker_errors.put((artist_name, str(e)))
+                    artist_failed = True
+                    artist_error = str(e)
                     groups = []
                     stats = {"ai_used": 0, "mb_used": 0}
                     all_editions_by_artist[artist_name] = []
@@ -11151,6 +11875,24 @@ def background_scan():
                             state["duplicates"][artist_name] = groups
                         # Enqueue for incremental persist (duplicates + scan_editions + scan_history)
                         scan_incremental_queue.put((scan_id, artist_name, groups, all_editions_by_artist.get(artist_name, [])))
+                    if _get_library_mode() == "files":
+                        _refresh_files_album_scan_cache_from_editions(
+                            all_editions_by_artist.get(artist_name, []),
+                            scan_id=scan_id,
+                        )
+                    _set_resume_artist_status(
+                        resume_run_id,
+                        artist_name,
+                        "failed" if artist_failed else "done",
+                        error=artist_error,
+                    )
+                    if scan_stream_post_by_artist and scan_post_queue is not None:
+                        improve_items = _build_improve_items_from_editions(
+                            artist_name,
+                            all_editions_by_artist.get(artist_name, []),
+                        )
+                        if improve_items:
+                            scan_post_queue.put((artist_name, improve_items))
                     artists_processed += 1
                     if _get_library_mode() == "files":
                         now_ts = time.time()
@@ -11308,6 +12050,12 @@ def background_scan():
             scan_incremental_queue.put(None)
             scan_incremental_writer_thread.join(timeout=120)
 
+        # Drain post-processing queue (Files mode streamed improve) before finalizing.
+        if scan_post_worker_thread is not None and scan_post_queue is not None:
+            scan_post_queue.put(None)
+            scan_post_queue.join()
+            scan_post_worker_thread.join(timeout=600)
+
         # Persist is done in finally so we always save (even on stop/exception); auto-move runs synchronously in finally after save.
 
     finally:
@@ -11320,6 +12068,14 @@ def background_scan():
             # Progress: ensure we're at step 2/3 (e.g. 39/40) during finalize; if there was no AI batch we were still at 38
             state["scan_progress"] = max(state["scan_progress"], state["scan_total"] - 1)
             state["scan_step_progress"] = state.get("scan_step_progress", 0) + 1  # finalize step started
+        if scan_post_worker_thread is not None and scan_post_queue is not None and scan_post_worker_thread.is_alive():
+            # If we arrived here through an exception path, stop and drain safely.
+            try:
+                scan_post_queue.put(None)
+                scan_post_queue.join()
+                scan_post_worker_thread.join(timeout=600)
+            except Exception:
+                logging.debug("Post-process queue shutdown in finally failed", exc_info=True)
         try:
             save_scan_to_db(all_results)
             with lock:
@@ -11673,10 +12429,21 @@ def background_scan():
                 )
             con.commit()
             con.close()
+            _set_resume_run_status(
+                resume_run_id,
+                "completed" if scan_status == "completed" else ("cancelled" if scan_status == "cancelled" else "failed"),
+                scan_id=scan_id,
+            )
         
+        if not scan_id:
+            _set_resume_run_status(
+                resume_run_id,
+                "completed" if scan_status == "completed" else ("cancelled" if scan_status == "cancelled" else "failed"),
+                scan_id=None,
+            )
+
         with lock:
             state["scan_finalizing"] = False
-            state["scanning"] = False
             run_improve_after = state.pop("run_improve_after", False)
         # Magic / run-improve-after: run improve-all only for a completed scan.
         should_request_improve = run_improve_after or MAGIC_MODE
@@ -11685,7 +12452,10 @@ def background_scan():
                 "Skipping post-scan improve-all because current scan status is '%s' (only 'completed' is eligible).",
                 scan_status,
             )
-        if should_request_improve and scan_status == "completed":
+        elif should_request_improve and scan_status == "completed" and streamed_post_process_done:
+            logging.info("Post-processing was streamed artist-by-artist during scan (Files mode).")
+
+        if should_request_improve and scan_status == "completed" and not streamed_post_process_done:
             best_albums = []
             seen_ids = set()
             seen_group_keys = set()  # One best per (artist, set of edition ids) when from duplicate groups
@@ -11783,18 +12553,43 @@ def background_scan():
                     logging.info("Magic mode: dedupe done, starting improve-all (%d albums) – tags, covers, artist images", len(best_albums))
                 else:
                     logging.info("Run improve after scan: starting improve-all for %d albums – tags, covers, artist images", len(best_albums))
-                threading.Thread(target=_run_improve_all_albums_global, args=(best_albums,), daemon=True).start()
+                with lock:
+                    state["scan_post_processing"] = True
+                    state["scan_post_total"] = len(best_albums)
+                    state["scan_post_done"] = 0
+                    state["scan_post_current_artist"] = None
+                    state["scan_post_current_album"] = None
+                _run_improve_all_albums_global(best_albums)
+                if _get_library_mode() == "files":
+                    _refresh_files_album_scan_cache_from_editions(best_albums, scan_id=scan_id)
             else:
                 if MAGIC_MODE:
                     logging.info("Magic mode: dedupe done; no albums to improve from current scan.")
                 else:
                     logging.info("Run improve after scan: no albums to improve from current scan.")
+        if scan_stream_post_by_artist and scan_status == "completed":
+            try:
+                if _get_library_mode() == "files" and getattr(sys.modules[__name__], "AUTO_EXPORT_LIBRARY", False):
+                    logging.info("Auto-export: rebuilding Files library after streamed post-processing.")
+                    with lock:
+                        state["scan_post_processing"] = True
+                        state["scan_post_current_artist"] = "Library"
+                        state["scan_post_current_album"] = "Export rebuild"
+                    _run_export_library()
+            except Exception as e:
+                logging.exception("Auto-export library after streamed post-processing failed: %s", e)
+        with lock:
+            state["scan_post_processing"] = False
+            state["scan_post_current_artist"] = None
+            state["scan_post_current_album"] = None
+            state["scan_resume_run_id"] = None
+            state["scanning"] = False
         logging.debug("background_scan(): finished (flag cleared)")
         duration = time.perf_counter() - scan_perf_start
         groups_found = sum(len(v) for v in all_results.values()) if 'all_results' in locals() else 0
         removed_dupes = get_stat("removed_dupes")
         space_saved   = get_stat("space_saved")
-        total_artists = len(artists) if 'artists' in locals() else 0
+        total_artists = len(artists_merged) if 'artists_merged' in locals() else 0
         err_count = worker_errors.qsize()
         if err_count:
             errs = []
@@ -12186,7 +12981,13 @@ def _build_card_list(dup_dict) -> list[dict]:
 from flask import Response
 
 def _requires_config():
-    """Return 503 response when Plex is not configured (wizard-first mode)."""
+    """Return 503 response when required backend config is missing for current mode."""
+    _reload_library_mode_and_files_roots_from_db()
+    mode = _get_library_mode()
+    if mode == "files":
+        if not FILES_ROOTS:
+            return jsonify({"error": "Files mode is enabled but no source folders are configured."}), 503
+        return None
     if not PLEX_CONFIGURED:
         return jsonify({"error": "Plex not configured", "requiresConfig": True}), 503
     return None
@@ -13021,6 +13822,8 @@ def start_scan():
     data = request.get_json(silent=True) or {}
     scan_type = (data.get("scan_type") or "full").strip().lower()
     run_improve_after = bool(data.get("run_improve_after", False))
+    if scan_type not in {"full", "changed_only", "incomplete_only"}:
+        return jsonify({"error": f"Invalid scan_type: {scan_type}"}), 400
 
     if scan_type == "incomplete_only":
         with lock:
@@ -13044,9 +13847,10 @@ def start_scan():
     scan_should_stop.clear()
     scan_is_paused.clear()
     with lock:
-        state["run_improve_after"] = run_improve_after
+        state["run_improve_after"] = run_improve_after if scan_type in {"full", "changed_only"} else False
+        state["scan_type"] = scan_type
     start_background_scan()
-    return jsonify({"status": "ok", "scan_type": "full", "run_improve_after": run_improve_after})
+    return jsonify({"status": "ok", "scan_type": scan_type, "run_improve_after": run_improve_after})
 
 @app.route("/scan/pause", methods=["POST"])
 def pause_scan():
@@ -13066,8 +13870,6 @@ def resume_scan():
 @app.route("/scan/stop", methods=["POST"])
 def stop_scan():
     scan_should_stop.set()
-    with lock:
-        state["scanning"] = False
     return jsonify({"status": "ok"})
 
 
@@ -15576,6 +16378,8 @@ def api_progress():
         format_done_count = state.get("scan_format_done_count", 0)
         mb_done_count = state.get("scan_mb_done_count", 0)
         scan_steps_log = state.get("scan_steps_log") or []
+        current_scan_type = (state.get("scan_type") or "full")
+        scan_resume_run_id = state.get("scan_resume_run_id")
         
         # Keep scan_progress for effective_progress / legacy; bar uses step progress
         active_artists_dict = state.get("scan_active_artists", {})
@@ -15633,6 +16437,20 @@ def api_progress():
         last_fix_all_by_provider = state.get("last_fix_all_by_provider")
         last_fix_all_total_albums = state.get("last_fix_all_total_albums", 0)
         total_albums = state.get("scan_total_albums", 0)
+        improve_all_state = state.get("improve_all") or {}
+        improve_all_running = bool(improve_all_state.get("running"))
+        scan_post_processing = bool(state.get("scan_post_processing") or improve_all_running)
+        scan_post_total = int(state.get("scan_post_total") or 0)
+        scan_post_done = int(state.get("scan_post_done") or 0)
+        scan_post_current_artist = state.get("scan_post_current_artist")
+        scan_post_current_album = state.get("scan_post_current_album")
+        if improve_all_running:
+            scan_post_total = max(scan_post_total, int(improve_all_state.get("total") or 0))
+            scan_post_done = max(scan_post_done, int(improve_all_state.get("current") or 0))
+            if not scan_post_current_artist:
+                scan_post_current_artist = improve_all_state.get("current_artist")
+            if not scan_post_current_album:
+                scan_post_current_album = improve_all_state.get("current_album")
         
         # Current micro-step (from first active artist with non-done status) for live indicators
         current_step = None
@@ -15657,6 +16475,8 @@ def api_progress():
             phase = "moving_dupes"
         elif finalizing:
             phase = "finalizing"
+        elif scan_post_processing and current_step in (None, "", "done") and "_ai_batch" not in active_artists_dict:
+            phase = "post_processing"
         elif current_step in ("comparing_versions", "detecting_best") or "_ai_batch" in active_artists_dict:
             phase = "ia_analysis"
         elif current_step == "searching_mb":
@@ -15762,6 +16582,8 @@ def api_progress():
         active_artists=active_artists_list,
         last_scan_summary=last_scan_summary,
         scan_steps_log=scan_steps_log,
+        scan_type=current_scan_type,
+        scan_resume_run_id=scan_resume_run_id,
         finalizing=finalizing,
         deduping=deduping,
         dedupe_progress=dedupe_progress,
@@ -15774,7 +16596,53 @@ def api_progress():
         scan_ai_batch_processed=scan_ai_batch_processed,
         scan_ai_current_label=scan_ai_current_label,
         total_albums=total_albums,
+        post_processing=scan_post_processing,
+        post_processing_done=scan_post_done,
+        post_processing_total=scan_post_total,
+        post_processing_current_artist=scan_post_current_artist,
+        post_processing_current_album=scan_post_current_album,
     )
+
+
+def _tail_log_lines(path: Path, lines: int = 200, max_bytes: int = 512 * 1024) -> list[str]:
+    """Return last `lines` lines from `path`, stripping ANSI escape codes for Web UI."""
+    if lines <= 0:
+        return []
+    ansi_re = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
+    try:
+        with path.open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            read_size = min(max_bytes, size)
+            if read_size > 0:
+                fh.seek(-read_size, os.SEEK_END)
+            raw = fh.read()
+    except FileNotFoundError:
+        return []
+    except Exception:
+        logging.debug("Could not tail log file %s", path, exc_info=True)
+        return []
+    text = raw.decode("utf-8", "replace")
+    out = text.splitlines()
+    if len(out) > lines:
+        out = out[-lines:]
+    return [ansi_re.sub("", ln) for ln in out]
+
+
+@app.get("/api/logs/tail")
+def api_logs_tail():
+    """Return recent backend logs for Scan page power-user panel."""
+    try:
+        lines = int(request.args.get("lines", 180))
+    except Exception:
+        lines = 180
+    lines = max(20, min(lines, 1200))
+    log_path = Path(str(LOG_FILE or "")).expanduser()
+    return jsonify(
+        path=str(log_path),
+        lines=_tail_log_lines(log_path, lines=lines),
+    )
+
 
 @app.get("/api/scan-history")
 def api_scan_history():
@@ -20847,6 +21715,42 @@ def _improve_one_album_item(item: dict) -> tuple:
         return (idx, album_id, album_title, artist_name, result, steps)
     finally:
         db_conn.close()
+
+
+def _build_improve_items_from_editions(artist_name: str, editions: list[dict]) -> list[dict]:
+    """
+    Convert scan editions for one artist into improve-album items, deduplicated by album_id.
+    Used to stream post-processing artist-by-artist in Files mode.
+    """
+    items: list[dict] = []
+    seen_album_ids: set[int] = set()
+    for e in editions or []:
+        try:
+            album_id = int(e.get("album_id") or 0)
+        except Exception:
+            album_id = 0
+        if album_id <= 0 or album_id in seen_album_ids:
+            continue
+        seen_album_ids.add(album_id)
+        folder_raw = e.get("folder")
+        folder_str = str(folder_raw).strip() if folder_raw is not None else ""
+        mbid = (
+            (e.get("musicbrainz_id") or "")
+            or ((e.get("meta") or {}).get("musicbrainz_releasegroupid") or "")
+            or ((e.get("meta") or {}).get("musicbrainz_id") or "")
+        )
+        mbid = str(mbid or "").strip()
+        title = (e.get("title_raw") or e.get("album_norm") or f"Album {album_id}")
+        items.append(
+            {
+                "artist": (artist_name or "").strip() or "Unknown Artist",
+                "album_id": album_id,
+                "album_title": str(title or "").strip() or f"Album {album_id}",
+                "musicbrainz_id": mbid,
+                "folder": folder_str,
+            }
+        )
+    return items
 
 
 def _run_improve_all_albums_global(best_albums_list: List[dict]):

@@ -38,8 +38,10 @@ export interface ScanProgress {
   /** Progress including in-progress artist albums (so bar moves during scan) */
   effective_progress?: number;
   status: 'running' | 'paused' | 'stopped' | 'idle';
-  /** Current scan phase: format_analysis | identification_tags | ia_analysis | finalizing | moving_dupes */
-  phase?: 'format_analysis' | 'identification_tags' | 'ia_analysis' | 'finalizing' | 'moving_dupes' | null;
+  scan_type?: 'full' | 'changed_only' | 'incomplete_only';
+  scan_resume_run_id?: string | null;
+  /** Current scan phase: format_analysis | identification_tags | ia_analysis | finalizing | moving_dupes | post_processing */
+  phase?: 'format_analysis' | 'identification_tags' | 'ia_analysis' | 'finalizing' | 'moving_dupes' | 'post_processing' | null;
   /** Micro-step for live indicators: analyzing_format | fetching_mb_id | searching_mb | comparing_versions | detecting_best | done */
   current_step?: string | null;
   /** Total albums in this scan (for N/M display in findings) */
@@ -115,6 +117,17 @@ export interface ScanProgress {
   scan_ai_current_label?: string | null;
   /** Rolling per-artist log of steps executed during the current scan (for activity log UI). */
   scan_steps_log?: string[];
+  /** True when post-scan/post-artist metadata fixing is still running. */
+  post_processing?: boolean;
+  post_processing_done?: number;
+  post_processing_total?: number;
+  post_processing_current_artist?: string | null;
+  post_processing_current_album?: string | null;
+}
+
+export interface LogTailResponse {
+  path: string;
+  lines: string[];
 }
 
 export interface LastScanSummary {
@@ -285,11 +298,11 @@ export interface PMDAConfig {
   EXPORT_ROOT?: string;
   /** Naming template used when exporting via hardlinks/symlinks/copies. */
   EXPORT_NAMING_TEMPLATE?: string;
-  /** Link strategy for export: hardlink | symlink | copy. */
-  EXPORT_LINK_STRATEGY?: 'hardlink' | 'symlink' | 'copy';
+  /** Link strategy for export: hardlink | symlink | copy | move. */
+  EXPORT_LINK_STRATEGY?: 'hardlink' | 'symlink' | 'copy' | 'move';
   /** NVMe-friendly media cache root for pre-rendered artwork thumbnails (album/artist). */
   MEDIA_CACHE_ROOT?: string;
-  /** When true (Files mode), rebuild the hardlink library automatically after a Magic scan. */
+  /** When true (Files mode), rebuild the export library automatically after a Magic scan. */
   AUTO_EXPORT_LIBRARY?: boolean;
   
   // AI Provider
@@ -665,6 +678,11 @@ export async function getScanProgress(): Promise<ScanProgress> {
   return fetchApi<ScanProgress>('/api/progress');
 }
 
+export async function getScanLogsTail(lines: number = 180): Promise<LogTailResponse> {
+  const n = Number.isFinite(lines) ? Math.max(20, Math.min(1200, Math.trunc(lines))) : 180;
+  return fetchApi<LogTailResponse>(`/api/logs/tail?lines=${n}`);
+}
+
 export interface ScanPreflightResult {
   musicbrainz: { ok: boolean; message: string };
   ai: { ok: boolean; message: string; provider: string };
@@ -681,7 +699,7 @@ export async function getScanPreflight(): Promise<ScanPreflightResult> {
 }
 
 export interface StartScanOptions {
-  scan_type?: 'full' | 'incomplete_only';
+  scan_type?: 'full' | 'changed_only' | 'incomplete_only';
   run_improve_after?: boolean;
 }
 
@@ -938,7 +956,7 @@ export async function saveConfig(config: Partial<PMDAConfig>): Promise<{ status:
   });
 }
 
-/** Files backend: start rebuild of export library (hardlinks/symlinks/copies). */
+/** Files backend: start rebuild of export library (hardlinks/symlinks/copies/moves). */
 export async function postFilesExportRebuild(): Promise<{ status: string; message?: string }> {
   return fetchApi<{ status: string; message?: string }>('/api/files/export/rebuild', { method: 'POST' });
 }
@@ -965,6 +983,27 @@ export interface FilesStructureOverview {
 }
 export async function getFilesStructureOverview(): Promise<FilesStructureOverview> {
   return fetchApi<FilesStructureOverview>('/api/files/structure/overview');
+}
+
+export interface FilesystemDirectoryEntry {
+  name: string;
+  path: string;
+  writable: boolean;
+}
+
+export interface FilesystemDirectoryList {
+  path: string;
+  parent: string | null;
+  writable: boolean;
+  directories: FilesystemDirectoryEntry[];
+  truncated: boolean;
+  roots: string[];
+}
+
+/** Settings folder picker: list directories under a given absolute path. */
+export async function getFilesystemDirectories(path?: string): Promise<FilesystemDirectoryList> {
+  const query = path ? `?path=${encodeURIComponent(path)}` : '';
+  return fetchApi<FilesystemDirectoryList>(`/api/fs/list${query}`);
 }
 
 /** Test Plex connection. Pass current form values to test before saving. */
