@@ -1092,6 +1092,26 @@ merged = {
     "MUSICBRAINZ_EMAIL": _get("MUSICBRAINZ_EMAIL", default="pmda@example.com", cast=str),
     "MB_QUEUE_ENABLED": _get("MB_QUEUE_ENABLED", default=True, cast=_parse_bool),
     "MB_RETRY_NOT_FOUND": _get("MB_RETRY_NOT_FOUND", default=False, cast=_parse_bool),
+    # Time budget (seconds) per album for MusicBrainz search flow before we fall back faster to other providers.
+    "MB_SEARCH_ALBUM_TIMEOUT_SEC": _get(
+        "MB_SEARCH_ALBUM_TIMEOUT_SEC",
+        default=45,
+        cast=lambda x: max(10, min(300, int(x) if x is not None and str(x).strip().isdigit() else 45)),
+    ),
+    # Maximum number of MB candidates for which we fetch full details per album.
+    "MB_CANDIDATE_FETCH_LIMIT": _get(
+        "MB_CANDIDATE_FETCH_LIMIT",
+        default=6,
+        cast=lambda x: max(1, min(20, int(x) if x is not None and str(x).strip().isdigit() else 6)),
+    ),
+    # Fetch recording-level track titles only for first N candidates (expensive endpoint).
+    "MB_TRACKLIST_FETCH_LIMIT": _get(
+        "MB_TRACKLIST_FETCH_LIMIT",
+        default=3,
+        cast=lambda x: max(0, min(20, int(x) if x is not None and str(x).strip().isdigit() else 3)),
+    ),
+    # If true, once MB budget is exceeded or MB has no candidates, we prioritize provider fallback and skip web+AI MBID hunt.
+    "MB_FAST_FALLBACK_MODE": _get("MB_FAST_FALLBACK_MODE", default=True, cast=_parse_bool),
     # When true, ignore cached MusicBrainz results and stored MBID tags for album→MBID lookup.
     # This forces a full lookup on every scan and is intended for advanced testing/debugging only.
     "MB_DISABLE_CACHE": _get("MB_DISABLE_CACHE", default=False, cast=_parse_bool),
@@ -1169,6 +1189,10 @@ USE_MUSICBRAINZ: bool = bool(merged["USE_MUSICBRAINZ"])
 MUSICBRAINZ_EMAIL: str = merged.get("MUSICBRAINZ_EMAIL", "pmda@example.com")
 MB_QUEUE_ENABLED: bool = bool(merged.get("MB_QUEUE_ENABLED", True))
 MB_RETRY_NOT_FOUND: bool = bool(merged.get("MB_RETRY_NOT_FOUND", False))
+MB_SEARCH_ALBUM_TIMEOUT_SEC: int = int(merged.get("MB_SEARCH_ALBUM_TIMEOUT_SEC", 45))
+MB_CANDIDATE_FETCH_LIMIT: int = int(merged.get("MB_CANDIDATE_FETCH_LIMIT", 6))
+MB_TRACKLIST_FETCH_LIMIT: int = int(merged.get("MB_TRACKLIST_FETCH_LIMIT", 3))
+MB_FAST_FALLBACK_MODE: bool = bool(merged.get("MB_FAST_FALLBACK_MODE", True))
 # Global flags controlling cache usage during scans
 SCAN_DISABLE_CACHE: bool = bool(merged.get("SCAN_DISABLE_CACHE", False))
 MB_DISABLE_CACHE: bool = bool(merged.get("MB_DISABLE_CACHE", False) or SCAN_DISABLE_CACHE)
@@ -3482,7 +3506,7 @@ _CACHE_TELEMETRY_SNAPSHOT = {"ts": 0.0, "payload": None}
 _CACHE_TELEMETRY_LOCK = threading.Lock()
 
 _LOSSLESS_FORMATS = {"FLAC", "ALAC", "APE", "WV", "WAV", "AIFF", "DSF"}
-_ARTIST_IMAGE_NAMES = ("artist.jpg", "artist.jpeg", "artist.png", "folder.jpg", "folder.jpeg", "folder.png")
+_ARTIST_IMAGE_NAMES = ("artist.jpg", "artist.jpeg", "artist.png", "artist.webp")
 
 
 def _files_pg_dsn() -> str:
@@ -6791,8 +6815,18 @@ class MusicBrainzQueue:
         # Submit to queue
         self.queue.put((request_id, callback))
         
-        # Batch fetch (fetch_rg_*) can take 100+ seconds (100 pages × 1 s rate limit). Single requests: 1 min.
-        timeout_seconds = 300 if (request_id.startswith("fetch_rg_")) else 60
+        # Batch fetch (fetch_rg_*) can take 100+ seconds (100 pages × 1 s rate limit).
+        # Single requests use a tighter timeout so scans can fall back to other providers faster.
+        if request_id.startswith("fetch_rg_"):
+            timeout_seconds = 300
+        else:
+            timeout_seconds = max(
+                15,
+                min(
+                    45,
+                    int(getattr(sys.modules[__name__], "MB_SEARCH_ALBUM_TIMEOUT_SEC", 45) or 45),
+                ),
+            )
         if event.wait(timeout=timeout_seconds):
             with self._lock:
                 result, error = self.results.pop(request_id, (None, None))
@@ -8720,6 +8754,82 @@ def _browse_mb_rg_by_artist(artist: str, album_norm: str) -> List[dict]:
         return []
 
 
+def _fetch_album_provider_fallbacks_parallel(artist: str, album_title: str) -> dict:
+    """
+    Fetch album metadata fallbacks concurrently (Discogs, Last.fm, Bandcamp).
+    Returns a dict with raw provider payloads and an `extra_sources` list for AI disambiguation.
+    """
+    out = {
+        "discogs": None,
+        "lastfm": None,
+        "bandcamp": None,
+        "extra_sources": [],
+    }
+    artist_name = (artist or "").strip()
+    title = (album_title or "").strip()
+    if not artist_name or not title:
+        return out
+
+    try:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+    except Exception:
+        # Fallback to sequential when concurrent futures is unavailable.
+        try:
+            if USE_DISCOGS:
+                out["discogs"] = _fetch_discogs_release(artist_name, title)
+            if USE_LASTFM:
+                out["lastfm"] = _fetch_lastfm_album_info(artist_name, title)
+            if USE_BANDCAMP:
+                out["bandcamp"] = _fetch_bandcamp_album_info(artist_name, title)
+        except Exception:
+            pass
+    else:
+        tasks = {}
+        with ThreadPoolExecutor(max_workers=3, thread_name_prefix="pmda-provider-fallback") as pool:
+            if USE_DISCOGS:
+                tasks[pool.submit(_fetch_discogs_release, artist_name, title)] = "discogs"
+            if USE_LASTFM:
+                tasks[pool.submit(_fetch_lastfm_album_info, artist_name, title)] = "lastfm"
+            if USE_BANDCAMP:
+                tasks[pool.submit(_fetch_bandcamp_album_info, artist_name, title)] = "bandcamp"
+
+            for fut in as_completed(tasks):
+                key = tasks[fut]
+                try:
+                    out[key] = fut.result()
+                except Exception as e:
+                    logging.debug("[Providers] %s fetch failed for %r - %r: %s", key, artist_name, title, e)
+
+    discogs_info = out.get("discogs")
+    if discogs_info:
+        out["extra_sources"].append(
+            {
+                "source": "Discogs",
+                "title": discogs_info.get("title"),
+                "artist_name": discogs_info.get("artist_name"),
+            }
+        )
+    lastfm_info = out.get("lastfm")
+    if lastfm_info:
+        out["extra_sources"].append(
+            {
+                "source": "Last.fm",
+                "title": lastfm_info.get("title"),
+                "artist": lastfm_info.get("artist"),
+            }
+        )
+    bandcamp_info = out.get("bandcamp")
+    if bandcamp_info:
+        out["extra_sources"].append(
+            {
+                "source": "Bandcamp",
+                "title": bandcamp_info.get("title"),
+                "artist_name": bandcamp_info.get("artist_name"),
+            }
+        )
+    return out
+
+
 def search_mb_release_group_by_metadata(
     artist: str,
     album_norm: str,
@@ -8738,6 +8848,25 @@ def search_mb_release_group_by_metadata(
     """
     if album_folder is not None and not isinstance(album_folder, Path):
         album_folder = Path(album_folder) if album_folder else None
+    mb_search_started = time.perf_counter()
+    mb_budget_sec = max(10, int(getattr(sys.modules[__name__], "MB_SEARCH_ALBUM_TIMEOUT_SEC", 45) or 45))
+    candidate_fetch_limit = max(1, int(getattr(sys.modules[__name__], "MB_CANDIDATE_FETCH_LIMIT", 6) or 6))
+    tracklist_fetch_limit = max(0, int(getattr(sys.modules[__name__], "MB_TRACKLIST_FETCH_LIMIT", 3) or 3))
+    fast_fallback_mode = bool(getattr(sys.modules[__name__], "MB_FAST_FALLBACK_MODE", True))
+    provider_fallback_cache: dict | None = None
+
+    def _mb_budget_exceeded() -> bool:
+        return (time.perf_counter() - mb_search_started) >= mb_budget_sec
+
+    def _provider_fallbacks() -> dict:
+        nonlocal provider_fallback_cache
+        if provider_fallback_cache is None:
+            provider_fallback_cache = _fetch_album_provider_fallbacks_parallel(
+                artist,
+                (title_raw or album_norm or "").strip(),
+            )
+        return provider_fallback_cache
+
     def _fetch_rg_details(rg_id: str):
         """Fetch release group details by ID. On 404, try treating rg_id as a release ID and resolve to release-group."""
         try:
@@ -8769,13 +8898,29 @@ def search_mb_release_group_by_metadata(
                 candidates.append(rg)
 
     def _run_search_and_browse(release_query: str) -> None:
+        if _mb_budget_exceeded():
+            return
         if MB_QUEUE_ENABLED and USE_MUSICBRAINZ:
-            _collect_candidates(get_mb_queue().submit(f"search_{artist}_{release_query}_1", lambda: _search_mb_rg_candidates(artist, release_query, True)))
-            _collect_candidates(get_mb_queue().submit(f"search_{artist}_{release_query}_0", lambda: _search_mb_rg_candidates(artist, release_query, False)))
+            try:
+                _collect_candidates(get_mb_queue().submit(f"search_{artist}_{release_query}_1", lambda: _search_mb_rg_candidates(artist, release_query, True)))
+            except Exception as e:
+                logging.debug("[MusicBrainz Search] strict query failed for %r - %r: %s", artist, release_query, e)
+            if not _mb_budget_exceeded():
+                try:
+                    _collect_candidates(get_mb_queue().submit(f"search_{artist}_{release_query}_0", lambda: _search_mb_rg_candidates(artist, release_query, False)))
+                except Exception as e:
+                    logging.debug("[MusicBrainz Search] relaxed query failed for %r - %r: %s", artist, release_query, e)
         else:
-            _collect_candidates(_search_mb_rg_candidates(artist, release_query, True))
-            _collect_candidates(_search_mb_rg_candidates(artist, release_query, False))
-        if not candidates:
+            try:
+                _collect_candidates(_search_mb_rg_candidates(artist, release_query, True))
+            except Exception as e:
+                logging.debug("[MusicBrainz Search] strict query failed for %r - %r: %s", artist, release_query, e)
+            if not _mb_budget_exceeded():
+                try:
+                    _collect_candidates(_search_mb_rg_candidates(artist, release_query, False))
+                except Exception as e:
+                    logging.debug("[MusicBrainz Search] relaxed query failed for %r - %r: %s", artist, release_query, e)
+        if not candidates and not _mb_budget_exceeded():
             browse_list = _browse_mb_rg_by_artist(artist, release_query)
             _collect_candidates(browse_list)
 
@@ -8784,7 +8929,7 @@ def search_mb_release_group_by_metadata(
         _run_search_and_browse(album_norm)
 
         # 4) If still no candidates, try with raw title (e.g. "Isolette") — MusicBrainz may match exact casing
-        if not candidates and title_raw and (title_raw.strip() != album_norm):
+        if (not candidates) and (not _mb_budget_exceeded()) and title_raw and (title_raw.strip() != album_norm):
             raw_clean = title_raw.strip()
             if raw_clean:
                 _run_search_and_browse(raw_clean)
@@ -8803,7 +8948,7 @@ def search_mb_release_group_by_metadata(
         all_fetched: List[tuple] = []
 
         # IA-first: ask AI to pick one candidate from titles only, then fetch only that one (reduces MB requests)
-        if USE_AI_FOR_MB_VERIFY and getattr(sys.modules[__name__], "ai_provider_ready", False) and candidates:
+        if USE_AI_FOR_MB_VERIFY and getattr(sys.modules[__name__], "ai_provider_ready", False) and candidates and (not _mb_budget_exceeded()):
             letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
             choices = [f"{letters[i]}) {rg.get('title', '?')} (id={rg.get('id', '')})" for i, rg in enumerate(candidates[:20])]
             track_list_str = ", ".join((list(tracks)[:30] if tracks else [])) if tracks else "(none)"
@@ -8883,7 +9028,24 @@ def search_mb_release_group_by_metadata(
                 logging.debug("[MusicBrainz] AI-first path failed: %s", e)
             # Fall through to full flow (fetch all candidates, then ai_verify_mb_match)
 
-        for rg in candidates:
+        if len(candidates) > candidate_fetch_limit:
+            logging.info(
+                "[MusicBrainz] %s – %r: %d candidate(s); limiting detailed fetch to top %d for speed",
+                artist,
+                title_raw or album_norm or "?",
+                len(candidates),
+                candidate_fetch_limit,
+            )
+
+        for idx, rg in enumerate(candidates[:candidate_fetch_limit]):
+            if _mb_budget_exceeded():
+                logging.info(
+                    "[MusicBrainz] %s – %r: MB budget reached after %.1fs; stopping detailed candidate fetch and using fallback flow",
+                    artist,
+                    title_raw or album_norm or "?",
+                    time.perf_counter() - mb_search_started,
+                )
+                break
             try:
                 rg_id = rg['id']
                 if MB_QUEUE_ENABLED and USE_MUSICBRAINZ:
@@ -8909,7 +9071,7 @@ def search_mb_release_group_by_metadata(
                     'cover_url': f"https://coverartarchive.org/release-group/{rg_id_final}/front",
                 }
                 # Phase 2: optionally fetch track titles from one release for AI verify prompt
-                if USE_AI_FOR_MB_VERIFY and info.get('release-list'):
+                if USE_AI_FOR_MB_VERIFY and info.get('release-list') and idx < tracklist_fetch_limit:
                     first_release_id = info['release-list'][0].get('id')
                     if first_release_id:
                         try:
@@ -8947,18 +9109,33 @@ def search_mb_release_group_by_metadata(
                 lines.append("  ... and %d more" % (len(all_fetched) - 20))
             logging.info("\n".join(lines))
 
-        # Partie 2+3: When no MusicBrainz candidates, try Bandcamp + web search + AI to suggest MBID
-        if not all_fetched and getattr(sys.modules[__name__], "ai_provider_ready", False):
+        if not all_fetched:
             title_for_zero = (title_raw or album_norm or "").strip()
-            bandcamp_text = ""
-            bc = None
-            if USE_BANDCAMP and title_for_zero:
-                try:
-                    bc = _fetch_bandcamp_album_info(artist, title_for_zero)
-                    if bc:
-                        bandcamp_text = f"Bandcamp: title={bc.get('title')}, artist={bc.get('artist_name')}"
-                except Exception:
-                    pass
+            if fast_fallback_mode:
+                reason = "budget exceeded" if _mb_budget_exceeded() else "no MB candidates/details"
+                logging.info(
+                    "[MusicBrainz] %s – %r: fast fallback mode -> skipping web+AI MBID hunt (%s)",
+                    artist,
+                    title_for_zero or album_norm or "?",
+                    reason,
+                )
+                return (None, False)
+
+            provider_info = _provider_fallbacks() if title_for_zero else {}
+            provider_sources = list(provider_info.get("extra_sources") or [])
+            if provider_sources:
+                lines = ["[Providers] %s – %r: no usable MusicBrainz match yet; fallback sources ready:" % (artist, title_for_zero or "?")]
+                for src in provider_sources:
+                    src_name = src.get("source", "?")
+                    src_title = src.get("title") or src.get("album") or "?"
+                    src_artist = src.get("artist") or src.get("artist_name") or "?"
+                    lines.append("  %s: %r by %s" % (src_name, src_title, src_artist))
+                logging.info("\n".join(lines))
+
+            if not getattr(sys.modules[__name__], "ai_provider_ready", False):
+                return (None, False)
+
+            # Optional slow path: try web + AI to infer MBID even when MB has no usable candidate.
             web_snippets = ""
             web_results = []
             if USE_WEB_SEARCH_FOR_MB and SERPER_API_KEY.strip() and title_for_zero:
@@ -8967,19 +9144,13 @@ def search_mb_release_group_by_metadata(
                 if web_results:
                     parts = [f"Web {i+1}) {r.get('title')} — {r.get('snippet')} ({r.get('link')})" for i, r in enumerate(web_results[:10])]
                     web_snippets = "\n".join(parts)
-            if bc or web_results:
-                lines = ["[Providers] %s – %r: no MusicBrainz candidates; fallback sources:" % (artist, title_for_zero or "?")]
-                if bc:
-                    lines.append("  Bandcamp: %r by %s" % (bc.get("title") or "?", bc.get("artist_name") or "?"))
-                if web_results:
-                    lines.append("  Web search (%s): %d result(s)" % (q, len(web_results)))
-                    for i, r in enumerate(web_results[:8]):
-                        lines.append("    %d. %s — %s" % (i + 1, (r.get("title") or "?")[:60], (r.get("link") or "?")[:70]))
-                    if len(web_results) > 8:
-                        lines.append("    ... and %d more" % (len(web_results) - 8))
-                logging.info("\n".join(lines))
+            bandcamp_text = ""
+            bc_info = provider_info.get("bandcamp") if provider_info else None
+            if bc_info:
+                bandcamp_text = f"Bandcamp: title={bc_info.get('title')}, artist={bc_info.get('artist_name')}"
+
             if bandcamp_text or web_snippets:
-                prompt = f"Our album: artist={artist}, title={title_for_zero}. No MusicBrainz candidates.\n"
+                prompt = f"Our album: artist={artist}, title={title_for_zero}. No usable MusicBrainz candidate.\n"
                 if bandcamp_text:
                     prompt += bandcamp_text + "\n"
                 if web_snippets:
@@ -9035,24 +9206,7 @@ def search_mb_release_group_by_metadata(
             extra_sources: List[dict] = []
             title_for_fetch = (title_raw or album_norm or "").strip()
             if title_for_fetch:
-                try:
-                    discogs_info = _fetch_discogs_release(artist, title_for_fetch)
-                    if discogs_info:
-                        extra_sources.append({"source": "Discogs", "title": discogs_info.get("title"), "artist_name": discogs_info.get("artist_name")})
-                except Exception:
-                    pass
-                try:
-                    lastfm_info = _fetch_lastfm_album_info(artist, title_for_fetch)
-                    if lastfm_info:
-                        extra_sources.append({"source": "Last.fm", "title": lastfm_info.get("title"), "artist": lastfm_info.get("artist")})
-                except Exception:
-                    pass
-                try:
-                    bandcamp_info = _fetch_bandcamp_album_info(artist, title_for_fetch)
-                    if bandcamp_info:
-                        extra_sources.append({"source": "Bandcamp", "title": bandcamp_info.get("title"), "artist_name": bandcamp_info.get("artist_name")})
-                except Exception:
-                    pass
+                extra_sources = list((_provider_fallbacks() or {}).get("extra_sources") or [])
             if extra_sources:
                 lines = ["[Providers] %s – %r: extra sources for AI disambiguation:" % (artist, title_for_fetch or "?")]
                 for s in extra_sources:
@@ -9135,7 +9289,14 @@ def search_mb_release_group_by_metadata(
                     logging.info("[MusicBrainz Verify] Match verified by AI for artist=%r album=%r", artist, album_norm)
                     return (chosen[1], True)
             # Partie 2 Cas 2: AI said NONE but we have candidates; try web search + one more AI call
-            if chosen is None and all_fetched and USE_WEB_SEARCH_FOR_MB and SERPER_API_KEY.strip():
+            if (
+                chosen is None
+                and all_fetched
+                and USE_WEB_SEARCH_FOR_MB
+                and SERPER_API_KEY.strip()
+                and (not fast_fallback_mode)
+                and (not _mb_budget_exceeded())
+            ):
                 title_for_web = (title_raw or album_norm or "").strip()
                 if title_for_web:
                     q = f"{artist} {title_for_web} album"
@@ -10396,12 +10557,11 @@ def scan_duplicates(
                 tracks = {t.title for t in e['tracks']}
                 artist_norm_key = artist.lower().strip()
                 if not rg_info:
-                    # Check cache for "artist+album -> MBID" unless a full rescan was requested.
-                    # Cached "not found" is never used to skip: we always re-query MusicBrainz so that transient
-                    # failures or improved data on MusicBrainz can be picked up on the next scan.
+                    # Check cache for "artist+album -> MBID".
                     cached_mbid = cached_rg_info = None
                     if not MB_DISABLE_CACHE:
                         cached_mbid, cached_rg_info = get_cached_mb_album_lookup(artist_norm_key, album_norm)
+                    cached_not_found = bool(cached_mbid == "")
                     if cached_mbid and cached_mbid != "":
                         # Cached: found MBID for this artist+album — use it, no API search
                         rg_info = cached_rg_info or get_cached_mb_info(cached_mbid)
@@ -10429,7 +10589,25 @@ def scan_duplicates(
                                 cached_mbid,
                             )
                             logging.debug("[Artist %s] Edition %s MBID from album lookup cache: %s", artist, e['album_id'], cached_mbid)
-                    if not rg_info:
+                    elif cached_not_found and not MB_RETRY_NOT_FOUND:
+                        e["mb_cache_hit"] = True
+                        e["rg_info_source"] = "mb_not_found_cached"
+                        with lock:
+                            if artist in state.get("scan_active_artists", {}) and e['album_id'] == state["scan_active_artists"][artist].get("current_album", {}).get("album_id"):
+                                state["scan_active_artists"][artist]["current_album"]["status_details"] = "MusicBrainz skipped (cached not found)"
+                                state["scan_active_artists"][artist]["current_album"]["step_summary"] = (
+                                    "MusicBrainz: cached not-found (provider fallback first)"
+                                )
+                                state["scan_active_artists"][artist]["current_album"]["step_response"] = (
+                                    "MusicBrainz: cached not-found, skipping re-query and using provider fallback."
+                                )
+                        album_title_log = e.get("title_raw") or e.get("plex_title") or album_norm
+                        log_mb(
+                            "Album %s – \"%s\": skipping MusicBrainz re-query (cached not-found, MB_RETRY_NOT_FOUND=false)",
+                            artist,
+                            album_title_log,
+                        )
+                    if not rg_info and not (cached_not_found and not MB_RETRY_NOT_FOUND):
                         # Not in cache (or cache intentionally bypassed): try pre-fetched artist index first, then search
                         with lock:
                             if artist in state.get("scan_active_artists", {}) and e['album_id'] == state["scan_active_artists"][artist].get("current_album", {}).get("album_id"):
@@ -10606,6 +10784,9 @@ def scan_duplicates(
                         discogs_info = _fetch_discogs_release(artist, title_raw)
                         if discogs_info:
                             e["fallback_discogs"] = discogs_info
+                            e["discogs_release_id"] = str(
+                                discogs_info.get("release_id") or discogs_info.get("master_id") or ""
+                            ).strip()
                             with lock:
                                 state["scan_discogs_matched"] = state.get("scan_discogs_matched", 0) + 1
                             fallback_sources.append("Discogs")
@@ -10616,6 +10797,7 @@ def scan_duplicates(
                         lastfm_info = _fetch_lastfm_album_info(artist, title_raw)
                         if lastfm_info:
                             e["fallback_lastfm"] = lastfm_info
+                            e["lastfm_album_mbid"] = str(lastfm_info.get("mbid") or "").strip()
                             with lock:
                                 state["scan_lastfm_matched"] = state.get("scan_lastfm_matched", 0) + 1
                             fallback_sources.append("Last.fm")
@@ -10643,6 +10825,7 @@ def scan_duplicates(
                         bandcamp_info = _fetch_bandcamp_album_info(artist, title_raw)
                         if bandcamp_info:
                             e["fallback_bandcamp"] = bandcamp_info
+                            e["bandcamp_album_url"] = str(bandcamp_info.get("url") or "").strip()
                             with lock:
                                 state["scan_bandcamp_matched"] = state.get("scan_bandcamp_matched", 0) + 1
                             fallback_sources.append("Bandcamp")
@@ -10673,6 +10856,54 @@ def scan_duplicates(
                                 )
                                 logging.info("[Artist %s] Edition %s: high-confidence %s match (tracklist %.2f)", artist, e.get("album_id"), src_label, score)
                                 break
+                # Fallback identity without MBID: accept provider as source-of-truth when title/artist are consistent.
+                if not rg_info and not e.get("primary_metadata_source"):
+                    def _looks_like_same_release(src: dict, *, src_name: str) -> bool:
+                        if not isinstance(src, dict):
+                            return False
+                        src_title = (src.get("title") or src.get("album") or "").strip()
+                        src_artist = (src.get("artist") or src.get("artist_name") or "").strip()
+                        if not src_title:
+                            return False
+                        title_norm_local = norm_album(title_raw)
+                        title_norm_src = norm_album(src_title)
+                        if not title_norm_local or not title_norm_src:
+                            return False
+                        title_ok = (
+                            title_norm_src == title_norm_local
+                            or title_norm_src in title_norm_local
+                            or title_norm_local in title_norm_src
+                        )
+                        if not title_ok:
+                            return False
+                        if not src_artist:
+                            return True
+                        artist_ok = norm_album(src_artist) == norm_album(artist)
+                        if not artist_ok:
+                            logging.debug(
+                                "[Artist %s] %s fallback rejected for identity (artist mismatch): %r vs %r",
+                                artist,
+                                src_name,
+                                src_artist,
+                                artist,
+                            )
+                        return artist_ok
+
+                    provider_candidates = [
+                        ("discogs", e.get("fallback_discogs")),
+                        ("lastfm", e.get("fallback_lastfm")),
+                        ("bandcamp", e.get("fallback_bandcamp")),
+                    ]
+                    for src_label, src_payload in provider_candidates:
+                        if _looks_like_same_release(src_payload, src_name=src_label):
+                            e["primary_metadata_source"] = src_label
+                            logging.info(
+                                "[Artist %s] Edition %s: provider identity accepted from %s (MB unavailable)",
+                                artist,
+                                e.get("album_id"),
+                                src_label,
+                            )
+                            break
             # Increment MB-done count for this edition (whether we found rg_info or not)
             with lock:
                 state["scan_mb_done_count"] = state.get("scan_mb_done_count", 0) + 1
@@ -12674,11 +12905,30 @@ def _publish_files_library_artist_from_items(
                 "artist_image_path": str(artist_image_path) if artist_image_path else "",
                 "mb_identified": bool(mbid),
                 "musicbrainz_release_group_id": mbid,
-                "discogs_release_id": (result.get("discogs_release_id") or "").strip(),
-                "lastfm_album_mbid": (result.get("lastfm_album_mbid") or "").strip(),
-                "bandcamp_album_url": (result.get("bandcamp_album_url") or "").strip(),
+                "discogs_release_id": (
+                    result.get("discogs_release_id")
+                    or item.get("discogs_release_id")
+                    or ""
+                ).strip(),
+                "lastfm_album_mbid": (
+                    result.get("lastfm_album_mbid")
+                    or item.get("lastfm_album_mbid")
+                    or ""
+                ).strip(),
+                "bandcamp_album_url": (
+                    result.get("bandcamp_album_url")
+                    or item.get("bandcamp_album_url")
+                    or ""
+                ).strip(),
                 "primary_metadata_source": (
-                    (result.get("provider_used") or result.get("pmda_match_provider") or pmda_provider or "").strip()
+                    (
+                        result.get("provider_used")
+                        or result.get("pmda_match_provider")
+                        or item.get("primary_metadata_source")
+                        or item.get("metadata_source")
+                        or pmda_provider
+                        or ""
+                    ).strip()
                 ),
                 "track_count": actual_track_count,
                 "total_duration_sec": total_duration_sec,
@@ -14285,11 +14535,35 @@ def background_scan():
                                             "ordered_paths": item.get("ordered_paths") or [],
                                             "fingerprint": item.get("fingerprint") or "",
                                             "provider_used": result.get("provider_used"),
-                                            "metadata_source": result.get("provider_used") or result.get("pmda_match_provider"),
-                                            "identity_provider": result.get("provider_used") or result.get("pmda_match_provider"),
-                                            "discogs_release_id": result.get("discogs_release_id") or "",
-                                            "lastfm_album_mbid": result.get("lastfm_album_mbid") or "",
-                                            "bandcamp_album_url": result.get("bandcamp_album_url") or "",
+                                            "metadata_source": (
+                                                result.get("provider_used")
+                                                or result.get("pmda_match_provider")
+                                                or item.get("metadata_source")
+                                                or item.get("primary_metadata_source")
+                                                or ""
+                                            ),
+                                            "identity_provider": (
+                                                result.get("provider_used")
+                                                or result.get("pmda_match_provider")
+                                                or item.get("metadata_source")
+                                                or item.get("primary_metadata_source")
+                                                or ""
+                                            ),
+                                            "discogs_release_id": (
+                                                result.get("discogs_release_id")
+                                                or item.get("discogs_release_id")
+                                                or ""
+                                            ),
+                                            "lastfm_album_mbid": (
+                                                result.get("lastfm_album_mbid")
+                                                or item.get("lastfm_album_mbid")
+                                                or ""
+                                            ),
+                                            "bandcamp_album_url": (
+                                                result.get("bandcamp_album_url")
+                                                or item.get("bandcamp_album_url")
+                                                or ""
+                                            ),
                                         }
                                     ],
                                     scan_id=scan_id,
@@ -18165,6 +18439,10 @@ def api_config_get():
         "USE_MUSICBRAINZ": get_setting_bool("USE_MUSICBRAINZ", USE_MUSICBRAINZ),
         "MUSICBRAINZ_EMAIL": get_setting("MUSICBRAINZ_EMAIL", MUSICBRAINZ_EMAIL),
         "MB_RETRY_NOT_FOUND": get_setting_bool("MB_RETRY_NOT_FOUND", MB_RETRY_NOT_FOUND),
+        "MB_SEARCH_ALBUM_TIMEOUT_SEC": get_setting("MB_SEARCH_ALBUM_TIMEOUT_SEC", MB_SEARCH_ALBUM_TIMEOUT_SEC),
+        "MB_CANDIDATE_FETCH_LIMIT": get_setting("MB_CANDIDATE_FETCH_LIMIT", MB_CANDIDATE_FETCH_LIMIT),
+        "MB_TRACKLIST_FETCH_LIMIT": get_setting("MB_TRACKLIST_FETCH_LIMIT", MB_TRACKLIST_FETCH_LIMIT),
+        "MB_FAST_FALLBACK_MODE": get_setting_bool("MB_FAST_FALLBACK_MODE", MB_FAST_FALLBACK_MODE),
         "USE_AI_FOR_MB_MATCH": get_setting_bool("USE_AI_FOR_MB_MATCH", USE_AI_FOR_MB_MATCH),
         "USE_AI_FOR_MB_VERIFY": get_setting_bool("USE_AI_FOR_MB_VERIFY", USE_AI_FOR_MB_VERIFY),
         "USE_AI_VISION_FOR_COVER": get_setting_bool("USE_AI_VISION_FOR_COVER", USE_AI_VISION_FOR_COVER),
@@ -18327,6 +18605,27 @@ def _apply_settings_in_memory(updates: dict):
     if "MB_RETRY_NOT_FOUND" in updates:
         global MB_RETRY_NOT_FOUND
         MB_RETRY_NOT_FOUND = bool(_parse_bool(updates["MB_RETRY_NOT_FOUND"]))
+    if "MB_SEARCH_ALBUM_TIMEOUT_SEC" in updates:
+        global MB_SEARCH_ALBUM_TIMEOUT_SEC
+        try:
+            MB_SEARCH_ALBUM_TIMEOUT_SEC = max(10, min(300, int(updates["MB_SEARCH_ALBUM_TIMEOUT_SEC"])))
+        except (TypeError, ValueError):
+            pass
+    if "MB_CANDIDATE_FETCH_LIMIT" in updates:
+        global MB_CANDIDATE_FETCH_LIMIT
+        try:
+            MB_CANDIDATE_FETCH_LIMIT = max(1, min(20, int(updates["MB_CANDIDATE_FETCH_LIMIT"])))
+        except (TypeError, ValueError):
+            pass
+    if "MB_TRACKLIST_FETCH_LIMIT" in updates:
+        global MB_TRACKLIST_FETCH_LIMIT
+        try:
+            MB_TRACKLIST_FETCH_LIMIT = max(0, min(20, int(updates["MB_TRACKLIST_FETCH_LIMIT"])))
+        except (TypeError, ValueError):
+            pass
+    if "MB_FAST_FALLBACK_MODE" in updates:
+        global MB_FAST_FALLBACK_MODE
+        MB_FAST_FALLBACK_MODE = bool(_parse_bool(updates["MB_FAST_FALLBACK_MODE"]))
     if "SCAN_DISABLE_CACHE" in updates:
         global SCAN_DISABLE_CACHE
         SCAN_DISABLE_CACHE = bool(_parse_bool(updates["SCAN_DISABLE_CACHE"]))
@@ -18631,6 +18930,7 @@ def api_config_put():
         "SCAN_THREADS", "LOG_LEVEL", "LOG_FILE", "AI_PROVIDER", "OPENAI_API_KEY", "OPENAI_MODEL",
         "OPENAI_MODEL_FALLBACKS", "ANTHROPIC_API_KEY", "GOOGLE_API_KEY", "OLLAMA_URL",
         "DISCORD_WEBHOOK", "USE_MUSICBRAINZ", "MUSICBRAINZ_EMAIL", "MB_RETRY_NOT_FOUND",
+        "MB_SEARCH_ALBUM_TIMEOUT_SEC", "MB_CANDIDATE_FETCH_LIMIT", "MB_TRACKLIST_FETCH_LIMIT", "MB_FAST_FALLBACK_MODE",
         "USE_AI_FOR_MB_MATCH", "USE_AI_FOR_MB_VERIFY",
         "USE_AI_VISION_FOR_COVER", "AI_CONFIDENCE_MIN", "OPENAI_VISION_MODEL", "USE_AI_VISION_BEFORE_COVER_INJECT", "USE_WEB_SEARCH_FOR_MB", "SERPER_API_KEY",
         "USE_ACOUSTID", "ACOUSTID_API_KEY", "USE_ACOUSTID_WHEN_TAGGED",
@@ -18678,6 +18978,21 @@ def api_config_put():
             updates["BROKEN_ALBUM_PERCENTAGE_THRESHOLD"] = float(updates["BROKEN_ALBUM_PERCENTAGE_THRESHOLD"])
         except (ValueError, TypeError):
             updates["BROKEN_ALBUM_PERCENTAGE_THRESHOLD"] = 0.20
+    if "MB_SEARCH_ALBUM_TIMEOUT_SEC" in updates:
+        try:
+            updates["MB_SEARCH_ALBUM_TIMEOUT_SEC"] = max(10, min(300, int(updates["MB_SEARCH_ALBUM_TIMEOUT_SEC"])))
+        except (ValueError, TypeError):
+            updates["MB_SEARCH_ALBUM_TIMEOUT_SEC"] = 45
+    if "MB_CANDIDATE_FETCH_LIMIT" in updates:
+        try:
+            updates["MB_CANDIDATE_FETCH_LIMIT"] = max(1, min(20, int(updates["MB_CANDIDATE_FETCH_LIMIT"])))
+        except (ValueError, TypeError):
+            updates["MB_CANDIDATE_FETCH_LIMIT"] = 6
+    if "MB_TRACKLIST_FETCH_LIMIT" in updates:
+        try:
+            updates["MB_TRACKLIST_FETCH_LIMIT"] = max(0, min(20, int(updates["MB_TRACKLIST_FETCH_LIMIT"])))
+        except (ValueError, TypeError):
+            updates["MB_TRACKLIST_FETCH_LIMIT"] = 3
     
     # Serialize complex types for SQLite storage. Do not overwrite secret keys with mask (e.g. "***").
     MASKED_SECRETS = (
@@ -22417,11 +22732,49 @@ def get_artist_images_mb(artist_mbid: str) -> List[str]:
 
 
 def _artist_folder_has_image(artist_folder: Path) -> bool:
-    """Return True if the artist folder already has an artist/folder image file."""
+    """Return True if the artist folder already has a dedicated artist image file."""
     if not artist_folder or not artist_folder.is_dir():
         return False
-    names = ("artist.jpg", "artist.jpeg", "artist.png", "folder.jpg", "folder.jpeg", "folder.png")
-    return any((artist_folder / n).is_file() for n in names)
+    return any((artist_folder / n).is_file() for n in _ARTIST_IMAGE_NAMES)
+
+
+def _is_probably_placeholder_artist_image_url(url: str) -> bool:
+    low = (url or "").strip().lower()
+    if not low:
+        return True
+    # Known Last.fm "missing artist image" hashes frequently returned for unknown artists.
+    placeholder_tokens = (
+        "2a96cbd8b46e442fc41c2b86b821562f",
+        "4128a6eb29f94943c9d206c08e625904",
+        "c6f59c1e5e7240a4c0d427abd71f3dbb",
+    )
+    if any(tok in low for tok in placeholder_tokens):
+        return True
+    if "default" in low and ("last.fm" in low or "lastfm" in low):
+        return True
+    return False
+
+
+def _is_usable_artist_image_bytes(raw: bytes, *, min_dim: int = 220, min_bytes: int = 8192) -> bool:
+    if not raw or len(raw) < min_bytes:
+        return False
+    try:
+        from PIL import Image
+        from io import BytesIO
+
+        with Image.open(BytesIO(raw)) as img:
+            w, h = img.size
+            if w < min_dim or h < min_dim:
+                return False
+            # Reject quasi-flat placeholders (very low color diversity).
+            thumb = img.convert("RGB").resize((32, 32), Image.Resampling.BILINEAR)
+            colors = thumb.getcolors(maxcolors=4096)
+            if colors is not None and len(colors) < 20:
+                return False
+    except Exception:
+        # If we cannot inspect image content, keep previous permissive behavior.
+        return True
+    return True
 
 
 def _fetch_and_save_artist_image_mb(artist_mbid: str, artist_folder: Path) -> bool:
@@ -22434,6 +22787,8 @@ def _fetch_and_save_artist_image_mb(artist_mbid: str, artist_folder: Path) -> bo
                 continue
             ct = resp.headers.get("content-type", "").lower()
             if "image/" in ct:
+                if not _is_usable_artist_image_bytes(resp.content):
+                    continue
                 ext = ".jpg"
                 if "png" in ct:
                     ext = ".png"
@@ -22448,6 +22803,8 @@ def _fetch_and_save_artist_image_mb(artist_mbid: str, artist_folder: Path) -> bo
                     img_url = m.group(1).strip()
                     img_resp = requests.get(img_url, timeout=10, allow_redirects=True)
                     if img_resp.status_code == 200 and "image/" in img_resp.headers.get("content-type", "").lower():
+                        if not _is_usable_artist_image_bytes(img_resp.content):
+                            continue
                         (artist_folder / "artist.jpg").write_bytes(img_resp.content)
                         logging.info("Saved artist image from Wikimedia to %s", artist_folder / "artist.jpg")
                         return True
@@ -22479,7 +22836,10 @@ def _fetch_artist_image_lastfm(artist_name: str) -> Optional[str]:
         url = None
         for img in images:
             if isinstance(img, dict) and img.get("#text"):
-                url = img.get("#text")
+                cand = (img.get("#text") or "").strip()
+                if not cand or _is_probably_placeholder_artist_image_url(cand):
+                    continue
+                url = cand
                 if img.get("size") == "extralarge":
                     return url
         return url
@@ -22572,7 +22932,7 @@ def _fetch_artist_image_web(artist_name: str) -> Optional[str]:
 def _fetch_and_save_artist_image(artist_name: str, artist_folder: Path, artist_mbid: Optional[str] = None) -> Optional[str]:
     """
     Fetch artist image from MB, then Last.fm, then Discogs and save to artist_folder (artist.jpg).
-    Skips if artist_folder already has an artist/folder image.
+    Skips if artist_folder already has a dedicated artist image.
     Returns provider string on success ("musicbrainz", "lastfm", "discogs"), or None on failure.
     """
     if not artist_folder or not artist_folder.is_dir():
@@ -22588,10 +22948,10 @@ def _fetch_and_save_artist_image(artist_name: str, artist_folder: Path, artist_m
     # Last.fm
     if USE_LASTFM:
         url = _fetch_artist_image_lastfm(artist_name)
-        if url:
+        if url and not _is_probably_placeholder_artist_image_url(url):
             try:
                 resp = requests.get(url, timeout=10, allow_redirects=True)
-                if resp.status_code == 200 and resp.content:
+                if resp.status_code == 200 and resp.content and _is_usable_artist_image_bytes(resp.content):
                     (artist_folder / "artist.jpg").write_bytes(resp.content)
                     logging.info("Saved artist image from Last.fm to %s", artist_folder / "artist.jpg")
                     return "lastfm"
@@ -22603,7 +22963,7 @@ def _fetch_and_save_artist_image(artist_name: str, artist_folder: Path, artist_m
         if url:
             try:
                 resp = requests.get(url, timeout=10, allow_redirects=True)
-                if resp.status_code == 200 and resp.content:
+                if resp.status_code == 200 and resp.content and _is_usable_artist_image_bytes(resp.content):
                     (artist_folder / "artist.jpg").write_bytes(resp.content)
                     logging.info("Saved artist image from Discogs to %s", artist_folder / "artist.jpg")
                     return "discogs"
@@ -22611,10 +22971,10 @@ def _fetch_and_save_artist_image(artist_name: str, artist_folder: Path, artist_m
                 logging.warning("Artist image download (Discogs) failed: %s", e)
     # Web search fallback (Serper + OpenGraph) when other providers did not yield an image
     web_url = _fetch_artist_image_web(artist_name)
-    if web_url:
+    if web_url and not _is_probably_placeholder_artist_image_url(web_url):
         try:
             resp = requests.get(web_url, timeout=10, allow_redirects=True)
-            if resp.status_code == 200 and resp.content:
+            if resp.status_code == 200 and resp.content and _is_usable_artist_image_bytes(resp.content):
                 (artist_folder / "artist.jpg").write_bytes(resp.content)
                 logging.info("Saved artist image from web search to %s", artist_folder / "artist.jpg")
                 return "web"
@@ -24530,6 +24890,11 @@ def _build_improve_items_from_editions(artist_name: str, editions: list[dict]) -
                 "meta": dict(e.get("meta") or {}),
                 "ordered_paths": list(e.get("ordered_paths") or []),
                 "fingerprint": e.get("fingerprint") or "",
+                "primary_metadata_source": e.get("primary_metadata_source") or e.get("metadata_source") or "",
+                "metadata_source": e.get("metadata_source") or e.get("primary_metadata_source") or "",
+                "discogs_release_id": e.get("discogs_release_id") or "",
+                "lastfm_album_mbid": e.get("lastfm_album_mbid") or "",
+                "bandcamp_album_url": e.get("bandcamp_album_url") or "",
                 "br": e.get("br") or 0,
                 "sr": e.get("sr") or 0,
                 "bd": e.get("bd") or 0,
