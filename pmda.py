@@ -24383,9 +24383,17 @@ def dedupe_selected():
 
 # ─── Integrated frontend (self-hosted: serve SPA from same container) ─────────────
 if _HAS_STATIC_UI:
+    def _send_index_no_cache():
+        resp = send_from_directory(_FRONTEND_DIST, "index.html")
+        # Prevent stale SPA shell after deploys; assets remain hash-versioned.
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        resp.headers["Pragma"] = "no-cache"
+        resp.headers["Expires"] = "0"
+        return resp
+
     @app.get("/")
     def serve_index():
-        return send_from_directory(_FRONTEND_DIST, "index.html")
+        return _send_index_no_cache()
 
     @app.get("/assets/<path:path>")
     def serve_assets(path):
@@ -24399,7 +24407,7 @@ if _HAS_STATIC_UI:
         path_obj = os.path.join(_FRONTEND_DIST, path)
         if os.path.isfile(path_obj):
             return send_from_directory(_FRONTEND_DIST, path)
-        return send_from_directory(_FRONTEND_DIST, "index.html")
+        return _send_index_no_cache()
 
 
 # ───────────────────────────────── MAIN ───────────────────────────────────
