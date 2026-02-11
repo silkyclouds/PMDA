@@ -10734,7 +10734,17 @@ def _refresh_files_album_scan_cache_from_editions(editions: list[dict], scan_id:
                 tags = extract_tags(ordered_paths[0]) or {}
             except Exception:
                 tags = {}
-        missing_required = _check_required_tags(tags, REQUIRED_TAGS, edition=e)
+        edition_for_required = e
+        if not (edition_for_required.get("tracks") or []):
+            # Keep incremental cache healthy when caller does not provide tracks:
+            # derive a minimal track list from filesystem order.
+            derived_tracks = [
+                {"title": p.stem or f"Track {i + 1}", "idx": i + 1}
+                for i, p in enumerate(ordered_paths)
+            ]
+            edition_for_required = dict(e)
+            edition_for_required["tracks"] = derived_tracks
+        missing_required = _check_required_tags(tags, REQUIRED_TAGS, edition=edition_for_required)
         has_cover = album_folder_has_cover(folder)
         has_artist_image = _artist_folder_has_image(folder.parent if folder.parent else folder)
         mbid = (e.get("musicbrainz_id") or _extract_musicbrainz_id_from_meta(tags) or "").strip()
@@ -11760,8 +11770,14 @@ def background_scan():
                                         {
                                             "folder": item.get("folder"),
                                             "artist": artist_name,
+                                            "artist_name": artist_name,
                                             "title_raw": album_title,
+                                            "album_title": album_title,
                                             "musicbrainz_id": item.get("musicbrainz_id") or result.get("musicbrainz_id"),
+                                            "meta": item.get("meta") or {},
+                                            "tracks": item.get("tracks") or [],
+                                            "ordered_paths": item.get("ordered_paths") or [],
+                                            "fingerprint": item.get("fingerprint") or "",
                                         }
                                     ],
                                     scan_id=scan_id,
@@ -21748,6 +21764,12 @@ def _build_improve_items_from_editions(artist_name: str, editions: list[dict]) -
                 "album_title": str(title or "").strip() or f"Album {album_id}",
                 "musicbrainz_id": mbid,
                 "folder": folder_str,
+                # Keep scan edition context so post-process cache refresh can preserve
+                # required-tags health (notably "tracks") for incremental changed-only scans.
+                "tracks": list(e.get("tracks") or []),
+                "meta": dict(e.get("meta") or {}),
+                "ordered_paths": list(e.get("ordered_paths") or []),
+                "fingerprint": e.get("fingerprint") or "",
             }
         )
     return items
