@@ -6543,6 +6543,7 @@ def _iter_audio_files_under_roots(
     *,
     progress_cb=None,
     progress_every: int = 250,
+    heartbeat_seconds: float = 10.0,
 ) -> list[Path]:
     """
     Return a list of audio files under the given filesystem roots.
@@ -6551,12 +6552,16 @@ def _iter_audio_files_under_roots(
     out: list[Path] = []
     seen_paths: set[str] = set()
     files_found = 0
+    entries_scanned = 0
     roots_total = len([r for r in (roots or []) if r])
     roots_done = 0
+    heartbeat_seconds = float(heartbeat_seconds or 0.0)
+    last_heartbeat = time.monotonic()
     for root in roots:
         if not root:
             continue
         base = Path(root)
+        root_entries_scanned = 0
         if not base.exists():
             logging.debug("FILES_ROOTS entry %s does not exist; skipping", root)
             roots_done += 1
@@ -6568,6 +6573,8 @@ def _iter_audio_files_under_roots(
                             "roots_done": roots_done,
                             "roots_total": roots_total,
                             "files_found": files_found,
+                            "entries_scanned": entries_scanned,
+                            "root_entries_scanned": root_entries_scanned,
                             "done": roots_done >= roots_total,
                         }
                     )
@@ -6575,6 +6582,26 @@ def _iter_audio_files_under_roots(
                     pass
             continue
         for p in base.rglob("*"):
+            entries_scanned += 1
+            root_entries_scanned += 1
+            if callable(progress_cb) and heartbeat_seconds > 0:
+                now = time.monotonic()
+                if (now - last_heartbeat) >= heartbeat_seconds:
+                    last_heartbeat = now
+                    try:
+                        progress_cb(
+                            {
+                                "root": str(base),
+                                "roots_done": roots_done,
+                                "roots_total": roots_total,
+                                "files_found": files_found,
+                                "entries_scanned": entries_scanned,
+                                "root_entries_scanned": root_entries_scanned,
+                                "done": False,
+                            }
+                        )
+                    except Exception:
+                        pass
             try:
                 if p.is_file() and AUDIO_RE.search(p.name):
                     sp = str(p)
@@ -6591,6 +6618,8 @@ def _iter_audio_files_under_roots(
                                     "roots_done": roots_done,
                                     "roots_total": roots_total,
                                     "files_found": files_found,
+                                    "entries_scanned": entries_scanned,
+                                    "root_entries_scanned": root_entries_scanned,
                                     "done": False,
                                 }
                             )
@@ -6607,6 +6636,8 @@ def _iter_audio_files_under_roots(
                         "roots_done": roots_done,
                         "roots_total": roots_total,
                         "files_found": files_found,
+                        "entries_scanned": entries_scanned,
+                        "root_entries_scanned": root_entries_scanned,
                         "done": roots_done >= roots_total,
                     }
                 )
@@ -11742,6 +11773,50 @@ def _build_files_editions(scan_type: str = "full") -> tuple[list[tuple[int, str,
 
     skip_list = list(SKIP_FOLDERS or [])
     cache_map = _load_files_album_scan_cache_map()
+    heartbeat_interval_s = 10.0
+    heartbeat_frames = ("|", "/", "-", "\\")
+    heartbeat_idx = 0
+    last_heartbeat_ts = 0.0
+
+    def _emit_files_discovery_heartbeat(
+        stage: str,
+        *,
+        root: str | None = None,
+        roots_done: int | None = None,
+        roots_total: int | None = None,
+        files_found: int | None = None,
+        entries_scanned: int | None = None,
+        folders_done: int | None = None,
+        folders_total: int | None = None,
+        artists_found: int | None = None,
+        albums_found: int | None = None,
+        force: bool = False,
+    ) -> None:
+        nonlocal heartbeat_idx, last_heartbeat_ts
+        now = time.monotonic()
+        if not force and (now - last_heartbeat_ts) < heartbeat_interval_s:
+            return
+        last_heartbeat_ts = now
+        frame = heartbeat_frames[heartbeat_idx % len(heartbeat_frames)]
+        heartbeat_idx += 1
+        parts: list[str] = []
+        if roots_done is not None and roots_total is not None:
+            parts.append(f"roots {int(roots_done)}/{int(roots_total)}")
+        if root:
+            parts.append(f"root={root}")
+        if entries_scanned is not None:
+            parts.append(f"visited={int(entries_scanned)}")
+        if files_found is not None:
+            parts.append(f"audio={int(files_found)}")
+        if folders_done is not None and folders_total is not None:
+            parts.append(f"folders {int(folders_done)}/{int(folders_total)}")
+        if artists_found is not None:
+            parts.append(f"artists={int(artists_found)}")
+        if albums_found is not None:
+            parts.append(f"albums={int(albums_found)}")
+        suffix = " | ".join(parts)
+        log_scan("FILES discovery %s %s%s", frame, stage, (f" | {suffix}" if suffix else ""))
+
     with lock:
         state["scan_discovery_running"] = True
         state["scan_discovery_current_root"] = None
@@ -11762,8 +11837,22 @@ def _build_files_editions(scan_type: str = "full") -> tuple[list[tuple[int, str,
                 state["scan_discovery_files_found"] = int(payload.get("files_found") or 0)
         except Exception:
             pass
+        _emit_files_discovery_heartbeat(
+            "scanning filesystem",
+            root=str(payload.get("root") or ""),
+            roots_done=int(payload.get("roots_done") or 0),
+            roots_total=int(payload.get("roots_total") or len(roots)),
+            files_found=int(payload.get("files_found") or 0),
+            entries_scanned=int(payload.get("entries_scanned") or 0),
+        )
 
-    audio_files = _iter_audio_files_under_roots(FILES_ROOTS, progress_cb=_on_discovery_progress, progress_every=250)
+    _emit_files_discovery_heartbeat("scanning filesystem", roots_done=0, roots_total=len(roots), force=True)
+    audio_files = _iter_audio_files_under_roots(
+        FILES_ROOTS,
+        progress_cb=_on_discovery_progress,
+        progress_every=250,
+        heartbeat_seconds=5.0,
+    )
     by_folder: dict[Path, list[Path]] = defaultdict(list)
     for p in audio_files:
         by_folder[p.parent].append(p)
@@ -11771,6 +11860,15 @@ def _build_files_editions(scan_type: str = "full") -> tuple[list[tuple[int, str,
         state["scan_discovery_files_found"] = len(audio_files)
         state["scan_discovery_folders_found"] = len(by_folder)
         state["scan_discovery_running"] = False
+    _emit_files_discovery_heartbeat(
+        "grouped audio files",
+        roots_done=len(roots),
+        roots_total=len(roots),
+        files_found=len(audio_files),
+        folders_done=0,
+        folders_total=len(by_folder),
+        force=True,
+    )
 
     files_editions_by_album_id: dict[int, dict] = {}
     artist_to_album_ids: dict[str, list[int]] = defaultdict(list)
@@ -11778,7 +11876,10 @@ def _build_files_editions(scan_type: str = "full") -> tuple[list[tuple[int, str,
     skipped_unchanged_complete = 0
     fast_skip_marked = 0
 
+    folders_total = len(by_folder)
+    folders_done = 0
     for folder, paths in sorted(by_folder.items(), key=lambda x: str(x[0])):
+        folders_done += 1
         try:
             folder_resolved = folder.resolve()
         except (OSError, RuntimeError):
@@ -11890,6 +11991,14 @@ def _build_files_editions(scan_type: str = "full") -> tuple[list[tuple[int, str,
             with lock:
                 state["scan_discovery_albums_found"] = next_album_id - 1
                 state["scan_discovery_artists_found"] = len(artist_to_album_ids)
+        _emit_files_discovery_heartbeat(
+            "building album candidates",
+            files_found=len(audio_files),
+            folders_done=folders_done,
+            folders_total=folders_total,
+            artists_found=len(artist_to_album_ids),
+            albums_found=next_album_id - 1,
+        )
         if fast_skip_heavy:
             fast_skip_marked += 1
     # Build artists_merged: (artist_id, artist_name, album_ids). For Files we use 0 as artist_id.
@@ -11900,6 +12009,15 @@ def _build_files_editions(scan_type: str = "full") -> tuple[list[tuple[int, str,
         state["scan_discovery_current_root"] = None
         state["scan_discovery_albums_found"] = total_albums
         state["scan_discovery_artists_found"] = len(artists_merged)
+    _emit_files_discovery_heartbeat(
+        "ready",
+        files_found=len(audio_files),
+        folders_done=folders_total,
+        folders_total=folders_total,
+        artists_found=len(artists_merged),
+        albums_found=total_albums,
+        force=True,
+    )
     log_scan(
         "FILES backend: discovered %d artist(s), %d album(s) from %d audio file(s)%s%s",
         len(artists_merged),
