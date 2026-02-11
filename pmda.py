@@ -10727,7 +10727,10 @@ def _refresh_files_album_scan_cache_from_editions(editions: list[dict], scan_id:
                 )
             except Exception:
                 ordered_paths = []
-        fingerprint = (e.get("fingerprint") or "").strip() or _compute_album_fingerprint(ordered_paths)
+        # Always prefer live filesystem stats so the cache reflects the post-fix state
+        # (mtime/size can change after tag/cover writes during improve step).
+        computed_fingerprint = _compute_album_fingerprint(ordered_paths)
+        fingerprint = computed_fingerprint or (e.get("fingerprint") or "").strip()
         tags = dict(e.get("meta") or {})
         if not tags and ordered_paths:
             try:
