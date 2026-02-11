@@ -25968,7 +25968,7 @@ if __name__ == "__main__":
 
     server_thread = threading.Thread(target=run_server, daemon=False)
     server_thread.start()
-    logging.info("Web UI listening on http://0.0.0.0:%s – startup path cross-check running in background", WEBUI_PORT)
+    logging.info("Web UI listening on http://0.0.0.0:%s", WEBUI_PORT)
 
     def run_cross_check_background():
         if _get_library_mode() == "files":
