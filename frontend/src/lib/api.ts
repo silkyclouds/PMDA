@@ -53,6 +53,14 @@ export interface ScanProgress {
   // Scan details
   artists_processed?: number;
   artists_total?: number;
+  /** Artists discovered from source before resume/incremental filtering. */
+  detected_artists_total?: number;
+  /** Albums discovered from source before resume/incremental filtering. */
+  detected_albums_total?: number;
+  /** Artists skipped by resume (already done/unchanged). */
+  resume_skipped_artists?: number;
+  /** Albums skipped by resume (already done/unchanged). */
+  resume_skipped_albums?: number;
   ai_used_count?: number;
   mb_used_count?: number;
   ai_enabled?: boolean;

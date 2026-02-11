@@ -5742,6 +5742,10 @@ state = {
     # Scan details tracking
     "scan_artists_processed": 0,      # Nombre d'artistes traités
     "scan_artists_total": 0,          # Total d'artistes
+    "scan_detected_artists_total": 0, # Artists detected from source before resume/incremental filtering
+    "scan_detected_albums_total": 0,  # Albums detected from source before resume/incremental filtering
+    "scan_resume_skipped_artists": 0, # Artists skipped by resume logic for current run
+    "scan_resume_skipped_albums": 0,  # Albums skipped by resume logic for current run
     "scan_ai_used_count": 0,          # Nombre de groupes où l'IA a été utilisée
     "scan_mb_used_count": 0,          # Nombre d'éditions enrichies avec MusicBrainz
     "scan_ai_enabled": False,         # Si l'IA est configurée et disponible
@@ -12355,6 +12359,10 @@ def background_scan():
         state["scan_step_total"] = 0
         state["scan_artists_processed"] = 0
         state["scan_artists_total"] = 0
+        state["scan_detected_artists_total"] = 0
+        state["scan_detected_albums_total"] = 0
+        state["scan_resume_skipped_artists"] = 0
+        state["scan_resume_skipped_albums"] = 0
         state["scan_active_artists"] = {}
         state["scan_finalizing"] = False
         state["scan_discovery_running"] = (_get_library_mode() == "files")
@@ -12386,7 +12394,9 @@ def background_scan():
 
         # 1) Build the scan plan from the active library backend.
         artists_merged, total_albums = _build_scan_plan(scan_type=scan_type)
-        total_artists = len(artists_merged)
+        detected_artists_total = len(artists_merged)
+        detected_albums_total = total_albums
+        total_artists = detected_artists_total
         files_editions_for_resume = {}
         if _get_library_mode() == "files":
             with lock:
@@ -12401,6 +12411,10 @@ def background_scan():
         total_albums = sum(len(ids) for _a, _n, ids in artists_merged)
         with lock:
             state["scan_resume_run_id"] = resume_run_id
+            state["scan_detected_artists_total"] = int(detected_artists_total or 0)
+            state["scan_detected_albums_total"] = int(detected_albums_total or 0)
+            state["scan_resume_skipped_artists"] = int(resume_skipped_artists or 0)
+            state["scan_resume_skipped_albums"] = int(resume_skipped_albums or 0)
         if resume_skipped_artists:
             log_scan(
                 "Resume: skipped %d already-done artist(s), %d album(s) unchanged since last interrupted run.",
@@ -12455,6 +12469,10 @@ def background_scan():
             state["scan_type"] = scan_type
             state["scan_resume_run_id"] = resume_run_id
             state["scan_total_albums"] = total_albums
+            state["scan_detected_artists_total"] = int(detected_artists_total or 0)
+            state["scan_detected_albums_total"] = int(detected_albums_total or 0)
+            state["scan_resume_skipped_artists"] = int(resume_skipped_artists or 0)
+            state["scan_resume_skipped_albums"] = int(resume_skipped_albums or 0)
             state["scan_step_progress"] = 0
             # scan_step_total set after _reload_auto_move_from_db() so AUTO_MOVE_DUPES is current
             state["duplicates"].clear()
@@ -17407,6 +17425,10 @@ def api_progress():
         # Copy all state values we need while still in the lock
         artists_processed = state.get("scan_artists_processed", 0)
         artists_total = state.get("scan_artists_total", 0)
+        detected_artists_total = state.get("scan_detected_artists_total", 0)
+        detected_albums_total = state.get("scan_detected_albums_total", 0)
+        resume_skipped_artists = state.get("scan_resume_skipped_artists", 0)
+        resume_skipped_albums = state.get("scan_resume_skipped_albums", 0)
         ai_used_count = state.get("scan_ai_used_count", 0)
         mb_used_count = state.get("scan_mb_used_count", 0)
         ai_enabled = state.get("scan_ai_enabled", False)
@@ -17560,6 +17582,10 @@ def api_progress():
         # Scan details
         artists_processed=artists_processed,
         artists_total=artists_total,
+        detected_artists_total=detected_artists_total,
+        detected_albums_total=detected_albums_total,
+        resume_skipped_artists=resume_skipped_artists,
+        resume_skipped_albums=resume_skipped_albums,
         ai_used_count=ai_used_count,
         mb_used_count=mb_used_count,
         ai_enabled=ai_enabled,

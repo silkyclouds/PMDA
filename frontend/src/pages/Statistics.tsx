@@ -377,6 +377,12 @@ export default function Statistics() {
     refetchIntervalInBackground: true,
   });
   const isLiveRunActive = Boolean(scanProgress?.scanning || scanProgress?.post_processing);
+  const liveRunArtistsTotal = n(scanProgress?.artists_total);
+  const liveRunAlbumsTotal = n(scanProgress?.total_albums);
+  const liveDetectedArtistsTotal = n(scanProgress?.detected_artists_total);
+  const liveDetectedAlbumsTotal = n(scanProgress?.detected_albums_total);
+  const liveSkippedArtists = n(scanProgress?.resume_skipped_artists);
+  const liveSkippedAlbums = n(scanProgress?.resume_skipped_albums);
 
   useEffect(() => {
     if (isLiveRunActive) {
@@ -441,6 +447,9 @@ export default function Statistics() {
 
   const sourceLabel = useMemo(() => {
     if (isLiveRunActive && period === 'last') {
+      if (liveDetectedArtistsTotal > 0 || liveDetectedAlbumsTotal > 0) {
+        return `source = live scan (run scope ${liveRunArtistsTotal}/${liveRunAlbumsTotal} from detected ${liveDetectedArtistsTotal}/${liveDetectedAlbumsTotal})`;
+      }
       return 'source = live scan (updates every 2s)';
     }
     if (isLiveRunActive) {
@@ -451,7 +460,18 @@ export default function Statistics() {
       return `source = scan #${latestSelected.scanId} (${format(new Date(latestSelected.startTime * 1000), 'yyyy-MM-dd HH:mm')})`;
     }
     return `source = ${selectedScans.length} scan(s) aggregated (${modeSummary || 'unknown'})`;
-  }, [historicalSelectedScans.length, isLiveRunActive, latestSelected, modeSummary, period, selectedScans.length]);
+  }, [
+    historicalSelectedScans.length,
+    isLiveRunActive,
+    latestSelected,
+    liveDetectedAlbumsTotal,
+    liveDetectedArtistsTotal,
+    liveRunAlbumsTotal,
+    liveRunArtistsTotal,
+    modeSummary,
+    period,
+    selectedScans.length,
+  ]);
 
   const throughputAlbumsPerMin =
     current.durationSeconds > 0 ? (current.albumsScanned / current.durationSeconds) * 60 : 0;
@@ -681,14 +701,41 @@ export default function Statistics() {
                 Live scan metrics
               </CardTitle>
               <CardDescription>
-                Live counters update during scan and post-processing. Values are partial until completion.
+                Live counters update every 2s during scan and post-processing.
               </CardDescription>
             </CardHeader>
-            <CardContent className="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">
+            <CardContent className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3 text-sm">
               <div className="rounded-lg border border-border bg-background/70 p-3">
-                <p className="text-muted-foreground">Artists</p>
+                <p className="text-muted-foreground">Artists progress</p>
                 <p className="text-xl font-semibold tabular-nums">
                   {n(scanProgress.artists_processed).toLocaleString()} / {n(scanProgress.artists_total).toLocaleString()}
+                </p>
+              </div>
+              <div className="rounded-lg border border-border bg-background/70 p-3">
+                <p className="text-muted-foreground">Run scope</p>
+                <p className="text-xl font-semibold tabular-nums">
+                  {n(scanProgress.artists_total).toLocaleString()} artists
+                </p>
+                <p className="text-xs text-muted-foreground tabular-nums">
+                  {n(scanProgress.total_albums).toLocaleString()} albums
+                </p>
+              </div>
+              <div className="rounded-lg border border-border bg-background/70 p-3">
+                <p className="text-muted-foreground">Detected source</p>
+                <p className="text-xl font-semibold tabular-nums">
+                  {n(scanProgress.detected_artists_total).toLocaleString()} artists
+                </p>
+                <p className="text-xs text-muted-foreground tabular-nums">
+                  {n(scanProgress.detected_albums_total).toLocaleString()} albums
+                </p>
+              </div>
+              <div className="rounded-lg border border-border bg-background/70 p-3">
+                <p className="text-muted-foreground">Resume skipped</p>
+                <p className="text-xl font-semibold tabular-nums">
+                  {n(scanProgress.resume_skipped_artists).toLocaleString()} artists
+                </p>
+                <p className="text-xs text-muted-foreground tabular-nums">
+                  {n(scanProgress.resume_skipped_albums).toLocaleString()} albums
                 </p>
               </div>
               <div className="rounded-lg border border-border bg-background/70 p-3">
@@ -697,15 +744,14 @@ export default function Statistics() {
                   {n(scanProgress.post_processing_done).toLocaleString()} / {n(scanProgress.post_processing_total).toLocaleString()}
                 </p>
               </div>
-              <div className="rounded-lg border border-border bg-background/70 p-3">
-                <p className="text-muted-foreground">Duplicates found</p>
-                <p className="text-xl font-semibold tabular-nums">{n(scanProgress.duplicate_groups_count).toLocaleString()}</p>
-              </div>
-              <div className="rounded-lg border border-border bg-background/70 p-3">
-                <p className="text-muted-foreground">Albums planned</p>
-                <p className="text-xl font-semibold tabular-nums">{n(scanProgress.total_albums).toLocaleString()}</p>
-              </div>
             </CardContent>
+            {(liveSkippedArtists > 0 || liveSkippedAlbums > 0) && (
+              <CardContent className="pt-0">
+                <p className="text-xs text-muted-foreground">
+                  Resume mode active: completed/unchanged entities are skipped and excluded from run scope totals.
+                </p>
+              </CardContent>
+            )}
           </Card>
         )}
 

@@ -119,6 +119,10 @@ export function ScanProgress({
     ai_model = '',
     artists_processed = 0,
     artists_total = 0,
+    detected_artists_total = 0,
+    detected_albums_total = 0,
+    resume_skipped_artists = 0,
+    resume_skipped_albums = 0,
     ai_used_count = 0,
     mb_used_count = 0,
     ai_enabled = false,
@@ -1018,6 +1022,36 @@ export function ScanProgress({
                 />
               </div>
             </div>
+
+            {scanning && (
+              <div className="rounded-lg border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+                <span className="font-medium text-foreground/80">Run scope</span>
+                <span className="mx-1">•</span>
+                {artists_total.toLocaleString()} artists
+                <span className="mx-1">•</span>
+                {total_albums.toLocaleString()} albums
+                {(detected_artists_total > 0 || detected_albums_total > 0) && (
+                  <>
+                    <span className="mx-1">|</span>
+                    <span className="font-medium text-foreground/80">Detected source</span>
+                    <span className="mx-1">•</span>
+                    {detected_artists_total.toLocaleString()} artists
+                    <span className="mx-1">•</span>
+                    {detected_albums_total.toLocaleString()} albums
+                  </>
+                )}
+                {(resume_skipped_artists > 0 || resume_skipped_albums > 0) && (
+                  <>
+                    <span className="mx-1">|</span>
+                    <span className="font-medium text-foreground/80">Resume skipped</span>
+                    <span className="mx-1">•</span>
+                    {resume_skipped_artists.toLocaleString()} artists
+                    <span className="mx-1">•</span>
+                    {resume_skipped_albums.toLocaleString()} albums
+                  </>
+                )}
+              </div>
+            )}
 
             {showDiscovery && (
               <div className="rounded-lg border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
