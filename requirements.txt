@@ -11,3 +11,4 @@ pylast>=5.1.0
 pyacoustid>=1.2.0
 psycopg[binary]>=3.2.0
 redis>=5.0.0
+watchdog>=4.0.0
