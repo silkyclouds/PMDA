@@ -13746,16 +13746,21 @@ def background_scan():
     # Reload library backend settings (mode + files roots) and Plex selectors/path map
     # so scan always uses the latest saved sources from Settings.
     _reload_library_mode_and_files_roots_from_db()
-    _reload_section_ids_from_db()
-    _reload_path_map_from_db()
-    if _get_library_mode() == "plex" and not SECTION_IDS:
+    mode = _get_library_mode()
+    if mode == "plex":
+        _reload_section_ids_from_db()
+        _reload_path_map_from_db()
+    if mode == "plex" and not SECTION_IDS:
         logging.warning("background_scan(): SECTION_IDS is empty after reload; aborting scan (Plex mode)")
         with lock:
             state["scanning"] = False
         return
-    if _get_library_mode() == "plex" and not PATH_MAP:
+    if mode == "plex" and not PATH_MAP:
         logging.warning("background_scan(): PATH_MAP is empty after reload; albums will not resolve to container paths. Run Detect & verify in Settings.")
-    logging.debug(f"background_scan(): SECTION_IDS=%s, PATH_MAP keys=%s, opening Plex DB at {PLEX_DB_FILE}", SECTION_IDS, list(PATH_MAP.keys()))
+    if mode == "plex":
+        logging.debug(f"background_scan(): SECTION_IDS=%s, PATH_MAP keys=%s, opening Plex DB at {PLEX_DB_FILE}", SECTION_IDS, list(PATH_MAP.keys()))
+    else:
+        logging.debug("background_scan(): FILES mode active; skipping Plex PATH_MAP reload/checks.")
     scan_perf_start = time.perf_counter()
     all_results: Dict[str, List[dict]] = {}  # Always defined so finally can persist
     all_editions_by_artist: Dict[str, List[dict]] = {}  # For scan_editions (Library, Tag Fixer)
@@ -25966,7 +25971,9 @@ if __name__ == "__main__":
     logging.info("Web UI listening on http://0.0.0.0:%s – startup path cross-check running in background", WEBUI_PORT)
 
     def run_cross_check_background():
-        if PLEX_CONFIGURED and not DISABLE_PATH_CROSSCHECK:
+        if _get_library_mode() == "files":
+            logging.info("PATH cross-check skipped at startup (LIBRARY_MODE=files).")
+        elif PLEX_CONFIGURED and not DISABLE_PATH_CROSSCHECK:
             _cross_check_bindings(raise_on_abort=False)
         elif DISABLE_PATH_CROSSCHECK:
             logging.info("PATH cross-check skipped (DISABLE_PATH_CROSSCHECK=true).")
