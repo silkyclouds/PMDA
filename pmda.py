@@ -13174,6 +13174,40 @@ def _build_files_editions(scan_type: str = "full") -> tuple[list[tuple[int, str,
         suffix = " | ".join(parts)
         log_scan("FILES discovery %s %s%s", frame, stage, (f" | {suffix}" if suffix else ""))
 
+    def _infer_disc_track_from_filename(path: Path, fallback_track: int) -> tuple[int, int]:
+        """
+        Fast filename-only track parser for cache-first scan path.
+        Examples accepted: 01 ..., 1-05 ..., CD2-07 ..., A1 ...
+        """
+        stem = path.stem.strip()
+        disc = 1
+        track = fallback_track
+        m = re.match(r"^\s*(?:cd|disc)\s*(\d{1,2})\s*[-_. ]\s*(\d{1,3})\b", stem, flags=re.IGNORECASE)
+        if m:
+            return (_parse_int_loose(m.group(1), 1) or 1, _parse_int_loose(m.group(2), fallback_track) or fallback_track)
+        m = re.match(r"^\s*(\d{1,2})\s*[-_.]\s*(\d{1,3})\b", stem)
+        if m:
+            return (_parse_int_loose(m.group(1), 1) or 1, _parse_int_loose(m.group(2), fallback_track) or fallback_track)
+        m = re.match(r"^\s*([A-Z])(?:\s*[-_. ]?\s*(\d{1,2}))?\b", stem, flags=re.IGNORECASE)
+        if m:
+            disc = (ord(m.group(1).upper()) - ord("A")) + 1
+            track = _parse_int_loose(m.group(2), 1) or 1
+            return (max(1, disc), max(1, track))
+        m = re.match(r"^\s*(\d{1,3})\b", stem)
+        if m:
+            track = _parse_int_loose(m.group(1), fallback_track) or fallback_track
+            return (disc, max(1, track))
+        return (disc, max(1, track))
+
+    def _title_from_filename(path: Path, fallback_index: int) -> str:
+        stem = path.stem.strip()
+        cleaned = re.sub(r"^\s*(?:cd|disc)\s*\d{1,2}\s*[-_. ]\s*\d{1,3}\s*[-_. ]*", "", stem, flags=re.IGNORECASE)
+        cleaned = re.sub(r"^\s*\d{1,2}\s*[-_.]\s*\d{1,3}\s*[-_. ]*", "", cleaned)
+        cleaned = re.sub(r"^\s*[A-Z](?:\s*[-_. ]?\s*\d{1,2})?\s*[-_. ]*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"^\s*\d{1,3}\s*[-_. ]*", "", cleaned)
+        cleaned = cleaned.strip(" -_.")
+        return cleaned or stem or f"Track {fallback_index}"
+
     with lock:
         state["scan_discovery_running"] = True
         state["scan_discovery_current_root"] = None
@@ -13300,6 +13334,7 @@ def _build_files_editions(scan_type: str = "full") -> tuple[list[tuple[int, str,
     next_album_id = 1
     skipped_unchanged_complete = 0
     fast_skip_marked = 0
+    fast_skip_full_cached = 0
 
     folders_total = len(by_folder)
     folders_done = 0
@@ -13317,10 +13352,111 @@ def _build_files_editions(scan_type: str = "full") -> tuple[list[tuple[int, str,
             except (ValueError, OSError):
                 pass
 
+        ordered_paths = sorted(paths, key=lambda p: str(p))
+        if not ordered_paths:
+            continue
+
+        # Cache-first fast path:
+        # avoid expensive per-file mutagen reads when album fingerprint is unchanged and
+        # last known quality/identity state is already healthy.
+        fingerprint = _compute_album_fingerprint(ordered_paths)
+        folder_key = _album_folder_cache_key(folder_resolved)
+        cached = cache_map.get(folder_key) or {}
+        cached_missing = cached.get("missing_required_tags") or []
+        unchanged = bool(cached and (cached.get("fingerprint") == fingerprint))
+        cached_has_cover = bool(cached.get("has_cover"))
+        cached_has_artist_image = bool(cached.get("has_artist_image"))
+        cached_healthy = bool(
+            cached
+            and cached_has_cover
+            and cached_has_artist_image
+            and cached.get("has_complete_tags")
+            and cached.get("has_identity")
+            and not cached_missing
+        )
+        has_cover_now = album_folder_has_cover(folder_resolved)
+        has_artist_image_now = _artist_folder_has_image(folder_resolved.parent if folder_resolved.parent else folder_resolved)
+        cached_fast_skip = bool(
+            unchanged
+            and cached_healthy
+            and has_cover_now
+            and has_artist_image_now
+        )
+        if cached_fast_skip and scan_type == "changed_only":
+            skipped_unchanged_complete += 1
+            continue
+        if cached_fast_skip and scan_type in {"full", "incomplete_only"}:
+            artist_name = (cached.get("artist_name") or folder_resolved.parent.name.replace("_", " ") or "Unknown Artist").strip() or "Unknown Artist"
+            album_title_tag = (cached.get("album_title") or folder_resolved.name.replace("_", " ")).strip() or "Unknown Album"
+            tracks: list[Track] = []
+            for i, p in enumerate(ordered_paths):
+                disc, trk = _infer_disc_track_from_filename(p, i + 1)
+                tracks.append(Track(title=_title_from_filename(p, i + 1), idx=trk, disc=disc, dur=0))
+            if not tracks:
+                continue
+            exts = [p.suffix.lower().lstrip(".") for p in ordered_paths]
+            format_ext = max(set(exts), key=exts.count).upper() if exts else "UNKNOWN"
+            normalize_parenthetical = bool(_parse_bool(_get_config_from_db("NORMALIZE_PARENTHETICAL_FOR_DEDUPE") or "true"))
+            album_norm = norm_album_for_dedup(album_title_tag, normalize_parenthetical)
+            identity_now = _extract_files_identity_fields(tags={}, edition={}, cached=cached)
+            mbid_now = identity_now["musicbrainz_id"]
+            has_mbid_now = bool(identity_now["has_mbid"])
+            has_identity_now = bool(identity_now["has_identity"])
+            identity_provider_now = identity_now["identity_provider"]
+            album_id = next_album_id
+            next_album_id += 1
+            files_editions_by_album_id[album_id] = {
+                "folder": folder,
+                "artist_name": artist_name,
+                "album_title": album_title_tag,
+                "album_norm": album_norm,
+                "tracks": tracks,
+                "format": format_ext,
+                "tags": {
+                    "artist": artist_name,
+                    "album": album_title_tag,
+                    "musicbrainz_releasegroupid": mbid_now,
+                    "musicbrainz_albumid": mbid_now,
+                },
+                "confidence_score": 0.9,
+                "file_count": len(ordered_paths),
+                "ordered_paths": ordered_paths,
+                "fingerprint": fingerprint,
+                "folder_key": folder_key,
+                "missing_required_tags": list(cached_missing),
+                "has_cover": has_cover_now,
+                "has_artist_image": has_artist_image_now,
+                "has_mbid": has_mbid_now,
+                "has_identity": has_identity_now,
+                "identity_provider": identity_provider_now,
+                "musicbrainz_id": mbid_now,
+                "discogs_release_id": identity_now["discogs_release_id"],
+                "lastfm_album_mbid": identity_now["lastfm_album_mbid"],
+                "bandcamp_album_url": identity_now["bandcamp_album_url"],
+                "metadata_source": identity_now["metadata_source"],
+                "skip_heavy_processing": True,
+            }
+            artist_to_album_ids[artist_name].append(album_id)
+            fast_skip_marked += 1
+            fast_skip_full_cached += 1
+            if (album_id % 25) == 0:
+                with lock:
+                    state["scan_discovery_albums_found"] = next_album_id - 1
+                    state["scan_discovery_artists_found"] = len(artist_to_album_ids)
+            _emit_files_discovery_heartbeat(
+                "building album candidates",
+                files_found=len(audio_files),
+                folders_done=folders_done,
+                folders_total=folders_total,
+                artists_found=len(artist_to_album_ids),
+                albums_found=next_album_id - 1,
+            )
+            continue
+
         # Cache tags per file once: used for ordering, metadata, and track list.
         paths_sorted: list[tuple[int, int, Path]] = []
         tags_by_path: dict[Path, dict] = {}
-        for p in paths:
+        for p in ordered_paths:
             t = extract_tags(p) or {}
             tags_by_path[p] = t
             disc, trk = _parse_disc_track_loose(t, fallback_disc=1, fallback_track=0)
@@ -13452,11 +13588,12 @@ def _build_files_editions(scan_type: str = "full") -> tuple[list[tuple[int, str,
         force=True,
     )
     log_scan(
-        "FILES backend: discovered %d artist(s), %d album(s) from %d audio file(s)%s%s",
+        "FILES backend: discovered %d artist(s), %d album(s) from %d audio file(s)%s%s%s",
         len(artists_merged),
         total_albums,
         len(audio_files),
         f"; changed-only skipped {skipped_unchanged_complete} unchanged+healthy album(s)" if scan_type == "changed_only" else "",
+        f"; cache-first fast-skip {fast_skip_full_cached} album(s)" if fast_skip_full_cached else "",
         f"; fast-skip candidates {fast_skip_marked}" if fast_skip_marked else "",
     )
     return artists_merged, total_albums, files_editions_by_album_id
