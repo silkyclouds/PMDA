@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import {
   Loader2,
@@ -27,7 +27,7 @@ import {
   Tooltip,
   Legend,
 } from 'chart.js';
-import { Bar, Line, Doughnut } from 'react-chartjs-2';
+import { Bar, Line, Doughnut, Pie } from 'react-chartjs-2';
 import type { ScanHistoryEntry, ScanProgress } from '@/lib/api';
 import { Header } from '@/components/Header';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
@@ -196,6 +196,58 @@ function normalizeScan(entry: ScanHistoryEntry): ScanSnapshot {
   };
 }
 
+function normalizeLiveScan(progress: ScanProgress, fallbackStartTime: number): ScanSnapshot {
+  const totalAlbums = Math.max(
+    n(progress.total_albums),
+    n(progress.post_processing_total),
+    n(progress.mb_done_count),
+    n(progress.format_done_count),
+  );
+  const withoutTags = n(progress.albums_without_complete_tags);
+  const withoutCover = n(progress.albums_without_album_image);
+  const withoutArtistImage = n(progress.albums_without_artist_image);
+  const albumsWithMbId = Math.max(0, totalAlbums - n(progress.albums_without_mb_id));
+  const discogsMatches = n(progress.scan_discogs_matched);
+  const lastfmMatches = n(progress.scan_lastfm_matched);
+  const bandcampMatches = n(progress.scan_bandcamp_matched);
+  const matchedAlbums = Math.min(
+    totalAlbums,
+    Math.max(0, albumsWithMbId + discogsMatches + lastfmMatches + bandcampMatches),
+  );
+  const startTime = n(progress.scan_start_time ?? fallbackStartTime);
+  const now = Math.floor(Date.now() / 1000);
+  const durationSeconds = startTime > 0 ? Math.max(0, now - startTime) : 0;
+
+  return {
+    scanId: -1,
+    startTime: startTime > 0 ? startTime : now,
+    albumsScanned: totalAlbums,
+    duplicatesFound: n(progress.duplicate_groups_count),
+    spaceSavedMb: 0,
+    albumsMoved: 0,
+    durationSeconds,
+    mode: 'live',
+    matchedAlbums,
+    albumsWithMbId,
+    mbVerifiedByAi: 0,
+    discogsMatches,
+    lastfmMatches,
+    bandcampMatches,
+    withTags: Math.max(0, totalAlbums - withoutTags),
+    withCover: Math.max(0, totalAlbums - withoutCover),
+    withArtistImage: Math.max(0, totalAlbums - withoutArtistImage),
+    fullyComplete: Math.max(0, totalAlbums - Math.max(withoutTags, withoutCover, withoutArtistImage)),
+    withoutTags,
+    withoutCover,
+    withoutArtistImage,
+    brokenAlbums: n(progress.broken_albums_count),
+    audioCacheHits: n(progress.audio_cache_hits),
+    audioCacheMisses: n(progress.audio_cache_misses),
+    mbCacheHits: n(progress.mb_cache_hits),
+    mbCacheMisses: n(progress.mb_cache_misses),
+  };
+}
+
 function aggregate(scans: ScanSnapshot[]): AggregateStats {
   return scans.reduce<AggregateStats>(
     (acc, scan) => {
@@ -311,6 +363,7 @@ function StatCard({
 export default function Statistics() {
   const [period, setPeriod] = useState<PeriodKey>('last');
   const [activeTab, setActiveTab] = useState<StatsTab>('overview');
+  const liveScanStartRef = useRef<number>(Math.floor(Date.now() / 1000));
 
   const { data: history = [], isLoading } = useQuery({
     queryKey: ['scan-history'],
@@ -320,8 +373,18 @@ export default function Statistics() {
   const { data: scanProgress } = useQuery<ScanProgress>({
     queryKey: ['scan-progress'],
     queryFn: api.getScanProgress,
-    refetchInterval: (data) => (data?.scanning ? 2000 : false),
+    refetchInterval: 2000,
   });
+
+  useEffect(() => {
+    if (scanProgress?.scanning) {
+      if (scanProgress.scan_start_time) {
+        liveScanStartRef.current = n(scanProgress.scan_start_time);
+      }
+      return;
+    }
+    liveScanStartRef.current = Math.floor(Date.now() / 1000);
+  }, [scanProgress?.scanning, scanProgress?.scan_start_time]);
 
   const completedScans = useMemo(() => {
     const entries = history
@@ -330,7 +393,12 @@ export default function Statistics() {
     return entries.map(normalizeScan);
   }, [history]);
 
-  const selectedScans = useMemo(() => {
+  const liveScan = useMemo(() => {
+    if (!scanProgress?.scanning) return null;
+    return normalizeLiveScan(scanProgress, liveScanStartRef.current);
+  }, [scanProgress]);
+
+  const historicalSelectedScans = useMemo(() => {
     if (period === 'last') {
       return completedScans.length > 0 ? [completedScans[0]] : [];
     }
@@ -341,6 +409,12 @@ export default function Statistics() {
     const cutoff = Date.now() / 1000 - hours * 3600;
     return completedScans.filter((scan) => scan.startTime >= cutoff);
   }, [completedScans, period]);
+
+  const selectedScans = useMemo(() => {
+    if (!liveScan) return historicalSelectedScans;
+    if (period === 'last') return [liveScan];
+    return [liveScan, ...historicalSelectedScans];
+  }, [historicalSelectedScans, liveScan, period]);
 
   const baselineScans = useMemo(() => {
     if (selectedScans.length === 0) return [];
@@ -364,12 +438,18 @@ export default function Statistics() {
   }, [selectedScans]);
 
   const sourceLabel = useMemo(() => {
+    if (liveScan && period === 'last') {
+      return 'source = live scan (updates every 2s)';
+    }
+    if (liveScan) {
+      return `source = live scan + ${historicalSelectedScans.length} completed scan(s)`;
+    }
     if (!latestSelected) return 'No completed scan in this period';
     if (period === 'last') {
       return `source = scan #${latestSelected.scanId} (${format(new Date(latestSelected.startTime * 1000), 'yyyy-MM-dd HH:mm')})`;
     }
     return `source = ${selectedScans.length} scan(s) aggregated (${modeSummary || 'unknown'})`;
-  }, [latestSelected, modeSummary, period, selectedScans.length]);
+  }, [historicalSelectedScans.length, latestSelected, liveScan, modeSummary, period, selectedScans.length]);
 
   const throughputAlbumsPerMin =
     current.durationSeconds > 0 ? (current.albumsScanned / current.durationSeconds) * 60 : 0;
@@ -433,6 +513,31 @@ export default function Statistics() {
     };
   }, [current.albumsWithMbId, current.discogsMatches, current.lastfmMatches, current.bandcampMatches]);
 
+  const metadataProvidersBarData = useMemo(() => {
+    return {
+      labels: ['MusicBrainz', 'Discogs', 'Last.fm', 'Bandcamp'],
+      datasets: [
+        {
+          label: 'Matched albums',
+          data: [
+            current.albumsWithMbId,
+            current.discogsMatches,
+            current.lastfmMatches,
+            current.bandcampMatches,
+          ],
+          backgroundColor: [
+            'rgba(59,130,246,0.85)',
+            'rgba(34,197,94,0.85)',
+            'rgba(249,115,22,0.85)',
+            'rgba(168,85,247,0.85)',
+          ],
+          borderColor: ['#2563eb', '#16a34a', '#ea580c', '#9333ea'],
+          borderWidth: 1,
+        },
+      ],
+    };
+  }, [current.albumsWithMbId, current.discogsMatches, current.lastfmMatches, current.bandcampMatches]);
+
   const qualityCoverageData = useMemo(() => {
     return {
       labels: ['Tags', 'Cover', 'Artist image', 'Fully complete'],
@@ -457,6 +562,25 @@ export default function Statistics() {
       ],
     };
   }, [current.albumsScanned, current.withCover, current.withTags, current.withArtistImage, current.fullyComplete]);
+
+  const qualityIssuePieData = useMemo(() => {
+    return {
+      labels: ['Missing tags', 'Missing cover', 'Missing artist image', 'Broken albums'],
+      datasets: [
+        {
+          data: [current.withoutTags, current.withoutCover, current.withoutArtistImage, current.brokenAlbums],
+          backgroundColor: [
+            'rgba(59,130,246,0.8)',
+            'rgba(34,197,94,0.8)',
+            'rgba(14,165,233,0.8)',
+            'rgba(239,68,68,0.8)',
+          ],
+          borderColor: ['#2563eb', '#16a34a', '#0284c7', '#dc2626'],
+          borderWidth: 1,
+        },
+      ],
+    };
+  }, [current.withoutTags, current.withoutCover, current.withoutArtistImage, current.brokenAlbums]);
 
   const operationsTrendData = useMemo(() => {
     return {
@@ -483,6 +607,28 @@ export default function Statistics() {
       ],
     };
   }, [scansChrono]);
+
+  const cacheMixData = useMemo(() => {
+    return {
+      labels: ['Audio cache', 'MusicBrainz cache'],
+      datasets: [
+        {
+          label: 'Hits',
+          data: [current.audioCacheHits, current.mbCacheHits],
+          backgroundColor: 'rgba(34,197,94,0.75)',
+          borderColor: '#16a34a',
+          borderWidth: 1,
+        },
+        {
+          label: 'Misses',
+          data: [current.audioCacheMisses, current.mbCacheMisses],
+          backgroundColor: 'rgba(239,68,68,0.75)',
+          borderColor: '#dc2626',
+          borderWidth: 1,
+        },
+      ],
+    };
+  }, [current.audioCacheHits, current.audioCacheMisses, current.mbCacheHits, current.mbCacheMisses]);
 
   if (isLoading) {
     return (
@@ -524,6 +670,42 @@ export default function Statistics() {
           {scanProgress?.scanning && <Badge variant="secondary">Live scan in progress</Badge>}
           {baselineScans.length > 0 && <Badge variant="outline">delta baseline = previous {baselineScans.length} scan(s)</Badge>}
         </div>
+
+        {scanProgress?.scanning && (
+          <Card className="border-primary/30 bg-primary/5">
+            <CardHeader className="pb-3">
+              <CardTitle className="text-sm flex items-center gap-2">
+                <Loader2 className="w-4 h-4 animate-spin text-primary" />
+                Live scan metrics
+              </CardTitle>
+              <CardDescription>
+                Live counters update during scan and post-processing. Values are partial until completion.
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">
+              <div className="rounded-lg border border-border bg-background/70 p-3">
+                <p className="text-muted-foreground">Artists</p>
+                <p className="text-xl font-semibold tabular-nums">
+                  {n(scanProgress.artists_processed).toLocaleString()} / {n(scanProgress.artists_total).toLocaleString()}
+                </p>
+              </div>
+              <div className="rounded-lg border border-border bg-background/70 p-3">
+                <p className="text-muted-foreground">Post-processing</p>
+                <p className="text-xl font-semibold tabular-nums">
+                  {n(scanProgress.post_processing_done).toLocaleString()} / {n(scanProgress.post_processing_total).toLocaleString()}
+                </p>
+              </div>
+              <div className="rounded-lg border border-border bg-background/70 p-3">
+                <p className="text-muted-foreground">Duplicates found</p>
+                <p className="text-xl font-semibold tabular-nums">{n(scanProgress.duplicate_groups_count).toLocaleString()}</p>
+              </div>
+              <div className="rounded-lg border border-border bg-background/70 p-3">
+                <p className="text-muted-foreground">Albums planned</p>
+                <p className="text-xl font-semibold tabular-nums">{n(scanProgress.total_albums).toLocaleString()}</p>
+              </div>
+            </CardContent>
+          </Card>
+        )}
 
         {current.scans === 0 ? (
           <Card>
@@ -649,6 +831,28 @@ export default function Statistics() {
                   </div>
                 </CardContent>
               </Card>
+              <Card>
+                <CardHeader>
+                  <CardTitle className="text-sm">Metadata provider counts</CardTitle>
+                  <CardDescription>Absolute volume by provider (horizontal bars).</CardDescription>
+                </CardHeader>
+                <CardContent>
+                  <div className="h-[260px]">
+                    <Bar
+                      data={metadataProvidersBarData}
+                      options={{
+                        ...chartOptions,
+                        indexAxis: 'y' as const,
+                        plugins: { ...chartOptions.plugins, legend: { display: false } },
+                        scales: {
+                          x: { beginAtZero: true },
+                          y: { beginAtZero: true },
+                        },
+                      }}
+                    />
+                  </div>
+                </CardContent>
+              </Card>
             </TabsContent>
 
             <TabsContent value="quality" className="space-y-4">
@@ -729,6 +933,17 @@ export default function Statistics() {
                   </div>
                 </CardContent>
               </Card>
+              <Card>
+                <CardHeader>
+                  <CardTitle className="text-sm">Issue composition</CardTitle>
+                  <CardDescription>Pie chart of missing metadata and broken albums.</CardDescription>
+                </CardHeader>
+                <CardContent>
+                  <div className="h-[260px] flex items-center justify-center">
+                    <Pie data={qualityIssuePieData} options={chartOptions} />
+                  </div>
+                </CardContent>
+              </Card>
             </TabsContent>
 
             <TabsContent value="operations" className="space-y-4">
@@ -788,6 +1003,26 @@ export default function Statistics() {
                             beginAtZero: true,
                             grid: { drawOnChartArea: false },
                           },
+                        },
+                      }}
+                    />
+                  </div>
+                </CardContent>
+              </Card>
+              <Card>
+                <CardHeader>
+                  <CardTitle className="text-sm">Cache hits vs misses</CardTitle>
+                  <CardDescription>Stacked bars for audio and MusicBrainz cache effectiveness.</CardDescription>
+                </CardHeader>
+                <CardContent>
+                  <div className="h-[260px]">
+                    <Bar
+                      data={cacheMixData}
+                      options={{
+                        ...chartOptions,
+                        scales: {
+                          x: { stacked: true },
+                          y: { stacked: true, beginAtZero: true },
                         },
                       }}
                     />

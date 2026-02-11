@@ -132,6 +132,10 @@ export interface ScanProgress {
   scan_discovery_folders_found?: number;
   scan_discovery_albums_found?: number;
   scan_discovery_artists_found?: number;
+  scan_discogs_matched?: number;
+  scan_lastfm_matched?: number;
+  scan_bandcamp_matched?: number;
+  scan_start_time?: number | null;
 }
 
 export interface LogTailResponse {

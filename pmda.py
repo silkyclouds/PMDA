@@ -17329,6 +17329,10 @@ def api_progress():
         scan_discovery_folders_found = int(state.get("scan_discovery_folders_found") or 0)
         scan_discovery_albums_found = int(state.get("scan_discovery_albums_found") or 0)
         scan_discovery_artists_found = int(state.get("scan_discovery_artists_found") or 0)
+        scan_discogs_matched = int(state.get("scan_discogs_matched") or 0)
+        scan_lastfm_matched = int(state.get("scan_lastfm_matched") or 0)
+        scan_bandcamp_matched = int(state.get("scan_bandcamp_matched") or 0)
+        scan_start_time = state.get("scan_start_time")
         if improve_all_running:
             scan_post_total = max(scan_post_total, int(improve_all_state.get("total") or 0))
             scan_post_done = max(scan_post_done, int(improve_all_state.get("current") or 0))
@@ -17494,6 +17498,10 @@ def api_progress():
         scan_discovery_folders_found=scan_discovery_folders_found,
         scan_discovery_albums_found=scan_discovery_albums_found,
         scan_discovery_artists_found=scan_discovery_artists_found,
+        scan_discogs_matched=scan_discogs_matched,
+        scan_lastfm_matched=scan_lastfm_matched,
+        scan_bandcamp_matched=scan_bandcamp_matched,
+        scan_start_time=scan_start_time,
     )
 
 
