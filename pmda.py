@@ -13453,30 +13453,23 @@ def _build_files_editions(scan_type: str = "full") -> tuple[list[tuple[int, str,
             )
             continue
 
-        # Cache tags per file once: used for ordering, metadata, and track list.
-        paths_sorted: list[tuple[int, int, Path]] = []
-        tags_by_path: dict[Path, dict] = {}
-        for p in ordered_paths:
-            t = extract_tags(p) or {}
-            tags_by_path[p] = t
-            disc, trk = _parse_disc_track_loose(t, fallback_disc=1, fallback_track=0)
-            paths_sorted.append((disc, trk, p))
-        paths_sorted.sort(key=lambda x: (x[0], x[1], str(x[2])))
-        ordered_paths = [x[2] for x in paths_sorted]
-        tag_dicts = [tags_by_path.get(p, {}) for p in ordered_paths]
-
-        first_tags = tags_by_path.get(ordered_paths[0], {}) if ordered_paths else {}
-        artist_name = _pick_album_artist_from_tag_dicts(tag_dicts, default="Unknown Artist")
-        album_title_tag = _pick_album_title_from_tag_dicts(tag_dicts, fallback=folder.name.replace("_", " "))
+        # Discovery hot path optimization:
+        # parse tags only on first file, derive track list from filenames for the rest.
+        first_tags = extract_tags(ordered_paths[0]) or {}
+        artist_name = _pick_album_artist_from_tag_dicts([first_tags], default="Unknown Artist")
+        album_title_tag = _pick_album_title_from_tag_dicts([first_tags], fallback=folder.name.replace("_", " "))
 
         tracks: list[Track] = []
+        first_disc, first_trk = _parse_disc_track_loose(first_tags, fallback_disc=1, fallback_track=1)
+        first_title = (first_tags.get("title") or first_tags.get("name") or "").strip()
         for i, p in enumerate(ordered_paths):
-            t = tags_by_path.get(p, {})
-            title = (t.get("title") or t.get("name") or p.stem or "").strip() or f"Track {i+1}"
-            disc, trk = _parse_disc_track_loose(t, fallback_disc=1, fallback_track=(i + 1))
-            duration_s = _parse_duration_seconds_loose(t.get("duration") or t.get("length"), 0.0)
-            dur_ms = int(max(0.0, duration_s) * 1000.0)
-            tracks.append(Track(title=title, idx=trk, disc=disc, dur=dur_ms))
+            disc, trk = _infer_disc_track_from_filename(p, i + 1)
+            title = _title_from_filename(p, i + 1)
+            if i == 0:
+                disc = first_disc or disc
+                trk = first_trk or trk
+                title = first_title or title
+            tracks.append(Track(title=title, idx=trk, disc=disc, dur=0))
 
         if not tracks:
             continue
@@ -13484,12 +13477,10 @@ def _build_files_editions(scan_type: str = "full") -> tuple[list[tuple[int, str,
         # Dominant format and confidence
         exts = [p.suffix.lower().lstrip(".") for p in ordered_paths]
         format_ext = max(set(exts), key=exts.count).upper() if exts else "UNKNOWN"
-        fmt_score = FMT_SCORE.get(format_ext.lower(), 0)
-        same_album = all(
-            _normalize_meta_text(tags_by_path.get(p, {}).get("album")) == _normalize_meta_text(album_title_tag)
-            for p in ordered_paths[1:]
-        )
-        confidence = 0.5 + (0.3 if same_album else 0) + (0.2 if len(ordered_paths) >= 3 else 0)
+        fmt_score = FMT_SCORE.get(format_ext.lower(), 0)  # kept for parity with legacy logic
+        has_album_tag = bool(_normalize_meta_text(first_tags.get("album")))
+        has_artist_tag = bool(_normalize_meta_text(first_tags.get("artist") or first_tags.get("albumartist")))
+        confidence = 0.5 + (0.2 if has_album_tag else 0) + (0.1 if has_artist_tag else 0) + (0.2 if len(ordered_paths) >= 3 else 0)
 
         normalize_parenthetical = bool(_parse_bool(_get_config_from_db("NORMALIZE_PARENTHETICAL_FOR_DEDUPE") or "true"))
         album_norm = norm_album_for_dedup(album_title_tag, normalize_parenthetical)
