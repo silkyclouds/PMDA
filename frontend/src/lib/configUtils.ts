@@ -62,6 +62,11 @@ export function normalizeConfigForUI(raw: Partial<PMDAConfig>): Partial<PMDAConf
   const out = { ...raw };
   if (out.CROSS_LIBRARY_DEDUPE !== undefined) out.CROSS_LIBRARY_DEDUPE = toBool(out.CROSS_LIBRARY_DEDUPE);
   if (out.AUTO_MOVE_DUPES !== undefined) out.AUTO_MOVE_DUPES = toBool(out.AUTO_MOVE_DUPES);
+  if (out.PIPELINE_ENABLE_MATCH_FIX !== undefined) out.PIPELINE_ENABLE_MATCH_FIX = toBool(out.PIPELINE_ENABLE_MATCH_FIX);
+  if (out.PIPELINE_ENABLE_DEDUPE !== undefined) out.PIPELINE_ENABLE_DEDUPE = toBool(out.PIPELINE_ENABLE_DEDUPE);
+  if (out.PIPELINE_ENABLE_INCOMPLETE_MOVE !== undefined) out.PIPELINE_ENABLE_INCOMPLETE_MOVE = toBool(out.PIPELINE_ENABLE_INCOMPLETE_MOVE);
+  if (out.PIPELINE_ENABLE_EXPORT !== undefined) out.PIPELINE_ENABLE_EXPORT = toBool(out.PIPELINE_ENABLE_EXPORT);
+  if (out.PIPELINE_ENABLE_PLAYER_SYNC !== undefined) out.PIPELINE_ENABLE_PLAYER_SYNC = toBool(out.PIPELINE_ENABLE_PLAYER_SYNC);
   if (out.NORMALIZE_PARENTHETICAL_FOR_DEDUPE !== undefined) out.NORMALIZE_PARENTHETICAL_FOR_DEDUPE = toBool(out.NORMALIZE_PARENTHETICAL_FOR_DEDUPE);
   if (out.BACKUP_BEFORE_FIX !== undefined) out.BACKUP_BEFORE_FIX = toBool(out.BACKUP_BEFORE_FIX);
   if (out.MAGIC_MODE !== undefined) out.MAGIC_MODE = toBool(out.MAGIC_MODE);
@@ -98,6 +103,10 @@ export function normalizeConfigForUI(raw: Partial<PMDAConfig>): Partial<PMDAConf
   if (out.FILES_ROOTS != null) {
     const roots = parsePathList(out.FILES_ROOTS as unknown);
     out.FILES_ROOTS = roots.join(', ');
+  }
+  if (out.PIPELINE_PLAYER_TARGET != null) {
+    const target = String(out.PIPELINE_PLAYER_TARGET).trim().toLowerCase();
+    out.PIPELINE_PLAYER_TARGET = (['none', 'plex', 'jellyfin', 'navidrome'].includes(target) ? target : 'none') as PMDAConfig['PIPELINE_PLAYER_TARGET'];
   }
   return out;
 }

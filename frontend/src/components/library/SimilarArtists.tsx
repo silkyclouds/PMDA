@@ -4,8 +4,6 @@ import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Badge } from '@/components/ui/badge';
-import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group';
-import { Label } from '@/components/ui/label';
 import { useToast } from '@/hooks/use-toast';
 
 interface SimilarArtist {
@@ -24,7 +22,6 @@ export function SimilarArtists({ artistId, artistName }: SimilarArtistsProps) {
   const [loading, setLoading] = useState(false);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [adding, setAdding] = useState(false);
-  const [addMethod, setAddMethod] = useState<'lidarr' | 'autobrr'>('lidarr');
   const { toast } = useToast();
 
   const loadSimilarArtists = async () => {
@@ -79,60 +76,31 @@ export function SimilarArtists({ artistId, artistName }: SimilarArtistsProps) {
     try {
       const artistsToAdd = similarArtists.filter(a => selected.has(a.mbid));
       
-      if (addMethod === 'lidarr') {
-        // Add each selected artist to Lidarr
-        const results = await Promise.allSettled(
-          artistsToAdd.map(artist =>
-            fetch('/api/lidarr/add-artist', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                artist_name: artist.name,
-                musicbrainz_artist_id: artist.mbid,
-              }),
-            })
-          )
-        );
-        
-        const successCount = results.filter(r => r.status === 'fulfilled').length;
-        const failedCount = results.length - successCount;
-        
-        if (successCount > 0) {
-          toast({
-            title: 'Success',
-            description: `Added ${successCount} artist(s) to Lidarr${failedCount > 0 ? ` (${failedCount} failed)` : ''}`,
-          });
-          setSelected(new Set());
-        } else {
-          throw new Error('All artists failed to add');
-        }
-      } else {
-        // Create Autobrr filter
-        const artistNames = artistsToAdd.map(a => a.name);
-        const response = await fetch('/api/autobrr/create-filter', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            artist_names: artistNames,
-          }),
+      // Create Autobrr filter
+      const artistNames = artistsToAdd.map(a => a.name);
+      const response = await fetch('/api/autobrr/create-filter', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          artist_names: artistNames,
+        }),
+      });
+
+      if (response.ok) {
+        const result = await response.json();
+        toast({
+          title: 'Success',
+          description: result.message,
         });
-        
-        if (response.ok) {
-          const result = await response.json();
-          toast({
-            title: 'Success',
-            description: result.message,
-          });
-          setSelected(new Set());
-        } else {
-          const error = await response.json();
-          throw new Error(error.message || 'Failed to create Autobrr filter');
-        }
+        setSelected(new Set());
+      } else {
+        const error = await response.json();
+        throw new Error(error.message || 'Failed to create Autobrr filter');
       }
     } catch (error) {
       toast({
         title: 'Error',
-        description: error instanceof Error ? error.message : `Failed to add artists to ${addMethod === 'lidarr' ? 'Lidarr' : 'Autobrr'}`,
+        description: error instanceof Error ? error.message : 'Failed to add artists to Autobrr',
         variant: 'destructive',
       });
     } finally {
@@ -184,19 +152,9 @@ export function SimilarArtists({ artistId, artistName }: SimilarArtistsProps) {
             </div>
           </div>
           
-          <div className="space-y-2">
-            <Label className="text-sm font-medium">Add method:</Label>
-            <RadioGroup value={addMethod} onValueChange={(v) => setAddMethod(v as 'lidarr' | 'autobrr')}>
-              <div className="flex items-center space-x-2">
-                <RadioGroupItem value="lidarr" id="lidarr" />
-                <Label htmlFor="lidarr" className="text-sm font-normal cursor-pointer">Lidarr (individual artists)</Label>
-              </div>
-              <div className="flex items-center space-x-2">
-                <RadioGroupItem value="autobrr" id="autobrr" />
-                <Label htmlFor="autobrr" className="text-sm font-normal cursor-pointer">Autobrr (filter for all)</Label>
-              </div>
-            </RadioGroup>
-          </div>
+          <p className="text-xs text-muted-foreground">
+            Add selected artists to Autobrr as a filter for automated monitoring.
+          </p>
           
           <div className="flex items-center gap-2">
             <Button

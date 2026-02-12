@@ -70,11 +70,6 @@ export function WelcomeModal({ onClose, config }: WelcomeModalProps) {
                   <span>Config folder (RW)</span>
                   <span className="ml-auto font-medium">{mounts.config_rw ? "✓" : "✗"}</span>
                 </li>
-                <li className={cn("flex items-center gap-2", mounts.plex_db_ro ? "text-green-600 dark:text-green-400" : "text-destructive")}>
-                  {mounts.plex_db_ro ? <CheckCircle2 className="w-4 h-4 shrink-0" /> : <XCircle className="w-4 h-4 shrink-0" />}
-                  <span>Plex database folder (RO)</span>
-                  <span className="ml-auto font-medium">{mounts.plex_db_ro ? "✓" : "✗"}</span>
-                </li>
                 <li className={cn("flex items-center gap-2", mounts.music_rw ? "text-green-600 dark:text-green-400" : "text-destructive")}>
                   {mounts.music_rw ? <CheckCircle2 className="w-4 h-4 shrink-0" /> : <XCircle className="w-4 h-4 shrink-0" />}
                   <span>Parent music folder (RW)</span>

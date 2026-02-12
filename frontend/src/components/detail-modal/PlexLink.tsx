@@ -22,7 +22,7 @@ export function PlexLink({ artistId, editions, selectedEditionIndex }: PlexLinkP
 
   useEffect(() => {
     api.getConfig().then(config => {
-      if (config.PLEX_HOST) {
+      if (config.LIBRARY_MODE === 'plex' && config.PLEX_HOST) {
         setPlexHost(config.PLEX_HOST.replace(/\/$/, ''));
       }
     });
@@ -67,7 +67,7 @@ export function PlexOpenLink({ ratingKey, label = 'Open in Plex', variant = 'out
 
   useEffect(() => {
     api.getConfig().then(config => {
-      if (config.PLEX_HOST) {
+      if (config.LIBRARY_MODE === 'plex' && config.PLEX_HOST) {
         setPlexHost(config.PLEX_HOST.replace(/\/$/, ''));
       }
     });

@@ -4,6 +4,18 @@ import { toast } from 'sonner';
 import * as api from '@/lib/api';
 import type { DuplicateCard, ScanProgress, DedupeProgress } from '@/lib/api';
 
+type ApiErrorShape = {
+  body?: {
+    error?: string;
+    requiresConfig?: boolean;
+    aiFunctionalFailure?: boolean;
+    requiresAiConfig?: boolean;
+  };
+  response?: {
+    status?: number;
+  };
+};
+
 export function useDuplicates(options?: { refetchInterval?: number }) {
   return useQuery({
     queryKey: ['duplicates'],
@@ -120,20 +132,21 @@ export function useScanControls() {
   const startMutation = useMutation({
     mutationFn: (options?: api.StartScanOptions) => api.startScan(options),
     onSuccess: invalidateQueries,
-    onError: (error: any) => {
-      const msg = error?.body?.error;
-      if (error?.response?.status === 409) {
+    onError: (error: unknown) => {
+      const err = error && typeof error === 'object' ? (error as ApiErrorShape) : {};
+      const msg = err.body?.error;
+      if (err.response?.status === 409) {
         toast.error(msg || 'A scan is already running.');
         return;
       }
-      if (error?.body?.requiresConfig) {
-        toast.error(msg || 'Plex is not configured. Go to Settings to set up Plex and your music library.');
-      } else if (error?.body?.aiFunctionalFailure) {
+      if (err.body?.requiresConfig) {
+        toast.error(msg || 'No source folders configured. Go to Settings to add your music folders.');
+      } else if (err.body?.aiFunctionalFailure) {
         toast.error(msg || 'No model accepted our parameters. Try another model in Settings.');
-      } else if (error?.body?.requiresAiConfig) {
+      } else if (err.body?.requiresAiConfig) {
         toast.error(msg || 'Configure the AI provider in Settings to run a scan');
-      } else if (error?.response?.status === 503) {
-        toast.error(msg || 'Scan cannot start. Check Settings (Plex and AI provider).');
+      } else if (err.response?.status === 503) {
+        toast.error(msg || 'Scan cannot start. Check Settings (folders and AI key).');
       }
     },
   });

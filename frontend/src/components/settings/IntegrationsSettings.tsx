@@ -1,13 +1,14 @@
-import { useState } from 'react';
-import { Link2, Loader2, CheckCircle2, XCircle, ExternalLink } from 'lucide-react';
+import { useMemo, useState } from 'react';
+import { Link2, Loader2, CheckCircle2, XCircle, ExternalLink, SlidersHorizontal } from 'lucide-react';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Switch } from '@/components/ui/switch';
 import { Button } from '@/components/ui/button';
 import { PasswordInput } from '@/components/ui/password-input';
 import { FieldTooltip } from '@/components/ui/field-tooltip';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import * as api from '@/lib/api';
-import type { PMDAConfig } from '@/lib/api';
+import type { PMDAConfig, PlayerTarget } from '@/lib/api';
 import { toast } from 'sonner';
 
 interface IntegrationsSettingsProps {
@@ -16,49 +17,77 @@ interface IntegrationsSettingsProps {
   errors: Record<string, string>;
 }
 
-export function IntegrationsSettings({ config, updateConfig, errors }: IntegrationsSettingsProps) {
-  const [testingLidarr, setTestingLidarr] = useState(false);
-  const [lidarrTestResult, setLidarrTestResult] = useState<{ success: boolean; message: string } | null>(null);
+const PLAYER_TARGETS: Array<{ value: PlayerTarget; label: string }> = [
+  { value: 'none', label: 'None' },
+  { value: 'jellyfin', label: 'Jellyfin' },
+  { value: 'navidrome', label: 'Navidrome' },
+];
+
+export function IntegrationsSettings({ config, updateConfig }: IntegrationsSettingsProps) {
+  const [testingPlayer, setTestingPlayer] = useState(false);
+  const [refreshingPlayer, setRefreshingPlayer] = useState(false);
+  const [playerResult, setPlayerResult] = useState<{ success: boolean; message: string } | null>(null);
   const [testingAutobrr, setTestingAutobrr] = useState(false);
   const [autobrrTestResult, setAutobrrTestResult] = useState<{ success: boolean; message: string } | null>(null);
 
-  const testLidarr = async () => {
-    const url = config.LIDARR_URL?.trim();
-    const apiKey = config.LIDARR_API_KEY?.trim();
-    
-    if (!url || !apiKey) {
-      setLidarrTestResult({ success: false, message: 'Lidarr URL and API Key are required' });
-      return;
-    }
+  const playerTarget: PlayerTarget = useMemo(() => {
+    const value = String(config.PIPELINE_PLAYER_TARGET || 'none').trim().toLowerCase();
+    return (['none', 'jellyfin', 'navidrome'].includes(value) ? value : 'none') as PlayerTarget;
+  }, [config.PIPELINE_PLAYER_TARGET]);
 
-    setTestingLidarr(true);
-    setLidarrTestResult(null);
+  const testPlayer = async () => {
+    setTestingPlayer(true);
+    setPlayerResult(null);
     try {
-      const result = await api.testLidarr(url, apiKey);
-      setLidarrTestResult(result);
+      const result = await api.playerCheck({
+        target: playerTarget,
+        PLEX_HOST: config.PLEX_HOST,
+        PLEX_TOKEN: config.PLEX_TOKEN,
+        JELLYFIN_URL: config.JELLYFIN_URL,
+        JELLYFIN_API_KEY: config.JELLYFIN_API_KEY,
+        NAVIDROME_URL: config.NAVIDROME_URL,
+        NAVIDROME_USERNAME: config.NAVIDROME_USERNAME,
+        NAVIDROME_PASSWORD: config.NAVIDROME_PASSWORD,
+        NAVIDROME_API_KEY: config.NAVIDROME_API_KEY,
+      });
+      setPlayerResult({ success: result.success, message: result.message });
       if (result.success) {
-        toast.success('Lidarr connection successful');
+        toast.success(result.message || 'Player connection successful');
       } else {
-        toast.error(result.message || 'Lidarr connection failed');
+        toast.error(result.message || 'Player connection failed');
       }
-    } catch (error: any) {
-      const message = error?.message || 'Failed to test Lidarr connection';
-      setLidarrTestResult({ success: false, message });
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : 'Failed to test player connection';
+      setPlayerResult({ success: false, message });
       toast.error(message);
     } finally {
-      setTestingLidarr(false);
+      setTestingPlayer(false);
+    }
+  };
+
+  const triggerPlayerRefresh = async () => {
+    setRefreshingPlayer(true);
+    try {
+      const result = await api.playerRefresh(playerTarget);
+      if (result.success) {
+        toast.success(result.message || 'Player refresh triggered');
+      } else {
+        toast.error(result.message || 'Failed to trigger player refresh');
+      }
+    } catch (error: unknown) {
+      toast.error(error instanceof Error ? error.message : 'Failed to trigger player refresh');
+    } finally {
+      setRefreshingPlayer(false);
     }
   };
 
   const testAutobrr = async () => {
     const url = config.AUTOBRR_URL?.trim();
     const apiKey = config.AUTOBRR_API_KEY?.trim();
-    
     if (!url || !apiKey) {
       setAutobrrTestResult({ success: false, message: 'Autobrr URL and API Key are required' });
       return;
     }
-
     setTestingAutobrr(true);
     setAutobrrTestResult(null);
     try {
@@ -69,8 +98,8 @@ export function IntegrationsSettings({ config, updateConfig, errors }: Integrati
       } else {
         toast.error(result.message || 'Autobrr connection failed');
       }
-    } catch (error: any) {
-      const message = error?.message || 'Failed to test Autobrr connection';
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : 'Failed to test Autobrr connection';
       setAutobrrTestResult({ success: false, message });
       toast.error(message);
     } finally {
@@ -85,224 +114,284 @@ export function IntegrationsSettings({ config, updateConfig, errors }: Integrati
           <Link2 className="w-5 h-5 text-primary" />
         </div>
         <div>
-          <h3 className="font-medium">Integrations</h3>
+          <h3 className="font-medium">Pipeline & Integrations</h3>
           <p className="text-sm text-muted-foreground">
-            Configure integrations with Lidarr and Autobrr for automated album management
+            Configure the automated pipeline and optional player sync.
           </p>
         </div>
       </div>
 
-      <div className="space-y-6">
-        {/* Lidarr Section */}
-        <div className="space-y-4 p-4 rounded-lg border border-border">
-          <div className="flex items-center justify-between">
-            <div>
-              <h4 className="font-medium text-sm">Lidarr</h4>
-              <p className="text-xs text-muted-foreground mt-1">
-                Automatically send broken albums to Lidarr for re-download
-              </p>
+      <div className="space-y-4 p-4 rounded-lg border border-border">
+        <div className="flex items-center gap-2">
+          <SlidersHorizontal className="w-4 h-4 text-primary" />
+          <h4 className="font-medium text-sm">Pipeline steps</h4>
+        </div>
+
+        <div className="space-y-3">
+          <div className="flex items-start justify-between p-3 rounded-lg bg-muted/50">
+            <div className="space-y-0.5 flex-1">
+              <Label>Match + Fix metadata</Label>
+              <p className="text-xs text-muted-foreground">Tags, album covers and artist images.</p>
             </div>
-            <Button
-              variant="outline"
-              size="sm"
-              asChild
-              className="gap-1.5 shrink-0"
-            >
-              <a
-                href="https://wiki.servarr.com/lidarr"
-                target="_blank"
-                rel="noopener noreferrer"
-              >
-                <ExternalLink className="w-3 h-3" />
-                Docs
-              </a>
-            </Button>
+            <Switch
+              checked={config.PIPELINE_ENABLE_MATCH_FIX ?? true}
+              onCheckedChange={(checked) => updateConfig({ PIPELINE_ENABLE_MATCH_FIX: checked })}
+              className="mt-1"
+            />
           </div>
 
-          <div className="space-y-3 pt-2 border-t border-border">
-            <div className="space-y-2">
-              <div className="flex items-center gap-1.5">
-                <Label htmlFor="lidarr-url">Lidarr URL</Label>
-                <FieldTooltip content="Base URL of your Lidarr instance (e.g. http://192.168.1.100:8686). No trailing slash." />
-              </div>
-              <Input
-                id="lidarr-url"
-                placeholder="http://192.168.1.100:8686"
-                value={config.LIDARR_URL || ''}
-                onChange={(e) => updateConfig({ LIDARR_URL: e.target.value })}
-              />
+          <div className="flex items-start justify-between p-3 rounded-lg bg-muted/50">
+            <div className="space-y-0.5 flex-1">
+              <Label>Deduplicate</Label>
+              <p className="text-xs text-muted-foreground">Move duplicate loser albums to the dupe folder.</p>
             </div>
+            <Switch
+              checked={config.PIPELINE_ENABLE_DEDUPE ?? true}
+              onCheckedChange={(checked) => updateConfig({ PIPELINE_ENABLE_DEDUPE: checked })}
+              className="mt-1"
+            />
+          </div>
 
-            <div className="space-y-2">
-              <div className="flex items-center gap-1.5">
-                <Label htmlFor="lidarr-api-key">Lidarr API Key</Label>
-                <FieldTooltip content="API key from Lidarr Settings → General → Security → API Key" />
-              </div>
-              <PasswordInput
-                id="lidarr-api-key"
-                placeholder="Enter your Lidarr API Key"
-                value={config.LIDARR_API_KEY || ''}
-                onChange={(e) => updateConfig({ LIDARR_API_KEY: e.target.value })}
-              />
+          <div className="flex items-start justify-between p-3 rounded-lg bg-muted/50">
+            <div className="space-y-0.5 flex-1">
+              <Label>Move incomplete albums</Label>
+              <p className="text-xs text-muted-foreground">Move incomplete albums to the configured incomplete folder.</p>
             </div>
+            <Switch
+              checked={config.PIPELINE_ENABLE_INCOMPLETE_MOVE ?? true}
+              onCheckedChange={(checked) => updateConfig({ PIPELINE_ENABLE_INCOMPLETE_MOVE: checked })}
+              className="mt-1"
+            />
+          </div>
 
-            <div className="flex items-start justify-between p-3 rounded-lg bg-muted/50">
-              <div className="space-y-0.5 flex-1">
-                <div className="flex items-center gap-1.5">
-                  <Label>Automatically fix broken albums</Label>
-                  <FieldTooltip content="When enabled, PMDA will automatically send broken albums (missing tracks) to Lidarr for re-download. Requires MusicBrainz ID to be available." />
-                </div>
-                <p className="text-xs text-muted-foreground">
-                  Automatically send broken albums to Lidarr when detected during scan
-                </p>
-              </div>
-              <Switch
-                checked={config.AUTO_FIX_BROKEN_ALBUMS ?? false}
-                onCheckedChange={(checked) => updateConfig({ AUTO_FIX_BROKEN_ALBUMS: checked })}
-                className="mt-1"
-                disabled={!config.LIDARR_URL || !config.LIDARR_API_KEY}
-              />
+          <div className="flex items-start justify-between p-3 rounded-lg bg-muted/50">
+            <div className="space-y-0.5 flex-1">
+              <Label>Export files library</Label>
+              <p className="text-xs text-muted-foreground">Build/update the export tree using hardlink/symlink/copy/move strategy.</p>
             </div>
+            <Switch
+              checked={config.PIPELINE_ENABLE_EXPORT ?? false}
+              onCheckedChange={(checked) => updateConfig({ PIPELINE_ENABLE_EXPORT: checked })}
+              className="mt-1"
+            />
+          </div>
 
-            {(config.LIDARR_URL?.trim() || config.LIDARR_API_KEY?.trim()) && (
-              <Button
-                variant="secondary"
-                onClick={testLidarr}
-                disabled={testingLidarr || !config.LIDARR_URL?.trim() || !config.LIDARR_API_KEY?.trim()}
-                className="gap-1.5 w-full"
-              >
-                {testingLidarr ? (
-                  <>
-                    <Loader2 className="w-4 h-4 animate-spin" />
-                    Testing...
-                  </>
-                ) : (
-                  <>
-                    Test Lidarr Connection
-                  </>
-                )}
-              </Button>
-            )}
+          <div className="flex items-start justify-between p-3 rounded-lg bg-muted/50">
+            <div className="space-y-0.5 flex-1">
+              <Label>Sync external player</Label>
+              <p className="text-xs text-muted-foreground">Trigger Jellyfin/Navidrome library refresh after scan.</p>
+            </div>
+            <Switch
+              checked={config.PIPELINE_ENABLE_PLAYER_SYNC ?? false}
+              onCheckedChange={(checked) => updateConfig({ PIPELINE_ENABLE_PLAYER_SYNC: checked })}
+              className="mt-1"
+            />
+          </div>
+        </div>
+      </div>
 
-            {lidarrTestResult && (
-              <div className={`p-3 rounded-lg flex items-start gap-2 ${
-                lidarrTestResult.success 
-                  ? 'bg-green-500/10 border border-green-500/20' 
-                  : 'bg-red-500/10 border border-red-500/20'
-              }`}>
-                {lidarrTestResult.success ? (
-                  <CheckCircle2 className="w-4 h-4 text-green-500 mt-0.5 shrink-0" />
-                ) : (
-                  <XCircle className="w-4 h-4 text-red-500 mt-0.5 shrink-0" />
-                )}
-                <p className={`text-xs ${lidarrTestResult.success ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}`}>
-                  {lidarrTestResult.message}
-                </p>
-              </div>
-            )}
-
-            <p className="text-xs text-muted-foreground">
-              Lidarr integration allows PMDA to automatically send broken albums (missing tracks) to Lidarr for re-download. 
-              The album must have a MusicBrainz Release Group ID for this to work.
+      <div className="space-y-4 p-4 rounded-lg border border-border">
+        <div className="flex items-center justify-between">
+          <div>
+            <h4 className="font-medium text-sm">Player sync target</h4>
+            <p className="text-xs text-muted-foreground mt-1">
+              Choose where PMDA sends refresh requests after the pipeline.
             </p>
           </div>
         </div>
 
-        {/* Autobrr Section */}
-        <div className="space-y-4 p-4 rounded-lg border border-border">
-          <div className="flex items-center justify-between">
-            <div>
-              <h4 className="font-medium text-sm">Autobrr</h4>
-              <p className="text-xs text-muted-foreground mt-1">
-                Create filters in Autobrr to monitor artists for new releases
-              </p>
-            </div>
-            <Button
-              variant="outline"
-              size="sm"
-              asChild
-              className="gap-1.5 shrink-0"
-            >
-              <a
-                href="https://autobrr.com"
-                target="_blank"
-                rel="noopener noreferrer"
-              >
-                <ExternalLink className="w-3 h-3" />
-                Docs
-              </a>
-            </Button>
+        <div className="space-y-2">
+          <div className="flex items-center gap-1.5">
+            <Label htmlFor="player-target">Target</Label>
+            <FieldTooltip content="Choose where PMDA sends refresh requests after the pipeline." />
           </div>
+          <Select
+            value={playerTarget}
+            onValueChange={(value) => updateConfig({ PIPELINE_PLAYER_TARGET: value as PMDAConfig['PIPELINE_PLAYER_TARGET'] })}
+          >
+            <SelectTrigger id="player-target">
+              <SelectValue placeholder="Select target" />
+            </SelectTrigger>
+            <SelectContent>
+              {PLAYER_TARGETS.map((item) => (
+                <SelectItem key={item.value} value={item.value}>
+                  {item.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
 
+        {playerTarget === 'jellyfin' && (
           <div className="space-y-3 pt-2 border-t border-border">
             <div className="space-y-2">
-              <div className="flex items-center gap-1.5">
-                <Label htmlFor="autobrr-url">Autobrr URL</Label>
-                <FieldTooltip content="Base URL of your Autobrr instance (e.g. http://192.168.1.100:7474). No trailing slash." />
-              </div>
+              <Label htmlFor="jellyfin-url">Jellyfin URL</Label>
               <Input
-                id="autobrr-url"
-                placeholder="http://192.168.1.100:7474"
-                value={config.AUTOBRR_URL || ''}
-                onChange={(e) => updateConfig({ AUTOBRR_URL: e.target.value })}
+                id="jellyfin-url"
+                placeholder="http://192.168.1.100:8096"
+                value={config.JELLYFIN_URL || ''}
+                onChange={(e) => updateConfig({ JELLYFIN_URL: e.target.value })}
               />
             </div>
-
             <div className="space-y-2">
-              <div className="flex items-center gap-1.5">
-                <Label htmlFor="autobrr-api-key">Autobrr API Key</Label>
-                <FieldTooltip content="API key from Autobrr Settings → API Keys. Generate a new key if needed." />
-              </div>
+              <Label htmlFor="jellyfin-api-key">Jellyfin API Key</Label>
               <PasswordInput
-                id="autobrr-api-key"
-                placeholder="Enter your Autobrr API Key"
-                value={config.AUTOBRR_API_KEY || ''}
-                onChange={(e) => updateConfig({ AUTOBRR_API_KEY: e.target.value })}
+                id="jellyfin-api-key"
+                placeholder="Enter Jellyfin API key"
+                value={config.JELLYFIN_API_KEY || ''}
+                onChange={(e) => updateConfig({ JELLYFIN_API_KEY: e.target.value })}
               />
             </div>
+          </div>
+        )}
 
-            {(config.AUTOBRR_URL?.trim() || config.AUTOBRR_API_KEY?.trim()) && (
-              <Button
-                variant="secondary"
-                onClick={testAutobrr}
-                disabled={testingAutobrr || !config.AUTOBRR_URL?.trim() || !config.AUTOBRR_API_KEY?.trim()}
-                className="gap-1.5 w-full"
-              >
-                {testingAutobrr ? (
-                  <>
-                    <Loader2 className="w-4 h-4 animate-spin" />
-                    Testing...
-                  </>
-                ) : (
-                  <>
-                    Test Autobrr Connection
-                  </>
-                )}
-              </Button>
+        {playerTarget === 'navidrome' && (
+          <div className="space-y-3 pt-2 border-t border-border">
+            <div className="space-y-2">
+              <Label htmlFor="navidrome-url">Navidrome URL</Label>
+              <Input
+                id="navidrome-url"
+                placeholder="http://192.168.1.100:4533"
+                value={config.NAVIDROME_URL || ''}
+                onChange={(e) => updateConfig({ NAVIDROME_URL: e.target.value })}
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="navidrome-user">Username</Label>
+              <Input
+                id="navidrome-user"
+                placeholder="admin"
+                value={config.NAVIDROME_USERNAME || ''}
+                onChange={(e) => updateConfig({ NAVIDROME_USERNAME: e.target.value })}
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="navidrome-pass">Password</Label>
+              <PasswordInput
+                id="navidrome-pass"
+                placeholder="Enter Navidrome password"
+                value={config.NAVIDROME_PASSWORD || ''}
+                onChange={(e) => updateConfig({ NAVIDROME_PASSWORD: e.target.value })}
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="navidrome-api-key">API key (optional)</Label>
+              <PasswordInput
+                id="navidrome-api-key"
+                placeholder="Optional if username/password is set"
+                value={config.NAVIDROME_API_KEY || ''}
+                onChange={(e) => updateConfig({ NAVIDROME_API_KEY: e.target.value })}
+              />
+            </div>
+          </div>
+        )}
+
+        {playerTarget !== 'none' && (
+          <div className="flex flex-wrap items-center gap-2 pt-2">
+            <Button
+              variant="secondary"
+              onClick={testPlayer}
+              disabled={testingPlayer}
+              className="gap-1.5"
+            >
+              {testingPlayer ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
+              Test connection
+            </Button>
+            <Button
+              variant="outline"
+              onClick={triggerPlayerRefresh}
+              disabled={refreshingPlayer}
+              className="gap-1.5"
+            >
+              {refreshingPlayer ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
+              Trigger refresh now
+            </Button>
+          </div>
+        )}
+
+        {playerResult && (
+          <div className={`p-3 rounded-lg flex items-start gap-2 ${
+            playerResult.success
+              ? 'bg-green-500/10 border border-green-500/20'
+              : 'bg-red-500/10 border border-red-500/20'
+          }`}>
+            {playerResult.success ? (
+              <CheckCircle2 className="w-4 h-4 text-green-500 mt-0.5 shrink-0" />
+            ) : (
+              <XCircle className="w-4 h-4 text-red-500 mt-0.5 shrink-0" />
             )}
-
-            {autobrrTestResult && (
-              <div className={`p-3 rounded-lg flex items-start gap-2 ${
-                autobrrTestResult.success 
-                  ? 'bg-green-500/10 border border-green-500/20' 
-                  : 'bg-red-500/10 border border-red-500/20'
-              }`}>
-                {autobrrTestResult.success ? (
-                  <CheckCircle2 className="w-4 h-4 text-green-500 mt-0.5 shrink-0" />
-                ) : (
-                  <XCircle className="w-4 h-4 text-red-500 mt-0.5 shrink-0" />
-                )}
-                <p className={`text-xs ${autobrrTestResult.success ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}`}>
-                  {autobrrTestResult.message}
-                </p>
-              </div>
-            )}
-
-            <p className="text-xs text-muted-foreground">
-              Autobrr integration allows PMDA to create filters for monitoring artists. 
-              You can add artists to Autobrr from the Library Browser when viewing similar artists.
+            <p className={`text-xs ${playerResult.success ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}`}>
+              {playerResult.message}
             </p>
           </div>
+        )}
+      </div>
+
+      <div className="space-y-4 p-4 rounded-lg border border-border">
+        <div className="flex items-center justify-between">
+          <div>
+            <h4 className="font-medium text-sm">Autobrr</h4>
+            <p className="text-xs text-muted-foreground mt-1">
+              Optional monitoring integration for similar artists.
+            </p>
+          </div>
+          <Button variant="outline" size="sm" asChild className="gap-1.5 shrink-0">
+            <a href="https://autobrr.com" target="_blank" rel="noopener noreferrer">
+              <ExternalLink className="w-3 h-3" />
+              Docs
+            </a>
+          </Button>
+        </div>
+
+        <div className="space-y-3 pt-2 border-t border-border">
+          <div className="space-y-2">
+            <Label htmlFor="autobrr-url">Autobrr URL</Label>
+            <Input
+              id="autobrr-url"
+              placeholder="http://192.168.1.100:7474"
+              value={config.AUTOBRR_URL || ''}
+              onChange={(e) => updateConfig({ AUTOBRR_URL: e.target.value })}
+            />
+          </div>
+
+          <div className="space-y-2">
+            <Label htmlFor="autobrr-api-key">Autobrr API Key</Label>
+            <PasswordInput
+              id="autobrr-api-key"
+              placeholder="Enter Autobrr API key"
+              value={config.AUTOBRR_API_KEY || ''}
+              onChange={(e) => updateConfig({ AUTOBRR_API_KEY: e.target.value })}
+            />
+          </div>
+
+          {(config.AUTOBRR_URL?.trim() || config.AUTOBRR_API_KEY?.trim()) && (
+            <Button
+              variant="secondary"
+              onClick={testAutobrr}
+              disabled={testingAutobrr || !config.AUTOBRR_URL?.trim() || !config.AUTOBRR_API_KEY?.trim()}
+              className="gap-1.5 w-full"
+            >
+              {testingAutobrr ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
+              Test Autobrr connection
+            </Button>
+          )}
+
+          {autobrrTestResult && (
+            <div className={`p-3 rounded-lg flex items-start gap-2 ${
+              autobrrTestResult.success
+                ? 'bg-green-500/10 border border-green-500/20'
+                : 'bg-red-500/10 border border-red-500/20'
+            }`}>
+              {autobrrTestResult.success ? (
+                <CheckCircle2 className="w-4 h-4 text-green-500 mt-0.5 shrink-0" />
+              ) : (
+                <XCircle className="w-4 h-4 text-red-500 mt-0.5 shrink-0" />
+              )}
+              <p className={`text-xs ${autobrrTestResult.success ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}`}>
+                {autobrrTestResult.message}
+              </p>
+            </div>
+          )}
         </div>
       </div>
     </div>

@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
-import { Settings, RefreshCw, History, BarChart2, Library, Scan, Package } from 'lucide-react';
+import { Settings, RefreshCw, History, BarChart2, Library, Scan, Package, Wrench } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { Button } from '@/components/ui/button';
 import { WelcomeModal } from '@/components/WelcomeModal';
@@ -145,6 +145,14 @@ export function Header() {
               >
                 <BarChart2 className="w-4 h-4" />
                 <span>Statistics</span>
+              </NavLink>
+              <NavLink 
+                to="/tools" 
+                className="flex items-center gap-2 px-3 py-2 rounded-md text-sm font-medium text-muted-foreground hover:text-foreground hover:bg-accent transition-colors"
+                activeClassName="text-foreground bg-accent"
+              >
+                <Wrench className="w-4 h-4" />
+                <span>Tools</span>
               </NavLink>
             </nav>
 

@@ -15,8 +15,6 @@ import {
   getDedupeProgress,
   getImproveAllProgress,
   getScanLogsTail,
-  addIncompleteAlbumsToLidarr,
-  getLidarrAddIncompleteProgress,
 } from '@/lib/api';
 import { toast } from 'sonner';
 
@@ -57,6 +55,8 @@ interface ScanProgressProps {
   /** Callbacks to update scan options from the component (optional; if not provided, options are internal state) */
   onScanTypeChange?: (t: ScanType) => void;
   onRunImproveAfterChange?: (v: boolean) => void;
+  /** Compact mode for simplified Scan page UI */
+  compact?: boolean;
 }
 
 export function ScanProgress({
@@ -77,6 +77,7 @@ export function ScanProgress({
   runImproveAfter: runImproveAfterProp,
   onScanTypeChange,
   onRunImproveAfterChange,
+  compact,
 }: ScanProgressProps) {
   const [expanded, setExpanded] = useState(false);
   const [showClearDialog, setShowClearDialog] = useState(false);
@@ -95,8 +96,8 @@ export function ScanProgress({
   const setScanType = onScanTypeChange ?? setScanTypeInternal;
   const runImproveAfter = runImproveAfterProp ?? runImproveAfterInternal;
   const setRunImproveAfter = onRunImproveAfterChange ?? setRunImproveAfterInternal;
+  const isCompact = Boolean(compact);
   const [improveAllProgressData, setImproveAllProgressData] = useState<Awaited<ReturnType<typeof getImproveAllProgress>> | null>(null);
-  const [lidarrAddProgressData, setLidarrAddProgressData] = useState<Awaited<ReturnType<typeof getLidarrAddIncompleteProgress>> | null>(null);
   const [postScanRunning, setPostScanRunning] = useState(false);
   const [magicRunning, setMagicRunning] = useState(false);
 
@@ -170,6 +171,13 @@ export function ScanProgress({
     scan_discovery_folders_found = 0,
     scan_discovery_albums_found = 0,
     scan_discovery_artists_found = 0,
+    scan_pipeline_flags = {},
+    scan_pipeline_sync_target = null,
+    scan_incomplete_moved_count = 0,
+    scan_incomplete_moved_mb = 0,
+    scan_player_sync_target = null,
+    scan_player_sync_ok = null,
+    scan_player_sync_message = null,
   } = safeProgress;
 
   // Stage badge: use backend phase (format_analysis | identification_tags | ia_analysis | finalizing | moving_dupes | post_processing)
@@ -219,14 +227,13 @@ export function ScanProgress({
     }
   }, [waitingForProgress, scanning, artists_total, total]);
 
-  // Poll improve-all and lidarr add-incomplete progress when not scanning
+  // Poll improve-all progress when not scanning
   useEffect(() => {
     if (scanning) return;
     const tick = async () => {
       try {
-        const [improve, lidarr] = await Promise.all([getImproveAllProgress(), getLidarrAddIncompleteProgress()]);
+        const improve = await getImproveAllProgress();
         setImproveAllProgressData(improve);
-        setLidarrAddProgressData(lidarr);
       } catch {
         // ignore
       }
@@ -238,6 +245,7 @@ export function ScanProgress({
 
   // Power-user live backend logs while scan/post-processing is active.
   useEffect(() => {
+    if (isCompact) return;
     if (!scanning && !post_processing) return;
     let cancelled = false;
     const tick = async () => {
@@ -260,8 +268,8 @@ export function ScanProgress({
   }, [scanning, post_processing]);
 
   const hasActiveStep = scanning && active_artists.length > 0 && active_artists[0]?.current_album && active_artists[0].current_album.status !== 'done';
+  const currentArtist = active_artists?.[0]?.artist_name || '';
   const improveAllRunning = improveAllProgressData?.running ?? false;
-  const lidarrAddRunning = lidarrAddProgressData?.running ?? false;
   
   // Use real-time duplicate count if available, fallback to last_scan_summary
   const actualDuplicateCount = currentDuplicateCount ?? (last_scan_summary?.duplicate_groups_count ?? 0);
@@ -279,12 +287,97 @@ export function ScanProgress({
     ? (active_artists[0].current_album!.status_details || active_artists[0].current_album!.status || 'processing')
     : '';
 
-  const workflowStage = useMemo<'undupe' | 'fix' | 'lidarr' | 'done'>(() => {
-    const broken = last_scan_summary?.broken_albums_count ?? 0;
+  const workflowStage = useMemo<'undupe' | 'fix' | 'done'>(() => {
     if (canDedupe && !dupesAlreadyAllMoved) return 'undupe';
-    if (!improveAllRunning) return broken > 0 ? 'lidarr' : 'fix';
+    if (!improveAllRunning) return 'done';
     return 'fix';
-  }, [canDedupe, dupesAlreadyAllMoved, improveAllRunning, last_scan_summary?.broken_albums_count]);
+  }, [canDedupe, dupesAlreadyAllMoved, improveAllRunning]);
+
+  if (isCompact) {
+    const statusLabel = scanning ? (phase ? `Scanning · ${phase}` : 'Scanning') : 'Idle';
+    const progressLabel = scanning
+      ? `${displayProgress}/${displayTotal} artist(s)`
+      : 'Ready to scan';
+    return (
+      <div className={cn("rounded-xl bg-card border border-border overflow-hidden", className)}>
+        <div className="p-6 space-y-4">
+          <div className="flex flex-wrap items-start justify-between gap-4">
+            <div className="space-y-1">
+              <h2 className="text-lg font-semibold text-foreground">Scan status</h2>
+              <p className="text-sm text-muted-foreground">{statusLabel}</p>
+              {currentArtist && scanning && (
+                <p className="text-xs text-muted-foreground">Artist: <span className="font-medium text-foreground">{currentArtist}</span></p>
+              )}
+            </div>
+            <div className="flex flex-wrap gap-2">
+              {!scanning && status !== 'running' && (
+                <Button onClick={() => onStart({ scan_type: scanType, run_improve_after: runImproveAfter })} disabled={isStarting} className="gap-2">
+                  {isStarting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
+                  Start scan
+                </Button>
+              )}
+              {scanning && status === 'running' && (
+                <Button variant="outline" onClick={onPause} disabled={isPausing} className="gap-2">
+                  {isPausing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Pause className="w-4 h-4" />}
+                  Pause
+                </Button>
+              )}
+              {status === 'paused' && (
+                <Button onClick={onResume} disabled={isResuming} className="gap-2">
+                  {isResuming ? <Loader2 className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
+                  Resume
+                </Button>
+              )}
+              {(scanning || status === 'paused') && (
+                <Button variant="destructive" onClick={onStop} disabled={isStopping} className="gap-2">
+                  {isStopping ? <Loader2 className="w-4 h-4 animate-spin" /> : <Square className="w-4 h-4" />}
+                  Stop
+                </Button>
+              )}
+            </div>
+          </div>
+          <div className="space-y-2">
+            <div className="h-2 rounded-full bg-muted overflow-hidden">
+              <div className="h-full bg-primary transition-all" style={{ width: `${percentage}%` }} />
+            </div>
+            <div className="flex items-center justify-between text-xs text-muted-foreground">
+              <span>{progressLabel}</span>
+              <span className="tabular-nums">{percentage}%</span>
+            </div>
+          </div>
+          <div className="flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
+            <span className="text-foreground font-medium">Mode:</span>
+            <div className="flex items-center gap-1">
+              <Button
+                variant={scanType === 'full' ? 'default' : 'outline'}
+                size="sm"
+                onClick={() => setScanType('full')}
+              >
+                Full
+              </Button>
+              <Button
+                variant={scanType === 'changed_only' ? 'default' : 'outline'}
+                size="sm"
+                onClick={() => setScanType('changed_only')}
+              >
+                Changed only
+              </Button>
+            </div>
+            <label className="flex items-center gap-2">
+              <Checkbox
+                checked={runImproveAfter}
+                onCheckedChange={(checked) => setRunImproveAfter(Boolean(checked))}
+              />
+              <span>Fix after scan</span>
+            </label>
+          </div>
+          <div className="text-xs text-muted-foreground">
+            Detailed stats live in <Link to="/statistics" className="underline underline-offset-2">Statistics</Link>.
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className={cn("rounded-xl bg-card border border-border overflow-hidden", className)}>
@@ -592,7 +685,7 @@ export function ScanProgress({
               <div className="rounded-xl border border-border bg-card p-4">
                 <h3 className="text-base font-semibold text-foreground">Post-scan workflow</h3>
                 <p className="text-sm text-muted-foreground mt-1">
-                  Resolve actions in order: Undupe → Fix Albums → Send incomplete to Lidarr.
+                  Resolve actions in order: Undupe → Fix Albums → Incomplete handling.
                 </p>
                 <p className="text-xs text-muted-foreground mt-2">
                   Current step: <span className="font-medium text-foreground capitalize">{workflowStage}</span>
@@ -678,36 +771,40 @@ export function ScanProgress({
                   )}
                 </div>
 
-                {(last_scan_summary.broken_albums_count ?? 0) > 0 && (
-                  <div className="rounded-xl border border-border bg-card p-4">
-                    <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
-                      <div>
-                        <p className="text-xs uppercase tracking-wider text-muted-foreground">Step 3</p>
-                        <h4 className="text-sm font-semibold text-foreground">Send incomplete to Lidarr</h4>
-                        <p className="text-xs text-muted-foreground mt-1">
-                          {last_scan_summary.broken_albums_count} incomplete album(s) available.
-                        </p>
-                      </div>
-                      <Button
-                        size="sm"
-                        onClick={async () => {
-                          if (lidarrAddRunning) return;
-                          setPostScanRunning(true);
-                          try {
-                            await addIncompleteAlbumsToLidarr();
-                            toast.success('Add incomplete to Lidarr started');
-                          } catch {
-                            toast.error('Failed to start');
-                          } finally {
-                            setPostScanRunning(false);
-                          }
-                        }}
-                        disabled={postScanRunning || lidarrAddRunning || canDedupe || deduping || improveAllRunning}
-                        className="gap-1.5"
-                      >
-                        {lidarrAddRunning ? <Loader2 className="w-4 h-4 animate-spin" /> : <AlertTriangle className="w-4 h-4" />}
-                        {lidarrAddRunning ? 'Sending…' : 'Send to Lidarr'}
+                <div className="rounded-xl border border-border bg-card p-4">
+                  <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+                    <div>
+                      <p className="text-xs uppercase tracking-wider text-muted-foreground">Step 3</p>
+                      <h4 className="text-sm font-semibold text-foreground">Incomplete handling</h4>
+                      <p className="text-xs text-muted-foreground mt-1">
+                        {(scan_pipeline_flags?.incomplete_move ?? false)
+                          ? `Auto-moved ${scan_incomplete_moved_count} incomplete album(s) (${scan_incomplete_moved_mb} MB) this run.`
+                          : `${last_scan_summary.broken_albums_count ?? 0} incomplete album(s) detected.`}
+                      </p>
+                    </div>
+                    <Link to="/broken-albums">
+                      <Button size="sm" variant="outline" className="gap-1.5">
+                        <AlertTriangle className="w-4 h-4" />
+                        Review
                       </Button>
+                    </Link>
+                  </div>
+                </div>
+
+                {(scan_pipeline_flags?.player_sync ?? false) && (
+                  <div className="rounded-xl border border-border bg-card p-4">
+                    <div className="flex flex-col gap-1">
+                      <p className="text-xs uppercase tracking-wider text-muted-foreground">Step 4</p>
+                      <h4 className="text-sm font-semibold text-foreground">Player sync</h4>
+                      <p className="text-xs text-muted-foreground">
+                        Target: <span className="font-medium text-foreground">{scan_player_sync_target || scan_pipeline_sync_target || 'none'}</span>
+                        {scan_player_sync_ok != null && (
+                          <span className={cn('ml-2 font-medium', scan_player_sync_ok ? 'text-emerald-500' : 'text-red-500')}>
+                            {scan_player_sync_ok ? 'OK' : 'Failed'}
+                          </span>
+                        )}
+                      </p>
+                      {scan_player_sync_message ? <p className="text-xs text-muted-foreground">{scan_player_sync_message}</p> : null}
                     </div>
                   </div>
                 )}

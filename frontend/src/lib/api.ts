@@ -144,6 +144,25 @@ export interface ScanProgress {
   scan_lastfm_matched?: number;
   scan_bandcamp_matched?: number;
   scan_start_time?: number | null;
+  /** Pipeline toggles effectively applied for this running scan. */
+  scan_pipeline_flags?: {
+    match_fix?: boolean;
+    dedupe?: boolean;
+    incomplete_move?: boolean;
+    export?: boolean;
+    player_sync?: boolean;
+    sync_target?: string;
+  };
+  /** Sync target resolved for this scan. */
+  scan_pipeline_sync_target?: string | null;
+  /** Number of incomplete albums auto-moved in this scan. */
+  scan_incomplete_moved_count?: number;
+  /** Total size moved for incompletes (MB) in this scan. */
+  scan_incomplete_moved_mb?: number;
+  /** Player sync telemetry. */
+  scan_player_sync_target?: string | null;
+  scan_player_sync_ok?: boolean | null;
+  scan_player_sync_message?: string | null;
 }
 
 export interface CacheControlMetrics {
@@ -194,6 +213,8 @@ export interface CacheControlMetrics {
     musicbrainz_cache_rows: number;
     musicbrainz_album_lookup_rows: number;
     musicbrainz_album_lookup_not_found_rows: number;
+    provider_album_lookup_rows?: number;
+    provider_album_lookup_not_found_rows?: number;
   };
   sqlite_state_db: {
     db_path: string;
@@ -501,6 +522,12 @@ export interface PMDAConfig {
   LOG_LEVEL: 'DEBUG' | 'INFO' | 'WARNING' | 'ERROR';
   LOG_FILE: string;
   AUTO_MOVE_DUPES: boolean;
+  PIPELINE_ENABLE_MATCH_FIX?: boolean;
+  PIPELINE_ENABLE_DEDUPE?: boolean;
+  PIPELINE_ENABLE_INCOMPLETE_MOVE?: boolean;
+  PIPELINE_ENABLE_EXPORT?: boolean;
+  PIPELINE_ENABLE_PLAYER_SYNC?: boolean;
+  PIPELINE_PLAYER_TARGET?: 'none' | 'plex' | 'jellyfin' | 'navidrome';
   // Integrations
   LIDARR_URL: string;
   LIDARR_API_KEY: string;
@@ -512,6 +539,33 @@ export interface PMDAConfig {
   BROKEN_ALBUM_PERCENTAGE_THRESHOLD: number;
   // Incomplete album definition
   REQUIRED_TAGS: string[];
+  // Player integrations
+  JELLYFIN_URL?: string;
+  JELLYFIN_API_KEY?: string;
+  NAVIDROME_URL?: string;
+  NAVIDROME_USERNAME?: string;
+  NAVIDROME_PASSWORD?: string;
+  NAVIDROME_API_KEY?: string;
+}
+
+export type PlayerTarget = 'none' | 'plex' | 'jellyfin' | 'navidrome';
+
+export interface PlayerActionResult {
+  success: boolean;
+  target: string;
+  message: string;
+}
+
+export interface PlayerCheckPayload {
+  target?: PlayerTarget;
+  PLEX_HOST?: string;
+  PLEX_TOKEN?: string;
+  JELLYFIN_URL?: string;
+  JELLYFIN_API_KEY?: string;
+  NAVIDROME_URL?: string;
+  NAVIDROME_USERNAME?: string;
+  NAVIDROME_PASSWORD?: string;
+  NAVIDROME_API_KEY?: string;
 }
 
 export interface ScanHistoryEntry {
@@ -592,6 +646,11 @@ export interface ScanHistorySummaryJson {
   scan_discogs_matched?: number;
   scan_lastfm_matched?: number;
   scan_bandcamp_matched?: number;
+  incomplete_moved_this_scan?: number;
+  incomplete_moved_mb_this_scan?: number;
+  player_sync_target?: string;
+  player_sync_ok?: boolean | null;
+  player_sync_message?: string;
   cover_from_mb?: number;
   cover_from_discogs?: number;
   cover_from_lastfm?: number;
@@ -646,7 +705,15 @@ export interface ScanMove {
   album_title?: string;
   /** Format description (e.g. FLAC 24/96) when available */
   fmt_text?: string;
+  /** Move reason: dedupe | incomplete */
+  move_reason?: 'dedupe' | 'incomplete' | string;
 }
+
+type ApiError = Error & { response?: Response; body?: unknown };
+
+const isApiError = (error: unknown): error is ApiError => {
+  return error instanceof Error && typeof (error as ApiError).response !== 'undefined';
+};
 
 // API Functions
 async function fetchApi<T>(endpoint: string, options?: RequestInit): Promise<T> {
@@ -659,7 +726,7 @@ async function fetchApi<T>(endpoint: string, options?: RequestInit): Promise<T> 
   });
   
   if (!response.ok) {
-    const error: any = new Error(`API Error: ${response.status} ${response.statusText}`);
+    const error = new Error(`API Error: ${response.status} ${response.statusText}`) as ApiError;
     error.response = response;
     try {
       const data = await response.json();
@@ -823,6 +890,20 @@ export interface ScanPreflightResult {
 
 export async function getScanPreflight(): Promise<ScanPreflightResult> {
   return fetchApi<ScanPreflightResult>('/api/scan/preflight');
+}
+
+export async function playerCheck(payload: PlayerCheckPayload = {}): Promise<PlayerActionResult> {
+  return fetchApi<PlayerActionResult>('/api/player/check', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function playerRefresh(target?: PlayerTarget): Promise<PlayerActionResult> {
+  return fetchApi<PlayerActionResult>('/api/player/refresh', {
+    method: 'POST',
+    body: JSON.stringify(target ? { target } : {}),
+  });
 }
 
 export interface StartScanOptions {
@@ -1269,8 +1350,8 @@ export async function testMusicBrainz(useMusicBrainz?: boolean): Promise<{ succe
       return { success: false, message: data.message || data.error || `MusicBrainz test failed: ${response.statusText}` };
     }
     return data;
-  } catch (error: any) {
-    return { success: false, message: error?.message || 'Failed to test MusicBrainz connection' };
+  } catch (error: unknown) {
+    return { success: false, message: error instanceof Error ? error.message : 'Failed to test MusicBrainz connection' };
   }
 }
 
@@ -1291,16 +1372,11 @@ export async function getOpenAIModels(apiKey: string): Promise<string[]> {
   if (!apiKey?.trim()) {
     throw new Error('API key is required to fetch models');
   }
-  try {
-    const body = { OPENAI_API_KEY: apiKey.trim() };
-    return await fetchApi<string[]>('/api/openai/models', {
-      method: 'POST',
-      body: JSON.stringify(body),
-    });
-  } catch (error) {
-    // Re-throw the error so the UI can handle it properly
-    throw error;
-  }
+  const body = { OPENAI_API_KEY: apiKey.trim() };
+  return await fetchApi<string[]>('/api/openai/models', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
 }
 
 export async function getAIModels(
@@ -1308,7 +1384,7 @@ export async function getAIModels(
   credentials: { apiKey?: string; url?: string }
 ): Promise<string[]> {
   try {
-    const body: any = { AI_PROVIDER: provider };
+    const body: Record<string, string> & { AI_PROVIDER: typeof provider } = { AI_PROVIDER: provider };
     if (provider === 'ollama') {
       if (!credentials.url?.trim()) {
         throw new Error('Ollama URL is required');
@@ -1330,13 +1406,19 @@ export async function getAIModels(
       method: 'POST',
       body: JSON.stringify(body),
     });
-  } catch (error: any) {
+  } catch (error: unknown) {
     // Re-throw with better error message
-    if (error?.response) {
-      const data = await error.response.json().catch(() => ({}));
-      throw new Error(data.error || error.message || 'Failed to fetch models');
+    if (isApiError(error)) {
+      const body = error.body;
+      if (body && typeof body === 'object') {
+        const msg = (body as { error?: unknown }).error;
+        if (typeof msg === 'string' && msg) {
+          throw new Error(msg);
+        }
+      }
+      throw new Error(error.message || 'Failed to fetch models');
     }
-    throw error;
+    throw error instanceof Error ? error : new Error('Failed to fetch models');
   }
 }
 

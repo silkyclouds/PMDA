@@ -145,7 +145,7 @@ export function AISettings({ config, updateConfig, errors }: AISettingsProps) {
             <Select
               value={provider}
               onValueChange={(value) => {
-                updateConfig({ AI_PROVIDER: value as any });
+                updateConfig({ AI_PROVIDER: value as PMDAConfig['AI_PROVIDER'] });
                 // Reset credentials ref when provider changes
                 credentialsRef.current = '';
               }}

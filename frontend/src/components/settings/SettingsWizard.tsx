@@ -299,9 +299,11 @@ export function SettingsWizard({ onClose, onRebootStart }: SettingsWizardProps) 
                 </div>
                 <h4 className="font-medium text-foreground">Integrations</h4>
                 <div className="grid gap-2 pl-2">
-                  <div className="p-2 rounded bg-muted/50"><span className="font-medium">Lidarr:</span> {config.LIDARR_URL ? 'Configured' : 'Not set'}</div>
+                  <div className="p-2 rounded bg-muted/50"><span className="font-medium">Player target:</span> {config.PIPELINE_PLAYER_TARGET || 'none'}</div>
+                  <div className="p-2 rounded bg-muted/50"><span className="font-medium">Pipeline match/fix:</span> {config.PIPELINE_ENABLE_MATCH_FIX !== false ? 'Enabled' : 'Disabled'}</div>
+                  <div className="p-2 rounded bg-muted/50"><span className="font-medium">Pipeline dedupe:</span> {config.PIPELINE_ENABLE_DEDUPE !== false ? 'Enabled' : 'Disabled'}</div>
+                  <div className="p-2 rounded bg-muted/50"><span className="font-medium">Pipeline incomplete move:</span> {config.PIPELINE_ENABLE_INCOMPLETE_MOVE !== false ? 'Enabled' : 'Disabled'}</div>
                   <div className="p-2 rounded bg-muted/50"><span className="font-medium">Autobrr:</span> {config.AUTOBRR_URL ? 'Configured' : 'Not set'}</div>
-                  <div className="p-2 rounded bg-muted/50"><span className="font-medium">Auto-fix broken albums:</span> {config.AUTO_FIX_BROKEN_ALBUMS ? 'Enabled' : 'Disabled'}</div>
                 </div>
                 <h4 className="font-medium text-foreground">Notifications & Logging</h4>
                 <div className="grid gap-2 pl-2">

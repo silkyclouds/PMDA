@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
-import { Search, Music, Star, Loader2, Edit, Image as ImageIcon, RefreshCw, LayoutGrid, List, Sparkles, Play, Check, X, Circle, CopyMinus, Wrench, FolderInput } from 'lucide-react';
+import { Search, Music, Loader2, Edit, Image as ImageIcon, RefreshCw, LayoutGrid, List, Sparkles, Play, Check, X, Circle, CopyMinus, Wrench, FolderInput } from 'lucide-react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { Header } from '@/components/Header';
 import { Input } from '@/components/ui/input';
@@ -103,7 +103,7 @@ function getCanImproveReasons(album: AlbumInfo): string[] {
     reasons.push('Not identified in MusicBrainz – can fetch tags and cover');
   }
   if (album.is_broken) {
-    reasons.push('Incomplete – missing tracks (recover via Lidarr/Autobrr)');
+    reasons.push('Incomplete – missing tracks');
   }
   return reasons;
 }
@@ -148,7 +148,7 @@ function NormalizeAlbumNamesButton({ onDone }: { onDone?: () => void }) {
       const n = result.renamed?.length ?? 0;
       const errs = result.errors?.length ?? 0;
       if (n > 0) {
-        toast({ title: 'Renamed', description: `${n} folder${n !== 1 ? 's' : ''} renamed.${errs > 0 ? ` ${errs} error(s).` : ''} Re-scan your library in Plex to refresh.` });
+        toast({ title: 'Renamed', description: `${n} folder${n !== 1 ? 's' : ''} renamed.${errs > 0 ? ` ${errs} error(s).` : ''} Re-scan your library to refresh.` });
         setOpen(false);
         onDone?.();
       }
@@ -173,7 +173,7 @@ function NormalizeAlbumNamesButton({ onDone }: { onDone?: () => void }) {
           <DialogHeader>
             <DialogTitle>Normalize album names</DialogTitle>
             <DialogDescription>
-              Remove format/version suffixes in parentheses from folder names (e.g. &quot;Album (flac)&quot; → &quot;Album&quot;). Re-scan your library in Plex after renaming.
+              Remove format/version suffixes in parentheses from folder names (e.g. &quot;Album (flac)&quot; → &quot;Album&quot;). Re-scan your library after renaming.
             </DialogDescription>
           </DialogHeader>
           {loading ? (
@@ -346,12 +346,13 @@ export default function LibraryBrowser() {
   const [loading, setLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
   const debouncedSearch = useDebounce(searchQuery, 120);
+  const [searchSuggestions, setSearchSuggestions] = useState<api.LibrarySearchSuggestionItem[]>([]);
+  const [searchSuggestionsOpen, setSearchSuggestionsOpen] = useState(false);
+  const [searchSuggestionsLoading, setSearchSuggestionsLoading] = useState(false);
   const [selectedArtist, setSelectedArtist] = useState<number | null>(null);
   const [artistDetails, setArtistDetails] = useState<ArtistDetails | null>(null);
   const [loadingDetails, setLoadingDetails] = useState(false);
   const [detailsLoadError, setDetailsLoadError] = useState<string | null>(null);
-  const [monitoredArtists, setMonitoredArtists] = useState<Set<number>>(new Set());
-  const [addingToLidarr, setAddingToLidarr] = useState(false);
   const [editingAlbum, setEditingAlbum] = useState<number | null>(null);
   const [albumViewMode, setAlbumViewMode] = useState<'tile' | 'list'>(() => (localStorage.getItem('pmda-library-album-view') as 'tile' | 'list') || 'tile');
   const [improvingAlbums, setImprovingAlbums] = useState(false);
@@ -396,6 +397,7 @@ export default function LibraryBrowser() {
   const [loadingRecommendations, setLoadingRecommendations] = useState(false);
   const [recommendationsError, setRecommendationsError] = useState<string | null>(null);
   const artistsListRef = useRef<HTMLDivElement>(null);
+  const searchBlurTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const { toast } = useToast();
   const [showAnalyzeChoiceModal, setShowAnalyzeChoiceModal] = useState(false);
   const [scanRunning, setScanRunning] = useState(false);
@@ -461,6 +463,33 @@ export default function LibraryBrowser() {
   useEffect(() => {
     loadArtists(debouncedSearch);
   }, [debouncedSearch, loadArtists]);
+
+  useEffect(() => {
+    let active = true;
+    const run = async () => {
+      const q = debouncedSearch.trim();
+      if (!q) {
+        setSearchSuggestions([]);
+        setSearchSuggestionsLoading(false);
+        return;
+      }
+      setSearchSuggestionsLoading(true);
+      try {
+        const data = await api.getLibrarySearchSuggest(q, 14);
+        if (!active) return;
+        setSearchSuggestions(Array.isArray(data.items) ? data.items : []);
+      } catch {
+        if (!active) return;
+        setSearchSuggestions([]);
+      } finally {
+        if (active) setSearchSuggestionsLoading(false);
+      }
+    };
+    run();
+    return () => {
+      active = false;
+    };
+  }, [debouncedSearch]);
 
   useEffect(() => {
     let active = true;
@@ -557,7 +586,22 @@ export default function LibraryBrowser() {
   const handleArtistClick = (artistId: number) => {
     setSelectedArtist(artistId);
     loadArtistDetails(artistId);
-    checkMonitoredStatus(artistId);
+  };
+
+  const openSearchSuggestion = (item: api.LibrarySearchSuggestionItem) => {
+    const artistId = item.artist_id ?? null;
+    if (artistId && artistId > 0) {
+      setSelectedArtist(artistId);
+      loadArtistDetails(artistId);
+      navigate(`/library/artist/${artistId}`);
+      setSearchSuggestionsOpen(false);
+      return;
+    }
+    if (item.type === 'artist' && item.artist_id && item.artist_id > 0) {
+      handleArtistClick(item.artist_id);
+      navigate(`/library/artist/${item.artist_id}`);
+      setSearchSuggestionsOpen(false);
+    }
   };
 
   useEffect(() => {
@@ -568,58 +612,6 @@ export default function LibraryBrowser() {
     handleArtistClick(artistParam);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [searchParams, selectedArtist]);
-
-  const checkMonitoredStatus = async (artistId: number) => {
-    try {
-      const response = await fetch(`/api/library/artist/${artistId}/monitored`);
-      if (response.ok) {
-        const data = await response.json();
-        if (data.monitored) {
-          setMonitoredArtists(prev => new Set(prev).add(artistId));
-        }
-      }
-    } catch (error) {
-      // Silently fail - not critical
-    }
-  };
-
-  const handleAddToLidarr = async (artistId: number, artistName: string) => {
-    setAddingToLidarr(true);
-    try {
-      const response = await fetch('/api/lidarr/add-artist', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          artist_id: artistId,
-          artist_name: artistName,
-        }),
-      });
-      
-      if (response.ok) {
-        const result = await response.json();
-        if (result.success) {
-          toast({
-            title: 'Success',
-            description: result.message,
-          });
-          setMonitoredArtists(prev => new Set(prev).add(artistId));
-        } else {
-          throw new Error(result.message);
-        }
-      } else {
-        const error = await response.json();
-        throw new Error(error.message || 'Failed to add artist to Lidarr');
-      }
-    } catch (error) {
-      toast({
-        title: 'Error',
-        description: error instanceof Error ? error.message : 'Failed to add artist to Lidarr',
-        variant: 'destructive',
-      });
-    } finally {
-      setAddingToLidarr(false);
-    }
-  };
 
   const handlePlayAlbum = async (albumId: number) => {
     try {
@@ -941,16 +933,71 @@ export default function LibraryBrowser() {
               <div className="relative">
                 <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
                 <Input
-                  placeholder="Search artists..."
+                  placeholder="Search artists, albums, tracks..."
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
+                  onFocus={() => {
+                    if (searchBlurTimer.current) clearTimeout(searchBlurTimer.current);
+                    setSearchSuggestionsOpen(true);
+                  }}
+                  onBlur={() => {
+                    if (searchBlurTimer.current) clearTimeout(searchBlurTimer.current);
+                    searchBlurTimer.current = setTimeout(() => setSearchSuggestionsOpen(false), 140);
+                  }}
                   onKeyDown={(e) => {
-                    if (e.key === 'Enter' && artists.length > 0) {
-                      navigate(`/library/artist/${artists[0].artist_id}`);
+                    if (e.key === 'Escape') {
+                      setSearchSuggestionsOpen(false);
+                    }
+                    if (e.key === 'Enter') {
+                      const first = searchSuggestions[0];
+                      if (first) {
+                        openSearchSuggestion(first);
+                        return;
+                      }
+                      if (artists.length > 0) {
+                        navigate(`/library/artist/${artists[0].artist_id}`);
+                      }
                     }
                   }}
                   className="pl-9"
                 />
+                {searchSuggestionsOpen && searchQuery.trim() && (
+                  <div className="absolute z-20 mt-1 w-full rounded-md border border-border bg-popover shadow-lg max-h-80 overflow-y-auto">
+                    {searchSuggestionsLoading ? (
+                      <div className="px-3 py-2 text-xs text-muted-foreground flex items-center gap-2">
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        Searching...
+                      </div>
+                    ) : searchSuggestions.length === 0 ? (
+                      <div className="px-3 py-2 text-xs text-muted-foreground">No result</div>
+                    ) : (
+                      <ul className="py-1">
+                        {searchSuggestions.map((item, idx) => (
+                          <li key={`${item.type}-${item.artist_id ?? 'x'}-${item.album_id ?? 'x'}-${item.track_id ?? 'x'}-${idx}`}>
+                            <button
+                              type="button"
+                              className="w-full px-3 py-2 text-left hover:bg-accent/60 transition-colors"
+                              onMouseDown={(ev) => {
+                                ev.preventDefault();
+                                openSearchSuggestion(item);
+                              }}
+                            >
+                              <div className="flex items-center gap-2 min-w-0">
+                                <Badge variant="outline" className="text-[10px] uppercase tracking-wide shrink-0">
+                                  {item.type}
+                                </Badge>
+                                <span className="text-sm font-medium truncate">{item.title}</span>
+                              </div>
+                              {item.subtitle && (
+                                <div className="text-xs text-muted-foreground truncate mt-0.5">{item.subtitle}</div>
+                              )}
+                            </button>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                )}
               </div>
             </div>
 
@@ -1121,20 +1168,6 @@ export default function LibraryBrowser() {
                             >
                               <RefreshCw className="w-4 h-4" />
                               {artistDetails.analysis_cached ? 'Re-analyze' : 'Refresh analysis'}
-                            </Button>
-                            <Button 
-                              variant="outline" 
-                              size="sm" 
-                              className={cn("gap-1.5", monitoredArtists.has(selectedArtist) && "bg-primary/10 border-primary")}
-                              onClick={() => handleAddToLidarr(selectedArtist, artistDetails.artist_name)}
-                              disabled={addingToLidarr || monitoredArtists.has(selectedArtist)}
-                            >
-                              {addingToLidarr ? (
-                                <Loader2 className="w-4 h-4 animate-spin" />
-                              ) : (
-                                <Star className={cn("w-4 h-4", monitoredArtists.has(selectedArtist) && "fill-primary text-primary")} />
-                              )}
-                              {monitoredArtists.has(selectedArtist) ? 'Monitored' : 'Monitor'}
                             </Button>
                             {artistDetails.stats && artistDetails.stats.duplicates > 0 && (
                               <Button

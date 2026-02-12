@@ -1,10 +1,12 @@
+import { useEffect, useState } from 'react';
 import { useNavigate, Link } from 'react-router-dom';
-import { Package, RefreshCw, CheckCircle2, Play, ArrowRight, Loader2, Wrench, AlertTriangle } from 'lucide-react';
+import { Package, RefreshCw, CheckCircle2, Play, ArrowRight, Loader2, Wrench, AlertTriangle, Terminal, ChevronDown, ChevronUp } from 'lucide-react';
 import { Progress } from '@/components/ui/progress';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
 import { useScanProgressShared } from '@/hooks/useScanProgressShared';
 import { useDuplicates, useScanControls } from '@/hooks/usePMDA';
+import { getScanLogsTail } from '@/lib/api';
 
 export function GlobalStatusBar() {
   const navigate = useNavigate();
@@ -24,6 +26,8 @@ export function GlobalStatusBar() {
   
   const { data: duplicates = [] } = useDuplicates({ refetchInterval: 30000 });
   const duplicateCount = duplicates.length;
+  const [showLogs, setShowLogs] = useState(false);
+  const [logLines, setLogLines] = useState<string[]>([]);
   
   // Count unique artists
   const artistSet = new Set<string>();
@@ -42,6 +46,28 @@ export function GlobalStatusBar() {
   const handleStartScan = () => {
     scanControls.start();
   };
+
+  useEffect(() => {
+    if (!showLogs) return;
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        const data = await getScanLogsTail(120);
+        if (!cancelled) {
+          const lines = Array.isArray(data?.lines) ? data.lines : [];
+          setLogLines(lines.slice(-8));
+        }
+      } catch {
+        // ignore
+      }
+    };
+    tick();
+    const id = setInterval(tick, 2000);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [showLogs, isScanning]);
 
   return (
     <div className="sticky top-[61px] z-40 border-b border-border/80 bg-gradient-to-r from-card via-card to-card/95 backdrop-blur supports-[backdrop-filter]:bg-card/90">
@@ -124,6 +150,14 @@ export function GlobalStatusBar() {
 
           {/* Center/Right: Quick stats */}
           <div className="flex items-center gap-3">
+            <button
+              onClick={() => setShowLogs((v) => !v)}
+              className="hidden sm:flex items-center gap-2 px-3 py-1.5 rounded-full text-sm font-medium transition-all bg-muted/60 text-muted-foreground hover:text-foreground hover:bg-muted"
+            >
+              <Terminal className="w-3.5 h-3.5" />
+              <span>Logs</span>
+              {showLogs ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+            </button>
             {/* Duplicates badge - prominent when > 0 */}
             {duplicateCount > 0 && (
               <button
@@ -190,6 +224,26 @@ export function GlobalStatusBar() {
             </div>
           </div>
         </div>
+        {showLogs && (
+          <div className="border-t border-border/80 bg-muted/30">
+            <div className="px-4 py-2 text-xs text-muted-foreground">
+              Live backend log (last 8 lines)
+            </div>
+            <div className="px-4 pb-3">
+              <div className="rounded-md border border-border bg-background/80 p-3 font-mono text-xs leading-5 h-40 overflow-hidden">
+                {logLines.length === 0 ? (
+                  <div className="text-muted-foreground">No logs yet…</div>
+                ) : (
+                  logLines.map((line, idx) => (
+                    <div key={`${idx}-${line}`} className="truncate">
+                      {line}
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

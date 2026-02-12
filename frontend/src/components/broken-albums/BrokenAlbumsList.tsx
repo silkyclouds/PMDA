@@ -1,6 +1,5 @@
 import { useState, useEffect } from 'react';
-import { AlertCircle, Music, Send, Loader2 } from 'lucide-react';
-import { Button } from '@/components/ui/button';
+import { AlertCircle, Music, Loader2 } from 'lucide-react';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Alert, AlertDescription } from '@/components/ui/alert';
@@ -11,7 +10,6 @@ import { useToast } from '@/hooks/use-toast';
 export function BrokenAlbumsList() {
   const [brokenAlbums, setBrokenAlbums] = useState<api.BrokenAlbum[]>([]);
   const [loading, setLoading] = useState(true);
-  const [sending, setSending] = useState<Set<number>>(new Set());
   const { toast } = useToast();
 
   useEffect(() => {
@@ -34,46 +32,6 @@ export function BrokenAlbumsList() {
     }
   };
 
-  const handleSendToLidarr = async (album: api.BrokenAlbum) => {
-    if (!album.musicbrainz_release_group_id) {
-      toast({
-        title: 'Error',
-        description: 'Album missing MusicBrainz ID',
-        variant: 'destructive',
-      });
-      return;
-    }
-
-    setSending(prev => new Set(prev).add(album.album_id));
-    try {
-      const result = await api.addAlbumToLidarr(album);
-      if (result.success) {
-        toast({
-          title: 'Success',
-          description: result.message,
-        });
-        // Update local state
-        setBrokenAlbums(prev => prev.map(a => 
-          a.album_id === album.album_id ? { ...a, sent_to_lidarr: true } : a
-        ));
-      } else {
-        throw new Error(result.message);
-      }
-    } catch (error) {
-      toast({
-        title: 'Error',
-        description: error instanceof Error ? error.message : 'Failed to send album to Lidarr',
-        variant: 'destructive',
-      });
-    } finally {
-      setSending(prev => {
-        const next = new Set(prev);
-        next.delete(album.album_id);
-        return next;
-      });
-    }
-  };
-
   return (
     <>
       <Header />
@@ -82,7 +40,7 @@ export function BrokenAlbumsList() {
           <div>
             <h2 className="text-2xl font-bold">Incomplete Albums</h2>
             <p className="text-sm text-muted-foreground mt-1">
-              Albums with missing tracks detected. Send them to Lidarr for re-download.
+              Albums with missing tracks detected by PMDA.
             </p>
           </div>
         </div>
@@ -114,8 +72,8 @@ export function BrokenAlbumsList() {
                       </CardDescription>
                     </div>
                     {album.sent_to_lidarr && (
-                      <Badge variant="outline" className="bg-green-500/10 text-green-600 dark:text-green-400">
-                        Sent to Lidarr
+                      <Badge variant="outline" className="bg-muted">
+                        Legacy Lidarr flag
                       </Badge>
                     )}
                   </div>
@@ -148,22 +106,9 @@ export function BrokenAlbumsList() {
                       </div>
                     )}
 
-                    <div className="flex items-center gap-2 pt-2">
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        onClick={() => handleSendToLidarr(album)}
-                        disabled={album.sent_to_lidarr || sending.has(album.album_id) || !album.musicbrainz_release_group_id}
-                        className="gap-1.5"
-                      >
-                        {sending.has(album.album_id) ? (
-                          <Loader2 className="w-3 h-3 animate-spin" />
-                        ) : (
-                          <Send className="w-3 h-3" />
-                        )}
-                        {album.sent_to_lidarr ? 'Sent to Lidarr' : 'Send to Lidarr'}
-                      </Button>
-                    </div>
+                    <p className="text-xs text-muted-foreground pt-2">
+                      Configure <span className="font-medium">Move incomplete albums</span> in Settings → Automation to quarantine incomplete releases automatically.
+                    </p>
                   </div>
                 </CardContent>
               </Card>

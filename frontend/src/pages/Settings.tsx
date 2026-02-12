@@ -1,14 +1,8 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Save, Loader2, Check, FolderOutput, RefreshCw, Plus, X } from 'lucide-react';
+import { Save, Loader2, Check, FolderOutput, RefreshCw, Plus, X, Database, Sparkles } from 'lucide-react';
 import { Header } from '@/components/Header';
 import { Button } from '@/components/ui/button';
 import { toast } from 'sonner';
-import { PlexSettings } from '@/components/settings/PlexSettings';
-import { LibrariesSettings } from '@/components/settings/LibrariesSettings';
-import { PathSettings } from '@/components/settings/PathSettings';
-import { ScanSettings } from '@/components/settings/ScanSettings';
-import { AISettings } from '@/components/settings/AISettings';
-import { MetadataSettings } from '@/components/settings/MetadataSettings';
 import { NotificationSettings } from '@/components/settings/NotificationSettings';
 import { IntegrationsSettings } from '@/components/settings/IntegrationsSettings';
 import * as api from '@/lib/api';
@@ -18,18 +12,16 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/com
 import { Separator } from '@/components/ui/separator';
 import { Label } from '@/components/ui/label';
 import { Switch } from '@/components/ui/switch';
-import { FieldTooltip } from '@/components/ui/field-tooltip';
+import { Input } from '@/components/ui/input';
+import { PasswordInput } from '@/components/ui/password-input';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { FolderBrowserInput } from '@/components/settings/FolderBrowserInput';
 
 const SETTINGS_SECTIONS: { id: string; label: string }[] = [
-  { id: 'settings-plex', label: 'Plex' },
-  { id: 'settings-libraries', label: 'Libraries' },
-  { id: 'settings-paths', label: 'Paths & Mapping' },
-  { id: 'settings-scan', label: 'Scan' },
+  { id: 'settings-files-export', label: 'Folders' },
+  { id: 'settings-pipeline', label: 'Pipeline' },
   { id: 'settings-ai', label: 'AI' },
-  { id: 'settings-metadata', label: 'Metadata' },
-  { id: 'settings-integrations', label: 'Integrations' },
+  { id: 'settings-providers', label: 'Providers' },
   { id: 'settings-notifications', label: 'Notifications' },
 ];
 
@@ -302,300 +294,251 @@ function SettingsPage() {
           </nav>
 
           <div className="min-w-0 flex-1 space-y-6">
-            {/* Library source (Plex vs Files) */}
-            <Card id="settings-library-source" className="scroll-mt-24">
+            <Card id="settings-files-export" className="scroll-mt-24">
               <CardHeader>
-                <CardTitle>Library source</CardTitle>
-                <CardDescription>Use Plex if you have it; otherwise use Folders only and set your music and library paths below.</CardDescription>
+                <CardTitle className="flex items-center gap-2">
+                  <FolderOutput className="w-5 h-5" />
+                  Folders
+                </CardTitle>
+                <CardDescription>
+                  Configure source folders, destination library, media cache, and export strategy (hardlink/symlink/copy/move).
+                </CardDescription>
               </CardHeader>
-              <CardContent>
-                <div className="space-y-3">
-                  <div className="flex flex-wrap gap-2">
-                    <Button
-                      type="button"
-                      variant={(config.LIBRARY_MODE ?? 'plex') === 'plex' ? 'default' : 'outline'}
-                      size="sm"
-                      onClick={() => updateConfig({ LIBRARY_MODE: 'plex' })}
-                    >
-                      Plex
-                    </Button>
-                    <Button
-                      type="button"
-                      variant={(config.LIBRARY_MODE ?? 'plex') === 'files' ? 'default' : 'outline'}
-                      size="sm"
-                      onClick={() => updateConfig({ LIBRARY_MODE: 'files' })}
-                    >
-                      Folders only
-                    </Button>
+              <CardContent className="space-y-4">
+                <div className="space-y-2">
+                  <Label>Music folders</Label>
+                  <p className="text-xs text-muted-foreground">
+                    Add one or more source folders to scan (container paths).
+                  </p>
+                  <div className="space-y-2">
+                    {filesRoots.length === 0 ? (
+                      <p className="text-xs text-muted-foreground border rounded-md px-3 py-2">
+                        No source folder configured.
+                      </p>
+                    ) : (
+                      <div className="space-y-2">
+                        {filesRoots.map((rootPath) => (
+                          <div key={rootPath} className="flex items-center justify-between gap-2 border rounded-md px-3 py-2">
+                            <span className="font-mono text-sm truncate" title={rootPath}>{rootPath}</span>
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="icon"
+                              onClick={() => removeFilesRoot(rootPath)}
+                              aria-label={`Remove ${rootPath}`}
+                            >
+                              <X className="w-4 h-4" />
+                            </Button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    <div className="flex items-center gap-2">
+                      <div className="flex-1">
+                        <FolderBrowserInput
+                          value={pendingFilesRoot}
+                          onChange={setPendingFilesRoot}
+                          placeholder="/music"
+                          selectLabel="Add music source folder"
+                        />
+                      </div>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        className="gap-2 shrink-0"
+                        onClick={() => addFilesRoot(pendingFilesRoot)}
+                        disabled={!pendingFilesRoot.trim()}
+                      >
+                        <Plus className="w-4 h-4" />
+                        Add
+                      </Button>
+                    </div>
                   </div>
-                  {(config.LIBRARY_MODE ?? 'plex') === 'files' && (
+                </div>
+                <div className="space-y-2">
+                  <Label>Library folder</Label>
+                  <p className="text-xs text-muted-foreground">
+                    Destination folder for exported files (clean structure), e.g. `/music_matched`.
+                  </p>
+                  <FolderBrowserInput
+                    value={config.EXPORT_ROOT ?? '/music/library'}
+                    onChange={(path) => updateConfig({ EXPORT_ROOT: path })}
+                    placeholder="/music/library"
+                    selectLabel="Select library destination folder"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label>Media cache folder</Label>
+                  <p className="text-xs text-muted-foreground">
+                    NVMe cache for instant artist/album artwork rendering (thumbnails pre-generated by PMDA).
+                  </p>
+                  <FolderBrowserInput
+                    value={config.MEDIA_CACHE_ROOT ?? '/config/media_cache'}
+                    onChange={(path) => updateConfig({ MEDIA_CACHE_ROOT: path || '/config/media_cache' })}
+                    placeholder="/config/media_cache"
+                    selectLabel="Select media cache folder"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label>Export strategy</Label>
+                  <p className="text-xs text-muted-foreground">
+                    Choose how PMDA writes files to the library folder.
+                  </p>
+                  <Select
+                    value={(config.EXPORT_LINK_STRATEGY as 'hardlink' | 'symlink' | 'copy' | 'move' | undefined) ?? 'hardlink'}
+                    onValueChange={(value: 'hardlink' | 'symlink' | 'copy' | 'move') => updateConfig({ EXPORT_LINK_STRATEGY: value })}
+                  >
+                    <SelectTrigger className="w-full md:w-[320px]">
+                      <SelectValue placeholder="Select strategy" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="hardlink">Hardlink (fast, no extra space)</SelectItem>
+                      <SelectItem value="symlink">Symlink (keeps original files)</SelectItem>
+                      <SelectItem value="copy">Copy (duplicates files)</SelectItem>
+                      <SelectItem value="move">Move (relocate files)</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className="flex items-center justify-between gap-4">
+                  <div className="space-y-1">
+                    <Label>Build library automatically</Label>
                     <p className="text-xs text-muted-foreground">
-                      Set source folders and destination library below, then click Build library. Duplicates go to /dupes.
+                      After a Magic scan in Folders mode, rebuild the library in the folder above.
                     </p>
+                  </div>
+                  <Switch
+                    checked={Boolean(config.AUTO_EXPORT_LIBRARY)}
+                    onCheckedChange={(checked) => updateConfig({ AUTO_EXPORT_LIBRARY: checked })}
+                    aria-label="Build library automatically after Magic scan"
+                  />
+                </div>
+                <div className="space-y-1">
+                  <Label className="text-muted-foreground">Duplicates folder</Label>
+                  <p className="text-xs text-muted-foreground">
+                    Duplicates are moved to <span className="font-mono">/dupes</span> (set by your Docker volume). No need to configure.
+                  </p>
+                </div>
+                <div className="flex flex-wrap items-center gap-3 pt-2 border-t pt-4">
+                  <Button
+                    type="button"
+                    variant="default"
+                    disabled={exportRebuilding}
+                    onClick={async () => {
+                      setExportRebuilding(true);
+                      setExportStatus(null);
+                      try {
+                        const res = await api.postFilesExportRebuild();
+                        if (res.status === 'already_running') {
+                          toast.info('Build already in progress');
+                          const s = await api.getFilesExportStatus();
+                          setExportStatus(s);
+                        } else if (res.status === 'started') {
+                          toast.success('Building library…');
+                          const s = await api.getFilesExportStatus();
+                          setExportStatus(s);
+                        } else {
+                          toast.error(res.message ?? 'Failed to start');
+                        }
+                      } catch (e) {
+                        toast.error('Failed to start');
+                      } finally {
+                        setExportRebuilding(false);
+                      }
+                    }}
+                    className="gap-2"
+                  >
+                    {exportRebuilding ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
+                    Build library
+                  </Button>
+                  {exportStatus && (exportStatus.running || exportStatus.error) && (
+                    <span className="text-sm text-muted-foreground">
+                      {exportStatus.running
+                        ? `${exportStatus.tracks_done}/${exportStatus.total_tracks} tracks`
+                        : exportStatus.error ?? 'Done'}
+                    </span>
                   )}
                 </div>
               </CardContent>
             </Card>
 
-            {(config.LIBRARY_MODE ?? 'plex') === 'files' && (
-              <>
-                <Card id="settings-files-export" className="scroll-mt-24">
-                  <CardHeader>
-                    <CardTitle className="flex items-center gap-2">
-                      <FolderOutput className="w-5 h-5" />
-                      Folders
-                    </CardTitle>
-                    <CardDescription>
-                      Configure source folders, destination library, media cache, and export strategy (hardlink/symlink/copy/move).
-                    </CardDescription>
-                  </CardHeader>
-                  <CardContent className="space-y-4">
-                    <div className="space-y-2">
-                      <Label>Music folders</Label>
-                      <p className="text-xs text-muted-foreground">
-                        Add one or more source folders to scan (container paths).
-                      </p>
-                      <div className="space-y-2">
-                        {filesRoots.length === 0 ? (
-                          <p className="text-xs text-muted-foreground border rounded-md px-3 py-2">
-                            No source folder configured.
-                          </p>
-                        ) : (
-                          <div className="space-y-2">
-                            {filesRoots.map((rootPath) => (
-                              <div key={rootPath} className="flex items-center justify-between gap-2 border rounded-md px-3 py-2">
-                                <span className="font-mono text-sm truncate" title={rootPath}>{rootPath}</span>
-                                <Button
-                                  type="button"
-                                  variant="ghost"
-                                  size="icon"
-                                  onClick={() => removeFilesRoot(rootPath)}
-                                  aria-label={`Remove ${rootPath}`}
-                                >
-                                  <X className="w-4 h-4" />
-                                </Button>
-                              </div>
-                            ))}
-                          </div>
-                        )}
-                        <div className="flex items-center gap-2">
-                          <div className="flex-1">
-                            <FolderBrowserInput
-                              value={pendingFilesRoot}
-                              onChange={setPendingFilesRoot}
-                              placeholder="/music"
-                              selectLabel="Add music source folder"
-                            />
-                          </div>
-                          <Button
-                            type="button"
-                            variant="outline"
-                            className="gap-2 shrink-0"
-                            onClick={() => addFilesRoot(pendingFilesRoot)}
-                            disabled={!pendingFilesRoot.trim()}
-                          >
-                            <Plus className="w-4 h-4" />
-                            Add
-                          </Button>
-                        </div>
-                      </div>
-                    </div>
-                    <div className="space-y-2">
-                      <Label>Library folder</Label>
-                      <p className="text-xs text-muted-foreground">
-                        Destination folder for exported files (clean structure), e.g. `/music_matched`.
-                      </p>
-                      <FolderBrowserInput
-                        value={config.EXPORT_ROOT ?? '/music/library'}
-                        onChange={(path) => updateConfig({ EXPORT_ROOT: path })}
-                        placeholder="/music/library"
-                        selectLabel="Select library destination folder"
-                      />
-                    </div>
-                    <div className="space-y-2">
-                      <Label>Media cache folder</Label>
-                      <p className="text-xs text-muted-foreground">
-                        NVMe cache for instant artist/album artwork rendering (thumbnails pre-generated by PMDA).
-                      </p>
-                      <FolderBrowserInput
-                        value={config.MEDIA_CACHE_ROOT ?? '/config/media_cache'}
-                        onChange={(path) => updateConfig({ MEDIA_CACHE_ROOT: path || '/config/media_cache' })}
-                        placeholder="/config/media_cache"
-                        selectLabel="Select media cache folder"
-                      />
-                    </div>
-                    <div className="space-y-2">
-                      <Label>Export strategy</Label>
-                      <p className="text-xs text-muted-foreground">
-                        Choose how PMDA writes files to the library folder.
-                      </p>
-                      <Select
-                        value={(config.EXPORT_LINK_STRATEGY as 'hardlink' | 'symlink' | 'copy' | 'move' | undefined) ?? 'hardlink'}
-                        onValueChange={(value: 'hardlink' | 'symlink' | 'copy' | 'move') => updateConfig({ EXPORT_LINK_STRATEGY: value })}
-                      >
-                        <SelectTrigger className="w-full md:w-[320px]">
-                          <SelectValue placeholder="Select strategy" />
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="hardlink">Hardlink (fast, no extra space)</SelectItem>
-                          <SelectItem value="symlink">Symlink (keeps original files)</SelectItem>
-                          <SelectItem value="copy">Copy (duplicates files)</SelectItem>
-                          <SelectItem value="move">Move (relocate files)</SelectItem>
-                        </SelectContent>
-                      </Select>
-                    </div>
-                    <div className="flex items-center justify-between gap-4">
-                      <div className="space-y-1">
-                        <Label>Build library automatically</Label>
-                        <p className="text-xs text-muted-foreground">
-                          After a Magic scan in Folders mode, rebuild the library in the folder above.
-                        </p>
-                      </div>
-                      <Switch
-                        checked={Boolean(config.AUTO_EXPORT_LIBRARY)}
-                        onCheckedChange={(checked) => updateConfig({ AUTO_EXPORT_LIBRARY: checked })}
-                        aria-label="Build library automatically after Magic scan"
-                      />
-                    </div>
-                    <div className="space-y-1">
-                      <Label className="text-muted-foreground">Duplicates folder</Label>
-                      <p className="text-xs text-muted-foreground">
-                        Duplicates are moved to <span className="font-mono">/dupes</span> (set by your Docker volume). No need to configure.
-                      </p>
-                    </div>
-                    <div className="flex flex-wrap items-center gap-3 pt-2 border-t pt-4">
-                      <Button
-                        type="button"
-                        variant="default"
-                        disabled={exportRebuilding}
-                        onClick={async () => {
-                          setExportRebuilding(true);
-                          setExportStatus(null);
-                          try {
-                            const res = await api.postFilesExportRebuild();
-                            if (res.status === 'already_running') {
-                              toast.info('Build already in progress');
-                              const s = await api.getFilesExportStatus();
-                              setExportStatus(s);
-                            } else if (res.status === 'started') {
-                              toast.success('Building library…');
-                              const s = await api.getFilesExportStatus();
-                              setExportStatus(s);
-                            } else {
-                              toast.error(res.message ?? 'Failed to start');
-                            }
-                          } catch (e) {
-                            toast.error('Failed to start');
-                          } finally {
-                            setExportRebuilding(false);
-                          }
-                        }}
-                        className="gap-2"
-                      >
-                        {exportRebuilding ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
-                        Build library
-                      </Button>
-                      {exportStatus && (exportStatus.running || exportStatus.error) && (
-                        <span className="text-sm text-muted-foreground">
-                          {exportStatus.running
-                            ? `${exportStatus.tracks_done}/${exportStatus.total_tracks} tracks`
-                            : exportStatus.error ?? 'Done'}
-                        </span>
-                      )}
-                    </div>
-                  </CardContent>
-                </Card>
-              </>
-            )}
-
             <Separator />
 
-            {/* Plex Settings */}
-            <Card id="settings-plex" className="scroll-mt-24">
+            <Card id="settings-pipeline" className="scroll-mt-24">
               <CardHeader>
-                <CardTitle>Plex Configuration</CardTitle>
-                <CardDescription>Configure your Plex Media Server connection</CardDescription>
-              </CardHeader>
-              <CardContent>
-                <PlexSettings config={config} updateConfig={updateConfig} errors={errors} />
-              </CardContent>
-            </Card>
-
-            <Separator />
-
-            {/* Libraries Settings */}
-            <Card id="settings-libraries" className="scroll-mt-24">
-              <CardHeader>
-                <CardTitle>Libraries</CardTitle>
-                <CardDescription>Select which Plex libraries to scan</CardDescription>
-              </CardHeader>
-              <CardContent>
-                <LibrariesSettings config={config} updateConfig={updateConfig} errors={errors} />
-              </CardContent>
-            </Card>
-
-            <Separator />
-
-            {/* Paths Settings */}
-            <Card id="settings-paths" className="scroll-mt-24">
-              <CardHeader>
-                <CardTitle>Paths & Mapping</CardTitle>
-                <CardDescription>Configure directory paths and container bindings</CardDescription>
-              </CardHeader>
-              <CardContent>
-                <PathSettings config={config} updateConfig={updateConfig} errors={errors} />
-              </CardContent>
-            </Card>
-
-            <Separator />
-
-            {/* Scan Settings */}
-            <Card id="settings-scan" className="scroll-mt-24">
-              <CardHeader>
-                <CardTitle>Scan Settings</CardTitle>
-                <CardDescription>Configure how PMDA scans your library</CardDescription>
-              </CardHeader>
-              <CardContent>
-                <ScanSettings config={config} updateConfig={updateConfig} errors={errors} />
-              </CardContent>
-            </Card>
-
-            <Separator />
-
-            {/* AI Settings */}
-            <Card id="settings-ai" className="scroll-mt-24">
-              <CardHeader>
-                <CardTitle>AI Configuration</CardTitle>
-                <CardDescription>Configure AI provider for duplicate detection</CardDescription>
-              </CardHeader>
-              <CardContent>
-                <AISettings config={config} updateConfig={updateConfig} errors={errors} />
-              </CardContent>
-            </Card>
-
-            <Separator />
-
-            {/* Metadata Settings */}
-            <Card id="settings-metadata" className="scroll-mt-24">
-              <CardHeader>
-                <CardTitle>Metadata</CardTitle>
-                <CardDescription>Configure metadata lookup and enrichment</CardDescription>
-              </CardHeader>
-              <CardContent>
-                <MetadataSettings config={config} updateConfig={updateConfig} errors={errors} />
-              </CardContent>
-            </Card>
-
-            <Separator />
-
-            {/* Integrations Settings */}
-            <Card id="settings-integrations" className="scroll-mt-24">
-              <CardHeader>
-                <CardTitle>Integrations</CardTitle>
-                <CardDescription>Configure external service integrations (Lidarr, Autobrr)</CardDescription>
+                <CardTitle>Pipeline automation</CardTitle>
+                <CardDescription>Enable/disable each pipeline stage and configure external player sync.</CardDescription>
               </CardHeader>
               <CardContent>
                 <IntegrationsSettings config={config} updateConfig={updateConfig} errors={errors} />
+              </CardContent>
+            </Card>
+
+            <Separator />
+
+            <Card id="settings-ai" className="scroll-mt-24">
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2">
+                  <Sparkles className="w-5 h-5" />
+                  AI
+                </CardTitle>
+                <CardDescription>Provide your OpenAI API key (required for match verification).</CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                <div className="space-y-2">
+                  <Label>OpenAI API key</Label>
+                  <p className="text-xs text-muted-foreground">Required for AI match verification and cover checks.</p>
+                  <PasswordInput
+                    value={config.OPENAI_API_KEY || ''}
+                    onChange={(e) => updateConfig({ OPENAI_API_KEY: e.target.value, AI_PROVIDER: 'openai' })}
+                    placeholder="sk-..."
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label>Model (optional)</Label>
+                  <Input
+                    placeholder="gpt-4.1-mini"
+                    value={config.OPENAI_MODEL || ''}
+                    onChange={(e) => updateConfig({ OPENAI_MODEL: e.target.value, AI_PROVIDER: 'openai' })}
+                  />
+                </div>
+              </CardContent>
+            </Card>
+
+            <Separator />
+
+            <Card id="settings-providers" className="scroll-mt-24">
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2">
+                  <Database className="w-5 h-5" />
+                  Providers
+                </CardTitle>
+                <CardDescription>Optional API keys to improve matches (all providers are always on).</CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                <div className="space-y-2">
+                  <Label>Discogs token (optional)</Label>
+                  <Input
+                    placeholder="Discogs user token"
+                    value={config.DISCOGS_USER_TOKEN || ''}
+                    onChange={(e) => updateConfig({ DISCOGS_USER_TOKEN: e.target.value })}
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label>Last.fm API key (optional)</Label>
+                  <Input
+                    placeholder="Last.fm API key"
+                    value={config.LASTFM_API_KEY || ''}
+                    onChange={(e) => updateConfig({ LASTFM_API_KEY: e.target.value })}
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label>Last.fm API secret (optional)</Label>
+                  <Input
+                    placeholder="Last.fm API secret"
+                    value={config.LASTFM_API_SECRET || ''}
+                    onChange={(e) => updateConfig({ LASTFM_API_SECRET: e.target.value })}
+                  />
+                </div>
               </CardContent>
             </Card>
 

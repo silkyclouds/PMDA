@@ -93,8 +93,8 @@ export function MetadataSettings({ config, updateConfig, errors }: MetadataSetti
       } else {
         toast.error(result.message || 'MusicBrainz connection failed');
       }
-    } catch (error: any) {
-      const message = error?.message || 'Failed to test MusicBrainz connection';
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : 'Failed to test MusicBrainz connection';
       setMbTestResult({ success: false, message });
       toast.error(message);
     } finally {

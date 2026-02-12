@@ -19,6 +19,19 @@ export function ScanDetails({ scanId, onRestore }: ScanDetailsProps) {
   const [isRestoring, setIsRestoring] = useState(false);
   const [isDeduping, setIsDeduping] = useState(false);
 
+  const getErrorMessage = (error: unknown, fallback: string) => {
+    if (error && typeof error === 'object') {
+      const maybeMessage = (error as { message?: unknown }).message;
+      if (typeof maybeMessage === 'string' && maybeMessage) return maybeMessage;
+      const body = (error as { body?: unknown }).body;
+      if (body && typeof body === 'object') {
+        const bodyMessage = (body as { error?: unknown }).error;
+        if (typeof bodyMessage === 'string' && bodyMessage) return bodyMessage;
+      }
+    }
+    return fallback;
+  };
+
   useEffect(() => {
     loadDetails();
   }, [scanId]);
@@ -74,8 +87,8 @@ export function ScanDetails({ scanId, onRestore }: ScanDetailsProps) {
       }
       onRestore();
       loadDetails();
-    } catch (error: any) {
-      toast.error(error?.message || 'Failed to restore albums');
+    } catch (error: unknown) {
+      toast.error(getErrorMessage(error, 'Failed to restore albums'));
     } finally {
       setIsRestoring(false);
     }
@@ -86,8 +99,8 @@ export function ScanDetails({ scanId, onRestore }: ScanDetailsProps) {
     try {
       await api.dedupeScan(scanId);
       toast.success('Deduplication started');
-    } catch (error: any) {
-      toast.error(error?.message || 'Failed to start deduplication');
+    } catch (error: unknown) {
+      toast.error(getErrorMessage(error, 'Failed to start deduplication'));
     } finally {
       setIsDeduping(false);
     }

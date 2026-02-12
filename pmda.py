@@ -26,6 +26,7 @@ v0.7.5
 """
 
 import base64
+import html
 import json
 import os
 import shutil
@@ -49,6 +50,7 @@ import socket
 import struct
 import hashlib
 import math
+import unicodedata
 import xml.etree.ElementTree as ET
 
 import requests
@@ -815,7 +817,7 @@ def _parse_required_tags(val):
     Migrates old default (with musicbrainz_release_group_id, musicbrainz_artist_id) to new default (artist, album, genre, year)."""
     # New default: focus on artist/album plus high-level album metadata (genre + year).
     # "date" is no longer required; year-only is sufficient for completeness.
-    default = ["artist", "album", "genre", "year"]
+    default = ["artist", "album", "genre", "year", "tracks"]
     if val is None:
         return default
     if isinstance(val, list):
@@ -1088,7 +1090,7 @@ merged = {
     "GOOGLE_API_KEY": _get("GOOGLE_API_KEY", default="", cast=str),
     "OLLAMA_URL": _get("OLLAMA_URL", default="http://localhost:11434", cast=str),
     "DISCORD_WEBHOOK": _get("DISCORD_WEBHOOK", default="", cast=str),
-    "USE_MUSICBRAINZ": _get("USE_MUSICBRAINZ", default=False, cast=_parse_bool),
+    "USE_MUSICBRAINZ": _get("USE_MUSICBRAINZ", default=True, cast=_parse_bool),
     "MUSICBRAINZ_EMAIL": _get("MUSICBRAINZ_EMAIL", default="pmda@example.com", cast=str),
     "MB_QUEUE_ENABLED": _get("MB_QUEUE_ENABLED", default=True, cast=_parse_bool),
     "MB_RETRY_NOT_FOUND": _get("MB_RETRY_NOT_FOUND", default=False, cast=_parse_bool),
@@ -1112,6 +1114,35 @@ merged = {
     ),
     # If true, once MB budget is exceeded or MB has no candidates, we prioritize provider fallback and skip web+AI MBID hunt.
     "MB_FAST_FALLBACK_MODE": _get("MB_FAST_FALLBACK_MODE", default=True, cast=_parse_bool),
+    # Provider identity arbitration (Discogs/Last.fm/Bandcamp when MB is unavailable).
+    "PROVIDER_IDENTITY_STRICT": _get("PROVIDER_IDENTITY_STRICT", default=True, cast=_parse_bool),
+    "PROVIDER_IDENTITY_USE_AI": _get("PROVIDER_IDENTITY_USE_AI", default=True, cast=_parse_bool),
+    "PROVIDER_IDENTITY_MIN_SCORE": _get(
+        "PROVIDER_IDENTITY_MIN_SCORE",
+        default=0.72,
+        cast=lambda x: float(x) if x is not None and str(x).replace(".", "", 1).replace("-", "", 1).isdigit() else 0.72,
+    ),
+    "PROVIDER_IDENTITY_SCORE_MARGIN": _get(
+        "PROVIDER_IDENTITY_SCORE_MARGIN",
+        default=0.08,
+        cast=lambda x: float(x) if x is not None and str(x).replace(".", "", 1).replace("-", "", 1).isdigit() else 0.08,
+    ),
+    # Provider lookup cache TTLs (seconds).
+    "PROVIDER_CACHE_FOUND_TTL_SEC": _get(
+        "PROVIDER_CACHE_FOUND_TTL_SEC",
+        default=60 * 60 * 24 * 30,
+        cast=lambda x: max(60, min(60 * 60 * 24 * 365, int(x) if x is not None and str(x).strip().isdigit() else 60 * 60 * 24 * 30)),
+    ),
+    "PROVIDER_CACHE_NOT_FOUND_TTL_SEC": _get(
+        "PROVIDER_CACHE_NOT_FOUND_TTL_SEC",
+        default=60 * 60 * 8,
+        cast=lambda x: max(60, min(60 * 60 * 24 * 30, int(x) if x is not None and str(x).strip().isdigit() else 60 * 60 * 8)),
+    ),
+    "PROVIDER_CACHE_ERROR_TTL_SEC": _get(
+        "PROVIDER_CACHE_ERROR_TTL_SEC",
+        default=60 * 20,
+        cast=lambda x: max(30, min(60 * 60 * 24, int(x) if x is not None and str(x).strip().isdigit() else 60 * 20)),
+    ),
     # When true, ignore cached MusicBrainz results and stored MBID tags for album→MBID lookup.
     # This forces a full lookup on every scan and is intended for advanced testing/debugging only.
     "MB_DISABLE_CACHE": _get("MB_DISABLE_CACHE", default=False, cast=_parse_bool),
@@ -1125,26 +1156,40 @@ merged = {
     "AUTO_FIX_BROKEN_ALBUMS": _get("AUTO_FIX_BROKEN_ALBUMS", default=False, cast=_parse_bool),
     "BROKEN_ALBUM_CONSECUTIVE_THRESHOLD": _get("BROKEN_ALBUM_CONSECUTIVE_THRESHOLD", default=2, cast=int),
     "BROKEN_ALBUM_PERCENTAGE_THRESHOLD": _get("BROKEN_ALBUM_PERCENTAGE_THRESHOLD", default=0.20, cast=float),
-    # New default: artist, album, genre, year (date no longer required)
-    "REQUIRED_TAGS": _get("REQUIRED_TAGS", default="artist,album,genre,year", cast=_parse_required_tags),
+    # Files-first default required tags: artist/album/genre/year + track numbers/titles.
+    "REQUIRED_TAGS": _get("REQUIRED_TAGS", default="artist,album,genre,year,tracks", cast=_parse_required_tags),
     "SKIP_FOLDERS": _get("SKIP_FOLDERS", default="", cast=_parse_skip_folders),
     "AI_BATCH_SIZE": _get("AI_BATCH_SIZE", default=10, cast=int),
     "FFPROBE_POOL_SIZE": _get("FFPROBE_POOL_SIZE", default=8, cast=int),
     "AUTO_MOVE_DUPES": _get("AUTO_MOVE_DUPES", default=False, cast=_parse_bool),
     "AUTO_EXPORT_LIBRARY": _get("AUTO_EXPORT_LIBRARY", default=False, cast=_parse_bool),
-    "USE_AI_FOR_MB_MATCH": _get("USE_AI_FOR_MB_MATCH", default=False, cast=_parse_bool),
-    "USE_AI_FOR_MB_VERIFY": _get("USE_AI_FOR_MB_VERIFY", default=False, cast=_parse_bool),
+    # End-to-end pipeline steps (all configurable from Settings)
+    "PIPELINE_ENABLE_MATCH_FIX": _get("PIPELINE_ENABLE_MATCH_FIX", default=True, cast=_parse_bool),
+    "PIPELINE_ENABLE_DEDUPE": _get("PIPELINE_ENABLE_DEDUPE", default=True, cast=_parse_bool),
+    "PIPELINE_ENABLE_INCOMPLETE_MOVE": _get("PIPELINE_ENABLE_INCOMPLETE_MOVE", default=True, cast=_parse_bool),
+    "PIPELINE_ENABLE_EXPORT": _get("PIPELINE_ENABLE_EXPORT", default=False, cast=_parse_bool),
+    "PIPELINE_ENABLE_PLAYER_SYNC": _get("PIPELINE_ENABLE_PLAYER_SYNC", default=False, cast=_parse_bool),
+    "PIPELINE_PLAYER_TARGET": _get("PIPELINE_PLAYER_TARGET", default="none", cast=str),
+    # External media player integrations (scan trigger only)
+    "JELLYFIN_URL": _get("JELLYFIN_URL", default="", cast=str),
+    "JELLYFIN_API_KEY": _get("JELLYFIN_API_KEY", default="", cast=str),
+    "NAVIDROME_URL": _get("NAVIDROME_URL", default="", cast=str),
+    "NAVIDROME_USERNAME": _get("NAVIDROME_USERNAME", default="", cast=str),
+    "NAVIDROME_PASSWORD": _get("NAVIDROME_PASSWORD", default="", cast=str),
+    "NAVIDROME_API_KEY": _get("NAVIDROME_API_KEY", default="", cast=str),
+    "USE_AI_FOR_MB_MATCH": _get("USE_AI_FOR_MB_MATCH", default=True, cast=_parse_bool),
+    "USE_AI_FOR_MB_VERIFY": _get("USE_AI_FOR_MB_VERIFY", default=True, cast=_parse_bool),
     "USE_AI_VISION_FOR_COVER": _get("USE_AI_VISION_FOR_COVER", default=True, cast=_parse_bool),
     "AI_CONFIDENCE_MIN": _get("AI_CONFIDENCE_MIN", default=50, cast=lambda x: int(x) if x is not None and str(x).strip().isdigit() else 50),
     "OPENAI_VISION_MODEL": _get("OPENAI_VISION_MODEL", default="", cast=str),
-    "USE_AI_VISION_BEFORE_COVER_INJECT": _get("USE_AI_VISION_BEFORE_COVER_INJECT", default=False, cast=_parse_bool),
+    "USE_AI_VISION_BEFORE_COVER_INJECT": _get("USE_AI_VISION_BEFORE_COVER_INJECT", default=True, cast=_parse_bool),
     "BACKUP_BEFORE_FIX": _get("BACKUP_BEFORE_FIX", default=False, cast=_parse_bool),
     "MAGIC_MODE": _get("MAGIC_MODE", default=False, cast=_parse_bool),
     "IMPROVE_ALL_WORKERS": _get("IMPROVE_ALL_WORKERS", default=1, cast=lambda x: max(1, min(8, int(x) if x is not None and str(x).strip().isdigit() else 1))),
-    "USE_ACOUSTID": _get("USE_ACOUSTID", default=False, cast=_parse_bool),
+    "USE_ACOUSTID": _get("USE_ACOUSTID", default=True, cast=_parse_bool),
     "ACOUSTID_API_KEY": _get("ACOUSTID_API_KEY", default="", cast=str),
     "USE_ACOUSTID_WHEN_TAGGED": _get("USE_ACOUSTID_WHEN_TAGGED", default="false", cast=_parse_bool),
-    "USE_WEB_SEARCH_FOR_MB": _get("USE_WEB_SEARCH_FOR_MB", default=False, cast=_parse_bool),
+    "USE_WEB_SEARCH_FOR_MB": _get("USE_WEB_SEARCH_FOR_MB", default=True, cast=_parse_bool),
     "SERPER_API_KEY": _get("SERPER_API_KEY", default="", cast=str),
     "CROSS_LIBRARY_DEDUPE": _get("CROSS_LIBRARY_DEDUPE", default="true", cast=_parse_bool),
     "CROSSCHECK_SAMPLES": _get("CROSSCHECK_SAMPLES", default=20, cast=lambda x: int(x) if x is not None and str(x).strip().isdigit() else 20),
@@ -1152,22 +1197,22 @@ merged = {
     "OPENAI_MODEL_FALLBACKS": _get("OPENAI_MODEL_FALLBACKS", default="", cast=str),
     "DISABLE_PATH_CROSSCHECK": _get("DISABLE_PATH_CROSSCHECK", default="false", cast=_parse_bool),
     "FORMAT_PREFERENCE": _get("FORMAT_PREFERENCE", default=None, cast=lambda v: _parse_format_preference_early(v)),
-    "USE_DISCOGS": _get("USE_DISCOGS", default=False, cast=_parse_bool),
+    "USE_DISCOGS": _get("USE_DISCOGS", default=True, cast=_parse_bool),
     "DISCOGS_USER_TOKEN": _get("DISCOGS_USER_TOKEN", default="", cast=str),
-    "USE_LASTFM": _get("USE_LASTFM", default=False, cast=_parse_bool),
+    "USE_LASTFM": _get("USE_LASTFM", default=True, cast=_parse_bool),
     "LASTFM_API_KEY": _get("LASTFM_API_KEY", default="", cast=str),
     "LASTFM_API_SECRET": _get("LASTFM_API_SECRET", default="", cast=str),
-    "USE_BANDCAMP": _get("USE_BANDCAMP", default=False, cast=_parse_bool),
+    "USE_BANDCAMP": _get("USE_BANDCAMP", default=True, cast=_parse_bool),
     # Artist / metadata modes
-    "ARTIST_CREDIT_MODE": _get("ARTIST_CREDIT_MODE", default="album_artist_strict", cast=str),
+    "ARTIST_CREDIT_MODE": _get("ARTIST_CREDIT_MODE", default="picard_like_default", cast=str),
     "LIVE_DEDUPE_MODE": _get("LIVE_DEDUPE_MODE", default="safe", cast=str),
     "SKIP_MB_FOR_LIVE_ALBUMS": _get("SKIP_MB_FOR_LIVE_ALBUMS", default="true", cast=_parse_bool),
-    "TRACKLIST_MATCH_MIN": _get("TRACKLIST_MATCH_MIN", default="0.8", cast=lambda x: float(x) if x is not None and str(x).replace(".", "", 1).replace("-", "", 1).isdigit() else 0.8),
+    "TRACKLIST_MATCH_MIN": _get("TRACKLIST_MATCH_MIN", default="0.9", cast=lambda x: float(x) if x is not None and str(x).replace(".", "", 1).replace("-", "", 1).isdigit() else 0.9),
     "LIVE_ALBUMS_MB_STRICT": _get("LIVE_ALBUMS_MB_STRICT", default="false", cast=_parse_bool),
     # Improve-all reprocess policy
     "REPROCESS_INCOMPLETE_ALBUMS": _get("REPROCESS_INCOMPLETE_ALBUMS", default="true", cast=_parse_bool),
     # Library backend & file-library settings
-    "LIBRARY_MODE": _get("LIBRARY_MODE", default="plex", cast=str),
+    "LIBRARY_MODE": _get("LIBRARY_MODE", default="files", cast=str),
     "FILES_ROOTS": _get("FILES_ROOTS", default="", cast=_parse_files_roots),
     "EXPORT_ROOT": _get("EXPORT_ROOT", default="", cast=str),
     "EXPORT_NAMING_TEMPLATE": _get("EXPORT_NAMING_TEMPLATE", default="", cast=str),
@@ -1177,7 +1222,7 @@ merged = {
 # PATH_MAP and all config from _get() (SQLite only > default)
 
 SKIP_FOLDERS: list[str] = merged["SKIP_FOLDERS"]
-LIBRARY_MODE: str = str(merged.get("LIBRARY_MODE", "plex") or "plex").strip().lower()
+LIBRARY_MODE: str = str(merged.get("LIBRARY_MODE", "files") or "files").strip().lower()
 FILES_ROOTS: list[str] = merged.get("FILES_ROOTS", []) or []
 EXPORT_ROOT: str = str(merged.get("EXPORT_ROOT", "") or "").strip()
 EXPORT_NAMING_TEMPLATE: str = str(merged.get("EXPORT_NAMING_TEMPLATE", "") or "").strip()
@@ -1193,6 +1238,13 @@ MB_SEARCH_ALBUM_TIMEOUT_SEC: int = int(merged.get("MB_SEARCH_ALBUM_TIMEOUT_SEC",
 MB_CANDIDATE_FETCH_LIMIT: int = int(merged.get("MB_CANDIDATE_FETCH_LIMIT", 6))
 MB_TRACKLIST_FETCH_LIMIT: int = int(merged.get("MB_TRACKLIST_FETCH_LIMIT", 3))
 MB_FAST_FALLBACK_MODE: bool = bool(merged.get("MB_FAST_FALLBACK_MODE", True))
+PROVIDER_IDENTITY_STRICT: bool = bool(merged.get("PROVIDER_IDENTITY_STRICT", True))
+PROVIDER_IDENTITY_USE_AI: bool = bool(merged.get("PROVIDER_IDENTITY_USE_AI", True))
+PROVIDER_IDENTITY_MIN_SCORE: float = float(merged.get("PROVIDER_IDENTITY_MIN_SCORE", 0.72))
+PROVIDER_IDENTITY_SCORE_MARGIN: float = float(merged.get("PROVIDER_IDENTITY_SCORE_MARGIN", 0.08))
+PROVIDER_CACHE_FOUND_TTL_SEC: int = int(merged.get("PROVIDER_CACHE_FOUND_TTL_SEC", 60 * 60 * 24 * 30))
+PROVIDER_CACHE_NOT_FOUND_TTL_SEC: int = int(merged.get("PROVIDER_CACHE_NOT_FOUND_TTL_SEC", 60 * 60 * 8))
+PROVIDER_CACHE_ERROR_TTL_SEC: int = int(merged.get("PROVIDER_CACHE_ERROR_TTL_SEC", 60 * 20))
 # Global flags controlling cache usage during scans
 SCAN_DISABLE_CACHE: bool = bool(merged.get("SCAN_DISABLE_CACHE", False))
 MB_DISABLE_CACHE: bool = bool(merged.get("MB_DISABLE_CACHE", False) or SCAN_DISABLE_CACHE)
@@ -1217,22 +1269,37 @@ AUTOBRR_API_KEY: str = merged.get("AUTOBRR_API_KEY", "")
 AUTO_FIX_BROKEN_ALBUMS: bool = bool(merged.get("AUTO_FIX_BROKEN_ALBUMS", False))
 BROKEN_ALBUM_CONSECUTIVE_THRESHOLD: int = int(merged.get("BROKEN_ALBUM_CONSECUTIVE_THRESHOLD", 2))
 BROKEN_ALBUM_PERCENTAGE_THRESHOLD: float = float(merged.get("BROKEN_ALBUM_PERCENTAGE_THRESHOLD", 0.20))
-# Default required tags now focus on artist/album + genre/year (no full date required)
-REQUIRED_TAGS: list[str] = merged.get("REQUIRED_TAGS", ["artist", "album", "genre", "year"])
+# Default required tags now focus on artist/album + genre/year + tracks.
+REQUIRED_TAGS: list[str] = merged.get("REQUIRED_TAGS", ["artist", "album", "genre", "year", "tracks"])
 AUTO_MOVE_DUPES: bool = bool(merged["AUTO_MOVE_DUPES"])
 AUTO_EXPORT_LIBRARY: bool = bool(merged.get("AUTO_EXPORT_LIBRARY", False))
-USE_AI_FOR_MB_MATCH: bool = bool(merged.get("USE_AI_FOR_MB_MATCH", False))
-USE_AI_FOR_MB_VERIFY: bool = bool(merged.get("USE_AI_FOR_MB_VERIFY", False))
+PIPELINE_ENABLE_MATCH_FIX: bool = bool(merged.get("PIPELINE_ENABLE_MATCH_FIX", True))
+PIPELINE_ENABLE_DEDUPE: bool = bool(merged.get("PIPELINE_ENABLE_DEDUPE", True))
+PIPELINE_ENABLE_INCOMPLETE_MOVE: bool = bool(merged.get("PIPELINE_ENABLE_INCOMPLETE_MOVE", True))
+PIPELINE_ENABLE_EXPORT: bool = bool(merged.get("PIPELINE_ENABLE_EXPORT", False))
+PIPELINE_ENABLE_PLAYER_SYNC: bool = bool(merged.get("PIPELINE_ENABLE_PLAYER_SYNC", False))
+PIPELINE_PLAYER_TARGET: str = str(merged.get("PIPELINE_PLAYER_TARGET", "none") or "none").strip().lower()
+if PIPELINE_PLAYER_TARGET not in {"none", "plex", "jellyfin", "navidrome"}:
+    PIPELINE_PLAYER_TARGET = "none"
+
+JELLYFIN_URL: str = str(merged.get("JELLYFIN_URL", "") or "").strip()
+JELLYFIN_API_KEY: str = str(merged.get("JELLYFIN_API_KEY", "") or "").strip()
+NAVIDROME_URL: str = str(merged.get("NAVIDROME_URL", "") or "").strip()
+NAVIDROME_USERNAME: str = str(merged.get("NAVIDROME_USERNAME", "") or "").strip()
+NAVIDROME_PASSWORD: str = str(merged.get("NAVIDROME_PASSWORD", "") or "").strip()
+NAVIDROME_API_KEY: str = str(merged.get("NAVIDROME_API_KEY", "") or "").strip()
+USE_AI_FOR_MB_MATCH: bool = bool(merged.get("USE_AI_FOR_MB_MATCH", True))
+USE_AI_FOR_MB_VERIFY: bool = bool(merged.get("USE_AI_FOR_MB_VERIFY", True))
 USE_AI_VISION_FOR_COVER: bool = bool(merged.get("USE_AI_VISION_FOR_COVER", True))
 AI_CONFIDENCE_MIN: int = int(merged.get("AI_CONFIDENCE_MIN", 50))
 OPENAI_VISION_MODEL: str = str(merged.get("OPENAI_VISION_MODEL", "") or "").strip()
-USE_AI_VISION_BEFORE_COVER_INJECT: bool = bool(merged.get("USE_AI_VISION_BEFORE_COVER_INJECT", False))
+USE_AI_VISION_BEFORE_COVER_INJECT: bool = bool(merged.get("USE_AI_VISION_BEFORE_COVER_INJECT", True))
 BACKUP_BEFORE_FIX: bool = bool(merged.get("BACKUP_BEFORE_FIX", False))
 MAGIC_MODE: bool = bool(merged.get("MAGIC_MODE", False))
-USE_ACOUSTID: bool = bool(merged.get("USE_ACOUSTID", False))
+USE_ACOUSTID: bool = bool(merged.get("USE_ACOUSTID", True))
 ACOUSTID_API_KEY: str = str(merged.get("ACOUSTID_API_KEY", "") or "").strip()
 USE_ACOUSTID_WHEN_TAGGED: bool = bool(merged.get("USE_ACOUSTID_WHEN_TAGGED", False))
-USE_WEB_SEARCH_FOR_MB: bool = bool(merged.get("USE_WEB_SEARCH_FOR_MB", False))
+USE_WEB_SEARCH_FOR_MB: bool = bool(merged.get("USE_WEB_SEARCH_FOR_MB", True))
 SERPER_API_KEY: str = str(merged.get("SERPER_API_KEY", "") or "").strip()
 AI_BATCH_SIZE: int = int(merged.get("AI_BATCH_SIZE", 10))
 FFPROBE_POOL_SIZE: int = int(merged.get("FFPROBE_POOL_SIZE", 8))
@@ -1248,14 +1315,51 @@ CROSSCHECK_SAMPLES = merged["CROSSCHECK_SAMPLES"]
 DISABLE_PATH_CROSSCHECK = merged["DISABLE_PATH_CROSSCHECK"]
 
 # Metadata fallback providers (Improve Album)
-USE_DISCOGS: bool = bool(merged.get("USE_DISCOGS", False))
+USE_DISCOGS: bool = bool(merged.get("USE_DISCOGS", True))
 DISCOGS_USER_TOKEN: str = str(merged.get("DISCOGS_USER_TOKEN", "") or "")
-USE_LASTFM: bool = bool(merged.get("USE_LASTFM", False))
+USE_LASTFM: bool = bool(merged.get("USE_LASTFM", True))
 LASTFM_API_KEY: str = str(merged.get("LASTFM_API_KEY", "") or "")
 LASTFM_API_SECRET: str = str(merged.get("LASTFM_API_SECRET", "") or "")
-USE_BANDCAMP: bool = bool(merged.get("USE_BANDCAMP", False))
-ARTIST_CREDIT_MODE: str = str(merged.get("ARTIST_CREDIT_MODE", "album_artist_strict") or "album_artist_strict").strip().lower()
+USE_BANDCAMP: bool = bool(merged.get("USE_BANDCAMP", True))
+ARTIST_CREDIT_MODE: str = str(merged.get("ARTIST_CREDIT_MODE", "picard_like_default") or "picard_like_default").strip().lower()
 LIVE_DEDUPE_MODE: str = str(merged.get("LIVE_DEDUPE_MODE", "safe") or "safe").strip().lower()
+
+
+def _apply_forced_runtime_defaults():
+    """Force simplified product defaults (files-only, always-on metadata pipeline)."""
+    global LIBRARY_MODE, REQUIRED_TAGS
+    global USE_MUSICBRAINZ, USE_AI_FOR_MB_MATCH, USE_AI_FOR_MB_VERIFY
+    global USE_AI_VISION_FOR_COVER, USE_AI_VISION_BEFORE_COVER_INJECT
+    global USE_WEB_SEARCH_FOR_MB, USE_ACOUSTID, USE_ACOUSTID_WHEN_TAGGED
+    global USE_DISCOGS, USE_LASTFM, USE_BANDCAMP
+    global SKIP_MB_FOR_LIVE_ALBUMS, TRACKLIST_MATCH_MIN, ARTIST_CREDIT_MODE
+
+    LIBRARY_MODE = "files"
+    merged["LIBRARY_MODE"] = "files"
+
+    REQUIRED_TAGS = ["artist", "album", "genre", "year", "tracks"]
+    merged["REQUIRED_TAGS"] = REQUIRED_TAGS
+
+    USE_MUSICBRAINZ = True
+    USE_AI_FOR_MB_MATCH = True
+    USE_AI_FOR_MB_VERIFY = True
+    USE_AI_VISION_FOR_COVER = True
+    USE_AI_VISION_BEFORE_COVER_INJECT = True
+    USE_WEB_SEARCH_FOR_MB = True
+    USE_ACOUSTID = True
+    USE_ACOUSTID_WHEN_TAGGED = False
+
+    USE_DISCOGS = True
+    USE_LASTFM = True
+    USE_BANDCAMP = True
+
+    SKIP_MB_FOR_LIVE_ALBUMS = True
+    TRACKLIST_MATCH_MIN = 0.9
+    ARTIST_CREDIT_MODE = "picard_like_default"
+    merged["ARTIST_CREDIT_MODE"] = ARTIST_CREDIT_MODE
+
+
+_apply_forced_runtime_defaults()
 SKIP_MB_FOR_LIVE_ALBUMS: bool = bool(merged.get("SKIP_MB_FOR_LIVE_ALBUMS", True))
 TRACKLIST_MATCH_MIN: float = float(merged.get("TRACKLIST_MATCH_MIN", 0.8))
 LIVE_ALBUMS_MB_STRICT: bool = bool(merged.get("LIVE_ALBUMS_MB_STRICT", False))
@@ -2952,7 +3056,7 @@ def init_state_db():
     # Migrate scan_moves: add album_title and fmt_text if missing
     cur.execute("PRAGMA table_info(scan_moves)")
     move_cols = [r[1] for r in cur.fetchall()]
-    for col_name, col_type in [("album_title", "TEXT"), ("fmt_text", "TEXT")]:
+    for col_name, col_type in [("album_title", "TEXT"), ("fmt_text", "TEXT"), ("move_reason", "TEXT DEFAULT 'dedupe'")]:
         if col_name not in move_cols:
             cur.execute(f"ALTER TABLE scan_moves ADD COLUMN {col_name} {col_type}")
     # Table for incomplete-albums scan diagnostics (double-check Plex vs disk)
@@ -3002,6 +3106,20 @@ def init_state_db():
             FOREIGN KEY (scan_id) REFERENCES scan_history(scan_id)
         )
     """)
+    # scan_editions provider identity columns (for Library badges/source-of-truth in Plex mode)
+    try:
+        cur.execute("PRAGMA table_info(scan_editions)")
+        se_cols = [r[1] for r in cur.fetchall()]
+        if "discogs_release_id" not in se_cols:
+            cur.execute("ALTER TABLE scan_editions ADD COLUMN discogs_release_id TEXT")
+        if "lastfm_album_mbid" not in se_cols:
+            cur.execute("ALTER TABLE scan_editions ADD COLUMN lastfm_album_mbid TEXT")
+        if "bandcamp_album_url" not in se_cols:
+            cur.execute("ALTER TABLE scan_editions ADD COLUMN bandcamp_album_url TEXT")
+        if "metadata_source" not in se_cols:
+            cur.execute("ALTER TABLE scan_editions ADD COLUMN metadata_source TEXT")
+    except sqlite3.OperationalError:
+        pass
     # Persistent resume state for interrupted scans (artist-level status machine).
     cur.execute("""
         CREATE TABLE IF NOT EXISTS scan_resume_runs (
@@ -3421,12 +3539,29 @@ def init_cache_db():
             PRIMARY KEY (artist_norm, album_norm)
         )
     """)
+    # Provider fallback cache (Discogs/Last.fm/Bandcamp) with per-row TTL.
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS provider_album_lookup (
+            provider    TEXT NOT NULL,
+            artist_norm TEXT NOT NULL,
+            album_norm  TEXT NOT NULL,
+            status      TEXT NOT NULL,
+            payload_json TEXT,
+            created_at  INTEGER NOT NULL,
+            expires_at  INTEGER NOT NULL,
+            PRIMARY KEY (provider, artist_norm, album_norm)
+        )
+        """
+    )
     
     # Add indexes for faster lookups
     try:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_audio_cache_path ON audio_cache(path)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_mb_cache_mbid ON musicbrainz_cache(mbid)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_mb_album_lookup_key ON musicbrainz_album_lookup(artist_norm, album_norm)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_provider_album_lookup_key ON provider_album_lookup(provider, artist_norm, album_norm)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_provider_album_lookup_expires ON provider_album_lookup(expires_at)")
     except sqlite3.OperationalError:
         # Indexes may already exist, ignore
         pass
@@ -3946,6 +4081,8 @@ def _read_sqlite_cache_metrics() -> dict:
         "musicbrainz_cache_rows": 0,
         "musicbrainz_album_lookup_rows": 0,
         "musicbrainz_album_lookup_not_found_rows": 0,
+        "provider_album_lookup_rows": 0,
+        "provider_album_lookup_not_found_rows": 0,
     }
     if not CACHE_DB_FILE.exists():
         return out
@@ -3965,6 +4102,12 @@ def _read_sqlite_cache_metrics() -> dict:
                 FROM musicbrainz_album_lookup
                 WHERE mbid IS NULL OR TRIM(COALESCE(mbid, '')) = ''
                 """,
+            )
+        if _sqlite_table_exists(cur, "provider_album_lookup"):
+            out["provider_album_lookup_rows"] = _sqlite_scalar(cur, "SELECT COUNT(*) FROM provider_album_lookup")
+            out["provider_album_lookup_not_found_rows"] = _sqlite_scalar(
+                cur,
+                "SELECT COUNT(*) FROM provider_album_lookup WHERE status = 'not_found'",
             )
         con.close()
     except Exception:
@@ -5115,7 +5258,7 @@ def _rebuild_files_library_index_for_artist(
 ) -> dict:
     """
     Granular Files index rebuild for one artist from published rows.
-    Falls back to full rebuild when no published rows are found for the artist.
+    If no published rows exist for that artist, perform targeted cleanup only.
     """
     if _get_library_mode() != "files":
         return {"ok": False, "error": "LIBRARY_MODE is not 'files'"}
@@ -5144,17 +5287,64 @@ def _rebuild_files_library_index_for_artist(
 
         artists_map, albums_payload, payload_count = _load_files_library_published_payload_for_artist(artist_name)
         if payload_count <= 0:
+            removed_artists = 0
+            conn = _files_pg_connect()
+            if conn is not None:
+                try:
+                    artist_norm = " ".join(artist_name.split()).lower()
+                    artist_norm_alt = norm_album(artist_name or "")
+                    with conn:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                """
+                                SELECT id
+                                FROM files_artists
+                                WHERE name_norm = %s
+                                   OR name_norm = %s
+                                   OR lower(name) = lower(%s)
+                                """,
+                                (artist_norm, artist_norm_alt or artist_norm, artist_name),
+                            )
+                            ids = [int(r[0]) for r in cur.fetchall() if r and r[0]]
+                            if ids:
+                                cur.execute("DELETE FROM files_artists WHERE id = ANY(%s)", (ids,))
+                                removed_artists = len(ids)
+                            cur.execute(
+                                """
+                                DELETE FROM files_artists
+                                WHERE id NOT IN (SELECT DISTINCT artist_id FROM files_albums)
+                                """
+                            )
+                            _files_index_write_meta(cur, "last_reason", reason)
+                            _files_index_write_meta(cur, "last_build_ts", str(int(time.time())))
+                            _files_index_write_meta(cur, "source", "published_rows_artist_cleanup")
+                finally:
+                    conn.close()
+            _files_cache_invalidate_all()
+            artists_count, albums_count, tracks_count = _files_index_read_counts()
             _files_index_set_state(
                 running=False,
                 finished_at=time.time(),
-                phase="idle",
+                phase="done",
                 current_folder=None,
+                artists=artists_count,
+                albums=albums_count,
+                tracks=tracks_count,
                 error=None,
             )
+            logging.info(
+                "Files library index artist cleanup (%s, artist=%s): no published rows, removed %d artist row(s).",
+                reason,
+                artist_name,
+                removed_artists,
+            )
             return {
-                "ok": False,
-                "fallback_full": True,
-                "error": f"No published rows found for artist '{artist_name}'",
+                "ok": True,
+                "artists": artists_count,
+                "albums": albums_count,
+                "tracks": tracks_count,
+                "artist_removed": removed_artists,
+                "source": "published_rows_artist_cleanup",
             }
 
         total_tracks = 0
@@ -5830,13 +6020,11 @@ def _trigger_files_index_rebuild_async(reason: str = "manual") -> bool:
 
     def _runner():
         if artist_hint:
-            res = _rebuild_files_library_index_for_artist(
+            _rebuild_files_library_index_for_artist(
                 artist_hint,
                 reason=reason_norm,
                 wait_if_running=False,
             )
-            if not res.get("ok") and res.get("fallback_full"):
-                _rebuild_files_library_index(reason=reason_norm, wait_if_running=False)
             return
         _rebuild_files_library_index(reason=reason_norm, wait_if_running=False)
 
@@ -6921,6 +7109,135 @@ def set_cached_mb_album_lookup(artist_norm: str, album_norm: str, mbid: str | No
     con.commit()
     con.close()
 
+
+def _provider_cache_norm(value: str) -> str:
+    txt = " ".join((value or "").strip().split())
+    if not txt:
+        return ""
+    norm = norm_album(txt)
+    return norm or txt.lower()
+
+
+def get_cached_provider_album_lookup(provider: str, artist_name: str, album_title: str) -> tuple[str | None, dict | None]:
+    """
+    Return cached provider lookup:
+    - (None, None): cache miss or expired
+    - ("not_found", None): cached negative lookup
+    - ("error", None): cached transient provider error
+    - ("found", payload_dict): cached provider payload
+    """
+    provider_key = (provider or "").strip().lower()
+    artist_norm = _provider_cache_norm(artist_name)
+    album_norm = _provider_cache_norm(album_title)
+    if not provider_key or not artist_norm or not album_norm:
+        return (None, None)
+    now = int(time.time())
+    con = sqlite3.connect(str(CACHE_DB_FILE), timeout=30)
+    cur = con.cursor()
+    cur.execute(
+        """
+        SELECT status, payload_json, expires_at
+        FROM provider_album_lookup
+        WHERE provider = ? AND artist_norm = ? AND album_norm = ?
+        """,
+        (provider_key, artist_norm, album_norm),
+    )
+    row = cur.fetchone()
+    con.close()
+    if row is None:
+        return (None, None)
+    status = str(row[0] or "").strip().lower()
+    payload_raw = row[1]
+    expires_at = int(row[2] or 0)
+    if expires_at and expires_at < now:
+        try:
+            con = sqlite3.connect(str(CACHE_DB_FILE), timeout=30)
+            cur = con.cursor()
+            cur.execute(
+                "DELETE FROM provider_album_lookup WHERE provider = ? AND artist_norm = ? AND album_norm = ?",
+                (provider_key, artist_norm, album_norm),
+            )
+            con.commit()
+            con.close()
+        except Exception:
+            pass
+        return (None, None)
+    if status == "found":
+        try:
+            payload = json.loads(payload_raw) if payload_raw else None
+        except Exception:
+            payload = None
+        return ("found", payload if isinstance(payload, dict) else None)
+    if status in {"not_found", "error"}:
+        return (status, None)
+    return (None, None)
+
+
+def set_cached_provider_album_lookup(
+    provider: str,
+    artist_name: str,
+    album_title: str,
+    status: str,
+    payload: dict | None = None,
+) -> None:
+    provider_key = (provider or "").strip().lower()
+    artist_norm = _provider_cache_norm(artist_name)
+    album_norm = _provider_cache_norm(album_title)
+    status_norm = (status or "").strip().lower()
+    if not provider_key or not artist_norm or not album_norm:
+        return
+    if status_norm not in {"found", "not_found", "error"}:
+        return
+    if status_norm == "found":
+        ttl = max(60, int(getattr(sys.modules[__name__], "PROVIDER_CACHE_FOUND_TTL_SEC", 60 * 60 * 24 * 30) or (60 * 60 * 24 * 30)))
+    elif status_norm == "not_found":
+        ttl = max(60, int(getattr(sys.modules[__name__], "PROVIDER_CACHE_NOT_FOUND_TTL_SEC", 60 * 60 * 8) or (60 * 60 * 8)))
+    else:
+        ttl = max(30, int(getattr(sys.modules[__name__], "PROVIDER_CACHE_ERROR_TTL_SEC", 60 * 20) or (60 * 20)))
+    now = int(time.time())
+    expires_at = now + int(ttl)
+    payload_json = json.dumps(payload) if (status_norm == "found" and isinstance(payload, dict)) else None
+    con = sqlite3.connect(str(CACHE_DB_FILE), timeout=30)
+    cur = con.cursor()
+    cur.execute(
+        """
+        INSERT OR REPLACE INTO provider_album_lookup
+        (provider, artist_norm, album_norm, status, payload_json, created_at, expires_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (provider_key, artist_norm, album_norm, status_norm, payload_json, now, expires_at),
+    )
+    con.commit()
+    con.close()
+
+
+def fetch_provider_album_lookup_cached(
+    provider: str,
+    artist_name: str,
+    album_title: str,
+    fetcher,
+) -> dict | None:
+    """
+    Cache wrapper around provider album fetchers.
+    """
+    if SCAN_DISABLE_CACHE:
+        return fetcher(artist_name, album_title)
+    cached_status, cached_payload = get_cached_provider_album_lookup(provider, artist_name, album_title)
+    if cached_status == "found":
+        return cached_payload
+    if cached_status in {"not_found", "error"}:
+        return None
+    try:
+        payload = fetcher(artist_name, album_title)
+    except Exception:
+        set_cached_provider_album_lookup(provider, artist_name, album_title, "error", None)
+        raise
+    if payload:
+        set_cached_provider_album_lookup(provider, artist_name, album_title, "found", payload if isinstance(payload, dict) else None)
+        return payload
+    set_cached_provider_album_lookup(provider, artist_name, album_title, "not_found", None)
+    return None
+
 # ───────────────────────────────── STATE IN MEMORY ──────────────────────────────────
 state = {
     "scanning": False,
@@ -7005,6 +7322,13 @@ state = {
         "last_event_path": None,
     },
     "scan_dirty_folders_pending_clear": [],
+    "scan_pipeline_flags": {},
+    "scan_pipeline_sync_target": "none",
+    "scan_incomplete_moved_count": 0,
+    "scan_incomplete_moved_mb": 0,
+    "scan_player_sync_target": None,
+    "scan_player_sync_ok": None,
+    "scan_player_sync_message": "",
 }
 lock = threading.Lock()
 files_index_lock = threading.Lock()
@@ -8776,22 +9100,37 @@ def _fetch_album_provider_fallbacks_parallel(artist: str, album_title: str) -> d
         # Fallback to sequential when concurrent futures is unavailable.
         try:
             if USE_DISCOGS:
-                out["discogs"] = _fetch_discogs_release(artist_name, title)
+                out["discogs"] = fetch_provider_album_lookup_cached(
+                    "discogs",
+                    artist_name,
+                    title,
+                    _fetch_discogs_release,
+                )
             if USE_LASTFM:
-                out["lastfm"] = _fetch_lastfm_album_info(artist_name, title)
+                out["lastfm"] = fetch_provider_album_lookup_cached(
+                    "lastfm",
+                    artist_name,
+                    title,
+                    _fetch_lastfm_album_info,
+                )
             if USE_BANDCAMP:
-                out["bandcamp"] = _fetch_bandcamp_album_info(artist_name, title)
+                out["bandcamp"] = fetch_provider_album_lookup_cached(
+                    "bandcamp",
+                    artist_name,
+                    title,
+                    _fetch_bandcamp_album_info,
+                )
         except Exception:
             pass
     else:
         tasks = {}
         with ThreadPoolExecutor(max_workers=3, thread_name_prefix="pmda-provider-fallback") as pool:
             if USE_DISCOGS:
-                tasks[pool.submit(_fetch_discogs_release, artist_name, title)] = "discogs"
+                tasks[pool.submit(fetch_provider_album_lookup_cached, "discogs", artist_name, title, _fetch_discogs_release)] = "discogs"
             if USE_LASTFM:
-                tasks[pool.submit(_fetch_lastfm_album_info, artist_name, title)] = "lastfm"
+                tasks[pool.submit(fetch_provider_album_lookup_cached, "lastfm", artist_name, title, _fetch_lastfm_album_info)] = "lastfm"
             if USE_BANDCAMP:
-                tasks[pool.submit(_fetch_bandcamp_album_info, artist_name, title)] = "bandcamp"
+                tasks[pool.submit(fetch_provider_album_lookup_cached, "bandcamp", artist_name, title, _fetch_bandcamp_album_info)] = "bandcamp"
 
             for fut in as_completed(tasks):
                 key = tasks[fut]
@@ -8828,6 +9167,371 @@ def _fetch_album_provider_fallbacks_parallel(artist: str, album_title: str) -> d
             }
         )
     return out
+
+
+def _normalize_identity_text_strict(value: str | None) -> str:
+    """
+    Normalize identity text for strict equality checks.
+    Keeps unicode letters but removes punctuation/extra spaces and decodes HTML entities.
+    """
+    raw = html.unescape(str(value or ""))
+    if not raw:
+        return ""
+    text = unicodedata.normalize("NFKC", raw).casefold().strip()
+    if not text:
+        return ""
+    text = text.replace("&", " and ").replace("_", " ")
+    text = re.sub(r"[`´’']", "", text)
+    text = re.sub(r"[^\w\s]+", " ", text, flags=re.UNICODE)
+    text = " ".join(text.split())
+    return text
+
+
+def _normalize_identity_album_strict(value: str | None) -> str:
+    """
+    Normalize album title for strict identity checks while ignoring format/version suffixes.
+    """
+    raw = html.unescape(str(value or ""))
+    if not raw:
+        return ""
+    dedup_norm = norm_album_for_dedup(raw, normalize_parenthetical=True)
+    return _normalize_identity_text_strict(dedup_norm)
+
+
+def _extract_mb_artist_names(payload: dict | None) -> list[str]:
+    """Extract readable artist names from a MusicBrainz payload."""
+    if not isinstance(payload, dict):
+        return []
+    out: list[str] = []
+    artist_credit = payload.get("artist-credit")
+    if isinstance(artist_credit, list):
+        for item in artist_credit:
+            if not isinstance(item, dict):
+                continue
+            nm = (item.get("name") or (item.get("artist") or {}).get("name") or "").strip()
+            if nm:
+                out.append(nm)
+    phrase = (payload.get("artist-credit-phrase") or "").strip()
+    if phrase:
+        out.append(phrase)
+    deduped: list[str] = []
+    seen = set()
+    for name in out:
+        key = _normalize_identity_text_strict(name)
+        if key and key not in seen:
+            deduped.append(name)
+            seen.add(key)
+    base_names = list(deduped)
+    if len(base_names) >= 2:
+        deduped.append(" & ".join(base_names))
+        deduped.append("; ".join(base_names))
+    return deduped
+
+
+def _strict_identity_match_details(
+    *,
+    local_artist: str,
+    local_title: str,
+    candidate_artist: str | list[str] | tuple[str, ...] | None,
+    candidate_title: str,
+) -> tuple[bool, str]:
+    """
+    Strict identity gate:
+    - normalized artist must match exactly
+    - normalized album title must match exactly
+    Returns (ok, reason).
+    """
+    local_artist_norm = _normalize_identity_text_strict(local_artist)
+    local_title_norm = _normalize_identity_album_strict(local_title)
+    candidate_title_norm = _normalize_identity_album_strict(candidate_title)
+    if isinstance(candidate_artist, (list, tuple)):
+        candidate_artist_values = [str(x or "") for x in candidate_artist]
+    else:
+        candidate_artist_values = [str(candidate_artist or "")]
+    candidate_artist_norms = [
+        n for n in (_normalize_identity_text_strict(v) for v in candidate_artist_values) if n
+    ]
+    artist_ok = bool(
+        local_artist_norm
+        and candidate_artist_norms
+        and local_artist_norm in candidate_artist_norms
+    )
+    title_ok = bool(local_title_norm and candidate_title_norm and local_title_norm == candidate_title_norm)
+    if artist_ok and title_ok:
+        return (True, "strict identity ok (artist/title exact)")
+    reasons: list[str] = []
+    if not local_artist_norm:
+        reasons.append("local artist missing")
+    if not local_title_norm:
+        reasons.append("local title missing")
+    if not candidate_artist_norms:
+        reasons.append("candidate artist missing")
+    elif not artist_ok:
+        reasons.append(
+            f"artist mismatch local={local_artist_norm!r} candidate={candidate_artist_norms[:3]!r}"
+        )
+    if not candidate_title_norm:
+        reasons.append("candidate title missing")
+    elif not title_ok:
+        reasons.append(
+            f"title mismatch local={local_title_norm!r} candidate={candidate_title_norm!r}"
+        )
+    return (False, "; ".join(reasons) if reasons else "strict identity failed")
+
+
+def _provider_identity_text_score(local_value: str, provider_value: str) -> float:
+    local_norm = norm_album(local_value or "")
+    provider_norm = norm_album(provider_value or "")
+    if not local_norm or not provider_norm:
+        return 0.0
+    if local_norm == provider_norm:
+        return 1.0
+    if local_norm in provider_norm or provider_norm in local_norm:
+        return 0.9
+    try:
+        from difflib import SequenceMatcher
+
+        return float(SequenceMatcher(None, local_norm, provider_norm).ratio())
+    except Exception:
+        return 0.0
+
+
+def _provider_candidate_id(payload: dict, provider: str) -> str:
+    p = (provider or "").strip().lower()
+    if not isinstance(payload, dict):
+        return ""
+    if p == "discogs":
+        return str(payload.get("release_id") or payload.get("master_id") or "").strip()
+    if p == "lastfm":
+        return str(payload.get("mbid") or "").strip()
+    if p == "bandcamp":
+        return str(payload.get("album_url") or payload.get("url") or "").strip()
+    return ""
+
+
+def _build_provider_identity_candidates(
+    artist_name: str,
+    album_title: str,
+    local_track_titles: List[str],
+    provider_payloads: dict,
+) -> list[dict]:
+    """
+    Build scored provider identity candidates (Discogs/Last.fm/Bandcamp).
+    """
+    out: list[dict] = []
+    provider_order = ("discogs", "lastfm", "bandcamp")
+    for provider in provider_order:
+        payload = provider_payloads.get(provider)
+        if not isinstance(payload, dict):
+            continue
+        src_title = (
+            (payload.get("title") if provider != "lastfm" else payload.get("title") or payload.get("album"))
+            or ""
+        ).strip()
+        src_artist = (
+            (payload.get("artist_name") if provider != "lastfm" else payload.get("artist") or payload.get("artist_name"))
+            or ""
+        ).strip()
+        if not src_title:
+            continue
+        strict_ok, strict_reason = _strict_identity_match_details(
+            local_artist=artist_name,
+            local_title=album_title,
+            candidate_artist=src_artist,
+            candidate_title=src_title,
+        )
+        title_score = _provider_identity_text_score(album_title, src_title)
+        artist_score = _provider_identity_text_score(artist_name, src_artist) if src_artist else 0.7
+        track_score = 0.0
+        src_tracks = payload.get("tracklist") or []
+        if local_track_titles and isinstance(src_tracks, list) and src_tracks:
+            try:
+                track_score = float(_crosscheck_tracklist(local_track_titles, src_tracks))
+            except Exception:
+                track_score = 0.0
+        confidence = round((title_score * 0.55) + (artist_score * 0.20) + (track_score * 0.25), 4)
+        provider_id = _provider_candidate_id(payload, provider)
+        out.append(
+            {
+                "provider": provider,
+                "payload": payload,
+                "provider_id": provider_id,
+                "title_score": title_score,
+                "artist_score": artist_score,
+                "track_score": track_score,
+                "confidence": confidence,
+                "title": src_title,
+                "artist": src_artist,
+                "strict_ok": strict_ok,
+                "strict_reason": strict_reason,
+            }
+        )
+    out.sort(key=lambda c: (-float(c.get("confidence") or 0.0), -float(c.get("track_score") or 0.0), str(c.get("provider") or "")))
+    return out
+
+
+def _ai_choose_provider_identity_candidate(
+    artist_name: str,
+    album_title: str,
+    local_track_titles: List[str],
+    candidates: list[dict],
+) -> tuple[dict | None, int | None]:
+    """
+    Ask AI to pick provider identity candidate when heuristics are ambiguous.
+    """
+    if not candidates:
+        return (None, None)
+    if not getattr(sys.modules[__name__], "ai_provider_ready", False):
+        return (None, None)
+    letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    choices = []
+    for i, cand in enumerate(candidates[:12]):
+        choices.append(
+            (
+                f"{letters[i]}) provider={cand.get('provider')} "
+                f"title={cand.get('title')!r} artist={cand.get('artist')!r} "
+                f"track_score={float(cand.get('track_score') or 0.0):.2f} "
+                f"heuristic={float(cand.get('confidence') or 0.0):.2f}"
+            )
+        )
+    tracks_preview = ", ".join(local_track_titles[:30]) if local_track_titles else "(none)"
+    if local_track_titles and len(local_track_titles) > 30:
+        tracks_preview += ", ..."
+    prompt = (
+        f"Album identity arbitration.\n"
+        f"Local album: artist={artist_name!r}, title={album_title!r}, tracks=[{tracks_preview}].\n\n"
+        f"Provider candidates:\n" + "\n".join(choices) + "\n\n"
+        "Pick the best matching provider candidate for this same release. "
+        "Reply with one letter (A/B/...) or NONE if no candidate is reliable enough. "
+        "Optionally append (confidence: N) with N from 0 to 100."
+    )
+    system_msg = "Reply with a single letter (A, B, C, ...) or NONE. Optionally end with (confidence: N). No explanation."
+    try:
+        provider = getattr(sys.modules[__name__], "AI_PROVIDER", "openai")
+        model = getattr(sys.modules[__name__], "RESOLVED_MODEL", None) or getattr(sys.modules[__name__], "OPENAI_MODEL", "gpt-4o-mini")
+        reply = call_ai_provider(provider, model, system_msg, prompt, max_tokens=30)
+        reply_clean, ai_confidence = parse_ai_confidence((reply or "").strip())
+        cleaned = (reply_clean or "").strip().upper()
+        if cleaned == "NONE":
+            return (None, ai_confidence)
+        idx = letters.find(cleaned[:1])
+        if 0 <= idx < len(candidates):
+            conf_min = max(
+                int(getattr(sys.modules[__name__], "AI_CONFIDENCE_MIN", 0) or 0),
+                55,
+            )
+            if ai_confidence is not None and ai_confidence < conf_min:
+                logging.info(
+                    "[Providers Arbitration] AI candidate rejected due to low confidence (%s < %s)",
+                    ai_confidence,
+                    conf_min,
+                )
+                return (None, ai_confidence)
+            return (candidates[idx], ai_confidence)
+    except Exception as e:
+        logging.debug("[Providers Arbitration] AI choice failed: %s", e)
+    return (None, None)
+
+
+def _arbitrate_provider_identity(
+    artist_name: str,
+    album_title: str,
+    local_track_titles: List[str],
+    provider_payloads: dict,
+) -> dict | None:
+    """
+    Decide which provider can be accepted as source-of-truth identity when MB is unavailable.
+    Returns dict with provider/payload/provider_id/confidence, or None.
+    """
+    candidates = _build_provider_identity_candidates(artist_name, album_title, local_track_titles, provider_payloads)
+    if not candidates:
+        logging.info(
+            "[Providers Arbitration] %r – %r: rejected (no provider candidates)",
+            artist_name,
+            album_title,
+        )
+        return None
+    strict_candidates = [c for c in candidates if bool(c.get("strict_ok"))]
+    if not strict_candidates:
+        rejected = "; ".join(
+            f"{c.get('provider')} -> {c.get('strict_reason') or 'strict identity failed'}"
+            for c in candidates[:3]
+        )
+        logging.info(
+            "[Providers Arbitration] %r – %r: rejected (strict identity failed for all candidates: %s)",
+            artist_name,
+            album_title,
+            rejected or "no reason",
+        )
+        return None
+    strict = bool(getattr(sys.modules[__name__], "PROVIDER_IDENTITY_STRICT", True))
+    min_score = float(getattr(sys.modules[__name__], "PROVIDER_IDENTITY_MIN_SCORE", 0.72) or 0.72)
+    min_margin = float(getattr(sys.modules[__name__], "PROVIDER_IDENTITY_SCORE_MARGIN", 0.08) or 0.08)
+    top = strict_candidates[0]
+    second = strict_candidates[1] if len(strict_candidates) > 1 else None
+    top_score = float(top.get("confidence") or 0.0)
+    margin = top_score - float(second.get("confidence") or 0.0) if second else top_score
+    top_track = float(top.get("track_score") or 0.0)
+    heuristics_ok = (top_score >= min_score) and ((not strict) or margin >= min_margin or top_track >= 0.9)
+    if heuristics_ok:
+        logging.info(
+            "[Providers Arbitration] %r – %r: accepted %s via heuristic (score=%.2f, margin=%.2f, track=%.2f)",
+            artist_name,
+            album_title,
+            top.get("provider"),
+            top_score,
+            margin,
+            top_track,
+        )
+        return {
+            "provider": top.get("provider"),
+            "payload": top.get("payload"),
+            "provider_id": top.get("provider_id") or "",
+            "confidence": top_score,
+            "confidence_source": "heuristic",
+            "title_score": float(top.get("title_score") or 0.0),
+            "artist_score": float(top.get("artist_score") or 0.0),
+            "track_score": top_track,
+        }
+    if not bool(getattr(sys.modules[__name__], "PROVIDER_IDENTITY_USE_AI", True)):
+        logging.info(
+            "[Providers Arbitration] %r – %r: rejected (heuristic below threshold, AI disabled)",
+            artist_name,
+            album_title,
+        )
+        return None
+    ai_choice, ai_conf = _ai_choose_provider_identity_candidate(
+        artist_name,
+        album_title,
+        local_track_titles,
+        strict_candidates[:8],
+    )
+    if ai_choice is None:
+        logging.info(
+            "[Providers Arbitration] %r – %r: rejected (AI returned no reliable strict candidate)",
+            artist_name,
+            album_title,
+        )
+        return None
+    logging.info(
+        "[Providers Arbitration] %r – %r: accepted %s via AI (ai_conf=%s, heuristic=%.2f)",
+        artist_name,
+        album_title,
+        ai_choice.get("provider"),
+        ai_conf if ai_conf is not None else "n/a",
+        float(ai_choice.get("confidence") or 0.0),
+    )
+    return {
+        "provider": ai_choice.get("provider"),
+        "payload": ai_choice.get("payload"),
+        "provider_id": ai_choice.get("provider_id") or "",
+        "confidence": float(ai_choice.get("confidence") or 0.0),
+        "confidence_source": "ai",
+        "ai_confidence": ai_conf,
+        "title_score": float(ai_choice.get("title_score") or 0.0),
+        "artist_score": float(ai_choice.get("artist_score") or 0.0),
+        "track_score": float(ai_choice.get("track_score") or 0.0),
+    }
 
 
 def search_mb_release_group_by_metadata(
@@ -8987,8 +9691,28 @@ def search_mb_release_group_by_metadata(
                     chosen_rg_id = None
                 if chosen_rg_id:
                     try:
+                        chosen_candidate = next((c for c in candidates if str(c.get("id") or "") == str(chosen_rg_id)), None)
                         info = _fetch_rg_details(chosen_rg_id)
                         mb_track_count = _mb_track_count_from_rg_info(info)
+                        mb_title = str(info.get("title") or (chosen_candidate or {}).get("title") or "").strip()
+                        mb_artists = _extract_mb_artist_names(info) or _extract_mb_artist_names(chosen_candidate or {})
+                        strict_ok, strict_reason = _strict_identity_match_details(
+                            local_artist=artist,
+                            local_title=title_raw or album_norm,
+                            candidate_artist=mb_artists,
+                            candidate_title=mb_title,
+                        )
+                        if not strict_ok:
+                            log_mb(
+                                "Album %s – \"%s\": AI-first candidate %s rejected (%s)",
+                                artist,
+                                title_raw or album_norm,
+                                chosen_rg_id,
+                                strict_reason,
+                            )
+                            chosen_rg_id = None
+                            # Fall through to full flow; if still no match, scan will try provider fallbacks.
+                            raise RuntimeError("strict identity mismatch")
                         # Sanity check: reject if local track count differs too much from MB
                         local_count = len(tracks) if tracks else 0
                         if abs(local_count - mb_track_count) > 2:
@@ -9010,10 +9734,12 @@ def search_mb_release_group_by_metadata(
                                 "id": rg_id_final,
                                 "track_count": mb_track_count,
                                 "cover_url": f"https://coverartarchive.org/release-group/{rg_id_final}/front",
+                                "mb_title": mb_title,
+                                "mb_artist_names": mb_artists,
                             }
                             set_cached_mb_info(rg_id_final, result_dict)
                             log_mb(
-                                "Album %s – \"%s\": AI-first title-only match chose release-group %s (candidates=%d, tracks local=%d, mb=%d)",
+                                "Album %s – \"%s\": AI-first title-only match chose release-group %s (strict identity ok; candidates=%d, tracks local=%d, mb=%d)",
                                 artist,
                                 title_raw or album_norm,
                                 rg_id_final,
@@ -9022,6 +9748,8 @@ def search_mb_release_group_by_metadata(
                                 mb_track_count,
                             )
                             return (result_dict, True)
+                    except RuntimeError:
+                        pass
                     except musicbrainzngs.WebServiceError as e:
                         logging.debug("[MusicBrainz] AI-first fetch failed for %s: %s", chosen_rg_id, e)
             except Exception as e:
@@ -9061,6 +9789,23 @@ def search_mb_release_group_by_metadata(
                         if fmt:
                             formats.add(f"{qty}×{fmt}")
                 rg_id_final = info.get('id', rg['id'])
+                mb_title = str(info.get("title") or rg.get("title") or "").strip()
+                mb_artists = _extract_mb_artist_names(info) or _extract_mb_artist_names(rg)
+                strict_ok, strict_reason = _strict_identity_match_details(
+                    local_artist=artist,
+                    local_title=title_raw or album_norm,
+                    candidate_artist=mb_artists,
+                    candidate_title=mb_title,
+                )
+                if not strict_ok:
+                    log_mb(
+                        "Album %s – \"%s\": candidate %s rejected before arbitration (%s)",
+                        artist,
+                        title_raw or album_norm,
+                        rg_id_final,
+                        strict_reason,
+                    )
+                    continue
                 result_dict = {
                     'primary_type': info.get('primary-type', ''),
                     'secondary_types': info.get('secondary-types', []),
@@ -9069,6 +9814,8 @@ def search_mb_release_group_by_metadata(
                     'track_count': mb_track_count,
                     # Phase 4: Cover Art Archive URL for optional vision comparison
                     'cover_url': f"https://coverartarchive.org/release-group/{rg_id_final}/front",
+                    'mb_title': mb_title,
+                    'mb_artist_names': mb_artists,
                 }
                 # Phase 2: optionally fetch track titles from one release for AI verify prompt
                 if USE_AI_FOR_MB_VERIFY and info.get('release-list') and idx < tracklist_fetch_limit:
@@ -9179,6 +9926,23 @@ def search_mb_release_group_by_metadata(
                                         if fmt:
                                             formats.add(f"{qty}×{fmt}")
                                 rg_id_final = info.get("id", suggested_mbid)
+                                mb_title = str(info.get("title") or "").strip()
+                                mb_artists = _extract_mb_artist_names(info)
+                                strict_ok, strict_reason = _strict_identity_match_details(
+                                    local_artist=artist,
+                                    local_title=title_for_zero or album_norm,
+                                    candidate_artist=mb_artists,
+                                    candidate_title=mb_title,
+                                )
+                                if not strict_ok:
+                                    log_mb(
+                                        "Album %s – \"%s\": web+AI suggested MBID %s rejected (%s)",
+                                        artist,
+                                        title_for_zero or album_norm,
+                                        rg_id_final,
+                                        strict_reason,
+                                    )
+                                    raise RuntimeError("strict identity mismatch")
                                 result_dict = {
                                     "primary_type": info.get("primary-type", ""),
                                     "secondary_types": info.get("secondary-types", []),
@@ -9186,10 +9950,14 @@ def search_mb_release_group_by_metadata(
                                     "id": rg_id_final,
                                     "track_count": mb_track_count,
                                     "cover_url": f"https://coverartarchive.org/release-group/{rg_id_final}/front",
+                                    "mb_title": mb_title,
+                                    "mb_artist_names": mb_artists,
                                 }
                                 set_cached_mb_info(rg_id_final, result_dict)
                                 logging.info("[MusicBrainz] MBID suggested by AI from Bandcamp/web for artist=%r album=%r: %s", artist, album_norm, rg_id_final)
                                 return (result_dict, True)
+                            except RuntimeError:
+                                pass
                             except musicbrainzngs.WebServiceError:
                                 logging.debug("[MusicBrainz] AI-suggested MBID %s invalid or 404", suggested_mbid)
                 except Exception as e:
@@ -9223,6 +9991,23 @@ def search_mb_release_group_by_metadata(
                 has_cover=False,
                 extra_sources=extra_sources or None,
             )
+            if chosen:
+                chosen_title = str(chosen[1].get("mb_title") or chosen[0].get("title") or "").strip()
+                chosen_artists = chosen[1].get("mb_artist_names") or _extract_mb_artist_names(chosen[0])
+                strict_ok, strict_reason = _strict_identity_match_details(
+                    local_artist=artist,
+                    local_title=title_raw or album_norm,
+                    candidate_artist=chosen_artists,
+                    candidate_title=chosen_title,
+                )
+                if not strict_ok:
+                    log_mb(
+                        "Album %s – \"%s\": AI-verified candidate rejected (%s)",
+                        artist,
+                        title_raw or album_norm,
+                        strict_reason,
+                    )
+                    chosen = None
             if chosen:
                 # Partie 1: Optional vision check (local cover vs Cover Art Archive)
                 use_vision = getattr(sys.modules[__name__], "USE_AI_VISION_FOR_COVER", True) and album_folder
@@ -9327,9 +10112,24 @@ def search_mb_release_group_by_metadata(
                                 letter = reply[:1]
                                 idx = letters.find(letter)
                                 if 0 <= idx < len(all_fetched):
-                                    set_cached_mb_info(all_fetched[idx][1]['id'], all_fetched[idx][1])
-                                    logging.info("[MusicBrainz Verify] Web+AI chose candidate %s for artist=%r album=%r", letter, artist, album_norm)
-                                    return (all_fetched[idx][1], True)
+                                    picked = all_fetched[idx][1]
+                                    strict_ok, strict_reason = _strict_identity_match_details(
+                                        local_artist=artist,
+                                        local_title=title_for_web or album_norm,
+                                        candidate_artist=picked.get("mb_artist_names") or _extract_mb_artist_names(all_fetched[idx][0]),
+                                        candidate_title=picked.get("mb_title") or all_fetched[idx][0].get("title") or "",
+                                    )
+                                    if strict_ok:
+                                        set_cached_mb_info(picked['id'], picked)
+                                        logging.info("[MusicBrainz Verify] Web+AI chose candidate %s for artist=%r album=%r", letter, artist, album_norm)
+                                        return (picked, True)
+                                    log_mb(
+                                        "Album %s – \"%s\": web+AI candidate %s rejected (%s)",
+                                        artist,
+                                        title_for_web or album_norm,
+                                        picked.get("id") or "?",
+                                        strict_reason,
+                                    )
                                 mbid_match = re.search(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}", reply)
                                 if mbid_match:
                                     suggested_mbid = mbid_match.group(0)
@@ -9343,10 +10143,38 @@ def search_mb_release_group_by_metadata(
                                                 if fmt:
                                                     formats.add(f"{qty}×{fmt}")
                                         rg_id_final = info.get("id", suggested_mbid)
-                                        result_dict = {"primary_type": info.get("primary-type", ""), "secondary_types": info.get("secondary-types", []), "format_summary": ", ".join(sorted(formats)), "id": rg_id_final, "track_count": mb_track_count, "cover_url": f"https://coverartarchive.org/release-group/{rg_id_final}/front"}
+                                        mb_title = str(info.get("title") or "").strip()
+                                        mb_artists = _extract_mb_artist_names(info)
+                                        strict_ok, strict_reason = _strict_identity_match_details(
+                                            local_artist=artist,
+                                            local_title=title_for_web or album_norm,
+                                            candidate_artist=mb_artists,
+                                            candidate_title=mb_title,
+                                        )
+                                        if not strict_ok:
+                                            log_mb(
+                                                "Album %s – \"%s\": web+AI MBID %s rejected (%s)",
+                                                artist,
+                                                title_for_web or album_norm,
+                                                rg_id_final,
+                                                strict_reason,
+                                            )
+                                            raise RuntimeError("strict identity mismatch")
+                                        result_dict = {
+                                            "primary_type": info.get("primary-type", ""),
+                                            "secondary_types": info.get("secondary-types", []),
+                                            "format_summary": ", ".join(sorted(formats)),
+                                            "id": rg_id_final,
+                                            "track_count": mb_track_count,
+                                            "cover_url": f"https://coverartarchive.org/release-group/{rg_id_final}/front",
+                                            "mb_title": mb_title,
+                                            "mb_artist_names": mb_artists,
+                                        }
                                         set_cached_mb_info(rg_id_final, result_dict)
                                         logging.info("[MusicBrainz] Web+AI suggested MBID %s for artist=%r album=%r", rg_id_final, artist, album_norm)
                                         return (result_dict, True)
+                                    except RuntimeError:
+                                        pass
                                     except musicbrainzngs.WebServiceError:
                                         pass
                         except Exception as e:
@@ -9374,6 +10202,12 @@ def search_mb_release_group_by_metadata(
             return (None, False)
         if len(matching) == 1:
             set_cached_mb_info(matching[0][1]['id'], matching[0][1])
+            log_mb(
+                "Album %s – \"%s\": accepted MB candidate %s (strict identity ok; single track-count match)",
+                artist,
+                title_raw or album_norm,
+                matching[0][1].get("id") or "?",
+            )
             return (matching[0][1], False)
 
         if len(matching) >= 2 and USE_AI_FOR_MB_MATCH:
@@ -9389,11 +10223,23 @@ def search_mb_release_group_by_metadata(
                 idx = letters.find(letter)
                 if 0 <= idx < len(matching):
                     set_cached_mb_info(matching[idx][1]['id'], matching[idx][1])
+                    log_mb(
+                        "Album %s – \"%s\": accepted MB candidate %s (strict identity ok; AI tie-break among matches)",
+                        artist,
+                        title_raw or album_norm,
+                        matching[idx][1].get("id") or "?",
+                    )
                     return (matching[idx][1], False)
             except Exception as e:
                 logging.debug("[MusicBrainz Search] AI pick failed: %s", e)
 
         set_cached_mb_info(matching[0][1]['id'], matching[0][1])
+        log_mb(
+            "Album %s – \"%s\": accepted MB candidate %s (strict identity ok; default top match)",
+            artist,
+            title_raw or album_norm,
+            matching[0][1].get("id") or "?",
+        )
         return (matching[0][1], False)
     except Exception as e:
         logging.debug("[MusicBrainz Search Groups] failed for '%s' / '%s': %s", artist, album_norm, e)
@@ -10779,131 +11625,149 @@ def scan_duplicates(
             title_raw = e.get("title_raw") or e.get("plex_title") or album_norm
             if not rg_info:
                 fallback_sources = []
-                if USE_DISCOGS:
-                    try:
-                        discogs_info = _fetch_discogs_release(artist, title_raw)
-                        if discogs_info:
-                            e["fallback_discogs"] = discogs_info
-                            e["discogs_release_id"] = str(
-                                discogs_info.get("release_id") or discogs_info.get("master_id") or ""
-                            ).strip()
-                            with lock:
-                                state["scan_discogs_matched"] = state.get("scan_discogs_matched", 0) + 1
-                            fallback_sources.append("Discogs")
-                    except Exception as discogs_exc:
-                        logging.debug("[Artist %s] Discogs fallback failed for %s: %s", artist, title_raw, discogs_exc)
-                if USE_LASTFM:
-                    try:
-                        lastfm_info = _fetch_lastfm_album_info(artist, title_raw)
-                        if lastfm_info:
-                            e["fallback_lastfm"] = lastfm_info
-                            e["lastfm_album_mbid"] = str(lastfm_info.get("mbid") or "").strip()
-                            with lock:
-                                state["scan_lastfm_matched"] = state.get("scan_lastfm_matched", 0) + 1
-                            fallback_sources.append("Last.fm")
-                            lfm_mbid = (lastfm_info.get("mbid") or "").strip()
-                            if lfm_mbid:
-                                try:
-                                    rg_info, _ = fetch_mb_release_group_info(lfm_mbid)
-                                    if rg_info:
-                                        e["rg_info"] = rg_info
-                                        e["musicbrainz_id"] = lfm_mbid
-                                        e["rg_info_source"] = "lastfm_fallback"
-                                        with lock:
-                                            if artist in state.get("scan_active_artists", {}) and e["album_id"] == state["scan_active_artists"][artist].get("current_album", {}).get("album_id"):
-                                                state["scan_active_artists"][artist]["current_album"]["status_details"] = "MusicBrainz ID from Last.fm"
-                                                state["scan_active_artists"][artist]["current_album"]["step_summary"] = (
-                                                    f"Last.fm: MusicBrainz release group (id: {lfm_mbid})"
-                                                )
-                                        logging.debug("[Artist %s] Edition %s MB ID from Last.fm mbid: %s", artist, e["album_id"], lfm_mbid)
-                                except Exception:
-                                    pass
-                    except Exception as lastfm_exc:
-                        logging.debug("[Artist %s] Last.fm fallback failed for %s: %s", artist, title_raw, lastfm_exc)
-                if not rg_info and USE_BANDCAMP:
-                    try:
-                        bandcamp_info = _fetch_bandcamp_album_info(artist, title_raw)
-                        if bandcamp_info:
-                            e["fallback_bandcamp"] = bandcamp_info
-                            e["bandcamp_album_url"] = str(bandcamp_info.get("url") or "").strip()
-                            with lock:
-                                state["scan_bandcamp_matched"] = state.get("scan_bandcamp_matched", 0) + 1
-                            fallback_sources.append("Bandcamp")
-                    except Exception as bandcamp_exc:
-                        logging.debug("[Artist %s] Bandcamp fallback failed for %s: %s", artist, title_raw, bandcamp_exc)
+                provider_payloads = {}
+                try:
+                    provider_payloads = _fetch_album_provider_fallbacks_parallel(artist, title_raw)
+                except Exception as provider_exc:
+                    logging.debug("[Artist %s] provider fallback fetch failed for %s: %s", artist, title_raw, provider_exc)
+                    provider_payloads = {}
+
+                discogs_info = provider_payloads.get("discogs")
+                if isinstance(discogs_info, dict):
+                    e["fallback_discogs"] = discogs_info
+                    fallback_sources.append("Discogs")
+
+                lastfm_info = provider_payloads.get("lastfm")
+                if isinstance(lastfm_info, dict):
+                    e["fallback_lastfm"] = lastfm_info
+                    fallback_sources.append("Last.fm")
+                    lfm_mbid = (lastfm_info.get("mbid") or "").strip()
+                    if lfm_mbid:
+                        try:
+                            rg_info, _ = fetch_mb_release_group_info(lfm_mbid)
+                            if rg_info:
+                                strict_ok_src, strict_reason_src = _strict_identity_match_details(
+                                    local_artist=artist,
+                                    local_title=title_raw,
+                                    candidate_artist=lastfm_info.get("artist") or lastfm_info.get("artist_name") or "",
+                                    candidate_title=lastfm_info.get("title") or lastfm_info.get("album") or "",
+                                )
+                                strict_ok_mb, strict_reason_mb = _strict_identity_match_details(
+                                    local_artist=artist,
+                                    local_title=title_raw,
+                                    candidate_artist=_extract_mb_artist_names(rg_info),
+                                    candidate_title=rg_info.get("title") or "",
+                                )
+                                if not strict_ok_src or not strict_ok_mb:
+                                    log_mb(
+                                        "Album %s – \"%s\": Last.fm MBID %s rejected (source=%s; mb=%s)",
+                                        artist,
+                                        title_raw,
+                                        lfm_mbid,
+                                        strict_reason_src,
+                                        strict_reason_mb,
+                                    )
+                                    raise RuntimeError("strict identity mismatch")
+                                e["rg_info"] = rg_info
+                                e["musicbrainz_id"] = lfm_mbid
+                                e["rg_info_source"] = "lastfm_fallback"
+                                e["primary_metadata_source"] = "lastfm"
+                                e["lastfm_album_mbid"] = lfm_mbid
+                                if not isinstance(e.get("meta"), dict):
+                                    e["meta"] = {}
+                                e["meta"]["primary_metadata_source"] = "lastfm"
+                                e["meta"][PMDA_MATCH_PROVIDER_TAG] = "lastfm"
+                                e["meta"]["lastfm_album_mbid"] = lfm_mbid
+                                with lock:
+                                    state["scan_lastfm_matched"] = state.get("scan_lastfm_matched", 0) + 1
+                                    if artist in state.get("scan_active_artists", {}) and e["album_id"] == state["scan_active_artists"][artist].get("current_album", {}).get("album_id"):
+                                        state["scan_active_artists"][artist]["current_album"]["status_details"] = "MusicBrainz ID from Last.fm"
+                                        state["scan_active_artists"][artist]["current_album"]["step_summary"] = (
+                                            f"Last.fm: MusicBrainz release group (id: {lfm_mbid})"
+                                        )
+                                logging.debug("[Artist %s] Edition %s MB ID from Last.fm mbid: %s", artist, e["album_id"], lfm_mbid)
+                        except RuntimeError:
+                            pass
+                        except Exception:
+                            pass
+
+                bandcamp_info = provider_payloads.get("bandcamp")
+                if isinstance(bandcamp_info, dict):
+                    e["fallback_bandcamp"] = bandcamp_info
+                    fallback_sources.append("Bandcamp")
+
                 if fallback_sources and artist in state.get("scan_active_artists", {}) and e["album_id"] == state["scan_active_artists"][artist].get("current_album", {}).get("album_id"):
                     with lock:
                         state["scan_active_artists"][artist]["current_album"]["step_response"] = (
                             state["scan_active_artists"][artist]["current_album"].get("step_response", "")
                             + ("; fallback: " + ", ".join(fallback_sources) if fallback_sources else "")
                         )
-                # When no MB match but Discogs/Bandcamp have tracklist and cross-check passes, mark as identified by that provider
-                if not rg_info and tracks_edition:
-                    local_titles = list(tracks_edition)
-                    track_min = getattr(sys.modules[__name__], "TRACKLIST_MATCH_MIN", 0.8)
-                    for src_key, src_label in [("fallback_discogs", "discogs"), ("fallback_bandcamp", "bandcamp")]:
-                        info = e.get(src_key)
-                        if info and isinstance(info, dict) and info.get("tracklist"):
-                            score = _crosscheck_tracklist(local_titles, info["tracklist"])
-                            if score >= track_min:
-                                e["primary_metadata_source"] = src_label
-                                e["mb_submission_payload"] = _prepare_mb_submission_payload(
-                                    info.get("artist_name") or artist,
-                                    info.get("title") or "",
-                                    info.get("year") or "",
-                                    info.get("tracklist") or [],
-                                    src_label,
-                                )
-                                logging.info("[Artist %s] Edition %s: high-confidence %s match (tracklist %.2f)", artist, e.get("album_id"), src_label, score)
-                                break
-                # Fallback identity without MBID: accept provider as source-of-truth when title/artist are consistent.
-                if not rg_info and not e.get("primary_metadata_source"):
-                    def _looks_like_same_release(src: dict, *, src_name: str) -> bool:
-                        if not isinstance(src, dict):
-                            return False
-                        src_title = (src.get("title") or src.get("album") or "").strip()
-                        src_artist = (src.get("artist") or src.get("artist_name") or "").strip()
-                        if not src_title:
-                            return False
-                        title_norm_local = norm_album(title_raw)
-                        title_norm_src = norm_album(src_title)
-                        if not title_norm_local or not title_norm_src:
-                            return False
-                        title_ok = (
-                            title_norm_src == title_norm_local
-                            or title_norm_src in title_norm_local
-                            or title_norm_local in title_norm_src
-                        )
-                        if not title_ok:
-                            return False
-                        if not src_artist:
-                            return True
-                        artist_ok = norm_album(src_artist) == norm_album(artist)
-                        if not artist_ok:
-                            logging.debug(
-                                "[Artist %s] %s fallback rejected for identity (artist mismatch): %r vs %r",
-                                artist,
-                                src_name,
-                                src_artist,
-                                artist,
-                            )
-                        return artist_ok
 
-                    provider_candidates = [
-                        ("discogs", e.get("fallback_discogs")),
-                        ("lastfm", e.get("fallback_lastfm")),
-                        ("bandcamp", e.get("fallback_bandcamp")),
-                    ]
-                    for src_label, src_payload in provider_candidates:
-                        if _looks_like_same_release(src_payload, src_name=src_label):
-                            e["primary_metadata_source"] = src_label
-                            logging.info(
-                                "[Artist %s] Edition %s: provider identity accepted from %s (MB unavailable)",
-                                artist,
-                                e.get("album_id"),
-                                src_label,
-                            )
-                            break
+                # Strict identity arbitration across providers when MB is unavailable.
+                if not rg_info:
+                    local_titles = list(tracks_edition) if tracks_edition else []
+                    arbitration = _arbitrate_provider_identity(
+                        artist_name=artist,
+                        album_title=title_raw,
+                        local_track_titles=local_titles,
+                        provider_payloads=provider_payloads,
+                    )
+                    if arbitration:
+                        chosen_provider = str(arbitration.get("provider") or "").strip().lower()
+                        chosen_payload = arbitration.get("payload") if isinstance(arbitration.get("payload"), dict) else {}
+                        e["primary_metadata_source"] = chosen_provider
+                        if not isinstance(e.get("meta"), dict):
+                            e["meta"] = {}
+                        e["meta"]["primary_metadata_source"] = chosen_provider
+                        e["meta"][PMDA_MATCH_PROVIDER_TAG] = chosen_provider
+                        if chosen_provider == "discogs":
+                            e["discogs_release_id"] = str(
+                                chosen_payload.get("release_id") or chosen_payload.get("master_id") or e.get("discogs_release_id") or ""
+                            ).strip()
+                            if e.get("discogs_release_id"):
+                                e["meta"]["discogs_release_id"] = e["discogs_release_id"]
+                            with lock:
+                                state["scan_discogs_matched"] = state.get("scan_discogs_matched", 0) + 1
+                        elif chosen_provider == "lastfm":
+                            e["lastfm_album_mbid"] = str(
+                                chosen_payload.get("mbid") or e.get("lastfm_album_mbid") or ""
+                            ).strip()
+                            if e.get("lastfm_album_mbid"):
+                                e["meta"]["lastfm_album_mbid"] = e["lastfm_album_mbid"]
+                            with lock:
+                                state["scan_lastfm_matched"] = state.get("scan_lastfm_matched", 0) + 1
+                        elif chosen_provider == "bandcamp":
+                            e["bandcamp_album_url"] = str(
+                                chosen_payload.get("album_url") or chosen_payload.get("url") or e.get("bandcamp_album_url") or ""
+                            ).strip()
+                            if e.get("bandcamp_album_url"):
+                                e["meta"]["bandcamp_album_url"] = e["bandcamp_album_url"]
+                            with lock:
+                                state["scan_bandcamp_matched"] = state.get("scan_bandcamp_matched", 0) + 1
+
+                        provider_tracklist = chosen_payload.get("tracklist") if isinstance(chosen_payload, dict) else None
+                        if local_titles and isinstance(provider_tracklist, list) and provider_tracklist:
+                            track_min = getattr(sys.modules[__name__], "TRACKLIST_MATCH_MIN", 0.8)
+                            score = _crosscheck_tracklist(local_titles, provider_tracklist)
+                            if score >= track_min:
+                                e["mb_submission_payload"] = _prepare_mb_submission_payload(
+                                    chosen_payload.get("artist_name") or chosen_payload.get("artist") or artist,
+                                    chosen_payload.get("title") or chosen_payload.get("album") or "",
+                                    chosen_payload.get("year") or "",
+                                    provider_tracklist,
+                                    chosen_provider,
+                                )
+                        logging.info(
+                            "[Artist %s] Edition %s: provider identity accepted via %s (confidence=%.2f, source=%s, title=%.2f artist=%.2f track=%.2f)",
+                            artist,
+                            e.get("album_id"),
+                            chosen_provider,
+                            float(arbitration.get("confidence") or 0.0),
+                            arbitration.get("confidence_source") or "heuristic",
+                            float(arbitration.get("title_score") or 0.0),
+                            float(arbitration.get("artist_score") or 0.0),
+                            float(arbitration.get("track_score") or 0.0),
+                        )
             # Increment MB-done count for this edition (whether we found rg_info or not)
             with lock:
                 state["scan_mb_done_count"] = state.get("scan_mb_done_count", 0) + 1
@@ -11645,6 +12509,8 @@ def save_scan_editions_to_db(scan_id: int, all_editions_by_artist: Dict[str, Lis
     Call after a scan completes (or is stopped) so last_completed_scan_id can be used to read from this table.
     """
     import json
+    mode = _get_library_mode()
+    cache_map = _load_files_album_scan_cache_map() if mode == "files" else {}
     con = sqlite3.connect(str(STATE_DB_FILE), timeout=30)
     cur = con.cursor()
     cur.execute("DELETE FROM scan_editions WHERE scan_id = ?", (scan_id,))
@@ -11664,18 +12530,82 @@ def save_scan_editions_to_db(scan_id: int, all_editions_by_artist: Dict[str, Lis
                     if image_matches:
                         has_cover = 1
                         break
+            ordered_paths: list[Path] = []
+            if mode == "files" and folder:
+                try:
+                    folder_path = Path(folder) if not isinstance(folder, Path) else folder
+                    ordered_paths = _files_collect_ordered_audio_paths(folder_path, e.get("ordered_paths") or [])
+                except Exception:
+                    ordered_paths = []
+                # Refresh tags from live files so required-tags reflect post-fix state
+                try:
+                    meta = dict(meta or {})
+                    if ordered_paths:
+                        live_tags = extract_tags(ordered_paths[0]) or {}
+                        if live_tags:
+                            meta.update(live_tags)
+                except Exception:
+                    pass
             # missing_required_tags (REQUIRED_TAGS from Settings = source of truth)
-            missing_required = _check_required_tags(meta, REQUIRED_TAGS, edition=e)
+            edition_for_required = e
+            if mode == "files" and not (edition_for_required.get("tracks") or []):
+                derived_tracks = [
+                    {"title": p.stem or f"Track {i + 1}", "idx": i + 1}
+                    for i, p in enumerate(ordered_paths)
+                ]
+                edition_for_required = dict(e)
+                edition_for_required["tracks"] = derived_tracks
+            missing_required = _check_required_tags(meta, REQUIRED_TAGS, edition=edition_for_required)
             missing_required_json = json.dumps(missing_required) if missing_required else None
             folder_str = str(folder) if folder else ""
             fmt_text = get_primary_format(Path(folder_str)) if folder_str else ""
-            mbid = (e.get("musicbrainz_id") or meta.get("musicbrainz_releasegroupid") or meta.get("musicbrainz_id") or "")
-            mbid = (mbid.strip() if isinstance(mbid, str) else str(mbid or "").strip()) or ""
+            if mode == "files":
+                folder_key = ""
+                try:
+                    if folder:
+                        folder_key = _album_folder_cache_key(Path(folder))
+                except Exception:
+                    folder_key = ""
+                cached = cache_map.get(folder_key) or {}
+                identity_fields = _extract_files_identity_fields(tags=meta, edition=e, cached=cached)
+                mbid = identity_fields["musicbrainz_id"]
+                discogs_release_id = identity_fields["discogs_release_id"]
+                lastfm_album_mbid = identity_fields["lastfm_album_mbid"]
+                bandcamp_album_url = identity_fields["bandcamp_album_url"]
+                metadata_source = identity_fields["metadata_source"]
+            else:
+                mbid = (e.get("musicbrainz_id") or meta.get("musicbrainz_releasegroupid") or meta.get("musicbrainz_id") or "")
+                mbid = (mbid.strip() if isinstance(mbid, str) else str(mbid or "").strip()) or ""
+                discogs_release_id = str(
+                    e.get("discogs_release_id")
+                    or meta.get("discogs_release_id")
+                    or ""
+                ).strip()
+                lastfm_album_mbid = str(
+                    e.get("lastfm_album_mbid")
+                    or meta.get("lastfm_album_mbid")
+                    or ""
+                ).strip()
+                bandcamp_album_url = str(
+                    e.get("bandcamp_album_url")
+                    or meta.get("bandcamp_album_url")
+                    or ""
+                ).strip()
+                metadata_source = _normalize_identity_provider(
+                    str(
+                        e.get("primary_metadata_source")
+                        or e.get("metadata_source")
+                        or meta.get("primary_metadata_source")
+                        or meta.get(PMDA_MATCH_PROVIDER_TAG)
+                        or ""
+                    )
+                )
             cur.execute("""
                 INSERT INTO scan_editions
                 (scan_id, artist, album_id, title_raw, folder, fmt_text, br, sr, bd, meta_json, musicbrainz_id,
-                 is_broken, expected_track_count, actual_track_count, missing_indices, has_cover, missing_required_tags)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 is_broken, expected_track_count, actual_track_count, missing_indices, has_cover, missing_required_tags,
+                 discogs_release_id, lastfm_album_mbid, bandcamp_album_url, metadata_source)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 scan_id,
                 artist,
@@ -11686,7 +12616,7 @@ def save_scan_editions_to_db(scan_id: int, all_editions_by_artist: Dict[str, Lis
                 e.get("br") or 0,
                 e.get("sr") or 0,
                 e.get("bd") or 0,
-                json.dumps(meta),
+                json.dumps(meta, default=str),
                 mbid,
                 1 if e.get("is_broken") else 0,
                 e.get("expected_track_count"),
@@ -11694,6 +12624,10 @@ def save_scan_editions_to_db(scan_id: int, all_editions_by_artist: Dict[str, Lis
                 json.dumps(e.get("missing_indices", [])),
                 has_cover,
                 missing_required_json,
+                discogs_release_id,
+                lastfm_album_mbid,
+                bandcamp_album_url,
+                metadata_source,
             ))
             row_count += 1
     con.commit()
@@ -11810,11 +12744,36 @@ def save_scan_editions_artist_to_db(scan_id: int, artist_name: str, editions_lis
             meta_json_str = "{}"
         mbid = (e.get("musicbrainz_id") or meta.get("musicbrainz_releasegroupid") or meta.get("musicbrainz_id") or "")
         mbid = (mbid.strip() if isinstance(mbid, str) else str(mbid or "").strip()) or ""
+        discogs_release_id = str(
+            e.get("discogs_release_id")
+            or meta.get("discogs_release_id")
+            or ""
+        ).strip()
+        lastfm_album_mbid = str(
+            e.get("lastfm_album_mbid")
+            or meta.get("lastfm_album_mbid")
+            or ""
+        ).strip()
+        bandcamp_album_url = str(
+            e.get("bandcamp_album_url")
+            or meta.get("bandcamp_album_url")
+            or ""
+        ).strip()
+        metadata_source = _normalize_identity_provider(
+            str(
+                e.get("primary_metadata_source")
+                or e.get("metadata_source")
+                or meta.get("primary_metadata_source")
+                or meta.get(PMDA_MATCH_PROVIDER_TAG)
+                or ""
+            )
+        )
         cur.execute("""
             INSERT INTO scan_editions
             (scan_id, artist, album_id, title_raw, folder, fmt_text, br, sr, bd, meta_json, musicbrainz_id,
-             is_broken, expected_track_count, actual_track_count, missing_indices, has_cover, missing_required_tags)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             is_broken, expected_track_count, actual_track_count, missing_indices, has_cover, missing_required_tags,
+             discogs_release_id, lastfm_album_mbid, bandcamp_album_url, metadata_source)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             scan_id,
             artist_name,
@@ -11833,6 +12792,10 @@ def save_scan_editions_artist_to_db(scan_id: int, artist_name: str, editions_lis
             json.dumps(e.get("missing_indices", [])),
             has_cover,
             missing_required_json,
+            discogs_release_id,
+            lastfm_album_mbid,
+            bandcamp_album_url,
+            metadata_source,
         ))
         row_count += 1
     con.commit()
@@ -12169,15 +13132,13 @@ def clear_db_on_new_scan():
 
 def _get_library_mode() -> str:
     """
-    Return the active library mode. Currently supported:
-    - 'plex'  : use Plex DB as the library backend (current behaviour).
-    - 'files' : planned filesystem backend (not yet implemented).
+    Return the active library mode.
+    PMDA now runs in Files mode only.
     """
-    mode = (LIBRARY_MODE or "plex").strip().lower()
-    if mode not in {"plex", "files"}:
-        logging.warning("Unknown LIBRARY_MODE '%s'; falling back to 'plex'.", mode)
-        return "plex"
-    return mode
+    mode = (LIBRARY_MODE or "files").strip().lower()
+    if mode != "files":
+        logging.warning("LIBRARY_MODE '%s' ignored; forcing 'files' mode.", mode)
+    return "files"
 
 
 def _extract_musicbrainz_id_from_meta(meta: dict | None) -> str:
@@ -13049,6 +14010,8 @@ def _load_files_library_published_payload_for_artist(artist_hint: str) -> tuple[
     if not artist_name:
         return {}, [], 0
     artist_norm = " ".join(artist_name.split()).lower()
+    artist_norm_alt = norm_album(artist_name or "") or artist_norm
+    artist_like = "%" + " ".join(artist_name.lower().split()).replace("%", "").replace("_", "") + "%"
     try:
         con = sqlite3.connect(str(STATE_DB_FILE), timeout=20)
         cur = con.cursor()
@@ -13063,10 +14026,13 @@ def _load_files_library_published_payload_for_artist(artist_hint: str) -> tuple[
                 missing_required_tags_json, primary_tags_json, tracks_json,
                 discogs_release_id, lastfm_album_mbid, bandcamp_album_url, primary_metadata_source
             FROM files_library_published_albums
-            WHERE artist_norm = ? OR lower(artist_name) = lower(?)
+            WHERE artist_norm = ?
+               OR artist_norm = ?
+               OR lower(artist_name) = lower(?)
+               OR lower(artist_name) LIKE ?
             ORDER BY lower(album_title), folder_path
             """,
-            (artist_norm, artist_name),
+            (artist_norm, artist_norm_alt, artist_name, artist_like),
         )
         rows = cur.fetchall()
         con.close()
@@ -14111,6 +15077,177 @@ def _build_scan_plan(scan_type: str = "full") -> tuple[list[tuple[int, str, list
     return artists_merged, total_albums
 
 
+def _pipeline_flags_for_scan(scan_type: str, run_improve_after_requested: bool) -> dict[str, bool | str]:
+    """Resolve effective pipeline flags for the current scan."""
+    scan_kind = (scan_type or "full").strip().lower()
+    scan_is_content = scan_kind in {"full", "changed_only"}
+    # Pipeline flags are the canonical source; run_improve_after remains a one-shot override.
+    run_match_fix = bool(scan_is_content and (PIPELINE_ENABLE_MATCH_FIX or run_improve_after_requested))
+    run_dedupe = bool(scan_is_content and PIPELINE_ENABLE_DEDUPE)
+    run_incomplete_move = bool(scan_is_content and PIPELINE_ENABLE_INCOMPLETE_MOVE)
+    run_export = bool(scan_is_content and PIPELINE_ENABLE_EXPORT)
+    run_player_sync = bool(scan_is_content and PIPELINE_ENABLE_PLAYER_SYNC)
+    sync_target = _normalize_player_target(getattr(sys.modules[__name__], "PIPELINE_PLAYER_TARGET", "none"))
+    if sync_target == "none":
+        run_player_sync = False
+    return {
+        "match_fix": run_match_fix,
+        "dedupe": run_dedupe,
+        "incomplete_move": run_incomplete_move,
+        "export": run_export,
+        "player_sync": run_player_sync,
+        "sync_target": sync_target,
+    }
+
+
+def _auto_move_incomplete_albums_for_scan(
+    scan_id: int | None,
+    editions_by_artist: dict[str, list[dict]] | None,
+) -> dict:
+    """
+    Move broken/incomplete album folders to INCOMPLETE_ALBUMS_TARGET_DIR.
+    Returns {'moved': int, 'size_mb': int, 'errors': int}.
+    """
+    result = {"moved": 0, "size_mb": 0, "errors": 0}
+    if not scan_id or not editions_by_artist:
+        return result
+
+    target_dir = str(_get_config_from_db("INCOMPLETE_ALBUMS_TARGET_DIR") or "/dupes/incomplete_albums").strip()
+    target_root = path_for_fs_access(Path(target_dir))
+    try:
+        target_root.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        logging.warning("Auto-move incomplete: cannot create target dir %s: %s", target_root, e)
+        result["errors"] += 1
+        return result
+
+    candidates: dict[str, dict] = {}
+    for artist_name, editions in (editions_by_artist or {}).items():
+        for e in (editions or []):
+            if not e.get("is_broken"):
+                continue
+            folder = e.get("folder")
+            if not folder:
+                continue
+            src_folder = path_for_fs_access(Path(str(folder)))
+            key = str(src_folder)
+            if key in candidates:
+                continue
+            candidates[key] = {
+                "artist": str(artist_name or ""),
+                "album_id": int(e.get("album_id") or 0),
+                "title_raw": str(e.get("title_raw") or ""),
+                "src": src_folder,
+                "fmt_text": str(e.get("fmt_text") or get_primary_format(src_folder) or ""),
+            }
+
+    if not candidates:
+        return result
+
+    try:
+        con = sqlite3.connect(str(STATE_DB_FILE), timeout=20)
+        cur = con.cursor()
+        cur.execute("PRAGMA table_info(scan_moves)")
+        move_cols = [r[1] for r in cur.fetchall()]
+        has_reason = "move_reason" in move_cols
+    except Exception:
+        con = None
+        cur = None
+        move_cols = []
+        has_reason = False
+
+    try:
+        for item in candidates.values():
+            src_folder = item["src"]
+            if not src_folder.exists():
+                continue
+            # Keep artist namespace for readability when browsing incomplete quarantine.
+            artist_dir = _sanitize_path_component(str(item["artist"] or "Unknown Artist"))
+            dst = target_root / artist_dir / src_folder.name
+            counter = 1
+            while dst.exists():
+                dst = target_root / artist_dir / f"{src_folder.name} ({counter})"
+                counter += 1
+            try:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                size_mb = int(folder_size(src_folder) // (1024 * 1024))
+                safe_move(str(src_folder), str(dst))
+                result["moved"] += 1
+                result["size_mb"] += size_mb
+                if cur is not None:
+                    moved_at = time.time()
+                    if "album_title" in move_cols and "fmt_text" in move_cols and has_reason:
+                        cur.execute(
+                            """
+                            INSERT INTO scan_moves
+                            (scan_id, artist, album_id, original_path, moved_to_path, size_mb, moved_at, album_title, fmt_text, move_reason)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                scan_id,
+                                item["artist"],
+                                item["album_id"],
+                                str(src_folder),
+                                str(dst),
+                                size_mb,
+                                moved_at,
+                                item["title_raw"],
+                                item["fmt_text"],
+                                "incomplete",
+                            ),
+                        )
+                    elif "album_title" in move_cols and "fmt_text" in move_cols:
+                        cur.execute(
+                            """
+                            INSERT INTO scan_moves
+                            (scan_id, artist, album_id, original_path, moved_to_path, size_mb, moved_at, album_title, fmt_text)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                scan_id,
+                                item["artist"],
+                                item["album_id"],
+                                str(src_folder),
+                                str(dst),
+                                size_mb,
+                                moved_at,
+                                item["title_raw"],
+                                item["fmt_text"],
+                            ),
+                        )
+                    else:
+                        cur.execute(
+                            """
+                            INSERT INTO scan_moves
+                            (scan_id, artist, album_id, original_path, moved_to_path, size_mb, moved_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                scan_id,
+                                item["artist"],
+                                item["album_id"],
+                                str(src_folder),
+                                str(dst),
+                                size_mb,
+                                moved_at,
+                            ),
+                        )
+            except Exception as move_err:
+                result["errors"] += 1
+                logging.warning(
+                    "Auto-move incomplete failed: %s -> %s: %s",
+                    src_folder,
+                    dst,
+                    move_err,
+                )
+        if con is not None:
+            con.commit()
+    finally:
+        if con is not None:
+            con.close()
+    return result
+
+
 # ───────────────────────────── BACKGROUND TASKS (WEB) ─────────────────────────────
 def background_scan():
     """
@@ -14152,6 +15289,14 @@ def background_scan():
     scan_post_queue = None
     scan_post_worker_thread = None
     run_improve_after_requested = False
+    pipeline_flags = {
+        "match_fix": False,
+        "dedupe": False,
+        "incomplete_move": False,
+        "export": False,
+        "player_sync": False,
+        "sync_target": "none",
+    }
     scan_stream_post_by_artist = False
     streamed_post_process_done = False
     files_live_index_precleared = False
@@ -14160,6 +15305,7 @@ def background_scan():
         scan_type = (state.get("scan_type") or "full").strip().lower()
     if scan_type not in {"full", "changed_only"}:
         scan_type = "full"
+    pipeline_flags = _pipeline_flags_for_scan(scan_type, run_improve_after_requested)
 
     # Mark scan as running immediately so UI can show early source-discovery activity.
     with lock:
@@ -14185,6 +15331,8 @@ def background_scan():
         state["scan_discovery_folders_found"] = 0
         state["scan_discovery_albums_found"] = 0
         state["scan_discovery_artists_found"] = 0
+        state["scan_pipeline_flags"] = dict(pipeline_flags)
+        state["scan_pipeline_sync_target"] = str(pipeline_flags.get("sync_target") or "none")
 
     try:
         if _get_library_mode() == "files" and scan_type == "full":
@@ -14326,6 +15474,11 @@ def background_scan():
             state["scan_pmda_albums_complete"] = 0
             state["scan_pmda_albums_with_cover"] = 0
             state["scan_pmda_albums_with_artist_image"] = 0
+            state["scan_incomplete_moved_count"] = 0
+            state["scan_incomplete_moved_mb"] = 0
+            state["scan_player_sync_target"] = None
+            state["scan_player_sync_ok"] = None
+            state["scan_player_sync_message"] = ""
             state["scan_ai_errors"] = []
             state["scan_steps_log"] = []  # Per-step log for "what was done" (append after each artist)
             state["scan_post_processing"] = False
@@ -14348,9 +15501,21 @@ def background_scan():
         
         # Reload AUTO_MOVE_DUPES from DB so scan uses current setting (UI may have toggled it)
         _reload_auto_move_from_db()
+        pipeline_flags = _pipeline_flags_for_scan(scan_type, run_improve_after_requested)
         with lock:
-            # Step-based progress: 3 steps per album (format, MB, compare) + 1 AI + 1 finalize + (1 if move)
-            state["scan_step_total"] = 3 * total_albums + 2 + (1 if AUTO_MOVE_DUPES else 0)
+            extra_steps = 0
+            if pipeline_flags.get("dedupe"):
+                extra_steps += 1
+            if pipeline_flags.get("incomplete_move"):
+                extra_steps += 1
+            if pipeline_flags.get("export"):
+                extra_steps += 1
+            if pipeline_flags.get("player_sync"):
+                extra_steps += 1
+            # Step-based progress: 3 steps per album + AI step + finalize + optional pipeline extras.
+            state["scan_step_total"] = 3 * total_albums + 2 + extra_steps
+            state["scan_pipeline_flags"] = dict(pipeline_flags)
+            state["scan_pipeline_sync_target"] = str(pipeline_flags.get("sync_target") or "none")
 
         # Create scan history entry
         con = sqlite3.connect(str(STATE_DB_FILE))
@@ -14371,7 +15536,7 @@ def background_scan():
                 total_artists,
                 1 if ai_provider_ready else 0,
                 1 if USE_MUSICBRAINZ else 0,
-                1 if AUTO_MOVE_DUPES else 0,
+                1 if pipeline_flags.get("dedupe") else 0,
                 'running',
                 0, 0, 0, 0, 0, 0, 0, 0, 0  # Initialize all detailed stats to 0
             ))
@@ -14389,7 +15554,7 @@ def background_scan():
                 total_artists,
                 1 if ai_provider_ready else 0,
                 1 if USE_MUSICBRAINZ else 0,
-                1 if AUTO_MOVE_DUPES else 0,
+                1 if pipeline_flags.get("dedupe") else 0,
                 'running',
                 0, 0, 0, 0, 0, 0, 0, 0, 0  # Initialize all detailed stats to 0
             ))
@@ -14450,7 +15615,7 @@ def background_scan():
         scan_incremental_writer_thread = threading.Thread(target=_scan_incremental_writer, daemon=True)
         scan_incremental_writer_thread.start()
 
-        should_request_improve = run_improve_after_requested or MAGIC_MODE
+        should_request_improve = bool(pipeline_flags.get("match_fix"))
         if should_request_improve and _get_library_mode() == "files":
             # Files mode: run metadata fix/covers artist-by-artist during the scan so
             # Library updates are progressive instead of "all at end".
@@ -14462,6 +15627,55 @@ def background_scan():
                 providers = ["musicbrainz", "discogs", "lastfm", "bandcamp"]
                 by_provider = {p: {"identified": 0, "covers": 0, "tags": 0} for p in providers}
                 post_done = 0
+                def _update_edition_after_fix(artist_name: str, item: dict, result: dict) -> None:
+                    folder_raw = (item.get("folder") or "").strip()
+                    if not folder_raw:
+                        return
+                    try:
+                        folder_path = Path(folder_raw)
+                    except Exception:
+                        return
+                    ordered_paths = _files_collect_ordered_audio_paths(folder_path, item.get("ordered_paths") or [])
+                    # Refresh tags from disk for accuracy.
+                    tags = dict(item.get("meta") or {})
+                    try:
+                        if ordered_paths:
+                            live_tags = extract_tags(ordered_paths[0]) or {}
+                            if live_tags:
+                                tags.update(live_tags)
+                    except Exception:
+                        pass
+                    with lock:
+                        editions = all_editions_by_artist.get(artist_name) or []
+                        for e in editions:
+                            if int(e.get("album_id") or 0) != int(item.get("album_id") or 0) and str(e.get("folder") or "") != folder_raw:
+                                continue
+                            e["meta"] = tags
+                            if ordered_paths:
+                                e["ordered_paths"] = [str(p) for p in ordered_paths]
+                            if result.get("musicbrainz_id"):
+                                e["musicbrainz_id"] = result.get("musicbrainz_id")
+                            if result.get("provider_used"):
+                                e["primary_metadata_source"] = result.get("provider_used")
+                                e["metadata_source"] = result.get("provider_used")
+                            if result.get("discogs_release_id"):
+                                e["discogs_release_id"] = result.get("discogs_release_id")
+                            if result.get("lastfm_album_mbid"):
+                                e["lastfm_album_mbid"] = result.get("lastfm_album_mbid")
+                            if result.get("bandcamp_album_url"):
+                                e["bandcamp_album_url"] = result.get("bandcamp_album_url")
+                            edition_for_required = e
+                            if not (edition_for_required.get("tracks") or []):
+                                derived_tracks = [
+                                    {"title": p.stem or f"Track {i + 1}", "idx": i + 1}
+                                    for i, p in enumerate(ordered_paths)
+                                ]
+                                edition_for_required = dict(e)
+                                edition_for_required["tracks"] = derived_tracks
+                            e["missing_required_tags"] = _check_required_tags(tags, REQUIRED_TAGS, edition=edition_for_required)
+                            e["has_cover"] = album_folder_has_cover(folder_path)
+                            e["has_artist_image"] = _artist_folder_has_image(folder_path.parent if folder_path.parent else folder_path)
+                            break
                 with lock:
                     state["scan_post_processing"] = True
                     state["scan_post_total"] = total_albums
@@ -14484,6 +15698,10 @@ def background_scan():
                             except Exception as post_err:
                                 logging.warning("Post-process worker failed for artist %s item: %s", artist_name_for_batch, post_err)
                                 continue
+                            try:
+                                _update_edition_after_fix(artist_name, item, result or {})
+                            except Exception:
+                                logging.debug("Post-process edition refresh failed for %s", artist_name, exc_info=True)
                             try:
                                 batch_results[int(album_id)] = dict(result or {})
                             except Exception:
@@ -14590,8 +15808,12 @@ def background_scan():
                                     reason=rebuild_reason,
                                     wait_if_running=True,
                                 )
-                                if not res.get("ok") and res.get("fallback_full"):
-                                    _rebuild_files_library_index(reason=rebuild_reason, wait_if_running=True)
+                                if not res.get("ok"):
+                                    logging.debug(
+                                        "Files artist index sync returned non-ok for %s in post worker: %s",
+                                        artist_name_for_batch,
+                                        res.get("error") or res,
+                                    )
                             except Exception:
                                 logging.debug(
                                     "Files artist index sync failed for %s",
@@ -14741,8 +15963,12 @@ def background_scan():
                                 reason=rebuild_reason,
                                 wait_if_running=True,
                             )
-                            if not res.get("ok") and res.get("fallback_full"):
-                                _rebuild_files_library_index(reason=rebuild_reason, wait_if_running=True)
+                            if not res.get("ok"):
+                                logging.debug(
+                                    "Files artist index sync returned non-ok for %s: %s",
+                                    artist_name,
+                                    res.get("error") or res,
+                                )
                         except Exception:
                             logging.debug("Files artist index sync failed for %s", artist_name, exc_info=True)
                     artists_processed += 1
@@ -14940,9 +16166,8 @@ def background_scan():
                 save_scan_editions_to_db(_scan_id, all_editions_by_artist)
         except Exception as e:
             logging.warning("save_scan_editions_to_db in finally failed: %s", e)
-        # Auto-move dupes synchronously so UI shows "Moving dupes" and scan_history gets correct albums_moved/space_saved
-        # Magic mode also triggers automatic dedupe
-        if (AUTO_MOVE_DUPES or MAGIC_MODE) and all_results:
+        # Pipeline step: dedupe (synchronous so scan summary includes moved counts).
+        if pipeline_flags.get("dedupe") and all_results:
             flat_groups = [g for groups in all_results.values() for g in groups]
             # One group per unique (artist, set of editions) so we never move both editions of the same album
             seen_group_keys = set()
@@ -14962,10 +16187,7 @@ def background_scan():
                 deduped_flat.append(g)
             flat_groups = deduped_flat
             if flat_groups:
-                if MAGIC_MODE:
-                    logging.info("Magic mode: starting automatic dedupe then improve-all")
-                else:
-                    logging.info("Auto-moving dupes enabled, running automatic deduplication (synchronous)...")
+                logging.info("Pipeline step dedupe: running automatic deduplication (%d group(s))...", len(flat_groups))
                 try:
                     background_dedupe(flat_groups)
                 except Exception as e:
@@ -14978,8 +16200,75 @@ def background_scan():
                         state["dedupe_current_group"] = None
                         state["dedupe_last_write"] = None
                         state["dedupe_saved_this_run"] = 0
-                if MAGIC_MODE:
-                    logging.info("Magic mode: dedupe done")
+                logging.info("Pipeline step dedupe: done")
+            with lock:
+                state["scan_step_progress"] = state.get("scan_step_progress", 0) + 1
+
+        # Pipeline step: move incomplete albums to configured quarantine folder.
+        incomplete_move_result = {"moved": 0, "size_mb": 0, "errors": 0}
+        if pipeline_flags.get("incomplete_move"):
+            logging.info("Pipeline step incomplete-move: scanning broken albums from current run...")
+            try:
+                incomplete_move_result = _auto_move_incomplete_albums_for_scan(
+                    int(state.get("scan_id") or 0),
+                    all_editions_by_artist,
+                )
+                logging.info(
+                    "Pipeline step incomplete-move: moved %d album(s), %d MB, errors=%d",
+                    int(incomplete_move_result.get("moved") or 0),
+                    int(incomplete_move_result.get("size_mb") or 0),
+                    int(incomplete_move_result.get("errors") or 0),
+                )
+            except Exception:
+                logging.exception("Pipeline step incomplete-move failed")
+            with lock:
+                state["scan_incomplete_moved_count"] = int(incomplete_move_result.get("moved") or 0)
+                state["scan_incomplete_moved_mb"] = int(incomplete_move_result.get("size_mb") or 0)
+                state["scan_step_progress"] = state.get("scan_step_progress", 0) + 1
+
+        # Pipeline step: export library (Files mode only).
+        if pipeline_flags.get("export"):
+            if _get_library_mode() == "files":
+                logging.info("Pipeline step export: rebuilding Files export library...")
+                try:
+                    with lock:
+                        state["scan_post_processing"] = True
+                        state["scan_post_current_artist"] = "Library"
+                        state["scan_post_current_album"] = "Export rebuild"
+                    _run_export_library()
+                except Exception:
+                    logging.exception("Pipeline step export failed")
+                finally:
+                    with lock:
+                        state["scan_post_processing"] = False
+                        state["scan_post_current_artist"] = None
+                        state["scan_post_current_album"] = None
+            else:
+                logging.info("Pipeline step export skipped: not in Files mode")
+            with lock:
+                state["scan_step_progress"] = state.get("scan_step_progress", 0) + 1
+
+        # Pipeline step: sync external player library.
+        sync_result_ok = None
+        sync_result_msg = ""
+        sync_target = str(pipeline_flags.get("sync_target") or "none")
+        if pipeline_flags.get("player_sync"):
+            logging.info("Pipeline step player-sync: target=%s", sync_target)
+            try:
+                sync_result_ok, sync_result_msg = _trigger_player_refresh_by_target(sync_target)
+                if sync_result_ok:
+                    logging.info("Pipeline step player-sync: %s", sync_result_msg)
+                else:
+                    logging.warning("Pipeline step player-sync failed: %s", sync_result_msg)
+            except Exception:
+                sync_result_ok = False
+                sync_result_msg = "Unexpected error while triggering player refresh"
+                logging.exception("Pipeline step player-sync failed")
+            with lock:
+                state["scan_player_sync_target"] = sync_target
+                state["scan_player_sync_ok"] = bool(sync_result_ok)
+                state["scan_player_sync_message"] = sync_result_msg
+                state["scan_step_progress"] = state.get("scan_step_progress", 0) + 1
         end_time = time.time()
         scan_id = None
         with lock:
@@ -15013,6 +16302,11 @@ def background_scan():
                 dupes_moved_this_scan = state.get("last_dedupe_moved_count", 0)
                 space_saved_mb_this_scan = state.get("last_dedupe_saved_mb", 0)
                 albums_moved_this_scan = state.get("last_dedupe_moved_count", 0)
+                incomplete_moved_this_scan = state.get("scan_incomplete_moved_count", 0)
+                incomplete_moved_mb_this_scan = state.get("scan_incomplete_moved_mb", 0)
+                player_sync_target = state.get("scan_player_sync_target")
+                player_sync_ok = state.get("scan_player_sync_ok")
+                player_sync_message = state.get("scan_player_sync_message")
             
             scan_status = 'cancelled' if scan_should_stop.is_set() else 'completed'
             # Build summary_json for end-of-scan summary (FFmpeg formats, MB, AI)
@@ -15122,6 +16416,11 @@ def background_scan():
                 # When auto-move ran this scan
                 "dupes_moved_this_scan": dupes_moved_this_scan,
                 "space_saved_mb_this_scan": space_saved_mb_this_scan,
+                "incomplete_moved_this_scan": incomplete_moved_this_scan,
+                "incomplete_moved_mb_this_scan": incomplete_moved_mb_this_scan,
+                "player_sync_target": player_sync_target,
+                "player_sync_ok": player_sync_ok,
+                "player_sync_message": player_sync_message,
                 # Fallback sources during scan (when MusicBrainz found nothing)
                 "scan_discogs_matched": scan_discogs_matched,
                 "scan_lastfm_matched": scan_lastfm_matched,
@@ -15178,6 +16477,15 @@ def background_scan():
             steps_executed.append(
                 f"11. Duplicate detection: {duplicate_groups_count} groups, {total_duplicates_count} total duplicate editions."
             )
+            steps_executed.append(
+                "12. Pipeline steps: "
+                f"match_fix={'on' if pipeline_flags.get('match_fix') else 'off'}, "
+                f"dedupe={'on' if pipeline_flags.get('dedupe') else 'off'}, "
+                f"incomplete_move={'on' if pipeline_flags.get('incomplete_move') else 'off'}, "
+                f"export={'on' if pipeline_flags.get('export') else 'off'}, "
+                f"player_sync={'on' if pipeline_flags.get('player_sync') else 'off'}"
+                + (f" (target={pipeline_flags.get('sync_target')})" if pipeline_flags.get("player_sync") else "")
+            )
             summary["steps_executed"] = steps_executed
             summary["scan_steps_log"] = state.get("scan_steps_log") or []
 
@@ -15217,6 +16525,17 @@ def background_scan():
                 "Duplicates               : groups=%s editions=%s moved=%s",
                 duplicate_groups_count, total_duplicates_count, albums_moved_this_scan
             )
+            logging.info(
+                "Incomplete moved         : %s album(s), %s MB",
+                incomplete_moved_this_scan,
+                incomplete_moved_mb_this_scan,
+            )
+            if player_sync_target:
+                logging.info(
+                    "Player sync             : target=%s status=%s",
+                    player_sync_target,
+                    "ok" if player_sync_ok else f"failed ({player_sync_message or 'unknown'})",
+                )
             logging.info("Space saved (this scan)  : %s MB", space_saved_mb_this_scan)
             logging.info(
                 "Cover sources            : MB=%s Discogs=%s Last.fm=%s Bandcamp=%s Web=%s",
@@ -15323,7 +16642,7 @@ def background_scan():
             state["scan_finalizing"] = False
             run_improve_after = state.pop("run_improve_after", False)
         # Magic / run-improve-after: run improve-all only for a completed scan.
-        should_request_improve = run_improve_after or MAGIC_MODE
+        should_request_improve = bool(run_improve_after or pipeline_flags.get("match_fix"))
         if should_request_improve and scan_status != "completed":
             logging.info(
                 "Skipping post-scan improve-all because current scan status is '%s' (only 'completed' is eligible).",
@@ -15715,7 +17034,24 @@ def perform_dedupe(group: dict, best_folders: set = None) -> List[dict]:
                 cur = con.cursor()
                 cur.execute("PRAGMA table_info(scan_moves)")
                 move_cols = [r[1] for r in cur.fetchall()]
-                if "album_title" in move_cols and "fmt_text" in move_cols:
+                if "album_title" in move_cols and "fmt_text" in move_cols and "move_reason" in move_cols:
+                    cur.execute("""
+                        INSERT INTO scan_moves
+                        (scan_id, artist, album_id, original_path, moved_to_path, size_mb, moved_at, album_title, fmt_text, move_reason)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        scan_id,
+                        artist,
+                        loser_id,
+                        str(src_folder),
+                        str(dst),
+                        size_mb,
+                        moved_at,
+                        best_title or "",
+                        fmt_text or "",
+                        "dedupe",
+                    ))
+                elif "album_title" in move_cols and "fmt_text" in move_cols:
                     cur.execute("""
                         INSERT INTO scan_moves
                         (scan_id, artist, album_id, original_path, moved_to_path, size_mb, moved_at, album_title, fmt_text)
@@ -15862,13 +17198,8 @@ from flask import Response
 def _requires_config():
     """Return 503 response when required backend config is missing for current mode."""
     _reload_library_mode_and_files_roots_from_db()
-    mode = _get_library_mode()
-    if mode == "files":
-        if not FILES_ROOTS:
-            return jsonify({"error": "Files mode is enabled but no source folders are configured."}), 503
-        return None
-    if not PLEX_CONFIGURED:
-        return jsonify({"error": "Plex not configured", "requiresConfig": True}), 503
+    if not FILES_ROOTS:
+        return jsonify({"error": "No source folders configured. Add your music folders in Settings.", "requiresConfig": True}), 503
     return None
 
 def start_background_scan():
@@ -16854,11 +18185,17 @@ def clear_scan():
             mb_cache_deleted = cur.rowcount
             cur.execute("DELETE FROM musicbrainz_album_lookup")
             mb_album_lookup_deleted = cur.rowcount
+            cur.execute("DELETE FROM provider_album_lookup")
+            provider_album_lookup_deleted = cur.rowcount
             con.commit()
             con.close()
             result["cleared"]["musicbrainz_cache"] = mb_cache_deleted
             result["cleared"]["musicbrainz_album_lookup"] = mb_album_lookup_deleted
-            result["message"] += f", {mb_cache_deleted} MB cache + {mb_album_lookup_deleted} album lookup cache cleared"
+            result["cleared"]["provider_album_lookup"] = provider_album_lookup_deleted
+            result["message"] += (
+                f", {mb_cache_deleted} MB cache + {mb_album_lookup_deleted} album lookup cache"
+                f" + {provider_album_lookup_deleted} provider lookup cache cleared"
+            )
         
         logging.info("Scan results cleared: %s", result)
         return jsonify(result)
@@ -16902,6 +18239,249 @@ def _do_plex_check(host: str, token: str):
         return jsonify({"success": False, "message": "Connection timed out. Check URL and network."})
     except Exception as e:
         return jsonify({"success": False, "message": str(e)})
+
+
+def _normalize_player_target(raw: str | None) -> str:
+    target = str(raw or "").strip().lower()
+    if target not in {"none", "plex", "jellyfin", "navidrome"}:
+        return "none"
+    return target
+
+
+def _normalize_http_base_url(url: str) -> str:
+    out = str(url or "").strip().rstrip("/")
+    if out and not out.startswith(("http://", "https://")):
+        out = "http://" + out
+    return out
+
+
+def _jellyfin_auth_headers(api_key: str) -> dict[str, str]:
+    token = str(api_key or "").strip()
+    # Jellyfin API key security scheme uses Authorization header.
+    return {
+        "Accept": "application/json",
+        "Authorization": f'MediaBrowser Token="{token}"',
+    }
+
+
+def _do_jellyfin_check(url: str, api_key: str) -> tuple[bool, str]:
+    base = _normalize_http_base_url(url)
+    key = str(api_key or "").strip()
+    if not base or not key:
+        return False, "Jellyfin URL and API key are required"
+    try:
+        # Public server info (network reachability + server alive)
+        public_resp = requests.get(f"{base}/System/Info/Public", timeout=10)
+        if public_resp.status_code >= 400:
+            return False, f"Jellyfin public info returned HTTP {public_resp.status_code}"
+
+        # Authenticated endpoint (token validity + permission)
+        auth_resp = requests.get(
+            f"{base}/Items/Counts",
+            headers=_jellyfin_auth_headers(key),
+            timeout=10,
+        )
+        if auth_resp.status_code == 401:
+            return False, "Jellyfin API key invalid (401)"
+        if auth_resp.status_code == 403:
+            return False, "Jellyfin API key lacks permissions (403)"
+        if auth_resp.status_code >= 400:
+            return False, f"Jellyfin auth check returned HTTP {auth_resp.status_code}"
+        return True, "Jellyfin connection successful"
+    except requests.exceptions.ConnectionError:
+        return False, "Jellyfin host unreachable or connection refused"
+    except requests.exceptions.Timeout:
+        return False, "Jellyfin request timed out"
+    except Exception as e:
+        return False, str(e)
+
+
+def _trigger_jellyfin_refresh(url: str, api_key: str) -> tuple[bool, str]:
+    base = _normalize_http_base_url(url)
+    key = str(api_key or "").strip()
+    if not base or not key:
+        return False, "Jellyfin URL and API key are required"
+    try:
+        resp = requests.post(
+            f"{base}/Library/Refresh",
+            headers=_jellyfin_auth_headers(key),
+            timeout=20,
+        )
+        if resp.status_code in (200, 204):
+            return True, "Jellyfin library refresh triggered"
+        if resp.status_code == 401:
+            return False, "Jellyfin API key invalid (401)"
+        if resp.status_code == 403:
+            return False, "Jellyfin API key lacks required permission (403)"
+        return False, f"Jellyfin refresh failed (HTTP {resp.status_code})"
+    except requests.exceptions.ConnectionError:
+        return False, "Jellyfin host unreachable or connection refused"
+    except requests.exceptions.Timeout:
+        return False, "Jellyfin refresh request timed out"
+    except Exception as e:
+        return False, str(e)
+
+
+def _navidrome_auth_params(username: str, password: str, api_key: str = "") -> tuple[dict[str, str], str]:
+    user = str(username or "").strip()
+    pwd = str(password or "")
+    key = str(api_key or "").strip()
+    if key:
+        params = {"v": "1.16.1", "c": "pmda", "f": "json", "apiKey": key}
+        if user:
+            params["u"] = user
+        return params, ""
+    if not user or not pwd:
+        return {}, "Navidrome username/password are required (or API key)"
+    salt = uuid.uuid4().hex[:10]
+    token = hashlib.md5((pwd + salt).encode("utf-8")).hexdigest()
+    return {"u": user, "t": token, "s": salt, "v": "1.16.1", "c": "pmda", "f": "json"}, ""
+
+
+def _do_navidrome_check(url: str, username: str, password: str, api_key: str = "") -> tuple[bool, str]:
+    base = _normalize_http_base_url(url)
+    if not base:
+        return False, "Navidrome URL is required"
+    params, err = _navidrome_auth_params(username, password, api_key)
+    if err:
+        return False, err
+    try:
+        resp = requests.get(f"{base}/rest/ping.view", params=params, timeout=10)
+        if resp.status_code >= 400:
+            return False, f"Navidrome ping failed (HTTP {resp.status_code})"
+        payload = resp.json() if "json" in (resp.headers.get("Content-Type") or "").lower() else {}
+        sr = payload.get("subsonic-response") if isinstance(payload, dict) else {}
+        status = (sr or {}).get("status")
+        if status == "ok":
+            return True, "Navidrome connection successful"
+        err_msg = (sr or {}).get("error", {}).get("message") if isinstance(sr, dict) else None
+        return False, err_msg or "Navidrome authentication failed"
+    except requests.exceptions.ConnectionError:
+        return False, "Navidrome host unreachable or connection refused"
+    except requests.exceptions.Timeout:
+        return False, "Navidrome request timed out"
+    except Exception as e:
+        return False, str(e)
+
+
+def _trigger_navidrome_refresh(url: str, username: str, password: str, api_key: str = "") -> tuple[bool, str]:
+    base = _normalize_http_base_url(url)
+    if not base:
+        return False, "Navidrome URL is required"
+    params, err = _navidrome_auth_params(username, password, api_key)
+    if err:
+        return False, err
+    try:
+        resp = requests.get(f"{base}/rest/startScan.view", params=params, timeout=20)
+        if resp.status_code >= 400:
+            return False, f"Navidrome startScan failed (HTTP {resp.status_code})"
+        payload = resp.json() if "json" in (resp.headers.get("Content-Type") or "").lower() else {}
+        sr = payload.get("subsonic-response") if isinstance(payload, dict) else {}
+        if (sr or {}).get("status") == "ok":
+            return True, "Navidrome library scan triggered"
+        err_msg = (sr or {}).get("error", {}).get("message") if isinstance(sr, dict) else None
+        return False, err_msg or "Navidrome scan trigger failed"
+    except requests.exceptions.ConnectionError:
+        return False, "Navidrome host unreachable or connection refused"
+    except requests.exceptions.Timeout:
+        return False, "Navidrome startScan timed out"
+    except Exception as e:
+        return False, str(e)
+
+
+def _effective_player_target(explicit_target: str | None = None) -> str:
+    target = _normalize_player_target(explicit_target)
+    if target != "none":
+        return target
+    return _normalize_player_target(getattr(sys.modules[__name__], "PIPELINE_PLAYER_TARGET", "none"))
+
+
+def _trigger_player_refresh_by_target(target: str) -> tuple[bool, str]:
+    tgt = _normalize_player_target(target)
+    if tgt == "none":
+        return False, "No player sync target configured"
+    if tgt == "plex":
+        _reload_section_ids_from_db()
+        if not SECTION_IDS:
+            return False, "No Plex library sections configured"
+        refreshed = []
+        errors = []
+        for sid in SECTION_IDS:
+            try:
+                plex_api(f"/library/sections/{sid}/refresh", method="GET")
+                refreshed.append(sid)
+            except Exception as e:
+                errors.append(f"section {sid}: {e}")
+        if refreshed:
+            msg = f"Plex refresh triggered for section(s) {refreshed}"
+            if errors:
+                msg += f" ({len(errors)} error(s))"
+            return True, msg
+        return False, "Plex refresh failed for all sections"
+    if tgt == "jellyfin":
+        return _trigger_jellyfin_refresh(
+            getattr(sys.modules[__name__], "JELLYFIN_URL", ""),
+            getattr(sys.modules[__name__], "JELLYFIN_API_KEY", ""),
+        )
+    if tgt == "navidrome":
+        return _trigger_navidrome_refresh(
+            getattr(sys.modules[__name__], "NAVIDROME_URL", ""),
+            getattr(sys.modules[__name__], "NAVIDROME_USERNAME", ""),
+            getattr(sys.modules[__name__], "NAVIDROME_PASSWORD", ""),
+            getattr(sys.modules[__name__], "NAVIDROME_API_KEY", ""),
+        )
+    return False, f"Unsupported sync target: {tgt}"
+
+
+@app.post("/api/player/check")
+def api_player_check():
+    """Test connectivity for Plex/Jellyfin/Navidrome based on requested or configured target."""
+    data = request.get_json(silent=True) or {}
+    target = _effective_player_target(data.get("target"))
+    if target == "none":
+        return jsonify({"success": False, "target": "none", "message": "No player target selected"}), 400
+    if target == "plex":
+        host = (data.get("PLEX_HOST") or "").strip() or PLEX_HOST
+        token = (data.get("PLEX_TOKEN") or "").strip() or PLEX_TOKEN
+        resp_obj = _do_plex_check(host, token)
+        status = 200
+        resp = resp_obj
+        if isinstance(resp_obj, tuple) and len(resp_obj) >= 2:
+            resp = resp_obj[0]
+            try:
+                status = int(resp_obj[1])
+            except (TypeError, ValueError):
+                status = 200
+        payload = resp.get_json(silent=True) if hasattr(resp, "get_json") else None
+        status = getattr(resp, "status_code", status)
+        if isinstance(payload, dict):
+            payload["target"] = "plex"
+            return jsonify(payload), status
+        return resp_obj
+    if target == "jellyfin":
+        ok, msg = _do_jellyfin_check(
+            (data.get("JELLYFIN_URL") or "").strip() or getattr(sys.modules[__name__], "JELLYFIN_URL", ""),
+            (data.get("JELLYFIN_API_KEY") or "").strip() or getattr(sys.modules[__name__], "JELLYFIN_API_KEY", ""),
+        )
+        return jsonify({"success": ok, "target": "jellyfin", "message": msg}), (200 if ok else 400)
+    if target == "navidrome":
+        ok, msg = _do_navidrome_check(
+            (data.get("NAVIDROME_URL") or "").strip() or getattr(sys.modules[__name__], "NAVIDROME_URL", ""),
+            (data.get("NAVIDROME_USERNAME") or "").strip() or getattr(sys.modules[__name__], "NAVIDROME_USERNAME", ""),
+            (data.get("NAVIDROME_PASSWORD") or "").strip() or getattr(sys.modules[__name__], "NAVIDROME_PASSWORD", ""),
+            (data.get("NAVIDROME_API_KEY") or "").strip() or getattr(sys.modules[__name__], "NAVIDROME_API_KEY", ""),
+        )
+        return jsonify({"success": ok, "target": "navidrome", "message": msg}), (200 if ok else 400)
+    return jsonify({"success": False, "target": target, "message": "Unknown target"}), 400
+
+
+@app.post("/api/player/refresh")
+def api_player_refresh():
+    """Trigger media library scan on the selected target (Plex/Jellyfin/Navidrome)."""
+    data = request.get_json(silent=True) or {}
+    target = _effective_player_target(data.get("target"))
+    ok, msg = _trigger_player_refresh_by_target(target)
+    return jsonify({"success": ok, "target": target, "message": msg}), (200 if ok else 400)
 
 
 @app.post("/api/plex/refresh")
@@ -18325,21 +19905,23 @@ def _reload_library_mode_and_files_roots_from_db():
     mode_raw = _get_config_from_db("LIBRARY_MODE")
     if mode_raw is not None:
         mode = str(mode_raw).strip().lower()
-        if mode in {"plex", "files"}:
-            LIBRARY_MODE = mode
-            mod.merged["LIBRARY_MODE"] = mode
+        if mode == "files":
+            LIBRARY_MODE = "files"
+            mod.merged["LIBRARY_MODE"] = "files"
+        else:
+            LIBRARY_MODE = "files"
+            mod.merged["LIBRARY_MODE"] = "files"
 
     roots_raw = _get_config_from_db("FILES_ROOTS")
     if roots_raw is not None:
         FILES_ROOTS = _parse_files_roots(roots_raw)
         mod.merged["FILES_ROOTS"] = FILES_ROOTS
 
-    if LIBRARY_MODE == "files":
-        logging.info(
-            "Files mode scan sources reloaded: %d root(s): %s",
-            len(FILES_ROOTS or []),
-            FILES_ROOTS or [],
-        )
+    logging.info(
+        "Files mode scan sources reloaded: %d root(s): %s",
+        len(FILES_ROOTS or []),
+        FILES_ROOTS or [],
+    )
 
 
 def _parse_format_preference(val):
@@ -18387,8 +19969,6 @@ def api_config_get():
     
     # Check if settings exist in DB (wizard was completed)
     has_settings = _has_settings_in_db()
-    # Wizard should not show if settings exist in DB OR if Plex is configured
-    configured = has_settings or PLEX_CONFIGURED
     
     # Load SECTION_IDS from SQLite if available (stored as comma-separated "1,5" or legacy JSON "[1,5]")
     section_ids_str = _get_config_from_db("SECTION_IDS")
@@ -18410,6 +19990,9 @@ def api_config_get():
         except Exception:
             pass
     
+    files_roots_effective = _parse_files_roots(get_setting("FILES_ROOTS", ",".join(FILES_ROOTS) if isinstance(FILES_ROOTS, list) else (FILES_ROOTS or "")))
+    configured = has_settings or bool(files_roots_effective)
+
     return jsonify({
         "configured": configured,
         "PLEX_HOST": get_setting("PLEX_HOST", PLEX_HOST),
@@ -18436,24 +20019,31 @@ def api_config_get():
         "ANTHROPIC_API_KEY": get_setting("ANTHROPIC_API_KEY", ANTHROPIC_API_KEY),
         "GOOGLE_API_KEY": get_setting("GOOGLE_API_KEY", GOOGLE_API_KEY),
         "OLLAMA_URL": get_setting("OLLAMA_URL", OLLAMA_URL),
-        "USE_MUSICBRAINZ": get_setting_bool("USE_MUSICBRAINZ", USE_MUSICBRAINZ),
+        "USE_MUSICBRAINZ": True,
         "MUSICBRAINZ_EMAIL": get_setting("MUSICBRAINZ_EMAIL", MUSICBRAINZ_EMAIL),
         "MB_RETRY_NOT_FOUND": get_setting_bool("MB_RETRY_NOT_FOUND", MB_RETRY_NOT_FOUND),
         "MB_SEARCH_ALBUM_TIMEOUT_SEC": get_setting("MB_SEARCH_ALBUM_TIMEOUT_SEC", MB_SEARCH_ALBUM_TIMEOUT_SEC),
         "MB_CANDIDATE_FETCH_LIMIT": get_setting("MB_CANDIDATE_FETCH_LIMIT", MB_CANDIDATE_FETCH_LIMIT),
         "MB_TRACKLIST_FETCH_LIMIT": get_setting("MB_TRACKLIST_FETCH_LIMIT", MB_TRACKLIST_FETCH_LIMIT),
         "MB_FAST_FALLBACK_MODE": get_setting_bool("MB_FAST_FALLBACK_MODE", MB_FAST_FALLBACK_MODE),
-        "USE_AI_FOR_MB_MATCH": get_setting_bool("USE_AI_FOR_MB_MATCH", USE_AI_FOR_MB_MATCH),
-        "USE_AI_FOR_MB_VERIFY": get_setting_bool("USE_AI_FOR_MB_VERIFY", USE_AI_FOR_MB_VERIFY),
-        "USE_AI_VISION_FOR_COVER": get_setting_bool("USE_AI_VISION_FOR_COVER", USE_AI_VISION_FOR_COVER),
-        "AI_CONFIDENCE_MIN": get_setting("AI_CONFIDENCE_MIN", AI_CONFIDENCE_MIN),
+        "PROVIDER_IDENTITY_STRICT": get_setting_bool("PROVIDER_IDENTITY_STRICT", PROVIDER_IDENTITY_STRICT),
+        "PROVIDER_IDENTITY_USE_AI": get_setting_bool("PROVIDER_IDENTITY_USE_AI", PROVIDER_IDENTITY_USE_AI),
+        "PROVIDER_IDENTITY_MIN_SCORE": get_setting("PROVIDER_IDENTITY_MIN_SCORE", PROVIDER_IDENTITY_MIN_SCORE),
+        "PROVIDER_IDENTITY_SCORE_MARGIN": get_setting("PROVIDER_IDENTITY_SCORE_MARGIN", PROVIDER_IDENTITY_SCORE_MARGIN),
+        "PROVIDER_CACHE_FOUND_TTL_SEC": get_setting("PROVIDER_CACHE_FOUND_TTL_SEC", PROVIDER_CACHE_FOUND_TTL_SEC),
+        "PROVIDER_CACHE_NOT_FOUND_TTL_SEC": get_setting("PROVIDER_CACHE_NOT_FOUND_TTL_SEC", PROVIDER_CACHE_NOT_FOUND_TTL_SEC),
+        "PROVIDER_CACHE_ERROR_TTL_SEC": get_setting("PROVIDER_CACHE_ERROR_TTL_SEC", PROVIDER_CACHE_ERROR_TTL_SEC),
+        "USE_AI_FOR_MB_MATCH": True,
+        "USE_AI_FOR_MB_VERIFY": True,
+        "USE_AI_VISION_FOR_COVER": True,
+        "AI_CONFIDENCE_MIN": max(0, min(100, int(get_setting("AI_CONFIDENCE_MIN", AI_CONFIDENCE_MIN) or 50))),
         "OPENAI_VISION_MODEL": get_setting("OPENAI_VISION_MODEL", OPENAI_VISION_MODEL),
-        "USE_AI_VISION_BEFORE_COVER_INJECT": get_setting_bool("USE_AI_VISION_BEFORE_COVER_INJECT", USE_AI_VISION_BEFORE_COVER_INJECT),
-        "USE_WEB_SEARCH_FOR_MB": get_setting_bool("USE_WEB_SEARCH_FOR_MB", USE_WEB_SEARCH_FOR_MB),
+        "USE_AI_VISION_BEFORE_COVER_INJECT": True,
+        "USE_WEB_SEARCH_FOR_MB": True,
         "SERPER_API_KEY": get_setting("SERPER_API_KEY", SERPER_API_KEY),
-        "USE_ACOUSTID": get_setting_bool("USE_ACOUSTID", USE_ACOUSTID),
+        "USE_ACOUSTID": True,
         "ACOUSTID_API_KEY": get_setting("ACOUSTID_API_KEY", ACOUSTID_API_KEY),
-        "USE_ACOUSTID_WHEN_TAGGED": get_setting_bool("USE_ACOUSTID_WHEN_TAGGED", USE_ACOUSTID_WHEN_TAGGED),
+        "USE_ACOUSTID_WHEN_TAGGED": False,
         "LIDARR_URL": get_setting("LIDARR_URL", merged.get("LIDARR_URL", "")),
         "LIDARR_API_KEY": get_setting("LIDARR_API_KEY", merged.get("LIDARR_API_KEY", "")),
         "AUTOBRR_URL": get_setting("AUTOBRR_URL", merged.get("AUTOBRR_URL", "")),
@@ -18461,39 +20051,44 @@ def api_config_get():
         "AUTO_FIX_BROKEN_ALBUMS": get_setting_bool("AUTO_FIX_BROKEN_ALBUMS", AUTO_FIX_BROKEN_ALBUMS),
         "BROKEN_ALBUM_CONSECUTIVE_THRESHOLD": get_setting("BROKEN_ALBUM_CONSECUTIVE_THRESHOLD", BROKEN_ALBUM_CONSECUTIVE_THRESHOLD),
         "BROKEN_ALBUM_PERCENTAGE_THRESHOLD": get_setting("BROKEN_ALBUM_PERCENTAGE_THRESHOLD", BROKEN_ALBUM_PERCENTAGE_THRESHOLD),
-        "REQUIRED_TAGS": _parse_required_tags(get_setting("REQUIRED_TAGS", ",".join(REQUIRED_TAGS))),
+        "REQUIRED_TAGS": ["artist", "album", "genre", "year", "tracks"],
         "DISCORD_WEBHOOK": get_setting("DISCORD_WEBHOOK", DISCORD_WEBHOOK),
         "LOG_LEVEL": get_setting("LOG_LEVEL", LOG_LEVEL),
         "LOG_FILE": get_setting("LOG_FILE", LOG_FILE),
         "AUTO_MOVE_DUPES": get_setting_bool("AUTO_MOVE_DUPES", AUTO_MOVE_DUPES),
+        "PIPELINE_ENABLE_MATCH_FIX": get_setting_bool("PIPELINE_ENABLE_MATCH_FIX", PIPELINE_ENABLE_MATCH_FIX),
+        "PIPELINE_ENABLE_DEDUPE": get_setting_bool("PIPELINE_ENABLE_DEDUPE", PIPELINE_ENABLE_DEDUPE),
+        "PIPELINE_ENABLE_INCOMPLETE_MOVE": get_setting_bool("PIPELINE_ENABLE_INCOMPLETE_MOVE", PIPELINE_ENABLE_INCOMPLETE_MOVE),
+        "PIPELINE_ENABLE_EXPORT": get_setting_bool("PIPELINE_ENABLE_EXPORT", PIPELINE_ENABLE_EXPORT),
+        "PIPELINE_ENABLE_PLAYER_SYNC": get_setting_bool("PIPELINE_ENABLE_PLAYER_SYNC", PIPELINE_ENABLE_PLAYER_SYNC),
+        "PIPELINE_PLAYER_TARGET": get_setting("PIPELINE_PLAYER_TARGET", PIPELINE_PLAYER_TARGET),
         "NORMALIZE_PARENTHETICAL_FOR_DEDUPE": get_setting_bool("NORMALIZE_PARENTHETICAL_FOR_DEDUPE", True),
         "BACKUP_BEFORE_FIX": get_setting_bool("BACKUP_BEFORE_FIX", BACKUP_BEFORE_FIX),
         "MAGIC_MODE": get_setting_bool("MAGIC_MODE", MAGIC_MODE),
         "REPROCESS_INCOMPLETE_ALBUMS": get_setting_bool("REPROCESS_INCOMPLETE_ALBUMS", REPROCESS_INCOMPLETE_ALBUMS),
-        "ARTIST_CREDIT_MODE": get_setting("ARTIST_CREDIT_MODE", ARTIST_CREDIT_MODE),
+        "ARTIST_CREDIT_MODE": "picard_like_default",
         "LIVE_DEDUPE_MODE": get_setting("LIVE_DEDUPE_MODE", LIVE_DEDUPE_MODE),
         "SCAN_DISABLE_CACHE": get_setting_bool("SCAN_DISABLE_CACHE", SCAN_DISABLE_CACHE),
         "DISABLE_PATH_CROSSCHECK": get_setting_bool("DISABLE_PATH_CROSSCHECK", DISABLE_PATH_CROSSCHECK),
-        "USE_DISCOGS": get_setting_bool("USE_DISCOGS", USE_DISCOGS),
+        "USE_DISCOGS": True,
         "DISCOGS_USER_TOKEN": get_setting("DISCOGS_USER_TOKEN", DISCOGS_USER_TOKEN),
-        "USE_LASTFM": get_setting_bool("USE_LASTFM", USE_LASTFM),
+        "USE_LASTFM": True,
         "LASTFM_API_KEY": get_setting("LASTFM_API_KEY", LASTFM_API_KEY),
         "LASTFM_API_SECRET": get_setting("LASTFM_API_SECRET", LASTFM_API_SECRET),
-        "USE_BANDCAMP": get_setting_bool("USE_BANDCAMP", USE_BANDCAMP),
-        "SKIP_MB_FOR_LIVE_ALBUMS": get_setting_bool("SKIP_MB_FOR_LIVE_ALBUMS", True),
-        "TRACKLIST_MATCH_MIN": get_setting("TRACKLIST_MATCH_MIN", str(TRACKLIST_MATCH_MIN)),
-        "LIVE_ALBUMS_MB_STRICT": get_setting_bool("LIVE_ALBUMS_MB_STRICT", False),
+        "USE_BANDCAMP": True,
+        "JELLYFIN_URL": get_setting("JELLYFIN_URL", JELLYFIN_URL),
+        "JELLYFIN_API_KEY": get_setting("JELLYFIN_API_KEY", JELLYFIN_API_KEY),
+        "NAVIDROME_URL": get_setting("NAVIDROME_URL", NAVIDROME_URL),
+        "NAVIDROME_USERNAME": get_setting("NAVIDROME_USERNAME", NAVIDROME_USERNAME),
+        "NAVIDROME_PASSWORD": get_setting("NAVIDROME_PASSWORD", NAVIDROME_PASSWORD),
+        "NAVIDROME_API_KEY": get_setting("NAVIDROME_API_KEY", NAVIDROME_API_KEY),
+        "SKIP_MB_FOR_LIVE_ALBUMS": True,
+        "TRACKLIST_MATCH_MIN": "0.9",
+        "LIVE_ALBUMS_MB_STRICT": False,
         "INCOMPLETE_ALBUMS_TARGET_DIR": get_setting("INCOMPLETE_ALBUMS_TARGET_DIR", "/dupes/incomplete_albums"),
         # Library backend and file-library settings
-        "LIBRARY_MODE": get_setting("LIBRARY_MODE", LIBRARY_MODE),
-        "FILES_ROOTS": ", ".join(
-            _parse_files_roots(
-                get_setting(
-                    "FILES_ROOTS",
-                    ",".join(FILES_ROOTS) if isinstance(FILES_ROOTS, list) else (FILES_ROOTS or ""),
-                )
-            )
-        ),
+        "LIBRARY_MODE": "files",
+        "FILES_ROOTS": ", ".join(files_roots_effective),
         "EXPORT_ROOT": get_setting("EXPORT_ROOT", EXPORT_ROOT),
         "EXPORT_NAMING_TEMPLATE": get_setting("EXPORT_NAMING_TEMPLATE", EXPORT_NAMING_TEMPLATE),
         "EXPORT_LINK_STRATEGY": get_setting("EXPORT_LINK_STRATEGY", EXPORT_LINK_STRATEGY),
@@ -18626,6 +20221,42 @@ def _apply_settings_in_memory(updates: dict):
     if "MB_FAST_FALLBACK_MODE" in updates:
         global MB_FAST_FALLBACK_MODE
         MB_FAST_FALLBACK_MODE = bool(_parse_bool(updates["MB_FAST_FALLBACK_MODE"]))
+    if "PROVIDER_IDENTITY_STRICT" in updates:
+        global PROVIDER_IDENTITY_STRICT
+        PROVIDER_IDENTITY_STRICT = bool(_parse_bool(updates["PROVIDER_IDENTITY_STRICT"]))
+    if "PROVIDER_IDENTITY_USE_AI" in updates:
+        global PROVIDER_IDENTITY_USE_AI
+        PROVIDER_IDENTITY_USE_AI = bool(_parse_bool(updates["PROVIDER_IDENTITY_USE_AI"]))
+    if "PROVIDER_IDENTITY_MIN_SCORE" in updates:
+        global PROVIDER_IDENTITY_MIN_SCORE
+        try:
+            PROVIDER_IDENTITY_MIN_SCORE = max(0.0, min(1.0, float(updates["PROVIDER_IDENTITY_MIN_SCORE"])))
+        except (TypeError, ValueError):
+            pass
+    if "PROVIDER_IDENTITY_SCORE_MARGIN" in updates:
+        global PROVIDER_IDENTITY_SCORE_MARGIN
+        try:
+            PROVIDER_IDENTITY_SCORE_MARGIN = max(0.0, min(1.0, float(updates["PROVIDER_IDENTITY_SCORE_MARGIN"])))
+        except (TypeError, ValueError):
+            pass
+    if "PROVIDER_CACHE_FOUND_TTL_SEC" in updates:
+        global PROVIDER_CACHE_FOUND_TTL_SEC
+        try:
+            PROVIDER_CACHE_FOUND_TTL_SEC = max(60, min(60 * 60 * 24 * 365, int(updates["PROVIDER_CACHE_FOUND_TTL_SEC"])))
+        except (TypeError, ValueError):
+            pass
+    if "PROVIDER_CACHE_NOT_FOUND_TTL_SEC" in updates:
+        global PROVIDER_CACHE_NOT_FOUND_TTL_SEC
+        try:
+            PROVIDER_CACHE_NOT_FOUND_TTL_SEC = max(60, min(60 * 60 * 24 * 30, int(updates["PROVIDER_CACHE_NOT_FOUND_TTL_SEC"])))
+        except (TypeError, ValueError):
+            pass
+    if "PROVIDER_CACHE_ERROR_TTL_SEC" in updates:
+        global PROVIDER_CACHE_ERROR_TTL_SEC
+        try:
+            PROVIDER_CACHE_ERROR_TTL_SEC = max(30, min(60 * 60 * 24, int(updates["PROVIDER_CACHE_ERROR_TTL_SEC"])))
+        except (TypeError, ValueError):
+            pass
     if "SCAN_DISABLE_CACHE" in updates:
         global SCAN_DISABLE_CACHE
         SCAN_DISABLE_CACHE = bool(_parse_bool(updates["SCAN_DISABLE_CACHE"]))
@@ -18806,6 +20437,31 @@ def _apply_settings_in_memory(updates: dict):
     if "AUTO_MOVE_DUPES" in updates:
         global AUTO_MOVE_DUPES
         AUTO_MOVE_DUPES = bool(_parse_bool(updates["AUTO_MOVE_DUPES"]))
+    if "PIPELINE_ENABLE_MATCH_FIX" in updates:
+        global PIPELINE_ENABLE_MATCH_FIX
+        PIPELINE_ENABLE_MATCH_FIX = bool(_parse_bool(updates["PIPELINE_ENABLE_MATCH_FIX"]))
+        mod.merged["PIPELINE_ENABLE_MATCH_FIX"] = PIPELINE_ENABLE_MATCH_FIX
+    if "PIPELINE_ENABLE_DEDUPE" in updates:
+        global PIPELINE_ENABLE_DEDUPE
+        PIPELINE_ENABLE_DEDUPE = bool(_parse_bool(updates["PIPELINE_ENABLE_DEDUPE"]))
+        mod.merged["PIPELINE_ENABLE_DEDUPE"] = PIPELINE_ENABLE_DEDUPE
+    if "PIPELINE_ENABLE_INCOMPLETE_MOVE" in updates:
+        global PIPELINE_ENABLE_INCOMPLETE_MOVE
+        PIPELINE_ENABLE_INCOMPLETE_MOVE = bool(_parse_bool(updates["PIPELINE_ENABLE_INCOMPLETE_MOVE"]))
+        mod.merged["PIPELINE_ENABLE_INCOMPLETE_MOVE"] = PIPELINE_ENABLE_INCOMPLETE_MOVE
+    if "PIPELINE_ENABLE_EXPORT" in updates:
+        global PIPELINE_ENABLE_EXPORT
+        PIPELINE_ENABLE_EXPORT = bool(_parse_bool(updates["PIPELINE_ENABLE_EXPORT"]))
+        mod.merged["PIPELINE_ENABLE_EXPORT"] = PIPELINE_ENABLE_EXPORT
+    if "PIPELINE_ENABLE_PLAYER_SYNC" in updates:
+        global PIPELINE_ENABLE_PLAYER_SYNC
+        PIPELINE_ENABLE_PLAYER_SYNC = bool(_parse_bool(updates["PIPELINE_ENABLE_PLAYER_SYNC"]))
+        mod.merged["PIPELINE_ENABLE_PLAYER_SYNC"] = PIPELINE_ENABLE_PLAYER_SYNC
+    if "PIPELINE_PLAYER_TARGET" in updates:
+        global PIPELINE_PLAYER_TARGET
+        PIPELINE_PLAYER_TARGET = _normalize_player_target(updates.get("PIPELINE_PLAYER_TARGET"))
+        mod.merged["PIPELINE_PLAYER_TARGET"] = PIPELINE_PLAYER_TARGET
+        logging.info("PIPELINE_PLAYER_TARGET updated in memory: %s", PIPELINE_PLAYER_TARGET)
     if "AUTO_EXPORT_LIBRARY" in updates:
         global AUTO_EXPORT_LIBRARY
         AUTO_EXPORT_LIBRARY = bool(_parse_bool(updates["AUTO_EXPORT_LIBRARY"]))
@@ -18887,6 +20543,36 @@ def _apply_settings_in_memory(updates: dict):
         mod.LASTFM_API_SECRET = str(updates["LASTFM_API_SECRET"] or "").strip()
     if "USE_BANDCAMP" in updates:
         mod.USE_BANDCAMP = bool(_parse_bool(updates["USE_BANDCAMP"]))
+    if "JELLYFIN_URL" in updates:
+        global JELLYFIN_URL
+        JELLYFIN_URL = _normalize_http_base_url(updates.get("JELLYFIN_URL"))
+        mod.merged["JELLYFIN_URL"] = JELLYFIN_URL
+    if "JELLYFIN_API_KEY" in updates:
+        global JELLYFIN_API_KEY
+        v = str(updates.get("JELLYFIN_API_KEY") or "").strip()
+        if v != "***":
+            JELLYFIN_API_KEY = v
+            mod.merged["JELLYFIN_API_KEY"] = JELLYFIN_API_KEY
+    if "NAVIDROME_URL" in updates:
+        global NAVIDROME_URL
+        NAVIDROME_URL = _normalize_http_base_url(updates.get("NAVIDROME_URL"))
+        mod.merged["NAVIDROME_URL"] = NAVIDROME_URL
+    if "NAVIDROME_USERNAME" in updates:
+        global NAVIDROME_USERNAME
+        NAVIDROME_USERNAME = str(updates.get("NAVIDROME_USERNAME") or "").strip()
+        mod.merged["NAVIDROME_USERNAME"] = NAVIDROME_USERNAME
+    if "NAVIDROME_PASSWORD" in updates:
+        global NAVIDROME_PASSWORD
+        v = str(updates.get("NAVIDROME_PASSWORD") or "")
+        if v != "***":
+            NAVIDROME_PASSWORD = v
+            mod.merged["NAVIDROME_PASSWORD"] = NAVIDROME_PASSWORD
+    if "NAVIDROME_API_KEY" in updates:
+        global NAVIDROME_API_KEY
+        v = str(updates.get("NAVIDROME_API_KEY") or "").strip()
+        if v != "***":
+            NAVIDROME_API_KEY = v
+            mod.merged["NAVIDROME_API_KEY"] = NAVIDROME_API_KEY
     if "SKIP_MB_FOR_LIVE_ALBUMS" in updates:
         mod.SKIP_MB_FOR_LIVE_ALBUMS = bool(_parse_bool(updates["SKIP_MB_FOR_LIVE_ALBUMS"]))
     if "TRACKLIST_MATCH_MIN" in updates:
@@ -18916,6 +20602,9 @@ def _apply_settings_in_memory(updates: dict):
     if need_ai_reinit:
         _reinit_ai_from_globals()
 
+    # Enforce product defaults for simplified UX (files-only + always-on metadata pipeline).
+    _apply_forced_runtime_defaults()
+
 
 @app.put("/api/config")
 def api_config_put():
@@ -18931,15 +20620,20 @@ def api_config_put():
         "OPENAI_MODEL_FALLBACKS", "ANTHROPIC_API_KEY", "GOOGLE_API_KEY", "OLLAMA_URL",
         "DISCORD_WEBHOOK", "USE_MUSICBRAINZ", "MUSICBRAINZ_EMAIL", "MB_RETRY_NOT_FOUND",
         "MB_SEARCH_ALBUM_TIMEOUT_SEC", "MB_CANDIDATE_FETCH_LIMIT", "MB_TRACKLIST_FETCH_LIMIT", "MB_FAST_FALLBACK_MODE",
+        "PROVIDER_IDENTITY_STRICT", "PROVIDER_IDENTITY_USE_AI", "PROVIDER_IDENTITY_MIN_SCORE", "PROVIDER_IDENTITY_SCORE_MARGIN",
+        "PROVIDER_CACHE_FOUND_TTL_SEC", "PROVIDER_CACHE_NOT_FOUND_TTL_SEC", "PROVIDER_CACHE_ERROR_TTL_SEC",
         "USE_AI_FOR_MB_MATCH", "USE_AI_FOR_MB_VERIFY",
         "USE_AI_VISION_FOR_COVER", "AI_CONFIDENCE_MIN", "OPENAI_VISION_MODEL", "USE_AI_VISION_BEFORE_COVER_INJECT", "USE_WEB_SEARCH_FOR_MB", "SERPER_API_KEY",
         "USE_ACOUSTID", "ACOUSTID_API_KEY", "USE_ACOUSTID_WHEN_TAGGED",
         "SKIP_FOLDERS", "CROSS_LIBRARY_DEDUPE", "CROSSCHECK_SAMPLES", "DISABLE_PATH_CROSSCHECK",
         "FORMAT_PREFERENCE", "AUTO_MOVE_DUPES", "NORMALIZE_PARENTHETICAL_FOR_DEDUPE", "BACKUP_BEFORE_FIX", "MAGIC_MODE", "REPROCESS_INCOMPLETE_ALBUMS", "IMPROVE_ALL_WORKERS", "FFPROBE_POOL_SIZE",
+        "PIPELINE_ENABLE_MATCH_FIX", "PIPELINE_ENABLE_DEDUPE", "PIPELINE_ENABLE_INCOMPLETE_MOVE", "PIPELINE_ENABLE_EXPORT", "PIPELINE_ENABLE_PLAYER_SYNC", "PIPELINE_PLAYER_TARGET",
         "ARTIST_CREDIT_MODE", "LIVE_DEDUPE_MODE",
         "LIDARR_URL", "LIDARR_API_KEY", "AUTOBRR_URL", "AUTOBRR_API_KEY", "AUTO_FIX_BROKEN_ALBUMS",
         "BROKEN_ALBUM_CONSECUTIVE_THRESHOLD", "BROKEN_ALBUM_PERCENTAGE_THRESHOLD", "REQUIRED_TAGS",
         "USE_DISCOGS", "DISCOGS_USER_TOKEN", "USE_LASTFM", "LASTFM_API_KEY", "LASTFM_API_SECRET", "USE_BANDCAMP",
+        "JELLYFIN_URL", "JELLYFIN_API_KEY",
+        "NAVIDROME_URL", "NAVIDROME_USERNAME", "NAVIDROME_PASSWORD", "NAVIDROME_API_KEY",
         "INCOMPLETE_ALBUMS_TARGET_DIR",
         "SCAN_DISABLE_CACHE",
         # Library backend & file-library settings
@@ -18966,6 +20660,14 @@ def api_config_put():
     if "EXPORT_LINK_STRATEGY" in updates:
         strategy = str(updates["EXPORT_LINK_STRATEGY"] or "hardlink").strip().lower()
         updates["EXPORT_LINK_STRATEGY"] = strategy if strategy in {"hardlink", "symlink", "copy", "move"} else "hardlink"
+    if "PIPELINE_PLAYER_TARGET" in updates:
+        updates["PIPELINE_PLAYER_TARGET"] = _normalize_player_target(updates["PIPELINE_PLAYER_TARGET"])
+    if "JELLYFIN_URL" in updates:
+        updates["JELLYFIN_URL"] = _normalize_http_base_url(updates["JELLYFIN_URL"])
+    if "NAVIDROME_URL" in updates:
+        updates["NAVIDROME_URL"] = _normalize_http_base_url(updates["NAVIDROME_URL"])
+    if "NAVIDROME_USERNAME" in updates:
+        updates["NAVIDROME_USERNAME"] = str(updates["NAVIDROME_USERNAME"] or "").strip()
     if "REQUIRED_TAGS" in updates:
         updates["REQUIRED_TAGS"] = _parse_required_tags(updates["REQUIRED_TAGS"])
     if "BROKEN_ALBUM_CONSECUTIVE_THRESHOLD" in updates:
@@ -18993,6 +20695,35 @@ def api_config_put():
             updates["MB_TRACKLIST_FETCH_LIMIT"] = max(0, min(20, int(updates["MB_TRACKLIST_FETCH_LIMIT"])))
         except (ValueError, TypeError):
             updates["MB_TRACKLIST_FETCH_LIMIT"] = 3
+    if "PROVIDER_IDENTITY_MIN_SCORE" in updates:
+        try:
+            updates["PROVIDER_IDENTITY_MIN_SCORE"] = max(0.0, min(1.0, float(updates["PROVIDER_IDENTITY_MIN_SCORE"])))
+        except (ValueError, TypeError):
+            updates["PROVIDER_IDENTITY_MIN_SCORE"] = 0.72
+    if "PROVIDER_IDENTITY_SCORE_MARGIN" in updates:
+        try:
+            updates["PROVIDER_IDENTITY_SCORE_MARGIN"] = max(0.0, min(1.0, float(updates["PROVIDER_IDENTITY_SCORE_MARGIN"])))
+        except (ValueError, TypeError):
+            updates["PROVIDER_IDENTITY_SCORE_MARGIN"] = 0.08
+    if "PROVIDER_CACHE_FOUND_TTL_SEC" in updates:
+        try:
+            updates["PROVIDER_CACHE_FOUND_TTL_SEC"] = max(60, min(60 * 60 * 24 * 365, int(updates["PROVIDER_CACHE_FOUND_TTL_SEC"])))
+        except (ValueError, TypeError):
+            updates["PROVIDER_CACHE_FOUND_TTL_SEC"] = 60 * 60 * 24 * 30
+    if "PROVIDER_CACHE_NOT_FOUND_TTL_SEC" in updates:
+        try:
+            updates["PROVIDER_CACHE_NOT_FOUND_TTL_SEC"] = max(60, min(60 * 60 * 24 * 30, int(updates["PROVIDER_CACHE_NOT_FOUND_TTL_SEC"])))
+        except (ValueError, TypeError):
+            updates["PROVIDER_CACHE_NOT_FOUND_TTL_SEC"] = 60 * 60 * 8
+    if "PROVIDER_CACHE_ERROR_TTL_SEC" in updates:
+        try:
+            updates["PROVIDER_CACHE_ERROR_TTL_SEC"] = max(30, min(60 * 60 * 24, int(updates["PROVIDER_CACHE_ERROR_TTL_SEC"])))
+        except (ValueError, TypeError):
+            updates["PROVIDER_CACHE_ERROR_TTL_SEC"] = 60 * 20
+
+    # Force files-only mode regardless of incoming value.
+    if "LIBRARY_MODE" in updates:
+        updates["LIBRARY_MODE"] = "files"
     
     # Serialize complex types for SQLite storage. Do not overwrite secret keys with mask (e.g. "***").
     MASKED_SECRETS = (
@@ -19000,8 +20731,27 @@ def api_config_put():
         "ANTHROPIC_API_KEY", "GOOGLE_API_KEY",
         "DISCOGS_USER_TOKEN", "LASTFM_API_KEY", "LASTFM_API_SECRET",
         "LIDARR_API_KEY", "AUTOBRR_API_KEY",
+        "JELLYFIN_API_KEY", "NAVIDROME_PASSWORD", "NAVIDROME_API_KEY",
     )
     updates_for_db = {}
+    forced_db_updates = {
+        "LIBRARY_MODE": "files",
+        "USE_MUSICBRAINZ": "true",
+        "USE_AI_FOR_MB_MATCH": "true",
+        "USE_AI_FOR_MB_VERIFY": "true",
+        "USE_AI_VISION_FOR_COVER": "true",
+        "USE_AI_VISION_BEFORE_COVER_INJECT": "true",
+        "USE_WEB_SEARCH_FOR_MB": "true",
+        "USE_ACOUSTID": "true",
+        "USE_ACOUSTID_WHEN_TAGGED": "false",
+        "USE_DISCOGS": "true",
+        "USE_LASTFM": "true",
+        "USE_BANDCAMP": "true",
+        "SKIP_MB_FOR_LIVE_ALBUMS": "true",
+        "TRACKLIST_MATCH_MIN": "0.9",
+        "ARTIST_CREDIT_MODE": "picard_like_default",
+        "REQUIRED_TAGS": "artist,album,genre,year,tracks",
+    }
     for k, v in updates.items():
         if k in MASKED_SECRETS and str(v).strip() == "***":
             continue  # Do not overwrite real key with mask
@@ -19019,6 +20769,8 @@ def api_config_put():
         else:
             # Preserve empty strings (they are valid values, e.g. empty webhook = disabled)
             updates_for_db[k] = str(v) if v is not None else ""
+    for k, v in forced_db_updates.items():
+        updates_for_db[k] = v
     
     try:
         # Save to dedicated settings.db (single source of truth for configuration)
@@ -19418,6 +21170,13 @@ def api_progress():
         scan_lastfm_matched = int(state.get("scan_lastfm_matched") or 0)
         scan_bandcamp_matched = int(state.get("scan_bandcamp_matched") or 0)
         scan_start_time = state.get("scan_start_time")
+        scan_pipeline_flags = dict(state.get("scan_pipeline_flags") or {})
+        scan_pipeline_sync_target = state.get("scan_pipeline_sync_target")
+        scan_incomplete_moved_count = int(state.get("scan_incomplete_moved_count") or 0)
+        scan_incomplete_moved_mb = int(state.get("scan_incomplete_moved_mb") or 0)
+        scan_player_sync_target = state.get("scan_player_sync_target")
+        scan_player_sync_ok = state.get("scan_player_sync_ok")
+        scan_player_sync_message = state.get("scan_player_sync_message")
         if improve_all_running:
             scan_post_total = max(scan_post_total, int(improve_all_state.get("total") or 0))
             scan_post_done = max(scan_post_done, int(improve_all_state.get("current") or 0))
@@ -19441,7 +21200,12 @@ def api_progress():
         dedupe_progress = state.get("dedupe_progress", 0)
         dedupe_total = state.get("dedupe_total", 0)
         dedupe_current_group = state.get("dedupe_current_group")
-        auto_move_enabled = getattr(sys.modules[__name__], "AUTO_MOVE_DUPES", False)
+        auto_move_enabled = bool(
+            (scan_pipeline_flags or {}).get(
+                "dedupe",
+                getattr(sys.modules[__name__], "AUTO_MOVE_DUPES", False),
+            )
+        )
         # Phase: derive from current_step and flags for UI (format_analysis | identification_tags | ia_analysis | finalizing | moving_dupes)
         if not scanning:
             phase = None
@@ -19596,6 +21360,13 @@ def api_progress():
         scan_lastfm_matched=scan_lastfm_matched,
         scan_bandcamp_matched=scan_bandcamp_matched,
         scan_start_time=scan_start_time,
+        scan_pipeline_flags=scan_pipeline_flags,
+        scan_pipeline_sync_target=scan_pipeline_sync_target,
+        scan_incomplete_moved_count=scan_incomplete_moved_count,
+        scan_incomplete_moved_mb=scan_incomplete_moved_mb,
+        scan_player_sync_target=scan_player_sync_target,
+        scan_player_sync_ok=scan_player_sync_ok,
+        scan_player_sync_message=scan_player_sync_message,
     )
 
 
@@ -20232,10 +22003,45 @@ def api_incomplete_albums_move():
                 c = con.cursor()
                 c.execute("PRAGMA table_info(scan_moves)")
                 cols = [c[1] for c in c.execute("PRAGMA table_info(scan_moves)").fetchall()]
-                c.execute("""
-                    INSERT INTO scan_moves (scan_id, artist, album_id, original_path, moved_to_path, size_mb, moved_at, album_title, fmt_text)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (scan_id, artist, album_id, str(src_folder), str(dst), 0, time.time(), it.get("title_raw", ""), "incomplete"))
+                if "move_reason" in cols:
+                    c.execute(
+                        """
+                        INSERT INTO scan_moves
+                        (scan_id, artist, album_id, original_path, moved_to_path, size_mb, moved_at, album_title, fmt_text, move_reason)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            scan_id,
+                            artist,
+                            album_id,
+                            str(src_folder),
+                            str(dst),
+                            0,
+                            time.time(),
+                            it.get("title_raw", ""),
+                            "incomplete",
+                            "incomplete",
+                        ),
+                    )
+                else:
+                    c.execute(
+                        """
+                        INSERT INTO scan_moves
+                        (scan_id, artist, album_id, original_path, moved_to_path, size_mb, moved_at, album_title, fmt_text)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            scan_id,
+                            artist,
+                            album_id,
+                            str(src_folder),
+                            str(dst),
+                            0,
+                            time.time(),
+                            it.get("title_raw", ""),
+                            "incomplete",
+                        ),
+                    )
                 con.commit()
                 con.close()
         except Exception as e:
@@ -21393,6 +23199,7 @@ def api_library_artist_detail(artist_id):
             cur.execute("""
                 SELECT album_id, title_raw, folder, fmt_text, br, sr, bd, meta_json, musicbrainz_id,
                        is_broken, expected_track_count, actual_track_count, missing_indices, has_cover, missing_required_tags
+                       , discogs_release_id, lastfm_album_mbid, bandcamp_album_url, metadata_source
                 FROM scan_editions WHERE scan_id = ? AND artist = ?
             """, (scan_id, artist_name))
             for row in cur.fetchall():
@@ -21401,6 +23208,8 @@ def api_library_artist_detail(artist_id):
                     "title_raw": row[1], "folder": row[2], "fmt_text": row[3], "br": row[4], "sr": row[5], "bd": row[6],
                     "meta_json": row[7], "musicbrainz_id": row[8], "is_broken": row[9], "expected_track_count": row[10],
                     "actual_track_count": row[11], "missing_indices": row[12], "has_cover": row[13], "missing_required_tags": row[14],
+                    "discogs_release_id": row[15], "lastfm_album_mbid": row[16], "bandcamp_album_url": row[17],
+                    "metadata_source": _normalize_identity_provider(str(row[18] or "")),
                 }
             cur.execute("SELECT album_id FROM duplicates_best WHERE artist = ?", (artist_name,))
             dup_album_ids_from_scan.update(r[0] for r in cur.fetchall())
@@ -21426,6 +23235,10 @@ def api_library_artist_detail(artist_id):
             mb_identified = bool(se.get("musicbrainz_id"))
             if se.get("musicbrainz_id"):
                 musicbrainz_release_group_id = se.get("musicbrainz_id")
+            discogs_release_id = str(se.get("discogs_release_id") or "").strip() or None
+            lastfm_album_mbid = str(se.get("lastfm_album_mbid") or "").strip() or None
+            bandcamp_album_url = str(se.get("bandcamp_album_url") or "").strip() or None
+            metadata_source = _normalize_identity_provider(str(se.get("metadata_source") or "")) or None
             thumb_empty = not (se.get("has_cover"))
             is_broken = bool(se.get("is_broken"))
             missing_raw = se.get("missing_indices")
@@ -21469,6 +23282,10 @@ def api_library_artist_detail(artist_id):
             format_str = None
             is_lossless = False
             mb_identified = False
+            discogs_release_id = None
+            lastfm_album_mbid = None
+            bandcamp_album_url = None
+            metadata_source = None
             album_type = "Album"
             folder = first_part_path(db_conn, album_id)
             if folder:
@@ -21532,6 +23349,10 @@ def api_library_artist_detail(artist_id):
             "thumb_empty": thumb_empty,
             "mb_identified": mb_identified,
             "musicbrainz_release_group_id": musicbrainz_release_group_id,
+            "discogs_release_id": discogs_release_id,
+            "lastfm_album_mbid": lastfm_album_mbid,
+            "bandcamp_album_url": bandcamp_album_url,
+            "metadata_source": metadata_source,
             "in_duplicate_group": in_duplicate_group,
             "can_improve": can_improve,
             "broken_detail": broken_detail,
@@ -22777,6 +24598,73 @@ def _is_usable_artist_image_bytes(raw: bytes, *, min_dim: int = 220, min_bytes: 
     return True
 
 
+def _image_ahash_hex(raw: bytes, size: int = 8) -> str | None:
+    try:
+        from PIL import Image
+        from io import BytesIO
+    except Exception:
+        return None
+    try:
+        with Image.open(BytesIO(raw)) as img:
+            gray = img.convert("L").resize((size, size), Image.Resampling.BILINEAR)
+            pixels = list(gray.getdata())
+        if not pixels:
+            return None
+        avg = sum(pixels) / len(pixels)
+        bits = "".join("1" if px >= avg else "0" for px in pixels)
+        return f"{int(bits, 2):0{size * size // 4}x}"
+    except Exception:
+        return None
+
+
+def _hamming_hex(a: str, b: str) -> int:
+    try:
+        return bin(int(a, 16) ^ int(b, 16)).count("1")
+    except Exception:
+        return 999
+
+
+def _is_artist_image_distinct_from_local_covers(artist_folder: Path, candidate_raw: bytes) -> bool:
+    """
+    Reject candidate artist images that are near-identical to local album covers for the same artist.
+    """
+    if not artist_folder or not artist_folder.is_dir():
+        return True
+    cand_hash = _image_ahash_hex(candidate_raw)
+    if not cand_hash:
+        return True
+    compared = 0
+    try:
+        for child in sorted(artist_folder.iterdir(), key=lambda p: str(p)):
+            if not child.is_dir():
+                continue
+            for pat in ("cover.*", "folder.*", "album.*", "artwork.*", "front.*"):
+                for cover in child.glob(pat):
+                    if cover.suffix.lower() not in {".jpg", ".jpeg", ".png", ".webp"}:
+                        continue
+                    try:
+                        raw = cover.read_bytes()
+                    except Exception:
+                        continue
+                    cover_hash = _image_ahash_hex(raw)
+                    if not cover_hash:
+                        continue
+                    dist = _hamming_hex(cand_hash, cover_hash)
+                    compared += 1
+                    if dist <= 4:
+                        logging.debug(
+                            "Artist image candidate rejected: too similar to album cover (%s, distance=%s)",
+                            cover,
+                            dist,
+                        )
+                        return False
+                    if compared >= 12:
+                        return True
+    except Exception:
+        return True
+    return True
+
+
 def _fetch_and_save_artist_image_mb(artist_mbid: str, artist_folder: Path) -> bool:
     """Fetch first artist image from MusicBrainz/Wikimedia and save to artist_folder/artist.jpg. Returns True if saved."""
     urls = get_artist_images_mb(artist_mbid)
@@ -22788,6 +24676,8 @@ def _fetch_and_save_artist_image_mb(artist_mbid: str, artist_folder: Path) -> bo
             ct = resp.headers.get("content-type", "").lower()
             if "image/" in ct:
                 if not _is_usable_artist_image_bytes(resp.content):
+                    continue
+                if not _is_artist_image_distinct_from_local_covers(artist_folder, resp.content):
                     continue
                 ext = ".jpg"
                 if "png" in ct:
@@ -22804,6 +24694,8 @@ def _fetch_and_save_artist_image_mb(artist_mbid: str, artist_folder: Path) -> bo
                     img_resp = requests.get(img_url, timeout=10, allow_redirects=True)
                     if img_resp.status_code == 200 and "image/" in img_resp.headers.get("content-type", "").lower():
                         if not _is_usable_artist_image_bytes(img_resp.content):
+                            continue
+                        if not _is_artist_image_distinct_from_local_covers(artist_folder, img_resp.content):
                             continue
                         (artist_folder / "artist.jpg").write_bytes(img_resp.content)
                         logging.info("Saved artist image from Wikimedia to %s", artist_folder / "artist.jpg")
@@ -22952,9 +24844,12 @@ def _fetch_and_save_artist_image(artist_name: str, artist_folder: Path, artist_m
             try:
                 resp = requests.get(url, timeout=10, allow_redirects=True)
                 if resp.status_code == 200 and resp.content and _is_usable_artist_image_bytes(resp.content):
-                    (artist_folder / "artist.jpg").write_bytes(resp.content)
-                    logging.info("Saved artist image from Last.fm to %s", artist_folder / "artist.jpg")
-                    return "lastfm"
+                    if not _is_artist_image_distinct_from_local_covers(artist_folder, resp.content):
+                        logging.debug("Skipped Last.fm artist image for '%s': too similar to local cover", artist_name)
+                    else:
+                        (artist_folder / "artist.jpg").write_bytes(resp.content)
+                        logging.info("Saved artist image from Last.fm to %s", artist_folder / "artist.jpg")
+                        return "lastfm"
             except Exception as e:
                 logging.warning("Artist image download (Last.fm) failed: %s", e)
     # Discogs
@@ -22964,9 +24859,12 @@ def _fetch_and_save_artist_image(artist_name: str, artist_folder: Path, artist_m
             try:
                 resp = requests.get(url, timeout=10, allow_redirects=True)
                 if resp.status_code == 200 and resp.content and _is_usable_artist_image_bytes(resp.content):
-                    (artist_folder / "artist.jpg").write_bytes(resp.content)
-                    logging.info("Saved artist image from Discogs to %s", artist_folder / "artist.jpg")
-                    return "discogs"
+                    if not _is_artist_image_distinct_from_local_covers(artist_folder, resp.content):
+                        logging.debug("Skipped Discogs artist image for '%s': too similar to local cover", artist_name)
+                    else:
+                        (artist_folder / "artist.jpg").write_bytes(resp.content)
+                        logging.info("Saved artist image from Discogs to %s", artist_folder / "artist.jpg")
+                        return "discogs"
             except Exception as e:
                 logging.warning("Artist image download (Discogs) failed: %s", e)
     # Web search fallback (Serper + OpenGraph) when other providers did not yield an image
@@ -22975,6 +24873,8 @@ def _fetch_and_save_artist_image(artist_name: str, artist_folder: Path, artist_m
         try:
             resp = requests.get(web_url, timeout=10, allow_redirects=True)
             if resp.status_code == 200 and resp.content and _is_usable_artist_image_bytes(resp.content):
+                if not _is_artist_image_distinct_from_local_covers(artist_folder, resp.content):
+                    return None
                 (artist_folder / "artist.jpg").write_bytes(resp.content)
                 logging.info("Saved artist image from web search to %s", artist_folder / "artist.jpg")
                 return "web"
@@ -23752,6 +25652,24 @@ def _improve_single_album(album_id: int, db_conn, known_release_group_id: Option
         try:
             result = musicbrainzngs.get_release_group_by_id(release_group_id, includes=["releases"])
             mb_release_info = result.get("release-group", {})
+            if mb_release_info:
+                strict_ok, strict_reason = _strict_identity_match_details(
+                    local_artist=artist_name,
+                    local_title=album_title_str,
+                    candidate_artist=_extract_mb_artist_names(mb_release_info),
+                    candidate_title=mb_release_info.get("title") or "",
+                )
+                if not strict_ok:
+                    logging.warning(
+                        "improve-album: rejected MBID %s for %s / %s (%s)",
+                        release_group_id,
+                        artist_name,
+                        album_title_str,
+                        strict_reason,
+                    )
+                    steps.append(f"MusicBrainz rejected by strict identity: {strict_reason}")
+                    mb_release_info = None
+                    release_mbid = None
         except Exception as e:
             logging.warning("improve-album: failed to fetch release group %s: %s", release_group_id, e)
             steps.append(f"MusicBrainz lookup failed: {e}")
@@ -23933,6 +25851,23 @@ def _improve_single_album(album_id: int, db_conn, known_release_group_id: Option
     if USE_DISCOGS and (not tags_updated or not has_cover_now):
         discogs_info = _fetch_discogs_release(artist_name, album_title_str)
         if discogs_info:
+            strict_ok, strict_reason = _strict_identity_match_details(
+                local_artist=artist_name,
+                local_title=album_title_str,
+                candidate_artist=discogs_info.get("artist_name") or "",
+                candidate_title=discogs_info.get("title") or "",
+            )
+            if not strict_ok:
+                logging.info(
+                    "Fix-all [album_id=%s] Discogs candidate rejected for %s / %s (%s)",
+                    album_id,
+                    artist_name,
+                    album_title_str,
+                    strict_reason,
+                )
+                steps.append(f"Discogs rejected by strict identity: {strict_reason}")
+                discogs_info = None
+        if discogs_info:
             discogs_release_id = str(discogs_info.get("release_id") or "").strip() or discogs_release_id
             artist_str = discogs_info.get("artist_name") or artist_name
             album_str = discogs_info.get("title") or album_title_str
@@ -23990,6 +25925,23 @@ def _improve_single_album(album_id: int, db_conn, known_release_group_id: Option
     # even if MusicBrainz already provided basic tags.
     if USE_LASTFM and ((not tags_updated or not has_cover_now) or ("genre" in missing_required)):
         lastfm_info = _fetch_lastfm_album_info(artist_name, album_title_str, release_mbid)
+        if lastfm_info:
+            strict_ok, strict_reason = _strict_identity_match_details(
+                local_artist=artist_name,
+                local_title=album_title_str,
+                candidate_artist=lastfm_info.get("artist") or lastfm_info.get("artist_name") or "",
+                candidate_title=lastfm_info.get("title") or lastfm_info.get("album") or "",
+            )
+            if not strict_ok:
+                logging.info(
+                    "Fix-all [album_id=%s] Last.fm candidate rejected for %s / %s (%s)",
+                    album_id,
+                    artist_name,
+                    album_title_str,
+                    strict_reason,
+                )
+                steps.append(f"Last.fm rejected by strict identity: {strict_reason}")
+                lastfm_info = None
         if lastfm_info:
             lfm_mbid_val = str(lastfm_info.get("mbid") or "").strip()
             if lfm_mbid_val:
@@ -24057,6 +26009,23 @@ def _improve_single_album(album_id: int, db_conn, known_release_group_id: Option
     # Also used to fill in missing genre when Bandcamp exposes useful tags.
     if USE_BANDCAMP and ((not tags_updated or not has_cover_now) or ("genre" in missing_required)):
         bandcamp_info = _fetch_bandcamp_album_info(artist_name, album_title_str)
+        if bandcamp_info:
+            strict_ok, strict_reason = _strict_identity_match_details(
+                local_artist=artist_name,
+                local_title=album_title_str,
+                candidate_artist=bandcamp_info.get("artist_name") or "",
+                candidate_title=bandcamp_info.get("title") or "",
+            )
+            if not strict_ok:
+                logging.info(
+                    "Fix-all [album_id=%s] Bandcamp candidate rejected for %s / %s (%s)",
+                    album_id,
+                    artist_name,
+                    album_title_str,
+                    strict_reason,
+                )
+                steps.append(f"Bandcamp rejected by strict identity: {strict_reason}")
+                bandcamp_info = None
         if bandcamp_info:
             bandcamp_album_url = str(bandcamp_info.get("album_url") or "").strip() or bandcamp_album_url
             artist_str = bandcamp_info.get("artist_name") or artist_name
@@ -24388,6 +26357,24 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
         try:
             result = musicbrainzngs.get_release_group_by_id(release_group_id, includes=["releases"])
             mb_release_info = result.get("release-group", {})
+            if mb_release_info:
+                strict_ok, strict_reason = _strict_identity_match_details(
+                    local_artist=artist_name,
+                    local_title=album_title_str,
+                    candidate_artist=_extract_mb_artist_names(mb_release_info),
+                    candidate_title=mb_release_info.get("title") or "",
+                )
+                if not strict_ok:
+                    logging.warning(
+                        "improve-folder: rejected MBID %s for %s / %s (%s)",
+                        release_group_id,
+                        artist_name,
+                        album_title_str,
+                        strict_reason,
+                    )
+                    steps.append(f"MusicBrainz rejected by strict identity: {strict_reason}")
+                    mb_release_info = None
+                    release_mbid = None
         except Exception as e:
             logging.warning("improve-folder: failed to fetch release group %s: %s", release_group_id, e)
             steps.append(f"MusicBrainz lookup failed: {e}")
@@ -24507,6 +26494,22 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
     if USE_DISCOGS and (not tags_updated or not has_cover_now):
         discogs_info = _fetch_discogs_release(artist_name, album_title_str)
         if discogs_info:
+            strict_ok, strict_reason = _strict_identity_match_details(
+                local_artist=artist_name,
+                local_title=album_title_str,
+                candidate_artist=discogs_info.get("artist_name") or "",
+                candidate_title=discogs_info.get("title") or "",
+            )
+            if not strict_ok:
+                logging.info(
+                    "improve-folder: Discogs candidate rejected for %s / %s (%s)",
+                    artist_name,
+                    album_title_str,
+                    strict_reason,
+                )
+                steps.append(f"Discogs rejected by strict identity: {strict_reason}")
+                discogs_info = None
+        if discogs_info:
             discogs_release_id = str(discogs_info.get("release_id") or "").strip() or discogs_release_id
             artist_str = discogs_info.get("artist_name") or artist_name
             album_str = discogs_info.get("title") or album_title_str
@@ -24553,6 +26556,22 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
     # even if MusicBrainz already provided basic tags.
     if USE_LASTFM and ((not tags_updated or not has_cover_now) or ("genre" in missing_required)):
         lastfm_info = _fetch_lastfm_album_info(artist_name, album_title_str, release_mbid)
+        if lastfm_info:
+            strict_ok, strict_reason = _strict_identity_match_details(
+                local_artist=artist_name,
+                local_title=album_title_str,
+                candidate_artist=lastfm_info.get("artist") or lastfm_info.get("artist_name") or "",
+                candidate_title=lastfm_info.get("title") or lastfm_info.get("album") or "",
+            )
+            if not strict_ok:
+                logging.info(
+                    "improve-folder: Last.fm candidate rejected for %s / %s (%s)",
+                    artist_name,
+                    album_title_str,
+                    strict_reason,
+                )
+                steps.append(f"Last.fm rejected by strict identity: {strict_reason}")
+                lastfm_info = None
         if lastfm_info:
             lfm_mbid_val = str(lastfm_info.get("mbid") or "").strip()
             if lfm_mbid_val:
@@ -24606,6 +26625,22 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
 
     if USE_BANDCAMP and ((not tags_updated or not has_cover_now) or ("genre" in missing_required)):
         bandcamp_info = _fetch_bandcamp_album_info(artist_name, album_title_str)
+        if bandcamp_info:
+            strict_ok, strict_reason = _strict_identity_match_details(
+                local_artist=artist_name,
+                local_title=album_title_str,
+                candidate_artist=bandcamp_info.get("artist_name") or "",
+                candidate_title=bandcamp_info.get("title") or "",
+            )
+            if not strict_ok:
+                logging.info(
+                    "improve-folder: Bandcamp candidate rejected for %s / %s (%s)",
+                    artist_name,
+                    album_title_str,
+                    strict_reason,
+                )
+                steps.append(f"Bandcamp rejected by strict identity: {strict_reason}")
+                bandcamp_info = None
         if bandcamp_info:
             bandcamp_album_url = str(bandcamp_info.get("album_url") or "").strip() or bandcamp_album_url
             artist_str = bandcamp_info.get("artist_name") or artist_name
@@ -25748,7 +27783,16 @@ def api_scan_history_moves(scan_id):
     cur.execute("PRAGMA table_info(scan_moves)")
     move_cols = [r[1] for r in cur.fetchall()]
     has_extra = "album_title" in move_cols and "fmt_text" in move_cols
-    if has_extra:
+    has_reason = "move_reason" in move_cols
+    if has_extra and has_reason:
+        cur.execute("""
+            SELECT move_id, scan_id, artist, album_id, original_path, moved_to_path,
+                   size_mb, moved_at, restored, album_title, fmt_text, move_reason
+            FROM scan_moves
+            WHERE scan_id = ?
+            ORDER BY moved_at DESC
+        """, (scan_id,))
+    elif has_extra:
         cur.execute("""
             SELECT move_id, scan_id, artist, album_id, original_path, moved_to_path,
                    size_mb, moved_at, restored, album_title, fmt_text
@@ -25783,6 +27827,8 @@ def api_scan_history_moves(scan_id):
         if has_extra and len(row) >= 11:
             m["album_title"] = row[9] or ""
             m["fmt_text"] = row[10] or ""
+        if has_reason and len(row) >= 12:
+            m["move_reason"] = (row[11] or "").strip().lower() or "dedupe"
         moves.append(m)
     
     return jsonify(moves)

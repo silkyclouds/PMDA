@@ -13,6 +13,7 @@ import ArtistPage from "./pages/ArtistPage";
 import TagFixer from "./pages/TagFixer";
 import Settings from "./pages/Settings";
 import NotFound from "./pages/NotFound";
+import Tools from "./pages/Tools";
 import { BrokenAlbumsList } from "./components/broken-albums/BrokenAlbumsList";
 import { PlaybackProvider, usePlayback } from "./contexts/PlaybackContext";
 import { AudioPlayer } from "./components/library/AudioPlayer";
@@ -30,6 +31,7 @@ function AppRoutesWithPlayer() {
         <Route path="/unduper" element={<Unduper />} />
         <Route path="/history" element={<ScanHistory />} />
         <Route path="/statistics" element={<Statistics />} />
+        <Route path="/tools" element={<Tools />} />
         <Route path="/library" element={<LibraryBrowser />} />
         <Route path="/library/artist/:artistId" element={<ArtistPage />} />
         <Route path="/tag-fixer" element={<TagFixer />} />

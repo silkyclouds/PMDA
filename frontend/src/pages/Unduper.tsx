@@ -254,7 +254,7 @@ export default function Unduper() {
         )}
         {showLibraryStatsHint && (
           <p className="text-sm text-muted-foreground">
-            Library stats unavailable. Run a scan or check Plex connection.
+            Library stats unavailable. Run a scan or check your source folders.
           </p>
         )}
 

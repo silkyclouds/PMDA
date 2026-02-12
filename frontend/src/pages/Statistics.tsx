@@ -722,7 +722,7 @@ export default function Statistics() {
 
   const cacheEntriesBarData = useMemo(() => {
     return {
-      labels: ['Audio cache', 'MB RG cache', 'MB album lookup', 'Files scan cache', 'Watcher queue', 'Redis PMDA keys'],
+      labels: ['Audio cache', 'MB RG cache', 'MB album lookup', 'Provider lookup', 'Files scan cache', 'Watcher queue', 'Redis PMDA keys'],
       datasets: [
         {
           label: 'Entries',
@@ -730,6 +730,7 @@ export default function Statistics() {
             n(cacheControl?.sqlite_cache_db?.audio_cache_rows),
             n(cacheControl?.sqlite_cache_db?.musicbrainz_cache_rows),
             n(cacheControl?.sqlite_cache_db?.musicbrainz_album_lookup_rows),
+            n(cacheControl?.sqlite_cache_db?.provider_album_lookup_rows),
             n(cacheControl?.sqlite_state_db?.files_album_scan_cache_rows),
             n(cacheControl?.sqlite_state_db?.files_pending_changes_rows),
             n(cacheControl?.redis?.pmda_prefix_keys),
@@ -738,11 +739,12 @@ export default function Statistics() {
             'rgba(34,197,94,0.78)',
             'rgba(59,130,246,0.78)',
             'rgba(14,165,233,0.78)',
+            'rgba(244,114,182,0.78)',
             'rgba(168,85,247,0.78)',
             'rgba(249,115,22,0.78)',
             'rgba(239,68,68,0.78)',
           ],
-          borderColor: ['#16a34a', '#2563eb', '#0284c7', '#9333ea', '#ea580c', '#dc2626'],
+          borderColor: ['#16a34a', '#2563eb', '#0284c7', '#db2777', '#9333ea', '#ea580c', '#dc2626'],
           borderWidth: 1,
         },
       ],
@@ -752,6 +754,7 @@ export default function Statistics() {
     cacheControl?.sqlite_cache_db?.audio_cache_rows,
     cacheControl?.sqlite_cache_db?.musicbrainz_album_lookup_rows,
     cacheControl?.sqlite_cache_db?.musicbrainz_cache_rows,
+    cacheControl?.sqlite_cache_db?.provider_album_lookup_rows,
     cacheControl?.sqlite_state_db?.files_album_scan_cache_rows,
     cacheControl?.sqlite_state_db?.files_pending_changes_rows,
   ]);
@@ -1239,6 +1242,12 @@ export default function Statistics() {
                   icon={<Layers className="w-4 h-4 text-primary" />}
                   value={n(cacheControl?.sqlite_state_db?.files_album_scan_cache_rows).toLocaleString()}
                   description={`${n(cacheControl?.sqlite_state_db?.files_album_scan_cache_healthy_rows).toLocaleString()} healthy rows`}
+                />
+                <StatCard
+                  title="Provider Lookup Cache"
+                  icon={<Database className="w-4 h-4 text-pink-500" />}
+                  value={n(cacheControl?.sqlite_cache_db?.provider_album_lookup_rows).toLocaleString()}
+                  description={`${n(cacheControl?.sqlite_cache_db?.provider_album_lookup_not_found_rows).toLocaleString()} negative rows`}
                 />
                 <StatCard
                   title="Watcher Queue"

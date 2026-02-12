@@ -148,11 +148,20 @@ export default function ArtistPage() {
         if (cancelled) return;
         const list = Array.isArray(data?.similar_artists) ? data.similar_artists : [];
         setFallbackSimilar(
-          list.map((x: any) => ({
-            name: String(x?.name || ''),
-            mbid: x?.mbid ? String(x.mbid) : undefined,
-            type: x?.type ? String(x.type) : undefined,
-          }))
+          list
+            .map((x: unknown) => {
+              if (!x || typeof x !== 'object') {
+                return { name: '' };
+              }
+              const obj = x as Record<string, unknown>;
+              const name = typeof obj.name === 'string' ? obj.name : String(obj.name ?? '');
+              return {
+                name,
+                mbid: typeof obj.mbid === 'string' ? obj.mbid : undefined,
+                type: typeof obj.type === 'string' ? obj.type : undefined,
+              };
+            })
+            .filter((entry) => entry.name.length > 0)
         );
       } catch {
         // no-op

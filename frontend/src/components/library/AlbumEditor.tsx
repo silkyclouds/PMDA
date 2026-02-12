@@ -30,10 +30,26 @@ interface AlbumEditorProps {
   onClose: () => void;
 }
 
+interface AlbumTagResponse {
+  current_tags?: Record<string, string>;
+  thumb_url?: string | null;
+  musicbrainz_id?: string | null;
+  musicbrainz_info?: {
+    primary_type?: string;
+    format_summary?: string;
+  };
+}
+
+interface SuggestedTagsResponse {
+  success?: boolean;
+  message?: string;
+  suggested_tags?: Record<string, string>;
+}
+
 export function AlbumEditor({ albumId, albumTitle, artistName, albumThumb, format, canImprove, improveReasons, brokenDetail, onClose }: AlbumEditorProps) {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
-  const [albumData, setAlbumData] = useState<any>(null);
+  const [albumData, setAlbumData] = useState<AlbumTagResponse | null>(null);
   const [tags, setTags] = useState<Record<string, string>>({});
   const [coverError, setCoverError] = useState(false);
   const [queryingMb, setQueryingMb] = useState(false);
@@ -54,9 +70,9 @@ export function AlbumEditor({ albumId, albumTitle, artistName, albumThumb, forma
       setLoading(true);
       const response = await fetch(`/api/library/album/${albumId}/tags`);
       if (response.ok) {
-        const data = await response.json();
+        const data = (await response.json()) as AlbumTagResponse;
         setAlbumData(data);
-        setTags(data.current_tags || {});
+        setTags(data.current_tags ?? {});
       } else {
         throw new Error('Failed to load album tags');
       }
@@ -80,7 +96,7 @@ export function AlbumEditor({ albumId, albumTitle, artistName, albumThumb, forma
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ album_id: albumId }),
       });
-      const data = await response.json();
+      const data = (await response.json()) as SuggestedTagsResponse;
       if (data.success && data.suggested_tags && Object.keys(data.suggested_tags).length > 0) {
         setSuggestedTags(data.suggested_tags);
         toast({ title: 'MusicBrainz', description: data.message ?? 'Suggested tags loaded.' });
@@ -222,9 +238,9 @@ export function AlbumEditor({ albumId, albumTitle, artistName, albumThumb, forma
           <div className="p-3 rounded-lg bg-primary/5 border border-primary/20">
             <div className="text-sm font-medium mb-2">MusicBrainz Info:</div>
             <div className="text-xs text-muted-foreground space-y-1">
-              <div>Type: {(albumData.musicbrainz_info as any).primary_type || 'Unknown'}</div>
-              {(albumData.musicbrainz_info as any).format_summary && (
-                <div>Formats: {(albumData.musicbrainz_info as any).format_summary}</div>
+              <div>Type: {albumData.musicbrainz_info.primary_type || 'Unknown'}</div>
+              {albumData.musicbrainz_info.format_summary && (
+                <div>Formats: {albumData.musicbrainz_info.format_summary}</div>
               )}
             </div>
           </div>
