@@ -19929,7 +19929,15 @@ def api_openai_oauth_device_poll():
     if sess.get("status") == "completed":
         return jsonify({"status": "completed", "message": "Already connected"})
     if sess.get("status") == "error":
-        return jsonify({"status": "error", "message": sess.get("error") or "OAuth failed"}), 500
+        msg = str(sess.get("error") or "OAuth failed").strip()
+        status = 400
+        m = re.search(r"status\\s+(\\d{3})", msg)
+        if m:
+            try:
+                status = int(m.group(1))
+            except Exception:
+                status = 400
+        return jsonify({"status": "error", "message": msg}), status
 
     now = time.time()
     created_at = float(sess.get("created_at") or 0.0)
@@ -19937,7 +19945,7 @@ def api_openai_oauth_device_poll():
         with _openai_oauth_lock:
             _openai_oauth_device_sessions[session_id]["status"] = "error"
             _openai_oauth_device_sessions[session_id]["error"] = "Device auth timed out after 15 minutes"
-        return jsonify({"status": "error", "message": "Device auth timed out after 15 minutes"}), 500
+        return jsonify({"status": "error", "message": "Device auth timed out after 15 minutes"}), 408
 
     interval = int(sess.get("interval") or 5)
     last_poll_at = float(sess.get("last_poll_at") or 0.0)
@@ -19998,7 +20006,17 @@ def api_openai_oauth_device_poll():
             _openai_oauth_device_sessions[session_id]["status"] = "error"
             _openai_oauth_device_sessions[session_id]["error"] = msg
         logging.warning("OpenAI OAuth failed (session=%s): %s", session_id, msg)
-        return jsonify({"status": "error", "message": msg}), 500
+        status = 500
+        m = re.search(r"status\\s+(\\d{3})", msg)
+        if m:
+            try:
+                status = int(m.group(1))
+            except Exception:
+                status = 500
+        # surface auth problems as 401 so UI can display a clear error
+        if "api key exchange" in msg.lower() and status == 500:
+            status = 401
+        return jsonify({"status": "error", "message": msg}), status
 
 
 @app.get("/api/musicbrainz/test")

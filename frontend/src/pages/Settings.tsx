@@ -92,6 +92,41 @@ function SettingsPage() {
   } | null>(null);
   const [openaiOAuthBusy, setOpenaiOAuthBusy] = useState(false);
 
+  const getApiErrorMessage = (e: unknown): string | null => {
+    const bodyMsg = (e as { body?: { message?: unknown } } | null)?.body?.message;
+    if (typeof bodyMsg === 'string' && bodyMsg.trim()) return bodyMsg.trim();
+    return null;
+  };
+
+  const copyTextToClipboard = async (text: string): Promise<boolean> => {
+    const clean = String(text ?? '');
+    if (!clean) return false;
+    try {
+      if (navigator?.clipboard?.writeText) {
+        await navigator.clipboard.writeText(clean);
+        return true;
+      }
+    } catch {
+      // Fall back below (HTTP/non-secure contexts).
+    }
+    try {
+      const el = document.createElement('textarea');
+      el.value = clean;
+      el.setAttribute('readonly', 'true');
+      el.style.position = 'fixed';
+      el.style.left = '-9999px';
+      el.style.top = '0';
+      document.body.appendChild(el);
+      el.focus();
+      el.select();
+      const ok = document.execCommand('copy');
+      document.body.removeChild(el);
+      return Boolean(ok);
+    } catch {
+      return false;
+    }
+  };
+
   useEffect(() => {
     loadConfig();
   }, []);
@@ -127,7 +162,7 @@ function SettingsPage() {
         warning: res.warning,
       });
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : 'Failed to start OpenAI OAuth');
+      toast.error(getApiErrorMessage(e) || (e instanceof Error ? e.message : 'Failed to start OpenAI OAuth'));
     } finally {
       setOpenaiOAuthBusy(false);
     }
@@ -151,7 +186,7 @@ function SettingsPage() {
       }
       setOpenaiOAuth((prev) => prev ? { ...prev, status: 'pending', message: res.message } : prev);
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : 'OpenAI OAuth poll failed');
+      toast.error(getApiErrorMessage(e) || (e instanceof Error ? e.message : 'OpenAI OAuth poll failed'));
     } finally {
       setOpenaiOAuthBusy(false);
     }
@@ -503,12 +538,9 @@ function SettingsPage() {
 	                            size="sm"
 	                            className="gap-1.5"
 	                            onClick={async () => {
-	                              try {
-	                                await navigator.clipboard.writeText(openaiOAuth.userCode);
-	                                toast.success('Code copied');
-	                              } catch {
-	                                toast.error('Copy failed');
-	                              }
+	                              const ok = await copyTextToClipboard(openaiOAuth.userCode);
+	                              if (ok) toast.success('Code copied');
+	                              else toast.error('Copy failed');
 	                            }}
 	                          >
 	                            <Copy className="w-4 h-4" />
