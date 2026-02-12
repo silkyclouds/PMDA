@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
-import { Settings, RefreshCw, History, BarChart2, Library, Scan, Wrench } from 'lucide-react';
+import { Settings, RefreshCw, BarChart2, Library, Scan, Wrench } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { Button } from '@/components/ui/button';
 import { WelcomeModal } from '@/components/WelcomeModal';
@@ -140,14 +140,6 @@ export function Header() {
                 <span>Library</span>
               </NavLink>
               {/* Tag Fixer and Incomplete Albums removed from main nav */}
-              <NavLink 
-                to="/history" 
-                className="flex items-center gap-2 px-3 py-2 rounded-md text-sm font-medium text-muted-foreground hover:text-foreground hover:bg-accent transition-colors"
-                activeClassName="text-foreground bg-accent"
-              >
-                <History className="w-4 h-4" />
-                <span>History</span>
-              </NavLink>
               <NavLink 
                 to="/statistics" 
                 className="flex items-center gap-2 px-3 py-2 rounded-md text-sm font-medium text-muted-foreground hover:text-foreground hover:bg-accent transition-colors"

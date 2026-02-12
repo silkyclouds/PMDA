@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { 
   Menu, Scan, Package, Library, 
-  History, BarChart2, Settings, Wrench
+  BarChart2, Settings, Wrench
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetTrigger } from '@/components/ui/sheet';
@@ -21,7 +21,6 @@ interface NavItem {
 const navItems: NavItem[] = [
   { to: '/', icon: Scan, label: 'Scan' },
   { to: '/library', icon: Library, label: 'Library' },
-  { to: '/history', icon: History, label: 'History' },
   { to: '/statistics', icon: BarChart2, label: 'Statistics' },
   { to: '/tools', icon: Wrench, label: 'Tools' },
 ];
@@ -128,7 +127,6 @@ export function MobileBottomNav({ duplicateCount }: { duplicateCount?: number })
     { to: '/', icon: Scan, label: 'Scan' },
     { to: '/library', icon: Library, label: 'Library' },
     { to: '/tools', icon: Wrench, label: 'Tools', badge: duplicateCount, badgeVariant: 'warning' },
-    { to: '/history', icon: History, label: 'History' },
     { to: '/statistics', icon: BarChart2, label: 'Stats' },
   ];
 

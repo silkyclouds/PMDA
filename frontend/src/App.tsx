@@ -5,7 +5,6 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 import { ThemeProvider } from "next-themes";
 import Scan from "./pages/Scan";
-import ScanHistory from "./pages/ScanHistory";
 import Statistics from "./pages/Statistics";
 import LibraryBrowser from "./pages/LibraryBrowser";
 import ArtistPage from "./pages/ArtistPage";
@@ -28,7 +27,7 @@ function AppRoutesWithPlayer() {
       <Routes>
         <Route path="/" element={<Scan />} />
         <Route path="/unduper" element={<Navigate to="/tools" replace />} />
-        <Route path="/history" element={<ScanHistory />} />
+        <Route path="/history" element={<Navigate to="/tools" replace />} />
         <Route path="/statistics" element={<Statistics />} />
         <Route path="/tools" element={<Tools />} />
         <Route path="/library" element={<LibraryBrowser />} />

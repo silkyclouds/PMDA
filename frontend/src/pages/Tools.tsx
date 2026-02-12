@@ -1,6 +1,6 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { AlertTriangle, Loader2, RefreshCw, Tags, Trash2, Undo2 } from 'lucide-react';
+import { AlertTriangle, ChevronLeft, ChevronRight, Loader2, RefreshCw, Tags, Trash2, Undo2 } from 'lucide-react';
 import { Header } from '@/components/Header';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -15,6 +15,7 @@ function fmtDate(ts?: number): string {
 
 export default function Tools() {
   const [restoring, setRestoring] = useState<'dedupe' | 'incomplete' | null>(null);
+  const [selectedScanId, setSelectedScanId] = useState<number | null>(null);
 
   const { data: history, isLoading: loadingHistory, refetch: refetchHistory } = useQuery({
     queryKey: ['scan-history-tools'],
@@ -22,24 +23,50 @@ export default function Tools() {
     refetchInterval: 5000,
   });
 
-  const latestCompleted = useMemo(() => {
+  const completedRuns = useMemo(() => {
     const rows = Array.isArray(history) ? history : [];
-    return rows.find((r) => r.status === 'completed') ?? null;
+    return rows
+      .filter((r) => r.status === 'completed')
+      .sort((a, b) => Number(b.scan_id) - Number(a.scan_id));
   }, [history]);
 
-  const latestSummary = latestCompleted?.summary_json ?? null;
+  useEffect(() => {
+    if (completedRuns.length === 0) {
+      setSelectedScanId(null);
+      return;
+    }
+    if (selectedScanId == null) {
+      setSelectedScanId(completedRuns[0].scan_id);
+      return;
+    }
+    if (!completedRuns.some((r) => r.scan_id === selectedScanId)) {
+      setSelectedScanId(completedRuns[0].scan_id);
+    }
+  }, [completedRuns, selectedScanId]);
+
+  const selectedIndex = useMemo(() => {
+    if (selectedScanId == null) return -1;
+    return completedRuns.findIndex((r) => r.scan_id === selectedScanId);
+  }, [completedRuns, selectedScanId]);
+
+  const selectedRun = useMemo(() => {
+    if (selectedIndex < 0) return null;
+    return completedRuns[selectedIndex] ?? null;
+  }, [completedRuns, selectedIndex]);
+
+  const selectedSummary = selectedRun?.summary_json ?? null;
 
   const {
     data: moves,
     isLoading: loadingMoves,
     refetch: refetchMoves,
   } = useQuery({
-    queryKey: ['scan-moves-tools', latestCompleted?.scan_id],
+    queryKey: ['scan-moves-tools', selectedRun?.scan_id],
     queryFn: async () => {
-      if (!latestCompleted?.scan_id) return [];
-      return api.getScanMoves(latestCompleted.scan_id);
+      if (!selectedRun?.scan_id) return [];
+      return api.getScanMoves(selectedRun.scan_id);
     },
-    enabled: Boolean(latestCompleted?.scan_id),
+    enabled: Boolean(selectedRun?.scan_id),
     refetchInterval: 5000,
   });
 
@@ -53,7 +80,7 @@ export default function Tools() {
   );
 
   const restoreByReason = async (reason: 'dedupe' | 'incomplete') => {
-    if (!latestCompleted?.scan_id) return;
+    if (!selectedRun?.scan_id) return;
     const selected = (moves || [])
       .filter((m) => (m.move_reason || 'dedupe') === reason && !m.restored)
       .map((m) => m.move_id);
@@ -63,7 +90,7 @@ export default function Tools() {
     }
     setRestoring(reason);
     try {
-      const result = await api.restoreMoves(latestCompleted.scan_id, selected, false);
+      const result = await api.restoreMoves(selectedRun.scan_id, selected, false);
       toast.success(`${result.restored} move(s) restored`);
       await Promise.all([refetchMoves(), refetchHistory()]);
     } catch (error: unknown) {
@@ -101,7 +128,7 @@ export default function Tools() {
           <div className="flex items-center justify-center py-16">
             <Loader2 className="w-8 h-8 animate-spin text-muted-foreground" />
           </div>
-        ) : !latestCompleted ? (
+        ) : !selectedRun ? (
           <Card>
             <CardContent className="py-10 text-sm text-muted-foreground">
               No completed scan yet.
@@ -111,16 +138,49 @@ export default function Tools() {
           <>
             <Card>
               <CardHeader>
-                <CardTitle>Latest completed run</CardTitle>
-                <CardDescription>
-                  Scan #{latestCompleted.scan_id} • started {fmtDate(latestCompleted.start_time)} • ended {fmtDate(latestCompleted.end_time)}
-                </CardDescription>
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <CardTitle>Run</CardTitle>
+                    <CardDescription>
+                      Scan #{selectedRun.scan_id} • started {fmtDate(selectedRun.start_time)} • ended {fmtDate(selectedRun.end_time)}
+                    </CardDescription>
+                  </div>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="icon"
+                      onClick={() => {
+                        if (selectedIndex > 0) setSelectedScanId(completedRuns[selectedIndex - 1].scan_id);
+                      }}
+                      disabled={selectedIndex <= 0}
+                      aria-label="Newer run"
+                    >
+                      <ChevronLeft className="w-4 h-4" />
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="icon"
+                      onClick={() => {
+                        if (selectedIndex >= 0 && selectedIndex < completedRuns.length - 1) setSelectedScanId(completedRuns[selectedIndex + 1].scan_id);
+                      }}
+                      disabled={selectedIndex < 0 || selectedIndex >= completedRuns.length - 1}
+                      aria-label="Older run"
+                    >
+                      <ChevronRight className="w-4 h-4" />
+                    </Button>
+                    <Badge variant="outline">
+                      {selectedIndex >= 0 ? `${selectedIndex + 1}/${completedRuns.length}` : `0/${completedRuns.length}`}
+                    </Badge>
+                  </div>
+                </div>
               </CardHeader>
               <CardContent className="flex flex-wrap gap-2">
-                <Badge variant="outline">{latestCompleted.albums_scanned} albums scanned</Badge>
-                <Badge variant="outline">{latestCompleted.artists_processed}/{latestCompleted.artists_total} artists processed</Badge>
-                <Badge variant="outline">{latestCompleted.duplicates_found} duplicate group(s)</Badge>
-                <Badge variant="outline">{latestCompleted.albums_moved} moved</Badge>
+                <Badge variant="outline">{selectedRun.albums_scanned} albums scanned</Badge>
+                <Badge variant="outline">{selectedRun.artists_processed}/{selectedRun.artists_total} artists processed</Badge>
+                <Badge variant="outline">{selectedRun.duplicates_found} duplicate group(s)</Badge>
+                <Badge variant="outline">{selectedRun.albums_moved} moved</Badge>
               </CardContent>
             </Card>
 
@@ -134,10 +194,10 @@ export default function Tools() {
                   <CardDescription>Albums touched by PMDA metadata pipeline.</CardDescription>
                 </CardHeader>
                 <CardContent className="space-y-2 text-sm">
-                  <div>Processed: <span className="font-medium">{latestSummary?.pmda_albums_processed ?? 0}</span></div>
-                  <div>Complete: <span className="font-medium">{latestSummary?.pmda_albums_complete ?? 0}</span></div>
-                  <div>With cover: <span className="font-medium">{latestSummary?.pmda_albums_with_cover ?? 0}</span></div>
-                  <div>With artist image: <span className="font-medium">{latestSummary?.pmda_albums_with_artist_image ?? 0}</span></div>
+                  <div>Processed: <span className="font-medium">{selectedSummary?.pmda_albums_processed ?? 0}</span></div>
+                  <div>Complete: <span className="font-medium">{selectedSummary?.pmda_albums_complete ?? 0}</span></div>
+                  <div>With cover: <span className="font-medium">{selectedSummary?.pmda_albums_with_cover ?? 0}</span></div>
+                  <div>With artist image: <span className="font-medium">{selectedSummary?.pmda_albums_with_artist_image ?? 0}</span></div>
                 </CardContent>
               </Card>
 
@@ -151,8 +211,8 @@ export default function Tools() {
                 </CardHeader>
                 <CardContent className="space-y-3">
                   <div className="text-sm">
-                    Moved this run: <span className="font-medium">{latestSummary?.incomplete_moved_this_scan ?? 0}</span>
-                    <span className="text-muted-foreground"> ({latestSummary?.incomplete_moved_mb_this_scan ?? 0} MB)</span>
+                    Moved this run: <span className="font-medium">{selectedSummary?.incomplete_moved_this_scan ?? 0}</span>
+                    <span className="text-muted-foreground"> ({selectedSummary?.incomplete_moved_mb_this_scan ?? 0} MB)</span>
                   </div>
                   <div className="flex items-center gap-2">
                     <Button
@@ -177,7 +237,7 @@ export default function Tools() {
                   <Trash2 className="w-4 h-4" />
                   Dedupe moves
                 </CardTitle>
-                <CardDescription>Albums moved by dedupe (latest run).</CardDescription>
+                <CardDescription>Albums moved by dedupe (selected run).</CardDescription>
               </CardHeader>
               <CardContent className="space-y-3">
                 <div className="flex items-center gap-2">
