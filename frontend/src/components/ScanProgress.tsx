@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useMemo } from 'react';
 import { Link } from 'react-router-dom';
-import { Play, Pause, Square, RefreshCw, Loader2, ChevronDown, ChevronUp, Sparkles, Database, Music, Cpu, Zap, AlertTriangle, Image, Tag, Package, Trash2, Clock, FolderInput, Terminal } from 'lucide-react';
+import { Play, Pause, Square, RefreshCw, Loader2, ChevronDown, ChevronUp, Sparkles, Database, Music, Cpu, Zap, AlertTriangle, Image, Tag, Package, Trash2, Clock, FolderInput, Terminal, Download } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
@@ -36,7 +36,7 @@ interface ScanProgressProps {
   progress: ScanProgressType;
   /** Real-time duplicate count from useDuplicates - used to determine card visibility */
   currentDuplicateCount?: number;
-  /** Called when user starts a scan. Options: scan_type (full | changed_only | incomplete_only), run_improve_after (except incomplete_only). */
+  /** Called when user starts a scan. Options: scan_type (full | changed_only | incomplete_only). */
   onStart: (options?: { scan_type?: ScanType; run_improve_after?: boolean }) => void;
   onPause: () => void;
   onResume: () => void;
@@ -50,11 +50,8 @@ interface ScanProgressProps {
   className?: string;
   /** Scan type: full (default), changed_only, or incomplete_only */
   scanType?: ScanType;
-  /** After scan: automatically run improve-all (tags + covers). Not used for incomplete_only. */
-  runImproveAfter?: boolean;
   /** Callbacks to update scan options from the component (optional; if not provided, options are internal state) */
   onScanTypeChange?: (t: ScanType) => void;
-  onRunImproveAfterChange?: (v: boolean) => void;
   /** Compact mode for simplified Scan page UI */
   compact?: boolean;
 }
@@ -74,9 +71,7 @@ export function ScanProgress({
   isClearing,
   className,
   scanType: scanTypeProp,
-  runImproveAfter: runImproveAfterProp,
   onScanTypeChange,
-  onRunImproveAfterChange,
   compact,
 }: ScanProgressProps) {
   const [expanded, setExpanded] = useState(false);
@@ -89,13 +84,12 @@ export function ScanProgress({
   const [liveLogLines, setLiveLogLines] = useState<string[]>([]);
   const [liveLogPath, setLiveLogPath] = useState('');
   const [showRawLogs, setShowRawLogs] = useState(false);
+  const rawLogViewportRef = useRef<HTMLDivElement | null>(null);
+  const rawLogStickToBottomRef = useRef(true);
   const hasToastedAiErrors = useRef(false);
   const [scanTypeInternal, setScanTypeInternal] = useState<ScanType>('full');
-  const [runImproveAfterInternal, setRunImproveAfterInternal] = useState(false);
   const scanType = scanTypeProp ?? scanTypeInternal;
   const setScanType = onScanTypeChange ?? setScanTypeInternal;
-  const runImproveAfter = runImproveAfterProp ?? runImproveAfterInternal;
-  const setRunImproveAfter = onRunImproveAfterChange ?? setRunImproveAfterInternal;
   const isCompact = Boolean(compact);
   const [improveAllProgressData, setImproveAllProgressData] = useState<Awaited<ReturnType<typeof getImproveAllProgress>> | null>(null);
   const [postScanRunning, setPostScanRunning] = useState(false);
@@ -267,6 +261,31 @@ export function ScanProgress({
     };
   }, [scanning, post_processing]);
 
+  // Keep the raw log viewport pinned to the bottom by default.
+  useEffect(() => {
+    if (!showRawLogs) return;
+    const el = rawLogViewportRef.current;
+    if (!el) return;
+    rawLogStickToBottomRef.current = true;
+    el.scrollTop = el.scrollHeight;
+
+    const onScroll = () => {
+      const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+      rawLogStickToBottomRef.current = distanceFromBottom < 24;
+    };
+    el.addEventListener('scroll', onScroll, { passive: true } as AddEventListenerOptions);
+    return () => el.removeEventListener('scroll', onScroll as EventListener);
+  }, [showRawLogs]);
+
+  useEffect(() => {
+    if (!showRawLogs) return;
+    const el = rawLogViewportRef.current;
+    if (!el) return;
+    if (rawLogStickToBottomRef.current) {
+      el.scrollTop = el.scrollHeight;
+    }
+  }, [liveLogLines, showRawLogs]);
+
   const hasActiveStep = scanning && active_artists.length > 0 && active_artists[0]?.current_album && active_artists[0].current_album.status !== 'done';
   const currentArtist = active_artists?.[0]?.artist_name || '';
   const improveAllRunning = improveAllProgressData?.running ?? false;
@@ -311,7 +330,7 @@ export function ScanProgress({
             </div>
             <div className="flex flex-wrap gap-2">
               {!scanning && status !== 'running' && (
-                <Button onClick={() => onStart({ scan_type: scanType, run_improve_after: runImproveAfter })} disabled={isStarting} className="gap-2">
+                <Button onClick={() => onStart({ scan_type: scanType })} disabled={isStarting} className="gap-2">
                   {isStarting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
                   Start scan
                 </Button>
@@ -345,9 +364,9 @@ export function ScanProgress({
               <span className="tabular-nums">{percentage}%</span>
             </div>
           </div>
-          <div className="flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
-            <span className="text-foreground font-medium">Mode:</span>
-            <div className="flex items-center gap-1">
+	          <div className="flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
+	            <span className="text-foreground font-medium">Mode:</span>
+	            <div className="flex items-center gap-1">
               <Button
                 variant={scanType === 'full' ? 'default' : 'outline'}
                 size="sm"
@@ -360,20 +379,17 @@ export function ScanProgress({
                 size="sm"
                 onClick={() => setScanType('changed_only')}
               >
-                Changed only
-              </Button>
-            </div>
-            <label className="flex items-center gap-2">
-              <Checkbox
-                checked={runImproveAfter}
-                onCheckedChange={(checked) => setRunImproveAfter(Boolean(checked))}
-              />
-              <span>Fix after scan</span>
-            </label>
-          </div>
-          <div className="text-xs text-muted-foreground">
-            Detailed stats live in <Link to="/statistics" className="underline underline-offset-2">Statistics</Link>.
-          </div>
+	                Changed only
+	              </Button>
+	            </div>
+	          </div>
+	          <p className="text-[11px] text-muted-foreground leading-4">
+	            <span className="font-medium text-foreground">Full</span>: scans everything under your sources (best for a first run).{' '}
+	            <span className="font-medium text-foreground">Changed only</span>: scans only new/modified album folders (recommended).
+	          </p>
+	          <div className="text-xs text-muted-foreground">
+	            Detailed stats live in <Link to="/statistics" className="underline underline-offset-2">Statistics</Link>.
+	          </div>
         </div>
       </div>
     );
@@ -859,30 +875,20 @@ export function ScanProgress({
 
           <div className="flex flex-col gap-3 pt-4 border-t border-border">
             <div className="flex flex-wrap items-center gap-4">
-              <div className="flex items-center gap-2">
-                <span className="text-sm font-medium text-foreground">Scan type</span>
-                <select
-                  className="rounded-md border border-input bg-background px-2 py-1.5 text-sm"
-                  value={scanType}
-                  onChange={(e) => setScanType(e.target.value as ScanType)}
-                  disabled={scanning}
-                >
-                  <option value="full">Full scan (duplicates + incomplete)</option>
-                  <option value="changed_only">Changed only (new/modified albums)</option>
-                  <option value="incomplete_only">Incomplete albums only</option>
-                </select>
-              </div>
-              {scanType !== 'incomplete_only' && (
-                <label className="flex items-center gap-2 text-sm cursor-pointer">
-                  <Checkbox
-                    checked={runImproveAfter}
-                    onCheckedChange={(v) => setRunImproveAfter(v === true)}
-                    disabled={scanning}
-                  />
-                <span className="text-muted-foreground">After scan: correct tags and covers</span>
-                </label>
-              )}
-            </div>
+	              <div className="flex items-center gap-2">
+	                <span className="text-sm font-medium text-foreground">Scan type</span>
+	                <select
+	                  className="rounded-md border border-input bg-background px-2 py-1.5 text-sm"
+	                  value={scanType}
+	                  onChange={(e) => setScanType(e.target.value as ScanType)}
+	                  disabled={scanning}
+	                >
+	                  <option value="full">Full scan (duplicates + incomplete)</option>
+	                  <option value="changed_only">Changed only (new/modified albums)</option>
+	                  <option value="incomplete_only">Incomplete albums only</option>
+	                </select>
+	              </div>
+	            </div>
           <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
             <div>
               <h3 className="text-base font-semibold text-foreground">Ready to scan</h3>
@@ -976,25 +982,25 @@ export function ScanProgress({
                       {preflightResult.acoustid.ok ? "AcousticID: OK" : `AcousticID: ${preflightResult.acoustid.message || "—"}`}
                     </div>
                   )}
-                  {!preflightResult.musicbrainz.ok && preflightResult.ai.ok && (
-                    <Button size="sm" variant="secondary" className="w-full mt-1" onClick={() => { setPreflightVerifiedAtStart(false); onStart({ scan_type: scanType, run_improve_after: scanType !== 'incomplete_only' ? runImproveAfter : false }); setPreflightResult(null); }} disabled={isStarting}>
-                      {isStarting ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
-                      Start scan anyway
-                    </Button>
-                  )}
+	                  {!preflightResult.musicbrainz.ok && preflightResult.ai.ok && (
+	                    <Button size="sm" variant="secondary" className="w-full mt-1" onClick={() => { setPreflightVerifiedAtStart(false); onStart({ scan_type: scanType }); setPreflightResult(null); }} disabled={isStarting}>
+	                      {isStarting ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
+	                      Start scan anyway
+	                    </Button>
+	                  )}
                 </div>
               )}
               <Button
                 size="default"
                 disabled={isStarting || preflightLoading}
                 className="gap-2"
-                onClick={async () => {
-                  if (preflightLoading || isStarting) return;
-                  const startOptions = { scan_type: scanType, run_improve_after: scanType !== 'incomplete_only' ? runImproveAfter : false };
-                  if (scanType === 'incomplete_only') {
-                    setWaitingForProgress(true);
-                    onStart(startOptions);
-                    return;
+	                onClick={async () => {
+	                  if (preflightLoading || isStarting) return;
+	                  const startOptions = { scan_type: scanType };
+	                  if (scanType === 'incomplete_only') {
+	                    setWaitingForProgress(true);
+	                    onStart(startOptions);
+	                    return;
                   }
                   setWaitingForProgress(true);
                   setPreflightLoading(true);
@@ -1358,18 +1364,30 @@ export function ScanProgress({
                     <Terminal className="w-3.5 h-3.5" />
                     Live backend log
                   </span>
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="sm"
-                    className="h-6 px-2 text-[11px]"
-                    onClick={() => setShowRawLogs((v) => !v)}
-                  >
-                    {showRawLogs ? 'Hide' : 'Show'}
-                  </Button>
+                  <div className="flex items-center gap-2">
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      className="h-6 px-2 text-[11px]"
+                      onClick={() => { window.location.href = '/api/logs/download?lines=50000'; }}
+                    >
+                      <Download className="w-3.5 h-3.5 mr-1" />
+                      Download
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      className="h-6 px-2 text-[11px]"
+                      onClick={() => setShowRawLogs((v) => !v)}
+                    >
+                      {showRawLogs ? 'Hide' : 'Show'}
+                    </Button>
+                  </div>
                 </div>
                 {showRawLogs && (
-                  <div className="rounded-lg border border-border bg-black/90 text-[11px] font-mono max-h-56 overflow-y-auto">
+                  <div ref={rawLogViewportRef} className="rounded-lg border border-border bg-black/90 text-[11px] font-mono max-h-56 overflow-y-auto">
                     {liveLogPath && (
                       <div className="px-3 py-1.5 text-[10px] text-emerald-400/80 border-b border-white/10 truncate" title={liveLogPath}>
                         {liveLogPath}

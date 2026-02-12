@@ -512,6 +512,7 @@ export default function Statistics() {
   );
 
   const scanTrendData = useMemo(() => {
+    const pointRadius = scansChrono.length <= 1 ? 4 : 2;
     return {
       labels: scansChrono.map((scan) => format(new Date(scan.startTime * 1000), 'MM-dd HH:mm')),
       datasets: [
@@ -522,6 +523,9 @@ export default function Statistics() {
           backgroundColor: 'rgba(59,130,246,0.2)',
           tension: 0.3,
           fill: true,
+          borderWidth: 2,
+          pointRadius,
+          pointHoverRadius: Math.max(4, pointRadius + 1),
         },
         {
           label: 'Duplicate groups',
@@ -530,6 +534,9 @@ export default function Statistics() {
           backgroundColor: 'rgba(245,158,11,0.2)',
           tension: 0.3,
           fill: true,
+          borderWidth: 2,
+          pointRadius,
+          pointHoverRadius: Math.max(4, pointRadius + 1),
         },
       ],
     };
@@ -891,11 +898,23 @@ export default function Statistics() {
           </Card>
         ) : (
           <Tabs value={activeTab} onValueChange={(v) => setActiveTab(v as StatsTab)}>
-            <TabsList className="grid grid-cols-2 md:grid-cols-4 w-full md:w-auto">
-              <TabsTrigger value="overview">Overview</TabsTrigger>
-              <TabsTrigger value="metadata">Metadata</TabsTrigger>
-              <TabsTrigger value="quality">Quality</TabsTrigger>
-              <TabsTrigger value="operations">Operations</TabsTrigger>
+            <TabsList className="grid grid-cols-2 md:grid-cols-4 w-full md:w-auto rounded-xl bg-muted/60 border border-border p-1 shadow-sm">
+              <TabsTrigger value="overview" className="gap-2 rounded-lg">
+                <BarChart3 className="w-4 h-4" />
+                Overview
+              </TabsTrigger>
+              <TabsTrigger value="metadata" className="gap-2 rounded-lg">
+                <Database className="w-4 h-4" />
+                Metadata
+              </TabsTrigger>
+              <TabsTrigger value="quality" className="gap-2 rounded-lg">
+                <Sparkles className="w-4 h-4" />
+                Quality
+              </TabsTrigger>
+              <TabsTrigger value="operations" className="gap-2 rounded-lg">
+                <Gauge className="w-4 h-4" />
+                Operations
+              </TabsTrigger>
             </TabsList>
 
             <TabsContent value="overview" className="space-y-4">
@@ -946,6 +965,12 @@ export default function Statistics() {
                   <CardDescription>Albums scanned and duplicates over selected scans.</CardDescription>
                 </CardHeader>
                 <CardContent>
+                  {scansChrono.length < 2 && (
+                    <div className="mb-3 flex items-center gap-2 text-xs text-muted-foreground">
+                      <AlertCircle className="w-3.5 h-3.5" />
+                      Run at least 2 completed scans to see a meaningful trend.
+                    </div>
+                  )}
                   <div className="h-[260px]">
                     <Line data={scanTrendData} options={chartOptions} />
                   </div>

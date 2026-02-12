@@ -19757,6 +19757,250 @@ def api_openai_check():
         return jsonify({"success": False, "message": f"Error: {error_msg}"}), 500
 
 
+# ───────────────────────── OpenAI OAuth (ChatGPT / Codex) ─────────────────────────
+
+_OPENAI_OAUTH_ISSUER = "https://auth.openai.com"
+# This is the public OAuth client_id used by OpenAI Codex "Sign in with ChatGPT".
+# It enables a device-code flow that works well for server-hosted PMDA (no localhost callback).
+_OPENAI_OAUTH_CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+_openai_oauth_lock = threading.Lock()
+_openai_oauth_device_sessions: dict[str, dict] = {}
+
+
+def _openai_oauth_device_request_user_code(
+    issuer: str = _OPENAI_OAUTH_ISSUER,
+    client_id: str = _OPENAI_OAUTH_CODEX_CLIENT_ID,
+) -> tuple[str, str, int]:
+    """
+    Start the OpenAI device-code flow.
+    Returns (device_auth_id, user_code, interval_sec).
+    """
+    url = f"{issuer.rstrip('/')}/api/accounts/deviceauth/usercode"
+    resp = requests.post(url, json={"client_id": client_id}, timeout=15)
+    if resp.status_code == 404:
+        raise RuntimeError(
+            "OpenAI device-code login is not enabled on this issuer. Use an API key instead."
+        )
+    if not resp.ok:
+        raise RuntimeError(f"OpenAI device-code start failed (status {resp.status_code})")
+    data = resp.json() if resp.content else {}
+    device_auth_id = str(data.get("device_auth_id") or "").strip()
+    user_code = str(data.get("user_code") or data.get("usercode") or "").strip()
+    interval_raw = data.get("interval") or 5
+    try:
+        interval = int(str(interval_raw).strip())
+    except Exception:
+        interval = 5
+    interval = max(1, min(interval, 30))
+    if not device_auth_id or not user_code:
+        raise RuntimeError("OpenAI device-code response was missing required fields")
+    return device_auth_id, user_code, interval
+
+
+def _openai_oauth_device_poll_for_code(
+    device_auth_id: str,
+    user_code: str,
+    issuer: str = _OPENAI_OAUTH_ISSUER,
+) -> dict | None:
+    """
+    Poll for device authorization completion.
+    Returns code payload on success, None when still pending.
+    """
+    url = f"{issuer.rstrip('/')}/api/accounts/deviceauth/token"
+    resp = requests.post(
+        url,
+        json={"device_auth_id": device_auth_id, "user_code": user_code},
+        timeout=15,
+    )
+    if resp.status_code in (403, 404):
+        return None
+    if not resp.ok:
+        raise RuntimeError(f"OpenAI device-code poll failed (status {resp.status_code})")
+    return resp.json() if resp.content else {}
+
+
+def _openai_oauth_exchange_authorization_code_for_tokens(
+    authorization_code: str,
+    code_verifier: str,
+    issuer: str = _OPENAI_OAUTH_ISSUER,
+    client_id: str = _OPENAI_OAUTH_CODEX_CLIENT_ID,
+) -> dict:
+    """Exchange authorization_code for (id_token, access_token, refresh_token)."""
+    token_url = f"{issuer.rstrip('/')}/oauth/token"
+    redirect_uri = f"{issuer.rstrip('/')}/deviceauth/callback"
+    resp = requests.post(
+        token_url,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        data={
+            "grant_type": "authorization_code",
+            "code": authorization_code,
+            "redirect_uri": redirect_uri,
+            "client_id": client_id,
+            "code_verifier": code_verifier,
+        },
+        timeout=20,
+    )
+    if not resp.ok:
+        raise RuntimeError(f"OpenAI token exchange failed (status {resp.status_code})")
+    data = resp.json() if resp.content else {}
+    if not str(data.get("id_token") or "").strip():
+        raise RuntimeError("OpenAI token exchange returned no id_token")
+    return data
+
+
+def _openai_oauth_token_exchange_for_api_key(
+    id_token: str,
+    issuer: str = _OPENAI_OAUTH_ISSUER,
+    client_id: str = _OPENAI_OAUTH_CODEX_CLIENT_ID,
+) -> str:
+    """Token exchange: id_token -> requested_token=openai-api-key (returns an API key-like token)."""
+    token_url = f"{issuer.rstrip('/')}/oauth/token"
+    resp = requests.post(
+        token_url,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        data={
+            "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+            "client_id": client_id,
+            "requested_token": "openai-api-key",
+            "subject_token": id_token,
+            "subject_token_type": "urn:ietf:params:oauth:token-type:id_token",
+        },
+        timeout=20,
+    )
+    if not resp.ok:
+        raise RuntimeError(f"OpenAI API key exchange failed (status {resp.status_code})")
+    data = resp.json() if resp.content else {}
+    key = str(data.get("access_token") or "").strip()
+    if not key:
+        raise RuntimeError("OpenAI API key exchange returned empty access_token")
+    return key
+
+
+@app.post("/api/openai/oauth/device/start")
+def api_openai_oauth_device_start():
+    """
+    Start OpenAI OAuth device-code flow (Codex/ChatGPT login).
+    Returns { ok, session_id, verification_url, user_code, interval }.
+    """
+    session_id = uuid.uuid4().hex
+    try:
+        device_auth_id, user_code, interval = _openai_oauth_device_request_user_code()
+        with _openai_oauth_lock:
+            _openai_oauth_device_sessions[session_id] = {
+                "status": "pending",
+                "created_at": time.time(),
+                "last_poll_at": 0.0,
+                "issuer": _OPENAI_OAUTH_ISSUER,
+                "client_id": _OPENAI_OAUTH_CODEX_CLIENT_ID,
+                "device_auth_id": device_auth_id,
+                "user_code": user_code,
+                "interval": interval,
+                "error": None,
+            }
+        return jsonify({
+            "ok": True,
+            "session_id": session_id,
+            "verification_url": f"{_OPENAI_OAUTH_ISSUER.rstrip('/')}/codex/device",
+            "user_code": user_code,
+            "interval": interval,
+            "message": "Enter the code in the OpenAI page, then return here.",
+            "warning": "This may generate an OpenAI API key for your account. ChatGPT subscription may not include API billing.",
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "message": str(e) or "OAuth start failed"}), 500
+
+
+@app.post("/api/openai/oauth/device/poll")
+def api_openai_oauth_device_poll():
+    """
+    Poll OpenAI device-code session and, when authorized, persist the resulting OPENAI_API_KEY.
+    Body: { session_id }
+    """
+    data = request.get_json(silent=True) or {}
+    session_id = str(data.get("session_id") or "").strip()
+    if not session_id:
+        return jsonify({"status": "error", "message": "session_id is required"}), 400
+
+    with _openai_oauth_lock:
+        sess = dict(_openai_oauth_device_sessions.get(session_id) or {})
+    if not sess:
+        return jsonify({"status": "error", "message": "Unknown session_id"}), 404
+
+    if sess.get("status") == "completed":
+        return jsonify({"status": "completed", "message": "Already connected"})
+    if sess.get("status") == "error":
+        return jsonify({"status": "error", "message": sess.get("error") or "OAuth failed"}), 500
+
+    now = time.time()
+    created_at = float(sess.get("created_at") or 0.0)
+    if created_at and now - created_at > 15 * 60:
+        with _openai_oauth_lock:
+            _openai_oauth_device_sessions[session_id]["status"] = "error"
+            _openai_oauth_device_sessions[session_id]["error"] = "Device auth timed out after 15 minutes"
+        return jsonify({"status": "error", "message": "Device auth timed out after 15 minutes"}), 500
+
+    interval = int(sess.get("interval") or 5)
+    last_poll_at = float(sess.get("last_poll_at") or 0.0)
+    retry_after = max(0, int((last_poll_at + interval) - now))
+    if retry_after > 0:
+        return jsonify({"status": "pending", "message": "Waiting for authorization…", "retry_after": retry_after})
+
+    try:
+        with _openai_oauth_lock:
+            _openai_oauth_device_sessions[session_id]["last_poll_at"] = now
+        payload = _openai_oauth_device_poll_for_code(
+            str(sess.get("device_auth_id") or ""),
+            str(sess.get("user_code") or ""),
+            issuer=str(sess.get("issuer") or _OPENAI_OAUTH_ISSUER),
+        )
+        if payload is None:
+            return jsonify({"status": "pending", "message": "Waiting for authorization…"})
+
+        authorization_code = str(payload.get("authorization_code") or "").strip()
+        code_verifier = str(payload.get("code_verifier") or "").strip()
+        if not authorization_code or not code_verifier:
+            raise RuntimeError("Device auth response missing authorization_code/code_verifier")
+
+        tokens = _openai_oauth_exchange_authorization_code_for_tokens(
+            authorization_code,
+            code_verifier,
+            issuer=str(sess.get("issuer") or _OPENAI_OAUTH_ISSUER),
+            client_id=str(sess.get("client_id") or _OPENAI_OAUTH_CODEX_CLIENT_ID),
+        )
+        id_token = str(tokens.get("id_token") or "").strip()
+        api_key = _openai_oauth_token_exchange_for_api_key(
+            id_token,
+            issuer=str(sess.get("issuer") or _OPENAI_OAUTH_ISSUER),
+            client_id=str(sess.get("client_id") or _OPENAI_OAUTH_CODEX_CLIENT_ID),
+        )
+
+        # Persist: save API key into settings.db so scans work immediately and survive restarts.
+        init_settings_db()
+        con = sqlite3.connect(str(SETTINGS_DB_FILE))
+        cur = con.cursor()
+        cur.execute("INSERT OR REPLACE INTO settings(key, value) VALUES(?, ?)", ("AI_PROVIDER", "openai"))
+        cur.execute("INSERT OR REPLACE INTO settings(key, value) VALUES(?, ?)", ("OPENAI_API_KEY", api_key))
+        con.commit()
+        con.close()
+
+        # Apply immediately in memory (re-init OpenAI client).
+        _apply_settings_in_memory({"AI_PROVIDER": "openai", "OPENAI_API_KEY": api_key})
+
+        with _openai_oauth_lock:
+            _openai_oauth_device_sessions[session_id]["status"] = "completed"
+            _openai_oauth_device_sessions[session_id]["error"] = None
+
+        logging.info("OpenAI OAuth completed: OPENAI_API_KEY stored in settings.db (session=%s)", session_id)
+        return jsonify({"status": "completed", "message": "Connected. OpenAI key saved."})
+    except Exception as e:
+        msg = str(e) or "OAuth failed"
+        with _openai_oauth_lock:
+            _openai_oauth_device_sessions[session_id]["status"] = "error"
+            _openai_oauth_device_sessions[session_id]["error"] = msg
+        logging.warning("OpenAI OAuth failed (session=%s): %s", session_id, msg)
+        return jsonify({"status": "error", "message": msg}), 500
+
+
 @app.get("/api/musicbrainz/test")
 @app.post("/api/musicbrainz/test")
 def api_musicbrainz_test():
@@ -21670,6 +21914,26 @@ def api_logs_tail():
     return jsonify(
         path=str(log_path),
         lines=_tail_log_lines(log_path, lines=lines),
+    )
+
+
+@app.get("/api/logs/download")
+def api_logs_download():
+    """Download backend logs as a text file (tail by default, safe size)."""
+    try:
+        lines = int(request.args.get("lines", 20000))
+    except Exception:
+        lines = 20000
+    lines = max(200, min(lines, 50000))
+    log_path = Path(str(LOG_FILE or "")).expanduser()
+    out_lines = _tail_log_lines(log_path, lines=lines, max_bytes=10 * 1024 * 1024)
+    payload = ("\n".join(out_lines) + "\n") if out_lines else ""
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    fname = f"pmda-log-{ts}.log"
+    return Response(
+        payload,
+        mimetype="text/plain",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
     )
 
 

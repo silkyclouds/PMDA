@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { useNavigate, Link } from 'react-router-dom';
-import { Package, RefreshCw, CheckCircle2, Play, ArrowRight, Loader2, Wrench, AlertTriangle, Terminal, ChevronDown, ChevronUp } from 'lucide-react';
+import { Package, RefreshCw, CheckCircle2, Play, ArrowRight, Loader2, Wrench, AlertTriangle, Terminal, ChevronDown, ChevronUp, Download } from 'lucide-react';
 import { Progress } from '@/components/ui/progress';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
@@ -55,7 +55,8 @@ export function GlobalStatusBar() {
         const data = await getScanLogsTail(120);
         if (!cancelled) {
           const lines = Array.isArray(data?.lines) ? data.lines : [];
-          setLogLines(lines.slice(-8));
+          // Show newest first for quick readability in the drawer.
+          setLogLines(lines.slice(-8).reverse());
         }
       } catch {
         // ignore
@@ -226,8 +227,17 @@ export function GlobalStatusBar() {
         </div>
         {showLogs && (
           <div className="border-t border-border/80 bg-muted/30">
-            <div className="px-4 py-2 text-xs text-muted-foreground">
-              Live backend log (last 8 lines)
+            <div className="px-4 py-2 flex items-center justify-between gap-3 text-xs text-muted-foreground">
+              <span>Live backend log (last 8 lines, newest first)</span>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-7 px-2 text-xs gap-1.5"
+                onClick={() => { window.location.href = '/api/logs/download?lines=20000'; }}
+              >
+                <Download className="w-3.5 h-3.5" />
+                Download
+              </Button>
             </div>
             <div className="px-4 pb-3">
               <div className="rounded-md border border-border bg-background/80 p-3 font-mono text-xs leading-5 h-40 overflow-hidden">

@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Save, Loader2, Check, FolderOutput, RefreshCw, Plus, X, Database, Sparkles } from 'lucide-react';
+import { Save, Loader2, Check, FolderOutput, RefreshCw, Plus, X, Database, Sparkles, ExternalLink, Copy } from 'lucide-react';
 import { Header } from '@/components/Header';
 import { Button } from '@/components/ui/button';
 import { toast } from 'sonner';
@@ -86,6 +86,16 @@ function SettingsPage() {
   const [exportRebuilding, setExportRebuilding] = useState(false);
   const [exportStatus, setExportStatus] = useState<api.FilesExportStatus | null>(null);
   const exportPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [openaiOAuth, setOpenaiOAuth] = useState<{
+    sessionId: string;
+    verificationUrl: string;
+    userCode: string;
+    intervalSec: number;
+    status: 'pending' | 'completed' | 'error';
+    message?: string;
+    warning?: string;
+  } | null>(null);
+  const [openaiOAuthBusy, setOpenaiOAuthBusy] = useState(false);
 
   useEffect(() => {
     loadConfig();
@@ -116,6 +126,64 @@ function SettingsPage() {
       setIsLoading(false);
     }
   };
+
+  const startOpenAIOAuth = useCallback(async () => {
+    setOpenaiOAuthBusy(true);
+    try {
+      const res = await api.startOpenAIDeviceOAuth();
+      if (!res.ok || !res.session_id || !res.verification_url || !res.user_code) {
+        toast.error(res.message || 'Failed to start OpenAI OAuth');
+        return;
+      }
+      setOpenaiOAuth({
+        sessionId: res.session_id,
+        verificationUrl: res.verification_url,
+        userCode: res.user_code,
+        intervalSec: typeof res.interval === 'number' ? res.interval : 5,
+        status: 'pending',
+        message: res.message,
+        warning: res.warning,
+      });
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : 'Failed to start OpenAI OAuth');
+    } finally {
+      setOpenaiOAuthBusy(false);
+    }
+  }, []);
+
+  const pollOpenAIOAuth = useCallback(async () => {
+    if (!openaiOAuth?.sessionId || openaiOAuthBusy) return;
+    setOpenaiOAuthBusy(true);
+    try {
+      const res = await api.pollOpenAIDeviceOAuth(openaiOAuth.sessionId);
+      if (res.status === 'completed') {
+        setOpenaiOAuth((prev) => prev ? { ...prev, status: 'completed', message: res.message } : prev);
+        toast.success(res.message || 'OpenAI connected');
+        await loadConfig();
+        return;
+      }
+      if (res.status === 'error') {
+        setOpenaiOAuth((prev) => prev ? { ...prev, status: 'error', message: res.message } : prev);
+        toast.error(res.message || 'OpenAI OAuth failed');
+        return;
+      }
+      setOpenaiOAuth((prev) => prev ? { ...prev, status: 'pending', message: res.message } : prev);
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : 'OpenAI OAuth poll failed');
+    } finally {
+      setOpenaiOAuthBusy(false);
+    }
+  }, [loadConfig, openaiOAuth?.sessionId, openaiOAuthBusy]);
+
+  useEffect(() => {
+    if (!openaiOAuth || openaiOAuth.status !== 'pending') return;
+    // Poll in the background while the user completes the flow in another tab.
+    const delayMs = Math.max(1000, Math.min(5000, (openaiOAuth.intervalSec || 5) * 1000));
+    const t = setTimeout(() => {
+      pollOpenAIOAuth();
+    }, delayMs);
+    return () => clearTimeout(t);
+  }, [openaiOAuth, pollOpenAIOAuth]);
 
   const pendingSaveRef = useRef<Partial<PMDAConfig>>({});
   const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -481,19 +549,98 @@ function SettingsPage() {
 
             <Separator />
 
-            <Card id="settings-ai" className="scroll-mt-24">
-              <CardHeader>
-                <CardTitle className="flex items-center gap-2">
-                  <Sparkles className="w-5 h-5" />
-                  AI
-                </CardTitle>
-                <CardDescription>Provide your OpenAI API key (required for match verification).</CardDescription>
-              </CardHeader>
-              <CardContent className="space-y-4">
-                <div className="space-y-2">
-                  <Label>OpenAI API key</Label>
-                  <p className="text-xs text-muted-foreground">Required for AI match verification and cover checks.</p>
-                  <PasswordInput
+	            <Card id="settings-ai" className="scroll-mt-24">
+	              <CardHeader>
+	                <CardTitle className="flex items-center gap-2">
+	                  <Sparkles className="w-5 h-5" />
+	                  AI
+	                </CardTitle>
+	                <CardDescription>Connect OpenAI via OAuth (recommended) or paste an API key (required for match verification).</CardDescription>
+	              </CardHeader>
+	              <CardContent className="space-y-4">
+	                <div className="rounded-lg border border-border p-4 space-y-3">
+	                  <div className="flex flex-wrap items-start justify-between gap-3">
+	                    <div className="space-y-1">
+	                      <Label>Sign in with OpenAI (OAuth)</Label>
+	                      <p className="text-xs text-muted-foreground">
+	                        Quick setup without copy/pasting an API key.
+	                      </p>
+	                      {openaiOAuth?.warning && (
+	                        <p className="text-xs text-muted-foreground">
+	                          <span className="font-medium">Note:</span> {openaiOAuth.warning}
+	                        </p>
+	                      )}
+	                    </div>
+	                    <Button
+	                      type="button"
+	                      variant="outline"
+	                      size="sm"
+	                      className="gap-2 shrink-0"
+	                      onClick={startOpenAIOAuth}
+	                      disabled={openaiOAuthBusy}
+	                    >
+	                      {openaiOAuthBusy ? <Loader2 className="w-4 h-4 animate-spin" /> : <ExternalLink className="w-4 h-4" />}
+	                      Connect
+	                    </Button>
+	                  </div>
+	                  {openaiOAuth && (
+	                    <div className="space-y-2">
+	                      <div className="flex flex-col sm:flex-row sm:items-center gap-2">
+	                        <Input readOnly value={openaiOAuth.userCode} className="font-mono" />
+	                        <div className="flex items-center gap-2">
+	                          <Button
+	                            type="button"
+	                            variant="secondary"
+	                            size="sm"
+	                            className="gap-1.5"
+	                            onClick={async () => {
+	                              try {
+	                                await navigator.clipboard.writeText(openaiOAuth.userCode);
+	                                toast.success('Code copied');
+	                              } catch {
+	                                toast.error('Copy failed');
+	                              }
+	                            }}
+	                          >
+	                            <Copy className="w-4 h-4" />
+	                            Copy
+	                          </Button>
+	                          <Button type="button" variant="secondary" size="sm" className="gap-1.5" asChild>
+	                            <a href={openaiOAuth.verificationUrl} target="_blank" rel="noreferrer">
+	                              <ExternalLink className="w-4 h-4" />
+	                              Open OpenAI
+	                            </a>
+	                          </Button>
+	                        </div>
+	                      </div>
+	                      <p className="text-xs text-muted-foreground">
+	                        1) Open the OpenAI page, 2) enter the code, 3) come back here. PMDA will connect automatically.
+	                      </p>
+	                      <div className="flex flex-wrap items-center gap-2">
+	                        <Button
+	                          type="button"
+	                          variant="outline"
+	                          size="sm"
+	                          className="gap-2"
+	                          onClick={pollOpenAIOAuth}
+	                          disabled={openaiOAuthBusy || openaiOAuth.status !== 'pending'}
+	                        >
+	                          {openaiOAuthBusy ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
+	                          Check status
+	                        </Button>
+	                        <span className="text-xs text-muted-foreground">
+	                          {openaiOAuth.message
+	                            || (openaiOAuth.status === 'pending' ? 'Waiting for authorization…'
+	                              : openaiOAuth.status === 'completed' ? 'Connected' : 'Error')}
+	                        </span>
+	                      </div>
+	                    </div>
+	                  )}
+	                </div>
+	                <div className="space-y-2">
+	                  <Label>OpenAI API key</Label>
+	                  <p className="text-xs text-muted-foreground">Required for AI match verification and cover checks.</p>
+	                  <PasswordInput
                     value={config.OPENAI_API_KEY || ''}
                     onChange={(e) => updateConfig({ OPENAI_API_KEY: e.target.value, AI_PROVIDER: 'openai' })}
                     placeholder="sk-..."
