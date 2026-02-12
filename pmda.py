@@ -1098,8 +1098,9 @@ merged = {
     # Time budget (seconds) per album for MusicBrainz search flow before we fall back faster to other providers.
     "MB_SEARCH_ALBUM_TIMEOUT_SEC": _get(
         "MB_SEARCH_ALBUM_TIMEOUT_SEC",
-        default=20,
-        cast=lambda x: max(10, min(300, int(x) if x is not None and str(x).strip().isdigit() else 20)),
+        # Default reduced to keep scans fast on large libraries; strict provider fallbacks cover the hard cases.
+        default=12,
+        cast=lambda x: max(10, min(300, int(x) if x is not None and str(x).strip().isdigit() else 12)),
     ),
     # Maximum number of MB candidates for which we fetch full details per album.
     "MB_CANDIDATE_FETCH_LIMIT": _get(
@@ -1110,8 +1111,9 @@ merged = {
     # Fetch recording-level track titles only for first N candidates (expensive endpoint).
     "MB_TRACKLIST_FETCH_LIMIT": _get(
         "MB_TRACKLIST_FETCH_LIMIT",
-        default=2,
-        cast=lambda x: max(0, min(20, int(x) if x is not None and str(x).strip().isdigit() else 2)),
+        # Default reduced: this endpoint is expensive and can dominate scan time when many albums are ambiguous.
+        default=1,
+        cast=lambda x: max(0, min(20, int(x) if x is not None and str(x).strip().isdigit() else 1)),
     ),
     # If true, once MB budget is exceeded or MB has no candidates, we prioritize provider fallback and skip web+AI MBID hunt.
     "MB_FAST_FALLBACK_MODE": _get("MB_FAST_FALLBACK_MODE", default=True, cast=_parse_bool),
