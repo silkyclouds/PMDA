@@ -26186,6 +26186,7 @@ def _improve_single_album(album_id: int, db_conn, known_release_group_id: Option
 
     # Always allow Last.fm when some required tags (e.g. genre) are still missing,
     # even if MusicBrainz already provided basic tags.
+    lastfm_used_for_tags = False
     if USE_LASTFM and ((not tags_updated or not has_cover_now) or ("genre" in missing_required)):
         lastfm_info = _fetch_lastfm_album_info(artist_name, album_title_str, release_mbid)
         if lastfm_info:
@@ -26225,6 +26226,7 @@ def _improve_single_album(album_id: int, db_conn, known_release_group_id: Option
                     tags_updated = True
                     files_updated = n
                     steps.append(f"Updated tags from Last.fm on {n} file(s)")
+                    lastfm_used_for_tags = True
                     if primary_genre:
                         # Keep current_tags in sync for downstream fallback decisions (Bandcamp genre).
                         current_tags["genre"] = primary_genre
@@ -26274,7 +26276,11 @@ def _improve_single_album(album_id: int, db_conn, known_release_group_id: Option
     # Bandcamp: ultimate fallback when still missing tags or cover.
     # Also used to fill in missing genre when Bandcamp exposes useful tags.
     genre_missing_now = not str((current_tags or {}).get("genre") or "").strip()
-    if USE_BANDCAMP and ((not tags_updated or not has_cover_now) or genre_missing_now):
+    # Special case: if Last.fm was the identity provider, prefer Bandcamp tags for richer genres
+    # when available (Bandcamp often exposes multiple useful genre tags).
+    mb_identity_used = bool(mb_release_info and artist_mbid)
+    want_bandcamp_genre = bool(lastfm_used_for_tags and not mb_identity_used and ("genre" in missing_required))
+    if USE_BANDCAMP and ((not tags_updated or not has_cover_now) or genre_missing_now or want_bandcamp_genre):
         bandcamp_info = _fetch_bandcamp_album_info(artist_name, album_title_str)
         if bandcamp_info:
             strict_ok, strict_reason = _strict_identity_match_details(
@@ -26305,7 +26311,7 @@ def _improve_single_album(album_id: int, db_conn, known_release_group_id: Option
             bandcamp_tags = bandcamp_info.get("tags") or []
             inferred_genre = _infer_genre_from_bandcamp_tags(bandcamp_tags) if bandcamp_tags else None
             tags_before_bandcamp = tags_updated
-            if (album_str or artist_str) and (not tags_updated or "genre" in missing_required):
+            if (album_str or artist_str) and (not tags_updated or "genre" in missing_required or want_bandcamp_genre):
                 n = _apply_fallback_tags(artist_str, album_str, year_str, "Bandcamp", genre=inferred_genre)
                 if n > 0:
                     tags_updated = True
@@ -26823,6 +26829,7 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
 
     # Always allow Last.fm when some required tags (e.g. genre) are still missing,
     # even if MusicBrainz already provided basic tags.
+    lastfm_used_for_tags = False
     if USE_LASTFM and ((not tags_updated or not has_cover_now) or ("genre" in missing_required)):
         lastfm_info = _fetch_lastfm_album_info(artist_name, album_title_str, release_mbid)
         if lastfm_info:
@@ -26860,6 +26867,7 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
                     tags_updated = True
                     files_updated = n
                     steps.append(f"Updated tags from Last.fm on {n} file(s)")
+                    lastfm_used_for_tags = True
                     if primary_genre:
                         current_tags["genre"] = primary_genre
             if not has_cover_now and lastfm_info.get("cover_url"):
@@ -26895,7 +26903,11 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
                 provider_used = "lastfm"
 
     genre_missing_now = not str((current_tags or {}).get("genre") or "").strip()
-    if USE_BANDCAMP and ((not tags_updated or not has_cover_now) or genre_missing_now):
+    # Special case: if Last.fm was the identity provider, prefer Bandcamp tags for richer genres
+    # when available (Bandcamp often exposes multiple useful genre tags).
+    mb_identity_used = bool(mb_release_info and artist_mbid)
+    want_bandcamp_genre = bool(lastfm_used_for_tags and not mb_identity_used and ("genre" in missing_required))
+    if USE_BANDCAMP and ((not tags_updated or not has_cover_now) or genre_missing_now or want_bandcamp_genre):
         bandcamp_info = _fetch_bandcamp_album_info(artist_name, album_title_str)
         if bandcamp_info:
             strict_ok, strict_reason = _strict_identity_match_details(
@@ -26922,7 +26934,7 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
             year_str = year_match.group(1) if year_match else year_raw
             bandcamp_tags = bandcamp_info.get("tags") or []
             inferred_genre = _infer_genre_from_bandcamp_tags(bandcamp_tags) if bandcamp_tags else None
-            if (album_str or artist_str) and (not tags_updated or "genre" in missing_required):
+            if (album_str or artist_str) and (not tags_updated or "genre" in missing_required or want_bandcamp_genre):
                 n = _apply_fallback_tags_folder(artist_str, album_str, year_str, "Bandcamp", genre=inferred_genre)
                 if n > 0:
                     tags_updated = True
