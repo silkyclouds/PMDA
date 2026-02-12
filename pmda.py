@@ -18042,7 +18042,9 @@ def _fetch_bandcamp_album_info(artist_name: str, album_title: str) -> Optional[d
 
         artist_str = artist_name
         if title and " by " in title:
-            parts = title.split(" by ", 1)
+            # Bandcamp uses "Album, by Artist". Album titles can themselves contain "by",
+            # so split on the *last* occurrence to avoid mis-parsing titles like "Destroyed by Fire".
+            parts = title.rsplit(" by ", 1)
             title = parts[0].strip()
             if len(parts) > 1:
                 artist_str = parts[1].strip()
