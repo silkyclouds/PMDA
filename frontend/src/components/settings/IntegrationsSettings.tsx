@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState } from 'react';
-import { Link2, Loader2, CheckCircle2, XCircle, ExternalLink, SlidersHorizontal, RefreshCw } from 'lucide-react';
+import { useMemo, useState } from 'react';
+import { Link2, Loader2, CheckCircle2, XCircle, ExternalLink, SlidersHorizontal } from 'lucide-react';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Switch } from '@/components/ui/switch';
@@ -31,26 +31,11 @@ export function IntegrationsSettings({ config, updateConfig }: IntegrationsSetti
   const [playerResult, setPlayerResult] = useState<{ success: boolean; message: string } | null>(null);
   const [testingAutobrr, setTestingAutobrr] = useState(false);
   const [autobrrTestResult, setAutobrrTestResult] = useState<{ success: boolean; message: string } | null>(null);
-  const [exportRebuilding, setExportRebuilding] = useState(false);
-  const [exportStatus, setExportStatus] = useState<api.FilesExportStatus | null>(null);
 
   const playerTarget: PlayerTarget = useMemo(() => {
     const value = String(config.PIPELINE_PLAYER_TARGET || 'none').trim().toLowerCase();
     return (['none', 'plex', 'jellyfin', 'navidrome'].includes(value) ? value : 'none') as PlayerTarget;
   }, [config.PIPELINE_PLAYER_TARGET]);
-
-  useEffect(() => {
-    if (!exportStatus?.running) return;
-    const t = setInterval(async () => {
-      try {
-        const s = await api.getFilesExportStatus();
-        setExportStatus(s);
-      } catch {
-        // ignore
-      }
-    }, 2000);
-    return () => clearInterval(t);
-  }, [exportStatus?.running]);
 
   const testPlayer = async () => {
     setTestingPlayer(true);
@@ -194,7 +179,7 @@ export function IntegrationsSettings({ config, updateConfig }: IntegrationsSetti
               />
             </div>
 
-            {(Boolean(config.PIPELINE_ENABLE_EXPORT) || exportStatus?.running) && (
+            {Boolean(config.PIPELINE_ENABLE_EXPORT) && (
               <div className="pt-3 border-t border-border/60 space-y-3">
                 <div className="space-y-2">
                   <Label>Library folder</Label>
@@ -217,7 +202,7 @@ export function IntegrationsSettings({ config, updateConfig }: IntegrationsSetti
                   <Select
                     value={(config.EXPORT_LINK_STRATEGY as 'hardlink' | 'symlink' | 'copy' | 'move' | undefined) ?? 'hardlink'}
                     onValueChange={(value: 'hardlink' | 'symlink' | 'copy' | 'move') => updateConfig({ EXPORT_LINK_STRATEGY: value })}
-                    disabled={!Boolean(config.PIPELINE_ENABLE_EXPORT) && !exportStatus?.running}
+                    disabled={!Boolean(config.PIPELINE_ENABLE_EXPORT)}
                   >
                     <SelectTrigger className="w-full md:w-[320px]">
                       <SelectValue placeholder="Select strategy" />
@@ -231,64 +216,9 @@ export function IntegrationsSettings({ config, updateConfig }: IntegrationsSetti
                   </Select>
                 </div>
 
-                <div className="flex flex-wrap items-center gap-3">
-                  <Button
-                    type="button"
-                    variant="secondary"
-                    disabled={exportRebuilding || !Boolean(config.PIPELINE_ENABLE_EXPORT)}
-                    onClick={async () => {
-                      if (exportRebuilding) return;
-                      setExportRebuilding(true);
-                      try {
-                        await api.postFilesExportRebuild();
-                        toast.success('Building library…');
-                      } catch (e: unknown) {
-                        const status = (e as { response?: { status?: number } } | null)?.response?.status;
-                        if (status === 409) {
-                          toast.info('Build already in progress');
-                        } else {
-                          toast.error(e instanceof Error ? e.message : 'Failed to start');
-                        }
-                      } finally {
-                        setExportRebuilding(false);
-                      }
-                      try {
-                        const s = await api.getFilesExportStatus();
-                        setExportStatus(s);
-                      } catch {
-                        // ignore
-                      }
-                    }}
-                    className="gap-2"
-                  >
-                    {exportRebuilding ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
-                    Build library now
-                  </Button>
-                  <Button
-                    type="button"
-                    variant="outline"
-                    disabled={exportRebuilding}
-                    onClick={async () => {
-                      try {
-                        const s = await api.getFilesExportStatus();
-                        setExportStatus(s);
-                      } catch {
-                        // ignore
-                      }
-                    }}
-                    className="gap-2"
-                  >
-                    <RefreshCw className="w-4 h-4" />
-                    Refresh status
-                  </Button>
-                  {exportStatus && (exportStatus.running || exportStatus.error) && (
-                    <span className="text-xs text-muted-foreground">
-                      {exportStatus.running
-                        ? `${exportStatus.tracks_done}/${exportStatus.total_tracks} tracks`
-                        : exportStatus.error ?? 'Done'}
-                    </span>
-                  )}
-                </div>
+                <p className="text-xs text-muted-foreground">
+                  Export is built automatically by the pipeline when enabled. No manual action is required.
+                </p>
               </div>
             )}
           </div>

@@ -19868,7 +19868,27 @@ def _openai_oauth_token_exchange_for_api_key(
         timeout=20,
     )
     if not resp.ok:
-        raise RuntimeError(f"OpenAI API key exchange failed (status {resp.status_code})")
+        detail = ""
+        try:
+            payload = resp.json()
+            if isinstance(payload, dict):
+                # Prefer known fields if present; keep the rest short to avoid log spam.
+                msg = (
+                    payload.get("error_description")
+                    or payload.get("error")
+                    or payload.get("message")
+                )
+                if msg:
+                    detail = f": {str(msg).strip()[:300]}"
+                else:
+                    detail = f": {json.dumps(payload, ensure_ascii=True)[:300]}"
+            else:
+                detail = f": {str(payload)[:300]}"
+        except Exception:
+            txt = (resp.text or "").strip()
+            if txt:
+                detail = f": {txt[:300]}"
+        raise RuntimeError(f"OpenAI API key exchange failed (status {resp.status_code}){detail}")
     data = resp.json() if resp.content else {}
     key = str(data.get("access_token") or "").strip()
     if not key:
@@ -19976,30 +19996,69 @@ def api_openai_oauth_device_poll():
             client_id=str(sess.get("client_id") or _OPENAI_OAUTH_CODEX_CLIENT_ID),
         )
         id_token = str(tokens.get("id_token") or "").strip()
-        api_key = _openai_oauth_token_exchange_for_api_key(
-            id_token,
-            issuer=str(sess.get("issuer") or _OPENAI_OAUTH_ISSUER),
-            client_id=str(sess.get("client_id") or _OPENAI_OAUTH_CODEX_CLIENT_ID),
-        )
+        refresh_token = str(tokens.get("refresh_token") or "").strip()
 
-        # Persist: save API key into settings.db so scans work immediately and survive restarts.
+        api_key = None
+        api_key_error = None
+        try:
+            api_key = _openai_oauth_token_exchange_for_api_key(
+                id_token,
+                issuer=str(sess.get("issuer") or _OPENAI_OAUTH_ISSUER),
+                client_id=str(sess.get("client_id") or _OPENAI_OAUTH_CODEX_CLIENT_ID),
+            )
+        except Exception as e:
+            api_key_error = str(e) or "OpenAI API key exchange failed"
+            logging.warning(
+                "OpenAI OAuth connected but API key could not be generated (session=%s): %s",
+                session_id,
+                api_key_error,
+            )
+
+        # Persist: save OAuth token(s) and the API key (when available) into settings.db.
         init_settings_db()
         con = sqlite3.connect(str(SETTINGS_DB_FILE))
         cur = con.cursor()
-        cur.execute("INSERT OR REPLACE INTO settings(key, value) VALUES(?, ?)", ("AI_PROVIDER", "openai"))
-        cur.execute("INSERT OR REPLACE INTO settings(key, value) VALUES(?, ?)", ("OPENAI_API_KEY", api_key))
+        if refresh_token:
+            cur.execute(
+                "INSERT OR REPLACE INTO settings(key, value) VALUES(?, ?)",
+                ("OPENAI_OAUTH_REFRESH_TOKEN", refresh_token),
+            )
+        if api_key:
+            cur.execute(
+                "INSERT OR REPLACE INTO settings(key, value) VALUES(?, ?)",
+                ("AI_PROVIDER", "openai"),
+            )
+            cur.execute(
+                "INSERT OR REPLACE INTO settings(key, value) VALUES(?, ?)",
+                ("OPENAI_API_KEY", api_key),
+            )
         con.commit()
         con.close()
 
-        # Apply immediately in memory (re-init OpenAI client).
-        _apply_settings_in_memory({"AI_PROVIDER": "openai", "OPENAI_API_KEY": api_key})
+        # Apply immediately in memory (re-init OpenAI client) when we got a key.
+        if api_key:
+            _apply_settings_in_memory({"AI_PROVIDER": "openai", "OPENAI_API_KEY": api_key})
 
         with _openai_oauth_lock:
             _openai_oauth_device_sessions[session_id]["status"] = "completed"
             _openai_oauth_device_sessions[session_id]["error"] = None
 
-        logging.info("OpenAI OAuth completed: OPENAI_API_KEY stored in settings.db (session=%s)", session_id)
-        return jsonify({"status": "completed", "message": "Connected. OpenAI key saved."})
+        if api_key:
+            logging.info(
+                "OpenAI OAuth completed: OPENAI_API_KEY stored in settings.db (session=%s)",
+                session_id,
+            )
+            return jsonify({"status": "completed", "api_key_saved": True, "message": "Connected. OpenAI key saved."})
+
+        msg = (
+            "Connected, but PMDA could not generate an OpenAI API key for this account. "
+            "This usually means your OpenAI API Platform access/billing is not enabled. "
+            "You can paste an API key manually or enable API billing on platform.openai.com and retry."
+        )
+        # Keep the low-level error for power users without making the UI noisy.
+        if api_key_error:
+            msg = f"{msg} ({api_key_error})"
+        return jsonify({"status": "completed", "api_key_saved": False, "message": msg})
     except Exception as e:
         msg = str(e) or "OAuth failed"
         with _openai_oauth_lock:

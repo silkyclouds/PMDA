@@ -89,6 +89,7 @@ function SettingsPage() {
     status: 'pending' | 'completed' | 'error';
     message?: string;
     warning?: string;
+    apiKeySaved?: boolean;
   } | null>(null);
   const [openaiOAuthBusy, setOpenaiOAuthBusy] = useState(false);
 
@@ -174,8 +175,13 @@ function SettingsPage() {
     try {
       const res = await api.pollOpenAIDeviceOAuth(openaiOAuth.sessionId);
       if (res.status === 'completed') {
-        setOpenaiOAuth((prev) => prev ? { ...prev, status: 'completed', message: res.message } : prev);
-        toast.success(res.message || 'OpenAI connected');
+        const saved = typeof res.api_key_saved === 'boolean' ? res.api_key_saved : undefined;
+        setOpenaiOAuth((prev) => prev ? { ...prev, status: 'completed', message: res.message, apiKeySaved: saved } : prev);
+        if (saved === false) {
+          toast.info(res.message || 'Connected, but API key not saved');
+        } else {
+          toast.success(res.message || 'OpenAI connected');
+        }
         await loadConfig();
         return;
       }
@@ -494,12 +500,14 @@ function SettingsPage() {
             <Separator />
 
 	            <Card id="settings-ai" className="scroll-mt-24">
-	              <CardHeader>
+	            <CardHeader>
 	                <CardTitle className="flex items-center gap-2">
 	                  <Sparkles className="w-5 h-5" />
 	                  AI
 	                </CardTitle>
-	                <CardDescription>Connect OpenAI via OAuth (recommended) or paste an API key (required for match verification).</CardDescription>
+	                <CardDescription>
+                    Connect OpenAI via OAuth (quick setup) or paste an API key. Note: ChatGPT subscription is separate from API billing.
+                  </CardDescription>
 	              </CardHeader>
 	              <CardContent className="space-y-4">
 	                <div className="rounded-lg border border-border p-4 space-y-3">

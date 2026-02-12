@@ -1382,6 +1382,7 @@ export interface OpenAIDeviceOAuthPollResponse {
   status: 'pending' | 'completed' | 'error';
   message?: string;
   retry_after?: number;
+  api_key_saved?: boolean;
 }
 
 export async function startOpenAIDeviceOAuth(): Promise<OpenAIDeviceOAuthStartResponse> {
