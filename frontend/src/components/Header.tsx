@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
-import { Settings, RefreshCw, History, BarChart2, Library, Scan, Package, Wrench } from 'lucide-react';
+import { Settings, RefreshCw, History, BarChart2, Library, Scan, Wrench } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { Button } from '@/components/ui/button';
 import { WelcomeModal } from '@/components/WelcomeModal';
@@ -109,19 +109,6 @@ export function Header() {
                 <span>Scan</span>
               </NavLink>
               <NavLink 
-                to="/unduper" 
-                className="flex items-center gap-2 px-3 py-2 rounded-md text-sm font-medium text-muted-foreground hover:text-foreground hover:bg-accent transition-colors"
-                activeClassName="text-foreground bg-accent"
-              >
-                <Package className="w-4 h-4" />
-                <span>Unduper</span>
-                {duplicateCount > 0 && (
-                  <Badge variant="outline" className="ml-1 h-5 px-1.5 text-[10px] border-warning text-warning">
-                    {duplicateCount > 99 ? '99+' : duplicateCount}
-                  </Badge>
-                )}
-              </NavLink>
-              <NavLink 
                 to="/library" 
                 className="flex items-center gap-2 px-3 py-2 rounded-md text-sm font-medium text-muted-foreground hover:text-foreground hover:bg-accent transition-colors"
                 activeClassName="text-foreground bg-accent"
@@ -153,6 +140,11 @@ export function Header() {
               >
                 <Wrench className="w-4 h-4" />
                 <span>Tools</span>
+                {duplicateCount > 0 && (
+                  <Badge variant="outline" className="ml-1 h-5 px-1.5 text-[10px] border-warning text-warning">
+                    {duplicateCount > 99 ? '99+' : duplicateCount}
+                  </Badge>
+                )}
               </NavLink>
             </nav>
 

@@ -1,5 +1,6 @@
 # Local Cursor rules – never publish to GitHub
 .cursorrules
+.codex/
 
 # Never push to GitHub: Cursor IDE, docs (README.md is allowed)
 .cursor/

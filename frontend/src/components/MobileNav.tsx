@@ -20,7 +20,6 @@ interface NavItem {
 // Simplified navigation - Tag Fixer and Incomplete Albums removed
 const navItems: NavItem[] = [
   { to: '/', icon: Scan, label: 'Scan' },
-  { to: '/unduper', icon: Package, label: 'Unduper' },
   { to: '/library', icon: Library, label: 'Library' },
   { to: '/history', icon: History, label: 'History' },
   { to: '/statistics', icon: BarChart2, label: 'Statistics' },
@@ -44,7 +43,7 @@ export function MobileNav({ duplicateCount, onSettingsClick }: MobileNavProps) {
 
   // Add badges to nav items
   const itemsWithBadges = navItems.map(item => {
-    if (item.to === '/unduper' && duplicateCount) {
+    if (item.to === '/tools' && duplicateCount) {
       return { ...item, badge: duplicateCount, badgeVariant: 'warning' as const };
     }
     return item;
@@ -127,9 +126,9 @@ export function MobileBottomNav({ duplicateCount }: { duplicateCount?: number })
 
   const bottomItems: NavItem[] = [
     { to: '/', icon: Scan, label: 'Scan' },
-    { to: '/unduper', icon: Package, label: 'Unduper', badge: duplicateCount, badgeVariant: 'warning' },
     { to: '/library', icon: Library, label: 'Library' },
-    { to: '/tools', icon: Wrench, label: 'Tools' },
+    { to: '/tools', icon: Wrench, label: 'Tools', badge: duplicateCount, badgeVariant: 'warning' },
+    { to: '/history', icon: History, label: 'History' },
     { to: '/statistics', icon: BarChart2, label: 'Stats' },
   ];
 

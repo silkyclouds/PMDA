@@ -4,6 +4,7 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Textarea } from '@/components/ui/textarea';
 import { Button } from '@/components/ui/button';
+import { FolderBrowserInput } from '@/components/FolderBrowserInput';
 import { FieldTooltip } from '@/components/ui/field-tooltip';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
 import { Switch } from '@/components/ui/switch';
@@ -570,11 +571,11 @@ export function PathSettings({ config, updateConfig, errors }: PathSettingsProps
                 <Label htmlFor="dupe-root">Duplicates Folder</Label>
                 <FieldTooltip content="Folder where duplicate albums will be moved (e.g. /dupes in container). This is where PMDA stores albums it marks as duplicates." />
               </div>
-              <Input
-                id="dupe-root"
+              <FolderBrowserInput
+                value={config.DUPE_ROOT || '/dupes'}
+                onChange={(path) => updateConfig({ DUPE_ROOT: path || '/dupes' })}
                 placeholder="/dupes"
-                value={config.DUPE_ROOT || ''}
-                onChange={(e) => updateConfig({ DUPE_ROOT: e.target.value })}
+                selectLabel="Select duplicates destination folder"
               />
             </div>
 

@@ -2,10 +2,9 @@ import { Toaster } from "@/components/ui/toaster";
 import { Toaster as Sonner } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { BrowserRouter, Routes, Route } from "react-router-dom";
+import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 import { ThemeProvider } from "next-themes";
 import Scan from "./pages/Scan";
-import Unduper from "./pages/Unduper";
 import ScanHistory from "./pages/ScanHistory";
 import Statistics from "./pages/Statistics";
 import LibraryBrowser from "./pages/LibraryBrowser";
@@ -28,7 +27,7 @@ function AppRoutesWithPlayer() {
       <ScanFinishedInvalidator />
       <Routes>
         <Route path="/" element={<Scan />} />
-        <Route path="/unduper" element={<Unduper />} />
+        <Route path="/unduper" element={<Navigate to="/tools" replace />} />
         <Route path="/history" element={<ScanHistory />} />
         <Route path="/statistics" element={<Statistics />} />
         <Route path="/tools" element={<Tools />} />

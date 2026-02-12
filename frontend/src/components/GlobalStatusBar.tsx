@@ -119,11 +119,11 @@ export function GlobalStatusBar() {
                   <span className="text-sm text-muted-foreground">Ready</span>
                 </div>
                 <Link 
-                  to="/unduper"
+                  to="/tools"
                   className="hidden sm:flex items-center gap-1.5 text-sm font-medium text-warning hover:text-warning/80 transition-colors"
                 >
                   <Package className="w-3.5 h-3.5" />
-                  <span>Review {duplicateCount} duplicates</span>
+                  <span>Review {duplicateCount} duplicates in Tools</span>
                   <ArrowRight className="w-3 h-3" />
                 </Link>
               </div>
@@ -161,7 +161,7 @@ export function GlobalStatusBar() {
             {/* Duplicates badge - prominent when > 0 */}
             {duplicateCount > 0 && (
               <button
-                onClick={() => navigate('/unduper')}
+                onClick={() => navigate('/tools')}
                 className={cn(
                   "flex items-center gap-2 px-3 py-1.5 rounded-full text-sm font-medium transition-all",
                   "bg-warning/15 text-warning hover:bg-warning/25",

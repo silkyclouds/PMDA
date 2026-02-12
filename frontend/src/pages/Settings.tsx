@@ -413,10 +413,16 @@ function SettingsPage() {
                   />
                 </div>
                 <div className="space-y-1">
-                  <Label className="text-muted-foreground">Duplicates folder</Label>
+                  <Label>Duplicates folder</Label>
                   <p className="text-xs text-muted-foreground">
-                    Duplicates are moved to <span className="font-mono">/dupes</span> (set by your Docker volume). No need to configure.
+                    Destination used by the dedupe step. Default is <span className="font-mono">/dupes</span>, but you can choose another writable folder.
                   </p>
+                  <FolderBrowserInput
+                    value={config.DUPE_ROOT ?? '/dupes'}
+                    onChange={(path) => updateConfig({ DUPE_ROOT: path || '/dupes' })}
+                    placeholder="/dupes"
+                    selectLabel="Select duplicates destination folder"
+                  />
                 </div>
                 <div className="flex flex-wrap items-center gap-3 pt-2 border-t pt-4">
                   <Button

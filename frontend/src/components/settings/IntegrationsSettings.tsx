@@ -19,6 +19,7 @@ interface IntegrationsSettingsProps {
 
 const PLAYER_TARGETS: Array<{ value: PlayerTarget; label: string }> = [
   { value: 'none', label: 'None' },
+  { value: 'plex', label: 'Plex' },
   { value: 'jellyfin', label: 'Jellyfin' },
   { value: 'navidrome', label: 'Navidrome' },
 ];
@@ -32,7 +33,7 @@ export function IntegrationsSettings({ config, updateConfig }: IntegrationsSetti
 
   const playerTarget: PlayerTarget = useMemo(() => {
     const value = String(config.PIPELINE_PLAYER_TARGET || 'none').trim().toLowerCase();
-    return (['none', 'jellyfin', 'navidrome'].includes(value) ? value : 'none') as PlayerTarget;
+    return (['none', 'plex', 'jellyfin', 'navidrome'].includes(value) ? value : 'none') as PlayerTarget;
   }, [config.PIPELINE_PLAYER_TARGET]);
 
   const testPlayer = async () => {
@@ -179,7 +180,7 @@ export function IntegrationsSettings({ config, updateConfig }: IntegrationsSetti
           <div className="flex items-start justify-between p-3 rounded-lg bg-muted/50">
             <div className="space-y-0.5 flex-1">
               <Label>Sync external player</Label>
-              <p className="text-xs text-muted-foreground">Trigger Jellyfin/Navidrome library refresh after scan.</p>
+              <p className="text-xs text-muted-foreground">Trigger Plex/Jellyfin/Navidrome library refresh after scan.</p>
             </div>
             <Switch
               checked={config.PIPELINE_ENABLE_PLAYER_SYNC ?? false}
@@ -221,6 +222,29 @@ export function IntegrationsSettings({ config, updateConfig }: IntegrationsSetti
             </SelectContent>
           </Select>
         </div>
+
+        {playerTarget === 'plex' && (
+          <div className="space-y-3 pt-2 border-t border-border">
+            <div className="space-y-2">
+              <Label htmlFor="plex-url">Plex URL</Label>
+              <Input
+                id="plex-url"
+                placeholder="http://192.168.1.100:32400"
+                value={config.PLEX_HOST || ''}
+                onChange={(e) => updateConfig({ PLEX_HOST: e.target.value })}
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="plex-token">Plex token</Label>
+              <PasswordInput
+                id="plex-token"
+                placeholder="x-plex-token"
+                value={config.PLEX_TOKEN || ''}
+                onChange={(e) => updateConfig({ PLEX_TOKEN: e.target.value })}
+              />
+            </div>
+          </div>
+        )}
 
         {playerTarget === 'jellyfin' && (
           <div className="space-y-3 pt-2 border-t border-border">

@@ -414,7 +414,7 @@ export function ScanProgress({
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
                 {/* Duplicates Found - with mini bar chart */}
                 <Link 
-                  to="/unduper"
+                  to="/tools"
                   className="group flex flex-col gap-2 rounded-xl bg-gradient-to-br from-warning/10 to-warning/5 border border-warning/30 p-5 hover:border-warning/50 transition-all card-hover"
                 >
                   <div className="flex items-center justify-between">
@@ -705,7 +705,7 @@ export function ScanProgress({
                       </p>
                     </div>
                     <div className="flex items-center gap-2">
-                      <Link to="/unduper">
+                      <Link to="/tools">
                         <Button variant="outline" size="sm">Review</Button>
                       </Link>
                       <Button
@@ -891,7 +891,7 @@ export function ScanProgress({
                   ? 'Scan only for incomplete albums (missing tracks). Results appear in Incomplete albums.'
                   : scanType === 'changed_only'
                     ? 'Scan only new/modified albums. Unchanged and already-complete albums are skipped.'
-                  : 'One scan analyzes duplicates, metadata, and tags. Results appear in Unduper, Library, and Tag Fixer.'}
+                  : 'One scan analyzes duplicates, metadata, and tags. Results appear in Tools, Library, and Statistics.'}
               </p>
             </div>
             <div className="flex items-center gap-2 shrink-0">
@@ -1256,7 +1256,7 @@ export function ScanProgress({
                     <div className="min-w-0 flex-1 space-y-1.5">
                       <span className="text-xs font-medium text-muted-foreground uppercase tracking-wide">Now</span>
                       <div className="text-sm font-medium text-foreground">
-                        Finalizing… Saving results to Unduper and summary.
+                        Finalizing… Saving results to Tools and summary.
                       </div>
                     </div>
                   </>
