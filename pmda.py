@@ -1375,9 +1375,11 @@ def _apply_forced_runtime_defaults():
     TRACKLIST_MATCH_MIN = 0.9
     ARTIST_CREDIT_MODE = "picard_like_default"
     merged["ARTIST_CREDIT_MODE"] = ARTIST_CREDIT_MODE
-    MB_SEARCH_ALBUM_TIMEOUT_SEC = 20
+    # Keep scans fast on large libraries; strict provider fallbacks cover the hard cases.
+    MB_SEARCH_ALBUM_TIMEOUT_SEC = 12
     MB_CANDIDATE_FETCH_LIMIT = 4
-    MB_TRACKLIST_FETCH_LIMIT = 2
+    # Recording-level tracklist fetch is expensive; keep it minimal by default.
+    MB_TRACKLIST_FETCH_LIMIT = 1
     MB_FAST_FALLBACK_MODE = True
     merged["MB_SEARCH_ALBUM_TIMEOUT_SEC"] = MB_SEARCH_ALBUM_TIMEOUT_SEC
     merged["MB_CANDIDATE_FETCH_LIMIT"] = MB_CANDIDATE_FETCH_LIMIT
