@@ -802,6 +802,20 @@ def _get(key: str, *, default=None, cast=lambda x: x):
             ENV_SOURCES[key] = "default"
             raw = default
         else:
+            # Backward-compatible "perf default" migration:
+            # some older builds persisted defaults into SQLite. When that happens, we treat legacy defaults
+            # as if they were unset so the newer recommended defaults apply without forcing a manual reset.
+            # Users can still override by setting any other value than the legacy default.
+            try:
+                raw_str = str(raw).strip()
+            except Exception:
+                raw_str = ""
+            if key == "MB_SEARCH_ALBUM_TIMEOUT_SEC" and raw_str == "20" and default is not None:
+                ENV_SOURCES[key] = "default"
+                return cast(default)
+            if key == "MB_TRACKLIST_FETCH_LIMIT" and raw_str == "2" and default is not None:
+                ENV_SOURCES[key] = "default"
+                return cast(default)
             return cast(raw)
     ENV_SOURCES[key] = "default"
     raw = default
