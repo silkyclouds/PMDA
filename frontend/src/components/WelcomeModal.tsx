@@ -45,19 +45,24 @@ export function WelcomeModal({ onClose, config }: WelcomeModalProps) {
         </div>
         <div className="space-y-4 pt-2">
           <h2 id="welcome-title" className="text-lg font-semibold text-foreground">
-            Hey, welcome!
+            Welcome to PMDA
           </h2>
-          <p className="text-sm text-muted-foreground">
-            It looks like you haven&apos;t configured PMDA yet. Head over to the{' '}
-            <button
-              type="button"
-              onClick={goToSettings}
-              className="font-medium text-primary underline underline-offset-2 hover:no-underline bg-transparent border-0 cursor-pointer p-0"
-            >
-              Settings page
-            </button>{' '}
-            to get started.
-          </p>
+          <div className="space-y-2 text-sm text-muted-foreground">
+            <p>
+              PMDA automates the boring part of managing a large music library.
+            </p>
+            <ul className="space-y-1 pl-4 list-disc">
+              <li>Scan one or more source folders</li>
+              <li>Match albums (MusicBrainz + fallbacks) and fix tags</li>
+              <li>Download best possible covers and artist images</li>
+              <li>Move duplicates and incomplete albums to quarantine folders</li>
+              <li>Export a clean library tree (hardlink/symlink/copy/move)</li>
+              <li>Optionally trigger Plex/Jellyfin/Navidrome refresh</li>
+            </ul>
+            <p>
+              Start by configuring your folders. Nothing is deleted: PMDA only moves files when needed.
+            </p>
+          </div>
 
           {mounts && (
             <div className="rounded-lg border border-border bg-muted/30 p-3 space-y-2">
@@ -86,7 +91,7 @@ export function WelcomeModal({ onClose, config }: WelcomeModalProps) {
 
           <Button onClick={goToSettings} className="w-full gap-2">
             <Settings className="w-4 h-4" />
-            Go to Settings
+            Open Settings
           </Button>
         </div>
       </div>

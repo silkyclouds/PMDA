@@ -13,6 +13,24 @@ import { Logo } from '@/components/Logo';
 import { GlobalSearch } from '@/components/GlobalSearch';
 import * as api from '@/lib/api';
 
+const WELCOME_COOKIE = 'pmda_welcome_dismissed';
+
+function hasWelcomeCookie(): boolean {
+  try {
+    return document.cookie.split(';').some((c) => c.trim().startsWith(`${WELCOME_COOKIE}=`));
+  } catch {
+    return false;
+  }
+}
+
+function setWelcomeCookie(): void {
+  try {
+    document.cookie = `${WELCOME_COOKIE}=1; Max-Age=31536000; Path=/; SameSite=Lax`;
+  } catch {
+    // ignore
+  }
+}
+
 function RebootCountdown({ onComplete, onProgress }: { onComplete: () => void; onProgress: (countdown: number, progress: number) => void }) {
   const onCompleteRef = useRef(onComplete);
   const onProgressRef = useRef(onProgress);
@@ -61,8 +79,9 @@ export function Header() {
   useEffect(() => {
     api.getConfig().then((data) => {
       setConfig(data);
-      setIsConfigured(data.configured === true);
-      if (data.configured === false) {
+      const configured = data.configured === true;
+      setIsConfigured(configured);
+      if (!configured && !hasWelcomeCookie()) {
         setShowSettings(true);
       }
     }).catch(() => {});
@@ -77,9 +96,13 @@ export function Header() {
   const handleSettingsClick = () => {
     if (isConfigured === true) {
       navigate('/settings');
-    } else {
-      setShowSettings(true);
+      return;
     }
+    if (hasWelcomeCookie()) {
+      navigate('/settings');
+      return;
+    }
+    setShowSettings(true);
   };
 
   return (
@@ -172,7 +195,13 @@ export function Header() {
 
       {/* Welcome modal when not configured */}
       {showSettings && !isConfigured && (
-        <WelcomeModal onClose={() => setShowSettings(false)} config={config} />
+        <WelcomeModal
+          onClose={() => {
+            setWelcomeCookie();
+            setShowSettings(false);
+          }}
+          config={config}
+        />
       )}
 
       {/* Effect to handle rebooting countdown */}
