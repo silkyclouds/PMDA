@@ -7,6 +7,7 @@ import { Button } from '@/components/ui/button';
 import { PasswordInput } from '@/components/ui/password-input';
 import { FieldTooltip } from '@/components/ui/field-tooltip';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { FolderBrowserInput } from '@/components/settings/FolderBrowserInput';
 import * as api from '@/lib/api';
 import type { PMDAConfig, PlayerTarget } from '@/lib/api';
 import { toast } from 'sonner';
@@ -19,6 +20,7 @@ interface IntegrationsSettingsProps {
 
 const PLAYER_TARGETS: Array<{ value: PlayerTarget; label: string }> = [
   { value: 'none', label: 'None' },
+  { value: 'plex', label: 'Plex' },
   { value: 'jellyfin', label: 'Jellyfin' },
   { value: 'navidrome', label: 'Navidrome' },
 ];
@@ -32,7 +34,7 @@ export function IntegrationsSettings({ config, updateConfig }: IntegrationsSetti
 
   const playerTarget: PlayerTarget = useMemo(() => {
     const value = String(config.PIPELINE_PLAYER_TARGET || 'none').trim().toLowerCase();
-    return (['none', 'jellyfin', 'navidrome'].includes(value) ? value : 'none') as PlayerTarget;
+    return (['none', 'plex', 'jellyfin', 'navidrome'].includes(value) ? value : 'none') as PlayerTarget;
   }, [config.PIPELINE_PLAYER_TARGET]);
 
   const testPlayer = async () => {
@@ -164,22 +166,67 @@ export function IntegrationsSettings({ config, updateConfig }: IntegrationsSetti
             />
           </div>
 
-          <div className="flex items-start justify-between p-3 rounded-lg bg-muted/50">
-            <div className="space-y-0.5 flex-1">
-              <Label>Export files library</Label>
-              <p className="text-xs text-muted-foreground">Build/update the export tree using hardlink/symlink/copy/move strategy.</p>
+          <div className="p-3 rounded-lg bg-muted/50 space-y-3">
+            <div className="flex items-start justify-between gap-3">
+              <div className="space-y-0.5 flex-1">
+                <Label>Export files library</Label>
+                <p className="text-xs text-muted-foreground">Build/update the export tree using hardlink/symlink/copy/move strategy.</p>
+              </div>
+              <Switch
+                checked={config.PIPELINE_ENABLE_EXPORT ?? false}
+                onCheckedChange={(checked) => updateConfig({ PIPELINE_ENABLE_EXPORT: checked })}
+                className="mt-1"
+              />
             </div>
-            <Switch
-              checked={config.PIPELINE_ENABLE_EXPORT ?? false}
-              onCheckedChange={(checked) => updateConfig({ PIPELINE_ENABLE_EXPORT: checked })}
-              className="mt-1"
-            />
+
+            {Boolean(config.PIPELINE_ENABLE_EXPORT) && (
+              <div className="pt-3 border-t border-border/60 space-y-3">
+                <div className="space-y-2">
+                  <Label>Library folder</Label>
+                  <p className="text-xs text-muted-foreground">
+                    Destination folder for exported files (clean structure), e.g. <span className="font-mono">/music_matched</span>.
+                  </p>
+                  <FolderBrowserInput
+                    value={config.EXPORT_ROOT ?? '/music/library'}
+                    onChange={(path) => updateConfig({ EXPORT_ROOT: path })}
+                    placeholder="/music/library"
+                    selectLabel="Select library destination folder"
+                  />
+                </div>
+
+                <div className="space-y-2">
+                  <Label>Export strategy</Label>
+                  <p className="text-xs text-muted-foreground">
+                    Choose how PMDA writes files to the library folder.
+                  </p>
+                  <Select
+                    value={(config.EXPORT_LINK_STRATEGY as 'hardlink' | 'symlink' | 'copy' | 'move' | undefined) ?? 'hardlink'}
+                    onValueChange={(value: 'hardlink' | 'symlink' | 'copy' | 'move') => updateConfig({ EXPORT_LINK_STRATEGY: value })}
+                    disabled={!Boolean(config.PIPELINE_ENABLE_EXPORT)}
+                  >
+                    <SelectTrigger className="w-full md:w-[320px]">
+                      <SelectValue placeholder="Select strategy" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="hardlink">Hardlink (fast, no extra space)</SelectItem>
+                      <SelectItem value="symlink">Symlink (keeps original files)</SelectItem>
+                      <SelectItem value="copy">Copy (duplicates files)</SelectItem>
+                      <SelectItem value="move">Move (relocate files)</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+
+                <p className="text-xs text-muted-foreground">
+                  Export is built automatically by the pipeline when enabled. No manual action is required.
+                </p>
+              </div>
+            )}
           </div>
 
           <div className="flex items-start justify-between p-3 rounded-lg bg-muted/50">
             <div className="space-y-0.5 flex-1">
               <Label>Sync external player</Label>
-              <p className="text-xs text-muted-foreground">Trigger Jellyfin/Navidrome library refresh after scan.</p>
+              <p className="text-xs text-muted-foreground">Trigger Plex/Jellyfin/Navidrome library refresh after scan.</p>
             </div>
             <Switch
               checked={config.PIPELINE_ENABLE_PLAYER_SYNC ?? false}
@@ -221,6 +268,29 @@ export function IntegrationsSettings({ config, updateConfig }: IntegrationsSetti
             </SelectContent>
           </Select>
         </div>
+
+        {playerTarget === 'plex' && (
+          <div className="space-y-3 pt-2 border-t border-border">
+            <div className="space-y-2">
+              <Label htmlFor="plex-url">Plex URL</Label>
+              <Input
+                id="plex-url"
+                placeholder="http://192.168.1.100:32400"
+                value={config.PLEX_HOST || ''}
+                onChange={(e) => updateConfig({ PLEX_HOST: e.target.value })}
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="plex-token">Plex token</Label>
+              <PasswordInput
+                id="plex-token"
+                placeholder="x-plex-token"
+                value={config.PLEX_TOKEN || ''}
+                onChange={(e) => updateConfig({ PLEX_TOKEN: e.target.value })}
+              />
+            </div>
+          </div>
+        )}
 
         {playerTarget === 'jellyfin' && (
           <div className="space-y-3 pt-2 border-t border-border">

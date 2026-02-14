@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
-import { Search, Music, Loader2, Edit, Image as ImageIcon, RefreshCw, LayoutGrid, List, Sparkles, Play, Check, X, Circle, CopyMinus, Wrench, FolderInput } from 'lucide-react';
+import { Search, Music, Loader2, Edit, Image as ImageIcon, RefreshCw, LayoutGrid, List, Sparkles, Play, Check, X, Circle, CopyMinus, Wrench } from 'lucide-react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { Header } from '@/components/Header';
 import { Input } from '@/components/ui/input';
@@ -116,100 +116,6 @@ function albumHasIssue(album: AlbumInfo): boolean {
   if (album.in_duplicate_group) return true;
   if (album.is_broken) return true;
   return false;
-}
-
-/** Button and dialog to list albums with parenthetical folder names (e.g. "Album (flac)") and rename them to "Album". */
-function NormalizeAlbumNamesButton({ onDone }: { onDone?: () => void }) {
-  const [open, setOpen] = useState(false);
-  const [albums, setAlbums] = useState<api.AlbumWithParentheticalName[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [renaming, setRenaming] = useState(false);
-  const { toast } = useToast();
-
-  const handleOpen = useCallback(async () => {
-    setOpen(true);
-    setLoading(true);
-    setAlbums([]);
-    try {
-      const res = await api.getAlbumsWithParentheticalNames();
-      setAlbums(res.albums ?? []);
-    } catch {
-      toast({ title: 'Error', description: 'Failed to load albums with parenthetical names', variant: 'destructive' });
-    } finally {
-      setLoading(false);
-    }
-  }, [toast]);
-
-  const handleRenameAll = useCallback(async () => {
-    if (albums.length === 0) return;
-    setRenaming(true);
-    try {
-      const result = await api.normalizeAlbumNames(albums.map((a) => a.album_id));
-      const n = result.renamed?.length ?? 0;
-      const errs = result.errors?.length ?? 0;
-      if (n > 0) {
-        toast({ title: 'Renamed', description: `${n} folder${n !== 1 ? 's' : ''} renamed.${errs > 0 ? ` ${errs} error(s).` : ''} Re-scan your library to refresh.` });
-        setOpen(false);
-        onDone?.();
-      }
-      if (errs > 0 && n === 0) {
-        toast({ title: 'Errors', description: result.errors?.map((e) => e.message).join('; ') ?? 'Rename failed', variant: 'destructive' });
-      }
-    } catch (e) {
-      toast({ title: 'Error', description: e instanceof Error ? e.message : 'Rename failed', variant: 'destructive' });
-    } finally {
-      setRenaming(false);
-    }
-  }, [albums, onDone, toast]);
-
-  return (
-    <>
-      <Button variant="outline" size="sm" onClick={handleOpen} className="gap-1.5">
-        <FolderInput className="w-4 h-4" />
-        Normalize album names
-      </Button>
-      <Dialog open={open} onOpenChange={setOpen}>
-        <DialogContent className="max-w-2xl max-h-[85vh] flex flex-col">
-          <DialogHeader>
-            <DialogTitle>Normalize album names</DialogTitle>
-            <DialogDescription>
-              Remove format/version suffixes in parentheses from folder names (e.g. &quot;Album (flac)&quot; → &quot;Album&quot;). Re-scan your library after renaming.
-            </DialogDescription>
-          </DialogHeader>
-          {loading ? (
-            <div className="flex items-center justify-center py-8">
-              <Loader2 className="w-8 h-8 animate-spin text-muted-foreground" />
-            </div>
-          ) : albums.length === 0 ? (
-            <p className="text-sm text-muted-foreground py-4">No albums with parenthetical suffixes found.</p>
-          ) : (
-            <>
-              <ScrollArea className="flex-1 max-h-[50vh] rounded-md border p-3">
-                <ul className="space-y-2 text-sm">
-                  {albums.map((a) => (
-                    <li key={a.album_id} className="flex items-center gap-2 flex-wrap">
-                      <span className="font-medium truncate">{a.artist}</span>
-                      <span className="text-muted-foreground">—</span>
-                      <span className="truncate" title={a.current_name}>{a.current_name}</span>
-                      <span className="text-muted-foreground">→</span>
-                      <span className="truncate text-primary" title={a.proposed_name}>{a.proposed_name}</span>
-                    </li>
-                  ))}
-                </ul>
-              </ScrollArea>
-              <div className="flex justify-end gap-2 pt-2">
-                <Button variant="outline" onClick={() => setOpen(false)}>Cancel</Button>
-                <Button onClick={handleRenameAll} disabled={renaming} className="gap-2">
-                  {renaming ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
-                  Rename {albums.length} folder{albums.length !== 1 ? 's' : ''}
-                </Button>
-              </div>
-            </>
-          )}
-        </DialogContent>
-      </Dialog>
-    </>
-  );
 }
 
 /** Issue badges with distinct colors for list/tile views. */
@@ -862,7 +768,6 @@ export default function LibraryBrowser() {
               </p>
             )}
           </div>
-          <NormalizeAlbumNamesButton onDone={() => { if (selectedArtist) loadArtistDetails(selectedArtist); }} />
         </div>
 
         <Card className="mb-6 border-border/70">
@@ -870,7 +775,6 @@ export default function LibraryBrowser() {
             <div className="flex items-center justify-between gap-3">
               <div>
                 <CardTitle className="text-base">For You</CardTitle>
-                <CardDescription>Session-aware recommendations (embedding + behavior ranking)</CardDescription>
               </div>
               <Button variant="outline" size="sm" onClick={loadRecommendations} disabled={loadingRecommendations} className="gap-1.5">
                 {loadingRecommendations ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
@@ -910,12 +814,9 @@ export default function LibraryBrowser() {
                         <p className="text-xs text-muted-foreground truncate mt-0.5">
                           {rec.artist_name} · {rec.album_title}
                         </p>
-                        <div className="flex items-center gap-2 mt-2">
-                          <Badge variant="outline" className="text-[10px]">score {(rec.score ?? 0).toFixed(2)}</Badge>
-                          {Array.isArray(rec.reasons) && rec.reasons.length > 0 && (
-                            <span className="text-[10px] text-muted-foreground truncate">{rec.reasons.join(' · ')}</span>
-                          )}
-                        </div>
+                        {Array.isArray(rec.reasons) && rec.reasons.length > 0 && (
+                          <p className="text-[10px] text-muted-foreground truncate mt-2">{rec.reasons.join(' · ')}</p>
+                        )}
                       </div>
                       <Play className="w-4 h-4 text-muted-foreground group-hover:text-primary shrink-0 mt-0.5" />
                     </div>

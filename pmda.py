@@ -802,6 +802,20 @@ def _get(key: str, *, default=None, cast=lambda x: x):
             ENV_SOURCES[key] = "default"
             raw = default
         else:
+            # Backward-compatible "perf default" migration:
+            # some older builds persisted defaults into SQLite. When that happens, we treat legacy defaults
+            # as if they were unset so the newer recommended defaults apply without forcing a manual reset.
+            # Users can still override by setting any other value than the legacy default.
+            try:
+                raw_str = str(raw).strip()
+            except Exception:
+                raw_str = ""
+            if key == "MB_SEARCH_ALBUM_TIMEOUT_SEC" and raw_str == "20" and default is not None:
+                ENV_SOURCES[key] = "default"
+                return cast(default)
+            if key == "MB_TRACKLIST_FETCH_LIMIT" and raw_str == "2" and default is not None:
+                ENV_SOURCES[key] = "default"
+                return cast(default)
             return cast(raw)
     ENV_SOURCES[key] = "default"
     raw = default
@@ -1082,6 +1096,7 @@ merged = {
     "SECTION_ID": SECTION_IDS[0] if SECTION_IDS else 0,
     "SCAN_THREADS":   _get("SCAN_THREADS",   default=os.cpu_count() or 4,               cast=_parse_int),
     "PATH_MAP":       _parse_path_map(_get("PATH_MAP", default={})),
+    "DUPE_ROOT":      _get("DUPE_ROOT", default="/dupes", cast=str),
     "LOG_LEVEL":      _get("LOG_LEVEL",      default="INFO").upper(),
     "AI_PROVIDER": _get("AI_PROVIDER", default="openai", cast=str),
     "OPENAI_API_KEY": _get("OPENAI_API_KEY", default="",                                cast=str),
@@ -1097,20 +1112,22 @@ merged = {
     # Time budget (seconds) per album for MusicBrainz search flow before we fall back faster to other providers.
     "MB_SEARCH_ALBUM_TIMEOUT_SEC": _get(
         "MB_SEARCH_ALBUM_TIMEOUT_SEC",
-        default=45,
-        cast=lambda x: max(10, min(300, int(x) if x is not None and str(x).strip().isdigit() else 45)),
+        # Default reduced to keep scans fast on large libraries; strict provider fallbacks cover the hard cases.
+        default=12,
+        cast=lambda x: max(10, min(300, int(x) if x is not None and str(x).strip().isdigit() else 12)),
     ),
     # Maximum number of MB candidates for which we fetch full details per album.
     "MB_CANDIDATE_FETCH_LIMIT": _get(
         "MB_CANDIDATE_FETCH_LIMIT",
-        default=6,
-        cast=lambda x: max(1, min(20, int(x) if x is not None and str(x).strip().isdigit() else 6)),
+        default=4,
+        cast=lambda x: max(1, min(20, int(x) if x is not None and str(x).strip().isdigit() else 4)),
     ),
     # Fetch recording-level track titles only for first N candidates (expensive endpoint).
     "MB_TRACKLIST_FETCH_LIMIT": _get(
         "MB_TRACKLIST_FETCH_LIMIT",
-        default=3,
-        cast=lambda x: max(0, min(20, int(x) if x is not None and str(x).strip().isdigit() else 3)),
+        # Default reduced: this endpoint is expensive and can dominate scan time when many albums are ambiguous.
+        default=1,
+        cast=lambda x: max(0, min(20, int(x) if x is not None and str(x).strip().isdigit() else 1)),
     ),
     # If true, once MB budget is exceeded or MB has no candidates, we prioritize provider fallback and skip web+AI MBID hunt.
     "MB_FAST_FALLBACK_MODE": _get("MB_FAST_FALLBACK_MODE", default=True, cast=_parse_bool),
@@ -1234,9 +1251,9 @@ USE_MUSICBRAINZ: bool = bool(merged["USE_MUSICBRAINZ"])
 MUSICBRAINZ_EMAIL: str = merged.get("MUSICBRAINZ_EMAIL", "pmda@example.com")
 MB_QUEUE_ENABLED: bool = bool(merged.get("MB_QUEUE_ENABLED", True))
 MB_RETRY_NOT_FOUND: bool = bool(merged.get("MB_RETRY_NOT_FOUND", False))
-MB_SEARCH_ALBUM_TIMEOUT_SEC: int = int(merged.get("MB_SEARCH_ALBUM_TIMEOUT_SEC", 45))
-MB_CANDIDATE_FETCH_LIMIT: int = int(merged.get("MB_CANDIDATE_FETCH_LIMIT", 6))
-MB_TRACKLIST_FETCH_LIMIT: int = int(merged.get("MB_TRACKLIST_FETCH_LIMIT", 3))
+MB_SEARCH_ALBUM_TIMEOUT_SEC: int = int(merged.get("MB_SEARCH_ALBUM_TIMEOUT_SEC", 20))
+MB_CANDIDATE_FETCH_LIMIT: int = int(merged.get("MB_CANDIDATE_FETCH_LIMIT", 4))
+MB_TRACKLIST_FETCH_LIMIT: int = int(merged.get("MB_TRACKLIST_FETCH_LIMIT", 2))
 MB_FAST_FALLBACK_MODE: bool = bool(merged.get("MB_FAST_FALLBACK_MODE", True))
 PROVIDER_IDENTITY_STRICT: bool = bool(merged.get("PROVIDER_IDENTITY_STRICT", True))
 PROVIDER_IDENTITY_USE_AI: bool = bool(merged.get("PROVIDER_IDENTITY_USE_AI", True))
@@ -1333,6 +1350,7 @@ def _apply_forced_runtime_defaults():
     global USE_WEB_SEARCH_FOR_MB, USE_ACOUSTID, USE_ACOUSTID_WHEN_TAGGED
     global USE_DISCOGS, USE_LASTFM, USE_BANDCAMP
     global SKIP_MB_FOR_LIVE_ALBUMS, TRACKLIST_MATCH_MIN, ARTIST_CREDIT_MODE
+    global MB_SEARCH_ALBUM_TIMEOUT_SEC, MB_CANDIDATE_FETCH_LIMIT, MB_TRACKLIST_FETCH_LIMIT, MB_FAST_FALLBACK_MODE
 
     LIBRARY_MODE = "files"
     merged["LIBRARY_MODE"] = "files"
@@ -1357,6 +1375,16 @@ def _apply_forced_runtime_defaults():
     TRACKLIST_MATCH_MIN = 0.9
     ARTIST_CREDIT_MODE = "picard_like_default"
     merged["ARTIST_CREDIT_MODE"] = ARTIST_CREDIT_MODE
+    # Keep scans fast on large libraries; strict provider fallbacks cover the hard cases.
+    MB_SEARCH_ALBUM_TIMEOUT_SEC = 12
+    MB_CANDIDATE_FETCH_LIMIT = 4
+    # Recording-level tracklist fetch is expensive; keep it minimal by default.
+    MB_TRACKLIST_FETCH_LIMIT = 1
+    MB_FAST_FALLBACK_MODE = True
+    merged["MB_SEARCH_ALBUM_TIMEOUT_SEC"] = MB_SEARCH_ALBUM_TIMEOUT_SEC
+    merged["MB_CANDIDATE_FETCH_LIMIT"] = MB_CANDIDATE_FETCH_LIMIT
+    merged["MB_TRACKLIST_FETCH_LIMIT"] = MB_TRACKLIST_FETCH_LIMIT
+    merged["MB_FAST_FALLBACK_MODE"] = MB_FAST_FALLBACK_MODE
 
 
 _apply_forced_runtime_defaults()
@@ -1376,8 +1404,8 @@ if not PLEX_CONFIGURED:
     logging.info(
         "Starting in unconfigured (wizard) mode – configure Plex and mount the database at /database in Settings."
     )
-# Duplicates always move to /dupes inside the container
-DUPE_ROOT = Path("/dupes")
+# Duplicates root defaults to /dupes but can be overridden from settings.
+DUPE_ROOT = Path(str(merged.get("DUPE_ROOT", "/dupes") or "").strip() or "/dupes")
 # WebUI always listens on container port 5005 inside the container
 WEBUI_PORT = 5005
 
@@ -7012,7 +7040,7 @@ class MusicBrainzQueue:
                 15,
                 min(
                     45,
-                    int(getattr(sys.modules[__name__], "MB_SEARCH_ALBUM_TIMEOUT_SEC", 45) or 45),
+                    int(getattr(sys.modules[__name__], "MB_SEARCH_ALBUM_TIMEOUT_SEC", 20) or 20),
                 ),
             )
         if event.wait(timeout=timeout_seconds):
@@ -9553,9 +9581,9 @@ def search_mb_release_group_by_metadata(
     if album_folder is not None and not isinstance(album_folder, Path):
         album_folder = Path(album_folder) if album_folder else None
     mb_search_started = time.perf_counter()
-    mb_budget_sec = max(10, int(getattr(sys.modules[__name__], "MB_SEARCH_ALBUM_TIMEOUT_SEC", 45) or 45))
-    candidate_fetch_limit = max(1, int(getattr(sys.modules[__name__], "MB_CANDIDATE_FETCH_LIMIT", 6) or 6))
-    tracklist_fetch_limit = max(0, int(getattr(sys.modules[__name__], "MB_TRACKLIST_FETCH_LIMIT", 3) or 3))
+    mb_budget_sec = max(10, int(getattr(sys.modules[__name__], "MB_SEARCH_ALBUM_TIMEOUT_SEC", 20) or 20))
+    candidate_fetch_limit = max(1, int(getattr(sys.modules[__name__], "MB_CANDIDATE_FETCH_LIMIT", 4) or 4))
+    tracklist_fetch_limit = max(0, int(getattr(sys.modules[__name__], "MB_TRACKLIST_FETCH_LIMIT", 2) or 2))
     fast_fallback_mode = bool(getattr(sys.modules[__name__], "MB_FAST_FALLBACK_MODE", True))
     provider_fallback_cache: dict | None = None
 
@@ -11524,7 +11552,58 @@ def scan_duplicates(
                                         logging.debug("[Artist %s] fetch_mb_release_group_info failed for %s (from index): %s", artist, chosen_rg_id, _err)
                                         rg_info = None
                         if not rg_info:
-                            rg_info, match_verified_by_ai = search_mb_release_group_by_metadata(artist, album_norm, tracks, title_raw=title_raw_mb, album_folder=album_folder_arg)
+                            # Fast-path: if we already have a cached strict Bandcamp identity with perfect tracklist,
+                            # skip expensive MB search for this album and rely on provider arbitration below.
+                            if bool(getattr(sys.modules[__name__], "MB_FAST_FALLBACK_MODE", True)) and not SCAN_DISABLE_CACHE:
+                                try:
+                                    bandcamp_status, bandcamp_cached = get_cached_provider_album_lookup(
+                                        "bandcamp",
+                                        artist,
+                                        title_raw_mb or album_norm,
+                                    )
+                                except Exception:
+                                    bandcamp_status, bandcamp_cached = (None, None)
+                                if bandcamp_status == "found" and isinstance(bandcamp_cached, dict):
+                                    provider_payloads_prefetched = {
+                                        "discogs": None,
+                                        "lastfm": None,
+                                        "bandcamp": bandcamp_cached,
+                                        "extra_sources": [],
+                                    }
+                                    local_titles_prefetch = list(tracks_edition) if tracks_edition else list(tracks or [])
+                                    prefetched_arbitration = _arbitrate_provider_identity(
+                                        artist_name=artist,
+                                        album_title=title_raw_mb or album_norm,
+                                        local_track_titles=local_titles_prefetch,
+                                        provider_payloads=provider_payloads_prefetched,
+                                    )
+                                    if prefetched_arbitration and str(prefetched_arbitration.get("provider") or "").strip().lower() == "bandcamp":
+                                        track_score_prefetch = float(prefetched_arbitration.get("track_score") or 0.0)
+                                        title_score_prefetch = float(prefetched_arbitration.get("title_score") or 0.0)
+                                        artist_score_prefetch = float(prefetched_arbitration.get("artist_score") or 0.0)
+                                        if (
+                                            track_score_prefetch >= 0.999
+                                            and title_score_prefetch >= 0.999
+                                            and artist_score_prefetch >= 0.999
+                                        ):
+                                            e["_provider_payloads_prefetched"] = provider_payloads_prefetched
+                                            e["_provider_arbitration_prefetched"] = prefetched_arbitration
+                                            e["_provider_fastpath_reason"] = "bandcamp_cached_strict_1.00"
+                                            log_mb(
+                                                "Album %s – \"%s\": skipping MusicBrainz search (cached strict Bandcamp match, tracklist=1.00)",
+                                                artist,
+                                                title_raw_mb or album_norm,
+                                            )
+
+                            fastpath_reason = e.pop("_provider_fastpath_reason", None)
+                            if not fastpath_reason:
+                                rg_info, match_verified_by_ai = search_mb_release_group_by_metadata(
+                                    artist,
+                                    album_norm,
+                                    tracks,
+                                    title_raw=title_raw_mb,
+                                    album_folder=album_folder_arg,
+                                )
                         if rg_info and rg_info.get("track_titles") and tracks:
                             track_min = getattr(sys.modules[__name__], "TRACKLIST_MATCH_MIN", 0.8)
                             score = _crosscheck_tracklist(list(tracks), rg_info["track_titles"])
@@ -11625,12 +11704,14 @@ def scan_duplicates(
             title_raw = e.get("title_raw") or e.get("plex_title") or album_norm
             if not rg_info:
                 fallback_sources = []
-                provider_payloads = {}
-                try:
-                    provider_payloads = _fetch_album_provider_fallbacks_parallel(artist, title_raw)
-                except Exception as provider_exc:
-                    logging.debug("[Artist %s] provider fallback fetch failed for %s: %s", artist, title_raw, provider_exc)
+                provider_payloads = e.pop("_provider_payloads_prefetched", None)
+                if not isinstance(provider_payloads, dict) or not provider_payloads:
                     provider_payloads = {}
+                    try:
+                        provider_payloads = _fetch_album_provider_fallbacks_parallel(artist, title_raw)
+                    except Exception as provider_exc:
+                        logging.debug("[Artist %s] provider fallback fetch failed for %s: %s", artist, title_raw, provider_exc)
+                        provider_payloads = {}
 
                 discogs_info = provider_payloads.get("discogs")
                 if isinstance(discogs_info, dict):
@@ -11706,12 +11787,16 @@ def scan_duplicates(
                 # Strict identity arbitration across providers when MB is unavailable.
                 if not rg_info:
                     local_titles = list(tracks_edition) if tracks_edition else []
-                    arbitration = _arbitrate_provider_identity(
-                        artist_name=artist,
-                        album_title=title_raw,
-                        local_track_titles=local_titles,
-                        provider_payloads=provider_payloads,
-                    )
+                    arbitration_prefetched = e.pop("_provider_arbitration_prefetched", None)
+                    if isinstance(arbitration_prefetched, dict):
+                        arbitration = arbitration_prefetched
+                    else:
+                        arbitration = _arbitrate_provider_identity(
+                            artist_name=artist,
+                            album_title=title_raw,
+                            local_track_titles=local_titles,
+                            provider_payloads=provider_payloads,
+                        )
                     if arbitration:
                         chosen_provider = str(arbitration.get("provider") or "").strip().lower()
                         chosen_payload = arbitration.get("payload") if isinstance(arbitration.get("payload"), dict) else {}
@@ -15645,6 +15730,47 @@ def background_scan():
                                 tags.update(live_tags)
                     except Exception:
                         pass
+
+                    # Snapshot pre-fix health from the publish item so we can update scan counters by delta.
+                    pre_missing_required = item.get("pre_missing_required_tags")
+                    pre_has_cover = item.get("pre_has_cover")
+                    pre_has_artist_image = item.get("pre_has_artist_image")
+                    pre_has_mb_id = item.get("pre_has_mb_id")
+                    pre_has_artist_mb_id = item.get("pre_has_artist_mb_id")
+
+                    # Compute post-fix health.
+                    edition_for_required: dict = {"tracks": list(item.get("tracks") or [])}
+                    if not (edition_for_required.get("tracks") or []):
+                        derived_tracks = [
+                            {"title": p.stem or f"Track {i + 1}", "idx": i + 1}
+                            for i, p in enumerate(ordered_paths)
+                        ]
+                        edition_for_required["tracks"] = derived_tracks
+                    try:
+                        missing_required_new = _check_required_tags(tags, REQUIRED_TAGS, edition=edition_for_required)
+                    except Exception:
+                        missing_required_new = []
+                    try:
+                        has_cover_new = bool(album_folder_has_cover(folder_path))
+                    except Exception:
+                        has_cover_new = False
+                    try:
+                        artist_folder = folder_path.parent if folder_path.parent else folder_path
+                        has_artist_image_new = bool(_artist_folder_has_image(artist_folder))
+                    except Exception:
+                        has_artist_image_new = False
+                    has_mb_id_new = bool(
+                        tags.get("musicbrainz_releasegroupid")
+                        or tags.get("musicbrainz_releaseid")
+                        or result.get("musicbrainz_id")
+                        or result.get("release_mbid")
+                    )
+                    has_artist_mb_id_new = bool(
+                        tags.get("musicbrainz_albumartistid")
+                        or tags.get("musicbrainz_artistid")
+                        or tags.get("musicbrainz_albumartist_id")
+                        or tags.get("musicbrainz_artist_id")
+                    )
                     with lock:
                         editions = all_editions_by_artist.get(artist_name) or []
                         for e in editions:
@@ -15664,17 +15790,54 @@ def background_scan():
                                 e["lastfm_album_mbid"] = result.get("lastfm_album_mbid")
                             if result.get("bandcamp_album_url"):
                                 e["bandcamp_album_url"] = result.get("bandcamp_album_url")
-                            edition_for_required = e
-                            if not (edition_for_required.get("tracks") or []):
-                                derived_tracks = [
-                                    {"title": p.stem or f"Track {i + 1}", "idx": i + 1}
-                                    for i, p in enumerate(ordered_paths)
-                                ]
-                                edition_for_required = dict(e)
-                                edition_for_required["tracks"] = derived_tracks
-                            e["missing_required_tags"] = _check_required_tags(tags, REQUIRED_TAGS, edition=edition_for_required)
-                            e["has_cover"] = album_folder_has_cover(folder_path)
-                            e["has_artist_image"] = _artist_folder_has_image(folder_path.parent if folder_path.parent else folder_path)
+                            e["missing_required_tags"] = list(missing_required_new or [])
+                            e["has_cover"] = bool(has_cover_new)
+                            e["has_artist_image"] = bool(has_artist_image_new)
+
+                            # Delta-adjust scan health counters so live stats reflect post-fix state.
+                            try:
+                                if pre_missing_required is not None:
+                                    old_missing = bool(pre_missing_required)
+                                    new_missing = bool(missing_required_new)
+                                    if old_missing != new_missing:
+                                        state["scan_albums_without_complete_tags"] = max(
+                                            0,
+                                            int(state.get("scan_albums_without_complete_tags", 0)) + (-1 if old_missing else 1),
+                                        )
+                                if pre_has_cover is not None:
+                                    old_without = not bool(pre_has_cover)
+                                    new_without = not bool(has_cover_new)
+                                    if old_without != new_without:
+                                        state["scan_albums_without_album_image"] = max(
+                                            0,
+                                            int(state.get("scan_albums_without_album_image", 0)) + (-1 if old_without else 1),
+                                        )
+                                if pre_has_artist_image is not None:
+                                    old_without = not bool(pre_has_artist_image)
+                                    new_without = not bool(has_artist_image_new)
+                                    if old_without != new_without:
+                                        state["scan_albums_without_artist_image"] = max(
+                                            0,
+                                            int(state.get("scan_albums_without_artist_image", 0)) + (-1 if old_without else 1),
+                                        )
+                                if pre_has_mb_id is not None:
+                                    old_without = not bool(pre_has_mb_id)
+                                    new_without = not bool(has_mb_id_new)
+                                    if old_without != new_without:
+                                        state["scan_albums_without_mb_id"] = max(
+                                            0,
+                                            int(state.get("scan_albums_without_mb_id", 0)) + (-1 if old_without else 1),
+                                        )
+                                if pre_has_artist_mb_id is not None:
+                                    old_without = not bool(pre_has_artist_mb_id)
+                                    new_without = not bool(has_artist_mb_id_new)
+                                    if old_without != new_without:
+                                        state["scan_albums_without_artist_mb_id"] = max(
+                                            0,
+                                            int(state.get("scan_albums_without_artist_mb_id", 0)) + (-1 if old_without else 1),
+                                        )
+                            except Exception:
+                                logging.debug("Post-process counter delta update failed", exc_info=True)
                             break
                 with lock:
                     state["scan_post_processing"] = True
@@ -17842,25 +18005,21 @@ def _fetch_bandcamp_album_info(artist_name: str, album_title: str) -> Optional[d
             time.sleep(wait)
         _last_bandcamp_request = time.time()
     headers = {"User-Agent": "PMDA/1.0 (metadata fallback; https://github.com/silkyclouds/PMDA)"}
-    try:
-        q = quote_plus(f"{artist_name} {album_title}".strip())
-        search_url = f"https://bandcamp.com/search?q={q}"
-        resp = requests.get(search_url, headers=headers, timeout=15)
-        if resp.status_code != 200:
-            return None
-        html = resp.text
-        album_clean = (norm_album(album_title) or album_title).lower().replace(" ", "").replace("-", "")
-        all_album_links = re.findall(r'href="(https?://[^"]*bandcamp\.com/album/([^"?]+))', html)
-        album_url = None
-        for full_url, slug in all_album_links:
-            slug_clean = (slug or "").lower().replace("-", "").replace("_", "")
-            if album_clean and (album_clean in slug_clean or slug_clean in album_clean):
-                album_url = full_url.split("?")[0]
-                break
-        if not album_url and all_album_links:
-            album_url = all_album_links[0][0].split("?")[0]
-        if not album_url:
-            return None
+
+    def _split_bandcamp_keywords(value: str) -> list[str]:
+        raw = (value or "").strip()
+        if not raw:
+            return []
+        # Bandcamp JSON-LD keywords is sometimes a comma-separated string.
+        # Split conservatively and keep insertion order.
+        parts: list[str] = []
+        for part in re.split(r"[,\n\r]+", raw):
+            txt = re.sub(r"\s+", " ", (part or "").strip())
+            if txt:
+                parts.append(txt)
+        return parts
+
+    def _parse_album_page(album_url: str) -> Optional[dict]:
         album_resp = requests.get(album_url, headers=headers, timeout=15)
         if album_resp.status_code != 200:
             return None
@@ -17870,69 +18029,71 @@ def _fetch_bandcamp_album_info(artist_name: str, album_title: str) -> Optional[d
         cover_candidates: List[str] = []
         og_title = re.search(r'<meta\s+property="og:title"\s+content="([^"]+)"', page)
         if og_title:
-            title = og_title.group(1).strip()
+            title = html.unescape(og_title.group(1)).strip()
         og_image = re.search(r'<meta\s+property="og:image"\s+content="([^"]+)"', page)
         if og_image:
             cover_url = og_image.group(1).strip()
             cover_candidates.append(cover_url)
-        # Any embedded bcbits image URL in page source (often includes multiple sizes).
-        page_cover_matches = re.findall(r"(https?://f\d+\.bcbits\.com/img/[ab]\d+_[0-9]+\.[a-zA-Z0-9]+(?:\?[^\"]*)?)", page)
+        page_cover_matches = re.findall(
+            r"(https?://f\d+\.bcbits\.com/img/[ab]\d+_[0-9]+\.[a-zA-Z0-9]+(?:\?[^\"]*)?)",
+            page,
+        )
         if page_cover_matches:
             cover_candidates.extend(page_cover_matches)
-        # Try art_id in page JSON to build canonical original-size URL.
         art_id_match = re.search(r'"art_id"\s*:\s*(\d+)', page)
         if art_id_match:
             art_id = art_id_match.group(1)
             cover_candidates.append(f"https://f4.bcbits.com/img/a{art_id}_0.jpg")
         cover_candidates = _dedupe_keep_order(cover_candidates)
-        # Prefer the highest declared candidate (Bandcamp _0 generally = original).
         if cover_candidates:
             prioritized = []
             for u in cover_candidates:
                 m_size = re.search(r"_([0-9]+)\.[a-zA-Z0-9]+(?:\?|$)", u)
                 if m_size:
                     val = int(m_size.group(1))
-                    # _0 is the best, treat as highest priority
                     score = 10_000_000 if val == 0 else val
                 else:
                     score = 0
                 prioritized.append((score, u))
             prioritized.sort(key=lambda x: x[0], reverse=True)
             cover_url = prioritized[0][1]
-        # Artist often in og:title as "Album Title, by Artist Name" or in itemprop
+
         artist_str = artist_name
         if title and " by " in title:
-            parts = title.split(" by ", 1)
+            # Bandcamp uses "Album, by Artist". Album titles can themselves contain "by",
+            # so split on the *last* occurrence to avoid mis-parsing titles like "Destroyed by Fire".
+            parts = title.rsplit(" by ", 1)
             title = parts[0].strip()
             if len(parts) > 1:
                 artist_str = parts[1].strip()
         if not title:
             title = album_title
+
         year = ""
         year_m = re.search(r'released\s+(\w+\s+\d{1,2},?\s+\d{4})', page)
         if year_m:
             year = year_m.group(1)
-        # Track titles
+
         tracklist = []
         track_title_spans = re.findall(r'class="track-title"[^>]*>([^<]+)</span>', page)
         if track_title_spans:
-            tracklist = [t.strip() for t in track_title_spans if t.strip()]
+            tracklist = [html.unescape(t).strip() for t in track_title_spans if t.strip()]
         if not tracklist:
             track_title_data = re.findall(r'data-item-title="([^"]+)"', page)
             if track_title_data:
-                tracklist = [t.strip() for t in track_title_data if t.strip()]
-        # Tags (Bandcamp "Tags" section). Some pages use rel="tag", others only class="tag".
-        # Fallback to JSON-LD keywords when HTML anchors are not present.
+                tracklist = [html.unescape(t).strip() for t in track_title_data if t.strip()]
+
         tags: List[str] = []
         try:
-            tag_matches = re.findall(r'rel="tag"[^>]*>([^<]+)</a>', page, flags=re.IGNORECASE)
+            # Some Bandcamp pages do not use rel="tag" anymore. Keep both patterns.
+            tag_matches = re.findall(r'rel=[\'"]tag[\'"][^>]*>([^<]+)</a>', page, flags=re.IGNORECASE)
             if not tag_matches:
                 tag_matches = re.findall(
-                    r'<a[^>]*class="[^"]*\btag\b[^"]*"[^>]*>([^<]+)</a>',
+                    r'<a[^>]*class=[\'"][^\'"]*\btag\b[^\'"]*[\'"][^>]*>([^<]+)</a>',
                     page,
                     flags=re.IGNORECASE,
                 )
-            tags = [t.strip() for t in tag_matches if isinstance(t, str) and t.strip()]
+            tags = [html.unescape(t).strip() for t in tag_matches if isinstance(t, str) and t.strip()]
             if not tags:
                 jsonld_blocks = re.findall(
                     r'<script[^>]+type="application/ld\+json"[^>]*>\s*(.*?)\s*</script>',
@@ -17944,17 +18105,43 @@ def _fetch_bandcamp_album_info(artist_name: str, album_title: str) -> Optional[d
                         data = json.loads(block)
                     except Exception:
                         continue
+                    # JSON-LD can be a dict or a list of dicts.
+                    objects = []
                     if isinstance(data, dict):
-                        keywords = data.get("keywords")
+                        objects = [data]
+                    elif isinstance(data, list):
+                        objects = [o for o in data if isinstance(o, dict)]
+                    for obj in objects:
+                        keywords = obj.get("keywords")
                         if isinstance(keywords, list):
-                            tags.extend(
-                                [str(x).strip() for x in keywords if str(x).strip()]
-                            )
+                            tags.extend([str(x).strip() for x in keywords if str(x).strip()])
+                        elif isinstance(keywords, str):
+                            tags.extend(_split_bandcamp_keywords(keywords))
                     if tags:
                         break
+            if not tags:
+                # Some pages embed JSON in the data-tralbum attribute.
+                m_tralbum = re.search(r'data-tralbum="([^"]+)"', page, flags=re.IGNORECASE)
+                if m_tralbum:
+                    try:
+                        blob = html.unescape(m_tralbum.group(1))
+                        data = json.loads(blob)
+                        if isinstance(data, dict):
+                            raw_tags = (
+                                data.get("tags")
+                                or (data.get("current") or {}).get("tags")
+                                or (data.get("album") or {}).get("tags")
+                            )
+                            if isinstance(raw_tags, list):
+                                tags.extend([str(x).strip() for x in raw_tags if str(x).strip()])
+                            elif isinstance(raw_tags, str):
+                                tags.extend(_split_bandcamp_keywords(raw_tags))
+                    except Exception:
+                        pass
             tags = _dedupe_keep_order([t for t in tags if isinstance(t, str) and t.strip()])
         except Exception:
             tags = []
+
         return {
             "title": title,
             "artist_name": artist_str,
@@ -17965,6 +18152,82 @@ def _fetch_bandcamp_album_info(artist_name: str, album_title: str) -> Optional[d
             "tags": tags,
             "album_url": album_url,
         }
+
+    try:
+        q = quote_plus(f"{artist_name} {album_title}".strip())
+        search_url = f"https://bandcamp.com/search?q={q}"
+        resp = requests.get(search_url, headers=headers, timeout=15)
+        if resp.status_code != 200:
+            return None
+        search_page = resp.text
+
+        artist_norm_compact = _normalize_identity_text_strict(artist_name).replace(" ", "")
+        album_norm_compact = _normalize_identity_album_strict(album_title).replace(" ", "")
+
+        candidates: List[Tuple[float, str]] = []
+        matches = re.findall(
+            r'href="(https?://[^"]*bandcamp\.com/album/([^"?#]+))',
+            search_page,
+            flags=re.IGNORECASE,
+        )
+        for idx, (full_url, slug) in enumerate(matches):
+            url = full_url.split("?")[0].split("#")[0].strip()
+            if not url:
+                continue
+            score = 0.0
+            slug_norm = _normalize_identity_album_strict(slug).replace(" ", "")
+            if album_norm_compact and slug_norm:
+                if album_norm_compact == slug_norm:
+                    score += 2.0
+                elif album_norm_compact in slug_norm or slug_norm in album_norm_compact:
+                    score += 1.0
+
+            host = re.sub(r"^https?://", "", url).split("/")[0]
+            host_artist = host.split(".")[0]
+            host_artist_norm = _normalize_identity_text_strict(host_artist).replace(" ", "")
+            if artist_norm_compact and host_artist_norm:
+                if artist_norm_compact == host_artist_norm:
+                    score += 1.5
+                elif artist_norm_compact in host_artist_norm or host_artist_norm in artist_norm_compact:
+                    score += 0.75
+
+            score += max(0.0, 0.25 - (idx * 0.01))
+            candidates.append((score, url))
+
+        if not candidates:
+            return None
+
+        ranked: Dict[str, float] = {}
+        for score, url in candidates:
+            ranked[url] = max(score, ranked.get(url, float("-inf")))
+        ranked_urls = [u for u, _s in sorted(ranked.items(), key=lambda item: item[1], reverse=True)]
+
+        strict_payload: Optional[dict] = None
+        best_payload: Optional[dict] = None
+        best_score = -1.0
+        for album_url in ranked_urls[:4]:
+            payload = _parse_album_page(album_url)
+            if not payload:
+                continue
+            strict_ok, _strict_reason = _strict_identity_match_details(
+                local_artist=artist_name,
+                local_title=album_title,
+                candidate_artist=payload.get("artist_name") or "",
+                candidate_title=payload.get("title") or "",
+            )
+            if strict_ok:
+                strict_payload = payload
+                break
+            title_score = _provider_identity_text_score(album_title, str(payload.get("title") or ""))
+            artist_score = _provider_identity_text_score(artist_name, str(payload.get("artist_name") or ""))
+            combined = (title_score * 0.6) + (artist_score * 0.4)
+            if combined > best_score:
+                best_score = combined
+                best_payload = payload
+
+        if strict_payload is not None:
+            return strict_payload
+        return best_payload
     except Exception as e:
         logging.warning("Bandcamp fetch failed for %s / %s: %s", artist_name, album_title, e)
         return None
@@ -19494,6 +19757,327 @@ def api_openai_check():
         return jsonify({"success": False, "message": f"Error: {error_msg}"}), 500
 
 
+# ───────────────────────── OpenAI OAuth (ChatGPT / Codex) ─────────────────────────
+
+_OPENAI_OAUTH_ISSUER = "https://auth.openai.com"
+# This is the public OAuth client_id used by OpenAI Codex "Sign in with ChatGPT".
+# It enables a device-code flow that works well for server-hosted PMDA (no localhost callback).
+_OPENAI_OAUTH_CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+_openai_oauth_lock = threading.Lock()
+_openai_oauth_device_sessions: dict[str, dict] = {}
+
+
+def _openai_oauth_device_request_user_code(
+    issuer: str = _OPENAI_OAUTH_ISSUER,
+    client_id: str = _OPENAI_OAUTH_CODEX_CLIENT_ID,
+) -> tuple[str, str, int]:
+    """
+    Start the OpenAI device-code flow.
+    Returns (device_auth_id, user_code, interval_sec).
+    """
+    url = f"{issuer.rstrip('/')}/api/accounts/deviceauth/usercode"
+    resp = requests.post(url, json={"client_id": client_id}, timeout=15)
+    if resp.status_code == 404:
+        raise RuntimeError(
+            "OpenAI device-code login is not enabled on this issuer. Use an API key instead."
+        )
+    if not resp.ok:
+        raise RuntimeError(f"OpenAI device-code start failed (status {resp.status_code})")
+    data = resp.json() if resp.content else {}
+    device_auth_id = str(data.get("device_auth_id") or "").strip()
+    user_code = str(data.get("user_code") or data.get("usercode") or "").strip()
+    interval_raw = data.get("interval") or 5
+    try:
+        interval = int(str(interval_raw).strip())
+    except Exception:
+        interval = 5
+    interval = max(1, min(interval, 30))
+    if not device_auth_id or not user_code:
+        raise RuntimeError("OpenAI device-code response was missing required fields")
+    return device_auth_id, user_code, interval
+
+
+def _openai_oauth_device_poll_for_code(
+    device_auth_id: str,
+    user_code: str,
+    issuer: str = _OPENAI_OAUTH_ISSUER,
+) -> dict | None:
+    """
+    Poll for device authorization completion.
+    Returns code payload on success, None when still pending.
+    """
+    url = f"{issuer.rstrip('/')}/api/accounts/deviceauth/token"
+    resp = requests.post(
+        url,
+        json={"device_auth_id": device_auth_id, "user_code": user_code},
+        timeout=15,
+    )
+    if resp.status_code in (403, 404):
+        return None
+    if not resp.ok:
+        raise RuntimeError(f"OpenAI device-code poll failed (status {resp.status_code})")
+    return resp.json() if resp.content else {}
+
+
+def _openai_oauth_exchange_authorization_code_for_tokens(
+    authorization_code: str,
+    code_verifier: str,
+    issuer: str = _OPENAI_OAUTH_ISSUER,
+    client_id: str = _OPENAI_OAUTH_CODEX_CLIENT_ID,
+) -> dict:
+    """Exchange authorization_code for (id_token, access_token, refresh_token)."""
+    token_url = f"{issuer.rstrip('/')}/oauth/token"
+    redirect_uri = f"{issuer.rstrip('/')}/deviceauth/callback"
+    resp = requests.post(
+        token_url,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        data={
+            "grant_type": "authorization_code",
+            "code": authorization_code,
+            "redirect_uri": redirect_uri,
+            "client_id": client_id,
+            "code_verifier": code_verifier,
+        },
+        timeout=20,
+    )
+    if not resp.ok:
+        raise RuntimeError(f"OpenAI token exchange failed (status {resp.status_code})")
+    data = resp.json() if resp.content else {}
+    if not str(data.get("id_token") or "").strip():
+        raise RuntimeError("OpenAI token exchange returned no id_token")
+    return data
+
+
+def _openai_oauth_token_exchange_for_api_key(
+    id_token: str,
+    issuer: str = _OPENAI_OAUTH_ISSUER,
+    client_id: str = _OPENAI_OAUTH_CODEX_CLIENT_ID,
+) -> str:
+    """Token exchange: id_token -> requested_token=openai-api-key (returns an API key-like token)."""
+    token_url = f"{issuer.rstrip('/')}/oauth/token"
+    resp = requests.post(
+        token_url,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        data={
+            "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+            "client_id": client_id,
+            "requested_token": "openai-api-key",
+            "subject_token": id_token,
+            "subject_token_type": "urn:ietf:params:oauth:token-type:id_token",
+        },
+        timeout=20,
+    )
+    if not resp.ok:
+        detail = ""
+        try:
+            payload = resp.json()
+            if isinstance(payload, dict):
+                # Prefer known fields if present; keep the rest short to avoid log spam.
+                msg = (
+                    payload.get("error_description")
+                    or payload.get("error")
+                    or payload.get("message")
+                )
+                if msg:
+                    detail = f": {str(msg).strip()[:300]}"
+                else:
+                    detail = f": {json.dumps(payload, ensure_ascii=True)[:300]}"
+            else:
+                detail = f": {str(payload)[:300]}"
+        except Exception:
+            txt = (resp.text or "").strip()
+            if txt:
+                detail = f": {txt[:300]}"
+        raise RuntimeError(f"OpenAI API key exchange failed (status {resp.status_code}){detail}")
+    data = resp.json() if resp.content else {}
+    key = str(data.get("access_token") or "").strip()
+    if not key:
+        raise RuntimeError("OpenAI API key exchange returned empty access_token")
+    return key
+
+
+@app.post("/api/openai/oauth/device/start")
+def api_openai_oauth_device_start():
+    """
+    Start OpenAI OAuth device-code flow (Codex/ChatGPT login).
+    Returns { ok, session_id, verification_url, user_code, interval }.
+    """
+    session_id = uuid.uuid4().hex
+    try:
+        device_auth_id, user_code, interval = _openai_oauth_device_request_user_code()
+        with _openai_oauth_lock:
+            _openai_oauth_device_sessions[session_id] = {
+                "status": "pending",
+                "created_at": time.time(),
+                "last_poll_at": 0.0,
+                "issuer": _OPENAI_OAUTH_ISSUER,
+                "client_id": _OPENAI_OAUTH_CODEX_CLIENT_ID,
+                "device_auth_id": device_auth_id,
+                "user_code": user_code,
+                "interval": interval,
+                "error": None,
+            }
+        return jsonify({
+            "ok": True,
+            "session_id": session_id,
+            "verification_url": f"{_OPENAI_OAUTH_ISSUER.rstrip('/')}/codex/device",
+            "user_code": user_code,
+            "interval": interval,
+            "message": "Enter the code in the OpenAI page, then return here.",
+            "warning": "This may generate an OpenAI API key for your account. ChatGPT subscription may not include API billing.",
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "message": str(e) or "OAuth start failed"}), 500
+
+
+@app.post("/api/openai/oauth/device/poll")
+def api_openai_oauth_device_poll():
+    """
+    Poll OpenAI device-code session and, when authorized, persist the resulting OPENAI_API_KEY.
+    Body: { session_id }
+    """
+    data = request.get_json(silent=True) or {}
+    session_id = str(data.get("session_id") or "").strip()
+    if not session_id:
+        return jsonify({"status": "error", "message": "session_id is required"}), 400
+
+    with _openai_oauth_lock:
+        sess = dict(_openai_oauth_device_sessions.get(session_id) or {})
+    if not sess:
+        return jsonify({"status": "error", "message": "Unknown session_id"}), 404
+
+    if sess.get("status") == "completed":
+        return jsonify({"status": "completed", "message": "Already connected"})
+    if sess.get("status") == "error":
+        msg = str(sess.get("error") or "OAuth failed").strip()
+        status = 400
+        m = re.search(r"status\\s+(\\d{3})", msg)
+        if m:
+            try:
+                status = int(m.group(1))
+            except Exception:
+                status = 400
+        return jsonify({"status": "error", "message": msg}), status
+
+    now = time.time()
+    created_at = float(sess.get("created_at") or 0.0)
+    if created_at and now - created_at > 15 * 60:
+        with _openai_oauth_lock:
+            _openai_oauth_device_sessions[session_id]["status"] = "error"
+            _openai_oauth_device_sessions[session_id]["error"] = "Device auth timed out after 15 minutes"
+        return jsonify({"status": "error", "message": "Device auth timed out after 15 minutes"}), 408
+
+    interval = int(sess.get("interval") or 5)
+    last_poll_at = float(sess.get("last_poll_at") or 0.0)
+    retry_after = max(0, int((last_poll_at + interval) - now))
+    if retry_after > 0:
+        return jsonify({"status": "pending", "message": "Waiting for authorization…", "retry_after": retry_after})
+
+    try:
+        with _openai_oauth_lock:
+            _openai_oauth_device_sessions[session_id]["last_poll_at"] = now
+        payload = _openai_oauth_device_poll_for_code(
+            str(sess.get("device_auth_id") or ""),
+            str(sess.get("user_code") or ""),
+            issuer=str(sess.get("issuer") or _OPENAI_OAUTH_ISSUER),
+        )
+        if payload is None:
+            return jsonify({"status": "pending", "message": "Waiting for authorization…"})
+
+        authorization_code = str(payload.get("authorization_code") or "").strip()
+        code_verifier = str(payload.get("code_verifier") or "").strip()
+        if not authorization_code or not code_verifier:
+            raise RuntimeError("Device auth response missing authorization_code/code_verifier")
+
+        tokens = _openai_oauth_exchange_authorization_code_for_tokens(
+            authorization_code,
+            code_verifier,
+            issuer=str(sess.get("issuer") or _OPENAI_OAUTH_ISSUER),
+            client_id=str(sess.get("client_id") or _OPENAI_OAUTH_CODEX_CLIENT_ID),
+        )
+        id_token = str(tokens.get("id_token") or "").strip()
+        refresh_token = str(tokens.get("refresh_token") or "").strip()
+
+        api_key = None
+        api_key_error = None
+        try:
+            api_key = _openai_oauth_token_exchange_for_api_key(
+                id_token,
+                issuer=str(sess.get("issuer") or _OPENAI_OAUTH_ISSUER),
+                client_id=str(sess.get("client_id") or _OPENAI_OAUTH_CODEX_CLIENT_ID),
+            )
+        except Exception as e:
+            api_key_error = str(e) or "OpenAI API key exchange failed"
+            logging.warning(
+                "OpenAI OAuth connected but API key could not be generated (session=%s): %s",
+                session_id,
+                api_key_error,
+            )
+
+        # Persist: save OAuth token(s) and the API key (when available) into settings.db.
+        init_settings_db()
+        con = sqlite3.connect(str(SETTINGS_DB_FILE))
+        cur = con.cursor()
+        if refresh_token:
+            cur.execute(
+                "INSERT OR REPLACE INTO settings(key, value) VALUES(?, ?)",
+                ("OPENAI_OAUTH_REFRESH_TOKEN", refresh_token),
+            )
+        if api_key:
+            cur.execute(
+                "INSERT OR REPLACE INTO settings(key, value) VALUES(?, ?)",
+                ("AI_PROVIDER", "openai"),
+            )
+            cur.execute(
+                "INSERT OR REPLACE INTO settings(key, value) VALUES(?, ?)",
+                ("OPENAI_API_KEY", api_key),
+            )
+        con.commit()
+        con.close()
+
+        # Apply immediately in memory (re-init OpenAI client) when we got a key.
+        if api_key:
+            _apply_settings_in_memory({"AI_PROVIDER": "openai", "OPENAI_API_KEY": api_key})
+
+        with _openai_oauth_lock:
+            _openai_oauth_device_sessions[session_id]["status"] = "completed"
+            _openai_oauth_device_sessions[session_id]["error"] = None
+
+        if api_key:
+            logging.info(
+                "OpenAI OAuth completed: OPENAI_API_KEY stored in settings.db (session=%s)",
+                session_id,
+            )
+            return jsonify({"status": "completed", "api_key_saved": True, "message": "Connected. OpenAI key saved."})
+
+        msg = (
+            "Connected, but PMDA could not generate an OpenAI API key for this account. "
+            "This usually means your OpenAI API Platform access/billing is not enabled. "
+            "You can paste an API key manually or enable API billing on platform.openai.com and retry."
+        )
+        # Keep the low-level error for power users without making the UI noisy.
+        if api_key_error:
+            msg = f"{msg} ({api_key_error})"
+        return jsonify({"status": "completed", "api_key_saved": False, "message": msg})
+    except Exception as e:
+        msg = str(e) or "OAuth failed"
+        with _openai_oauth_lock:
+            _openai_oauth_device_sessions[session_id]["status"] = "error"
+            _openai_oauth_device_sessions[session_id]["error"] = msg
+        logging.warning("OpenAI OAuth failed (session=%s): %s", session_id, msg)
+        status = 500
+        m = re.search(r"status\\s+(\\d{3})", msg)
+        if m:
+            try:
+                status = int(m.group(1))
+            except Exception:
+                status = 500
+        # surface auth problems as 401 so UI can display a clear error
+        if "api key exchange" in msg.lower() and status == 500:
+            status = 401
+        return jsonify({"status": "error", "message": msg}), status
+
+
 @app.get("/api/musicbrainz/test")
 @app.post("/api/musicbrainz/test")
 def api_musicbrainz_test():
@@ -20022,9 +20606,9 @@ def api_config_get():
         "USE_MUSICBRAINZ": True,
         "MUSICBRAINZ_EMAIL": get_setting("MUSICBRAINZ_EMAIL", MUSICBRAINZ_EMAIL),
         "MB_RETRY_NOT_FOUND": get_setting_bool("MB_RETRY_NOT_FOUND", MB_RETRY_NOT_FOUND),
-        "MB_SEARCH_ALBUM_TIMEOUT_SEC": get_setting("MB_SEARCH_ALBUM_TIMEOUT_SEC", MB_SEARCH_ALBUM_TIMEOUT_SEC),
-        "MB_CANDIDATE_FETCH_LIMIT": get_setting("MB_CANDIDATE_FETCH_LIMIT", MB_CANDIDATE_FETCH_LIMIT),
-        "MB_TRACKLIST_FETCH_LIMIT": get_setting("MB_TRACKLIST_FETCH_LIMIT", MB_TRACKLIST_FETCH_LIMIT),
+        "MB_SEARCH_ALBUM_TIMEOUT_SEC": MB_SEARCH_ALBUM_TIMEOUT_SEC,
+        "MB_CANDIDATE_FETCH_LIMIT": MB_CANDIDATE_FETCH_LIMIT,
+        "MB_TRACKLIST_FETCH_LIMIT": MB_TRACKLIST_FETCH_LIMIT,
         "MB_FAST_FALLBACK_MODE": get_setting_bool("MB_FAST_FALLBACK_MODE", MB_FAST_FALLBACK_MODE),
         "PROVIDER_IDENTITY_STRICT": get_setting_bool("PROVIDER_IDENTITY_STRICT", PROVIDER_IDENTITY_STRICT),
         "PROVIDER_IDENTITY_USE_AI": get_setting_bool("PROVIDER_IDENTITY_USE_AI", PROVIDER_IDENTITY_USE_AI),
@@ -20684,17 +21268,17 @@ def api_config_put():
         try:
             updates["MB_SEARCH_ALBUM_TIMEOUT_SEC"] = max(10, min(300, int(updates["MB_SEARCH_ALBUM_TIMEOUT_SEC"])))
         except (ValueError, TypeError):
-            updates["MB_SEARCH_ALBUM_TIMEOUT_SEC"] = 45
+            updates["MB_SEARCH_ALBUM_TIMEOUT_SEC"] = 20
     if "MB_CANDIDATE_FETCH_LIMIT" in updates:
         try:
             updates["MB_CANDIDATE_FETCH_LIMIT"] = max(1, min(20, int(updates["MB_CANDIDATE_FETCH_LIMIT"])))
         except (ValueError, TypeError):
-            updates["MB_CANDIDATE_FETCH_LIMIT"] = 6
+            updates["MB_CANDIDATE_FETCH_LIMIT"] = 4
     if "MB_TRACKLIST_FETCH_LIMIT" in updates:
         try:
             updates["MB_TRACKLIST_FETCH_LIMIT"] = max(0, min(20, int(updates["MB_TRACKLIST_FETCH_LIMIT"])))
         except (ValueError, TypeError):
-            updates["MB_TRACKLIST_FETCH_LIMIT"] = 3
+            updates["MB_TRACKLIST_FETCH_LIMIT"] = 2
     if "PROVIDER_IDENTITY_MIN_SCORE" in updates:
         try:
             updates["PROVIDER_IDENTITY_MIN_SCORE"] = max(0.0, min(1.0, float(updates["PROVIDER_IDENTITY_MIN_SCORE"])))
@@ -21407,6 +21991,26 @@ def api_logs_tail():
     return jsonify(
         path=str(log_path),
         lines=_tail_log_lines(log_path, lines=lines),
+    )
+
+
+@app.get("/api/logs/download")
+def api_logs_download():
+    """Download backend logs as a text file (tail by default, safe size)."""
+    try:
+        lines = int(request.args.get("lines", 20000))
+    except Exception:
+        lines = 20000
+    lines = max(200, min(lines, 50000))
+    log_path = Path(str(LOG_FILE or "")).expanduser()
+    out_lines = _tail_log_lines(log_path, lines=lines, max_bytes=10 * 1024 * 1024)
+    payload = ("\n".join(out_lines) + "\n") if out_lines else ""
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    fname = f"pmda-log-{ts}.log"
+    return Response(
+        payload,
+        mimetype="text/plain",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
     )
 
 
@@ -25923,6 +26527,7 @@ def _improve_single_album(album_id: int, db_conn, known_release_group_id: Option
 
     # Always allow Last.fm when some required tags (e.g. genre) are still missing,
     # even if MusicBrainz already provided basic tags.
+    lastfm_used_for_tags = False
     if USE_LASTFM and ((not tags_updated or not has_cover_now) or ("genre" in missing_required)):
         lastfm_info = _fetch_lastfm_album_info(artist_name, album_title_str, release_mbid)
         if lastfm_info:
@@ -25962,6 +26567,10 @@ def _improve_single_album(album_id: int, db_conn, known_release_group_id: Option
                     tags_updated = True
                     files_updated = n
                     steps.append(f"Updated tags from Last.fm on {n} file(s)")
+                    lastfm_used_for_tags = True
+                    if primary_genre:
+                        # Keep current_tags in sync for downstream fallback decisions (Bandcamp genre).
+                        current_tags["genre"] = primary_genre
             if not has_cover_now and lastfm_info.get("cover_url"):
                 try:
                     best_cover = _download_best_cover_image("Last.fm", lastfm_info.get("cover_url"))
@@ -26007,7 +26616,12 @@ def _improve_single_album(album_id: int, db_conn, known_release_group_id: Option
 
     # Bandcamp: ultimate fallback when still missing tags or cover.
     # Also used to fill in missing genre when Bandcamp exposes useful tags.
-    if USE_BANDCAMP and ((not tags_updated or not has_cover_now) or ("genre" in missing_required)):
+    genre_missing_now = not str((current_tags or {}).get("genre") or "").strip()
+    # Special case: if Last.fm was the identity provider, prefer Bandcamp tags for richer genres
+    # when available (Bandcamp often exposes multiple useful genre tags).
+    mb_identity_used = bool(mb_release_info and artist_mbid)
+    want_bandcamp_genre = bool(lastfm_used_for_tags and not mb_identity_used and ("genre" in missing_required))
+    if USE_BANDCAMP and ((not tags_updated or not has_cover_now) or genre_missing_now or want_bandcamp_genre):
         bandcamp_info = _fetch_bandcamp_album_info(artist_name, album_title_str)
         if bandcamp_info:
             strict_ok, strict_reason = _strict_identity_match_details(
@@ -26038,12 +26652,14 @@ def _improve_single_album(album_id: int, db_conn, known_release_group_id: Option
             bandcamp_tags = bandcamp_info.get("tags") or []
             inferred_genre = _infer_genre_from_bandcamp_tags(bandcamp_tags) if bandcamp_tags else None
             tags_before_bandcamp = tags_updated
-            if (album_str or artist_str) and (not tags_updated or "genre" in missing_required):
+            if (album_str or artist_str) and (not tags_updated or "genre" in missing_required or want_bandcamp_genre):
                 n = _apply_fallback_tags(artist_str, album_str, year_str, "Bandcamp", genre=inferred_genre)
                 if n > 0:
                     tags_updated = True
                     files_updated = n
                     steps.append(f"Updated tags from Bandcamp on {n} file(s)")
+                    if inferred_genre:
+                        current_tags["genre"] = inferred_genre
             if not has_cover_now and bandcamp_info.get("cover_url"):
                 try:
                     best_cover = _download_best_cover_image(
@@ -26554,6 +27170,7 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
 
     # Always allow Last.fm when some required tags (e.g. genre) are still missing,
     # even if MusicBrainz already provided basic tags.
+    lastfm_used_for_tags = False
     if USE_LASTFM and ((not tags_updated or not has_cover_now) or ("genre" in missing_required)):
         lastfm_info = _fetch_lastfm_album_info(artist_name, album_title_str, release_mbid)
         if lastfm_info:
@@ -26591,6 +27208,9 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
                     tags_updated = True
                     files_updated = n
                     steps.append(f"Updated tags from Last.fm on {n} file(s)")
+                    lastfm_used_for_tags = True
+                    if primary_genre:
+                        current_tags["genre"] = primary_genre
             if not has_cover_now and lastfm_info.get("cover_url"):
                 try:
                     best_cover = _download_best_cover_image("Last.fm", lastfm_info.get("cover_url"))
@@ -26623,7 +27243,12 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
             if tags_updated or cover_saved:
                 provider_used = "lastfm"
 
-    if USE_BANDCAMP and ((not tags_updated or not has_cover_now) or ("genre" in missing_required)):
+    genre_missing_now = not str((current_tags or {}).get("genre") or "").strip()
+    # Special case: if Last.fm was the identity provider, prefer Bandcamp tags for richer genres
+    # when available (Bandcamp often exposes multiple useful genre tags).
+    mb_identity_used = bool(mb_release_info and artist_mbid)
+    want_bandcamp_genre = bool(lastfm_used_for_tags and not mb_identity_used and ("genre" in missing_required))
+    if USE_BANDCAMP and ((not tags_updated or not has_cover_now) or genre_missing_now or want_bandcamp_genre):
         bandcamp_info = _fetch_bandcamp_album_info(artist_name, album_title_str)
         if bandcamp_info:
             strict_ok, strict_reason = _strict_identity_match_details(
@@ -26650,12 +27275,14 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
             year_str = year_match.group(1) if year_match else year_raw
             bandcamp_tags = bandcamp_info.get("tags") or []
             inferred_genre = _infer_genre_from_bandcamp_tags(bandcamp_tags) if bandcamp_tags else None
-            if (album_str or artist_str) and (not tags_updated or "genre" in missing_required):
+            if (album_str or artist_str) and (not tags_updated or "genre" in missing_required or want_bandcamp_genre):
                 n = _apply_fallback_tags_folder(artist_str, album_str, year_str, "Bandcamp", genre=inferred_genre)
                 if n > 0:
                     tags_updated = True
                     files_updated = n
                     steps.append(f"Updated tags from Bandcamp on {n} file(s)")
+                    if inferred_genre:
+                        current_tags["genre"] = inferred_genre
             if not has_cover_now and bandcamp_info.get("cover_url"):
                 try:
                     best_cover = _download_best_cover_image(
@@ -26912,6 +27539,51 @@ def _build_improve_items_from_editions(artist_name: str, editions: list[dict]) -
         )
         mbid = str(mbid or "").strip()
         title = (e.get("title_raw") or e.get("album_norm") or f"Album {album_id}")
+        # Snapshot pre-fix health so post-processing can update live counters by delta.
+        folder_path: Optional[Path] = None
+        if folder_str:
+            try:
+                folder_path = Path(folder_str)
+            except Exception:
+                folder_path = None
+        meta_snapshot = dict(e.get("meta") or {})
+        # Required tags check needs tracks; derive them if absent (so "tracks" requirement is meaningful).
+        edition_for_required = dict(e)
+        if not (edition_for_required.get("tracks") or []):
+            ordered_paths = [Path(p) for p in (e.get("ordered_paths") or []) if str(p).strip()]
+            if folder_path is not None and not ordered_paths:
+                try:
+                    ordered_paths = _files_collect_ordered_audio_paths(folder_path, [])
+                except Exception:
+                    ordered_paths = []
+            derived_tracks = [
+                {"title": p.stem or f"Track {i + 1}", "idx": i + 1}
+                for i, p in enumerate(ordered_paths)
+            ]
+            edition_for_required["tracks"] = derived_tracks
+        try:
+            pre_missing_required = _check_required_tags(meta_snapshot, REQUIRED_TAGS, edition=edition_for_required)
+        except Exception:
+            pre_missing_required = []
+        pre_has_cover = False
+        pre_has_artist_image = False
+        if folder_path is not None:
+            try:
+                pre_has_cover = bool(album_folder_has_cover(folder_path))
+            except Exception:
+                pre_has_cover = False
+            try:
+                artist_folder = folder_path.parent if folder_path.parent else folder_path
+                pre_has_artist_image = bool(_artist_folder_has_image(artist_folder))
+            except Exception:
+                pre_has_artist_image = False
+        pre_has_mb_id = bool(mbid)
+        pre_has_artist_mb_id = bool(
+            meta_snapshot.get("musicbrainz_albumartistid")
+            or meta_snapshot.get("musicbrainz_artistid")
+            or meta_snapshot.get("musicbrainz_albumartist_id")
+            or meta_snapshot.get("musicbrainz_artist_id")
+        )
         items.append(
             {
                 "artist": (artist_name or "").strip() or "Unknown Artist",
@@ -26933,6 +27605,11 @@ def _build_improve_items_from_editions(artist_name: str, editions: list[dict]) -
                 "br": e.get("br") or 0,
                 "sr": e.get("sr") or 0,
                 "bd": e.get("bd") or 0,
+                "pre_missing_required_tags": list(pre_missing_required or []),
+                "pre_has_cover": bool(pre_has_cover),
+                "pre_has_artist_image": bool(pre_has_artist_image),
+                "pre_has_mb_id": bool(pre_has_mb_id),
+                "pre_has_artist_mb_id": bool(pre_has_artist_mb_id),
             }
         )
     return items

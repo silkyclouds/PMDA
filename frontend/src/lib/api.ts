@@ -1368,6 +1368,36 @@ export async function checkOpenAI(apiKey?: string): Promise<{ success: boolean; 
   }
 }
 
+export interface OpenAIDeviceOAuthStartResponse {
+  ok: boolean;
+  session_id?: string;
+  verification_url?: string;
+  user_code?: string;
+  interval?: number;
+  message?: string;
+  warning?: string;
+}
+
+export interface OpenAIDeviceOAuthPollResponse {
+  status: 'pending' | 'completed' | 'error';
+  message?: string;
+  retry_after?: number;
+  api_key_saved?: boolean;
+}
+
+export async function startOpenAIDeviceOAuth(): Promise<OpenAIDeviceOAuthStartResponse> {
+  return fetchApi<OpenAIDeviceOAuthStartResponse>('/api/openai/oauth/device/start', {
+    method: 'POST',
+  });
+}
+
+export async function pollOpenAIDeviceOAuth(sessionId: string): Promise<OpenAIDeviceOAuthPollResponse> {
+  return fetchApi<OpenAIDeviceOAuthPollResponse>('/api/openai/oauth/device/poll', {
+    method: 'POST',
+    body: JSON.stringify({ session_id: sessionId }),
+  });
+}
+
 export async function getOpenAIModels(apiKey: string): Promise<string[]> {
   if (!apiKey?.trim()) {
     throw new Error('API key is required to fetch models');

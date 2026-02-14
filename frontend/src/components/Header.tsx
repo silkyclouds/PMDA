@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
-import { Settings, RefreshCw, History, BarChart2, Library, Scan, Package, Wrench } from 'lucide-react';
+import { Settings, RefreshCw, BarChart2, Library, Scan, Wrench } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { Button } from '@/components/ui/button';
 import { WelcomeModal } from '@/components/WelcomeModal';
@@ -12,6 +12,24 @@ import { Badge } from '@/components/ui/badge';
 import { Logo } from '@/components/Logo';
 import { GlobalSearch } from '@/components/GlobalSearch';
 import * as api from '@/lib/api';
+
+const WELCOME_COOKIE = 'pmda_welcome_dismissed';
+
+function hasWelcomeCookie(): boolean {
+  try {
+    return document.cookie.split(';').some((c) => c.trim().startsWith(`${WELCOME_COOKIE}=`));
+  } catch {
+    return false;
+  }
+}
+
+function setWelcomeCookie(): void {
+  try {
+    document.cookie = `${WELCOME_COOKIE}=1; Max-Age=31536000; Path=/; SameSite=Lax`;
+  } catch {
+    // ignore
+  }
+}
 
 function RebootCountdown({ onComplete, onProgress }: { onComplete: () => void; onProgress: (countdown: number, progress: number) => void }) {
   const onCompleteRef = useRef(onComplete);
@@ -61,8 +79,9 @@ export function Header() {
   useEffect(() => {
     api.getConfig().then((data) => {
       setConfig(data);
-      setIsConfigured(data.configured === true);
-      if (data.configured === false) {
+      const configured = data.configured === true;
+      setIsConfigured(configured);
+      if (!configured && !hasWelcomeCookie()) {
         setShowSettings(true);
       }
     }).catch(() => {});
@@ -77,9 +96,13 @@ export function Header() {
   const handleSettingsClick = () => {
     if (isConfigured === true) {
       navigate('/settings');
-    } else {
-      setShowSettings(true);
+      return;
     }
+    if (hasWelcomeCookie()) {
+      navigate('/settings');
+      return;
+    }
+    setShowSettings(true);
   };
 
   return (
@@ -109,19 +132,6 @@ export function Header() {
                 <span>Scan</span>
               </NavLink>
               <NavLink 
-                to="/unduper" 
-                className="flex items-center gap-2 px-3 py-2 rounded-md text-sm font-medium text-muted-foreground hover:text-foreground hover:bg-accent transition-colors"
-                activeClassName="text-foreground bg-accent"
-              >
-                <Package className="w-4 h-4" />
-                <span>Unduper</span>
-                {duplicateCount > 0 && (
-                  <Badge variant="outline" className="ml-1 h-5 px-1.5 text-[10px] border-warning text-warning">
-                    {duplicateCount > 99 ? '99+' : duplicateCount}
-                  </Badge>
-                )}
-              </NavLink>
-              <NavLink 
                 to="/library" 
                 className="flex items-center gap-2 px-3 py-2 rounded-md text-sm font-medium text-muted-foreground hover:text-foreground hover:bg-accent transition-colors"
                 activeClassName="text-foreground bg-accent"
@@ -130,14 +140,6 @@ export function Header() {
                 <span>Library</span>
               </NavLink>
               {/* Tag Fixer and Incomplete Albums removed from main nav */}
-              <NavLink 
-                to="/history" 
-                className="flex items-center gap-2 px-3 py-2 rounded-md text-sm font-medium text-muted-foreground hover:text-foreground hover:bg-accent transition-colors"
-                activeClassName="text-foreground bg-accent"
-              >
-                <History className="w-4 h-4" />
-                <span>History</span>
-              </NavLink>
               <NavLink 
                 to="/statistics" 
                 className="flex items-center gap-2 px-3 py-2 rounded-md text-sm font-medium text-muted-foreground hover:text-foreground hover:bg-accent transition-colors"
@@ -153,6 +155,11 @@ export function Header() {
               >
                 <Wrench className="w-4 h-4" />
                 <span>Tools</span>
+                {duplicateCount > 0 && (
+                  <Badge variant="outline" className="ml-1 h-5 px-1.5 text-[10px] border-warning text-warning">
+                    {duplicateCount > 99 ? '99+' : duplicateCount}
+                  </Badge>
+                )}
               </NavLink>
             </nav>
 
@@ -180,7 +187,13 @@ export function Header() {
 
       {/* Welcome modal when not configured */}
       {showSettings && !isConfigured && (
-        <WelcomeModal onClose={() => setShowSettings(false)} config={config} />
+        <WelcomeModal
+          onClose={() => {
+            setWelcomeCookie();
+            setShowSettings(false);
+          }}
+          config={config}
+        />
       )}
 
       {/* Effect to handle rebooting countdown */}

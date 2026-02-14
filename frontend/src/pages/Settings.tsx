@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Save, Loader2, Check, FolderOutput, RefreshCw, Plus, X, Database, Sparkles } from 'lucide-react';
+import { Save, Loader2, Check, FolderOutput, RefreshCw, Plus, X, Database, Sparkles, ExternalLink, Copy } from 'lucide-react';
 import { Header } from '@/components/Header';
 import { Button } from '@/components/ui/button';
 import { toast } from 'sonner';
@@ -11,17 +11,15 @@ import { normalizeConfigForUI } from '@/lib/configUtils';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Separator } from '@/components/ui/separator';
 import { Label } from '@/components/ui/label';
-import { Switch } from '@/components/ui/switch';
 import { Input } from '@/components/ui/input';
 import { PasswordInput } from '@/components/ui/password-input';
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { FolderBrowserInput } from '@/components/settings/FolderBrowserInput';
 
 const SETTINGS_SECTIONS: { id: string; label: string }[] = [
   { id: 'settings-files-export', label: 'Folders' },
   { id: 'settings-pipeline', label: 'Pipeline' },
   { id: 'settings-ai', label: 'AI' },
-  { id: 'settings-providers', label: 'Providers' },
+  { id: 'settings-providers', label: 'Metadata providers' },
   { id: 'settings-notifications', label: 'Notifications' },
 ];
 
@@ -83,26 +81,56 @@ function SettingsPage() {
   const [isLoading, setIsLoading] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
   const [errors, setErrors] = useState<Record<string, string>>({});
-  const [exportRebuilding, setExportRebuilding] = useState(false);
-  const [exportStatus, setExportStatus] = useState<api.FilesExportStatus | null>(null);
-  const exportPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [openaiOAuth, setOpenaiOAuth] = useState<{
+    sessionId: string;
+    verificationUrl: string;
+    userCode: string;
+    intervalSec: number;
+    status: 'pending' | 'completed' | 'error';
+    message?: string;
+    warning?: string;
+    apiKeySaved?: boolean;
+  } | null>(null);
+  const [openaiOAuthBusy, setOpenaiOAuthBusy] = useState(false);
+
+  const getApiErrorMessage = (e: unknown): string | null => {
+    const bodyMsg = (e as { body?: { message?: unknown } } | null)?.body?.message;
+    if (typeof bodyMsg === 'string' && bodyMsg.trim()) return bodyMsg.trim();
+    return null;
+  };
+
+  const copyTextToClipboard = async (text: string): Promise<boolean> => {
+    const clean = String(text ?? '');
+    if (!clean) return false;
+    try {
+      if (navigator?.clipboard?.writeText) {
+        await navigator.clipboard.writeText(clean);
+        return true;
+      }
+    } catch {
+      // Fall back below (HTTP/non-secure contexts).
+    }
+    try {
+      const el = document.createElement('textarea');
+      el.value = clean;
+      el.setAttribute('readonly', 'true');
+      el.style.position = 'fixed';
+      el.style.left = '-9999px';
+      el.style.top = '0';
+      document.body.appendChild(el);
+      el.focus();
+      el.select();
+      const ok = document.execCommand('copy');
+      document.body.removeChild(el);
+      return Boolean(ok);
+    } catch {
+      return false;
+    }
+  };
 
   useEffect(() => {
     loadConfig();
   }, []);
-
-  useEffect(() => {
-    if (!exportStatus?.running) return;
-    const t = setInterval(async () => {
-      try {
-        const s = await api.getFilesExportStatus();
-        setExportStatus(s);
-      } catch {
-        // ignore
-      }
-    }, 2000);
-    return () => clearInterval(t);
-  }, [exportStatus?.running]);
 
   const loadConfig = async () => {
     setIsLoading(true);
@@ -116,6 +144,69 @@ function SettingsPage() {
       setIsLoading(false);
     }
   };
+
+  const startOpenAIOAuth = useCallback(async () => {
+    setOpenaiOAuthBusy(true);
+    try {
+      const res = await api.startOpenAIDeviceOAuth();
+      if (!res.ok || !res.session_id || !res.verification_url || !res.user_code) {
+        toast.error(res.message || 'Failed to start OpenAI OAuth');
+        return;
+      }
+      setOpenaiOAuth({
+        sessionId: res.session_id,
+        verificationUrl: res.verification_url,
+        userCode: res.user_code,
+        intervalSec: typeof res.interval === 'number' ? res.interval : 5,
+        status: 'pending',
+        message: res.message,
+        warning: res.warning,
+      });
+    } catch (e) {
+      toast.error(getApiErrorMessage(e) || (e instanceof Error ? e.message : 'Failed to start OpenAI OAuth'));
+    } finally {
+      setOpenaiOAuthBusy(false);
+    }
+  }, []);
+
+  const pollOpenAIOAuth = useCallback(async () => {
+    if (!openaiOAuth?.sessionId || openaiOAuthBusy) return;
+    setOpenaiOAuthBusy(true);
+    try {
+      const res = await api.pollOpenAIDeviceOAuth(openaiOAuth.sessionId);
+      if (res.status === 'completed') {
+        const saved = typeof res.api_key_saved === 'boolean' ? res.api_key_saved : undefined;
+        setOpenaiOAuth((prev) => prev ? { ...prev, status: 'completed', message: res.message, apiKeySaved: saved } : prev);
+        if (saved === false) {
+          toast.info(res.message || 'Connected, but API key not saved');
+        } else {
+          toast.success(res.message || 'OpenAI connected');
+        }
+        await loadConfig();
+        return;
+      }
+      if (res.status === 'error') {
+        setOpenaiOAuth((prev) => prev ? { ...prev, status: 'error', message: res.message } : prev);
+        toast.error(res.message || 'OpenAI OAuth failed');
+        return;
+      }
+      setOpenaiOAuth((prev) => prev ? { ...prev, status: 'pending', message: res.message } : prev);
+    } catch (e) {
+      toast.error(getApiErrorMessage(e) || (e instanceof Error ? e.message : 'OpenAI OAuth poll failed'));
+    } finally {
+      setOpenaiOAuthBusy(false);
+    }
+  }, [loadConfig, openaiOAuth?.sessionId, openaiOAuthBusy]);
+
+  useEffect(() => {
+    if (!openaiOAuth || openaiOAuth.status !== 'pending') return;
+    // Poll in the background while the user completes the flow in another tab.
+    const delayMs = Math.max(1000, Math.min(5000, (openaiOAuth.intervalSec || 5) * 1000));
+    const t = setTimeout(() => {
+      pollOpenAIOAuth();
+    }, delayMs);
+    return () => clearTimeout(t);
+  }, [openaiOAuth, pollOpenAIOAuth]);
 
   const pendingSaveRef = useRef<Partial<PMDAConfig>>({});
   const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -301,7 +392,7 @@ function SettingsPage() {
                   Folders
                 </CardTitle>
                 <CardDescription>
-                  Configure source folders, destination library, media cache, and export strategy (hardlink/symlink/copy/move).
+                  Configure scan sources, caches, and destination folders used by pipeline steps.
                 </CardDescription>
               </CardHeader>
               <CardContent className="space-y-4">
@@ -356,18 +447,6 @@ function SettingsPage() {
                   </div>
                 </div>
                 <div className="space-y-2">
-                  <Label>Library folder</Label>
-                  <p className="text-xs text-muted-foreground">
-                    Destination folder for exported files (clean structure), e.g. `/music_matched`.
-                  </p>
-                  <FolderBrowserInput
-                    value={config.EXPORT_ROOT ?? '/music/library'}
-                    onChange={(path) => updateConfig({ EXPORT_ROOT: path })}
-                    placeholder="/music/library"
-                    selectLabel="Select library destination folder"
-                  />
-                </div>
-                <div className="space-y-2">
                   <Label>Media cache folder</Label>
                   <p className="text-xs text-muted-foreground">
                     NVMe cache for instant artist/album artwork rendering (thumbnails pre-generated by PMDA).
@@ -379,84 +458,29 @@ function SettingsPage() {
                     selectLabel="Select media cache folder"
                   />
                 </div>
-                <div className="space-y-2">
-                  <Label>Export strategy</Label>
+                <div className="space-y-1">
+                  <Label>Incomplete albums folder</Label>
                   <p className="text-xs text-muted-foreground">
-                    Choose how PMDA writes files to the library folder.
+                    Destination used by the incomplete step. Default is <span className="font-mono">/dupes/incomplete_albums</span>.
                   </p>
-                  <Select
-                    value={(config.EXPORT_LINK_STRATEGY as 'hardlink' | 'symlink' | 'copy' | 'move' | undefined) ?? 'hardlink'}
-                    onValueChange={(value: 'hardlink' | 'symlink' | 'copy' | 'move') => updateConfig({ EXPORT_LINK_STRATEGY: value })}
-                  >
-                    <SelectTrigger className="w-full md:w-[320px]">
-                      <SelectValue placeholder="Select strategy" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="hardlink">Hardlink (fast, no extra space)</SelectItem>
-                      <SelectItem value="symlink">Symlink (keeps original files)</SelectItem>
-                      <SelectItem value="copy">Copy (duplicates files)</SelectItem>
-                      <SelectItem value="move">Move (relocate files)</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </div>
-                <div className="flex items-center justify-between gap-4">
-                  <div className="space-y-1">
-                    <Label>Build library automatically</Label>
-                    <p className="text-xs text-muted-foreground">
-                      After a Magic scan in Folders mode, rebuild the library in the folder above.
-                    </p>
-                  </div>
-                  <Switch
-                    checked={Boolean(config.AUTO_EXPORT_LIBRARY)}
-                    onCheckedChange={(checked) => updateConfig({ AUTO_EXPORT_LIBRARY: checked })}
-                    aria-label="Build library automatically after Magic scan"
+                  <FolderBrowserInput
+                    value={config.INCOMPLETE_ALBUMS_TARGET_DIR ?? '/dupes/incomplete_albums'}
+                    onChange={(path) => updateConfig({ INCOMPLETE_ALBUMS_TARGET_DIR: path || '/dupes/incomplete_albums' })}
+                    placeholder="/dupes/incomplete_albums"
+                    selectLabel="Select incomplete albums destination folder"
                   />
                 </div>
                 <div className="space-y-1">
-                  <Label className="text-muted-foreground">Duplicates folder</Label>
+                  <Label>Duplicates folder</Label>
                   <p className="text-xs text-muted-foreground">
-                    Duplicates are moved to <span className="font-mono">/dupes</span> (set by your Docker volume). No need to configure.
+                    Destination used by the dedupe step. Default is <span className="font-mono">/dupes</span>, but you can choose another writable folder.
                   </p>
-                </div>
-                <div className="flex flex-wrap items-center gap-3 pt-2 border-t pt-4">
-                  <Button
-                    type="button"
-                    variant="default"
-                    disabled={exportRebuilding}
-                    onClick={async () => {
-                      setExportRebuilding(true);
-                      setExportStatus(null);
-                      try {
-                        const res = await api.postFilesExportRebuild();
-                        if (res.status === 'already_running') {
-                          toast.info('Build already in progress');
-                          const s = await api.getFilesExportStatus();
-                          setExportStatus(s);
-                        } else if (res.status === 'started') {
-                          toast.success('Building library…');
-                          const s = await api.getFilesExportStatus();
-                          setExportStatus(s);
-                        } else {
-                          toast.error(res.message ?? 'Failed to start');
-                        }
-                      } catch (e) {
-                        toast.error('Failed to start');
-                      } finally {
-                        setExportRebuilding(false);
-                      }
-                    }}
-                    className="gap-2"
-                  >
-                    {exportRebuilding ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
-                    Build library
-                  </Button>
-                  {exportStatus && (exportStatus.running || exportStatus.error) && (
-                    <span className="text-sm text-muted-foreground">
-                      {exportStatus.running
-                        ? `${exportStatus.tracks_done}/${exportStatus.total_tracks} tracks`
-                        : exportStatus.error ?? 'Done'}
-                    </span>
-                  )}
+                  <FolderBrowserInput
+                    value={config.DUPE_ROOT ?? '/dupes'}
+                    onChange={(path) => updateConfig({ DUPE_ROOT: path || '/dupes' })}
+                    placeholder="/dupes"
+                    selectLabel="Select duplicates destination folder"
+                  />
                 </div>
               </CardContent>
             </Card>
@@ -475,19 +499,97 @@ function SettingsPage() {
 
             <Separator />
 
-            <Card id="settings-ai" className="scroll-mt-24">
-              <CardHeader>
-                <CardTitle className="flex items-center gap-2">
-                  <Sparkles className="w-5 h-5" />
-                  AI
-                </CardTitle>
-                <CardDescription>Provide your OpenAI API key (required for match verification).</CardDescription>
-              </CardHeader>
-              <CardContent className="space-y-4">
-                <div className="space-y-2">
-                  <Label>OpenAI API key</Label>
-                  <p className="text-xs text-muted-foreground">Required for AI match verification and cover checks.</p>
-                  <PasswordInput
+	            <Card id="settings-ai" className="scroll-mt-24">
+	            <CardHeader>
+	                <CardTitle className="flex items-center gap-2">
+	                  <Sparkles className="w-5 h-5" />
+	                  AI
+	                </CardTitle>
+	                <CardDescription>
+                    Connect OpenAI via OAuth (quick setup) or paste an API key. Note: ChatGPT subscription is separate from API billing.
+                  </CardDescription>
+	              </CardHeader>
+	              <CardContent className="space-y-4">
+	                <div className="rounded-lg border border-border p-4 space-y-3">
+	                  <div className="flex flex-wrap items-start justify-between gap-3">
+	                    <div className="space-y-1">
+	                      <Label>Sign in with OpenAI (OAuth)</Label>
+	                      <p className="text-xs text-muted-foreground">
+	                        Quick setup without copy/pasting an API key.
+	                      </p>
+	                      {openaiOAuth?.warning && (
+	                        <p className="text-xs text-muted-foreground">
+	                          <span className="font-medium">Note:</span> {openaiOAuth.warning}
+	                        </p>
+	                      )}
+	                    </div>
+	                    <Button
+	                      type="button"
+	                      variant="outline"
+	                      size="sm"
+	                      className="gap-2 shrink-0"
+	                      onClick={startOpenAIOAuth}
+	                      disabled={openaiOAuthBusy}
+	                    >
+	                      {openaiOAuthBusy ? <Loader2 className="w-4 h-4 animate-spin" /> : <ExternalLink className="w-4 h-4" />}
+	                      Connect
+	                    </Button>
+	                  </div>
+	                  {openaiOAuth && (
+	                    <div className="space-y-2">
+	                      <div className="flex flex-col sm:flex-row sm:items-center gap-2">
+	                        <Input readOnly value={openaiOAuth.userCode} className="font-mono" />
+	                        <div className="flex items-center gap-2">
+	                          <Button
+	                            type="button"
+	                            variant="secondary"
+	                            size="sm"
+	                            className="gap-1.5"
+	                            onClick={async () => {
+	                              const ok = await copyTextToClipboard(openaiOAuth.userCode);
+	                              if (ok) toast.success('Code copied');
+	                              else toast.error('Copy failed');
+	                            }}
+	                          >
+	                            <Copy className="w-4 h-4" />
+	                            Copy
+	                          </Button>
+	                          <Button type="button" variant="secondary" size="sm" className="gap-1.5" asChild>
+	                            <a href={openaiOAuth.verificationUrl} target="_blank" rel="noreferrer">
+	                              <ExternalLink className="w-4 h-4" />
+	                              Open OpenAI
+	                            </a>
+	                          </Button>
+	                        </div>
+	                      </div>
+	                      <p className="text-xs text-muted-foreground">
+	                        1) Open the OpenAI page, 2) enter the code, 3) come back here. PMDA will connect automatically.
+	                      </p>
+	                      <div className="flex flex-wrap items-center gap-2">
+	                        <Button
+	                          type="button"
+	                          variant="outline"
+	                          size="sm"
+	                          className="gap-2"
+	                          onClick={pollOpenAIOAuth}
+	                          disabled={openaiOAuthBusy || openaiOAuth.status !== 'pending'}
+	                        >
+	                          {openaiOAuthBusy ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
+	                          Check status
+	                        </Button>
+	                        <span className="text-xs text-muted-foreground">
+	                          {openaiOAuth.message
+	                            || (openaiOAuth.status === 'pending' ? 'Waiting for authorization…'
+	                              : openaiOAuth.status === 'completed' ? 'Connected' : 'Error')}
+	                        </span>
+	                      </div>
+	                    </div>
+	                  )}
+	                </div>
+	                <div className="space-y-2">
+	                  <Label>OpenAI API key</Label>
+	                  <p className="text-xs text-muted-foreground">Required for AI match verification and cover checks.</p>
+	                  <PasswordInput
                     value={config.OPENAI_API_KEY || ''}
                     onChange={(e) => updateConfig({ OPENAI_API_KEY: e.target.value, AI_PROVIDER: 'openai' })}
                     placeholder="sk-..."
@@ -510,30 +612,53 @@ function SettingsPage() {
               <CardHeader>
                 <CardTitle className="flex items-center gap-2">
                   <Database className="w-5 h-5" />
-                  Providers
+                  Metadata providers
                 </CardTitle>
                 <CardDescription>Optional API keys to improve matches (all providers are always on).</CardDescription>
               </CardHeader>
               <CardContent className="space-y-4">
                 <div className="space-y-2">
-                  <Label>Discogs token (optional)</Label>
-                  <Input
+                  <div className="flex items-center justify-between gap-3">
+                    <Label htmlFor="discogs-token">Discogs token (optional)</Label>
+                    <a
+                      href="https://www.discogs.com/settings/developers"
+                      target="_blank"
+                      rel="noreferrer"
+                      className="text-xs text-primary inline-flex items-center gap-1 hover:underline"
+                    >
+                      Create token <ExternalLink className="w-3 h-3" />
+                    </a>
+                  </div>
+                  <PasswordInput
+                    id="discogs-token"
                     placeholder="Discogs user token"
                     value={config.DISCOGS_USER_TOKEN || ''}
                     onChange={(e) => updateConfig({ DISCOGS_USER_TOKEN: e.target.value })}
                   />
                 </div>
                 <div className="space-y-2">
-                  <Label>Last.fm API key (optional)</Label>
-                  <Input
+                  <div className="flex items-center justify-between gap-3">
+                    <Label htmlFor="lastfm-key">Last.fm API key (optional)</Label>
+                    <a
+                      href="https://www.last.fm/api/account/create"
+                      target="_blank"
+                      rel="noreferrer"
+                      className="text-xs text-primary inline-flex items-center gap-1 hover:underline"
+                    >
+                      Create API key <ExternalLink className="w-3 h-3" />
+                    </a>
+                  </div>
+                  <PasswordInput
+                    id="lastfm-key"
                     placeholder="Last.fm API key"
                     value={config.LASTFM_API_KEY || ''}
                     onChange={(e) => updateConfig({ LASTFM_API_KEY: e.target.value })}
                   />
                 </div>
                 <div className="space-y-2">
-                  <Label>Last.fm API secret (optional)</Label>
-                  <Input
+                  <Label htmlFor="lastfm-secret">Last.fm API secret (optional)</Label>
+                  <PasswordInput
+                    id="lastfm-secret"
                     placeholder="Last.fm API secret"
                     value={config.LASTFM_API_SECRET || ''}
                     onChange={(e) => updateConfig({ LASTFM_API_SECRET: e.target.value })}
