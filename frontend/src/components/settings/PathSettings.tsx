@@ -4,7 +4,7 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Textarea } from '@/components/ui/textarea';
 import { Button } from '@/components/ui/button';
-import { FolderBrowserInput } from '@/components/FolderBrowserInput';
+import { FolderBrowserInput } from '@/components/settings/FolderBrowserInput';
 import { FieldTooltip } from '@/components/ui/field-tooltip';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
 import { Switch } from '@/components/ui/switch';

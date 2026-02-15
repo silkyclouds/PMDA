@@ -9,3 +9,10 @@ docs
 local-test-config
 static
 frontend/.git
+
+# Local state / secrets (never bake into the image)
+*.db
+*.sqlite
+*.sqlite3
+*.log
+pmda.log*

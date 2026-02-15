@@ -299,18 +299,6 @@ export function AISettings({ config, updateConfig, errors }: AISettingsProps) {
                 Stored in SQLite. Empty = use built-in default (classical vs non-classical, format priority, output format).
               </p>
             </div>
-            <div className="space-y-2">
-              <div className="flex items-center gap-1.5">
-                <Label htmlFor="openai-model-fallbacks">Model fallbacks</Label>
-                <FieldTooltip content="Comma-separated list of fallback models if the primary model fails (e.g. gpt-4o-mini,gpt-4o-nano). Leave empty for no fallbacks." />
-              </div>
-              <Input
-                id="openai-model-fallbacks"
-                placeholder="gpt-4o-mini,gpt-4o-nano"
-                value={config.OPENAI_MODEL_FALLBACKS ?? ''}
-                onChange={(e) => updateConfig({ OPENAI_MODEL_FALLBACKS: e.target.value })}
-              />
-            </div>
           </CollapsibleContent>
         </Collapsible>
       </div>

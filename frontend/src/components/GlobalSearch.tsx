@@ -68,15 +68,11 @@ export function GlobalSearch() {
 
   const goToItem = (item: LibrarySearchSuggestionItem | undefined) => {
     if (!item) return;
-    if (item.type === 'artist' && item.artist_id) {
+    // PMDA library UX: prefer deep-linking to the artist page (album/track pages can be added later).
+    if (item.artist_id) {
       navigate(`/library/artist/${item.artist_id}`);
     } else {
-      const params = new URLSearchParams();
-      if (item.artist_id) params.set('artist', String(item.artist_id));
-      if (item.album_id) params.set('album', String(item.album_id));
-      if (item.track_id) params.set('track', String(item.track_id));
-      const q = params.toString();
-      navigate(`/library${q ? `?${q}` : ''}`);
+      navigate('/library');
     }
     setQuery('');
     setOpen(false);

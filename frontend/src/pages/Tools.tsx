@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { AlertTriangle, ChevronLeft, ChevronRight, Loader2, RefreshCw, Tags, Trash2, Undo2 } from 'lucide-react';
-import { Header } from '@/components/Header';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
@@ -101,9 +100,7 @@ export default function Tools() {
   };
 
   return (
-    <>
-      <Header />
-      <div className="container mx-auto p-6 max-w-6xl space-y-6">
+    <div className="container mx-auto p-6 max-w-6xl space-y-6">
         <div className="flex items-center justify-between">
           <div>
             <h1 className="text-3xl font-bold">Tools</h1>
@@ -287,7 +284,6 @@ export default function Tools() {
             </Card>
           </>
         )}
-      </div>
-    </>
+    </div>
   );
 }

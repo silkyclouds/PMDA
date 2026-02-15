@@ -179,7 +179,7 @@ export function IntegrationsSettings({ config, updateConfig }: IntegrationsSetti
               />
             </div>
 
-            {Boolean(config.PIPELINE_ENABLE_EXPORT) && (
+            {config.PIPELINE_ENABLE_EXPORT === true && (
               <div className="pt-3 border-t border-border/60 space-y-3">
                 <div className="space-y-2">
                   <Label>Library folder</Label>
@@ -202,7 +202,7 @@ export function IntegrationsSettings({ config, updateConfig }: IntegrationsSetti
                   <Select
                     value={(config.EXPORT_LINK_STRATEGY as 'hardlink' | 'symlink' | 'copy' | 'move' | undefined) ?? 'hardlink'}
                     onValueChange={(value: 'hardlink' | 'symlink' | 'copy' | 'move') => updateConfig({ EXPORT_LINK_STRATEGY: value })}
-                    disabled={!Boolean(config.PIPELINE_ENABLE_EXPORT)}
+                    disabled={config.PIPELINE_ENABLE_EXPORT !== true}
                   >
                     <SelectTrigger className="w-full md:w-[320px]">
                       <SelectValue placeholder="Select strategy" />
