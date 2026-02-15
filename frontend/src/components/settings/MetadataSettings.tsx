@@ -266,17 +266,6 @@ export function MetadataSettings({ config, updateConfig, errors }: MetadataSetti
                       onCheckedChange={(checked) => updateConfig({ USE_AI_VISION_FOR_COVER: checked })}
                     />
                   </div>
-                  {(config.USE_AI_VISION_FOR_COVER ?? true) && (
-                    <div className="space-y-2 pl-3 border-l-2 border-border">
-                      <Label htmlFor="openai-vision-model" className="text-sm">Vision model (optional)</Label>
-                      <Input
-                        id="openai-vision-model"
-                        placeholder="gpt-4o-mini (default)"
-                        value={config.OPENAI_VISION_MODEL || ''}
-                        onChange={(e) => updateConfig({ OPENAI_VISION_MODEL: e.target.value })}
-                      />
-                    </div>
-                  )}
                   <div className="flex items-center justify-between rounded-lg border border-border p-3">
                     <div className="space-y-0.5">
                       <Label htmlFor="ai-confidence-min" className="text-sm font-medium">AI confidence minimum (0–100)</Label>
@@ -622,6 +611,29 @@ export function MetadataSettings({ config, updateConfig, errors }: MetadataSetti
                   value={config.LASTFM_API_SECRET || ''}
                   onChange={(e) => {
                     updateConfig({ LASTFM_API_SECRET: e.target.value });
+                  }}
+                />
+              </div>
+
+              <div className="space-y-2">
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  <Label htmlFor="fanart-api-key">Fanart.tv API Key (optional)</Label>
+                  <FieldTooltip content="Optional: extra artist artwork fallback (MBID-based). Helpful when Last.fm images are missing/placeholders." />
+                  <a
+                    href="https://fanart.tv/get-an-api-key/"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-xs text-primary hover:underline inline-flex items-center gap-1"
+                  >
+                    Get API key <ExternalLink className="w-3 h-3" />
+                  </a>
+                </div>
+                <PasswordInput
+                  id="fanart-api-key"
+                  placeholder="Your Fanart.tv API key"
+                  value={String(config.FANART_API_KEY ?? '')}
+                  onChange={(e) => {
+                    updateConfig({ FANART_API_KEY: e.target.value });
                   }}
                 />
               </div>

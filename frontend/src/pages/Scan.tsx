@@ -1,6 +1,5 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { Header } from '@/components/Header';
 import { ScanProgress } from '@/components/ScanProgress';
 import { useScanProgress, useScanControls, useDuplicates } from '@/hooks/usePMDA';
 import type { ScanProgress as ScanProgressType } from '@/lib/api';
@@ -60,31 +59,27 @@ export default function Scan() {
   }, [scanProgress?.scanning, queryClient]);
 
   return (
-    <div className="min-h-screen bg-background">
-      <Header />
+    <main className="container py-6 space-y-6">
+      <div>
+        <h1 className="text-display text-foreground">Library Scan</h1>
+        <p className="text-small text-muted-foreground mt-1">Run scans, then resolve duplicates and metadata in a clear workflow</p>
+      </div>
 
-      <main className="container py-6 space-y-6">
-        <div>
-          <h1 className="text-display text-foreground">Library Scan</h1>
-          <p className="text-small text-muted-foreground mt-1">Run scans, then resolve duplicates and metadata in a clear workflow</p>
-        </div>
-
-        <ScanProgress
-          progress={enhancedProgress}
-          currentDuplicateCount={currentDuplicateCount}
-          onStart={scanControls.start}
-          onPause={scanControls.pause}
-          onResume={scanControls.resume}
-          onStop={scanControls.stop}
-          onClear={handleClear}
-          isStarting={scanControls.isStarting}
-          isPausing={scanControls.isPausing}
-          isResuming={scanControls.isResuming}
-          isStopping={scanControls.isStopping}
-          isClearing={scanControls.isClearing}
-          compact
-        />
-      </main>
-    </div>
+      <ScanProgress
+        progress={enhancedProgress}
+        currentDuplicateCount={currentDuplicateCount}
+        onStart={scanControls.start}
+        onPause={scanControls.pause}
+        onResume={scanControls.resume}
+        onStop={scanControls.stop}
+        onClear={handleClear}
+        isStarting={scanControls.isStarting}
+        isPausing={scanControls.isPausing}
+        isResuming={scanControls.isResuming}
+        isStopping={scanControls.isStopping}
+        isClearing={scanControls.isClearing}
+        compact
+      />
+    </main>
   );
 }

@@ -2,7 +2,6 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { Search, Music, Loader2, Edit, Image as ImageIcon, RefreshCw, LayoutGrid, List, Sparkles, Play, Check, X, Circle, CopyMinus, Wrench } from 'lucide-react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
-import { Header } from '@/components/Header';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
@@ -741,20 +740,16 @@ export default function LibraryBrowser() {
 
   if (loading && artists.length === 0) {
     return (
-      <>
-        <Header />
-        <div className="container py-6">
-          <div className="flex items-center justify-center py-12">
-            <Loader2 className="w-8 h-8 animate-spin text-primary" />
-          </div>
+      <div className="container py-6">
+        <div className="flex items-center justify-center py-12">
+          <Loader2 className="w-8 h-8 animate-spin text-primary" />
         </div>
-      </>
+      </div>
     );
   }
 
   return (
     <>
-      <Header />
       <div className="container py-6">
         <div className="flex items-center justify-between mb-6">
           <div>

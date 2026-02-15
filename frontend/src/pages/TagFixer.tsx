@@ -1,6 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
 import { Search, Music, Loader2, Tag, Filter } from 'lucide-react';
-import { Header } from '@/components/Header';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
@@ -81,9 +80,7 @@ export default function TagFixer() {
   }, [searchQuery, filterArtist, albums]);
 
   return (
-    <>
-      <Header />
-      <div className="container py-6">
+    <div className="container py-6">
         <div className="flex items-center justify-between mb-6">
           <div>
             <h1 className="text-3xl font-bold">Tag Fixer</h1>
@@ -181,6 +178,5 @@ export default function TagFixer() {
           </Card>
         )}
       </div>
-    </>
   );
 }

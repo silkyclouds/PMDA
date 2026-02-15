@@ -16,6 +16,7 @@ import {
   RefreshCw,
 } from 'lucide-react';
 import { useQuery } from '@tanstack/react-query';
+import { useNavigate } from 'react-router-dom';
 import { format } from 'date-fns';
 import {
   Chart as ChartJS,
@@ -31,7 +32,6 @@ import {
 } from 'chart.js';
 import { Bar, Line, Doughnut, Pie } from 'react-chartjs-2';
 import type { CacheControlMetrics, ScanHistoryEntry, ScanProgress } from '@/lib/api';
-import { Header } from '@/components/Header';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
@@ -375,6 +375,7 @@ function StatCard({
 }
 
 export default function Statistics() {
+  const navigate = useNavigate();
   const [period, setPeriod] = useState<PeriodKey>('last');
   const [activeTab, setActiveTab] = useState<StatsTab>('overview');
   const liveScanStartRef = useRef<number>(Math.floor(Date.now() / 1000));
@@ -785,36 +786,41 @@ export default function Statistics() {
 
   if (isLoading) {
     return (
-      <>
-        <Header />
-        <div className="flex items-center justify-center min-h-[60vh]">
-          <Loader2 className="w-8 h-8 animate-spin text-muted-foreground" />
-        </div>
-      </>
+      <div className="flex items-center justify-center min-h-[60vh]">
+        <Loader2 className="w-8 h-8 animate-spin text-muted-foreground" />
+      </div>
     );
   }
 
   return (
-    <>
-      <Header />
-      <div className="container mx-auto p-6 space-y-6">
+    <div className="container mx-auto p-6 space-y-6">
         <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
           <div>
             <h1 className="text-display text-foreground">Statistics</h1>
             <p className="text-small text-muted-foreground mt-1">Single source of truth from completed scans</p>
           </div>
-          <div className="flex rounded-lg border border-border p-0.5 bg-muted/30">
-            {PERIODS.map((p) => (
-              <Button
-                key={p.key}
-                variant={period === p.key ? 'secondary' : 'ghost'}
-                size="sm"
-                className="px-3"
-                onClick={() => setPeriod(p.key)}
-              >
-                {p.label}
-              </Button>
-            ))}
+          <div className="flex flex-wrap items-center justify-end gap-2">
+            <Button variant="outline" size="sm" onClick={() => navigate('/statistics/listening')} className="gap-2">
+              <Clock className="h-4 w-4" />
+              Listening
+            </Button>
+            <Button variant="outline" size="sm" onClick={() => navigate('/statistics/library')} className="gap-2">
+              <Database className="h-4 w-4" />
+              Library
+            </Button>
+            <div className="flex rounded-lg border border-border p-0.5 bg-muted/30">
+              {PERIODS.map((p) => (
+                <Button
+                  key={p.key}
+                  variant={period === p.key ? 'secondary' : 'ghost'}
+                  size="sm"
+                  className="px-3"
+                  onClick={() => setPeriod(p.key)}
+                >
+                  {p.label}
+                </Button>
+              ))}
+            </div>
           </div>
         </div>
 
@@ -1397,7 +1403,6 @@ export default function Statistics() {
             </TabsContent>
           </Tabs>
         )}
-      </div>
-    </>
+    </div>
   );
 }

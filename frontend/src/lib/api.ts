@@ -509,6 +509,8 @@ export interface PMDAConfig {
   USE_LASTFM: boolean;
   LASTFM_API_KEY: string;
   LASTFM_API_SECRET: string;
+  /** fanart.tv API key (optional). Used for additional artist artwork (MBID-based). */
+  FANART_API_KEY?: string;
   USE_BANDCAMP: boolean;
   /** Skip MusicBrainz lookup and tagging for albums detected as live (folder/title heuristics). */
   SKIP_MB_FOR_LIVE_ALBUMS?: boolean;
@@ -518,6 +520,15 @@ export interface PMDAConfig {
   LIVE_ALBUMS_MB_STRICT?: boolean;
   /** Safety mode for live albums dedupe heuristics. */
   LIVE_DEDUPE_MODE?: 'safe' | 'aggressive';
+
+  // Concert discovery (UI filtering)
+  CONCERTS_FILTER_ENABLED?: boolean;
+  /** Home latitude used to filter upcoming concerts (stringified float). */
+  CONCERTS_HOME_LAT?: string;
+  /** Home longitude used to filter upcoming concerts (stringified float). */
+  CONCERTS_HOME_LON?: string;
+  /** Radius (km) used to filter upcoming concerts (stringified int). */
+  CONCERTS_RADIUS_KM?: string;
   DISCORD_WEBHOOK: string;
   LOG_LEVEL: 'DEBUG' | 'INFO' | 'WARNING' | 'ERROR';
   LOG_FILE: string;
@@ -757,6 +768,77 @@ export async function getLibraryStats(): Promise<LibraryStats> {
   return fetchApi<LibraryStats>('/api/library/stats');
 }
 
+export interface LibraryStatsYearPoint {
+  year: number;
+  count: number;
+}
+
+export interface LibraryStatsGrowthPoint {
+  month: string; // YYYY-MM
+  count: number;
+}
+
+export interface LibraryStatsGenreItem {
+  genre: string;
+  count: number;
+}
+
+export interface LibraryStatsLabelItem {
+  label: string;
+  count: number;
+}
+
+export interface LibraryStatsFormatItem {
+  format: string;
+  count: number;
+}
+
+export interface LibraryStatsLibraryResponse {
+  artists: number;
+  albums: number;
+  tracks: number;
+  years: LibraryStatsYearPoint[];
+  growth: LibraryStatsGrowthPoint[];
+  genres: LibraryStatsGenreItem[];
+  labels: LibraryStatsLabelItem[];
+  formats: LibraryStatsFormatItem[];
+  quality: {
+    with_cover: number;
+    without_cover: number;
+    lossless: number;
+    lossy: number;
+  };
+}
+
+export async function getLibraryStatsLibrary(): Promise<LibraryStatsLibraryResponse> {
+  return fetchApi<LibraryStatsLibraryResponse>('/api/library/stats/library');
+}
+
+export type LibraryDiscoverSectionKey = 'genre' | 'artists' | 'similar' | 'labels' | 'year' | 'random';
+
+export interface LibraryDiscoverSection {
+  key: LibraryDiscoverSectionKey;
+  title: string;
+  reason: string;
+  seed?: Record<string, unknown>;
+  albums: LibraryAlbumItem[];
+}
+
+export interface LibraryDiscoverResponse {
+  days: number;
+  limit: number;
+  generated_at: number;
+  sections: LibraryDiscoverSection[];
+}
+
+export async function getLibraryDiscover(days = 90, limit = 18, refresh = false): Promise<LibraryDiscoverResponse> {
+  const qs = new URLSearchParams();
+  qs.set('days', String(Math.max(7, Math.min(365, days))));
+  qs.set('limit', String(Math.max(6, Math.min(36, limit))));
+  if (refresh) qs.set('refresh', '1');
+  return fetchApi<LibraryDiscoverResponse>(`/api/library/discover?${qs.toString()}`);
+}
+
 export type LibrarySearchItemType = 'artist' | 'album' | 'track';
 
 export interface LibrarySearchSuggestionItem {
@@ -781,6 +863,322 @@ export async function getLibrarySearchSuggest(query: string, limit = 12): Promis
   return fetchApi<LibrarySearchSuggestResponse>(
     `/api/library/search/suggest?q=${encodeURIComponent(query.trim())}&limit=${Math.max(1, Math.min(40, limit))}`
   );
+}
+
+export interface LibraryAlbumItem {
+  album_id: number;
+  title: string;
+  year?: number | null;
+  genre?: string | null;
+  genres?: string[] | null;
+  label?: string | null;
+  track_count: number;
+  format?: string | null;
+  is_lossless: boolean;
+  thumb?: string | null;
+  artist_id: number;
+  artist_name: string;
+  short_description?: string | null;
+  profile_source?: string | null;
+}
+
+export interface LibraryAlbumsResponse {
+  albums: LibraryAlbumItem[];
+  total: number;
+  limit: number;
+  offset: number;
+  error?: string;
+}
+
+export interface LibraryDigestResponse {
+  limit: number;
+  generated_at: number;
+  albums: LibraryAlbumItem[];
+  enrichment?: {
+    triggered?: boolean;
+    missing_total?: number;
+    available_total?: number;
+    active_jobs?: number;
+    profile_backfill?: {
+      running?: boolean;
+      reason?: string;
+      started_at?: number;
+      finished_at?: number;
+      current?: number;
+      total?: number;
+      current_artist?: string;
+      errors?: number;
+    };
+    error?: string;
+  };
+}
+
+export async function getLibraryDigest(limit = 12, trigger = true): Promise<LibraryDigestResponse> {
+  const q = new URLSearchParams();
+  q.set('limit', String(Math.max(1, Math.min(36, limit))));
+  if (!trigger) q.set('trigger', '0');
+  return fetchApi<LibraryDigestResponse>(`/api/library/digest?${q.toString()}`);
+}
+
+export async function getLibraryAlbums(options?: {
+  search?: string;
+  sort?: 'recent' | 'year_desc' | 'alpha' | 'artist';
+  genre?: string;
+  label?: string;
+  year?: number;
+  limit?: number;
+  offset?: number;
+}): Promise<LibraryAlbumsResponse> {
+  const q = new URLSearchParams();
+  if (options?.search) q.set('search', options.search);
+  if (options?.sort) q.set('sort', options.sort);
+  if (options?.genre) q.set('genre', options.genre);
+  if (options?.label) q.set('label', options.label);
+  if (options?.year != null) q.set('year', String(options.year));
+  if (options?.limit != null) q.set('limit', String(Math.max(1, Math.min(240, options.limit))));
+  if (options?.offset != null) q.set('offset', String(Math.max(0, options.offset)));
+  const qs = q.toString();
+  return fetchApi<LibraryAlbumsResponse>(`/api/library/albums${qs ? `?${qs}` : ''}`);
+}
+
+export interface LibraryFacetItem {
+  value: string;
+  count: number;
+}
+
+export interface LibraryFacetYearItem {
+  value: number;
+  count: number;
+}
+
+export interface LibraryFacetsResponse {
+  genres: LibraryFacetItem[];
+  labels: LibraryFacetItem[];
+  years: LibraryFacetYearItem[];
+  error?: string;
+}
+
+export async function getLibraryFacets(): Promise<LibraryFacetsResponse> {
+  return fetchApi<LibraryFacetsResponse>('/api/library/facets');
+}
+
+export interface LibraryGenresSuggestResponse {
+  query: string;
+  genres: LibraryFacetItem[];
+  error?: string;
+}
+
+export async function suggestLibraryGenres(
+  query = '',
+  limit = 16,
+  refresh = false,
+  filters?: { label?: string; year?: number | null }
+): Promise<LibraryGenresSuggestResponse> {
+  const q = new URLSearchParams();
+  if (query.trim()) q.set('q', query.trim());
+  q.set('limit', String(Math.max(1, Math.min(80, limit))));
+  if (refresh) q.set('refresh', '1');
+  if (filters?.label) q.set('label', String(filters.label));
+  if (filters?.year != null) q.set('year', String(filters.year));
+  return fetchApi<LibraryGenresSuggestResponse>(`/api/library/genres/suggest?${q.toString()}`);
+}
+
+export interface LibraryLabelsSuggestResponse {
+  query: string;
+  labels: LibraryFacetItem[];
+  error?: string;
+}
+
+export async function suggestLibraryLabels(
+  query = '',
+  limit = 16,
+  refresh = false,
+  filters?: { genre?: string; year?: number | null }
+): Promise<LibraryLabelsSuggestResponse> {
+  const q = new URLSearchParams();
+  if (query.trim()) q.set('q', query.trim());
+  q.set('limit', String(Math.max(1, Math.min(80, limit))));
+  if (refresh) q.set('refresh', '1');
+  if (filters?.genre) q.set('genre', String(filters.genre));
+  if (filters?.year != null) q.set('year', String(filters.year));
+  return fetchApi<LibraryLabelsSuggestResponse>(`/api/library/labels/suggest?${q.toString()}`);
+}
+
+export interface GenreLabelItem {
+  label: string;
+  count: number;
+}
+
+export interface LibraryGenreLabelsResponse {
+  genre: string;
+  album_count: number;
+  labels: GenreLabelItem[];
+  error?: string;
+}
+
+export async function getLibraryGenreLabels(genre: string, limit = 80, refresh = false): Promise<LibraryGenreLabelsResponse> {
+  const g = genre.trim();
+  const q = new URLSearchParams();
+  q.set('limit', String(Math.max(1, Math.min(200, limit))));
+  if (refresh) q.set('refresh', '1');
+  return fetchApi<LibraryGenreLabelsResponse>(`/api/library/genre/${encodeURIComponent(g)}/labels?${q.toString()}`);
+}
+
+export interface RecentlyPlayedAlbumItem extends LibraryAlbumItem {
+  last_played_at?: number;
+}
+
+export interface LibraryRecentlyPlayedAlbumsResponse {
+  days: number;
+  limit: number;
+  generated_at: number;
+  source?: 'playback' | 'reco';
+  albums: RecentlyPlayedAlbumItem[];
+  error?: string;
+}
+
+export async function getLibraryRecentlyPlayedAlbums(days = 90, limit = 18, refresh = false): Promise<LibraryRecentlyPlayedAlbumsResponse> {
+  const q = new URLSearchParams();
+  q.set('days', String(Math.max(7, Math.min(365, days))));
+  q.set('limit', String(Math.max(1, Math.min(60, limit))));
+  if (refresh) q.set('refresh', '1');
+  return fetchApi<LibraryRecentlyPlayedAlbumsResponse>(`/api/library/recently-played/albums?${q.toString()}`);
+}
+
+export interface LibraryArtistItem {
+  artist_id: number;
+  artist_name: string;
+  album_count: number;
+  broken_albums_count?: number;
+  artist_thumb?: string | null;
+}
+
+export interface LibraryArtistsResponse {
+  artists: LibraryArtistItem[];
+  total: number;
+  limit: number;
+  offset: number;
+  error?: string;
+}
+
+export async function getLibraryArtists(options?: {
+  search?: string;
+  genre?: string;
+  label?: string;
+  year?: number;
+  limit?: number;
+  offset?: number;
+}): Promise<LibraryArtistsResponse> {
+  const q = new URLSearchParams();
+  if (options?.search) q.set('search', options.search);
+  if (options?.genre) q.set('genre', options.genre);
+  if (options?.label) q.set('label', options.label);
+  if (options?.year != null) q.set('year', String(options.year));
+  if (options?.limit != null) q.set('limit', String(Math.max(1, Math.min(500, options.limit))));
+  if (options?.offset != null) q.set('offset', String(Math.max(0, options.offset)));
+  const qs = q.toString();
+  return fetchApi<LibraryArtistsResponse>(`/api/library/artists${qs ? `?${qs}` : ''}`);
+}
+
+export interface LibraryGenresResponse {
+  genres: LibraryFacetItem[];
+  total: number;
+  limit: number;
+  offset: number;
+  error?: string;
+}
+
+export async function getLibraryGenres(options?: {
+  search?: string;
+  label?: string;
+  year?: number;
+  limit?: number;
+  offset?: number;
+}): Promise<LibraryGenresResponse> {
+  const q = new URLSearchParams();
+  if (options?.search) q.set('search', options.search);
+  if (options?.label) q.set('label', options.label);
+  if (options?.year != null) q.set('year', String(options.year));
+  if (options?.limit != null) q.set('limit', String(Math.max(1, Math.min(200, options.limit))));
+  if (options?.offset != null) q.set('offset', String(Math.max(0, options.offset)));
+  const qs = q.toString();
+  return fetchApi<LibraryGenresResponse>(`/api/library/genres${qs ? `?${qs}` : ''}`);
+}
+
+export interface LibraryLabelsResponse {
+  labels: LibraryFacetItem[];
+  total: number;
+  limit: number;
+  offset: number;
+  error?: string;
+}
+
+export async function getLibraryLabels(options?: {
+  search?: string;
+  genre?: string;
+  year?: number;
+  limit?: number;
+  offset?: number;
+}): Promise<LibraryLabelsResponse> {
+  const q = new URLSearchParams();
+  if (options?.search) q.set('search', options.search);
+  if (options?.genre) q.set('genre', options.genre);
+  if (options?.year != null) q.set('year', String(options.year));
+  if (options?.limit != null) q.set('limit', String(Math.max(1, Math.min(200, options.limit))));
+  if (options?.offset != null) q.set('offset', String(Math.max(0, options.offset)));
+  const qs = q.toString();
+  return fetchApi<LibraryLabelsResponse>(`/api/library/labels${qs ? `?${qs}` : ''}`);
+}
+
+export interface TopArtistItem {
+  artist_id: number;
+  artist_name: string;
+  album_count: number;
+  completion_count: number;
+  play_count: number;
+  thumb?: string | null;
+}
+
+export interface TopArtistsResponse {
+  artists: TopArtistItem[];
+  limit?: number;
+  days?: number;
+  error?: string;
+}
+
+export async function getTopArtists(limit = 18, days = 0): Promise<TopArtistsResponse> {
+  const q = new URLSearchParams();
+  q.set('limit', String(Math.max(1, Math.min(60, limit))));
+  if (days && days > 0) q.set('days', String(Math.max(1, Math.min(3650, days))));
+  return fetchApi<TopArtistsResponse>(`/api/library/artists/top?${q.toString()}`);
+}
+
+export type LikeEntityType = 'artist' | 'album' | 'track';
+
+export interface LikeItem {
+  entity_id: number;
+  liked: boolean;
+  updated_at: number;
+}
+
+export interface LikesResponse {
+  entity_type: LikeEntityType;
+  items: LikeItem[];
+  error?: string;
+}
+
+export async function getLikes(entityType: LikeEntityType, ids?: number[]): Promise<LikesResponse> {
+  const q = new URLSearchParams();
+  q.set('entity_type', entityType);
+  if (ids && ids.length > 0) q.set('ids', ids.join(','));
+  return fetchApi<LikesResponse>(`/api/library/likes?${q.toString()}`);
+}
+
+export async function setLike(payload: { entity_type: LikeEntityType; entity_id: number; liked: boolean; source?: string }): Promise<{ entity_type: LikeEntityType; entity_id: number; liked: boolean; updated_at: number }> {
+  return fetchApi(`/api/library/likes`, {
+    method: 'PUT',
+    body: JSON.stringify(payload),
+  });
 }
 
 export type RecoEventType = 'play_start' | 'play_partial' | 'play_complete' | 'skip' | 'stop' | 'like' | 'dislike';
@@ -829,6 +1227,289 @@ export async function postRecommendationEvent(payload: {
     method: 'POST',
     body: JSON.stringify(payload),
   });
+}
+
+export async function postPlaybackEvent(payload: {
+  track_id: number;
+  event_type: RecoEventType;
+  played_seconds?: number;
+}): Promise<{ ok: boolean; track_id: number; event_type: string; played_seconds: number }> {
+  return fetchApi('/api/library/playback/event', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+export interface PlaybackTopArtist {
+  artist_id: number;
+  artist_name: string;
+  seconds: number;
+  plays: number;
+}
+
+export interface PlaybackTopTrack {
+  track_id: number;
+  track_title: string;
+  artist_id: number;
+  artist_name: string;
+  album_id: number;
+  album_title: string;
+  seconds: number;
+  plays: number;
+}
+
+export interface PlaybackTopGenre {
+  genre: string;
+  seconds: number;
+}
+
+export interface PlaybackDailyPoint {
+  day: string; // YYYY-MM-DD
+  seconds: number;
+  plays: number;
+}
+
+export interface PlaybackEventTypeCount {
+  event_type: string;
+  count: number;
+}
+
+export interface PlaybackHourPoint {
+  hour: number; // 0-23
+  seconds: number;
+}
+
+export interface PlaybackStatsResponse {
+  days: number;
+  total_seconds: number;
+  events: number;
+  distinct_tracks: number;
+  top_artists: PlaybackTopArtist[];
+  top_tracks: PlaybackTopTrack[];
+  top_genres: PlaybackTopGenre[];
+  daily: PlaybackDailyPoint[];
+  event_types: PlaybackEventTypeCount[];
+  hours: PlaybackHourPoint[];
+}
+
+export async function getPlaybackStats(days = 30): Promise<PlaybackStatsResponse> {
+  const q = new URLSearchParams();
+  q.set('days', String(Math.max(1, Math.min(365, days))));
+  return fetchApi<PlaybackStatsResponse>(`/api/library/playback/stats?${q.toString()}`);
+}
+
+export interface ArtistSummaryPayload {
+  artist_id: number;
+  artist_name: string;
+  original: { text: string; source: string; updated_at: number };
+  ai: { text: string; source: string; provider: string; model: string; lang: string; updated_at: number };
+}
+
+export async function getArtistSummary(artistId: number): Promise<ArtistSummaryPayload> {
+  return fetchApi<ArtistSummaryPayload>(`/api/library/artist/${encodeURIComponent(String(artistId))}/summary`);
+}
+
+export async function generateArtistAiSummary(artistId: number, lang?: string): Promise<{ artist_id: number; artist_name: string; ai: { text: string; source: string; provider: string; model: string; lang: string; updated_at: number } }> {
+  return fetchApi(`/api/library/artist/${encodeURIComponent(String(artistId))}/summary/ai`, {
+    method: 'POST',
+    body: JSON.stringify(lang ? { lang } : {}),
+  });
+}
+
+export interface ArtistConcertVenue {
+  name: string;
+  city: string;
+  region?: string;
+  country?: string;
+  latitude?: string;
+  longitude?: string;
+}
+
+export interface ArtistConcertEvent {
+  provider: 'bandsintown' | string;
+  id?: string;
+  datetime?: string;
+  title?: string;
+  url?: string;
+  lineup?: string[];
+  venue?: ArtistConcertVenue;
+}
+
+export interface ArtistConcertsResponse {
+  artist_id: number;
+  artist_name: string;
+  provider: string;
+  events: ArtistConcertEvent[];
+  source_url?: string | null;
+  updated_at: number;
+  cached?: boolean;
+}
+
+export async function getArtistConcerts(artistId: number, options?: { refresh?: boolean }): Promise<ArtistConcertsResponse> {
+  const q = new URLSearchParams();
+  if (options?.refresh) q.set('refresh', '1');
+  const qs = q.toString();
+  return fetchApi<ArtistConcertsResponse>(`/api/library/artist/${encodeURIComponent(String(artistId))}/concerts${qs ? `?${qs}` : ''}`);
+}
+
+export interface ArtistFactsResponse {
+  artist_id: number;
+  artist_name: string;
+  facts: Record<string, unknown>;
+  evidence: Array<{ fact_path?: string; excerpt?: string; source?: string }>;
+  source: string;
+  provider: string;
+  model: string;
+  updated_at: number;
+}
+
+export async function getArtistFacts(artistId: number): Promise<ArtistFactsResponse> {
+  return fetchApi<ArtistFactsResponse>(`/api/library/artist/${encodeURIComponent(String(artistId))}/facts`);
+}
+
+export async function extractArtistFacts(artistId: number): Promise<ArtistFactsResponse> {
+  return fetchApi<ArtistFactsResponse>(`/api/library/artist/${encodeURIComponent(String(artistId))}/facts/extract`, {
+    method: 'POST',
+    body: JSON.stringify({}),
+  });
+}
+
+export interface AlbumDetailTrack {
+  track_id: number;
+  title: string;
+  disc_num: number;
+  track_num: number;
+  duration_sec: number;
+  format?: string;
+  bitrate?: number;
+  sample_rate?: number;
+  bit_depth?: number;
+  file_size_bytes?: number;
+  file_path?: string;
+  featured?: string;
+  file_url: string;
+}
+
+export interface AlbumDetailReview {
+  description?: string;
+  short_description?: string;
+  source?: string;
+  updated_at?: number;
+}
+
+export interface AlbumDetailResponse {
+  album_id: number;
+  title: string;
+  year?: number | null;
+  date_text?: string;
+  genre?: string;
+  label?: string;
+  format?: string;
+  is_lossless?: boolean;
+  track_count: number;
+  total_duration_sec: number;
+  has_cover?: boolean;
+  cover_url?: string | null;
+  bandcamp_album_url?: string | null;
+  metadata_source?: string | null;
+  artist_id: number;
+  artist_name: string;
+  review?: AlbumDetailReview;
+  tracks: AlbumDetailTrack[];
+}
+
+export async function getAlbumDetail(albumId: number): Promise<AlbumDetailResponse> {
+  return fetchApi<AlbumDetailResponse>(`/api/library/album/${encodeURIComponent(String(albumId))}`);
+}
+
+export interface PlaylistSummary {
+  playlist_id: number;
+  name: string;
+  description?: string;
+  item_count: number;
+  updated_at: number;
+}
+
+export interface PlaylistsResponse {
+  playlists: PlaylistSummary[];
+}
+
+export async function getPlaylists(): Promise<PlaylistsResponse> {
+  return fetchApi<PlaylistsResponse>('/api/library/playlists');
+}
+
+export async function createPlaylist(payload: { name: string; description?: string }): Promise<PlaylistSummary> {
+  return fetchApi<PlaylistSummary>('/api/library/playlists', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+export interface PlaylistTrack {
+  track_id: number;
+  title: string;
+  artist_id: number;
+  artist_name: string;
+  album_id: number;
+  album_title: string;
+  duration_sec: number;
+  track_num: number;
+  disc_num: number;
+  thumb?: string | null;
+  file_url: string;
+}
+
+export interface PlaylistItem {
+  item_id: number;
+  position: number;
+  added_at: number;
+  track: PlaylistTrack;
+}
+
+export interface PlaylistDetailResponse {
+  playlist_id: number;
+  name: string;
+  description?: string;
+  updated_at: number;
+  items: PlaylistItem[];
+}
+
+export async function getPlaylist(playlistId: number): Promise<PlaylistDetailResponse> {
+  return fetchApi<PlaylistDetailResponse>(`/api/library/playlists/${encodeURIComponent(String(playlistId))}`);
+}
+
+export async function deletePlaylist(playlistId: number): Promise<{ ok: boolean; playlist_id: number }> {
+  return fetchApi<{ ok: boolean; playlist_id: number }>(`/api/library/playlists/${encodeURIComponent(String(playlistId))}`, { method: 'DELETE' });
+}
+
+export async function addPlaylistItems(
+  playlistId: number,
+  payload: { track_ids?: number[]; track_id?: number; album_id?: number }
+): Promise<{ ok: boolean; playlist_id: number; inserted: number }> {
+  return fetchApi<{ ok: boolean; playlist_id: number; inserted: number }>(`/api/library/playlists/${encodeURIComponent(String(playlistId))}/items`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function deletePlaylistItem(
+  playlistId: number,
+  itemId: number
+): Promise<{ ok: boolean; playlist_id: number; item_id: number }> {
+  return fetchApi<{ ok: boolean; playlist_id: number; item_id: number }>(
+    `/api/library/playlists/${encodeURIComponent(String(playlistId))}/items/${encodeURIComponent(String(itemId))}`,
+    { method: 'DELETE' }
+  );
+}
+
+export async function reorderPlaylist(
+  playlistId: number,
+  itemIds: number[]
+): Promise<{ ok: boolean; playlist_id: number; count: number }> {
+  return fetchApi<{ ok: boolean; playlist_id: number; count: number }>(
+    `/api/library/playlists/${encodeURIComponent(String(playlistId))}/reorder`,
+    { method: 'POST', body: JSON.stringify({ item_ids: itemIds }) }
+  );
 }
 
 export interface AlbumWithParentheticalName {
@@ -1727,4 +2408,72 @@ export async function addAlbumToLidarr(album: BrokenAlbum): Promise<{ success: b
     throw new Error(error.message || 'Failed to add album to Lidarr');
   }
   return response.json();
+}
+
+// ─────────────────────────────── Assistant (Chat) ───────────────────────────────
+export interface AssistantStatus {
+  library_mode: string;
+  ai_provider: string;
+  ai_model: string;
+  ai_ready: boolean;
+  ai_error?: string | null;
+  postgres_ready: boolean;
+  pg_host?: string;
+  pg_port?: number;
+  pg_db?: string;
+  pg_user?: string;
+  config_dir?: string;
+  config_sources?: Record<string, string>;
+}
+
+export interface AssistantCitation {
+  entity_type: string;
+  entity_id: number;
+  doc_type: string;
+  source: string;
+  title: string;
+  chunk_id: number;
+  score: number;
+  snippet: string;
+}
+
+export interface AssistantMessage {
+  id: number;
+  role: 'user' | 'assistant' | 'system';
+  content: string;
+  created_at: number;
+  context?: Record<string, unknown>;
+  metadata?: Record<string, unknown>;
+}
+
+export interface AssistantSessionResponse {
+  session_id: string;
+  messages: AssistantMessage[];
+}
+
+export interface AssistantChatResponse {
+  session_id: string;
+  user_message: AssistantMessage;
+  assistant_message: AssistantMessage;
+  citations: AssistantCitation[];
+}
+
+export async function getAssistantStatus(): Promise<AssistantStatus> {
+  return fetchApi<AssistantStatus>('/api/assistant/status');
+}
+
+export async function getAssistantSession(sessionId: string, limit: number = 120): Promise<AssistantSessionResponse> {
+  const sid = encodeURIComponent(String(sessionId || ''));
+  return fetchApi<AssistantSessionResponse>(`/api/assistant/session/${sid}?limit=${encodeURIComponent(String(limit))}`);
+}
+
+export async function postAssistantChat(input: {
+  message: string;
+  session_id?: string;
+  context?: { artist_id?: number; context_inferred?: boolean; [k: string]: unknown };
+}): Promise<AssistantChatResponse> {
+  return fetchApi<AssistantChatResponse>('/api/assistant/chat', {
+    method: 'POST',
+    body: JSON.stringify(input),
+  });
 }

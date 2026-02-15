@@ -1,6 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Save, Loader2, Check, FolderOutput, RefreshCw, Plus, X, Database, Sparkles, ExternalLink, Copy } from 'lucide-react';
-import { Header } from '@/components/Header';
+import { Save, Loader2, Check, FolderOutput, RefreshCw, Plus, X, Database, Sparkles, ExternalLink, Copy, MapPin } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { toast } from 'sonner';
 import { NotificationSettings } from '@/components/settings/NotificationSettings';
@@ -14,12 +13,21 @@ import { Label } from '@/components/ui/label';
 import { Input } from '@/components/ui/input';
 import { PasswordInput } from '@/components/ui/password-input';
 import { FolderBrowserInput } from '@/components/settings/FolderBrowserInput';
+import { Switch } from '@/components/ui/switch';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
 
 const SETTINGS_SECTIONS: { id: string; label: string }[] = [
   { id: 'settings-files-export', label: 'Folders' },
   { id: 'settings-pipeline', label: 'Pipeline' },
   { id: 'settings-ai', label: 'AI' },
   { id: 'settings-providers', label: 'Metadata providers' },
+  { id: 'settings-concerts', label: 'Concerts' },
   { id: 'settings-notifications', label: 'Notifications' },
 ];
 
@@ -92,6 +100,10 @@ function SettingsPage() {
     apiKeySaved?: boolean;
   } | null>(null);
   const [openaiOAuthBusy, setOpenaiOAuthBusy] = useState(false);
+  const [openaiModelsLoading, setOpenaiModelsLoading] = useState(false);
+  const [openaiModels, setOpenaiModels] = useState<string[]>([]);
+  const [openaiModelsError, setOpenaiModelsError] = useState<string | null>(null);
+  const openaiModelsKeyRef = useRef<string>('');
 
   const getApiErrorMessage = (e: unknown): string | null => {
     const bodyMsg = (e as { body?: { message?: unknown } } | null)?.body?.message;
@@ -131,6 +143,35 @@ function SettingsPage() {
   useEffect(() => {
     loadConfig();
   }, []);
+
+  // Fetch the curated list of compatible OpenAI models for the dropdown (avoids manual typing).
+  useEffect(() => {
+    const key = (config.OPENAI_API_KEY || '').trim();
+    // Avoid calling the endpoint on every keystroke while user is typing.
+    if (!key || !key.startsWith('sk-') || key.length < 20) {
+      openaiModelsKeyRef.current = '';
+      setOpenaiModels([]);
+      setOpenaiModelsError(null);
+      setOpenaiModelsLoading(false);
+      return;
+    }
+    if (openaiModelsKeyRef.current === key) return;
+    openaiModelsKeyRef.current = key;
+    setOpenaiModelsLoading(true);
+    setOpenaiModelsError(null);
+    (async () => {
+      try {
+        const models = await api.getOpenAIModels(key);
+        setOpenaiModels(Array.isArray(models) ? models : []);
+      } catch (e: unknown) {
+        const msg = getApiErrorMessage(e) || (e instanceof Error ? e.message : 'Failed to fetch OpenAI models');
+        setOpenaiModels([]);
+        setOpenaiModelsError(msg);
+      } finally {
+        setOpenaiModelsLoading(false);
+      }
+    })();
+  }, [config.OPENAI_API_KEY]);
 
   const loadConfig = async () => {
     setIsLoading(true);
@@ -303,19 +344,14 @@ function SettingsPage() {
 
   if (isLoading) {
     return (
-      <>
-        <Header />
-        <div className="flex items-center justify-center min-h-screen">
-          <Loader2 className="w-8 h-8 animate-spin text-muted-foreground" />
-        </div>
-      </>
+      <div className="flex items-center justify-center min-h-[60vh]">
+        <Loader2 className="w-8 h-8 animate-spin text-muted-foreground" />
+      </div>
     );
   }
 
   return (
-    <>
-      <Header />
-      <div className="container mx-auto p-6 max-w-5xl">
+    <div className="container mx-auto p-6 max-w-5xl">
         <div className="flex items-center justify-between mb-6">
           <div>
             <h1 className="text-3xl font-bold">Settings</h1>
@@ -595,16 +631,50 @@ function SettingsPage() {
                     placeholder="sk-..."
                   />
                 </div>
-                <div className="space-y-2">
-                  <Label>Model (optional)</Label>
-                  <Input
-                    placeholder="gpt-4.1-mini"
-                    value={config.OPENAI_MODEL || ''}
-                    onChange={(e) => updateConfig({ OPENAI_MODEL: e.target.value, AI_PROVIDER: 'openai' })}
-                  />
-                </div>
-              </CardContent>
-            </Card>
+	                <div className="space-y-2">
+	                  <Label>Model (optional)</Label>
+	                  {openaiModelsLoading ? (
+	                    <div className="flex items-center gap-2 text-sm text-muted-foreground py-2">
+	                      <Loader2 className="w-4 h-4 animate-spin" />
+	                      Loading available models...
+	                    </div>
+	                  ) : openaiModels.length > 0 ? (
+	                    (() => {
+	                      const current = (config.OPENAI_MODEL || '').trim();
+	                      const items = current && !openaiModels.includes(current)
+	                        ? [current, ...openaiModels]
+	                        : openaiModels;
+	                      return (
+	                        <Select
+	                          value={current}
+	                          onValueChange={(value) => updateConfig({ OPENAI_MODEL: value, AI_PROVIDER: 'openai' })}
+	                        >
+	                          <SelectTrigger>
+	                            <SelectValue placeholder="Select a model" />
+	                          </SelectTrigger>
+	                          <SelectContent>
+	                            {items.map((m) => (
+	                              <SelectItem key={m} value={m}>
+	                                {m}{m === current && !openaiModels.includes(current) ? ' (custom)' : ''}
+	                              </SelectItem>
+	                            ))}
+	                          </SelectContent>
+	                        </Select>
+	                      );
+	                    })()
+	                  ) : (
+	                    <Input
+	                      placeholder="gpt-5-nano"
+	                      value={config.OPENAI_MODEL || ''}
+	                      onChange={(e) => updateConfig({ OPENAI_MODEL: e.target.value, AI_PROVIDER: 'openai' })}
+	                    />
+	                  )}
+	                  {openaiModelsError && (
+	                    <p className="text-xs text-destructive">{openaiModelsError}</p>
+	                  )}
+	                </div>
+	              </CardContent>
+	            </Card>
 
             <Separator />
 
@@ -664,6 +734,132 @@ function SettingsPage() {
                     onChange={(e) => updateConfig({ LASTFM_API_SECRET: e.target.value })}
                   />
                 </div>
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between gap-3">
+                    <Label htmlFor="fanart-key">Fanart.tv API key (optional)</Label>
+                    <a
+                      href="https://fanart.tv/get-an-api-key/"
+                      target="_blank"
+                      rel="noreferrer"
+                      className="text-xs text-primary inline-flex items-center gap-1 hover:underline"
+                    >
+                      Create API key <ExternalLink className="w-3 h-3" />
+                    </a>
+                  </div>
+                  <PasswordInput
+                    id="fanart-key"
+                    placeholder="Fanart.tv API key"
+                    value={String(config.FANART_API_KEY ?? '')}
+                    onChange={(e) => updateConfig({ FANART_API_KEY: e.target.value })}
+                  />
+                </div>
+              </CardContent>
+            </Card>
+
+            <Separator />
+
+            <Card id="settings-concerts" className="scroll-mt-24">
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2">
+                  <MapPin className="w-5 h-5" />
+                  Concerts
+                </CardTitle>
+                <CardDescription>
+                  Filter upcoming concerts around a custom location (used on artist pages).
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="space-y-1">
+                    <Label>Enable location filter</Label>
+                    <p className="text-xs text-muted-foreground">
+                      When enabled, only concerts within your radius are shown.
+                    </p>
+                  </div>
+                  <Switch
+                    checked={Boolean(config.CONCERTS_FILTER_ENABLED)}
+                    onCheckedChange={(checked) => updateConfig({ CONCERTS_FILTER_ENABLED: Boolean(checked) })}
+                  />
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                  <div className="space-y-1">
+                    <Label htmlFor="concerts-lat">Latitude</Label>
+                    <Input
+                      id="concerts-lat"
+                      inputMode="decimal"
+                      placeholder="50.535"
+                      value={String(config.CONCERTS_HOME_LAT ?? '')}
+                      onChange={(e) => updateConfig({ CONCERTS_HOME_LAT: e.target.value })}
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <Label htmlFor="concerts-lon">Longitude</Label>
+                    <Input
+                      id="concerts-lon"
+                      inputMode="decimal"
+                      placeholder="5.567"
+                      value={String(config.CONCERTS_HOME_LON ?? '')}
+                      onChange={(e) => updateConfig({ CONCERTS_HOME_LON: e.target.value })}
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <Label htmlFor="concerts-radius">Radius (km)</Label>
+                    <Input
+                      id="concerts-radius"
+                      type="number"
+                      min={1}
+                      max={2000}
+                      placeholder="150"
+                      value={String(config.CONCERTS_RADIUS_KM ?? '150')}
+                      onChange={(e) => updateConfig({ CONCERTS_RADIUS_KM: e.target.value })}
+                    />
+                  </div>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="gap-2"
+                    onClick={() => {
+                      if (!navigator?.geolocation?.getCurrentPosition) {
+                        toast.error('Geolocation is not available in this browser.');
+                        return;
+                      }
+                      navigator.geolocation.getCurrentPosition(
+                        (pos) => {
+                          const lat = pos.coords?.latitude;
+                          const lon = pos.coords?.longitude;
+                          if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+                            toast.error('Could not read your location.');
+                            return;
+                          }
+                          updateConfig({
+                            CONCERTS_HOME_LAT: String(lat),
+                            CONCERTS_HOME_LON: String(lon),
+                            CONCERTS_FILTER_ENABLED: true,
+                          });
+                          toast.success('Location saved');
+                        },
+                        () => toast.error('Location permission denied.'),
+                        { enableHighAccuracy: false, maximumAge: 60_000, timeout: 10_000 }
+                      );
+                    }}
+                  >
+                    <MapPin className="w-4 h-4" />
+                    Use my location
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => updateConfig({ CONCERTS_HOME_LAT: '', CONCERTS_HOME_LON: '' })}
+                  >
+                    Clear
+                  </Button>
+                </div>
               </CardContent>
             </Card>
 
@@ -697,8 +893,7 @@ function SettingsPage() {
             </div>
           </div>
         </div>
-      </div>
-    </>
+    </div>
   );
 }
 

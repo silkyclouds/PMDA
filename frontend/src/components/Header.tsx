@@ -1,17 +1,15 @@
 import { useState, useEffect, useRef } from 'react';
-import { Settings, RefreshCw, BarChart2, Library, Scan, Wrench } from 'lucide-react';
+import { Settings, RefreshCw } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { Button } from '@/components/ui/button';
 import { WelcomeModal } from '@/components/WelcomeModal';
 import { ThemeToggle } from '@/components/ThemeToggle';
 import { Progress } from '@/components/ui/progress';
-import { NavLink } from '@/components/NavLink';
 import { GlobalStatusBar } from '@/components/GlobalStatusBar';
-import { MobileNav } from '@/components/MobileNav';
-import { Badge } from '@/components/ui/badge';
 import { Logo } from '@/components/Logo';
 import { GlobalSearch } from '@/components/GlobalSearch';
 import * as api from '@/lib/api';
+import { SidebarTrigger } from '@/components/ui/sidebar';
 
 const WELCOME_COOKIE = 'pmda_welcome_dismissed';
 
@@ -73,7 +71,6 @@ export function Header() {
   const [rebootProgress, setRebootProgress] = useState(0);
   const [isConfigured, setIsConfigured] = useState<boolean | null>(null);
   const [config, setConfig] = useState<api.ConfigResponse | null>(null);
-  const [duplicateCount, setDuplicateCount] = useState(0);
 
   // Check if PMDA is configured and load config (for welcome modal mounts checklist)
   useEffect(() => {
@@ -84,12 +81,6 @@ export function Header() {
       if (!configured && !hasWelcomeCookie()) {
         setShowSettings(true);
       }
-    }).catch(() => {});
-    
-    // Fetch counts for badges
-    api.getDuplicates().then((dupes) => {
-      const list = Array.isArray(dupes) ? dupes : [];
-      setDuplicateCount(list.length);
     }).catch(() => {});
   }, []);
 
@@ -112,56 +103,9 @@ export function Header() {
           <div className="flex items-center justify-between">
             {/* Logo */}
             <div className="flex items-center gap-3">
-              {/* Mobile menu */}
-              <MobileNav 
-                duplicateCount={duplicateCount} 
-                onSettingsClick={handleSettingsClick}
-              />
-              
+              <SidebarTrigger className="h-9 w-9" />
               <Logo size="md" />
             </div>
-
-            {/* Desktop Navigation */}
-            <nav className="hidden lg:flex items-center gap-1">
-              <NavLink 
-                to="/" 
-                className="flex items-center gap-2 px-3 py-2 rounded-md text-sm font-medium text-muted-foreground hover:text-foreground hover:bg-accent transition-colors"
-                activeClassName="text-foreground bg-accent"
-              >
-                <Scan className="w-4 h-4" />
-                <span>Scan</span>
-              </NavLink>
-              <NavLink 
-                to="/library" 
-                className="flex items-center gap-2 px-3 py-2 rounded-md text-sm font-medium text-muted-foreground hover:text-foreground hover:bg-accent transition-colors"
-                activeClassName="text-foreground bg-accent"
-              >
-                <Library className="w-4 h-4" />
-                <span>Library</span>
-              </NavLink>
-              {/* Tag Fixer and Incomplete Albums removed from main nav */}
-              <NavLink 
-                to="/statistics" 
-                className="flex items-center gap-2 px-3 py-2 rounded-md text-sm font-medium text-muted-foreground hover:text-foreground hover:bg-accent transition-colors"
-                activeClassName="text-foreground bg-accent"
-              >
-                <BarChart2 className="w-4 h-4" />
-                <span>Statistics</span>
-              </NavLink>
-              <NavLink 
-                to="/tools" 
-                className="flex items-center gap-2 px-3 py-2 rounded-md text-sm font-medium text-muted-foreground hover:text-foreground hover:bg-accent transition-colors"
-                activeClassName="text-foreground bg-accent"
-              >
-                <Wrench className="w-4 h-4" />
-                <span>Tools</span>
-                {duplicateCount > 0 && (
-                  <Badge variant="outline" className="ml-1 h-5 px-1.5 text-[10px] border-warning text-warning">
-                    {duplicateCount > 99 ? '99+' : duplicateCount}
-                  </Badge>
-                )}
-              </NavLink>
-            </nav>
 
             <GlobalSearch />
 

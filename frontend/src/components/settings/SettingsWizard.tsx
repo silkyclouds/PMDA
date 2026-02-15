@@ -285,12 +285,11 @@ export function SettingsWizard({ onClose, onRebootStart }: SettingsWizardProps) 
                   <div className="p-2 rounded bg-muted/50"><span className="font-medium">Scan threads:</span> {config.SCAN_THREADS ?? 'auto'}</div>
                   <div className="p-2 rounded bg-muted/50"><span className="font-medium">Skip folders:</span> {config.SKIP_FOLDERS || 'None'}</div>
                 </div>
-                <h4 className="font-medium text-foreground">AI</h4>
-                <div className="grid gap-2 pl-2">
-                  <div className="p-2 rounded bg-muted/50"><span className="font-medium">AI Provider:</span> {config.AI_PROVIDER || 'openai'}</div>
-                  <div className="p-2 rounded bg-muted/50"><span className="font-medium">Model:</span> {config.OPENAI_MODEL || 'Not set'}</div>
-                  <div className="p-2 rounded bg-muted/50"><span className="font-medium">Model fallbacks:</span> {config.OPENAI_MODEL_FALLBACKS || 'None'}</div>
-                </div>
+	                <h4 className="font-medium text-foreground">AI</h4>
+	                <div className="grid gap-2 pl-2">
+	                  <div className="p-2 rounded bg-muted/50"><span className="font-medium">AI Provider:</span> {config.AI_PROVIDER || 'openai'}</div>
+	                  <div className="p-2 rounded bg-muted/50"><span className="font-medium">Model:</span> {config.OPENAI_MODEL || 'Not set'}</div>
+	                </div>
                 <h4 className="font-medium text-foreground">Metadata</h4>
                 <div className="grid gap-2 pl-2">
                   <div className="p-2 rounded bg-muted/50"><span className="font-medium">Use MusicBrainz:</span> {config.USE_MUSICBRAINZ ? 'Enabled' : 'Disabled'}</div>

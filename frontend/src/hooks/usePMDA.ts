@@ -16,10 +16,11 @@ type ApiErrorShape = {
   };
 };
 
-export function useDuplicates(options?: { refetchInterval?: number }) {
-  return useQuery({
-    queryKey: ['duplicates'],
-    queryFn: api.getDuplicates,
+export function useDuplicates(options?: { refetchInterval?: number; source?: 'scan' | 'all' }) {
+  const source = options?.source ?? 'scan';
+  return useQuery<DuplicateCard[], Error>({
+    queryKey: ['duplicates', source],
+    queryFn: () => api.getDuplicates({ source }),
     refetchInterval: options?.refetchInterval ?? 10000,
   });
 }
@@ -129,8 +130,12 @@ export function useScanControls() {
     queryClient.invalidateQueries({ queryKey: ['dedupe-progress'] });
   };
 
-  const startMutation = useMutation({
-    mutationFn: (options?: api.StartScanOptions) => api.startScan(options),
+  const startMutation = useMutation<
+    { status: string; scan_type?: string; run_improve_after?: boolean },
+    unknown,
+    api.StartScanOptions | undefined
+  >({
+    mutationFn: (options) => api.startScan(options),
     onSuccess: invalidateQueries,
     onError: (error: unknown) => {
       const err = error && typeof error === 'object' ? (error as ApiErrorShape) : {};
@@ -174,12 +179,18 @@ export function useScanControls() {
     },
   });
 
+  const start = (options?: api.StartScanOptions) => startMutation.mutate(options);
+  const pause = () => pauseMutation.mutate();
+  const resume = () => resumeMutation.mutate();
+  const stop = () => stopMutation.mutate();
+  const clear = (options?: api.ClearScanOptions) => clearMutation.mutate(options ?? {});
+
   return {
-    start: startMutation.mutate,
-    pause: pauseMutation.mutate,
-    resume: resumeMutation.mutate,
-    stop: stopMutation.mutate,
-    clear: clearMutation.mutate,
+    start,
+    pause,
+    resume,
+    stop,
+    clear,
     isStarting: startMutation.isPending,
     isPausing: pauseMutation.isPending,
     isResuming: resumeMutation.isPending,

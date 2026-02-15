@@ -26,6 +26,7 @@ v0.7.5
 """
 
 import base64
+import ast
 import html
 import json
 import os
@@ -42,7 +43,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import NamedTuple, List, Dict, Optional, Tuple
-from urllib.parse import quote_plus
+from urllib.parse import quote, quote_plus
 
 import logging
 import re
@@ -68,7 +69,8 @@ try:
 except ImportError:
     anthropic = None
 try:
-    import google.generativeai as genai
+    # google-generativeai is deprecated; use google-genai (import path: google.genai).
+    from google import genai
 except ImportError:
     genai = None
 
@@ -555,6 +557,10 @@ FILES_CACHE_PREFIX = "pmda:files:v2:"
 PMDA_MEDIA_CACHE_ROOT = (os.getenv("PMDA_MEDIA_CACHE_ROOT", "") or "").strip()
 PMDA_FILES_WATCHER_ENABLED = _parse_bool(os.getenv("PMDA_FILES_WATCHER_ENABLED", "true"))
 PMDA_FILES_WATCHER_LOG_COOLDOWN_SEC = float(os.getenv("PMDA_FILES_WATCHER_LOG_COOLDOWN_SEC", "10") or "10")
+PMDA_AUTO_CHANGED_ONLY_SCAN = _parse_bool(os.getenv("PMDA_AUTO_CHANGED_ONLY_SCAN", "true"))
+PMDA_AUTO_CHANGED_ONLY_SCAN_DEBOUNCE_SEC = float(os.getenv("PMDA_AUTO_CHANGED_ONLY_SCAN_DEBOUNCE_SEC", "60") or "60")
+PMDA_AUTO_CHANGED_ONLY_SCAN_COOLDOWN_SEC = float(os.getenv("PMDA_AUTO_CHANGED_ONLY_SCAN_COOLDOWN_SEC", "300") or "300")
+PMDA_AUTO_CHANGED_ONLY_SCAN_MIN_PENDING = int(os.getenv("PMDA_AUTO_CHANGED_ONLY_SCAN_MIN_PENDING", "1") or "1")
 PMDA_CACHE_TELEMETRY_TTL_SEC = float(os.getenv("PMDA_CACHE_TELEMETRY_TTL_SEC", "15") or "15")
 PMDA_CACHE_TELEMETRY_MAX_WALK_FILES = int(os.getenv("PMDA_CACHE_TELEMETRY_MAX_WALK_FILES", "400000") or "400000")
 PMDA_CACHE_TELEMETRY_MAX_REDIS_SCAN_KEYS = int(os.getenv("PMDA_CACHE_TELEMETRY_MAX_REDIS_SCAN_KEYS", "200000") or "200000")
@@ -741,48 +747,30 @@ try:
             logging.info("%-40s | %-30s | %s", "PLEX_PATH", "PMDA_PATH", "HOST_PATH")
             for plex_path, host_path in merged_map.items():
                 logging.info("%-40s | %-30s | %s", plex_path, host_path, host_path)
-            # Persist PATH_MAP to SQLite (single source of truth)
+            # Persist PATH_MAP to settings.db (single source of truth)
             try:
-                con = sqlite3.connect(str(STATE_DB_FILE), timeout=5)
+                init_settings_db()
+                con = sqlite3.connect(str(SETTINGS_DB_FILE), timeout=5)
                 con.execute("INSERT OR REPLACE INTO settings(key, value) VALUES('PATH_MAP', ?)", (json.dumps(merged_map),))
                 con.commit()
                 con.close()
             except Exception as e:
-                logging.debug("Could not persist PATH_MAP to SQLite at discovery: %s", e)
+                logging.debug("Could not persist PATH_MAP to settings.db at discovery: %s", e)
             logging.info("Auto-generated/updated PATH_MAP from Plex (saved to settings.db)")
 except Exception as e:
     logging.warning("⚠️  Failed to auto‑generate PATH_MAP – %s", e)
     SECTION_IDS = []
     SECTION_NAMES = {}
 
-# Load SECTION_IDS from SQLite if saved (so restart uses last library selection)
-try:
-    state_db_path = CONFIG_DIR / "state.db"
-    if state_db_path.exists():
-        con = sqlite3.connect(str(state_db_path), timeout=5)
-        cur = con.cursor()
-        cur.execute("SELECT value FROM settings WHERE key = ?", ("SECTION_IDS",))
-        row = cur.fetchone()
-        con.close()
-        if row and row[0]:
-            raw = str(row[0]).strip()
-            if raw:
-                if raw.startswith("["):
-                    SECTION_IDS = [int(x) for x in json.loads(raw)]
-                else:
-                    SECTION_IDS = [int(x.strip()) for x in raw.split(",") if x.strip()]
-                logging.info("Loaded SECTION_IDS from SQLite at startup: %s", SECTION_IDS)
-except Exception as e:
-    logging.debug("Could not load SECTION_IDS from SQLite at startup: %s", e)
-
 # (4) Merge with environment variables ----------------------------------------
 ENV_SOURCES: dict[str, str] = {}
 
 def _get(key: str, *, default=None, cast=lambda x: x):
     """Return the merged value and remember where it came from.
-    Priority: SQLite only > default (no env, no config.json).
+    Priority: SQLite > env > default.
     """
     sqlite_val = None
+    sqlite_has_row = False
     try:
         if SETTINGS_DB_FILE.exists():
             con = sqlite3.connect(str(SETTINGS_DB_FILE), timeout=5)
@@ -790,12 +778,13 @@ def _get(key: str, *, default=None, cast=lambda x: x):
             cur.execute("SELECT value FROM settings WHERE key = ?", (key,))
             row = cur.fetchone()
             con.close()
-            if row and row[0]:
+            if row is not None:
+                sqlite_has_row = True
                 sqlite_val = row[0]
     except Exception:
         pass
 
-    if sqlite_val is not None:
+    if sqlite_has_row:
         ENV_SOURCES[key] = "sqlite"
         raw = sqlite_val
         if isinstance(raw, str) and raw.strip() == "" and default is not None:
@@ -817,9 +806,16 @@ def _get(key: str, *, default=None, cast=lambda x: x):
                 ENV_SOURCES[key] = "default"
                 return cast(default)
             return cast(raw)
+    env_val = os.getenv(key)
+    if env_val is not None:
+        raw = env_val
+        if isinstance(raw, str) and raw.strip() == "" and default is not None:
+            ENV_SOURCES[key] = "default"
+            return cast(default)
+        ENV_SOURCES[key] = "env"
+        return cast(raw)
     ENV_SOURCES[key] = "default"
-    raw = default
-    return cast(raw)
+    return cast(default)
 
 
 # Old default that included MusicBrainz IDs (caused all albums to show as "incomplete" if no MB tags)
@@ -1076,14 +1072,14 @@ def _ensure_plex_db_path_resolved() -> str | None:
     resolved = _resolve_plex_db_from_base(base)
     if resolved:
         try:
-            if STATE_DB_FILE.exists():
-                con = sqlite3.connect(str(STATE_DB_FILE), timeout=5)
-                con.execute("INSERT OR REPLACE INTO settings(key, value) VALUES(?, ?)", ("PLEX_DB_PATH", resolved))
-                con.commit()
-                con.close()
-                logging.info("Plex DB discovered at %s (saved to SQLite)", resolved)
+            init_settings_db()
+            con = sqlite3.connect(str(SETTINGS_DB_FILE), timeout=5)
+            con.execute("INSERT OR REPLACE INTO settings(key, value) VALUES(?, ?)", ("PLEX_DB_PATH", resolved))
+            con.commit()
+            con.close()
+            logging.info("Plex DB discovered at %s (saved to settings.db)", resolved)
         except Exception as e:
-            logging.debug("Could not persist PLEX_DB_PATH to SQLite: %s", e)
+            logging.debug("Could not persist PLEX_DB_PATH to settings.db: %s", e)
         return resolved
     return None
 
@@ -1200,6 +1196,10 @@ merged = {
     "AI_CONFIDENCE_MIN": _get("AI_CONFIDENCE_MIN", default=50, cast=lambda x: int(x) if x is not None and str(x).strip().isdigit() else 50),
     "OPENAI_VISION_MODEL": _get("OPENAI_VISION_MODEL", default="", cast=str),
     "USE_AI_VISION_BEFORE_COVER_INJECT": _get("USE_AI_VISION_BEFORE_COVER_INJECT", default=True, cast=_parse_bool),
+    # AI cost controls for MusicBrainz "verify" prompt size.
+    "AI_MB_VERIFY_MAX_CANDIDATES": _get("AI_MB_VERIFY_MAX_CANDIDATES", default=8, cast=lambda x: max(1, min(20, int(x) if x is not None and str(x).strip().isdigit() else 8))),
+    "AI_MB_VERIFY_LOCAL_TRACK_PREVIEW": _get("AI_MB_VERIFY_LOCAL_TRACK_PREVIEW", default=12, cast=lambda x: max(0, min(60, int(x) if x is not None and str(x).strip().isdigit() else 12))),
+    "AI_MB_VERIFY_MB_TRACK_PREVIEW": _get("AI_MB_VERIFY_MB_TRACK_PREVIEW", default=5, cast=lambda x: max(0, min(30, int(x) if x is not None and str(x).strip().isdigit() else 5))),
     "BACKUP_BEFORE_FIX": _get("BACKUP_BEFORE_FIX", default=False, cast=_parse_bool),
     "MAGIC_MODE": _get("MAGIC_MODE", default=False, cast=_parse_bool),
     "IMPROVE_ALL_WORKERS": _get("IMPROVE_ALL_WORKERS", default=1, cast=lambda x: max(1, min(8, int(x) if x is not None and str(x).strip().isdigit() else 1))),
@@ -1219,6 +1219,9 @@ merged = {
     "USE_LASTFM": _get("USE_LASTFM", default=True, cast=_parse_bool),
     "LASTFM_API_KEY": _get("LASTFM_API_KEY", default="", cast=str),
     "LASTFM_API_SECRET": _get("LASTFM_API_SECRET", default="", cast=str),
+    # Extra artist image providers (optional)
+    "FANART_API_KEY": _get("FANART_API_KEY", default="", cast=str),
+    "THEAUDIODB_API_KEY": _get("THEAUDIODB_API_KEY", default="", cast=str),
     "USE_BANDCAMP": _get("USE_BANDCAMP", default=True, cast=_parse_bool),
     # Artist / metadata modes
     "ARTIST_CREDIT_MODE": _get("ARTIST_CREDIT_MODE", default="picard_like_default", cast=str),
@@ -1311,6 +1314,10 @@ USE_AI_VISION_FOR_COVER: bool = bool(merged.get("USE_AI_VISION_FOR_COVER", True)
 AI_CONFIDENCE_MIN: int = int(merged.get("AI_CONFIDENCE_MIN", 50))
 OPENAI_VISION_MODEL: str = str(merged.get("OPENAI_VISION_MODEL", "") or "").strip()
 USE_AI_VISION_BEFORE_COVER_INJECT: bool = bool(merged.get("USE_AI_VISION_BEFORE_COVER_INJECT", True))
+# MusicBrainz AI verify prompt caps (input-token cost control).
+AI_MB_VERIFY_MAX_CANDIDATES: int = int(merged.get("AI_MB_VERIFY_MAX_CANDIDATES", 8) or 8)
+AI_MB_VERIFY_LOCAL_TRACK_PREVIEW: int = int(merged.get("AI_MB_VERIFY_LOCAL_TRACK_PREVIEW", 12) or 12)
+AI_MB_VERIFY_MB_TRACK_PREVIEW: int = int(merged.get("AI_MB_VERIFY_MB_TRACK_PREVIEW", 5) or 5)
 BACKUP_BEFORE_FIX: bool = bool(merged.get("BACKUP_BEFORE_FIX", False))
 MAGIC_MODE: bool = bool(merged.get("MAGIC_MODE", False))
 USE_ACOUSTID: bool = bool(merged.get("USE_ACOUSTID", True))
@@ -1337,6 +1344,8 @@ DISCOGS_USER_TOKEN: str = str(merged.get("DISCOGS_USER_TOKEN", "") or "")
 USE_LASTFM: bool = bool(merged.get("USE_LASTFM", True))
 LASTFM_API_KEY: str = str(merged.get("LASTFM_API_KEY", "") or "")
 LASTFM_API_SECRET: str = str(merged.get("LASTFM_API_SECRET", "") or "")
+FANART_API_KEY: str = str(merged.get("FANART_API_KEY", "") or "")
+THEAUDIODB_API_KEY: str = str(merged.get("THEAUDIODB_API_KEY", "") or "")
 USE_BANDCAMP: bool = bool(merged.get("USE_BANDCAMP", True))
 ARTIST_CREDIT_MODE: str = str(merged.get("ARTIST_CREDIT_MODE", "picard_like_default") or "picard_like_default").strip().lower()
 LIVE_DEDUPE_MODE: str = str(merged.get("LIVE_DEDUPE_MODE", "safe") or "safe").strip().lower()
@@ -1350,7 +1359,6 @@ def _apply_forced_runtime_defaults():
     global USE_WEB_SEARCH_FOR_MB, USE_ACOUSTID, USE_ACOUSTID_WHEN_TAGGED
     global USE_DISCOGS, USE_LASTFM, USE_BANDCAMP
     global SKIP_MB_FOR_LIVE_ALBUMS, TRACKLIST_MATCH_MIN, ARTIST_CREDIT_MODE
-    global MB_SEARCH_ALBUM_TIMEOUT_SEC, MB_CANDIDATE_FETCH_LIMIT, MB_TRACKLIST_FETCH_LIMIT, MB_FAST_FALLBACK_MODE
 
     LIBRARY_MODE = "files"
     merged["LIBRARY_MODE"] = "files"
@@ -1375,16 +1383,9 @@ def _apply_forced_runtime_defaults():
     TRACKLIST_MATCH_MIN = 0.9
     ARTIST_CREDIT_MODE = "picard_like_default"
     merged["ARTIST_CREDIT_MODE"] = ARTIST_CREDIT_MODE
-    # Keep scans fast on large libraries; strict provider fallbacks cover the hard cases.
-    MB_SEARCH_ALBUM_TIMEOUT_SEC = 12
-    MB_CANDIDATE_FETCH_LIMIT = 4
-    # Recording-level tracklist fetch is expensive; keep it minimal by default.
-    MB_TRACKLIST_FETCH_LIMIT = 1
-    MB_FAST_FALLBACK_MODE = True
-    merged["MB_SEARCH_ALBUM_TIMEOUT_SEC"] = MB_SEARCH_ALBUM_TIMEOUT_SEC
-    merged["MB_CANDIDATE_FETCH_LIMIT"] = MB_CANDIDATE_FETCH_LIMIT
-    merged["MB_TRACKLIST_FETCH_LIMIT"] = MB_TRACKLIST_FETCH_LIMIT
-    merged["MB_FAST_FALLBACK_MODE"] = MB_FAST_FALLBACK_MODE
+    # MusicBrainz tuning is intentionally *not* forced here: the user may set
+    # MB_SEARCH_ALBUM_TIMEOUT_SEC / MB_CANDIDATE_FETCH_LIMIT / MB_TRACKLIST_FETCH_LIMIT
+    # from Settings (SQLite) and scans should respect those values.
 
 
 _apply_forced_runtime_defaults()
@@ -1558,6 +1559,7 @@ if _level_num == logging.DEBUG:
 
 openai_client = None
 anthropic_client = None
+google_client = None
 google_client_configured = False
 ollama_url = None
 ai_provider_ready = False
@@ -1589,7 +1591,7 @@ elif AI_PROVIDER.lower() == "anthropic":
 elif AI_PROVIDER.lower() == "google":
     if GOOGLE_API_KEY and genai:
         try:
-            genai.configure(api_key=GOOGLE_API_KEY)
+            google_client = genai.Client(api_key=GOOGLE_API_KEY)
             google_client_configured = True
             ai_provider_ready = True
             logging.info("Google Gemini client configured")
@@ -1597,7 +1599,7 @@ elif AI_PROVIDER.lower() == "google":
             logging.warning("Google client configuration failed: %s", e)
     else:
         if not genai:
-            logging.warning("Google Generative AI SDK not installed. Install with: pip install google-generativeai")
+            logging.warning("Google GenAI SDK not installed. Install with: pip install google-genai")
         else:
             logging.info("No GOOGLE_API_KEY provided; AI-driven selection disabled.")
 elif AI_PROVIDER.lower() == "ollama":
@@ -1621,7 +1623,7 @@ else:
 
 def _reinit_ai_from_globals():
     """Re-initialize AI clients from current module globals (after settings save). No restart needed."""
-    global openai_client, anthropic_client, google_client_configured, ollama_url, ai_provider_ready
+    global openai_client, anthropic_client, google_client, google_client_configured, ollama_url, ai_provider_ready
     global RESOLVED_MODEL, RESOLVED_PARAM_STYLE, RESOLVED_STOP_OK, AI_FUNCTIONAL_ERROR_MSG
     mod = sys.modules[__name__]
     provider = (getattr(mod, "AI_PROVIDER", "") or "openai").strip().lower()
@@ -1631,10 +1633,10 @@ def _reinit_ai_from_globals():
     ollama_u = (getattr(mod, "OLLAMA_URL", "") or "").strip().rstrip("/")
     openai_model = getattr(mod, "OPENAI_MODEL", "gpt-4") or "gpt-4"
     _merged = getattr(mod, "merged", None) or {}
-    user_fallbacks = [m.strip() for m in (_merged.get("OPENAI_MODEL_FALLBACKS") or "").split(",") if m and m.strip()]
 
     openai_client = None
     anthropic_client = None
+    google_client = None
     google_client_configured = False
     ollama_url = None
     ai_provider_ready = False
@@ -1649,36 +1651,20 @@ def _reinit_ai_from_globals():
             except Exception as e:
                 logging.warning("OpenAI client re-init failed: %s", e)
         if openai_client:
-            compatible_set = set(getattr(mod, "OPENAI_COMPATIBLE_MODELS", []))
-            reinit_candidates = []
-            for ladder in getattr(mod, "MODEL_LADDERS", []):
-                if openai_model in ladder:
-                    start = ladder.index(openai_model)
-                    reinit_candidates.extend(ladder[start:])
-                    break
-            if not reinit_candidates and openai_model and openai_model in compatible_set:
-                reinit_candidates = [openai_model]
-            for m in user_fallbacks:
-                if m and m not in reinit_candidates and m in compatible_set:
-                    reinit_candidates.append(m)
-            for m in ("gpt-4o-mini",):
-                if m not in reinit_candidates:
-                    reinit_candidates.append(m)
-            for cand in reinit_candidates:
-                style = _probe_model(cand)
-                if not style:
-                    continue
-                if not _probe_ai_choose_best_response(cand):
-                    logging.warning("OpenAI model '%s' failed functional probe (empty or unparseable choose_best response); trying next candidate", cand)
-                    continue
+            # One model only: probe the configured model to learn token param style and
+            # ensure we get parseable output for PMDA. We do not auto-fallback to other models.
+            cand = (openai_model or "").strip() or "gpt-4o-mini"
+            style = _probe_model(cand)
+            if style and _probe_ai_choose_best_response(cand):
                 RESOLVED_MODEL = cand
                 RESOLVED_PARAM_STYLE = style
                 AI_FUNCTIONAL_ERROR_MSG = None
-                if RESOLVED_MODEL != openai_model:
-                    logging.warning("OPENAI_MODEL '%s' unavailable or unsuitable; falling back to '%s' (%s, stop_ok=%s)", openai_model, RESOLVED_MODEL, RESOLVED_PARAM_STYLE, RESOLVED_STOP_OK)
-                else:
-                    logging.info("Using requested OpenAI model '%s' (%s, stop_ok=%s)", RESOLVED_MODEL, RESOLVED_PARAM_STYLE, RESOLVED_STOP_OK)
-                break
+                logging.info(
+                    "Using OpenAI model '%s' (%s, stop_ok=%s)",
+                    RESOLVED_MODEL,
+                    RESOLVED_PARAM_STYLE,
+                    RESOLVED_STOP_OK,
+                )
             else:
                 ai_provider_ready = False
                 if getattr(sys.modules[__name__], "OPENAI_LAST_PROBE_401", False):
@@ -1687,17 +1673,16 @@ def _reinit_ai_from_globals():
                         "Check your key in Settings → AI and try again."
                     )
                 else:
-                    tried = ", ".join(reinit_candidates[:5])
-                    if len(reinit_candidates) > 5:
-                        tried += ", ..."
+                    probe_detail = (getattr(sys.modules[__name__], "OPENAI_MODEL_PROBE_LAST_ERROR", "") or "").strip()
+                    detail_suffix = f" Reason: {probe_detail}" if probe_detail else ""
                     AI_FUNCTIONAL_ERROR_MSG = (
-                        f"No OpenAI model returned a valid edition-choice response (tried: {tried}). "
-                        "Models that return empty or unparseable output are rejected. Use a working model (e.g. gpt-4o-mini) in Settings."
+                        f"AI disabled: OpenAI model '{cand}' failed PMDA preflight (unsupported params or empty/unparseable output)."
+                        f"{detail_suffix}"
                     )
-                RESOLVED_MODEL = openai_model
+                RESOLVED_MODEL = cand
                 RESOLVED_PARAM_STYLE = "mct"
                 RESOLVED_STOP_OK = True
-                logging.warning("OpenAI model probe failed for all candidates; AI disabled. %s", AI_FUNCTIONAL_ERROR_MSG)
+                logging.warning("OpenAI model probe failed; AI disabled. %s", AI_FUNCTIONAL_ERROR_MSG)
         else:
             logging.info("No OPENAI_API_KEY; AI-driven selection disabled.")
     elif provider == "anthropic":
@@ -1713,7 +1698,7 @@ def _reinit_ai_from_globals():
     elif provider == "google":
         if google_key and genai:
             try:
-                genai.configure(api_key=google_key)
+                google_client = genai.Client(api_key=google_key)
                 google_client_configured = True
                 ai_provider_ready = True
                 logging.info("Google Gemini client re-initialized (settings applied)")
@@ -1740,13 +1725,18 @@ def _reinit_ai_from_globals():
 
 
 def _reload_ai_config_and_reinit():
-    """Load AI config from DB and run _reinit_ai_from_globals(). Used at scan start and preflight."""
+    """Reload AI config from settings.db and run _reinit_ai_from_globals().
+
+    Used at scan start and provider preflight. This must read from SETTINGS_DB_FILE
+    (single source of truth for configuration), not STATE_DB_FILE (scan data DB).
+    """
     mod = sys.modules[__name__]
-    ai_config_keys = ("AI_PROVIDER", "OPENAI_API_KEY", "OPENAI_MODEL", "OPENAI_MODEL_FALLBACKS",
+    ai_config_keys = ("AI_PROVIDER", "OPENAI_API_KEY", "OPENAI_MODEL",
                       "ANTHROPIC_API_KEY", "GOOGLE_API_KEY", "OLLAMA_URL")
     try:
-        if STATE_DB_FILE.exists():
-            con = sqlite3.connect(str(STATE_DB_FILE), timeout=5)
+        db_path = SETTINGS_DB_FILE
+        if db_path.exists():
+            con = sqlite3.connect(str(db_path), timeout=5)
             cur = con.cursor()
             placeholders = ",".join("?" for _ in ai_config_keys)
             cur.execute(
@@ -1771,6 +1761,8 @@ RESOLVED_STOP_OK = True
 AI_FUNCTIONAL_ERROR_MSG = None
 # Set by _probe_model when last failure was 401 so we can show a clear message.
 OPENAI_LAST_PROBE_401 = False
+# Best-effort error detail captured during OpenAI model probe so the UI can show an actionable reason.
+OPENAI_MODEL_PROBE_LAST_ERROR = ""
 
 def _probe_model(model_name: str) -> str | None:
     """Return param style ("mct" or "mt") if a 1-line ping works, else None.
@@ -1778,10 +1770,42 @@ def _probe_model(model_name: str) -> str | None:
     If both fail with unsupported_parameter, retries without stop (some models do not accept stop).
     Sets global RESOLVED_STOP_OK to False when the model only works without stop.
     """
-    global RESOLVED_STOP_OK, OPENAI_LAST_PROBE_401
+    global RESOLVED_STOP_OK, OPENAI_LAST_PROBE_401, AI_FUNCTIONAL_ERROR_MSG
+    global OPENAI_MODEL_PROBE_LAST_ERROR
     OPENAI_LAST_PROBE_401 = False
+    OPENAI_MODEL_PROBE_LAST_ERROR = ""
     if not (OPENAI_API_KEY and openai_client):
         return None
+    # GPT-5 family models are known to reject some Chat Completions params (notably "stop"),
+    # and can spend short completion budgets entirely on reasoning, producing empty text.
+    # Probe them with a larger completion budget and without stop, and require a visible "PONG".
+    try:
+        mlow = (model_name or "").strip().lower()
+    except Exception:
+        mlow = ""
+    if mlow.startswith("gpt-5"):
+        try:
+            resp = openai_client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {"role": "system", "content": "Reply with exactly: PONG"},
+                    {"role": "user", "content": "ping"},
+                ],
+                max_completion_tokens=96,
+            )
+            txt = (resp.choices[0].message.content or "").strip() if resp and resp.choices else ""
+            if txt.upper().startswith("PONG"):
+                RESOLVED_STOP_OK = False
+                return "mct"
+            OPENAI_MODEL_PROBE_LAST_ERROR = "Probe returned empty/unexpected output for a strict 'PONG' ping"
+            return None
+        except Exception as e:
+            msg = str(e)
+            OPENAI_MODEL_PROBE_LAST_ERROR = msg[:240]
+            if "401" in msg or "unauthorized" in msg.lower():
+                OPENAI_LAST_PROBE_401 = True
+            logging.debug("Model probe (gpt-5 no-stop) failed for %s: %s", model_name, msg)
+            return None
     # Try with max_completion_tokens + stop
     try:
         openai_client.chat.completions.create(
@@ -1796,6 +1820,7 @@ def _probe_model(model_name: str) -> str | None:
         msg = str(e)
         if "401" in msg or "unauthorized" in msg.lower():
             OPENAI_LAST_PROBE_401 = True
+        OPENAI_MODEL_PROBE_LAST_ERROR = msg[:240]
         logging.debug("Model probe (mct+stop) failed for %s: %s", model_name, msg)
     # Try legacy max_tokens + stop
     try:
@@ -1811,9 +1836,19 @@ def _probe_model(model_name: str) -> str | None:
         msg2 = str(e2)
         if "401" in msg2 or "unauthorized" in msg2.lower():
             OPENAI_LAST_PROBE_401 = True
+        OPENAI_MODEL_PROBE_LAST_ERROR = msg2[:240]
         logging.debug("Model probe (mt+stop) failed for %s: %s", model_name, msg2)
     # If both failed with unsupported_parameter, try without stop (some reasoning models reject stop)
-    if "unsupported_parameter" not in msg.lower() and "unsupported_parameter" not in msg2.lower():
+    low_msg = (msg or "").lower()
+    low_msg2 = (msg2 or "").lower()
+    unsupported = (
+        ("unsupported_parameter" in low_msg) or ("unsupported_parameter" in low_msg2)
+        or ("unsupported" in low_msg and "parameter" in low_msg)
+        or ("unsupported" in low_msg2 and "parameter" in low_msg2)
+        or ("stop" in low_msg and "unsupported" in low_msg)
+        or ("stop" in low_msg2 and "unsupported" in low_msg2)
+    )
+    if not unsupported:
         return None
     try:
         openai_client.chat.completions.create(
@@ -1851,6 +1886,13 @@ def call_ai_provider(provider: str, model: str, system_msg: str, user_msg: str, 
     if provider_lower == "openai":
         if not openai_client:
             raise ValueError("OpenAI client not initialized")
+        # GPT-5 family models may spend a small completion budget entirely on reasoning
+        # and return empty text. Enforce a sane minimum for PMDA's short-format outputs.
+        try:
+            if (model or "").strip().lower().startswith("gpt-5") and int(max_tokens or 0) < 128:
+                max_tokens = 128
+        except Exception:
+            pass
         param_style = getattr(sys.modules[__name__], "RESOLVED_PARAM_STYLE", "mct")
         stop_ok = getattr(sys.modules[__name__], "RESOLVED_STOP_OK", True)
         _kwargs = {
@@ -1860,7 +1902,11 @@ def call_ai_provider(provider: str, model: str, system_msg: str, user_msg: str, 
                 {"role": "user", "content": user_msg},
             ],
         }
-        if stop_ok:
+        try:
+            is_gpt5 = (model or "").strip().lower().startswith("gpt-5")
+        except Exception:
+            is_gpt5 = False
+        if stop_ok and not is_gpt5:
             _kwargs["stop"] = ["\n"]
         if param_style == "mct":
             _kwargs["max_completion_tokens"] = max_tokens
@@ -1868,7 +1914,16 @@ def call_ai_provider(provider: str, model: str, system_msg: str, user_msg: str, 
             _kwargs["max_tokens"] = max_tokens
         try:
             resp = openai_client.chat.completions.create(**_kwargs)
-            return (resp.choices[0].message.content or "").strip()
+            out = (resp.choices[0].message.content or "").strip()
+            if not out and is_gpt5 and int(max_tokens or 0) < 256:
+                # One retry with a larger budget for GPT-5 family models.
+                _kwargs_retry = dict(_kwargs)
+                _kwargs_retry.pop("stop", None)
+                _kwargs_retry.pop("max_tokens", None)
+                _kwargs_retry["max_completion_tokens"] = 256
+                resp2 = openai_client.chat.completions.create(**_kwargs_retry)
+                out = (resp2.choices[0].message.content or "").strip()
+            return out
         except Exception as e:
             err_msg = str(e).lower()
             # On 400 unsupported parameter, retry with the other param or without stop
@@ -1892,6 +1947,11 @@ def call_ai_provider(provider: str, model: str, system_msg: str, user_msg: str, 
                     raise e
             if "stop" in err_msg or "unsupported" in err_msg:
                 _kwargs.pop("stop", None)
+                # Persist: this model doesn't accept stop.
+                try:
+                    sys.modules[__name__].RESOLVED_STOP_OK = False
+                except Exception:
+                    pass
                 try:
                     resp = openai_client.chat.completions.create(**_kwargs)
                     return (resp.choices[0].message.content or "").strip()
@@ -1911,18 +1971,18 @@ def call_ai_provider(provider: str, model: str, system_msg: str, user_msg: str, 
         return resp.content[0].text.strip()
 
     elif provider_lower == "google":
-        if not google_client_configured:
+        if not google_client_configured or not google_client:
             raise ValueError("Google client not configured")
-        model_instance = genai.GenerativeModel(model)
-        prompt = f"{system_msg}\n\n{user_msg}"
-        response = model_instance.generate_content(
-            prompt,
-            generation_config=genai.types.GenerationConfig(
-                max_output_tokens=max_tokens,
-                stop_sequences=["\n"],
+        response = google_client.models.generate_content(
+            model=model,
+            contents=(user_msg or ""),
+            config=genai.types.GenerateContentConfig(
+                systemInstruction=(system_msg or ""),
+                maxOutputTokens=max_tokens,
+                stopSequences=["\n"],
             ),
         )
-        return response.text.strip()
+        return (getattr(response, "text", "") or "").strip()
 
     elif provider_lower == "ollama":
         if not ollama_url:
@@ -2038,24 +2098,28 @@ def ai_verify_mb_match(
         return (None, None)
     if not candidates:
         return (None, None)
+    # Keep prompts bounded: MB search can return many candidates and full tracklists are token-expensive.
+    # These caps dramatically reduce input tokens while preserving enough signal for disambiguation.
+    max_candidates = int(getattr(sys.modules[__name__], "AI_MB_VERIFY_MAX_CANDIDATES", 8) or 8)
+    max_local_tracks = int(getattr(sys.modules[__name__], "AI_MB_VERIFY_LOCAL_TRACK_PREVIEW", 12) or 12)
+    max_mb_tracks = int(getattr(sys.modules[__name__], "AI_MB_VERIFY_MB_TRACK_PREVIEW", 5) or 5)
     letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
     choices = []
-    for i, (rg, result_dict) in enumerate(candidates[:20]):
+    for i, (rg, result_dict) in enumerate(candidates[:max_candidates]):
         tc = result_dict.get("track_count", "?")
         line = f"{letters[i]}: {rg.get('title', 'Unknown')} (id={rg.get('id', '')}, {tc} tracks)"
         mb_tracks = result_dict.get("track_titles")
         if mb_tracks:
-            track_preview = ", ".join(mb_tracks[:15]) + ("..." if len(mb_tracks) > 15 else "")
+            track_preview = ", ".join(mb_tracks[:max_mb_tracks]) + ("..." if len(mb_tracks) > max_mb_tracks else "")
             line += f" — tracks: [{track_preview}]"
         choices.append(line)
-    track_list_str = ", ".join((track_titles or [])[:30]) if track_titles else "(none)"
-    if track_titles and len(track_titles) > 30:
+    track_list_str = ", ".join((track_titles or [])[:max_local_tracks]) if track_titles else "(none)"
+    if track_titles and len(track_titles) > max_local_tracks:
         track_list_str += ", ..."
     user_msg = (
-        f"Our album: artist={artist!r}, title_raw={title_raw or title_norm!r}, normalized={title_norm!r}, "
-        f"track_count={track_count}, track_titles=[{track_list_str}]. "
-        f"Cover present: {has_cover}.\n\n"
-        "MusicBrainz candidates:\n" + "\n".join(choices)
+        f"Album: artist={artist!r}; title={title_raw or title_norm!r}; norm={title_norm!r}; "
+        f"tracks={track_count}; local_tracks=[{track_list_str}]; cover={has_cover}.\n"
+        "Candidates:\n" + "\n".join(choices)
     )
     if extra_sources:
         other_lines = []
@@ -2070,7 +2134,7 @@ def ai_verify_mb_match(
         "Reply with only the letter (A, B, ...) or NONE if no candidate matches. "
         "Optionally end with (confidence: N) where N is 0-100."
     )
-    system_msg = "You reply with a single letter (A, B, C, ...) or the word NONE. Optionally end with (confidence: N). No other explanation."
+    system_msg = "Reply with only: a single letter (A, B, C, ...) or NONE. Optionally add (confidence: N)."
     try:
         model = getattr(sys.modules[__name__], "RESOLVED_MODEL", None) or getattr(sys.modules[__name__], "OPENAI_MODEL", "gpt-4")
         provider = getattr(sys.modules[__name__], "AI_PROVIDER", "openai")
@@ -2120,6 +2184,10 @@ def _probe_ai_choose_best_response(model_name: str) -> bool:
         txt = call_ai_provider(AI_PROVIDER, model_name, system_msg, user_msg, max_tokens=256)
         if not txt:
             logging.debug("Functional probe: model %s returned empty response", model_name)
+            try:
+                sys.modules[__name__].OPENAI_MODEL_PROBE_LAST_ERROR = "Functional probe returned empty output for choose_best"
+            except Exception:
+                pass
             return False
         lines = [l.strip() for l in txt.replace("```", "").splitlines() if l.strip()]
         txt = lines[0] if lines else txt
@@ -2131,18 +2199,26 @@ def _probe_ai_choose_best_response(model_name: str) -> bool:
                 logging.debug("Functional probe: model %s returned parseable response (index=%s)", model_name, idx)
                 return True
         logging.debug("Functional probe: model %s response not parseable: %r", model_name, txt[:80])
+        try:
+            sys.modules[__name__].OPENAI_MODEL_PROBE_LAST_ERROR = f"Functional probe output not parseable: {txt[:120]!r}"
+        except Exception:
+            pass
         return False
     except Exception as e:
         logging.debug("Functional probe failed for %s: %s", model_name, e)
+        try:
+            sys.modules[__name__].OPENAI_MODEL_PROBE_LAST_ERROR = f"Functional probe exception: {str(e)[:180]}"
+        except Exception:
+            pass
         return False
 
 
-# User-provided explicit fallbacks override everything (comma-separated) (from SQLite only)
-_user_fallbacks = [m.strip() for m in (merged.get("OPENAI_MODEL_FALLBACKS") or "").split(",") if m.strip()]
-
 # Curated list of OpenAI Chat Completions models known to work with PMDA (parseable index|rationale|extras).
-# Excludes models that return empty or use different API (e.g. gpt-5-nano). Only these are shown in Settings.
+# Only these are shown in Settings. (We probe the model at runtime to verify token params + output format.)
 OPENAI_COMPATIBLE_MODELS = [
+    "gpt-5",
+    "gpt-5-mini",
+    "gpt-5-nano",
     "gpt-4o-mini",
     "gpt-4o",
     "gpt-4.1",
@@ -2153,55 +2229,24 @@ OPENAI_COMPATIBLE_MODELS = [
     "gpt-3.5-turbo",
 ]
 
-# Price ladders (cheapest → most expensive) – only models from OPENAI_COMPATIBLE_MODELS (no gpt-5-nano etc.)
-MODEL_LADDERS = [
-    ["gpt-4.1-nano", "gpt-4.1-mini", "gpt-4.1"],
-    ["gpt-4o-mini", "gpt-4o"],
-    ["gpt-4-turbo", "gpt-4"],
-    ["gpt-3.5-turbo"],
-]
-
-# Build candidate list: requested → next tiers upward in its ladder → user fallbacks (only if compatible) → safe default
-candidates: list[str] = []
-compatible_set = set(OPENAI_COMPATIBLE_MODELS)
-found = False
-for ladder in MODEL_LADDERS:
-    if OPENAI_MODEL in ladder:
-        found = True
-        start = ladder.index(OPENAI_MODEL)
-        candidates.extend(ladder[start:])
-        break
-if not found and OPENAI_MODEL and OPENAI_MODEL in compatible_set:
-    candidates.append(OPENAI_MODEL)
-for m in _user_fallbacks:
-    if m not in candidates and m in compatible_set:
-        candidates.append(m)
-for m in ("gpt-4o-mini",):
-    if m not in candidates:
-        candidates.append(m)
-
-for cand in candidates:
-    style = _probe_model(cand)
-    if style and _probe_ai_choose_best_response(cand):
-        RESOLVED_MODEL = cand
-        RESOLVED_PARAM_STYLE = style
-        if RESOLVED_MODEL != OPENAI_MODEL:
-            logging.warning("OPENAI_MODEL '%s' unavailable or unsuitable; falling back to '%s' (%s)", OPENAI_MODEL, RESOLVED_MODEL, RESOLVED_PARAM_STYLE)
-        else:
-            logging.info("Using requested OpenAI model '%s' (%s)", RESOLVED_MODEL, RESOLVED_PARAM_STYLE)
-        break
+# Probe the configured OpenAI model (no fallbacks). If it fails, AI is disabled and the UI
+# will show a clear error. This keeps configuration simple: one model applies everywhere.
+_startup_model = (OPENAI_MODEL or "").strip() or "gpt-4o-mini"
+style = _probe_model(_startup_model)
+if style and _probe_ai_choose_best_response(_startup_model):
+    RESOLVED_MODEL = _startup_model
+    RESOLVED_PARAM_STYLE = style
+    logging.info("Using requested OpenAI model '%s' (%s)", RESOLVED_MODEL, RESOLVED_PARAM_STYLE)
 else:
-    # No candidate passed both param probe and functional (choose_best) probe
-    if openai_client and candidates:
+    if openai_client:
         ai_provider_ready = False
-        tried = ", ".join(candidates[:5])
-        if len(candidates) > 5:
-            tried += ", ..."
+        _detail = (getattr(sys.modules[__name__], "OPENAI_MODEL_PROBE_LAST_ERROR", "") or "").strip()
+        _suffix = f" Reason: {_detail}" if _detail else ""
         AI_FUNCTIONAL_ERROR_MSG = (
-            f"No OpenAI model returned a valid edition-choice response (tried: {tried}). "
-            "Use a working model (e.g. gpt-4o-mini) in Settings."
+            f"AI disabled: OpenAI model '{_startup_model}' failed PMDA preflight (unsupported params or empty/unparseable output)."
+            f"{_suffix}"
         )
-        logging.warning("OpenAI: all candidates failed functional probe; AI disabled. %s", AI_FUNCTIONAL_ERROR_MSG)
+        logging.warning("OpenAI: model probe failed; AI disabled. %s", AI_FUNCTIONAL_ERROR_MSG)
 
 # (10) Validate Plex connection ------------------------------------------------
 # (10) Validate Plex connection ------------------------------------------------
@@ -2931,6 +2976,8 @@ def init_state_db():
         cur.execute("ALTER TABLE duplicates_best ADD COLUMN ai_provider TEXT")
     if "ai_model" not in cols:
         cur.execute("ALTER TABLE duplicates_best ADD COLUMN ai_model TEXT")
+    if "evidence_json" not in cols:
+        cur.execute("ALTER TABLE duplicates_best ADD COLUMN evidence_json TEXT")
     if "size_mb" not in cols:
         cur.execute("ALTER TABLE duplicates_best ADD COLUMN size_mb INTEGER")
     if "track_count" not in cols:
@@ -2995,6 +3042,80 @@ def init_state_db():
     loser_cols = {r[1] for r in cur.fetchall()}
     if "loser_album_id" not in loser_cols:
         cur.execute("ALTER TABLE duplicates_loser ADD COLUMN loser_album_id INTEGER")
+
+    # AI cache for dupe selection decisions across scans.
+    # This is separate from duplicates_best (scan results) because duplicates_best is cleared on each scan.
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS dupe_ai_cache (
+            artist      TEXT NOT NULL,
+            group_key   TEXT NOT NULL,
+            best_folder TEXT,
+            rationale   TEXT,
+            merge_list  TEXT,
+            ai_provider TEXT,
+            ai_model    TEXT,
+            confidence  INTEGER,
+            created_at  REAL,
+            updated_at  REAL,
+            PRIMARY KEY (artist, group_key)
+        )
+        """
+    )
+    cur.execute("PRAGMA table_info(dupe_ai_cache)")
+    dupe_ai_cols = {r[1] for r in cur.fetchall()}
+    for col, col_type in (
+        ("best_folder", "TEXT"),
+        ("rationale", "TEXT"),
+        ("merge_list", "TEXT"),
+        ("ai_provider", "TEXT"),
+        ("ai_model", "TEXT"),
+        ("confidence", "INTEGER"),
+        ("created_at", "REAL"),
+        ("updated_at", "REAL"),
+    ):
+        if col not in dupe_ai_cols:
+            try:
+                cur.execute(f"ALTER TABLE dupe_ai_cache ADD COLUMN {col} {col_type}")
+            except sqlite3.OperationalError:
+                pass
+    try:
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_dupe_ai_cache_artist ON dupe_ai_cache(artist)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_dupe_ai_cache_updated ON dupe_ai_cache(updated_at DESC)")
+    except sqlite3.OperationalError:
+        pass
+
+    # User feedback loop for duplicates detection (pairs labeled as "dupe" or "not_dupe").
+    # Stored by folder paths (stable across Files scans where album_id is run-local).
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS dupe_feedback_pairs (
+            artist     TEXT NOT NULL,
+            folder_a   TEXT NOT NULL,
+            folder_b   TEXT NOT NULL,
+            label      TEXT NOT NULL,
+            updated_at REAL,
+            note       TEXT,
+            PRIMARY KEY (artist, folder_a, folder_b)
+        )
+        """
+    )
+    cur.execute("PRAGMA table_info(dupe_feedback_pairs)")
+    dupe_fb_cols = {r[1] for r in cur.fetchall()}
+    for col, col_type in (
+        ("updated_at", "REAL"),
+        ("note", "TEXT"),
+    ):
+        if col not in dupe_fb_cols:
+            try:
+                cur.execute(f"ALTER TABLE dupe_feedback_pairs ADD COLUMN {col} {col_type}")
+            except sqlite3.OperationalError:
+                pass
+    try:
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_dupe_feedback_pairs_artist ON dupe_feedback_pairs(artist)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_dupe_feedback_pairs_updated ON dupe_feedback_pairs(updated_at DESC)")
+    except sqlite3.OperationalError:
+        pass
     # Table for stats like space_saved and removed_dupes
     cur.execute("""
         CREATE TABLE IF NOT EXISTS stats (
@@ -3219,6 +3340,7 @@ def init_state_db():
             year INTEGER,
             date_text TEXT,
             genre TEXT,
+            label TEXT,
             tags_json TEXT NOT NULL DEFAULT '[]',
             format TEXT,
             is_lossless INTEGER NOT NULL DEFAULT 0,
@@ -3272,6 +3394,7 @@ def init_state_db():
         ("year", "INTEGER"),
         ("date_text", "TEXT"),
         ("genre", "TEXT"),
+        ("label", "TEXT"),
         ("tags_json", "TEXT NOT NULL DEFAULT '[]'"),
         ("format", "TEXT"),
         ("is_lossless", "INTEGER NOT NULL DEFAULT 0"),
@@ -3679,7 +3802,7 @@ def _files_pg_dsn() -> str:
     )
 
 
-def _files_pg_connect(*, autocommit: bool = False):
+def _files_pg_connect(*, autocommit: bool = True):
     if psycopg is None:
         return None
     try:
@@ -3733,6 +3856,7 @@ def _files_pg_init_schema() -> bool:
                     year INTEGER,
                     date_text TEXT,
                     genre TEXT,
+                    label TEXT,
                     tags_json TEXT NOT NULL DEFAULT '[]',
                     format TEXT,
                     is_lossless BOOLEAN NOT NULL DEFAULT FALSE,
@@ -3758,6 +3882,7 @@ def _files_pg_init_schema() -> bool:
             """)
             # Backward-compatible schema evolution for files_albums.
             for col_name, col_sql in [
+                ("label", "TEXT"),
                 ("discogs_release_id", "TEXT"),
                 ("lastfm_album_mbid", "TEXT"),
                 ("bandcamp_album_url", "TEXT"),
@@ -3817,6 +3942,17 @@ def _files_pg_init_schema() -> bool:
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
             """)
+            # User listening telemetry (single-user install). This powers listening statistics charts.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS files_playback_events (
+                    id BIGSERIAL PRIMARY KEY,
+                    user_id INTEGER NOT NULL DEFAULT 1,
+                    track_id BIGINT NOT NULL REFERENCES files_tracks(id) ON DELETE CASCADE,
+                    event_type TEXT NOT NULL,
+                    played_seconds INTEGER NOT NULL DEFAULT 0,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS files_reco_sessions (
                     session_id TEXT PRIMARY KEY,
@@ -3850,25 +3986,184 @@ def _files_pg_init_schema() -> bool:
                     PRIMARY KEY (artist_norm, title_norm)
                 )
             """)
+            # Cached artist images that do not live on disk next to audio files.
+            # This allows us to persist external artwork across index rebuilds and
+            # to show images for "similar artists" even when they are not in the
+            # local library.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS files_external_artist_images (
+                    name_norm TEXT PRIMARY KEY,
+                    artist_name TEXT NOT NULL,
+                    provider TEXT NOT NULL DEFAULT 'lastfm',
+                    image_path TEXT,
+                    image_url TEXT,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_files_external_artist_images_updated_at ON files_external_artist_images(updated_at DESC)")
+            # ───────────────────── Playlists (Files mode) ─────────────────────
+            # Lightweight local playlists stored in PostgreSQL so they are fast and
+            # available to both UI and assistant logic. Items are ordered via `position`.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS files_playlists (
+                    id BIGSERIAL PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    description TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS files_playlist_items (
+                    id BIGSERIAL PRIMARY KEY,
+                    playlist_id BIGINT NOT NULL REFERENCES files_playlists(id) ON DELETE CASCADE,
+                    track_id BIGINT NOT NULL REFERENCES files_tracks(id) ON DELETE CASCADE,
+                    position INTEGER NOT NULL DEFAULT 0,
+                    added_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_files_playlist_items_playlist_pos ON files_playlist_items(playlist_id, position ASC, id ASC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_files_playlist_items_track_id ON files_playlist_items(track_id)")
+
+            # ───────────────────── Likes / Favorites (Files mode) ─────────────────────
+            # Persist user preferences (artist/album/track). Stored in PostgreSQL so the
+            # assistant and recommendation engine can reuse the same preference signals.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS files_entity_likes (
+                    entity_type TEXT NOT NULL,
+                    entity_id BIGINT NOT NULL,
+                    liked BOOLEAN NOT NULL DEFAULT TRUE,
+                    source TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (entity_type, entity_id)
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_files_entity_likes_updated_at ON files_entity_likes(updated_at DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_files_entity_likes_type_liked ON files_entity_likes(entity_type, liked)")
+
+            # ───────────────────── Concert Cache (Files mode) ─────────────────────
+            # Cached upcoming concerts for artist pages. Providers may be added later
+            # (Songkick, etc.). We keep the raw-ish provider payload as JSON for
+            # forward compatibility.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS files_artist_concerts (
+                    artist_id BIGINT PRIMARY KEY REFERENCES files_artists(id) ON DELETE CASCADE,
+                    provider TEXT NOT NULL DEFAULT 'bandsintown',
+                    events_json TEXT NOT NULL DEFAULT '[]',
+                    source_url TEXT,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_files_artist_concerts_updated_at ON files_artist_concerts(updated_at DESC)")
+            # ───────────────────── Assistant (RAG + Chat Traces) ─────────────────────
+            # Stored in PostgreSQL so "what the AI learned" is inspectable, attributable,
+            # and can be garbage-collected safely without losing core library data.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS assistant_sessions (
+                    session_id TEXT PRIMARY KEY,
+                    title TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS assistant_messages (
+                    id BIGSERIAL PRIMARY KEY,
+                    session_id TEXT NOT NULL REFERENCES assistant_sessions(session_id) ON DELETE CASCADE,
+                    role TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    context_json TEXT NOT NULL DEFAULT '{}',
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS assistant_docs (
+                    id BIGSERIAL PRIMARY KEY,
+                    entity_type TEXT NOT NULL,
+                    entity_id BIGINT NOT NULL,
+                    doc_type TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    provider TEXT,
+                    model TEXT,
+                    title TEXT,
+                    url TEXT,
+                    lang TEXT,
+                    content TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    UNIQUE (entity_type, entity_id, doc_type, source)
+                )
+            """)
+            # Backward-compatible schema evolution for assistant_docs.
+            for col_name, col_sql in [
+                ("provider", "TEXT"),
+                ("model", "TEXT"),
+            ]:
+                try:
+                    cur.execute(f"ALTER TABLE assistant_docs ADD COLUMN IF NOT EXISTS {col_name} {col_sql}")
+                except Exception:
+                    pass
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS assistant_doc_chunks (
+                    id BIGSERIAL PRIMARY KEY,
+                    doc_id BIGINT NOT NULL REFERENCES assistant_docs(id) ON DELETE CASCADE,
+                    chunk_index INTEGER NOT NULL,
+                    content TEXT NOT NULL,
+                    embed_json TEXT NOT NULL DEFAULT '[]',
+                    norm REAL NOT NULL DEFAULT 1.0,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    UNIQUE (doc_id, chunk_index)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS assistant_entity_facts (
+                    entity_type TEXT NOT NULL,
+                    entity_id BIGINT NOT NULL,
+                    facts_json TEXT NOT NULL DEFAULT '{}',
+                    evidence_json TEXT NOT NULL DEFAULT '[]',
+                    source TEXT NOT NULL DEFAULT 'ai_extracted_v1',
+                    provider TEXT,
+                    model TEXT,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (entity_type, entity_id)
+                )
+            """)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_files_artists_name ON files_artists(name)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_files_albums_artist_id ON files_albums(artist_id)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_files_albums_title ON files_albums(title)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_files_albums_title_norm ON files_albums(title_norm)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_files_albums_genre ON files_albums(genre)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_files_albums_label ON files_albums(label)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_files_tracks_album_id ON files_tracks(album_id)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_files_tracks_title ON files_tracks(title)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_files_tracks_order ON files_tracks(album_id, disc_num, track_num, id)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_files_track_embeddings_updated_at ON files_track_embeddings(updated_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_files_reco_events_session_time ON files_reco_events(session_id, created_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_files_reco_events_track_time ON files_reco_events(track_id, created_at DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_files_playback_events_time ON files_playback_events(created_at DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_files_playback_events_track_time ON files_playback_events(track_id, created_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_files_reco_track_stats_score ON files_reco_track_stats(play_count DESC, completion_count DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_files_reco_sessions_last_event ON files_reco_sessions(last_event_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_files_artist_profiles_updated_at ON files_artist_profiles(updated_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_files_album_profiles_updated_at ON files_album_profiles(updated_at DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_assistant_messages_session_time ON assistant_messages(session_id, created_at DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_assistant_messages_created_at ON assistant_messages(created_at DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_assistant_docs_entity ON assistant_docs(entity_type, entity_id)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_assistant_doc_chunks_doc_id ON assistant_doc_chunks(doc_id)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_assistant_entity_facts_updated_at ON assistant_entity_facts(updated_at DESC)")
             try:
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_files_artists_name_trgm ON files_artists USING gin (name gin_trgm_ops)")
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_files_albums_title_trgm ON files_albums USING gin (title gin_trgm_ops)")
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_files_tracks_title_trgm ON files_tracks USING gin (title gin_trgm_ops)")
+            except Exception:
+                pass
+            # Migrate legacy external-artist-image keys to the same loose normalization used by files_artists.name_norm.
+            # This keeps joins fast and prevents repeated re-downloads when the library contains punctuation/&/unicode.
+            try:
+                _files_migrate_external_artist_images_norm_keys(cur)
             except Exception:
                 pass
         _FILES_PG_SCHEMA_READY = True
@@ -3878,6 +4173,153 @@ def _files_pg_init_schema() -> bool:
         return False
     finally:
         conn.close()
+
+
+def _files_migrate_external_artist_images_norm_keys(cur) -> None:
+    """
+    Some builds cached external artist images using a stricter normalization than the Files library index.
+    Files library uses a loose normalization for files_artists.name_norm (lower + collapse spaces, keep punctuation).
+    This migrates files_external_artist_images.name_norm to the loose normalization so joins work and
+    backfill can reuse cached images instead of re-downloading everything.
+    """
+    try:
+        cur.execute("SELECT COALESCE(value, '') FROM files_index_meta WHERE key = 'external_artist_images_norm' LIMIT 1")
+        row = cur.fetchone()
+        if row and str(row[0] or "").strip() == "loose_v1":
+            return
+    except Exception:
+        # If meta read fails, still attempt best-effort migration.
+        pass
+
+    try:
+        cur.execute(
+            """
+            SELECT name_norm, artist_name, provider, COALESCE(image_path, ''), COALESCE(image_url, '')
+            FROM files_external_artist_images
+            """
+        )
+        rows = cur.fetchall()
+    except Exception:
+        rows = []
+    if not rows:
+        try:
+            cur.execute(
+                """
+                INSERT INTO files_index_meta(key, value, updated_at)
+                VALUES ('external_artist_images_norm', 'loose_v1', NOW())
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
+                """
+            )
+        except Exception:
+            pass
+        return
+
+    def _path_size(p: str) -> int:
+        try:
+            pp = Path((p or "").strip())
+            if pp.is_file():
+                return int(pp.stat().st_size or 0)
+        except Exception:
+            return 0
+        return 0
+
+    migrated = 0
+    for old_norm, artist_name, provider, image_path, image_url in rows:
+        old_key = str(old_norm or "").strip()
+        name = str(artist_name or "").strip()
+        if not old_key or not name:
+            continue
+        new_key = _norm_artist_key(name) or old_key
+        if not new_key or new_key == old_key:
+            continue
+
+        cand_path = str(image_path or "").strip()
+        cand_url = str(image_url or "").strip()
+        cand_size = _path_size(cand_path)
+
+        # Decide whether to override an existing strict-key row.
+        try:
+            cur.execute(
+                "SELECT COALESCE(image_path, ''), COALESCE(image_url, ''), COALESCE(provider, '') FROM files_external_artist_images WHERE name_norm = %s",
+                (new_key,),
+            )
+            ex = cur.fetchone()
+        except Exception:
+            ex = None
+        override = True
+        if ex:
+            ex_path = str(ex[0] or "").strip()
+            ex_url = str(ex[1] or "").strip()
+            ex_provider = str(ex[2] or "").strip()
+            ex_size = _path_size(ex_path)
+            # Prefer the larger on-disk cached image; also replace tiny placeholders.
+            if ex_size >= 8192 and (ex_size >= cand_size or cand_size <= 0):
+                override = False
+            if ex_size < 8192 and cand_size >= 8192:
+                override = True
+            # If existing URL is a known placeholder but candidate is not, override.
+            try:
+                if ex_url and _is_probably_placeholder_artist_image_url(ex_url) and cand_url and not _is_probably_placeholder_artist_image_url(cand_url):
+                    override = True
+                elif ex_url and _is_probably_placeholder_artist_image_url(ex_url) and not cand_url:
+                    override = False
+            except Exception:
+                pass
+            # If existing row is empty but candidate has a usable file, override.
+            if (not ex_path and cand_path) or (ex_size <= 0 and cand_size > 0):
+                override = True
+            # Prefer existing non-empty data when candidate is empty.
+            if ex_path and not cand_path and ex_size > 0:
+                override = False
+            if ex_url and not cand_url and not cand_path:
+                override = False
+            # Preserve existing provider if we decide not to override.
+            if not override:
+                provider = ex_provider or provider
+
+        if override:
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO files_external_artist_images(name_norm, artist_name, provider, image_path, image_url, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, NOW())
+                    ON CONFLICT (name_norm) DO UPDATE SET
+                        artist_name = EXCLUDED.artist_name,
+                        provider = EXCLUDED.provider,
+                        image_path = EXCLUDED.image_path,
+                        image_url = EXCLUDED.image_url,
+                        updated_at = NOW()
+                    """,
+                    (
+                        new_key,
+                        name,
+                        (provider or "").strip().lower() or "lastfm",
+                        cand_path or None,
+                        cand_url or None,
+                    ),
+                )
+            except Exception:
+                pass
+
+        # Delete the legacy row regardless; the normalized-key row will be reused by joins.
+        try:
+            cur.execute("DELETE FROM files_external_artist_images WHERE name_norm = %s", (old_key,))
+            migrated += 1
+        except Exception:
+            pass
+
+    try:
+        cur.execute(
+            """
+            INSERT INTO files_index_meta(key, value, updated_at)
+            VALUES ('external_artist_images_norm', 'loose_v1', NOW())
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
+            """
+        )
+    except Exception:
+        pass
+    if migrated:
+        logging.info("Migrated %d external artist image cache keys to loose normalization", migrated)
 
 
 def _files_redis_client():
@@ -4647,7 +5089,93 @@ def _restart_files_watcher_if_needed() -> bool:
         _files_watcher_observer = obs
     _update_files_watcher_state(running=True, roots=valid_roots)
     logging.info("FILES watcher started on %d root(s): %s", len(valid_roots), ", ".join(valid_roots))
+    _start_auto_changed_only_scan_scheduler()
     return True
+
+
+_auto_changed_only_scan_lock = threading.Lock()
+_auto_changed_only_scan_thread = None
+_auto_changed_only_scan_last_started_ts = 0.0
+
+
+def _start_auto_changed_only_scan_scheduler() -> None:
+    """Start a background scheduler that can trigger changed-only scans from watcher events."""
+    global _auto_changed_only_scan_thread
+    if not PMDA_AUTO_CHANGED_ONLY_SCAN:
+        return
+    if not PMDA_FILES_WATCHER_ENABLED:
+        return
+    if _get_library_mode() != "files":
+        return
+    if not _files_watcher_available():
+        return
+    with _auto_changed_only_scan_lock:
+        if _auto_changed_only_scan_thread is not None and _auto_changed_only_scan_thread.is_alive():
+            return
+        t = threading.Thread(target=_auto_changed_only_scan_loop, daemon=True, name="auto-changed-only-scan")
+        _auto_changed_only_scan_thread = t
+        t.start()
+
+
+def _auto_changed_only_scan_loop() -> None:
+    """Debounce/coalesce filesystem events into an efficient changed-only scan."""
+    global _auto_changed_only_scan_last_started_ts
+    poll_sec = 10.0
+    while True:
+        try:
+            time.sleep(poll_sec)
+            if not PMDA_AUTO_CHANGED_ONLY_SCAN:
+                continue
+            if _get_library_mode() != "files":
+                continue
+            if not ai_provider_ready:
+                continue
+            # Do not trigger while a scan is running/finalizing.
+            with lock:
+                scanning_now = bool(state.get("scanning"))
+                finalizing_now = bool(state.get("scan_finalizing"))
+                fw_state = dict(state.get("files_watcher") or {})
+            if scanning_now or finalizing_now:
+                continue
+
+            # Require some pending changes.
+            try:
+                con = sqlite3.connect(str(STATE_DB_FILE), timeout=5)
+                cur = con.cursor()
+                cur.execute("SELECT COUNT(*) FROM files_pending_changes")
+                pending = int((cur.fetchone() or [0])[0] or 0)
+                cur.execute("SELECT MAX(last_seen) FROM files_pending_changes")
+                last_seen_db = float((cur.fetchone() or [0])[0] or 0.0)
+                con.close()
+            except Exception:
+                pending = 0
+                last_seen_db = 0.0
+            if pending < max(1, int(PMDA_AUTO_CHANGED_ONLY_SCAN_MIN_PENDING or 1)):
+                continue
+
+            now = time.time()
+            last_event_at = float(fw_state.get("last_event_at") or 0.0)
+            last_event_at = max(last_event_at, last_seen_db or 0.0)
+            debounce = max(5.0, float(PMDA_AUTO_CHANGED_ONLY_SCAN_DEBOUNCE_SEC or 60.0))
+            if last_event_at and (now - last_event_at) < debounce:
+                continue
+
+            cooldown = max(30.0, float(PMDA_AUTO_CHANGED_ONLY_SCAN_COOLDOWN_SEC or 300.0))
+            if (now - float(_auto_changed_only_scan_last_started_ts or 0.0)) < cooldown:
+                continue
+
+            # Trigger scan.
+            with lock:
+                if state.get("scanning"):
+                    continue
+                state["run_improve_after"] = False
+                state["scan_type"] = "changed_only"
+                state["scan_auto_trigger"] = "files_watcher"
+            _auto_changed_only_scan_last_started_ts = now
+            logging.info("AUTO scan: starting changed-only scan (pending=%d)", pending)
+            start_background_scan()
+        except Exception:
+            logging.debug("AUTO scan loop error", exc_info=True)
 
 
 def _tokenize_reco_text(raw: str) -> list[str]:
@@ -5152,6 +5680,18 @@ def _normalize_meta_text(value) -> str:
         return ""
     return re.sub(r"\s+", " ", txt)
 
+def _first_scalar_meta_value(value):
+    """Return the first non-empty scalar value from common tag shapes (list/tuple/scalar)."""
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            v = _first_scalar_meta_value(item)
+            if v is not None and str(v).strip():
+                return v
+        return None
+    return value
+
 
 def _pick_weighted_metadata_value(candidates: list[tuple[object, int]]) -> str:
     """
@@ -5201,6 +5741,24 @@ def _pick_album_title_from_tag_dicts(tag_dicts: list[dict], fallback: str = "Unk
     picked = _pick_weighted_metadata_value(candidates)
     return picked or (_normalize_meta_text(fallback) or "Unknown Album")
 
+def _pick_album_label_from_tag_dicts(tag_dicts: list[dict]) -> str:
+    """Pick record label/publisher from tags when available."""
+    candidates: list[tuple[object, int]] = []
+    keys = [
+        ("label", 4),
+        ("recordlabel", 3),
+        ("record_label", 3),
+        ("record label", 3),
+        ("publisher", 2),
+        ("organization", 1),
+    ]
+    for tags in tag_dicts or []:
+        if not isinstance(tags, dict):
+            continue
+        for k, w in keys:
+            candidates.append((_first_scalar_meta_value(tags.get(k)), w))
+    return _pick_weighted_metadata_value(candidates)
+
 
 def _split_genre_values(raw_value: str) -> list[str]:
     if not raw_value:
@@ -5224,6 +5782,98 @@ def _first_artist_image_path(artist_folder: Path) -> Optional[Path]:
                 return p
     except OSError:
         return None
+    return None
+
+
+def _files_root_dir_strings() -> set[str]:
+    """
+    Return normalized string variants for FILES_ROOTS so we can reliably detect
+    when we are at a library root while walking parent folders.
+    """
+    out: set[str] = set()
+    for r in (FILES_ROOTS or []):
+        rs = str(r or "").strip()
+        if not rs:
+            continue
+        try:
+            p = path_for_fs_access(Path(rs))
+        except Exception:
+            p = Path(rs)
+        try:
+            out.add(str(p.resolve()))
+        except Exception:
+            pass
+        out.add(str(p))
+    return out
+
+
+def _files_is_files_root_dir(p: Path, *, root_dirs: Optional[set[str]] = None) -> bool:
+    if not p:
+        return False
+    roots = root_dirs if isinstance(root_dirs, set) else _files_root_dir_strings()
+    try:
+        if str(p.resolve()) in roots:
+            return True
+    except Exception:
+        pass
+    return str(p) in roots
+
+
+def _files_guess_artist_folder(
+    album_folder: Path,
+    artist_name: str,
+    *,
+    root_dirs: Optional[set[str]] = None,
+    max_up: int = 6,
+) -> Optional[Path]:
+    """
+    Guess the "artist folder" for an album folder in Files mode.
+
+    Why: in flat libraries where albums are directly under FILES_ROOTS, blindly using
+    `folder.parent` makes the FILES_ROOT look like the artist folder, causing a single
+    `/root/artist.jpg` to be incorrectly assigned to every artist.
+
+    Strategy: walk up from `album_folder` and return the first ancestor directory whose
+    name matches the artist name (strict normalization). Never return FILES_ROOT itself.
+    """
+    if not album_folder:
+        return None
+    artist_disp = str(artist_name or "").strip()
+    if not artist_disp:
+        return None
+    artist_norm = _normalize_identity_text_strict(artist_disp)
+    if not artist_norm:
+        return None
+    artist_tokens = [t for t in artist_norm.split() if t]
+    roots = root_dirs if isinstance(root_dirs, set) else _files_root_dir_strings()
+
+    try:
+        cur = path_for_fs_access(Path(album_folder))
+    except Exception:
+        cur = Path(album_folder)
+
+    try:
+        if not cur.is_dir():
+            return None
+    except Exception:
+        return None
+
+    # Walk from the album folder up to a few levels, stopping at FILES_ROOTS.
+    for _ in range(max(0, int(max_up)) + 1):
+        if _files_is_files_root_dir(cur, root_dirs=roots):
+            break
+        cand_norm = _normalize_identity_text_strict(cur.name)
+        if cand_norm:
+            if cand_norm == artist_norm:
+                return cur
+            # Tolerate simple token reordering (e.g. "Beatles, The" vs "The Beatles").
+            cand_tokens = [t for t in cand_norm.split() if t]
+            if len(cand_tokens) > 1 and len(artist_tokens) > 1 and sorted(cand_tokens) == sorted(artist_tokens):
+                return cur
+        parent = cur.parent
+        if not parent or parent == cur:
+            break
+        cur = parent
     return None
 
 
@@ -5321,7 +5971,7 @@ def _rebuild_files_library_index_for_artist(
                 try:
                     artist_norm = " ".join(artist_name.split()).lower()
                     artist_norm_alt = norm_album(artist_name or "")
-                    with conn:
+                    with conn.transaction():
                         with conn.cursor() as cur:
                             cur.execute(
                                 """
@@ -5381,7 +6031,7 @@ def _rebuild_files_library_index_for_artist(
         if conn is None:
             raise RuntimeError("PostgreSQL connection unavailable during granular rebuild")
         try:
-            with conn:
+            with conn.transaction():
                 with conn.cursor() as cur:
                     artist_rows = [
                         (
@@ -5432,6 +6082,7 @@ def _rebuild_files_library_index_for_artist(
                                 album["year"],
                                 album["date_text"],
                                 album["genre"],
+                                album.get("label") or "",
                                 album["tags_json"],
                                 album["format"],
                                 bool(album["is_lossless"]),
@@ -5457,14 +6108,14 @@ def _rebuild_files_library_index_for_artist(
                         cur.executemany(
                             """
                             INSERT INTO files_albums (
-                                artist_id, title, title_norm, folder_path, year, date_text, genre, tags_json,
+                                artist_id, title, title_norm, folder_path, year, date_text, genre, label, tags_json,
                                 format, is_lossless, has_cover, cover_path, mb_identified, musicbrainz_release_group_id,
                                 discogs_release_id, lastfm_album_mbid, bandcamp_album_url, metadata_source,
                                 track_count, total_duration_sec, is_broken, expected_track_count, actual_track_count,
                                 missing_indices_json, missing_required_tags_json, primary_tags_json,
                                 created_at, updated_at
                             ) VALUES (
-                                %s, %s, %s, %s, %s, %s, %s, %s,
+                                %s, %s, %s, %s, %s, %s, %s, %s, %s,
                                 %s, %s, %s, %s, %s, %s,
                                 %s, %s, %s, %s,
                                 %s, %s, %s, %s, %s,
@@ -5478,6 +6129,7 @@ def _rebuild_files_library_index_for_artist(
                                 year = EXCLUDED.year,
                                 date_text = EXCLUDED.date_text,
                                 genre = EXCLUDED.genre,
+                                label = EXCLUDED.label,
                                 tags_json = EXCLUDED.tags_json,
                                 format = EXCLUDED.format,
                                 is_lossless = EXCLUDED.is_lossless,
@@ -5701,6 +6353,7 @@ def _rebuild_files_library_index(reason: str = "manual", wait_if_running: bool =
                 by_folder[p.parent].append(p)
             folders = sorted(by_folder.items(), key=lambda x: str(x[0]).lower())
             _files_index_set_state(total_folders=len(folders), phase="parsing")
+            root_dirs = _files_root_dir_strings()
 
             for idx, (folder, files) in enumerate(folders, start=1):
                 _files_index_set_state(folders_processed=idx, current_folder=str(folder))
@@ -5762,6 +6415,7 @@ def _rebuild_files_library_index(reason: str = "manual", wait_if_running: bool =
                     tag_dicts,
                     fallback=folder.name.replace("_", " ").strip() or "Unknown Album",
                 )
+                label = _pick_album_label_from_tag_dicts(tag_dicts)
                 artist_norm = " ".join((artist_name or "").split()).lower() or "unknown artist"
                 title_norm = norm_album_for_dedup(album_title, normalize_parenthetical=True)
                 date_text = (first_tags.get("date") or first_tags.get("year") or "").strip()
@@ -5770,7 +6424,8 @@ def _rebuild_files_library_index(reason: str = "manual", wait_if_running: bool =
                 is_lossless = dominant_format in _LOSSLESS_FORMATS
                 cover_path = _first_cover_path(folder)
                 has_cover = bool(cover_path and cover_path.is_file())
-                artist_image_path = _first_artist_image_path(folder.parent)
+                artist_folder = _files_guess_artist_folder(folder, artist_name, root_dirs=root_dirs)
+                artist_image_path = _first_artist_image_path(artist_folder) if artist_folder else None
                 artist_has_image = bool(artist_image_path and artist_image_path.is_file())
                 if artist_norm not in artists_map:
                     artists_map[artist_norm] = {
@@ -5783,15 +6438,31 @@ def _rebuild_files_library_index(reason: str = "manual", wait_if_running: bool =
                     artists_map[artist_norm]["has_image"] = True
 
                 indices = [t["track_num"] for t in track_entries if t["track_num"] > 0]
+                actual_track_count = len(track_entries)
                 is_broken = False
                 expected_track_count = None
                 missing_indices: list[int] = []
                 if indices:
-                    is_broken, _actual_count_from_indices, gaps = _detect_gaps_in_indices(indices)
-                    expected_track_count = max(indices)
-                    for start_i, end_i in gaps:
-                        missing_indices.extend(list(range(start_i + 1, end_i)))
-                actual_track_count = len(track_entries)
+                    # Track numbers can be garbage (e.g. "745" on a 15-track album). In that case
+                    # gaps-based "broken" detection produces massive false positives and UI junk.
+                    max_idx = max(indices)
+                    coverage = (actual_track_count / max_idx) if max_idx else 1.0
+                    if max_idx > max(120, actual_track_count * 3) and coverage < 0.5:
+                        is_broken = False
+                        expected_track_count = None
+                        missing_indices = []
+                    else:
+                        is_broken, _actual_count_from_indices, gaps = _detect_gaps_in_indices(indices)
+                        if is_broken:
+                            expected_track_count = max_idx
+                            for start_i, end_i in gaps:
+                                # Defensive cap to avoid pathological arrays.
+                                if (end_i - start_i) > 2000:
+                                    continue
+                                missing_indices.extend(list(range(start_i + 1, end_i)))
+                                if len(missing_indices) > 5000:
+                                    missing_indices = missing_indices[:5000]
+                                    break
 
                 inferred_genre = _infer_genre_from_bandcamp_tags(raw_genres) if raw_genres else None
                 identity_fields = _extract_files_identity_fields(tags=first_tags, edition={}, cached={})
@@ -5811,6 +6482,7 @@ def _rebuild_files_library_index(reason: str = "manual", wait_if_running: bool =
                         "year": year,
                         "date_text": date_text[:32] if date_text else "",
                         "genre": inferred_genre or "",
+                        "label": (label or "").strip(),
                         "tags_json": json.dumps(raw_genres[:20]),
                         "format": dominant_format,
                         "is_lossless": bool(is_lossless),
@@ -5840,11 +6512,35 @@ def _rebuild_files_library_index(reason: str = "manual", wait_if_running: bool =
         if conn is None:
             raise RuntimeError("PostgreSQL connection unavailable during rebuild")
         try:
-            with conn:
+            with conn.transaction():
                 with conn.cursor() as cur:
                     cur.execute("TRUNCATE TABLE files_tracks, files_albums, files_artists RESTART IDENTITY CASCADE")
+                    ext_artist_images: dict[str, str] = {}
+                    try:
+                        norms = list(artists_map.keys())
+                        if norms:
+                            cur.execute(
+                                """
+                                SELECT name_norm, COALESCE(image_path, '')
+                                FROM files_external_artist_images
+                                WHERE name_norm = ANY(%s)
+                                """,
+                                (norms,),
+                            )
+                            for n, p in cur.fetchall():
+                                nkey = str(n or "").strip()
+                                pval = str(p or "").strip()
+                                if nkey and pval:
+                                    ext_artist_images[nkey] = pval
+                    except Exception:
+                        ext_artist_images = {}
                     artist_rows = [
-                        (data["name"], norm, bool(data["has_image"]), data.get("image_path") or "")
+                        (
+                            data["name"],
+                            norm,
+                            bool(data["has_image"]) or bool(ext_artist_images.get(norm)),
+                            (data.get("image_path") or "").strip() or ext_artist_images.get(norm) or "",
+                        )
                         for norm, data in artists_map.items()
                     ]
                     if artist_rows:
@@ -5872,6 +6568,7 @@ def _rebuild_files_library_index(reason: str = "manual", wait_if_running: bool =
                                 album["year"],
                                 album["date_text"],
                                 album["genre"],
+                                album.get("label") or "",
                                 album["tags_json"],
                                 album["format"],
                                 bool(album["is_lossless"]),
@@ -5897,14 +6594,14 @@ def _rebuild_files_library_index(reason: str = "manual", wait_if_running: bool =
                         cur.executemany(
                             """
                             INSERT INTO files_albums (
-                                artist_id, title, title_norm, folder_path, year, date_text, genre, tags_json,
+                                artist_id, title, title_norm, folder_path, year, date_text, genre, label, tags_json,
                                 format, is_lossless, has_cover, cover_path, mb_identified, musicbrainz_release_group_id,
                                 discogs_release_id, lastfm_album_mbid, bandcamp_album_url, metadata_source,
                                 track_count, total_duration_sec, is_broken, expected_track_count, actual_track_count,
                                 missing_indices_json, missing_required_tags_json, primary_tags_json,
                                 created_at, updated_at
                             ) VALUES (
-                                %s, %s, %s, %s, %s, %s, %s, %s,
+                                %s, %s, %s, %s, %s, %s, %s, %s, %s,
                                 %s, %s, %s, %s, %s, %s,
                                 %s, %s, %s, %s,
                                 %s, %s, %s, %s, %s,
@@ -6009,6 +6706,13 @@ def _rebuild_files_library_index(reason: str = "manual", wait_if_running: bool =
             covers_cached,
             artists_cached,
         )
+        # Post-build: backfill artist profiles (bios/tags/similar) and cache external images,
+        # so browsing shows rich pages (no placeholders) without waiting for first click.
+        try:
+            if bool(_FILES_PROFILE_BACKFILL_ON_REBUILD):
+                _trigger_files_profile_backfill_async(reason=f"after_files_index_rebuild:{reason}")
+        except Exception:
+            pass
         return {
             "ok": True,
             "artists": len(artists_map),
@@ -6084,7 +6788,7 @@ def _rebuild_files_reco_embeddings(reason: str = "manual", wait_if_running: bool
         if conn is None:
             raise RuntimeError("PostgreSQL connection unavailable during embedding rebuild")
         try:
-            with conn:
+            with conn.transaction():
                 embedding_count = _reco_build_track_embeddings(conn)
                 with conn.cursor() as cur:
                     _files_index_write_meta(cur, "track_embeddings", str(embedding_count))
@@ -6346,12 +7050,405 @@ def _files_upsert_album_profile(conn, artist_norm: str, title_norm: str, album_t
         )
 
 
+_FILES_EXTERNAL_ARTIST_IMAGE_MAX_AGE_SEC = 120 * 24 * 3600
+
+
+def _is_external_artist_image_stale(updated_at) -> bool:
+    ts = _dt_to_epoch(updated_at)
+    if ts <= 0:
+        return True
+    return (time.time() - ts) > _FILES_EXTERNAL_ARTIST_IMAGE_MAX_AGE_SEC
+
+
+def _files_get_external_artist_images(conn, name_norms: list[str]) -> dict[str, dict]:
+    """Return map name_norm -> {image_path,image_url,provider,updated_at,stale}."""
+    norms = [str(n or "").strip() for n in (name_norms or []) if str(n or "").strip()]
+    if not norms:
+        return {}
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT name_norm, artist_name, provider, COALESCE(image_path, ''), COALESCE(image_url, ''), updated_at
+                FROM files_external_artist_images
+                WHERE name_norm = ANY(%s)
+                """,
+                (norms,),
+            )
+            rows = cur.fetchall()
+        out: dict[str, dict] = {}
+        for n, artist_name, provider, image_path, image_url, updated_at in rows:
+            key = str(n or "").strip()
+            if not key:
+                continue
+            img_path = (image_path or "").strip() or None
+            img_url = (image_url or "").strip() or None
+            stale = _is_external_artist_image_stale(updated_at)
+
+            # Never serve known placeholder images (e.g. Last.fm "music note" missing-avatar).
+            try:
+                if img_url and _is_probably_placeholder_artist_image_url(img_url):
+                    img_path = None
+                    img_url = None
+                    stale = True
+            except Exception:
+                pass
+
+            # If the cached file disappeared, treat as stale so a refresh can fix it.
+            if img_path:
+                try:
+                    p = Path(img_path)
+                    if not p.exists():
+                        img_path = None
+                        stale = True
+                    else:
+                        # Tiny files are almost always placeholders (e.g. blank avatars); treat as stale.
+                        try:
+                            if int(p.stat().st_size or 0) < 8192:
+                                img_path = None
+                                stale = True
+                        except Exception:
+                            pass
+                except Exception:
+                    img_path = None
+                    stale = True
+            out[key] = {
+                "artist_name": artist_name or "",
+                "provider": provider or "",
+                "image_path": img_path,
+                "image_url": img_url,
+                "updated_at": int(_dt_to_epoch(updated_at)) if updated_at else 0,
+                "stale": stale,
+            }
+        return out
+    except Exception:
+        return {}
+
+
+def _files_upsert_external_artist_image(
+    conn,
+    *,
+    name_norm: str,
+    artist_name: str,
+    provider: str,
+    image_path: Optional[str],
+    image_url: Optional[str],
+) -> None:
+    key = str(name_norm or "").strip()
+    if not key:
+        return
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO files_external_artist_images(name_norm, artist_name, provider, image_path, image_url, updated_at)
+            VALUES (%s, %s, %s, %s, %s, NOW())
+            ON CONFLICT (name_norm) DO UPDATE SET
+                artist_name = EXCLUDED.artist_name,
+                provider = EXCLUDED.provider,
+                image_path = EXCLUDED.image_path,
+                image_url = EXCLUDED.image_url,
+                updated_at = NOW()
+            """,
+            (
+                key,
+                (artist_name or "").strip(),
+                (provider or "").strip().lower() or "lastfm",
+                (image_path or "").strip() if image_path else None,
+                (image_url or "").strip() if image_url else None,
+            ),
+        )
+        # Keep files_artists in sync so list endpoints relying on files_artists.has_image
+        # show thumbnails immediately without requiring a full index rebuild.
+        try:
+            img_path = (image_path or "").strip() if image_path else ""
+            if img_path:
+                cur.execute("SELECT COALESCE(image_path, '') FROM files_artists WHERE name_norm = %s", (key,))
+                row = cur.fetchone()
+                existing_raw = str((row[0] if row else "") or "").strip()
+                override = False
+                if not existing_raw:
+                    override = True
+                else:
+                    try:
+                        existing_path = path_for_fs_access(Path(existing_raw))
+                    except Exception:
+                        existing_path = Path(existing_raw)
+                    try:
+                        if not existing_path.exists():
+                            override = True
+                    except Exception:
+                        override = True
+                    # Never keep a FILES_ROOT-level "artist.jpg" as the canonical artist image: it's almost certainly
+                    # a flat-library artifact that would be incorrectly shared by many artists.
+                    try:
+                        if not override and existing_path.name.lower() in {n.lower() for n in _ARTIST_IMAGE_NAMES}:
+                            if _files_is_files_root_dir(existing_path.parent):
+                                override = True
+                    except Exception:
+                        pass
+                if override:
+                    cur.execute(
+                        """
+                        UPDATE files_artists
+                        SET has_image = TRUE,
+                            image_path = %s,
+                            updated_at = NOW()
+                        WHERE name_norm = %s
+                        """,
+                        (img_path, key),
+                    )
+                else:
+                    cur.execute(
+                        "UPDATE files_artists SET has_image = TRUE, updated_at = NOW() WHERE name_norm = %s",
+                        (key,),
+                    )
+        except Exception:
+            pass
+
+
+def _files_cache_external_artist_image(
+    conn,
+    *,
+    artist_name: str,
+    provider: str,
+    image_url: str,
+    max_px: int = 640,
+) -> Optional[str]:
+    """
+    Download + store an external artist image into the media cache and upsert the DB row.
+    Returns the cached file path string, or None.
+    """
+    name = (artist_name or "").strip()
+    if not name:
+        return None
+    key = _norm_artist_key(name)
+    img_url = (image_url or "").strip()
+    if not img_url:
+        return None
+    try:
+        if _is_probably_placeholder_artist_image_url(img_url):
+            return None
+    except Exception:
+        pass
+
+    # Skip refresh if a recent cached image exists and the file is still present.
+    existing = _files_get_external_artist_images(conn, [key]).get(key) or {}
+    if existing and not bool(existing.get("stale")):
+        p = (existing.get("image_path") or "").strip()
+        if p:
+            try:
+                pp = Path(p)
+                if pp.exists():
+                    # If the cached file is tiny/low-res/placeholder-ish, force a refresh.
+                    try:
+                        if not _is_usable_artist_image_path(pp):
+                            p = ""
+                        else:
+                            # Keep files_artists in sync even when we reuse an existing cached file.
+                            try:
+                                _files_upsert_external_artist_image(
+                                    conn,
+                                    name_norm=key,
+                                    artist_name=name,
+                                    provider=str(existing.get("provider") or provider),
+                                    image_path=str(pp),
+                                    image_url=str(existing.get("image_url") or img_url),
+                                )
+                            except Exception:
+                                pass
+                            return str(pp)
+                    except Exception:
+                        return str(pp)
+            except Exception:
+                pass
+
+    dl = _download_best_cover_image(provider, img_url, cover_candidates=[img_url], timeout=12)
+    if not dl:
+        return None
+    raw, mime, url_used = dl
+    try:
+        if not _is_usable_artist_image_bytes(raw):
+            return None
+    except Exception:
+        # Keep permissive behavior if inspection fails unexpectedly.
+        pass
+    cached = _ensure_cached_image_from_bytes(
+        raw,
+        mime,
+        kind="artist",
+        cache_key_hint=f"external-artist-{key}",
+        max_px=max_px,
+    )
+    if not cached:
+        return None
+    cached_path = str(cached)
+    _files_upsert_external_artist_image(
+        conn,
+        name_norm=key,
+        artist_name=name,
+        provider=provider,
+        image_path=cached_path,
+        image_url=url_used,
+    )
+    return cached_path
+
+
+def _files_attach_similar_artist_refs(conn, similar_artists: list, base_url: str) -> list:
+    """
+    Attach `artist_id` and `image_url` (prefer local, then cached external, then remote)
+    to similar artist entries.
+    """
+    if not isinstance(similar_artists, list) or not similar_artists:
+        return []
+    base = (base_url or "").rstrip("/")
+    # Build normalized name keys.
+    norms: list[str] = []
+    for entry in similar_artists:
+        if not isinstance(entry, dict):
+            continue
+        n = _norm_artist_key(str(entry.get("name") or ""))
+        if n:
+            norms.append(n)
+    norms = list(dict.fromkeys(norms))
+    if not norms:
+        return similar_artists
+
+    local_map: dict[str, dict] = {}
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, name_norm, has_image
+                FROM files_artists
+                WHERE name_norm = ANY(%s)
+                """,
+                (norms,),
+            )
+            for aid, nn, has_img in cur.fetchall():
+                key = str(nn or "").strip()
+                if not key:
+                    continue
+                local_map[key] = {"artist_id": int(aid or 0), "has_image": bool(has_img)}
+    except Exception:
+        local_map = {}
+
+    ext_map = _files_get_external_artist_images(conn, norms)
+
+    out: list[dict] = []
+    for entry in similar_artists:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("name") or "").strip()
+        if not name:
+            continue
+        key = _norm_artist_key(name)
+        patched = dict(entry)
+        # Local link + image.
+        local = local_map.get(key)
+        local_has_image = False
+        if local and int(local.get("artist_id") or 0) > 0:
+            patched["artist_id"] = int(local["artist_id"])
+            local_has_image = bool(local.get("has_image"))
+            if local_has_image:
+                patched["image_url"] = f"{base}/api/library/files/artist/{int(local['artist_id'])}/image?size=320"
+        # Prefer cached external image over remote hotlinks when we don't have a local on-disk image.
+        # This keeps browsing snappy and avoids broken hotlink/CDN behavior.
+        if not local_has_image:
+            ext = ext_map.get(key) or {}
+            ext_path = str(ext.get("image_path") or "").strip()
+            if ext_path:
+                patched["image_url"] = f"{base}/api/library/external/artist-image/{quote(key, safe='')}?size=320"
+        # Drop any known placeholder URLs so the UI never shows the "music note" missing-avatar.
+        try:
+            img = str(patched.get("image_url") or "").strip()
+            if img and _is_probably_placeholder_artist_image_url(img):
+                patched.pop("image_url", None)
+        except Exception:
+            pass
+        out.append(patched)
+    return out
+
+
+def _files_similar_artists_by_genre(conn, artist_id: int, *, limit: int = 20) -> list[dict]:
+    """
+    Local fallback: suggest similar artists from the local library by overlapping inferred genres.
+    This is a safe fallback when provider similar artists are missing or unreliable.
+    """
+    artist_id = int(artist_id or 0)
+    limit = max(1, min(40, int(limit or 20)))
+    if artist_id <= 0:
+        return []
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT LOWER(TRIM(g.value)) AS g, COUNT(DISTINCT alb.id) AS c
+                FROM files_albums alb
+                CROSS JOIN LATERAL jsonb_array_elements_text(COALESCE(alb.tags_json, '[]')::jsonb) AS g(value)
+                WHERE alb.artist_id = %s
+                  AND COALESCE(TRIM(g.value), '') <> ''
+                GROUP BY LOWER(TRIM(g.value))
+                ORDER BY COUNT(DISTINCT alb.id) DESC, g ASC
+                LIMIT 12
+                """,
+                (artist_id,),
+            )
+            target_genres = [str(r[0] or "").strip() for r in cur.fetchall() if str(r[0] or "").strip()]
+        if not target_genres:
+            return []
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    a.id,
+                    a.name,
+                    COUNT(DISTINCT LOWER(TRIM(g.value))) AS score,
+                    ARRAY_AGG(DISTINCT LOWER(TRIM(g.value))) AS matched_genres
+                FROM files_artists a
+                JOIN files_albums alb ON alb.artist_id = a.id
+                CROSS JOIN LATERAL jsonb_array_elements_text(COALESCE(alb.tags_json, '[]')::jsonb) AS g(value)
+                WHERE a.id <> %s
+                  AND COALESCE(TRIM(g.value), '') <> ''
+                  AND LOWER(TRIM(g.value)) = ANY(%s)
+                GROUP BY a.id, a.name, a.album_count
+                ORDER BY score DESC, a.album_count DESC, a.name ASC
+                LIMIT %s
+                """,
+                (artist_id, target_genres, limit),
+            )
+            rows = cur.fetchall()
+        out: list[dict] = []
+        for aid, name, score, matched_genres in rows:
+            nm = str(name or "").strip()
+            if not nm:
+                continue
+            mg: list[str] = []
+            if isinstance(matched_genres, list):
+                for g in matched_genres:
+                    gg = str(g or "").strip()
+                    if gg:
+                        mg.append(gg)
+            label = f"Genre: {', '.join(mg[:2])}" if mg else "Genre match"
+            out.append(
+                {
+                    "name": nm,
+                    "artist_id": int(aid or 0),
+                    "type": label,
+                    "score": int(score or 0),
+                }
+            )
+        return out[:limit]
+    except Exception:
+        return []
+
+
 def _run_files_profile_enrichment_job(
     *,
     job_key: str,
     artist_name: str,
     artist_norm: str,
     albums: list[tuple[str, str]],
+    skip_album_profiles: bool = False,
 ) -> None:
     try:
         conn = _files_pg_connect()
@@ -6359,18 +7456,52 @@ def _run_files_profile_enrichment_job(
             return
         try:
             existing_profile = _files_get_artist_profile_cached(artist_name, artist_norm)
-            should_refresh_artist = not bool(existing_profile.get("short_bio")) or bool(existing_profile.get("stale"))
+            existing_bio_text = ((existing_profile.get("bio") or existing_profile.get("short_bio") or "") if isinstance(existing_profile, dict) else "").strip()
+            should_refresh_artist = (
+                not bool(existing_profile.get("short_bio"))
+                or bool(existing_profile.get("stale"))
+                or _is_garbage_bio(existing_bio_text)
+            )
+
+            lastfm_info = None
+            wiki_info = None
 
             artist_profile = None
             if should_refresh_artist:
-                artist_profile = _fetch_lastfm_artist_info(artist_name) or {}
-                if (not artist_profile.get("similar")) and USE_MUSICBRAINZ:
+                lastfm_info = _fetch_lastfm_artist_info(artist_name) or {}
+                wiki_info = _fetch_wikipedia_artist_bio(artist_name, lang="en") or _fetch_wikipedia_artist_bio(artist_name, lang="fr") or {}
+
+                # Start with Last.fm tags/similar; replace the bio if Wikipedia is better.
+                artist_profile = {
+                    "bio": (lastfm_info.get("bio") or "").strip(),
+                    "short_bio": (lastfm_info.get("short_bio") or "").strip(),
+                    "tags": lastfm_info.get("tags") or [],
+                    "similar": lastfm_info.get("similar") or [],
+                    "source": (lastfm_info.get("source") or "").strip() or "lastfm",
+                }
+
+                # Prefer Wikipedia when it provides a real intro paragraph (spec: >= 100 words).
+                if isinstance(wiki_info, dict) and _is_acceptable_original_bio((wiki_info.get("bio") or "").strip()):
+                    artist_profile["bio"] = (wiki_info.get("bio") or "").strip()
+                    artist_profile["short_bio"] = (wiki_info.get("short_bio") or "").strip()
+                    artist_profile["source"] = (wiki_info.get("source") or "").strip() or "wikipedia"
+                else:
+                    # Keep Last.fm only if it's not garbage; otherwise blank it so UI can fall back to AI.
+                    if _is_garbage_bio(artist_profile.get("bio") or ""):
+                        artist_profile["bio"] = ""
+                    if _is_garbage_bio(artist_profile.get("short_bio") or ""):
+                        artist_profile["short_bio"] = ""
+
+                # Similar artists fallback via MusicBrainz (names only; images handled separately).
+                if (not (artist_profile.get("similar") or [])) and USE_MUSICBRAINZ:
+                    mbid = ""
                     try:
-                        search_result = musicbrainzngs.search_artists(artist=artist_name, limit=1)
+                        search_result = musicbrainzngs.search_artists(artist=artist_name, limit=3)
                         artist_list = search_result.get("artist-list") or []
-                        mbid = ""
                         if artist_list and isinstance(artist_list[0], dict):
-                            mbid = (artist_list[0].get("id") or "").strip()
+                            cand_name = (artist_list[0].get("name") or "").strip()
+                            if _provider_identity_text_score(artist_name, cand_name) >= 0.78:
+                                mbid = (artist_list[0].get("id") or "").strip()
                     except Exception:
                         mbid = ""
                     if mbid:
@@ -6378,46 +7509,298 @@ def _run_files_profile_enrichment_job(
                             mb_similar = get_similar_artists_mb(mbid)
                             if mb_similar:
                                 artist_profile["similar"] = mb_similar[:20]
-                                artist_profile["source"] = (artist_profile.get("source") or "musicbrainz").strip()
+                                # Keep the bio source; only override source if it was empty.
+                                if not (artist_profile.get("source") or "").strip():
+                                    artist_profile["source"] = "musicbrainz"
                         except Exception:
                             pass
-                if artist_profile:
-                    with conn:
-                        _files_upsert_artist_profile(conn, artist_norm, artist_name, artist_profile)
 
-            # Album descriptions: fill missing/stale entries progressively.
-            album_pairs = [(str(title or ""), str(norm or "")) for title, norm in albums if str(norm or "").strip()]
-            if album_pairs:
+                # Persist profile.
+                with conn.transaction():
+                    _files_upsert_artist_profile(conn, artist_norm, artist_name, artist_profile)
+
+            # Cache external artist images (main + similar) so the UI never shows empty placeholders.
+            # This is best-effort; failures should not break enrichment. Importantly, this should run
+            # even when the bio/tags profile does not need a refresh (images can be missing/low quality).
+            try:
+                # Local artist image presence.
                 with conn.cursor() as cur:
-                    placeholders = ",".join(["%s"] * len(album_pairs))
-                    norms = [norm for _, norm in album_pairs]
-                    cur.execute(
-                        f"""
-                        SELECT title_norm, updated_at
-                        FROM files_album_profiles
-                        WHERE artist_norm = %s AND title_norm IN ({placeholders})
-                        """,
-                        [artist_norm, *norms],
-                    )
-                    existing = {str(r[0] or ""): r[1] for r in cur.fetchall()}
-                to_fetch: list[tuple[str, str]] = []
-                for title, norm in album_pairs:
-                    if norm not in existing or _is_profile_stale(existing.get(norm)):
-                        to_fetch.append((title, norm))
-                for title, norm in to_fetch[:120]:
-                    info = _fetch_lastfm_album_info(artist_name, title) or {}
-                    if not info:
-                        continue
-                    full_desc = _strip_html_text((info.get("wiki_content") or info.get("wiki_summary") or "").strip())
-                    short_desc = _truncate_text(info.get("wiki_summary") or full_desc, max_chars=280)
-                    profile = {
-                        "description": full_desc,
-                        "short_description": short_desc,
-                        "tags": info.get("toptags") or [],
-                        "source": "lastfm",
-                    }
-                    with conn:
-                        _files_upsert_album_profile(conn, artist_norm, norm, title, profile)
+                    cur.execute("SELECT id, has_image, COALESCE(image_path, '') FROM files_artists WHERE name_norm = %s", (artist_norm,))
+                    arow = cur.fetchone()
+                artist_id = int(arow[0]) if arow else 0
+                local_has_image = bool(arow[1]) if arow else False
+                local_image_path = str((arow[2] if arow else "") or "").strip()
+                if local_has_image and local_image_path:
+                    try:
+                        if not Path(local_image_path).exists():
+                            local_has_image = False
+                    except Exception:
+                        pass
+
+                # External cached image state (quality-aware) so we can decide whether a refresh is needed.
+                needs_image = not local_has_image
+                if needs_image:
+                    ext_row = _files_get_external_artist_images(conn, [artist_norm]).get(artist_norm) or {}
+                    ext_path = str(ext_row.get("image_path") or "").strip()
+                    if ext_path and not bool(ext_row.get("stale")):
+                        try:
+                            if _is_usable_artist_image_path(Path(ext_path)):
+                                needs_image = False
+                        except Exception:
+                            needs_image = False
+
+                if needs_image:
+                    # Lazy fetch sources only if we actually need an image.
+                    if lastfm_info is None:
+                        lastfm_info = _fetch_lastfm_artist_info(artist_name) or {}
+                    if wiki_info is None:
+                        wiki_info = _fetch_wikipedia_artist_bio(artist_name, lang="en") or _fetch_wikipedia_artist_bio(artist_name, lang="fr") or {}
+
+                    # Persist Wikipedia intro for assistant RAG even if it is too short for the "Original" UI slot.
+                    try:
+                        if artist_id > 0 and isinstance(wiki_info, dict):
+                            wtxt = (wiki_info.get("bio") or "").strip()
+                            if wtxt:
+                                _assistant_upsert_doc(
+                                    conn,
+                                    entity_type="artist",
+                                    entity_id=int(artist_id),
+                                    doc_type="artist_external_wikipedia_intro",
+                                    source=str(wiki_info.get("source") or "wikipedia"),
+                                    title=str(artist_name),
+                                    url=str(wiki_info.get("url") or ""),
+                                    lang=str(wiki_info.get("lang") or ""),
+                                    content=wtxt,
+                                )
+                    except Exception:
+                        pass
+
+                    # Try providers in order until one yields a usable cached image.
+                    # Prefer Fanart.tv when available (often better artwork than Last.fm placeholders).
+                    candidates: list[tuple[str, str]] = []
+                    try:
+                        lf_mbid = str((lastfm_info.get("mbid") if isinstance(lastfm_info, dict) else "") or "").strip()
+                    except Exception:
+                        lf_mbid = ""
+                    if lf_mbid:
+                        try:
+                            fu = (_fetch_artist_image_fanart(lf_mbid) or "").strip()
+                        except Exception:
+                            fu = ""
+                        if fu:
+                            candidates.append(("fanart", fu))
+                    try:
+                        img_url = (lastfm_info.get("image_url") or "").strip() if isinstance(lastfm_info, dict) else ""
+                    except Exception:
+                        img_url = ""
+                    if img_url:
+                        candidates.append(("lastfm", img_url))
+                    try:
+                        wiki_img_url = (wiki_info.get("image_url") or "").strip() if isinstance(wiki_info, dict) else ""
+                    except Exception:
+                        wiki_img_url = ""
+                    if wiki_img_url:
+                        candidates.append(("wikipedia", wiki_img_url))
+                    try:
+                        au = (_fetch_artist_image_audiodb(artist_name) or "").strip()
+                    except Exception:
+                        au = ""
+                    if au:
+                        candidates.append(("audiodb", au))
+                    try:
+                        du = (_fetch_artist_image_discogs(artist_name) or "").strip()
+                    except Exception:
+                        du = ""
+                    if du:
+                        candidates.append(("discogs", du))
+                    try:
+                        wu = (_fetch_artist_image_web(artist_name) or "").strip()
+                    except Exception:
+                        wu = ""
+                    if wu:
+                        candidates.append(("web", wu))
+
+                    for prov, url in candidates:
+                        try:
+                            with conn.transaction():
+                                outp = _files_cache_external_artist_image(
+                                    conn,
+                                    artist_name=artist_name,
+                                    provider=prov,
+                                    image_url=url,
+                                    max_px=640,
+                                )
+                            if outp:
+                                break
+                        except Exception:
+                            continue
+
+                # Similar artists: warm top N images (use refreshed profile if present, else existing cached profile).
+                profile_for_similar = artist_profile if isinstance(artist_profile, dict) else existing_profile if isinstance(existing_profile, dict) else {}
+                sim_list = []
+                if isinstance(profile_for_similar, dict):
+                    sim_list = profile_for_similar.get("similar") or profile_for_similar.get("similar_artists") or []
+                if isinstance(sim_list, list) and sim_list:
+                    # Preload local/external image presence to avoid unnecessary network calls.
+                    sim_norms: list[str] = []
+                    for sim in sim_list[:12]:
+                        if not isinstance(sim, dict):
+                            continue
+                        sname = (sim.get("name") or "").strip()
+                        if not sname:
+                            continue
+                        sim_norms.append(_norm_artist_key(sname))
+                    sim_norms = list(dict.fromkeys([n for n in sim_norms if n]))
+                    local_sim_map: dict[str, dict] = {}
+                    if sim_norms:
+                        try:
+                            with conn.cursor() as cur:
+                                cur.execute(
+                                    """
+                                    SELECT name_norm, has_image
+                                    FROM files_artists
+                                    WHERE name_norm = ANY(%s)
+                                    """,
+                                    (sim_norms,),
+                                )
+                                for nn, has_img in cur.fetchall():
+                                    key = str(nn or "").strip()
+                                    if key:
+                                        local_sim_map[key] = {"has_image": bool(has_img)}
+                        except Exception:
+                            local_sim_map = {}
+                    ext_sim_map = _files_get_external_artist_images(conn, sim_norms) if sim_norms else {}
+
+                    warmed = 0
+                    for sim in sim_list[:12]:
+                        if not isinstance(sim, dict):
+                            continue
+                        sname = (sim.get("name") or "").strip()
+                        surl = (sim.get("image_url") or "").strip()
+                        if not sname:
+                            continue
+
+                        # Fast path: provider already gave an image URL (but still validate/cache).
+                        if surl and not _is_probably_placeholder_artist_image_url(surl):
+                            try:
+                                with conn.transaction():
+                                    outp = _files_cache_external_artist_image(conn, artist_name=sname, provider="lastfm", image_url=surl, max_px=640)
+                                if outp:
+                                    continue
+                            except Exception:
+                                pass
+
+                        # Otherwise: best-effort warm a small number of missing/poor images so UI doesn't show placeholders.
+                        if warmed >= 8:
+                            continue
+                        key = _norm_artist_key(sname)
+                        if not key:
+                            continue
+                        if local_sim_map.get(key, {}).get("has_image"):
+                            continue
+                        ext_row = ext_sim_map.get(key) or {}
+                        ext_path = str(ext_row.get("image_path") or "").strip()
+                        if ext_path and not bool(ext_row.get("stale")):
+                            try:
+                                if _is_usable_artist_image_path(Path(ext_path)):
+                                    continue
+                            except Exception:
+                                continue
+
+                        # Try providers in order until one succeeds.
+                        candidates_sim: list[tuple[str, str]] = []
+                        try:
+                            lf = _fetch_lastfm_artist_info(sname) or {}
+                            lf_img = (lf.get("image_url") or "").strip()
+                            lf_mbid = str(lf.get("mbid") or "").strip()
+                        except Exception:
+                            lf = {}
+                            lf_img = ""
+                            lf_mbid = ""
+                        if lf_mbid:
+                            try:
+                                fu = (_fetch_artist_image_fanart(lf_mbid) or "").strip()
+                            except Exception:
+                                fu = ""
+                            if fu:
+                                candidates_sim.append(("fanart", fu))
+                        if lf_img:
+                            candidates_sim.append(("lastfm", lf_img))
+                        try:
+                            w = _fetch_wikipedia_artist_bio(sname, lang="en") or _fetch_wikipedia_artist_bio(sname, lang="fr") or {}
+                            w_img = (w.get("image_url") or "").strip() if isinstance(w, dict) else ""
+                        except Exception:
+                            w_img = ""
+                        if w_img:
+                            candidates_sim.append(("wikipedia", w_img))
+                        try:
+                            au = (_fetch_artist_image_audiodb(sname) or "").strip()
+                        except Exception:
+                            au = ""
+                        if au:
+                            candidates_sim.append(("audiodb", au))
+                        try:
+                            du = (_fetch_artist_image_discogs(sname) or "").strip()
+                        except Exception:
+                            du = ""
+                        if du:
+                            candidates_sim.append(("discogs", du))
+                        try:
+                            wu = (_fetch_artist_image_web(sname) or "").strip()
+                        except Exception:
+                            wu = ""
+                        if wu:
+                            candidates_sim.append(("web", wu))
+
+                        success = False
+                        for prov, url in candidates_sim:
+                            try:
+                                with conn.transaction():
+                                    outp = _files_cache_external_artist_image(conn, artist_name=sname, provider=prov, image_url=url, max_px=640)
+                                if outp:
+                                    success = True
+                                    break
+                            except Exception:
+                                continue
+                        if success:
+                            warmed += 1
+            except Exception:
+                pass
+
+            # Album descriptions: fill missing/stale entries progressively (optional).
+            if not bool(skip_album_profiles):
+                album_pairs = [(str(title or ""), str(norm or "")) for title, norm in albums if str(norm or "").strip()]
+                if album_pairs:
+                    with conn.cursor() as cur:
+                        placeholders = ",".join(["%s"] * len(album_pairs))
+                        norms = [norm for _, norm in album_pairs]
+                        cur.execute(
+                            f"""
+                            SELECT title_norm, updated_at
+                            FROM files_album_profiles
+                            WHERE artist_norm = %s AND title_norm IN ({placeholders})
+                            """,
+                            [artist_norm, *norms],
+                        )
+                        existing = {str(r[0] or ""): r[1] for r in cur.fetchall()}
+                    to_fetch: list[tuple[str, str]] = []
+                    for title, norm in album_pairs:
+                        if norm not in existing or _is_profile_stale(existing.get(norm)):
+                            to_fetch.append((title, norm))
+                    for title, norm in to_fetch[:120]:
+                        info = _fetch_lastfm_album_info(artist_name, title) or {}
+                        if not info:
+                            continue
+                        full_desc = _strip_html_text((info.get("wiki_content") or info.get("wiki_summary") or "").strip())
+                        short_desc = _truncate_text(info.get("wiki_summary") or full_desc, max_chars=280)
+                        profile = {
+                            "description": full_desc,
+                            "short_description": short_desc,
+                            "tags": info.get("toptags") or [],
+                            "source": "lastfm",
+                        }
+                        with conn.transaction():
+                            _files_upsert_album_profile(conn, artist_norm, norm, title, profile)
         finally:
             conn.close()
         _files_cache_invalidate_all()
@@ -6448,6 +7831,2257 @@ def _enqueue_files_profile_enrichment(artist_name: str, artist_norm: str, albums
         name=f"profile-enrich-{artist_norm[:24]}",
     ).start()
     return True
+
+
+_files_similar_images_jobs_lock = threading.Lock()
+_files_similar_images_jobs_active: set[str] = set()
+
+
+def _run_files_similar_images_warm_job(*, job_key: str, artist_norm: str, names: list[str]) -> None:
+    """
+    Best-effort background job: cache external images for a list of artist names.
+    Intended to make "Similar artists" grids look good even when providers return placeholders.
+    """
+    try:
+        conn = _files_pg_connect()
+        if conn is None:
+            return
+        try:
+            # Deduplicate names while preserving order.
+            uniq: list[str] = []
+            seen: set[str] = set()
+            for n in (names or [])[:24]:
+                s = str(n or "").strip()
+                if not s:
+                    continue
+                key = _norm_artist_key(s)
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                uniq.append(s)
+
+            if not uniq:
+                return
+
+            for sname in uniq[:12]:
+                key = _norm_artist_key(sname)
+                if not key:
+                    continue
+
+                # Skip if local library already has a real on-disk artist image.
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT has_image FROM files_artists WHERE name_norm = %s", (key,))
+                        r = cur.fetchone()
+                    if r and bool(r[0]):
+                        continue
+                except Exception:
+                    pass
+
+                # Skip if an external cached image already exists and is fresh.
+                try:
+                    ext = _files_get_external_artist_images(conn, [key]).get(key) or {}
+                    if ext and not bool(ext.get("stale")) and str(ext.get("image_path") or "").strip():
+                        continue
+                except Exception:
+                    pass
+
+                # 1) Last.fm artist.getInfo (best coverage when configured).
+                img_url = ""
+                lf_mbid = ""
+                try:
+                    lf = _fetch_lastfm_artist_info(sname) or {}
+                    img_url = str(lf.get("image_url") or "").strip()
+                    lf_mbid = str(lf.get("mbid") or "").strip()
+                except Exception:
+                    img_url = ""
+                    lf_mbid = ""
+
+                # 1a) Fanart.tv (MBID-based) – prefer when available (often higher quality than placeholders).
+                if lf_mbid:
+                    try:
+                        f_url = (_fetch_artist_image_fanart(lf_mbid) or "").strip()
+                    except Exception:
+                        f_url = ""
+                    if f_url:
+                        try:
+                            with conn.transaction():
+                                outp = _files_cache_external_artist_image(conn, artist_name=sname, provider="fanart", image_url=f_url, max_px=640)
+                            if outp:
+                                continue
+                        except Exception:
+                            pass
+
+                # 1b) Last.fm image (fallback).
+                if img_url and not _is_probably_placeholder_artist_image_url(img_url):
+                    try:
+                        with conn.transaction():
+                            outp = _files_cache_external_artist_image(conn, artist_name=sname, provider="lastfm", image_url=img_url, max_px=640)
+                        if outp:
+                            continue
+                    except Exception:
+                        pass
+
+                # 2) Wikipedia lead image as fallback (no API key).
+                try:
+                    wiki_img = ""
+                    for query, lang in (
+                        (sname, "en"),
+                        (f"{sname} musician", "en"),
+                        (f"{sname} band", "en"),
+                        (sname, "fr"),
+                    ):
+                        w = _fetch_wikipedia_artist_bio(query, lang=lang) or {}
+                        if not isinstance(w, dict):
+                            continue
+                        w_img = str(w.get("image_url") or "").strip()
+                        if w_img:
+                            wiki_img = w_img
+                            break
+                except Exception:
+                    wiki_img = ""
+                if wiki_img:
+                    try:
+                        with conn.transaction():
+                            outp = _files_cache_external_artist_image(conn, artist_name=sname, provider="wikipedia", image_url=wiki_img, max_px=640)
+                        if outp:
+                            continue
+                    except Exception:
+                        pass
+
+                # 3) TheAudioDB (name-based) – optional.
+                try:
+                    aurl = (_fetch_artist_image_audiodb(sname) or "").strip()
+                except Exception:
+                    aurl = ""
+                if aurl:
+                    try:
+                        with conn.transaction():
+                            outp = _files_cache_external_artist_image(conn, artist_name=sname, provider="audiodb", image_url=aurl, max_px=640)
+                        if outp:
+                            continue
+                    except Exception:
+                        pass
+
+                # 4) Discogs artist image (often available when Wikipedia isn't).
+                try:
+                    durl = (_fetch_artist_image_discogs(sname) or "").strip()
+                except Exception:
+                    durl = ""
+                if durl:
+                    try:
+                        with conn.transaction():
+                            outp = _files_cache_external_artist_image(conn, artist_name=sname, provider="discogs", image_url=durl, max_px=640)
+                        if outp:
+                            continue
+                    except Exception:
+                        pass
+
+                # 5) Web search fallback (Serper -> og:image). Last resort.
+                try:
+                    wurl = (_fetch_artist_image_web(sname) or "").strip()
+                except Exception:
+                    wurl = ""
+                if wurl:
+                    try:
+                        with conn.transaction():
+                            outp = _files_cache_external_artist_image(conn, artist_name=sname, provider="web", image_url=wurl, max_px=640)
+                        if outp:
+                            continue
+                    except Exception:
+                        pass
+
+                time.sleep(0.12)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            _files_cache_invalidate_all()
+    except Exception:
+        pass
+    finally:
+        with _files_similar_images_jobs_lock:
+            _files_similar_images_jobs_active.discard(job_key)
+
+
+def _enqueue_files_similar_images_warm(artist_norm: str, names: list[str]) -> bool:
+    key = str(artist_norm or "").strip()
+    if not key:
+        return False
+    job_key = f"similar-images:{key}"
+    with _files_similar_images_jobs_lock:
+        if job_key in _files_similar_images_jobs_active:
+            return True
+        _files_similar_images_jobs_active.add(job_key)
+    threading.Thread(
+        target=_run_files_similar_images_warm_job,
+        kwargs={"job_key": job_key, "artist_norm": key, "names": list(names or [])},
+        daemon=True,
+        name=f"similar-img-{key[:24]}",
+    ).start()
+    return True
+
+
+_FILES_PROFILE_BACKFILL_ON_REBUILD = True
+_files_profile_backfill_lock = threading.Lock()
+_files_profile_backfill_state: dict = {
+    "running": False,
+    "reason": "",
+    "started_at": 0,
+    "finished_at": 0,
+    "current": 0,
+    "total": 0,
+    "current_artist": "",
+    "errors": 0,
+}
+
+
+def _run_files_profile_backfill(*, reason: str = "manual", sleep_sec: float = 0.15) -> None:
+    """
+    Background job: progressively enrich all artists (bios/tags/similar) and cache external artist images.
+    This is intentionally throttled to avoid provider rate limits.
+    """
+    sleep_sec = max(0.0, min(2.0, float(sleep_sec or 0.0)))
+    try:
+        conn = _files_pg_connect()
+        if conn is None:
+            return
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id, name, name_norm
+                    FROM files_artists
+                    ORDER BY album_count DESC, name ASC
+                    """
+                )
+                artists = [(int(r[0] or 0), str(r[1] or "").strip(), str(r[2] or "").strip()) for r in cur.fetchall()]
+        finally:
+            conn.close()
+
+        with _files_profile_backfill_lock:
+            _files_profile_backfill_state["running"] = True
+            _files_profile_backfill_state["reason"] = str(reason or "manual")
+            _files_profile_backfill_state["started_at"] = int(time.time())
+            _files_profile_backfill_state["finished_at"] = 0
+            _files_profile_backfill_state["current"] = 0
+            _files_profile_backfill_state["total"] = int(len(artists))
+            _files_profile_backfill_state["current_artist"] = ""
+            _files_profile_backfill_state["errors"] = 0
+
+        for idx, (_aid, artist_name, artist_norm) in enumerate(artists, start=1):
+            if not artist_norm or not artist_name:
+                continue
+            with _files_profile_backfill_lock:
+                if not bool(_files_profile_backfill_state.get("running")):
+                    break
+                _files_profile_backfill_state["current"] = int(idx)
+                _files_profile_backfill_state["current_artist"] = artist_name
+            # Avoid duplicate work when a user is browsing the same artist.
+            with _files_profile_jobs_lock:
+                if artist_norm in _files_profile_jobs_active:
+                    continue
+                _files_profile_jobs_active.add(artist_norm)
+            try:
+                _run_files_profile_enrichment_job(
+                    job_key=artist_norm,
+                    artist_name=artist_name,
+                    artist_norm=artist_norm,
+                    albums=[],
+                    skip_album_profiles=True,
+                )
+            except Exception:
+                with _files_profile_backfill_lock:
+                    _files_profile_backfill_state["errors"] = int(_files_profile_backfill_state.get("errors") or 0) + 1
+            if sleep_sec:
+                time.sleep(sleep_sec)
+    finally:
+        with _files_profile_backfill_lock:
+            _files_profile_backfill_state["running"] = False
+            _files_profile_backfill_state["finished_at"] = int(time.time())
+            _files_profile_backfill_state["current_artist"] = ""
+
+
+def _trigger_files_profile_backfill_async(reason: str = "manual") -> bool:
+    with _files_profile_backfill_lock:
+        if bool(_files_profile_backfill_state.get("running")):
+            return False
+        # Mark running here to close race conditions (thread may start a bit later).
+        _files_profile_backfill_state["running"] = True
+        _files_profile_backfill_state["reason"] = str(reason or "manual")
+        _files_profile_backfill_state["started_at"] = int(time.time())
+        _files_profile_backfill_state["finished_at"] = 0
+        _files_profile_backfill_state["current"] = 0
+        _files_profile_backfill_state["total"] = 0
+        _files_profile_backfill_state["current_artist"] = ""
+        _files_profile_backfill_state["errors"] = 0
+    threading.Thread(
+        target=_run_files_profile_backfill,
+        kwargs={"reason": str(reason or "manual")},
+        daemon=True,
+        name="files-profile-backfill",
+    ).start()
+    return True
+
+
+# ─────────────────────────────── Assistant (RAG + Chat) ───────────────────────────────
+_ASSISTANT_GC_INTERVAL_SEC = 24 * 3600
+_ASSISTANT_SESSION_MAX_AGE_DAYS = 90
+_ASSISTANT_SESSION_HARD_CAP = 200
+
+
+def call_ai_provider_longform(provider: str, model: str, system_msg: str, user_msg: str, max_tokens: int = 800) -> str:
+    """AI call that allows multi-line answers (unlike call_ai_provider which uses stop='\\n')."""
+    provider_lower = (provider or "").strip().lower()
+    if provider_lower == "openai":
+        if not openai_client:
+            raise ValueError("OpenAI client not initialized")
+        param_style = getattr(sys.modules[__name__], "RESOLVED_PARAM_STYLE", "mct")
+        _kwargs = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+        }
+        if param_style == "mct":
+            _kwargs["max_completion_tokens"] = max_tokens
+        else:
+            _kwargs["max_tokens"] = max_tokens
+        try:
+            resp = openai_client.chat.completions.create(**_kwargs)
+            return (resp.choices[0].message.content or "").strip()
+        except Exception as e:
+            err_msg = str(e).lower()
+            # Retry with other token parameter style when OpenAI errors on one of them.
+            if "unsupported_parameter" in err_msg or "400" in err_msg:
+                if "max_completion_tokens" in err_msg and ("max_tokens" in err_msg or "use" in err_msg):
+                    _kwargs.pop("max_completion_tokens", None)
+                    _kwargs["max_tokens"] = max_tokens
+                    resp = openai_client.chat.completions.create(**_kwargs)
+                    return (resp.choices[0].message.content or "").strip()
+                if "max_tokens" in err_msg and "max_completion_tokens" in err_msg:
+                    _kwargs.pop("max_tokens", None)
+                    _kwargs["max_completion_tokens"] = max_tokens
+                    resp = openai_client.chat.completions.create(**_kwargs)
+                    return (resp.choices[0].message.content or "").strip()
+            raise
+
+    if provider_lower == "anthropic":
+        if not anthropic_client:
+            raise ValueError("Anthropic client not initialized")
+        resp = anthropic_client.messages.create(
+            model=model,
+            max_tokens=max_tokens,
+            system=system_msg,
+            messages=[{"role": "user", "content": user_msg}],
+        )
+        return resp.content[0].text.strip()
+
+    if provider_lower == "google":
+        if not google_client_configured or not google_client:
+            raise ValueError("Google client not configured")
+        response = google_client.models.generate_content(
+            model=model,
+            contents=(user_msg or ""),
+            config=genai.types.GenerateContentConfig(
+                systemInstruction=(system_msg or ""),
+                maxOutputTokens=max_tokens,
+            ),
+        )
+        return (getattr(response, "text", "") or "").strip()
+
+    if provider_lower == "ollama":
+        if not ollama_url:
+            raise ValueError("Ollama URL not configured")
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            "options": {
+                "num_predict": max_tokens,
+            },
+            "stream": False,
+        }
+        response = requests.post(f"{ollama_url}/api/chat", json=payload, timeout=120)
+        if response.status_code != 200:
+            raise Exception(f"Ollama API error: {response.status_code} - {response.text}")
+        result = response.json()
+        return (result.get("message", {}) or {}).get("content", "").strip()
+
+    raise ValueError(f"Unknown AI provider: {provider}")
+
+
+def _assistant_text_hash(text: str) -> str:
+    return hashlib.sha1((text or "").encode("utf-8", errors="ignore")).hexdigest()
+
+
+def _assistant_chunk_text(text: str, max_chars: int = 900) -> list[str]:
+    """Chunk text roughly by paragraphs, capped by max_chars (ASCII-friendly)."""
+    raw = (text or "").strip()
+    if not raw:
+        return []
+    paras = [p.strip() for p in re.split(r"\n\s*\n+", raw) if p and p.strip()]
+    chunks: list[str] = []
+    buf = ""
+    for p in paras:
+        if not buf:
+            buf = p
+            continue
+        if len(buf) + 2 + len(p) <= max_chars:
+            buf = f"{buf}\n\n{p}"
+            continue
+        chunks.append(buf)
+        buf = p
+    if buf:
+        chunks.append(buf)
+
+    # Hard split any oversize chunk.
+    out: list[str] = []
+    for c in chunks:
+        if len(c) <= max_chars:
+            out.append(c)
+            continue
+        start = 0
+        while start < len(c):
+            out.append(c[start : start + max_chars].strip())
+            start += max_chars
+    return [c for c in out if c]
+
+
+def _assistant_upsert_doc(
+    conn,
+    *,
+    entity_type: str,
+    entity_id: int,
+    doc_type: str,
+    source: str,
+    provider: str = "",
+    model: str = "",
+    title: str = "",
+    url: str = "",
+    lang: str = "",
+    content: str,
+) -> int | None:
+    """Upsert a document and (re)build its chunk embeddings when content changes."""
+    et = (entity_type or "").strip().lower()
+    dt = (doc_type or "").strip().lower()
+    src = (source or "").strip().lower() or "unknown"
+    if not et or int(entity_id or 0) <= 0 or not dt:
+        return None
+    body = (content or "").strip()
+    if not body:
+        return None
+    h = _assistant_text_hash(body)
+    title = (title or "").strip()
+    url = (url or "").strip()
+    lang = (lang or "").strip()
+    provider = (provider or "").strip()
+    model = (model or "").strip()
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, content_hash
+            FROM assistant_docs
+            WHERE entity_type = %s AND entity_id = %s AND doc_type = %s AND source = %s
+            """,
+            (et, int(entity_id), dt, src),
+        )
+        row = cur.fetchone()
+        if row:
+            doc_id = int(row[0])
+            prev_hash = str(row[1] or "")
+            if prev_hash == h:
+                return doc_id
+        else:
+            doc_id = 0
+            prev_hash = ""
+
+    # Upsert document.
+    with conn.transaction():
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO assistant_docs(
+                    entity_type, entity_id, doc_type, source, provider, model, title, url, lang, content, content_hash, created_at, updated_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+                ON CONFLICT (entity_type, entity_id, doc_type, source) DO UPDATE
+                SET provider = EXCLUDED.provider,
+                    model = EXCLUDED.model,
+                    title = EXCLUDED.title,
+                    url = EXCLUDED.url,
+                    lang = EXCLUDED.lang,
+                    content = EXCLUDED.content,
+                    content_hash = EXCLUDED.content_hash,
+                    updated_at = NOW()
+                RETURNING id
+                """,
+                (et, int(entity_id), dt, src, provider, model, title, url, lang, body, h),
+            )
+            doc_id = int((cur.fetchone() or [0])[0] or 0)
+            if doc_id <= 0:
+                return None
+            if prev_hash and prev_hash == h:
+                return doc_id
+
+            # Rebuild chunks only when content changed.
+            cur.execute("DELETE FROM assistant_doc_chunks WHERE doc_id = %s", (doc_id,))
+            chunks = _assistant_chunk_text(body, max_chars=900)
+            if not chunks:
+                return doc_id
+            rows = []
+            for idx, chunk in enumerate(chunks):
+                vec, norm = _build_hashed_embedding(chunk, RECO_EMBED_DIM)
+                rows.append((doc_id, idx, chunk, json.dumps(vec), float(norm or 1.0)))
+            cur.executemany(
+                """
+                INSERT INTO assistant_doc_chunks(doc_id, chunk_index, content, embed_json, norm, created_at)
+                VALUES (%s, %s, %s, %s, %s, NOW())
+                """,
+                rows,
+            )
+    return doc_id
+
+
+_ASSISTANT_LIBRARY_SNAPSHOT_REFRESH_SEC = 15 * 60
+
+
+def _assistant_ingest_library_rag(conn) -> dict:
+    """
+    Ensure RAG docs exist for library-level questions (counts/facets).
+
+    Keeps a lightweight "library snapshot" document in Postgres so the assistant can answer
+    collection-wide questions without guessing.
+    """
+    # Throttle rebuilds; this runs in the request path.
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT value FROM files_index_meta WHERE key = %s", ("assistant_library_snapshot_ts",))
+            row = cur.fetchone()
+        last_ts = float(row[0] or 0) if row and row[0] else 0.0
+    except Exception:
+        last_ts = 0.0
+    if last_ts > 0 and (time.time() - last_ts) < _ASSISTANT_LIBRARY_SNAPSHOT_REFRESH_SEC:
+        return {"skipped": True}
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM files_artists")
+            artists = int((cur.fetchone() or [0])[0] or 0)
+            cur.execute("SELECT COUNT(*) FROM files_albums")
+            albums = int((cur.fetchone() or [0])[0] or 0)
+            cur.execute("SELECT COUNT(*) FROM files_tracks")
+            tracks = int((cur.fetchone() or [0])[0] or 0)
+
+            # Top genres (multi-genre tags_json first, then legacy alb.genre).
+            cur.execute(
+                """
+                WITH genre_tokens AS (
+                    SELECT
+                        alb.id AS album_id,
+                        LOWER(TRIM(g.value)) AS genre
+                    FROM files_albums alb
+                    CROSS JOIN LATERAL jsonb_array_elements_text(COALESCE(alb.tags_json, '[]')::jsonb) AS g(value)
+                    WHERE COALESCE(TRIM(g.value), '') <> ''
+                    UNION ALL
+                    SELECT
+                        alb.id AS album_id,
+                        LOWER(TRIM(alb.genre)) AS genre
+                    FROM files_albums alb
+                    WHERE COALESCE(TRIM(alb.genre), '') <> ''
+                      AND COALESCE(alb.tags_json, '[]') = '[]'
+                )
+                SELECT genre, COUNT(DISTINCT album_id) AS c
+                FROM genre_tokens
+                WHERE COALESCE(genre, '') <> ''
+                GROUP BY genre
+                ORDER BY c DESC, genre ASC
+                LIMIT 20
+                """
+            )
+            genre_rows = cur.fetchall()
+
+            # Top labels.
+            cur.execute(
+                """
+                SELECT TRIM(label) AS label, COUNT(*) AS c
+                FROM files_albums
+                WHERE COALESCE(TRIM(label), '') <> ''
+                GROUP BY TRIM(label)
+                ORDER BY c DESC, label ASC
+                LIMIT 20
+                """
+            )
+            label_rows = cur.fetchall()
+
+            # Recently indexed albums (acts like "recently added").
+            cur.execute(
+                """
+                SELECT
+                    alb.id,
+                    alb.title,
+                    COALESCE(alb.year, 0) AS year,
+                    ar.id AS artist_id,
+                    ar.name AS artist_name
+                FROM files_albums alb
+                JOIN files_artists ar ON ar.id = alb.artist_id
+                ORDER BY alb.created_at DESC, alb.id DESC
+                LIMIT 20
+                """
+            )
+            recent_rows = cur.fetchall()
+    except Exception:
+        logging.debug("Assistant library snapshot build failed", exc_info=True)
+        return {}
+
+    lines: list[str] = []
+    lines.append("PMDA Library snapshot (local files)")
+    lines.append(f"Artists: {artists}")
+    lines.append(f"Albums: {albums}")
+    lines.append(f"Tracks: {tracks}")
+
+    if genre_rows:
+        lines.append("")
+        lines.append("Top genres (by #albums):")
+        for g, c in genre_rows[:15]:
+            gg = str(g or "").strip()
+            if not gg:
+                continue
+            lines.append(f"- {gg}: {int(c or 0)}")
+
+    if label_rows:
+        lines.append("")
+        lines.append("Top labels (by #albums):")
+        for lab, c in label_rows[:12]:
+            ll = str(lab or "").strip()
+            if not ll:
+                continue
+            lines.append(f"- {ll}: {int(c or 0)}")
+
+    if recent_rows:
+        lines.append("")
+        lines.append("Recently added albums (most recent first):")
+        for aid, title, year, artist_id, artist_name in recent_rows[:15]:
+            y = int(year or 0)
+            year_txt = str(y) if y > 0 else "—"
+            t = str(title or "").strip()
+            a = str(artist_name or "").strip()
+            if not (t and a):
+                continue
+            lines.append(f"- {a} · {year_txt} · {t} · album_id={int(aid or 0)} · artist_id={int(artist_id or 0)}")
+
+    # Upsert the snapshot doc for RAG.
+    try:
+        _assistant_upsert_doc(
+            conn,
+            entity_type="library",
+            entity_id=1,
+            doc_type="library_snapshot",
+            source="pmda_db",
+            title="PMDA Library",
+            content="\n".join(lines),
+        )
+        with conn.transaction():
+            with conn.cursor() as cur:
+                _files_index_write_meta(cur, "assistant_library_snapshot_ts", str(int(time.time())))
+    except Exception:
+        logging.debug("Assistant library snapshot upsert failed", exc_info=True)
+
+    return {"artists": artists, "albums": albums, "tracks": tracks}
+
+
+def _assistant_ingest_artist_rag(conn, artist_id: int) -> dict:
+    """Ensure RAG docs exist for an artist. Returns minimal context info for citations."""
+    artist_id = int(artist_id or 0)
+    if artist_id <= 0:
+        return {}
+    with conn.cursor() as cur:
+        cur.execute("SELECT id, name, name_norm FROM files_artists WHERE id = %s", (artist_id,))
+        row = cur.fetchone()
+        if not row:
+            return {}
+        artist_name = (row[1] or "").strip()
+        artist_norm = (row[2] or "").strip() or " ".join((artist_name or "").split()).lower()
+
+        cur.execute(
+            """
+            SELECT bio, short_bio, tags_json, similar_json, source, updated_at
+            FROM files_artist_profiles
+            WHERE name_norm = %s
+            """,
+            (artist_norm,),
+        )
+        prof_row = cur.fetchone()
+        bio = (prof_row[0] or "").strip() if prof_row else ""
+        short_bio = (prof_row[1] or "").strip() if prof_row else ""
+        tags_json = (prof_row[2] or "").strip() if prof_row else ""
+        similar_json = (prof_row[3] or "").strip() if prof_row else ""
+        prof_source = (prof_row[4] or "").strip() if prof_row else ""
+        prof_updated_at = prof_row[5] if prof_row else None
+
+        try:
+            tags = json.loads(tags_json) if tags_json else []
+        except Exception:
+            tags = []
+        if not isinstance(tags, list):
+            tags = []
+        try:
+            similar = json.loads(similar_json) if similar_json else []
+        except Exception:
+            similar = []
+        if not isinstance(similar, list):
+            similar = []
+
+        cur.execute(
+            """
+            SELECT id, title, title_norm, COALESCE(year, 0) AS year, track_count, COALESCE(format, ''), is_lossless, has_cover
+            FROM files_albums
+            WHERE artist_id = %s
+            ORDER BY COALESCE(year, 0) DESC, title ASC
+            LIMIT 160
+            """,
+            (artist_id,),
+        )
+        album_rows = cur.fetchall()
+
+        # Local genre cues to disambiguate common-name artists (e.g. Last.fm "multiple artists using this name").
+        try:
+            cur.execute(
+                """
+                WITH genre_tokens AS (
+                    SELECT
+                        LOWER(TRIM(g.value)) AS genre
+                    FROM files_albums alb
+                    CROSS JOIN LATERAL jsonb_array_elements_text(COALESCE(alb.tags_json, '[]')::jsonb) AS g(value)
+                    WHERE alb.artist_id = %s
+                      AND COALESCE(TRIM(g.value), '') <> ''
+                    UNION ALL
+                    SELECT
+                        LOWER(TRIM(alb.genre)) AS genre
+                    FROM files_albums alb
+                    WHERE alb.artist_id = %s
+                      AND COALESCE(TRIM(alb.genre), '') <> ''
+                      AND COALESCE(alb.tags_json, '[]') = '[]'
+                )
+                SELECT genre, COUNT(*) AS c
+                FROM genre_tokens
+                WHERE COALESCE(genre, '') <> ''
+                GROUP BY genre
+                ORDER BY c DESC, genre ASC
+                LIMIT 12
+                """,
+                (artist_id, artist_id),
+            )
+            genre_rows = cur.fetchall()
+        except Exception:
+            genre_rows = []
+
+    if bio:
+        _assistant_upsert_doc(
+            conn,
+            entity_type="artist",
+            entity_id=artist_id,
+            doc_type="artist_profile_bio",
+            source=prof_source or "unknown",
+            title=artist_name,
+            content=bio,
+        )
+    if short_bio and (not bio or len(bio) < 140):
+        _assistant_upsert_doc(
+            conn,
+            entity_type="artist",
+            entity_id=artist_id,
+            doc_type="artist_profile_short",
+            source=prof_source or "unknown",
+            title=artist_name,
+            content=short_bio,
+        )
+
+    # Always ingest a local library snapshot for factual "what do I own" questions.
+    lines = []
+    lines.append(f"Artist: {artist_name}")
+    lines.append(f"Local albums: {len(album_rows)}")
+    try:
+        if genre_rows:
+            parts = []
+            for g, c in genre_rows[:12]:
+                gg = str(g or "").strip()
+                if not gg:
+                    continue
+                try:
+                    cc = int(c or 0)
+                except Exception:
+                    cc = 0
+                parts.append(f"{gg} ({cc})" if cc > 1 else gg)
+            if parts:
+                lines.append("Local genres: " + ", ".join(parts[:12]))
+    except Exception:
+        pass
+    for aid, title, title_norm, year, track_count, fmt, is_lossless, has_cover in album_rows[:160]:
+        yr = int(year or 0)
+        year_txt = str(yr) if yr > 0 else "—"
+        fmt_txt = (fmt or "").strip().upper() or "—"
+        loss = "lossless" if bool(is_lossless) else "lossy"
+        cover = "cover" if bool(has_cover) else "no_cover"
+        lines.append(f"- {year_txt} · {title} ({int(track_count or 0)} tracks) · {fmt_txt} · {loss} · {cover} · album_id={int(aid)}")
+    _assistant_upsert_doc(
+        conn,
+        entity_type="artist",
+        entity_id=artist_id,
+        doc_type="artist_library_snapshot",
+        source="pmda_db",
+        title=artist_name,
+        content="\n".join(lines),
+    )
+
+    # Ingest tags + similar artists for conversational recommendations.
+    try:
+        if tags:
+            tag_txt = ", ".join([str(t or "").strip() for t in tags if str(t or "").strip()][:30])
+            if tag_txt:
+                _assistant_upsert_doc(
+                    conn,
+                    entity_type="artist",
+                    entity_id=artist_id,
+                    doc_type="artist_tags",
+                    source=prof_source or "unknown",
+                    title=artist_name,
+                    content=f"Tags: {tag_txt}",
+                )
+    except Exception:
+        pass
+
+    try:
+        if similar:
+            s_lines = ["Similar artists (from metadata providers):"]
+            for s in similar[:40]:
+                if not isinstance(s, dict):
+                    continue
+                nm = (s.get("name") or "").strip()
+                if not nm:
+                    continue
+                typ = (s.get("type") or "").strip()
+                if typ:
+                    s_lines.append(f"- {nm} ({typ})")
+                else:
+                    s_lines.append(f"- {nm}")
+            if len(s_lines) > 1:
+                _assistant_upsert_doc(
+                    conn,
+                    entity_type="artist",
+                    entity_id=artist_id,
+                    doc_type="artist_similar_artists",
+                    source=prof_source or "unknown",
+                    title=artist_name,
+                    content="\n".join(s_lines),
+                )
+    except Exception:
+        pass
+
+    # Ingest cached album snippets/reviews (local-only "journal" use-case).
+    try:
+        title_norms = [str(r[2] or "").strip() for r in album_rows if str(r[2] or "").strip()]
+        title_norms = list(dict.fromkeys(title_norms))[:160]
+        prof_map: dict[str, dict] = {}
+        if title_norms:
+            placeholders = ",".join(["%s"] * len(title_norms))
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT title_norm, short_description, source
+                    FROM files_album_profiles
+                    WHERE artist_norm = %s AND title_norm IN ({placeholders})
+                    """,
+                    [artist_norm, *title_norms],
+                )
+                for tn, sd, src in cur.fetchall():
+                    key = str(tn or "").strip()
+                    if not key:
+                        continue
+                    prof_map[key] = {"short_description": (sd or "").strip(), "source": (src or "").strip()}
+
+        review_lines: list[str] = []
+        for aid, title, title_norm, year, track_count, fmt, is_lossless, has_cover in album_rows[:120]:
+            tn = str(title_norm or "").strip()
+            if not tn:
+                continue
+            p = prof_map.get(tn) or {}
+            sd = (p.get("short_description") or "").strip()
+            if not sd:
+                continue
+            src = (p.get("source") or "").strip() or "unknown"
+            yr = int(year or 0)
+            year_txt = str(yr) if yr > 0 else "—"
+            review_lines.append(f"- {year_txt} · {title}: {sd} (source={src})")
+            if len(review_lines) >= 80:
+                break
+        if review_lines:
+            _assistant_upsert_doc(
+                conn,
+                entity_type="artist",
+                entity_id=artist_id,
+                doc_type="artist_album_snippets",
+                source="pmda_db",
+                title=artist_name,
+                content="Album snippets:\n" + "\n".join(review_lines),
+            )
+    except Exception:
+        pass
+
+    # Ingest upcoming concerts if cached (or recently refreshed by the artist page).
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT provider, events_json, source_url, updated_at
+                FROM files_artist_concerts
+                WHERE artist_id = %s
+                """,
+                (artist_id,),
+            )
+            crow = cur.fetchone()
+        if crow:
+            provider = (crow[0] or "").strip().lower() or "bandsintown"
+            source_url = (crow[2] or "").strip()
+            try:
+                events = json.loads(crow[1] or "[]") if crow[1] else []
+            except Exception:
+                events = []
+            if not isinstance(events, list):
+                events = []
+            if events:
+                c_lines = []
+                for ev in events[:30]:
+                    if not isinstance(ev, dict):
+                        continue
+                    dt = (ev.get("datetime") or ev.get("date") or "").strip()
+                    venue = ev.get("venue") if isinstance(ev.get("venue"), dict) else {}
+                    vname = (venue.get("name") or "").strip() if isinstance(venue, dict) else ""
+                    city = (venue.get("city") or "").strip() if isinstance(venue, dict) else ""
+                    country = (venue.get("country") or "").strip() if isinstance(venue, dict) else ""
+                    where = ", ".join([x for x in [city, country] if x])
+                    url = (ev.get("url") or "").strip()
+                    line = " · ".join([x for x in [dt, vname, where, url] if x])
+                    if line:
+                        c_lines.append(f"- {line}")
+                if c_lines:
+                    _assistant_upsert_doc(
+                        conn,
+                        entity_type="artist",
+                        entity_id=artist_id,
+                        doc_type="artist_concerts_upcoming",
+                        source=provider,
+                        title=artist_name,
+                        url=source_url,
+                        content="Upcoming concerts:\n" + "\n".join(c_lines),
+                    )
+    except Exception:
+        pass
+
+    # Ingest extracted facts (AKA/groups/labels/collabs) when available.
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT facts_json, source, provider, model, updated_at
+                FROM assistant_entity_facts
+                WHERE entity_type = 'artist' AND entity_id = %s
+                """,
+                (artist_id,),
+            )
+            frow = cur.fetchone()
+        if frow:
+            try:
+                facts = json.loads(frow[0] or "{}") if frow[0] else {}
+            except Exception:
+                facts = {}
+            if not isinstance(facts, dict):
+                facts = {}
+            src = (frow[1] or "").strip() or "facts"
+            provider = (frow[2] or "").strip()
+            model = (frow[3] or "").strip()
+            lines = []
+            for key, label in (
+                ("aka", "AKA"),
+                ("aliases", "Aliases"),
+                ("member_of", "Groups"),
+                ("collaborated_with", "Collaborations"),
+                ("labels", "Labels"),
+                ("notable_cities", "Cities"),
+            ):
+                val = facts.get(key)
+                if not isinstance(val, list):
+                    continue
+                clean = [str(x or "").strip() for x in val if str(x or "").strip()]
+                if not clean:
+                    continue
+                lines.append(f"{label}: {', '.join(clean[:30])}")
+            if lines:
+                _assistant_upsert_doc(
+                    conn,
+                    entity_type="artist",
+                    entity_id=artist_id,
+                    doc_type="artist_facts_extracted",
+                    source=src,
+                    provider=provider,
+                    model=model,
+                    title=artist_name,
+                    content="\n".join(lines),
+                )
+    except Exception:
+        pass
+
+    return {
+        "artist_id": artist_id,
+        "artist_name": artist_name,
+        "artist_norm": artist_norm,
+        "profile_source": prof_source,
+        "profile_updated_at": int(_dt_to_epoch(prof_updated_at)) if prof_updated_at else 0,
+    }
+
+
+def _assistant_find_artist_ids_for_query(conn, query: str, limit: int = 3) -> list[int]:
+    q = (query or "").strip()
+    if not q:
+        return []
+    limit = max(1, min(10, int(limit or 3)))
+    with conn.cursor() as cur:
+        # 1) Strong heuristic: if the message contains an artist name verbatim, prefer that.
+        # This is robust for natural language queries like "Quels albums de Rod Stewart...".
+        cur.execute(
+            """
+            SELECT id
+            FROM files_artists
+            WHERE length(name) >= 3
+              AND position(lower(name) in lower(%s)) > 0
+            ORDER BY length(name) DESC, album_count DESC, name ASC
+            LIMIT %s
+            """,
+            (q, limit),
+        )
+        rows = cur.fetchall()
+        if rows:
+            return [int(r[0] or 0) for r in rows if int(r[0] or 0) > 0]
+
+        # 2) Fallback: similarity / ILIKE when pg_trgm is available.
+        like = f"%{q}%"
+        try:
+            cur.execute(
+                """
+                SELECT id
+                FROM files_artists
+                WHERE name ILIKE %s
+                ORDER BY similarity(name, %s) DESC, album_count DESC, name ASC
+                LIMIT %s
+                """,
+                (like, q, limit),
+            )
+        except Exception:
+            cur.execute(
+                """
+                SELECT id
+                FROM files_artists
+                WHERE name ILIKE %s
+                ORDER BY album_count DESC, name ASC
+                LIMIT %s
+                """,
+                (like, limit),
+            )
+        rows = cur.fetchall()
+    return [int(r[0] or 0) for r in rows if int(r[0] or 0) > 0]
+
+
+def _assistant_fetch_session_messages(conn, session_id: str, limit: int = 12) -> list[dict]:
+    session_id = (session_id or "").strip()
+    if not session_id:
+        return []
+    limit = max(1, min(50, int(limit or 12)))
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT role, content
+            FROM assistant_messages
+            WHERE session_id = %s
+            ORDER BY created_at DESC
+            LIMIT %s
+            """,
+            (session_id, limit),
+        )
+        rows = cur.fetchall()
+    out = []
+    for role, content in reversed(rows):
+        r = (role or "").strip().lower()
+        if r not in {"user", "assistant", "system"}:
+            continue
+        out.append({"role": r, "content": (content or "").strip()})
+    return out
+
+
+def _assistant_retrieve_chunks(conn, query: str, *, artist_id: int | None = None, k: int = 8) -> dict:
+    """Return top-k chunks with citation metadata (artist + library snapshot)."""
+    query = (query or "").strip()
+    k = max(1, min(16, int(k or 8)))
+    artist_id = int(artist_id or 0) if artist_id else 0
+    if not query:
+        return {"chunks": [], "citations": []}
+
+    doc_ids: list[int] = []
+    # Always include library snapshot docs so collection-wide questions have grounding.
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id
+                FROM assistant_docs
+                WHERE entity_type = 'library' AND entity_id = 1
+                ORDER BY updated_at DESC
+                """,
+            )
+            doc_ids.extend([int(r[0] or 0) for r in cur.fetchall() if int(r[0] or 0) > 0])
+    except Exception:
+        pass
+
+    if artist_id > 0:
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id
+                    FROM assistant_docs
+                    WHERE entity_type = 'artist' AND entity_id = %s
+                    ORDER BY updated_at DESC
+                    """,
+                    (artist_id,),
+                )
+                doc_ids.extend([int(r[0] or 0) for r in cur.fetchall() if int(r[0] or 0) > 0])
+        except Exception:
+            pass
+    # Deduplicate while preserving order.
+    doc_ids = list(dict.fromkeys([int(x) for x in doc_ids if int(x) > 0]))
+    if not doc_ids:
+        return {"chunks": [], "citations": []}
+
+    q_vec, _q_norm = _build_hashed_embedding(query, RECO_EMBED_DIM)
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                c.id,
+                c.content,
+                c.embed_json,
+                d.entity_type,
+                d.entity_id,
+                d.doc_type,
+                d.source,
+                COALESCE(d.title, '')
+            FROM assistant_doc_chunks c
+            JOIN assistant_docs d ON d.id = c.doc_id
+            WHERE c.doc_id = ANY(%s)
+            """,
+            (doc_ids,),
+        )
+        rows = cur.fetchall()
+
+    scored = []
+    artist_snapshot_item: dict | None = None
+    library_snapshot_item: dict | None = None
+    for chunk_id, content, embed_json, et, eid, doc_type, source, title in rows:
+        emb = _load_embedding_json(embed_json or "[]")
+        sim = _vec_cosine(q_vec, emb) if emb else 0.0
+        txt = (content or "").strip()
+        # Small lexical boost for exact substring match.
+        if query.lower() in txt.lower():
+            sim += 0.08
+        item = (
+            {
+                "chunk_id": int(chunk_id or 0),
+                "score": float(sim),
+                "text": txt,
+                "citation": {
+                    "entity_type": str(et or ""),
+                    "entity_id": int(eid or 0),
+                    "doc_type": str(doc_type or ""),
+                    "source": str(source or ""),
+                    "title": str(title or ""),
+                },
+            }
+        )
+        scored.append(item)
+        # Always keep snapshot chunks so "what do I own" questions are answerable without relying on
+        # embedding similarity (artist inventory + collection snapshot).
+        dt = str(doc_type or "").strip().lower()
+        if dt == "artist_library_snapshot" and artist_snapshot_item is None:
+            artist_snapshot_item = item
+        if dt == "library_snapshot" and library_snapshot_item is None:
+            library_snapshot_item = item
+    scored.sort(key=lambda x: float(x.get("score") or 0.0), reverse=True)
+    top = scored[: max(k, 1)]
+
+    # Ensure snapshots are present (artist snapshot first, then library snapshot).
+    merged = list(top)
+    for snap in [artist_snapshot_item, library_snapshot_item]:
+        if snap is None:
+            continue
+        snap_dt = (snap.get("citation") or {}).get("doc_type")
+        if snap_dt and any((it.get("citation") or {}).get("doc_type") == snap_dt for it in merged):
+            continue
+        merged = [snap, *merged]
+    if merged != top:
+        # Put snapshots first so the model sees local inventory before external bios.
+        seen = set()
+        deduped = []
+        for it in merged:
+            cid = int(it.get("chunk_id") or 0)
+            if cid and cid in seen:
+                continue
+            if cid:
+                seen.add(cid)
+            deduped.append(it)
+        top = deduped[: min(14, max(k, 1) + 4)]
+    citations = []
+    for item in top:
+        c = dict(item.get("citation") or {})
+        c["chunk_id"] = int(item.get("chunk_id") or 0)
+        c["score"] = round(float(item.get("score") or 0.0), 4)
+        c["snippet"] = _truncate_text(item.get("text") or "", max_chars=240)
+        citations.append(c)
+    return {"chunks": top, "citations": citations}
+
+
+def _assistant_maybe_gc(conn) -> None:
+    """Daily GC for assistant sessions/messages to prevent unbounded growth."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT value FROM files_index_meta WHERE key = %s", ("assistant_gc_ts",))
+            row = cur.fetchone()
+        last_ts = float(row[0] or 0) if row and row[0] else 0.0
+    except Exception:
+        last_ts = 0.0
+    if last_ts > 0 and (time.time() - last_ts) < _ASSISTANT_GC_INTERVAL_SEC:
+        return
+    try:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"DELETE FROM assistant_sessions WHERE updated_at < NOW() - INTERVAL '{int(_ASSISTANT_SESSION_MAX_AGE_DAYS)} days'"
+                )
+                # Hard cap: keep most recent sessions.
+                cur.execute(
+                    """
+                    SELECT session_id
+                    FROM assistant_sessions
+                    ORDER BY updated_at DESC
+                    OFFSET %s
+                    """,
+                    (int(_ASSISTANT_SESSION_HARD_CAP),),
+                )
+                extra = [str(r[0] or "").strip() for r in cur.fetchall() if str(r[0] or "").strip()]
+                if extra:
+                    cur.execute("DELETE FROM assistant_sessions WHERE session_id = ANY(%s)", (extra,))
+                _files_index_write_meta(cur, "assistant_gc_ts", str(int(time.time())))
+    except Exception:
+        # Never block UI/API on GC.
+        logging.debug("Assistant GC failed", exc_info=True)
+
+
+def _assistant_ensure_session(conn, session_id: str | None) -> str:
+    sid = (session_id or "").strip()
+    if not sid:
+        sid = str(uuid.uuid4())
+    with conn.transaction():
+        with conn.cursor() as cur:
+            cur.execute("SELECT session_id FROM assistant_sessions WHERE session_id = %s", (sid,))
+            if cur.fetchone():
+                cur.execute("UPDATE assistant_sessions SET updated_at = NOW() WHERE session_id = %s", (sid,))
+                return sid
+            cur.execute(
+                """
+                INSERT INTO assistant_sessions(session_id, created_at, updated_at)
+                VALUES (%s, NOW(), NOW())
+                """,
+                (sid,),
+            )
+    return sid
+
+
+def _assistant_insert_message(conn, *, session_id: str, role: str, content: str, context: dict, metadata: dict) -> dict:
+    sid = (session_id or "").strip()
+    role_norm = (role or "").strip().lower()
+    if role_norm not in {"user", "assistant", "system"}:
+        role_norm = "user"
+    ctx_json = json.dumps(context or {}, ensure_ascii=True)
+    meta_json = json.dumps(metadata or {}, ensure_ascii=True)
+    with conn.transaction():
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO assistant_messages(session_id, role, content, context_json, metadata_json, created_at)
+                VALUES (%s, %s, %s, %s, %s, NOW())
+                RETURNING id, EXTRACT(EPOCH FROM created_at)::BIGINT
+                """,
+                (sid, role_norm, (content or "").strip(), ctx_json, meta_json),
+            )
+            row = cur.fetchone() or [0, 0]
+            msg_id = int(row[0] or 0)
+            created_at = int(row[1] or 0)
+            cur.execute("UPDATE assistant_sessions SET updated_at = NOW() WHERE session_id = %s", (sid,))
+    # Include context/metadata in the returned payload so the UI can render citations/links immediately
+    # without requiring a separate history fetch.
+    return {
+        "id": msg_id,
+        "role": role_norm,
+        "content": (content or "").strip(),
+        "created_at": created_at,
+        "context": context if isinstance(context, dict) else {},
+        "metadata": metadata if isinstance(metadata, dict) else {},
+    }
+
+
+def _assistant_build_prompt(
+    *,
+    user_message: str,
+    retrieved: dict,
+    history: list[dict],
+    context_info: dict,
+) -> tuple[str, str]:
+    system_msg = (
+        "You are PMDA Intelligence, an audiophile-focused music librarian for a LOCAL library.\n"
+        "Rules:\n"
+        "- Use only the provided context excerpts. Do not invent facts.\n"
+        "- If the answer is not in context, say so and suggest a concrete next step (refresh profile, rescan, etc.).\n"
+        "- If a current artist context is provided, focus only on that artist (do not enumerate other artists with the same name unless the user explicitly asks).\n"
+        "- If a provider bio mentions multiple artists with the same name, DO NOT repeat the disambiguation; pick the variant that matches the local PMDA cues (local genres, local releases, known collaborators) and ignore the others.\n"
+        "- When sources conflict about identity, prefer pmda_db excerpts as the identity anchor.\n"
+        "- Answer in the same language as the user.\n"
+        "- Prefer structured output (short sections / bullets) when helpful.\n"
+    )
+    ctx_lines = []
+    chunks = retrieved.get("chunks") or []
+    for i, item in enumerate(chunks[:12], start=1):
+        cit = (item.get("citation") or {})
+        label = f"C{i}"
+        src = f"{cit.get('source') or 'unknown'}"
+        dtype = f"{cit.get('doc_type') or 'doc'}"
+        title = f"{cit.get('title') or ''}".strip()
+        header = f"[{label}] ({dtype}, source={src}{', title='+title if title else ''})"
+        ctx_lines.append(header)
+        ctx_lines.append(item.get("text") or "")
+        ctx_lines.append("")
+    ctx_block = "\n".join(ctx_lines).strip()
+
+    hist_lines = []
+    for m in history[-12:]:
+        role = (m.get("role") or "").strip().lower()
+        content = (m.get("content") or "").strip()
+        if not role or not content:
+            continue
+        prefix = "User" if role == "user" else ("Assistant" if role == "assistant" else "System")
+        hist_lines.append(f"{prefix}: {content}")
+    hist_block = "\n".join(hist_lines).strip()
+
+    focus = ""
+    if context_info.get("artist_name"):
+        focus = f"Context: Current artist = {context_info.get('artist_name')}\n"
+
+    user_prompt = (
+        f"{focus}"
+        f"User question:\n{(user_message or '').strip()}\n\n"
+        f"Conversation (most recent last):\n{hist_block if hist_block else '(none)'}\n\n"
+        f"Context excerpts:\n{ctx_block if ctx_block else '(none)'}\n"
+    )
+    return system_msg, user_prompt
+
+
+def _assistant_simplify_for_intent(text: str) -> str:
+    """Lowercase, strip accents, collapse whitespace (good enough for intent heuristics)."""
+    t = (text or "").strip().lower()
+    if not t:
+        return ""
+    try:
+        t = unicodedata.normalize("NFKD", t)
+        t = "".join(ch for ch in t if not unicodedata.combining(ch))
+    except Exception:
+        pass
+    t = re.sub(r"[^a-z0-9]+", " ", t)
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def _assistant_lang_for_message(user_message: str) -> str:
+    s = _assistant_simplify_for_intent(user_message)
+    if any(tok in s for tok in ["combien", "quel", "quelle", "quels", "bibliotheque", "bibliotheque", "morceau", "artiste", "album", "collection"]):
+        return "fr"
+    if any(tok in s for tok in ["how many", "library", "collection", "artist", "album", "track", "genre"]):
+        return "en"
+    try:
+        return _assistant_preferred_lang()
+    except Exception:
+        return "en"
+
+
+def _assistant_detect_tool_intent(user_message: str, *, context_artist_id: int) -> str | None:
+    s = _assistant_simplify_for_intent(user_message)
+    if not s:
+        return None
+
+    wants_count = any(tok in s for tok in ["combien", "nombre", "how many", "count"])
+    if wants_count:
+        if "artiste" in s or "artist" in s:
+            return "library_count_artists"
+        if "album" in s or "albums" in s:
+            return "library_count_albums"
+        if any(tok in s for tok in ["morceau", "track", "tracks", "titre", "song", "songs"]):
+            return "library_count_tracks"
+
+    # "Top" / "most present" / "most represented"
+    if ("genre" in s) and any(tok in s for tok in ["plus present", "plus frequent", "most common", "most frequent", "most present"]):
+        return "library_top_genres"
+    if any(tok in s for tok in ["artistes les plus presents", "artistes les plus presents", "most represented artists", "top artists", "artistes les plus representes"]):
+        return "library_top_artists"
+
+    if context_artist_id > 0:
+        if ("artiste similaire" in s) or ("artistes similaires" in s) or ("similar artists" in s) or ("similaires" in s and "artiste" in s):
+            return "artist_similar_artists"
+        if ("album" in s or "albums" in s) and any(tok in s for tok in ["liste", "list", "quels", "which", "dispose", "dans ma collection", "local"]):
+            return "artist_list_albums"
+
+    return None
+
+
+def _assistant_tool_library_counts(conn) -> dict:
+    with conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM files_artists")
+        artists = int((cur.fetchone() or [0])[0] or 0)
+        cur.execute("SELECT COUNT(*) FROM files_albums")
+        albums = int((cur.fetchone() or [0])[0] or 0)
+        cur.execute("SELECT COUNT(*) FROM files_tracks")
+        tracks = int((cur.fetchone() or [0])[0] or 0)
+    return {"artists": artists, "albums": albums, "tracks": tracks}
+
+
+def _assistant_tool_library_top_genres(conn, *, limit: int = 10) -> list[tuple[str, int]]:
+    limit = max(1, min(50, int(limit or 10)))
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            WITH genre_tokens AS (
+                SELECT
+                    alb.id AS album_id,
+                    LOWER(TRIM(g.value)) AS genre
+                FROM files_albums alb
+                CROSS JOIN LATERAL jsonb_array_elements_text(COALESCE(alb.tags_json, '[]')::jsonb) AS g(value)
+                WHERE COALESCE(TRIM(g.value), '') <> ''
+                UNION ALL
+                SELECT
+                    alb.id AS album_id,
+                    LOWER(TRIM(alb.genre)) AS genre
+                FROM files_albums alb
+                WHERE COALESCE(TRIM(alb.genre), '') <> ''
+                  AND COALESCE(alb.tags_json, '[]') = '[]'
+            )
+            SELECT genre, COUNT(DISTINCT album_id) AS c
+            FROM genre_tokens
+            WHERE COALESCE(genre, '') <> ''
+            GROUP BY genre
+            ORDER BY c DESC, genre ASC
+            LIMIT %s
+            """,
+            (int(limit),),
+        )
+        rows = cur.fetchall()
+    out: list[tuple[str, int]] = []
+    for g, c in rows:
+        gg = str(g or "").strip()
+        if not gg:
+            continue
+        out.append((gg, int(c or 0)))
+    return out
+
+
+def _assistant_tool_library_top_artists(conn, *, base_url: str, limit: int = 12) -> list[dict]:
+    limit = max(1, min(40, int(limit or 12)))
+    base = (base_url or "").rstrip("/")
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                a.id,
+                a.name,
+                a.name_norm,
+                a.album_count,
+                a.track_count,
+                a.has_image,
+                COALESCE(ext.image_path, '') AS ext_path
+            FROM files_artists a
+            LEFT JOIN files_external_artist_images ext ON ext.name_norm = a.name_norm
+            ORDER BY a.album_count DESC, a.track_count DESC, a.name ASC
+            LIMIT %s
+            """,
+            (int(limit),),
+        )
+        rows = cur.fetchall()
+    out: list[dict] = []
+    for aid, name, name_norm, album_count, track_count, has_image, ext_path in rows:
+        artist_id = int(aid or 0)
+        nm = str(name or "").strip()
+        if artist_id <= 0 or not nm:
+            continue
+        thumb = None
+        if bool(has_image):
+            thumb = f"{base}/api/library/files/artist/{artist_id}/image?size=192"
+        elif str(ext_path or "").strip():
+            thumb = f"{base}/api/library/external/artist-image/{quote(str(name_norm or '').strip(), safe='')}?size=192"
+        out.append(
+            {
+                "artist_id": artist_id,
+                "artist_name": nm,
+                "name_norm": str(name_norm or "").strip(),
+                "album_count": int(album_count or 0),
+                "track_count": int(track_count or 0),
+                "thumb": thumb,
+            }
+        )
+    return out
+
+
+def _assistant_tool_artist_list_albums(conn, *, artist_id: int, limit: int = 80) -> tuple[str, list[dict]]:
+    artist_id = int(artist_id or 0)
+    limit = max(1, min(200, int(limit or 80)))
+    with conn.cursor() as cur:
+        cur.execute("SELECT name FROM files_artists WHERE id = %s", (artist_id,))
+        row = cur.fetchone()
+        artist_name = str((row[0] if row else "") or "").strip()
+        cur.execute(
+            """
+            SELECT id, title, COALESCE(year, 0) AS year, track_count, COALESCE(format, '') AS fmt, is_lossless, has_cover
+            FROM files_albums
+            WHERE artist_id = %s
+            ORDER BY COALESCE(year, 0) DESC, title ASC
+            LIMIT %s
+            """,
+            (artist_id, int(limit)),
+        )
+        rows = cur.fetchall()
+    albums: list[dict] = []
+    for aid, title, year, track_count, fmt, is_lossless, has_cover in rows:
+        albums.append(
+            {
+                "album_id": int(aid or 0),
+                "title": str(title or "").strip(),
+                "year": int(year or 0),
+                "track_count": int(track_count or 0),
+                "format": str(fmt or "").strip(),
+                "is_lossless": bool(is_lossless),
+                "has_cover": bool(has_cover),
+            }
+        )
+    return artist_name, albums
+
+
+def _assistant_tool_artist_similar(conn, *, artist_id: int, base_url: str, limit: int = 18) -> tuple[str, str, list[dict]]:
+    """Return (artist_name, source, similar_items) with local ids + image_url when possible."""
+    artist_id = int(artist_id or 0)
+    limit = max(1, min(40, int(limit or 18)))
+    base = (base_url or "").rstrip("/")
+    with conn.cursor() as cur:
+        cur.execute("SELECT name, name_norm FROM files_artists WHERE id = %s", (artist_id,))
+        row = cur.fetchone()
+        artist_name = str((row[0] if row else "") or "").strip()
+        artist_norm = str((row[1] if row else "") or "").strip()
+        cur.execute(
+            """
+            SELECT similar_json, source
+            FROM files_artist_profiles
+            WHERE name_norm = %s
+            """,
+            (artist_norm,),
+        )
+        prow = cur.fetchone()
+    source = ""
+    similar: list[dict] = []
+    if prow:
+        source = str(prow[1] or "").strip()
+        try:
+            sim = json.loads(prow[0] or "[]") if prow[0] else []
+        except Exception:
+            sim = []
+        if isinstance(sim, list):
+            for it in sim:
+                if isinstance(it, dict) and str(it.get("name") or "").strip():
+                    similar.append(dict(it))
+
+    if not similar:
+        # Local fallback: overlap genres from the library (works for Bandcamp-only libraries).
+        similar = _files_similar_artists_by_genre(conn, artist_id, limit=limit) or []
+        source = "pmda_db_genre"
+
+    patched = _files_attach_similar_artist_refs(conn, similar[:limit], base)
+    return artist_name, (source or "").strip(), (patched or [])[:limit]
+
+
+def _assistant_try_handle_tool_query(conn, *, user_message: str, context_artist_id: int, base_url: str) -> dict:
+    """
+    Fast path: answer common DB-grounded questions without calling the LLM.
+
+    Returns {handled: bool, assistant_text, citations, links, tool}.
+    """
+    intent = _assistant_detect_tool_intent(user_message, context_artist_id=context_artist_id)
+    if not intent:
+        return {"handled": False}
+
+    lang = _assistant_lang_for_message(user_message)
+    now_ts = int(time.time())
+
+    def _cit(entity_type: str, entity_id: int, title: str, snippet: str, doc_type: str = "sql_tool") -> list[dict]:
+        return [
+            {
+                "entity_type": entity_type,
+                "entity_id": int(entity_id or 0),
+                "doc_type": doc_type,
+                "source": "pmda_db",
+                "title": title,
+                "chunk_id": -1,
+                "score": 1.0,
+                "snippet": _truncate_text(snippet or "", max_chars=240),
+            }
+        ]
+
+    if intent in {"library_count_artists", "library_count_albums", "library_count_tracks"}:
+        counts = _assistant_tool_library_counts(conn)
+        if lang == "fr":
+            text = (
+                "Stats de ta bibliotheque locale (PMDA):\n"
+                f"- Artistes: {counts['artists']}\n"
+                f"- Albums: {counts['albums']}\n"
+                f"- Morceaux: {counts['tracks']}\n"
+            )
+        else:
+            text = (
+                "Local library stats (PMDA):\n"
+                f"- Artists: {counts['artists']}\n"
+                f"- Albums: {counts['albums']}\n"
+                f"- Tracks: {counts['tracks']}\n"
+            )
+        return {
+            "handled": True,
+            "tool": intent,
+            "assistant_text": text.strip(),
+            "citations": _cit("library", 1, "Library stats", f"artists={counts['artists']}, albums={counts['albums']}, tracks={counts['tracks']}"),
+            "links": [],
+            "ts": now_ts,
+        }
+
+    if intent == "library_top_genres":
+        top = _assistant_tool_library_top_genres(conn, limit=12)
+        if not top:
+            text = "Je n'ai trouve aucun genre exploitable dans ta bibliotheque." if lang == "fr" else "I could not find any usable genres in your library."
+            return {"handled": True, "tool": intent, "assistant_text": text, "citations": _cit("library", 1, "Library genres", "no genres found"), "links": [], "ts": now_ts}
+        if lang == "fr":
+            lines = ["Genres les plus presents (par #albums):"]
+        else:
+            lines = ["Most present genres (by #albums):"]
+        for g, c in top[:12]:
+            lines.append(f"- {g}: {c}")
+        snippet = ", ".join([f"{g}={c}" for g, c in top[:6]])
+        return {"handled": True, "tool": intent, "assistant_text": "\n".join(lines), "citations": _cit("library", 1, "Library genres", snippet), "links": [], "ts": now_ts}
+
+    if intent == "library_top_artists":
+        items = _assistant_tool_library_top_artists(conn, base_url=base_url, limit=16)
+        if not items:
+            text = "Je n'ai trouve aucun artiste dans la base." if lang == "fr" else "I couldn't find any artists in the database."
+            return {"handled": True, "tool": intent, "assistant_text": text, "citations": _cit("library", 1, "Library artists", "no artists found"), "links": [], "ts": now_ts}
+        if lang == "fr":
+            lines = ["Artistes les plus presents (par #albums):"]
+        else:
+            lines = ["Most represented artists (by #albums):"]
+        links: list[dict] = []
+        for it in items[:16]:
+            nm = str(it.get("artist_name") or "").strip()
+            aid = int(it.get("artist_id") or 0)
+            ac = int(it.get("album_count") or 0)
+            if not nm or aid <= 0:
+                continue
+            lines.append(f"- {nm}: {ac} albums")
+            links.append(
+                {
+                    "kind": "internal",
+                    "label": nm,
+                    "href": f"/library/artist/{aid}",
+                    "entity_type": "artist",
+                    "entity_id": aid,
+                    "thumb": it.get("thumb"),
+                }
+            )
+        snippet = "; ".join([f"{it.get('artist_name')}={it.get('album_count')}" for it in items[:6]])
+        return {"handled": True, "tool": intent, "assistant_text": "\n".join(lines), "citations": _cit("library", 1, "Top artists", snippet), "links": links[:24], "ts": now_ts}
+
+    if intent == "artist_list_albums" and int(context_artist_id or 0) > 0:
+        artist_name, albums = _assistant_tool_artist_list_albums(conn, artist_id=int(context_artist_id), limit=120)
+        if lang == "fr":
+            lines = [f"Albums locaux pour {artist_name or f'Artist #{int(context_artist_id)}'} ({len(albums)}):"]
+        else:
+            lines = [f"Local albums for {artist_name or f'Artist #{int(context_artist_id)}'} ({len(albums)}):"]
+        for a in albums[:120]:
+            yr = int(a.get("year") or 0)
+            year_txt = str(yr) if yr > 0 else "—"
+            fmt = str(a.get("format") or "").strip().upper() or "—"
+            loss = "lossless" if bool(a.get("is_lossless")) else "lossy"
+            lines.append(f"- {year_txt} · {a.get('title') or ''} ({int(a.get('track_count') or 0)} tracks) · {fmt} · {loss} · album_id={int(a.get('album_id') or 0)}")
+        snippet = ", ".join([str(a.get("title") or "") for a in albums[:6] if str(a.get("title") or "").strip()])
+        return {"handled": True, "tool": intent, "assistant_text": "\n".join(lines).strip(), "citations": _cit("artist", int(context_artist_id), artist_name or "Artist albums", snippet), "links": [], "ts": now_ts}
+
+    if intent == "artist_similar_artists" and int(context_artist_id or 0) > 0:
+        artist_name, source, sim = _assistant_tool_artist_similar(conn, artist_id=int(context_artist_id), base_url=base_url, limit=20)
+        if lang == "fr":
+            lines = [f"Artistes similaires a {artist_name or f'Artist #{int(context_artist_id)}'} (source: {source or 'unknown'}):"]
+        else:
+            lines = [f"Similar artists to {artist_name or f'Artist #{int(context_artist_id)}'} (source: {source or 'unknown'}):"]
+        links: list[dict] = []
+        for it in (sim or [])[:20]:
+            nm = str(it.get("name") or "").strip()
+            if not nm:
+                continue
+            local_id = int(it.get("artist_id") or 0)
+            typ = str(it.get("type") or "").strip()
+            label = f"{nm} ({typ})" if typ else nm
+            if local_id > 0:
+                lines.append(f"- {label} (dans ta librairie)")
+                links.append(
+                    {
+                        "kind": "internal",
+                        "label": nm,
+                        "href": f"/library/artist/{local_id}",
+                        "entity_type": "artist",
+                        "entity_id": local_id,
+                        "thumb": it.get("image_url"),
+                    }
+                )
+            else:
+                lines.append(f"- {label}")
+                # Generic external lookup (non-local artists).
+                links.append(
+                    {
+                        "kind": "external",
+                        "label": nm,
+                        "href": f"https://bandcamp.com/search?q={quote(nm)}",
+                        "entity_type": "artist",
+                        "entity_id": 0,
+                        "thumb": it.get("image_url"),
+                    }
+                )
+        snippet = ", ".join([str(it.get("name") or "") for it in (sim or [])[:8] if str(it.get("name") or "").strip()])
+        return {"handled": True, "tool": intent, "assistant_text": "\n".join(lines).strip(), "citations": _cit("artist", int(context_artist_id), artist_name or "Similar artists", snippet, doc_type="artist_similar_tool"), "links": links[:28], "ts": now_ts}
+
+    return {"handled": False}
+
+
+def _assistant_should_try_sql_agent(user_message: str) -> bool:
+    """
+    Return True when the user's question looks like a library/stats query where we should
+    attempt a DB-backed SQL answer (instead of biography/interpretation questions).
+    """
+    s = _assistant_simplify_for_intent(user_message)
+    if not s:
+        return False
+
+    # Avoid running the SQL agent for biography-like prompts; those should use RAG docs.
+    if any(tok in s for tok in ["qui est", "who is", "biographie", "biography", "resume", "resumer", "summarize", "tell me about", "dis m en plus"]):
+        return False
+
+    # Strong signals that the question is about the user's local collection / statistics.
+    strong = [
+        "ma collection", "ma bibliotheque", "bibliotheque", "collection", "my library", "library",
+        "dans ma", "dans mon", "j ai", "ai je", "do i have", "owned",
+        "combien", "nombre", "how many", "count",
+        "stat", "stats", "statistique", "statistiques",
+        "ecoute", "ecoutes", "listened", "played", "playback", "plays", "lecture",
+        "like", "dislike", "favori", "favorite", "playlist",
+    ]
+    if any(tok in s for tok in strong):
+        return True
+
+    # Weaker signals: entity words + possessive context.
+    if any(tok in s for tok in ["artiste", "artist", "album", "morceau", "track", "genre", "label", "annee", "year"]):
+        if any(tok in s for tok in ["ma", "mon", "mes", "my", "dans", "collection", "bibliotheque", "library"]):
+            return True
+
+    return False
+
+
+def _assistant_extract_json_obj(text: str) -> dict:
+    """Best-effort JSON object extractor for LLM outputs (no exceptions)."""
+    raw = (text or "").strip()
+    if not raw:
+        return {}
+
+    # Strip common fenced formats.
+    raw = re.sub(r"^\s*```(?:json)?\s*", "", raw, flags=re.IGNORECASE).strip()
+    raw = re.sub(r"\s*```\s*$", "", raw).strip()
+
+    def _try_parse_obj(s: str) -> dict:
+        s = (s or "").strip()
+        if not s:
+            return {}
+        try:
+            obj = json.loads(s)
+            return obj if isinstance(obj, dict) else {}
+        except Exception:
+            pass
+        # Some models still output Python-like dicts (single quotes). literal_eval is safe for literals.
+        try:
+            py = s
+            py = re.sub(r"\bnull\b", "None", py, flags=re.IGNORECASE)
+            py = re.sub(r"\btrue\b", "True", py, flags=re.IGNORECASE)
+            py = re.sub(r"\bfalse\b", "False", py, flags=re.IGNORECASE)
+            obj = ast.literal_eval(py)
+            return obj if isinstance(obj, dict) else {}
+        except Exception:
+            return {}
+
+    # If the output is already a clean JSON object, parse directly.
+    direct = _try_parse_obj(raw)
+    if direct:
+        return direct
+
+    # Otherwise, scan for the first balanced {...} object (ignoring braces in strings).
+    start = None
+    depth = 0
+    in_str = False
+    str_ch = ""
+    esc = False
+    for i, ch in enumerate(raw):
+        if in_str:
+            if esc:
+                esc = False
+                continue
+            if ch == "\\":
+                esc = True
+                continue
+            if ch == str_ch:
+                in_str = False
+                str_ch = ""
+            continue
+        if ch in ("\"", "'"):
+            in_str = True
+            str_ch = ch
+            continue
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+            continue
+        if ch == "}" and depth > 0:
+            depth -= 1
+            if depth == 0 and start is not None:
+                cand = raw[start : i + 1]
+                obj = _try_parse_obj(cand)
+                if obj:
+                    return obj
+                start = None
+    return {}
+
+
+def _assistant_validate_readonly_sql(sql: str) -> tuple[bool, str]:
+    """Reject obviously unsafe SQL. Only allow SELECT/CTE SELECT statements."""
+    s = (sql or "").strip()
+    if not s:
+        return (False, "empty_sql")
+    # Allow a single trailing semicolon, but reject any other semicolons.
+    while s.endswith(";"):
+        s = s[:-1].rstrip()
+    if ";" in s:
+        return (False, "multiple_statements_forbidden")
+    low = s.lower()
+    if not re.match(r"^(select|with)\b", low.strip()):
+        return (False, "only_select_queries_allowed")
+    # Disallow common mutating / privileged keywords.
+    banned = [
+        "insert", "update", "delete", "drop", "alter", "truncate", "create",
+        "grant", "revoke", "copy", "call", "do", "execute", "vacuum",
+        "analyze", "refresh", "listen", "notify",
+    ]
+    for kw in banned:
+        if re.search(rf"\b{kw}\b", low):
+            return (False, f"forbidden_keyword:{kw}")
+    if re.search(r"\bpg_sleep\b", low):
+        return (False, "forbidden_function:pg_sleep")
+    return (True, "ok")
+
+
+def _assistant_sql_agent_generate_query(
+    *,
+    user_message: str,
+    context_artist_id: int,
+    context_artist_name: str,
+    provider: str,
+    model: str,
+    error_hint: str = "",
+) -> dict:
+    """
+    Ask the LLM for a single read-only SQL query + params (positional).
+    Returns dict with keys: sql, params (best-effort).
+    """
+    schema = (
+        "files_artists(id, name, name_norm, album_count, track_count, broken_albums_count, has_image, image_path, created_at, updated_at)\n"
+        "files_albums(id, artist_id, title, title_norm, folder_path, year, date_text, genre, label, tags_json, format, is_lossless, has_cover, cover_path, "
+        "mb_identified, musicbrainz_release_group_id, discogs_release_id, lastfm_album_mbid, bandcamp_album_url, metadata_source, track_count, total_duration_sec, "
+        "is_broken, expected_track_count, actual_track_count, missing_indices_json, missing_required_tags_json, primary_tags_json, created_at, updated_at)\n"
+        "files_tracks(id, album_id, file_path, title, disc_num, track_num, duration_sec, format, bitrate, sample_rate, bit_depth, file_size_bytes, created_at, updated_at)\n"
+        "files_playback_events(user_id, track_id, event_type, played_seconds, created_at)  # user_id is always 1\n"
+        "files_entity_likes(entity_type, entity_id, liked, source, created_at, updated_at)\n"
+        "files_reco_events(session_id, track_id, album_id, artist_id, event_type, played_seconds, created_at)\n"
+        "files_artist_profiles(name_norm, artist_name, bio, short_bio, tags_json, similar_json, source, updated_at)\n"
+        "files_album_profiles(artist_norm, title_norm, album_title, description, short_description, tags_json, source, updated_at)\n"
+    )
+    system_msg = (
+        "You are a PostgreSQL query generator for PMDA (a local music library app).\n"
+        "Output ONLY a JSON object, no extra text.\n"
+        "JSON keys:\n"
+        "- sql: string (a single read-only query; SELECT or WITH ... SELECT)\n"
+        "- params: array (positional parameters for psycopg, use %s placeholders)\n"
+        "- title: short string describing what the query answers\n"
+        "Rules:\n"
+        "- No semicolons. No multiple statements.\n"
+        "- Never use INSERT/UPDATE/DELETE/CREATE/DROP/ALTER/TRUNCATE/COPY/CALL/DO.\n"
+        "- Prefer parameterized values (%s) for user-provided strings.\n"
+        "- For non-aggregate queries, include LIMIT <= 100.\n"
+        "- If the user asks about their listening stats, use files_playback_events (user_id=1).\n"
+        "Formatting rules for downstream UI:\n"
+        "- If returning artists, include columns: artist_id, artist_name.\n"
+        "- If returning labels, include a column named: label.\n"
+        "- If returning albums, include columns: artist_id, artist_name, album_id, album_title (and bandcamp_album_url when available).\n"
+        "Schema:\n"
+        f"{schema}"
+        "Join hints:\n"
+        "- files_tracks.album_id -> files_albums.id\n"
+        "- files_albums.artist_id -> files_artists.id\n"
+    )
+    ctx_line = ""
+    if int(context_artist_id or 0) > 0 and (context_artist_name or "").strip():
+        ctx_line = f"Current context artist: id={int(context_artist_id)} name={context_artist_name}\n"
+    user_msg = (
+        f"{ctx_line}"
+        "User question:\n"
+        f"{(user_message or '').strip()}\n"
+    )
+    if (error_hint or "").strip():
+        user_msg = (
+            f"{user_msg}\n"
+            "Previous error (fix your SQL accordingly):\n"
+            f"{_truncate_text(str(error_hint), max_chars=800)}\n"
+        )
+
+    out = ""
+    provider_lower = (provider or "").strip().lower()
+    if provider_lower == "openai" and openai_client:
+        # Prefer JSON mode for reliability; fall back to normal call on older models.
+        param_style = getattr(sys.modules[__name__], "RESOLVED_PARAM_STYLE", "mct")
+        _kwargs = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            "temperature": 0,
+            "response_format": {"type": "json_object"},
+        }
+        if param_style == "mct":
+            _kwargs["max_completion_tokens"] = 420
+        else:
+            _kwargs["max_tokens"] = 420
+        try:
+            resp = openai_client.chat.completions.create(**_kwargs)
+            out = (resp.choices[0].message.content or "").strip()
+        except Exception as e:
+            # Retry with other token parameter style when OpenAI errors on one of them.
+            err_msg = str(e).lower()
+            try:
+                if "unsupported_parameter" in err_msg or "400" in err_msg:
+                    if "max_completion_tokens" in err_msg and ("max_tokens" in err_msg or "use" in err_msg):
+                        _kwargs.pop("max_completion_tokens", None)
+                        _kwargs["max_tokens"] = 420
+                        resp = openai_client.chat.completions.create(**_kwargs)
+                        out = (resp.choices[0].message.content or "").strip()
+                    elif "max_tokens" in err_msg and "max_completion_tokens" in err_msg:
+                        _kwargs.pop("max_tokens", None)
+                        _kwargs["max_completion_tokens"] = 420
+                        resp = openai_client.chat.completions.create(**_kwargs)
+                        out = (resp.choices[0].message.content or "").strip()
+            except Exception:
+                out = ""
+            if not out:
+                logging.debug("Assistant SQL agent JSON-mode call failed, falling back: %s", str(e)[:240])
+                out = call_ai_provider_longform(provider, model, system_msg, user_msg, max_tokens=420)
+    else:
+        out = call_ai_provider_longform(provider, model, system_msg, user_msg, max_tokens=420)
+
+    obj = _assistant_extract_json_obj(out)
+    if not obj:
+        logging.debug("Assistant SQL agent produced no JSON plan. out=%s", _truncate_text(out, max_chars=600))
+        return {}
+    if "params" in obj and not isinstance(obj.get("params"), list):
+        obj["params"] = []
+    return obj
+
+
+def _assistant_sql_agent_execute(conn, *, sql: str, params: list, max_rows: int = 100) -> tuple[list[str], list[tuple]]:
+    """Execute SQL with a statement timeout. Returns (columns, rows)."""
+    max_rows = max(1, min(500, int(max_rows or 100)))
+    params = params if isinstance(params, list) else []
+    with conn.cursor() as cur:
+        # Keep requests responsive; reset after executing.
+        try:
+            cur.execute("SET statement_timeout TO '5000ms'")
+        except Exception:
+            pass
+        try:
+            cur.execute(sql, params)
+            cols = [str(d.name or "") for d in (cur.description or []) if getattr(d, "name", None)]
+            rows = cur.fetchmany(max_rows)
+            return (cols, rows)
+        finally:
+            try:
+                cur.execute("RESET statement_timeout")
+            except Exception:
+                pass
+
+
+def _assistant_sql_agent_format_result(*, lang: str, title: str, cols: list[str], rows: list[tuple]) -> str:
+    """Format SQL rows into a chat-friendly answer (deterministic; no hallucination)."""
+    title = (title or "").strip() or ("Resultats (PMDA)" if lang == "fr" else "Results (PMDA)")
+    if not rows:
+        return f"{title}:\n- Aucun resultat." if lang == "fr" else f"{title}:\n- No results."
+
+    if len(rows) == 1 and len(cols) == 1:
+        val = rows[0][0]
+        return f"{title}: {val}"
+
+    # Special-case common 2-col shapes: (name, count)
+    if len(cols) == 2:
+        lines = [f"{title}:"]
+        for r in rows[:20]:
+            a = str(r[0] if len(r) > 0 else "").strip()
+            b = r[1] if len(r) > 1 else ""
+            if not a:
+                continue
+            lines.append(f"- {a}: {b}")
+        return "\n".join(lines).strip()
+
+    # Generic row formatter.
+    lines = [f"{title}:"]
+    for r in rows[:20]:
+        parts = []
+        for idx, col in enumerate(cols[:8]):
+            try:
+                v = r[idx]
+            except Exception:
+                v = None
+            if v is None or v == "":
+                continue
+            parts.append(f"{col}={v}")
+        if parts:
+            lines.append(f"- " + " · ".join(parts))
+    return "\n".join(lines).strip()
+
+
+def _assistant_sql_agent_links_from_result(*, cols: list[str], rows: list[tuple], base_url: str) -> list[dict]:
+    """Create clickable links (internal + external) from common result shapes."""
+    base = (base_url or "").rstrip("/")
+    idx = {str(c or "").strip().lower(): i for i, c in enumerate(cols or []) if str(c or "").strip()}
+
+    links: list[dict] = []
+    seen: set[str] = set()
+
+    def _add(link: dict) -> None:
+        href = str(link.get("href") or "").strip()
+        label = str(link.get("label") or "").strip()
+        if not href or not label:
+            return
+        key = f"{href}||{label}"
+        if key in seen:
+            return
+        seen.add(key)
+        links.append(link)
+
+    for r in (rows or [])[:60]:
+        # Artist link
+        if "artist_id" in idx:
+            try:
+                aid = int(r[idx["artist_id"]] or 0)
+            except Exception:
+                aid = 0
+            if aid > 0:
+                nm = ""
+                if "artist_name" in idx:
+                    try:
+                        nm = str(r[idx["artist_name"]] or "").strip()
+                    except Exception:
+                        nm = ""
+                if not nm:
+                    nm = f"Artist #{aid}"
+                _add(
+                    {
+                        "kind": "internal",
+                        "label": nm,
+                        "href": f"/library/artist/{aid}",
+                        "entity_type": "artist",
+                        "entity_id": aid,
+                        "thumb": f"{base}/api/library/files/artist/{aid}/image?size=96",
+                    }
+                )
+
+        # Label link
+        if "label" in idx:
+            try:
+                lab = str(r[idx["label"]] or "").strip()
+            except Exception:
+                lab = ""
+            if lab:
+                _add(
+                    {
+                        "kind": "internal",
+                        "label": lab,
+                        "href": f"/library/label/{quote(lab)}",
+                        "entity_type": "label",
+                        "entity_id": 0,
+                        "thumb": None,
+                    }
+                )
+
+        # Bandcamp album link when present (nice "internet link" without needing extra crawling).
+        if "bandcamp_album_url" in idx:
+            try:
+                url = str(r[idx["bandcamp_album_url"]] or "").strip()
+            except Exception:
+                url = ""
+            if url and url.startswith(("http://", "https://")):
+                title = ""
+                for key in ("album_title", "title"):
+                    if key in idx:
+                        try:
+                            title = str(r[idx[key]] or "").strip()
+                        except Exception:
+                            title = ""
+                        if title:
+                            break
+                if not title:
+                    title = "Bandcamp"
+                _add(
+                    {
+                        "kind": "external",
+                        "label": title,
+                        "href": url,
+                        "entity_type": "album",
+                        "entity_id": 0,
+                        "thumb": None,
+                    }
+                )
+
+    return links[:18]
+
+
+def _assistant_try_handle_sql_agent_query(conn, *, user_message: str, context_artist_id: int, base_url: str) -> dict:
+    """
+    Slow path (LLM-assisted): generate a safe SELECT query, execute, and format the result.
+    Returns {handled: bool, assistant_text, citations, links, tool}.
+    """
+    if not _assistant_should_try_sql_agent(user_message):
+        return {"handled": False}
+
+    # Context artist name (optional).
+    context_artist_id = int(context_artist_id or 0)
+    context_artist_name = ""
+    if context_artist_id > 0:
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT name FROM files_artists WHERE id = %s", (context_artist_id,))
+                row = cur.fetchone()
+            context_artist_name = str((row[0] if row else "") or "").strip()
+        except Exception:
+            context_artist_name = ""
+
+    provider = getattr(sys.modules[__name__], "AI_PROVIDER", "openai")
+    model = getattr(sys.modules[__name__], "RESOLVED_MODEL", None) or getattr(sys.modules[__name__], "OPENAI_MODEL", "gpt-4o-mini")
+    lang = _assistant_lang_for_message(user_message)
+
+    last_err = ""
+    plan: dict = {}
+    sql = ""
+    params: list = []
+    title = ""
+    cols: list[str] = []
+    rows: list[tuple] = []
+
+    for attempt in range(2):
+        plan = _assistant_sql_agent_generate_query(
+            user_message=user_message,
+            context_artist_id=context_artist_id,
+            context_artist_name=context_artist_name,
+            provider=provider,
+            model=model,
+            error_hint=last_err if attempt > 0 else "",
+        )
+        sql = str(plan.get("sql") or "").strip()
+        params = plan.get("params") if isinstance(plan.get("params"), list) else []
+        title = str(plan.get("title") or "").strip()
+
+        # Strip trailing semicolons (we still forbid multi-statement SQL).
+        while sql.endswith(";"):
+            sql = sql[:-1].rstrip()
+
+        ok, reason = _assistant_validate_readonly_sql(sql)
+        if not ok:
+            logging.debug("Assistant SQL agent rejected query (%s): %s", reason, sql[:240])
+            last_err = f"validation_failed:{reason}"
+            continue
+
+        # Add a hard LIMIT if the model forgot one (safe default).
+        if not re.search(r"\blimit\b", sql, flags=re.IGNORECASE):
+            sql = f"{sql.rstrip()} LIMIT 100"
+
+        try:
+            cols, rows = _assistant_sql_agent_execute(conn, sql=sql, params=params, max_rows=100)
+            break
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {str(e)[:400]}"
+            logging.debug("Assistant SQL agent execute failed (attempt %s): %s", attempt + 1, last_err)
+            cols, rows = ([], [])
+            continue
+
+    if not cols and not rows:
+        return {"handled": False}
+
+    assistant_text = _assistant_sql_agent_format_result(lang=lang, title=title, cols=cols, rows=rows)
+    links = _assistant_sql_agent_links_from_result(cols=cols, rows=rows, base_url=base_url)
+
+    # Attach a minimal citation so the UI can show "pmda_db" provenance.
+    snippet = _truncate_text(assistant_text, max_chars=240)
+    citations = [
+        {
+            "entity_type": "library" if context_artist_id <= 0 else "artist",
+            "entity_id": 1 if context_artist_id <= 0 else int(context_artist_id),
+            "doc_type": "sql_agent",
+            "source": "pmda_db",
+            "title": title or ("SQL result" if lang != "fr" else "Resultat SQL"),
+            "chunk_id": -1,
+            "score": 1.0,
+            "snippet": snippet,
+        }
+    ]
+
+    return {
+        "handled": True,
+        "tool": "sql_agent_v1",
+        "assistant_text": assistant_text,
+        "citations": citations,
+        "links": links,
+        "ts": int(time.time()),
+    }
 
 
 def _reco_genre_tokens(raw_genre: str) -> list[str]:
@@ -7500,6 +11134,16 @@ def _sanitize_path_component(s: str, max_len: int = 120) -> str:
     return out[:max_len] if len(out) > max_len else out
 
 
+def _sanitize_album_title_display(title: str) -> str:
+    """Normalize album titles for display/indexing (avoid obvious provider artifacts like trailing commas)."""
+    t = str(title or "").strip()
+    t = re.sub(r"\s+", " ", t).strip()
+    # Strip trailing punctuation that is almost certainly an artifact.
+    while t and t[-1] in {",", ";", ":"}:
+        t = t[:-1].rstrip()
+    return t
+
+
 def _backup_album_folder_before_fix(folder: Path, artist: str, album_title: str) -> Optional[Path]:
     """
     Copy the album folder to DUPE_ROOT/original_version/Artist/Album (with suffix if exists).
@@ -7619,6 +11263,130 @@ def norm_album_for_dedup(title: str, normalize_parenthetical: bool) -> str:
         h = hashlib.sha1((raw or title or "").encode("utf-8", "ignore")).hexdigest()[:8]
         return f"__untitled__-{h}"
     return "__untitled__"
+
+
+# Dupe Detection v2: stronger album-title normalization for grouping (recall) while keeping
+# "edition markers" available for explainability / classification.
+_DUPE_NOISE_WORDS = {
+    # Sources / release pipeline noise
+    "web", "web-flac", "retail", "scene", "rip",
+    # Formats / containers / codecs
+    "flac", "mp3", "wav", "aiff", "alac", "ape", "wv", "ogg", "opus", "m4a", "aac",
+    "dsd", "dsf", "dff", "mqa", "sacd",
+    # Media
+    "vinyl", "cassette", "cd", "digital",
+}
+_DUPE_EDITION_MARKERS = {
+    # Variants that are usually the same "core" album for duplicate grouping
+    "remaster", "remastered", "remastering",
+    "deluxe", "expanded", "anniversary", "edition", "reissue", "re-release", "rerelease",
+    "special", "limited", "extended", "enhanced",
+    "bonus", "extras", "outtakes",
+    "mono", "stereo",
+    "explicit", "clean",
+}
+_DUPE_CONTENT_MARKERS = {
+    # Markers that often mean a *different* album (avoid over-grouping by stripping them)
+    "live", "demo", "soundtrack", "ost", "score",
+}
+
+
+def _dupe_extract_edition_tokens(title: str) -> list[str]:
+    """Extract edition/variant markers from noisy album titles (kept for explainability)."""
+    raw = (title or "").strip()
+    if not raw:
+        return []
+    low = raw.lower()
+    found: list[str] = []
+
+    # Pull tokens from bracket/parenthetical segments too.
+    for seg in re.findall(r"[\(\[]([^)\]]+)[\)\]]", low):
+        seg = re.sub(r"\s+", " ", (seg or "").strip())
+        if not seg:
+            continue
+        for tok in re.split(r"[\s,/|;]+", seg):
+            t = (tok or "").strip()
+            if not t:
+                continue
+            if t in _DUPE_NOISE_WORDS or t in _DUPE_EDITION_MARKERS or t in _DUPE_CONTENT_MARKERS:
+                found.append(t)
+            # Hi-res patterns like 24-96, 16/44.1
+            if re.fullmatch(r"\d{1,2}[-/]\d{2,3}(?:\.\d)?", t):
+                found.append(t)
+            # Bitrate like 320kbps
+            if re.fullmatch(r"\d{3,4}kbps", t):
+                found.append(t)
+            # "24bit", "16-bit"
+            if re.fullmatch(r"\d{1,2}\s*[- ]?bit", t):
+                found.append(t.replace(" ", ""))
+
+    # Whole-title scan for common markers.
+    for w in sorted(_DUPE_EDITION_MARKERS | _DUPE_CONTENT_MARKERS | _DUPE_NOISE_WORDS):
+        if re.search(rf"\\b{re.escape(w)}\\b", low):
+            found.append(w)
+
+    # Resolution patterns in free text: "24-96", "24/96", "16-44.1"
+    for m in re.findall(r"\b\d{1,2}\s*[-/]\s*\d{2,3}(?:\.\d)?\b", low):
+        found.append(re.sub(r"\s+", "", m))
+
+    # Dedupe keep order
+    out: list[str] = []
+    seen = set()
+    for t in found:
+        tt = (t or "").strip().lower()
+        if not tt or tt in seen:
+            continue
+        seen.add(tt)
+        out.append(tt)
+    return out[:20]
+
+
+def norm_album_for_dedup_loose(title: str) -> str:
+    """
+    Aggressive title normalization for dupe candidate grouping.
+    Removes common release pipeline noise (WEB-FLAC, 24-96, etc.) and edition markers
+    (Remastered/Deluxe/Expanded/Anniversary...) while keeping content markers like "live".
+    """
+    raw = (title or "").strip()
+    if not raw:
+        return "__untitled__"
+
+    s = raw.replace("_", " ")
+    # Drop bracketed segments entirely (often pure noise).
+    s = re.sub(r"\[[^\]]*\]", " ", s)
+    # Drop parenthetical segments (keep tokens separately via _dupe_extract_edition_tokens()).
+    s = re.sub(r"\([^)]*\)", " ", s)
+
+    low = s.lower()
+    # Normalize separators
+    low = re.sub(r"[_•·]+", " ", low)
+    # Remove common hi-res / bitrate markers
+    low = re.sub(r"\b\d{1,2}\s*[-/]\s*\d{2,3}(?:\.\d)?\b", " ", low)  # 24-96, 16/44.1
+    low = re.sub(r"\b\d{3,4}\s*kbps\b", " ", low)
+    low = re.sub(r"\b\d{1,2}\s*[- ]?bit\b", " ", low)
+    low = re.sub(r"\b\d{2,3}(?:\.\d)?\s*khz\b", " ", low)
+
+    # Remove noise words + edition markers, but keep content markers (live, soundtrack, etc.)
+    drop_words = (_DUPE_NOISE_WORDS | _DUPE_EDITION_MARKERS) - _DUPE_CONTENT_MARKERS
+    for w in sorted(drop_words, key=len, reverse=True):
+        low = re.sub(rf"\\b{re.escape(w)}\\b", " ", low)
+
+    # Strip catalog-like tokens (heuristic): ABC-1234, abc1234, etc.
+    low = re.sub(r"\b[a-z]{2,6}[- ]?\d{2,6}\b", " ", low)
+
+    # Collapse punctuation and whitespace
+    low = re.sub(r"[\"'`]", "", low)
+    low = re.sub(r"[^\w\s]+", " ", low)
+    low = " ".join(low.split()).strip()
+
+    if len(low) >= 3:
+        return low
+
+    # Fallback to strict normalization if loose collapsed too much.
+    try:
+        return norm_album_for_dedup(raw, normalize_parenthetical=True)
+    except Exception:
+        return low or "__untitled__"
 
 def derive_album_title(plex_title: str, meta: Dict[str, str], folder: Path, album_id: int) -> Tuple[str, str]:
     """
@@ -8268,6 +12036,23 @@ def _run_ffprobe(fpath: str) -> tuple[int, int, int]:
     
     return (br, sr, bd)
 
+
+def _run_ffprobe_duration_sec(fpath: str) -> int:
+    """Return media duration (seconds) via ffprobe. Best-effort; returns 0 on failure."""
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        fpath,
+    ]
+    try:
+        out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, text=True, timeout=20).strip()
+        if not out:
+            return 0
+        return int(max(0.0, float(out)))
+    except Exception:
+        return 0
+
 def analyse_format(folder: Path) -> tuple[int, int, int, int, bool]:
     """
     Inspect up to **three** audio files inside *folder* and return a 4‑tuple:
@@ -8374,6 +12159,589 @@ def signature(tracks: List[Track]) -> tuple:
 def overlap(a: set, b: set) -> float:
     return len(a & b) / max(len(a), len(b))
 
+def _dupe_norm_track_title(s: str) -> str:
+    """Normalize a track title for dupe similarity (robust to tags/filename noise)."""
+    raw = (s or "").strip().lower()
+    if not raw:
+        return ""
+    # Drop bracket/parenthetical segments and leading index patterns.
+    raw = re.sub(r"[\(\[][^)\]]*[\)\]]", " ", raw)
+    raw = re.sub(r"^\s*\d+\s*[-.)]\s*", "", raw)
+    raw = re.sub(r"\s+", " ", raw)
+    raw = raw.strip()
+    # Strip punctuation, keep letters/numbers/spaces.
+    raw = re.sub(r"[^\w\s]+", " ", raw)
+    raw = " ".join(raw.split())
+    return raw[:240]
+
+
+def _dupe_track_title_set(tracks: list) -> set[str]:
+    """Return a normalized set of track titles for an edition."""
+    out: set[str] = set()
+    for t in tracks or []:
+        title = ""
+        try:
+            if isinstance(t, dict):
+                title = str(t.get("title") or t.get("name") or "")
+            else:
+                title = str(getattr(t, "title", "") or "")
+        except Exception:
+            title = ""
+        nt = _dupe_norm_track_title(title)
+        if nt:
+            out.add(nt)
+    return out
+
+
+def _dupe_jaccard(a: set[str], b: set[str]) -> float:
+    if not a and not b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    inter = len(a & b)
+    union = len(a | b)
+    return (float(inter) / float(union)) if union else 0.0
+
+
+def _dupe_track_count_ratio(a_tracks: list, b_tracks: list) -> float:
+    a_n = len(a_tracks or [])
+    b_n = len(b_tracks or [])
+    if a_n <= 0 and b_n <= 0:
+        return 1.0
+    if a_n <= 0 or b_n <= 0:
+        return 0.0
+    return float(min(a_n, b_n)) / float(max(a_n, b_n))
+
+
+def _dupe_folder_key_str(folder) -> str:
+    """Stable-ish folder identity for caching/feedback (prefer resolved absolute path)."""
+    if not folder:
+        return ""
+    try:
+        return str(Path(str(folder)).resolve())
+    except Exception:
+        return str(folder)
+
+
+def _dupe_group_key_from_editions(editions: list[dict]) -> str:
+    """Compute a stable group key from the set of edition folders (order-independent)."""
+    keys: list[str] = []
+    for e in editions or []:
+        k = _dupe_folder_key_str((e or {}).get("folder"))
+        if k:
+            keys.append(k)
+    keys = sorted(set(keys))
+    payload = "dupe_v2\n" + "\n".join(keys)
+    return hashlib.sha1(payload.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def _dupe_feedback_pair_key(folder_a: str, folder_b: str) -> tuple[str, str]:
+    a = (folder_a or "").strip()
+    b = (folder_b or "").strip()
+    if not a or not b:
+        return ("", "")
+    if a == b:
+        return (a, b)
+    return (a, b) if a < b else (b, a)
+
+
+def _dupe_load_feedback_pairs_for_artist(artist: str) -> dict[tuple[str, str], str]:
+    """Return {(folder_a, folder_b): label} for one artist."""
+    out: dict[tuple[str, str], str] = {}
+    artist_name = (artist or "").strip()
+    if not artist_name:
+        return out
+    try:
+        con = sqlite3.connect(str(STATE_DB_FILE), timeout=10)
+        cur = con.cursor()
+        cur.execute(
+            "SELECT folder_a, folder_b, label FROM dupe_feedback_pairs WHERE artist = ?",
+            (artist_name,),
+        )
+        rows = cur.fetchall()
+        con.close()
+    except Exception:
+        return out
+    for fa, fb, lab in rows or []:
+        a = (fa or "").strip()
+        b = (fb or "").strip()
+        if not a or not b:
+            continue
+        key = _dupe_feedback_pair_key(a, b)
+        if not key[0] or not key[1]:
+            continue
+        out[key] = (lab or "").strip().lower()
+    return out
+
+
+def _dupe_ai_cache_get(artist: str, group_key: str) -> Optional[dict]:
+    if not artist or not group_key:
+        return None
+    try:
+        con = sqlite3.connect(str(STATE_DB_FILE), timeout=10)
+        cur = con.cursor()
+        cur.execute(
+            """
+            SELECT best_folder, rationale, merge_list, ai_provider, ai_model, confidence
+            FROM dupe_ai_cache
+            WHERE artist = ? AND group_key = ?
+            """,
+            ((artist or "").strip(), (group_key or "").strip()),
+        )
+        row = cur.fetchone()
+        con.close()
+    except Exception:
+        return None
+    if not row:
+        return None
+    best_folder, rationale, merge_list_json, provider, model, confidence = row
+    try:
+        merge_list = json.loads(merge_list_json) if merge_list_json else []
+        if not isinstance(merge_list, list):
+            merge_list = []
+    except Exception:
+        merge_list = []
+    conf = None
+    try:
+        if confidence is not None:
+            conf = int(confidence)
+    except Exception:
+        conf = None
+    return {
+        "best_folder": (best_folder or "").strip(),
+        "rationale": (rationale or "").strip(),
+        "merge_list": merge_list,
+        "ai_provider": (provider or "").strip(),
+        "ai_model": (model or "").strip(),
+        "confidence": conf,
+    }
+
+
+def _dupe_ai_cache_put(
+    *,
+    artist: str,
+    group_key: str,
+    best_folder: str,
+    rationale: str,
+    merge_list: list[str],
+    ai_provider: str,
+    ai_model: str,
+    confidence: int | None,
+) -> None:
+    if not artist or not group_key:
+        return
+    now = time.time()
+    try:
+        con = sqlite3.connect(str(STATE_DB_FILE), timeout=10)
+        cur = con.cursor()
+        cur.execute(
+            """
+            INSERT INTO dupe_ai_cache
+              (artist, group_key, best_folder, rationale, merge_list, ai_provider, ai_model, confidence, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(artist, group_key) DO UPDATE SET
+              best_folder = excluded.best_folder,
+              rationale   = excluded.rationale,
+              merge_list  = excluded.merge_list,
+              ai_provider = excluded.ai_provider,
+              ai_model    = excluded.ai_model,
+              confidence  = excluded.confidence,
+              updated_at  = excluded.updated_at
+            """,
+            (
+                (artist or "").strip(),
+                (group_key or "").strip(),
+                (best_folder or "").strip(),
+                (rationale or "").strip(),
+                json.dumps(list(merge_list or [])),
+                (ai_provider or "").strip(),
+                (ai_model or "").strip(),
+                int(confidence) if confidence is not None else None,
+                now,
+                now,
+            ),
+        )
+        con.commit()
+        con.close()
+    except Exception:
+        # Cache failures must never break the scan.
+        return
+
+
+def _dupe_choose_best_heuristic(editions: list[dict]) -> tuple[Optional[dict], str, list[str], bool]:
+    """
+    Deterministic fallback for choosing the "best" edition without AI.
+    Returns (best, rationale, merge_list, confident).
+
+    "Confident" is intentionally conservative: we only return confident=True when
+    the pick is obviously superior (or identical track counts with better technical quality),
+    so we can skip expensive AI calls without increasing wrong auto-moves.
+    """
+    if not editions:
+        return (None, "", [], False)
+
+    def _metrics(e: dict) -> tuple:
+        fmt_score = int(e.get("fmt_score") or 0)
+        bd = int(e.get("bd") or 0)
+        sr = int(e.get("sr") or 0)
+        br = int(e.get("br") or 0)
+        track_count = len(e.get("tracks") or [])
+        file_count = int(e.get("file_count") or 0)
+        return (fmt_score, bd, sr, br, track_count, file_count)
+
+    ranked = sorted(list(editions), key=_metrics, reverse=True)
+    best = ranked[0]
+    if len(ranked) == 1:
+        fmt_score, bd, sr, br, track_count, file_count = _metrics(best)
+        rationale = (
+            f"Heuristic: single edition (fmt_score={fmt_score}, bd={bd}, sr={sr}, br={br}, tracks={track_count}, files={file_count})"
+        )
+        return (best, rationale, [], True)
+
+    second = ranked[1]
+    b_fmt, b_bd, b_sr, b_br, b_tr, b_fc = _metrics(best)
+    s_fmt, s_bd, s_sr, s_br, s_tr, s_fc = _metrics(second)
+
+    # Conservative confidence rules.
+    confident = False
+
+    # Never be "confident" if the best has fewer tracks than runner-up (deluxe/bonus vs standard ambiguity).
+    if b_tr < s_tr:
+        confident = False
+    else:
+        # Big codec/container class difference (e.g., FLAC vs MP3).
+        if b_fmt >= (s_fmt + 2):
+            confident = True
+        # Same track count + better technical quality.
+        elif b_tr == s_tr:
+            if b_fmt > s_fmt:
+                confident = True
+            elif b_fmt == s_fmt:
+                if b_bd >= (s_bd + 8):
+                    confident = True
+                elif b_sr >= (s_sr + 22050):
+                    confident = True
+                elif (b_bd == s_bd) and (b_sr == s_sr) and (b_br >= (s_br + 200000)):
+                    confident = True
+        # Slightly more tracks and not worse quality: often the same album + bonus.
+        elif b_tr > s_tr and (b_tr - s_tr) <= 2:
+            if (b_fmt >= s_fmt) and (b_bd >= s_bd) and (b_sr >= s_sr):
+                confident = True
+
+    rationale = (
+        "Heuristic pick: "
+        f"fmt_score {b_fmt} vs {s_fmt}, "
+        f"bd {b_bd} vs {s_bd}, "
+        f"sr {b_sr} vs {s_sr}, "
+        f"br {b_br} vs {s_br}, "
+        f"tracks {b_tr} vs {s_tr}"
+    )
+    return (best, rationale, [], confident)
+
+
+def _dupe_get_mb_release_group_id(e: dict) -> str:
+    try:
+        rg = (e.get("rg_info") or {}).get("id")
+    except Exception:
+        rg = None
+    if rg:
+        return str(rg).strip()
+    if e.get("musicbrainz_id"):
+        return str(e.get("musicbrainz_id") or "").strip()
+    meta = e.get("meta") or {}
+    if isinstance(meta, dict):
+        for k in ("musicbrainz_releasegroupid", "musicbrainz_release_group_id"):
+            v = (meta.get(k) or "").strip()
+            if v:
+                return v
+        # Some pipelines store RGID into albumid; accept as last resort.
+        for k in ("musicbrainz_albumid", "musicbrainz_releaseid"):
+            v = (meta.get(k) or "").strip()
+            if v and re.fullmatch(r"[0-9a-fA-F-]{36}", v):
+                return v
+    return ""
+
+
+def _dupe_get_mb_release_id(e: dict) -> str:
+    meta = e.get("meta") or {}
+    if isinstance(meta, dict):
+        for k in ("musicbrainz_releaseid", "musicbrainz_albumid", "musicbrainz_originalreleaseid"):
+            v = (meta.get(k) or "").strip()
+            if v and re.fullmatch(r"[0-9a-fA-F-]{36}", v):
+                return v
+    return ""
+
+
+def _dupe_get_discogs_id(e: dict) -> str:
+    v = (e.get("discogs_release_id") or "").strip()
+    if v:
+        return v
+    meta = e.get("meta") or {}
+    if isinstance(meta, dict):
+        v = (meta.get("discogs_release_id") or meta.get("discogs_releaseid") or "").strip()
+        if v:
+            return v
+    return ""
+
+
+def _dupe_get_lastfm_mbid(e: dict) -> str:
+    v = (e.get("lastfm_album_mbid") or "").strip()
+    if v:
+        return v
+    meta = e.get("meta") or {}
+    if isinstance(meta, dict):
+        v = (meta.get("lastfm_album_mbid") or "").strip()
+        if v:
+            return v
+    return ""
+
+
+def _dupe_get_bandcamp_url(e: dict) -> str:
+    v = (e.get("bandcamp_album_url") or "").strip()
+    if v:
+        return v
+    meta = e.get("meta") or {}
+    if isinstance(meta, dict):
+        v = (meta.get("bandcamp_album_url") or "").strip()
+        if v:
+            return v
+    return ""
+
+
+def _dupe_audio_fp_set_for_edition(e: dict, *, max_tracks: int = 12) -> set[str]:
+    """
+    Return a set of chromaprint fingerprints for the edition (cached in cache.db).
+    Used as high-precision evidence for duplicates when titles/tags are messy.
+    """
+    cached = e.get("_dupe_audio_fp_set")
+    if isinstance(cached, set):
+        return cached
+
+    folder = e.get("folder")
+    if not folder:
+        e["_dupe_audio_fp_set"] = set()
+        return set()
+    try:
+        folder_path = path_for_fs_access(Path(folder))
+    except Exception:
+        folder_path = Path(folder)
+    if not folder_path or not folder_path.exists():
+        e["_dupe_audio_fp_set"] = set()
+        return set()
+
+    paths: list[Path] = []
+    try:
+        ordered = e.get("ordered_paths") or []
+        if ordered:
+            for p in ordered:
+                try:
+                    pp = path_for_fs_access(Path(p))
+                except Exception:
+                    pp = Path(p)
+                if pp and pp.is_file() and AUDIO_RE.search(pp.name):
+                    paths.append(pp)
+    except Exception:
+        paths = []
+    if not paths:
+        try:
+            paths = sorted([p for p in folder_path.rglob("*") if p.is_file() and AUDIO_RE.search(p.name)], key=lambda p: str(p))[: max(1, int(max_tracks or 12))]
+        except Exception:
+            paths = []
+
+    fps: set[str] = set()
+    for p in paths[: max(1, int(max_tracks or 12))]:
+        try:
+            path_str = str(p)
+            cached_track = get_cached_acoustid(path_str)
+            if cached_track:
+                _dur, fp = cached_track
+                if fp:
+                    fps.add(str(fp))
+                    continue
+            # Compute via fpcalc (subprocess) and store.
+            res = _fpcalc_fingerprint_file(path_str, length_sec=120, timeout_sec=45)
+            if not res:
+                continue
+            dur, fp = res
+            if fp:
+                set_cached_acoustid(path_str, dur, fp)
+                fps.add(str(fp))
+        except Exception:
+            continue
+
+    e["_dupe_audio_fp_set"] = fps
+    return fps
+
+
+def _dupe_audio_sig_for_edition(
+    e: dict,
+    *,
+    max_tracks: int = 10,
+    min_fps: int = 3,
+    compute_missing: bool = False,
+) -> str:
+    """
+    Return a stable-ish album audio signature derived from a small set of track fingerprints.
+    - When compute_missing=False, only uses cached fingerprints (cheap).
+    - When compute_missing=True, will compute missing fingerprints via fpcalc and cache them.
+    """
+    cached_sig = e.get("_dupe_audio_sig")
+    if isinstance(cached_sig, str) and cached_sig:
+        return cached_sig
+
+    folder = e.get("folder")
+    if not folder:
+        e["_dupe_audio_sig"] = ""
+        return ""
+    try:
+        folder_path = path_for_fs_access(Path(folder))
+    except Exception:
+        folder_path = Path(folder)
+    if not folder_path or not folder_path.exists():
+        e["_dupe_audio_sig"] = ""
+        return ""
+
+    paths: list[Path] = []
+    try:
+        ordered = e.get("ordered_paths") or []
+        if ordered:
+            for p in ordered:
+                try:
+                    pp = path_for_fs_access(Path(p))
+                except Exception:
+                    pp = Path(p)
+                if pp and pp.is_file() and AUDIO_RE.search(pp.name):
+                    paths.append(pp)
+    except Exception:
+        paths = []
+    if not paths:
+        try:
+            paths = sorted(
+                [p for p in folder_path.rglob("*") if p.is_file() and AUDIO_RE.search(p.name)],
+                key=lambda p: str(p),
+            )
+        except Exception:
+            paths = []
+
+    fps: list[str] = []
+    for p in (paths or [])[: max(1, int(max_tracks or 10))]:
+        try:
+            path_str = str(p)
+            cached_track = get_cached_acoustid(path_str)
+            if cached_track:
+                _dur, fp = cached_track
+                if fp:
+                    fps.append(str(fp))
+                    continue
+            if not compute_missing:
+                continue
+            res = _fpcalc_fingerprint_file(path_str, length_sec=120, timeout_sec=45)
+            if not res:
+                continue
+            dur, fp = res
+            if fp:
+                set_cached_acoustid(path_str, dur, fp)
+                fps.append(str(fp))
+        except Exception:
+            continue
+
+    # Require some fingerprints to avoid collisions.
+    if len(fps) < max(1, int(min_fps or 3)):
+        e["_dupe_audio_sig"] = ""
+        return ""
+
+    # Hash fingerprints to keep payload small and stable.
+    digests: list[str] = []
+    for fp in fps:
+        try:
+            digests.append(hashlib.sha1(fp.encode("utf-8", errors="ignore")).hexdigest())
+        except Exception:
+            continue
+    digests = sorted(set(digests))
+    payload = "audio_sig_v1\n" + "\n".join(digests) + f"\nN={len(digests)}"
+    sig = hashlib.sha1(payload.encode("utf-8", errors="ignore")).hexdigest()
+    e["_dupe_audio_sig"] = sig
+    return sig
+
+
+def _dupe_split_editions_by_similarity(
+    editions: list[dict],
+    *,
+    min_jaccard: float = 0.82,
+    min_ratio: float = 0.75,
+    allow_audio_fp: bool = True,
+    audio_min_overlap: float = 0.87,
+) -> list[list[dict]]:
+    """
+    Split a noisy candidate group into one or more coherent clusters using track-title
+    similarity (and optionally chromaprint overlap as a tie-break).
+    """
+    if not editions:
+        return []
+    if len(editions) <= 1:
+        return [editions]
+
+    # Local union-find over list indices.
+    n = len(editions)
+    parent = list(range(n))
+    rank = [0] * n
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i: int, j: int) -> None:
+        ri = find(i)
+        rj = find(j)
+        if ri == rj:
+            return
+        if rank[ri] < rank[rj]:
+            parent[ri] = rj
+        elif rank[ri] > rank[rj]:
+            parent[rj] = ri
+        else:
+            parent[rj] = ri
+            rank[ri] += 1
+
+    title_sets: list[set[str]] = []
+    track_lists: list[list] = []
+    for e in editions:
+        tr = e.get("tracks") or []
+        track_lists.append(tr)
+        cached_titles = e.get("_dupe_track_title_set")
+        if isinstance(cached_titles, set):
+            title_sets.append(cached_titles)
+        else:
+            ts = _dupe_track_title_set(tr)
+            e["_dupe_track_title_set"] = ts
+            title_sets.append(ts)
+
+    # Pairwise comparisons within this small candidate set only.
+    for i in range(n):
+        for j in range(i + 1, n):
+            ratio = _dupe_track_count_ratio(track_lists[i], track_lists[j])
+            if ratio < 0.55:
+                continue
+            jac = _dupe_jaccard(title_sets[i], title_sets[j])
+            if jac >= float(min_jaccard) and ratio >= float(min_ratio):
+                union(i, j)
+                continue
+            # Optional tie-break: if track titles are messy but audio overlaps, keep together.
+            if allow_audio_fp and jac >= 0.55 and ratio >= 0.60:
+                a = _dupe_audio_fp_set_for_edition(editions[i])
+                b = _dupe_audio_fp_set_for_edition(editions[j])
+                if a and b:
+                    ov = (len(a & b) / max(len(a), len(b))) if max(len(a), len(b)) else 0.0
+                    if ov >= float(audio_min_overlap):
+                        union(i, j)
+
+    comps: dict[int, list[dict]] = defaultdict(list)
+    for i, e in enumerate(editions):
+        comps[find(i)].append(e)
+    return [c for c in comps.values() if c]
+
 def editions_share_confident_signal(ed_list: List[dict]) -> bool:
     """
     Determine whether a potential duplicate group has enough evidence to be trusted.
@@ -8400,6 +12768,27 @@ def editions_share_confident_signal(ed_list: List[dict]) -> bool:
     if len(rg_ids) == 1 and rg_ids:
         return True
 
+    # Dupe Detection v2: accept when provider IDs match even if rg_info is absent.
+    mb_rg_ids = {_dupe_get_mb_release_group_id(e) for e in ed_list}
+    mb_rg_ids = {x for x in mb_rg_ids if x}
+    if len(mb_rg_ids) == 1 and mb_rg_ids:
+        return True
+
+    discogs_ids = {_dupe_get_discogs_id(e) for e in ed_list}
+    discogs_ids = {x for x in discogs_ids if x}
+    if len(discogs_ids) == 1 and discogs_ids:
+        return True
+
+    lastfm_mbids = {_dupe_get_lastfm_mbid(e) for e in ed_list}
+    lastfm_mbids = {x for x in lastfm_mbids if x}
+    if len(lastfm_mbids) == 1 and lastfm_mbids:
+        return True
+
+    bandcamp_urls = {_dupe_get_bandcamp_url(e) for e in ed_list}
+    bandcamp_urls = {x for x in bandcamp_urls if x}
+    if len(bandcamp_urls) == 1 and bandcamp_urls:
+        return True
+
     # Same normalized title (e.g. "Night Cycle" and "Night Cycle [dupe]" -> "night cycle")
     norms = {e.get("album_norm") for e in ed_list if e.get("album_norm")}
     if len(norms) == 1 and norms:
@@ -8408,6 +12797,12 @@ def editions_share_confident_signal(ed_list: List[dict]) -> bool:
     # Same Plex-normalized title (we grouped by this; accept so scan results match library)
     plex_norms = {e.get("plex_norm") for e in ed_list if e.get("plex_norm")}
     if len(plex_norms) == 1 and plex_norms:
+        return True
+
+    # Dupe Detection v2: same loose normalized title (aggressive noise stripping).
+    loose_norms = {(e.get("_dupe_title_norm_loose") or "").strip() for e in ed_list if e.get("_dupe_title_norm_loose")}
+    loose_norms = {x for x in loose_norms if x and not x.startswith("__untitled__")}
+    if len(loose_norms) == 1 and loose_norms:
         return True
 
     return False
@@ -8425,13 +12820,26 @@ def detect_broken_album(db_conn, album_id: int, tracks: List[Track], mb_release_
     if actual_count == 0:
         return True, 0, 0, []
     
-    track_indices = sorted([t.idx for t in tracks])
-    
-    # Check for gaps in track indices
+    # Ignore non-positive indices (Plex sometimes stores missing track numbers as 0).
+    # Note: in multi-disc albums, Plex track indices are per-disc; we currently only use
+    # the heuristic to catch obviously broken/tag-garbage cases like a single track "11".
+    track_indices = [int(t.idx or 0) for t in tracks if int(t.idx or 0) > 0]
+    if not track_indices:
+        return False, None, actual_count, []
+    track_indices = sorted(track_indices)
+    max_idx = max(track_indices)
+    coverage = (actual_count / max_idx) if max_idx else 1.0
+    # Skip "broken" detection when track numbering is obviously corrupt (prevents huge false positives).
+    if max_idx > max(120, actual_count * 3) and coverage < 0.5:
+        return False, None, actual_count, []
+
+    # Check for gaps (including a leading gap when the smallest index is > 1).
     gaps = []
+    if track_indices and track_indices[0] > 1:
+        gaps.append((0, track_indices[0]))
     for i in range(len(track_indices) - 1):
-        if track_indices[i+1] - track_indices[i] > 1:
-            gaps.append((track_indices[i], track_indices[i+1]))
+        if track_indices[i + 1] - track_indices[i] > 1:
+            gaps.append((track_indices[i], track_indices[i + 1]))
     
     # Method 1: MusicBrainz comparison
     if mb_release_group_info:
@@ -8445,12 +12853,12 @@ def detect_broken_album(db_conn, album_id: int, tracks: List[Track], mb_release_
         # Check if gap > configured consecutive threshold
         large_gaps = [g for g in gaps if g[1] - g[0] > BROKEN_ALBUM_CONSECUTIVE_THRESHOLD]
         if large_gaps:
-            return True, None, actual_count, gaps
+            return True, max_idx, actual_count, gaps
         
         # Check if gaps represent > configured percentage threshold
         total_missing = sum(g[1] - g[0] - 1 for g in gaps)
         if total_missing > actual_count * BROKEN_ALBUM_PERCENTAGE_THRESHOLD:
-            return True, None, actual_count, gaps
+            return True, max_idx, actual_count, gaps
     
     return False, None, actual_count, []
 
@@ -8463,9 +12871,14 @@ def _detect_gaps_in_indices(indices: list) -> tuple[bool, int, list]:
     """
     if not indices:
         return False, 0, []
-    track_indices = sorted([int(i) for i in indices])
+    track_indices = sorted([int(i) for i in indices if int(i) > 0])
+    if not track_indices:
+        return False, 0, []
     actual_count = len(track_indices)
     gaps = []
+    # Leading gap: a single track numbered "11" should count as missing 1..10.
+    if track_indices[0] > 1:
+        gaps.append((0, track_indices[0]))
     for i in range(len(track_indices) - 1):
         if track_indices[i + 1] - track_indices[i] > 1:
             gaps.append((track_indices[i], track_indices[i + 1]))
@@ -8786,6 +13199,50 @@ def _crosscheck_tracklist(local_titles: List[str], release_titles: List[str]) ->
     return matches / len(local_n)
 
 
+def _crosscheck_tracklist_perfect(local_titles: List[str], release_titles: List[str]) -> float:
+    """
+    More conservative tracklist match: normalize titles and require exact equality (no substring).
+    This is intended for "certain match" fast-paths where we want to avoid false positives.
+    """
+    if not local_titles:
+        return 1.0
+
+    def _norm(s: str) -> str:
+        raw = (s or "").strip().lower()
+        if not raw:
+            return ""
+        had_remaster = bool(re.search(r"\bremaster", raw))
+        # Drop leading index patterns.
+        raw = re.sub(r"^\s*\d+\s*[-.)]\s*", "", raw)
+        raw = raw.replace("&", " and ")
+        # Strip punctuation, keep letters/numbers/spaces.
+        raw = re.sub(r"[^\w\s]+", " ", raw)
+        raw = " ".join(raw.split()).strip()
+        if not raw:
+            return ""
+        if had_remaster:
+            tokens = raw.split()
+            tokens = [t for t in tokens if not re.fullmatch(r"remaster(?:ed|ing)?", t)]
+            # Common tag noise: "... 2011 Remaster" -> keep the song title, drop trailing year.
+            if len(tokens) >= 2 and re.fullmatch(r"(19|20)\d{2}", tokens[-1] or ""):
+                tokens = tokens[:-1]
+            raw = " ".join(tokens).strip()
+        return raw[:240]
+
+    local_n = [_norm(t) for t in local_titles if (t or "").strip()]
+    release_n = [_norm(t) for t in release_titles if (t or "").strip()]
+    if not local_n:
+        return 1.0
+    release_set = {t for t in release_n if t}
+    if not release_set:
+        return 0.0
+    matches = 0
+    for ln in local_n:
+        if ln and ln in release_set:
+            matches += 1
+    return matches / len(local_n)
+
+
 def _prepare_mb_submission_payload(artist: str, title: str, date: str, tracklist: List[str], source: str = "discogs") -> dict:
     """
     Build a payload suitable for preparing a MusicBrainz submission (manual or via MB edit API).
@@ -8800,6 +13257,76 @@ def _prepare_mb_submission_payload(artist: str, title: str, date: str, tracklist
         "tracks": tracks,
         "source": source,
     }
+
+def _fpcalc_fingerprint_file(path_str: str, *, length_sec: int = 120, timeout_sec: int = 45) -> Optional[tuple[float, str]]:
+    """Compute chromaprint fingerprint via `fpcalc` subprocess.
+
+    Important: We never call chromaprint in-process for scanning because certain
+    audio files can trigger a hard abort inside chromaprint (assertion failure),
+    killing the entire PMDA server. By isolating fingerprinting in a subprocess,
+    we can safely skip problematic files and continue the scan.
+    """
+    fpcalc = shutil.which("fpcalc")
+    if not fpcalc:
+        return None
+    try:
+        length_sec_i = max(1, int(length_sec or 120))
+    except Exception:
+        length_sec_i = 120
+
+    args = [fpcalc, "-json", "-length", str(length_sec_i), path_str]
+    try:
+        proc = subprocess.run(args, capture_output=True, text=True, timeout=timeout_sec)
+    except subprocess.TimeoutExpired:
+        logging.debug("[AcousticID] fpcalc timeout for %s", Path(path_str).name)
+        return None
+    except Exception as e:
+        logging.debug("[AcousticID] fpcalc failed for %s: %s", Path(path_str).name, e)
+        return None
+
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "").strip().replace("\n", " ")[:200]
+        logging.debug("[AcousticID] fpcalc rc=%s for %s: %s", proc.returncode, Path(path_str).name, err)
+        return None
+
+    out = (proc.stdout or "").strip()
+    if not out:
+        out = (proc.stderr or "").strip()
+    if not out:
+        return None
+
+    # Prefer JSON output (fpcalc -json).
+    try:
+        if out.lstrip().startswith("{"):
+            data = json.loads(out)
+            fingerprint = data.get("fingerprint")
+            duration = data.get("duration")
+            if fingerprint:
+                try:
+                    return float(duration or 0.0), str(fingerprint)
+                except Exception:
+                    return 0.0, str(fingerprint)
+    except Exception as e:
+        logging.debug("[AcousticID] fpcalc JSON parse failed for %s: %s", Path(path_str).name, e)
+
+    # Fallback: KEY=VALUE output (older fpcalc).
+    duration = None
+    fingerprint = None
+    for line in out.splitlines():
+        up = (line or "").strip().upper()
+        if up.startswith("DURATION="):
+            try:
+                duration = float(line.split("=", 1)[1].strip())
+            except Exception:
+                duration = None
+        elif up.startswith("FINGERPRINT="):
+            fingerprint = line.split("=", 1)[1].strip()
+    if fingerprint:
+        try:
+            return float(duration or 0.0), str(fingerprint)
+        except Exception:
+            return 0.0, str(fingerprint)
+    return None
 
 
 def _store_acoustid_fingerprints_for_folder(folder: Path, max_tracks: int = 20) -> int:
@@ -8822,8 +13349,10 @@ def _store_acoustid_fingerprints_for_folder(folder: Path, max_tracks: int = 20) 
         if get_cached_acoustid(path_str):
             continue
         try:
-            duration, fp = acoustid.fingerprint_file(path_str)
-            fingerprint = fp.decode("utf-8") if isinstance(fp, bytes) else fp
+            res = _fpcalc_fingerprint_file(path_str, length_sec=120, timeout_sec=45)
+            if not res:
+                continue
+            duration, fingerprint = res
             set_cached_acoustid(path_str, duration, fingerprint)
             stored += 1
         except Exception:
@@ -8867,8 +13396,10 @@ def _identify_album_by_acoustic_id(
             duration, fingerprint = cached
         else:
             try:
-                duration, fp = acoustid.fingerprint_file(path_str)
-                fingerprint = fp.decode("utf-8") if isinstance(fp, bytes) else fp
+                res = _fpcalc_fingerprint_file(path_str, length_sec=120, timeout_sec=45)
+                if not res:
+                    continue
+                duration, fingerprint = res
                 set_cached_acoustid(path_str, duration, fingerprint)
             except Exception as ex:
                 logging.debug("[AcousticID] fingerprint_file failed for %s: %s", path.name, ex)
@@ -9586,6 +14117,9 @@ def search_mb_release_group_by_metadata(
     tracklist_fetch_limit = max(0, int(getattr(sys.modules[__name__], "MB_TRACKLIST_FETCH_LIMIT", 2) or 2))
     fast_fallback_mode = bool(getattr(sys.modules[__name__], "MB_FAST_FALLBACK_MODE", True))
     provider_fallback_cache: dict | None = None
+    use_ai_for_mb_match = bool(getattr(sys.modules[__name__], "USE_AI_FOR_MB_MATCH", False))
+    use_ai_for_mb_verify = bool(getattr(sys.modules[__name__], "USE_AI_FOR_MB_VERIFY", False))
+    use_ai_for_mb = bool(use_ai_for_mb_match or use_ai_for_mb_verify)
 
     def _mb_budget_exceeded() -> bool:
         return (time.perf_counter() - mb_search_started) >= mb_budget_sec
@@ -9678,111 +14212,8 @@ def search_mb_release_group_by_metadata(
             logging.info("\n".join(lines))
 
         all_fetched: List[tuple] = []
-
-        # IA-first: ask AI to pick one candidate from titles only, then fetch only that one (reduces MB requests)
-        if USE_AI_FOR_MB_VERIFY and getattr(sys.modules[__name__], "ai_provider_ready", False) and candidates and (not _mb_budget_exceeded()):
-            letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-            choices = [f"{letters[i]}) {rg.get('title', '?')} (id={rg.get('id', '')})" for i, rg in enumerate(candidates[:20])]
-            track_list_str = ", ".join((list(tracks)[:30] if tracks else [])) if tracks else "(none)"
-            if tracks and len(tracks) > 30:
-                track_list_str += ", ..."
-            prompt = (
-                f"Our album: artist={artist!r}, title_raw={title_raw or album_norm!r}, normalized={album_norm!r}. "
-                f"Our track titles: [{track_list_str}].\n\n"
-                "MusicBrainz candidates (id + title only):\n" + "\n".join(choices) + "\n\n"
-                "Which candidate matches our album? Consider title variants (e.g. Volume I = volume i). "
-                "Reply with only the letter (A, B, ...) or the MBID (UUID) or NONE if no match. "
-                "Optionally end with (confidence: N) where N is 0-100."
-            )
-            system_msg = "You reply with a single letter (A, B, C, ...) or an MBID (UUID) or the word NONE. Optionally end with (confidence: N). No other explanation."
-            try:
-                provider = getattr(sys.modules[__name__], "AI_PROVIDER", "openai")
-                model = getattr(sys.modules[__name__], "RESOLVED_MODEL", None) or getattr(sys.modules[__name__], "OPENAI_MODEL", "gpt-4o-mini")
-                reply = call_ai_provider(provider, model, system_msg, prompt, max_tokens=40)
-                reply_clean, ai_confidence = parse_ai_confidence((reply or "").strip())
-                if ai_confidence is not None:
-                    logging.info("[MusicBrainz] AI-first title-only match confidence: %d", ai_confidence)
-                reply = reply_clean.upper()
-                chosen_rg_id = None
-                if reply and reply != "NONE":
-                    letter = reply[:1]
-                    idx = letters.find(letter)
-                    if 0 <= idx < len(candidates):
-                        chosen_rg_id = candidates[idx].get("id")
-                    if not chosen_rg_id:
-                        mbid_match = re.search(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}", reply)
-                        if mbid_match:
-                            chosen_rg_id = mbid_match.group(0)
-                confidence_min = getattr(sys.modules[__name__], "AI_CONFIDENCE_MIN", 0)
-                if confidence_min > 0 and ai_confidence is not None and ai_confidence < confidence_min:
-                    logging.info("[MusicBrainz] AI-first low confidence (%d < %d): skipping, will try full flow and other sources", ai_confidence, confidence_min)
-                    chosen_rg_id = None
-                if chosen_rg_id:
-                    try:
-                        chosen_candidate = next((c for c in candidates if str(c.get("id") or "") == str(chosen_rg_id)), None)
-                        info = _fetch_rg_details(chosen_rg_id)
-                        mb_track_count = _mb_track_count_from_rg_info(info)
-                        mb_title = str(info.get("title") or (chosen_candidate or {}).get("title") or "").strip()
-                        mb_artists = _extract_mb_artist_names(info) or _extract_mb_artist_names(chosen_candidate or {})
-                        strict_ok, strict_reason = _strict_identity_match_details(
-                            local_artist=artist,
-                            local_title=title_raw or album_norm,
-                            candidate_artist=mb_artists,
-                            candidate_title=mb_title,
-                        )
-                        if not strict_ok:
-                            log_mb(
-                                "Album %s – \"%s\": AI-first candidate %s rejected (%s)",
-                                artist,
-                                title_raw or album_norm,
-                                chosen_rg_id,
-                                strict_reason,
-                            )
-                            chosen_rg_id = None
-                            # Fall through to full flow; if still no match, scan will try provider fallbacks.
-                            raise RuntimeError("strict identity mismatch")
-                        # Sanity check: reject if local track count differs too much from MB
-                        local_count = len(tracks) if tracks else 0
-                        if abs(local_count - mb_track_count) > 2:
-                            logging.debug("[MusicBrainz] AI-first chosen %s rejected: track count mismatch (local=%d, mb=%d)", chosen_rg_id, local_count, mb_track_count)
-                            # Fall through to full flow; if still no match, scan will try Discogs/Last.fm/Bandcamp for this album
-                        else:
-                            formats = set()
-                            for release in info.get("release-list", []):
-                                for medium in release.get("medium-list", []):
-                                    fmt = medium.get("format")
-                                    qty = medium.get("track-count", 1)
-                                    if fmt:
-                                        formats.add(f"{qty}×{fmt}")
-                            rg_id_final = info.get("id", chosen_rg_id)
-                            result_dict = {
-                                "primary_type": info.get("primary-type", ""),
-                                "secondary_types": info.get("secondary-types", []),
-                                "format_summary": ", ".join(sorted(formats)),
-                                "id": rg_id_final,
-                                "track_count": mb_track_count,
-                                "cover_url": f"https://coverartarchive.org/release-group/{rg_id_final}/front",
-                                "mb_title": mb_title,
-                                "mb_artist_names": mb_artists,
-                            }
-                            set_cached_mb_info(rg_id_final, result_dict)
-                            log_mb(
-                                "Album %s – \"%s\": AI-first title-only match chose release-group %s (strict identity ok; candidates=%d, tracks local=%d, mb=%d)",
-                                artist,
-                                title_raw or album_norm,
-                                rg_id_final,
-                                len(candidates),
-                                local_count,
-                                mb_track_count,
-                            )
-                            return (result_dict, True)
-                    except RuntimeError:
-                        pass
-                    except musicbrainzngs.WebServiceError as e:
-                        logging.debug("[MusicBrainz] AI-first fetch failed for %s: %s", chosen_rg_id, e)
-            except Exception as e:
-                logging.debug("[MusicBrainz] AI-first path failed: %s", e)
-            # Fall through to full flow (fetch all candidates, then ai_verify_mb_match)
+        # Intentionally avoid an "AI-first" pick here. We fetch a limited number of candidates and
+        # only use AI later if disambiguation is genuinely ambiguous.
 
         if len(candidates) > candidate_fetch_limit:
             logging.info(
@@ -9796,10 +14227,11 @@ def search_mb_release_group_by_metadata(
         for idx, rg in enumerate(candidates[:candidate_fetch_limit]):
             if _mb_budget_exceeded():
                 logging.info(
-                    "[MusicBrainz] %s – %r: MB budget reached after %.1fs; stopping detailed candidate fetch and using fallback flow",
+                    "[MusicBrainz] %s – %r: MB budget reached after %.1fs (budget=%ds); stopping detailed candidate fetch and using fallback flow",
                     artist,
                     title_raw or album_norm or "?",
                     time.perf_counter() - mb_search_started,
+                    mb_budget_sec,
                 )
                 break
             try:
@@ -9845,8 +14277,9 @@ def search_mb_release_group_by_metadata(
                     'mb_title': mb_title,
                     'mb_artist_names': mb_artists,
                 }
-                # Phase 2: optionally fetch track titles from one release for AI verify prompt
-                if USE_AI_FOR_MB_VERIFY and info.get('release-list') and idx < tracklist_fetch_limit:
+                # Optionally fetch recording-level track titles for deterministic tracklist crosschecks
+                # (no LLM cost, but this endpoint is heavier; controlled by MB_TRACKLIST_FETCH_LIMIT).
+                if info.get('release-list') and idx < tracklist_fetch_limit and tracks:
                     first_release_id = info['release-list'][0].get('id')
                     if first_release_id:
                         try:
@@ -9887,7 +14320,10 @@ def search_mb_release_group_by_metadata(
         if not all_fetched:
             title_for_zero = (title_raw or album_norm or "").strip()
             if fast_fallback_mode:
-                reason = "budget exceeded" if _mb_budget_exceeded() else "no MB candidates/details"
+                if _mb_budget_exceeded():
+                    reason = f"budget exceeded (budget={mb_budget_sec}s)"
+                else:
+                    reason = "no MB candidates/details"
                 logging.info(
                     "[MusicBrainz] %s – %r: fast fallback mode -> skipping web+AI MBID hunt (%s)",
                     artist,
@@ -9907,7 +14343,7 @@ def search_mb_release_group_by_metadata(
                     lines.append("  %s: %r by %s" % (src_name, src_title, src_artist))
                 logging.info("\n".join(lines))
 
-            if not getattr(sys.modules[__name__], "ai_provider_ready", False):
+            if (not use_ai_for_mb) or (not getattr(sys.modules[__name__], "ai_provider_ready", False)):
                 return (None, False)
 
             # Optional slow path: try web + AI to infer MBID even when MB has no usable candidate.
@@ -9997,10 +14433,69 @@ def search_mb_release_group_by_metadata(
             if not tracks or abs(len(tracks) - x[1].get('track_count', 0)) <= 1
         ]
 
-        if USE_AI_FOR_MB_VERIFY and all_fetched:
-            # Phase 3: optional Discogs/Last.fm/Bandcamp for AI disambiguation
+        # Deterministic fast-path: if track titles were fetched for *all* candidates and exactly one is a perfect
+        # tracklist match, accept it without AI (secure + cheaper). This only triggers when we have enough local
+        # signal (track titles) and enough remote signal (track titles for every candidate).
+        if tracks and len(matching) >= 2:
+            try:
+                local_titles = list(tracks)
+                scored: list[tuple[float, dict]] = []
+                missing_titles = 0
+                for _rg, info in matching:
+                    cand_titles = info.get("track_titles") if isinstance(info, dict) else None
+                    if not cand_titles:
+                        missing_titles += 1
+                        continue
+                    score = float(_crosscheck_tracklist_perfect(local_titles, list(cand_titles)))
+                    scored.append((score, info))
+                if scored and missing_titles == 0:
+                    scored.sort(key=lambda x: -x[0])
+                    best_score = float(scored[0][0])
+                    best_count = sum(1 for s, _ in scored if abs(float(s) - best_score) < 1e-9)
+                    if best_count == 1 and best_score >= 0.999:
+                        picked = scored[0][1]
+                        set_cached_mb_info(picked['id'], picked)
+                        log_mb(
+                            "Album %s – \"%s\": accepted MB candidate %s (perfect tracklist match; skipped AI)",
+                            artist,
+                            title_raw or album_norm,
+                            picked.get("id") or "?",
+                        )
+                        return (picked, False)
+            except Exception:
+                pass
+
+        if use_ai_for_mb_verify and len(matching) >= 2:
+            # AI verify is expensive (prompt can include tracklists). Only use it when there is real ambiguity.
+            title_for_strict = (title_raw or album_norm or "").strip()
+            strict_matches: list[tuple] = []
+            if title_for_strict:
+                for rg, info in all_fetched[:12]:
+                    cand_title = str(info.get("mb_title") or rg.get("title") or "").strip()
+                    cand_artists = info.get("mb_artist_names") or _extract_mb_artist_names(rg)
+                    ok, _reason = _strict_identity_match_details(
+                        local_artist=artist,
+                        local_title=title_for_strict,
+                        candidate_artist=cand_artists,
+                        candidate_title=cand_title,
+                    )
+                    if ok:
+                        strict_matches.append((rg, info))
+            if len(strict_matches) == 1:
+                # Unique strict match: no need to pay for an LLM disambiguation call.
+                picked = strict_matches[0][1]
+                set_cached_mb_info(picked['id'], picked)
+                log_mb(
+                    "Album %s – \"%s\": accepted MB candidate %s (strict identity unique; skipped AI verify)",
+                    artist,
+                    title_for_strict or album_norm,
+                    picked.get("id") or "?",
+                )
+                return (picked, False)
+
+            # Phase 3: optional Discogs/Last.fm/Bandcamp for AI disambiguation (only when we actually call AI).
             extra_sources: List[dict] = []
-            title_for_fetch = (title_raw or album_norm or "").strip()
+            title_for_fetch = title_for_strict
             if title_for_fetch:
                 extra_sources = list((_provider_fallbacks() or {}).get("extra_sources") or [])
             if extra_sources:
@@ -10011,6 +14506,7 @@ def search_mb_release_group_by_metadata(
                     artist_val = s.get("artist") or s.get("artist_name") or "?"
                     lines.append("  %s: %r by %s" % (src, title, artist_val))
                 logging.info("\n".join(lines))
+
             chosen, _ = ai_verify_mb_match(
                 artist, title_raw, album_norm,
                 list(tracks) if tracks else None,
@@ -10045,7 +14541,7 @@ def search_mb_release_group_by_metadata(
                     mb_cover_url = chosen[1].get("cover_url")
                     if local_data_uri and mb_cover_url:
                         try:
-                            vision_model = getattr(sys.modules[__name__], "OPENAI_VISION_MODEL", "") or getattr(sys.modules[__name__], "RESOLVED_MODEL", "gpt-4o-mini")
+                            vision_model = getattr(sys.modules[__name__], "RESOLVED_MODEL", None) or getattr(sys.modules[__name__], "OPENAI_MODEL", "gpt-4o-mini")
                             sys_msg = "You reply with exactly Yes or No. If No, add in parentheses the reason, e.g. (artist photo) or (different cover). Optionally end with (confidence: N) where N is 0-100."
                             user_msg = (
                                 "Image 1 is the local album cover. Image 2 is the MusicBrainz Cover Art Archive cover. "
@@ -10238,37 +14734,137 @@ def search_mb_release_group_by_metadata(
             )
             return (matching[0][1], False)
 
-        if len(matching) >= 2 and USE_AI_FOR_MB_MATCH:
-            letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-            choices = [f"{letters[i]}: {m[0].get('title', 'Unknown')}" for i, m in enumerate(matching[:10])]
-            prompt = f"Artist: {artist}. Album we have: {album_norm}. Which MusicBrainz release-group title is the same release? Reply with only the letter. Optionally end with (confidence: N) where N is 0-100.\n" + "\n".join(choices)
-            try:
-                reply = call_ai_provider(AI_PROVIDER, RESOLVED_MODEL or OPENAI_MODEL, "You reply with a single letter. Optionally end with (confidence: N).", prompt, max_tokens=30)
-                reply_clean, ai_confidence = parse_ai_confidence((reply or "").strip())
-                if ai_confidence is not None:
-                    logging.info("[MusicBrainz Search] AI pick among matching candidates confidence: %d", ai_confidence)
-                letter = reply_clean.upper()[:1]
-                idx = letters.find(letter)
-                if 0 <= idx < len(matching):
-                    set_cached_mb_info(matching[idx][1]['id'], matching[idx][1])
+        if len(matching) >= 2:
+            # Try deterministic provider evidence (no LLM cost) before asking AI.
+            title_for_fetch = (title_raw or album_norm or "").strip()
+            extra_sources: List[dict] = []
+            if title_for_fetch:
+                try:
+                    extra_sources = list((_provider_fallbacks() or {}).get("extra_sources") or [])
+                except Exception:
+                    extra_sources = []
+            if extra_sources:
+                votes = [0] * len(matching)
+                for i, (rg, info) in enumerate(matching[:12]):
+                    cand_title = str(info.get("mb_title") or rg.get("title") or "").strip()
+                    cand_artists = info.get("mb_artist_names") or _extract_mb_artist_names(rg)
+                    for s in extra_sources:
+                        src_title = str(s.get("title") or s.get("album") or "").strip()
+                        src_artist = str(s.get("artist") or s.get("artist_name") or "").strip()
+                        if not src_title or not src_artist:
+                            continue
+                        ok, _reason = _strict_identity_match_details(
+                            local_artist=src_artist,
+                            local_title=src_title,
+                            candidate_artist=cand_artists,
+                            candidate_title=cand_title,
+                        )
+                        if ok:
+                            votes[i] += 1
+                max_votes = max(votes) if votes else 0
+                if max_votes > 0 and votes.count(max_votes) == 1:
+                    best_idx = votes.index(max_votes)
+                    picked = matching[best_idx][1]
+                    set_cached_mb_info(picked['id'], picked)
                     log_mb(
-                        "Album %s – \"%s\": accepted MB candidate %s (strict identity ok; AI tie-break among matches)",
+                        "Album %s – \"%s\": accepted MB candidate %s (provider strict match; skipped AI)",
                         artist,
                         title_raw or album_norm,
-                        matching[idx][1].get("id") or "?",
+                        picked.get("id") or "?",
                     )
-                    return (matching[idx][1], False)
-            except Exception as e:
-                logging.debug("[MusicBrainz Search] AI pick failed: %s", e)
+                    return (picked, False)
 
-        set_cached_mb_info(matching[0][1]['id'], matching[0][1])
-        log_mb(
-            "Album %s – \"%s\": accepted MB candidate %s (strict identity ok; default top match)",
-            artist,
-            title_raw or album_norm,
-            matching[0][1].get("id") or "?",
-        )
-        return (matching[0][1], False)
+            # Still ambiguous: ask AI to pick among matching titles only (cheap).
+            if use_ai_for_mb_match and getattr(sys.modules[__name__], "ai_provider_ready", False):
+                letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                choices: list[str] = []
+                for i, m in enumerate(matching[:10]):
+                    rg, info = m
+                    mid = str(info.get("id") or rg.get("id") or "").strip()
+                    choices.append(f"{letters[i]}: {rg.get('title', 'Unknown')} (id={mid})")
+                prompt = (
+                    f"Artist: {artist}. Album: {title_raw or album_norm}. "
+                    "Which MusicBrainz release-group is the same release? "
+                    "Reply with only the letter (A/B/...) or NONE. Optionally end with (confidence: N).\n"
+                    + "\n".join(choices)
+                )
+                if extra_sources:
+                    other_lines = []
+                    for s in extra_sources:
+                        src = s.get("source", "?")
+                        t = s.get("title") or s.get("album") or "?"
+                        a = s.get("artist") or s.get("artist_name") or "?"
+                        other_lines.append(f"  {src}: {t!r} (artist: {a!r})")
+                    prompt += "\n\nOther sources:\n" + "\n".join(other_lines)
+                try:
+                    provider = getattr(sys.modules[__name__], "AI_PROVIDER", "openai")
+                    model = getattr(sys.modules[__name__], "RESOLVED_MODEL", None) or getattr(sys.modules[__name__], "OPENAI_MODEL", "gpt-4o-mini")
+                    reply = call_ai_provider(
+                        provider,
+                        model,
+                        "Reply with a single letter (A/B/...) or NONE. Optionally end with (confidence: N).",
+                        prompt,
+                        max_tokens=30,
+                    )
+                    reply_clean, ai_confidence = parse_ai_confidence((reply or "").strip())
+                    if ai_confidence is not None:
+                        logging.info("[MusicBrainz Search] AI pick among matching candidates confidence: %d", ai_confidence)
+                    letter = (reply_clean or "").strip().upper()[:1]
+                    idx = letters.find(letter)
+                    if 0 <= idx < len(matching):
+                        picked = matching[idx][1]
+                        # Optional vision check (OpenAI only): local cover vs CAA.
+                        use_vision = bool(getattr(sys.modules[__name__], "USE_AI_VISION_FOR_COVER", True)) and album_folder and str(provider or "").strip().lower() == "openai"
+                        if use_vision:
+                            try:
+                                folder_path = Path(album_folder) if not isinstance(album_folder, Path) else album_folder
+                                local_data_uri = _get_local_cover_data_uri_for_vision(folder_path)
+                                mb_cover_url = picked.get("cover_url")
+                                if local_data_uri and mb_cover_url:
+                                    sys_msg = "You reply with exactly Yes or No. If No, add in parentheses the reason. Optionally end with (confidence: N)."
+                                    user_msg = (
+                                        "Image 1 is the local album cover. Image 2 is the MusicBrainz Cover Art Archive cover. "
+                                        "Do they represent the same album cover? Reply: Yes or No."
+                                    )
+                                    resp = call_ai_provider_vision(
+                                        provider,
+                                        model,
+                                        sys_msg,
+                                        user_msg,
+                                        image_urls=[mb_cover_url],
+                                        image_base64=[{"type": "image_url", "image_url": {"url": local_data_uri}}],
+                                        max_tokens=20,
+                                    )
+                                    verdict_clean, _vision_conf = parse_ai_confidence((resp or "").strip())
+                                    verdict = (verdict_clean or "").strip().upper()
+                                    if verdict and "NO" in verdict:
+                                        log_cov(
+                                            "Cover mismatch: rejecting AI-chosen MB match for artist=%r album=%r based on vision",
+                                            artist,
+                                            album_norm or title_raw or "",
+                                        )
+                                        return (None, False)
+                            except Exception as e:
+                                logging.debug("[MusicBrainz Vision] Vision check failed: %s", e)
+
+                        set_cached_mb_info(picked['id'], picked)
+                        log_mb(
+                            "Album %s – \"%s\": accepted MB candidate %s (strict identity ok; AI tie-break among matches)",
+                            artist,
+                            title_raw or album_norm,
+                            picked.get("id") or "?",
+                        )
+                        return (picked, True)
+                except Exception as e:
+                    logging.debug("[MusicBrainz Search] AI pick failed: %s", e)
+
+            # Ambiguous and no deterministic winner: do not guess.
+            log_mb(
+                "Album %s – \"%s\": multiple MusicBrainz candidates remain (strict identity ok) but no reliable disambiguation; leaving unmatched",
+                artist,
+                title_raw or album_norm,
+            )
+            return (None, False)
     except Exception as e:
         logging.debug("[MusicBrainz Search Groups] failed for '%s' / '%s': %s", artist, album_norm, e)
     return (None, False)
@@ -10304,7 +14900,16 @@ def process_ai_groups_batch(ai_groups: List[dict], max_workers: int = None) -> L
             if not best:
                 return None
             losers = [e for e in editions if e.get("album_id") != best.get("album_id")]
-            return {
+
+            # Preserve group-level evidence/flags for explainability + safe pipeline behavior.
+            dupe_evidence = group.get("dupe_evidence")
+            if dupe_evidence and isinstance(best, dict):
+                try:
+                    best["dupe_evidence"] = list(dupe_evidence)
+                except Exception:
+                    pass
+
+            res = {
                 "artist": artist,
                 "album_id": best.get("album_id"),
                 "best": best,
@@ -10312,6 +14917,10 @@ def process_ai_groups_batch(ai_groups: List[dict], max_workers: int = None) -> L
                 "fuzzy": group.get("fuzzy", False),
                 "needs_ai": False,
             }
+            for k in ("dupe_signal", "dupe_evidence", "same_folder", "no_move", "manual_review"):
+                if k in group:
+                    res[k] = group.get(k)
+            return res
         except Exception as e:
             logging.error("[AI Batch] Error processing group for %s: %s", group_label, e)
             try:
@@ -10456,392 +15065,185 @@ def ai_suggest_artist_roles(
         except Exception:
             pass
         return None
-    
-    if max_workers is None:
-        max_workers = min(AI_BATCH_SIZE, len(ai_groups))
-    
-    def process_group(group):
-        """Process a single group requiring AI."""
-        editions = group["editions"]
-        artist = group["artist"]
-        fuzzy = group.get("fuzzy", False)
-        
-        try:
-            # Call choose_best without defer_ai to actually process
-            best = choose_best(editions, defer_ai=False)
-            # choose_best should never return None when defer_ai=False
-            # (it will use heuristic if AI is not available)
-            if best is None:
-                raise ValueError("choose_best returned None unexpectedly")
-            
-            losers = [e for e in editions if e['album_id'] != best['album_id']]
-            
-            return {
-                "artist": artist,
-                "album_id": best["album_id"],
-                "best": best,
-                "losers": losers,
-                "fuzzy": fuzzy,
-                "needs_ai": False,
-            }
-        except Exception as e:
-            logging.error(f"[AI Batch] Error processing group for {artist}: {e}", exc_info=True)
-            group_label = f"{artist} – {editions[0].get('title_raw', editions[0].get('album_norm', ''))}" if editions else artist
-            with lock:
-                state.setdefault("scan_ai_errors", []).append({"message": str(e), "group": group_label})
-                if len(state["scan_ai_errors"]) > 100:
-                    state["scan_ai_errors"] = state["scan_ai_errors"][-80:]
-            # No heuristic fallback: AI-only. Skip this group so it does not appear as "Heuristic".
-            return None
-
-    def group_label(g):
-        if not g.get("editions"):
-            return g.get("artist", "")
-        return f"{g['artist']} – {g['editions'][0].get('title_raw', g['editions'][0].get('album_norm', ''))}"
-    
-    results = []
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(process_group, group): group for group in ai_groups}
-        try:
-            for future in as_completed(futures, timeout=900):
-                group = futures[future]
-                label = group_label(group)
-                try:
-                    result = future.result(timeout=60)
-                    if result:
-                        results.append(result)
-                except Exception as e:
-                    logging.error(f"[AI Batch] Failed to process group for {group['artist']}: {e}", exc_info=True)
-                    with lock:
-                        state.setdefault("scan_ai_errors", []).append({"message": str(e), "group": label})
-                        if len(state["scan_ai_errors"]) > 100:
-                            state["scan_ai_errors"] = state["scan_ai_errors"][-80:]
-                with lock:
-                    state["scan_ai_batch_processed"] = state.get("scan_ai_batch_processed", 0) + 1
-                    state["scan_ai_current_label"] = label
-        except TimeoutError:
-            logging.warning("[AI Batch] Timeout waiting for all groups; saving partial results.")
-    
-    return results
 
 def choose_best(editions: List[dict], defer_ai: bool = False) -> dict | None:
-    """
-    Selects the best edition either via AI provider (when configured) or via a local heuristic, re‑using any existing AI cache first.
-    Broken albums (missing tracks) automatically lose against non-broken albums.
-    
-    Args:
-        editions: List of edition dicts to choose from
-        defer_ai: If True and AI is needed, return None instead of calling AI (for batch processing)
-    
-    Returns:
-        Best edition dict, or None if defer_ai=True and AI call is needed
-    """
-    import sqlite3, json
+    """Select the best edition for a duplicate group.
 
-    # 0) Filter out broken albums if there are non-broken alternatives
+    Strategy:
+    - Reuse stable AI cache when the exact same folder set appears again (dupe_ai_cache).
+    - Prefer a conservative deterministic heuristic when the pick is obvious.
+    - Otherwise call the AI provider (unless defer_ai=True), and cache the result.
+    - On AI failure, fall back to the heuristic instead of dropping the group.
+    """
+    if not editions:
+        return None
+
+    # 0) Filter out broken albums if there are non-broken alternatives.
     non_broken = [e for e in editions if not e.get('is_broken', False)]
     broken = [e for e in editions if e.get('is_broken', False)]
-    
     if non_broken and broken:
-        # If we have both broken and non-broken, only consider non-broken
-        log_dupes(
-            "Filtering out %d broken album(s) in favor of %d non-broken album(s) for artist=%s",
-            len(broken),
-            len(non_broken),
-            editions[0].get("artist", "?"),
-        )
+        try:
+            log_dupes(
+                "Filtering out %d broken album(s) in favor of %d non-broken album(s) for artist=%s",
+                len(broken),
+                len(non_broken),
+                editions[0].get('artist', '?'),
+            )
+        except Exception:
+            pass
         editions = non_broken
-    
-    # 1) Re‑use a previously stored AI choice
-    con = sqlite3.connect(str(STATE_DB_FILE))
-    cur = con.cursor()
-    ids = tuple(e['album_id'] for e in editions)
-    placeholders = ",".join("?" for _ in ids)
-    # assume all editions have the same artist
-    artist = editions[0]['artist']
-    cur.execute(
-        f"SELECT album_id, rationale, merge_list, ai_provider, ai_model "
-        f"FROM duplicates_best "
-        f"WHERE artist = ? AND album_id IN ({placeholders}) AND ai_used = 1",
-        (artist, ) + ids
-    )
-    row = cur.fetchone()
-    con.close()
-    existing_list = json.loads(row[2]) if row and row[2] else []
-    # Only reuse cache if no new editions have appeared
-    if row and (len(existing_list) + 1) == len(editions):
-        prev_id, rationale, merge_json = row[0], row[1], row[2]
-        best = next(e for e in editions if e['album_id'] == prev_id)
-        best["rationale"]  = rationale
-        best["merge_list"] = existing_list
-        best["used_ai"]    = True
-        best["ai_provider"] = (row[3] or "") if len(row) > 3 else ""
-        best["ai_model"]   = (row[4] or "") if len(row) > 4 else ""
-        return best
 
-    # 2) If there is no AI cache, call AI provider when possible
-    used_ai = False
+    artist = str((editions[0] or {}).get('artist') or '').strip()
+    group_key = _dupe_group_key_from_editions(editions)
+
+    # 1) AI cache reuse.
+    cached = _dupe_ai_cache_get(artist, group_key)
+    if cached and cached.get('best_folder'):
+        best_folder_key = _dupe_folder_key_str(cached.get('best_folder'))
+        best_cached = next(
+            (e for e in editions if _dupe_folder_key_str((e or {}).get('folder')) == best_folder_key),
+            None,
+        )
+        if best_cached is not None:
+            best_cached['rationale'] = cached.get('rationale') or 'AI cache'
+            best_cached['merge_list'] = cached.get('merge_list') or []
+            best_cached['used_ai'] = True
+            best_cached['ai_provider'] = cached.get('ai_provider') or ''
+            best_cached['ai_model'] = cached.get('ai_model') or ''
+            if cached.get('confidence') is not None:
+                best_cached['ai_confidence'] = cached.get('confidence')
+            return best_cached
+
+    # 2) Heuristic fast path.
+    h_best, h_rationale, h_merge, h_confident = _dupe_choose_best_heuristic(editions)
+    if h_best is not None and (h_confident or not ai_provider_ready):
+        h_best['rationale'] = h_rationale
+        h_best['merge_list'] = h_merge or []
+        h_best['used_ai'] = False
+        h_best['ai_provider'] = ''
+        h_best['ai_model'] = ''
+        return h_best
+
+    # 3) AI path for ambiguous groups.
     if ai_provider_ready:
         if defer_ai:
-            # Return None to indicate AI call is needed (will be processed in batch)
             return None
-        used_ai = True
-        log_ai("Duplicate selection: using AI for edition choice (artist=%s, %d editions)", artist, len(editions))
-        # Load prompt template from external file
-        template = AI_PROMPT_FILE.read_text(encoding="utf-8")
+
+        template = AI_PROMPT_FILE.read_text(encoding='utf-8')
         user_msg = template + "\nCandidate editions:\n"
         for idx, e in enumerate(editions):
-            track_count = len(e.get("tracks", []))
-            folder_path = path_for_fs_access(Path(e["folder"])) if e.get("folder") else None
+            track_count = len(e.get('tracks', []))
+            folder_path = path_for_fs_access(Path(e['folder'])) if e.get('folder') else None
             size_mb = (safe_folder_size(folder_path) // (1024 * 1024)) if folder_path else 0
             user_msg += (
-                f"{idx}: fmt_score={e['fmt_score']}, bitdepth={e['bd']}, "
-                f"tracks={track_count}, track_count={track_count}, size_mb={size_mb}, files={e['file_count']}, "
-                f"bitrate={e['br']}, samplerate={e['sr']}, duration={e['dur']}"
+                f"{idx}: fmt_score={e.get('fmt_score', 0)}, bitdepth={e.get('bd', 0)}, "
+                f"tracks={track_count}, track_count={track_count}, size_mb={size_mb}, files={e.get('file_count', 0)}, "
+                f"bitrate={e.get('br', 0)}, samplerate={e.get('sr', 0)}, duration={e.get('dur', 0)}"
             )
-            # Add year and mbid tags from meta
-            year = e["meta"].get("date") or e["meta"].get("originaldate") or ""
-            mbid = e["meta"].get("musicbrainz_albumid","")
+            meta = e.get('meta') or {}
+            year = meta.get('date') or meta.get('originaldate') or ''
+            mbid = meta.get('musicbrainz_albumid', '')
             user_msg += f" year={year} mbid={mbid}\n"
 
-        # --- Append MusicBrainz release-group info to AI prompt ---
         rg_info = None
         for e in editions:
-            if e.get("rg_info"):
-                rg_info = e["rg_info"]
+            if e.get('rg_info'):
+                rg_info = e['rg_info']
                 break
-        if not rg_info:
-            first = editions[0]
-            rgid = first.get("musicbrainz_id")
-            meta = first.get("meta", {})
-            if not rgid:
-                rgid = meta.get("musicbrainz_releasegroupid")
-            if rgid:
-                try:
-                    rg_info, _ = fetch_mb_release_group_info(rgid)
-                except Exception as e:
-                    logging.debug("MusicBrainz lookup failed for rgid %s: %s", rgid, e)
-            if not rgid:
-                release_mbid = meta.get("musicbrainz_albumid") or meta.get("musicbrainz_releaseid")
-                tag_src = "musicbrainz_albumid" if meta.get("musicbrainz_albumid") else "musicbrainz_releaseid"
-                if release_mbid:
-                    rgid = resolve_mbid_to_release_group(release_mbid, tag_src)
-                    if rgid:
-                        try:
-                            rg_info, _ = fetch_mb_release_group_info(rgid)
-                        except Exception as e:
-                            logging.debug("MusicBrainz lookup failed for resolved rgid %s: %s", rgid, e)
         if rg_info:
-            user_msg += f"Release group info: primary_type={rg_info.get('primary_type', '')}, formats={rg_info.get('format_summary', '')}\n"
+            user_msg += (
+                'Release group info: '
+                f"primary_type={rg_info.get('primary_type', '')}, "
+                f"formats={rg_info.get('format_summary', '')}\n"
+            )
 
         system_msg = (
-            "You are an expert digital-music librarian.\n"
-            "OUTPUT RULES (must follow exactly):\n"
+            'You are an expert digital-music librarian.\n'
+            'OUTPUT RULES (must follow exactly):\n'
             "- Return ONE single line only.\n"
             "- The line must contain EXACTLY two '|' characters.\n"
             "- Format: <index>|<brief rationale>|<comma-separated extra tracks>\n"
             "- Index is 0-based: 0 = first edition, 1 = second, etc. (candidates are listed as 0:, 1:, ...).\n"
             "- If there are no extra tracks, still include the final pipe but leave it empty.\n"
-            "- Do not add any other text, do not explain, do not add extra lines.\n"
-            "Example of valid outputs (two editions: 0 and 1):\n"
-            "1|Winner has: - [CLASSICAL:NO] lossless FLAC, 24-bit, more tracks - Higher bitrate than 0|Track 12 - Live bonus\n"
-            "0|Winner has: - [CLASSICAL:YES] same interpretation (shared MBID) - More complete edition, 9 vs 7 tracks|\n"
-            "Optionally end the rationale with (confidence: N) where N is 0-100 for your decision confidence; e.g. ...edition (confidence: 85)|"
+            "- Do not add any other text.\n"
+            'Optionally end the rationale with (confidence: N) where N is 0-100.\n'
         )
-        
-        # Determine model to use based on provider
-        # Use RESOLVED_MODEL for OpenAI (the one that passed functional probe); fallback to OPENAI_MODEL only if unset
+
         mod = sys.modules[__name__]
-        model_to_use = getattr(mod, "RESOLVED_MODEL", None) or OPENAI_MODEL
-        if not model_to_use:
-            # Set defaults if no model selected
-            if AI_PROVIDER.lower() == "anthropic":
-                model_to_use = "claude-3-5-sonnet-20241022"
-            elif AI_PROVIDER.lower() == "google":
-                model_to_use = "gemini-1.5-pro"
-            elif AI_PROVIDER.lower() == "ollama":
-                model_to_use = "llama2"  # Common default Ollama model
-            else:
-                model_to_use = "gpt-4o-mini"
-        
-        # Log concise AI request summary (respect verbosity)
-        if PMDA_LOG_VERBOSE:
-            log_ai(
-                "Request: provider=%s, model=%s, max_out=256, candidate_editions=%d",
-                AI_PROVIDER,
-                model_to_use,
-                len(editions),
-            )
-        else:
-            logging.debug(
-                "AI request (%s): model=%s, max_out=256, candidate_editions=%d",
-                AI_PROVIDER,
-                model_to_use,
-                len(editions),
-            )
-        
+        model_to_use = getattr(mod, 'RESOLVED_MODEL', None) or OPENAI_MODEL or 'gpt-4o-mini'
+        model_display = getattr(mod, 'RESOLVED_MODEL', None) or OPENAI_MODEL or model_to_use
+
+        ai_confidence = None
         try:
             txt = call_ai_provider(AI_PROVIDER, model_to_use, system_msg, user_msg, max_tokens=256)
-            logging.debug("AI raw response: %s", txt)
-
-            # --- sanitize: keep only first non-empty line, strip code fences / prefixes ---
-            lines = [l.strip() for l in txt.replace("```", "").splitlines() if l.strip()]
-            txt = lines[0] if lines else txt
+            lines = [l.strip() for l in (txt or '').replace('```', '').splitlines() if l.strip()]
+            txt = lines[0] if lines else (txt or '')
             txt = re.sub(r'^(answer|réponse)\s*:\s*', '', txt, flags=re.IGNORECASE).strip()
 
-            # --- try strict format: <index>|<rationale>|<extras> ---
             m = re.match(r'^(\d+)\s*\|\s*(.*?)\s*\|\s*(.*)$', txt)
             if m:
                 idx = int(m.group(1))
-                # Accept 1-based index: model often returns 1/2 for first/second; we use 0-based
                 if idx == len(editions) and len(editions) > 1:
-                    idx = idx - 1
-                elif not (0 <= idx < len(editions)):
-                    # Clamp out-of-range index instead of failing the whole group; do not record as AI error since we recover
-                    original_idx = idx
-                    idx = max(0, min(len(editions) - 1, idx))
-                    logging.warning("AI index out of range: %s / %s; clamped to %s (group will be processed)", original_idx, len(editions), idx)
+                    idx -= 1
+                idx = max(0, min(len(editions) - 1, idx))
                 rationale = m.group(2).strip()
                 extras_raw = m.group(3).strip()
                 merge_list = [t.strip() for t in extras_raw.split(',') if t.strip()]
-                # Optional confidence score 0-100 from end of rationale
-                ai_confidence = None
-                m_conf = re.search(r"\s*\(confidence:\s*(\d+)\)\s*$", rationale, re.I)
+                m_conf = re.search(r'\s*\(confidence:\s*(\d+)\)\s*$', rationale, re.I)
                 if m_conf:
                     ai_confidence = min(100, max(0, int(m_conf.group(1))))
                     rationale = rationale[: m_conf.start()].strip()
             else:
-                # --- tolerant fallback: accept a lone index or any line containing a number ---
                 m_num = re.search(r'(\d+)', txt)
                 if not m_num:
-                    raise ValueError(f"Invalid AI response format (no index found) – got: {txt!r}")
+                    raise ValueError(f'Invalid AI response format (no index found) – got: {txt!r}')
                 idx = int(m_num.group(1))
                 if idx == len(editions) and len(editions) > 1:
-                    idx = idx - 1
-                elif not (0 <= idx < len(editions)):
-                    # Clamp out-of-range index instead of failing the whole group; do not record as AI error since we recover
-                    original_idx = idx
-                    idx = max(0, min(len(editions) - 1, idx))
-                    logging.warning("AI index out of range: %s / %s; clamped to %s (group will be processed)", original_idx, len(editions), idx)
-                rationale = "minimal AI reply; fallback parser used"
+                    idx -= 1
+                idx = max(0, min(len(editions) - 1, idx))
+                rationale = 'minimal AI reply; fallback parser used'
                 merge_list = []
-                ai_confidence = None
-
-            logging.debug("AI parsed result -> idx=%s rationale=%r extras=%r%s", idx, rationale, merge_list, f" confidence={ai_confidence}" if ai_confidence is not None else "")
 
             best = editions[idx]
-            model_display = getattr(sys.modules[__name__], "RESOLVED_MODEL", None) or OPENAI_MODEL or model_to_use
             best.update({
-                "rationale":  rationale,
-                "merge_list": merge_list,
-                "used_ai":    True,
-                "ai_provider": (AI_PROVIDER or ""),
-                "ai_model":   (model_display or ""),
+                'rationale': rationale,
+                'merge_list': merge_list,
+                'used_ai': True,
+                'ai_provider': (AI_PROVIDER or ''),
+                'ai_model': (model_display or ''),
             })
             if ai_confidence is not None:
-                best["ai_confidence"] = ai_confidence
+                best['ai_confidence'] = ai_confidence
+
+            _dupe_ai_cache_put(
+                artist=artist,
+                group_key=group_key,
+                best_folder=_dupe_folder_key_str(best.get('folder')),
+                rationale=rationale,
+                merge_list=merge_list,
+                ai_provider=(AI_PROVIDER or ''),
+                ai_model=(model_display or ''),
+                confidence=ai_confidence,
+            )
+            return best
         except Exception as e:
-            log_ai("AI failed (%s); no heuristic fallback (AI required). Skipping group.", e)
-            group_label = f"{artist} – {editions[0].get('title_raw', editions[0].get('album_norm', ''))}" if editions else (artist or "")
+            group_label = f"{artist} – {editions[0].get('title_raw', editions[0].get('album_norm', ''))}" if editions else (artist or '')
             with lock:
-                state.setdefault("scan_ai_errors", []).append({"message": str(e), "group": group_label})
-                if len(state["scan_ai_errors"]) > 100:
-                    state["scan_ai_errors"] = state["scan_ai_errors"][-80:]
-            return None
+                state.setdefault('scan_ai_errors', []).append({'message': str(e), 'group': group_label})
+                if len(state['scan_ai_errors']) > 100:
+                    state['scan_ai_errors'] = state['scan_ai_errors'][-80:]
+            logging.warning('AI failed for dupe group (%s): %s; falling back to heuristic', group_label, e)
 
-    # 3) AI is required; no heuristic path. If we reach here without used_ai, AI was not configured.
-    if not used_ai:
-        log_ai(
-            "AI required but not ready (artist=%s, %d editions); skipping duplicate group.",
-            artist,
-            len(editions),
-        )
-        return None
+    # 4) Final fallback: heuristic even if not confident.
+    if h_best is not None:
+        h_best['rationale'] = h_rationale
+        h_best['merge_list'] = h_merge or []
+        h_best['used_ai'] = False
+        h_best['ai_provider'] = ''
+        h_best['ai_model'] = ''
+        return h_best
 
-    # 4) Persist choice to DB (INSERT OR IGNORE so we never overwrite an existing cache)
-    best_folder_path = path_for_fs_access(Path(best["folder"])) if best.get("folder") else None
-    best_size_mb = (safe_folder_size(best_folder_path) // (1024 * 1024)) if best_folder_path else 0
-    best_track_count = len(best.get("tracks", []))
-    con = sqlite3.connect(str(STATE_DB_FILE))
-    cur = con.cursor()
-    cur.execute("""
-        INSERT OR IGNORE INTO duplicates_best
-          (artist, album_id, title_raw, album_norm, folder, fmt_text,
-           br, sr, bd, dur, discs, rationale, merge_list, ai_used, meta_json, ai_provider, ai_model, size_mb, track_count, match_verified_by_ai)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        best["artist"],
-        best["album_id"],
-        best["title_raw"],
-        best["album_norm"],
-        str(best["folder"]),
-        get_primary_format(Path(best["folder"])),
-        best["br"],
-        best["sr"],
-        best["bd"],
-        best["dur"],
-        best["discs"],
-        best.get("rationale", ""),
-        json.dumps(best.get("merge_list", [])),
-        int(best.get("used_ai", False)),
-        json.dumps(best.get("meta", {})),
-        best.get("ai_provider", ""),
-        best.get("ai_model", ""),
-        best_size_mb,
-        best_track_count,
-        1 if best.get("match_verified_by_ai") else 0,
-    ))
-    con.commit()
-    # Persist loser editions so details modal can show all versions after restart
-    losers = []
-    for e in editions:
-        if e['album_id'] != best['album_id']:
-            size_mb = folder_size(Path(e['folder'])) // (1024 * 1024)
-            cur.execute("""
-                INSERT INTO duplicates_loser
-                  (artist, album_id, folder, fmt_text, br, sr, bd, size_mb)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                best["artist"],
-                best["album_id"],
-                str(e["folder"]),
-                get_primary_format(Path(e["folder"])),
-                e.get("br", 0),
-                e.get("sr", 0),
-                e.get("bd", 0),
-                size_mb,
-            ))
-            losers.append({"folder": str(e["folder"]), "fmt": get_primary_format(Path(e["folder"])), "size_mb": size_mb})
-    con.commit()
-    con.close()
-
-    # High-level per-group summary for logs
-    try:
-        losers_count = len(losers)
-        fmt = get_primary_format(Path(best["folder"]))
-        conf_suffix = f" confidence={best['ai_confidence']}" if best.get("ai_confidence") is not None else ""
-        log_dupes(
-            "Group decided for artist=%s album=%s – BEST=%s (%s, %d tracks, %d MB) LOSERS=%d (ai=%s, model=%s)%s",
-            best.get("artist", "?"),
-            best.get("album_norm") or best.get("title_raw") or "?",
-            str(best.get("folder")),
-            fmt,
-            best_track_count,
-            best_size_mb,
-            losers_count,
-            "yes" if best.get("used_ai") else "no",
-            best.get("ai_model", ""),
-            conf_suffix,
-        )
-    except Exception:
-        # Logging only – never break duplicate selection
-        pass
-
-    return best
-    # Check for any other literal uses of the French header and replace
-    # (This is for the extremely rare case where it appears elsewhere in this function.)
-
-# --- Remove any other temperature=0.0 from openai_client.chat.completions.create calls in this file ---
+    return None
 
 def scan_artist_duplicates(args):
     """
@@ -10935,8 +15337,135 @@ def scan_artist_duplicates(args):
                     "missing_required_tags": list(fe.get("missing_required_tags") or []),
                     "has_mbid": bool(fe.get("has_mbid")),
                     "musicbrainz_id": (fe.get("musicbrainz_id") or "").strip(),
+                    # Provider identity (used by Dupe Detection v2 hard grouping)
+                    "discogs_release_id": str(fe.get("discogs_release_id") or meta_tags.get("discogs_release_id") or "").strip(),
+                    "lastfm_album_mbid": str(fe.get("lastfm_album_mbid") or meta_tags.get("lastfm_album_mbid") or "").strip(),
+                    "bandcamp_album_url": str(fe.get("bandcamp_album_url") or meta_tags.get("bandcamp_album_url") or "").strip(),
+                    "metadata_source": str(fe.get("metadata_source") or fe.get("identity_provider") or meta_tags.get("primary_metadata_source") or "").strip(),
                 })
             prebuilt_editions = editions_for_artist
+            # Changed-only scans only build editions for changed folders. For dupe detection we still
+            # need to compare new/changed albums against the existing local catalog, otherwise we
+            # miss dupes introduced in later runs. We pull lightweight context editions from the
+            # published cache in state.db (no heavy provider work).
+            try:
+                with lock:
+                    scan_type_hint = str(state.get("scan_type") or "full").strip().lower()
+            except Exception:
+                scan_type_hint = "full"
+            if scan_type_hint == "changed_only" and editions_for_artist:
+                try:
+                    existing_folders: set[str] = set()
+                    for e in editions_for_artist:
+                        try:
+                            existing_folders.add(str(Path(e.get("folder")).resolve()))
+                        except Exception:
+                            existing_folders.add(str(e.get("folder") or ""))
+                    _ctx_artists, ctx_albums, _ctx_count = _load_files_library_published_payload_for_artist(artist_name)
+                    # Allocate stable per-run ids for context editions (avoid collisions with scan-local ids)
+                    next_ctx_id = (max([int(x) for x in album_ids if x is not None] or [0]) + 1) if album_ids else (max([int(e.get("album_id") or 0) for e in editions_for_artist] or [0]) + 1)
+                    added = 0
+                    for alb in (ctx_albums or []):
+                        folder_path = str(alb.get("folder_path") or "").strip()
+                        if not folder_path:
+                            continue
+                        try:
+                            folder_obj = Path(folder_path)
+                        except Exception:
+                            continue
+                        try:
+                            folder_key = str(folder_obj.resolve())
+                        except Exception:
+                            folder_key = str(folder_obj)
+                        if not folder_key or folder_key in existing_folders:
+                            continue
+                        # Convert published track dicts into Track tuples expected by dupe logic.
+                        tracks_in: list = list(alb.get("tracks") or [])
+                        tracks: list[Track] = []
+                        br_guess = 0
+                        sr_guess = 0
+                        bd_guess = 0
+                        for i, t in enumerate(tracks_in):
+                            if not isinstance(t, dict):
+                                continue
+                            title = (t.get("title") or "").strip() or f"Track {i + 1}"
+                            disc_num = _parse_int_loose(t.get("disc_num") or t.get("disc") or 1, 1) or 1
+                            track_num = _parse_int_loose(t.get("track_num") or t.get("idx") or t.get("track") or (i + 1), i + 1) or (i + 1)
+                            dur_sec = _parse_int_loose(t.get("duration_sec") or 0, 0) or 0
+                            tracks.append(Track(title=title, idx=track_num, disc=disc_num, dur=int(dur_sec) * 1000))
+                            br_guess = max(br_guess, int(_parse_int_loose(t.get("bitrate") or 0, 0) or 0))
+                            sr_guess = max(sr_guess, int(_parse_int_loose(t.get("sample_rate") or 0, 0) or 0))
+                            bd_guess = max(bd_guess, int(_parse_int_loose(t.get("bit_depth") or 0, 0) or 0))
+
+                        meta_tags = {}
+                        try:
+                            meta_tags = json.loads(alb.get("primary_tags_json") or "{}") if alb.get("primary_tags_json") else {}
+                            if not isinstance(meta_tags, dict):
+                                meta_tags = {}
+                        except Exception:
+                            meta_tags = {}
+                        try:
+                            missing_required = json.loads(alb.get("missing_required_tags_json") or "[]") if alb.get("missing_required_tags_json") else []
+                            if not isinstance(missing_required, list):
+                                missing_required = []
+                        except Exception:
+                            missing_required = []
+
+                        normalize_parenthetical = bool(_parse_bool(_get_config_from_db("NORMALIZE_PARENTHETICAL_FOR_DEDUPE") or "true"))
+                        title_raw = (alb.get("title") or "").strip() or folder_obj.name.replace("_", " ").strip() or "Unknown Album"
+                        album_norm_value = norm_album_for_dedup(title_raw, normalize_parenthetical)
+                        fmt_txt = (alb.get("format") or "").strip().upper()
+                        fmt_score_val = score_format(fmt_txt.lower()) if fmt_txt else 0
+
+                        editions_for_artist.append(
+                            {
+                                "album_id": next_ctx_id,
+                                "title_raw": title_raw,
+                                "album_norm": album_norm_value,
+                                "plex_norm": album_norm_value,
+                                "artist": artist_name,
+                                "folder": folder_obj,
+                                "tracks": tracks,
+                                "file_count": int(alb.get("track_count") or len(tracks) or 0),
+                                "sig": signature(tracks),
+                                "titles": {t.title for t in tracks},
+                                "dur": sum(t.dur for t in tracks),
+                                "fmt_score": fmt_score_val,
+                                "br": br_guess,
+                                "sr": sr_guess,
+                                "bd": bd_guess,
+                                "discs": len({t.disc for t in tracks}) if tracks else 1,
+                                "meta": meta_tags,
+                                "invalid": False,
+                                "title_source": "published_cache",
+                                "plex_title": title_raw,
+                                "audio_cache_hit": True,
+                                "ordered_paths": [Path(str(t.get("file_path"))) for t in tracks_in if isinstance(t, dict) and t.get("file_path")] if tracks_in else [],
+                                "fingerprint": (alb.get("fingerprint") or "").strip() if isinstance(alb.get("fingerprint"), str) else alb.get("fingerprint"),
+                                "skip_heavy_processing": True,
+                                "has_cover": bool(alb.get("has_cover")),
+                                "has_artist_image": bool(alb.get("has_artist_image")),
+                                "missing_required_tags": missing_required,
+                                "has_mbid": bool(alb.get("mb_identified")),
+                                "musicbrainz_id": str(alb.get("musicbrainz_release_group_id") or "").strip(),
+                                "discogs_release_id": str(alb.get("discogs_release_id") or "").strip(),
+                                "lastfm_album_mbid": str(alb.get("lastfm_album_mbid") or "").strip(),
+                                "bandcamp_album_url": str(alb.get("bandcamp_album_url") or "").strip(),
+                                "metadata_source": str(alb.get("metadata_source") or "").strip(),
+                                # Marker so scan stats can exclude this if needed.
+                                "context_only": True,
+                            }
+                        )
+                        existing_folders.add(folder_key)
+                        next_ctx_id += 1
+                        added += 1
+                        if added >= 220:
+                            break
+                    if added:
+                        prebuilt_editions = editions_for_artist
+                        logging.debug("Files changed-only: added %d context edition(s) from published cache for artist %s", added, artist_name)
+                except Exception:
+                    logging.debug("Files changed-only: failed to add published context editions for artist %s", artist_name, exc_info=True)
         else:
             db_conn = plex_connect()
 
@@ -11034,9 +15563,9 @@ def scan_duplicates(
             if folder is not None:
                 try:
                     folder_str_resolved = str(Path(folder).resolve())
-                    seen_folders[folder_str_resolved] = [e["album_id"]]
+                    seen_folders.setdefault(folder_str_resolved, []).append(e["album_id"])
                 except (OSError, RuntimeError):
-                    seen_folders[str(folder)] = [e["album_id"]]
+                    seen_folders.setdefault(str(folder), []).append(e["album_id"])
         # Continue to MB enrichment and grouping below (skip the Plex for-loop).
     else:
         for aid in album_ids:
@@ -11962,428 +16491,540 @@ def scan_duplicates(
         e["album_id"]: (e.get("title_raw") or e.get("plex_title") or f"Album {e['album_id']}")
         for e in editions
     }
-    # --- First pass: group by album_norm, with classical disambiguation ---
+    # --- Dupe Detection v2 grouping: provider IDs + signatures + loose title + similarity ---
     from collections import defaultdict
-    # initial grouping by normalized title
-    # Group by Plex-normalized title so we match get_duplicate_groups_from_library (same artist + norm_album(plex title))
-    raw_groups: dict[str, list[dict]] = defaultdict(list)
-    for e in editions:
-        group_key = (e.get('plex_norm') or e['album_norm'] or '').strip()
-        if not group_key or group_key.startswith('__untitled__'):
-            group_key = e['album_norm']
-        raw_groups[group_key].append(e)
-    # Log grouping: how many keys have 2+ editions (potential duplicate groups)
-    dup_keys = [(k, len(v)) for k, v in raw_groups.items() if len(v) >= 2]
-    logging.info(
-        "[Artist %s] raw_groups: %d keys, %d with 2+ editions: %s",
-        artist, len(raw_groups), len(dup_keys),
-        dup_keys[:15] if len(dup_keys) > 15 else dup_keys,
-    )
-    
-    # Filter out groups where all editions share the same folder (not real duplicates)
-    # This can happen if Plex has duplicate album entries pointing to the same folder
-    # SAFETY: Normalize all folder paths using resolve() to catch same folders with different representations
-    filtered_groups: dict[str, list[dict]] = {}
-    for norm, ed_list in raw_groups.items():
-        if len(ed_list) < 2:
-            filtered_groups[norm] = ed_list
-            continue
-        # Normalize all folders using resolve() for accurate comparison
-        folders_resolved = set()
+
+    # In changed-only scans, we may inject context-only editions from the published cache
+    # to detect dupes against older albums. Those context editions should not affect scan
+    # health stats nor be persisted into scan_editions (they use run-local album_id).
+    all_editions_for_stats = [e for e in editions if not bool(e.get("context_only"))]
+
+    dupe_report: dict = {
+        "version": 2,
+        "groups_total": 0,
+        "groups_needs_ai": 0,
+        "groups_by_signal": {},
+        "rejected_by_reason": {},
+    }
+
+    def _dr_inc(bucket: str, key: str, n: int = 1) -> None:
+        if not key:
+            return
+        d = dupe_report.get(bucket)
+        if not isinstance(d, dict):
+            d = {}
+            dupe_report[bucket] = d
+        k = str(key)
+        d[k] = int(d.get(k) or 0) + int(n or 0)
+
+    def _folder_key(e: dict) -> str:
+        folder = e.get("folder")
+        if not folder:
+            return ""
+        try:
+            return str(Path(folder).resolve())
+        except Exception:
+            return str(folder)
+
+    def _all_same_folder(ed_list: list[dict]) -> bool:
+        keys = {_folder_key(e) for e in ed_list if e.get("folder")}
+        keys = {k for k in keys if k}
+        return len(keys) == 1 and bool(keys)
+
+    def _ensure_track_set(e: dict) -> set[str]:
+        ts = e.get("_dupe_track_title_set")
+        if isinstance(ts, set):
+            return ts
+        ts = _dupe_track_title_set(e.get("tracks") or [])
+        e["_dupe_track_title_set"] = ts
+        return ts
+
+    def _is_classical(ed_list: list[dict]) -> bool:
+        genres: list[str] = []
         for e in ed_list:
-            folder = e.get('folder')
-            if folder:
-                try:
-                    folder_resolved = str(Path(folder).resolve())
-                    folders_resolved.add(folder_resolved)
-                except Exception as resolve_err:
-                    # If resolve fails, fall back to string representation
-                    logging.debug("Could not resolve folder %s: %s, using string representation", folder, resolve_err)
-                    folders_resolved.add(str(folder))
-        
-        if len(folders_resolved) == 1:
-            # All editions in same folder - likely duplicate Plex entries, not real duplicates
-            logging.warning(
-                "[Artist %s] Skipping group '%s' - all %d editions share the same resolved folder: %s. "
-                "This indicates duplicate Plex album entries pointing to the same files. "
-                "Album IDs in this group: %s",
-                artist, norm, len(ed_list), list(folders_resolved)[0],
-                [e.get('album_id') for e in ed_list]
-            )
-            continue
-        
-        # Additional safety: check if any editions have the same (album_id, folder) combo
-        # This should not happen with the earlier check, but double-check here
-        seen_combos = set()
-        duplicates_found = False
+            g = ""
+            try:
+                g = (e.get("meta") or {}).get("genre") or ""
+            except Exception:
+                g = ""
+            if g:
+                genres.append(str(g).lower())
+        return bool(genres) and all("classical" in g for g in genres)
+
+    def _split_classical(ed_list: list[dict]) -> list[list[dict]]:
+        subgroups: list[dict] = []
         for e in ed_list:
-            folder = e.get('folder')
-            album_id = e.get('album_id')
-            if folder:
-                try:
-                    folder_resolved = str(Path(folder).resolve())
-                except Exception:
-                    folder_resolved = str(folder)
-            else:
-                folder_resolved = ""
-            combo = (album_id, folder_resolved)
-            if combo in seen_combos:
-                logging.error(
-                    "[Artist %s] CRITICAL: Found duplicate edition with same album_id=%d and folder=%s in group '%s'. "
-                    "This should not happen. Skipping this edition.",
-                    artist, album_id, folder_resolved, norm
-                )
-                duplicates_found = True
-            seen_combos.add(combo)
-        
-        if duplicates_found:
-            # Remove duplicate editions (keep first occurrence)
-            unique_editions = []
-            seen_combos_clean = set()
-            for e in ed_list:
-                folder = e.get('folder')
-                album_id = e.get('album_id')
-                if folder:
-                    try:
-                        folder_resolved = str(Path(folder).resolve())
-                    except Exception:
-                        folder_resolved = str(folder)
-                else:
-                    folder_resolved = ""
-                combo = (album_id, folder_resolved)
-                if combo not in seen_combos_clean:
-                    unique_editions.append(e)
-                    seen_combos_clean.add(combo)
-            ed_list = unique_editions
-        
-        if len(ed_list) < 2:
-            # After deduplication, not enough editions for a duplicate group
-            continue
-        
-        filtered_groups[norm] = ed_list
-    raw_groups = filtered_groups
-    logging.info(
-        "[Artist %s] filtered_groups (after same-folder filter): %d keys with 2+ editions",
-        artist, len([k for k, v in raw_groups.items() if len(v) >= 2]),
-    )
-    # refine groups: for classical, split by year and first-track duration threshold
-    exact_groups: dict[tuple, list[dict]] = {}
-    for norm, ed_list in raw_groups.items():
-        if len(ed_list) < 2:
-            # single edition or no duplicates
-            exact_groups[(norm, None, None)] = ed_list
-            continue
-        # detect classical genre in metadata (case-insensitive)
-        genres = [e.get('meta', {}).get('genre', '').lower() for e in ed_list]
-        is_classical = all('classical' in g for g in genres if g)
-        if is_classical:
-            # subdivide editions by year and duration of first track
-            subgroups: list[dict] = []
-            for e in ed_list:
-                year = e.get('meta', {}).get('date') or e.get('meta', {}).get('originaldate') or ''
-                dur = e['tracks'][0].dur if e.get('tracks') else 0
-                placed = False
-                for sg in subgroups:
-                    if sg['year'] == year and abs(sg['dur'] - dur) <= 10000:
-                        sg['editions'].append(e)
-                        placed = True
-                        break
-                if not placed:
-                    subgroups.append({'year': year, 'dur': dur, 'editions': [e]})
+            meta = e.get("meta", {}) or {}
+            year = meta.get("date") or meta.get("originaldate") or ""
+            dur0 = e["tracks"][0].dur if e.get("tracks") else 0
+            placed = False
             for sg in subgroups:
-                exact_groups[(norm, sg['year'], sg['dur'])] = sg['editions']
+                if sg["year"] == year and abs(int(sg["dur0"]) - int(dur0)) <= 10000:
+                    sg["editions"].append(e)
+                    placed = True
+                    break
+            if not placed:
+                subgroups.append({"year": year, "dur0": dur0, "editions": [e]})
+        return [sg["editions"] for sg in subgroups if sg.get("editions")]
+
+    def _group_pair_metrics(ed_list: list[dict]) -> tuple[float, float]:
+        # Return (max_jaccard, min_track_ratio) across all pairs in this group.
+        n = len(ed_list)
+        if n < 2:
+            return (1.0, 1.0)
+        sets = [_ensure_track_set(e) for e in ed_list]
+        tracks = [e.get("tracks") or [] for e in ed_list]
+        max_j = 0.0
+        min_ratio = 1.0
+        for i in range(n):
+            for j in range(i + 1, n):
+                ratio = _dupe_track_count_ratio(tracks[i], tracks[j])
+                if ratio < min_ratio:
+                    min_ratio = ratio
+                jac = _dupe_jaccard(sets[i], sets[j])
+                if jac > max_j:
+                    max_j = jac
+        return (max_j, min_ratio)
+
+    def _maybe_audio_overlap_max(ed_list: list[dict]) -> float:
+        # Expensive: compute max chromaprint overlap across any pair in group.
+        n = len(ed_list)
+        if n < 2:
+            return 0.0
+        fps: list[set[str]] = []
+        for e in ed_list:
+            try:
+                fps.append(_dupe_audio_fp_set_for_edition(e))
+            except Exception:
+                fps.append(set())
+        max_ov = 0.0
+        for i in range(n):
+            for j in range(i + 1, n):
+                a = fps[i]
+                b = fps[j]
+                if not a or not b:
+                    continue
+                ov = (len(a & b) / max(len(a), len(b))) if max(len(a), len(b)) else 0.0
+                if ov > max_ov:
+                    max_ov = ov
+        return max_ov
+
+    def _live_safety_skip(ed_list: list[dict]) -> bool:
+        if LIVE_DEDUPE_MODE != "safe" or len(ed_list) < 2:
+            return False
+        live_flags: list[bool] = []
+        track_sets: list[set[str]] = []
+        track_counts: list[int] = []
+        for e in ed_list:
+            meta = e.get("meta", {}) or {}
+            title_lower = (e.get("plex_title") or e.get("title_raw") or "").lower()
+            sec_types = (meta.get("musicbrainz_secondarytypes") or "").lower()
+            is_live = (
+                "live" in sec_types
+                or " live " in f" {title_lower} "
+                or " live at " in title_lower
+                or " live in " in title_lower
+            )
+            live_flags.append(is_live)
+            ts = _ensure_track_set(e)
+            if ts:
+                track_sets.append(ts)
+            track_counts.append(len(e.get("tracks") or []))
+        if not any(live_flags):
+            return False
+        if not all(live_flags):
+            _dr_inc("rejected_by_reason", "mixed_live_nonlive")
+            return True
+        if len(track_sets) >= 2:
+            union = set().union(*track_sets)
+            inter = set.intersection(*track_sets) if track_sets else set()
+            jaccard = (len(inter) / len(union)) if union else 1.0
         else:
-            # non-classical: group all under single key
-            exact_groups[(norm, None, None)] = ed_list
-    logging.debug(
-        f"[Artist {artist}] Exact groups after classical filter: "
-        f"{[(k, [ed['album_id'] for ed in v]) for k, v in exact_groups.items()]}"
-    )
+            jaccard = 1.0
+        min_tracks = min(track_counts) if track_counts else 0
+        max_tracks = max(track_counts) if track_counts else 0
+        ratio = (min_tracks / max_tracks) if max_tracks else 1.0
+        if jaccard < 0.8 or ratio < 0.75:
+            _dr_inc("rejected_by_reason", "live_low_similarity")
+            return True
+        return False
+
+    # Precompute v2 identity + loose title norms for grouping.
+    for e in editions:
+        title_src = (e.get("title_raw") or e.get("plex_title") or e.get("album_norm") or "").strip()
+        e["_dupe_title_norm_loose"] = norm_album_for_dedup_loose(title_src)
+        e["_dupe_edition_tokens"] = _dupe_extract_edition_tokens(title_src)
+        e["_dupe_mb_rg"] = _dupe_get_mb_release_group_id(e)
+        e["_dupe_mb_rel"] = _dupe_get_mb_release_id(e)
+        e["_dupe_discogs"] = _dupe_get_discogs_id(e)
+        e["_dupe_lastfm"] = _dupe_get_lastfm_mbid(e)
+        e["_dupe_bandcamp"] = _dupe_get_bandcamp_url(e)
 
     out: list[dict] = []
     used_ids: set[int] = set()
+    feedback_pairs = _dupe_load_feedback_pairs_for_artist(artist)
+
     # Track statistics
-    mb_used_count = 0  # Editions enriched with MusicBrainz
-    ai_used_count = 0  # Groups where AI was used
-    audio_cache_hits = 0  # Albums that used audio cache
-    audio_cache_misses = 0  # Albums that needed ffprobe
-    mb_cache_hits = 0  # MusicBrainz lookups from cache
-    mb_cache_misses = 0  # MusicBrainz lookups requiring API call
-    
-    # Count cache usage
-    audio_cache_hits = sum(1 for e in editions if e.get('audio_cache_hit', False))
+    mb_used_count = 0  # Editions enriched with provider identity
+    ai_used_count = 0  # Groups where a previous AI decision was reused immediately
+    audio_cache_hits = sum(1 for e in editions if e.get("audio_cache_hit", False))
     audio_cache_misses = len(editions) - audio_cache_hits
-    
-    # Count MusicBrainz usage and cache hits
+    mb_cache_hits = 0
+    mb_cache_misses = 0
+
     if USE_MUSICBRAINZ:
-        mb_used_count = sum(1 for e in editions if 'rg_info' in e)
-        mb_cache_hits = sum(1 for e in editions if e.get('mb_cache_hit', False))
-        mb_cache_misses = mb_used_count - mb_cache_hits
-    
-    for norm, ed_list in exact_groups.items():
-        logging.debug(f"[Artist {artist}] Processing exact group for norm='{norm}' with albums {[e['album_id'] for e in ed_list]}")
-    for ed_list in exact_groups.values():
+        mb_used_count = sum(
+            1
+            for e in editions
+            if e.get("musicbrainz_id") or (isinstance(e.get("rg_info"), dict) and e["rg_info"].get("id"))
+        )
+        mb_cache_hits = sum(1 for e in editions if (("rg_info" in e) and bool(e.get("mb_cache_hit", False))))
+        mb_cache_misses = sum(1 for e in editions if (("rg_info" in e) and (not bool(e.get("mb_cache_hit", False)))))
+
+    def _append_group(
+        ed_list: list[dict],
+        *,
+        fuzzy: bool,
+        signal: str,
+        evidence: list[str] | None = None,
+    ) -> None:
+        nonlocal ai_used_count
+        if not ed_list or len(ed_list) < 2:
+            return
+        # Never regroup already-used editions.
+        ed_list = [e for e in ed_list if e.get("album_id") not in used_ids]
         if len(ed_list) < 2:
-            continue
-        logging.debug(f"[Artist {artist}] Exact group members: {[e['album_id'] for e in ed_list]}")
+            return
+        if _all_same_folder(ed_list):
+            _dr_inc("rejected_by_reason", "same_folder")
+            return
+        if _live_safety_skip(ed_list):
+            return
 
-        # Update: comparing versions
-        current_album_id = None
-        with lock:
-            if artist in state.get("scan_active_artists", {}):
-                current_album = state["scan_active_artists"][artist].get("current_album", {})
-                current_album_id = current_album.get("album_id")
-                # Check if any edition in this group matches current album
-                if current_album_id and any(e['album_id'] == current_album_id for e in ed_list):
-                    state["scan_active_artists"][artist]["current_album"]["status"] = "comparing_versions"
-                    state["scan_active_artists"][artist]["current_album"]["status_details"] = f"found {len(ed_list)} versions"
-                    # Low-level: show bitrate/sample rate/bit depth for each version (max 3)
-                    parts = []
-                    for ed in ed_list[:3]:
-                        br_k = (ed["br"] // 1000) if ed.get("br", 0) >= 1000 else ed.get("br", 0)
-                        parts.append(f"{br_k} kbps · {ed.get('sr', 0)} Hz · {ed.get('bd', 0)}-bit")
-                    tail = " …" if len(ed_list) > 3 else ""
-                    state["scan_active_artists"][artist]["current_album"]["step_summary"] = (
-                        f"{len(ed_list)} versions: " + " vs ".join(parts) + tail
-                    )
-                    state["scan_active_artists"][artist]["current_album"]["step_response"] = (
-                        f"Comparing: " + " vs ".join(parts) + tail
-                    )
+        # Classical safety: split by year + first-track duration threshold.
+        subgroups = _split_classical(ed_list) if _is_classical(ed_list) else [ed_list]
 
-        # Live safety: when LIVE_DEDUPE_MODE is 'safe', require high tracklist similarity for live albums
-        is_live_group = False
-        track_titles_sets: list[set[str]] = []
-        if LIVE_DEDUPE_MODE == "safe":
-            for e in ed_list:
-                meta = e.get("meta", {}) or {}
-                title_lower = (e.get("plex_title") or e.get("title_raw") or "").lower()
-                sec_types = (meta.get("musicbrainz_secondarytypes") or "").lower()
-                if "live" in sec_types or " live " in f" {title_lower} ":
-                    is_live_group = True
-                titles = {t.title.strip().lower() for t in e.get("tracks", []) if getattr(t, "title", None)}
-                if titles:
-                    track_titles_sets.append(titles)
-        if is_live_group and len(track_titles_sets) >= 2:
-            # Compute a simple Jaccard similarity over track titles across all editions
-            union = set().union(*track_titles_sets)
-            inter = track_titles_sets[0].intersection(*track_titles_sets[1:]) if len(track_titles_sets) > 1 else set()
-            jaccard = (len(inter) / len(union)) if union else 1.0
-            if jaccard < 0.8:
-                logging.info(
-                    "[Artist %s] Skipping live group with low tracklist similarity (%.2f): album_ids=%s",
-                    artist, jaccard, [e['album_id'] for e in ed_list],
-                )
+        for sg in subgroups:
+            if not sg or len(sg) < 2:
+                continue
+            sg = [e for e in sg if e.get("album_id") not in used_ids]
+            if len(sg) < 2:
                 continue
 
-        if not editions_share_confident_signal(ed_list):
-            logging.info(
-                "[Artist %s] Skipping low-confidence exact group (norm=%s) album_ids=%s",
-                artist, ed_list[0].get('album_norm') if ed_list else "", [e['album_id'] for e in ed_list],
+            if signal not in {"provider_id", "track_sig", "audio_fp", "user_label"} and not editions_share_confident_signal(sg):
+                _dr_inc("rejected_by_reason", "low_confidence")
+                continue
+
+            chips = list(evidence or [])
+            max_jac, min_ratio = _group_pair_metrics(sg)
+            chips.append(f"TRACKS_JACCARD_MAX:{max_jac:.2f}")
+            chips.append(f"TRACKS_RATIO_MIN:{min_ratio:.2f}")
+
+            tok_union: set[str] = set()
+            for e in sg:
+                toks = e.get("_dupe_edition_tokens") or []
+                if isinstance(toks, list):
+                    for t in toks:
+                        if t:
+                            tok_union.add(str(t))
+            if tok_union:
+                chips.append("TOKENS:" + ",".join(sorted(tok_union))[:200])
+
+            no_move = False
+            manual_review = False
+
+            # Feedback loop: if the user explicitly marked any pair as NOT a dupe, never auto-move.
+            if feedback_pairs:
+                try:
+                    folders = [_folder_key(e) for e in sg]
+                except Exception:
+                    folders = []
+                user_dupe = False
+                user_not_dupe = False
+                for i in range(len(folders)):
+                    for j in range(i + 1, len(folders)):
+                        key = _dupe_feedback_pair_key(folders[i], folders[j])
+                        lab = feedback_pairs.get(key)
+                        if lab == "dupe":
+                            user_dupe = True
+                        elif lab in {"not_dupe", "notdupe", "no"}:
+                            user_not_dupe = True
+                if user_dupe:
+                    chips.append("USER_LABEL:DUPE")
+                if user_not_dupe:
+                    chips.append("USER_LABEL:NOT_DUPE")
+                    manual_review = True
+                    no_move = True
+                    _dr_inc("rejected_by_reason", "user_not_dupe_conflict")
+            if signal == "provider_id":
+                # Provider IDs are strong, but wrong tags can collide. If coherence is extremely low,
+                # keep for review but do not auto-move.
+                if max_jac < 0.22 and min_ratio < 0.35:
+                    audio_ov = 0.0
+                    try:
+                        audio_ov = _maybe_audio_overlap_max(sg)
+                    except Exception:
+                        audio_ov = 0.0
+                    if audio_ov:
+                        chips.append(f"AUDIO_FP_MAX:{audio_ov:.2f}")
+                    if audio_ov < 0.87:
+                        no_move = True
+                        manual_review = True
+                        chips.append("COHERENCE_LOW")
+                        _dr_inc("rejected_by_reason", "provider_low_coherence")
+
+            best = choose_best(sg, defer_ai=True)
+            if best is None:
+                out.append(
+                    {
+                        "artist": artist,
+                        "album_id": None,
+                        "editions": sg,
+                        "fuzzy": bool(fuzzy),
+                        "needs_ai": True,
+                        "dupe_signal": signal,
+                        "dupe_evidence": chips,
+                        "no_move": bool(no_move),
+                        "manual_review": bool(manual_review),
+                    }
+                )
+                used_ids.update(e.get("album_id") for e in sg if e.get("album_id") is not None)
+                dupe_report["groups_total"] = int(dupe_report.get("groups_total") or 0) + 1
+                dupe_report["groups_needs_ai"] = int(dupe_report.get("groups_needs_ai") or 0) + 1
+                _dr_inc("groups_by_signal", signal)
+                continue
+
+            losers = [e for e in sg if e.get("album_id") != best.get("album_id")]
+            if not losers:
+                used_ids.update(e.get("album_id") for e in sg if e.get("album_id") is not None)
+                continue
+
+            best["dupe_evidence"] = chips
+            if best.get("used_ai", False):
+                ai_used_count += 1
+
+            out.append(
+                {
+                    "artist": artist,
+                    "album_id": best.get("album_id"),
+                    "best": best,
+                    "losers": losers,
+                    "fuzzy": bool(fuzzy),
+                    "needs_ai": False,
+                    "dupe_signal": signal,
+                    "dupe_evidence": chips,
+                    "no_move": bool(no_move),
+                    "manual_review": bool(manual_review),
+                }
             )
-            continue
-        # Choose best across all identical normalized titles
-        # Try with defer_ai=True first to check if AI is needed
-        best = choose_best(ed_list, defer_ai=True)
-        
-        if best is None:
-            # AI is needed, will be processed in batch later
-            # Store group for batch processing
-            group_data = {
-                "artist": artist,
-                "album_id": None,  # Will be set after AI processing
-                "editions": ed_list,
-                "fuzzy": False,
-                "needs_ai": True,
-            }
-            out.append(group_data)
-            continue
-        
-        # Update: detecting best
-        with lock:
-            if artist in state.get("scan_active_artists", {}) and current_album_id and any(e['album_id'] == current_album_id for e in ed_list):
-                state["scan_active_artists"][artist]["current_album"]["status"] = "detecting_best"
-                state["scan_active_artists"][artist]["current_album"]["status_details"] = "detecting best candidate"
-                state["scan_active_artists"][artist]["current_album"]["step_summary"] = "Selecting best…"
-                state["scan_active_artists"][artist]["current_album"]["step_response"] = "Selecting best edition by format & bitrate…"
-        
-        losers = [e for e in ed_list if e['album_id'] != best['album_id']]
-        logging.debug(f"[Artist {artist}] Exact grouping selected best {best['album_id']}, losers { [e['album_id'] for e in losers] }")
-        if not losers:
-            continue
+            used_ids.update(e.get("album_id") for e in sg if e.get("album_id") is not None)
+            dupe_report["groups_total"] = int(dupe_report.get("groups_total") or 0) + 1
+            _dr_inc("groups_by_signal", signal)
 
-        # Track AI usage (note: AI processing time will be measured in batch processing)
-        if best.get('used_ai', False):
-            ai_used_count += 1
+    # Phase 0: user feedback labels (force dupe grouping).
+    if feedback_pairs and len(editions) >= 2:
+        try:
+            n = len(editions)
+            parent = list(range(n))
+            rank = [0] * n
 
-        group_data = {
-            "artist":  artist,
-            "album_id": best["album_id"],
-            "best":    best,
-            "losers":  losers,
-            "fuzzy":   False,
-            "needs_ai": False,
-        }
-        out.append(group_data)
-        used_ids.update(e['album_id'] for e in ed_list)
-        # Update progress tracking periodically
-        with lock:
-            if artist in state.get("scan_active_artists", {}):
-                state["scan_active_artists"][artist]["albums_processed"] = len(used_ids)
-                # Mark current album as done when we've processed it
-                current_album = state["scan_active_artists"][artist].get("current_album", {})
-                if current_album.get("album_id") in used_ids:
-                    state["scan_active_artists"][artist]["current_album"]["status"] = "done"
-                    state["scan_active_artists"][artist]["current_album"]["status_details"] = ""
-                    state["scan_active_artists"][artist]["current_album"]["step_summary"] = ""
-                    state["scan_active_artists"][artist]["current_album"]["step_response"] = ""
+            def _find_fb(i: int) -> int:
+                while parent[i] != i:
+                    parent[i] = parent[parent[i]]
+                    i = parent[i]
+                return i
 
-    # Filter out editions already grouped exactly so fuzzy pass only sees the rest
-    all_editions_for_stats = list(editions)  # keep full list for stats (broken_albums, cache, etc.)
-    editions = [e for e in editions if e['album_id'] not in used_ids]
+            def _union_fb(i: int, j: int) -> None:
+                ri = _find_fb(i)
+                rj = _find_fb(j)
+                if ri == rj:
+                    return
+                if rank[ri] < rank[rj]:
+                    parent[ri] = rj
+                elif rank[ri] > rank[rj]:
+                    parent[rj] = ri
+                else:
+                    parent[rj] = ri
+                    rank[ri] += 1
 
-    # --- Second pass: fuzzy match on album_norm only, for remaining editions ---
-    norm_groups = defaultdict(list)
-    for e in editions:
-        if e['album_id'] not in used_ids:
-            norm_groups[e['album_norm']].append(e)
+            folder_to_idxs: dict[str, list[int]] = defaultdict(list)
+            for i, e in enumerate(editions):
+                fk = _folder_key(e)
+                if fk:
+                    folder_to_idxs[fk].append(i)
 
-    for norm, ed_list in norm_groups.items():
-        logging.debug(f"[Artist {artist}] Processing fuzzy group for norm='{norm}' with albums {[e['album_id'] for e in ed_list]}")
-    for ed_list in norm_groups.values():
+            for (fa, fb), lab in (feedback_pairs or {}).items():
+                if str(lab or "").strip().lower() != "dupe":
+                    continue
+                a = (fa or "").strip()
+                b = (fb or "").strip()
+                if not a or not b:
+                    continue
+                for ia in folder_to_idxs.get(a, [])[:5]:
+                    for ib in folder_to_idxs.get(b, [])[:5]:
+                        _union_fb(ia, ib)
+
+            comps: dict[int, list[int]] = defaultdict(list)
+            for i in range(n):
+                comps[_find_fb(i)].append(i)
+            for idxs in comps.values():
+                if len(idxs) < 2:
+                    continue
+                grp = [editions[i] for i in idxs]
+                _append_group(grp, fuzzy=False, signal="user_label", evidence=["USER_DUPE_LABEL"])
+        except Exception:
+            logging.debug("[Artist %s] user-label dupe grouping failed", artist, exc_info=True)
+
+    # Phase 2: group by provider IDs (high precision).
+    if len(editions) >= 2:
+        n = len(editions)
+        parent = list(range(n))
+        rank = [0] * n
+
+        def _find(i: int) -> int:
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+
+        def _union(i: int, j: int) -> None:
+            ri = _find(i)
+            rj = _find(j)
+            if ri == rj:
+                return
+            if rank[ri] < rank[rj]:
+                parent[ri] = rj
+            elif rank[ri] > rank[rj]:
+                parent[rj] = ri
+            else:
+                parent[rj] = ri
+                rank[ri] += 1
+
+        id_to_idxs: dict[str, list[int]] = defaultdict(list)
+        for i, e in enumerate(editions):
+            mb_rg = (e.get("_dupe_mb_rg") or "").strip()
+            if mb_rg:
+                id_to_idxs[f"mb_rg:{mb_rg}"].append(i)
+            mb_rel = (e.get("_dupe_mb_rel") or "").strip()
+            if mb_rel:
+                id_to_idxs[f"mb_rel:{mb_rel}"].append(i)
+            discogs = (e.get("_dupe_discogs") or "").strip()
+            if discogs:
+                id_to_idxs[f"discogs:{discogs}"].append(i)
+            lastfm = (e.get("_dupe_lastfm") or "").strip()
+            if lastfm:
+                id_to_idxs[f"lastfm:{lastfm}"].append(i)
+            bandcamp = (e.get("_dupe_bandcamp") or "").strip()
+            if bandcamp:
+                id_to_idxs[f"bandcamp:{bandcamp}"].append(i)
+
+        for _k, idxs in id_to_idxs.items():
+            if len(idxs) < 2:
+                continue
+            base = idxs[0]
+            for j in idxs[1:]:
+                _union(base, j)
+
+        comps: dict[int, list[int]] = defaultdict(list)
+        for i in range(n):
+            comps[_find(i)].append(i)
+
+        for idxs in comps.values():
+            if len(idxs) < 2:
+                continue
+            grp = [editions[i] for i in idxs]
+            if len(grp) > 10:
+                by_loose: dict[str, list[dict]] = defaultdict(list)
+                for e in grp:
+                    by_loose[str(e.get("_dupe_title_norm_loose") or "")].append(e)
+                for _lk, sub in by_loose.items():
+                    if len(sub) < 2:
+                        continue
+                    mb_rg_ids = {e.get("_dupe_mb_rg") for e in sub if e.get("_dupe_mb_rg")}
+                    discogs_ids = {e.get("_dupe_discogs") for e in sub if e.get("_dupe_discogs")}
+                    lastfm_ids = {e.get("_dupe_lastfm") for e in sub if e.get("_dupe_lastfm")}
+                    bandcamp_urls = {e.get("_dupe_bandcamp") for e in sub if e.get("_dupe_bandcamp")}
+                    evidence: list[str] = []
+                    if len(mb_rg_ids) == 1:
+                        evidence.append(f"MB_RG:{next(iter(mb_rg_ids))}")
+                    if len(discogs_ids) == 1:
+                        evidence.append(f"DISCOGS:{next(iter(discogs_ids))}")
+                    if len(lastfm_ids) == 1:
+                        evidence.append(f"LASTFM_MBID:{next(iter(lastfm_ids))}")
+                    if len(bandcamp_urls) == 1:
+                        evidence.append("BANDCAMP:" + str(next(iter(bandcamp_urls)))[:120])
+                    _append_group(sub, fuzzy=False, signal="provider_id", evidence=evidence)
+            else:
+                mb_rg_ids = {e.get("_dupe_mb_rg") for e in grp if e.get("_dupe_mb_rg")}
+                discogs_ids = {e.get("_dupe_discogs") for e in grp if e.get("_dupe_discogs")}
+                lastfm_ids = {e.get("_dupe_lastfm") for e in grp if e.get("_dupe_lastfm")}
+                bandcamp_urls = {e.get("_dupe_bandcamp") for e in grp if e.get("_dupe_bandcamp")}
+                evidence: list[str] = []
+                if len(mb_rg_ids) == 1:
+                    evidence.append(f"MB_RG:{next(iter(mb_rg_ids))}")
+                if len(discogs_ids) == 1:
+                    evidence.append(f"DISCOGS:{next(iter(discogs_ids))}")
+                if len(lastfm_ids) == 1:
+                    evidence.append(f"LASTFM_MBID:{next(iter(lastfm_ids))}")
+                if len(bandcamp_urls) == 1:
+                    evidence.append("BANDCAMP:" + str(next(iter(bandcamp_urls)))[:120])
+                _append_group(grp, fuzzy=False, signal="provider_id", evidence=evidence)
+
+    # Phase 3: exact grouping by track signature (strong evidence; catches bad titles).
+    remaining = [e for e in editions if e.get("album_id") not in used_ids]
+    sig_groups: dict[tuple, list[dict]] = defaultdict(list)
+    for e in remaining:
+        sig = e.get("sig")
+        if sig:
+            sig_groups[sig].append(e)
+    for ed_list in sig_groups.values():
         if len(ed_list) < 2:
             continue
-        logging.debug(f"[Artist {artist}] Fuzzy group members: {[e['album_id'] for e in ed_list]}")
-        
-        # Update: comparing versions (fuzzy)
-        current_album_id = None
-        with lock:
-            if artist in state.get("scan_active_artists", {}):
-                current_album = state["scan_active_artists"][artist].get("current_album", {})
-                current_album_id = current_album.get("album_id")
-                if current_album_id and any(e['album_id'] == current_album_id for e in ed_list):
-                    state["scan_active_artists"][artist]["current_album"]["status"] = "comparing_versions"
-                    state["scan_active_artists"][artist]["current_album"]["status_details"] = f"found {len(ed_list)} versions (fuzzy match)"
-                    parts = []
-                    for ed in ed_list[:3]:
-                        br_k = (ed["br"] // 1000) if ed.get("br", 0) >= 1000 else ed.get("br", 0)
-                        parts.append(f"{br_k} kbps · {ed.get('sr', 0)} Hz · {ed.get('bd', 0)}-bit")
-                    tail = " …" if len(ed_list) > 3 else ""
-                    state["scan_active_artists"][artist]["current_album"]["step_summary"] = (
-                        f"{len(ed_list)} versions (fuzzy): " + " vs ".join(parts) + tail
-                    )
-        
-        # Live safety for fuzzy groups: in safe mode, avoid treating clearly different live sets as dupes
-        if LIVE_DEDUPE_MODE == "safe":
-            live_flags: list[bool] = []
-            track_titles_sets: list[set[str]] = []
-            track_counts: list[int] = []
-            for e in ed_list:
-                meta = e.get("meta", {}) or {}
-                title_lower = (e.get("plex_title") or e.get("title_raw") or "").lower()
-                sec_types = (meta.get("musicbrainz_secondarytypes") or "").lower()
-                is_live = "live" in sec_types or " live " in f" {title_lower} " or " live at " in title_lower or " live in " in title_lower
-                live_flags.append(is_live)
-                titles = {t.title.strip().lower() for t in e.get("tracks", []) if getattr(t, "title", None)}
-                if titles:
-                    track_titles_sets.append(titles)
-                track_counts.append(len(e.get("tracks", []) or []))
-            if any(live_flags):
-                # Mixed live / non-live editions are considered unsafe to auto-dedupe
-                if not all(live_flags):
-                    logging.info(
-                        "[Artist %s] Skipping fuzzy group with mixed live/non-live editions: album_ids=%s",
-                        artist, [e['album_id'] for e in ed_list],
-                    )
-                    continue
-                if len(track_titles_sets) >= 2:
-                    union = set().union(*track_titles_sets)
-                    inter = track_titles_sets[0].intersection(*track_titles_sets[1:]) if len(track_titles_sets) > 1 else set()
-                    jaccard = (len(inter) / len(union)) if union else 1.0
-                else:
-                    jaccard = 1.0
-                min_tracks = min(track_counts) if track_counts else 0
-                max_tracks = max(track_counts) if track_counts else 0
-                ratio = (min_tracks / max_tracks) if max_tracks else 1.0
-                if jaccard < 0.8 or ratio < 0.75:
-                    logging.info(
-                        "[Artist %s] Skipping fuzzy live group with low similarity (J=%.2f, tracks ratio=%.2f): album_ids=%s",
-                        artist, jaccard, ratio, [e['album_id'] for e in ed_list],
-                    )
-                    continue
+        _append_group(ed_list, fuzzy=False, signal="track_sig", evidence=["SIG_MATCH"])
 
-        # Only perform fuzzy grouping via AI; skip if no AI provider configured
-        if not ai_provider_ready:
+    # Phase 3.5: exact grouping by audio fingerprint signature (cached-only, high precision).
+    remaining = [e for e in editions if e.get("album_id") not in used_ids]
+    audio_groups: dict[str, list[dict]] = defaultdict(list)
+    for e in remaining:
+        try:
+            sig = _dupe_audio_sig_for_edition(e, max_tracks=10, min_fps=3, compute_missing=False)
+        except Exception:
+            sig = ""
+        if sig:
+            audio_groups[sig].append(e)
+    for sig, ed_list in audio_groups.items():
+        if len(ed_list) < 2:
             continue
-        if not editions_share_confident_signal(ed_list):
-            logging.debug(
-                "[Artist %s] Skipping low-confidence fuzzy group %s",
-                artist,
-                [e['album_id'] for e in ed_list]
-            )
+        _append_group(ed_list, fuzzy=False, signal="audio_fp", evidence=[f"AUDIO_SIG:{sig[:12]}"])
+
+    # Phase 1/3: loose title grouping + similarity-based splitting.
+    remaining = [e for e in editions if e.get("album_id") not in used_ids]
+    loose_groups: dict[str, list[dict]] = defaultdict(list)
+    for e in remaining:
+        key = (e.get("_dupe_title_norm_loose") or "").strip() or (e.get("album_norm") or "").strip()
+        loose_groups[key].append(e)
+    for key, ed_list in loose_groups.items():
+        if len(ed_list) < 2:
             continue
-        # Force AI selection for fuzzy groups
-        # Try with defer_ai=True first to check if AI is needed
-        best = choose_best(ed_list, defer_ai=True)
-        
-        if best is None:
-            # AI is needed, will be processed in batch later
-            # Store group for batch processing
-            group_data = {
-                "artist": artist,
-                "album_id": None,  # Will be set after AI processing
-                "editions": ed_list,
-                "fuzzy": True,
-                "needs_ai": True,
-            }
-            out.append(group_data)
+        clusters = _dupe_split_editions_by_similarity(ed_list, min_jaccard=0.82, min_ratio=0.75, allow_audio_fp=True)
+        for c in clusters:
+            if len(c) < 2:
+                continue
+            _append_group(c, fuzzy=True, signal="title_loose", evidence=[f"TITLE_LOOSE:{key}"])
+
+    # Fallback: strict title grouping for remaining editions.
+    remaining = [e for e in editions if e.get("album_id") not in used_ids]
+    strict_groups: dict[str, list[dict]] = defaultdict(list)
+    for e in remaining:
+        group_key = (e.get("plex_norm") or e.get("album_norm") or "").strip()
+        if not group_key or group_key.startswith("__untitled__"):
+            group_key = (e.get("album_norm") or "").strip()
+        strict_groups[group_key].append(e)
+    for key, ed_list in strict_groups.items():
+        if len(ed_list) < 2:
             continue
-        
-        # Update: detecting best (fuzzy)
-        with lock:
-            if artist in state.get("scan_active_artists", {}) and current_album_id and any(e['album_id'] == current_album_id for e in ed_list):
-                state["scan_active_artists"][artist]["current_album"]["status"] = "detecting_best"
-                state["scan_active_artists"][artist]["current_album"]["status_details"] = "detecting best candidate (AI)"
-                state["scan_active_artists"][artist]["current_album"]["step_summary"] = "Selecting best (AI)…"
-                state["scan_active_artists"][artist]["current_album"]["step_response"] = "AI: selecting best edition…"
-        
-        losers = [e for e in ed_list if e is not best]
-        logging.debug(f"[Artist {artist}] Fuzzy grouping selected best {best['album_id']}, losers { [e['album_id'] for e in losers] }")
-        
-        # Track AI usage (fuzzy groups always use AI if available)
-        if best.get('used_ai', False):
-            ai_used_count += 1
-        
-        group_data = {
-            'artist': artist,
-            'album_id': best['album_id'],
-            'best': best,
-            'losers': losers,
-            'fuzzy': True,
-            'needs_ai': False,
-        }
-        out.append(group_data)
-        used_ids.update(e['album_id'] for e in ed_list)
-        # Update progress tracking periodically
-        with lock:
-            if artist in state.get("scan_active_artists", {}):
-                state["scan_active_artists"][artist]["albums_processed"] = len(used_ids)
-                # Mark current album as done when we've processed it (fuzzy groups)
-                current_album = state["scan_active_artists"][artist].get("current_album", {})
-                if current_album.get("album_id") in used_ids:
-                    state["scan_active_artists"][artist]["current_album"]["status"] = "done"
-                    state["scan_active_artists"][artist]["current_album"]["status_details"] = ""
-                    state["scan_active_artists"][artist]["current_album"]["step_summary"] = ""
-                    state["scan_active_artists"][artist]["current_album"]["step_response"] = ""
-        notify_discord_embed(
-            title="Duplicate group (fuzzy) found",
-            description=(
-                f"**{artist} – {best['title_raw']}**\n"
-                f"Versions: {len(losers)+1}\n"
-                f"Best: {get_primary_format(Path(best['folder']))}, "
-                f"{best['bd']}‑bit, {len(best['tracks'])} tracks."
-            ),
-            thumbnail_url=thumb_url(best['album_id'])
-        )
+        _append_group(ed_list, fuzzy=True, signal="title_strict", evidence=[f"TITLE_STRICT:{key}"])
+
     # --- Same-folder duplicate groups: multiple Plex album entries pointing to one folder ---
     for folder_str, album_ids in seen_folders.items():
         if len(album_ids) < 2:
@@ -12408,6 +17049,11 @@ def scan_duplicates(
             })
         if not losers:
             continue
+        chips = ["SAME_FOLDER_DUPLICATE"]
+        try:
+            best_edition["dupe_evidence"] = chips
+        except Exception:
+            pass
         logging.info(
             "[Artist %s] Same-folder duplicate group: '%s' has %d Plex entries (best=%s, losers=%s)",
             artist, best_edition.get("title_raw", ""), len(album_ids),
@@ -12420,8 +17066,24 @@ def scan_duplicates(
             "losers": losers,
             "fuzzy": False,
             "needs_ai": False,
+            "dupe_signal": "same_folder",
+            "dupe_evidence": chips,
+            # Same-folder groups are Plex metadata duplicates; they require manual cleanup, not moves.
+            "no_move": True,
+            "manual_review": True,
             "same_folder": True,
         })
+        dupe_report["groups_total"] = int(dupe_report.get("groups_total") or 0) + 1
+        _dr_inc("groups_by_signal", "same_folder")
+
+    logging.info(
+        "[Artist %s] dupe_v2: groups=%d (needs_ai=%d) signals=%s rejected=%s",
+        artist,
+        int(dupe_report.get("groups_total") or 0),
+        int(dupe_report.get("groups_needs_ai") or 0),
+        dupe_report.get("groups_by_signal") or {},
+        dupe_report.get("rejected_by_reason") or {},
+    )
     # Keep groups that have losers (resolved) or need AI (will be resolved in batch).
     # Do not drop needs_ai groups: they have "editions" but no "losers" yet.
     out = [g for g in out if g.get("losers") or g.get("needs_ai")]
@@ -12430,49 +17092,103 @@ def scan_duplicates(
     scan_total_time = time.perf_counter() - scan_start_time
     
     # Compile stats with timing (use all_editions_for_stats for per-edition counts)
+    stats_editions = list(all_editions_for_stats)
+    audio_cache_hits_stats = sum(1 for e in stats_editions if e.get("audio_cache_hit", False))
+    audio_cache_misses_stats = max(0, len(stats_editions) - audio_cache_hits_stats)
+    mb_cache_hits_stats = sum(
+        1 for e in stats_editions if ("rg_info" in e) and bool(e.get("mb_cache_hit", False))
+    )
+    mb_cache_misses_stats = sum(
+        1 for e in stats_editions if ("rg_info" in e) and (not bool(e.get("mb_cache_hit", False)))
+    )
+    mb_used_stats = sum(
+        1
+        for e in stats_editions
+        if e.get("musicbrainz_id") or (isinstance(e.get("rg_info"), dict) and e["rg_info"].get("id"))
+    )
+    mb_verified_by_ai = sum(1 for e in stats_editions if e.get("match_verified_by_ai"))
+    duplicate_groups_count = len(out)
+    total_duplicates_count = sum(len(g.get("losers", [])) for g in out)
+    broken_albums_count = sum(1 for e in stats_editions if e.get("is_broken", False))
+    albums_without_mb_id = 0
+    albums_without_artist_mb_id = 0
+    albums_without_complete_tags = 0
+    albums_without_artist_image = 0
+    albums_without_album_image = 0
+
+    for e in stats_editions:
+        meta = e.get("meta", {}) or {}
+        if (
+            not meta.get("musicbrainz_releasegroupid")
+            and not meta.get("musicbrainz_releaseid")
+            and not e.get("musicbrainz_id")
+        ):
+            albums_without_mb_id += 1
+        if not meta.get("musicbrainz_albumartistid") and not meta.get("musicbrainz_artistid"):
+            albums_without_artist_mb_id += 1
+
+        # REQUIRED_TAGS from settings = single source of truth
+        missing_required = []
+        try:
+            missing_required = _check_required_tags(meta, REQUIRED_TAGS, edition=e)
+        except Exception:
+            missing_required = []
+        if missing_required:
+            albums_without_complete_tags += 1
+
+        # Album cover (prefer cached boolean when available).
+        has_cover = None
+        if "has_cover" in e:
+            has_cover = bool(e.get("has_cover"))
+        else:
+            folder = e.get("folder")
+            folder_path = None
+            if folder:
+                folder_path = folder if isinstance(folder, Path) else Path(str(folder))
+            if folder_path and folder_path.exists():
+                cover_patterns = ["cover.*", "folder.*", "album.*", "artwork.*", "front.*"]
+                for pattern in cover_patterns:
+                    try:
+                        matches = list(folder_path.glob(pattern))
+                    except Exception:
+                        matches = []
+                    image_matches = [f for f in matches if f.suffix.lower() in [".jpg", ".jpeg", ".png", ".webp", ".gif"]]
+                    if image_matches:
+                        has_cover = True
+                        break
+                if has_cover is None:
+                    has_cover = False
+        if has_cover is False:
+            albums_without_album_image += 1
+
+        # Artist image is tracked downstream (per-artist), but keep the counter for completeness.
+        if "has_artist_image" in e and (not bool(e.get("has_artist_image"))):
+            albums_without_artist_image += 1
+
     stats = {
         "ai_used": ai_used_count,
-        "mb_used": mb_used_count,
-        "audio_cache_hits": sum(1 for e in all_editions_for_stats if e.get('audio_cache_hit', False)),
-        "audio_cache_misses": sum(1 for e in all_editions_for_stats if not e.get('audio_cache_hit', True)),
-        "mb_cache_hits": sum(1 for e in all_editions_for_stats if e.get('mb_cache_hit', False)),
-        "mb_cache_misses": sum(1 for e in all_editions_for_stats if 'mb_cache_hit' in e and not e.get('mb_cache_hit', True)),
-        "duplicate_groups_count": len(out),
-        "total_duplicates_count": sum(len(g.get("losers", [])) for g in out),
-        "broken_albums_count": sum(1 for e in all_editions_for_stats if e.get('is_broken', False)),
-        "albums_without_mb_id": sum(1 for e in all_editions_for_stats if (not e.get('meta', {}).get('musicbrainz_releasegroupid') and not e.get('meta', {}).get('musicbrainz_releaseid') and not e.get('musicbrainz_id'))),
-        "albums_without_artist_mb_id": sum(1 for e in all_editions_for_stats if not e.get('meta', {}).get('musicbrainz_albumartistid') and not e.get('meta', {}).get('musicbrainz_artistid')),
-        "albums_without_complete_tags": 0,  # Will be calculated below
-        "albums_without_album_image": 0,  # Will be calculated below
-        "albums_without_artist_image": 0,  # Will be calculated below
+        "mb_used": mb_used_stats,
+        "mb_verified_by_ai": mb_verified_by_ai,
+        "audio_cache_hits": audio_cache_hits_stats,
+        "audio_cache_misses": audio_cache_misses_stats,
+        "mb_cache_hits": mb_cache_hits_stats,
+        "mb_cache_misses": mb_cache_misses_stats,
+        "duplicate_groups_count": duplicate_groups_count,
+        "total_duplicates_count": total_duplicates_count,
+        "broken_albums_count": broken_albums_count,
+        "albums_without_mb_id": albums_without_mb_id,
+        "albums_without_artist_mb_id": albums_without_artist_mb_id,
+        "albums_without_complete_tags": albums_without_complete_tags,
+        "albums_without_album_image": albums_without_album_image,
+        "albums_without_artist_image": albums_without_artist_image,
+        "dupe_report": dupe_report,
         "timing": {
             "audio_analysis_time": audio_analysis_time,
             "mb_lookup_time": mb_lookup_time,
             "ai_processing_time": ai_processing_time,
             "total_time": scan_total_time,
-        }
+        },
     }
-    
-    # Calculate albums without complete tags/images (REQUIRED_TAGS from Settings = source of truth)
-    for e in editions:
-        meta = e.get('meta', {})
-        missing_required = _check_required_tags(meta, REQUIRED_TAGS, edition=e)
-        if missing_required:
-            stats["albums_without_complete_tags"] += 1
-        
-        # Check for album cover images
-        folder = e.get('folder')
-        if folder:
-            cover_patterns = ["cover.*", "folder.*", "album.*", "artwork.*", "front.*"]
-            has_cover = False
-            for pattern in cover_patterns:
-                matches = list(folder.glob(pattern))
-                image_matches = [f for f in matches if f.suffix.lower() in ['.jpg', '.jpeg', '.png', '.webp', '.gif']]
-                if image_matches:
-                    has_cover = True
-                    break
-            if not has_cover:
-                stats["albums_without_album_image"] += 1
     
     # Mark all remaining albums as done (those not in any duplicate group)
     with lock:
@@ -12491,7 +17207,7 @@ def scan_duplicates(
     import json
     con = sqlite3.connect(str(STATE_DB_FILE), timeout=30)
     cur = con.cursor()
-    for e in editions:
+    for e in all_editions_for_stats:
         if e.get('is_broken', False):
             missing_indices_json = json.dumps(e.get('missing_indices', []))
             cur.execute("""
@@ -12521,71 +17237,6 @@ def scan_duplicates(
     con.commit()
     con.close()
     
-    # Collect detailed statistics
-    mb_used_count = sum(
-        1
-        for e in all_editions_for_stats
-        if e.get("musicbrainz_id") or (isinstance(e.get("rg_info"), dict) and e["rg_info"].get("id"))
-    )
-    duplicate_groups_count = len(out)
-    total_duplicates_count = sum(len(g.get("losers", [])) for g in out)
-    broken_albums_count = sum(1 for e in editions if e.get('is_broken', False))
-    mb_verified_by_ai = sum(1 for e in editions if e.get('match_verified_by_ai'))
-
-    # Count albums with missing tags/images
-    albums_without_mb_id = 0
-    albums_without_artist_mb_id = 0
-    albums_without_complete_tags = 0
-    albums_without_artist_image = 0
-    albums_without_album_image = 0
-    
-    for e in editions:
-        meta = e.get('meta', {})
-        # Check MusicBrainz IDs (include e.get('musicbrainz_id') so scan/IA matches count as "with MBID")
-        if (not meta.get('musicbrainz_releasegroupid') and not meta.get('musicbrainz_releaseid') and not e.get('musicbrainz_id')):
-            albums_without_mb_id += 1
-        if not meta.get('musicbrainz_albumartistid') and not meta.get('musicbrainz_artistid'):
-            albums_without_artist_mb_id += 1
-
-        # Check for complete tags (REQUIRED_TAGS from Settings = source of truth)
-        missing_required = _check_required_tags(meta, REQUIRED_TAGS, edition=e)
-        if missing_required:
-            albums_without_complete_tags += 1
-        
-        # Check for album cover images
-        folder = e.get('folder')
-        if folder:
-            # Look for common cover art filenames
-            cover_patterns = ["cover.*", "folder.*", "album.*", "artwork.*", "front.*"]
-            has_cover = False
-            for pattern in cover_patterns:
-                matches = list(folder.glob(pattern))
-                # Filter to image extensions
-                image_matches = [f for f in matches if f.suffix.lower() in ['.jpg', '.jpeg', '.png', '.webp', '.gif']]
-                if image_matches:
-                    has_cover = True
-                    break
-            if not has_cover:
-                albums_without_album_image += 1
-    
-    # Return groups and statistics
-    stats = {
-        "ai_used": ai_used_count,
-        "mb_used": mb_used_count,
-        "mb_verified_by_ai": mb_verified_by_ai,
-        "audio_cache_hits": audio_cache_hits,
-        "audio_cache_misses": audio_cache_misses,
-        "mb_cache_hits": mb_cache_hits,
-        "mb_cache_misses": mb_cache_misses,
-        "duplicate_groups_count": duplicate_groups_count,
-        "total_duplicates_count": total_duplicates_count,
-        "broken_albums_count": broken_albums_count,
-        "albums_without_mb_id": albums_without_mb_id,
-        "albums_without_artist_mb_id": albums_without_artist_mb_id,
-        "albums_without_complete_tags": albums_without_complete_tags,
-        "albums_without_album_image": albums_without_album_image,
-        "albums_without_artist_image": albums_without_artist_image,  # Will be calculated per artist later
-    }
     return out, stats, all_editions_for_stats
 
 def save_scan_editions_to_db(scan_id: int, all_editions_by_artist: Dict[str, List[dict]]):
@@ -12743,33 +17394,38 @@ def save_scan_artist_to_db(artist_name: str, groups: List[dict]) -> int:
             mod = sys.modules[__name__]
             ai_provider = ai_provider or (getattr(mod, "AI_PROVIDER", None) or "")
             ai_model = ai_model or (getattr(mod, "RESOLVED_MODEL", None) or getattr(mod, "OPENAI_MODEL", None) or "")
+        try:
+            evidence_json = json.dumps(best.get("dupe_evidence", []))
+        except Exception:
+            evidence_json = "[]"
         cur.execute("""
-            INSERT OR IGNORE INTO duplicates_best
-              (artist, album_id, title_raw, album_norm, folder,
-               fmt_text, br, sr, bd, dur, discs, rationale, merge_list, ai_used, meta_json, ai_provider, ai_model, size_mb, track_count, match_verified_by_ai)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            artist_name,
-            best["album_id"],
-            best["title_raw"],
-            best["album_norm"],
-            str(best["folder"]),
-            get_primary_format(Path(best["folder"])),
-            best["br"],
-            best["sr"],
-            best["bd"],
-            best["dur"],
-            best["discs"],
-            best.get("rationale", ""),
-            json.dumps(best.get("merge_list", [])),
-            int(used_ai),
-            json.dumps(best.get("meta", {})),
-            ai_provider,
-            ai_model,
-            best_size_mb,
-            best_track_count,
-            1 if best.get("match_verified_by_ai") else 0,
-        ))
+              INSERT OR IGNORE INTO duplicates_best
+                (artist, album_id, title_raw, album_norm, folder,
+                 fmt_text, br, sr, bd, dur, discs, rationale, merge_list, ai_used, meta_json, ai_provider, ai_model, evidence_json, size_mb, track_count, match_verified_by_ai)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          """, (
+              artist_name,
+              best["album_id"],
+              best["title_raw"],
+              best["album_norm"],
+              str(best["folder"]),
+              get_primary_format(Path(best["folder"])),
+              best["br"],
+              best["sr"],
+              best["bd"],
+              best["dur"],
+              best["discs"],
+              best.get("rationale", ""),
+              json.dumps(best.get("merge_list", [])),
+              int(used_ai),
+              json.dumps(best.get("meta", {})),
+              ai_provider,
+              ai_model,
+              evidence_json,
+              best_size_mb,
+              best_track_count,
+              1 if best.get("match_verified_by_ai") else 0,
+          ))
         for e in g["losers"]:
             size_mb = folder_size(e["folder"]) // (1024 * 1024)
             cur.execute("""
@@ -12986,34 +17642,39 @@ def save_scan_to_db(scan_results: Dict[str, List[dict]]):
                 mod = sys.modules[__name__]
                 ai_provider = ai_provider or (getattr(mod, "AI_PROVIDER", None) or "")
                 ai_model = ai_model or (getattr(mod, "RESOLVED_MODEL", None) or getattr(mod, "OPENAI_MODEL", None) or "")
+            try:
+                evidence_json = json.dumps(best.get("dupe_evidence", []))
+            except Exception:
+                evidence_json = "[]"
             # Best edition
             cur.execute("""
-                INSERT OR IGNORE INTO duplicates_best
-                  (artist, album_id, title_raw, album_norm, folder,
-                   fmt_text, br, sr, bd, dur, discs, rationale, merge_list, ai_used, meta_json, ai_provider, ai_model, size_mb, track_count, match_verified_by_ai)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                artist,
-                best['album_id'],
-                best['title_raw'],
-                best['album_norm'],
-                str(best['folder']),
-                get_primary_format(Path(best['folder'])),
-                best['br'],
-                best['sr'],
-                best['bd'],
-                best['dur'],
-                best['discs'],
-                best.get('rationale', ''),
-                json.dumps(best.get('merge_list', [])),
-                int(used_ai),
-                json.dumps(best.get('meta', {})),
-                ai_provider,
-                ai_model,
-                best_size_mb,
-                best_track_count,
-                1 if best.get('match_verified_by_ai') else 0,
-            ))
+                  INSERT OR IGNORE INTO duplicates_best
+                    (artist, album_id, title_raw, album_norm, folder,
+                     fmt_text, br, sr, bd, dur, discs, rationale, merge_list, ai_used, meta_json, ai_provider, ai_model, evidence_json, size_mb, track_count, match_verified_by_ai)
+                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              """, (
+                  artist,
+                  best['album_id'],
+                  best['title_raw'],
+                  best['album_norm'],
+                  str(best['folder']),
+                  get_primary_format(Path(best['folder'])),
+                  best['br'],
+                  best['sr'],
+                  best['bd'],
+                  best['dur'],
+                  best['discs'],
+                  best.get('rationale', ''),
+                  json.dumps(best.get('merge_list', [])),
+                  int(used_ai),
+                  json.dumps(best.get('meta', {})),
+                  ai_provider,
+                  ai_model,
+                  evidence_json,
+                  best_size_mb,
+                  best_track_count,
+                  1 if best.get('match_verified_by_ai') else 0,
+              ))
 
             # All "loser" editions
             for e in g['losers']:
@@ -13086,11 +17747,14 @@ def load_scan_from_db() -> Dict[str, List[dict]]:
         cur.execute("PRAGMA table_info(duplicates_best)")
         best_cols = {r[1] for r in cur.fetchall()}
         has_match_verified = "match_verified_by_ai" in best_cols
+        has_evidence_json = "evidence_json" in best_cols
         cur.execute(
             """
             SELECT artist, album_id, title_raw, album_norm, folder,
                    fmt_text, br, sr, bd, dur, discs, rationale, merge_list, ai_used, meta_json,
-                   ai_provider, ai_model, size_mb, track_count
+                   ai_provider, ai_model
+            """ + (", evidence_json" if has_evidence_json else "") + """
+                   , size_mb, track_count
             """ + (", match_verified_by_ai" if has_match_verified else "") + """
             FROM   duplicates_best
             """
@@ -13158,11 +17822,26 @@ def load_scan_from_db() -> Dict[str, List[dict]]:
     for row in best_rows:
         (artist, aid, title_raw, album_norm, folder, fmt_txt, br, sr, bd, dur, discs,
          rationale, merge_list_json, ai_used, meta_json) = row[:15]
-        ai_provider = (row[15] or "") if len(row) > 15 else ""
-        ai_model = (row[16] or "") if len(row) > 16 else ""
-        size_mb = row[17] if len(row) > 17 else None
-        track_count = row[18] if len(row) > 18 else None
-        match_verified_by_ai = bool(row[19]) if has_match_verified and len(row) > 19 else False
+        idx = 15
+        ai_provider = (row[idx] or "") if len(row) > idx else ""
+        idx += 1
+        ai_model = (row[idx] or "") if len(row) > idx else ""
+        idx += 1
+        evidence_raw = None
+        if has_evidence_json:
+            evidence_raw = row[idx] if len(row) > idx else None
+            idx += 1
+        size_mb = row[idx] if len(row) > idx else None
+        idx += 1
+        track_count = row[idx] if len(row) > idx else None
+        idx += 1
+        match_verified_by_ai = bool(row[idx]) if has_match_verified and len(row) > idx else False
+        try:
+            dupe_evidence = json.loads(evidence_raw) if evidence_raw else []
+            if not isinstance(dupe_evidence, list):
+                dupe_evidence = []
+        except Exception:
+            dupe_evidence = []
 
         best_entry = {
             "album_id": aid,
@@ -13181,6 +17860,7 @@ def load_scan_from_db() -> Dict[str, List[dict]]:
             "meta": json.loads(meta_json or "{}"),
             "ai_provider": ai_provider,
             "ai_model": ai_model,
+            "dupe_evidence": dupe_evidence,
             "size_mb": size_mb,
             "track_count": track_count,
             "match_verified_by_ai": match_verified_by_ai,
@@ -13706,7 +18386,7 @@ def _reset_files_live_index_for_scan() -> None:
             logging.warning("Files live index reset: PostgreSQL unavailable")
             return
         try:
-            with conn:
+            with conn.transaction():
                 with conn.cursor() as cur:
                     cur.execute("TRUNCATE TABLE files_tracks, files_albums, files_artists RESTART IDENTITY CASCADE")
                     _files_index_write_meta(cur, "artists", "0")
@@ -13750,7 +18430,7 @@ def _upsert_files_library_published_rows(rows: list[dict]) -> int:
             """
             INSERT INTO files_library_published_albums (
                 folder_path, scan_id, artist_name, artist_norm, album_title, title_norm,
-                year, date_text, genre, tags_json, format, is_lossless,
+                year, date_text, genre, label, tags_json, format, is_lossless,
                 has_cover, cover_path, has_artist_image, artist_image_path,
                 mb_identified, musicbrainz_release_group_id, discogs_release_id, lastfm_album_mbid,
                 bandcamp_album_url, primary_metadata_source, track_count, total_duration_sec,
@@ -13758,7 +18438,7 @@ def _upsert_files_library_published_rows(rows: list[dict]) -> int:
                 missing_required_tags_json, primary_tags_json, tracks_json, fingerprint, updated_at
             ) VALUES (
                 ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?,
                 ?, ?, ?, ?,
                 ?, ?, ?, ?,
                 ?, ?, ?, ?,
@@ -13774,6 +18454,7 @@ def _upsert_files_library_published_rows(rows: list[dict]) -> int:
                 year=excluded.year,
                 date_text=excluded.date_text,
                 genre=excluded.genre,
+                label=excluded.label,
                 tags_json=excluded.tags_json,
                 format=excluded.format,
                 is_lossless=excluded.is_lossless,
@@ -13810,6 +18491,7 @@ def _upsert_files_library_published_rows(rows: list[dict]) -> int:
                     r.get("year"),
                     r.get("date_text") or "",
                     r.get("genre") or "",
+                    r.get("label") or "",
                     r.get("tags_json") or "[]",
                     r.get("format") or "",
                     1 if r.get("is_lossless") else 0,
@@ -13891,6 +18573,8 @@ def _publish_files_library_artist_from_items(
         artist_fallback = (item.get("artist") or "").strip() or (artist_name or "").strip() or "Unknown Artist"
         artist_resolved = _pick_album_artist_from_tag_dicts([tags], default=artist_fallback)
         album_resolved = _pick_album_title_from_tag_dicts([tags], fallback=title_fallback)
+        album_resolved = _sanitize_album_title_display(album_resolved)
+        label_resolved = _pick_album_label_from_tag_dicts([tags])
         artist_norm = " ".join((artist_resolved or "").split()).lower() or "unknown artist"
         title_norm = norm_album_for_dedup(album_resolved, normalize_parenthetical=True) or "unknown album"
         date_text = (tags.get("date") or tags.get("year") or "").strip()
@@ -13906,18 +18590,33 @@ def _publish_files_library_artist_from_items(
         dominant_format = max(fmt_counts.items(), key=lambda x: x[1])[0] if fmt_counts else "UNKNOWN"
         cover_path = _first_cover_path(folder)
         has_cover = bool(cover_path and cover_path.is_file())
-        artist_image_path = _first_artist_image_path(folder.parent)
+        artist_folder = _files_guess_artist_folder(folder, artist_resolved)
+        artist_image_path = _first_artist_image_path(artist_folder) if artist_folder else None
         has_artist_image = bool(artist_image_path and artist_image_path.is_file())
         indices = [int(t.get("track_num") or 0) for t in track_entries if int(t.get("track_num") or 0) > 0]
+        actual_track_count = len(track_entries)
         is_broken = False
         expected_track_count = None
         missing_indices: list[int] = []
         if indices:
-            is_broken, _actual_count_from_indices, gaps = _detect_gaps_in_indices(indices)
-            expected_track_count = max(indices)
-            for start_i, end_i in gaps:
-                missing_indices.extend(list(range(start_i + 1, end_i)))
-        actual_track_count = len(track_entries)
+            max_idx = max(indices)
+            coverage = (actual_track_count / max_idx) if max_idx else 1.0
+            # Skip broken detection when track numbering is obviously corrupt.
+            if max_idx > max(120, actual_track_count * 3) and coverage < 0.5:
+                is_broken = False
+                expected_track_count = None
+                missing_indices = []
+            else:
+                is_broken, _actual_count_from_indices, gaps = _detect_gaps_in_indices(indices)
+                if is_broken:
+                    expected_track_count = max_idx
+                    for start_i, end_i in gaps:
+                        if (end_i - start_i) > 2000:
+                            continue
+                        missing_indices.extend(list(range(start_i + 1, end_i)))
+                        if len(missing_indices) > 5000:
+                            missing_indices = missing_indices[:5000]
+                            break
         mbid = (
             (item.get("musicbrainz_id") or "").strip()
             or _extract_musicbrainz_id_from_meta(tags)
@@ -13942,6 +18641,7 @@ def _publish_files_library_artist_from_items(
                 "year": year,
                 "date_text": date_text[:32] if date_text else "",
                 "genre": genre or "",
+                "label": (label_resolved or "").strip(),
                 "tags_json": json.dumps(raw_genres[:20]),
                 "format": dominant_format,
                 "is_lossless": dominant_format in _LOSSLESS_FORMATS,
@@ -13998,15 +18698,50 @@ def _publish_files_library_artist_from_items(
 def _rows_to_files_library_payload(rows: list[tuple]) -> tuple[dict[str, dict], list[dict], int]:
     artists_map: dict[str, dict] = {}
     albums_payload: list[dict] = []
+    root_dirs = _files_root_dir_strings()
     for row in rows:
         folder_path = (row[0] or "").strip()
         if not folder_path:
             continue
         artist_name = (row[1] or "").strip() or "Unknown Artist"
         artist_norm = (row[2] or "").strip() or " ".join(artist_name.split()).lower() or "unknown artist"
-        album_title = (row[3] or "").strip() or "Unknown Album"
-        image_path = (row[14] or "").strip()
-        has_image = bool(row[13]) and bool(image_path)
+        album_title = _sanitize_album_title_display((row[3] or "").strip()) or "Unknown Album"
+        # Recompute local artist image from the actual folder structure to avoid
+        # falsely assigning a single FILES_ROOT/artist.jpg to every artist in flat libraries.
+        image_path = ""
+        has_image = False
+        try:
+            album_folder = path_for_fs_access(Path(folder_path))
+            artist_folder = _files_guess_artist_folder(album_folder, artist_name, root_dirs=root_dirs)
+            local_img = _first_artist_image_path(artist_folder) if artist_folder else None
+            if local_img and local_img.is_file():
+                image_path = str(local_img)
+                has_image = True
+        except Exception:
+            has_image = False
+            image_path = ""
+        if not has_image:
+            # Fallback to the published stored path only when it exists and is not a FILES_ROOT-level image.
+            stored_path = (row[15] or "").strip()
+            stored_has = bool(row[14]) and bool(stored_path)
+            if stored_has:
+                try:
+                    sp = path_for_fs_access(Path(stored_path))
+                except Exception:
+                    sp = Path(stored_path)
+                try:
+                    if sp.is_file() and not _files_is_files_root_dir(sp.parent, root_dirs=root_dirs):
+                        # Extra guard: image should live under the album folder's ancestry.
+                        try:
+                            album_folder = path_for_fs_access(Path(folder_path))
+                            if sp.parent == album_folder or sp.parent in album_folder.parents:
+                                image_path = str(sp)
+                                has_image = True
+                        except Exception:
+                            image_path = str(sp)
+                            has_image = True
+                except Exception:
+                    pass
         if artist_norm not in artists_map:
             artists_map[artist_norm] = {
                 "name": artist_name,
@@ -14017,13 +18752,13 @@ def _rows_to_files_library_payload(rows: list[tuple]) -> tuple[dict[str, dict], 
             artists_map[artist_norm]["image_path"] = image_path
             artists_map[artist_norm]["has_image"] = True
         try:
-            tags_json = json.loads(row[8] or "[]") if row[8] else []
+            tags_json = json.loads(row[9] or "[]") if row[9] else []
             if not isinstance(tags_json, list):
                 tags_json = []
         except Exception:
             tags_json = []
         try:
-            tracks = json.loads(row[25] or "[]") if row[25] else []
+            tracks = json.loads(row[26] or "[]") if row[26] else []
             if not isinstance(tracks, list):
                 tracks = []
         except Exception:
@@ -14037,26 +18772,27 @@ def _rows_to_files_library_payload(rows: list[tuple]) -> tuple[dict[str, dict], 
                 "year": row[5],
                 "date_text": (row[6] or "").strip(),
                 "genre": (row[7] or "").strip(),
+                "label": (row[8] or "").strip(),
                 "tags_json": json.dumps(tags_json),
-                "format": (row[9] or "").strip(),
-                "is_lossless": bool(row[10]),
-                "has_cover": bool(row[11]),
-                "cover_path": (row[12] or "").strip(),
-                "mb_identified": bool(row[15]),
-                "musicbrainz_release_group_id": (row[16] or "").strip(),
-                "track_count": int(row[17] or 0),
-                "total_duration_sec": int(row[18] or 0),
-                "is_broken": bool(row[19]),
-                "expected_track_count": row[20],
-                "actual_track_count": int(row[21] or 0),
-                "missing_indices_json": row[22] or "[]",
-                "missing_required_tags_json": row[23] or "[]",
-                "primary_tags_json": row[24] or "{}",
+                "format": (row[10] or "").strip(),
+                "is_lossless": bool(row[11]),
+                "has_cover": bool(row[12]),
+                "cover_path": (row[13] or "").strip(),
+                "mb_identified": bool(row[16]),
+                "musicbrainz_release_group_id": (row[17] or "").strip(),
+                "track_count": int(row[18] or 0),
+                "total_duration_sec": int(row[19] or 0),
+                "is_broken": bool(row[20]),
+                "expected_track_count": row[21],
+                "actual_track_count": int(row[22] or 0),
+                "missing_indices_json": row[23] or "[]",
+                "missing_required_tags_json": row[24] or "[]",
+                "primary_tags_json": row[25] or "{}",
                 "tracks": tracks,
-                "discogs_release_id": (row[26] or "").strip(),
-                "lastfm_album_mbid": (row[27] or "").strip(),
-                "bandcamp_album_url": (row[28] or "").strip(),
-                "metadata_source": _normalize_identity_provider((row[29] or "").strip()),
+                "discogs_release_id": (row[27] or "").strip(),
+                "lastfm_album_mbid": (row[28] or "").strip(),
+                "bandcamp_album_url": (row[29] or "").strip(),
+                "metadata_source": _normalize_identity_provider((row[30] or "").strip()),
             }
         )
     return artists_map, albums_payload, len(albums_payload)
@@ -14071,7 +18807,7 @@ def _load_files_library_published_payload() -> tuple[dict[str, dict], list[dict]
             """
             SELECT
                 folder_path, artist_name, artist_norm, album_title, title_norm,
-                year, date_text, genre, tags_json, format, is_lossless,
+                year, date_text, genre, label, tags_json, format, is_lossless,
                 has_cover, cover_path, has_artist_image, artist_image_path,
                 mb_identified, musicbrainz_release_group_id, track_count, total_duration_sec,
                 is_broken, expected_track_count, actual_track_count, missing_indices_json,
@@ -14104,7 +18840,7 @@ def _load_files_library_published_payload_for_artist(artist_hint: str) -> tuple[
             """
             SELECT
                 folder_path, artist_name, artist_norm, album_title, title_norm,
-                year, date_text, genre, tags_json, format, is_lossless,
+                year, date_text, genre, label, tags_json, format, is_lossless,
                 has_cover, cover_path, has_artist_image, artist_image_path,
                 mb_identified, musicbrainz_release_group_id, track_count, total_duration_sec,
                 is_broken, expected_track_count, actual_track_count, missing_indices_json,
@@ -14489,7 +19225,9 @@ def _build_files_editions(scan_type: str = "full") -> tuple[list[tuple[int, str,
         m = re.match(r"^\s*(\d{1,2})\s*[-_.]\s*(\d{1,3})\b", stem)
         if m:
             return (_parse_int_loose(m.group(1), 1) or 1, _parse_int_loose(m.group(2), fallback_track) or fallback_track)
-        m = re.match(r"^\s*([A-Z])(?:\s*[-_. ]?\s*(\d{1,2}))?\b", stem, flags=re.IGNORECASE)
+        # Vinyl-side style: "A1", "B2", optionally with separators. Require digits so we don't mis-detect
+        # normal names like "Ochre - ..." as side "O".
+        m = re.match(r"^\s*([A-Z])\s*(?:[-_. ]?\s*(\d{1,3}))\b", stem, flags=re.IGNORECASE)
         if m:
             disc = (ord(m.group(1).upper()) - ord("A")) + 1
             track = _parse_int_loose(m.group(2), 1) or 1
@@ -14504,7 +19242,9 @@ def _build_files_editions(scan_type: str = "full") -> tuple[list[tuple[int, str,
         stem = path.stem.strip()
         cleaned = re.sub(r"^\s*(?:cd|disc)\s*\d{1,2}\s*[-_. ]\s*\d{1,3}\s*[-_. ]*", "", stem, flags=re.IGNORECASE)
         cleaned = re.sub(r"^\s*\d{1,2}\s*[-_.]\s*\d{1,3}\s*[-_. ]*", "", cleaned)
-        cleaned = re.sub(r"^\s*[A-Z](?:\s*[-_. ]?\s*\d{1,2})?\s*[-_. ]*", "", cleaned, flags=re.IGNORECASE)
+        # Vinyl-side style: "A1 - Track", "B02_Track". Require digits so we don't strip leading letters
+        # from normal names (e.g. "Ochre - ...").
+        cleaned = re.sub(r"^\s*[A-Z]\s*(?:[-_. ]?\s*\d{1,3})\s*[-_. ]*", "", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"^\s*\d{1,3}\s*[-_. ]*", "", cleaned)
         cleaned = cleaned.strip(" -_.")
         return cleaned or stem or f"Track {fallback_index}"
@@ -15229,6 +19969,27 @@ def _auto_move_incomplete_albums_for_scan(
     if not candidates:
         return result
 
+    def _files_forget_album_folder(folder: Path | str) -> None:
+        """Remove a moved/deleted album folder from Files-mode caches/index payload tables."""
+        try:
+            if _get_library_mode() != "files":
+                return
+        except Exception:
+            return
+        try:
+            key = _album_folder_cache_key(folder)
+        except Exception:
+            key = str(folder)
+        try:
+            con2 = sqlite3.connect(str(STATE_DB_FILE), timeout=10)
+            cur2 = con2.cursor()
+            cur2.execute("DELETE FROM files_album_scan_cache WHERE folder_path = ?", (key,))
+            cur2.execute("DELETE FROM files_library_published_albums WHERE folder_path = ?", (key,))
+            con2.commit()
+            con2.close()
+        except Exception:
+            logging.debug("Files cache/published cleanup failed for %s", key, exc_info=True)
+
     try:
         con = sqlite3.connect(str(STATE_DB_FILE), timeout=20)
         cur = con.cursor()
@@ -15257,6 +20018,7 @@ def _auto_move_incomplete_albums_for_scan(
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 size_mb = int(folder_size(src_folder) // (1024 * 1024))
                 safe_move(str(src_folder), str(dst))
+                _files_forget_album_folder(src_folder)
                 result["moved"] += 1
                 result["size_mb"] += size_mb
                 if cur is not None:
@@ -15346,6 +20108,7 @@ def background_scan():
     # Reload library backend settings (mode + files roots) and Plex selectors/path map
     # so scan always uses the latest saved sources from Settings.
     _reload_library_mode_and_files_roots_from_db()
+    _reload_musicbrainz_settings_from_db()
     mode = _get_library_mode()
     if mode == "plex":
         _reload_section_ids_from_db()
@@ -15566,6 +20329,14 @@ def background_scan():
             state["scan_player_sync_message"] = ""
             state["scan_ai_errors"] = []
             state["scan_steps_log"] = []  # Per-step log for "what was done" (append after each artist)
+            # Aggregate explainable dupe detection stats across the scan (Dupe Detection v2).
+            state["scan_dupe_report"] = {
+                "version": 2,
+                "groups_total": 0,
+                "groups_needs_ai": 0,
+                "groups_by_signal": {},
+                "rejected_by_reason": {},
+            }
             state["scan_post_processing"] = False
             state["scan_post_total"] = 0
             state["scan_post_done"] = 0
@@ -15587,6 +20358,19 @@ def background_scan():
         # Reload AUTO_MOVE_DUPES from DB so scan uses current setting (UI may have toggled it)
         _reload_auto_move_from_db()
         pipeline_flags = _pipeline_flags_for_scan(scan_type, run_improve_after_requested)
+        # Files changed-only scans can legitimately produce 0 albums to process (e.g. watcher noise,
+        # or a folder that is unchanged+healthy and gets fast-skipped). In that case, skip expensive
+        # pipeline steps (export rebuild, player sync, etc.) so the auto background scan stays fast.
+        if str(scan_type or "").strip().lower() == "changed_only" and int(total_albums or 0) == 0:
+            pipeline_flags = dict(pipeline_flags)
+            pipeline_flags.update(
+                match_fix=False,
+                dedupe=False,
+                incomplete_move=False,
+                export=False,
+                player_sync=False,
+                sync_target="none",
+            )
         with lock:
             extra_steps = 0
             if pipeline_flags.get("dedupe"):
@@ -15712,6 +20496,7 @@ def background_scan():
                 providers = ["musicbrainz", "discogs", "lastfm", "bandcamp"]
                 by_provider = {p: {"identified": 0, "covers": 0, "tags": 0} for p in providers}
                 post_done = 0
+                root_dirs = _files_root_dir_strings()
                 def _update_edition_after_fix(artist_name: str, item: dict, result: dict) -> None:
                     folder_raw = (item.get("folder") or "").strip()
                     if not folder_raw:
@@ -15755,8 +20540,8 @@ def background_scan():
                     except Exception:
                         has_cover_new = False
                     try:
-                        artist_folder = folder_path.parent if folder_path.parent else folder_path
-                        has_artist_image_new = bool(_artist_folder_has_image(artist_folder))
+                        artist_folder = _files_guess_artist_folder(folder_path, artist_name, root_dirs=root_dirs)
+                        has_artist_image_new = bool(_artist_folder_has_image(artist_folder)) if artist_folder else False
                     except Exception:
                         has_artist_image_new = False
                     has_mb_id_new = bool(
@@ -16068,6 +20853,38 @@ def background_scan():
                         state["scan_albums_without_complete_tags"] += stats.get("albums_without_complete_tags", 0)
                         state["scan_albums_without_album_image"] += stats.get("albums_without_album_image", 0)
                         state["scan_albums_without_artist_image"] += stats.get("albums_without_artist_image", 0)
+                        # Merge dupe_report (per-artist) into a scan-level report for comparisons between builds.
+                        dr = stats.get("dupe_report")
+                        if isinstance(dr, dict):
+                            agg = state.get("scan_dupe_report")
+                            if not isinstance(agg, dict):
+                                agg = {
+                                    "version": 2,
+                                    "groups_total": 0,
+                                    "groups_needs_ai": 0,
+                                    "groups_by_signal": {},
+                                    "rejected_by_reason": {},
+                                }
+                            try:
+                                agg["version"] = int(agg.get("version") or dr.get("version") or 2)
+                            except Exception:
+                                agg["version"] = 2
+                            agg["groups_total"] = int(agg.get("groups_total") or 0) + int(dr.get("groups_total") or 0)
+                            agg["groups_needs_ai"] = int(agg.get("groups_needs_ai") or 0) + int(dr.get("groups_needs_ai") or 0)
+                            for bucket in ("groups_by_signal", "rejected_by_reason"):
+                                dst = agg.get(bucket)
+                                if not isinstance(dst, dict):
+                                    dst = {}
+                                    agg[bucket] = dst
+                                src = dr.get(bucket) or {}
+                                if isinstance(src, dict):
+                                    for k, v in src.items():
+                                        key = str(k)
+                                        try:
+                                            dst[key] = int(dst.get(key) or 0) + int(v or 0)
+                                        except Exception:
+                                            continue
+                            state["scan_dupe_report"] = agg
                         # Remove artist from active tracking when done
                         if artist_name in state.get("scan_active_artists", {}):
                             del state["scan_active_artists"][artist_name]
@@ -16336,6 +21153,9 @@ def background_scan():
             seen_group_keys = set()
             deduped_flat = []
             for g in flat_groups:
+                # Safety: never auto-move groups explicitly marked as no-move/manual-review.
+                if g.get("no_move") or g.get("manual_review") or g.get("same_folder"):
+                    continue
                 best = g.get("best")
                 losers = g.get("losers", [])
                 if not best or not losers:
@@ -16600,6 +21420,7 @@ def background_scan():
                 "pmda_albums_with_cover": pmda_albums_with_cover,
                 "pmda_albums_with_artist_image": pmda_albums_with_artist_image,
             }
+            summary["dupe_report"] = state.get("scan_dupe_report") or {}
             # Build human-readable list of steps executed (for History > Scan Details)
             steps_executed = []
             steps_executed.append("1. Format analysis (FFprobe): all albums analyzed for format/bitrate/sample rate.")
@@ -17131,6 +21952,27 @@ def perform_dedupe(group: dict, best_folders: set = None) -> List[dict]:
     if best_folders is None:
         best_folders = set()
 
+    def _files_forget_album_folder(folder: Path | str) -> None:
+        """Remove a moved/deleted album folder from Files-mode caches/index payload tables."""
+        try:
+            if _get_library_mode() != "files":
+                return
+        except Exception:
+            return
+        try:
+            key = _album_folder_cache_key(folder)
+        except Exception:
+            key = str(folder)
+        try:
+            con = sqlite3.connect(str(STATE_DB_FILE), timeout=10)
+            cur = con.cursor()
+            cur.execute("DELETE FROM files_album_scan_cache WHERE folder_path = ?", (key,))
+            cur.execute("DELETE FROM files_library_published_albums WHERE folder_path = ?", (key,))
+            con.commit()
+            con.close()
+        except Exception:
+            logging.debug("Files cache/published cleanup failed for %s", key, exc_info=True)
+
     num_losers = len(group["losers"])
     for idx, loser in enumerate(group["losers"], 1):
         src_folder = Path(loser["folder"])
@@ -17158,6 +22000,8 @@ def perform_dedupe(group: dict, best_folders: set = None) -> List[dict]:
         logging.debug("perform_dedupe(): moving %s → %s", src_folder, dst)
         try:
             safe_move(str(src_folder), str(dst))
+            # Keep Files-mode browsing consistent: the loser is now outside FILES_ROOTS.
+            _files_forget_album_folder(src_folder)
             with lock:
                 state["dedupe_last_write"] = {"path": str(dst), "at": time.time()}
             logging.info("Moved to /dupes: %s", dst)
@@ -17366,15 +22210,12 @@ def _requires_config():
     return None
 
 def start_background_scan():
-    if not ai_provider_ready:
-        logging.warning("start_background_scan(): AI not configured; scan not started")
-        return
     if _get_library_mode() == "files":
         _restart_files_watcher_if_needed()
     with lock:
         if not state["scanning"]:
             state.update(scanning=True, scan_progress=0, scan_total=0, scan_step_progress=0, scan_step_total=0)
-            state["scan_ai_enabled"] = True
+            state["scan_ai_enabled"] = bool(ai_provider_ready)
             state["scan_mb_enabled"] = USE_MUSICBRAINZ
             logging.debug("start_scan(): launching background_scan() thread")
             threading.Thread(target=background_scan, daemon=True).start()
@@ -17763,6 +22604,69 @@ def _truncate_text(value: str, max_chars: int = 420) -> str:
     return f"{clipped}..." if clipped else txt[:max_chars]
 
 
+def _norm_artist_key(name: str) -> str:
+    """Stable key for artist-name lookups (DB keys, external image cache keys)."""
+    return " ".join((name or "").split()).lower().strip()
+
+
+def _word_count(text: str) -> int:
+    try:
+        return len(re.findall(r"[A-Za-z0-9]+(?:'[A-Za-z0-9]+)?", (text or "")))
+    except Exception:
+        return 0
+
+
+_LASTFM_BIO_GARBAGE_PATTERNS = (
+    r"read more on last\.?fm\.?$",
+    r"read more on last\.?fm.*$",
+    r"user-contributed text is available under the creative commons.*$",
+    r"additional terms may apply.*$",
+)
+
+
+def _cleanup_lastfm_bio_text(text: str) -> str:
+    """Strip common Last.fm boilerplate from the end of bios/summaries."""
+    t = _strip_html_text(text or "")
+    if not t:
+        return ""
+    lowered = t.lower()
+    # Fast path: remove common suffixes.
+    for pat in _LASTFM_BIO_GARBAGE_PATTERNS:
+        try:
+            if re.search(pat, lowered, flags=re.IGNORECASE):
+                t = re.sub(pat, "", t, flags=re.IGNORECASE).strip()
+                lowered = t.lower()
+        except Exception:
+            continue
+    # Remove any trailing "Read more on Last.fm" segment even when preceded by ellipsis.
+    m = re.search(r"\bread more on last\.?fm\b", lowered)
+    if m:
+        t = t[: m.start()].strip(" .·\u2026")
+    return t.strip()
+
+
+def _is_garbage_bio(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return True
+    low = t.lower()
+    if "read more on last.fm" in low or "read more on lastfm" in low:
+        return True
+    if low.startswith("read more on last.fm"):
+        return True
+    if "user-contributed text is available under" in low:
+        return True
+    # A handful of tokens is effectively useless as a bio.
+    if _word_count(t) < 12:
+        return True
+    return False
+
+
+def _is_acceptable_original_bio(text: str) -> bool:
+    # Spec target: accept original sources when >= 100 words.
+    return _word_count(text or "") >= 100
+
+
 def _fetch_lastfm_artist_info(artist_name: str) -> Optional[dict]:
     """
     Call Last.fm artist.getInfo. Returns dict with bio/tags/similar artists or None.
@@ -17773,17 +22677,64 @@ def _fetch_lastfm_artist_info(artist_name: str) -> Optional[dict]:
     if not api_key:
         return None
     try:
-        params = {"method": "artist.getInfo", "artist": artist_name, "api_key": api_key, "format": "json", "autocorrect": 1}
-        resp = requests.get("https://ws.audioscrobbler.com/2.0/", params=params, timeout=10)
-        if resp.status_code != 200:
+        def _pick_best_lastfm_image_url(images) -> str:
+            if isinstance(images, dict):
+                images = [images]
+            if not isinstance(images, list):
+                return ""
+            rank = {
+                "mega": 60,
+                "extralarge": 50,
+                "large": 40,
+                "medium": 30,
+                "small": 20,
+                "": 10,
+            }
+            best_url = ""
+            best_rank = -1
+            for im in images:
+                if not isinstance(im, dict):
+                    continue
+                url = (im.get("#text") or im.get("text") or "").strip()
+                if not url:
+                    continue
+                # Last.fm frequently returns a "missing image" placeholder that looks like a music note.
+                # We treat those as absent so the UI can fall back to Wikipedia or local/DB images.
+                try:
+                    if _is_probably_placeholder_artist_image_url(url):
+                        continue
+                except Exception:
+                    pass
+                r = rank.get(str(im.get("size") or "").strip().lower(), 0)
+                if r > best_rank:
+                    best_rank = r
+                    best_url = url
+            return best_url
+
+        data = None
+        artist = {}
+        # Avoid Last.fm autocorrect mapping obscure artists to wrong entities.
+        for autocorrect in (0, 1):
+            params = {"method": "artist.getInfo", "artist": artist_name, "api_key": api_key, "format": "json", "autocorrect": autocorrect}
+            resp = requests.get("https://ws.audioscrobbler.com/2.0/", params=params, timeout=10)
+            if resp.status_code != 200:
+                continue
+            data = resp.json()
+            if (data or {}).get("error") and (data or {}).get("error") != 0:
+                continue
+            artist = (data or {}).get("artist") or {}
+            returned_name = (artist.get("name") or "").strip()
+            if returned_name:
+                score = _provider_identity_text_score(artist_name or "", returned_name)
+                if score < 0.78:
+                    # Try without/with autocorrect; otherwise reject to prevent nonsense bios/similar.
+                    continue
+            break
+        if not artist:
             return None
-        data = resp.json()
-        if data.get("error") and data.get("error") != 0:
-            return None
-        artist = data.get("artist") or {}
         bio = artist.get("bio") or {}
-        summary = _strip_html_text((bio.get("summary") if isinstance(bio, dict) else "") or "")
-        content = _strip_html_text((bio.get("content") if isinstance(bio, dict) else "") or "")
+        summary = _cleanup_lastfm_bio_text((bio.get("summary") if isinstance(bio, dict) else "") or "")
+        content = _cleanup_lastfm_bio_text((bio.get("content") if isinstance(bio, dict) else "") or "")
         tags_raw = (artist.get("tags") or {}).get("tag") or []
         if isinstance(tags_raw, dict):
             tags_raw = [tags_raw]
@@ -17803,17 +22754,204 @@ def _fetch_lastfm_artist_info(artist_name: str) -> Optional[dict]:
             mbid = (item.get("mbid") or "").strip()
             if not name:
                 continue
-            similar.append({"name": name, "mbid": mbid, "type": "Last.fm"})
+            sim_img = _pick_best_lastfm_image_url(item.get("image"))
+            entry = {"name": name, "mbid": mbid, "type": "Last.fm"}
+            if sim_img:
+                entry["image_url"] = sim_img
+            similar.append(entry)
+        artist_image_url = _pick_best_lastfm_image_url(artist.get("image"))
+        best_bio = content or summary
+        if _is_garbage_bio(best_bio):
+            best_bio = ""
+        best_short = summary or content
+        best_short = "" if _is_garbage_bio(best_short) else best_short
         return {
-            "bio": content or summary,
-            "short_bio": _truncate_text(summary or content, max_chars=460),
+            "bio": best_bio,
+            "short_bio": _truncate_text(best_short, max_chars=460) if best_short else "",
             "tags": _dedupe_keep_order(tags)[:20],
             "similar": similar[:20],
+            "image_url": artist_image_url or "",
             "source": "lastfm",
         }
     except Exception as e:
         logging.debug("Last.fm artist profile fetch failed for %s: %s", artist_name, e)
         return None
+
+
+def _fetch_wikipedia_pageimage(title: str, lang: str = "en", thumb_px: int = 640) -> str:
+    """
+    Return a Wikipedia lead thumbnail URL for a page title, or "" on failure.
+    Uses MediaWiki `pageimages` (no API key required).
+    """
+    t = (title or "").strip()
+    l = (lang or "en").strip().lower() or "en"
+    thumb_px = max(64, min(1600, int(thumb_px or 640)))
+    if not t:
+        return ""
+    api_url = f"https://{l}.wikipedia.org/w/api.php"
+    headers = {"User-Agent": "PMDA/0.7.5 (self-hosted music library; https://github.com/silkyclouds/PMDA)"}
+    try:
+        resp = requests.get(
+            api_url,
+            params={
+                "action": "query",
+                "prop": "pageimages",
+                "piprop": "thumbnail",
+                "pithumbsize": thumb_px,
+                "titles": t,
+                "redirects": 1,
+                "format": "json",
+                "utf8": 1,
+            },
+            headers=headers,
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            return ""
+        data = resp.json()
+        pages = ((data.get("query") or {}).get("pages") or {}) if isinstance(data, dict) else {}
+        for _pid, page in (pages or {}).items():
+            if not isinstance(page, dict):
+                continue
+            thumb = page.get("thumbnail") or {}
+            if isinstance(thumb, dict):
+                src = (thumb.get("source") or "").strip()
+                if src:
+                    return src
+        return ""
+    except Exception:
+        return ""
+
+
+def _fetch_wikipedia_intro_extract(title: str, lang: str = "en") -> tuple[str, str]:
+    """
+    Return (extract, page_url) for a Wikipedia page title, or ("","") on failure.
+    Uses the MediaWiki API with plaintext extracts.
+    """
+    t = (title or "").strip()
+    l = (lang or "en").strip().lower() or "en"
+    if not t:
+        return "", ""
+    api_url = f"https://{l}.wikipedia.org/w/api.php"
+    headers = {"User-Agent": "PMDA/0.7.5 (self-hosted music library; https://github.com/silkyclouds/PMDA)"}
+    try:
+        resp = requests.get(
+            api_url,
+            params={
+                "action": "query",
+                "prop": "extracts",
+                "explaintext": 1,
+                "exintro": 1,
+                "redirects": 1,
+                "titles": t,
+                "format": "json",
+                "utf8": 1,
+            },
+            headers=headers,
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            return "", ""
+        data = resp.json()
+        pages = ((data.get("query") or {}).get("pages") or {}) if isinstance(data, dict) else {}
+        extract = ""
+        canonical_title = t
+        for _pid, page in (pages or {}).items():
+            if not isinstance(page, dict):
+                continue
+            canonical_title = (page.get("title") or canonical_title).strip()
+            extract = (page.get("extract") or "").strip()
+            break
+        extract = re.sub(r"\s+", " ", extract).strip()
+        if not extract:
+            return "", ""
+        # Avoid disambiguation intros (common false positives).
+        low = extract.lower()
+        if "may refer to" in low and len(extract) < 220:
+            return "", ""
+        page_url = f"https://{l}.wikipedia.org/wiki/{quote(canonical_title.replace(' ', '_'), safe='')}"
+        return extract, page_url
+    except Exception:
+        return "", ""
+
+
+def _fetch_wikipedia_artist_bio(artist_name: str, lang: str = "en") -> Optional[dict]:
+    """
+    Best-effort Wikipedia intro for an artist name.
+    Returns {"bio","short_bio","source","url","lang"} or None.
+    """
+    name = (artist_name or "").strip()
+    l = (lang or "en").strip().lower() or "en"
+    if not name:
+        return None
+    api_url = f"https://{l}.wikipedia.org/w/api.php"
+    headers = {"User-Agent": "PMDA/0.7.5 (self-hosted music library; https://github.com/silkyclouds/PMDA)"}
+    try:
+        def _looks_music_related(extract: str) -> bool:
+            low = (extract or "").lower()
+            if not low:
+                return False
+            good = (
+                "musician", "band", "singer", "songwriter", "composer", "producer", "dj",
+                "album", "record", "label", "single", "track", "genre", "formed", "born",
+            )
+            bad = (
+                "pigment", "clay", "oxide", "mineral", "earth pigment", "paint", "soil",
+                "ferric", "hematite", "kaolin",
+            )
+            score = 0
+            for kw in good:
+                if kw in low:
+                    score += 1
+            for kw in bad:
+                if kw in low:
+                    score -= 2
+            return score >= 1
+
+        # Use slightly biased queries to avoid common false positives (e.g. "Ochre" the pigment).
+        for q in (f"{name} musician", f"{name} band", name):
+            resp = requests.get(
+                api_url,
+                params={
+                    "action": "query",
+                    "list": "search",
+                    "srsearch": q,
+                    "srlimit": 5,
+                    "format": "json",
+                    "utf8": 1,
+                },
+                headers=headers,
+                timeout=10,
+            )
+            if resp.status_code != 200:
+                continue
+            data = resp.json()
+            results = ((data.get("query") or {}).get("search") or []) if isinstance(data, dict) else []
+            if not isinstance(results, list) or not results:
+                continue
+            # Try a few candidates to dodge disambiguation pages and non-music pages.
+            for item in results[:5]:
+                if not isinstance(item, dict):
+                    continue
+                title = (item.get("title") or "").strip()
+                if not title:
+                    continue
+                extract, page_url = _fetch_wikipedia_intro_extract(title, lang=l)
+                if not extract or not _looks_music_related(extract):
+                    continue
+                img_url = _fetch_wikipedia_pageimage(title, lang=l, thumb_px=720) or ""
+                short = _truncate_text(extract, max_chars=460)
+                return {
+                    "bio": extract,
+                    "short_bio": short,
+                    "source": f"wikipedia:{l}",
+                    "url": page_url,
+                    "lang": l,
+                    "image_url": img_url,
+                }
+    except Exception:
+        return None
+    return None
 
 
 _last_bandcamp_request = 0.0
@@ -17909,7 +23047,9 @@ def _download_best_cover_image(
     candidates = _dedupe_keep_order(expanded)
 
     best: Optional[Tuple[bytes, str, str, int]] = None
-    req_headers = headers or {}
+    req_headers = dict(headers or {})
+    # Many hosts (notably Wikimedia/Wikipedia) expect a real UA; keep it consistent across fetches.
+    req_headers.setdefault("User-Agent", "PMDA/0.7.5 (self-hosted music library; https://github.com/silkyclouds/PMDA)")
     for u in candidates:
         try:
             resp = requests.get(u, headers=req_headers, timeout=timeout, allow_redirects=True)
@@ -18328,24 +23468,24 @@ def start_scan():
         return jsonify({"status": "ok", "scan_type": "incomplete_only"})
 
     _reload_ai_config_and_reinit()
+    # Scans must be allowed even when AI is not ready: PMDA will use deterministic heuristics,
+    # and only attempt AI calls when ai_provider_ready is True.
+    ai_warning = None
     if not ai_provider_ready:
-        func_msg = getattr(sys.modules[__name__], "AI_FUNCTIONAL_ERROR_MSG", None)
-        if func_msg:
-            return jsonify({
-                "error": func_msg,
-                "aiFunctionalFailure": True,
-            }), 503
-        return jsonify({
-            "error": "Configure the AI provider in Settings to run a scan",
-            "requiresAiConfig": True,
-        }), 503
+        ai_warning = getattr(sys.modules[__name__], "AI_FUNCTIONAL_ERROR_MSG", None) or "AI is not ready; scan will run without AI."
     scan_should_stop.clear()
     scan_is_paused.clear()
     with lock:
         state["run_improve_after"] = run_improve_after if scan_type in {"full", "changed_only"} else False
         state["scan_type"] = scan_type
     start_background_scan()
-    return jsonify({"status": "ok", "scan_type": scan_type, "run_improve_after": run_improve_after})
+    return jsonify({
+        "status": "ok",
+        "scan_type": scan_type,
+        "run_improve_after": run_improve_after,
+        "ai_enabled": bool(ai_provider_ready),
+        "ai_warning": ai_warning,
+    })
 
 @app.route("/scan/pause", methods=["POST"])
 def pause_scan():
@@ -20167,7 +25307,7 @@ def api_musicbrainz_test():
 @app.post("/api/openai/models")
 def api_openai_models():
     """Return only OpenAI model IDs that are compatible with PMDA (Chat Completions, parseable output).
-    Uses a curated list so we never show models that return empty or fail (e.g. gpt-5-nano)."""
+    Uses a curated list so we never show models that fail PMDA's parseable-output requirements."""
     from flask import g
     data = getattr(g, 'ai_models_request_data', None) or request.get_json(silent=True) or {}
     key = (data.get("OPENAI_API_KEY") or "").strip() or OPENAI_API_KEY
@@ -20272,12 +25412,12 @@ def api_google_models():
         return jsonify({"error": "GOOGLE_API_KEY is required"}), 400
 
     if not genai:
-        return jsonify({"error": "Google Generative AI SDK not installed. Please install google-generativeai package."}), 500
+        return jsonify({"error": "Google GenAI SDK not installed. Please install google-genai package."}), 500
 
     try:
-        genai.configure(api_key=key)
         try:
-            models_list = genai.list_models()
+            client = genai.Client(api_key=key)
+            models_list = client.models.list()
         except Exception as e:
             error_msg = str(e)
             if "invalid_api_key" in error_msg.lower() or "authentication" in error_msg.lower() or "401" in error_msg or "unauthorized" in error_msg.lower():
@@ -20287,9 +25427,13 @@ def api_google_models():
         compatible_set = set(GOOGLE_COMPATIBLE_MODELS)
         available_models = []
         for model in models_list:
-            model_name = model.name
+            model_name = getattr(model, "name", None) or ""
             model_id = model_name.split("/")[-1] if "/" in model_name else model_name
-            if model_id in compatible_set and "generateContent" in str(getattr(model, "supported_generation_methods", [])):
+            # google-genai exposes "supported_actions"; older SDKs used "supported_generation_methods".
+            supported = getattr(model, "supported_actions", None)
+            if supported is None:
+                supported = getattr(model, "supported_generation_methods", [])
+            if model_id in compatible_set and (not supported or "generateContent" in str(supported)):
                 if model_id not in available_models:
                     available_models.append(model_id)
 
@@ -20445,6 +25589,96 @@ def _reload_auto_move_from_db():
     if val is not None:
         AUTO_MOVE_DUPES = bool(_parse_bool(val))
         logging.debug("AUTO_MOVE_DUPES reloaded from DB: %s", AUTO_MOVE_DUPES)
+
+
+def _reload_musicbrainz_settings_from_db():
+    """Reload MusicBrainz-related settings from SQLite so scans use the latest UI values without restart."""
+    global USE_MUSICBRAINZ
+    global MB_SEARCH_ALBUM_TIMEOUT_SEC, MB_CANDIDATE_FETCH_LIMIT, MB_TRACKLIST_FETCH_LIMIT, MB_FAST_FALLBACK_MODE
+    global MB_QUEUE_ENABLED
+    global _mb_queue
+
+    mod = sys.modules[__name__]
+    changed: dict[str, object] = {}
+
+    def _reload_bool(key: str, current: bool) -> tuple[bool, bool]:
+        raw = _get_config_from_db(key)
+        if raw is None:
+            return current, False
+        new_val = bool(_parse_bool(raw))
+        return new_val, new_val != current
+
+    def _reload_int(key: str, current: int, *, min_v: int, max_v: int) -> tuple[int, bool]:
+        raw = _get_config_from_db(key)
+        if raw is None:
+            return current, False
+        try:
+            new_val = int(str(raw).strip())
+        except Exception:
+            return current, False
+        new_val = max(min_v, min(max_v, new_val))
+        return new_val, new_val != current
+
+    use_mb, use_mb_changed = _reload_bool("USE_MUSICBRAINZ", bool(USE_MUSICBRAINZ))
+    if use_mb_changed:
+        USE_MUSICBRAINZ = bool(use_mb)
+        mod.merged["USE_MUSICBRAINZ"] = USE_MUSICBRAINZ
+        changed["USE_MUSICBRAINZ"] = USE_MUSICBRAINZ
+
+    mb_queue_enabled, mb_queue_changed = _reload_bool("MB_QUEUE_ENABLED", bool(MB_QUEUE_ENABLED))
+    if mb_queue_changed:
+        MB_QUEUE_ENABLED = bool(mb_queue_enabled)
+        mod.merged["MB_QUEUE_ENABLED"] = MB_QUEUE_ENABLED
+        changed["MB_QUEUE_ENABLED"] = MB_QUEUE_ENABLED
+        # Update live queue instance if already created.
+        try:
+            if _mb_queue is not None:
+                _mb_queue.enabled = bool(MB_QUEUE_ENABLED and USE_MUSICBRAINZ)
+        except Exception:
+            pass
+
+    timeout_sec, timeout_changed = _reload_int(
+        "MB_SEARCH_ALBUM_TIMEOUT_SEC",
+        int(MB_SEARCH_ALBUM_TIMEOUT_SEC),
+        min_v=10,
+        max_v=300,
+    )
+    if timeout_changed:
+        MB_SEARCH_ALBUM_TIMEOUT_SEC = int(timeout_sec)
+        mod.merged["MB_SEARCH_ALBUM_TIMEOUT_SEC"] = MB_SEARCH_ALBUM_TIMEOUT_SEC
+        changed["MB_SEARCH_ALBUM_TIMEOUT_SEC"] = MB_SEARCH_ALBUM_TIMEOUT_SEC
+
+    cand_limit, cand_changed = _reload_int(
+        "MB_CANDIDATE_FETCH_LIMIT",
+        int(MB_CANDIDATE_FETCH_LIMIT),
+        min_v=1,
+        max_v=20,
+    )
+    if cand_changed:
+        MB_CANDIDATE_FETCH_LIMIT = int(cand_limit)
+        mod.merged["MB_CANDIDATE_FETCH_LIMIT"] = MB_CANDIDATE_FETCH_LIMIT
+        changed["MB_CANDIDATE_FETCH_LIMIT"] = MB_CANDIDATE_FETCH_LIMIT
+
+    track_limit, track_changed = _reload_int(
+        "MB_TRACKLIST_FETCH_LIMIT",
+        int(MB_TRACKLIST_FETCH_LIMIT),
+        min_v=0,
+        max_v=20,
+    )
+    if track_changed:
+        MB_TRACKLIST_FETCH_LIMIT = int(track_limit)
+        mod.merged["MB_TRACKLIST_FETCH_LIMIT"] = MB_TRACKLIST_FETCH_LIMIT
+        changed["MB_TRACKLIST_FETCH_LIMIT"] = MB_TRACKLIST_FETCH_LIMIT
+
+    fast_fallback, fast_changed = _reload_bool("MB_FAST_FALLBACK_MODE", bool(MB_FAST_FALLBACK_MODE))
+    if fast_changed:
+        MB_FAST_FALLBACK_MODE = bool(fast_fallback)
+        mod.merged["MB_FAST_FALLBACK_MODE"] = MB_FAST_FALLBACK_MODE
+        changed["MB_FAST_FALLBACK_MODE"] = MB_FAST_FALLBACK_MODE
+
+    if changed:
+        summary = ", ".join([f"{k}={v}" for k, v in changed.items()])
+        logging.info("MusicBrainz settings reloaded from SQLite: %s", summary)
 
 
 def _reload_section_ids_from_db():
@@ -20606,9 +25840,27 @@ def api_config_get():
         "USE_MUSICBRAINZ": True,
         "MUSICBRAINZ_EMAIL": get_setting("MUSICBRAINZ_EMAIL", MUSICBRAINZ_EMAIL),
         "MB_RETRY_NOT_FOUND": get_setting_bool("MB_RETRY_NOT_FOUND", MB_RETRY_NOT_FOUND),
-        "MB_SEARCH_ALBUM_TIMEOUT_SEC": MB_SEARCH_ALBUM_TIMEOUT_SEC,
-        "MB_CANDIDATE_FETCH_LIMIT": MB_CANDIDATE_FETCH_LIMIT,
-        "MB_TRACKLIST_FETCH_LIMIT": MB_TRACKLIST_FETCH_LIMIT,
+        "MB_SEARCH_ALBUM_TIMEOUT_SEC": max(
+            10,
+            min(
+                300,
+                int(get_setting("MB_SEARCH_ALBUM_TIMEOUT_SEC", MB_SEARCH_ALBUM_TIMEOUT_SEC) or 12),
+            ),
+        ),
+        "MB_CANDIDATE_FETCH_LIMIT": max(
+            1,
+            min(
+                20,
+                int(get_setting("MB_CANDIDATE_FETCH_LIMIT", MB_CANDIDATE_FETCH_LIMIT) or 4),
+            ),
+        ),
+        "MB_TRACKLIST_FETCH_LIMIT": max(
+            0,
+            min(
+                20,
+                int(get_setting("MB_TRACKLIST_FETCH_LIMIT", MB_TRACKLIST_FETCH_LIMIT) or 1),
+            ),
+        ),
         "MB_FAST_FALLBACK_MODE": get_setting_bool("MB_FAST_FALLBACK_MODE", MB_FAST_FALLBACK_MODE),
         "PROVIDER_IDENTITY_STRICT": get_setting_bool("PROVIDER_IDENTITY_STRICT", PROVIDER_IDENTITY_STRICT),
         "PROVIDER_IDENTITY_USE_AI": get_setting_bool("PROVIDER_IDENTITY_USE_AI", PROVIDER_IDENTITY_USE_AI),
@@ -20659,6 +25911,8 @@ def api_config_get():
         "USE_LASTFM": True,
         "LASTFM_API_KEY": get_setting("LASTFM_API_KEY", LASTFM_API_KEY),
         "LASTFM_API_SECRET": get_setting("LASTFM_API_SECRET", LASTFM_API_SECRET),
+        "FANART_API_KEY": get_setting("FANART_API_KEY", FANART_API_KEY),
+        "THEAUDIODB_API_KEY": get_setting("THEAUDIODB_API_KEY", THEAUDIODB_API_KEY),
         "USE_BANDCAMP": True,
         "JELLYFIN_URL": get_setting("JELLYFIN_URL", JELLYFIN_URL),
         "JELLYFIN_API_KEY": get_setting("JELLYFIN_API_KEY", JELLYFIN_API_KEY),
@@ -20680,6 +25934,11 @@ def api_config_get():
         "AUTO_EXPORT_LIBRARY": get_setting_bool("AUTO_EXPORT_LIBRARY", AUTO_EXPORT_LIBRARY),
         "paths_status": _paths_rw_status(),
         "container_mounts": _container_mounts_status(),
+        # Concert discovery (UI filtering)
+        "CONCERTS_FILTER_ENABLED": get_setting_bool("CONCERTS_FILTER_ENABLED", False),
+        "CONCERTS_HOME_LAT": str(get_setting("CONCERTS_HOME_LAT", "") or "").strip(),
+        "CONCERTS_HOME_LON": str(get_setting("CONCERTS_HOME_LON", "") or "").strip(),
+        "CONCERTS_RADIUS_KM": str(get_setting("CONCERTS_RADIUS_KM", "150") or "").strip() or "150",
     })
 
 
@@ -21125,6 +26384,10 @@ def _apply_settings_in_memory(updates: dict):
         mod.LASTFM_API_KEY = str(updates["LASTFM_API_KEY"] or "").strip()
     if "LASTFM_API_SECRET" in updates:
         mod.LASTFM_API_SECRET = str(updates["LASTFM_API_SECRET"] or "").strip()
+    if "FANART_API_KEY" in updates:
+        mod.FANART_API_KEY = str(updates["FANART_API_KEY"] or "").strip()
+    if "THEAUDIODB_API_KEY" in updates:
+        mod.THEAUDIODB_API_KEY = str(updates["THEAUDIODB_API_KEY"] or "").strip()
     if "USE_BANDCAMP" in updates:
         mod.USE_BANDCAMP = bool(_parse_bool(updates["USE_BANDCAMP"]))
     if "JELLYFIN_URL" in updates:
@@ -21216,10 +26479,13 @@ def api_config_put():
         "LIDARR_URL", "LIDARR_API_KEY", "AUTOBRR_URL", "AUTOBRR_API_KEY", "AUTO_FIX_BROKEN_ALBUMS",
         "BROKEN_ALBUM_CONSECUTIVE_THRESHOLD", "BROKEN_ALBUM_PERCENTAGE_THRESHOLD", "REQUIRED_TAGS",
         "USE_DISCOGS", "DISCOGS_USER_TOKEN", "USE_LASTFM", "LASTFM_API_KEY", "LASTFM_API_SECRET", "USE_BANDCAMP",
+        "FANART_API_KEY", "THEAUDIODB_API_KEY",
         "JELLYFIN_URL", "JELLYFIN_API_KEY",
         "NAVIDROME_URL", "NAVIDROME_USERNAME", "NAVIDROME_PASSWORD", "NAVIDROME_API_KEY",
         "INCOMPLETE_ALBUMS_TARGET_DIR",
         "SCAN_DISABLE_CACHE",
+        # Concert discovery (UI filtering)
+        "CONCERTS_FILTER_ENABLED", "CONCERTS_HOME_LAT", "CONCERTS_HOME_LON", "CONCERTS_RADIUS_KM",
         # Library backend & file-library settings
         "LIBRARY_MODE", "FILES_ROOTS", "EXPORT_ROOT", "EXPORT_NAMING_TEMPLATE", "EXPORT_LINK_STRATEGY", "MEDIA_CACHE_ROOT", "AUTO_EXPORT_LIBRARY",
     }
@@ -21304,6 +26570,31 @@ def api_config_put():
             updates["PROVIDER_CACHE_ERROR_TTL_SEC"] = max(30, min(60 * 60 * 24, int(updates["PROVIDER_CACHE_ERROR_TTL_SEC"])))
         except (ValueError, TypeError):
             updates["PROVIDER_CACHE_ERROR_TTL_SEC"] = 60 * 20
+
+    # Concert discovery (UI filtering)
+    if "CONCERTS_FILTER_ENABLED" in updates:
+        updates["CONCERTS_FILTER_ENABLED"] = bool(_parse_bool(updates["CONCERTS_FILTER_ENABLED"]))
+    if "CONCERTS_RADIUS_KM" in updates:
+        try:
+            updates["CONCERTS_RADIUS_KM"] = str(max(1, min(2000, int(float(updates["CONCERTS_RADIUS_KM"])))))
+        except (ValueError, TypeError):
+            updates["CONCERTS_RADIUS_KM"] = "150"
+    for k in ("CONCERTS_HOME_LAT", "CONCERTS_HOME_LON"):
+        if k in updates:
+            raw = str(updates.get(k) or "").strip()
+            if not raw:
+                updates[k] = ""
+                continue
+            try:
+                # Keep as string for config storage; clamp lat/lon bounds.
+                v = float(raw)
+                if k.endswith("_LAT"):
+                    v = max(-90.0, min(90.0, v))
+                else:
+                    v = max(-180.0, min(180.0, v))
+                updates[k] = f"{v:.6f}".rstrip("0").rstrip(".")
+            except Exception:
+                updates[k] = ""
 
     # Force files-only mode regardless of incoming value.
     if "LIBRARY_MODE" in updates:
@@ -21534,6 +26825,38 @@ def api_library_files_index_status():
     st["indexed_albums"] = albums
     st["indexed_tracks"] = tracks
     return jsonify(st)
+
+
+@app.get("/api/library/files-profile-backfill/status")
+def api_library_files_profile_backfill_status():
+    """Return current artist profile backfill status (bios/tags/similar + external images)."""
+    with _files_profile_backfill_lock:
+        st = dict(_files_profile_backfill_state or {})
+    if not st:
+        st = {"running": False}
+    return jsonify(st)
+
+
+@app.post("/api/library/files-profile-backfill/start")
+def api_library_files_profile_backfill_start():
+    """Trigger a background backfill to enrich artist pages and cache external artist images."""
+    if _get_library_mode() != "files":
+        return jsonify({"status": "error", "message": "Backfill is only available in Files library mode"}), 400
+    payload = request.get_json(silent=True) or {}
+    reason = str(payload.get("reason") or "api_manual")
+    if _trigger_files_profile_backfill_async(reason=reason):
+        return jsonify({"status": "started"})
+    with _files_profile_backfill_lock:
+        st = dict(_files_profile_backfill_state or {})
+    return jsonify({"status": "already_running", "progress": st}), 409
+
+
+@app.post("/api/library/files-profile-backfill/stop")
+def api_library_files_profile_backfill_stop():
+    """Request the running backfill job to stop."""
+    with _files_profile_backfill_lock:
+        _files_profile_backfill_state["running"] = False
+    return jsonify({"status": "stopping"})
 
 
 def get_duplicate_groups_from_library():
@@ -22754,6 +28077,631 @@ def api_library_stats():
     return jsonify({"artists": artists, "albums": albums})
 
 
+@app.get("/api/library/stats/library")
+def api_library_stats_library():
+    """Return library-wide distributions for charts (Files mode only)."""
+    if _get_library_mode() != "files":
+        return jsonify({"error": "Files mode required"}), 400
+    cache_key = "library:stats:library"
+    cached = _files_cache_get_json(cache_key)
+    if cached is not None:
+        return jsonify(cached)
+    ok, err = _ensure_files_index_ready()
+    if not ok:
+        return jsonify({"error": err or "Files index unavailable"}), 503
+    conn = _files_pg_connect()
+    if conn is None:
+        return jsonify({"error": "PostgreSQL unavailable"}), 503
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM files_artists")
+            artists = int((cur.fetchone() or [0])[0] or 0)
+            cur.execute("SELECT COUNT(*) FROM files_albums")
+            albums = int((cur.fetchone() or [0])[0] or 0)
+            cur.execute("SELECT COUNT(*) FROM files_tracks")
+            tracks = int((cur.fetchone() or [0])[0] or 0)
+
+            cur.execute(
+                """
+                SELECT COALESCE(year, 0) AS year, COUNT(*) AS c
+                FROM files_albums
+                WHERE COALESCE(year, 0) > 0
+                GROUP BY COALESCE(year, 0)
+                ORDER BY year ASC
+                """
+            )
+            years = [{"year": int(r[0] or 0), "count": int(r[1] or 0)} for r in cur.fetchall() if int(r[0] or 0) > 0]
+
+            # Growth: albums by month (created_at).
+            cur.execute(
+                """
+                SELECT to_char(date_trunc('month', created_at), 'YYYY-MM') AS ym, COUNT(*) AS c
+                FROM files_albums
+                GROUP BY ym
+                ORDER BY ym ASC
+                """
+            )
+            growth = [{"month": str(r[0] or ""), "count": int(r[1] or 0)} for r in cur.fetchall() if str(r[0] or "").strip()]
+
+            # Formats distribution (album-level).
+            cur.execute(
+                """
+                SELECT UPPER(TRIM(COALESCE(format, ''))) AS fmt, COUNT(*) AS c
+                FROM files_albums
+                GROUP BY UPPER(TRIM(COALESCE(format, '')))
+                ORDER BY c DESC, fmt ASC
+                LIMIT 40
+                """
+            )
+            formats = [{"format": str(r[0] or "").strip() or "—", "count": int(r[1] or 0)} for r in cur.fetchall()]
+
+            # Cover + lossless quality.
+            cur.execute("SELECT SUM(CASE WHEN has_cover THEN 1 ELSE 0 END), SUM(CASE WHEN is_lossless THEN 1 ELSE 0 END) FROM files_albums")
+            row = cur.fetchone() or [0, 0]
+            with_cover = int(row[0] or 0)
+            lossless = int(row[1] or 0)
+
+            # Genre distribution: prefer tags_json (multi-genre), fall back to album.genre.
+            cur.execute(
+                """
+                SELECT lower(trim(g.value)) AS genre, COUNT(*) AS c
+                FROM files_albums alb
+                JOIN LATERAL jsonb_array_elements_text(COALESCE(NULLIF(alb.tags_json, ''), '[]')::jsonb) AS g(value) ON TRUE
+                WHERE COALESCE(trim(g.value), '') <> ''
+                GROUP BY lower(trim(g.value))
+                ORDER BY c DESC, genre ASC
+                LIMIT 80
+                """
+            )
+            genre_rows = cur.fetchall()
+            genres = [{"genre": str(r[0] or "").strip(), "count": int(r[1] or 0)} for r in genre_rows if str(r[0] or "").strip()]
+            if not genres:
+                cur.execute(
+                    """
+                    SELECT lower(trim(COALESCE(genre, ''))) AS genre, COUNT(*) AS c
+                    FROM files_albums
+                    WHERE COALESCE(trim(genre), '') <> ''
+                    GROUP BY lower(trim(COALESCE(genre, '')))
+                    ORDER BY c DESC, genre ASC
+                    LIMIT 80
+                    """
+                )
+                genres = [{"genre": str(r[0] or "").strip(), "count": int(r[1] or 0)} for r in cur.fetchall() if str(r[0] or "").strip()]
+
+            # Labels distribution.
+            cur.execute(
+                """
+                SELECT TRIM(COALESCE(label, '')) AS label, COUNT(*) AS c
+                FROM files_albums
+                WHERE COALESCE(trim(label), '') <> ''
+                GROUP BY TRIM(COALESCE(label, ''))
+                ORDER BY c DESC, label ASC
+                LIMIT 80
+                """
+            )
+            labels = [{"label": str(r[0] or "").strip(), "count": int(r[1] or 0)} for r in cur.fetchall() if str(r[0] or "").strip()]
+
+        payload = {
+            "artists": artists,
+            "albums": albums,
+            "tracks": tracks,
+            "years": years,
+            "growth": growth,
+            "genres": genres,
+            "labels": labels,
+            "formats": formats,
+            "quality": {
+                "with_cover": with_cover,
+                "without_cover": max(0, albums - with_cover),
+                "lossless": lossless,
+                "lossy": max(0, albums - lossless),
+            },
+        }
+        _files_cache_set_json(cache_key, payload, ttl=30)
+        return jsonify(payload)
+    finally:
+        conn.close()
+
+
+@app.get("/api/library/discover")
+def api_library_discover():
+    """Personalized discovery feed (Files mode only).
+
+    Returns a set of album carousels driven by listening telemetry:
+    - genres you listen to
+    - your top artists
+    - similar artists (from cached artist profiles)
+    - labels you tend to play
+    """
+    if _get_library_mode() != "files":
+        return jsonify({"error": "Files mode required"}), 400
+
+    days = max(7, min(365, _parse_int_loose(request.args.get("days"), 90)))
+    limit = max(6, min(36, _parse_int_loose(request.args.get("limit"), 18)))
+    refresh = bool(_parse_bool(request.args.get("refresh")))
+
+    cache_key = f"library:discover:{days}:{limit}"
+    if not refresh:
+        cached = _files_cache_get_json(cache_key)
+        if cached is not None:
+            return jsonify(cached)
+
+    ok, err = _ensure_files_index_ready()
+    if not ok:
+        return jsonify({"error": err or "Files index unavailable"}), 503
+    conn = _files_pg_connect()
+    if conn is None:
+        return jsonify({"error": "PostgreSQL unavailable"}), 503
+
+    def _split_genre_string(raw: str) -> list[str]:
+        parts = []
+        try:
+            parts = _split_genre_values(raw or "")
+        except Exception:
+            parts = []
+        out: list[str] = []
+        seen: set[str] = set()
+        for p in parts:
+            v = re.sub(r"\s+", " ", str(p or "").strip())
+            if not v:
+                continue
+            k = v.lower()
+            if k in seen:
+                continue
+            seen.add(k)
+            out.append(v)
+        return out
+
+    def _album_rows_to_payload(rows: list[tuple]) -> list[dict]:
+        base_url = request.url_root.rstrip("/")
+        albums_out: list[dict] = []
+        for album_id, title, year, genre, label, tags_json, track_count, fmt, is_lossless, has_cover, artist_id, artist_name, short_desc, profile_source in rows:
+            aid = int(album_id or 0)
+            arid = int(artist_id or 0)
+            thumb = f"{base_url}/api/library/files/album/{aid}/cover?size=512" if bool(has_cover) else None
+            short_desc_clean = (short_desc or "").strip()
+            genres_list: list[str] = []
+            try:
+                tags_list = json.loads(tags_json) if tags_json else []
+                if isinstance(tags_list, list):
+                    for t in tags_list:
+                        v = str(t or "").strip()
+                        if v:
+                            genres_list.append(v)
+            except Exception:
+                genres_list = []
+            if not genres_list:
+                genres_list = _split_genre_string(genre or "")
+            if genres_list:
+                seen = set()
+                deduped = []
+                for g in genres_list:
+                    gg = re.sub(r"\s+", " ", (g or "").strip())
+                    if not gg:
+                        continue
+                    key = gg.lower()
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    deduped.append(gg)
+                genres_list = deduped[:20]
+            albums_out.append(
+                {
+                    "album_id": aid,
+                    "title": title or "",
+                    "year": int(year or 0) or None,
+                    "genre": (genre or "").strip() or None,
+                    "genres": genres_list,
+                    "label": (label or "").strip() or None,
+                    "track_count": int(track_count or 0),
+                    "format": (fmt or "").strip() or None,
+                    "is_lossless": bool(is_lossless),
+                    "thumb": thumb,
+                    "artist_id": arid,
+                    "artist_name": artist_name or "",
+                    "short_description": short_desc_clean or None,
+                    "profile_source": (profile_source or "").strip() or None,
+                }
+            )
+        return albums_out
+
+    def _fetch_random_albums(where_sql: str, params: list, n: int, exclude_album_ids: set[int]) -> list[dict]:
+        if n <= 0:
+            return []
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT
+                    alb.id,
+                    alb.title,
+                    COALESCE(alb.year, 0) AS year,
+                    COALESCE(alb.genre, '') AS genre,
+                    COALESCE(alb.label, '') AS label,
+                    COALESCE(alb.tags_json, '[]') AS tags_json,
+                    alb.track_count,
+                    COALESCE(alb.format, '') AS format,
+                    alb.is_lossless,
+                    alb.has_cover,
+                    ar.id AS artist_id,
+                    ar.name AS artist_name,
+                    COALESCE(pr.short_description, '') AS short_description,
+                    COALESCE(pr.source, '') AS profile_source
+                FROM files_albums alb
+                JOIN files_artists ar ON ar.id = alb.artist_id
+                LEFT JOIN files_album_profiles pr
+                       ON pr.artist_norm = ar.name_norm
+                      AND pr.title_norm = alb.title_norm
+                WHERE {where_sql}
+                ORDER BY random()
+                LIMIT %s
+                """,
+                [*params, int(n)],
+            )
+            rows = cur.fetchall()
+        albums = _album_rows_to_payload(rows)
+        # Defensive: ensure no duplicates in caller exclude set.
+        out = []
+        for a in albums:
+            aid = int(a.get("album_id") or 0)
+            if aid <= 0:
+                continue
+            if aid in exclude_album_ids:
+                continue
+            out.append(a)
+            exclude_album_ids.add(aid)
+        return out
+
+    try:
+        generated_at = int(time.time())
+        with conn.cursor() as cur:
+            # Prefer explicit playback telemetry; fall back to recommendation telemetry when empty.
+            cur.execute(
+                """
+                SELECT COUNT(*)
+                FROM files_playback_events
+                WHERE user_id = 1
+                  AND created_at >= NOW() - (%s || ' days')::interval
+                  AND played_seconds >= 12
+                """,
+                (int(days),),
+            )
+            playback_count = int((cur.fetchone() or [0])[0] or 0)
+            use_reco = playback_count <= 0
+            # NOTE: files_reco_events has no user_id (single-user), but does store played_seconds + created_at.
+            ev_table = "files_reco_events" if use_reco else "files_playback_events"
+            ev_user_filter = "1=1" if use_reco else "e.user_id = 1"
+
+            # Recently played albums (to reduce repetition).
+            cur.execute(
+                f"""
+                SELECT t.album_id
+                FROM {ev_table} e
+                JOIN files_tracks t ON t.id = e.track_id
+                WHERE {ev_user_filter}
+                  AND e.created_at >= NOW() - (%s || ' days')::interval
+                  AND COALESCE(e.played_seconds, 0) >= 12
+                ORDER BY e.created_at DESC
+                LIMIT 600
+                """,
+                (int(days),),
+            )
+            recent_album_rows = cur.fetchall()
+
+            cur.execute(
+                f"""
+                SELECT
+                    a.id AS artist_id,
+                    a.name AS artist_name,
+                    a.name_norm AS artist_norm,
+                    SUM(e.played_seconds) AS sec
+                FROM {ev_table} e
+                JOIN files_tracks t ON t.id = e.track_id
+                JOIN files_albums alb ON alb.id = t.album_id
+                JOIN files_artists a ON a.id = alb.artist_id
+                WHERE {ev_user_filter}
+                  AND e.created_at >= NOW() - (%s || ' days')::interval
+                  AND COALESCE(e.played_seconds, 0) >= 12
+                GROUP BY a.id, a.name, a.name_norm
+                ORDER BY sec DESC, a.name ASC
+                LIMIT 10
+                """,
+                (int(days),),
+            )
+            top_artist_rows = cur.fetchall()
+
+            cur.execute(
+                f"""
+                SELECT
+                    lower(trim(COALESCE(alb.label, ''))) AS label_norm,
+                    MIN(trim(COALESCE(alb.label, ''))) AS label,
+                    SUM(e.played_seconds) AS sec
+                FROM {ev_table} e
+                JOIN files_tracks t ON t.id = e.track_id
+                JOIN files_albums alb ON alb.id = t.album_id
+                WHERE {ev_user_filter}
+                  AND e.created_at >= NOW() - (%s || ' days')::interval
+                  AND COALESCE(e.played_seconds, 0) >= 12
+                  AND COALESCE(trim(alb.label), '') <> ''
+                GROUP BY lower(trim(COALESCE(alb.label, '')))
+                ORDER BY sec DESC, label ASC
+                LIMIT 10
+                """,
+                (int(days),),
+            )
+            top_label_rows = cur.fetchall()
+
+            # Album-level rows to compute genre preference (multi-genre albums: split seconds across tags).
+            cur.execute(
+                f"""
+                SELECT
+                    alb.id AS album_id,
+                    COALESCE(alb.tags_json, '[]') AS tags_json,
+                    COALESCE(alb.genre, '') AS genre,
+                    SUM(e.played_seconds) AS sec
+                FROM {ev_table} e
+                JOIN files_tracks t ON t.id = e.track_id
+                JOIN files_albums alb ON alb.id = t.album_id
+                WHERE {ev_user_filter}
+                  AND e.created_at >= NOW() - (%s || ' days')::interval
+                  AND COALESCE(e.played_seconds, 0) >= 12
+                GROUP BY alb.id, alb.tags_json, alb.genre
+                ORDER BY sec DESC
+                LIMIT 1200
+                """,
+                (int(days),),
+            )
+            album_genre_rows = cur.fetchall()
+
+            cur.execute(
+                f"""
+                SELECT
+                    COALESCE(alb.year, 0) AS year,
+                    SUM(e.played_seconds) AS sec
+                FROM {ev_table} e
+                JOIN files_tracks t ON t.id = e.track_id
+                JOIN files_albums alb ON alb.id = t.album_id
+                WHERE {ev_user_filter}
+                  AND e.created_at >= NOW() - (%s || ' days')::interval
+                  AND COALESCE(e.played_seconds, 0) >= 12
+                  AND alb.year IS NOT NULL AND alb.year > 0
+                GROUP BY COALESCE(alb.year, 0)
+                ORDER BY sec DESC, year DESC
+                LIMIT 10
+                """,
+                (int(days),),
+            )
+            year_rows = cur.fetchall()
+
+            # Fallback seeds: liked artists (when listening telemetry is empty).
+            cur.execute(
+                """
+                SELECT l.entity_id, a.name, a.name_norm, EXTRACT(EPOCH FROM l.updated_at)::BIGINT AS ts
+                FROM files_entity_likes l
+                JOIN files_artists a ON a.id = l.entity_id
+                WHERE l.entity_type = 'artist' AND l.liked = TRUE
+                ORDER BY l.updated_at DESC, l.entity_id DESC
+                LIMIT 10
+                """
+            )
+            liked_artist_rows = cur.fetchall()
+
+        recent_album_ids: set[int] = set()
+        for r in recent_album_rows:
+            try:
+                aid = int(r[0] or 0)
+            except Exception:
+                aid = 0
+            if aid > 0:
+                recent_album_ids.add(aid)
+
+        top_artists = [
+            {"artist_id": int(r[0] or 0), "artist_name": (r[1] or ""), "artist_norm": (r[2] or ""), "seconds": int(r[3] or 0)}
+            for r in top_artist_rows
+            if int(r[0] or 0) > 0
+        ]
+        liked_artists = [
+            {"artist_id": int(r[0] or 0), "artist_name": (r[1] or ""), "artist_norm": (r[2] or ""), "updated_at": int(r[3] or 0)}
+            for r in liked_artist_rows
+            if int(r[0] or 0) > 0
+        ]
+        top_labels = [
+            {"label": (r[1] or "").strip(), "seconds": int(r[2] or 0)}
+            for r in top_label_rows
+            if str(r[1] or "").strip()
+        ]
+
+        # Genre preference map.
+        genre_seconds: dict[str, float] = {}
+        for album_id, tags_json, genre_raw, sec in album_genre_rows:
+            seconds = float(sec or 0)
+            if seconds <= 0:
+                continue
+            tags_list: list[str] = []
+            try:
+                t = json.loads(tags_json or "[]") if tags_json else []
+                if isinstance(t, list):
+                    tags_list = [re.sub(r"\s+", " ", str(x or "").strip()) for x in t]
+                    tags_list = [x for x in tags_list if x]
+            except Exception:
+                tags_list = []
+            if not tags_list:
+                tags_list = _split_genre_string(genre_raw or "")
+            tags_list = [x for x in tags_list if x]
+            if not tags_list:
+                continue
+            share = seconds / max(1.0, float(len(tags_list)))
+            for g in tags_list[:12]:
+                k = g.lower()
+                genre_seconds[k] = genre_seconds.get(k, 0.0) + share
+
+        top_genres = sorted(genre_seconds.items(), key=lambda kv: (-kv[1], kv[0]))[:10]
+        top_genre_names = [g for g, _ in top_genres if g]
+        top_years = sorted([(int(y or 0), float(sec or 0.0)) for y, sec in (year_rows or []) if int(y or 0) > 0], key=lambda kv: (-kv[1], -kv[0]))
+        top_year = int(top_years[0][0]) if top_years else 0
+
+        # Build carousels (avoid duplicates across sections).
+        used_album_ids: set[int] = set(recent_album_ids)
+        sections: list[dict] = []
+
+        # 1) Genres you listen to.
+        if top_genre_names:
+            g = top_genre_names[0]
+            albums = _fetch_random_albums(
+                """
+                NOT (alb.id = ANY(%s))
+                AND EXISTS (
+                    SELECT 1
+                    FROM jsonb_array_elements_text(COALESCE(alb.tags_json, '[]')::jsonb) AS gg(value)
+                    WHERE lower(trim(gg.value)) = %s
+                )
+                """,
+                [list(used_album_ids), str(g)],
+                limit,
+                used_album_ids,
+            )
+            if albums:
+                sections.append(
+                    {
+                        "key": "genre",
+                        "title": f"More in {g}",
+                        "reason": f"Because you listen to {g}.",
+                        "seed": {"genre": g},
+                        "albums": albums,
+                    }
+                )
+
+        # 2) Your top artists (or liked artists).
+        seed_artists = [a for a in top_artists[:4]]
+        if not seed_artists and liked_artists:
+            seed_artists = [{"artist_id": a["artist_id"], "artist_name": a["artist_name"], "artist_norm": a["artist_norm"], "seconds": 0} for a in liked_artists[:3]]
+        if seed_artists:
+            artist_ids = [int(a["artist_id"]) for a in seed_artists if int(a.get("artist_id") or 0) > 0]
+            if artist_ids:
+                label_artist = seed_artists[0]["artist_name"]
+                albums = _fetch_random_albums(
+                    "NOT (alb.id = ANY(%s)) AND alb.artist_id = ANY(%s)",
+                    [list(used_album_ids), artist_ids],
+                    limit,
+                    used_album_ids,
+                )
+                if albums:
+                    sections.append(
+                        {
+                            "key": "artists",
+                            "title": "Because you play these artists",
+                            "reason": f"Because you often listen to {label_artist}.",
+                            "seed": {"artist_ids": artist_ids},
+                            "albums": albums,
+                        }
+                    )
+
+        # 3) Similar artists (from cached profile of your top artist).
+        if top_artists:
+            seed = top_artists[0]
+            artist_norm = (seed.get("artist_norm") or "").strip()
+            artist_name = (seed.get("artist_name") or "").strip()
+            base_url = request.url_root.rstrip("/")
+            sim_ids: list[int] = []
+            try:
+                prof = _files_get_artist_profile_cached(artist_name, artist_norm)
+                sim = prof.get("similar_artists") if isinstance(prof, dict) else []
+                if isinstance(sim, list) and sim:
+                    sim = _files_attach_similar_artist_refs(conn, sim, base_url)
+                    for it in sim:
+                        if not isinstance(it, dict):
+                            continue
+                        sid = _parse_int_loose(it.get("artist_id"), 0)
+                        if sid > 0:
+                            sim_ids.append(int(sid))
+                # De-dupe while preserving order.
+                seen = set()
+                sim_ids = [x for x in sim_ids if not (x in seen or seen.add(x))]
+                sim_ids = sim_ids[:20]
+            except Exception:
+                sim_ids = []
+            if sim_ids:
+                albums = _fetch_random_albums(
+                    "NOT (alb.id = ANY(%s)) AND alb.artist_id = ANY(%s)",
+                    [list(used_album_ids), sim_ids],
+                    limit,
+                    used_album_ids,
+                )
+                if albums:
+                    sections.append(
+                        {
+                            "key": "similar",
+                            "title": "From similar artists",
+                            "reason": f"Artists similar to {artist_name}.",
+                            "seed": {"artist_id": int(seed.get("artist_id") or 0), "similar_artist_ids": sim_ids[:10]},
+                            "albums": albums,
+                        }
+                    )
+
+        # 4) Labels you tend to play.
+        if top_labels:
+            label = (top_labels[0].get("label") or "").strip()
+            if label:
+                albums = _fetch_random_albums(
+                    "NOT (alb.id = ANY(%s)) AND lower(trim(COALESCE(alb.label, ''))) = lower(%s)",
+                    [list(used_album_ids), label],
+                    limit,
+                    used_album_ids,
+                )
+                if albums:
+                    sections.append(
+                        {
+                            "key": "labels",
+                            "title": f"More from {label}",
+                            "reason": f"Because you often play releases on {label}.",
+                            "seed": {"label": label},
+                            "albums": albums,
+                        }
+                    )
+
+        # 5) Most played year.
+        if top_year and int(top_year) > 0:
+            albums = _fetch_random_albums(
+                "NOT (alb.id = ANY(%s)) AND COALESCE(alb.year, 0) = %s",
+                [list(used_album_ids), int(top_year)],
+                limit,
+                used_album_ids,
+            )
+            if albums:
+                sections.append(
+                    {
+                        "key": "year",
+                        "title": f"Most played in {int(top_year)}",
+                        "reason": f"Because you often listen to music from {int(top_year)}.",
+                        "seed": {"year": int(top_year)},
+                        "albums": albums,
+                    }
+                )
+
+        # Fallback: no listening telemetry yet (or empty library signals). Show random picks so Discover isn't empty.
+        if not sections:
+            albums = _fetch_random_albums(
+                "NOT (alb.id = ANY(%s))",
+                [list(used_album_ids)],
+                limit,
+                used_album_ids,
+            )
+            if albums:
+                sections.append(
+                    {
+                        "key": "random",
+                        "title": "Random picks",
+                        "reason": "Start listening to personalize Discover. For now, here are random albums from your library.",
+                        "albums": albums,
+                    }
+                )
+
+        payload = {"days": days, "limit": limit, "generated_at": generated_at, "sections": sections}
+        _files_cache_set_json(cache_key, payload, ttl=30)
+        return jsonify(payload)
+    finally:
+        conn.close()
+
+
 @app.get("/api/library/albums-with-parenthetical-names")
 def api_library_albums_with_parenthetical_names():
     """Return albums whose folder name (or Plex title) has removable parenthetical suffixes like (flac), (mp3), (EP)."""
@@ -22952,9 +28900,12 @@ def api_library_artists():
     """
     if _get_library_mode() == "files":
         search_query = request.args.get("search", "").strip()
+        genre = (request.args.get("genre") or "").strip()
+        label = (request.args.get("label") or "").strip()
+        year = _parse_int_loose(request.args.get("year"), 0)
         limit = max(1, min(500, _parse_int_loose(request.args.get("limit"), 100)))
         offset = max(0, _parse_int_loose(request.args.get("offset"), 0))
-        cache_key = f"library:artists:{search_query.lower()}:{limit}:{offset}"
+        cache_key = f"library:artists:{search_query.lower()}:{genre.lower()}:{label.lower()}:{int(year or 0)}:{limit}:{offset}"
         cached = _files_cache_get_json(cache_key)
         if cached is not None:
             return jsonify(cached)
@@ -22966,48 +28917,132 @@ def api_library_artists():
             return jsonify({"error": "PostgreSQL unavailable"}), 503
         try:
             with conn.cursor() as cur:
+                where_parts = ["1=1"]
+                params: list = []
+
                 if search_query:
                     like = f"%{search_query}%"
-                    cur.execute(
-                        "SELECT COUNT(*) FROM files_artists WHERE name ILIKE %s",
-                        (like,),
+                    where_parts.append("a.name ILIKE %s")
+                    params.append(like)
+
+                if year and int(year) > 0:
+                    where_parts.append(
+                        """
+                        EXISTS (
+                            SELECT 1
+                            FROM files_albums alb
+                            WHERE alb.artist_id = a.id
+                              AND COALESCE(alb.year, 0) = %s
+                        )
+                        """
                     )
-                    total = int(cur.fetchone()[0] or 0)
+                    params.append(int(year))
+
+                if label:
+                    parts = [p.strip() for p in str(label).split(",") if p.strip()]
+                    if parts:
+                        where_parts.append(
+                            """
+                            EXISTS (
+                                SELECT 1
+                                FROM files_albums alb
+                                WHERE alb.artist_id = a.id
+                                  AND lower(trim(COALESCE(alb.label, ''))) = ANY(%s)
+                            )
+                            """
+                        )
+                        params.append([p.lower() for p in parts])
+
+                if genre:
+                    parts = [p.strip() for p in str(genre).split(",") if p.strip()]
+                    if parts:
+                        norms = [p.lower() for p in parts]
+                        where_parts.append(
+                            """
+                            EXISTS (
+                                SELECT 1
+                                FROM files_albums alb
+                                WHERE alb.artist_id = a.id
+                                  AND (
+                                    EXISTS (
+                                        SELECT 1
+                                        FROM jsonb_array_elements_text(COALESCE(alb.tags_json, '[]')::jsonb) AS g(value)
+                                        WHERE lower(trim(g.value)) = ANY(%s)
+                                    )
+                                    OR (
+                                        COALESCE(alb.tags_json, '[]') = '[]'
+                                        AND lower(trim(COALESCE(alb.genre, ''))) = ANY(%s)
+                                    )
+                                  )
+                            )
+                            """
+                        )
+                        params.append(norms)
+                        params.append(norms)
+
+                cur.execute(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM files_artists a
+                    WHERE {" AND ".join(where_parts)}
+                    """,
+                    params,
+                )
+                total = int((cur.fetchone() or [0])[0] or 0)
+
+                if search_query:
                     try:
                         cur.execute(
-                            """
-                            SELECT id, name, album_count, broken_albums_count, has_image,
-                                   similarity(name, %s) AS score,
-                                   CASE WHEN lower(name) LIKE lower(%s) || '%%' THEN 0 ELSE 1 END AS prefix_rank
-                            FROM files_artists
-                            WHERE name ILIKE %s
-                            ORDER BY prefix_rank ASC, score DESC, album_count DESC, name ASC
+                            f"""
+                            SELECT
+                                a.id,
+                                a.name,
+                                a.album_count,
+                                a.broken_albums_count,
+                                (a.has_image OR COALESCE(ext.image_path, '') <> '') AS has_image,
+                                similarity(a.name, %s) AS score,
+                                CASE WHEN lower(a.name) LIKE lower(%s) || '%%' THEN 0 ELSE 1 END AS prefix_rank
+                            FROM files_artists a
+                            LEFT JOIN files_external_artist_images ext ON ext.name_norm = a.name_norm
+                            WHERE {" AND ".join(where_parts)}
+                            ORDER BY prefix_rank ASC, score DESC, a.album_count DESC, a.name ASC
                             LIMIT %s OFFSET %s
                             """,
-                            (search_query, search_query, like, limit, offset),
+                            [search_query, search_query, *params, int(limit), int(offset)],
                         )
                     except Exception:
                         cur.execute(
-                            """
-                            SELECT id, name, album_count, broken_albums_count, has_image
-                            FROM files_artists
-                            WHERE name ILIKE %s
-                            ORDER BY album_count DESC, name ASC
+                            f"""
+                            SELECT
+                                a.id,
+                                a.name,
+                                a.album_count,
+                                a.broken_albums_count,
+                                (a.has_image OR COALESCE(ext.image_path, '') <> '') AS has_image
+                            FROM files_artists a
+                            LEFT JOIN files_external_artist_images ext ON ext.name_norm = a.name_norm
+                            WHERE {" AND ".join(where_parts)}
+                            ORDER BY a.album_count DESC, a.name ASC
                             LIMIT %s OFFSET %s
                             """,
-                            (like, limit, offset),
+                            [*params, int(limit), int(offset)],
                         )
                 else:
-                    cur.execute("SELECT COUNT(*) FROM files_artists")
-                    total = int(cur.fetchone()[0] or 0)
                     cur.execute(
-                        """
-                        SELECT id, name, album_count, broken_albums_count, has_image
-                        FROM files_artists
-                        ORDER BY album_count DESC, name ASC
+                        f"""
+                        SELECT
+                            a.id,
+                            a.name,
+                            a.album_count,
+                            a.broken_albums_count,
+                            (a.has_image OR COALESCE(ext.image_path, '') <> '') AS has_image
+                        FROM files_artists a
+                        LEFT JOIN files_external_artist_images ext ON ext.name_norm = a.name_norm
+                        WHERE {" AND ".join(where_parts)}
+                        ORDER BY a.album_count DESC, a.name ASC
                         LIMIT %s OFFSET %s
                         """,
-                        (limit, offset),
+                        [*params, int(limit), int(offset)],
                     )
                 rows = cur.fetchall()
             base_url = request.url_root.rstrip("/")
@@ -23159,12 +29194,18 @@ def api_library_artists_suggest():
             try:
                 cur.execute(
                     """
-                    SELECT id, name, album_count, broken_albums_count, has_image,
-                           similarity(name, %s) AS score,
-                           CASE WHEN lower(name) LIKE lower(%s) || '%%' THEN 0 ELSE 1 END AS prefix_rank
-                    FROM files_artists
-                    WHERE name ILIKE %s
-                    ORDER BY prefix_rank ASC, score DESC, album_count DESC, name ASC
+                    SELECT
+                        a.id,
+                        a.name,
+                        a.album_count,
+                        a.broken_albums_count,
+                        (a.has_image OR COALESCE(ext.image_path, '') <> '') AS has_image,
+                        similarity(a.name, %s) AS score,
+                        CASE WHEN lower(a.name) LIKE lower(%s) || '%%' THEN 0 ELSE 1 END AS prefix_rank
+                    FROM files_artists a
+                    LEFT JOIN files_external_artist_images ext ON ext.name_norm = a.name_norm
+                    WHERE a.name ILIKE %s
+                    ORDER BY prefix_rank ASC, score DESC, a.album_count DESC, a.name ASC
                     LIMIT %s
                     """,
                     (query, query, like, limit),
@@ -23172,10 +29213,16 @@ def api_library_artists_suggest():
             except Exception:
                 cur.execute(
                     """
-                    SELECT id, name, album_count, broken_albums_count, has_image
-                    FROM files_artists
-                    WHERE name ILIKE %s
-                    ORDER BY album_count DESC, name ASC
+                    SELECT
+                        a.id,
+                        a.name,
+                        a.album_count,
+                        a.broken_albums_count,
+                        (a.has_image OR COALESCE(ext.image_path, '') <> '') AS has_image
+                    FROM files_artists a
+                    LEFT JOIN files_external_artist_images ext ON ext.name_norm = a.name_norm
+                    WHERE a.name ILIKE %s
+                    ORDER BY a.album_count DESC, a.name ASC
                     LIMIT %s
                     """,
                     (like, limit),
@@ -23237,10 +29284,11 @@ def api_library_search_suggest():
                         a.id,
                         a.name,
                         a.album_count,
-                        a.has_image,
+                        (a.has_image OR COALESCE(ext.image_path, '') <> '') AS has_image,
                         similarity(a.name, %s) AS score,
                         CASE WHEN lower(a.name) LIKE lower(%s) || '%%' THEN 0 ELSE 1 END AS prefix_rank
                     FROM files_artists a
+                    LEFT JOIN files_external_artist_images ext ON ext.name_norm = a.name_norm
                     WHERE a.name ILIKE %s
                     ORDER BY prefix_rank ASC, score DESC, a.album_count DESC, a.name ASC
                     LIMIT %s
@@ -23250,10 +29298,17 @@ def api_library_search_suggest():
             except Exception:
                 cur.execute(
                     """
-                    SELECT id, name, album_count, has_image, 0.0 AS score, 1 AS prefix_rank
-                    FROM files_artists
-                    WHERE name ILIKE %s
-                    ORDER BY album_count DESC, name ASC
+                    SELECT
+                        a.id,
+                        a.name,
+                        a.album_count,
+                        (a.has_image OR COALESCE(ext.image_path, '') <> '') AS has_image,
+                        0.0 AS score,
+                        1 AS prefix_rank
+                    FROM files_artists a
+                    LEFT JOIN files_external_artist_images ext ON ext.name_norm = a.name_norm
+                    WHERE a.name ILIKE %s
+                    ORDER BY a.album_count DESC, a.name ASC
                     LIMIT %s
                     """,
                     (like, per_kind),
@@ -23440,6 +29495,1877 @@ def api_library_search_suggest():
         conn.close()
 
 
+@app.get("/api/library/albums")
+def api_library_albums():
+    """List albums (Files mode). Used for Roon-like album grid and carousels."""
+    if _get_library_mode() != "files":
+        return jsonify({"albums": [], "total": 0, "limit": 0, "offset": 0, "error": "Files mode required"}), 400
+
+    search_query = (request.args.get("search") or "").strip()
+    genre = (request.args.get("genre") or "").strip()
+    label = (request.args.get("label") or "").strip()
+    year = _parse_int_loose(request.args.get("year"), 0)
+    sort = (request.args.get("sort") or "recent").strip().lower()
+    limit = max(1, min(240, _parse_int_loose(request.args.get("limit"), 80)))
+    offset = max(0, _parse_int_loose(request.args.get("offset"), 0))
+
+    cache_key = f"library:albums:{search_query.lower()}:{genre.lower()}:{label.lower()}:{int(year or 0)}:{sort}:{limit}:{offset}"
+    cached = _files_cache_get_json(cache_key)
+    if cached is not None:
+        return jsonify(cached)
+
+    ok, err = _ensure_files_index_ready()
+    if not ok:
+        return jsonify({"albums": [], "total": 0, "limit": limit, "offset": offset, "error": err or "Files index unavailable"}), 503
+    conn = _files_pg_connect()
+    if conn is None:
+        return jsonify({"albums": [], "total": 0, "limit": limit, "offset": offset, "error": "PostgreSQL unavailable"}), 503
+
+    try:
+        where_parts = ["1=1"]
+        params: list = []
+        if search_query:
+            where_parts.append("(alb.title ILIKE %s OR ar.name ILIKE %s)")
+            like = f"%{search_query}%"
+            params.extend([like, like])
+        if year and int(year) > 0:
+            where_parts.append("alb.year = %s")
+            params.append(int(year))
+        if genre:
+            parts = [p.strip() for p in str(genre).split(",") if p.strip()]
+            if parts:
+                # Multi-genre support: album tags_json stores the full list (e.g. ["ambient","electronic"]).
+                # We match case-insensitively against any token in that array.
+                where_parts.append(
+                    """
+                    EXISTS (
+                        SELECT 1
+                        FROM jsonb_array_elements_text(COALESCE(alb.tags_json, '[]')::jsonb) AS g(value)
+                        WHERE lower(trim(g.value)) = ANY(%s)
+                    )
+                    """
+                )
+                params.append([p.lower() for p in parts])
+        if label:
+            parts = [p.strip() for p in str(label).split(",") if p.strip()]
+            if parts:
+                where_parts.append("lower(COALESCE(alb.label, '')) = ANY(%s)")
+                params.append([p.lower() for p in parts])
+
+        if sort == "year_desc":
+            order_sql = "ORDER BY COALESCE(alb.year, 0) DESC, alb.title ASC, alb.id DESC"
+        elif sort == "alpha":
+            order_sql = "ORDER BY alb.title ASC, alb.id DESC"
+        elif sort == "artist":
+            order_sql = "ORDER BY ar.name ASC, COALESCE(alb.year, 0) DESC, alb.title ASC, alb.id DESC"
+        else:
+            # recent (default): created/updated activity during index build
+            order_sql = "ORDER BY alb.created_at DESC, alb.id DESC"
+
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT COUNT(*)
+                FROM files_albums alb
+                JOIN files_artists ar ON ar.id = alb.artist_id
+                WHERE {" AND ".join(where_parts)}
+                """,
+                params,
+            )
+            total = int((cur.fetchone() or [0])[0] or 0)
+
+            cur.execute(
+                f"""
+                SELECT
+                    alb.id,
+                    alb.title,
+                    COALESCE(alb.year, 0) AS year,
+                    COALESCE(alb.genre, '') AS genre,
+                    COALESCE(alb.label, '') AS label,
+                    COALESCE(alb.tags_json, '[]') AS tags_json,
+                    alb.track_count,
+                    COALESCE(alb.format, '') AS format,
+                    alb.is_lossless,
+                    alb.has_cover,
+                    ar.id AS artist_id,
+                    ar.name AS artist_name,
+                    COALESCE(pr.short_description, '') AS short_description,
+                    COALESCE(pr.source, '') AS profile_source
+                FROM files_albums alb
+                JOIN files_artists ar ON ar.id = alb.artist_id
+                LEFT JOIN files_album_profiles pr
+                       ON pr.artist_norm = ar.name_norm
+                      AND pr.title_norm = alb.title_norm
+                WHERE {" AND ".join(where_parts)}
+                {order_sql}
+                LIMIT %s OFFSET %s
+                """,
+                [*params, int(limit), int(offset)],
+            )
+            rows = cur.fetchall()
+
+        base_url = request.url_root.rstrip("/")
+        albums = []
+        for album_id, title, year, genre, label, tags_json, track_count, fmt, is_lossless, has_cover, artist_id, artist_name, short_desc, profile_source in rows:
+            aid = int(album_id or 0)
+            arid = int(artist_id or 0)
+            thumb = f"{base_url}/api/library/files/album/{aid}/cover?size=512" if bool(has_cover) else None
+            short_desc_clean = (short_desc or "").strip()
+            # Parsed list of genres for UI badges (multi-genre albums).
+            genres_list: list[str] = []
+            try:
+                tags_list = json.loads(tags_json) if tags_json else []
+                if isinstance(tags_list, list):
+                    for t in tags_list:
+                        v = str(t or "").strip()
+                        if v:
+                            genres_list.append(v)
+            except Exception:
+                genres_list = []
+            if not genres_list:
+                try:
+                    genres_list = _split_genre_values(genre or "")
+                except Exception:
+                    genres_list = []
+            # Defensive: dedupe while keeping order.
+            if genres_list:
+                seen = set()
+                deduped = []
+                for g in genres_list:
+                    gg = re.sub(r"\s+", " ", (g or "").strip())
+                    if not gg:
+                        continue
+                    key = gg.lower()
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    deduped.append(gg)
+                genres_list = deduped[:20]
+            albums.append(
+                {
+                    "album_id": aid,
+                    "title": title or "",
+                    "year": int(year or 0) or None,
+                    "genre": (genre or "").strip() or None,
+                    "genres": genres_list,
+                    "label": (label or "").strip() or None,
+                    "track_count": int(track_count or 0),
+                    "format": (fmt or "").strip() or None,
+                    "is_lossless": bool(is_lossless),
+                    "thumb": thumb,
+                    "artist_id": arid,
+                    "artist_name": artist_name or "",
+                    "short_description": short_desc_clean or None,
+                    "profile_source": (profile_source or "").strip() or None,
+                }
+            )
+
+        payload = {"albums": albums, "total": total, "limit": limit, "offset": offset}
+        _files_cache_set_json(cache_key, payload, ttl=20)
+        return jsonify(payload)
+    finally:
+        conn.close()
+
+
+@app.get("/api/library/digest")
+def api_library_digest():
+    """
+    Library Digest feed (Files mode): recent albums that *have* a review snippet (short_description).
+
+    Important behavior:
+    - Albums without a review snippet are omitted (no placeholder).
+    - Optionally triggers background enrichment for missing snippets on the returned recent albums.
+    """
+    if _get_library_mode() != "files":
+        return jsonify({"albums": [], "limit": 0, "generated_at": int(time.time()), "enrichment": {"triggered": False, "missing_total": 0, "available_total": 0, "error": "Files mode required"}}), 400
+
+    ok, err = _ensure_files_index_ready()
+    if not ok:
+        return jsonify({"albums": [], "limit": 0, "generated_at": int(time.time()), "enrichment": {"triggered": False, "missing_total": 0, "available_total": 0, "error": err or "Files index unavailable"}}), 503
+
+    limit = max(1, min(36, _parse_int_loose(request.args.get("limit"), 12)))
+    trigger = str(request.args.get("trigger", "1")).strip().lower() in {"1", "true", "yes"}
+
+    conn = _files_pg_connect()
+    if conn is None:
+        return jsonify({"albums": [], "limit": limit, "generated_at": int(time.time()), "enrichment": {"triggered": False, "missing_total": 0, "available_total": 0, "error": "PostgreSQL unavailable"}}), 503
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    alb.id,
+                    alb.title,
+                    alb.title_norm,
+                    COALESCE(alb.year, 0) AS year,
+                    COALESCE(alb.genre, '') AS genre,
+                    COALESCE(alb.label, '') AS label,
+                    COALESCE(alb.tags_json, '[]') AS tags_json,
+                    alb.track_count,
+                    COALESCE(alb.format, '') AS format,
+                    alb.is_lossless,
+                    alb.has_cover,
+                    ar.id AS artist_id,
+                    ar.name AS artist_name,
+                    ar.name_norm AS artist_norm,
+                    COALESCE(pr.short_description, '') AS short_description,
+                    COALESCE(pr.source, '') AS profile_source
+                FROM files_albums alb
+                JOIN files_artists ar ON ar.id = alb.artist_id
+                LEFT JOIN files_album_profiles pr
+                       ON pr.artist_norm = ar.name_norm
+                      AND pr.title_norm = alb.title_norm
+                ORDER BY alb.created_at DESC, alb.id DESC
+                LIMIT %s
+                """,
+                (int(limit),),
+            )
+            rows = cur.fetchall()
+
+        base_url = request.url_root.rstrip("/")
+        albums_with_reviews: list[dict] = []
+        missing_by_artist: dict[str, dict] = {}
+        missing_total = 0
+
+        for (
+            album_id,
+            title,
+            title_norm,
+            year,
+            genre,
+            label,
+            tags_json,
+            track_count,
+            fmt,
+            is_lossless,
+            has_cover,
+            artist_id,
+            artist_name,
+            artist_norm,
+            short_desc,
+            profile_source,
+        ) in rows:
+            aid = int(album_id or 0)
+            arid = int(artist_id or 0)
+            if aid <= 0 or arid <= 0:
+                continue
+
+            # Parsed list of genres for UI badges (multi-genre albums).
+            genres_list: list[str] = []
+            try:
+                tags_list = json.loads(tags_json) if tags_json else []
+                if isinstance(tags_list, list):
+                    for t in tags_list:
+                        v = str(t or "").strip()
+                        if v:
+                            genres_list.append(v)
+            except Exception:
+                genres_list = []
+            if not genres_list:
+                try:
+                    genres_list = _split_genre_values(genre or "")
+                except Exception:
+                    genres_list = []
+            if genres_list:
+                seen = set()
+                deduped = []
+                for g in genres_list:
+                    gg = re.sub(r"\s+", " ", (g or "").strip())
+                    if not gg:
+                        continue
+                    key = gg.lower()
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    deduped.append(gg)
+                genres_list = deduped[:20]
+
+            short_desc_clean = (short_desc or "").strip()
+            prof_source_clean = (profile_source or "").strip() or None
+
+            if not short_desc_clean:
+                missing_total += 1
+                an = str(artist_norm or "").strip()
+                tn = str(title_norm or "").strip()
+                if an and tn:
+                    slot = missing_by_artist.setdefault(
+                        an,
+                        {
+                            "artist_name": str(artist_name or "").strip(),
+                            "artist_norm": an,
+                            "albums": [],
+                        },
+                    )
+                    slot["albums"].append((str(title or "").strip(), tn))
+                continue
+
+            thumb = f"{base_url}/api/library/files/album/{aid}/cover?size=512" if bool(has_cover) else None
+            albums_with_reviews.append(
+                {
+                    "album_id": aid,
+                    "title": title or "",
+                    "year": int(year or 0) or None,
+                    "genre": (genre or "").strip() or None,
+                    "genres": genres_list,
+                    "label": (label or "").strip() or None,
+                    "track_count": int(track_count or 0),
+                    "format": (fmt or "").strip() or None,
+                    "is_lossless": bool(is_lossless),
+                    "thumb": thumb,
+                    "artist_id": arid,
+                    "artist_name": artist_name or "",
+                    "short_description": short_desc_clean,
+                    "profile_source": prof_source_clean,
+                }
+            )
+
+        triggered = False
+        if trigger and missing_by_artist:
+            # Keep this bounded: we only want to backfill "recent digest" coverage, not the full library.
+            max_artists = 10
+            max_albums_per_artist = 24
+            for idx, (_artist_norm, info) in enumerate(list(missing_by_artist.items())[:max_artists]):
+                try:
+                    artist_name = str(info.get("artist_name") or "").strip()
+                    artist_norm = str(info.get("artist_norm") or "").strip()
+                    albums = list(info.get("albums") or [])[:max_albums_per_artist]
+                    if artist_name and artist_norm and albums:
+                        ok_enq = _enqueue_files_profile_enrichment(artist_name, artist_norm, albums)
+                        triggered = triggered or bool(ok_enq)
+                except Exception:
+                    continue
+
+        with _files_profile_jobs_lock:
+            active_jobs = int(len(_files_profile_jobs_active))
+        with _files_profile_backfill_lock:
+            backfill_state = dict(_files_profile_backfill_state or {})
+
+        payload = {
+            "limit": int(limit),
+            "generated_at": int(time.time()),
+            "albums": albums_with_reviews,
+            "enrichment": {
+                "triggered": bool(triggered),
+                "missing_total": int(missing_total),
+                "available_total": int(len(albums_with_reviews)),
+                "active_jobs": active_jobs,
+                "profile_backfill": backfill_state,
+            },
+        }
+        return jsonify(payload)
+    finally:
+        conn.close()
+
+
+@app.get("/api/library/likes")
+def api_library_likes_get():
+    """Return like state for one or more entities (Files mode only)."""
+    if _get_library_mode() != "files":
+        return jsonify({"items": [], "error": "Files mode required"}), 400
+    ok, err = _ensure_files_index_ready()
+    if not ok:
+        return jsonify({"items": [], "error": err or "Files index unavailable"}), 503
+    entity_type = (request.args.get("entity_type") or "").strip().lower()
+    if entity_type not in {"artist", "album", "track"}:
+        return jsonify({"items": [], "error": "entity_type must be one of: artist, album, track"}), 400
+    ids_raw = str(request.args.get("ids") or "").strip()
+    limit = max(1, min(1000, _parse_int_loose(request.args.get("limit"), 250)))
+
+    ids: list[int] = []
+    if ids_raw:
+        for part in ids_raw.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                n = int(part)
+            except ValueError:
+                continue
+            if n > 0:
+                ids.append(n)
+            if len(ids) >= 1000:
+                break
+
+    conn = _files_pg_connect()
+    if conn is None:
+        return jsonify({"items": [], "error": "PostgreSQL unavailable"}), 503
+    try:
+        with conn.cursor() as cur:
+            if ids:
+                cur.execute(
+                    """
+                    SELECT entity_id, liked, EXTRACT(EPOCH FROM updated_at)::BIGINT
+                    FROM files_entity_likes
+                    WHERE entity_type = %s
+                      AND entity_id = ANY(%s)
+                    """,
+                    (entity_type, ids),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT entity_id, liked, EXTRACT(EPOCH FROM updated_at)::BIGINT
+                    FROM files_entity_likes
+                    WHERE entity_type = %s
+                      AND liked = TRUE
+                    ORDER BY updated_at DESC, entity_id DESC
+                    LIMIT %s
+                    """,
+                    (entity_type, int(limit)),
+                )
+            rows = cur.fetchall()
+        items = [
+            {"entity_id": int(r[0] or 0), "liked": bool(r[1]), "updated_at": int(r[2] or 0)}
+            for r in rows
+            if int(r[0] or 0) > 0
+        ]
+        return jsonify({"entity_type": entity_type, "items": items})
+    finally:
+        conn.close()
+
+
+@app.put("/api/library/likes")
+def api_library_likes_put():
+    """Set like state for a single entity (Files mode only)."""
+    if _get_library_mode() != "files":
+        return jsonify({"error": "Files mode required"}), 400
+    ok, err = _ensure_files_index_ready()
+    if not ok:
+        return jsonify({"error": err or "Files index unavailable"}), 503
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        data = {}
+    entity_type = str(data.get("entity_type") or "").strip().lower()
+    if entity_type not in {"artist", "album", "track"}:
+        return jsonify({"error": "entity_type must be one of: artist, album, track"}), 400
+    entity_id = _parse_int_loose(data.get("entity_id"), 0)
+    if entity_id <= 0:
+        return jsonify({"error": "entity_id must be a positive integer"}), 400
+    liked = bool(_parse_bool(data.get("liked") if data.get("liked") is not None else True))
+    source = str(data.get("source") or "ui").strip()[:64] or "ui"
+
+    conn = _files_pg_connect()
+    if conn is None:
+        return jsonify({"error": "PostgreSQL unavailable"}), 503
+    try:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO files_entity_likes(entity_type, entity_id, liked, source, created_at, updated_at)
+                    VALUES (%s, %s, %s, %s, NOW(), NOW())
+                    ON CONFLICT (entity_type, entity_id) DO UPDATE SET
+                        liked = EXCLUDED.liked,
+                        source = EXCLUDED.source,
+                        updated_at = NOW()
+                    """,
+                    (entity_type, int(entity_id), bool(liked), source),
+                )
+        return jsonify({"entity_type": entity_type, "entity_id": int(entity_id), "liked": bool(liked), "updated_at": int(time.time())})
+    finally:
+        conn.close()
+
+
+@app.get("/api/library/artists/top")
+def api_library_top_artists():
+    """Return top listened artists (Files mode only)."""
+    if _get_library_mode() != "files":
+        return jsonify({"artists": [], "error": "Files mode required"}), 400
+    ok, err = _ensure_files_index_ready()
+    if not ok:
+        return jsonify({"artists": [], "error": err or "Files index unavailable"}), 503
+    limit = max(1, min(60, _parse_int_loose(request.args.get("limit"), 18)))
+    days = max(0, min(3650, _parse_int_loose(request.args.get("days"), 0)))
+
+    cache_key = f"library:top_artists:{limit}:{days}"
+    cached = _files_cache_get_json(cache_key)
+    if cached is not None:
+        return jsonify(cached)
+
+    conn = _files_pg_connect()
+    if conn is None:
+        return jsonify({"artists": [], "error": "PostgreSQL unavailable"}), 503
+    try:
+        base_url = request.url_root.rstrip("/")
+        with conn.cursor() as cur:
+            if days > 0:
+                cur.execute(
+                    """
+                    SELECT
+                        ar.id,
+                        ar.name,
+                        ar.album_count,
+                        ar.has_image,
+                        COALESCE(SUM(CASE WHEN e.event_type IN ('play_complete', 'like') THEN 1 ELSE 0 END), 0) AS completion_count,
+                        COALESCE(SUM(CASE WHEN e.event_type IN ('play_start', 'play_partial', 'play_complete', 'like') THEN 1 ELSE 0 END), 0) AS play_events
+                    FROM files_reco_events e
+                    JOIN files_artists ar ON ar.id = e.artist_id
+                    WHERE e.created_at >= (NOW() - (%s || ' days')::INTERVAL)
+                    GROUP BY ar.id
+                    ORDER BY completion_count DESC, play_events DESC, ar.album_count DESC, ar.name ASC
+                    LIMIT %s
+                    """,
+                    (int(days), int(limit)),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT
+                        ar.id,
+                        ar.name,
+                        ar.album_count,
+                        ar.has_image,
+                        COALESCE(SUM(st.completion_count), 0) AS completion_count,
+                        COALESCE(SUM(st.play_count), 0) AS play_count
+                    FROM files_reco_track_stats st
+                    JOIN files_tracks tr ON tr.id = st.track_id
+                    JOIN files_albums alb ON alb.id = tr.album_id
+                    JOIN files_artists ar ON ar.id = alb.artist_id
+                    GROUP BY ar.id
+                    ORDER BY completion_count DESC, play_count DESC, ar.album_count DESC, ar.name ASC
+                    LIMIT %s
+                    """,
+                    (int(limit),),
+                )
+            rows = cur.fetchall()
+
+        artists = []
+        for artist_id, name, album_count, has_image, completion_count, play_count in rows:
+            aid = int(artist_id or 0)
+            if aid <= 0:
+                continue
+            thumb = f"{base_url}/api/library/files/artist/{aid}/image?size=192" if bool(has_image) else None
+            artists.append(
+                {
+                    "artist_id": aid,
+                    "artist_name": name or "",
+                    "album_count": int(album_count or 0),
+                    "completion_count": int(completion_count or 0),
+                    "play_count": int(play_count or 0),
+                    "thumb": thumb,
+                }
+            )
+
+        payload = {"artists": artists, "limit": int(limit), "days": int(days)}
+        _files_cache_set_json(cache_key, payload, ttl=30)
+        return jsonify(payload)
+    finally:
+        conn.close()
+
+
+@app.get("/api/library/facets")
+def api_library_facets():
+    """Return library facets (genres/labels/years) for discovery chips (Files mode only)."""
+    if _get_library_mode() != "files":
+        return jsonify({"genres": [], "labels": [], "years": [], "error": "Files mode required"}), 400
+    ok, err = _ensure_files_index_ready()
+    if not ok:
+        return jsonify({"genres": [], "labels": [], "years": [], "error": err or "Files index unavailable"}), 503
+    limit_genres = max(1, min(80, _parse_int_loose(request.args.get("limit_genres"), 24)))
+    limit_labels = max(1, min(80, _parse_int_loose(request.args.get("limit_labels"), 24)))
+    limit_years = max(1, min(200, _parse_int_loose(request.args.get("limit_years"), 50)))
+
+    cache_key = f"library:facets:{limit_genres}:{limit_labels}:{limit_years}"
+    cached = _files_cache_get_json(cache_key)
+    if cached is not None:
+        return jsonify(cached)
+
+    conn = _files_pg_connect()
+    if conn is None:
+        return jsonify({"genres": [], "labels": [], "years": [], "error": "PostgreSQL unavailable"}), 503
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                WITH genre_tokens AS (
+                    -- Primary source: tags_json array (multi-genre support)
+                    SELECT
+                        alb.id AS album_id,
+                        TRIM(g.value) AS genre_disp
+                    FROM files_albums alb
+                    CROSS JOIN LATERAL jsonb_array_elements_text(COALESCE(alb.tags_json, '[]')::jsonb) AS g(value)
+                    WHERE COALESCE(TRIM(g.value), '') <> ''
+                    UNION ALL
+                    -- Fallback: legacy single-genre column when tags_json is empty
+                    SELECT
+                        alb.id AS album_id,
+                        TRIM(alb.genre) AS genre_disp
+                    FROM files_albums alb
+                    WHERE COALESCE(TRIM(alb.genre), '') <> ''
+                      AND COALESCE(alb.tags_json, '[]') = '[]'
+                ),
+                norm_tokens AS (
+                    SELECT
+                        album_id,
+                        LOWER(genre_disp) AS genre_norm,
+                        genre_disp
+                    FROM genre_tokens
+                    WHERE COALESCE(genre_disp, '') <> ''
+                ),
+                counts AS (
+                    SELECT genre_norm, COUNT(DISTINCT album_id) AS c
+                    FROM norm_tokens
+                    GROUP BY genre_norm
+                ),
+                best_disp AS (
+                    SELECT
+                        genre_norm,
+                        genre_disp,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY genre_norm
+                            ORDER BY COUNT(DISTINCT album_id) DESC, LENGTH(genre_disp) DESC, genre_disp ASC
+                        ) AS rn
+                    FROM norm_tokens
+                    GROUP BY genre_norm, genre_disp
+                )
+                SELECT b.genre_disp AS genre, c.c
+                FROM counts c
+                JOIN best_disp b ON b.genre_norm = c.genre_norm AND b.rn = 1
+                ORDER BY c.c DESC, genre ASC
+                LIMIT %s
+                """,
+                (int(limit_genres),),
+            )
+            genres = [{"value": (r[0] or "").strip(), "count": int(r[1] or 0)} for r in cur.fetchall() if str(r[0] or "").strip()]
+
+            cur.execute(
+                """
+                WITH label_tokens AS (
+                    SELECT TRIM(COALESCE(label, '')) AS label_disp
+                    FROM files_albums
+                    WHERE COALESCE(TRIM(label), '') <> ''
+                ),
+                norm_tokens AS (
+                    SELECT LOWER(label_disp) AS label_norm, label_disp
+                    FROM label_tokens
+                    WHERE COALESCE(label_disp, '') <> ''
+                ),
+                counts AS (
+                    SELECT label_norm, COUNT(*) AS c
+                    FROM norm_tokens
+                    GROUP BY label_norm
+                ),
+                best_disp AS (
+                    SELECT
+                        label_norm,
+                        label_disp,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY label_norm
+                            ORDER BY COUNT(*) DESC, LENGTH(label_disp) DESC, label_disp ASC
+                        ) AS rn
+                    FROM norm_tokens
+                    GROUP BY label_norm, label_disp
+                )
+                SELECT b.label_disp AS label, c.c
+                FROM counts c
+                JOIN best_disp b ON b.label_norm = c.label_norm AND b.rn = 1
+                ORDER BY c.c DESC, label ASC
+                LIMIT %s
+                """,
+                (int(limit_labels),),
+            )
+            labels = [{"value": (r[0] or "").strip(), "count": int(r[1] or 0)} for r in cur.fetchall() if str(r[0] or "").strip()]
+
+            cur.execute(
+                """
+                SELECT year, COUNT(*) AS c
+                FROM files_albums
+                WHERE year IS NOT NULL AND year > 0
+                GROUP BY year
+                ORDER BY year DESC
+                LIMIT %s
+                """,
+                (int(limit_years),),
+            )
+            years = [{"value": int(r[0] or 0), "count": int(r[1] or 0)} for r in cur.fetchall() if int(r[0] or 0) > 0]
+
+        payload = {"genres": genres, "labels": labels, "years": years}
+        _files_cache_set_json(cache_key, payload, ttl=60)
+        return jsonify(payload)
+    finally:
+        conn.close()
+
+
+@app.get("/api/library/genres/suggest")
+def api_library_genres_suggest():
+    """Suggest genres with album counts (Files mode only). Used for advanced filtering UI."""
+    if _get_library_mode() != "files":
+        return jsonify({"query": "", "genres": [], "error": "Files mode required"}), 400
+    ok, err = _ensure_files_index_ready()
+    if not ok:
+        return jsonify({"query": "", "genres": [], "error": err or "Files index unavailable"}), 503
+
+    query = (request.args.get("q") or "").strip()
+    label = (request.args.get("label") or "").strip()
+    year = _parse_int_loose(request.args.get("year"), 0)
+    limit = max(1, min(80, _parse_int_loose(request.args.get("limit"), 16)))
+    refresh = bool(_parse_bool(request.args.get("refresh")))
+
+    cache_key = f"library:genres:suggest:{query.lower()}:{label.lower()}:{int(year or 0)}:{limit}"
+    if not refresh:
+        cached = _files_cache_get_json(cache_key)
+        if cached is not None:
+            return jsonify(cached)
+
+    conn = _files_pg_connect()
+    if conn is None:
+        return jsonify({"query": query, "genres": [], "error": "PostgreSQL unavailable"}), 503
+    try:
+        album_filters = ["1=1"]
+        album_params: list = []
+        if year and int(year) > 0:
+            album_filters.append("COALESCE(alb.year, 0) = %s")
+            album_params.append(int(year))
+        if label:
+            parts = [p.strip() for p in str(label).split(",") if p.strip()]
+            if parts:
+                album_filters.append("lower(trim(COALESCE(alb.label, ''))) = ANY(%s)")
+                album_params.append([p.lower() for p in parts])
+
+        like = f"%{query}%"
+        with conn.cursor() as cur:
+            if query:
+                cur.execute(
+                    f"""
+                    WITH genre_tokens AS (
+                        SELECT
+                            alb.id AS album_id,
+                            TRIM(g.value) AS genre_disp
+                        FROM files_albums alb
+                        CROSS JOIN LATERAL jsonb_array_elements_text(COALESCE(alb.tags_json, '[]')::jsonb) AS g(value)
+                        WHERE COALESCE(TRIM(g.value), '') <> ''
+                          AND {" AND ".join(album_filters)}
+                        UNION ALL
+                        SELECT
+                            alb.id AS album_id,
+                            TRIM(alb.genre) AS genre_disp
+                        FROM files_albums alb
+                        WHERE COALESCE(TRIM(alb.genre), '') <> ''
+                          AND {" AND ".join(album_filters)}
+                          AND COALESCE(alb.tags_json, '[]') = '[]'
+                    ),
+                    norm_tokens AS (
+                        SELECT
+                            album_id,
+                            LOWER(genre_disp) AS genre_norm,
+                            genre_disp
+                        FROM genre_tokens
+                        WHERE COALESCE(genre_disp, '') <> ''
+                          AND genre_disp ILIKE %s
+                    ),
+                    counts AS (
+                        SELECT genre_norm, COUNT(DISTINCT album_id) AS c
+                        FROM norm_tokens
+                        GROUP BY genre_norm
+                    ),
+                    best_disp AS (
+                        SELECT
+                            genre_norm,
+                            genre_disp,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY genre_norm
+                                ORDER BY COUNT(DISTINCT album_id) DESC, LENGTH(genre_disp) DESC, genre_disp ASC
+                            ) AS rn
+                        FROM norm_tokens
+                        GROUP BY genre_norm, genre_disp
+                    )
+                    SELECT b.genre_disp AS genre, c.c
+                    FROM counts c
+                    JOIN best_disp b ON b.genre_norm = c.genre_norm AND b.rn = 1
+                    ORDER BY c.c DESC, genre ASC
+                    LIMIT %s
+                    """,
+                    (*album_params, like, int(limit)),
+                )
+            else:
+                cur.execute(
+                    f"""
+                    WITH genre_tokens AS (
+                        SELECT
+                            alb.id AS album_id,
+                            TRIM(g.value) AS genre_disp
+                        FROM files_albums alb
+                        CROSS JOIN LATERAL jsonb_array_elements_text(COALESCE(alb.tags_json, '[]')::jsonb) AS g(value)
+                        WHERE COALESCE(TRIM(g.value), '') <> ''
+                          AND {" AND ".join(album_filters)}
+                        UNION ALL
+                        SELECT
+                            alb.id AS album_id,
+                            TRIM(alb.genre) AS genre_disp
+                        FROM files_albums alb
+                        WHERE COALESCE(TRIM(alb.genre), '') <> ''
+                          AND {" AND ".join(album_filters)}
+                          AND COALESCE(alb.tags_json, '[]') = '[]'
+                    ),
+                    norm_tokens AS (
+                        SELECT
+                            album_id,
+                            LOWER(genre_disp) AS genre_norm,
+                            genre_disp
+                        FROM genre_tokens
+                        WHERE COALESCE(genre_disp, '') <> ''
+                    ),
+                    counts AS (
+                        SELECT genre_norm, COUNT(DISTINCT album_id) AS c
+                        FROM norm_tokens
+                        GROUP BY genre_norm
+                    ),
+                    best_disp AS (
+                        SELECT
+                            genre_norm,
+                            genre_disp,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY genre_norm
+                                ORDER BY COUNT(DISTINCT album_id) DESC, LENGTH(genre_disp) DESC, genre_disp ASC
+                            ) AS rn
+                        FROM norm_tokens
+                        GROUP BY genre_norm, genre_disp
+                    )
+                    SELECT b.genre_disp AS genre, c.c
+                    FROM counts c
+                    JOIN best_disp b ON b.genre_norm = c.genre_norm AND b.rn = 1
+                    ORDER BY c.c DESC, genre ASC
+                    LIMIT %s
+                    """,
+                    (*album_params, int(limit)),
+                )
+            rows = cur.fetchall()
+
+        genres = [{"value": (r[0] or "").strip(), "count": int(r[1] or 0)} for r in rows if str(r[0] or "").strip()]
+        payload = {"query": query, "genres": genres}
+        _files_cache_set_json(cache_key, payload, ttl=30)
+        return jsonify(payload)
+    finally:
+        conn.close()
+
+
+@app.get("/api/library/labels/suggest")
+def api_library_labels_suggest():
+    """Suggest labels with album counts (Files mode only). Used for advanced filtering UI."""
+    if _get_library_mode() != "files":
+        return jsonify({"query": "", "labels": [], "error": "Files mode required"}), 400
+    ok, err = _ensure_files_index_ready()
+    if not ok:
+        return jsonify({"query": "", "labels": [], "error": err or "Files index unavailable"}), 503
+
+    query = (request.args.get("q") or "").strip()
+    genre = (request.args.get("genre") or "").strip()
+    year = _parse_int_loose(request.args.get("year"), 0)
+    limit = max(1, min(80, _parse_int_loose(request.args.get("limit"), 16)))
+    refresh = bool(_parse_bool(request.args.get("refresh")))
+
+    cache_key = f"library:labels:suggest:{query.lower()}:{genre.lower()}:{int(year or 0)}:{limit}"
+    if not refresh:
+        cached = _files_cache_get_json(cache_key)
+        if cached is not None:
+            return jsonify(cached)
+
+    conn = _files_pg_connect()
+    if conn is None:
+        return jsonify({"query": query, "labels": [], "error": "PostgreSQL unavailable"}), 503
+    try:
+        album_filters = ["1=1"]
+        album_params: list = []
+        if year and int(year) > 0:
+            album_filters.append("COALESCE(alb.year, 0) = %s")
+            album_params.append(int(year))
+        if genre:
+            parts = [p.strip() for p in str(genre).split(",") if p.strip()]
+            if parts:
+                norms = [p.lower() for p in parts]
+                album_filters.append(
+                    """
+                    (
+                        EXISTS (
+                            SELECT 1
+                            FROM jsonb_array_elements_text(COALESCE(alb.tags_json, '[]')::jsonb) AS g(value)
+                            WHERE lower(trim(g.value)) = ANY(%s)
+                        )
+                        OR (
+                            COALESCE(alb.tags_json, '[]') = '[]'
+                            AND lower(trim(COALESCE(alb.genre, ''))) = ANY(%s)
+                        )
+                    )
+                    """
+                )
+                album_params.append(norms)
+                album_params.append(norms)
+
+        like = f"%{query}%"
+        with conn.cursor() as cur:
+            if query:
+                cur.execute(
+                    f"""
+                    WITH label_tokens AS (
+                        SELECT TRIM(COALESCE(alb.label, '')) AS label_disp
+                        FROM files_albums alb
+                        WHERE COALESCE(TRIM(alb.label), '') <> ''
+                          AND {" AND ".join(album_filters)}
+                          AND TRIM(COALESCE(alb.label, '')) ILIKE %s
+                    ),
+                    norm_tokens AS (
+                        SELECT LOWER(label_disp) AS label_norm, label_disp
+                        FROM label_tokens
+                        WHERE COALESCE(label_disp, '') <> ''
+                    ),
+                    counts AS (
+                        SELECT label_norm, COUNT(*) AS c
+                        FROM norm_tokens
+                        GROUP BY label_norm
+                    ),
+                    best_disp AS (
+                        SELECT
+                            label_norm,
+                            label_disp,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY label_norm
+                                ORDER BY COUNT(*) DESC, LENGTH(label_disp) DESC, label_disp ASC
+                            ) AS rn
+                        FROM norm_tokens
+                        GROUP BY label_norm, label_disp
+                    )
+                    SELECT b.label_disp AS label, c.c
+                    FROM counts c
+                    JOIN best_disp b ON b.label_norm = c.label_norm AND b.rn = 1
+                    ORDER BY c.c DESC, label ASC
+                    LIMIT %s
+                    """,
+                    (*album_params, like, int(limit)),
+                )
+            else:
+                cur.execute(
+                    f"""
+                    WITH label_tokens AS (
+                        SELECT TRIM(COALESCE(alb.label, '')) AS label_disp
+                        FROM files_albums alb
+                        WHERE COALESCE(TRIM(alb.label), '') <> ''
+                          AND {" AND ".join(album_filters)}
+                    ),
+                    norm_tokens AS (
+                        SELECT LOWER(label_disp) AS label_norm, label_disp
+                        FROM label_tokens
+                        WHERE COALESCE(label_disp, '') <> ''
+                    ),
+                    counts AS (
+                        SELECT label_norm, COUNT(*) AS c
+                        FROM norm_tokens
+                        GROUP BY label_norm
+                    ),
+                    best_disp AS (
+                        SELECT
+                            label_norm,
+                            label_disp,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY label_norm
+                                ORDER BY COUNT(*) DESC, LENGTH(label_disp) DESC, label_disp ASC
+                            ) AS rn
+                        FROM norm_tokens
+                        GROUP BY label_norm, label_disp
+                    )
+                    SELECT b.label_disp AS label, c.c
+                    FROM counts c
+                    JOIN best_disp b ON b.label_norm = c.label_norm AND b.rn = 1
+                    ORDER BY c.c DESC, label ASC
+                    LIMIT %s
+                    """,
+                    (*album_params, int(limit)),
+                )
+            rows = cur.fetchall()
+
+        labels = [{"value": (r[0] or "").strip(), "count": int(r[1] or 0)} for r in rows if str(r[0] or "").strip()]
+        payload = {"query": query, "labels": labels}
+        _files_cache_set_json(cache_key, payload, ttl=30)
+        return jsonify(payload)
+    finally:
+        conn.close()
+
+
+@app.get("/api/library/genres")
+def api_library_genres():
+    """List genres with album counts (Files mode only). Supports search + pagination and optional label/year filtering."""
+    if _get_library_mode() != "files":
+        return jsonify({"genres": [], "total": 0, "limit": 0, "offset": 0, "error": "Files mode required"}), 400
+    ok, err = _ensure_files_index_ready()
+    if not ok:
+        return jsonify({"genres": [], "total": 0, "limit": 0, "offset": 0, "error": err or "Files index unavailable"}), 503
+
+    search = (request.args.get("search") or request.args.get("q") or "").strip()
+    label = (request.args.get("label") or "").strip()
+    year = _parse_int_loose(request.args.get("year"), 0)
+    limit = max(1, min(200, _parse_int_loose(request.args.get("limit"), 80)))
+    offset = max(0, _parse_int_loose(request.args.get("offset"), 0))
+    refresh = bool(_parse_bool(request.args.get("refresh")))
+
+    cache_key = f"library:genres:list:{search.lower()}:{label.lower()}:{int(year or 0)}:{limit}:{offset}"
+    if not refresh:
+        cached = _files_cache_get_json(cache_key)
+        if cached is not None:
+            return jsonify(cached)
+
+    album_filters = ["1=1"]
+    album_params: list = []
+    if year and int(year) > 0:
+        album_filters.append("COALESCE(alb.year, 0) = %s")
+        album_params.append(int(year))
+    if label:
+        parts = [p.strip() for p in str(label).split(",") if p.strip()]
+        if parts:
+            album_filters.append("lower(trim(COALESCE(alb.label, ''))) = ANY(%s)")
+            album_params.append([p.lower() for p in parts])
+
+    conn = _files_pg_connect()
+    if conn is None:
+        return jsonify({"genres": [], "total": 0, "limit": limit, "offset": offset, "error": "PostgreSQL unavailable"}), 503
+    try:
+        like = f"%{search}%"
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                WITH genre_tokens AS (
+                    SELECT
+                        alb.id AS album_id,
+                        TRIM(g.value) AS genre_disp
+                    FROM files_albums alb
+                    CROSS JOIN LATERAL jsonb_array_elements_text(COALESCE(alb.tags_json, '[]')::jsonb) AS g(value)
+                    WHERE COALESCE(TRIM(g.value), '') <> ''
+                      AND {" AND ".join(album_filters)}
+                    UNION ALL
+                    SELECT
+                        alb.id AS album_id,
+                        TRIM(alb.genre) AS genre_disp
+                    FROM files_albums alb
+                    WHERE COALESCE(TRIM(alb.genre), '') <> ''
+                      AND {" AND ".join(album_filters)}
+                      AND COALESCE(alb.tags_json, '[]') = '[]'
+                ),
+                norm_tokens AS (
+                    SELECT
+                        album_id,
+                        LOWER(genre_disp) AS genre_norm,
+                        genre_disp
+                    FROM genre_tokens
+                    WHERE COALESCE(genre_disp, '') <> ''
+                      AND (%s = '' OR genre_disp ILIKE %s)
+                ),
+                counts AS (
+                    SELECT genre_norm, COUNT(DISTINCT album_id) AS c
+                    FROM norm_tokens
+                    GROUP BY genre_norm
+                ),
+                best_disp AS (
+                    SELECT
+                        genre_norm,
+                        genre_disp,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY genre_norm
+                            ORDER BY COUNT(DISTINCT album_id) DESC, LENGTH(genre_disp) DESC, genre_disp ASC
+                        ) AS rn
+                    FROM norm_tokens
+                    GROUP BY genre_norm, genre_disp
+                )
+                SELECT COUNT(*) FROM counts
+                """,
+                (*album_params, search, like),
+            )
+            total = int((cur.fetchone() or [0])[0] or 0)
+
+            cur.execute(
+                f"""
+                WITH genre_tokens AS (
+                    SELECT
+                        alb.id AS album_id,
+                        TRIM(g.value) AS genre_disp
+                    FROM files_albums alb
+                    CROSS JOIN LATERAL jsonb_array_elements_text(COALESCE(alb.tags_json, '[]')::jsonb) AS g(value)
+                    WHERE COALESCE(TRIM(g.value), '') <> ''
+                      AND {" AND ".join(album_filters)}
+                    UNION ALL
+                    SELECT
+                        alb.id AS album_id,
+                        TRIM(alb.genre) AS genre_disp
+                    FROM files_albums alb
+                    WHERE COALESCE(TRIM(alb.genre), '') <> ''
+                      AND {" AND ".join(album_filters)}
+                      AND COALESCE(alb.tags_json, '[]') = '[]'
+                ),
+                norm_tokens AS (
+                    SELECT
+                        album_id,
+                        LOWER(genre_disp) AS genre_norm,
+                        genre_disp
+                    FROM genre_tokens
+                    WHERE COALESCE(genre_disp, '') <> ''
+                      AND (%s = '' OR genre_disp ILIKE %s)
+                ),
+                counts AS (
+                    SELECT genre_norm, COUNT(DISTINCT album_id) AS c
+                    FROM norm_tokens
+                    GROUP BY genre_norm
+                ),
+                best_disp AS (
+                    SELECT
+                        genre_norm,
+                        genre_disp,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY genre_norm
+                            ORDER BY COUNT(DISTINCT album_id) DESC, LENGTH(genre_disp) DESC, genre_disp ASC
+                        ) AS rn
+                    FROM norm_tokens
+                    GROUP BY genre_norm, genre_disp
+                )
+                SELECT b.genre_disp AS genre, c.c
+                FROM counts c
+                JOIN best_disp b ON b.genre_norm = c.genre_norm AND b.rn = 1
+                ORDER BY c.c DESC, genre ASC
+                LIMIT %s OFFSET %s
+                """,
+                (*album_params, search, like, int(limit), int(offset)),
+            )
+            rows = cur.fetchall()
+
+        genres = [{"value": (r[0] or "").strip(), "count": int(r[1] or 0)} for r in rows if str(r[0] or "").strip()]
+        payload = {"genres": genres, "total": total, "limit": int(limit), "offset": int(offset)}
+        _files_cache_set_json(cache_key, payload, ttl=45)
+        return jsonify(payload)
+    finally:
+        conn.close()
+
+
+@app.get("/api/library/labels")
+def api_library_labels():
+    """List labels with album counts (Files mode only). Supports search + pagination and optional genre/year filtering."""
+    if _get_library_mode() != "files":
+        return jsonify({"labels": [], "total": 0, "limit": 0, "offset": 0, "error": "Files mode required"}), 400
+    ok, err = _ensure_files_index_ready()
+    if not ok:
+        return jsonify({"labels": [], "total": 0, "limit": 0, "offset": 0, "error": err or "Files index unavailable"}), 503
+
+    search = (request.args.get("search") or request.args.get("q") or "").strip()
+    genre = (request.args.get("genre") or "").strip()
+    year = _parse_int_loose(request.args.get("year"), 0)
+    limit = max(1, min(200, _parse_int_loose(request.args.get("limit"), 80)))
+    offset = max(0, _parse_int_loose(request.args.get("offset"), 0))
+    refresh = bool(_parse_bool(request.args.get("refresh")))
+
+    cache_key = f"library:labels:list:{search.lower()}:{genre.lower()}:{int(year or 0)}:{limit}:{offset}"
+    if not refresh:
+        cached = _files_cache_get_json(cache_key)
+        if cached is not None:
+            return jsonify(cached)
+
+    album_filters = ["1=1"]
+    album_params: list = []
+    if year and int(year) > 0:
+        album_filters.append("COALESCE(alb.year, 0) = %s")
+        album_params.append(int(year))
+    if genre:
+        parts = [p.strip() for p in str(genre).split(",") if p.strip()]
+        if parts:
+            norms = [p.lower() for p in parts]
+            album_filters.append(
+                """
+                (
+                    EXISTS (
+                        SELECT 1
+                        FROM jsonb_array_elements_text(COALESCE(alb.tags_json, '[]')::jsonb) AS g(value)
+                        WHERE lower(trim(g.value)) = ANY(%s)
+                    )
+                    OR (
+                        COALESCE(alb.tags_json, '[]') = '[]'
+                        AND lower(trim(COALESCE(alb.genre, ''))) = ANY(%s)
+                    )
+                )
+                """
+            )
+            album_params.append(norms)
+            album_params.append(norms)
+
+    conn = _files_pg_connect()
+    if conn is None:
+        return jsonify({"labels": [], "total": 0, "limit": limit, "offset": offset, "error": "PostgreSQL unavailable"}), 503
+    try:
+        like = f"%{search}%"
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                WITH label_tokens AS (
+                    SELECT TRIM(COALESCE(alb.label, '')) AS label_disp
+                    FROM files_albums alb
+                    WHERE COALESCE(TRIM(alb.label), '') <> ''
+                      AND {" AND ".join(album_filters)}
+                      AND (%s = '' OR TRIM(COALESCE(alb.label, '')) ILIKE %s)
+                ),
+                norm_tokens AS (
+                    SELECT LOWER(label_disp) AS label_norm, label_disp
+                    FROM label_tokens
+                    WHERE COALESCE(label_disp, '') <> ''
+                ),
+                counts AS (
+                    SELECT label_norm, COUNT(*) AS c
+                    FROM norm_tokens
+                    GROUP BY label_norm
+                )
+                SELECT COUNT(*) FROM counts
+                """,
+                (*album_params, search, like),
+            )
+            total = int((cur.fetchone() or [0])[0] or 0)
+
+            cur.execute(
+                f"""
+                WITH label_tokens AS (
+                    SELECT TRIM(COALESCE(alb.label, '')) AS label_disp
+                    FROM files_albums alb
+                    WHERE COALESCE(TRIM(alb.label), '') <> ''
+                      AND {" AND ".join(album_filters)}
+                      AND (%s = '' OR TRIM(COALESCE(alb.label, '')) ILIKE %s)
+                ),
+                norm_tokens AS (
+                    SELECT LOWER(label_disp) AS label_norm, label_disp
+                    FROM label_tokens
+                    WHERE COALESCE(label_disp, '') <> ''
+                ),
+                counts AS (
+                    SELECT label_norm, COUNT(*) AS c
+                    FROM norm_tokens
+                    GROUP BY label_norm
+                ),
+                best_disp AS (
+                    SELECT
+                        label_norm,
+                        label_disp,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY label_norm
+                            ORDER BY COUNT(*) DESC, LENGTH(label_disp) DESC, label_disp ASC
+                        ) AS rn
+                    FROM norm_tokens
+                    GROUP BY label_norm, label_disp
+                )
+                SELECT b.label_disp AS label, c.c
+                FROM counts c
+                JOIN best_disp b ON b.label_norm = c.label_norm AND b.rn = 1
+                ORDER BY c.c DESC, label ASC
+                LIMIT %s OFFSET %s
+                """,
+                (*album_params, search, like, int(limit), int(offset)),
+            )
+            rows = cur.fetchall()
+
+        labels = [{"value": (r[0] or "").strip(), "count": int(r[1] or 0)} for r in rows if str(r[0] or "").strip()]
+        payload = {"labels": labels, "total": total, "limit": int(limit), "offset": int(offset)}
+        _files_cache_set_json(cache_key, payload, ttl=45)
+        return jsonify(payload)
+    finally:
+        conn.close()
+
+
+@app.get("/api/library/genre/<path:genre>/labels")
+def api_library_genre_labels(genre: str):
+    """Return labels publishing a given genre (Files mode only)."""
+    if _get_library_mode() != "files":
+        return jsonify({"genre": genre or "", "album_count": 0, "labels": [], "error": "Files mode required"}), 400
+    ok, err = _ensure_files_index_ready()
+    if not ok:
+        return jsonify({"genre": genre or "", "album_count": 0, "labels": [], "error": err or "Files index unavailable"}), 503
+    g = (genre or "").strip()
+    if not g:
+        return jsonify({"genre": "", "album_count": 0, "labels": [], "error": "Invalid genre"}), 400
+    limit = max(1, min(200, _parse_int_loose(request.args.get("limit"), 80)))
+    refresh = bool(_parse_bool(request.args.get("refresh")))
+    cache_key = f"library:genre:labels:{g.lower()}:{limit}"
+    if not refresh:
+        cached = _files_cache_get_json(cache_key)
+        if cached is not None:
+            return jsonify(cached)
+
+    conn = _files_pg_connect()
+    if conn is None:
+        return jsonify({"genre": g, "album_count": 0, "labels": [], "error": "PostgreSQL unavailable"}), 503
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                WITH matched_albums AS (
+                    SELECT DISTINCT alb.id AS album_id
+                    FROM files_albums alb
+                    WHERE EXISTS (
+                        SELECT 1
+                        FROM jsonb_array_elements_text(COALESCE(alb.tags_json, '[]')::jsonb) AS gg(value)
+                        WHERE lower(trim(gg.value)) = lower(%s)
+                    )
+                    UNION
+                    SELECT DISTINCT alb.id AS album_id
+                    FROM files_albums alb
+                    WHERE COALESCE(alb.tags_json, '[]') = '[]'
+                      AND lower(trim(COALESCE(alb.genre, ''))) = lower(%s)
+                      AND COALESCE(trim(alb.genre), '') <> ''
+                )
+                SELECT COUNT(*) FROM matched_albums
+                """,
+                (g, g),
+            )
+            album_count = int((cur.fetchone() or [0])[0] or 0)
+
+            cur.execute(
+                """
+                WITH matched_albums AS (
+                    SELECT DISTINCT alb.id AS album_id
+                    FROM files_albums alb
+                    WHERE EXISTS (
+                        SELECT 1
+                        FROM jsonb_array_elements_text(COALESCE(alb.tags_json, '[]')::jsonb) AS gg(value)
+                        WHERE lower(trim(gg.value)) = lower(%s)
+                    )
+                    UNION
+                    SELECT DISTINCT alb.id AS album_id
+                    FROM files_albums alb
+                    WHERE COALESCE(alb.tags_json, '[]') = '[]'
+                      AND lower(trim(COALESCE(alb.genre, ''))) = lower(%s)
+                      AND COALESCE(trim(alb.genre), '') <> ''
+                ),
+                label_tokens AS (
+                    SELECT TRIM(COALESCE(alb.label, '')) AS label_disp
+                    FROM files_albums alb
+                    JOIN matched_albums m ON m.album_id = alb.id
+                    WHERE COALESCE(TRIM(alb.label), '') <> ''
+                ),
+                norm_tokens AS (
+                    SELECT LOWER(label_disp) AS label_norm, label_disp
+                    FROM label_tokens
+                    WHERE COALESCE(label_disp, '') <> ''
+                ),
+                counts AS (
+                    SELECT label_norm, COUNT(*) AS c
+                    FROM norm_tokens
+                    GROUP BY label_norm
+                ),
+                best_disp AS (
+                    SELECT
+                        label_norm,
+                        label_disp,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY label_norm
+                            ORDER BY COUNT(*) DESC, LENGTH(label_disp) DESC, label_disp ASC
+                        ) AS rn
+                    FROM norm_tokens
+                    GROUP BY label_norm, label_disp
+                )
+                SELECT b.label_disp AS label, c.c
+                FROM counts c
+                JOIN best_disp b ON b.label_norm = c.label_norm AND b.rn = 1
+                ORDER BY c.c DESC, label ASC
+                LIMIT %s
+                """,
+                (g, g, int(limit)),
+            )
+            rows = cur.fetchall()
+
+        labels = [{"label": (r[0] or "").strip(), "count": int(r[1] or 0)} for r in rows if str(r[0] or "").strip()]
+        payload = {"genre": g, "album_count": int(album_count), "labels": labels}
+        _files_cache_set_json(cache_key, payload, ttl=60)
+        return jsonify(payload)
+    finally:
+        conn.close()
+
+
+@app.get("/api/library/recently-played/albums")
+def api_library_recently_played_albums():
+    """Return recently played albums based on listening telemetry (Files mode only)."""
+    if _get_library_mode() != "files":
+        return jsonify({"days": 0, "limit": 0, "generated_at": int(time.time()), "albums": [], "error": "Files mode required"}), 400
+    ok, err = _ensure_files_index_ready()
+    if not ok:
+        return jsonify({"days": 0, "limit": 0, "generated_at": int(time.time()), "albums": [], "error": err or "Files index unavailable"}), 503
+
+    days = max(7, min(365, _parse_int_loose(request.args.get("days"), 90)))
+    limit = max(1, min(60, _parse_int_loose(request.args.get("limit"), 18)))
+    refresh = bool(_parse_bool(request.args.get("refresh")))
+
+    cache_key = f"library:recently_played_albums:{days}:{limit}"
+    if not refresh:
+        cached = _files_cache_get_json(cache_key)
+        if cached is not None:
+            return jsonify(cached)
+
+    conn = _files_pg_connect()
+    if conn is None:
+        return jsonify({"days": days, "limit": limit, "generated_at": int(time.time()), "albums": [], "error": "PostgreSQL unavailable"}), 503
+    try:
+        base_url = request.url_root.rstrip("/")
+        with conn.cursor() as cur:
+            # Prefer explicit playback telemetry; fall back to reco telemetry when empty.
+            cur.execute(
+                """
+                SELECT COUNT(*)
+                FROM files_playback_events
+                WHERE user_id = 1
+                  AND created_at >= NOW() - (%s || ' days')::interval
+                  AND played_seconds >= 12
+                """,
+                (int(days),),
+            )
+            playback_count = int((cur.fetchone() or [0])[0] or 0)
+            use_reco = playback_count <= 0
+            ev_table = "files_reco_events" if use_reco else "files_playback_events"
+            ev_user_filter = "1=1" if use_reco else "e.user_id = 1"
+
+            cur.execute(
+                f"""
+                SELECT
+                    t.album_id,
+                    MAX(e.created_at) AS last_played_at
+                FROM {ev_table} e
+                JOIN files_tracks t ON t.id = e.track_id
+                WHERE {ev_user_filter}
+                  AND e.created_at >= NOW() - (%s || ' days')::interval
+                  AND COALESCE(e.played_seconds, 0) >= 12
+                GROUP BY t.album_id
+                ORDER BY last_played_at DESC
+                LIMIT %s
+                """,
+                (int(days), int(limit)),
+            )
+            rows = cur.fetchall()
+
+            album_ids: list[int] = []
+            last_played: dict[int, int] = {}
+            for album_id, ts in rows:
+                try:
+                    aid = int(album_id or 0)
+                except Exception:
+                    aid = 0
+                if aid <= 0:
+                    continue
+                album_ids.append(aid)
+                last_played[aid] = int(_dt_to_epoch(ts)) if ts else 0
+
+            albums_out: list[dict] = []
+            if album_ids:
+                cur.execute(
+                    """
+                    WITH ids AS (
+                        SELECT album_id, ord
+                        FROM unnest(%s::bigint[]) WITH ORDINALITY AS u(album_id, ord)
+                    )
+                    SELECT
+                        alb.id,
+                        alb.title,
+                        COALESCE(alb.year, 0) AS year,
+                        COALESCE(alb.genre, '') AS genre,
+                        COALESCE(alb.label, '') AS label,
+                        COALESCE(alb.tags_json, '[]') AS tags_json,
+                        alb.track_count,
+                        COALESCE(alb.format, '') AS format,
+                        alb.is_lossless,
+                        alb.has_cover,
+                        ar.id AS artist_id,
+                        ar.name AS artist_name,
+                        COALESCE(pr.short_description, '') AS short_description,
+                        COALESCE(pr.source, '') AS profile_source,
+                        ids.ord
+                    FROM ids
+                    JOIN files_albums alb ON alb.id = ids.album_id
+                    JOIN files_artists ar ON ar.id = alb.artist_id
+                    LEFT JOIN files_album_profiles pr
+                           ON pr.artist_norm = ar.name_norm
+                          AND pr.title_norm = alb.title_norm
+                    ORDER BY ids.ord ASC
+                    """,
+                    (album_ids,),
+                )
+                alb_rows = cur.fetchall()
+                for album_id, title, year, genre, label, tags_json, track_count, fmt, is_lossless, has_cover, artist_id, artist_name, short_desc, profile_source, _ord in alb_rows:
+                    aid = int(album_id or 0)
+                    arid = int(artist_id or 0)
+                    thumb = f"{base_url}/api/library/files/album/{aid}/cover?size=512" if bool(has_cover) else None
+                    short_desc_clean = (short_desc or "").strip()
+                    genres_list: list[str] = []
+                    try:
+                        tags_list = json.loads(tags_json) if tags_json else []
+                        if isinstance(tags_list, list):
+                            for t in tags_list:
+                                v = str(t or "").strip()
+                                if v:
+                                    genres_list.append(v)
+                    except Exception:
+                        genres_list = []
+                    if not genres_list:
+                        try:
+                            genres_list = _split_genre_values(genre or "")
+                        except Exception:
+                            genres_list = []
+                    if genres_list:
+                        seen = set()
+                        deduped = []
+                        for g in genres_list:
+                            gg = re.sub(r"\\s+", " ", (g or "").strip())
+                            if not gg:
+                                continue
+                            key = gg.lower()
+                            if key in seen:
+                                continue
+                            seen.add(key)
+                            deduped.append(gg)
+                        genres_list = deduped[:20]
+                    albums_out.append(
+                        {
+                            "album_id": aid,
+                            "title": title or "",
+                            "year": int(year or 0) or None,
+                            "genre": (genre or "").strip() or None,
+                            "genres": genres_list,
+                            "label": (label or "").strip() or None,
+                            "track_count": int(track_count or 0),
+                            "format": (fmt or "").strip() or None,
+                            "is_lossless": bool(is_lossless),
+                            "thumb": thumb,
+                            "artist_id": arid,
+                            "artist_name": artist_name or "",
+                            "short_description": short_desc_clean or None,
+                            "profile_source": (profile_source or "").strip() or None,
+                            "last_played_at": int(last_played.get(aid) or 0),
+                        }
+                    )
+
+        payload = {
+            "days": int(days),
+            "limit": int(limit),
+            "generated_at": int(time.time()),
+            "source": "reco" if bool(use_reco) else "playback",
+            "albums": albums_out,
+        }
+        _files_cache_set_json(cache_key, payload, ttl=30)
+        return jsonify(payload)
+    finally:
+        conn.close()
+
+
+@app.get("/api/library/playlists")
+def api_library_playlists():
+    """List local playlists (Files mode only)."""
+    if _get_library_mode() != "files":
+        return jsonify({"playlists": [], "error": "Files mode required"}), 400
+    ok, err = _ensure_files_index_ready()
+    if not ok:
+        return jsonify({"playlists": [], "error": err or "Files index unavailable"}), 503
+    conn = _files_pg_connect()
+    if conn is None:
+        return jsonify({"playlists": [], "error": "PostgreSQL unavailable"}), 503
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    pl.id,
+                    pl.name,
+                    COALESCE(pl.description, '') AS description,
+                    pl.updated_at,
+                    COUNT(it.id) AS item_count
+                FROM files_playlists pl
+                LEFT JOIN files_playlist_items it ON it.playlist_id = pl.id
+                GROUP BY pl.id
+                ORDER BY pl.updated_at DESC, pl.id DESC
+                """
+            )
+            rows = cur.fetchall()
+        playlists = [
+            {
+                "playlist_id": int(r[0]),
+                "name": r[1] or "",
+                "description": r[2] or "",
+                "item_count": int(r[4] or 0),
+                "updated_at": int(_dt_to_epoch(r[3])) if r[3] else 0,
+            }
+            for r in rows
+        ]
+        return jsonify({"playlists": playlists})
+    finally:
+        conn.close()
+
+
+@app.post("/api/library/playlists")
+def api_library_playlists_create():
+    """Create a local playlist (Files mode only)."""
+    if _get_library_mode() != "files":
+        return jsonify({"error": "Files mode required"}), 400
+    ok, err = _ensure_files_index_ready()
+    if not ok:
+        return jsonify({"error": err or "Files index unavailable"}), 503
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        data = {}
+    name = str(data.get("name") or "").strip()
+    description = str(data.get("description") or "").strip() or None
+    if not name:
+        return jsonify({"error": "name is required"}), 400
+    if len(name) > 160:
+        return jsonify({"error": "name too long"}), 400
+    conn = _files_pg_connect()
+    if conn is None:
+        return jsonify({"error": "PostgreSQL unavailable"}), 503
+    try:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO files_playlists(name, description, created_at, updated_at) VALUES (%s, %s, NOW(), NOW()) RETURNING id",
+                    (name, description),
+                )
+                pid = int((cur.fetchone() or [0])[0] or 0)
+        return jsonify({"playlist_id": pid, "name": name, "description": description or "", "item_count": 0, "updated_at": int(time.time())})
+    finally:
+        conn.close()
+
+
+@app.get("/api/library/playlists/<int:playlist_id>")
+def api_library_playlist_detail(playlist_id: int):
+    """Return playlist details and items (Files mode only)."""
+    if _get_library_mode() != "files":
+        return jsonify({"error": "Files mode required"}), 400
+    ok, err = _ensure_files_index_ready()
+    if not ok:
+        return jsonify({"error": err or "Files index unavailable"}), 503
+    conn = _files_pg_connect()
+    if conn is None:
+        return jsonify({"error": "PostgreSQL unavailable"}), 503
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, name, COALESCE(description, ''), updated_at FROM files_playlists WHERE id = %s", (int(playlist_id),))
+            pl = cur.fetchone()
+            if not pl:
+                return jsonify({"error": "Playlist not found"}), 404
+            cur.execute(
+                """
+                SELECT
+                    it.id AS item_id,
+                    it.position,
+                    it.added_at,
+                    tr.id AS track_id,
+                    tr.title AS track_title,
+                    tr.duration_sec,
+                    tr.track_num,
+                    tr.disc_num,
+                    alb.id AS album_id,
+                    alb.title AS album_title,
+                    alb.has_cover,
+                    art.id AS artist_id,
+                    art.name AS artist_name
+                FROM files_playlist_items it
+                JOIN files_tracks tr ON tr.id = it.track_id
+                JOIN files_albums alb ON alb.id = tr.album_id
+                JOIN files_artists art ON art.id = alb.artist_id
+                WHERE it.playlist_id = %s
+                ORDER BY it.position ASC, it.id ASC
+                """,
+                (int(playlist_id),),
+            )
+            rows = cur.fetchall()
+        base_url = request.url_root.rstrip("/")
+        items: list[dict] = []
+        for r in rows:
+            item_id = int(r[0] or 0)
+            track_id = int(r[3] or 0)
+            album_id = int(r[8] or 0)
+            has_cover = bool(r[10])
+            items.append(
+                {
+                    "item_id": item_id,
+                    "position": int(r[1] or 0),
+                    "added_at": int(_dt_to_epoch(r[2])) if r[2] else 0,
+                    "track": {
+                        "track_id": track_id,
+                        "title": r[4] or "",
+                        "artist_id": int(r[11] or 0),
+                        "artist_name": r[12] or "",
+                        "album_id": album_id,
+                        "album_title": r[9] or "",
+                        "duration_sec": int(r[5] or 0),
+                        "track_num": int(r[6] or 0),
+                        "disc_num": int(r[7] or 0),
+                        "thumb": f"{base_url}/api/library/files/album/{album_id}/cover?size=96" if has_cover else None,
+                        "file_url": f"{base_url}/api/library/track/{track_id}/stream",
+                    },
+                }
+            )
+        return jsonify(
+            {
+                "playlist_id": int(pl[0]),
+                "name": pl[1] or "",
+                "description": pl[2] or "",
+                "updated_at": int(_dt_to_epoch(pl[3])) if pl[3] else 0,
+                "items": items,
+            }
+        )
+    finally:
+        conn.close()
+
+
+@app.delete("/api/library/playlists/<int:playlist_id>")
+def api_library_playlist_delete(playlist_id: int):
+    """Delete a playlist (Files mode only)."""
+    if _get_library_mode() != "files":
+        return jsonify({"error": "Files mode required"}), 400
+    ok, err = _ensure_files_index_ready()
+    if not ok:
+        return jsonify({"error": err or "Files index unavailable"}), 503
+    conn = _files_pg_connect()
+    if conn is None:
+        return jsonify({"error": "PostgreSQL unavailable"}), 503
+    try:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM files_playlists WHERE id = %s", (int(playlist_id),))
+                if cur.rowcount <= 0:
+                    return jsonify({"error": "Playlist not found"}), 404
+        return jsonify({"ok": True, "playlist_id": int(playlist_id)})
+    finally:
+        conn.close()
+
+
+@app.post("/api/library/playlists/<int:playlist_id>/items")
+def api_library_playlist_items_add(playlist_id: int):
+    """Append tracks (or an album) to a playlist (Files mode only)."""
+    if _get_library_mode() != "files":
+        return jsonify({"error": "Files mode required"}), 400
+    ok, err = _ensure_files_index_ready()
+    if not ok:
+        return jsonify({"error": err or "Files index unavailable"}), 503
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        data = {}
+    track_ids_raw = data.get("track_ids")
+    track_id_single = _parse_int_loose(data.get("track_id"), 0)
+    album_id = _parse_int_loose(data.get("album_id"), 0)
+
+    track_ids: list[int] = []
+    if isinstance(track_ids_raw, list):
+        for x in track_ids_raw:
+            tid = _parse_int_loose(x, 0)
+            if tid > 0:
+                track_ids.append(int(tid))
+    if track_id_single > 0:
+        track_ids.append(int(track_id_single))
+
+    conn = _files_pg_connect()
+    if conn is None:
+        return jsonify({"error": "PostgreSQL unavailable"}), 503
+    try:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute("SELECT id FROM files_playlists WHERE id = %s", (int(playlist_id),))
+                if not cur.fetchone():
+                    return jsonify({"error": "Playlist not found"}), 404
+
+                # Expand album -> tracks (ordered).
+                if album_id > 0:
+                    cur.execute(
+                        """
+                        SELECT id
+                        FROM files_tracks
+                        WHERE album_id = %s
+                        ORDER BY disc_num ASC, track_num ASC, id ASC
+                        """,
+                        (int(album_id),),
+                    )
+                    for (tid,) in cur.fetchall():
+                        tid_int = int(tid or 0)
+                        if tid_int > 0:
+                            track_ids.append(tid_int)
+
+                # Deduplicate while preserving order.
+                seen = set()
+                track_ids = [t for t in track_ids if not (t in seen or seen.add(t))]
+                if not track_ids:
+                    return jsonify({"error": "track_ids (or album_id) required"}), 400
+
+                cur.execute("SELECT COALESCE(MAX(position), -1) FROM files_playlist_items WHERE playlist_id = %s", (int(playlist_id),))
+                max_pos = int((cur.fetchone() or [-1])[0] or -1)
+                pos = max_pos + 1
+                inserted = 0
+                for tid in track_ids:
+                    cur.execute(
+                        """
+                        INSERT INTO files_playlist_items(playlist_id, track_id, position, added_at)
+                        VALUES (%s, %s, %s, NOW())
+                        """,
+                        (int(playlist_id), int(tid), int(pos)),
+                    )
+                    inserted += 1
+                    pos += 1
+                cur.execute("UPDATE files_playlists SET updated_at = NOW() WHERE id = %s", (int(playlist_id),))
+        return jsonify({"ok": True, "playlist_id": int(playlist_id), "inserted": int(inserted)})
+    finally:
+        conn.close()
+
+
+@app.delete("/api/library/playlists/<int:playlist_id>/items/<int:item_id>")
+def api_library_playlist_item_delete(playlist_id: int, item_id: int):
+    """Remove a single playlist item (Files mode only)."""
+    if _get_library_mode() != "files":
+        return jsonify({"error": "Files mode required"}), 400
+    ok, err = _ensure_files_index_ready()
+    if not ok:
+        return jsonify({"error": err or "Files index unavailable"}), 503
+    conn = _files_pg_connect()
+    if conn is None:
+        return jsonify({"error": "PostgreSQL unavailable"}), 503
+    try:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM files_playlist_items WHERE id = %s AND playlist_id = %s",
+                    (int(item_id), int(playlist_id)),
+                )
+                if cur.rowcount <= 0:
+                    return jsonify({"error": "Item not found"}), 404
+                cur.execute("UPDATE files_playlists SET updated_at = NOW() WHERE id = %s", (int(playlist_id),))
+        return jsonify({"ok": True, "playlist_id": int(playlist_id), "item_id": int(item_id)})
+    finally:
+        conn.close()
+
+
+@app.post("/api/library/playlists/<int:playlist_id>/reorder")
+def api_library_playlist_reorder(playlist_id: int):
+    """Reorder playlist items by item_id list (Files mode only)."""
+    if _get_library_mode() != "files":
+        return jsonify({"error": "Files mode required"}), 400
+    ok, err = _ensure_files_index_ready()
+    if not ok:
+        return jsonify({"error": err or "Files index unavailable"}), 503
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        data = {}
+    item_ids_raw = data.get("item_ids")
+    if not isinstance(item_ids_raw, list) or not item_ids_raw:
+        return jsonify({"error": "item_ids is required"}), 400
+    item_ids: list[int] = []
+    for x in item_ids_raw:
+        iid = _parse_int_loose(x, 0)
+        if iid > 0:
+            item_ids.append(int(iid))
+    if not item_ids:
+        return jsonify({"error": "item_ids is required"}), 400
+
+    conn = _files_pg_connect()
+    if conn is None:
+        return jsonify({"error": "PostgreSQL unavailable"}), 503
+    try:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute("SELECT id FROM files_playlists WHERE id = %s", (int(playlist_id),))
+                if not cur.fetchone():
+                    return jsonify({"error": "Playlist not found"}), 404
+                for idx, iid in enumerate(item_ids):
+                    cur.execute(
+                        "UPDATE files_playlist_items SET position = %s WHERE id = %s AND playlist_id = %s",
+                        (int(idx), int(iid), int(playlist_id)),
+                    )
+                cur.execute("UPDATE files_playlists SET updated_at = NOW() WHERE id = %s", (int(playlist_id),))
+        return jsonify({"ok": True, "playlist_id": int(playlist_id), "count": len(item_ids)})
+    finally:
+        conn.close()
+
+
 @app.post("/api/library/reco/event")
 def api_library_reco_event():
     """Record a playback/session event for recommendation ranking (Files mode)."""
@@ -23463,12 +31389,271 @@ def api_library_reco_event():
     if conn is None:
         return jsonify({"error": "PostgreSQL unavailable"}), 503
     try:
-        with conn:
+        with conn.transaction():
             success, message = _reco_record_event(conn, session_id, track_id, event_type, played_seconds)
         if not success:
             status = 404 if "track not found" in message else 400
             return jsonify({"error": message}), status
         return jsonify({"ok": True, "session_id": session_id, "track_id": track_id, "event_type": event_type})
+    finally:
+        conn.close()
+
+
+@app.post("/api/library/playback/event")
+def api_library_playback_event():
+    """Record a listening event (Files mode). Used for user listening statistics charts."""
+    if _get_library_mode() != "files":
+        return jsonify({"error": "Files mode required"}), 400
+    ok, err = _ensure_files_index_ready()
+    if not ok:
+        return jsonify({"error": err or "Files index unavailable"}), 503
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        data = {}
+    track_id = _parse_int_loose(data.get("track_id"), 0)
+    event_type = str(data.get("event_type") or "").strip().lower() or "play_partial"
+    played_seconds = _parse_int_loose(data.get("played_seconds"), 0)
+    user_id = 1
+    if track_id <= 0:
+        return jsonify({"error": "track_id is required"}), 400
+    if played_seconds < 0:
+        played_seconds = 0
+    if event_type not in {"play_complete", "play_partial", "skip", "stop", "play_start"}:
+        event_type = "play_partial"
+
+    conn = _files_pg_connect()
+    if conn is None:
+        return jsonify({"error": "PostgreSQL unavailable"}), 503
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT duration_sec FROM files_tracks WHERE id = %s", (int(track_id),))
+            row = cur.fetchone()
+            if not row:
+                return jsonify({"error": "track not found"}), 404
+            dur = int(row[0] or 0)
+        if dur > 0:
+            played_seconds = max(0, min(int(played_seconds), int(dur)))
+        else:
+            played_seconds = max(0, min(int(played_seconds), 60 * 60 * 8))
+
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO files_playback_events(user_id, track_id, event_type, played_seconds, created_at)
+                    VALUES (%s, %s, %s, %s, NOW())
+                    """,
+                    (int(user_id), int(track_id), str(event_type), int(played_seconds)),
+                )
+        return jsonify({"ok": True, "track_id": int(track_id), "event_type": event_type, "played_seconds": int(played_seconds)})
+    finally:
+        conn.close()
+
+
+@app.get("/api/library/playback/stats")
+def api_library_playback_stats():
+    """Return listening statistics for charts (Files mode)."""
+    if _get_library_mode() != "files":
+        return jsonify({"error": "Files mode required"}), 400
+    ok, err = _ensure_files_index_ready()
+    if not ok:
+        return jsonify({"error": err or "Files index unavailable"}), 503
+    days = max(1, min(365, _parse_int_loose(request.args.get("days"), 30)))
+    user_id = 1
+
+    conn = _files_pg_connect()
+    if conn is None:
+        return jsonify({"error": "PostgreSQL unavailable"}), 503
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                WITH filtered AS (
+                    SELECT track_id, event_type, played_seconds, created_at
+                    FROM files_playback_events
+                    WHERE user_id = %s
+                      AND created_at >= NOW() - (%s || ' days')::interval
+                )
+                SELECT
+                    COALESCE(SUM(played_seconds), 0) AS total_seconds,
+                    COUNT(*) AS events,
+                    COUNT(DISTINCT track_id) AS distinct_tracks
+                FROM filtered
+                """,
+                (int(user_id), int(days)),
+            )
+            row = cur.fetchone() or [0, 0, 0]
+            total_seconds = int(row[0] or 0)
+            events = int(row[1] or 0)
+            distinct_tracks = int(row[2] or 0)
+
+            cur.execute(
+                """
+                WITH filtered AS (
+                    SELECT track_id, event_type, played_seconds, created_at
+                    FROM files_playback_events
+                    WHERE user_id = %s
+                      AND created_at >= NOW() - (%s || ' days')::interval
+                )
+                SELECT
+                    ar.id AS artist_id,
+                    ar.name AS artist_name,
+                    COALESCE(SUM(f.played_seconds), 0) AS seconds,
+                    COUNT(*) AS plays
+                FROM filtered f
+                JOIN files_tracks tr ON tr.id = f.track_id
+                JOIN files_albums alb ON alb.id = tr.album_id
+                JOIN files_artists ar ON ar.id = alb.artist_id
+                GROUP BY ar.id, ar.name
+                ORDER BY seconds DESC, plays DESC, artist_name ASC
+                LIMIT 10
+                """
+            , (int(user_id), int(days)))
+            top_artists = [
+                {"artist_id": int(r[0] or 0), "artist_name": r[1] or "", "seconds": int(r[2] or 0), "plays": int(r[3] or 0)}
+                for r in cur.fetchall()
+                if int(r[0] or 0) > 0
+            ]
+
+            cur.execute(
+                """
+                WITH filtered AS (
+                    SELECT track_id, event_type, played_seconds, created_at
+                    FROM files_playback_events
+                    WHERE user_id = %s
+                      AND created_at >= NOW() - (%s || ' days')::interval
+                )
+                SELECT
+                    tr.id AS track_id,
+                    tr.title AS track_title,
+                    ar.id AS artist_id,
+                    ar.name AS artist_name,
+                    alb.id AS album_id,
+                    alb.title AS album_title,
+                    COALESCE(SUM(f.played_seconds), 0) AS seconds,
+                    COUNT(*) AS plays
+                FROM filtered f
+                JOIN files_tracks tr ON tr.id = f.track_id
+                JOIN files_albums alb ON alb.id = tr.album_id
+                JOIN files_artists ar ON ar.id = alb.artist_id
+                GROUP BY tr.id, tr.title, ar.id, ar.name, alb.id, alb.title
+                ORDER BY seconds DESC, plays DESC, track_title ASC
+                LIMIT 10
+                """
+            , (int(user_id), int(days)))
+            top_tracks = [
+                {
+                    "track_id": int(r[0] or 0),
+                    "track_title": r[1] or "",
+                    "artist_id": int(r[2] or 0),
+                    "artist_name": r[3] or "",
+                    "album_id": int(r[4] or 0),
+                    "album_title": r[5] or "",
+                    "seconds": int(r[6] or 0),
+                    "plays": int(r[7] or 0),
+                }
+                for r in cur.fetchall()
+                if int(r[0] or 0) > 0
+            ]
+
+            # Genres: split seconds across tags_json elements to avoid inflating totals.
+            cur.execute(
+                """
+                WITH filtered AS (
+                    SELECT track_id, played_seconds, created_at
+                    FROM files_playback_events
+                    WHERE user_id = %s
+                      AND created_at >= NOW() - (%s || ' days')::interval
+                ),
+                joined AS (
+                    SELECT
+                        f.played_seconds,
+                        COALESCE(NULLIF(alb.tags_json, ''), '[]')::jsonb AS tags
+                    FROM filtered f
+                    JOIN files_tracks tr ON tr.id = f.track_id
+                    JOIN files_albums alb ON alb.id = tr.album_id
+                ),
+                expanded AS (
+                    SELECT
+                        lower(trim(g.value)) AS genre,
+                        (joined.played_seconds::double precision / GREATEST(1, jsonb_array_length(joined.tags))) AS sec_share
+                    FROM joined
+                    JOIN LATERAL jsonb_array_elements_text(joined.tags) AS g(value) ON TRUE
+                    WHERE COALESCE(trim(g.value), '') <> ''
+                )
+                SELECT genre, ROUND(SUM(sec_share))::BIGINT AS seconds
+                FROM expanded
+                GROUP BY genre
+                ORDER BY seconds DESC, genre ASC
+                LIMIT 10
+                """
+            , (int(user_id), int(days)))
+            top_genres = [{"genre": str(r[0] or ""), "seconds": int(r[1] or 0)} for r in cur.fetchall() if str(r[0] or "").strip()]
+
+            cur.execute(
+                """
+                WITH filtered AS (
+                    SELECT track_id, event_type, played_seconds, created_at
+                    FROM files_playback_events
+                    WHERE user_id = %s
+                      AND created_at >= NOW() - (%s || ' days')::interval
+                )
+                SELECT to_char(date_trunc('day', created_at), 'YYYY-MM-DD') AS day,
+                       COALESCE(SUM(played_seconds), 0) AS seconds,
+                       COUNT(*) AS plays
+                FROM filtered
+                GROUP BY day
+                ORDER BY day ASC
+                """
+            , (int(user_id), int(days)))
+            daily = [{"day": str(r[0] or ""), "seconds": int(r[1] or 0), "plays": int(r[2] or 0)} for r in cur.fetchall() if str(r[0] or "").strip()]
+
+            cur.execute(
+                """
+                WITH filtered AS (
+                    SELECT event_type, played_seconds, created_at
+                    FROM files_playback_events
+                    WHERE user_id = %s
+                      AND created_at >= NOW() - (%s || ' days')::interval
+                )
+                SELECT event_type, COUNT(*) AS c
+                FROM filtered
+                GROUP BY event_type
+                ORDER BY c DESC, event_type ASC
+                """
+            , (int(user_id), int(days)))
+            event_types = [{"event_type": str(r[0] or ""), "count": int(r[1] or 0)} for r in cur.fetchall() if str(r[0] or "").strip()]
+
+            cur.execute(
+                """
+                WITH filtered AS (
+                    SELECT played_seconds, created_at
+                    FROM files_playback_events
+                    WHERE user_id = %s
+                      AND created_at >= NOW() - (%s || ' days')::interval
+                )
+                SELECT EXTRACT(HOUR FROM created_at)::INT AS hour, COALESCE(SUM(played_seconds), 0) AS seconds
+                FROM filtered
+                GROUP BY hour
+                ORDER BY hour ASC
+                """
+            , (int(user_id), int(days)))
+            hours = [{"hour": int(r[0] or 0), "seconds": int(r[1] or 0)} for r in cur.fetchall()]
+
+        return jsonify(
+            {
+                "days": int(days),
+                "total_seconds": total_seconds,
+                "events": events,
+                "distinct_tracks": distinct_tracks,
+                "top_artists": top_artists,
+                "top_tracks": top_tracks,
+                "top_genres": top_genres,
+                "daily": daily,
+                "event_types": event_types,
+                "hours": hours,
+            }
+        )
     finally:
         conn.close()
 
@@ -23679,8 +31864,45 @@ def api_library_artist_detail(artist_id):
                 })
 
             artist_thumb = None
+            base_url = request.url_root.rstrip("/")
             if has_artist_image and artist_image_path:
-                artist_thumb = f"{request.url_root.rstrip('/')}/api/library/files/artist/{artist_id}/image?size=320"
+                artist_thumb = f"{base_url}/api/library/files/artist/{artist_id}/image?size=320"
+            else:
+                # External cached image (e.g. Last.fm) for artists without on-disk artwork.
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "SELECT COALESCE(image_path,'') FROM files_external_artist_images WHERE name_norm = %s",
+                            (artist_norm,),
+                        )
+                        erow = cur.fetchone()
+                    ext_path = (erow[0] or "").strip() if erow else ""
+                    if ext_path and Path(ext_path).exists():
+                        artist_thumb = f"{base_url}/api/library/external/artist-image/{quote(artist_norm, safe='')}?size=320"
+                except Exception:
+                    pass
+            # Patch similar artists with local IDs + images (local first, then cached external).
+            try:
+                if isinstance(artist_profile, dict):
+                    sim = artist_profile.get("similar_artists")
+                    if isinstance(sim, list) and sim:
+                        artist_profile = dict(artist_profile)
+                        artist_profile["similar_artists"] = _files_attach_similar_artist_refs(conn, sim, base_url)
+                        # If images are still missing (e.g. provider only returned placeholders),
+                        # warm external image cache in the background so the grid becomes pretty.
+                        missing_names: list[str] = []
+                        for it in artist_profile.get("similar_artists") or []:
+                            if not isinstance(it, dict):
+                                continue
+                            nm = str(it.get("name") or "").strip()
+                            if not nm:
+                                continue
+                            if not str(it.get("image_url") or "").strip():
+                                missing_names.append(nm)
+                        if missing_names:
+                            _enqueue_files_similar_images_warm(artist_norm, missing_names[:12])
+            except Exception:
+                pass
             payload = {
                 "artist_id": artist_id,
                 "artist_name": artist_name,
@@ -24037,27 +32259,1073 @@ def api_library_artist_profile(artist_id: int):
                 (artist_id,),
             )
             albums = [(str(r[0] or ""), str(r[1] or "")) for r in cur.fetchall()]
+        profile = _files_get_artist_profile_cached(artist_name, artist_norm)
+        force_refresh = str(request.args.get("refresh", "")).strip().lower() in {"1", "true", "yes"}
+        should_enrich = force_refresh or (not bool(profile.get("short_bio"))) or bool(profile.get("stale"))
+        enriching = False
+        if should_enrich:
+            enriching = _enqueue_files_profile_enrichment(artist_name, artist_norm, albums)
+
+        # Attach local IDs + images to similar artists.
+        base_url = request.url_root.rstrip("/")
+        try:
+            if isinstance(profile, dict):
+                sim = profile.get("similar_artists")
+                if isinstance(sim, list) and sim:
+                    profile = dict(profile)
+                    profile["similar_artists"] = _files_attach_similar_artist_refs(conn, sim, base_url)
+        except Exception:
+            pass
+
+        album_profiles = _files_get_album_profiles_cached(artist_norm, [norm for _, norm in albums if norm])
+        return jsonify(
+            {
+                "artist_id": artist_id,
+                "artist_name": artist_name,
+                "artist_norm": artist_norm,
+                "profile": profile,
+                "album_profiles": album_profiles,
+                "enriching": enriching,
+            }
+        )
     finally:
         conn.close()
 
-    profile = _files_get_artist_profile_cached(artist_name, artist_norm)
-    force_refresh = str(request.args.get("refresh", "")).strip().lower() in {"1", "true", "yes"}
-    should_enrich = force_refresh or (not bool(profile.get("short_bio"))) or bool(profile.get("stale"))
-    enriching = False
-    if should_enrich:
-        enriching = _enqueue_files_profile_enrichment(artist_name, artist_norm, albums)
 
-    album_profiles = _files_get_album_profiles_cached(artist_norm, [norm for _, norm in albums if norm])
-    return jsonify(
-        {
-            "artist_id": artist_id,
-            "artist_name": artist_name,
-            "artist_norm": artist_norm,
-            "profile": profile,
-            "album_profiles": album_profiles,
-            "enriching": enriching,
-        }
-    )
+def _assistant_preferred_lang() -> str:
+    try:
+        raw = (request.headers.get("Accept-Language") or "").lower()
+    except Exception:
+        raw = ""
+    # Very small heuristic (good enough for UI defaults).
+    if "fr" in raw:
+        return "fr"
+    if "en" in raw:
+        return "en"
+    return "en"
+
+
+@app.get("/api/library/artist/<int:artist_id>/summary")
+def api_library_artist_summary(artist_id: int):
+    """Return original vs AI summary for an artist (Files mode only)."""
+    if _get_library_mode() != "files":
+        return jsonify({"error": "Artist summary endpoint is available in Files mode only"}), 400
+    ok, err = _ensure_files_index_ready()
+    if not ok:
+        return jsonify({"error": err or "Files index unavailable"}), 503
+    conn = _files_pg_connect()
+    if conn is None:
+        return jsonify({"error": "PostgreSQL unavailable"}), 503
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, name, name_norm FROM files_artists WHERE id = %s", (int(artist_id),))
+            row = cur.fetchone()
+            if not row:
+                return jsonify({"error": "Artist not found"}), 404
+            artist_name = (row[1] or "").strip()
+            artist_norm = (row[2] or "").strip() or " ".join((artist_name or "").split()).lower()
+
+            cur.execute(
+                """
+                SELECT bio, short_bio, source, updated_at
+                FROM files_artist_profiles
+                WHERE name_norm = %s
+                """,
+                (artist_norm,),
+            )
+            prof_row = cur.fetchone()
+            original_text = ""
+            original_source = ""
+            original_updated_at = 0
+            if prof_row:
+                # Prefer long-form bio, fall back to short.
+                original_text = (prof_row[0] or "").strip() or (prof_row[1] or "").strip()
+                original_source = (prof_row[2] or "").strip()
+                original_updated_at = int(_dt_to_epoch(prof_row[3])) if prof_row[3] else 0
+            # Hide garbage bios (e.g. "Read more on Last.fm") so UI can fall back to AI.
+            if _is_garbage_bio(original_text):
+                original_text = ""
+
+            cur.execute(
+                """
+                SELECT content, source, provider, model, lang, updated_at
+                FROM assistant_docs
+                WHERE entity_type = 'artist'
+                  AND entity_id = %s
+                  AND doc_type = %s
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                (int(artist_id), "artist_summary_ai"),
+            )
+            ai_row = cur.fetchone()
+            ai_text = ""
+            ai_source = ""
+            ai_provider = ""
+            ai_model = ""
+            ai_lang = ""
+            ai_updated_at = 0
+            if ai_row:
+                ai_text = (ai_row[0] or "").strip()
+                ai_source = (ai_row[1] or "").strip()
+                ai_provider = (ai_row[2] or "").strip()
+                ai_model = (ai_row[3] or "").strip()
+                ai_lang = (ai_row[4] or "").strip()
+                ai_updated_at = int(_dt_to_epoch(ai_row[5])) if ai_row[5] else 0
+                # Back-compat: older rows used internal markers like "ai_generated".
+                if ai_source.lower() in {"ai_generated", "ai"}:
+                    ai_source = "web"
+
+        return jsonify(
+            {
+                "artist_id": int(artist_id),
+                "artist_name": artist_name,
+                "original": {
+                    "text": original_text,
+                    "source": original_source,
+                    "updated_at": original_updated_at,
+                },
+                "ai": {
+                    "text": ai_text,
+                    "source": ai_source,
+                    "provider": ai_provider,
+                    "model": ai_model,
+                    "lang": ai_lang,
+                    "updated_at": ai_updated_at,
+                },
+            }
+        )
+    finally:
+        conn.close()
+
+
+@app.post("/api/library/artist/<int:artist_id>/summary/ai")
+def api_library_artist_summary_ai(artist_id: int):
+    """Generate/refresh an AI summary (100-200 words) for an artist and persist it in PostgreSQL."""
+    if _get_library_mode() != "files":
+        return jsonify({"error": "Artist summary endpoint is available in Files mode only"}), 400
+    if not bool(getattr(sys.modules[__name__], "ai_provider_ready", False)):
+        msg = getattr(sys.modules[__name__], "AI_FUNCTIONAL_ERROR_MSG", None) or "AI is not configured"
+        return jsonify({"error": msg}), 503
+
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        body = {}
+    lang = str(body.get("lang") or "").strip().lower() or _assistant_preferred_lang()
+    if lang not in {"en", "fr"}:
+        lang = "en"
+
+    ok, err = _ensure_files_index_ready()
+    if not ok:
+        return jsonify({"error": err or "Files index unavailable"}), 503
+    conn = _files_pg_connect()
+    if conn is None:
+        return jsonify({"error": "PostgreSQL unavailable"}), 503
+
+    try:
+        # Ensure we have the latest local context docs.
+        context_info = _assistant_ingest_artist_rag(conn, int(artist_id))
+        if not context_info:
+            return jsonify({"error": "Artist not found"}), 404
+        artist_name = context_info.get("artist_name") or ""
+
+        # Collect context: original bio (if any) + local snapshot.
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT doc_type, source, content
+                FROM assistant_docs
+                WHERE entity_type = 'artist'
+                  AND entity_id = %s
+                  AND doc_type IN ('artist_profile_bio', 'artist_profile_short', 'artist_library_snapshot')
+                ORDER BY updated_at DESC
+                """,
+                (int(artist_id),),
+            )
+            rows = cur.fetchall()
+        doc_map: dict[str, dict] = {}
+        for dt, src, content in rows:
+            key = str(dt or "").strip().lower()
+            if not key or key in doc_map:
+                continue
+            doc_map[key] = {"source": (src or "").strip(), "content": (content or "").strip()}
+
+        original_text = (doc_map.get("artist_profile_bio") or {}).get("content") or (doc_map.get("artist_profile_short") or {}).get("content") or ""
+        original_source = (doc_map.get("artist_profile_bio") or {}).get("source") or (doc_map.get("artist_profile_short") or {}).get("source") or ""
+        snapshot_text = (doc_map.get("artist_library_snapshot") or {}).get("content") or ""
+
+        # External context for "real" summaries when local/provider bios are missing.
+        wiki_text = ""
+        wiki_source = ""
+        wiki_url = ""
+        wiki_lang = ""
+        serper_snippets_text = ""
+        concerts_text = ""
+        concerts_provider_used = ""
+
+        try:
+            if _is_garbage_bio(original_text):
+                original_text = ""
+        except Exception:
+            pass
+
+        if not original_text.strip():
+            try:
+                wiki_pref = "fr" if lang == "fr" else "en"
+                wiki_info = (
+                    _fetch_wikipedia_artist_bio(artist_name, lang=wiki_pref)
+                    or _fetch_wikipedia_artist_bio(artist_name, lang="en")
+                    or _fetch_wikipedia_artist_bio(artist_name, lang="fr")
+                    or {}
+                )
+                if isinstance(wiki_info, dict) and str(wiki_info.get("bio") or "").strip():
+                    wiki_text = str(wiki_info.get("bio") or "").strip()
+                    wiki_source = str(wiki_info.get("source") or "").strip() or "wikipedia"
+                    wiki_url = str(wiki_info.get("url") or "").strip()
+                    wiki_lang = str(wiki_info.get("lang") or "").strip()
+                    _assistant_upsert_doc(
+                        conn,
+                        entity_type="artist",
+                        entity_id=int(artist_id),
+                        doc_type="artist_external_wikipedia_intro",
+                        source=wiki_source,
+                        title=str(artist_name),
+                        url=wiki_url,
+                        lang=wiki_lang,
+                        content=wiki_text,
+                    )
+            except Exception:
+                pass
+
+            # Serper web snippets (optional, best-effort).
+            try:
+                if (getattr(sys.modules[__name__], "SERPER_API_KEY", "") or "").strip():
+                    hits = _serper_web_search(f"{artist_name} musician", num=5)
+                    lines: list[str] = []
+                    for h in hits[:5]:
+                        if not isinstance(h, dict):
+                            continue
+                        title = str(h.get("title") or "").strip()
+                        link = str(h.get("link") or "").strip()
+                        snippet = str(h.get("snippet") or "").strip()
+                        if not (title or snippet):
+                            continue
+                        chunk = f"- {title} | {snippet}"
+                        if link:
+                            chunk += f" | {link}"
+                        lines.append(chunk)
+                    serper_snippets_text = "\n".join(lines).strip()
+                    if serper_snippets_text:
+                        _assistant_upsert_doc(
+                            conn,
+                            entity_type="artist",
+                            entity_id=int(artist_id),
+                            doc_type="artist_external_web_snippets",
+                            source="serper",
+                            provider="serper",
+                            title=str(artist_name),
+                            content=serper_snippets_text,
+                        )
+            except Exception:
+                pass
+
+            # Upcoming concerts (cached; refresh if missing).
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT provider, events_json, source_url, updated_at
+                        FROM files_artist_concerts
+                        WHERE artist_id = %s
+                        """,
+                        (int(artist_id),),
+                    )
+                    crow = cur.fetchone()
+                events: list[dict] = []
+                provider = "bandsintown"
+                source_url = ""
+                if crow:
+                    provider = str(crow[0] or "").strip() or provider
+                    source_url = str(crow[2] or "").strip()
+                    try:
+                        events = json.loads(crow[1] or "[]") if crow[1] else []
+                    except Exception:
+                        events = []
+                # If missing, fetch once (Songkick first; Bandsintown may be blocked with 403).
+                if not events:
+                    provider = "songkick"
+                    events, sk_url = _songkick_fetch_upcoming_events(artist_name)
+                    if sk_url:
+                        source_url = sk_url
+                    if not events:
+                        provider = "bandsintown"
+                        app_id = str(_get_config_from_db("BANDSINTOWN_APP_ID", "") or "").strip() or "pmda"
+                        events = _bandsintown_fetch_upcoming_events(artist_name, app_id)
+                        if not source_url:
+                            source_url = f"https://www.bandsintown.com/a/{quote(artist_name, safe='')}" if artist_name else ""
+                    with conn.transaction():
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                """
+                                INSERT INTO files_artist_concerts(artist_id, provider, events_json, source_url, updated_at)
+                                VALUES (%s, %s, %s, %s, NOW())
+                                ON CONFLICT (artist_id) DO UPDATE SET
+                                    provider = EXCLUDED.provider,
+                                    events_json = EXCLUDED.events_json,
+                                    source_url = EXCLUDED.source_url,
+                                    updated_at = NOW()
+                                """,
+                                (int(artist_id), provider, json.dumps(events, ensure_ascii=False), source_url or None),
+                            )
+                if isinstance(events, list) and events:
+                    lines = []
+                    for ev in events[:8]:
+                        if not isinstance(ev, dict):
+                            continue
+                        dt = str(ev.get("datetime") or "").strip()
+                        venue = ev.get("venue") if isinstance(ev.get("venue"), dict) else {}
+                        city = str((venue or {}).get("city") or "").strip()
+                        country = str((venue or {}).get("country") or "").strip()
+                        vname = str((venue or {}).get("name") or "").strip()
+                        where = ", ".join([x for x in [city, country] if x])
+                        parts = [p for p in [dt[:10] if dt else "", where, vname] if p]
+                        if parts:
+                            lines.append("- " + " · ".join(parts))
+                    concerts_text = "\n".join(lines).strip()
+                    concerts_provider_used = str(provider or "").strip().lower()
+                    if concerts_text:
+                        _assistant_upsert_doc(
+                            conn,
+                            entity_type="artist",
+                            entity_id=int(artist_id),
+                            doc_type="artist_concerts_upcoming",
+                            source=str(provider or "bandsintown"),
+                            title=str(artist_name),
+                            url=str(source_url or ""),
+                            content=concerts_text,
+                        )
+            except Exception:
+                pass
+
+        # AI prompt: produce a clean artist description (no "AI" mentions, no local file/format talk).
+        lang_hint = "French" if lang == "fr" else "English"
+        system_msg = (
+            "You are PMDA Intelligence, a meticulous music librarian.\n"
+            "Rules:\n"
+            "- Use ONLY the provided context.\n"
+            "- Do not invent facts.\n"
+            "- Output must be plain text (no markdown).\n"
+            f"- Write in {lang_hint}.\n"
+            "- Length: 100 to 200 words.\n"
+            "- Focus on the artist (bio, style, era, notable works, labels, collaborations, scene).\n"
+            "- Do NOT mention audio formats, file quality, local file paths, IDs, or anything about the user's library.\n"
+            "- If the context is insufficient, keep it generic and short rather than guessing.\n"
+        )
+        external_blocks: list[str] = []
+        if wiki_text:
+            external_blocks.append(f"Wikipedia intro (source={wiki_source}, lang={wiki_lang}, url={wiki_url or 'n/a'}):\n{wiki_text}")
+        if serper_snippets_text:
+            external_blocks.append(f"Web snippets (Serper):\n{serper_snippets_text}")
+        if concerts_text:
+            external_blocks.append(f"Upcoming concerts:\n{concerts_text}")
+        external_context = "\n\n".join([b for b in external_blocks if b]).strip()
+        external_section = ""
+        if external_context:
+            external_section = "External sources:\n" + external_context + "\n\n"
+        user_msg = (
+            f"Artist: {artist_name}\n\n"
+            f"Original bio (source={original_source or 'unknown'}):\n{original_text or '(none)'}\n\n"
+            f"{external_section}"
+            "Task: Write the best possible artist description for a music library UI."
+        )
+
+        provider = getattr(sys.modules[__name__], "AI_PROVIDER", "openai")
+        model = getattr(sys.modules[__name__], "RESOLVED_MODEL", None) or getattr(sys.modules[__name__], "OPENAI_MODEL", "gpt-4o-mini")
+        ai_text = call_ai_provider_longform(provider, model, system_msg, user_msg, max_tokens=520)
+        ai_text = (ai_text or "").strip()
+        if not ai_text:
+            return jsonify({"error": "AI returned empty summary"}), 502
+
+        # Persist as assistant doc so it can be chunked and re-used by the chat RAG.
+        sources_used: list[str] = []
+        try:
+            if original_text.strip() and (original_source or "").strip():
+                sources_used.append(str(original_source).strip())
+            if wiki_text:
+                sources_used.append("wikipedia")
+            if serper_snippets_text:
+                sources_used.append("web")
+            if concerts_text:
+                sources_used.append(concerts_provider_used or "concerts")
+        except Exception:
+            sources_used = []
+        # Deduplicate while preserving order.
+        sources_used = list(dict.fromkeys([s for s in sources_used if (s or "").strip()]))[:8]
+        source_label = ", ".join(sources_used) if sources_used else "web"
+        _assistant_upsert_doc(
+            conn,
+            entity_type="artist",
+            entity_id=int(artist_id),
+            doc_type="artist_summary_ai",
+            source=source_label,
+            provider=str(provider),
+            model=str(model),
+            title=str(artist_name),
+            lang=lang,
+            content=ai_text,
+        )
+        _files_cache_invalidate_all()
+
+        return jsonify(
+            {
+                "artist_id": int(artist_id),
+                "artist_name": artist_name,
+                "ai": {
+                    "text": ai_text,
+                    "source": source_label,
+                    "provider": str(provider),
+                    "model": str(model),
+                    "lang": lang,
+                    "updated_at": int(time.time()),
+                },
+            }
+        )
+    finally:
+        conn.close()
+
+
+def _bandsintown_fetch_upcoming_events(artist_name: str, app_id: str) -> list[dict]:
+    """
+    Fetch upcoming events for an artist from Bandsintown.
+    Notes:
+    - Bandsintown uses `app_id` (string) for identification; it is not a secret.
+    - We normalize the payload for UI stability.
+    """
+    name = (artist_name or "").strip()
+    if not name:
+        return []
+    encoded = quote(name, safe="")
+    url = f"https://rest.bandsintown.com/artists/{encoded}/events"
+    try:
+        r = requests.get(
+            url,
+            params={"app_id": (app_id or "pmda"), "date": "upcoming"},
+            headers={"User-Agent": "PMDA/0.7.5"},
+            timeout=12,
+        )
+        if r.status_code == 404:
+            return []
+        # Bandsintown frequently returns 403 from some hosting environments.
+        # Keep it non-fatal so we can fall back to Songkick scraping.
+        if r.status_code == 403:
+            logging.info("[Concerts] Bandsintown forbidden (403) for artist=%s", name)
+            return []
+        r.raise_for_status()
+        data = r.json()
+        if not isinstance(data, list):
+            return []
+        out: list[dict] = []
+        for ev in data:
+            if not isinstance(ev, dict):
+                continue
+            dt = str(ev.get("datetime") or "").strip()
+            venue = ev.get("venue") if isinstance(ev.get("venue"), dict) else {}
+            offers = ev.get("offers") if isinstance(ev.get("offers"), list) else []
+            ticket_url = str(ev.get("url") or "").strip()
+            if not ticket_url and offers:
+                for off in offers:
+                    if isinstance(off, dict) and str(off.get("url") or "").strip():
+                        ticket_url = str(off.get("url") or "").strip()
+                        break
+            out.append(
+                {
+                    "provider": "bandsintown",
+                    "id": str(ev.get("id") or ""),
+                    "datetime": dt,
+                    "title": str(ev.get("title") or "").strip(),
+                    "url": ticket_url,
+                    "lineup": ev.get("lineup") if isinstance(ev.get("lineup"), list) else [],
+                    "venue": {
+                        "name": str(venue.get("name") or "").strip(),
+                        "city": str(venue.get("city") or "").strip(),
+                        "region": str(venue.get("region") or "").strip(),
+                        "country": str(venue.get("country") or "").strip(),
+                        "latitude": str(venue.get("latitude") or "").strip(),
+                        "longitude": str(venue.get("longitude") or "").strip(),
+                    },
+                }
+            )
+        return out
+    except Exception:
+        return []
+
+
+# --- Geo helpers (concert map) ------------------------------------------------
+
+_GEO_OSM_CACHE: dict[str, tuple[float, str, str]] = {}
+_GEO_OSM_CACHE_TTL_SEC = 60 * 60 * 24 * 30
+
+
+def _osm_geocode_place(query: str) -> tuple[str, str]:
+    """Best-effort geocode using Nominatim (OpenStreetMap). Returns (lat, lon) strings or ('','')."""
+    q = (query or "").strip()
+    if not q:
+        return ("", "")
+    key = q.lower()
+    now = float(time.time())
+    try:
+        cached = _GEO_OSM_CACHE.get(key)
+        if cached and (now - float(cached[0] or 0.0)) < _GEO_OSM_CACHE_TTL_SEC:
+            return (str(cached[1] or ""), str(cached[2] or ""))
+    except Exception:
+        pass
+    try:
+        r = requests.get(
+            "https://nominatim.openstreetmap.org/search",
+            params={"q": q, "format": "jsonv2", "limit": 1, "addressdetails": 0},
+            headers={"User-Agent": "PMDA/0.7.5 (concert-map)"},
+            timeout=8,
+        )
+        r.raise_for_status()
+        data = r.json()
+        if not isinstance(data, list) or not data:
+            return ("", "")
+        item = data[0] if isinstance(data[0], dict) else {}
+        lat = str(item.get("lat") or "").strip()
+        lon = str(item.get("lon") or "").strip()
+        if lat and lon:
+            _GEO_OSM_CACHE[key] = (now, lat, lon)
+            return (lat, lon)
+    except Exception:
+        return ("", "")
+    return ("", "")
+
+
+def _songkick_search_artist(artist_name: str) -> dict | None:
+    """Best-effort Songkick artist search (HTML). Returns {name, href, id, upcoming_events}."""
+    name = (artist_name or "").strip()
+    if not name:
+        return None
+    try:
+        r = requests.get(
+            "https://www.songkick.com/search",
+            params={"query": name, "type": "artists"},
+            headers={"User-Agent": "Mozilla/5.0 (PMDA)"},
+            timeout=12,
+        )
+        r.raise_for_status()
+        html_text = r.text or ""
+    except Exception:
+        return None
+
+    def _norm(s: str) -> str:
+        s = (s or "").strip().lower()
+        s = re.sub(r"[^a-z0-9]+", " ", s)
+        return re.sub(r"\s+", " ", s).strip()
+
+    qn = _norm(name)
+    blocks = re.findall(r'<li class="artist">.*?</li>', html_text, flags=re.S | re.I)
+    best: dict | None = None
+    best_score = -1.0
+    for b in blocks[:50]:
+        href_m = re.search(r'href="(/artists/[^"]+)"', b, flags=re.I)
+        name_m = re.search(r"<strong>(.*?)</strong>", b, flags=re.I | re.S)
+        if not href_m or not name_m:
+            continue
+        href = str(href_m.group(1) or "").strip()
+        cand_name = html.unescape(str(name_m.group(1) or "")).strip()
+        if not href or not cand_name:
+            continue
+        upcoming = 0
+        um = re.search(r"(\d+)\s+upcoming\s+events", b, flags=re.I)
+        if um:
+            try:
+                upcoming = int(um.group(1) or 0)
+            except Exception:
+                upcoming = 0
+        cn = _norm(cand_name)
+        # Prefer exact normalized matches, otherwise best similarity.
+        score = 0.0
+        if cn == qn:
+            score = 1000.0 + float(upcoming)
+        else:
+            try:
+                import difflib
+
+                ratio = difflib.SequenceMatcher(None, cn, qn).ratio()
+                score = ratio * 100.0 + min(50.0, float(upcoming) / 2.0)
+            except Exception:
+                score = float(upcoming)
+        if score > best_score:
+            best_score = score
+            best = {
+                "name": cand_name,
+                "href": href,
+                "id": _parse_int_loose(re.search(r"/artists/(\d+)", href).group(1) if re.search(r"/artists/(\d+)", href) else 0),
+                "upcoming_events": upcoming,
+            }
+    return best
+
+
+def _songkick_fetch_upcoming_events(artist_name: str) -> tuple[list[dict], str | None]:
+    """Fetch upcoming events for an artist from Songkick (scrape HTML). Returns (events, source_url)."""
+    name = (artist_name or "").strip()
+    if not name:
+        return ([], None)
+    hit = _songkick_search_artist(name)
+    if not hit or not str(hit.get("href") or "").strip():
+        return ([], None)
+    href = str(hit.get("href") or "").strip()
+    source_url = f"https://www.songkick.com{href}"
+    try:
+        r = requests.get(source_url, headers={"User-Agent": "Mozilla/5.0 (PMDA)"}, timeout=12)
+        r.raise_for_status()
+        page = r.text or ""
+    except Exception:
+        return ([], source_url)
+
+    low = page.lower()
+    start = low.find('id="coming-up"')
+    end = low.find('id="past-events"', start + 1) if start != -1 else -1
+    scope = page[start:end] if start != -1 and end != -1 else page
+
+    items = re.findall(r'<li[^>]*class="event-listing-item[^"]*"[^>]*>.*?</li>', scope, flags=re.S | re.I)
+    out: list[dict] = []
+    for it in items[:80]:
+        try:
+            dt_m = re.search(r'<time[^>]*datetime="([^"]+)"', it, flags=re.I)
+            href_m = re.search(r'href="(/concerts/[^"]+)"', it, flags=re.I)
+            loc_m = re.search(r'<div[^>]*class="primary-detail"[^>]*>(.*?)</div>', it, flags=re.I | re.S)
+            venue_m = re.search(r'<div[^>]*class="secondary-detail"[^>]*>(.*?)</div>', it, flags=re.I | re.S)
+            if not href_m:
+                continue
+            event_href = str(href_m.group(1) or "").strip()
+            event_url = f"https://www.songkick.com{event_href}"
+            ev_id_m = re.search(r"/concerts/(\d+)", event_href)
+            ev_id = str(ev_id_m.group(1) or "") if ev_id_m else ""
+            dt = str(dt_m.group(1) or "").strip() if dt_m else ""
+            location = html.unescape(re.sub(r"<[^>]+>", " ", (loc_m.group(1) if loc_m else "")).strip())
+            location = re.sub(r"\s+", " ", location).strip()
+            venue = html.unescape(re.sub(r"<[^>]+>", " ", (venue_m.group(1) if venue_m else "")).strip())
+            venue = re.sub(r"\s+", " ", venue).strip()
+
+            city = location
+            region = ""
+            country = ""
+            parts = [p.strip() for p in location.split(",") if p.strip()]
+            if len(parts) >= 3:
+                city, region, country = parts[0], parts[1], parts[2]
+            elif len(parts) == 2:
+                city, country = parts[0], parts[1]
+
+            out.append(
+                {
+                    "provider": "songkick",
+                    "id": ev_id,
+                    "datetime": dt,
+                    "title": name,
+                    "url": event_url,
+                    "lineup": [name],
+                    "venue": {
+                        "name": venue,
+                        "city": city,
+                        "region": region,
+                        "country": country,
+                        "latitude": "",
+                        "longitude": "",
+                    },
+                }
+            )
+        except Exception:
+            continue
+
+    # Best-effort geocoding so the UI can render a small map with pins.
+    # We intentionally geocode only city/region/country (not the venue name) to reduce noise.
+    try:
+        # Deduplicate queries and cap requests so this endpoint remains responsive.
+        q_to_latlon: dict[str, tuple[str, str]] = {}
+        queries: list[str] = []
+        for ev in out[:32]:
+            v = ev.get("venue") if isinstance(ev.get("venue"), dict) else {}
+            if not isinstance(v, dict):
+                continue
+            if str(v.get("latitude") or "").strip() and str(v.get("longitude") or "").strip():
+                continue
+            city = str(v.get("city") or "").strip()
+            region = str(v.get("region") or "").strip()
+            country = str(v.get("country") or "").strip()
+            if not (city and country):
+                continue
+            q = ", ".join([p for p in [city, region, country] if p]).strip()
+            if not q or q in q_to_latlon:
+                continue
+            queries.append(q)
+            if len(queries) >= 8:
+                break
+        for q in queries:
+            lat, lon = _osm_geocode_place(q)
+            if lat and lon:
+                q_to_latlon[q] = (lat, lon)
+        if q_to_latlon:
+            for ev in out:
+                v = ev.get("venue") if isinstance(ev.get("venue"), dict) else {}
+                if not isinstance(v, dict):
+                    continue
+                if str(v.get("latitude") or "").strip() and str(v.get("longitude") or "").strip():
+                    continue
+                city = str(v.get("city") or "").strip()
+                region = str(v.get("region") or "").strip()
+                country = str(v.get("country") or "").strip()
+                q = ", ".join([p for p in [city, region, country] if p]).strip()
+                if q in q_to_latlon:
+                    v["latitude"], v["longitude"] = q_to_latlon[q]
+    except Exception:
+        pass
+    return (out, source_url)
+
+
+@app.get("/api/library/artist/<int:artist_id>/concerts")
+def api_library_artist_concerts(artist_id: int):
+    """Return cached upcoming concerts for an artist (Files mode only)."""
+    if _get_library_mode() != "files":
+        return jsonify({"error": "Artist concerts endpoint is available in Files mode only"}), 400
+    ok, err = _ensure_files_index_ready()
+    if not ok:
+        return jsonify({"error": err or "Files index unavailable"}), 503
+
+    refresh = str(request.args.get("refresh") or "").strip().lower() in {"1", "true", "yes"}
+    provider = str(request.args.get("provider") or "auto").strip().lower() or "auto"
+    ttl_sec = max(600, min(24 * 3600, _parse_int_loose(request.args.get("ttl_sec"), 6 * 3600)))
+
+    if provider not in {"auto", "bandsintown", "songkick"}:
+        return jsonify({"error": f"Unsupported provider: {provider}"}), 400
+
+    conn = _files_pg_connect()
+    if conn is None:
+        return jsonify({"error": "PostgreSQL unavailable"}), 503
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, name FROM files_artists WHERE id = %s", (int(artist_id),))
+            row = cur.fetchone()
+            if not row:
+                return jsonify({"error": "Artist not found"}), 404
+            artist_name = (row[1] or "").strip()
+
+            cur.execute(
+                """
+                SELECT provider, events_json, source_url, updated_at
+                FROM files_artist_concerts
+                WHERE artist_id = %s
+                """,
+                (int(artist_id),),
+            )
+            cached = cur.fetchone()
+
+        now_epoch = int(time.time())
+        if cached and not refresh:
+            cached_provider = str(cached[0] or "").strip() or provider
+            cached_events_json = str(cached[1] or "[]")
+            cached_source_url = str(cached[2] or "").strip() or None
+            cached_updated_epoch = int(_dt_to_epoch(cached[3])) if cached[3] else 0
+            if cached_updated_epoch and (now_epoch - cached_updated_epoch) < ttl_sec:
+                try:
+                    events = json.loads(cached_events_json) if cached_events_json else []
+                except (TypeError, ValueError):
+                    events = []
+                if not isinstance(events, list):
+                    events = []
+                return jsonify(
+                    {
+                        "artist_id": int(artist_id),
+                        "artist_name": artist_name,
+                        "provider": cached_provider,
+                        "events": events,
+                        "source_url": cached_source_url,
+                        "updated_at": cached_updated_epoch,
+                        "cached": True,
+                    }
+                )
+
+        # Refresh from provider.
+        events: list[dict] = []
+        source_url: str | None = None
+        provider_used = provider
+        if provider == "songkick":
+            events, source_url = _songkick_fetch_upcoming_events(artist_name)
+            provider_used = "songkick"
+        elif provider == "bandsintown":
+            app_id = str(_get_config_from_db("BANDSINTOWN_APP_ID", "") or "").strip() or "pmda"
+            events = _bandsintown_fetch_upcoming_events(artist_name, app_id)
+            source_url = f"https://www.bandsintown.com/a/{quote(artist_name, safe='')}" if artist_name else None
+            provider_used = "bandsintown"
+        else:
+            # auto: prefer Songkick HTML (works reliably when Bandsintown blocks API access).
+            events, source_url = _songkick_fetch_upcoming_events(artist_name)
+            provider_used = "songkick"
+            if not events:
+                app_id = str(_get_config_from_db("BANDSINTOWN_APP_ID", "") or "").strip() or "pmda"
+                events = _bandsintown_fetch_upcoming_events(artist_name, app_id)
+                if events:
+                    provider_used = "bandsintown"
+                    source_url = f"https://www.bandsintown.com/a/{quote(artist_name, safe='')}" if artist_name else source_url
+
+        events_json = json.dumps(events, ensure_ascii=False)
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO files_artist_concerts(artist_id, provider, events_json, source_url, updated_at)
+                    VALUES (%s, %s, %s, %s, NOW())
+                    ON CONFLICT (artist_id) DO UPDATE SET
+                        provider = EXCLUDED.provider,
+                        events_json = EXCLUDED.events_json,
+                        source_url = EXCLUDED.source_url,
+                        updated_at = NOW()
+                    """,
+                    (int(artist_id), provider_used, events_json, source_url),
+                )
+
+        return jsonify(
+            {
+                "artist_id": int(artist_id),
+                "artist_name": artist_name,
+                "provider": provider_used,
+                "events": events,
+                "source_url": source_url,
+                "updated_at": int(time.time()),
+                "cached": False,
+            }
+        )
+    finally:
+        conn.close()
+
+
+@app.get("/api/library/artist/<int:artist_id>/facts")
+def api_library_artist_facts(artist_id: int):
+    """Return extracted structured facts for an artist (Files mode only)."""
+    if _get_library_mode() != "files":
+        return jsonify({"error": "Artist facts endpoint is available in Files mode only"}), 400
+    ok, err = _ensure_files_index_ready()
+    if not ok:
+        return jsonify({"error": err or "Files index unavailable"}), 503
+    conn = _files_pg_connect()
+    if conn is None:
+        return jsonify({"error": "PostgreSQL unavailable"}), 503
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT name FROM files_artists WHERE id = %s", (int(artist_id),))
+            row = cur.fetchone()
+            if not row:
+                return jsonify({"error": "Artist not found"}), 404
+            artist_name = (row[0] or "").strip()
+
+            cur.execute(
+                """
+                SELECT facts_json, evidence_json, source, provider, model, updated_at
+                FROM assistant_entity_facts
+                WHERE entity_type = 'artist' AND entity_id = %s
+                """,
+                (int(artist_id),),
+            )
+            frow = cur.fetchone()
+        if not frow:
+            return jsonify(
+                {
+                    "artist_id": int(artist_id),
+                    "artist_name": artist_name,
+                    "facts": {},
+                    "evidence": [],
+                    "source": "",
+                    "provider": "",
+                    "model": "",
+                    "updated_at": 0,
+                }
+            )
+        try:
+            facts = json.loads(frow[0] or "{}") if frow[0] else {}
+        except (TypeError, ValueError):
+            facts = {}
+        try:
+            evidence = json.loads(frow[1] or "[]") if frow[1] else []
+        except (TypeError, ValueError):
+            evidence = []
+        if not isinstance(facts, dict):
+            facts = {}
+        if not isinstance(evidence, list):
+            evidence = []
+        return jsonify(
+            {
+                "artist_id": int(artist_id),
+                "artist_name": artist_name,
+                "facts": facts,
+                "evidence": evidence,
+                "source": str(frow[2] or "").strip(),
+                "provider": str(frow[3] or "").strip(),
+                "model": str(frow[4] or "").strip(),
+                "updated_at": int(_dt_to_epoch(frow[5])) if frow[5] else 0,
+            }
+        )
+    finally:
+        conn.close()
+
+
+@app.post("/api/library/artist/<int:artist_id>/facts/extract")
+def api_library_artist_facts_extract(artist_id: int):
+    """Extract artist facts via AI (stored in PostgreSQL)."""
+    if _get_library_mode() != "files":
+        return jsonify({"error": "Artist facts endpoint is available in Files mode only"}), 400
+    if not bool(getattr(sys.modules[__name__], "ai_provider_ready", False)):
+        msg = getattr(sys.modules[__name__], "AI_FUNCTIONAL_ERROR_MSG", None) or "AI is not configured"
+        return jsonify({"error": msg}), 503
+    ok, err = _ensure_files_index_ready()
+    if not ok:
+        return jsonify({"error": err or "Files index unavailable"}), 503
+    conn = _files_pg_connect()
+    if conn is None:
+        return jsonify({"error": "PostgreSQL unavailable"}), 503
+    try:
+        context_info = _assistant_ingest_artist_rag(conn, int(artist_id))
+        if not context_info:
+            return jsonify({"error": "Artist not found"}), 404
+        artist_name = (context_info.get("artist_name") or "").strip()
+
+        # Pull best-effort context for grounded extraction.
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT doc_type, source, title, url, content
+                FROM assistant_docs
+                WHERE entity_type = 'artist'
+                  AND entity_id = %s
+                  AND doc_type IN (
+                    'artist_profile_bio',
+                    'artist_profile_short',
+                    'artist_summary_ai',
+                    'artist_external_wikipedia_intro',
+                    'artist_external_web_snippets'
+                  )
+                ORDER BY updated_at DESC
+                """,
+                (int(artist_id),),
+            )
+            rows = cur.fetchall()
+
+        ctx_parts: list[str] = []
+        evidence: list[dict] = []
+        for dt, src, title, url, content in rows:
+            dt_s = str(dt or "").strip()
+            src_s = str(src or "").strip()
+            title_s = str(title or "").strip()
+            url_s = str(url or "").strip()
+            text = (content or "").strip()
+            if not text:
+                continue
+            # Keep context bounded to avoid runaway tokens.
+            excerpt = text[:2400]
+            ctx_parts.append(f"[{dt_s} source={src_s} title={title_s} url={url_s}]\n{excerpt}")
+        ctx = "\n\n".join(ctx_parts) if ctx_parts else "(no context)"
+
+        system_msg = (
+            "You are PMDA Intelligence.\n"
+            "Task: extract structured artist facts from the given context.\n"
+            "Rules:\n"
+            "- Use ONLY the provided context.\n"
+            "- Do NOT invent facts.\n"
+            "- Output must be STRICT JSON only.\n"
+            "- If unknown, use empty arrays/empty strings.\n"
+        )
+        user_msg = (
+            f"Artist: {artist_name}\n\n"
+            "Return JSON with exactly these keys:\n"
+            "{\n"
+            '  "facts": {\n'
+            '    "aka": [string],\n'
+            '    "aliases": [string],\n'
+            '    "member_of": [string],\n'
+            '    "collaborated_with": [string],\n'
+            '    "labels": [string],\n'
+            '    "notable_cities": [string]\n'
+            "  },\n"
+            '  "evidence": [ { "fact_path": string, "excerpt": string, "source": string } ]\n'
+            "}\n\n"
+            "Context:\n"
+            f"{ctx}\n"
+        )
+
+        provider = getattr(sys.modules[__name__], "AI_PROVIDER", "openai")
+        model = getattr(sys.modules[__name__], "RESOLVED_MODEL", None) or getattr(sys.modules[__name__], "OPENAI_MODEL", "gpt-4o-mini")
+        raw = call_ai_provider_longform(provider, model, system_msg, user_msg, max_tokens=800)
+        raw = (raw or "").strip()
+        if not raw:
+            return jsonify({"error": "AI returned empty payload"}), 502
+        parsed = None
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            # Attempt to salvage JSON from surrounding text.
+            try:
+                start = raw.find("{")
+                end = raw.rfind("}")
+                if start != -1 and end != -1 and end > start:
+                    parsed = json.loads(raw[start : end + 1])
+            except Exception:
+                parsed = None
+        if not isinstance(parsed, dict):
+            return jsonify({"error": "AI returned invalid JSON"}), 502
+        facts = parsed.get("facts") if isinstance(parsed.get("facts"), dict) else {}
+        evidence = parsed.get("evidence") if isinstance(parsed.get("evidence"), list) else []
+
+        facts_json = json.dumps(facts or {}, ensure_ascii=False)
+        evidence_json = json.dumps(evidence or [], ensure_ascii=False)
+
+        # For UI: keep a human-friendly "source" label (avoid exposing AI/provider internals).
+        sources_used: list[str] = []
+        try:
+            for dt, src, _title, _url, _content in rows:
+                dt_s = str(dt or "").strip().lower()
+                src_s = str(src or "").strip()
+                if dt_s == "artist_external_wikipedia_intro":
+                    sources_used.append("wikipedia")
+                elif dt_s == "artist_external_web_snippets":
+                    sources_used.append("web")
+                elif src_s:
+                    sources_used.append(src_s)
+        except Exception:
+            sources_used = []
+        sources_used = list(dict.fromkeys([s for s in sources_used if (s or "").strip()]))[:8]
+        source_label = ", ".join(sources_used) if sources_used else "web"
+
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO assistant_entity_facts(entity_type, entity_id, facts_json, evidence_json, source, provider, model, updated_at)
+                    VALUES ('artist', %s, %s, %s, %s, %s, %s, NOW())
+                    ON CONFLICT (entity_type, entity_id) DO UPDATE SET
+                        facts_json = EXCLUDED.facts_json,
+                        evidence_json = EXCLUDED.evidence_json,
+                        source = EXCLUDED.source,
+                        provider = EXCLUDED.provider,
+                        model = EXCLUDED.model,
+                        updated_at = NOW()
+                    """,
+                    (int(artist_id), facts_json, evidence_json, source_label, str(provider), str(model)),
+                )
+
+        return jsonify(
+            {
+                "artist_id": int(artist_id),
+                "artist_name": artist_name,
+                "facts": facts,
+                "evidence": evidence,
+                "source": source_label,
+                "provider": str(provider),
+                "model": str(model),
+                "updated_at": int(time.time()),
+            }
+        )
+    finally:
+        conn.close()
 
 
 @app.get("/api/library/missing-tags")
@@ -24171,7 +33439,7 @@ def api_library_album_tracks(album_id):
                 has_cover = bool(album_row[2])
                 cur.execute(
                     """
-                    SELECT id, title, duration_sec, track_num
+                    SELECT id, title, duration_sec, track_num, file_path
                     FROM files_tracks
                     WHERE album_id = %s
                     ORDER BY disc_num ASC, track_num ASC, id ASC
@@ -24179,6 +33447,13 @@ def api_library_album_tracks(album_id):
                     (album_id,),
                 )
                 rows = cur.fetchall()
+            # If durations are missing (0), compute them on-demand via ffprobe and persist.
+            # This keeps the Files index lightweight while ensuring the player UI shows real durations.
+            duration_overrides = _files_fix_missing_album_track_durations(
+                conn,
+                album_id=int(album_id),
+                rows=[(int(r[0] or 0), int(r[2] or 0), str(r[4] or "")) for r in rows],
+            )
             base_url = request.url_root.rstrip("/")
             tracks = [
                 {
@@ -24186,7 +33461,7 @@ def api_library_album_tracks(album_id):
                     "title": r[1] or "",
                     "artist": artist_name,
                     "album": album_title,
-                    "duration": int(r[2] or 0),
+                    "duration": int(duration_overrides.get(int(r[0] or 0)) or (r[2] or 0) or 0),
                     "index": int(r[3] or 0),
                     "file_url": f"{base_url}/api/library/track/{int(r[0])}/stream",
                 }
@@ -24234,6 +33509,281 @@ def api_library_album_tracks(album_id):
         return jsonify({"tracks": tracks, "album_thumb": album_thumb})
     finally:
         db_conn.close()
+
+
+def _files_fix_missing_album_track_durations(conn, *, album_id: int, rows: list[tuple[int, int, str]]) -> dict[int, int]:
+    """
+    Best-effort: ensure duration_sec is populated for the given album's tracks.
+    Input rows: (track_id, duration_sec, file_path).
+    Returns: {track_id: computed_duration_sec} overrides for tracks that were fixed in this request.
+    """
+    album_id = int(album_id or 0)
+    if album_id <= 0:
+        return {}
+    duration_overrides: dict[int, int] = {}
+    try:
+        missing: list[tuple[int, Path]] = []
+        for tid, dur, fpath in (rows or []):
+            tid = int(tid or 0)
+            if tid <= 0:
+                continue
+            if int(dur or 0) > 0:
+                continue
+            raw_path = str(fpath or "").strip()
+            if not raw_path:
+                continue
+            p = path_for_fs_access(Path(raw_path))
+            if not p.exists() or not p.is_file():
+                continue
+            missing.append((tid, p))
+        if not missing:
+            return {}
+
+        pool = get_ffprobe_pool()
+        futures = {pool.submit(_run_ffprobe_duration_sec, str(p)): tid for tid, p in missing[:96]}
+        updates: list[tuple[int, int]] = []
+        for fut in as_completed(futures):
+            tid = int(futures.get(fut) or 0)
+            try:
+                dur_sec = int(fut.result() or 0)
+            except Exception:
+                dur_sec = 0
+            if tid > 0 and dur_sec > 0:
+                duration_overrides[tid] = dur_sec
+                updates.append((dur_sec, tid))
+        if not updates:
+            return duration_overrides
+
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.executemany(
+                    "UPDATE files_tracks SET duration_sec = %s, updated_at = NOW() WHERE id = %s",
+                    updates,
+                )
+                # Keep album total_duration_sec consistent (best-effort).
+                cur.execute(
+                    """
+                    UPDATE files_albums
+                    SET total_duration_sec = COALESCE((
+                        SELECT SUM(t.duration_sec)
+                        FROM files_tracks t
+                        WHERE t.album_id = %s
+                    ), 0)
+                    WHERE id = %s
+                    """,
+                    (int(album_id), int(album_id)),
+                )
+        _files_cache_invalidate_all()
+        return duration_overrides
+    except Exception:
+        return {}
+
+
+@app.get("/api/library/album/<int:album_id>")
+def api_library_album_detail(album_id: int):
+    """Return album details + tracklist (for album page). Files mode only."""
+    if _get_library_mode() != "files":
+        return jsonify({"error": "Files mode required"}), 400
+    ok, err = _ensure_files_index_ready()
+    if not ok:
+        return jsonify({"error": err or "Files index unavailable"}), 503
+    album_id = int(album_id or 0)
+    if album_id <= 0:
+        return jsonify({"error": "Invalid album id"}), 400
+
+    cache_key = f"library:album:{album_id}"
+    cached = _files_cache_get_json(cache_key)
+    if cached is not None:
+        return jsonify(cached)
+
+    conn = _files_pg_connect()
+    if conn is None:
+        return jsonify({"error": "PostgreSQL unavailable"}), 503
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    alb.id,
+                    alb.title,
+                    alb.title_norm,
+                    COALESCE(alb.year, 0) AS year,
+                    COALESCE(alb.date_text, '') AS date_text,
+                    COALESCE(alb.genre, '') AS genre,
+                    COALESCE(alb.label, '') AS label,
+                    COALESCE(alb.format, '') AS format,
+                    alb.is_lossless,
+                    COALESCE(alb.track_count, 0) AS track_count,
+                    COALESCE(alb.total_duration_sec, 0) AS total_duration_sec,
+                    alb.has_cover,
+                    COALESCE(alb.bandcamp_album_url, '') AS bandcamp_album_url,
+                    COALESCE(alb.metadata_source, '') AS metadata_source,
+                    art.id AS artist_id,
+                    COALESCE(art.name, '') AS artist_name
+                FROM files_albums alb
+                JOIN files_artists art ON art.id = alb.artist_id
+                WHERE alb.id = %s
+                """,
+                (album_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return jsonify({"error": "Album not found"}), 404
+
+            (
+                _aid,
+                album_title,
+                title_norm,
+                year,
+                date_text,
+                genre,
+                label,
+                fmt,
+                is_lossless,
+                track_count,
+                total_duration_sec,
+                has_cover,
+                bandcamp_album_url,
+                metadata_source,
+                artist_id,
+                artist_name,
+            ) = row
+
+            # Album profile (review/description) is keyed by (artist_norm, title_norm).
+            artist_norm = " ".join((artist_name or "").split()).lower()
+            title_norm = str(title_norm or "").strip()
+            prof = {}
+            if artist_norm and title_norm:
+                try:
+                    cur.execute(
+                        """
+                        SELECT description, short_description, source, updated_at
+                        FROM files_album_profiles
+                        WHERE artist_norm = %s AND title_norm = %s
+                        """,
+                        (artist_norm, title_norm),
+                    )
+                    prow = cur.fetchone()
+                    if prow:
+                        prof = {
+                            "description": (prow[0] or "").strip(),
+                            "short_description": (prow[1] or "").strip(),
+                            "source": (prow[2] or "").strip(),
+                            "updated_at": int(_dt_to_epoch(prow[3])) if prow[3] else 0,
+                        }
+                except Exception:
+                    prof = {}
+
+            # Tracks (detailed)
+            cur.execute(
+                """
+                SELECT
+                    id,
+                    COALESCE(title, '') AS title,
+                    COALESCE(disc_num, 0) AS disc_num,
+                    COALESCE(track_num, 0) AS track_num,
+                    COALESCE(duration_sec, 0) AS duration_sec,
+                    COALESCE(format, '') AS format,
+                    COALESCE(bitrate, 0) AS bitrate,
+                    COALESCE(sample_rate, 0) AS sample_rate,
+                    COALESCE(bit_depth, 0) AS bit_depth,
+                    COALESCE(file_size_bytes, 0) AS file_size_bytes,
+                    COALESCE(file_path, '') AS file_path
+                FROM files_tracks
+                WHERE album_id = %s
+                ORDER BY disc_num ASC, track_num ASC, id ASC
+                """,
+                (album_id,),
+            )
+            track_rows = cur.fetchall()
+
+        duration_overrides = _files_fix_missing_album_track_durations(
+            conn,
+            album_id=int(album_id),
+            rows=[(int(r[0] or 0), int(r[4] or 0), str(r[10] or "")) for r in track_rows],
+        )
+
+        base_url = request.url_root.rstrip("/")
+        tracks = []
+        for r in track_rows:
+            tid = int(r[0] or 0)
+            title = str(r[1] or "").strip()
+            disc_num = int(r[2] or 0)
+            track_num = int(r[3] or 0)
+            dur = int(duration_overrides.get(tid) or (r[4] or 0) or 0)
+            t_fmt = (r[5] or "").strip()
+            bitrate = int(r[6] or 0)
+            sample_rate = int(r[7] or 0)
+            bit_depth = int(r[8] or 0)
+            size_bytes = int(r[9] or 0)
+            file_path = str(r[10] or "").strip()
+
+            # Heuristic: extract featured artists from title for nicer UI ("collab").
+            feat = ""
+            try:
+                m = re.search(r"\\b(?:feat\\.?|ft\\.?|featuring)\\s+([^\\)\\]\\-]+)", title, flags=re.IGNORECASE)
+                if m:
+                    feat = str(m.group(1) or "").strip()
+            except Exception:
+                feat = ""
+
+            tracks.append(
+                {
+                    "track_id": tid,
+                    "title": title,
+                    "disc_num": disc_num,
+                    "track_num": track_num,
+                    "duration_sec": dur,
+                    "format": t_fmt,
+                    "bitrate": bitrate,
+                    "sample_rate": sample_rate,
+                    "bit_depth": bit_depth,
+                    "file_size_bytes": size_bytes,
+                    "file_path": file_path,
+                    "featured": feat,
+                    "file_url": f"{base_url}/api/library/track/{tid}/stream" if tid > 0 else "",
+                }
+            )
+
+        # Best-effort total duration (keep existing album value when present).
+        try:
+            total_duration_sec = int(total_duration_sec or 0)
+        except Exception:
+            total_duration_sec = 0
+        if total_duration_sec <= 0 and tracks:
+            total_duration_sec = sum(int(t.get("duration_sec") or 0) for t in tracks)
+
+        cover_url = f"{base_url}/api/library/files/album/{album_id}/cover?size=640" if bool(has_cover) else None
+
+        payload = {
+            "album_id": int(album_id),
+            "title": (album_title or "").strip(),
+            "year": int(year or 0) if int(year or 0) > 0 else None,
+            "date_text": (date_text or "").strip(),
+            "genre": (genre or "").strip(),
+            "label": (label or "").strip(),
+            "format": (fmt or "").strip(),
+            "is_lossless": bool(is_lossless),
+            "track_count": int(track_count or 0),
+            "total_duration_sec": int(total_duration_sec or 0),
+            "has_cover": bool(has_cover),
+            "cover_url": cover_url,
+            "bandcamp_album_url": (bandcamp_album_url or "").strip() or None,
+            "metadata_source": (metadata_source or "").strip() or None,
+            "artist_id": int(artist_id or 0),
+            "artist_name": (artist_name or "").strip(),
+            "review": {
+                "description": str(prof.get("description") or "").strip(),
+                "short_description": str(prof.get("short_description") or "").strip(),
+                "source": str(prof.get("source") or "").strip(),
+                "updated_at": int(prof.get("updated_at") or 0),
+            },
+            "tracks": tracks,
+        }
+        _files_cache_set_json(cache_key, payload, ttl=30)
+        return jsonify(payload)
+    finally:
+        conn.close()
 
 
 def _track_file_path(db_conn, track_id: int) -> Optional[Path]:
@@ -24378,16 +33928,74 @@ def api_library_files_artist_image(artist_id):
     if conn is None:
         return jsonify({"error": "PostgreSQL unavailable"}), 503
     try:
+        name_norm = ""
+        img_raw = ""
         with conn.cursor() as cur:
-            cur.execute("SELECT image_path FROM files_artists WHERE id = %s", (artist_id,))
+            cur.execute("SELECT name_norm, COALESCE(image_path, '') FROM files_artists WHERE id = %s", (artist_id,))
             row = cur.fetchone()
-        if not row or not (row[0] or "").strip():
-            return jsonify({"error": "Artist image not found"}), 404
-        img_path = path_for_fs_access(Path(row[0]))
-        if not img_path.exists() or not img_path.is_file():
-            return jsonify({"error": "Artist image missing"}), 404
-        cached = _ensure_cached_image_for_path(img_path, kind="artist", max_px=size)
-        to_send = cached or img_path
+        if row:
+            name_norm = str(row[0] or "").strip()
+            img_raw = str(row[1] or "").strip()
+
+        # Primary: local/external path stored on the artist row.
+        if img_raw:
+            img_path = path_for_fs_access(Path(img_raw))
+            if img_path.exists() and img_path.is_file():
+                cached = _ensure_cached_image_for_path(img_path, kind="artist", max_px=size)
+                to_send = cached or img_path
+                return send_file(str(to_send), as_attachment=False, conditional=True)
+
+        # Fallback: external cache table (keeps UI working even if files_artists wasn't updated yet).
+        if name_norm:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COALESCE(image_path, '') FROM files_external_artist_images WHERE name_norm = %s",
+                    (name_norm,),
+                )
+                erow = cur.fetchone()
+            ext_raw = str((erow[0] if erow else "") or "").strip()
+            if ext_raw:
+                ext_path = path_for_fs_access(Path(ext_raw))
+                if ext_path.exists() and ext_path.is_file():
+                    cached = _ensure_cached_image_for_path(ext_path, kind="artist", max_px=size)
+                    to_send = cached or ext_path
+                    return send_file(str(to_send), as_attachment=False, conditional=True)
+
+        return jsonify({"error": "Artist image not found"}), 404
+    finally:
+        conn.close()
+
+
+@app.get("/api/library/external/artist-image/<path:name_norm>")
+def api_library_external_artist_image(name_norm: str):
+    """Serve cached external artist images (not necessarily in local library)."""
+    if _get_library_mode() != "files":
+        return jsonify({"error": "Files mode required"}), 400
+    size = max(64, min(2048, _parse_int_loose(request.args.get("size"), 320)))
+    ok, err = _ensure_files_index_ready()
+    if not ok:
+        return jsonify({"error": err or "Files index unavailable"}), 503
+    key = _norm_artist_key(str(name_norm or ""))
+    if not key:
+        return jsonify({"error": "Invalid name"}), 400
+    conn = _files_pg_connect()
+    if conn is None:
+        return jsonify({"error": "PostgreSQL unavailable"}), 503
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COALESCE(image_path, '') FROM files_external_artist_images WHERE name_norm = %s",
+                (key,),
+            )
+            row = cur.fetchone()
+        img_raw = (row[0] or "").strip() if row else ""
+        if not img_raw:
+            return jsonify({"error": "External artist image not found"}), 404
+        p = Path(img_raw)
+        if not p.exists() or not p.is_file():
+            return jsonify({"error": "External artist image missing"}), 404
+        cached = _ensure_cached_image_for_path(p, kind="artist", max_px=size)
+        to_send = cached or p
         return send_file(str(to_send), as_attachment=False, conditional=True)
     finally:
         conn.close()
@@ -24926,10 +34534,8 @@ def get_similar_artists_mb(artist_mbid: str) -> List[dict]:
 
 @app.get("/api/library/artist/<int:artist_id>/similar")
 def api_library_artist_similar(artist_id):
-    """Get similar artists for a given artist via MusicBrainz."""
+    """Get similar artists for a given artist (providers + local genre fallback)."""
     if _get_library_mode() == "files":
-        if not USE_MUSICBRAINZ:
-            return jsonify({"error": "MusicBrainz not enabled"}), 400
         ok, err = _ensure_files_index_ready()
         if not ok:
             return jsonify({"error": err or "Files index unavailable"}), 503
@@ -24938,25 +34544,157 @@ def api_library_artist_similar(artist_id):
             return jsonify({"error": "PostgreSQL unavailable"}), 503
         try:
             with conn.cursor() as cur:
-                cur.execute("SELECT name FROM files_artists WHERE id = %s", (artist_id,))
+                cur.execute("SELECT id, name, name_norm FROM files_artists WHERE id = %s", (int(artist_id),))
                 row = cur.fetchone()
-            if not row:
-                return jsonify({"error": "Artist not found"}), 404
-            artist_name = row[0] or ""
+                if not row:
+                    return jsonify({"error": "Artist not found"}), 404
+                artist_name = (row[1] or "").strip()
+                artist_norm = (row[2] or "").strip() or _norm_artist_key(artist_name)
+
+                cur.execute(
+                    """
+                    SELECT COALESCE(similar_json, ''), updated_at
+                    FROM files_artist_profiles
+                    WHERE name_norm = %s
+                    """,
+                    (artist_norm,),
+                )
+                prof_row = cur.fetchone()
+
+            base_url = request.url_root.rstrip("/")
+
+            # 1) Prefer already-enriched similar artists from cached profiles.
+            if prof_row and str(prof_row[0] or "").strip():
+                try:
+                    stored = json.loads(prof_row[0] or "[]")
+                except Exception:
+                    stored = []
+                if isinstance(stored, list) and stored:
+                    patched = _files_attach_similar_artist_refs(conn, stored, base_url)
+                    # Warm missing images asynchronously (keeps API fast; UI can refetch).
+                    try:
+                        missing = [
+                            str(it.get("name") or "").strip()
+                            for it in (patched or [])
+                            if isinstance(it, dict)
+                            and str(it.get("name") or "").strip()
+                            and not str(it.get("image_url") or "").strip()
+                        ]
+                        if missing:
+                            _enqueue_files_similar_images_warm(artist_norm, missing[:12])
+                    except Exception:
+                        pass
+                    return jsonify(
+                        {
+                            "artist_id": int(artist_id),
+                            "source": "profile",
+                            "similar_artists": patched[:20],
+                        }
+                    )
+
+            # 2) Try Last.fm (best UX: includes similar artists + images).
+            lastfm_info = _fetch_lastfm_artist_info(artist_name) or {}
+            lf_sim = lastfm_info.get("similar") or []
+            if isinstance(lf_sim, list) and lf_sim:
+                # Best-effort: persist similar list (do not overwrite a good bio).
+                try:
+                    existing = _files_get_artist_profile_cached(artist_name, artist_norm) or {}
+                    next_profile = dict(existing) if isinstance(existing, dict) else {}
+                    if not next_profile.get("bio") and str(lastfm_info.get("bio") or "").strip():
+                        next_profile["bio"] = str(lastfm_info.get("bio") or "").strip()
+                    if not next_profile.get("short_bio") and str(lastfm_info.get("short_bio") or "").strip():
+                        next_profile["short_bio"] = str(lastfm_info.get("short_bio") or "").strip()
+                    if lastfm_info.get("tags"):
+                        next_profile["tags"] = lastfm_info.get("tags") or []
+                    next_profile["similar"] = lf_sim
+                    if not (next_profile.get("source") or "").strip():
+                        next_profile["source"] = "lastfm"
+                    with conn.transaction():
+                        _files_upsert_artist_profile(conn, artist_norm, artist_name, next_profile)
+                except Exception:
+                    pass
+                # Best-effort: cache similar artists images so UI stays pretty offline.
+                try:
+                    for sim in lf_sim[:12]:
+                        if not isinstance(sim, dict):
+                            continue
+                        sname = (sim.get("name") or "").strip()
+                        surl = (sim.get("image_url") or "").strip()
+                        if not sname or not surl:
+                            continue
+                        if _is_probably_placeholder_artist_image_url(surl):
+                            continue
+                        with conn.transaction():
+                            _files_cache_external_artist_image(conn, artist_name=sname, provider="lastfm", image_url=surl, max_px=640)
+                except Exception:
+                    pass
+                patched = _files_attach_similar_artist_refs(conn, lf_sim, base_url)
+                # Warm missing images asynchronously (Last.fm similar sometimes lacks usable images).
+                try:
+                    missing = [
+                        str(it.get("name") or "").strip()
+                        for it in (patched or [])
+                        if isinstance(it, dict)
+                        and str(it.get("name") or "").strip()
+                        and not str(it.get("image_url") or "").strip()
+                    ]
+                    if missing:
+                        _enqueue_files_similar_images_warm(artist_norm, missing[:12])
+                except Exception:
+                    pass
+                return jsonify(
+                    {
+                        "artist_id": int(artist_id),
+                        "source": "lastfm",
+                        "similar_artists": patched[:20],
+                    }
+                )
+
+            # 3) Try MusicBrainz, but only when identity match is sane (avoid nonsense).
+            mbid = ""
+            mb_sim: list[dict] = []
+            if USE_MUSICBRAINZ:
+                try:
+                    search_result = musicbrainzngs.search_artists(artist=artist_name, limit=3)
+                    artist_list = search_result.get("artist-list") or []
+                    for cand in artist_list[:3]:
+                        if not isinstance(cand, dict):
+                            continue
+                        cand_name = (cand.get("name") or "").strip()
+                        if cand_name and _provider_identity_text_score(artist_name, cand_name) >= 0.78:
+                            mbid = (cand.get("id") or "").strip()
+                            break
+                except Exception:
+                    mbid = ""
+                if mbid:
+                    try:
+                        mb_sim = get_similar_artists_mb(mbid) or []
+                    except Exception:
+                        mb_sim = []
+            if isinstance(mb_sim, list) and mb_sim:
+                patched = _files_attach_similar_artist_refs(conn, mb_sim, base_url)
+                return jsonify(
+                    {
+                        "artist_id": int(artist_id),
+                        "artist_mbid": mbid,
+                        "source": "musicbrainz",
+                        "similar_artists": patched[:20],
+                    }
+                )
+
+            # 4) Local fallback: overlap inferred genres in the local DB.
+            genre_sim = _files_similar_artists_by_genre(conn, int(artist_id), limit=20) or []
+            if genre_sim:
+                genre_sim = _files_attach_similar_artist_refs(conn, genre_sim, base_url)
+            return jsonify(
+                {
+                    "artist_id": int(artist_id),
+                    "source": "genre" if genre_sim else "none",
+                    "similar_artists": (genre_sim[:20] if isinstance(genre_sim, list) else []),
+                }
+            )
         finally:
             conn.close()
-        mbid = None
-        try:
-            search_result = musicbrainzngs.search_artists(artist=artist_name, limit=1)
-            if search_result.get("artist-list"):
-                mbid = search_result["artist-list"][0]["id"]
-        except Exception as e:
-            logging.warning("Failed to search MusicBrainz for artist '%s': %s", artist_name, e)
-            return jsonify({"error": "Could not find MusicBrainz ID for artist"}), 404
-        if not mbid:
-            return jsonify({"error": "Could not find MusicBrainz ID for artist"}), 404
-        similar = get_similar_artists_mb(mbid)
-        return jsonify({"artist_mbid": mbid, "similar_artists": similar[:20]})
 
     if not PLEX_CONFIGURED:
         return jsonify({"error": "Plex not configured"}), 503
@@ -25172,10 +34910,25 @@ def _is_probably_placeholder_artist_image_url(url: str) -> bool:
         "2a96cbd8b46e442fc41c2b86b821562f",
         "4128a6eb29f94943c9d206c08e625904",
         "c6f59c1e5e7240a4c0d427abd71f3dbb",
+        # Generic placeholder patterns from various CDNs/search results.
+        "placeholder-artist",
+        "/placeholders/",
+        "default_avatar",
+        "default-avatar",
+        "noimage",
+        "no-image",
+        "blank.jpg",
+        "spacer.gif",
+        "transparent.png",
     )
     if any(tok in low for tok in placeholder_tokens):
         return True
     if "default" in low and ("last.fm" in low or "lastfm" in low):
+        return True
+    # Common known placeholder endpoints.
+    if "static-images.merchbar.com" in low and "/placeholders/" in low:
+        return True
+    if "s0.wp.com/i/blank.jpg" in low:
         return True
     return False
 
@@ -25198,6 +34951,36 @@ def _is_usable_artist_image_bytes(raw: bytes, *, min_dim: int = 220, min_bytes: 
                 return False
     except Exception:
         # If we cannot inspect image content, keep previous permissive behavior.
+        return True
+    return True
+
+
+def _is_usable_artist_image_path(path: Path, *, min_dim: int = 220, min_bytes: int = 8192) -> bool:
+    """
+    Validate an on-disk cached artist image without loading it through the "download" path.
+    Used to decide whether an existing cache entry is good enough to keep.
+    """
+    try:
+        if not path or not path.is_file():
+            return False
+        st = path.stat()
+        if int(st.st_size or 0) < int(min_bytes):
+            return False
+    except Exception:
+        return False
+    try:
+        from PIL import Image
+
+        with Image.open(path) as img:
+            w, h = img.size
+            if w < min_dim or h < min_dim:
+                return False
+            thumb = img.convert("RGB").resize((32, 32), Image.Resampling.BILINEAR)
+            colors = thumb.getcolors(maxcolors=4096)
+            if colors is not None and len(colors) < 20:
+                return False
+    except Exception:
+        # If we cannot inspect image content, keep permissive behavior.
         return True
     return True
 
@@ -25373,6 +35156,119 @@ def _fetch_artist_image_discogs(artist_name: str) -> Optional[str]:
         return None
 
 
+def _fetch_artist_image_fanart(artist_mbid: str) -> Optional[str]:
+    """
+    Fetch an artist image from fanart.tv using a MusicBrainz artist MBID.
+    Returns a direct image URL (usually `artistthumb`) or None.
+    """
+    api_key = (getattr(sys.modules[__name__], "FANART_API_KEY", "") or "").strip()
+    mbid = str(artist_mbid or "").strip()
+    if not api_key or not mbid or len(mbid) != 36:
+        return None
+    try:
+        resp = requests.get(
+            f"https://webservice.fanart.tv/v3/music/{mbid}",
+            params={"api_key": api_key},
+            timeout=10,
+            allow_redirects=True,
+        )
+        if resp.status_code != 200:
+            return None
+        data = resp.json() if resp.content else {}
+        if not isinstance(data, dict):
+            return None
+
+        def _pick_best(list_val: object) -> str:
+            if not isinstance(list_val, list):
+                return ""
+            best_url = ""
+            best_likes = -1
+            for it in list_val:
+                if not isinstance(it, dict):
+                    continue
+                url = str(it.get("url") or "").strip()
+                if not url:
+                    continue
+                try:
+                    if _is_probably_placeholder_artist_image_url(url):
+                        continue
+                except Exception:
+                    pass
+                likes = _parse_int_loose(it.get("likes"), 0)
+                if likes > best_likes:
+                    best_likes = likes
+                    best_url = url
+            return best_url
+
+        # Prefer an artist thumb (portrait/headshot), fall back to background art when needed.
+        url = _pick_best(data.get("artistthumb"))
+        if url:
+            return url
+        url = _pick_best(data.get("artistbackground"))
+        if url:
+            return url
+        return None
+    except Exception as e:
+        logging.debug("Fanart.tv artist image fetch failed for MBID %s: %s", mbid, e)
+        return None
+
+
+def _fetch_artist_image_audiodb(artist_name: str) -> Optional[str]:
+    """
+    Fetch an artist image from TheAudioDB by name search.
+    Returns a direct image URL (`strArtistThumb` preferred) or None.
+    """
+    api_key = (getattr(sys.modules[__name__], "THEAUDIODB_API_KEY", "") or "").strip()
+    name = str(artist_name or "").strip()
+    if not api_key or not name:
+        return None
+    try:
+        resp = requests.get(
+            f"https://www.theaudiodb.com/api/v1/json/{api_key}/search.php",
+            params={"s": name},
+            timeout=10,
+            allow_redirects=True,
+        )
+        if resp.status_code != 200:
+            return None
+        data = resp.json() if resp.content else {}
+        if not isinstance(data, dict):
+            return None
+        artists = data.get("artists") or []
+        if not isinstance(artists, list) or not artists:
+            return None
+        best_url = ""
+        best_score = 0.0
+        for a in artists[:10]:
+            if not isinstance(a, dict):
+                continue
+            cand_name = str(a.get("strArtist") or "").strip()
+            if not cand_name:
+                continue
+            score = _provider_identity_text_score(name, cand_name)
+            if score < 0.78:
+                continue
+            url = (
+                str(a.get("strArtistThumb") or "").strip()
+                or str(a.get("strArtistFanart") or "").strip()
+                or str(a.get("strArtistFanart2") or "").strip()
+            )
+            if not url:
+                continue
+            try:
+                if _is_probably_placeholder_artist_image_url(url):
+                    continue
+            except Exception:
+                pass
+            if score > best_score:
+                best_score = score
+                best_url = url
+        return best_url or None
+    except Exception as e:
+        logging.debug("TheAudioDB artist image fetch failed for %s: %s", name, e)
+        return None
+
+
 def _fetch_artist_image_web(artist_name: str) -> Optional[str]:
     """
     Fallback: try to find an artist image via web search (Serper + OpenGraph image).
@@ -25441,6 +35337,21 @@ def _fetch_and_save_artist_image(artist_name: str, artist_folder: Path, artist_m
     if artist_mbid and USE_MUSICBRAINZ:
         if _fetch_and_save_artist_image_mb(artist_mbid, artist_folder):
             return "musicbrainz"
+    # Fanart.tv (MBID-based) – optional but often high-quality.
+    if artist_mbid:
+        url = _fetch_artist_image_fanart(artist_mbid)
+        if url:
+            try:
+                resp = requests.get(url, timeout=10, allow_redirects=True)
+                if resp.status_code == 200 and resp.content and _is_usable_artist_image_bytes(resp.content):
+                    if not _is_artist_image_distinct_from_local_covers(artist_folder, resp.content):
+                        logging.debug("Skipped Fanart.tv artist image for '%s': too similar to local cover", artist_name)
+                    else:
+                        (artist_folder / "artist.jpg").write_bytes(resp.content)
+                        logging.info("Saved artist image from Fanart.tv to %s", artist_folder / "artist.jpg")
+                        return "fanart"
+            except Exception as e:
+                logging.warning("Artist image download (Fanart.tv) failed: %s", e)
     # Last.fm
     if USE_LASTFM:
         url = _fetch_artist_image_lastfm(artist_name)
@@ -25456,6 +35367,20 @@ def _fetch_and_save_artist_image(artist_name: str, artist_folder: Path, artist_m
                         return "lastfm"
             except Exception as e:
                 logging.warning("Artist image download (Last.fm) failed: %s", e)
+    # TheAudioDB (name-based) – optional.
+    url = _fetch_artist_image_audiodb(artist_name)
+    if url:
+        try:
+            resp = requests.get(url, timeout=10, allow_redirects=True)
+            if resp.status_code == 200 and resp.content and _is_usable_artist_image_bytes(resp.content):
+                if not _is_artist_image_distinct_from_local_covers(artist_folder, resp.content):
+                    logging.debug("Skipped TheAudioDB artist image for '%s': too similar to local cover", artist_name)
+                else:
+                    (artist_folder / "artist.jpg").write_bytes(resp.content)
+                    logging.info("Saved artist image from TheAudioDB to %s", artist_folder / "artist.jpg")
+                    return "audiodb"
+        except Exception as e:
+            logging.warning("Artist image download (TheAudioDB) failed: %s", e)
     # Discogs
     if USE_DISCOGS:
         url = _fetch_artist_image_discogs(artist_name)
@@ -25737,9 +35662,7 @@ def _vision_verify_cover_before_inject(
             "Answer only Yes or No. Optionally end with (confidence: N)."
         )
         provider = getattr(sys.modules[__name__], "AI_PROVIDER", "openai")
-        vision_model = (
-            getattr(sys.modules[__name__], "OPENAI_VISION_MODEL", "") or getattr(sys.modules[__name__], "RESOLVED_MODEL", "gpt-4o-mini")
-        )
+        vision_model = getattr(sys.modules[__name__], "RESOLVED_MODEL", None) or getattr(sys.modules[__name__], "OPENAI_MODEL", "gpt-4o-mini")
         resp = call_ai_provider_vision(
             provider,
             vision_model,
@@ -27320,15 +37243,91 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
             if tags_updated or cover_saved:
                 provider_used = "bandcamp"
 
-    artist_folder = folder_path.parent
+    root_dirs = _files_root_dir_strings()
+    artist_folder = _files_guess_artist_folder(folder_path, artist_name, root_dirs=root_dirs)
     artist_provider = None
-    had_artist_image = bool(_first_artist_image_path(artist_folder))
+    had_artist_image = bool(_first_artist_image_path(artist_folder)) if artist_folder else False
+    external_cached_path: Optional[str] = None
     if tags_updated or cover_saved:
-        artist_provider = _fetch_and_save_artist_image(artist_name, artist_folder, artist_mbid)
-        if artist_provider:
-            pmda_artist_provider = artist_provider
-            steps.append("Fetched and saved artist image")
-    has_artist_image_now = bool(_first_artist_image_path(artist_folder))
+        if artist_folder:
+            artist_provider = _fetch_and_save_artist_image(artist_name, artist_folder, artist_mbid)
+            if artist_provider:
+                pmda_artist_provider = artist_provider
+                steps.append("Fetched and saved artist image")
+        else:
+            # Flat libraries (albums directly under FILES_ROOTS) have no reliable per-artist folder.
+            # In that case, cache an external image instead of writing artist.jpg into the library root.
+            try:
+                conn = _files_pg_connect()
+            except Exception:
+                conn = None
+            if conn is not None:
+                try:
+                    # If an external image is already cached, count it immediately (even if we don't fetch a new one).
+                    try:
+                        key = _norm_artist_key(artist_name)
+                        ext = _files_get_external_artist_images(conn, [key]).get(key) or {}
+                        ext_path = str(ext.get("image_path") or "").strip()
+                        if ext_path:
+                            external_cached_path = ext_path
+                    except Exception:
+                        pass
+                    url = ""
+                    prov = ""
+                    try:
+                        if artist_mbid:
+                            url = (_fetch_artist_image_fanart(artist_mbid) or "").strip()
+                            if url:
+                                prov = "fanart"
+                    except Exception:
+                        url = ""
+                        prov = ""
+                    if not url:
+                        try:
+                            url = (_fetch_artist_image_lastfm(artist_name) or "").strip()
+                            if url:
+                                prov = "lastfm"
+                        except Exception:
+                            url = ""
+                            prov = ""
+                    if not url:
+                        try:
+                            w = _fetch_wikipedia_artist_bio(artist_name, lang="en") or _fetch_wikipedia_artist_bio(artist_name, lang="fr") or {}
+                            if isinstance(w, dict):
+                                url = str(w.get("image_url") or "").strip()
+                                if url:
+                                    prov = "wikipedia"
+                        except Exception:
+                            url = ""
+                            prov = ""
+                    if not url:
+                        try:
+                            url = (_fetch_artist_image_audiodb(artist_name) or "").strip()
+                            if url:
+                                prov = "audiodb"
+                        except Exception:
+                            url = ""
+                            prov = ""
+                    if url and prov:
+                        with conn.transaction():
+                            external_cached_path = _files_cache_external_artist_image(
+                                conn,
+                                artist_name=artist_name,
+                                provider=prov,
+                                image_url=url,
+                                max_px=640,
+                            )
+                        if external_cached_path:
+                            pmda_artist_provider = prov
+                            steps.append("Cached external artist image")
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+    has_artist_image_now = bool(_first_artist_image_path(artist_folder)) if artist_folder else bool(external_cached_path)
     pmda_matched = bool(tags_updated)
     pmda_cover = bool(cover_saved or has_cover_now)
     pmda_artist_image = has_artist_image_now
@@ -27521,6 +37520,7 @@ def _build_improve_items_from_editions(artist_name: str, editions: list[dict]) -
     Used to stream post-processing artist-by-artist in Files mode.
     """
     items: list[dict] = []
+    root_dirs = _files_root_dir_strings()
     seen_album_ids: set[int] = set()
     for e in editions or []:
         try:
@@ -27573,8 +37573,8 @@ def _build_improve_items_from_editions(artist_name: str, editions: list[dict]) -
             except Exception:
                 pre_has_cover = False
             try:
-                artist_folder = folder_path.parent if folder_path.parent else folder_path
-                pre_has_artist_image = bool(_artist_folder_has_image(artist_folder))
+                artist_folder = _files_guess_artist_folder(folder_path, artist_name, root_dirs=root_dirs)
+                pre_has_artist_image = bool(_artist_folder_has_image(artist_folder)) if artist_folder else False
             except Exception:
                 pre_has_artist_image = False
         pre_has_mb_id = bool(mbid)
@@ -29137,8 +39137,311 @@ def dedupe_selected():
     return jsonify(moved=moved_list), 200
 
 
+# ─────────────────────────────── Assistant API ───────────────────────────────
+@app.get("/api/assistant/status")
+def api_assistant_status():
+    """Lightweight health/status endpoint for the in-UI assistant."""
+    payload = {
+        "library_mode": _get_library_mode(),
+        "ai_provider": getattr(sys.modules[__name__], "AI_PROVIDER", "openai"),
+        "ai_model": getattr(sys.modules[__name__], "RESOLVED_MODEL", None) or getattr(sys.modules[__name__], "OPENAI_MODEL", ""),
+        "ai_ready": bool(getattr(sys.modules[__name__], "ai_provider_ready", False)),
+        "ai_error": getattr(sys.modules[__name__], "AI_FUNCTIONAL_ERROR_MSG", None) if not bool(getattr(sys.modules[__name__], "ai_provider_ready", False)) else None,
+        "postgres_ready": False,
+        "pg_host": PMDA_PG_HOST,
+        "pg_port": PMDA_PG_PORT,
+        "pg_db": PMDA_PG_DB,
+        "pg_user": PMDA_PG_USER,
+        "config_dir": str(CONFIG_DIR),
+        "config_sources": {k: ENV_SOURCES.get(k, "") for k in ("AI_PROVIDER", "OPENAI_API_KEY", "OPENAI_MODEL", "FILES_ROOTS", "LIBRARY_MODE")},
+    }
+    if _get_library_mode() == "files":
+        payload["postgres_ready"] = bool(_files_pg_init_schema())
+    return jsonify(payload)
+
+
+@app.get("/api/assistant/session/<session_id>")
+def api_assistant_get_session(session_id: str):
+    if _get_library_mode() != "files":
+        return jsonify({"error": "Assistant is available in Files mode only"}), 400
+    ok, err = _ensure_files_index_ready()
+    if not ok:
+        return jsonify({"error": err or "Files index unavailable"}), 503
+    conn = _files_pg_connect()
+    if conn is None:
+        return jsonify({"error": "PostgreSQL unavailable"}), 503
+    try:
+        limit = max(1, min(400, _parse_int_loose(request.args.get("limit"), 120)))
+        with conn.cursor() as cur:
+            cur.execute("SELECT session_id FROM assistant_sessions WHERE session_id = %s", ((session_id or "").strip(),))
+            if not cur.fetchone():
+                return jsonify({"session_id": (session_id or "").strip(), "messages": []})
+            cur.execute(
+                """
+                SELECT id, role, content, context_json, metadata_json, EXTRACT(EPOCH FROM created_at)::BIGINT
+                FROM assistant_messages
+                WHERE session_id = %s
+                ORDER BY created_at ASC
+                LIMIT %s
+                """,
+                ((session_id or "").strip(), int(limit)),
+            )
+            rows = cur.fetchall()
+        messages = []
+        for mid, role, content, ctx_json, meta_json, created_at in rows:
+            try:
+                ctx = json.loads(ctx_json or "{}") if ctx_json else {}
+            except Exception:
+                ctx = {}
+            try:
+                meta = json.loads(meta_json or "{}") if meta_json else {}
+            except Exception:
+                meta = {}
+            messages.append(
+                {
+                    "id": int(mid or 0),
+                    "role": (role or "").strip().lower(),
+                    "content": (content or "").strip(),
+                    "created_at": int(created_at or 0),
+                    "context": ctx if isinstance(ctx, dict) else {},
+                    "metadata": meta if isinstance(meta, dict) else {},
+                }
+            )
+        return jsonify({"session_id": (session_id or "").strip(), "messages": messages})
+    finally:
+        conn.close()
+
+
+@app.post("/api/assistant/chat")
+def api_assistant_chat():
+    """Chat endpoint: uses Postgres-backed RAG (artist profiles + local library snapshot)."""
+    if _get_library_mode() != "files":
+        return jsonify({"error": "Assistant is available in Files mode only"}), 400
+    if not bool(getattr(sys.modules[__name__], "ai_provider_ready", False)):
+        msg = getattr(sys.modules[__name__], "AI_FUNCTIONAL_ERROR_MSG", None) or "AI is not configured"
+        return jsonify({"error": msg}), 503
+    data = request.get_json() or {}
+    if not isinstance(data, dict):
+        return jsonify({"error": "Invalid JSON body"}), 400
+    user_message = str(data.get("message") or "").strip()
+    if not user_message:
+        return jsonify({"error": "message is required"}), 400
+    session_id = str(data.get("session_id") or "").strip()
+    ctx = data.get("context") or {}
+    if not isinstance(ctx, dict):
+        ctx = {}
+
+    ok, err = _ensure_files_index_ready()
+    if not ok:
+        return jsonify({"error": err or "Files index unavailable"}), 503
+    conn = _files_pg_connect()
+    if conn is None:
+        return jsonify({"error": "PostgreSQL unavailable"}), 503
+
+    try:
+        _assistant_maybe_gc(conn)
+        session_id = _assistant_ensure_session(conn, session_id)
+
+        # Conversation history before we insert current user message.
+        history = _assistant_fetch_session_messages(conn, session_id, limit=10)
+
+        # Ensure a library snapshot doc exists so collection-wide questions have grounding.
+        try:
+            _assistant_ingest_library_rag(conn)
+        except Exception:
+            pass
+
+        context_artist_id = _parse_int_loose(ctx.get("artist_id"), 0)
+        context_inferred = False
+        context_info: dict = {}
+
+        if context_artist_id and int(context_artist_id) > 0:
+            context_info = _assistant_ingest_artist_rag(conn, int(context_artist_id))
+        else:
+            # Best-effort inference for "Ask PMDA" from anywhere.
+            inferred_ids = _assistant_find_artist_ids_for_query(conn, user_message, limit=1)
+            if inferred_ids:
+                context_inferred = True
+                context_artist_id = inferred_ids[0]
+                ctx = dict(ctx)
+                ctx["artist_id"] = int(context_artist_id)
+                ctx["context_inferred"] = True
+                context_info = _assistant_ingest_artist_rag(conn, int(context_artist_id))
+
+        # Persist the user message.
+        user_msg_row = _assistant_insert_message(
+            conn,
+            session_id=session_id,
+            role="user",
+            content=user_message,
+            context=ctx,
+            metadata={},
+        )
+
+        # Fast path: answer common DB-grounded questions without paying LLM tokens.
+        try:
+            tool = _assistant_try_handle_tool_query(
+                conn,
+                user_message=user_message,
+                context_artist_id=int(context_artist_id or 0),
+                base_url=request.url_root.rstrip("/"),
+            )
+        except Exception:
+            tool = {"handled": False}
+
+        if tool.get("handled"):
+            assistant_text = str(tool.get("assistant_text") or "").strip()
+            citations = tool.get("citations") or []
+            links = tool.get("links") or []
+            assistant_meta = {
+                "provider": "pmda_db",
+                "model": str(tool.get("tool") or "sql_tool_v1"),
+                "context_inferred": bool(context_inferred),
+                "citations": citations,
+                "links": links,
+                "tool": str(tool.get("tool") or ""),
+            }
+            assistant_msg_row = _assistant_insert_message(
+                conn,
+                session_id=session_id,
+                role="assistant",
+                content=assistant_text,
+                context=ctx,
+                metadata=assistant_meta,
+            )
+            return jsonify(
+                {
+                    "session_id": session_id,
+                    "user_message": user_msg_row,
+                    "assistant_message": assistant_msg_row,
+                    "citations": citations,
+                }
+            )
+
+        # Slow path: LLM-assisted SQL query over the library DB (read-only).
+        try:
+            sql_tool = _assistant_try_handle_sql_agent_query(
+                conn,
+                user_message=user_message,
+                context_artist_id=int(context_artist_id or 0),
+                base_url=request.url_root.rstrip("/"),
+            )
+        except Exception:
+            sql_tool = {"handled": False}
+
+        if sql_tool.get("handled"):
+            assistant_text = str(sql_tool.get("assistant_text") or "").strip()
+            citations = sql_tool.get("citations") or []
+            links = sql_tool.get("links") or []
+            assistant_meta = {
+                "provider": "pmda_db",
+                "model": str(sql_tool.get("tool") or "sql_agent_v1"),
+                "context_inferred": bool(context_inferred),
+                "citations": citations,
+                "links": links,
+                "tool": str(sql_tool.get("tool") or ""),
+            }
+            assistant_msg_row = _assistant_insert_message(
+                conn,
+                session_id=session_id,
+                role="assistant",
+                content=assistant_text,
+                context=ctx,
+                metadata=assistant_meta,
+            )
+            return jsonify(
+                {
+                    "session_id": session_id,
+                    "user_message": user_msg_row,
+                    "assistant_message": assistant_msg_row,
+                    "citations": citations,
+                }
+            )
+
+        retrieved = _assistant_retrieve_chunks(conn, user_message, artist_id=int(context_artist_id or 0), k=8)
+        system_msg, prompt = _assistant_build_prompt(
+            user_message=user_message,
+            retrieved=retrieved,
+            history=history,
+            context_info=context_info,
+        )
+
+        provider = getattr(sys.modules[__name__], "AI_PROVIDER", "openai")
+        model = getattr(sys.modules[__name__], "RESOLVED_MODEL", None) or getattr(sys.modules[__name__], "OPENAI_MODEL", "gpt-4o-mini")
+        assistant_text = call_ai_provider_longform(provider, model, system_msg, prompt, max_tokens=900)
+
+        assistant_meta = {
+            "provider": provider,
+            "model": model,
+            "context_inferred": bool(context_inferred),
+            "citations": retrieved.get("citations") or [],
+            "links": [],
+        }
+        assistant_msg_row = _assistant_insert_message(
+            conn,
+            session_id=session_id,
+            role="assistant",
+            content=assistant_text,
+            context=ctx,
+            metadata=assistant_meta,
+        )
+
+        return jsonify(
+            {
+                "session_id": session_id,
+                "user_message": user_msg_row,
+                "assistant_message": assistant_msg_row,
+                "citations": retrieved.get("citations") or [],
+            }
+        )
+    finally:
+        conn.close()
+
+
 # ─── Integrated frontend (self-hosted: serve SPA from same container) ─────────────
 if _HAS_STATIC_UI:
+    def _ui_build_payload():
+        """Return the current Vite asset paths from dist/index.html.
+
+        This is used by the frontend to detect stale SPA tabs after a deploy and prompt reload.
+        """
+        import re
+
+        index_path = os.path.join(_FRONTEND_DIST, "index.html")
+        try:
+            with open(index_path, "r", encoding="utf-8") as f:
+                html = f.read()
+        except Exception as e:
+            return {"ok": False, "error": f"Failed to read index.html: {e}"}
+
+        js_matches = re.findall(r'src="(/assets/[^"]+\.js)"', html)
+        css_matches = re.findall(r'href="(/assets/[^"]+\.css)"', html)
+
+        # Prefer the main Vite entry (usually /assets/index-<hash>.js)
+        asset_js = next((p for p in js_matches if "/assets/index-" in p), js_matches[0] if js_matches else None)
+        asset_css = next((p for p in css_matches if "/assets/index-" in p), css_matches[0] if css_matches else None)
+
+        try:
+            index_mtime = os.path.getmtime(index_path)
+        except Exception:
+            index_mtime = None
+
+        return {
+            "ok": True,
+            "index_mtime": index_mtime,
+            "asset_js": asset_js,
+            "asset_css": asset_css,
+        }
+
+    @app.get("/api/ui/build")
+    def api_ui_build():
+        payload = _ui_build_payload()
+        resp = jsonify(payload)
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        resp.headers["Pragma"] = "no-cache"
+        resp.headers["Expires"] = "0"
+        return resp
+
     def _send_index_no_cache():
         resp = send_from_directory(_FRONTEND_DIST, "index.html")
         # Prevent stale SPA shell after deploys; assets remain hash-versioned.
