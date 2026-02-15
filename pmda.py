@@ -26508,10 +26508,6 @@ def api_config_get():
         "CONCERTS_RADIUS_KM": str(get_setting("CONCERTS_RADIUS_KM", "150") or "").strip() or "150",
     }
 
-    # Defensive: if a secret key accidentally makes it into the payload, blank it.
-    for k in secret_keys:
-        if k in payload:
-            payload[k] = ""
     return jsonify(payload)
 
 
