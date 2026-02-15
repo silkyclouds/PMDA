@@ -13009,22 +13009,58 @@ def detect_broken_album(db_conn, album_id: int, tracks: List[Track], mb_release_
     
     # Method 1: MusicBrainz comparison
     if mb_release_group_info:
-        # Try to extract expected track count from MusicBrainz release-group
-        # This would require parsing the releases/media structure
-        # For now, we'll use the heuristic method as primary
-        pass
-    
+        # If we have a track_count from the MB matching step, use it as an "expected" size signal.
+        # This catches "tail-truncated" albums (no gaps in indices) which the heuristic cannot detect.
+        try:
+            expected = int(mb_release_group_info.get("track_count") or 0)
+        except Exception:
+            expected = 0
+        if expected > 0:
+            # Allow small mismatches for bonus tracks, alt editions, etc. (only treat as broken when notably short).
+            if actual_count < int(expected * 0.90):
+                # Best-effort missing indices: combine gaps + missing tail indices.
+                missing_indices: list[int] = []
+                try:
+                    indices_set = set(track_indices or [])
+                    # Cap to avoid giant arrays on very large releases.
+                    if expected <= 500:
+                        missing_indices = [i for i in range(1, expected + 1) if i not in indices_set]
+                    else:
+                        # Only report a small preview for huge track counts.
+                        missing_indices = [i for i in range(1, min(expected, 200) + 1) if i not in indices_set]
+                except Exception:
+                    missing_indices = []
+                return True, expected, actual_count, missing_indices
+
     # Method 2: Heuristic (gaps) - using configurable thresholds
     if gaps:
         # Check if gap > configured consecutive threshold
         large_gaps = [g for g in gaps if g[1] - g[0] > BROKEN_ALBUM_CONSECUTIVE_THRESHOLD]
         if large_gaps:
-            return True, max_idx, actual_count, gaps
+            missing_indices = []
+            for start_i, end_i in gaps:
+                try:
+                    missing_indices.extend(list(range(int(start_i) + 1, int(end_i))))
+                except Exception:
+                    continue
+                if len(missing_indices) > 5000:
+                    missing_indices = missing_indices[:5000]
+                    break
+            return True, max_idx, actual_count, missing_indices
         
         # Check if gaps represent > configured percentage threshold
         total_missing = sum(g[1] - g[0] - 1 for g in gaps)
         if total_missing > actual_count * BROKEN_ALBUM_PERCENTAGE_THRESHOLD:
-            return True, max_idx, actual_count, gaps
+            missing_indices = []
+            for start_i, end_i in gaps:
+                try:
+                    missing_indices.extend(list(range(int(start_i) + 1, int(end_i))))
+                except Exception:
+                    continue
+                if len(missing_indices) > 5000:
+                    missing_indices = missing_indices[:5000]
+                    break
+            return True, max_idx, actual_count, missing_indices
     
     return False, None, actual_count, []
 
@@ -13188,13 +13224,13 @@ def fetch_mb_release_group_info(mbid: str) -> tuple[dict, bool]:
         logging.debug("[MusicBrainz RG Info] using cached info for MBID %s", mbid)
         return cached, True  # True = cache hit
     
-    # Use queue for rate-limited API call
-    # Note: for release-group, only inc=releases is valid; inc=media applies to release, not release-group (400 if used).
+    # Use queue for rate-limited API call.
+    # Note: for release-group, include "releases" and "artist-credits". Avoid "media" here (use release endpoint instead).
     def _fetch():
         try:
             result = musicbrainzngs.get_release_group_by_id(
                 mbid,
-                includes=["releases"]
+                includes=["releases", "artist-credits"]
             )["release-group"]
             return result
         except musicbrainzngs.WebServiceError as e:
@@ -13203,7 +13239,7 @@ def fetch_mb_release_group_info(mbid: str) -> tuple[dict, bool]:
                 logging.warning("[MusicBrainz] Rate limited for MBID %s, will retry after delay", mbid)
                 time.sleep(1.5)
                 try:
-                    result = musicbrainzngs.get_release_group_by_id(mbid, includes=["releases"])["release-group"]
+                    result = musicbrainzngs.get_release_group_by_id(mbid, includes=["releases", "artist-credits"])["release-group"]
                     return result
                 except musicbrainzngs.WebServiceError as e2:
                     raise RuntimeError(f"MusicBrainz lookup failed for {mbid} after retry: {e2}") from None
@@ -13212,7 +13248,7 @@ def fetch_mb_release_group_info(mbid: str) -> tuple[dict, bool]:
                 resolved = resolve_mbid_to_release_group(mbid, "")
                 if resolved and resolved != mbid:
                     result = musicbrainzngs.get_release_group_by_id(
-                        resolved, includes=["releases"]
+                        resolved, includes=["releases", "artist-credits"]
                     )["release-group"]
                     return result
             raise RuntimeError(f"MusicBrainz lookup failed for {mbid}: {e}") from None
@@ -14303,7 +14339,7 @@ def search_mb_release_group_by_metadata(
         """Fetch release group details by ID. On 404, try treating rg_id as a release ID and resolve to release-group."""
         try:
             info = musicbrainzngs.get_release_group_by_id(
-                rg_id, includes=["releases"]
+                rg_id, includes=["releases", "artist-credits"]
             )["release-group"]
             return info
         except musicbrainzngs.WebServiceError as e:
@@ -14314,7 +14350,7 @@ def search_mb_release_group_by_metadata(
             resolved = resolve_mbid_to_release_group(rg_id, "musicbrainz_releaseid", use_queue=False)
             if resolved and resolved != rg_id:
                 info = musicbrainzngs.get_release_group_by_id(
-                    resolved, includes=["releases"]
+                    resolved, includes=["releases", "artist-credits"]
                 )["release-group"]
                 return info
             raise
@@ -21315,6 +21351,29 @@ def background_scan():
                 save_scan_editions_to_db(_scan_id, all_editions_by_artist)
         except Exception as e:
             logging.warning("save_scan_editions_to_db in finally failed: %s", e)
+        # Pipeline step: move incomplete albums to configured quarantine folder.
+        # Run this *before* dedupe so "broken" variants don't get moved as dupes.
+        incomplete_move_result = {"moved": 0, "size_mb": 0, "errors": 0}
+        if pipeline_flags.get("incomplete_move"):
+            logging.info("Pipeline step incomplete-move: scanning broken albums from current run...")
+            try:
+                incomplete_move_result = _auto_move_incomplete_albums_for_scan(
+                    int(state.get("scan_id") or 0),
+                    all_editions_by_artist,
+                )
+                logging.info(
+                    "Pipeline step incomplete-move: moved %d album(s), %d MB, errors=%d",
+                    int(incomplete_move_result.get("moved") or 0),
+                    int(incomplete_move_result.get("size_mb") or 0),
+                    int(incomplete_move_result.get("errors") or 0),
+                )
+            except Exception:
+                logging.exception("Pipeline step incomplete-move failed")
+            with lock:
+                state["scan_incomplete_moved_count"] = int(incomplete_move_result.get("moved") or 0)
+                state["scan_incomplete_moved_mb"] = int(incomplete_move_result.get("size_mb") or 0)
+                state["scan_step_progress"] = state.get("scan_step_progress", 0) + 1
+
         # Pipeline step: dedupe (synchronous so scan summary includes moved counts).
         # Guarded by AUTO_MOVE_DUPES: when disabled, we must never move anything automatically.
         auto_move_dup = bool(getattr(sys.modules[__name__], "AUTO_MOVE_DUPES", False))
@@ -21331,14 +21390,33 @@ def background_scan():
                 losers = g.get("losers", [])
                 if not best or not losers:
                     continue
-                edition_ids = [int(best.get("album_id") or 0)]
+                # Never auto-move broken/incomplete editions as dupes; those belong in the incomplete quarantine step.
+                filtered_losers = []
                 for e in losers:
+                    try:
+                        if e.get("is_broken", False):
+                            continue
+                    except Exception:
+                        pass
+                    try:
+                        folder = path_for_fs_access(Path(str(e.get("folder") or "")))
+                    except Exception:
+                        folder = None
+                    if not folder or (not folder.exists()):
+                        continue
+                    filtered_losers.append(e)
+                if not filtered_losers:
+                    continue
+                g2 = dict(g)
+                g2["losers"] = filtered_losers
+                edition_ids = [int(best.get("album_id") or 0)]
+                for e in filtered_losers:
                     edition_ids.append(int(e.get("album_id") or 0))
-                key = (g.get("artist") or "", tuple(sorted(edition_ids)))
+                key = (g2.get("artist") or "", tuple(sorted(edition_ids)))
                 if key in seen_group_keys:
                     continue
                 seen_group_keys.add(key)
-                deduped_flat.append(g)
+                deduped_flat.append(g2)
             flat_groups = deduped_flat
             if flat_groups:
                 logging.info("Pipeline step dedupe: running automatic deduplication (%d group(s))...", len(flat_groups))
@@ -21360,28 +21438,6 @@ def background_scan():
         elif pipeline_flags.get("dedupe") and all_results and (not auto_move_dup):
             logging.info("Pipeline step dedupe: AUTO_MOVE_DUPES is disabled; skipping automatic deduplication")
             with lock:
-                state["scan_step_progress"] = state.get("scan_step_progress", 0) + 1
-
-        # Pipeline step: move incomplete albums to configured quarantine folder.
-        incomplete_move_result = {"moved": 0, "size_mb": 0, "errors": 0}
-        if pipeline_flags.get("incomplete_move"):
-            logging.info("Pipeline step incomplete-move: scanning broken albums from current run...")
-            try:
-                incomplete_move_result = _auto_move_incomplete_albums_for_scan(
-                    int(state.get("scan_id") or 0),
-                    all_editions_by_artist,
-                )
-                logging.info(
-                    "Pipeline step incomplete-move: moved %d album(s), %d MB, errors=%d",
-                    int(incomplete_move_result.get("moved") or 0),
-                    int(incomplete_move_result.get("size_mb") or 0),
-                    int(incomplete_move_result.get("errors") or 0),
-                )
-            except Exception:
-                logging.exception("Pipeline step incomplete-move failed")
-            with lock:
-                state["scan_incomplete_moved_count"] = int(incomplete_move_result.get("moved") or 0)
-                state["scan_incomplete_moved_mb"] = int(incomplete_move_result.get("size_mb") or 0)
                 state["scan_step_progress"] = state.get("scan_step_progress", 0) + 1
 
         # Pipeline step: export library (Files mode only).
@@ -34997,9 +35053,12 @@ def api_library_release_group_labels(mbid):
         return jsonify({"error": "Invalid release-group MBID"}), 400
     try:
         if MB_QUEUE_ENABLED and USE_MUSICBRAINZ:
-            rg_data = get_mb_queue().submit(f"rg_labels_{mbid}", lambda: musicbrainzngs.get_release_group_by_id(mbid, includes=["releases"]))
+            rg_data = get_mb_queue().submit(
+                f"rg_labels_{mbid}",
+                lambda: musicbrainzngs.get_release_group_by_id(mbid, includes=["releases", "artist-credits"]),
+            )
         else:
-            rg_data = musicbrainzngs.get_release_group_by_id(mbid, includes=["releases"])
+            rg_data = musicbrainzngs.get_release_group_by_id(mbid, includes=["releases", "artist-credits"])
         rg = rg_data.get("release-group", {})
         releases = rg.get("release-list") or []
         if not releases:
@@ -36362,7 +36421,7 @@ def _improve_single_album(album_id: int, db_conn, known_release_group_id: Option
             if resolved:
                 release_group_id = resolved
         try:
-            result = musicbrainzngs.get_release_group_by_id(release_group_id, includes=["releases"])
+            result = musicbrainzngs.get_release_group_by_id(release_group_id, includes=["releases", "artist-credits"])
             mb_release_info = result.get("release-group", {})
             if mb_release_info:
                 strict_ok, strict_reason = _strict_identity_match_details(
@@ -37128,7 +37187,7 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
             if resolved:
                 release_group_id = resolved
         try:
-            result = musicbrainzngs.get_release_group_by_id(release_group_id, includes=["releases"])
+            result = musicbrainzngs.get_release_group_by_id(release_group_id, includes=["releases", "artist-credits"])
             mb_release_info = result.get("release-group", {})
             if mb_release_info:
                 strict_ok, strict_reason = _strict_identity_match_details(
@@ -38446,7 +38505,7 @@ def api_musicbrainz_fix_artist_tags():
             mb_release_info = None
             if release_group_id:
                 try:
-                    result = musicbrainzngs.get_release_group_by_id(release_group_id, includes=["releases"])
+                    result = musicbrainzngs.get_release_group_by_id(release_group_id, includes=["releases", "artist-credits"])
                     mb_release_info = result.get("release-group", {})
                 except Exception:
                     pass
