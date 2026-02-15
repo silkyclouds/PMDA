@@ -14624,18 +14624,25 @@ def search_mb_release_group_by_metadata(
                 return (None, False)
 
             # Optional slow path: try web + AI to infer MBID even when MB has no usable candidate.
-            web_snippets = ""
-            web_results = []
-            if USE_WEB_SEARCH_FOR_MB and SERPER_API_KEY.strip() and title_for_zero:
-                q = f"{artist} {title_for_zero} album"
-                web_results = _web_search_serper(q, num=10)
-                if web_results:
-                    parts = [f"Web {i+1}) {r.get('title')} — {r.get('snippet')} ({r.get('link')})" for i, r in enumerate(web_results[:10])]
-                    web_snippets = "\n".join(parts)
             bandcamp_text = ""
             bc_info = provider_info.get("bandcamp") if provider_info else None
             if bc_info:
                 bandcamp_text = f"Bandcamp: title={bc_info.get('title')}, artist={bc_info.get('artist_name')}"
+
+            # IMPORTANT: web+AI MBID hunting is high-risk (false positives like Wikipedia disambiguations).
+            # Only attempt it when we have at least one grounding signal from providers (Discogs/Last.fm/Bandcamp).
+            has_grounding = bool(provider_sources) or bool(bandcamp_text)
+            web_snippets = ""
+            web_results = []
+            if has_grounding and USE_WEB_SEARCH_FOR_MB and SERPER_API_KEY.strip() and title_for_zero:
+                q = f"{artist} {title_for_zero} album"
+                web_results = _web_search_serper(q, num=10)
+                if web_results:
+                    parts = [
+                        f"Web {i+1}) {r.get('title')} — {r.get('snippet')} ({r.get('link')})"
+                        for i, r in enumerate(web_results[:10])
+                    ]
+                    web_snippets = "\n".join(parts)
 
             if bandcamp_text or web_snippets:
                 prompt = f"Our album: artist={artist}, title={title_for_zero}. No usable MusicBrainz candidate.\n"
@@ -16712,17 +16719,16 @@ def scan_duplicates(
                 e['musicbrainz_id'] = e['rg_info']['id']
                 e['musicbrainz_type'] = 'release-group'
             
-            # Detect broken album (missing tracks)
             # Detect broken album (missing tracks).
             # Prefer MB track_count when present; otherwise fall back to provider tracklist size when available.
-            mb_hint = e.get("rg_info")
-                if not mb_hint:
-                    try:
-                        exp = int(e.get("_expected_track_count") or 0)
-                    except Exception:
-                        exp = 0
-                    if exp > 0:
-                        mb_hint = {"track_count": exp, "source": "provider_tracklist"}
+            mb_hint = e.get("rg_info") if isinstance(e.get("rg_info"), dict) else None
+            if not mb_hint:
+                try:
+                    exp = int(e.get("_expected_track_count") or 0)
+                except Exception:
+                    exp = 0
+                if exp > 0:
+                    mb_hint = {"track_count": exp, "source": "provider_tracklist"}
             is_broken, expected_count, actual_count, missing_indices = detect_broken_album(
                 db_conn,
                 e["album_id"],
@@ -20264,7 +20270,9 @@ def _pipeline_flags_for_scan(scan_type: str, run_improve_after_requested: bool) 
     run_match_fix = bool(scan_is_content and (PIPELINE_ENABLE_MATCH_FIX or run_improve_after_requested))
     # "dedupe" in pipeline flags means *automatic* deduplication/moves, not just detection.
     # It must track AUTO_MOVE_DUPES to avoid misleading scan summaries and scan_history rows.
-    auto_move_dup = bool(getattr(sys.modules[__name__], "AUTO_MOVE_DUPES", False))
+    # Magic mode is intended as "full pipeline" testing; ensure dedupe auto-move is enabled
+    # even if AUTO_MOVE_DUPES is off, so users can validate end-to-end behaviour.
+    auto_move_dup = bool(getattr(sys.modules[__name__], "AUTO_MOVE_DUPES", False) or getattr(sys.modules[__name__], "MAGIC_MODE", False))
     run_dedupe = bool(scan_is_content and PIPELINE_ENABLE_DEDUPE and auto_move_dup)
     run_incomplete_move = bool(scan_is_content and PIPELINE_ENABLE_INCOMPLETE_MOVE)
     run_export = bool(scan_is_content and PIPELINE_ENABLE_EXPORT)
