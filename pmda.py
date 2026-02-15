@@ -23570,15 +23570,15 @@ def _fetch_wikipedia_pageimage(title: str, lang: str = "en", thumb_px: int = 640
         return ""
 
 
-def _fetch_wikipedia_intro_extract(title: str, lang: str = "en") -> tuple[str, str]:
+def _fetch_wikipedia_intro_extract(title: str, lang: str = "en") -> tuple[str, str, str]:
     """
-    Return (extract, page_url) for a Wikipedia page title, or ("","") on failure.
+    Return (extract, page_url, description) for a Wikipedia page title, or ("","","") on failure.
     Uses the MediaWiki API with plaintext extracts.
     """
     t = (title or "").strip()
     l = (lang or "en").strip().lower() or "en"
     if not t:
-        return "", ""
+        return "", "", ""
     api_url = f"https://{l}.wikipedia.org/w/api.php"
     headers = {"User-Agent": "PMDA/0.7.5 (self-hosted music library; https://github.com/silkyclouds/PMDA)"}
     try:
@@ -23586,7 +23586,8 @@ def _fetch_wikipedia_intro_extract(title: str, lang: str = "en") -> tuple[str, s
             api_url,
             params={
                 "action": "query",
-                "prop": "extracts",
+                # `description` is Wikipedia's short description (often includes "musician"/"band").
+                "prop": "extracts|description",
                 "explaintext": 1,
                 "exintro": 1,
                 "redirects": 1,
@@ -23598,28 +23599,33 @@ def _fetch_wikipedia_intro_extract(title: str, lang: str = "en") -> tuple[str, s
             timeout=10,
         )
         if resp.status_code != 200:
-            return "", ""
+            return "", "", ""
         data = resp.json()
         pages = ((data.get("query") or {}).get("pages") or {}) if isinstance(data, dict) else {}
         extract = ""
+        description = ""
         canonical_title = t
         for _pid, page in (pages or {}).items():
             if not isinstance(page, dict):
                 continue
             canonical_title = (page.get("title") or canonical_title).strip()
             extract = (page.get("extract") or "").strip()
+            description = (page.get("description") or "").strip()
             break
         extract = re.sub(r"\s+", " ", extract).strip()
         if not extract:
-            return "", ""
+            return "", "", ""
         # Avoid disambiguation intros (common false positives).
         low = extract.lower()
         if "may refer to" in low and len(extract) < 220:
-            return "", ""
+            return "", "", ""
+        # The short description is the strongest hint we can get without parsing HTML.
+        if "disambiguation page" in (description or "").lower():
+            return "", "", ""
         page_url = f"https://{l}.wikipedia.org/wiki/{quote(canonical_title.replace(' ', '_'), safe='')}"
-        return extract, page_url
+        return extract, page_url, description
     except Exception:
-        return "", ""
+        return "", "", ""
 
 
 def _fetch_wikipedia_artist_bio(artist_name: str, lang: str = "en") -> Optional[dict]:
@@ -23634,17 +23640,70 @@ def _fetch_wikipedia_artist_bio(artist_name: str, lang: str = "en") -> Optional[
     api_url = f"https://{l}.wikipedia.org/w/api.php"
     headers = {"User-Agent": "PMDA/0.7.5 (self-hosted music library; https://github.com/silkyclouds/PMDA)"}
     try:
-        def _looks_music_related(extract: str) -> bool:
+        def _looks_music_related(extract: str, description: str = "", title: str = "") -> bool:
             low = (extract or "").lower()
             if not low:
                 return False
+            desc_low = (description or "").strip().lower()
+            title_low = (title or "").strip().lower()
+            # If Wikipedia explicitly describes the page as "Earth pigment ..." etc, reject immediately.
+            if desc_low:
+                hard_bad = (
+                    "disambiguation page",
+                    "earth pigment",
+                    "pigment",
+                    "clay",
+                    "oxide",
+                    "mineral",
+                    "paint",
+                    "soil",
+                    "ferric",
+                    "hematite",
+                    "kaolin",
+                )
+                if any(tok in desc_low for tok in hard_bad):
+                    return False
+                # Positive hints in the short description are very reliable.
+                hard_good = (
+                    "musician",
+                    "electronic musician",
+                    "singer",
+                    "singer-songwriter",
+                    "songwriter",
+                    "composer",
+                    "producer",
+                    "dj",
+                    "rapper",
+                    "band",
+                    "music group",
+                    # French variants (when using frwiki).
+                    "musicien",
+                    "groupe",
+                    "chanteur",
+                    "chanteuse",
+                    "auteur-compositeur",
+                    "compositeur",
+                    "producteur",
+                    "rappeur",
+                )
+                if any(tok in desc_low for tok in hard_good):
+                    return True
+
+            # Title disambiguators are also a strong signal.
+            if re.search(r"\((band|musician|singer|rapper|dj|music group|groupe|musicien)\)", title_low):
+                return True
+
             good = (
                 "musician", "band", "singer", "songwriter", "composer", "producer", "dj",
                 "album", "record", "label", "single", "track", "genre", "formed", "born",
+                # French variants
+                "musicien", "groupe", "chanteur", "chanteuse", "album", "label", "dj",
             )
             bad = (
                 "pigment", "clay", "oxide", "mineral", "earth pigment", "paint", "soil",
                 "ferric", "hematite", "kaolin",
+                # French variants
+                "argile", "oxyde", "mineral", "pigment",
             )
             score = 0
             for kw in good:
@@ -23683,8 +23742,8 @@ def _fetch_wikipedia_artist_bio(artist_name: str, lang: str = "en") -> Optional[
                 title = (item.get("title") or "").strip()
                 if not title:
                     continue
-                extract, page_url = _fetch_wikipedia_intro_extract(title, lang=l)
-                if not extract or not _looks_music_related(extract):
+                extract, page_url, desc = _fetch_wikipedia_intro_extract(title, lang=l)
+                if not extract or not _looks_music_related(extract, description=desc, title=title):
                     continue
                 img_url = _fetch_wikipedia_pageimage(title, lang=l, thumb_px=720) or ""
                 short = _truncate_text(extract, max_chars=460)
