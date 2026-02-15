@@ -14803,7 +14803,9 @@ def search_mb_release_group_by_metadata(
                     chosen = None
             if chosen:
                 # Partie 1: Optional vision check (local cover vs Cover Art Archive)
-                use_vision = getattr(sys.modules[__name__], "USE_AI_VISION_FOR_COVER", True) and album_folder
+                # Vision cover comparison is expensive and can reject correct matches; keep it off by default.
+                # We already guard identity via strict checks + tracklist evidence above.
+                use_vision = False
                 if use_vision:
                     folder_path = Path(album_folder) if not isinstance(album_folder, Path) else album_folder
                     local_data_uri = _get_local_cover_data_uri_for_vision(folder_path)
@@ -15083,7 +15085,8 @@ def search_mb_release_group_by_metadata(
                     if 0 <= idx < len(matching):
                         picked = matching[idx][1]
                         # Optional vision check (OpenAI only): local cover vs CAA.
-                        use_vision = bool(getattr(sys.modules[__name__], "USE_AI_VISION_FOR_COVER", True)) and album_folder and str(provider or "").strip().lower() == "openai"
+                        # Vision cover comparison is expensive and can reject correct matches; keep it off by default.
+                        use_vision = False
                         if use_vision:
                             try:
                                 folder_path = Path(album_folder) if not isinstance(album_folder, Path) else album_folder
@@ -21740,7 +21743,8 @@ def background_scan():
 
         # Pipeline step: dedupe (synchronous so scan summary includes moved counts).
         # Guarded by AUTO_MOVE_DUPES: when disabled, we must never move anything automatically.
-        auto_move_dup = bool(getattr(sys.modules[__name__], "AUTO_MOVE_DUPES", False))
+        # Magic mode implies automatic dedupe moves (users expect "fully automatic" behavior).
+        auto_move_dup = bool(getattr(sys.modules[__name__], "AUTO_MOVE_DUPES", False) or getattr(sys.modules[__name__], "MAGIC_MODE", False))
         if pipeline_flags.get("dedupe") and all_results and auto_move_dup:
             flat_groups = [g for groups in all_results.values() for g in groups]
             # One group per unique (artist, set of editions) so we never move both editions of the same album
@@ -34565,7 +34569,15 @@ def api_library_files_album_cover(album_id):
                 if cached and cached.exists():
                     return send_file(str(cached), as_attachment=False, conditional=True)
                 return Response(raw, headers={"Content-Type": mime})
-        return jsonify({"error": "Cover not found"}), 404
+        # Avoid noisy 404s in the browser console: return a tiny transparent placeholder.
+        # The UI still shows a "no cover" state (based on has_cover), but the image request won't error.
+        try:
+            transparent = base64.b64decode(
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII="
+            )
+        except Exception:
+            transparent = b""
+        return Response(transparent or b"", headers={"Content-Type": "image/png"})
     finally:
         conn.close()
 
@@ -36303,6 +36315,12 @@ def _vision_verify_cover_before_inject(
     Ask vision AI whether the proposed cover image matches the album (artist/title).
     Returns True only if the AI answers Yes. Logs verdict and adds to detailed log.
     """
+    # Cost + false-negative control:
+    # Only run vision gating for inherently risky "Web" cover pulls. For trusted providers
+    # (MusicBrainz/CAA, Discogs, Last.fm, Bandcamp), vision is flaky and can reject correct covers.
+    # Those providers are already guarded by strict identity checks upstream.
+    if str(source or "").strip().lower() != "web":
+        return True
     if not image_bytes or not getattr(sys.modules[__name__], "USE_AI_VISION_BEFORE_COVER_INJECT", False):
         return True
     if not getattr(sys.modules[__name__], "ai_provider_ready", False):
