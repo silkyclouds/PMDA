@@ -2176,6 +2176,13 @@ def ai_verify_mb_match(
     try:
         model = getattr(sys.modules[__name__], "RESOLVED_MODEL", None) or getattr(sys.modules[__name__], "OPENAI_MODEL", "gpt-4")
         provider = getattr(sys.modules[__name__], "AI_PROVIDER", "openai")
+        # Track real AI usage for cost/debugging (MB verify disambiguation).
+        try:
+            with lock:
+                state["scan_ai_calls_total"] = int(state.get("scan_ai_calls_total") or 0) + 1
+                state["scan_ai_calls_mb_verify"] = int(state.get("scan_ai_calls_mb_verify") or 0) + 1
+        except Exception:
+            pass
         reply = call_ai_provider(provider, model, system_msg, user_msg, max_tokens=30)
         reply_clean, ai_confidence = parse_ai_confidence((reply or "").strip())
         reply_clean = reply_clean.upper()
@@ -14225,6 +14232,13 @@ def _ai_choose_provider_identity_candidate(
     try:
         provider = getattr(sys.modules[__name__], "AI_PROVIDER", "openai")
         model = getattr(sys.modules[__name__], "RESOLVED_MODEL", None) or getattr(sys.modules[__name__], "OPENAI_MODEL", "gpt-4o-mini")
+        # Track real AI usage for cost/debugging (provider identity arbitration).
+        try:
+            with lock:
+                state["scan_ai_calls_total"] = int(state.get("scan_ai_calls_total") or 0) + 1
+                state["scan_ai_calls_provider_identity"] = int(state.get("scan_ai_calls_provider_identity") or 0) + 1
+        except Exception:
+            pass
         reply = call_ai_provider(provider, model, system_msg, prompt, max_tokens=30)
         reply_clean, ai_confidence = parse_ai_confidence((reply or "").strip())
         cleaned = (reply_clean or "").strip().upper()
@@ -14288,7 +14302,14 @@ def _arbitrate_provider_identity(
     top_score = float(top.get("confidence") or 0.0)
     margin = top_score - float(second.get("confidence") or 0.0) if second else top_score
     top_track = float(top.get("track_score") or 0.0)
-    heuristics_ok = (top_score >= min_score) and ((not strict) or margin >= min_margin or top_track >= 0.9)
+    top_title = float(top.get("title_score") or 0.0)
+    top_artist = float(top.get("artist_score") or 0.0)
+    # If title+artist are exact/near-exact for the top strict candidate and the overall score is already high,
+    # accept without AI even when the margin is small (common for Discogs master vs release duplicates).
+    strong_strict = (top_title >= 0.99) and (top_artist >= 0.99) and (top_score >= 0.90)
+    heuristics_ok = (top_score >= min_score) and (
+        (not strict) or margin >= min_margin or top_track >= 0.9 or strong_strict
+    )
     if heuristics_ok:
         logging.info(
             "[Providers Arbitration] %r – %r: accepted %s via heuristic (score=%.2f, margin=%.2f, track=%.2f)",
@@ -14634,7 +14655,20 @@ def search_mb_release_group_by_metadata(
                 try:
                     provider = getattr(sys.modules[__name__], "AI_PROVIDER", "openai")
                     model = getattr(sys.modules[__name__], "RESOLVED_MODEL", None) or getattr(sys.modules[__name__], "OPENAI_MODEL", "gpt-4o-mini")
-                    reply = call_ai_provider(provider, model, "You reply with a single MBID (UUID) or the word NONE. Optionally end with (confidence: N).", prompt, max_tokens=70)
+                    # Track real AI usage for cost/debugging (web/Bandcamp MBID inference).
+                    try:
+                        with lock:
+                            state["scan_ai_calls_total"] = int(state.get("scan_ai_calls_total") or 0) + 1
+                            state["scan_ai_calls_web_mbid"] = int(state.get("scan_ai_calls_web_mbid") or 0) + 1
+                    except Exception:
+                        pass
+                    reply = call_ai_provider(
+                        provider,
+                        model,
+                        "You reply with a single MBID (UUID) or the word NONE. Optionally end with (confidence: N).",
+                        prompt,
+                        max_tokens=70,
+                    )
                     reply_clean, ai_confidence = parse_ai_confidence((reply or "").strip())
                     if ai_confidence is not None:
                         logging.info("[MusicBrainz] Bandcamp/web AI MBID suggestion confidence: %d", ai_confidence)
@@ -20894,13 +20928,12 @@ def background_scan():
         logging.debug("Scan: AI reload/reinit done. ai_provider_ready=%s", ai_provider_ready)
 
         if not ai_provider_ready:
-            logging.warning("background_scan(): AI not configured or functional check failed; aborting scan.")
-            _set_resume_run_status(resume_run_id, "failed")
+            # Scans must still run without AI: the pipeline can rely on deterministic/provider signals.
+            logging.warning(
+                "background_scan(): AI not configured or functional check failed; continuing scan without AI."
+            )
             with lock:
-                state["scanning"] = False
-                state["scan_ai_preflight_error"] = getattr(sys.modules[__name__], "AI_FUNCTIONAL_ERROR_MSG", None) or "Configure the AI provider in Settings."
-                state["scan_resume_run_id"] = resume_run_id
-            return
+                state["scan_ai_preflight_error"] = getattr(sys.modules[__name__], "AI_FUNCTIONAL_ERROR_MSG", None) or "AI not ready; scan will run without AI."
 
         # Reset live state. Step-based progress: total_steps = 3*albums + 2 (+1 if auto-move).
         scan_start_epoch = time.time()
@@ -20921,6 +20954,12 @@ def background_scan():
             state["scan_artists_total"] = total_artists
             state["scan_ai_used_count"] = 0
             state["scan_mb_used_count"] = 0
+            # Real AI usage counters (calls), independent from the legacy ai_used_count (dupe groups).
+            state["scan_ai_calls_total"] = 0
+            state["scan_ai_calls_provider_identity"] = 0
+            state["scan_ai_calls_mb_verify"] = 0
+            state["scan_ai_calls_web_mbid"] = 0
+            state["scan_ai_calls_vision"] = 0
             state["scan_ai_enabled"] = ai_provider_ready
             state["scan_mb_enabled"] = USE_MUSICBRAINZ
             # Initialize ETA tracking
@@ -21985,6 +22024,11 @@ def background_scan():
             mb_used = state.get("scan_mb_used_count", 0)
             ai_groups = state.get("scan_ai_used_count", 0)
             mb_verified_by_ai = state.get("scan_mb_verified_by_ai_count", 0)
+            ai_calls_total = int(state.get("scan_ai_calls_total") or 0)
+            ai_calls_provider_identity = int(state.get("scan_ai_calls_provider_identity") or 0)
+            ai_calls_mb_verify = int(state.get("scan_ai_calls_mb_verify") or 0)
+            ai_calls_web_mbid = int(state.get("scan_ai_calls_web_mbid") or 0)
+            ai_calls_vision = int(state.get("scan_ai_calls_vision") or 0)
             cur.execute(
                 "SELECT fmt_text, COUNT(*) FROM scan_editions WHERE scan_id = ? GROUP BY fmt_text",
                 (scan_id,),
@@ -22052,6 +22096,11 @@ def background_scan():
                 "ai_connection_ok": ai_conn_ok,
                 "ai_groups_count": ai_groups,
                 "mb_verified_by_ai": mb_verified_by_ai,
+                "ai_calls_total": ai_calls_total,
+                "ai_calls_provider_identity": ai_calls_provider_identity,
+                "ai_calls_mb_verify": ai_calls_mb_verify,
+                "ai_calls_web_mbid": ai_calls_web_mbid,
+                "ai_calls_vision": ai_calls_vision,
                 "ai_errors": ai_errors_dedup,
                 # Duplicate decision stats
                 "duplicate_groups_total": duplicate_groups_count,
@@ -36433,6 +36482,13 @@ def _vision_verify_cover_before_inject(
             or getattr(sys.modules[__name__], "RESOLVED_MODEL", None)
             or getattr(sys.modules[__name__], "OPENAI_MODEL", "gpt-4o-mini")
         )
+        # Track real AI usage for cost/debugging (vision cover gating).
+        try:
+            with lock:
+                state["scan_ai_calls_total"] = int(state.get("scan_ai_calls_total") or 0) + 1
+                state["scan_ai_calls_vision"] = int(state.get("scan_ai_calls_vision") or 0) + 1
+        except Exception:
+            pass
         resp = call_ai_provider_vision(
             provider,
             vision_model,
