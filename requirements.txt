@@ -2,7 +2,7 @@ Flask>=2.0
 requests>=2.0
 # PMDA uses the `OpenAI` client class and the `client.chat.completions.create(...)` API shape,
 # which require the 1.x OpenAI Python SDK.
-openai>=1.0.0
+openai>=1.0.0,<2
 musicbrainzngs>=0.7.1
 anthropic>=0.18.0
 google-genai>=1.0.0
