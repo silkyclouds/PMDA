@@ -20324,6 +20324,90 @@ def _auto_move_incomplete_albums_for_scan(
     return result
 
 
+def _mark_broken_from_dupe_groups(
+    all_results: dict,
+    editions_by_artist: dict[str, list[dict]] | None,
+    *,
+    ratio_threshold: float = 0.90,
+) -> int:
+    """
+    Heuristic: if a dupe group's best edition has notably more tracks than a loser,
+    mark that loser as broken so the incomplete-move step can quarantine it.
+
+    This catches tail-truncated albums even when provider/MB expected track count is unknown.
+    """
+    if not all_results or not editions_by_artist:
+        return 0
+    try:
+        thr = float(ratio_threshold)
+    except Exception:
+        thr = 0.90
+    thr = max(0.50, min(0.99, thr))
+
+    by_id: dict[int, dict] = {}
+    for _artist, eds in (editions_by_artist or {}).items():
+        for e in (eds or []):
+            try:
+                aid = int(e.get("album_id") or 0)
+            except Exception:
+                aid = 0
+            if aid > 0:
+                by_id[aid] = e
+
+    marked = 0
+    for _artist, groups in (all_results or {}).items():
+        for g in (groups or []):
+            best = g.get("best") if isinstance(g, dict) else None
+            losers = (g.get("losers") or []) if isinstance(g, dict) else []
+            if not isinstance(best, dict) or not losers:
+                continue
+            try:
+                best_count = int(best.get("actual_track_count") or best.get("track_count") or len(best.get("tracks") or []))
+            except Exception:
+                best_count = 0
+            if best_count < 3:
+                continue
+            for loser in losers:
+                if not isinstance(loser, dict):
+                    continue
+                try:
+                    if loser.get("is_broken", False):
+                        continue
+                except Exception:
+                    pass
+                try:
+                    loser_count = int(loser.get("actual_track_count") or loser.get("track_count") or len(loser.get("tracks") or []))
+                except Exception:
+                    loser_count = 0
+                if loser_count <= 0:
+                    continue
+                if (loser_count / best_count) >= thr:
+                    continue
+                # Mark loser (group dict) and the canonical edition dict (by album_id) so later steps agree.
+                try:
+                    loser["is_broken"] = True
+                    loser["expected_track_count"] = best_count
+                    loser["actual_track_count"] = loser_count
+                    loser.setdefault("missing_indices", [])
+                except Exception:
+                    pass
+                try:
+                    loser_id = int(loser.get("album_id") or 0)
+                except Exception:
+                    loser_id = 0
+                if loser_id > 0 and loser_id in by_id:
+                    try:
+                        e = by_id[loser_id]
+                        e["is_broken"] = True
+                        e["expected_track_count"] = best_count
+                        e["actual_track_count"] = loser_count
+                        e.setdefault("missing_indices", [])
+                    except Exception:
+                        pass
+                marked += 1
+    return marked
+
+
 # ───────────────────────────── BACKGROUND TASKS (WEB) ─────────────────────────────
 def background_scan():
     """
@@ -21375,6 +21459,28 @@ def background_scan():
                 save_scan_editions_to_db(_scan_id, all_editions_by_artist)
         except Exception as e:
             logging.warning("save_scan_editions_to_db in finally failed: %s", e)
+        # Heuristic: if a dupe group has a clear "best" and a loser with notably fewer tracks,
+        # treat that loser as incomplete so it can be quarantined (instead of being moved as a dupe).
+        try:
+            marked_incomplete = _mark_broken_from_dupe_groups(all_results, all_editions_by_artist, ratio_threshold=0.90)
+            if marked_incomplete:
+                logging.info(
+                    "Incomplete heuristic: marked %d edition(s) as broken based on dupe-group track-count ratio",
+                    int(marked_incomplete),
+                )
+                # Ensure scan_history reflects the additional broken editions.
+                try:
+                    broken_now = 0
+                    for _a, eds in (all_editions_by_artist or {}).items():
+                        for _e in (eds or []):
+                            if _e.get("is_broken"):
+                                broken_now += 1
+                    with lock:
+                        state["scan_broken_albums_count"] = int(broken_now)
+                except Exception:
+                    pass
+        except Exception:
+            logging.debug("Incomplete heuristic failed", exc_info=True)
         # Pipeline step: move incomplete albums to configured quarantine folder.
         # Run this *before* dedupe so "broken" variants don't get moved as dupes.
         incomplete_move_result = {"moved": 0, "size_mb": 0, "errors": 0}
