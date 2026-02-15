@@ -5134,6 +5134,16 @@ if FileSystemEventHandler is not None:
             self._last_log_ts = 0.0
 
         def _handle(self, path: str, reason: str) -> None:
+            # Avoid scan storms: PMDA reads/writes a lot during scans (tag writes, cover downloads,
+            # backups/moves, etc.). Those self-induced filesystem events should not enqueue
+            # changed-only scans.
+            try:
+                with lock:
+                    if bool(state.get("scanning")) or bool(state.get("scan_finalizing")):
+                        return
+            except Exception:
+                # If state is unavailable for any reason, fall back to recording the event.
+                pass
             folders = _resolve_album_folders_from_event_path(path)
             if not folders:
                 return
@@ -22451,27 +22461,29 @@ def background_scan():
             )
 
         if _get_library_mode() == "files" and scan_status == "completed":
-            pending_to_clear: list[str] = []
-            if scan_type == "full":
-                pending_to_clear = [
-                    str(r.get("folder_path") or "").strip()
-                    for r in _list_files_pending_changes(limit=50000)
-                    if str(r.get("folder_path") or "").strip()
-                ]
-            else:
-                with lock:
-                    pending_to_clear = [
-                        str(p).strip()
-                        for p in (state.get("scan_dirty_folders_pending_clear") or [])
-                        if str(p).strip()
-                    ]
-            if pending_to_clear:
-                cleared = _clear_files_pending_changes(pending_to_clear)
-                logging.info(
-                    "FILES %s scan: cleared %d pending change row(s) after successful run.",
-                    scan_type,
-                    cleared,
-                )
+            # In practice, the watcher queue may be refilled during a scan by PMDA's own writes
+            # (or by atime/metadata updates on some filesystems). For robustness, clear the
+            # whole pending-changes table after any successful scan.
+            cleared = 0
+            try:
+                con = sqlite3.connect(str(STATE_DB_FILE), timeout=10)
+                cur = con.cursor()
+                cur.execute("DELETE FROM files_pending_changes")
+                cleared = int(cur.rowcount or 0)
+                con.commit()
+                con.close()
+            except Exception:
+                logging.debug("Failed to clear files_pending_changes after scan", exc_info=True)
+                cleared = 0
+            logging.info(
+                "FILES %s scan: cleared %d pending change row(s) after successful run.",
+                scan_type,
+                cleared,
+            )
+            with lock:
+                fw = dict(state.get("files_watcher") or {})
+                fw["dirty_count"] = 0
+                state["files_watcher"] = fw
         with lock:
             state["scan_dirty_folders_pending_clear"] = []
 
