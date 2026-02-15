@@ -1352,37 +1352,16 @@ LIVE_DEDUPE_MODE: str = str(merged.get("LIVE_DEDUPE_MODE", "safe") or "safe").st
 
 
 def _apply_forced_runtime_defaults():
-    """Force simplified product defaults (files-only, always-on metadata pipeline)."""
-    global LIBRARY_MODE, REQUIRED_TAGS
-    global USE_MUSICBRAINZ, USE_AI_FOR_MB_MATCH, USE_AI_FOR_MB_VERIFY
-    global USE_AI_VISION_FOR_COVER, USE_AI_VISION_BEFORE_COVER_INJECT
-    global USE_WEB_SEARCH_FOR_MB, USE_ACOUSTID, USE_ACOUSTID_WHEN_TAGGED
-    global USE_DISCOGS, USE_LASTFM, USE_BANDCAMP
-    global SKIP_MB_FOR_LIVE_ALBUMS, TRACKLIST_MATCH_MIN, ARTIST_CREDIT_MODE
+    """
+    Keep UX simple without silently re-enabling costly features.
 
+    We still enforce Files mode in this build, but we do NOT force-enable AI/Vision/Web-search
+    toggles: those are controlled by settings.db + runtime config, and the pipeline itself
+    is responsible for only invoking AI when it is truly ambiguous.
+    """
+    global LIBRARY_MODE
     LIBRARY_MODE = "files"
     merged["LIBRARY_MODE"] = "files"
-
-    REQUIRED_TAGS = ["artist", "album", "genre", "year", "tracks"]
-    merged["REQUIRED_TAGS"] = REQUIRED_TAGS
-
-    USE_MUSICBRAINZ = True
-    USE_AI_FOR_MB_MATCH = True
-    USE_AI_FOR_MB_VERIFY = True
-    USE_AI_VISION_FOR_COVER = True
-    USE_AI_VISION_BEFORE_COVER_INJECT = True
-    USE_WEB_SEARCH_FOR_MB = True
-    USE_ACOUSTID = True
-    USE_ACOUSTID_WHEN_TAGGED = False
-
-    USE_DISCOGS = True
-    USE_LASTFM = True
-    USE_BANDCAMP = True
-
-    SKIP_MB_FOR_LIVE_ALBUMS = True
-    TRACKLIST_MATCH_MIN = 0.9
-    ARTIST_CREDIT_MODE = "picard_like_default"
-    merged["ARTIST_CREDIT_MODE"] = ARTIST_CREDIT_MODE
     # MusicBrainz tuning is intentionally *not* forced here: the user may set
     # MB_SEARCH_ALBUM_TIMEOUT_SEC / MB_CANDIDATE_FETCH_LIMIT / MB_TRACKLIST_FETCH_LIMIT
     # from Settings (SQLite) and scans should respect those values.
@@ -12547,13 +12526,27 @@ def _dupe_choose_best_heuristic(editions: list[dict]) -> tuple[Optional[dict], s
         return (None, "", [], False)
 
     def _metrics(e: dict) -> tuple:
+        # Deterministic quality/health signals (cheap):
+        # - prefer editions with provider identity and MBIDs (less ambiguous)
+        # - prefer editions with complete tags and a cover (better user experience and safer dedupe)
+        has_identity = 1 if (
+            _dupe_get_mb_release_group_id(e)
+            or _dupe_get_mb_release_id(e)
+            or _dupe_get_discogs_id(e)
+            or _dupe_get_lastfm_mbid(e)
+            or _dupe_get_bandcamp_url(e)
+        ) else 0
+        missing_required = e.get("missing_required_tags") or []
+        has_complete_tags = 1 if (not missing_required) else 0
+        has_cover = 1 if bool(e.get("has_cover")) else 0
+
         fmt_score = int(e.get("fmt_score") or 0)
         bd = int(e.get("bd") or 0)
         sr = int(e.get("sr") or 0)
         br = int(e.get("br") or 0)
         track_count = len(e.get("tracks") or [])
         file_count = int(e.get("file_count") or 0)
-        return (fmt_score, bd, sr, br, track_count, file_count)
+        return (has_identity, has_complete_tags, has_cover, fmt_score, bd, sr, br, track_count, file_count)
 
     ranked = sorted(list(editions), key=_metrics, reverse=True)
     best = ranked[0]
@@ -12565,8 +12558,8 @@ def _dupe_choose_best_heuristic(editions: list[dict]) -> tuple[Optional[dict], s
         return (best, rationale, [], True)
 
     second = ranked[1]
-    b_fmt, b_bd, b_sr, b_br, b_tr, b_fc = _metrics(best)
-    s_fmt, s_bd, s_sr, s_br, s_tr, s_fc = _metrics(second)
+    (b_ident, b_tags, b_cov, b_fmt, b_bd, b_sr, b_br, b_tr, b_fc) = _metrics(best)
+    (s_ident, s_tags, s_cov, s_fmt, s_bd, s_sr, s_br, s_tr, s_fc) = _metrics(second)
 
     # Conservative confidence rules.
     confident = False
@@ -12575,11 +12568,16 @@ def _dupe_choose_best_heuristic(editions: list[dict]) -> tuple[Optional[dict], s
     if b_tr < s_tr:
         confident = False
     else:
+        # Strong health signals should be enough to avoid AI.
+        if (b_ident, b_tags, b_cov) != (s_ident, s_tags, s_cov):
+            # If we have a clear improvement on identity/tags/cover, it's safe and deterministic.
+            if (b_ident > s_ident) or (b_tags > s_tags) or (b_cov > s_cov):
+                confident = True
         # Big codec/container class difference (e.g., FLAC vs MP3).
-        if b_fmt >= (s_fmt + 2):
+        if not confident and b_fmt >= (s_fmt + 2):
             confident = True
         # Same track count + better technical quality.
-        elif b_tr == s_tr:
+        elif (not confident) and b_tr == s_tr:
             if b_fmt > s_fmt:
                 confident = True
             elif b_fmt == s_fmt:
@@ -12590,12 +12588,15 @@ def _dupe_choose_best_heuristic(editions: list[dict]) -> tuple[Optional[dict], s
                 elif (b_bd == s_bd) and (b_sr == s_sr) and (b_br >= (s_br + 200000)):
                     confident = True
         # Slightly more tracks and not worse quality: often the same album + bonus.
-        elif b_tr > s_tr and (b_tr - s_tr) <= 2:
+        elif (not confident) and b_tr > s_tr and (b_tr - s_tr) <= 2:
             if (b_fmt >= s_fmt) and (b_bd >= s_bd) and (b_sr >= s_sr):
                 confident = True
 
     rationale = (
         "Heuristic pick: "
+        f"identity {b_ident} vs {s_ident}, "
+        f"tags {b_tags} vs {s_tags}, "
+        f"cover {b_cov} vs {s_cov}, "
         f"fmt_score {b_fmt} vs {s_fmt}, "
         f"bd {b_bd} vs {s_bd}, "
         f"sr {b_sr} vs {s_sr}, "
@@ -20370,7 +20371,76 @@ def _mark_broken_from_dupe_groups(
         except Exception:
             pass
         idxs = sorted(set(idxs))
-        return idxs
+        if idxs:
+            return idxs
+
+        # Files-mode editions often do not carry rich Track objects through all codepaths.
+        # Fall back to parsing track numbers from filenames inside the edition folder.
+        cached = edition.get("_fs_track_indices")
+        if isinstance(cached, list) and cached:
+            try:
+                return sorted(set(int(x) for x in cached if int(x) > 0))
+            except Exception:
+                pass
+
+        folder_raw = edition.get("folder")
+        if not folder_raw:
+            return []
+        try:
+            folder_path = path_for_fs_access(Path(str(folder_raw)))
+        except Exception:
+            try:
+                folder_path = Path(str(folder_raw))
+            except Exception:
+                folder_path = None
+        if not folder_path or (not folder_path.exists()) or (not folder_path.is_dir()):
+            return []
+
+        def _parse_track_idx(name: str) -> int:
+            base = os.path.basename(name or "")
+            if not base:
+                return 0
+            stem = Path(base).stem
+            s = stem.strip()
+            if not s:
+                return 0
+            # Common patterns:
+            # - "01 Title"
+            # - "1-01 Title" (disc-track)
+            # - "CD1 01 Title"
+            m = re.match(r"^\s*(?:cd\s*\d+\s*)?(\d{1,3})\b", s, flags=re.IGNORECASE)
+            if m:
+                try:
+                    return int(m.group(1))
+                except Exception:
+                    return 0
+            m2 = re.match(r"^\s*(\d{1,2})\s*[-_. ]\s*(\d{1,2})\b", s)
+            if m2:
+                try:
+                    return int(m2.group(2))
+                except Exception:
+                    return 0
+            return 0
+
+        found: list[int] = []
+        try:
+            for p in folder_path.rglob("*"):
+                if not p.is_file():
+                    continue
+                if not AUDIO_RE.search(p.name):
+                    continue
+                idx = _parse_track_idx(p.name)
+                if idx > 0:
+                    found.append(idx)
+        except Exception:
+            found = []
+        found = sorted(set(found))
+        try:
+            if found:
+                edition["_fs_track_indices"] = found
+        except Exception:
+            pass
+        return found
 
     marked = 0
     for _artist, groups in (all_results or {}).items():
@@ -20381,7 +20451,12 @@ def _mark_broken_from_dupe_groups(
                 continue
             best_idxs = _track_indices(best)
             try:
-                best_count = int(best.get("actual_track_count") or best.get("track_count") or len(best.get("tracks") or []))
+                best_count = int(
+                    best.get("actual_track_count")
+                    or best.get("track_count")
+                    or best.get("file_count")
+                    or len(best.get("tracks") or [])
+                )
             except Exception:
                 best_count = 0
             if best_count < 3 and len(best_idxs) < 3:
@@ -20396,7 +20471,12 @@ def _mark_broken_from_dupe_groups(
                     pass
                 loser_idxs = _track_indices(loser)
                 try:
-                    loser_count = int(loser.get("actual_track_count") or loser.get("track_count") or len(loser.get("tracks") or []))
+                    loser_count = int(
+                        loser.get("actual_track_count")
+                        or loser.get("track_count")
+                        or loser.get("file_count")
+                        or len(loser.get("tracks") or [])
+                    )
                 except Exception:
                     loser_count = 0
                 if loser_count <= 0:
@@ -21448,6 +21528,30 @@ def background_scan():
             with lock:
                 state["scan_ai_used_count"] = state.get("scan_ai_used_count", 0) + fallback_count
                 state["duplicates"] = all_results
+
+        # Recompute dupe counts from final all_results (after AI merge + final pass),
+        # so scan_history stats match what actually happened (even when groups were unresolved during per-artist threads).
+        try:
+            final_groups = 0
+            final_losers = 0
+            final_needs_ai = 0
+            for _a, _grps in (all_results or {}).items():
+                for _g in (_grps or []):
+                    if isinstance(_g, dict) and _g.get("needs_ai", False):
+                        final_needs_ai += 1
+                    if not isinstance(_g, dict):
+                        continue
+                    best = _g.get("best")
+                    losers = _g.get("losers")
+                    if best is not None and isinstance(losers, list):
+                        final_groups += 1
+                        final_losers += len(losers or [])
+            with lock:
+                state["scan_duplicate_groups_count"] = int(final_groups)
+                state["scan_total_duplicates_count"] = int(final_losers)
+                state["scan_dupe_groups_needs_ai"] = int(final_needs_ai)
+        except Exception:
+            logging.debug("Final dupe count recompute failed", exc_info=True)
         
         # Calculate missing albums count (compare Plex albums with MusicBrainz)
         # This is a simplified version - for now, we'll set it to 0 as calculating it requires
@@ -22749,6 +22853,10 @@ def _fetch_cover_from_web(artist_name: str, album_title: str) -> Optional[tuple[
     for item in results:
         link = item.get("link") or ""
         if not link:
+            continue
+        low = link.lower()
+        # Avoid Wikipedia/Wikimedia results; they are often unrelated photos and create false positives.
+        if "wikipedia.org/" in low or "wikimedia.org/" in low:
             continue
         try:
             resp = requests.get(link, timeout=8, allow_redirects=True)
@@ -26213,10 +26321,52 @@ def api_config_get():
     files_roots_effective = _parse_files_roots(get_setting("FILES_ROOTS", ",".join(FILES_ROOTS) if isinstance(FILES_ROOTS, list) else (FILES_ROOTS or "")))
     configured = has_settings or bool(files_roots_effective)
 
-    return jsonify({
+    # Never leak secrets to the UI (browser console/network tab). Return *_SET flags instead.
+    secret_keys = {
+        "PLEX_TOKEN",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "GOOGLE_API_KEY",
+        "DISCOGS_USER_TOKEN",
+        "LASTFM_API_KEY",
+        "LASTFM_API_SECRET",
+        "FANART_API_KEY",
+        "THEAUDIODB_API_KEY",
+        "SERPER_API_KEY",
+        "ACOUSTID_API_KEY",
+        "LIDARR_API_KEY",
+        "AUTOBRR_API_KEY",
+        "JELLYFIN_API_KEY",
+        "NAVIDROME_PASSWORD",
+        "NAVIDROME_API_KEY",
+    }
+
+    def _is_set(val) -> bool:
+        return bool(str(val or "").strip())
+
+    # Fetch effective secret values (from DB/runtime) once so *_SET flags are accurate.
+    plex_token_eff = get_setting("PLEX_TOKEN", PLEX_TOKEN)
+    openai_key_eff = get_setting("OPENAI_API_KEY", OPENAI_API_KEY)
+    anthropic_key_eff = get_setting("ANTHROPIC_API_KEY", ANTHROPIC_API_KEY)
+    google_key_eff = get_setting("GOOGLE_API_KEY", GOOGLE_API_KEY)
+    discogs_token_eff = get_setting("DISCOGS_USER_TOKEN", DISCOGS_USER_TOKEN)
+    lastfm_key_eff = get_setting("LASTFM_API_KEY", LASTFM_API_KEY)
+    lastfm_secret_eff = get_setting("LASTFM_API_SECRET", LASTFM_API_SECRET)
+    fanart_key_eff = get_setting("FANART_API_KEY", FANART_API_KEY)
+    theaudiodb_key_eff = get_setting("THEAUDIODB_API_KEY", THEAUDIODB_API_KEY)
+    serper_key_eff = get_setting("SERPER_API_KEY", SERPER_API_KEY)
+    acoustid_key_eff = get_setting("ACOUSTID_API_KEY", ACOUSTID_API_KEY)
+    lidarr_key_eff = get_setting("LIDARR_API_KEY", merged.get("LIDARR_API_KEY", ""))
+    autobrr_key_eff = get_setting("AUTOBRR_API_KEY", merged.get("AUTOBRR_API_KEY", ""))
+    jellyfin_key_eff = get_setting("JELLYFIN_API_KEY", JELLYFIN_API_KEY)
+    navidrome_pass_eff = get_setting("NAVIDROME_PASSWORD", NAVIDROME_PASSWORD)
+    navidrome_key_eff = get_setting("NAVIDROME_API_KEY", NAVIDROME_API_KEY)
+
+    payload = {
         "configured": configured,
         "PLEX_HOST": get_setting("PLEX_HOST", PLEX_HOST),
-        "PLEX_TOKEN": get_setting("PLEX_TOKEN", PLEX_TOKEN),
+        "PLEX_TOKEN": "***" if _is_set(plex_token_eff) else "",
+        "PLEX_TOKEN_SET": _is_set(plex_token_eff),
         "PLEX_BASE_PATH": get_setting("PLEX_BASE_PATH", "/database"),
         "PLEX_DB_PATH": get_setting("PLEX_DB_PATH", merged.get("PLEX_DB_PATH", "/database")),
         "PLEX_DB_FILE": "com.plexapp.plugins.library.db",
@@ -26233,11 +26383,14 @@ def api_config_get():
         "CROSSCHECK_SAMPLES": get_setting("CROSSCHECK_SAMPLES", CROSSCHECK_SAMPLES),
         "FORMAT_PREFERENCE": _parse_format_preference(get_setting("FORMAT_PREFERENCE", FORMAT_PREFERENCE)),
         "AI_PROVIDER": get_setting("AI_PROVIDER", AI_PROVIDER),
-        "OPENAI_API_KEY": get_setting("OPENAI_API_KEY", OPENAI_API_KEY),
+        "OPENAI_API_KEY": "***" if _is_set(openai_key_eff) else "",
+        "OPENAI_API_KEY_SET": _is_set(openai_key_eff),
         "OPENAI_MODEL": get_setting("OPENAI_MODEL", OPENAI_MODEL),
         "OPENAI_MODEL_FALLBACKS": get_setting("OPENAI_MODEL_FALLBACKS", merged.get("OPENAI_MODEL_FALLBACKS", "")),
-        "ANTHROPIC_API_KEY": get_setting("ANTHROPIC_API_KEY", ANTHROPIC_API_KEY),
-        "GOOGLE_API_KEY": get_setting("GOOGLE_API_KEY", GOOGLE_API_KEY),
+        "ANTHROPIC_API_KEY": "***" if _is_set(anthropic_key_eff) else "",
+        "ANTHROPIC_API_KEY_SET": _is_set(anthropic_key_eff),
+        "GOOGLE_API_KEY": "***" if _is_set(google_key_eff) else "",
+        "GOOGLE_API_KEY_SET": _is_set(google_key_eff),
         "OLLAMA_URL": get_setting("OLLAMA_URL", OLLAMA_URL),
         "USE_MUSICBRAINZ": True,
         "MUSICBRAINZ_EMAIL": get_setting("MUSICBRAINZ_EMAIL", MUSICBRAINZ_EMAIL),
@@ -26271,21 +26424,25 @@ def api_config_get():
         "PROVIDER_CACHE_FOUND_TTL_SEC": get_setting("PROVIDER_CACHE_FOUND_TTL_SEC", PROVIDER_CACHE_FOUND_TTL_SEC),
         "PROVIDER_CACHE_NOT_FOUND_TTL_SEC": get_setting("PROVIDER_CACHE_NOT_FOUND_TTL_SEC", PROVIDER_CACHE_NOT_FOUND_TTL_SEC),
         "PROVIDER_CACHE_ERROR_TTL_SEC": get_setting("PROVIDER_CACHE_ERROR_TTL_SEC", PROVIDER_CACHE_ERROR_TTL_SEC),
-        "USE_AI_FOR_MB_MATCH": True,
-        "USE_AI_FOR_MB_VERIFY": True,
-        "USE_AI_VISION_FOR_COVER": True,
+        "USE_AI_FOR_MB_MATCH": get_setting_bool("USE_AI_FOR_MB_MATCH", USE_AI_FOR_MB_MATCH),
+        "USE_AI_FOR_MB_VERIFY": get_setting_bool("USE_AI_FOR_MB_VERIFY", USE_AI_FOR_MB_VERIFY),
+        "USE_AI_VISION_FOR_COVER": get_setting_bool("USE_AI_VISION_FOR_COVER", USE_AI_VISION_FOR_COVER),
         "AI_CONFIDENCE_MIN": max(0, min(100, int(get_setting("AI_CONFIDENCE_MIN", AI_CONFIDENCE_MIN) or 50))),
         "OPENAI_VISION_MODEL": get_setting("OPENAI_VISION_MODEL", OPENAI_VISION_MODEL),
-        "USE_AI_VISION_BEFORE_COVER_INJECT": True,
-        "USE_WEB_SEARCH_FOR_MB": True,
-        "SERPER_API_KEY": get_setting("SERPER_API_KEY", SERPER_API_KEY),
+        "USE_AI_VISION_BEFORE_COVER_INJECT": get_setting_bool("USE_AI_VISION_BEFORE_COVER_INJECT", USE_AI_VISION_BEFORE_COVER_INJECT),
+        "USE_WEB_SEARCH_FOR_MB": get_setting_bool("USE_WEB_SEARCH_FOR_MB", USE_WEB_SEARCH_FOR_MB),
+        "SERPER_API_KEY": "***" if _is_set(serper_key_eff) else "",
+        "SERPER_API_KEY_SET": _is_set(serper_key_eff),
         "USE_ACOUSTID": True,
-        "ACOUSTID_API_KEY": get_setting("ACOUSTID_API_KEY", ACOUSTID_API_KEY),
+        "ACOUSTID_API_KEY": "***" if _is_set(acoustid_key_eff) else "",
+        "ACOUSTID_API_KEY_SET": _is_set(acoustid_key_eff),
         "USE_ACOUSTID_WHEN_TAGGED": False,
         "LIDARR_URL": get_setting("LIDARR_URL", merged.get("LIDARR_URL", "")),
-        "LIDARR_API_KEY": get_setting("LIDARR_API_KEY", merged.get("LIDARR_API_KEY", "")),
+        "LIDARR_API_KEY": "***" if _is_set(lidarr_key_eff) else "",
+        "LIDARR_API_KEY_SET": _is_set(lidarr_key_eff),
         "AUTOBRR_URL": get_setting("AUTOBRR_URL", merged.get("AUTOBRR_URL", "")),
-        "AUTOBRR_API_KEY": get_setting("AUTOBRR_API_KEY", merged.get("AUTOBRR_API_KEY", "")),
+        "AUTOBRR_API_KEY": "***" if _is_set(autobrr_key_eff) else "",
+        "AUTOBRR_API_KEY_SET": _is_set(autobrr_key_eff),
         "AUTO_FIX_BROKEN_ALBUMS": get_setting_bool("AUTO_FIX_BROKEN_ALBUMS", AUTO_FIX_BROKEN_ALBUMS),
         "BROKEN_ALBUM_CONSECUTIVE_THRESHOLD": get_setting("BROKEN_ALBUM_CONSECUTIVE_THRESHOLD", BROKEN_ALBUM_CONSECUTIVE_THRESHOLD),
         "BROKEN_ALBUM_PERCENTAGE_THRESHOLD": get_setting("BROKEN_ALBUM_PERCENTAGE_THRESHOLD", BROKEN_ALBUM_PERCENTAGE_THRESHOLD),
@@ -26309,19 +26466,27 @@ def api_config_get():
         "SCAN_DISABLE_CACHE": get_setting_bool("SCAN_DISABLE_CACHE", SCAN_DISABLE_CACHE),
         "DISABLE_PATH_CROSSCHECK": get_setting_bool("DISABLE_PATH_CROSSCHECK", DISABLE_PATH_CROSSCHECK),
         "USE_DISCOGS": True,
-        "DISCOGS_USER_TOKEN": get_setting("DISCOGS_USER_TOKEN", DISCOGS_USER_TOKEN),
+        "DISCOGS_USER_TOKEN": "***" if _is_set(discogs_token_eff) else "",
+        "DISCOGS_USER_TOKEN_SET": _is_set(discogs_token_eff),
         "USE_LASTFM": True,
-        "LASTFM_API_KEY": get_setting("LASTFM_API_KEY", LASTFM_API_KEY),
-        "LASTFM_API_SECRET": get_setting("LASTFM_API_SECRET", LASTFM_API_SECRET),
-        "FANART_API_KEY": get_setting("FANART_API_KEY", FANART_API_KEY),
-        "THEAUDIODB_API_KEY": get_setting("THEAUDIODB_API_KEY", THEAUDIODB_API_KEY),
+        "LASTFM_API_KEY": "***" if _is_set(lastfm_key_eff) else "",
+        "LASTFM_API_KEY_SET": _is_set(lastfm_key_eff),
+        "LASTFM_API_SECRET": "***" if _is_set(lastfm_secret_eff) else "",
+        "LASTFM_API_SECRET_SET": _is_set(lastfm_secret_eff),
+        "FANART_API_KEY": "***" if _is_set(fanart_key_eff) else "",
+        "FANART_API_KEY_SET": _is_set(fanart_key_eff),
+        "THEAUDIODB_API_KEY": "***" if _is_set(theaudiodb_key_eff) else "",
+        "THEAUDIODB_API_KEY_SET": _is_set(theaudiodb_key_eff),
         "USE_BANDCAMP": True,
         "JELLYFIN_URL": get_setting("JELLYFIN_URL", JELLYFIN_URL),
-        "JELLYFIN_API_KEY": get_setting("JELLYFIN_API_KEY", JELLYFIN_API_KEY),
+        "JELLYFIN_API_KEY": "***" if _is_set(jellyfin_key_eff) else "",
+        "JELLYFIN_API_KEY_SET": _is_set(jellyfin_key_eff),
         "NAVIDROME_URL": get_setting("NAVIDROME_URL", NAVIDROME_URL),
         "NAVIDROME_USERNAME": get_setting("NAVIDROME_USERNAME", NAVIDROME_USERNAME),
-        "NAVIDROME_PASSWORD": get_setting("NAVIDROME_PASSWORD", NAVIDROME_PASSWORD),
-        "NAVIDROME_API_KEY": get_setting("NAVIDROME_API_KEY", NAVIDROME_API_KEY),
+        "NAVIDROME_PASSWORD": "***" if _is_set(navidrome_pass_eff) else "",
+        "NAVIDROME_PASSWORD_SET": _is_set(navidrome_pass_eff),
+        "NAVIDROME_API_KEY": "***" if _is_set(navidrome_key_eff) else "",
+        "NAVIDROME_API_KEY_SET": _is_set(navidrome_key_eff),
         "SKIP_MB_FOR_LIVE_ALBUMS": True,
         "TRACKLIST_MATCH_MIN": "0.9",
         "LIVE_ALBUMS_MB_STRICT": False,
@@ -26341,7 +26506,13 @@ def api_config_get():
         "CONCERTS_HOME_LAT": str(get_setting("CONCERTS_HOME_LAT", "") or "").strip(),
         "CONCERTS_HOME_LON": str(get_setting("CONCERTS_HOME_LON", "") or "").strip(),
         "CONCERTS_RADIUS_KM": str(get_setting("CONCERTS_RADIUS_KM", "150") or "").strip() or "150",
-    })
+    }
+
+    # Defensive: if a secret key accidentally makes it into the payload, blank it.
+    for k in secret_keys:
+        if k in payload:
+            payload[k] = ""
+    return jsonify(payload)
 
 
 def _restart_container():
@@ -27010,24 +27181,13 @@ def api_config_put():
         "LIDARR_API_KEY", "AUTOBRR_API_KEY",
         "JELLYFIN_API_KEY", "NAVIDROME_PASSWORD", "NAVIDROME_API_KEY",
     )
+    # Drop masked secrets from the in-memory apply path as well.
+    for k in list(updates.keys()):
+        if k in MASKED_SECRETS and str(updates.get(k) or "").strip() == "***":
+            updates.pop(k, None)
     updates_for_db = {}
     forced_db_updates = {
         "LIBRARY_MODE": "files",
-        "USE_MUSICBRAINZ": "true",
-        "USE_AI_FOR_MB_MATCH": "true",
-        "USE_AI_FOR_MB_VERIFY": "true",
-        "USE_AI_VISION_FOR_COVER": "true",
-        "USE_AI_VISION_BEFORE_COVER_INJECT": "true",
-        "USE_WEB_SEARCH_FOR_MB": "true",
-        "USE_ACOUSTID": "true",
-        "USE_ACOUSTID_WHEN_TAGGED": "false",
-        "USE_DISCOGS": "true",
-        "USE_LASTFM": "true",
-        "USE_BANDCAMP": "true",
-        "SKIP_MB_FOR_LIVE_ALBUMS": "true",
-        "TRACKLIST_MATCH_MIN": "0.9",
-        "ARTIST_CREDIT_MODE": "picard_like_default",
-        "REQUIRED_TAGS": "artist,album,genre,year,tracks",
     }
     for k, v in updates.items():
         if k in MASKED_SECRETS and str(v).strip() == "***":
@@ -36043,6 +36203,8 @@ def _vision_verify_cover_before_inject(
     artist: str,
     album_title: str,
     source: str = "CAA",
+    *,
+    fail_open: bool = True,
 ) -> bool:
     """
     Ask vision AI whether the proposed cover image matches the album (artist/title).
@@ -36057,7 +36219,7 @@ def _vision_verify_cover_before_inject(
             image_bytes, mime = _resize_cover_for_vision(image_bytes, mime or "image/jpeg")
         if not image_bytes:
             logging.warning("[Vision before inject] Resize failed for %s / %s", artist, album_title)
-            return False
+            return True if fail_open else False
         b64 = base64.b64encode(image_bytes).decode("ascii")
         data_uri = f"data:{mime or 'image/jpeg'};base64,{b64}"
         system_msg = "Answer only Yes or No. Optionally end with (confidence: N) where N is 0-100."
@@ -36081,8 +36243,19 @@ def _vision_verify_cover_before_inject(
             image_base64=[{"type": "image_url", "image_url": {"url": data_uri}}],
             max_tokens=20,
         )
-        verdict_clean, vision_confidence = parse_ai_confidence((resp or "").strip())
-        verdict = verdict_clean.upper()
+        resp_txt = (resp or "").strip()
+        verdict_clean, vision_confidence = parse_ai_confidence(resp_txt)
+        verdict = (verdict_clean or "").strip().upper()
+        if not verdict:
+            # If the model returns an empty/invalid verdict, never block cover injection.
+            logging.info(
+                "[Vision before inject] artist=%r album=%r source=%s verdict=(empty) -> %s",
+                artist,
+                album_title,
+                source,
+                "accepted (fail-open)" if fail_open else "rejected (fail-closed)",
+            )
+            return True if fail_open else False
         if vision_confidence is not None:
             logging.info("[Vision before inject] confidence: %d", vision_confidence)
         ok = verdict.startswith("YES")
@@ -36122,7 +36295,7 @@ def _vision_verify_cover_before_inject(
         return ok
     except Exception as e:
         logging.warning("[Vision before inject] Verification failed for %s / %s: %s", artist, album_title, e)
-        return False
+        return True if fail_open else False
 
 
 def _embed_cover_in_audio_files(cover_path: Path, audio_files: list) -> None:
@@ -37114,7 +37287,15 @@ def _improve_single_album(album_id: int, db_conn, known_release_group_id: Option
                 mime = "image/jpeg"
             accepted = True
             if USE_AI_VISION_BEFORE_COVER_INJECT:
-                accepted = _vision_verify_cover_before_inject(content, mime, artist_name, album_title_str, "Web")
+                # Web covers are inherently risky: if vision fails, fail-closed and do not save.
+                accepted = _vision_verify_cover_before_inject(
+                    content,
+                    mime,
+                    artist_name,
+                    album_title_str,
+                    "Web",
+                    fail_open=False,
+                )
                 if not accepted:
                     steps.append("Vision: web cover rejected (not matching album)")
                     logging.info(
