@@ -5,7 +5,7 @@ import { Slider } from '@/components/ui/slider';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { cn } from '@/lib/utils';
 import * as api from '@/lib/api';
-import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Badge } from '@/components/ui/badge';
 
 export interface TrackInfo {
@@ -492,6 +492,9 @@ export function AudioPlayer({
               <div className="flex items-center justify-between gap-3 px-4 md:px-6 py-3 border-b border-white/10 bg-black/25 backdrop-blur-sm">
                 <DialogHeader className="space-y-0">
                   <DialogTitle className="text-white">Now Playing</DialogTitle>
+                  <DialogDescription className="sr-only">
+                    Full-screen player showing the current track and the queued track list.
+                  </DialogDescription>
                 </DialogHeader>
                 <div className="flex items-center gap-2">
                   <Badge className="bg-white/10 text-white border-white/10 hidden sm:inline-flex" variant="outline">
