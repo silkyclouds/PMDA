@@ -13105,35 +13105,20 @@ def detect_broken_album(db_conn, album_id: int, tracks: List[Track], mb_release_
                     missing_indices = []
                 return True, expected, actual_count, missing_indices
 
-    # Method 2: Heuristic (gaps) - using configurable thresholds
+    # Method 2: heuristic (gaps). If track indices are sane (guarded above) and we see any gap,
+    # treat the album as incomplete. This is the most reliable deterministic signal in both Plex
+    # and Files mode, and avoids moving "gaps" albums as duplicates.
     if gaps:
-        # Check if gap > configured consecutive threshold
-        large_gaps = [g for g in gaps if g[1] - g[0] > BROKEN_ALBUM_CONSECUTIVE_THRESHOLD]
-        if large_gaps:
-            missing_indices = []
-            for start_i, end_i in gaps:
-                try:
-                    missing_indices.extend(list(range(int(start_i) + 1, int(end_i))))
-                except Exception:
-                    continue
-                if len(missing_indices) > 5000:
-                    missing_indices = missing_indices[:5000]
-                    break
-            return True, max_idx, actual_count, missing_indices
-        
-        # Check if gaps represent > configured percentage threshold
-        total_missing = sum(g[1] - g[0] - 1 for g in gaps)
-        if total_missing > actual_count * BROKEN_ALBUM_PERCENTAGE_THRESHOLD:
-            missing_indices = []
-            for start_i, end_i in gaps:
-                try:
-                    missing_indices.extend(list(range(int(start_i) + 1, int(end_i))))
-                except Exception:
-                    continue
-                if len(missing_indices) > 5000:
-                    missing_indices = missing_indices[:5000]
-                    break
-            return True, max_idx, actual_count, missing_indices
+        missing_indices: list[int] = []
+        for start_i, end_i in gaps:
+            try:
+                missing_indices.extend(list(range(int(start_i) + 1, int(end_i))))
+            except Exception:
+                continue
+            if len(missing_indices) > 5000:
+                missing_indices = missing_indices[:5000]
+                break
+        return True, max_idx, actual_count, missing_indices
     
     return False, None, actual_count, []
 
@@ -13159,13 +13144,8 @@ def _detect_gaps_in_indices(indices: list) -> tuple[bool, int, list]:
             gaps.append((track_indices[i], track_indices[i + 1]))
     if not gaps:
         return False, actual_count, []
-    large_gaps = [g for g in gaps if g[1] - g[0] > BROKEN_ALBUM_CONSECUTIVE_THRESHOLD]
-    if large_gaps:
-        return True, actual_count, gaps
-    total_missing = sum(g[1] - g[0] - 1 for g in gaps)
-    if total_missing > actual_count * BROKEN_ALBUM_PERCENTAGE_THRESHOLD:
-        return True, actual_count, gaps
-    return False, actual_count, []
+    # Any gap is considered incomplete when indices are sane (caller ensures this).
+    return True, actual_count, gaps
 
 
 def _incomplete_album_disk_crosscheck(
