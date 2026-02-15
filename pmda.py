@@ -8289,23 +8289,54 @@ def call_ai_provider_longform(provider: str, model: str, system_msg: str, user_m
     if provider_lower == "openai":
         if not openai_client:
             raise ValueError("OpenAI client not initialized")
+        try:
+            is_gpt5 = (model or "").strip().lower().startswith("gpt-5")
+        except Exception:
+            is_gpt5 = False
+        # GPT-5 family models may spend a completion budget entirely on reasoning and emit empty output.
+        # Enforce a sane minimum for longform outputs too.
+        try:
+            if is_gpt5 and int(max_tokens or 0) < 256:
+                max_tokens = 256
+        except Exception:
+            pass
         param_style = getattr(sys.modules[__name__], "RESOLVED_PARAM_STYLE", "mct")
         _kwargs = {
             "model": model,
             "messages": [
-                {"role": "system", "content": system_msg},
+                # For o1+ models (including GPT-5), prefer "developer" messages for instructions.
+                {"role": ("developer" if is_gpt5 else "system"), "content": system_msg},
                 {"role": "user", "content": user_msg},
             ],
         }
+        if is_gpt5:
+            # Reduce hidden reasoning tokens so we reliably get visible JSON/text output.
+            _kwargs["reasoning_effort"] = "minimal"
         if param_style == "mct":
             _kwargs["max_completion_tokens"] = max_tokens
         else:
             _kwargs["max_tokens"] = max_tokens
         try:
             resp = openai_client.chat.completions.create(**_kwargs)
-            return (resp.choices[0].message.content or "").strip()
+            out = (resp.choices[0].message.content or "").strip()
+            if not out and is_gpt5:
+                # One retry with a larger budget for GPT-5 family models.
+                _kwargs_retry = dict(_kwargs)
+                _kwargs_retry.pop("max_tokens", None)
+                _kwargs_retry["max_completion_tokens"] = max(512, int(max_tokens or 0) * 2)
+                resp2 = openai_client.chat.completions.create(**_kwargs_retry)
+                out = (resp2.choices[0].message.content or "").strip()
+            return out
         except Exception as e:
             err_msg = str(e).lower()
+            # If reasoning_effort is not supported by the model, retry without it.
+            if "reasoning_effort" in err_msg and ("unsupported_parameter" in err_msg or "400" in err_msg):
+                _kwargs.pop("reasoning_effort", None)
+                try:
+                    resp = openai_client.chat.completions.create(**_kwargs)
+                    return (resp.choices[0].message.content or "").strip()
+                except Exception:
+                    raise e
             # Retry with other token parameter style when OpenAI errors on one of them.
             if "unsupported_parameter" in err_msg or "400" in err_msg:
                 if "max_completion_tokens" in err_msg and ("max_tokens" in err_msg or "use" in err_msg):
