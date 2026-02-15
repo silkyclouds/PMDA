@@ -21163,7 +21163,9 @@ def background_scan():
         except Exception as e:
             logging.warning("save_scan_editions_to_db in finally failed: %s", e)
         # Pipeline step: dedupe (synchronous so scan summary includes moved counts).
-        if pipeline_flags.get("dedupe") and all_results:
+        # Guarded by AUTO_MOVE_DUPES: when disabled, we must never move anything automatically.
+        auto_move_dup = bool(getattr(sys.modules[__name__], "AUTO_MOVE_DUPES", False))
+        if pipeline_flags.get("dedupe") and all_results and auto_move_dup:
             flat_groups = [g for groups in all_results.values() for g in groups]
             # One group per unique (artist, set of editions) so we never move both editions of the same album
             seen_group_keys = set()
@@ -21200,6 +21202,10 @@ def background_scan():
                         state["dedupe_last_write"] = None
                         state["dedupe_saved_this_run"] = 0
                 logging.info("Pipeline step dedupe: done")
+            with lock:
+                state["scan_step_progress"] = state.get("scan_step_progress", 0) + 1
+        elif pipeline_flags.get("dedupe") and all_results and (not auto_move_dup):
+            logging.info("Pipeline step dedupe: AUTO_MOVE_DUPES is disabled; skipping automatic deduplication")
             with lock:
                 state["scan_step_progress"] = state.get("scan_step_progress", 0) + 1
 
