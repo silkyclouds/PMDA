@@ -1788,9 +1788,13 @@ def _probe_model(model_name: str) -> str | None:
             resp = openai_client.chat.completions.create(
                 model=model_name,
                 messages=[
-                    {"role": "system", "content": "Reply with exactly: PONG"},
+                    # For o1+ models (including GPT-5), prefer "developer" over "system".
+                    {"role": "developer", "content": "Reply with exactly: PONG"},
                     {"role": "user", "content": "ping"},
                 ],
+                # Reduce reasoning to avoid spending the entire budget on hidden tokens.
+                # This both lowers cost and makes it far more likely to get visible output.
+                reasoning_effort="minimal",
                 max_completion_tokens=96,
             )
             txt = (resp.choices[0].message.content or "").strip() if resp and resp.choices else ""
@@ -1893,26 +1897,30 @@ def call_ai_provider(provider: str, model: str, system_msg: str, user_msg: str, 
                 max_tokens = 128
         except Exception:
             pass
+        try:
+            is_gpt5 = (model or "").strip().lower().startswith("gpt-5")
+        except Exception:
+            is_gpt5 = False
         param_style = getattr(sys.modules[__name__], "RESOLVED_PARAM_STYLE", "mct")
         stop_ok = getattr(sys.modules[__name__], "RESOLVED_STOP_OK", True)
         _kwargs = {
             "model": model,
             "messages": [
-                {"role": "system", "content": system_msg},
+                # For o1+ models (including GPT-5), prefer "developer" messages for instructions.
+                {"role": ("developer" if is_gpt5 else "system"), "content": system_msg},
                 {"role": "user", "content": user_msg},
             ],
         }
+        if is_gpt5:
+            # Lower reasoning effort for cheap + deterministic, short, parseable outputs.
+            _kwargs["reasoning_effort"] = "minimal"
         try:
-            is_gpt5 = (model or "").strip().lower().startswith("gpt-5")
-        except Exception:
-            is_gpt5 = False
-        if stop_ok and not is_gpt5:
-            _kwargs["stop"] = ["\n"]
-        if param_style == "mct":
-            _kwargs["max_completion_tokens"] = max_tokens
-        else:
-            _kwargs["max_tokens"] = max_tokens
-        try:
+            if stop_ok and not is_gpt5:
+                _kwargs["stop"] = ["\n"]
+            if param_style == "mct":
+                _kwargs["max_completion_tokens"] = max_tokens
+            else:
+                _kwargs["max_tokens"] = max_tokens
             resp = openai_client.chat.completions.create(**_kwargs)
             out = (resp.choices[0].message.content or "").strip()
             if not out and is_gpt5 and int(max_tokens or 0) < 256:
@@ -1926,6 +1934,14 @@ def call_ai_provider(provider: str, model: str, system_msg: str, user_msg: str, 
             return out
         except Exception as e:
             err_msg = str(e).lower()
+            # If reasoning_effort is not supported by the model, retry without it.
+            if "reasoning_effort" in err_msg and ("unsupported_parameter" in err_msg or "400" in err_msg):
+                _kwargs.pop("reasoning_effort", None)
+                try:
+                    resp = openai_client.chat.completions.create(**_kwargs)
+                    return (resp.choices[0].message.content or "").strip()
+                except Exception:
+                    raise e
             # On 400 unsupported parameter, retry with the other param or without stop
             if "unsupported_parameter" not in err_msg and "400" not in err_msg:
                 raise
