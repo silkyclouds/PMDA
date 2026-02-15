@@ -13285,6 +13285,8 @@ def fetch_mb_release_group_info(mbid: str) -> tuple[dict, bool]:
     info = {
         "id": mbid,  # Include the MBID in the info dict
         "title": result.get("title", ""),
+        # Keep artist names so strict identity checks can validate MBIDs sourced from providers (e.g. Last.fm).
+        "mb_artist_names": _extract_mb_artist_names(result),
         "primary_type": primary,
         "secondary_types": secondary,
         "format_summary": format_summary
@@ -16562,6 +16564,13 @@ def scan_duplicates(
                                 state["scan_bandcamp_matched"] = state.get("scan_bandcamp_matched", 0) + 1
 
                         provider_tracklist = chosen_payload.get("tracklist") if isinstance(chosen_payload, dict) else None
+                        # Track-count hint for incomplete detection when MB isn't available.
+                        # This allows detecting tail-truncated albums even when there are no index gaps.
+                        if isinstance(provider_tracklist, list) and provider_tracklist:
+                            try:
+                                e["_expected_track_count"] = int(len(provider_tracklist))
+                            except Exception:
+                                pass
                         if local_titles and isinstance(provider_tracklist, list) and provider_tracklist:
                             track_min = getattr(sys.modules[__name__], "TRACKLIST_MATCH_MIN", 0.8)
                             score = _crosscheck_tracklist(local_titles, provider_tracklist)
@@ -16594,7 +16603,22 @@ def scan_duplicates(
                 e['musicbrainz_type'] = 'release-group'
             
             # Detect broken album (missing tracks)
-            is_broken, expected_count, actual_count, missing_indices = detect_broken_album(db_conn, e['album_id'], e['tracks'], e.get('rg_info'))
+            # Detect broken album (missing tracks).
+            # Prefer MB track_count when present; otherwise fall back to provider tracklist size when available.
+            mb_hint = e.get("rg_info")
+            if not mb_hint:
+                try:
+                    exp = int(e.get("_expected_track_count") or 0)
+                except Exception:
+                    exp = 0
+                if exp > 0:
+                    mb_hint = {"track_count": exp}
+            is_broken, expected_count, actual_count, missing_indices = detect_broken_album(
+                db_conn,
+                e["album_id"],
+                e["tracks"],
+                mb_hint,
+            )
             e['is_broken'] = is_broken
             if is_broken:
                 e['expected_track_count'] = expected_count
