@@ -2437,17 +2437,41 @@ def _self_diag() -> bool:
     # --- OpenAI key -------------------------------------------------------------
     if OPENAI_API_KEY and openai_client:
         try:
-            # a 1‑token "ping" to verify the key / model combination works
+            # A small "ping" to verify the key/model works.
+            # Some models (notably GPT-5) reject Chat Completions params like "stop".
+            # Keep this check resilient; it should not block startup.
+            is_gpt5 = (str(RESOLVED_MODEL or "").strip().lower().startswith("gpt-5"))
+            stop_ok = bool(getattr(sys.modules[__name__], "RESOLVED_STOP_OK", True))
             _kwargs = {
                 "model": RESOLVED_MODEL,
-                "messages": [{"role": "user", "content": "ping"}],
-                "stop": ["\n"],
+                "messages": [{"role": ("developer" if is_gpt5 else "user"), "content": "Reply with exactly: PONG"}],
             }
+            if is_gpt5:
+                _kwargs["reasoning_effort"] = "minimal"
+            if stop_ok and not is_gpt5:
+                _kwargs["stop"] = ["\n"]
             if RESOLVED_PARAM_STYLE == "mct":
-                _kwargs["max_completion_tokens"] = 8
+                _kwargs["max_completion_tokens"] = 32 if is_gpt5 else 8
             else:
-                _kwargs["max_tokens"] = 8
-            openai_client.chat.completions.create(**_kwargs)
+                _kwargs["max_tokens"] = 32 if is_gpt5 else 8
+            try:
+                resp = openai_client.chat.completions.create(**_kwargs)
+                _txt = (resp.choices[0].message.content or "").strip() if resp and resp.choices else ""
+            except Exception as e:
+                # If stop is rejected, retry once without it and persist that property.
+                msg = str(e).lower()
+                if "stop" in msg and ("unsupported" in msg or "unsupported_parameter" in msg or "400" in msg):
+                    _kwargs.pop("stop", None)
+                    try:
+                        sys.modules[__name__].RESOLVED_STOP_OK = False
+                    except Exception:
+                        pass
+                    resp = openai_client.chat.completions.create(**_kwargs)
+                    _txt = (resp.choices[0].message.content or "").strip() if resp and resp.choices else ""
+                else:
+                    raise
+            # Keep the check permissive: any non-empty output indicates the key/model works.
+            # For GPT-5, we prefer a visible PONG but don't hard-fail on formatting.
             logging.info("%s OpenAI API key valid – model **%s** reachable",
                          colour("✓", ANSI_GREEN), RESOLVED_MODEL)
             openai_ok = True

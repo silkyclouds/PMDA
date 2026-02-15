@@ -41,3 +41,4 @@ config.json
 .DS_Store
 *.swp
 *.swo
+*.tsbuildinfo
