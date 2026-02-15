@@ -13921,30 +13921,36 @@ def _fetch_album_provider_fallbacks_parallel(artist: str, album_title: str) -> d
         from concurrent.futures import ThreadPoolExecutor, as_completed
     except Exception:
         # Fallback to sequential when concurrent futures is unavailable.
-        try:
-            if USE_DISCOGS:
+        if USE_DISCOGS:
+            try:
                 out["discogs"] = fetch_provider_album_lookup_cached(
                     "discogs",
                     artist_name,
                     title,
                     _fetch_discogs_release,
                 )
-            if USE_LASTFM:
+            except Exception as e:
+                logging.debug("[Providers] discogs fetch failed for %r - %r: %s", artist_name, title, e)
+        if USE_LASTFM:
+            try:
                 out["lastfm"] = fetch_provider_album_lookup_cached(
                     "lastfm",
                     artist_name,
                     title,
                     _fetch_lastfm_album_info,
                 )
-            if USE_BANDCAMP:
+            except Exception as e:
+                logging.debug("[Providers] lastfm fetch failed for %r - %r: %s", artist_name, title, e)
+        if USE_BANDCAMP:
+            try:
                 out["bandcamp"] = fetch_provider_album_lookup_cached(
                     "bandcamp",
                     artist_name,
                     title,
                     _fetch_bandcamp_album_info,
                 )
-        except Exception:
-            pass
+            except Exception as e:
+                logging.debug("[Providers] bandcamp fetch failed for %r - %r: %s", artist_name, title, e)
     else:
         tasks = {}
         with ThreadPoolExecutor(max_workers=3, thread_name_prefix="pmda-provider-fallback") as pool:
@@ -16569,14 +16575,56 @@ def scan_duplicates(
             if not rg_info:
                 fallback_sources = []
                 provider_payloads = e.pop("_provider_payloads_prefetched", None)
-                if not isinstance(provider_payloads, dict) or not provider_payloads:
+                if not isinstance(provider_payloads, dict):
                     provider_payloads = {}
-                    try:
-                        provider_payloads = _fetch_album_provider_fallbacks_parallel(artist, title_raw)
-                    except Exception as provider_exc:
-                        logging.debug("[Artist %s] provider fallback fetch failed for %s: %s", artist, title_raw, provider_exc)
-                        provider_payloads = {}
+                # Normalize expected provider keys so arbitration is deterministic.
+                provider_payloads.setdefault("discogs", None)
+                provider_payloads.setdefault("lastfm", None)
+                provider_payloads.setdefault("bandcamp", None)
 
+                def _ensure_provider_payload(provider_key: str) -> None:
+                    """Fetch a provider payload (cached) only when needed."""
+                    try:
+                        if isinstance(provider_payloads.get(provider_key), dict):
+                            return
+                        if provider_key == "lastfm" and USE_LASTFM:
+                            provider_payloads["lastfm"] = fetch_provider_album_lookup_cached(
+                                "lastfm",
+                                artist,
+                                title_raw,
+                                _fetch_lastfm_album_info,
+                            )
+                        elif provider_key == "discogs" and USE_DISCOGS:
+                            provider_payloads["discogs"] = fetch_provider_album_lookup_cached(
+                                "discogs",
+                                artist,
+                                title_raw,
+                                _fetch_discogs_release,
+                            )
+                        elif provider_key == "bandcamp" and USE_BANDCAMP:
+                            provider_payloads["bandcamp"] = fetch_provider_album_lookup_cached(
+                                "bandcamp",
+                                artist,
+                                title_raw,
+                                _fetch_bandcamp_album_info,
+                            )
+                    except DiscogsRateLimited:
+                        # Rate limiting is handled globally; treat as "no payload" for this edition.
+                        provider_payloads[provider_key] = None
+                    except Exception as provider_exc:
+                        logging.debug(
+                            "[Artist %s] provider %s fetch failed for %s: %s",
+                            artist,
+                            provider_key,
+                            title_raw,
+                            provider_exc,
+                        )
+                        provider_payloads[provider_key] = None
+
+                # Start with Last.fm only (fast, often provides cover + MBID). Fetch Discogs/Bandcamp only when needed.
+                _ensure_provider_payload("lastfm")
+
+                # Keep any already-prefetched Discogs/Bandcamp payloads (but do not fetch them eagerly).
                 discogs_info = provider_payloads.get("discogs")
                 if isinstance(discogs_info, dict):
                     e["fallback_discogs"] = discogs_info
@@ -16643,8 +16691,10 @@ def scan_duplicates(
 
                 if fallback_sources and artist in state.get("scan_active_artists", {}) and e["album_id"] == state["scan_active_artists"][artist].get("current_album", {}).get("album_id"):
                     with lock:
+                        cur_resp = state["scan_active_artists"][artist]["current_album"].get("step_response", "") or ""
+                        base_resp = cur_resp.split("; fallback:", 1)[0]
                         state["scan_active_artists"][artist]["current_album"]["step_response"] = (
-                            state["scan_active_artists"][artist]["current_album"].get("step_response", "")
+                            base_resp
                             + ("; fallback: " + ", ".join(fallback_sources) if fallback_sources else "")
                         )
 
@@ -16661,6 +16711,43 @@ def scan_duplicates(
                             local_track_titles=local_titles,
                             provider_payloads=provider_payloads,
                         )
+                        # If arbitration fails with only Last.fm (no tracklist), progressively fetch other providers.
+                        if not arbitration:
+                            if USE_DISCOGS and not isinstance(provider_payloads.get("discogs"), dict):
+                                _ensure_provider_payload("discogs")
+                                discogs_info = provider_payloads.get("discogs")
+                                if isinstance(discogs_info, dict):
+                                    e["fallback_discogs"] = discogs_info
+                                    if "Discogs" not in fallback_sources:
+                                        fallback_sources.append("Discogs")
+                                arbitration = _arbitrate_provider_identity(
+                                    artist_name=artist,
+                                    album_title=title_raw,
+                                    local_track_titles=local_titles,
+                                    provider_payloads=provider_payloads,
+                                )
+                            if (not arbitration) and USE_BANDCAMP and not isinstance(provider_payloads.get("bandcamp"), dict):
+                                _ensure_provider_payload("bandcamp")
+                                bandcamp_info = provider_payloads.get("bandcamp")
+                                if isinstance(bandcamp_info, dict):
+                                    e["fallback_bandcamp"] = bandcamp_info
+                                    if "Bandcamp" not in fallback_sources:
+                                        fallback_sources.append("Bandcamp")
+                                arbitration = _arbitrate_provider_identity(
+                                    artist_name=artist,
+                                    album_title=title_raw,
+                                    local_track_titles=local_titles,
+                                    provider_payloads=provider_payloads,
+                                )
+                            # Refresh UI step response to reflect newly used fallback sources.
+                            if fallback_sources and artist in state.get("scan_active_artists", {}) and e["album_id"] == state["scan_active_artists"][artist].get("current_album", {}).get("album_id"):
+                                with lock:
+                                    cur_resp = state["scan_active_artists"][artist]["current_album"].get("step_response", "") or ""
+                                    base_resp = cur_resp.split("; fallback:", 1)[0]
+                                    state["scan_active_artists"][artist]["current_album"]["step_response"] = (
+                                        base_resp
+                                        + ("; fallback: " + ", ".join(fallback_sources) if fallback_sources else "")
+                                    )
                     if arbitration:
                         chosen_provider = str(arbitration.get("provider") or "").strip().lower()
                         chosen_payload = arbitration.get("payload") if isinstance(arbitration.get("payload"), dict) else {}
@@ -22978,16 +23065,132 @@ def _run_preflight_checks():
     return mb_ok, ai_ok
 
 
+# ─────────────────────────────── Discogs throttling ───────────────────────────────
+# Discogs enforces a fairly strict rate limit (commonly ~60 req/min for authenticated calls).
+# PMDA can issue Discogs calls from multiple scan/background threads, so we need a global throttle
+# to avoid 429s and to keep Discogs as a reliable cover/tracklist source.
+
+class DiscogsRateLimited(RuntimeError):
+    """Raised when Discogs responds with HTTP 429 (rate limited)."""
+
+
+_discogs_lock = threading.Lock()
+_discogs_next_allowed_at = 0.0
+_discogs_429_streak = 0
+_discogs_client = None
+_discogs_client_token = None
+
+
+def _discogs_min_interval_sec() -> float:
+    """
+    Minimum delay between Discogs API requests across the whole process.
+    Not exposed in the UI; can be overridden via env/DB for debugging.
+    """
+    try:
+        v = float(getattr(sys.modules[__name__], "DISCOGS_MIN_INTERVAL_SEC", 1.1) or 1.1)
+    except Exception:
+        v = 1.1
+    return max(0.2, min(v, 10.0))
+
+
+def _discogs_throttle() -> None:
+    """Reserve a global Discogs request slot and sleep until it is due."""
+    global _discogs_next_allowed_at
+    interval = _discogs_min_interval_sec()
+    with _discogs_lock:
+        now = time.monotonic()
+        scheduled = max(float(_discogs_next_allowed_at or 0.0), now)
+        _discogs_next_allowed_at = scheduled + interval
+    wait = scheduled - now
+    if wait > 0:
+        time.sleep(wait)
+
+
+def _discogs_penalize(seconds: float) -> None:
+    """Push the next allowed time into the future (used after 429 backoff)."""
+    global _discogs_next_allowed_at
+    try:
+        sec = float(seconds or 0.0)
+    except Exception:
+        sec = 0.0
+    if sec <= 0:
+        return
+    with _discogs_lock:
+        now = time.monotonic()
+        _discogs_next_allowed_at = max(float(_discogs_next_allowed_at or 0.0), now + sec)
+
+
+def _get_discogs_client():
+    """Return a cached Discogs client (token-scoped), or None when not configured."""
+    token = (getattr(sys.modules[__name__], "DISCOGS_USER_TOKEN", "") or "").strip()
+    if not token:
+        return None
+    global _discogs_client, _discogs_client_token
+    with _discogs_lock:
+        if _discogs_client is None or _discogs_client_token != token:
+            import discogs_client
+            _discogs_client = discogs_client.Client("PMDA/0.6.6", user_token=token)
+            _discogs_client_token = token
+        return _discogs_client
+
+
+def _discogs_call(desc: str, fn, attempts: int = 2):
+    """
+    Execute a Discogs API call under a global throttle, with 429 backoff.
+    The *fn* must be the code path that actually triggers HTTP (e.g. `.page()`, `.data`).
+    """
+    global _discogs_429_streak
+    try:
+        from discogs_client.exceptions import HTTPError
+    except Exception:
+        HTTPError = Exception  # type: ignore
+    last_exc = None
+    for attempt in range(1, max(1, int(attempts or 1)) + 1):
+        _discogs_throttle()
+        try:
+            result = fn()
+            with _discogs_lock:
+                _discogs_429_streak = 0
+            return result
+        except HTTPError as he:  # type: ignore[misc]
+            last_exc = he
+            if getattr(he, "status_code", None) == 429:
+                with _discogs_lock:
+                    _discogs_429_streak = int(_discogs_429_streak or 0) + 1
+                    streak = int(_discogs_429_streak or 0)
+                # Exponential backoff with jitter, capped.
+                base = 3.0
+                backoff = min(120.0, base * (2.0 ** min(max(0, streak - 1), 6)))
+                backoff *= 0.8 + (random.random() * 0.4)
+                _discogs_penalize(backoff)
+                logging.warning(
+                    "[Discogs] 429 rate limited during %s; backing off %.1fs (attempt %d/%d)",
+                    (desc or "call"),
+                    backoff,
+                    attempt,
+                    attempts,
+                )
+                if attempt >= attempts:
+                    raise DiscogsRateLimited(f"Discogs rate limited during {desc}: {he}") from he
+                continue
+            raise
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError(f"Discogs call failed: {desc}")
+
+
 def _run_discogs_preflight() -> tuple[bool, str]:
     """Test Discogs API connectivity. Returns (ok, message)."""
     if not USE_DISCOGS or not (getattr(sys.modules[__name__], "DISCOGS_USER_TOKEN", "") or "").strip():
         return False, "Disabled (no token)"
     try:
-        import discogs_client
-        token = (getattr(sys.modules[__name__], "DISCOGS_USER_TOKEN", "") or "").strip()
-        d = discogs_client.Client("PMDA/0.6.6", user_token=token)
-        d.identity()
+        d = _get_discogs_client()
+        if d is None:
+            return False, "Disabled (no token)"
+        _discogs_call("preflight identity", lambda: d.identity(), attempts=1)
         return True, "Discogs reachable"
+    except DiscogsRateLimited as e:
+        return False, f"Discogs rate limited: {e}"
     except Exception as e:
         return False, f"Discogs unreachable: {e}"
 
@@ -23158,91 +23361,136 @@ def _fetch_discogs_release(artist_name: str, album_title: str) -> Optional[dict]
     """
     if not USE_DISCOGS:
         return None
-    token = (getattr(sys.modules[__name__], "DISCOGS_USER_TOKEN", "") or "").strip()
-    if not token:
+    d = _get_discogs_client()
+    if d is None:
         return None
-    def _page_to_candidate_ids(d_client, page_list: list) -> list:
-        out = []
+
+    def _int_id(value) -> Optional[int]:
+        if value is None:
+            return None
+        try:
+            if isinstance(value, int):
+                return int(value)
+            return int(getattr(value, "id", value))
+        except Exception:
+            return None
+
+    def _page_to_candidate_ids(page_list: list) -> list[int]:
+        out: list[int] = []
         for item in page_list or []:
-            item_id = getattr(item, "id", None) or (getattr(item, "data", None) or {}).get("id")
-            if item_id is None:
+            data = getattr(item, "data", None)
+            if isinstance(data, dict):
+                item_id = data.get("id", None) if "id" in data else getattr(item, "id", None)
+                item_type = (data.get("type") or getattr(item, "type", None) or "release")
+            else:
+                item_id = getattr(item, "id", None)
+                item_type = getattr(item, "type", None) or "release"
+            iid = _int_id(item_id)
+            if iid is None:
                 continue
-            item_type = getattr(item, "type", None) or (getattr(item, "data", None) or {}).get("type", "release")
             if item_type == "release":
-                rid = getattr(item_id, "id", item_id) if not isinstance(item_id, int) else item_id
-                out.append(int(rid))
-            elif item_type == "master":
-                try:
-                    master = d_client.master(int(item_id))
-                    main = getattr(master, "main_release", None) or (getattr(master, "data", None) or {}).get("main_release")
-                    if main is not None:
-                        rid = getattr(main, "id", main) if not isinstance(main, int) else main
-                        out.append(int(rid))
-                except Exception:
-                    continue
+                out.append(iid)
+                continue
+            if item_type != "master":
+                continue
+            # Try to resolve master -> main release without extra API calls when possible.
+            main_release = None
+            if isinstance(data, dict):
+                main_release = data.get("main_release") or data.get("main_release_id")
+                if isinstance(main_release, dict):
+                    main_release = main_release.get("id")
+            rid = _int_id(main_release)
+            if rid is not None:
+                out.append(rid)
+                continue
+            try:
+                master_data = _discogs_call(f"master {iid} data", lambda mid=iid: d.master(mid).data)
+                main_release = master_data.get("main_release") if isinstance(master_data, dict) else None
+                if isinstance(main_release, dict):
+                    main_release = main_release.get("id")
+                rid = _int_id(main_release)
+                if rid is not None:
+                    out.append(rid)
+            except DiscogsRateLimited:
+                raise
+            except Exception:
+                continue
         return out
 
-    try:
-        import discogs_client
-        from discogs_client.exceptions import HTTPError
-        d = discogs_client.Client("PMDA/0.6.6", user_token=token)
-        album_norm = norm_album(album_title) or album_title
-        results = d.search(album_norm, artist=artist_name, type="release")
-        page = results.page(1)
-        candidate_ids = _page_to_candidate_ids(d, page)
-        if not candidate_ids:
-            combined = f"{artist_name} {album_title}".strip()
-            if combined:
-                results = d.search(combined, type="release")
-                page = results.page(1)
-                candidate_ids = _page_to_candidate_ids(d, page)
-        seen = set()
-        unique_ids = [x for x in candidate_ids if x not in seen and not seen.add(x)]
-        for release_id in unique_ids:
-            try:
-                full_release = d.release(release_id)
-                title = getattr(full_release, "title", None) or (full_release.data.get("title") if getattr(full_release, "data", None) else album_title)
-                year = getattr(full_release, "year", None) or (full_release.data.get("year") if getattr(full_release, "data", None) else "")
-                cover_url = None
-                if getattr(full_release, "images", None) and len(full_release.images) > 0:
-                    img = full_release.images[0]
-                    cover_url = img.get("uri") or img.get("resource_url")
-                artist_str = artist_name
-                if getattr(full_release, "artists", None) and full_release.artists:
-                    artist_str = getattr(full_release.artists[0], "name", None) or artist_name
-                tracklist = []
-                for tr in getattr(full_release, "tracklist", []) or []:
-                    t_title = getattr(tr, "title", None) or (getattr(tr, "data", None) or {}).get("title")
-                    if t_title:
-                        tracklist.append(str(t_title))
-                try:
-                    release_id = str(getattr(full_release, "id", "") or "")
-                except Exception:
-                    release_id = ""
-                master_id = ""
-                try:
-                    master_obj = getattr(full_release, "master", None)
-                    if master_obj is not None:
-                        master_id = str(getattr(master_obj, "id", "") or "")
-                except Exception:
-                    master_id = ""
-                return {
-                    "title": title,
-                    "year": str(year) if year else "",
-                    "cover_url": cover_url,
-                    "artist_name": artist_str,
-                    "tracklist": tracklist,
-                    "release_id": release_id,
-                    "master_id": master_id,
-                }
-            except HTTPError as he:
-                if getattr(he, "status_code", None) == 404:
-                    continue
-                raise
-        return None
-    except Exception as e:
-        logging.warning("Discogs fetch failed for %s / %s: %s", artist_name, album_title, e)
-        return None
+    album_norm = norm_album(album_title) or album_title
+    # Discogs client may trigger HTTP on search/page/data. Keep every HTTP trigger behind _discogs_call.
+    results = d.search(album_norm, artist=artist_name, type="release")
+    page = _discogs_call("search release page=1", lambda: results.page(1))
+    candidate_ids = _page_to_candidate_ids(page)
+
+    if not candidate_ids:
+        combined = f"{artist_name} {album_title}".strip()
+        if combined:
+            results = d.search(combined, type="release")
+            page = _discogs_call("search combined page=1", lambda: results.page(1))
+            candidate_ids = _page_to_candidate_ids(page)
+
+    seen: set[int] = set()
+    unique_ids = [x for x in candidate_ids if x not in seen and not seen.add(x)]
+    for release_id in unique_ids:
+        try:
+            rel_data = _discogs_call(
+                f"release {release_id} data",
+                lambda rid=release_id: d.release(int(rid)).data,
+            )
+        except DiscogsRateLimited:
+            raise
+        except Exception as e:
+            # Skip invalid ids (Discogs sometimes returns masters/releases that don't resolve).
+            if getattr(e, "status_code", None) == 404:
+                continue
+            raise
+        if not isinstance(rel_data, dict):
+            continue
+
+        title = str(rel_data.get("title") or album_title or "").strip() or str(album_title or "").strip()
+        year_val = rel_data.get("year")
+        year = str(year_val).strip() if year_val else ""
+
+        cover_url = None
+        images = rel_data.get("images") or []
+        if isinstance(images, list) and images:
+            img0 = images[0] if isinstance(images[0], dict) else None
+            if img0:
+                cover_url = (img0.get("uri") or img0.get("resource_url") or "").strip() or None
+
+        artist_str = (artist_name or "").strip()
+        artists = rel_data.get("artists") or []
+        if isinstance(artists, list) and artists:
+            a0 = artists[0] if isinstance(artists[0], dict) else None
+            if a0 and a0.get("name"):
+                artist_str = str(a0.get("name") or "").strip() or artist_str
+
+        tracklist: list[str] = []
+        for tr in rel_data.get("tracklist") or []:
+            if not isinstance(tr, dict):
+                continue
+            t_title = tr.get("title")
+            if t_title:
+                tracklist.append(str(t_title))
+
+        release_id_str = str(rel_data.get("id") or release_id or "").strip()
+        master_id = str(rel_data.get("master_id") or "").strip()
+        if not master_id:
+            master_val = rel_data.get("master")
+            if isinstance(master_val, dict):
+                master_id = str(master_val.get("id") or "").strip()
+
+        return {
+            "title": title,
+            "year": year,
+            "cover_url": cover_url,
+            "artist_name": artist_str,
+            "tracklist": tracklist,
+            "release_id": release_id_str,
+            "master_id": master_id,
+        }
+    return None
 
 
 def _fetch_lastfm_album_info(artist_name: str, album_title: str, mbid: Optional[str] = None) -> Optional[dict]:
@@ -35996,28 +36244,33 @@ def _fetch_artist_image_discogs(artist_name: str) -> Optional[str]:
     """Get artist image URL from Discogs (search artist, first result). Returns URL or None."""
     if not USE_DISCOGS:
         return None
-    token = (getattr(sys.modules[__name__], "DISCOGS_USER_TOKEN", "") or "").strip()
-    if not token:
-        return None
     try:
-        import discogs_client
-        d = discogs_client.Client("PMDA/0.6.6", user_token=token)
+        d = _get_discogs_client()
+        if d is None:
+            return None
         results = d.search(artist_name, type="artist")
-        page = results.page(1)
+        page = _discogs_call("artist search page=1", lambda: results.page(1))
         if not page:
             return None
         artist = page[0]
-        artist_id = getattr(artist, "id", None) or (artist.data.get("id") if getattr(artist, "data", None) else None)
+        artist_data = getattr(artist, "data", None)
+        artist_id = getattr(artist, "id", None) or (artist_data.get("id") if isinstance(artist_data, dict) else None)
         if not artist_id:
             return None
-        full_artist = d.artist(artist_id)
-        images = getattr(full_artist, "images", None)
-        if images and len(images) > 0:
-            img = images[0]
-            return img.get("uri") or img.get("resource_url")
+        full_id = int(getattr(artist_id, "id", artist_id))
+        full_data = _discogs_call(f"artist {full_id} data", lambda aid=full_id: d.artist(aid).data)
+        if isinstance(full_data, dict):
+            images = full_data.get("images") or []
+            if isinstance(images, list) and images:
+                img = images[0] if isinstance(images[0], dict) else None
+                if img:
+                    return (img.get("uri") or img.get("resource_url") or "").strip() or None
+        return None
+    except DiscogsRateLimited:
+        # Already logged + backed off in _discogs_call.
         return None
     except Exception as e:
-        logging.warning("Discogs artist image fetch failed for %s: %s", artist_name, e)
+        logging.debug("Discogs artist image fetch failed for %s: %s", artist_name, e)
         return None
 
 
@@ -37288,7 +37541,14 @@ def _improve_single_album(album_id: int, db_conn, known_release_group_id: Option
     # Fallback: Discogs then Last.fm/Bandcamp to fill in what MusicBrainz did not provide
     has_cover_now = has_cover or cover_saved
     if USE_DISCOGS and (not tags_updated or not has_cover_now):
-        discogs_info = _fetch_discogs_release(artist_name, album_title_str)
+        try:
+            discogs_info = _fetch_discogs_release(artist_name, album_title_str)
+        except DiscogsRateLimited:
+            steps.append("Discogs: rate limited (skipped)")
+            discogs_info = None
+        except Exception as e:
+            logging.debug("improve-album: Discogs fetch failed: %s", e)
+            discogs_info = None
         discogs_strict_ok = False
         if discogs_info:
             strict_ok, strict_reason = _strict_identity_match_details(
@@ -38002,7 +38262,14 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
 
     has_cover_now = has_cover or cover_saved
     if USE_DISCOGS and (not tags_updated or not has_cover_now):
-        discogs_info = _fetch_discogs_release(artist_name, album_title_str)
+        try:
+            discogs_info = _fetch_discogs_release(artist_name, album_title_str)
+        except DiscogsRateLimited:
+            steps.append("Discogs: rate limited (skipped)")
+            discogs_info = None
+        except Exception as e:
+            logging.debug("improve-folder: Discogs fetch failed: %s", e)
+            discogs_info = None
         discogs_strict_ok = False
         if discogs_info:
             strict_ok, strict_reason = _strict_identity_match_details(
