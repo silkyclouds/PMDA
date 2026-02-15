@@ -2055,14 +2055,27 @@ def call_ai_provider_vision(
                 content.append(img)
     param_style = getattr(sys.modules[__name__], "RESOLVED_PARAM_STYLE", "mct")
     stop_ok = getattr(sys.modules[__name__], "RESOLVED_STOP_OK", True)
+    try:
+        is_gpt5 = (model or "").strip().lower().startswith("gpt-5")
+    except Exception:
+        is_gpt5 = False
+    # GPT-5 family models may spend very small budgets entirely on reasoning and return empty output.
+    # Enforce a sane minimum for short YES/NO style outputs.
+    try:
+        if is_gpt5 and int(max_tokens or 0) < 128:
+            max_tokens = 128
+    except Exception:
+        pass
     _kwargs = {
         "model": model,
         "messages": [
-            {"role": "system", "content": system_msg},
+            {"role": ("developer" if is_gpt5 else "system"), "content": system_msg},
             {"role": "user", "content": content},
         ],
     }
-    if stop_ok:
+    if is_gpt5:
+        _kwargs["reasoning_effort"] = "minimal"
+    if stop_ok and not is_gpt5:
         _kwargs["stop"] = ["\n"]
     if param_style == "mct":
         _kwargs["max_completion_tokens"] = max_tokens
@@ -2070,9 +2083,39 @@ def call_ai_provider_vision(
         _kwargs["max_tokens"] = max_tokens
     try:
         resp = openai_client.chat.completions.create(**_kwargs)
-        return (resp.choices[0].message.content or "").strip()
+        out = (resp.choices[0].message.content or "").strip()
+        if not out and is_gpt5 and int(max_tokens or 0) < 256:
+            # One retry with a larger budget for GPT-5 family models.
+            _kwargs_retry = dict(_kwargs)
+            _kwargs_retry.pop("stop", None)
+            _kwargs_retry.pop("max_tokens", None)
+            _kwargs_retry["max_completion_tokens"] = 256
+            resp2 = openai_client.chat.completions.create(**_kwargs_retry)
+            out = (resp2.choices[0].message.content or "").strip()
+        return out
     except Exception as e:
         logging.debug("[AI Vision] OpenAI vision call failed: %s", e)
+        # Retry without reasoning_effort for models that don't support it.
+        try:
+            msg = str(e).lower()
+        except Exception:
+            msg = ""
+        if "reasoning_effort" in msg and ("unsupported_parameter" in msg or "400" in msg):
+            _kwargs.pop("reasoning_effort", None)
+            try:
+                resp = openai_client.chat.completions.create(**_kwargs)
+                return (resp.choices[0].message.content or "").strip()
+            except Exception:
+                raise e
+        # Retry without stop if the model rejects it (some reasoning models reject stop).
+        if "stop" in msg and ("unsupported" in msg or "unsupported_parameter" in msg or "400" in msg):
+            _kwargs.pop("stop", None)
+            try:
+                sys.modules[__name__].RESOLVED_STOP_OK = False
+            except Exception:
+                pass
+            resp = openai_client.chat.completions.create(**_kwargs)
+            return (resp.choices[0].message.content or "").strip()
         raise
 
 
@@ -4877,6 +4920,66 @@ def _record_files_pending_change(folder_path: str, reason: str) -> None:
         state["files_watcher"] = fw
 
 
+# Files watcher suppression ----------------------------------------------------
+# The Files watcher can observe PMDA's own writes (tag updates, cover/artwork writes,
+# and dupe/incomplete moves) and accidentally retrigger changed-only scans in a loop.
+# We suppress events for recently-touched album folders to avoid scan storms.
+_FILES_WATCHER_SUPPRESS_LOCK = threading.Lock()
+_FILES_WATCHER_SUPPRESS_UNTIL: dict[str, float] = {}
+
+
+def _files_watcher_suppress_folder(folder: Path | str, *, seconds: float = 90.0, reason: str = "pmda_write") -> None:
+    try:
+        key = _album_folder_cache_key(folder)
+    except Exception:
+        key = str(folder or "")
+    key = (key or "").strip()
+    if not key:
+        return
+    until = time.time() + max(5.0, float(seconds or 90.0))
+    with _FILES_WATCHER_SUPPRESS_LOCK:
+        _FILES_WATCHER_SUPPRESS_UNTIL[key] = max(_FILES_WATCHER_SUPPRESS_UNTIL.get(key, 0.0), until)
+
+
+def _files_watcher_is_suppressed(folder_key: str) -> bool:
+    key = (folder_key or "").strip()
+    if not key:
+        return False
+    now = time.time()
+    with _FILES_WATCHER_SUPPRESS_LOCK:
+        # Opportunistic cleanup (keeps map small).
+        if _FILES_WATCHER_SUPPRESS_UNTIL:
+            expired = [k for k, v in _FILES_WATCHER_SUPPRESS_UNTIL.items() if float(v or 0.0) <= now]
+            for k in expired[:5000]:
+                _FILES_WATCHER_SUPPRESS_UNTIL.pop(k, None)
+        until = float(_FILES_WATCHER_SUPPRESS_UNTIL.get(key, 0.0) or 0.0)
+    return bool(until and until > now)
+
+
+def _files_watcher_should_ignore_folder_key(folder_key: str) -> bool:
+    """
+    Ignore watcher events for folders that are never intended to be scanned (dupes,
+    incomplete quarantine, config).
+    """
+    p = (folder_key or "").strip()
+    if not p:
+        return True
+    low = p.lower()
+    if low.startswith("/config/") or low == "/config":
+        return True
+    if low.startswith("/dupes/") or low == "/dupes":
+        return True
+    try:
+        target_dir = str(_get_config_from_db("INCOMPLETE_ALBUMS_TARGET_DIR") or "/dupes/incomplete_albums").strip()
+        if target_dir:
+            target_norm = str(path_for_fs_access(Path(target_dir))).strip().lower()
+            if target_norm and low.startswith(target_norm.lower().rstrip("/") + "/"):
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def _list_files_pending_changes(limit: int = 10000) -> list[dict]:
     out: list[dict] = []
     try:
@@ -5024,12 +5127,19 @@ if FileSystemEventHandler is not None:
             folders = _resolve_album_folders_from_event_path(path)
             if not folders:
                 return
+            kept = 0
             for folder_key in folders:
+                if _files_watcher_should_ignore_folder_key(folder_key):
+                    continue
+                if _files_watcher_is_suppressed(folder_key):
+                    continue
                 _record_files_pending_change(folder_key, reason)
+                kept += 1
             now = time.time()
             if (now - self._last_log_ts) >= max(1.0, PMDA_FILES_WATCHER_LOG_COOLDOWN_SEC):
                 self._last_log_ts = now
-                logging.info("[FILES watcher] queued %d changed album folder(s) (%s)", len(folders), reason)
+                if kept:
+                    logging.info("[FILES watcher] queued %d changed album folder(s) (%s)", kept, reason)
 
         def on_created(self, event):
             self._handle(getattr(event, "src_path", ""), "created")
@@ -5143,8 +5253,6 @@ def _auto_changed_only_scan_loop() -> None:
             if not PMDA_AUTO_CHANGED_ONLY_SCAN:
                 continue
             if _get_library_mode() != "files":
-                continue
-            if not ai_provider_ready:
                 continue
             # Do not trigger while a scan is running/finalizing.
             with lock:
@@ -6635,22 +6743,28 @@ def _rebuild_files_library_index(reason: str = "manual", wait_if_running: bool =
                         album_id = album_id_by_folder.get(album["folder_path"])
                         if not album_id:
                             continue
-                        track_rows = [
-                            (
+                        # Defensive: ensure file_path uniqueness within this batch.
+                        track_by_path: dict[str, tuple] = {}
+                        for t in album["tracks"]:
+                            fp = str(t.get("file_path") or "").strip()
+                            if not fp:
+                                continue
+                            if fp in track_by_path:
+                                continue
+                            track_by_path[fp] = (
                                 album_id,
-                                t["file_path"],
-                                t["title"],
-                                t["disc_num"],
-                                t["track_num"],
-                                t["duration_sec"],
-                                t["format"],
-                                t["bitrate"],
-                                t["sample_rate"],
-                                t["bit_depth"],
-                                t["file_size_bytes"],
+                                fp,
+                                t.get("title") or "",
+                                t.get("disc_num") or 1,
+                                t.get("track_num") or 0,
+                                t.get("duration_sec") or 0,
+                                t.get("format") or "",
+                                t.get("bitrate") or 0,
+                                t.get("sample_rate") or 0,
+                                t.get("bit_depth") or 0,
+                                t.get("file_size_bytes") or 0,
                             )
-                            for t in album["tracks"]
-                        ]
+                        track_rows = list(track_by_path.values())
                         if track_rows:
                             cur.executemany(
                                 """
@@ -6661,6 +6775,18 @@ def _rebuild_files_library_index(reason: str = "manual", wait_if_running: bool =
                                     %s, %s, %s, %s, %s, %s, %s,
                                     %s, %s, %s, %s, NOW(), NOW()
                                 )
+                                ON CONFLICT (file_path) DO UPDATE
+                                SET album_id = EXCLUDED.album_id,
+                                    title = EXCLUDED.title,
+                                    disc_num = EXCLUDED.disc_num,
+                                    track_num = EXCLUDED.track_num,
+                                    duration_sec = EXCLUDED.duration_sec,
+                                    format = EXCLUDED.format,
+                                    bitrate = EXCLUDED.bitrate,
+                                    sample_rate = EXCLUDED.sample_rate,
+                                    bit_depth = EXCLUDED.bit_depth,
+                                    file_size_bytes = EXCLUDED.file_size_bytes,
+                                    updated_at = NOW()
                                 """,
                                 track_rows,
                             )
@@ -19924,7 +20050,10 @@ def _pipeline_flags_for_scan(scan_type: str, run_improve_after_requested: bool) 
     scan_is_content = scan_kind in {"full", "changed_only"}
     # Pipeline flags are the canonical source; run_improve_after remains a one-shot override.
     run_match_fix = bool(scan_is_content and (PIPELINE_ENABLE_MATCH_FIX or run_improve_after_requested))
-    run_dedupe = bool(scan_is_content and PIPELINE_ENABLE_DEDUPE)
+    # "dedupe" in pipeline flags means *automatic* deduplication/moves, not just detection.
+    # It must track AUTO_MOVE_DUPES to avoid misleading scan summaries and scan_history rows.
+    auto_move_dup = bool(getattr(sys.modules[__name__], "AUTO_MOVE_DUPES", False))
+    run_dedupe = bool(scan_is_content and PIPELINE_ENABLE_DEDUPE and auto_move_dup)
     run_incomplete_move = bool(scan_is_content and PIPELINE_ENABLE_INCOMPLETE_MOVE)
     run_export = bool(scan_is_content and PIPELINE_ENABLE_EXPORT)
     run_player_sync = bool(scan_is_content and PIPELINE_ENABLE_PLAYER_SYNC)
@@ -20421,7 +20550,7 @@ def background_scan():
                 total_artists,
                 1 if ai_provider_ready else 0,
                 1 if USE_MUSICBRAINZ else 0,
-                1 if pipeline_flags.get("dedupe") else 0,
+                1 if bool(getattr(sys.modules[__name__], "AUTO_MOVE_DUPES", False)) else 0,
                 'running',
                 0, 0, 0, 0, 0, 0, 0, 0, 0  # Initialize all detailed stats to 0
             ))
@@ -20439,7 +20568,7 @@ def background_scan():
                 total_artists,
                 1 if ai_provider_ready else 0,
                 1 if USE_MUSICBRAINZ else 0,
-                1 if pipeline_flags.get("dedupe") else 0,
+                1 if bool(getattr(sys.modules[__name__], "AUTO_MOVE_DUPES", False)) else 0,
                 'running',
                 0, 0, 0, 0, 0, 0, 0, 0, 0  # Initialize all detailed stats to 0
             ))
@@ -35684,7 +35813,12 @@ def _vision_verify_cover_before_inject(
             "Answer only Yes or No. Optionally end with (confidence: N)."
         )
         provider = getattr(sys.modules[__name__], "AI_PROVIDER", "openai")
-        vision_model = getattr(sys.modules[__name__], "RESOLVED_MODEL", None) or getattr(sys.modules[__name__], "OPENAI_MODEL", "gpt-4o-mini")
+        # Prefer an explicit vision model when configured; fall back to the main model.
+        vision_model = (
+            (getattr(sys.modules[__name__], "OPENAI_VISION_MODEL", None) or "").strip()
+            or getattr(sys.modules[__name__], "RESOLVED_MODEL", None)
+            or getattr(sys.modules[__name__], "OPENAI_MODEL", "gpt-4o-mini")
+        )
         resp = call_ai_provider_vision(
             provider,
             vision_model,
@@ -35917,6 +36051,11 @@ def _write_pmda_album_tags(
     """
     if not audio_files:
         return
+    # Writing tags triggers filesystem events; suppress watcher-triggered rescans for a short period.
+    try:
+        _files_watcher_suppress_folder(folder, seconds=120.0, reason="pmda_tag_write")
+    except Exception:
+        pass
     try:
         from mutagen import File as MutagenFile  # type: ignore
     except Exception:
@@ -36320,7 +36459,10 @@ def _improve_single_album(album_id: int, db_conn, known_release_group_id: Option
                 mime = (cover_resp.headers.get("content-type") or "").split(";")[0].strip() or "image/jpeg"
                 if not mime.startswith("image/"):
                     mime = "image/jpeg"
-                if USE_AI_VISION_BEFORE_COVER_INJECT:
+                # Use vision only when identity is ambiguous. When we have an MB release-group id,
+                # Cover Art Archive is considered safe and we avoid costly + flaky vision gating.
+                use_vision = bool(USE_AI_VISION_BEFORE_COVER_INJECT) and False
+                if use_vision:
                     if not _vision_verify_cover_before_inject(content, mime, artist_name, album_title_str, "CAA"):
                         steps.append("Vision: cover rejected (not matching album)")
                         cover_outcome = "CAA_vision_rejected"
@@ -36332,6 +36474,10 @@ def _improve_single_album(album_id: int, db_conn, known_release_group_id: Option
                         with open(cover_path, "wb") as f:
                             f.write(content)
                         cover_saved = True
+                        try:
+                            _files_watcher_suppress_folder(folder, seconds=120.0, reason="cover_write")
+                        except Exception:
+                            pass
                         log_cov("Fix-all [album_id=%s] source=Cover Art Archive saved cover to %s", album_id, cover_path)
                         steps.append("Fetched and saved cover art")
                         _embed_cover_in_audio_files(cover_path, audio_files)
@@ -36346,6 +36492,10 @@ def _improve_single_album(album_id: int, db_conn, known_release_group_id: Option
                     with open(cover_path, "wb") as f:
                         f.write(content)
                     cover_saved = True
+                    try:
+                        _files_watcher_suppress_folder(folder, seconds=120.0, reason="cover_write")
+                    except Exception:
+                        pass
                     log_cov("Fix-all [album_id=%s] source=Cover Art Archive saved cover to %s", album_id, cover_path)
                     steps.append("Fetched and saved cover art")
                     _embed_cover_in_audio_files(cover_path, audio_files)
@@ -36399,6 +36549,7 @@ def _improve_single_album(album_id: int, db_conn, known_release_group_id: Option
     has_cover_now = has_cover or cover_saved
     if USE_DISCOGS and (not tags_updated or not has_cover_now):
         discogs_info = _fetch_discogs_release(artist_name, album_title_str)
+        discogs_strict_ok = False
         if discogs_info:
             strict_ok, strict_reason = _strict_identity_match_details(
                 local_artist=artist_name,
@@ -36416,6 +36567,8 @@ def _improve_single_album(album_id: int, db_conn, known_release_group_id: Option
                 )
                 steps.append(f"Discogs rejected by strict identity: {strict_reason}")
                 discogs_info = None
+            else:
+                discogs_strict_ok = True
         if discogs_info:
             discogs_release_id = str(discogs_info.get("release_id") or "").strip() or discogs_release_id
             artist_str = discogs_info.get("artist_name") or artist_name
@@ -36432,7 +36585,8 @@ def _improve_single_album(album_id: int, db_conn, known_release_group_id: Option
                     best_cover = _download_best_cover_image("Discogs", discogs_info.get("cover_url"))
                     if best_cover:
                         content, mime, _url_used = best_cover
-                        if USE_AI_VISION_BEFORE_COVER_INJECT:
+                        use_vision = bool(USE_AI_VISION_BEFORE_COVER_INJECT) and (not discogs_strict_ok)
+                        if use_vision:
                             if not _vision_verify_cover_before_inject(content, mime, artist_name, album_title_str, "Discogs"):
                                 steps.append("Vision: cover rejected (not matching album)")
                             else:
@@ -36443,6 +36597,10 @@ def _improve_single_album(album_id: int, db_conn, known_release_group_id: Option
                                 cover_saved = True
                                 has_cover_now = True
                                 cover_outcome = "Discogs_saved"
+                                try:
+                                    _files_watcher_suppress_folder(folder, seconds=120.0, reason="cover_write")
+                                except Exception:
+                                    pass
                                 log_cov("Fix-all [album_id=%s] source=Discogs saved cover to %s", album_id, cover_path)
                                 steps.append("Fetched and saved cover art from Discogs")
                                 _embed_cover_in_audio_files(cover_path, audio_files)
@@ -36457,6 +36615,10 @@ def _improve_single_album(album_id: int, db_conn, known_release_group_id: Option
                                 f.write(content)
                             cover_saved = True
                             has_cover_now = True
+                            try:
+                                _files_watcher_suppress_folder(folder, seconds=120.0, reason="cover_write")
+                            except Exception:
+                                pass
                             log_cov("Fix-all [album_id=%s] source=Discogs saved cover to %s", album_id, cover_path)
                             steps.append("Fetched and saved cover art from Discogs")
                             _embed_cover_in_audio_files(cover_path, audio_files)
@@ -36475,6 +36637,7 @@ def _improve_single_album(album_id: int, db_conn, known_release_group_id: Option
     lastfm_used_for_tags = False
     if USE_LASTFM and ((not tags_updated or not has_cover_now) or ("genre" in missing_required)):
         lastfm_info = _fetch_lastfm_album_info(artist_name, album_title_str, release_mbid)
+        lastfm_strict_ok = False
         if lastfm_info:
             strict_ok, strict_reason = _strict_identity_match_details(
                 local_artist=artist_name,
@@ -36492,6 +36655,8 @@ def _improve_single_album(album_id: int, db_conn, known_release_group_id: Option
                 )
                 steps.append(f"Last.fm rejected by strict identity: {strict_reason}")
                 lastfm_info = None
+            else:
+                lastfm_strict_ok = True
         if lastfm_info:
             lfm_mbid_val = str(lastfm_info.get("mbid") or "").strip()
             if lfm_mbid_val:
@@ -36521,7 +36686,9 @@ def _improve_single_album(album_id: int, db_conn, known_release_group_id: Option
                     best_cover = _download_best_cover_image("Last.fm", lastfm_info.get("cover_url"))
                     if best_cover:
                         content, mime, _url_used = best_cover
-                        if USE_AI_VISION_BEFORE_COVER_INJECT:
+                        # Use vision only when identity is ambiguous; strict provider identity is considered safe.
+                        use_vision = bool(USE_AI_VISION_BEFORE_COVER_INJECT) and (not lastfm_strict_ok)
+                        if use_vision:
                             if not _vision_verify_cover_before_inject(content, mime, artist_name, album_title_str, "Last.fm"):
                                 steps.append("Vision: cover rejected (not matching album)")
                             else:
@@ -36531,6 +36698,10 @@ def _improve_single_album(album_id: int, db_conn, known_release_group_id: Option
                                     f.write(content)
                                 cover_saved = True
                                 has_cover_now = True
+                                try:
+                                    _files_watcher_suppress_folder(folder, seconds=120.0, reason="cover_write")
+                                except Exception:
+                                    pass
                                 log_cov("Fix-all [album_id=%s] source=Last.fm saved cover to %s", album_id, cover_path)
                                 steps.append("Fetched and saved cover art from Last.fm")
                                 _embed_cover_in_audio_files(cover_path, audio_files)
@@ -36545,6 +36716,10 @@ def _improve_single_album(album_id: int, db_conn, known_release_group_id: Option
                                 f.write(content)
                             cover_saved = True
                             has_cover_now = True
+                            try:
+                                _files_watcher_suppress_folder(folder, seconds=120.0, reason="cover_write")
+                            except Exception:
+                                pass
                             log_cov("Fix-all [album_id=%s] source=Last.fm saved cover to %s", album_id, cover_path)
                             steps.append("Fetched and saved cover art from Last.fm")
                             _embed_cover_in_audio_files(cover_path, audio_files)
@@ -36568,6 +36743,7 @@ def _improve_single_album(album_id: int, db_conn, known_release_group_id: Option
     want_bandcamp_genre = bool(lastfm_used_for_tags and not mb_identity_used and ("genre" in missing_required))
     if USE_BANDCAMP and ((not tags_updated or not has_cover_now) or genre_missing_now or want_bandcamp_genre):
         bandcamp_info = _fetch_bandcamp_album_info(artist_name, album_title_str)
+        bandcamp_strict_ok = False
         if bandcamp_info:
             strict_ok, strict_reason = _strict_identity_match_details(
                 local_artist=artist_name,
@@ -36585,6 +36761,8 @@ def _improve_single_album(album_id: int, db_conn, known_release_group_id: Option
                 )
                 steps.append(f"Bandcamp rejected by strict identity: {strict_reason}")
                 bandcamp_info = None
+            else:
+                bandcamp_strict_ok = True
         if bandcamp_info:
             bandcamp_album_url = str(bandcamp_info.get("album_url") or "").strip() or bandcamp_album_url
             artist_str = bandcamp_info.get("artist_name") or artist_name
@@ -36615,7 +36793,9 @@ def _improve_single_album(album_id: int, db_conn, known_release_group_id: Option
                     )
                     if best_cover:
                         content, mime, _url_used = best_cover
-                        if USE_AI_VISION_BEFORE_COVER_INJECT:
+                        # Use vision only when identity is ambiguous; strict provider identity is considered safe.
+                        use_vision = bool(USE_AI_VISION_BEFORE_COVER_INJECT) and (not bandcamp_strict_ok)
+                        if use_vision:
                             if not _vision_verify_cover_before_inject(content, mime, artist_name, album_title_str, "Bandcamp"):
                                 steps.append("Vision: cover rejected (not matching album)")
                             else:
@@ -36625,6 +36805,10 @@ def _improve_single_album(album_id: int, db_conn, known_release_group_id: Option
                                     f.write(content)
                                 cover_saved = True
                                 has_cover_now = True
+                                try:
+                                    _files_watcher_suppress_folder(folder, seconds=120.0, reason="cover_write")
+                                except Exception:
+                                    pass
                                 log_cov("Fix-all [album_id=%s] source=Bandcamp saved cover to %s", album_id, cover_path)
                                 steps.append("Fetched and saved cover art from Bandcamp")
                                 _embed_cover_in_audio_files(cover_path, audio_files)
@@ -36639,6 +36823,10 @@ def _improve_single_album(album_id: int, db_conn, known_release_group_id: Option
                                 f.write(content)
                             cover_saved = True
                             has_cover_now = True
+                            try:
+                                _files_watcher_suppress_folder(folder, seconds=120.0, reason="cover_write")
+                            except Exception:
+                                pass
                             log_cov("Fix-all [album_id=%s] source=Bandcamp saved cover to %s", album_id, cover_path)
                             steps.append("Fetched and saved cover art from Bandcamp")
                             _embed_cover_in_audio_files(cover_path, audio_files)
@@ -37054,6 +37242,7 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
     has_cover_now = has_cover or cover_saved
     if USE_DISCOGS and (not tags_updated or not has_cover_now):
         discogs_info = _fetch_discogs_release(artist_name, album_title_str)
+        discogs_strict_ok = False
         if discogs_info:
             strict_ok, strict_reason = _strict_identity_match_details(
                 local_artist=artist_name,
@@ -37070,6 +37259,8 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
                 )
                 steps.append(f"Discogs rejected by strict identity: {strict_reason}")
                 discogs_info = None
+            else:
+                discogs_strict_ok = True
         if discogs_info:
             discogs_release_id = str(discogs_info.get("release_id") or "").strip() or discogs_release_id
             artist_str = discogs_info.get("artist_name") or artist_name
@@ -37086,7 +37277,9 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
                     best_cover = _download_best_cover_image("Discogs", discogs_info.get("cover_url"))
                     if best_cover:
                         content, mime, _url_used = best_cover
-                        if USE_AI_VISION_BEFORE_COVER_INJECT:
+                        # Use vision only when identity is ambiguous; strict provider identity is considered safe.
+                        use_vision = bool(USE_AI_VISION_BEFORE_COVER_INJECT) and (not discogs_strict_ok)
+                        if use_vision:
                             if not _vision_verify_cover_before_inject(content, mime, artist_name, album_title_str, "Discogs"):
                                 steps.append("Vision: cover rejected (not matching album)")
                             else:
@@ -37097,6 +37290,10 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
                                 cover_saved = True
                                 has_cover_now = True
                                 pmda_cover_provider = "discogs"
+                                try:
+                                    _files_watcher_suppress_folder(folder_path, seconds=120.0, reason="cover_write")
+                                except Exception:
+                                    pass
                                 _embed_cover_in_audio_files(cover_path, audio_files)
                                 steps.append("Fetched and saved cover art from Discogs")
                         else:
@@ -37106,6 +37303,10 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
                             cover_saved = True
                             has_cover_now = True
                             pmda_cover_provider = "discogs"
+                            try:
+                                _files_watcher_suppress_folder(folder_path, seconds=120.0, reason="cover_write")
+                            except Exception:
+                                pass
                             _embed_cover_in_audio_files(cover_path, audio_files)
                             steps.append("Fetched and saved cover art from Discogs")
                 except Exception as e:
@@ -37118,6 +37319,7 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
     lastfm_used_for_tags = False
     if USE_LASTFM and ((not tags_updated or not has_cover_now) or ("genre" in missing_required)):
         lastfm_info = _fetch_lastfm_album_info(artist_name, album_title_str, release_mbid)
+        lastfm_strict_ok = False
         if lastfm_info:
             strict_ok, strict_reason = _strict_identity_match_details(
                 local_artist=artist_name,
@@ -37134,6 +37336,8 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
                 )
                 steps.append(f"Last.fm rejected by strict identity: {strict_reason}")
                 lastfm_info = None
+            else:
+                lastfm_strict_ok = True
         if lastfm_info:
             lfm_mbid_val = str(lastfm_info.get("mbid") or "").strip()
             if lfm_mbid_val:
@@ -37161,7 +37365,9 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
                     best_cover = _download_best_cover_image("Last.fm", lastfm_info.get("cover_url"))
                     if best_cover:
                         content, mime, _url_used = best_cover
-                        if USE_AI_VISION_BEFORE_COVER_INJECT:
+                        # Use vision only when identity is ambiguous; strict provider identity is considered safe.
+                        use_vision = bool(USE_AI_VISION_BEFORE_COVER_INJECT) and (not lastfm_strict_ok)
+                        if use_vision:
                             if not _vision_verify_cover_before_inject(content, mime, artist_name, album_title_str, "Last.fm"):
                                 steps.append("Vision: cover rejected (not matching album)")
                             else:
@@ -37172,6 +37378,10 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
                                 cover_saved = True
                                 has_cover_now = True
                                 pmda_cover_provider = "lastfm"
+                                try:
+                                    _files_watcher_suppress_folder(folder_path, seconds=120.0, reason="cover_write")
+                                except Exception:
+                                    pass
                                 _embed_cover_in_audio_files(cover_path, audio_files)
                                 steps.append("Fetched and saved cover art from Last.fm")
                         else:
@@ -37181,6 +37391,10 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
                             cover_saved = True
                             has_cover_now = True
                             pmda_cover_provider = "lastfm"
+                            try:
+                                _files_watcher_suppress_folder(folder_path, seconds=120.0, reason="cover_write")
+                            except Exception:
+                                pass
                             _embed_cover_in_audio_files(cover_path, audio_files)
                             steps.append("Fetched and saved cover art from Last.fm")
                 except Exception as e:
@@ -37195,6 +37409,7 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
     want_bandcamp_genre = bool(lastfm_used_for_tags and not mb_identity_used and ("genre" in missing_required))
     if USE_BANDCAMP and ((not tags_updated or not has_cover_now) or genre_missing_now or want_bandcamp_genre):
         bandcamp_info = _fetch_bandcamp_album_info(artist_name, album_title_str)
+        bandcamp_strict_ok = False
         if bandcamp_info:
             strict_ok, strict_reason = _strict_identity_match_details(
                 local_artist=artist_name,
@@ -37211,6 +37426,8 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
                 )
                 steps.append(f"Bandcamp rejected by strict identity: {strict_reason}")
                 bandcamp_info = None
+            else:
+                bandcamp_strict_ok = True
         if bandcamp_info:
             bandcamp_album_url = str(bandcamp_info.get("album_url") or "").strip() or bandcamp_album_url
             artist_str = bandcamp_info.get("artist_name") or artist_name
@@ -37238,7 +37455,9 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
                     )
                     if best_cover:
                         content, mime, _url_used = best_cover
-                        if USE_AI_VISION_BEFORE_COVER_INJECT:
+                        # Use vision only when identity is ambiguous; strict provider identity is considered safe.
+                        use_vision = bool(USE_AI_VISION_BEFORE_COVER_INJECT) and (not bandcamp_strict_ok)
+                        if use_vision:
                             if not _vision_verify_cover_before_inject(content, mime, artist_name, album_title_str, "Bandcamp"):
                                 steps.append("Vision: cover rejected (not matching album)")
                             else:
@@ -37249,6 +37468,10 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
                                 cover_saved = True
                                 has_cover_now = True
                                 pmda_cover_provider = "bandcamp"
+                                try:
+                                    _files_watcher_suppress_folder(folder_path, seconds=120.0, reason="cover_write")
+                                except Exception:
+                                    pass
                                 _embed_cover_in_audio_files(cover_path, audio_files)
                                 steps.append("Fetched and saved cover art from Bandcamp")
                         else:
@@ -37258,6 +37481,10 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
                             cover_saved = True
                             has_cover_now = True
                             pmda_cover_provider = "bandcamp"
+                            try:
+                                _files_watcher_suppress_folder(folder_path, seconds=120.0, reason="cover_write")
+                            except Exception:
+                                pass
                             _embed_cover_in_audio_files(cover_path, audio_files)
                             steps.append("Fetched and saved cover art from Bandcamp")
                 except Exception as e:
