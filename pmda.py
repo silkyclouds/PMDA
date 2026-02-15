@@ -15579,24 +15579,32 @@ def scan_artist_duplicates(args):
                 normalize_parenthetical = bool(_parse_bool(_get_config_from_db("NORMALIZE_PARENTHETICAL_FOR_DEDUPE") or "true"))
                 album_norm_value = fe.get("album_norm") or norm_album_for_dedup(title_raw, normalize_parenthetical)
                 plex_norm_value = album_norm_value
-                # Files mode: deterministic broken detection from track indices (no AI, no provider required).
+                # Files mode: deterministic broken detection from track indices.
+                # For local files, *any* gap in a sane numbering sequence is a strong signal of missing tracks.
                 is_broken = False
                 expected_track_count = None
                 actual_track_count = len(tr)
                 missing_indices: list[int] = []
                 try:
                     idxs = [int(getattr(t, "idx", 0) or 0) for t in (tr or []) if int(getattr(t, "idx", 0) or 0) > 0]
-                    if idxs:
-                        is_broken, _actual_from_idx, gaps = _detect_gaps_in_indices(sorted(idxs))
-                        if is_broken:
-                            expected_track_count = max(idxs) if idxs else None
-                            for start_i, end_i in gaps:
-                                if (end_i - start_i) > 2000:
-                                    continue
-                                missing_indices.extend(list(range(int(start_i) + 1, int(end_i))))
+                    idxs = sorted(set(idxs))
+                    if idxs and actual_track_count >= 4:
+                        max_idx = max(idxs)
+                        coverage = (actual_track_count / max_idx) if max_idx else 1.0
+                        # Skip when numbering is obviously corrupt (prevents huge false positives).
+                        if not (max_idx > max(120, actual_track_count * 3) and coverage < 0.5):
+                            # Leading gap
+                            if idxs[0] > 1:
+                                missing_indices.extend(list(range(1, int(idxs[0]))))
+                            # Internal gaps
+                            for a, b in zip(idxs, idxs[1:]):
+                                if int(b) - int(a) > 1:
+                                    missing_indices.extend(list(range(int(a) + 1, int(b))))
+                            if missing_indices:
+                                is_broken = True
+                                expected_track_count = max_idx
                                 if len(missing_indices) > 5000:
                                     missing_indices = missing_indices[:5000]
-                                    break
                 except Exception:
                     is_broken = False
                     expected_track_count = None
@@ -19829,6 +19837,14 @@ def _build_files_editions(scan_type: str = "full") -> tuple[list[tuple[int, str,
         artist_name = _pick_album_artist_from_tag_dicts([first_tags], default="Unknown Artist")
         album_title_tag = _pick_album_title_from_tag_dicts([first_tags], fallback=folder.name.replace("_", " "))
         album_title_tag = _sanitize_album_title_display(album_title_tag)
+        # Untagged albums: use folder structure as fallback identity.
+        if (artist_name or "").strip().lower() in {"unknown", "unknown artist", "various", "various artists"}:
+            try:
+                parent_name = (folder.parent.name or "").replace("_", " ").strip()
+            except Exception:
+                parent_name = ""
+            if parent_name:
+                artist_name = parent_name
 
         tracks: list[Track] = []
         first_disc, first_trk = _parse_disc_track_loose(first_tags, fallback_disc=1, fallback_track=1)
@@ -37547,11 +37563,21 @@ def _infer_artist_album_from_folder(folder_path: Path, audio_files: List[Path]) 
         or artist_name
     )
     album_title_str = (first_tags.get("album") or "").strip() or album_title_str
+    # Folder-based fallback is more reliable than filename parsing for album identity.
+    # For untagged albums, parent folder is almost always the artist.
+    if (artist_name or "").strip().lower() in {"unknown", "unknown artist", "various", "various artists"}:
+        try:
+            parent_name = (folder_path.parent.name or "").replace("_", " ").strip()
+        except Exception:
+            parent_name = ""
+        if parent_name:
+            artist_name = parent_name
     if artist_name == "Unknown" or album_title_str == folder_path.name:
         parts = audio_files[0].stem.split(" - ")
         if len(parts) >= 2:
             artist_name = artist_name if artist_name != "Unknown" else parts[0].strip()
             album_title_str = album_title_str if album_title_str != folder_path.name else parts[1].strip()
+    album_title_str = _sanitize_album_title_display(album_title_str)
     return (artist_name, album_title_str)
 
 
