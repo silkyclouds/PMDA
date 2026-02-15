@@ -12539,6 +12539,32 @@ def _dupe_choose_best_heuristic(editions: list[dict]) -> tuple[Optional[dict], s
         missing_required = e.get("missing_required_tags") or []
         has_complete_tags = 1 if (not missing_required) else 0
         has_cover = 1 if bool(e.get("has_cover")) else 0
+        has_artist_image = 1 if bool(e.get("has_artist_image")) else 0
+        missing_count_neg = -int(len(missing_required))
+
+        # Prefer "clean" folder names when everything else is equal.
+        # This is especially helpful for test sets and for user-created variants like "(no tags)".
+        folder_raw = e.get("folder")
+        folder_name = ""
+        try:
+            folder_name = str(Path(folder_raw).name if folder_raw else "").lower()
+        except Exception:
+            folder_name = str(folder_raw or "").lower()
+        noisy_tokens = (
+            "no tags",
+            "no cover",
+            "gaps",
+            "incomplete",
+            "broken",
+            "[dupe]",
+            " dupe",
+            "(dupe)",
+        )
+        variant_clean = 1
+        for tok in noisy_tokens:
+            if tok and tok in folder_name:
+                variant_clean = 0
+                break
 
         fmt_score = int(e.get("fmt_score") or 0)
         bd = int(e.get("bd") or 0)
@@ -12546,7 +12572,20 @@ def _dupe_choose_best_heuristic(editions: list[dict]) -> tuple[Optional[dict], s
         br = int(e.get("br") or 0)
         track_count = len(e.get("tracks") or [])
         file_count = int(e.get("file_count") or 0)
-        return (has_identity, has_complete_tags, has_cover, fmt_score, bd, sr, br, track_count, file_count)
+        return (
+            has_identity,
+            has_complete_tags,
+            has_cover,
+            has_artist_image,
+            variant_clean,
+            missing_count_neg,
+            fmt_score,
+            bd,
+            sr,
+            br,
+            track_count,
+            file_count,
+        )
 
     ranked = sorted(list(editions), key=_metrics, reverse=True)
     best = ranked[0]
@@ -12558,8 +12597,8 @@ def _dupe_choose_best_heuristic(editions: list[dict]) -> tuple[Optional[dict], s
         return (best, rationale, [], True)
 
     second = ranked[1]
-    (b_ident, b_tags, b_cov, b_fmt, b_bd, b_sr, b_br, b_tr, b_fc) = _metrics(best)
-    (s_ident, s_tags, s_cov, s_fmt, s_bd, s_sr, s_br, s_tr, s_fc) = _metrics(second)
+    (b_ident, b_tags, b_cov, b_img, b_clean, b_miss, b_fmt, b_bd, b_sr, b_br, b_tr, b_fc) = _metrics(best)
+    (s_ident, s_tags, s_cov, s_img, s_clean, s_miss, s_fmt, s_bd, s_sr, s_br, s_tr, s_fc) = _metrics(second)
 
     # Conservative confidence rules.
     confident = False
@@ -12569,9 +12608,9 @@ def _dupe_choose_best_heuristic(editions: list[dict]) -> tuple[Optional[dict], s
         confident = False
     else:
         # Strong health signals should be enough to avoid AI.
-        if (b_ident, b_tags, b_cov) != (s_ident, s_tags, s_cov):
+        if (b_ident, b_tags, b_cov, b_img, b_clean) != (s_ident, s_tags, s_cov, s_img, s_clean):
             # If we have a clear improvement on identity/tags/cover, it's safe and deterministic.
-            if (b_ident > s_ident) or (b_tags > s_tags) or (b_cov > s_cov):
+            if (b_ident > s_ident) or (b_tags > s_tags) or (b_cov > s_cov) or (b_img > s_img) or (b_clean > s_clean):
                 confident = True
         # Big codec/container class difference (e.g., FLAC vs MP3).
         if not confident and b_fmt >= (s_fmt + 2):
@@ -12592,11 +12631,36 @@ def _dupe_choose_best_heuristic(editions: list[dict]) -> tuple[Optional[dict], s
             if (b_fmt >= s_fmt) and (b_bd >= s_bd) and (b_sr >= s_sr):
                 confident = True
 
+    # If all technical/health metrics are essentially tied but the group shares a strong identity signal,
+    # treat the heuristic pick as confident to avoid unnecessary AI spend.
+    if not confident and len(editions) >= 2:
+        try:
+            discogs_ids = {_dupe_get_discogs_id(e) for e in editions}
+            discogs_ids = {x for x in discogs_ids if x}
+            lastfm_ids = {_dupe_get_lastfm_mbid(e) for e in editions}
+            lastfm_ids = {x for x in lastfm_ids if x}
+            bandcamp_urls = {_dupe_get_bandcamp_url(e) for e in editions}
+            bandcamp_urls = {x for x in bandcamp_urls if x}
+            mb_rg_ids = {_dupe_get_mb_release_group_id(e) for e in editions}
+            mb_rg_ids = {x for x in mb_rg_ids if x}
+            strong = (
+                (len(mb_rg_ids) == 1 and mb_rg_ids)
+                or (len(discogs_ids) == 1 and discogs_ids)
+                or (len(lastfm_ids) == 1 and lastfm_ids)
+                or (len(bandcamp_urls) == 1 and bandcamp_urls)
+            )
+            if strong and b_tr == s_tr and b_fc == s_fc:
+                confident = True
+        except Exception:
+            pass
+
     rationale = (
         "Heuristic pick: "
         f"identity {b_ident} vs {s_ident}, "
         f"tags {b_tags} vs {s_tags}, "
         f"cover {b_cov} vs {s_cov}, "
+        f"artist_img {b_img} vs {s_img}, "
+        f"clean_name {b_clean} vs {s_clean}, "
         f"fmt_score {b_fmt} vs {s_fmt}, "
         f"bd {b_bd} vs {s_bd}, "
         f"sr {b_sr} vs {s_sr}, "
@@ -15508,10 +15572,32 @@ def scan_artist_duplicates(args):
                 fmt_score_val, br, sr, bd, audio_cache_hit = analyse_format(folder)
                 tr = fe.get("tracks") or []
                 meta_tags = fe.get("tags") or {}
-                title_raw = fe.get("album_title") or folder.name.replace("_", " ")
+                title_raw = _sanitize_album_title_display(fe.get("album_title") or folder.name.replace("_", " "))
                 normalize_parenthetical = bool(_parse_bool(_get_config_from_db("NORMALIZE_PARENTHETICAL_FOR_DEDUPE") or "true"))
                 album_norm_value = fe.get("album_norm") or norm_album_for_dedup(title_raw, normalize_parenthetical)
                 plex_norm_value = album_norm_value
+                # Files mode: deterministic broken detection from track indices (no AI, no provider required).
+                is_broken = False
+                expected_track_count = None
+                actual_track_count = len(tr)
+                missing_indices: list[int] = []
+                try:
+                    idxs = [int(getattr(t, "idx", 0) or 0) for t in (tr or []) if int(getattr(t, "idx", 0) or 0) > 0]
+                    if idxs:
+                        is_broken, _actual_from_idx, gaps = _detect_gaps_in_indices(sorted(idxs))
+                        if is_broken:
+                            expected_track_count = max(idxs) if idxs else None
+                            for start_i, end_i in gaps:
+                                if (end_i - start_i) > 2000:
+                                    continue
+                                missing_indices.extend(list(range(int(start_i) + 1, int(end_i))))
+                                if len(missing_indices) > 5000:
+                                    missing_indices = missing_indices[:5000]
+                                    break
+                except Exception:
+                    is_broken = False
+                    expected_track_count = None
+                    missing_indices = []
                 editions_for_artist.append({
                     "album_id": aid,
                     "title_raw": title_raw,
@@ -15542,6 +15628,10 @@ def scan_artist_duplicates(args):
                     "missing_required_tags": list(fe.get("missing_required_tags") or []),
                     "has_mbid": bool(fe.get("has_mbid")),
                     "musicbrainz_id": (fe.get("musicbrainz_id") or "").strip(),
+                    "is_broken": bool(is_broken),
+                    "expected_track_count": expected_track_count,
+                    "actual_track_count": int(actual_track_count),
+                    "missing_indices": missing_indices,
                     # Provider identity (used by Dupe Detection v2 hard grouping)
                     "discogs_release_id": str(fe.get("discogs_release_id") or meta_tags.get("discogs_release_id") or "").strip(),
                     "lastfm_album_mbid": str(fe.get("lastfm_album_mbid") or meta_tags.get("lastfm_album_mbid") or "").strip(),
@@ -18930,6 +19020,14 @@ def _rows_to_files_library_payload(rows: list[tuple]) -> tuple[dict[str, dict], 
         folder_path = (row[0] or "").strip()
         if not folder_path:
             continue
+        # Published rows can become stale when PMDA moves albums out of FILES_ROOTS (dupes/incomplete)
+        # or when the user deletes folders. Never rebuild the live index with missing paths.
+        try:
+            album_folder_live = path_for_fs_access(Path(folder_path))
+            if not album_folder_live.exists() or not album_folder_live.is_dir():
+                continue
+        except Exception:
+            continue
         artist_name = (row[1] or "").strip() or "Unknown Artist"
         artist_norm = (row[2] or "").strip() or " ".join(artist_name.split()).lower() or "unknown artist"
         album_title = _sanitize_album_title_display((row[3] or "").strip()) or "Unknown Album"
@@ -19656,6 +19754,7 @@ def _build_files_editions(scan_type: str = "full") -> tuple[list[tuple[int, str,
         if cached_fast_skip and scan_type in {"full", "incomplete_only"}:
             artist_name = (cached.get("artist_name") or folder_resolved.parent.name.replace("_", " ") or "Unknown Artist").strip() or "Unknown Artist"
             album_title_tag = (cached.get("album_title") or folder_resolved.name.replace("_", " ")).strip() or "Unknown Album"
+            album_title_tag = _sanitize_album_title_display(album_title_tag)
             tracks: list[Track] = []
             for i, p in enumerate(ordered_paths):
                 disc, trk = _infer_disc_track_from_filename(p, i + 1)
@@ -19726,6 +19825,7 @@ def _build_files_editions(scan_type: str = "full") -> tuple[list[tuple[int, str,
         first_tags = extract_tags(ordered_paths[0]) or {}
         artist_name = _pick_album_artist_from_tag_dicts([first_tags], default="Unknown Artist")
         album_title_tag = _pick_album_title_from_tag_dicts([first_tags], fallback=folder.name.replace("_", " "))
+        album_title_tag = _sanitize_album_title_display(album_title_tag)
 
         tracks: list[Track] = []
         first_disc, first_trk = _parse_disc_track_loose(first_tags, fallback_disc=1, fallback_track=1)
@@ -20247,7 +20347,15 @@ def _auto_move_incomplete_albums_for_scan(
             try:
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 size_mb = int(folder_size(src_folder) // (1024 * 1024))
+                try:
+                    _files_watcher_suppress_folder(src_folder, seconds=180.0, reason="pmda_move_incomplete")
+                except Exception:
+                    pass
                 safe_move(str(src_folder), str(dst))
+                try:
+                    _files_watcher_suppress_folder(dst, seconds=180.0, reason="pmda_move_incomplete")
+                except Exception:
+                    pass
                 _files_forget_album_folder(src_folder)
                 result["moved"] += 1
                 result["size_mb"] += size_mb
@@ -21604,28 +21712,9 @@ def background_scan():
                 save_scan_editions_to_db(_scan_id, all_editions_by_artist)
         except Exception as e:
             logging.warning("save_scan_editions_to_db in finally failed: %s", e)
-        # Heuristic: if a dupe group has a clear "best" and a loser with notably fewer tracks,
-        # treat that loser as incomplete so it can be quarantined (instead of being moved as a dupe).
-        try:
-            marked_incomplete = _mark_broken_from_dupe_groups(all_results, all_editions_by_artist, ratio_threshold=0.90)
-            if marked_incomplete:
-                logging.info(
-                    "Incomplete heuristic: marked %d edition(s) as broken based on dupe-group track-count ratio",
-                    int(marked_incomplete),
-                )
-                # Ensure scan_history reflects the additional broken editions.
-                try:
-                    broken_now = 0
-                    for _a, eds in (all_editions_by_artist or {}).items():
-                        for _e in (eds or []):
-                            if _e.get("is_broken"):
-                                broken_now += 1
-                    with lock:
-                        state["scan_broken_albums_count"] = int(broken_now)
-                except Exception:
-                    pass
-        except Exception:
-            logging.debug("Incomplete heuristic failed", exc_info=True)
+        # Safety rule: do not infer "broken/incomplete" state from duplicate groups.
+        # Incomplete moves must only use deterministic broken detection computed per-edition
+        # (track index gaps, etc.). This avoids large false positives and unintended mass moves.
         # Pipeline step: move incomplete albums to configured quarantine folder.
         # Run this *before* dedupe so "broken" variants don't get moved as dupes.
         incomplete_move_result = {"moved": 0, "size_mb": 0, "errors": 0}
@@ -22505,7 +22594,15 @@ def perform_dedupe(group: dict, best_folders: set = None) -> List[dict]:
         logging.info("Moving dupe %s/%s: %s  →  %s", idx, num_losers, src_folder, dst)
         logging.debug("perform_dedupe(): moving %s → %s", src_folder, dst)
         try:
+            try:
+                _files_watcher_suppress_folder(src_folder, seconds=180.0, reason="pmda_move_dedupe")
+            except Exception:
+                pass
             safe_move(str(src_folder), str(dst))
+            try:
+                _files_watcher_suppress_folder(dst, seconds=180.0, reason="pmda_move_dedupe")
+            except Exception:
+                pass
             # Keep Files-mode browsing consistent: the loser is now outside FILES_ROOTS.
             _files_forget_album_folder(src_folder)
             with lock:
@@ -37645,7 +37742,10 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
                 mime = (cover_resp.headers.get("content-type") or "").split(";")[0].strip() or "image/jpeg"
                 if not mime.startswith("image/"):
                     mime = "image/jpeg"
-                if USE_AI_VISION_BEFORE_COVER_INJECT:
+                # With a validated MB release-group id, CAA is considered trusted.
+                # Do not gate it behind vision (costly + can reject correct covers).
+                use_vision = bool(USE_AI_VISION_BEFORE_COVER_INJECT) and False
+                if use_vision:
                     if not _vision_verify_cover_before_inject(content, mime, artist_name, album_title_str, "CAA"):
                         steps.append("Vision: cover rejected (not matching album)")
                     else:
