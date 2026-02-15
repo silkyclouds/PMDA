@@ -19477,6 +19477,14 @@ def _build_files_editions(scan_type: str = "full") -> tuple[list[tuple[int, str,
     """
     from collections import defaultdict
 
+    # For Files mode, we want track index gaps to be detectable (incomplete albums) without relying on
+    # filenames. `extract_tags()` uses ffprobe (subprocess) and is too expensive to run per file,
+    # so we opportunistically use mutagen (fast in-process) for per-file track/disc/title only.
+    try:
+        from mutagen import File as MutagenFile  # type: ignore
+    except Exception:
+        MutagenFile = None  # type: ignore
+
     scan_type = (scan_type or "full").strip().lower()
     if scan_type not in {"full", "changed_only", "incomplete_only"}:
         scan_type = "full"
@@ -19598,6 +19606,61 @@ def _build_files_editions(scan_type: str = "full") -> tuple[list[tuple[int, str,
         cleaned = re.sub(r"^\s*\d{1,3}\s*[-_. ]*", "", cleaned)
         cleaned = cleaned.strip(" -_.")
         return cleaned or stem or f"Track {fallback_index}"
+
+    def _filename_has_explicit_track_number(path: Path) -> bool:
+        """Return True when filename contains an explicit track/disc+track prefix."""
+        stem = path.stem.strip()
+        if not stem:
+            return False
+        if re.match(r"^\s*(?:cd|disc)\s*\d{1,2}\s*[-_. ]\s*\d{1,3}\b", stem, flags=re.IGNORECASE):
+            return True
+        if re.match(r"^\s*\d{1,2}\s*[-_.]\s*\d{1,3}\b", stem):
+            return True
+        if re.match(r"^\s*[A-Z]\s*(?:[-_. ]?\s*\d{1,3})\b", stem, flags=re.IGNORECASE):
+            return True
+        if re.match(r"^\s*\d{1,3}\b", stem):
+            return True
+        return False
+
+    def _parse_int_tag(value: object, default: int) -> int:
+        try:
+            if value is None:
+                return default
+            if isinstance(value, (list, tuple)):
+                if not value:
+                    return default
+                value = value[0]
+            s = str(value).strip()
+            if not s:
+                return default
+            # Common forms: "3", "3/12"
+            if "/" in s:
+                s = s.split("/", 1)[0].strip()
+            m = re.search(r"\d+", s)
+            if not m:
+                return default
+            n = int(m.group(0))
+            return n if n > 0 else default
+        except Exception:
+            return default
+
+    def _infer_track_from_mutagen(path: Path, fallback_index: int) -> tuple[int, int, str]:
+        """Return (disc, track, title) using mutagen easy tags when available."""
+        disc = 1
+        trk = max(1, int(fallback_index or 1))
+        title = ""
+        if MutagenFile is not None:
+            try:
+                f = MutagenFile(str(path), easy=True)
+                tags = getattr(f, "tags", None) or {}
+                title = (tags.get("title") or [""])[0] if isinstance(tags.get("title"), list) else (tags.get("title") or "")
+                trk = _parse_int_tag(tags.get("tracknumber") or tags.get("track") or tags.get("track_number"), trk)
+                disc = _parse_int_tag(tags.get("discnumber") or tags.get("disc") or tags.get("disc_number"), disc)
+            except Exception:
+                pass
+        if not (title or "").strip():
+            title = _title_from_filename(path, fallback_index)
+        return (max(1, disc or 1), max(1, trk or 1), str(title or "").strip())
 
     with lock:
         state["scan_discovery_running"] = True
@@ -19863,14 +19926,26 @@ def _build_files_editions(scan_type: str = "full") -> tuple[list[tuple[int, str,
         tracks: list[Track] = []
         first_disc, first_trk = _parse_disc_track_loose(first_tags, fallback_disc=1, fallback_track=1)
         first_title = (first_tags.get("title") or first_tags.get("name") or "").strip()
+
+        # If filenames do not encode track numbers, rely on embedded tags (mutagen) so we can
+        # detect gaps (missing tracks) deterministically and avoid false dupe moves.
+        use_mutagen_tracks = False
+        if MutagenFile is not None and ordered_paths:
+            explicit = sum(1 for p in ordered_paths if _filename_has_explicit_track_number(p))
+            if (explicit / max(1, len(ordered_paths))) < 0.70:
+                use_mutagen_tracks = True
+
         for i, p in enumerate(ordered_paths):
-            disc, trk = _infer_disc_track_from_filename(p, i + 1)
-            title = _title_from_filename(p, i + 1)
-            if i == 0:
+            if use_mutagen_tracks:
+                disc, trk, title = _infer_track_from_mutagen(p, i + 1)
+            else:
+                disc, trk = _infer_disc_track_from_filename(p, i + 1)
+                title = _title_from_filename(p, i + 1)
+            if i == 0 and not use_mutagen_tracks:
                 disc = first_disc or disc
                 trk = first_trk or trk
                 title = first_title or title
-            tracks.append(Track(title=title, idx=trk, disc=disc, dur=0))
+            tracks.append(Track(title=(title or "").strip(), idx=trk, disc=disc, dur=0))
 
         if not tracks:
             continue
