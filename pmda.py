@@ -20354,6 +20354,24 @@ def _mark_broken_from_dupe_groups(
             if aid > 0:
                 by_id[aid] = e
 
+    def _track_indices(edition: dict) -> list[int]:
+        idxs: list[int] = []
+        try:
+            for t in (edition.get("tracks") or []):
+                try:
+                    v = int(getattr(t, "idx", None) or 0)
+                except Exception:
+                    try:
+                        v = int((t or {}).get("idx") or 0) if isinstance(t, dict) else 0
+                    except Exception:
+                        v = 0
+                if v > 0:
+                    idxs.append(v)
+        except Exception:
+            pass
+        idxs = sorted(set(idxs))
+        return idxs
+
     marked = 0
     for _artist, groups in (all_results or {}).items():
         for g in (groups or []):
@@ -20361,11 +20379,12 @@ def _mark_broken_from_dupe_groups(
             losers = (g.get("losers") or []) if isinstance(g, dict) else []
             if not isinstance(best, dict) or not losers:
                 continue
+            best_idxs = _track_indices(best)
             try:
                 best_count = int(best.get("actual_track_count") or best.get("track_count") or len(best.get("tracks") or []))
             except Exception:
                 best_count = 0
-            if best_count < 3:
+            if best_count < 3 and len(best_idxs) < 3:
                 continue
             for loser in losers:
                 if not isinstance(loser, dict):
@@ -20375,20 +20394,39 @@ def _mark_broken_from_dupe_groups(
                         continue
                 except Exception:
                     pass
+                loser_idxs = _track_indices(loser)
                 try:
                     loser_count = int(loser.get("actual_track_count") or loser.get("track_count") or len(loser.get("tracks") or []))
                 except Exception:
                     loser_count = 0
                 if loser_count <= 0:
                     continue
-                if (loser_count / best_count) >= thr:
-                    continue
+
+                # Prefer an index-based "missing in the middle" signal: missing indices <= max(loser_idx).
+                missing_mid = []
+                if best_idxs and loser_idxs:
+                    try:
+                        best_set = set(best_idxs)
+                        loser_set = set(loser_idxs)
+                        missing = sorted(best_set - loser_set)
+                        if missing and (min(missing) <= max(loser_idxs)):
+                            missing_mid = missing
+                    except Exception:
+                        missing_mid = []
+
+                # Fallback: only mark as broken on track-count ratio when indices are unavailable.
+                if (not missing_mid) and best_count > 0:
+                    if (loser_count / best_count) >= thr:
+                        continue
                 # Mark loser (group dict) and the canonical edition dict (by album_id) so later steps agree.
                 try:
                     loser["is_broken"] = True
-                    loser["expected_track_count"] = best_count
+                    loser["expected_track_count"] = int(max(best_idxs) if best_idxs else best_count)
                     loser["actual_track_count"] = loser_count
-                    loser.setdefault("missing_indices", [])
+                    if missing_mid:
+                        loser["missing_indices"] = missing_mid[:5000]
+                    else:
+                        loser.setdefault("missing_indices", [])
                 except Exception:
                     pass
                 try:
@@ -20399,9 +20437,12 @@ def _mark_broken_from_dupe_groups(
                     try:
                         e = by_id[loser_id]
                         e["is_broken"] = True
-                        e["expected_track_count"] = best_count
+                        e["expected_track_count"] = int(max(best_idxs) if best_idxs else best_count)
                         e["actual_track_count"] = loser_count
-                        e.setdefault("missing_indices", [])
+                        if missing_mid:
+                            e["missing_indices"] = missing_mid[:5000]
+                        else:
+                            e.setdefault("missing_indices", [])
                     except Exception:
                         pass
                 marked += 1
