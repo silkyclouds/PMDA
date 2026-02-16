@@ -13,7 +13,7 @@ export function AppLayout() {
       <SidebarInset>
         <Header />
         <UiBuildWatcher />
-        <div key={location.pathname} className="animate-in fade-in-0 duration-300">
+        <div key={location.pathname} className="pmda-page-transition safe-bottom">
           <Outlet />
         </div>
       </SidebarInset>

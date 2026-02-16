@@ -51,6 +51,7 @@ export default function LibraryAlbums() {
   const [albumError, setAlbumError] = useState<string | null>(null);
   const [albums, setAlbums] = useState<api.LibraryAlbumItem[]>([]);
   const [totalAlbums, setTotalAlbums] = useState(0);
+  const [appending, setAppending] = useState(false);
 
   const [albumLikes, setAlbumLikes] = useState<Record<number, boolean>>({});
 
@@ -115,8 +116,10 @@ export default function LibraryAlbums() {
   const fetchAlbums = useCallback(async (opts: { reset: boolean; pageOffset: number }) => {
     const rid = ++requestIdRef.current;
     try {
-      setAlbumLoading(true);
-      setAlbumError(null);
+      if (opts.reset) {
+        setAlbumLoading(true);
+        setAlbumError(null);
+      }
       const data = await api.getLibraryAlbums({
         search: search.trim() || undefined,
         sort,
@@ -196,9 +199,11 @@ export default function LibraryAlbums() {
   const loadMore = useCallback(async () => {
     if (!canLoadMore || loadingMoreRef.current) return;
     loadingMoreRef.current = true;
+    setAppending(true);
     try {
       await fetchAlbums({ reset: false, pageOffset: offset });
     } finally {
+      setAppending(false);
       loadingMoreRef.current = false;
     }
   }, [canLoadMore, fetchAlbums, offset]);
@@ -401,7 +406,7 @@ export default function LibraryAlbums() {
 
       <div ref={sentinelRef} className="h-8" />
       <div className="flex items-center justify-center py-2 text-xs text-muted-foreground">
-        {albumLoading && albums.length > 0 ? <span className="inline-flex items-center gap-2"><Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading more…</span> : null}
+        {appending ? <span className="inline-flex items-center gap-2"><Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading more…</span> : null}
       </div>
     </div>
   );

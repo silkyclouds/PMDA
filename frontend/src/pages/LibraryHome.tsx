@@ -192,9 +192,9 @@ export default function LibraryHome() {
   }, [location.search, navigate]);
 
   return (
-    <div className="container pb-6 space-y-6">
+    <div className="container pb-6 space-y-5 md:space-y-6">
       {/* Discover */}
-      <Card className="border-border/60 overflow-hidden">
+      <Card className="pmda-shelf overflow-hidden animate-in fade-in-0 slide-in-from-bottom-2 duration-300">
         <CardHeader className="pb-3">
           <div className="flex items-center justify-between gap-3">
             <div className="space-y-1">
@@ -275,12 +275,12 @@ export default function LibraryHome() {
               {sec.albums.length === 0 ? (
                 <p className="text-sm text-muted-foreground">No suggestions available.</p>
               ) : (
-                <Carousel opts={{ align: 'start', dragFree: true }} className="w-full">
+                <Carousel opts={{ align: 'start', dragFree: true }} className="w-full pmda-fade-mask">
                   <CarouselContent className="-ml-3">
                     {sec.albums.map((a) => (
                       <CarouselItem key={`disc-${sec.key}-${a.album_id}`} className="basis-[160px] sm:basis-[190px] md:basis-[220px] pl-3">
                         <div className="group">
-                          <Card className="overflow-hidden border-border/60">
+                          <Card className="overflow-hidden border-border/60 bg-card/90 transition-all duration-300 hover:-translate-y-1 hover:border-primary/35 hover:shadow-card-hover">
                             <AspectRatio
                               ratio={1}
                               className="bg-muted"
@@ -340,8 +340,8 @@ export default function LibraryHome() {
                     ))}
                   </CarouselContent>
                   <div className="hidden md:block">
-                    <CarouselPrevious />
-                    <CarouselNext />
+                    <CarouselPrevious className="left-2 top-[42%] h-9 w-9 bg-background/70 backdrop-blur-sm" />
+                    <CarouselNext className="right-2 top-[42%] h-9 w-9 bg-background/70 backdrop-blur-sm" />
                   </div>
                 </Carousel>
               )}
@@ -351,7 +351,7 @@ export default function LibraryHome() {
       </Card>
 
       {/* For You */}
-      <Card className="border-border/60 overflow-hidden">
+      <Card className="pmda-shelf overflow-hidden animate-in fade-in-0 slide-in-from-bottom-2 duration-300">
         <CardHeader className="pb-3">
           <div className="flex items-center justify-between gap-3">
             <div className="space-y-1">
@@ -382,7 +382,7 @@ export default function LibraryHome() {
                   key={`rec-${rec.track_id}`}
                   type="button"
                   onClick={() => void handlePlayRecommendedTrack(rec)}
-                  className="group rounded-xl border border-border/60 bg-card p-3 text-left hover:border-primary/40 hover:bg-accent/30 transition-colors"
+                  className="group rounded-xl border border-border/60 bg-card/90 p-3 text-left hover:-translate-y-0.5 hover:border-primary/40 hover:bg-accent/20 transition-all duration-300"
                 >
                   <div className="flex items-start gap-3">
                     <div className="w-12 h-12 rounded-lg bg-muted overflow-hidden shrink-0 flex items-center justify-center">
@@ -411,7 +411,7 @@ export default function LibraryHome() {
       </Card>
 
       {/* Top Artists */}
-      <Card className="border-border/60 overflow-hidden">
+      <Card className="pmda-shelf overflow-hidden animate-in fade-in-0 slide-in-from-bottom-2 duration-300">
         <CardHeader className="pb-3">
           <div className="flex items-center justify-between gap-3">
             <div className="space-y-1">
@@ -433,12 +433,12 @@ export default function LibraryHome() {
           ) : topArtists.length === 0 ? (
             <p className="text-sm text-muted-foreground">No listening stats yet. Start playing music to build this section.</p>
           ) : (
-            <Carousel opts={{ align: 'start', dragFree: true }} className="w-full">
+            <Carousel opts={{ align: 'start', dragFree: true }} className="w-full pmda-fade-mask">
               <CarouselContent className="-ml-3">
                 {topArtists.map((a) => (
                   <CarouselItem key={`ta-${a.artist_id}`} className="basis-[170px] sm:basis-[200px] md:basis-[220px] pl-3">
                     <button type="button" onClick={() => navigate(`/library/artist/${a.artist_id}${location.search || ''}`)} className="w-full text-left group">
-                      <Card className="overflow-hidden border-border/60 hover:bg-accent/30 transition-colors">
+                      <Card className="overflow-hidden border-border/60 bg-card/90 transition-all duration-300 hover:-translate-y-1 hover:border-primary/35 hover:bg-accent/20">
                         <CardContent className="p-4 space-y-3">
                           <div className="flex items-center gap-3">
                             <div className="h-12 w-12 rounded-full bg-muted overflow-hidden shrink-0 flex items-center justify-center border border-border/60">
@@ -464,8 +464,8 @@ export default function LibraryHome() {
                 ))}
               </CarouselContent>
               <div className="hidden md:block">
-                <CarouselPrevious />
-                <CarouselNext />
+                <CarouselPrevious className="left-2 top-[42%] h-9 w-9 bg-background/70 backdrop-blur-sm" />
+                <CarouselNext className="right-2 top-[42%] h-9 w-9 bg-background/70 backdrop-blur-sm" />
               </div>
             </Carousel>
           )}
@@ -473,7 +473,7 @@ export default function LibraryHome() {
       </Card>
 
       {/* Recently Added Artists */}
-      <Card className="border-border/60 overflow-hidden">
+      <Card className="pmda-shelf overflow-hidden animate-in fade-in-0 slide-in-from-bottom-2 duration-300">
         <CardHeader className="pb-3">
           <div className="flex items-center justify-between gap-3">
             <div className="space-y-1">
@@ -495,12 +495,12 @@ export default function LibraryHome() {
           ) : recentArtists.length === 0 ? (
             <p className="text-sm text-muted-foreground">No recently added artists yet.</p>
           ) : (
-            <Carousel opts={{ align: 'start', dragFree: true }} className="w-full">
+            <Carousel opts={{ align: 'start', dragFree: true }} className="w-full pmda-fade-mask">
               <CarouselContent className="-ml-3">
                 {recentArtists.map((a) => (
                   <CarouselItem key={`ra-${a.artist_id}`} className="basis-[170px] sm:basis-[200px] md:basis-[220px] pl-3">
                     <button type="button" onClick={() => navigate(`/library/artist/${a.artist_id}${location.search || ''}`)} className="w-full text-left group">
-                      <Card className="overflow-hidden border-border/60 hover:bg-accent/30 transition-colors">
+                      <Card className="overflow-hidden border-border/60 bg-card/90 transition-all duration-300 hover:-translate-y-1 hover:border-primary/35 hover:bg-accent/20">
                         <CardContent className="p-4 space-y-3">
                           <div className="flex items-center gap-3">
                             <div className="h-12 w-12 rounded-full bg-muted overflow-hidden shrink-0 flex items-center justify-center border border-border/60">
@@ -525,8 +525,8 @@ export default function LibraryHome() {
                 ))}
               </CarouselContent>
               <div className="hidden md:block">
-                <CarouselPrevious />
-                <CarouselNext />
+                <CarouselPrevious className="left-2 top-[42%] h-9 w-9 bg-background/70 backdrop-blur-sm" />
+                <CarouselNext className="right-2 top-[42%] h-9 w-9 bg-background/70 backdrop-blur-sm" />
               </div>
             </Carousel>
           )}
@@ -534,7 +534,7 @@ export default function LibraryHome() {
       </Card>
 
       {/* Recently Played */}
-      <Card className="border-border/60 overflow-hidden">
+      <Card className="pmda-shelf overflow-hidden animate-in fade-in-0 slide-in-from-bottom-2 duration-300">
         <CardHeader className="pb-3">
           <div className="flex items-center justify-between gap-3">
             <div className="space-y-1">
@@ -562,12 +562,12 @@ export default function LibraryHome() {
           ) : recentlyPlayedAlbums.length === 0 ? (
             <p className="text-sm text-muted-foreground">{recentlyPlayedError ?? 'No playback history yet.'}</p>
           ) : (
-            <Carousel opts={{ align: 'start', dragFree: true }} className="w-full">
+            <Carousel opts={{ align: 'start', dragFree: true }} className="w-full pmda-fade-mask">
               <CarouselContent className="-ml-3">
                 {recentlyPlayedAlbums.map((a) => (
                   <CarouselItem key={`rplay-${a.album_id}`} className="basis-[160px] sm:basis-[190px] md:basis-[220px] pl-3">
                     <div className="group">
-                      <Card className="overflow-hidden border-border/60">
+                      <Card className="overflow-hidden border-border/60 bg-card/90 transition-all duration-300 hover:-translate-y-1 hover:border-primary/35 hover:shadow-card-hover">
                         <AspectRatio ratio={1} className="bg-muted">
                           <AlbumArtwork albumThumb={a.thumb} artistId={a.artist_id} alt={a.title} size={512} />
                           <button
@@ -614,8 +614,8 @@ export default function LibraryHome() {
                 ))}
               </CarouselContent>
               <div className="hidden md:block">
-                <CarouselPrevious />
-                <CarouselNext />
+                <CarouselPrevious className="left-2 top-[42%] h-9 w-9 bg-background/70 backdrop-blur-sm" />
+                <CarouselNext className="right-2 top-[42%] h-9 w-9 bg-background/70 backdrop-blur-sm" />
               </div>
             </Carousel>
           )}
@@ -623,7 +623,7 @@ export default function LibraryHome() {
       </Card>
 
       {/* Recently Added */}
-      <Card className="border-border/60 overflow-hidden">
+      <Card className="pmda-shelf overflow-hidden animate-in fade-in-0 slide-in-from-bottom-2 duration-300">
         <CardHeader className="pb-3">
           <div className="flex items-center justify-between gap-3">
             <div className="space-y-1">
@@ -645,12 +645,12 @@ export default function LibraryHome() {
           ) : recentAlbums.length === 0 ? (
             <p className="text-sm text-muted-foreground">No recent albums yet.</p>
           ) : (
-            <Carousel opts={{ align: 'start', dragFree: true }} className="w-full">
+            <Carousel opts={{ align: 'start', dragFree: true }} className="w-full pmda-fade-mask">
               <CarouselContent className="-ml-3">
                 {recentAlbums.map((a) => (
                   <CarouselItem key={`recent-${a.album_id}`} className="basis-[160px] sm:basis-[190px] md:basis-[220px] pl-3">
                     <div className="group">
-                      <Card className="overflow-hidden border-border/60">
+                      <Card className="overflow-hidden border-border/60 bg-card/90 transition-all duration-300 hover:-translate-y-1 hover:border-primary/35 hover:shadow-card-hover">
                         <AspectRatio ratio={1} className="bg-muted">
                           <AlbumArtwork albumThumb={a.thumb} artistId={a.artist_id} alt={a.title} size={512} />
                           <button
@@ -697,8 +697,8 @@ export default function LibraryHome() {
                 ))}
               </CarouselContent>
               <div className="hidden md:block">
-                <CarouselPrevious />
-                <CarouselNext />
+                <CarouselPrevious className="left-2 top-[42%] h-9 w-9 bg-background/70 backdrop-blur-sm" />
+                <CarouselNext className="right-2 top-[42%] h-9 w-9 bg-background/70 backdrop-blur-sm" />
               </div>
             </Carousel>
           )}

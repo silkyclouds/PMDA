@@ -131,9 +131,28 @@
     @apply border-border;
   }
 
+  html,
+  body,
+  #root {
+    min-height: 100%;
+  }
+
   body {
     @apply bg-background text-foreground antialiased;
     font-feature-settings: "rlig" 1, "calt" 1;
+    overflow-x: hidden;
+    background-image:
+      radial-gradient(1200px circle at 0% -20%, hsl(var(--primary) / 0.08), transparent 42%),
+      radial-gradient(1000px circle at 100% -10%, hsl(var(--secondary) / 0.06), transparent 40%),
+      linear-gradient(180deg, hsl(var(--background)), hsl(var(--background)));
+  }
+
+  h1,
+  h2,
+  h3,
+  .font-display {
+    font-family: "Sora", "Manrope", system-ui, sans-serif;
+    letter-spacing: -0.01em;
   }
 
   /* Custom scrollbar */
@@ -148,6 +167,13 @@
 
   ::-webkit-scrollbar-thumb {
     @apply bg-muted-foreground/30 rounded-full hover:bg-muted-foreground/50 transition-colors;
+  }
+
+  :root {
+    --pmda-safe-bottom: env(safe-area-inset-bottom, 0px);
+    --pmda-safe-top: env(safe-area-inset-top, 0px);
+    --pmda-safe-left: env(safe-area-inset-left, 0px);
+    --pmda-safe-right: env(safe-area-inset-right, 0px);
   }
 }
 
@@ -286,6 +312,65 @@
 }
 
 @layer utilities {
+  .safe-bottom {
+    padding-bottom: max(0.75rem, var(--pmda-safe-bottom));
+  }
+
+  .safe-top {
+    padding-top: max(0.25rem, var(--pmda-safe-top));
+  }
+
+  .safe-x {
+    padding-left: max(0.5rem, var(--pmda-safe-left));
+    padding-right: max(0.5rem, var(--pmda-safe-right));
+  }
+
+  .pmda-page-transition {
+    animation: pmdaPageEnter 320ms cubic-bezier(0.2, 0.8, 0.2, 1);
+  }
+
+  .pmda-shelf {
+    @apply rounded-2xl border border-border/60 bg-card/75 backdrop-blur-sm;
+    box-shadow: 0 14px 40px -28px rgba(0, 0, 0, 0.45);
+  }
+
+  .pmda-shelf-row {
+    @apply relative overflow-hidden rounded-xl border border-border/50 bg-background/50;
+  }
+
+  .pmda-fade-mask {
+    mask-image: linear-gradient(to right, transparent, black 3%, black 97%, transparent);
+  }
+
+  @keyframes pmdaPageEnter {
+    from {
+      opacity: 0;
+      transform: translateY(10px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .pmda-page-transition,
+    .animate-slide-up,
+    .animate-fade-scale,
+    .animate-pulse-subtle,
+    .stagger-children > * {
+      animation: none !important;
+      transition-duration: 0ms !important;
+    }
+  }
+
+  @media (max-width: 767px) {
+    .container {
+      padding-left: max(0.875rem, var(--pmda-safe-left));
+      padding-right: max(0.875rem, var(--pmda-safe-right));
+    }
+  }
+
   /* Glass effect */
   .glass {
     @apply bg-background/60 backdrop-blur-xl border border-border/50;

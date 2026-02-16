@@ -23,6 +23,7 @@ import {
   SidebarSeparator,
 } from '@/components/ui/sidebar';
 import { Logo } from '@/components/Logo';
+import { useIsMobile } from '@/hooks/use-mobile';
 
 function isPathActive(pathname: string, target: string): boolean {
   if (target === '/library') {
@@ -56,6 +57,7 @@ function parseDropPayload(e: React.DragEvent): { track_id?: number; album_id?: n
 }
 
 export function AppSidebar() {
+  const isMobile = useIsMobile();
   const { toast } = useToast();
   const location = useLocation();
   const navigate = useNavigate();
@@ -109,6 +111,7 @@ export function AppSidebar() {
   );
 
   const playlistItems = useMemo(() => playlists.slice(0, 10), [playlists]);
+  const visiblePlaylistItems = useMemo(() => (isMobile ? playlistItems.slice(0, 5) : playlistItems), [isMobile, playlistItems]);
 
   const handleDropOnPlaylist = async (playlistId: number, e: React.DragEvent) => {
     e.preventDefault();
@@ -137,7 +140,7 @@ export function AppSidebar() {
   return (
     <Sidebar collapsible="icon" variant="sidebar">
       <SidebarHeader>
-        <div className="flex items-center gap-2 px-2 py-1">
+        <div className="flex items-center gap-2 px-2 py-1.5">
           <Logo showText={false} size="sm" />
           <div className="min-w-0 group-data-[collapsible=icon]:hidden">
             <div className="font-semibold leading-tight">PMDA</div>
@@ -211,7 +214,7 @@ export function AppSidebar() {
 
         <SidebarSeparator />
 
-        <SidebarGroup>
+        <SidebarGroup className={cn(isMobile ? 'pt-1' : '')}>
           <SidebarGroupLabel>Playlists</SidebarGroupLabel>
           <SidebarGroupAction asChild title="New playlist">
             <Button
@@ -225,15 +228,15 @@ export function AppSidebar() {
             </Button>
           </SidebarGroupAction>
           <SidebarGroupContent>
-            {loadingPlaylists && playlistItems.length === 0 ? (
+            {loadingPlaylists && visiblePlaylistItems.length === 0 ? (
               <div className="px-2 py-2 text-xs text-muted-foreground">Loading…</div>
-            ) : playlistItems.length === 0 ? (
+            ) : visiblePlaylistItems.length === 0 ? (
               <div className="px-2 py-2 text-xs text-muted-foreground">
                 No playlists yet. Create one and drag tracks here.
               </div>
             ) : (
               <SidebarMenu>
-                {playlistItems.map((pl) => {
+                {visiblePlaylistItems.map((pl) => {
                   const active = isPathActive(location.pathname, `/library/playlists/${pl.playlist_id}`);
                   const dragOver = dragOverPlaylistId === pl.playlist_id;
                   return (
@@ -290,7 +293,7 @@ export function AppSidebar() {
       </SidebarContent>
 
       <SidebarFooter>
-        <div className="px-2 py-1 text-[11px] text-muted-foreground group-data-[collapsible=icon]:hidden">
+        <div className="hidden md:block px-2 py-1 text-[11px] text-muted-foreground group-data-[collapsible=icon]:hidden">
           Tip: drag a track from Now Playing queue onto a playlist.
         </div>
       </SidebarFooter>

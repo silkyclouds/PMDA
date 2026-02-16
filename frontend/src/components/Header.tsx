@@ -9,6 +9,7 @@ import { Logo } from '@/components/Logo';
 import { GlobalSearch } from '@/components/GlobalSearch';
 import * as api from '@/lib/api';
 import { SidebarTrigger } from '@/components/ui/sidebar';
+import { useIsMobile } from '@/hooks/use-mobile';
 
 const WELCOME_COOKIE = 'pmda_welcome_dismissed';
 
@@ -63,6 +64,7 @@ function RebootCountdown({ onComplete, onProgress }: { onComplete: () => void; o
 }
 
 export function Header() {
+  const isMobile = useIsMobile();
   const [showSettings, setShowSettings] = useState(false);
   const [isRebooting, setIsRebooting] = useState(false);
   const [rebootCountdown, setRebootCountdown] = useState(30);
@@ -84,19 +86,19 @@ export function Header() {
 
   return (
     <>
-      <header className="sticky top-0 z-50 border-b border-border bg-card/95 backdrop-blur supports-[backdrop-filter]:bg-card/80">
-        <div className="container py-3">
-          <div className="space-y-3">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-3">
-                <SidebarTrigger className="h-9 w-9" />
-                <Logo size="md" />
+      <header className="sticky top-0 z-50 safe-top border-b border-border/70 bg-card/85 backdrop-blur-xl supports-[backdrop-filter]:bg-card/70">
+        <div className="container py-2.5 md:py-3">
+          <div className="space-y-2.5 md:space-y-3">
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2.5 min-w-0">
+                <SidebarTrigger />
+                <Logo size={isMobile ? 'sm' : 'md'} showText={!isMobile} />
               </div>
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-1.5">
                 <ThemeToggle />
               </div>
             </div>
-            <GlobalSearch className="max-w-none" />
+            <GlobalSearch className="max-w-none animate-in fade-in-0 slide-in-from-bottom-1 duration-300" />
           </div>
         </div>
       </header>

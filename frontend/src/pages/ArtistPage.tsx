@@ -5,8 +5,8 @@ import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Card, CardContent } from '@/components/ui/card';
 import { AspectRatio } from '@/components/ui/aspect-ratio';
-import { ScrollArea } from '@/components/ui/scroll-area';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
+import { Carousel, CarouselContent, CarouselItem, CarouselNext, CarouselPrevious } from '@/components/ui/carousel';
 import { AlbumArtwork } from '@/components/library/AlbumArtwork';
 import { cn } from '@/lib/utils';
 import { FormatBadge } from '@/components/FormatBadge';
@@ -1009,77 +1009,82 @@ export default function ArtistPage() {
                 <Disc3 className="w-4 h-4 text-primary" />
                 <h2 className="text-lg font-semibold">{type === 'Single' ? 'Singles' : `${type}s`}</h2>
               </div>
-	              <ScrollArea className="w-full whitespace-nowrap">
-	                <div className="flex gap-4 pb-2">
-	                  {grouped[type].map((album) => (
-                    <Card
-                      key={album.album_id}
-                      className="group w-[200px] shrink-0 overflow-hidden border-border/70 cursor-pointer hover:bg-muted/40 transition-colors"
-                      role="button"
-                      tabIndex={0}
-                      onClick={() => navigate(`/library/album/${album.album_id}${location.search || ''}`)}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter" || e.key === " ") {
-                          e.preventDefault();
-                          navigate(`/library/album/${album.album_id}${location.search || ''}`);
-                        }
-                      }}
-                      title="Open album"
-                    >
-                      <AspectRatio
-                        ratio={1}
-                        className="bg-muted"
-                        draggable
-                        onDragStart={(e) => {
-                          try {
-                            e.dataTransfer.setData('application/x-pmda-album', JSON.stringify({ album_id: album.album_id }));
-                            e.dataTransfer.setData('text/plain', `${details.artist_name} – ${album.title}`);
-                            e.dataTransfer.effectAllowed = 'copy';
-                          } catch {
-                            // ignore
+              <Carousel opts={{ align: 'start', dragFree: true }} className="w-full">
+                <CarouselContent className="-ml-3">
+                  {grouped[type].map((album) => (
+                    <CarouselItem key={album.album_id} className="pl-3 basis-[180px] sm:basis-[200px] md:basis-[220px]">
+                      <Card
+                        className="group h-full overflow-hidden border-border/70 bg-card/90 cursor-pointer transition-all duration-300 hover:-translate-y-1 hover:border-primary/35 hover:bg-muted/20"
+                        role="button"
+                        tabIndex={0}
+                        onClick={() => navigate(`/library/album/${album.album_id}${location.search || ''}`)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter" || e.key === " ") {
+                            e.preventDefault();
+                            navigate(`/library/album/${album.album_id}${location.search || ''}`);
                           }
                         }}
+                        title="Open album"
                       >
-                        <AlbumArtwork albumThumb={album.thumb} artistId={artistId} alt={album.title} size={512} />
-                        <div className="absolute inset-x-0 bottom-0 p-2.5 opacity-0 group-hover:opacity-100 transition-opacity">
-                          <Button
-                            size="sm"
-                            className="h-8 w-full gap-2 rounded-full"
-                            onClick={(e) => {
-                              e.preventDefault();
-                              e.stopPropagation();
-                              void handlePlayAlbum(album.album_id, album.title, album.thumb);
-                            }}
-                          >
-                            <Play className="h-4 w-4" />
-                            Play
-                          </Button>
-                        </div>
-                      </AspectRatio>
-                      <CardContent className="p-3 space-y-2">
-                        <h3 className="text-sm font-semibold truncate" title={album.title}>
-                          {album.title}
-                        </h3>
-                        <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground">
-                          <span>{album.year || album.date || 'Unknown'}</span>
-                          <span>{album.track_count} tracks</span>
-                        </div>
-                        <div className="flex items-center gap-1.5 flex-wrap">
-                          {album.format && <FormatBadge format={album.format} size="sm" />}
-                          <Badge variant={album.is_lossless ? 'secondary' : 'outline'} className="text-[10px]">
-                            {album.is_lossless ? 'Lossless' : 'Lossy'}
-                          </Badge>
-                        </div>
-                        {album.short_description && (
-                          <p className={cn('text-[11px] text-muted-foreground line-clamp-3')}>
-                            {album.short_description}
-                          </p>
-                        )}
-                      </CardContent>
-                    </Card>
+                        <AspectRatio
+                          ratio={1}
+                          className="bg-muted"
+                          draggable
+                          onDragStart={(e) => {
+                            try {
+                              e.dataTransfer.setData('application/x-pmda-album', JSON.stringify({ album_id: album.album_id }));
+                              e.dataTransfer.setData('text/plain', `${details.artist_name} – ${album.title}`);
+                              e.dataTransfer.effectAllowed = 'copy';
+                            } catch {
+                              // ignore
+                            }
+                          }}
+                        >
+                          <AlbumArtwork albumThumb={album.thumb} artistId={artistId} alt={album.title} size={512} />
+                          <div className="absolute inset-x-0 bottom-0 p-2.5 opacity-0 group-hover:opacity-100 transition-opacity">
+                            <Button
+                              size="sm"
+                              className="h-8 w-full gap-2 rounded-full"
+                              onClick={(e) => {
+                                e.preventDefault();
+                                e.stopPropagation();
+                                void handlePlayAlbum(album.album_id, album.title, album.thumb);
+                              }}
+                            >
+                              <Play className="h-4 w-4" />
+                              Play
+                            </Button>
+                          </div>
+                        </AspectRatio>
+                        <CardContent className="p-3 space-y-2">
+                          <h3 className="text-sm font-semibold truncate" title={album.title}>
+                            {album.title}
+                          </h3>
+                          <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground">
+                            <span>{album.year || album.date || 'Unknown'}</span>
+                            <span>{album.track_count} tracks</span>
+                          </div>
+                          <div className="flex items-center gap-1.5 flex-wrap">
+                            {album.format && <FormatBadge format={album.format} size="sm" />}
+                            <Badge variant={album.is_lossless ? 'secondary' : 'outline'} className="text-[10px]">
+                              {album.is_lossless ? 'Lossless' : 'Lossy'}
+                            </Badge>
+                          </div>
+                          {album.short_description && (
+                            <p className={cn('text-[11px] text-muted-foreground line-clamp-3')}>
+                              {album.short_description}
+                            </p>
+                          )}
+                        </CardContent>
+                      </Card>
+                    </CarouselItem>
                   ))}
+                </CarouselContent>
+                <div className="hidden md:block">
+                  <CarouselPrevious className="left-2 top-[42%] h-9 w-9 bg-background/70 backdrop-blur-sm" />
+                  <CarouselNext className="right-2 top-[42%] h-9 w-9 bg-background/70 backdrop-blur-sm" />
                 </div>
-              </ScrollArea>
+              </Carousel>
             </section>
           ))}
         </div>

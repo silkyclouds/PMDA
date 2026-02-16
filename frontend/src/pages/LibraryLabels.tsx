@@ -20,6 +20,7 @@ export default function LibraryLabels() {
   const [labels, setLabels] = useState<api.LibraryFacetItem[]>([]);
   const [total, setTotal] = useState(0);
   const [offset, setOffset] = useState(0);
+  const [appending, setAppending] = useState(false);
   const limit = 120;
 
   const requestIdRef = useRef(0);
@@ -29,8 +30,10 @@ export default function LibraryLabels() {
   const fetchLabels = useCallback(async (opts: { reset: boolean; pageOffset: number }) => {
     const rid = ++requestIdRef.current;
     try {
-      setLoading(true);
-      setError(null);
+      if (opts.reset) {
+        setLoading(true);
+        setError(null);
+      }
       const res = await api.getLibraryLabels({
         search: search.trim() || undefined,
         genre: genre || undefined,
@@ -66,9 +69,11 @@ export default function LibraryLabels() {
   const loadMore = useCallback(async () => {
     if (!canLoadMore || loadingMoreRef.current) return;
     loadingMoreRef.current = true;
+    setAppending(true);
     try {
       await fetchLabels({ reset: false, pageOffset: offset });
     } finally {
+      setAppending(false);
       loadingMoreRef.current = false;
     }
   }, [canLoadMore, fetchLabels, offset]);
@@ -145,7 +150,7 @@ export default function LibraryLabels() {
 
       <div ref={sentinelRef} className="h-6" />
       <div className="flex items-center justify-center py-2 text-xs text-muted-foreground">
-        {canLoadMore ? (loading ? <span className="inline-flex items-center gap-2"><Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading more…</span> : 'Scroll to load more') : 'All loaded'}
+        {canLoadMore ? (appending ? <span className="inline-flex items-center gap-2"><Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading more…</span> : 'Scroll to load more') : 'All loaded'}
       </div>
     </div>
   );

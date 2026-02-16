@@ -127,18 +127,18 @@ export function GlobalSearch({ className }: { className?: string }) {
         onFocus={() => setOpen(items.length > 0)}
         onKeyDown={onKeyDown}
         placeholder="Search artist, album, track..."
-        className="pl-9 pr-9 bg-background/90"
+        className="h-11 pl-9 pr-9 rounded-xl bg-background/85 border-border/70"
       />
       {loading ? (
         <Loader2 className="w-4 h-4 absolute right-3 top-1/2 -translate-y-1/2 animate-spin text-muted-foreground" />
       ) : null}
 
       {open && (
-        <div className="absolute top-[calc(100%+0.35rem)] left-0 right-0 z-50 rounded-lg border border-border bg-popover shadow-xl overflow-hidden">
+        <div className="absolute top-[calc(100%+0.35rem)] left-0 right-0 z-50 rounded-xl border border-border/70 bg-popover/95 backdrop-blur-xl shadow-2xl overflow-hidden">
           {items.length === 0 ? (
             <div className="px-3 py-2.5 text-sm text-muted-foreground">No results</div>
           ) : (
-            <div className="max-h-[26rem] overflow-y-auto">
+            <div className="max-h-[min(26rem,62vh)] overflow-y-auto">
               {items.map((item, idx) => (
                 <button
                   key={`${item.type}:${item.artist_id ?? ''}:${item.album_id ?? ''}:${item.track_id ?? ''}:${item.title}:${idx}`}
