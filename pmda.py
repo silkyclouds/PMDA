@@ -35079,6 +35079,7 @@ def api_library_album_detail(album_id: int):
                     COALESCE(alb.track_count, 0) AS track_count,
                     COALESCE(alb.total_duration_sec, 0) AS total_duration_sec,
                     alb.has_cover,
+                    COALESCE(alb.cover_path, '') AS cover_path,
                     COALESCE(alb.bandcamp_album_url, '') AS bandcamp_album_url,
                     COALESCE(alb.metadata_source, '') AS metadata_source,
                     art.id AS artist_id,
@@ -35106,6 +35107,7 @@ def api_library_album_detail(album_id: int):
                 track_count,
                 total_duration_sec,
                 has_cover,
+                cover_path_raw,
                 bandcamp_album_url,
                 metadata_source,
                 artist_id,
@@ -35159,6 +35161,55 @@ def api_library_album_detail(album_id: int):
                 (album_id,),
             )
             track_rows = cur.fetchall()
+
+        has_cover_effective = bool(has_cover)
+        cover_path_effective = str(cover_path_raw or "").strip()
+        if cover_path_effective and not has_cover_effective:
+            try:
+                cp = path_for_fs_access(Path(cover_path_effective))
+                if cp.exists() and cp.is_file():
+                    has_cover_effective = True
+            except Exception:
+                pass
+
+        cover_persist_needed = False
+        if not has_cover_effective and track_rows:
+            try:
+                first_track_path = path_for_fs_access(Path(str(track_rows[0][10] or "")))
+                embedded = _extract_embedded_cover_from_audio(first_track_path)
+            except Exception:
+                embedded = None
+            if embedded:
+                raw, mime = embedded
+                master_cached = _ensure_cached_image_from_bytes(
+                    raw,
+                    mime,
+                    kind="embedded",
+                    cache_key_hint=f"album-{album_id}-master",
+                    max_px=1600,
+                )
+                if master_cached and master_cached.exists():
+                    cover_path_effective = str(master_cached)
+                has_cover_effective = True
+                cover_persist_needed = True
+
+        if cover_persist_needed:
+            try:
+                with conn.transaction():
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            UPDATE files_albums
+                            SET has_cover = TRUE,
+                                cover_path = %s,
+                                updated_at = NOW()
+                            WHERE id = %s
+                            """,
+                            (cover_path_effective, int(album_id)),
+                        )
+                _files_cache_invalidate_all()
+            except Exception:
+                logging.debug("Unable to persist embedded cover state for album_id=%s", album_id, exc_info=True)
 
         duration_overrides = _files_fix_missing_album_track_durations(
             conn,
@@ -35216,7 +35267,7 @@ def api_library_album_detail(album_id: int):
         if total_duration_sec <= 0 and tracks:
             total_duration_sec = sum(int(t.get("duration_sec") or 0) for t in tracks)
 
-        cover_url = f"{base_url}/api/library/files/album/{album_id}/cover?size=640" if bool(has_cover) else None
+        cover_url = f"{base_url}/api/library/files/album/{album_id}/cover?size=640" if bool(has_cover_effective) else None
 
         payload = {
             "album_id": int(album_id),
@@ -35229,7 +35280,7 @@ def api_library_album_detail(album_id: int):
             "is_lossless": bool(is_lossless),
             "track_count": int(track_count or 0),
             "total_duration_sec": int(total_duration_sec or 0),
-            "has_cover": bool(has_cover),
+            "has_cover": bool(has_cover_effective),
             "cover_url": cover_url,
             "bandcamp_album_url": (bandcamp_album_url or "").strip() or None,
             "metadata_source": (metadata_source or "").strip() or None,
@@ -35363,15 +35414,33 @@ def api_library_files_album_cover(album_id):
             embedded = _extract_embedded_cover_from_audio(first_track)
             if embedded:
                 raw, mime = embedded
-                cached = _ensure_cached_image_from_bytes(
+                master_cached = _ensure_cached_image_from_bytes(
                     raw,
                     mime,
                     kind="embedded",
-                    cache_key_hint=f"album-{album_id}",
-                    max_px=size,
+                    cache_key_hint=f"album-{album_id}-master",
+                    max_px=1600,
                 )
-                if cached and cached.exists():
-                    return send_file(str(cached), as_attachment=False, conditional=True)
+                if master_cached and master_cached.exists():
+                    try:
+                        with conn.transaction():
+                            with conn.cursor() as cur:
+                                cur.execute(
+                                    """
+                                    UPDATE files_albums
+                                    SET has_cover = TRUE,
+                                        cover_path = %s,
+                                        updated_at = NOW()
+                                    WHERE id = %s
+                                    """,
+                                    (str(master_cached), int(album_id)),
+                                )
+                        _files_cache_invalidate_all()
+                    except Exception:
+                        logging.debug("Unable to persist embedded cover for album_id=%s", album_id, exc_info=True)
+                    sized = _ensure_cached_image_for_path(master_cached, kind="album", max_px=size)
+                    to_send = sized or master_cached
+                    return send_file(str(to_send), as_attachment=False, conditional=True)
                 return Response(raw, headers={"Content-Type": mime})
         # Avoid noisy 404s in the browser console: return a tiny transparent placeholder.
         # The UI still shows a "no cover" state (based on has_cover), but the image request won't error.
