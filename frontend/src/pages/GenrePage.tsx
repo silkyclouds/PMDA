@@ -33,6 +33,14 @@ export default function GenrePage() {
   const [albums, setAlbums] = useState<api.LibraryAlbumItem[]>([]);
   const [total, setTotal] = useState(0);
   const [offset, setOffset] = useState(0);
+  const [coverSize] = useState<number>(() => {
+    try {
+      const raw = Number(localStorage.getItem('pmda_library_cover_size') || 220);
+      return Number.isFinite(raw) ? Math.max(150, Math.min(320, raw)) : 220;
+    } catch {
+      return 220;
+    }
+  });
 
   const [labelsLoading, setLabelsLoading] = useState(false);
   const [labels, setLabels] = useState<api.GenreLabelItem[]>([]);
@@ -105,6 +113,10 @@ export default function GenrePage() {
   const labelChips = useMemo(() => {
     return labels.slice(0, 60);
   }, [labels]);
+  const gridTemplateColumns = useMemo(() => {
+    const col = Math.max(140, Math.min(340, Math.floor(coverSize)));
+    return `repeat(auto-fill, minmax(${col}px, 1fr))`;
+  }, [coverSize]);
 
   return (
     <div className="container py-6 space-y-6">
@@ -179,7 +191,7 @@ export default function GenrePage() {
             <CardContent className="p-8 text-sm text-muted-foreground">No albums found for this genre.</CardContent>
           </Card>
         ) : (
-          <div className="grid gap-4" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(10.5rem, 1fr))' }}>
+          <div className="grid gap-4" style={{ gridTemplateColumns }}>
             {albums.map((a) => (
               <div
                 key={`genre-alb-${a.album_id}`}

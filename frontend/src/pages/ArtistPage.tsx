@@ -152,6 +152,18 @@ export default function ArtistPage() {
   const [descExpanded, setDescExpanded] = useState(false);
   const [refreshAllBusy, setRefreshAllBusy] = useState(false);
   const [concertFilter, setConcertFilter] = useState<{ enabled: boolean; lat: number | null; lon: number | null; radiusKm: number } | null>(null);
+  const includeUnmatchedParam = useMemo(() => {
+    const raw = new URLSearchParams(location.search || '').get('include_unmatched');
+    if (raw == null) return null;
+    const low = String(raw || '').trim().toLowerCase();
+    if (['1', 'true', 'yes', 'on'].includes(low)) return '1';
+    if (['0', 'false', 'no', 'off'].includes(low)) return '0';
+    return null;
+  }, [location.search]);
+  const appendIncludeUnmatched = useCallback((url: string) => {
+    if (includeUnmatchedParam == null) return url;
+    return `${url}${url.includes('?') ? '&' : '?'}include_unmatched=${includeUnmatchedParam}`;
+  }, [includeUnmatchedParam]);
 
   const fetchArtist = useCallback(async () => {
     if (!Number.isFinite(artistId) || artistId <= 0) {
@@ -162,7 +174,7 @@ export default function ArtistPage() {
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch(`/api/library/artist/${artistId}`);
+      const res = await fetch(appendIncludeUnmatched(`/api/library/artist/${artistId}`));
       if (!res.ok) throw new Error('Failed to load artist');
       const data = (await res.json()) as ArtistDetailResponse;
       setDetails(data);
@@ -173,13 +185,13 @@ export default function ArtistPage() {
     } finally {
       setLoading(false);
     }
-  }, [artistId]);
+  }, [appendIncludeUnmatched, artistId]);
 
   const fetchProfile = useCallback(
     async (refresh: boolean) => {
       if (!Number.isFinite(artistId) || artistId <= 0) return false;
       try {
-        const res = await fetch(`/api/library/artist/${artistId}/profile${refresh ? '?refresh=1' : ''}`);
+        const res = await fetch(appendIncludeUnmatched(`/api/library/artist/${artistId}/profile${refresh ? '?refresh=1' : ''}`));
         if (!res.ok) return false;
         const data = (await res.json()) as ArtistProfileResponse;
         if (data.profile) {
@@ -191,7 +203,7 @@ export default function ArtistPage() {
         return false;
       }
     },
-    [artistId]
+    [appendIncludeUnmatched, artistId]
   );
 
   useEffect(() => {
@@ -481,7 +493,7 @@ export default function ArtistPage() {
     similarRefreshAttemptsRef.current = 0;
     const run = async () => {
       try {
-        const res = await fetch(`/api/library/artist/${details.artist_id}/similar`);
+        const res = await fetch(appendIncludeUnmatched(`/api/library/artist/${details.artist_id}/similar`));
         if (!res.ok) return;
         const data = await res.json();
         if (cancelled) return;
@@ -530,7 +542,7 @@ export default function ArtistPage() {
       cancelled = true;
       if (timer) clearTimeout(timer);
     };
-  }, [details]);
+  }, [appendIncludeUnmatched, details]);
 
   const grouped = useMemo(() => {
     const src = details?.albums ?? [];

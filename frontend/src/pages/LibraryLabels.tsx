@@ -3,7 +3,6 @@ import { useLocation, useNavigate, useOutletContext } from 'react-router-dom';
 import { Building2, Loader2 } from 'lucide-react';
 
 import { Badge } from '@/components/ui/badge';
-import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { useLibraryQuery } from '@/hooks/useLibraryQuery';
 import * as api from '@/lib/api';
@@ -24,6 +23,8 @@ export default function LibraryLabels() {
   const limit = 120;
 
   const requestIdRef = useRef(0);
+  const sentinelRef = useRef<HTMLDivElement | null>(null);
+  const loadingMoreRef = useRef(false);
 
   const fetchLabels = useCallback(async (opts: { reset: boolean; pageOffset: number }) => {
     const rid = ++requestIdRef.current;
@@ -62,6 +63,33 @@ export default function LibraryLabels() {
   }, [search, genre, year, includeUnmatched, fetchLabels]);
 
   const canLoadMore = labels.length < total && !loading;
+  const loadMore = useCallback(async () => {
+    if (!canLoadMore || loadingMoreRef.current) return;
+    loadingMoreRef.current = true;
+    try {
+      await fetchLabels({ reset: false, pageOffset: offset });
+    } finally {
+      loadingMoreRef.current = false;
+    }
+  }, [canLoadMore, fetchLabels, offset]);
+
+  useEffect(() => {
+    const node = sentinelRef.current;
+    if (!node) return;
+    const obs = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          if (entry.isIntersecting) {
+            void loadMore();
+            break;
+          }
+        }
+      },
+      { root: null, rootMargin: '900px 0px 900px 0px', threshold: 0.01 },
+    );
+    obs.observe(node);
+    return () => obs.disconnect();
+  }, [labels.length, loadMore, total]);
 
   return (
     <div className="container pb-6 space-y-4">
@@ -109,16 +137,9 @@ export default function LibraryLabels() {
         )}
       </Card>
 
-      <div className="flex items-center justify-center py-6">
-        <Button
-          variant="outline"
-          className="gap-2"
-          onClick={() => void fetchLabels({ reset: false, pageOffset: offset })}
-          disabled={!canLoadMore}
-        >
-          {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
-          {canLoadMore ? 'Load more' : 'All loaded'}
-        </Button>
+      <div ref={sentinelRef} className="h-6" />
+      <div className="flex items-center justify-center py-2 text-xs text-muted-foreground">
+        {canLoadMore ? (loading ? <span className="inline-flex items-center gap-2"><Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading more…</span> : 'Scroll to load more') : 'All loaded'}
       </div>
     </div>
   );

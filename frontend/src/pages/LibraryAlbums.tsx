@@ -71,6 +71,8 @@ export default function LibraryAlbums() {
   const limit = 96;
 
   const requestIdRef = useRef(0);
+  const sentinelRef = useRef<HTMLDivElement | null>(null);
+  const loadingMoreRef = useRef(false);
 
   const gridTemplateColumns = useMemo(() => {
     const col = Math.max(140, Math.min(340, Math.floor(coverSize)));
@@ -178,6 +180,33 @@ export default function LibraryAlbums() {
   };
 
   const canLoadMore = albums.length < totalAlbums && !albumLoading;
+  const loadMore = useCallback(async () => {
+    if (!canLoadMore || loadingMoreRef.current) return;
+    loadingMoreRef.current = true;
+    try {
+      await fetchAlbums({ reset: false, pageOffset: offset });
+    } finally {
+      loadingMoreRef.current = false;
+    }
+  }, [canLoadMore, fetchAlbums, offset]);
+
+  useEffect(() => {
+    const node = sentinelRef.current;
+    if (!node) return;
+    const obs = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          if (entry.isIntersecting) {
+            void loadMore();
+            break;
+          }
+        }
+      },
+      { root: null, rootMargin: '1000px 0px 1000px 0px', threshold: 0.01 },
+    );
+    obs.observe(node);
+    return () => obs.disconnect();
+  }, [albums.length, loadMore, totalAlbums]);
 
   return (
     <div className="container pb-6 space-y-4">
@@ -376,16 +405,9 @@ export default function LibraryAlbums() {
         ) : null}
       </div>
 
-      <div className="flex items-center justify-center py-6">
-        <Button
-          variant="outline"
-          className="gap-2"
-          onClick={() => void fetchAlbums({ reset: false, pageOffset: offset })}
-          disabled={!canLoadMore}
-        >
-          {albumLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
-          {canLoadMore ? 'Load more' : 'All loaded'}
-        </Button>
+      <div ref={sentinelRef} className="h-8" />
+      <div className="flex items-center justify-center py-2 text-xs text-muted-foreground">
+        {canLoadMore ? (albumLoading ? <span className="inline-flex items-center gap-2"><Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading more…</span> : 'Scroll to load more') : 'All loaded'}
       </div>
     </div>
   );

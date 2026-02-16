@@ -3872,7 +3872,11 @@ _CACHE_TELEMETRY_SNAPSHOT = {"ts": 0.0, "payload": None}
 _CACHE_TELEMETRY_LOCK = threading.Lock()
 
 _LOSSLESS_FORMATS = {"FLAC", "ALAC", "APE", "WV", "WAV", "AIFF", "DSF"}
-_ARTIST_IMAGE_NAMES = ("artist.jpg", "artist.jpeg", "artist.png", "artist.webp")
+_ARTIST_IMAGE_NAMES = (
+    "artist.jpg", "artist.jpeg", "artist.png", "artist.webp",
+    "artists.jpg", "artists.jpeg", "artists.png", "artists.webp",
+    "fanart.jpg", "fanart.jpeg", "fanart.png", "fanart.webp",
+)
 
 
 def _files_pg_dsn() -> str:
@@ -6578,7 +6582,7 @@ def _rebuild_files_library_index(reason: str = "manual", wait_if_running: bool =
                 dominant_format = max(fmt_counts.items(), key=lambda x: x[1])[0] if fmt_counts else "UNKNOWN"
                 is_lossless = dominant_format in _LOSSLESS_FORMATS
                 cover_path = _first_cover_path(folder)
-                has_cover = bool(cover_path and cover_path.is_file())
+                has_cover = bool(cover_path and cover_path.is_file()) or album_folder_has_cover(folder)
                 artist_folder = _files_guess_artist_folder(folder, artist_name, root_dirs=root_dirs)
                 artist_image_path = _first_artist_image_path(artist_folder) if artist_folder else None
                 artist_has_image = bool(artist_image_path and artist_image_path.is_file())
@@ -11954,20 +11958,51 @@ def _album_path_under_dupes(db_conn, album_id: int) -> bool:
 
 # Cover filenames we consider "has cover" (same as create_pmda_test_files.sh)
 _COVER_NAMES = (
-    "cover.jpg", "cover.png", "cover.jpeg",
-    "folder.jpg", "Folder.jpg", "AlbumArt.jpg", "AlbumArtSmall.jpg",
-    "front.jpg", "artwork.jpg",
+    "cover.jpg", "cover.png", "cover.jpeg", "cover.webp",
+    "folder.jpg", "folder.png", "folder.jpeg", "folder.webp",
+    "front.jpg", "front.png", "front.jpeg", "front.webp",
+    "artwork.jpg", "artwork.png", "artwork.jpeg", "artwork.webp",
+    "albumart.jpg", "albumart.png", "albumart.jpeg", "albumart.webp",
+    "albumartsmall.jpg", "albumartsmall.png",
+    "thumb.jpg", "thumb.png", "thumb.jpeg", "thumb.webp",
 )
+_COVER_NAMES_LOWER = {n.lower() for n in _COVER_NAMES}
+
+_COVER_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tif", ".tiff"}
+_COVER_STEM_PREFIXES = ("cover", "folder", "front", "artwork", "albumart", "thumb")
+
+
+def _is_probable_cover_filename(name: str) -> bool:
+    low = str(name or "").strip().lower()
+    if not low:
+        return False
+    if low in _COVER_NAMES_LOWER:
+        return True
+    stem, ext = os.path.splitext(low)
+    if ext not in _COVER_EXTS:
+        return False
+    if any(stem.startswith(prefix) for prefix in _COVER_STEM_PREFIXES):
+        return True
+    if stem in {"art", "album", "jacket", "sleeve"}:
+        return True
+    return False
 
 def album_folder_has_cover(folder: Path) -> bool:
-    """Return True if the album folder contains any known cover image file."""
+    """
+    Return True if the album folder has a cover image.
+    Priority:
+    1) common image files in folder (cover/front/folder/artwork...)
+    2) embedded cover in first audio file (ID3 APIC / FLAC picture / MP4 covr)
+    """
     if not folder or not folder.is_dir():
         return False
     try:
-        for name in _COVER_NAMES:
-            if (folder / name).is_file():
-                return True
-        return False
+        if _first_cover_path(folder):
+            return True
+        first_audio = next((p for p in sorted(folder.rglob("*")) if AUDIO_RE.search(p.name)), None)
+        if not first_audio:
+            return False
+        return bool(_extract_embedded_cover_from_audio(first_audio))
     except OSError:
         return False
 
@@ -11980,6 +12015,11 @@ def _first_cover_path(folder: Path) -> Optional[Path]:
         for name in _COVER_NAMES:
             p = folder / name
             if p.is_file():
+                return p
+        for p in sorted(folder.iterdir(), key=lambda x: x.name.lower()):
+            if not p.is_file():
+                continue
+            if _is_probable_cover_filename(p.name):
                 return p
         return None
     except OSError:
@@ -19340,7 +19380,7 @@ def _publish_files_library_artist_from_items(
             total_duration_sec += int(tr.get("duration_sec") or 0)
         dominant_format = max(fmt_counts.items(), key=lambda x: x[1])[0] if fmt_counts else "UNKNOWN"
         cover_path = _first_cover_path(folder)
-        has_cover = bool(cover_path and cover_path.is_file())
+        has_cover = bool(cover_path and cover_path.is_file()) or album_folder_has_cover(folder)
         artist_folder = _files_guess_artist_folder(folder, artist_resolved)
         artist_image_path = _first_artist_image_path(artist_folder) if artist_folder else None
         has_artist_image = bool(artist_image_path and artist_image_path.is_file())
@@ -19535,6 +19575,12 @@ def _rows_to_files_library_payload(rows: list[tuple]) -> tuple[dict[str, dict], 
         discogs_release_id = (row[27] or "").strip()
         lastfm_album_mbid = (row[28] or "").strip()
         bandcamp_album_url = (row[29] or "").strip()
+        has_cover_row = bool(row[12])
+        if not has_cover_row:
+            try:
+                has_cover_row = album_folder_has_cover(path_for_fs_access(Path(folder_path)))
+            except Exception:
+                has_cover_row = False
         albums_payload.append(
             {
                 "artist_norm": artist_norm,
@@ -19548,7 +19594,7 @@ def _rows_to_files_library_payload(rows: list[tuple]) -> tuple[dict[str, dict], 
                 "tags_json": json.dumps(tags_json),
                 "format": (row[10] or "").strip(),
                 "is_lossless": bool(row[11]),
-                "has_cover": bool(row[12]),
+                "has_cover": has_cover_row,
                 "cover_path": (row[13] or "").strip(),
                 "mb_identified": _has_trusted_album_identity(
                     musicbrainz_id=musicbrainz_id,

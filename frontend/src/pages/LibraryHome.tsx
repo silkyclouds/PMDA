@@ -1,38 +1,18 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { useLocation, useNavigate, useOutletContext } from 'react-router-dom';
-import { ChevronDown, Flame, Heart, Loader2, Music, Play, RefreshCw, Sparkles, UserRound } from 'lucide-react';
+import { Flame, Loader2, Music, Play, RefreshCw, Sparkles, UserRound } from 'lucide-react';
 
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { AspectRatio } from '@/components/ui/aspect-ratio';
 import { Carousel, CarouselContent, CarouselItem, CarouselNext, CarouselPrevious } from '@/components/ui/carousel';
-import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
 import { cn } from '@/lib/utils';
 import { usePlayback } from '@/contexts/PlaybackContext';
 import { useToast } from '@/hooks/use-toast';
 import * as api from '@/lib/api';
 import type { TrackInfo } from '@/components/library/AudioPlayer';
 import type { LibraryOutletContext } from '@/pages/LibraryLayout';
-
-function normalizeGenreBadges(album: api.LibraryAlbumItem): string[] {
-  const raw: unknown =
-    (album && typeof album === 'object' && 'genres' in album)
-      ? (album as { genres?: unknown }).genres
-      : undefined;
-  const base = Array.isArray(raw) ? raw : (album.genre ? String(album.genre).split(/[;,/|]+/) : []);
-  const out: string[] = [];
-  const seen = new Set<string>();
-  for (const item of base) {
-    const txt = String(item ?? '').replace(/\s+/g, ' ').trim();
-    if (!txt) continue;
-    const key = txt.toLowerCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(txt);
-  }
-  return out;
-}
 
 function isUnmatchedAlbum(album: api.LibraryAlbumItem): boolean {
   return album.mb_identified === false;
@@ -79,44 +59,7 @@ export default function LibraryHome() {
   const [recentlyPlayedLoading, setRecentlyPlayedLoading] = useState(false);
   const [recentlyPlayedError, setRecentlyPlayedError] = useState<string | null>(null);
   const [recentlyPlayedAlbums, setRecentlyPlayedAlbums] = useState<api.RecentlyPlayedAlbumItem[]>([]);
-
-  const [digestLoading, setDigestLoading] = useState(false);
-  const [digestOpen, setDigestOpen] = useState(false);
-  const [digestAlbums, setDigestAlbums] = useState<api.LibraryAlbumItem[]>([]);
-  const [digestEnrichment, setDigestEnrichment] = useState<api.LibraryDigestResponse['enrichment'] | null>(null);
-
-  const [albumLikes, setAlbumLikes] = useState<Record<number, boolean>>({});
-
-  const hydrateAlbumLikes = useCallback(async (ids: number[]) => {
-    const unique = Array.from(new Set(ids.filter((x) => Number.isFinite(x) && x > 0)));
-    if (unique.length === 0) return;
-    const unknown = unique.filter((id) => albumLikes[id] === undefined);
-    if (unknown.length === 0) return;
-    try {
-      const res = await api.getLikes('album', unknown);
-      const next: Record<number, boolean> = {};
-      for (const it of (res.items || [])) next[it.entity_id] = Boolean(it.liked);
-      setAlbumLikes((prev) => ({ ...prev, ...next }));
-    } catch {
-      // ignore
-    }
-  }, [albumLikes]);
-
-  const toggleAlbumLike = useCallback(async (albumId: number) => {
-    const current = Boolean(albumLikes[albumId]);
-    const next = !current;
-    setAlbumLikes((prev) => ({ ...prev, [albumId]: next }));
-    try {
-      await api.setLike({ entity_type: 'album', entity_id: albumId, liked: next, source: 'ui_library_home' });
-    } catch (e) {
-      setAlbumLikes((prev) => ({ ...prev, [albumId]: current }));
-      toast({
-        title: 'Like failed',
-        description: e instanceof Error ? e.message : 'Failed to update like',
-        variant: 'destructive',
-      });
-    }
-  }, [albumLikes, toast]);
+  const [statsAll, setStatsAll] = useState<api.LibraryStats | null>(null);
 
   const loadRecommendations = useCallback(async () => {
     if (!recommendationSessionId) return;
@@ -198,36 +141,33 @@ export default function LibraryHome() {
     }
   }, [includeUnmatched]);
 
-  const loadDigest = useCallback(async () => {
-    try {
-      setDigestLoading(true);
-      const data = await api.getLibraryDigestWithOptions(18, true, { includeUnmatched });
-      setDigestAlbums(Array.isArray(data.albums) ? data.albums : []);
-      setDigestEnrichment(data.enrichment ?? null);
-    } catch {
-      setDigestAlbums([]);
-      setDigestEnrichment(null);
-    } finally {
-      setDigestLoading(false);
-    }
-  }, [includeUnmatched]);
-
   useEffect(() => {
     void loadDiscover();
     void loadTopArtists();
     void loadRecentArtists();
     void loadRecentlyPlayed();
     void loadRecent();
-    void loadDigest();
-  }, [includeUnmatched, loadDiscover, loadTopArtists, loadRecentArtists, loadRecentlyPlayed, loadRecent, loadDigest]);
+  }, [includeUnmatched, loadDiscover, loadTopArtists, loadRecentArtists, loadRecentlyPlayed, loadRecent]);
 
   useEffect(() => {
     void loadRecommendations();
   }, [loadRecommendations]);
 
   useEffect(() => {
-    void hydrateAlbumLikes(digestAlbums.map((a) => a.album_id));
-  }, [digestAlbums, hydrateAlbumLikes]);
+    let cancelled = false;
+    api.getLibraryStats({ includeUnmatched: true })
+      .then((res) => {
+        if (cancelled) return;
+        setStatsAll(res);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setStatsAll(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [includeUnmatched]);
 
   const handlePlayAlbum = async (albumId: number, fallbackTitle: string, fallbackThumb?: string | null) => {
     try {
@@ -291,11 +231,21 @@ export default function LibraryHome() {
     <div className="container pb-6 space-y-6">
       <Card className="border-border/60">
         <CardContent className="p-4 sm:p-5">
-          <div className="flex items-center justify-between gap-4">
-            <div className="space-y-1">
+          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+            <div className="space-y-2">
               <div className="text-xs uppercase tracking-wide text-muted-foreground">Identified Library</div>
-              <div className="text-lg font-semibold">
-                {stats ? `${stats.artists.toLocaleString()} artists · ${stats.albums.toLocaleString()} albums` : 'Loading...'}
+              <div className="text-sm text-muted-foreground">
+                Matched: <span className="font-semibold text-foreground">{stats ? `${stats.artists.toLocaleString()} artists · ${stats.albums.toLocaleString()} albums` : 'Loading...'}</span>
+              </div>
+              <div className="text-sm text-muted-foreground">
+                Non matched: <span className="font-semibold text-foreground">{stats && statsAll ? `${Math.max(0, (statsAll.artists || 0) - (stats.artists || 0)).toLocaleString()} artists · ${Math.max(0, (statsAll.albums || 0) - (stats.albums || 0)).toLocaleString()} albums` : 'Loading...'}</span>
+              </div>
+              <div className="text-sm text-muted-foreground">
+                Displayed: <span className="font-semibold text-foreground">
+                  {includeUnmatched
+                    ? (statsAll ? `${statsAll.artists.toLocaleString()} artists · ${statsAll.albums.toLocaleString()} albums` : 'Loading...')
+                    : (stats ? `${stats.artists.toLocaleString()} artists · ${stats.albums.toLocaleString()} albums` : 'Loading...')}
+                </span>
               </div>
             </div>
             {!includeUnmatched ? (
@@ -864,152 +814,6 @@ export default function LibraryHome() {
         </CardContent>
       </Card>
 
-      {/* Digest */}
-      <Collapsible open={digestOpen} onOpenChange={setDigestOpen}>
-        <Card className="border-border/60 overflow-hidden">
-          <CardHeader className="pb-3">
-            <div className="flex items-start justify-between gap-3">
-              <div className="space-y-1">
-                <CardTitle className="text-base flex items-center gap-2">
-                  Picked for You
-                  {digestAlbums.length > 0 ? <Badge variant="secondary" className="text-[10px]">{digestAlbums.length}</Badge> : null}
-                  {(digestEnrichment?.missing_total || 0) > 0 ? (
-                    <Badge variant="outline" className="text-[10px]">
-                      {digestEnrichment?.missing_total} pending
-                    </Badge>
-                  ) : null}
-                </CardTitle>
-                <CardDescription>Albums you may like, prioritized when review snippets are available.</CardDescription>
-              </div>
-              <CollapsibleTrigger asChild>
-                <Button variant="ghost" size="sm" className="gap-2">
-                  <span className="text-xs text-muted-foreground">{digestOpen ? 'Hide' : 'Show'}</span>
-                  <ChevronDown className={cn('h-4 w-4 transition-transform', digestOpen ? 'rotate-180' : '')} />
-                </Button>
-              </CollapsibleTrigger>
-            </div>
-          </CardHeader>
-          <CollapsibleContent>
-            <CardContent className="space-y-3">
-              <div className="flex items-center justify-between gap-3">
-                <div className="text-xs text-muted-foreground">
-                  Reviews are fetched in background when this digest loads, and also when you open an artist page.
-                </div>
-                <Button variant="outline" size="sm" onClick={() => void loadDigest()} disabled={digestLoading} className="gap-1.5">
-                  {digestLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
-                  Refresh
-                </Button>
-              </div>
-
-              {digestLoading && digestAlbums.length === 0 ? (
-                <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                  <Loader2 className="w-4 h-4 animate-spin" />
-                  Loading…
-                </div>
-              ) : digestAlbums.length === 0 ? (
-                <p className="text-sm text-muted-foreground">
-                  {(digestEnrichment?.missing_total || 0) > 0
-                    ? `No review snippets yet. Background enrichment is working on ${digestEnrichment?.missing_total} recent album(s).`
-                    : 'No recent albums with reviews yet.'}
-                </p>
-              ) : (
-                <div className="space-y-3">
-                  {digestAlbums.slice(0, 8).map((a) => {
-                    const liked = Boolean(albumLikes[a.album_id]);
-                    const genres = normalizeGenreBadges(a);
-                    const shownGenres = genres.slice(0, 3);
-                    const moreGenres = Math.max(0, genres.length - shownGenres.length);
-                    return (
-                      <div key={`dig-${a.album_id}`} className={cn('rounded-2xl border border-border/60 bg-card overflow-hidden', unmatchedAlbumCardClass(a))}>
-                        <div className="grid grid-cols-1 sm:grid-cols-[160px,1fr] gap-0">
-                          <div className="relative bg-muted">
-                            <AspectRatio ratio={1} className="bg-muted">
-                              {a.thumb ? (
-                                <img src={a.thumb} alt={a.title} className="w-full h-full object-cover animate-in fade-in-0 duration-300" />
-                              ) : (
-                                <div className="w-full h-full flex items-center justify-center">
-                                  <Music className="w-10 h-10 text-muted-foreground" />
-                                </div>
-                              )}
-                            </AspectRatio>
-                            {isUnmatchedAlbum(a) ? <div className="absolute top-2 left-2">{unmatchedBadge(a)}</div> : null}
-                            <div className="absolute inset-0 opacity-0 hover:opacity-100 transition-opacity bg-black/35" />
-                            <div className="absolute top-2 right-2 flex items-center gap-2">
-                              <Button
-                                type="button"
-                                size="icon"
-                                variant="secondary"
-                                className={cn('h-9 w-9 rounded-full', liked ? 'bg-primary text-primary-foreground hover:bg-primary/90' : 'bg-background/70')}
-                                onClick={() => void toggleAlbumLike(a.album_id)}
-                                title={liked ? 'Unlike' : 'Like'}
-                              >
-                                <Heart className={cn('h-4 w-4', liked ? 'fill-current' : '')} />
-                              </Button>
-                            </div>
-                          </div>
-                          <div className="p-4 sm:p-5 space-y-2">
-                            <div className="flex items-start justify-between gap-3">
-                              <div className="min-w-0">
-                                <button
-                                  type="button"
-                                  className="text-sm font-semibold truncate hover:underline text-left w-full"
-                                  onClick={() => navigate(`/library/album/${a.album_id}${location.search || ''}`)}
-                                  title="Open album"
-                                >
-                                  {a.title}
-                                </button>
-                                <button
-                                  type="button"
-                                  className="text-xs text-muted-foreground truncate hover:underline"
-                                  onClick={() => navigate(`/library/artist/${a.artist_id}${location.search || ''}`)}
-                                  title="Open artist"
-                                >
-                                  {a.artist_name}
-                                </button>
-                              </div>
-                              <div className="flex items-center justify-end flex-wrap gap-2 shrink-0">
-                                <Badge variant="outline" className="text-[10px]">{a.year ?? '—'}</Badge>
-                                {shownGenres.map((g) => (
-                                  <Badge key={`dig-g-${a.album_id}-${g}`} variant="secondary" className="text-[10px] cursor-pointer" onClick={() => openGenre(g)} title="Browse genre">
-                                    {g}
-                                  </Badge>
-                                ))}
-                                {moreGenres > 0 ? <Badge variant="secondary" className="text-[10px]">+{moreGenres}</Badge> : null}
-                                {a.label ? (
-                                  <Badge variant="outline" className="text-[10px] cursor-pointer" onClick={() => openLabel(String(a.label || ''))} title="Open label">
-                                    {a.label}
-                                  </Badge>
-                                ) : null}
-                                {a.profile_source ? <Badge variant="outline" className="text-[10px]">Source: {a.profile_source}</Badge> : null}
-                                {isUnmatchedAlbum(a) ? (
-                                  <Badge variant="outline" className="text-[10px] border-amber-500/50 text-amber-700 dark:text-amber-300">
-                                    Verify tags
-                                  </Badge>
-                                ) : null}
-                              </div>
-                            </div>
-                            <p className="text-sm text-muted-foreground leading-relaxed line-clamp-3">
-                              {a.short_description}
-                            </p>
-                            <div className="flex items-center gap-2 pt-1">
-                              <Button size="sm" className="h-9 rounded-full gap-2" onClick={() => void handlePlayAlbum(a.album_id, a.title, a.thumb)}>
-                                <Play className="h-4 w-4" /> Play
-                              </Button>
-                              <Button size="sm" variant="outline" className="h-9 rounded-full" onClick={() => navigate(`/library/artist/${a.artist_id}${location.search || ''}`)} title="Open artist">
-                                <UserRound className="h-4 w-4" />
-                              </Button>
-                            </div>
-                          </div>
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-            </CardContent>
-          </CollapsibleContent>
-        </Card>
-      </Collapsible>
     </div>
   );
 }

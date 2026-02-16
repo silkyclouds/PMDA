@@ -31,6 +31,14 @@ export default function LabelPage() {
   const [albums, setAlbums] = useState<api.LibraryAlbumItem[]>([]);
   const [total, setTotal] = useState(0);
   const [offset, setOffset] = useState(0);
+  const [coverSize] = useState<number>(() => {
+    try {
+      const raw = Number(localStorage.getItem('pmda_library_cover_size') || 220);
+      return Number.isFinite(raw) ? Math.max(150, Math.min(320, raw)) : 220;
+    } catch {
+      return 220;
+    }
+  });
 
   const load = useCallback(async () => {
     if (!label) {
@@ -89,6 +97,10 @@ export default function LabelPage() {
       .sort((a, b) => a.artist_name.localeCompare(b.artist_name))
       .slice(0, 60);
   }, [albums]);
+  const gridTemplateColumns = useMemo(() => {
+    const col = Math.max(140, Math.min(340, Math.floor(coverSize)));
+    return `repeat(auto-fill, minmax(${col}px, 1fr))`;
+  }, [coverSize]);
 
   const canPrev = offset > 0;
   const canNext = offset + albums.length < total;
@@ -158,7 +170,7 @@ export default function LabelPage() {
             <CardContent className="p-8 text-sm text-muted-foreground">No releases found for this label.</CardContent>
           </Card>
         ) : (
-          <div className="grid gap-4" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(10.5rem, 1fr))' }}>
+          <div className="grid gap-4" style={{ gridTemplateColumns }}>
             {albums.map((a) => (
               <div
                 key={`lab-alb-${a.album_id}`}
