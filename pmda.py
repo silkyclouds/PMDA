@@ -30276,6 +30276,8 @@ def api_library_artists():
                 )
                 total = int((cur.fetchone() or [0])[0] or 0)
 
+                album_count_match_sql = _library_albums_match_where(include_unmatched, "alb_cnt")
+
                 if search_query:
                     try:
                         cur.execute(
@@ -30287,7 +30289,7 @@ def api_library_artists():
                                     SELECT COUNT(*)
                                     FROM files_albums alb_cnt
                                     WHERE alb_cnt.artist_id = a.id
-                                      AND """ + _library_albums_match_where(include_unmatched, "alb_cnt") + """
+                                      AND {album_count_match_sql}
                                 ) AS album_count,
                                 a.broken_albums_count,
                                 (a.has_image OR COALESCE(ext.image_path, '') <> '') AS has_image,
@@ -30311,7 +30313,7 @@ def api_library_artists():
                                     SELECT COUNT(*)
                                     FROM files_albums alb_cnt
                                     WHERE alb_cnt.artist_id = a.id
-                                      AND """ + _library_albums_match_where(include_unmatched, "alb_cnt") + """
+                                      AND {album_count_match_sql}
                                 ) AS album_count,
                                 a.broken_albums_count,
                                 (a.has_image OR COALESCE(ext.image_path, '') <> '') AS has_image
@@ -30333,7 +30335,7 @@ def api_library_artists():
                                 SELECT COUNT(*)
                                 FROM files_albums alb_cnt
                                 WHERE alb_cnt.artist_id = a.id
-                                  AND """ + _library_albums_match_where(include_unmatched, "alb_cnt") + """
+                                  AND {album_count_match_sql}
                             ) AS album_count,
                             a.broken_albums_count,
                             (a.has_image OR COALESCE(ext.image_path, '') <> '') AS has_image
