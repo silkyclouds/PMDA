@@ -7027,6 +7027,17 @@ def _ensure_files_index_ready() -> tuple[bool, Optional[str]]:
         # before first artist publication. Do not force a full bootstrap rebuild.
         return True, None
     if albums > 0 and tracks > 0:
+        # One-time migration for legacy rows: align mb_identified with trusted provider IDs.
+        # This keeps "Unmatched" badges/counts coherent even before a fresh full scan.
+        try:
+            mod = sys.modules[__name__]
+            if not bool(getattr(mod, "_FILES_MATCH_FLAG_MIGRATED", False)):
+                changed = _files_backfill_trusted_match_flags()
+                setattr(mod, "_FILES_MATCH_FLAG_MIGRATED", True)
+                if changed > 0:
+                    _files_cache_invalidate_all()
+        except Exception:
+            pass
         track_count, embedding_count = _files_index_read_track_and_embedding_counts()
         min_expected = max(1, int(track_count * 0.85)) if track_count > 0 else 0
         if track_count > 0 and embedding_count < min_expected:
@@ -7048,6 +7059,38 @@ def _ensure_files_index_ready() -> tuple[bool, Optional[str]]:
     if not result.get("ok"):
         return False, str(result.get("error") or "Files index build failed")
     return True, None
+
+
+def _files_backfill_trusted_match_flags() -> int:
+    """Backfill files_albums.mb_identified from trusted provider IDs for legacy rows."""
+    conn = _files_pg_connect()
+    if conn is None:
+        return 0
+    changed = 0
+    try:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                expr = (
+                    "(COALESCE(length(musicbrainz_release_group_id),0)>0 "
+                    "OR COALESCE(length(discogs_release_id),0)>0 "
+                    "OR COALESCE(length(lastfm_album_mbid),0)>0 "
+                    "OR COALESCE(length(bandcamp_album_url),0)>0)"
+                )
+                cur.execute(
+                    f"""
+                    UPDATE files_albums
+                    SET mb_identified = CASE WHEN {expr} THEN TRUE ELSE FALSE END
+                    WHERE mb_identified IS DISTINCT FROM CASE WHEN {expr} THEN TRUE ELSE FALSE END
+                    """
+                )
+                changed = int(cur.rowcount or 0)
+        if changed > 0:
+            logging.info("Files index: backfilled trusted match flag on %d album row(s).", changed)
+    except Exception:
+        logging.debug("Failed to backfill trusted match flags", exc_info=True)
+    finally:
+        conn.close()
+    return changed
 
 
 _FILES_PROFILE_MAX_AGE_SEC = 30 * 24 * 3600
