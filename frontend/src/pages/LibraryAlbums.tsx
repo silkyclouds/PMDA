@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useLocation, useNavigate, useOutletContext } from 'react-router-dom';
-import { Heart, Loader2, Music, Play, UserRound } from 'lucide-react';
+import { Heart, Loader2, Play, UserRound } from 'lucide-react';
 
 import { AspectRatio } from '@/components/ui/aspect-ratio';
 import { Badge } from '@/components/ui/badge';
@@ -9,6 +9,7 @@ import { Card } from '@/components/ui/card';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Slider } from '@/components/ui/slider';
 import { FormatBadge } from '@/components/FormatBadge';
+import { AlbumArtwork } from '@/components/library/AlbumArtwork';
 import { usePlayback } from '@/contexts/PlaybackContext';
 import { useToast } from '@/hooks/use-toast';
 import { useLibraryQuery } from '@/hooks/useLibraryQuery';
@@ -290,13 +291,7 @@ export default function LibraryAlbums() {
                   }
                 }}
               >
-                {a.thumb ? (
-                  <img src={a.thumb} alt={a.title} loading="lazy" decoding="async" className="w-full h-full object-cover animate-in fade-in-0 duration-300" />
-                ) : (
-                  <div className="w-full h-full flex items-center justify-center">
-                    <Music className="w-10 h-10 text-muted-foreground" />
-                  </div>
-                )}
+                <AlbumArtwork albumThumb={a.thumb} artistId={a.artist_id} alt={a.title} size={512} />
                 <div className="absolute inset-0 opacity-0 group-hover:opacity-100 transition-opacity bg-black/35" />
                 <div className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity">
                   <Button

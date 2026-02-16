@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useLocation, useNavigate, useOutletContext, useParams } from 'react-router-dom';
-import { ArrowLeft, Music, Play, UserRound } from 'lucide-react';
+import { ArrowLeft, Play, UserRound } from 'lucide-react';
 
 import { AspectRatio } from '@/components/ui/aspect-ratio';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { ScrollArea } from '@/components/ui/scroll-area';
+import { AlbumArtwork } from '@/components/library/AlbumArtwork';
 import { usePlayback } from '@/contexts/PlaybackContext';
 import { useToast } from '@/hooks/use-toast';
 import * as api from '@/lib/api';
@@ -206,13 +207,13 @@ export default function GenrePage() {
                   className="relative overflow-hidden rounded-2xl border border-border/60 bg-card shadow-sm"
                 >
                   <AspectRatio ratio={1} className="bg-muted">
-                    {a.thumb ? (
-                      <img src={a.thumb} alt={a.title} loading="lazy" decoding="async" className="w-full h-full object-cover" />
-                    ) : (
-                      <div className="w-full h-full flex items-center justify-center">
-                        <Music className="w-10 h-10 text-muted-foreground" />
-                      </div>
-                    )}
+                    <AlbumArtwork
+                      albumThumb={a.thumb}
+                      artistId={a.artist_id}
+                      alt={a.title}
+                      size={512}
+                      imageClassName="w-full h-full object-cover"
+                    />
                     <div className="absolute inset-0 opacity-0 group-hover:opacity-100 transition-opacity bg-black/25" />
                     <div className="absolute inset-x-0 bottom-0 p-3 opacity-0 group-hover:opacity-100 transition-opacity">
                       <div className="flex items-center justify-between gap-2">

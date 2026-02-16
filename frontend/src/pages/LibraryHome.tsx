@@ -7,6 +7,7 @@ import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { AspectRatio } from '@/components/ui/aspect-ratio';
 import { Carousel, CarouselContent, CarouselItem, CarouselNext, CarouselPrevious } from '@/components/ui/carousel';
+import { AlbumArtwork } from '@/components/library/AlbumArtwork';
 import { usePlayback } from '@/contexts/PlaybackContext';
 import { useToast } from '@/hooks/use-toast';
 import * as api from '@/lib/api';
@@ -309,13 +310,7 @@ export default function LibraryHome() {
                                 }
                               }}
                             >
-                              {a.thumb ? (
-                                <img src={a.thumb} alt={a.title} loading="lazy" decoding="async" className="w-full h-full object-cover animate-in fade-in-0 duration-300" />
-                              ) : (
-                                <div className="w-full h-full flex items-center justify-center">
-                                  <Music className="w-10 h-10 text-muted-foreground" />
-                                </div>
-                              )}
+                              <AlbumArtwork albumThumb={a.thumb} artistId={a.artist_id} alt={a.title} size={512} />
                               <button
                                 type="button"
                                 onClick={() => void handlePlayAlbum(a.album_id, a.title, a.thumb)}
@@ -589,13 +584,7 @@ export default function LibraryHome() {
                     <div className="group">
                       <Card className="overflow-hidden border-border/60">
                         <AspectRatio ratio={1} className="bg-muted">
-                          {a.thumb ? (
-                            <img src={a.thumb} alt={a.title} loading="lazy" decoding="async" className="w-full h-full object-cover animate-in fade-in-0 duration-300" />
-                          ) : (
-                            <div className="w-full h-full flex items-center justify-center">
-                              <Music className="w-10 h-10 text-muted-foreground" />
-                            </div>
-                          )}
+                          <AlbumArtwork albumThumb={a.thumb} artistId={a.artist_id} alt={a.title} size={512} />
                           <button
                             type="button"
                             onClick={() => void handlePlayAlbum(a.album_id, a.title, a.thumb)}
@@ -678,13 +667,7 @@ export default function LibraryHome() {
                     <div className="group">
                       <Card className="overflow-hidden border-border/60">
                         <AspectRatio ratio={1} className="bg-muted">
-                          {a.thumb ? (
-                            <img src={a.thumb} alt={a.title} loading="lazy" decoding="async" className="w-full h-full object-cover animate-in fade-in-0 duration-300" />
-                          ) : (
-                            <div className="w-full h-full flex items-center justify-center">
-                              <Music className="w-10 h-10 text-muted-foreground" />
-                            </div>
-                          )}
+                          <AlbumArtwork albumThumb={a.thumb} artistId={a.artist_id} alt={a.title} size={512} />
                           <button
                             type="button"
                             onClick={() => void handlePlayAlbum(a.album_id, a.title, a.thumb)}

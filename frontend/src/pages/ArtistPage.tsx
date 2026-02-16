@@ -7,6 +7,7 @@ import { Card, CardContent } from '@/components/ui/card';
 import { AspectRatio } from '@/components/ui/aspect-ratio';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
+import { AlbumArtwork } from '@/components/library/AlbumArtwork';
 import { cn } from '@/lib/utils';
 import { FormatBadge } from '@/components/FormatBadge';
 import * as api from '@/lib/api';
@@ -1039,13 +1040,7 @@ export default function ArtistPage() {
                           }
                         }}
                       >
-                        {album.thumb ? (
-                          <img src={album.thumb} alt={album.title} loading="lazy" decoding="async" className="w-full h-full object-cover animate-in fade-in-0 duration-300" />
-                        ) : (
-                          <div className="w-full h-full flex items-center justify-center">
-                            <Music className="w-10 h-10 text-muted-foreground" />
-                          </div>
-                        )}
+                        <AlbumArtwork albumThumb={album.thumb} artistId={artistId} alt={album.title} size={512} />
                         <div className="absolute inset-x-0 bottom-0 p-2.5 opacity-0 group-hover:opacity-100 transition-opacity">
                           <Button
                             size="sm"
