@@ -1233,6 +1233,7 @@ merged = {
     "REPROCESS_INCOMPLETE_ALBUMS": _get("REPROCESS_INCOMPLETE_ALBUMS", default="true", cast=_parse_bool),
     # Library backend & file-library settings
     "LIBRARY_MODE": _get("LIBRARY_MODE", default="files", cast=str),
+    "LIBRARY_INCLUDE_UNMATCHED": _get("LIBRARY_INCLUDE_UNMATCHED", default=False, cast=_parse_bool),
     "FILES_ROOTS": _get("FILES_ROOTS", default="", cast=_parse_files_roots),
     "EXPORT_ROOT": _get("EXPORT_ROOT", default="", cast=str),
     "EXPORT_NAMING_TEMPLATE": _get("EXPORT_NAMING_TEMPLATE", default="", cast=str),
@@ -1243,6 +1244,7 @@ merged = {
 
 SKIP_FOLDERS: list[str] = merged["SKIP_FOLDERS"]
 LIBRARY_MODE: str = str(merged.get("LIBRARY_MODE", "files") or "files").strip().lower()
+LIBRARY_INCLUDE_UNMATCHED: bool = bool(merged.get("LIBRARY_INCLUDE_UNMATCHED", False))
 FILES_ROOTS: list[str] = merged.get("FILES_ROOTS", []) or []
 EXPORT_ROOT: str = str(merged.get("EXPORT_ROOT", "") or "").strip()
 EXPORT_NAMING_TEMPLATE: str = str(merged.get("EXPORT_NAMING_TEMPLATE", "") or "").strip()
@@ -26860,6 +26862,31 @@ def _parse_format_preference(val):
         return parts if parts else _default
     return _default
 
+
+def _library_include_unmatched_effective() -> bool:
+    """
+    Resolve whether Files library endpoints should include albums not formally matched by PMDA.
+
+    Priority:
+    1) Request query param `include_unmatched` (1/0, true/false)
+    2) Persisted global setting `LIBRARY_INCLUDE_UNMATCHED`
+    """
+    raw = request.args.get("include_unmatched")
+    if raw is None or str(raw).strip() == "":
+        return bool(getattr(sys.modules[__name__], "LIBRARY_INCLUDE_UNMATCHED", False))
+    return bool(_parse_bool(raw))
+
+
+def _library_albums_match_where(include_unmatched: bool, alias: str = "alb") -> str:
+    if include_unmatched:
+        return "1=1"
+    return f"COALESCE({alias}.mb_identified, FALSE) = TRUE"
+
+
+def _library_cache_unmatched_suffix(include_unmatched: bool) -> str:
+    return "all" if include_unmatched else "matched"
+
+
 @app.get("/api/config")
 def api_config_get():
     """Return current effective configuration for the Web UI.
@@ -27080,6 +27107,7 @@ def api_config_get():
         "INCOMPLETE_ALBUMS_TARGET_DIR": get_setting("INCOMPLETE_ALBUMS_TARGET_DIR", "/dupes/incomplete_albums"),
         # Library backend and file-library settings
         "LIBRARY_MODE": "files",
+        "LIBRARY_INCLUDE_UNMATCHED": get_setting_bool("LIBRARY_INCLUDE_UNMATCHED", LIBRARY_INCLUDE_UNMATCHED),
         "FILES_ROOTS": ", ".join(files_roots_effective),
         "EXPORT_ROOT": get_setting("EXPORT_ROOT", EXPORT_ROOT),
         "EXPORT_NAMING_TEMPLATE": get_setting("EXPORT_NAMING_TEMPLATE", EXPORT_NAMING_TEMPLATE),
@@ -27353,6 +27381,11 @@ def _apply_settings_in_memory(updates: dict):
             if mode == "files":
                 _trigger_files_index_rebuild_async(reason="settings_library_mode_files")
             _restart_files_watcher_if_needed()
+    if "LIBRARY_INCLUDE_UNMATCHED" in updates:
+        global LIBRARY_INCLUDE_UNMATCHED
+        LIBRARY_INCLUDE_UNMATCHED = bool(_parse_bool(updates["LIBRARY_INCLUDE_UNMATCHED"]))
+        mod.merged["LIBRARY_INCLUDE_UNMATCHED"] = LIBRARY_INCLUDE_UNMATCHED
+        logging.info("LIBRARY_INCLUDE_UNMATCHED updated in memory: %s", LIBRARY_INCLUDE_UNMATCHED)
     if "FILES_ROOTS" in updates:
         roots = _parse_files_roots(updates["FILES_ROOTS"])
         global FILES_ROOTS
@@ -27533,17 +27566,27 @@ def _apply_settings_in_memory(updates: dict):
     if "USE_DISCOGS" in updates:
         mod.USE_DISCOGS = bool(_parse_bool(updates["USE_DISCOGS"]))
     if "DISCOGS_USER_TOKEN" in updates:
-        mod.DISCOGS_USER_TOKEN = str(updates["DISCOGS_USER_TOKEN"] or "").strip()
+        v = str(updates["DISCOGS_USER_TOKEN"] or "").strip()
+        if v != "***":
+            mod.DISCOGS_USER_TOKEN = v
     if "USE_LASTFM" in updates:
         mod.USE_LASTFM = bool(_parse_bool(updates["USE_LASTFM"]))
     if "LASTFM_API_KEY" in updates:
-        mod.LASTFM_API_KEY = str(updates["LASTFM_API_KEY"] or "").strip()
+        v = str(updates["LASTFM_API_KEY"] or "").strip()
+        if v != "***":
+            mod.LASTFM_API_KEY = v
     if "LASTFM_API_SECRET" in updates:
-        mod.LASTFM_API_SECRET = str(updates["LASTFM_API_SECRET"] or "").strip()
+        v = str(updates["LASTFM_API_SECRET"] or "").strip()
+        if v != "***":
+            mod.LASTFM_API_SECRET = v
     if "FANART_API_KEY" in updates:
-        mod.FANART_API_KEY = str(updates["FANART_API_KEY"] or "").strip()
+        v = str(updates["FANART_API_KEY"] or "").strip()
+        if v != "***":
+            mod.FANART_API_KEY = v
     if "THEAUDIODB_API_KEY" in updates:
-        mod.THEAUDIODB_API_KEY = str(updates["THEAUDIODB_API_KEY"] or "").strip()
+        v = str(updates["THEAUDIODB_API_KEY"] or "").strip()
+        if v != "***":
+            mod.THEAUDIODB_API_KEY = v
     if "USE_BANDCAMP" in updates:
         mod.USE_BANDCAMP = bool(_parse_bool(updates["USE_BANDCAMP"]))
     if "JELLYFIN_URL" in updates:
@@ -27596,9 +27639,13 @@ def _apply_settings_in_memory(updates: dict):
     if "OPENAI_MODEL" in updates:
         mod.OPENAI_MODEL = str(updates["OPENAI_MODEL"] or "gpt-4")
     if "ANTHROPIC_API_KEY" in updates:
-        mod.ANTHROPIC_API_KEY = str(updates["ANTHROPIC_API_KEY"] or "")
+        v = str(updates["ANTHROPIC_API_KEY"] or "").strip()
+        if v != "***":
+            mod.ANTHROPIC_API_KEY = v
     if "GOOGLE_API_KEY" in updates:
-        mod.GOOGLE_API_KEY = str(updates["GOOGLE_API_KEY"] or "")
+        v = str(updates["GOOGLE_API_KEY"] or "").strip()
+        if v != "***":
+            mod.GOOGLE_API_KEY = v
     if "OLLAMA_URL" in updates:
         mod.OLLAMA_URL = str(updates["OLLAMA_URL"] or "").strip().rstrip("/")
 
@@ -27643,7 +27690,7 @@ def api_config_put():
         # Concert discovery (UI filtering)
         "CONCERTS_FILTER_ENABLED", "CONCERTS_HOME_LAT", "CONCERTS_HOME_LON", "CONCERTS_RADIUS_KM",
         # Library backend & file-library settings
-        "LIBRARY_MODE", "FILES_ROOTS", "EXPORT_ROOT", "EXPORT_NAMING_TEMPLATE", "EXPORT_LINK_STRATEGY", "MEDIA_CACHE_ROOT", "AUTO_EXPORT_LIBRARY",
+        "LIBRARY_MODE", "LIBRARY_INCLUDE_UNMATCHED", "FILES_ROOTS", "EXPORT_ROOT", "EXPORT_NAMING_TEMPLATE", "EXPORT_LINK_STRATEGY", "MEDIA_CACHE_ROOT", "AUTO_EXPORT_LIBRARY",
     }
     # Only process keys that are in the request AND in the allowed list
     # This preserves existing values in SQLite for keys not in the request
@@ -27755,12 +27802,16 @@ def api_config_put():
     # Force files-only mode regardless of incoming value.
     if "LIBRARY_MODE" in updates:
         updates["LIBRARY_MODE"] = "files"
+    if "LIBRARY_INCLUDE_UNMATCHED" in updates:
+        updates["LIBRARY_INCLUDE_UNMATCHED"] = bool(_parse_bool(updates["LIBRARY_INCLUDE_UNMATCHED"]))
     
     # Serialize complex types for SQLite storage. Do not overwrite secret keys with mask (e.g. "***").
     MASKED_SECRETS = (
         "OPENAI_API_KEY", "PLEX_TOKEN", "DISCORD_WEBHOOK",
         "ANTHROPIC_API_KEY", "GOOGLE_API_KEY",
         "DISCOGS_USER_TOKEN", "LASTFM_API_KEY", "LASTFM_API_SECRET",
+        "FANART_API_KEY", "THEAUDIODB_API_KEY",
+        "SERPER_API_KEY", "ACOUSTID_API_KEY",
         "LIDARR_API_KEY", "AUTOBRR_API_KEY",
         "JELLYFIN_API_KEY", "NAVIDROME_PASSWORD", "NAVIDROME_API_KEY",
     )
@@ -29166,7 +29217,9 @@ def api_incomplete_albums_export(run_id):
 def api_library_stats():
     """Return library stats (artists count, albums count) for selected sections. Used by Unduper and others."""
     if _get_library_mode() == "files":
-        cache_key = "library:stats"
+        include_unmatched = _library_include_unmatched_effective()
+        matched_where = _library_albums_match_where(include_unmatched, "alb")
+        cache_key = f"library:stats:{_library_cache_unmatched_suffix(include_unmatched)}"
         cached = _files_cache_get_json(cache_key)
         if cached is not None:
             return jsonify(cached)
@@ -29178,12 +29231,31 @@ def api_library_stats():
             return jsonify({"error": "PostgreSQL unavailable"}), 503
         try:
             with conn.cursor() as cur:
-                cur.execute("SELECT COUNT(*) FROM files_artists")
-                artists = int(cur.fetchone()[0] or 0)
-                cur.execute("SELECT COUNT(*) FROM files_albums")
-                albums = int(cur.fetchone()[0] or 0)
-                cur.execute("SELECT COUNT(*) FROM files_tracks")
-                tracks = int(cur.fetchone()[0] or 0)
+                cur.execute(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM files_albums alb
+                    WHERE {matched_where}
+                    """
+                )
+                albums = int((cur.fetchone() or [0])[0] or 0)
+                cur.execute(
+                    f"""
+                    SELECT COUNT(DISTINCT alb.artist_id)
+                    FROM files_albums alb
+                    WHERE {matched_where}
+                    """
+                )
+                artists = int((cur.fetchone() or [0])[0] or 0)
+                cur.execute(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM files_tracks tr
+                    JOIN files_albums alb ON alb.id = tr.album_id
+                    WHERE {matched_where}
+                    """
+                )
+                tracks = int((cur.fetchone() or [0])[0] or 0)
             payload = {"artists": artists, "albums": albums, "tracks": tracks}
             _files_cache_set_json(cache_key, payload, ttl=30)
             return jsonify(payload)
@@ -29364,8 +29436,10 @@ def api_library_discover():
     days = max(7, min(365, _parse_int_loose(request.args.get("days"), 90)))
     limit = max(6, min(36, _parse_int_loose(request.args.get("limit"), 18)))
     refresh = bool(_parse_bool(request.args.get("refresh")))
+    include_unmatched = _library_include_unmatched_effective()
+    matched_where = _library_albums_match_where(include_unmatched, "alb")
 
-    cache_key = f"library:discover:{days}:{limit}"
+    cache_key = f"library:discover:{days}:{limit}:{_library_cache_unmatched_suffix(include_unmatched)}"
     if not refresh:
         cached = _files_cache_get_json(cache_key)
         if cached is not None:
@@ -29400,7 +29474,7 @@ def api_library_discover():
     def _album_rows_to_payload(rows: list[tuple]) -> list[dict]:
         base_url = request.url_root.rstrip("/")
         albums_out: list[dict] = []
-        for album_id, title, year, genre, label, tags_json, track_count, fmt, is_lossless, has_cover, artist_id, artist_name, short_desc, profile_source in rows:
+        for album_id, title, year, genre, label, tags_json, track_count, fmt, is_lossless, has_cover, mb_identified, artist_id, artist_name, short_desc, profile_source in rows:
             aid = int(album_id or 0)
             arid = int(artist_id or 0)
             thumb = f"{base_url}/api/library/files/album/{aid}/cover?size=512" if bool(has_cover) else None
@@ -29441,6 +29515,7 @@ def api_library_discover():
                     "track_count": int(track_count or 0),
                     "format": (fmt or "").strip() or None,
                     "is_lossless": bool(is_lossless),
+                    "mb_identified": bool(mb_identified),
                     "thumb": thumb,
                     "artist_id": arid,
                     "artist_name": artist_name or "",
@@ -29453,6 +29528,7 @@ def api_library_discover():
     def _fetch_random_albums(where_sql: str, params: list, n: int, exclude_album_ids: set[int]) -> list[dict]:
         if n <= 0:
             return []
+        where_all = f"({matched_where}) AND ({where_sql})"
         with conn.cursor() as cur:
             cur.execute(
                 f"""
@@ -29467,6 +29543,7 @@ def api_library_discover():
                     COALESCE(alb.format, '') AS format,
                     alb.is_lossless,
                     alb.has_cover,
+                    alb.mb_identified,
                     ar.id AS artist_id,
                     ar.name AS artist_name,
                     COALESCE(pr.short_description, '') AS short_description,
@@ -29476,7 +29553,7 @@ def api_library_discover():
                 LEFT JOIN files_album_profiles pr
                        ON pr.artist_norm = ar.name_norm
                       AND pr.title_norm = alb.title_norm
-                WHERE {where_sql}
+                WHERE {where_all}
                 ORDER BY random()
                 LIMIT %s
                 """,
@@ -29522,7 +29599,9 @@ def api_library_discover():
                 SELECT t.album_id
                 FROM {ev_table} e
                 JOIN files_tracks t ON t.id = e.track_id
+                JOIN files_albums alb ON alb.id = t.album_id
                 WHERE {ev_user_filter}
+                  AND {matched_where}
                   AND e.created_at >= NOW() - (%s || ' days')::interval
                   AND COALESCE(e.played_seconds, 0) >= 12
                 ORDER BY e.created_at DESC
@@ -29544,6 +29623,7 @@ def api_library_discover():
                 JOIN files_albums alb ON alb.id = t.album_id
                 JOIN files_artists a ON a.id = alb.artist_id
                 WHERE {ev_user_filter}
+                  AND {matched_where}
                   AND e.created_at >= NOW() - (%s || ' days')::interval
                   AND COALESCE(e.played_seconds, 0) >= 12
                 GROUP BY a.id, a.name, a.name_norm
@@ -29564,6 +29644,7 @@ def api_library_discover():
                 JOIN files_tracks t ON t.id = e.track_id
                 JOIN files_albums alb ON alb.id = t.album_id
                 WHERE {ev_user_filter}
+                  AND {matched_where}
                   AND e.created_at >= NOW() - (%s || ' days')::interval
                   AND COALESCE(e.played_seconds, 0) >= 12
                   AND COALESCE(trim(alb.label), '') <> ''
@@ -29587,6 +29668,7 @@ def api_library_discover():
                 JOIN files_tracks t ON t.id = e.track_id
                 JOIN files_albums alb ON alb.id = t.album_id
                 WHERE {ev_user_filter}
+                  AND {matched_where}
                   AND e.created_at >= NOW() - (%s || ' days')::interval
                   AND COALESCE(e.played_seconds, 0) >= 12
                 GROUP BY alb.id, alb.tags_json, alb.genre
@@ -29606,6 +29688,7 @@ def api_library_discover():
                 JOIN files_tracks t ON t.id = e.track_id
                 JOIN files_albums alb ON alb.id = t.album_id
                 WHERE {ev_user_filter}
+                  AND {matched_where}
                   AND e.created_at >= NOW() - (%s || ' days')::interval
                   AND COALESCE(e.played_seconds, 0) >= 12
                   AND alb.year IS NOT NULL AND alb.year > 0
@@ -30048,9 +30131,11 @@ def api_library_artists():
         genre = (request.args.get("genre") or "").strip()
         label = (request.args.get("label") or "").strip()
         year = _parse_int_loose(request.args.get("year"), 0)
+        include_unmatched = _library_include_unmatched_effective()
+        album_match_sql = _library_albums_match_where(include_unmatched, "alb")
         limit = max(1, min(500, _parse_int_loose(request.args.get("limit"), 100)))
         offset = max(0, _parse_int_loose(request.args.get("offset"), 0))
-        cache_key = f"library:artists:{search_query.lower()}:{genre.lower()}:{label.lower()}:{int(year or 0)}:{limit}:{offset}"
+        cache_key = f"library:artists:{search_query.lower()}:{genre.lower()}:{label.lower()}:{int(year or 0)}:{limit}:{offset}:{_library_cache_unmatched_suffix(include_unmatched)}"
         cached = _files_cache_get_json(cache_key)
         if cached is not None:
             return jsonify(cached)
@@ -30064,11 +30149,43 @@ def api_library_artists():
             with conn.cursor() as cur:
                 where_parts = ["1=1"]
                 params: list = []
+                where_parts.append(
+                    f"""
+                    EXISTS (
+                        SELECT 1
+                        FROM files_albums alb
+                        WHERE alb.artist_id = a.id
+                          AND {album_match_sql}
+                    )
+                    """
+                )
 
                 if search_query:
                     like = f"%{search_query}%"
-                    where_parts.append("a.name ILIKE %s")
-                    params.append(like)
+                    search_album_match = _library_albums_match_where(include_unmatched, "alb2")
+                    where_parts.append(
+                        f"""
+                        (
+                            a.name ILIKE %s
+                            OR EXISTS (
+                                SELECT 1
+                                FROM files_albums alb2
+                                WHERE alb2.artist_id = a.id
+                                  AND {search_album_match}
+                                  AND (
+                                      alb2.title ILIKE %s
+                                      OR EXISTS (
+                                          SELECT 1
+                                          FROM files_tracks tr2
+                                          WHERE tr2.album_id = alb2.id
+                                            AND tr2.title ILIKE %s
+                                      )
+                                  )
+                            )
+                        )
+                        """
+                    )
+                    params.extend([like, like, like])
 
                 if year and int(year) > 0:
                     where_parts.append(
@@ -30077,6 +30194,7 @@ def api_library_artists():
                             SELECT 1
                             FROM files_albums alb
                             WHERE alb.artist_id = a.id
+                              AND """ + album_match_sql + """
                               AND COALESCE(alb.year, 0) = %s
                         )
                         """
@@ -30092,6 +30210,7 @@ def api_library_artists():
                                 SELECT 1
                                 FROM files_albums alb
                                 WHERE alb.artist_id = a.id
+                                  AND """ + album_match_sql + """
                                   AND lower(trim(COALESCE(alb.label, ''))) = ANY(%s)
                             )
                             """
@@ -30108,6 +30227,7 @@ def api_library_artists():
                                 SELECT 1
                                 FROM files_albums alb
                                 WHERE alb.artist_id = a.id
+                                  AND """ + album_match_sql + """
                                   AND (
                                     EXISTS (
                                         SELECT 1
@@ -30142,7 +30262,12 @@ def api_library_artists():
                             SELECT
                                 a.id,
                                 a.name,
-                                a.album_count,
+                                (
+                                    SELECT COUNT(*)
+                                    FROM files_albums alb_cnt
+                                    WHERE alb_cnt.artist_id = a.id
+                                      AND """ + _library_albums_match_where(include_unmatched, "alb_cnt") + """
+                                ) AS album_count,
                                 a.broken_albums_count,
                                 (a.has_image OR COALESCE(ext.image_path, '') <> '') AS has_image,
                                 similarity(a.name, %s) AS score,
@@ -30150,7 +30275,7 @@ def api_library_artists():
                             FROM files_artists a
                             LEFT JOIN files_external_artist_images ext ON ext.name_norm = a.name_norm
                             WHERE {" AND ".join(where_parts)}
-                            ORDER BY prefix_rank ASC, score DESC, a.album_count DESC, a.name ASC
+                            ORDER BY prefix_rank ASC, score DESC, album_count DESC, a.name ASC
                             LIMIT %s OFFSET %s
                             """,
                             [search_query, search_query, *params, int(limit), int(offset)],
@@ -30161,13 +30286,18 @@ def api_library_artists():
                             SELECT
                                 a.id,
                                 a.name,
-                                a.album_count,
+                                (
+                                    SELECT COUNT(*)
+                                    FROM files_albums alb_cnt
+                                    WHERE alb_cnt.artist_id = a.id
+                                      AND """ + _library_albums_match_where(include_unmatched, "alb_cnt") + """
+                                ) AS album_count,
                                 a.broken_albums_count,
                                 (a.has_image OR COALESCE(ext.image_path, '') <> '') AS has_image
                             FROM files_artists a
                             LEFT JOIN files_external_artist_images ext ON ext.name_norm = a.name_norm
                             WHERE {" AND ".join(where_parts)}
-                            ORDER BY a.album_count DESC, a.name ASC
+                            ORDER BY album_count DESC, a.name ASC
                             LIMIT %s OFFSET %s
                             """,
                             [*params, int(limit), int(offset)],
@@ -30178,13 +30308,18 @@ def api_library_artists():
                         SELECT
                             a.id,
                             a.name,
-                            a.album_count,
+                            (
+                                SELECT COUNT(*)
+                                FROM files_albums alb_cnt
+                                WHERE alb_cnt.artist_id = a.id
+                                  AND """ + _library_albums_match_where(include_unmatched, "alb_cnt") + """
+                            ) AS album_count,
                             a.broken_albums_count,
                             (a.has_image OR COALESCE(ext.image_path, '') <> '') AS has_image
                         FROM files_artists a
                         LEFT JOIN files_external_artist_images ext ON ext.name_norm = a.name_norm
                         WHERE {" AND ".join(where_parts)}
-                        ORDER BY a.album_count DESC, a.name ASC
+                        ORDER BY album_count DESC, a.name ASC
                         LIMIT %s OFFSET %s
                         """,
                         [*params, int(limit), int(offset)],
@@ -30398,12 +30533,15 @@ def api_library_search_suggest():
     """Unified typeahead search across artists, albums and tracks (Files mode)."""
     query = (request.args.get("q") or "").strip()
     limit = max(1, min(40, _parse_int_loose(request.args.get("limit"), 12)))
+    include_unmatched = _library_include_unmatched_effective()
+    album_match_sql = _library_albums_match_where(include_unmatched, "alb")
+    artist_match_sql = _library_albums_match_where(include_unmatched, "alb2")
     if not query:
         return jsonify({"query": "", "items": []})
     if _get_library_mode() != "files":
         return jsonify({"query": query, "items": []})
 
-    cache_key = f"library:search:suggest:{query.lower()}:{limit}"
+    cache_key = f"library:search:suggest:{query.lower()}:{limit}:{_library_cache_unmatched_suffix(include_unmatched)}"
     cached = _files_cache_get_json(cache_key)
     if cached is not None:
         return jsonify(cached)
@@ -30435,6 +30573,12 @@ def api_library_search_suggest():
                     FROM files_artists a
                     LEFT JOIN files_external_artist_images ext ON ext.name_norm = a.name_norm
                     WHERE a.name ILIKE %s
+                      AND EXISTS (
+                        SELECT 1
+                        FROM files_albums alb2
+                        WHERE alb2.artist_id = a.id
+                          AND """ + artist_match_sql + """
+                      )
                     ORDER BY prefix_rank ASC, score DESC, a.album_count DESC, a.name ASC
                     LIMIT %s
                     """,
@@ -30453,6 +30597,12 @@ def api_library_search_suggest():
                     FROM files_artists a
                     LEFT JOIN files_external_artist_images ext ON ext.name_norm = a.name_norm
                     WHERE a.name ILIKE %s
+                      AND EXISTS (
+                        SELECT 1
+                        FROM files_albums alb2
+                        WHERE alb2.artist_id = a.id
+                          AND """ + artist_match_sql + """
+                      )
                     ORDER BY a.album_count DESC, a.name ASC
                     LIMIT %s
                     """,
@@ -30492,7 +30642,8 @@ def api_library_search_suggest():
                         END AS prefix_rank
                     FROM files_albums alb
                     JOIN files_artists ar ON ar.id = alb.artist_id
-                    WHERE alb.title ILIKE %s OR ar.name ILIKE %s
+                    WHERE (alb.title ILIKE %s OR ar.name ILIKE %s)
+                      AND """ + album_match_sql + """
                     ORDER BY prefix_rank ASC, score DESC, alb.track_count DESC, alb.title ASC
                     LIMIT %s
                     """,
@@ -30512,7 +30663,8 @@ def api_library_search_suggest():
                         2 AS prefix_rank
                     FROM files_albums alb
                     JOIN files_artists ar ON ar.id = alb.artist_id
-                    WHERE alb.title ILIKE %s OR ar.name ILIKE %s
+                    WHERE (alb.title ILIKE %s OR ar.name ILIKE %s)
+                      AND """ + album_match_sql + """
                     ORDER BY alb.track_count DESC, alb.title ASC
                     LIMIT %s
                     """,
@@ -30566,7 +30718,8 @@ def api_library_search_suggest():
                     JOIN files_albums alb ON alb.id = tr.album_id
                     JOIN files_artists ar ON ar.id = alb.artist_id
                     LEFT JOIN files_reco_track_stats st ON st.track_id = tr.id
-                    WHERE tr.title ILIKE %s OR alb.title ILIKE %s OR ar.name ILIKE %s
+                    WHERE (tr.title ILIKE %s OR alb.title ILIKE %s OR ar.name ILIKE %s)
+                      AND """ + album_match_sql + """
                     ORDER BY prefix_rank ASC, score DESC, play_count DESC, tr.id DESC
                     LIMIT %s
                     """,
@@ -30591,7 +30744,8 @@ def api_library_search_suggest():
                     FROM files_tracks tr
                     JOIN files_albums alb ON alb.id = tr.album_id
                     JOIN files_artists ar ON ar.id = alb.artist_id
-                    WHERE tr.title ILIKE %s OR alb.title ILIKE %s OR ar.name ILIKE %s
+                    WHERE (tr.title ILIKE %s OR alb.title ILIKE %s OR ar.name ILIKE %s)
+                      AND """ + album_match_sql + """
                     ORDER BY tr.id DESC
                     LIMIT %s
                     """,
@@ -30650,11 +30804,13 @@ def api_library_albums():
     genre = (request.args.get("genre") or "").strip()
     label = (request.args.get("label") or "").strip()
     year = _parse_int_loose(request.args.get("year"), 0)
+    include_unmatched = _library_include_unmatched_effective()
+    album_match_sql = _library_albums_match_where(include_unmatched, "alb")
     sort = (request.args.get("sort") or "recent").strip().lower()
     limit = max(1, min(240, _parse_int_loose(request.args.get("limit"), 80)))
     offset = max(0, _parse_int_loose(request.args.get("offset"), 0))
 
-    cache_key = f"library:albums:{search_query.lower()}:{genre.lower()}:{label.lower()}:{int(year or 0)}:{sort}:{limit}:{offset}"
+    cache_key = f"library:albums:{search_query.lower()}:{genre.lower()}:{label.lower()}:{int(year or 0)}:{sort}:{limit}:{offset}:{_library_cache_unmatched_suffix(include_unmatched)}"
     cached = _files_cache_get_json(cache_key)
     if cached is not None:
         return jsonify(cached)
@@ -30667,12 +30823,25 @@ def api_library_albums():
         return jsonify({"albums": [], "total": 0, "limit": limit, "offset": offset, "error": "PostgreSQL unavailable"}), 503
 
     try:
-        where_parts = ["1=1"]
+        where_parts = ["1=1", album_match_sql]
         params: list = []
         if search_query:
-            where_parts.append("(alb.title ILIKE %s OR ar.name ILIKE %s)")
+            where_parts.append(
+                """
+                (
+                    alb.title ILIKE %s
+                    OR ar.name ILIKE %s
+                    OR EXISTS (
+                        SELECT 1
+                        FROM files_tracks tr
+                        WHERE tr.album_id = alb.id
+                          AND tr.title ILIKE %s
+                    )
+                )
+                """
+            )
             like = f"%{search_query}%"
-            params.extend([like, like])
+            params.extend([like, like, like])
         if year and int(year) > 0:
             where_parts.append("alb.year = %s")
             params.append(int(year))
@@ -30732,6 +30901,7 @@ def api_library_albums():
                     COALESCE(alb.format, '') AS format,
                     alb.is_lossless,
                     alb.has_cover,
+                    alb.mb_identified,
                     ar.id AS artist_id,
                     ar.name AS artist_name,
                     COALESCE(pr.short_description, '') AS short_description,
@@ -30751,7 +30921,7 @@ def api_library_albums():
 
         base_url = request.url_root.rstrip("/")
         albums = []
-        for album_id, title, year, genre, label, tags_json, track_count, fmt, is_lossless, has_cover, artist_id, artist_name, short_desc, profile_source in rows:
+        for album_id, title, year, genre, label, tags_json, track_count, fmt, is_lossless, has_cover, mb_identified, artist_id, artist_name, short_desc, profile_source in rows:
             aid = int(album_id or 0)
             arid = int(artist_id or 0)
             thumb = f"{base_url}/api/library/files/album/{aid}/cover?size=512" if bool(has_cover) else None
@@ -30797,6 +30967,7 @@ def api_library_albums():
                     "track_count": int(track_count or 0),
                     "format": (fmt or "").strip() or None,
                     "is_lossless": bool(is_lossless),
+                    "mb_identified": bool(mb_identified),
                     "thumb": thumb,
                     "artist_id": arid,
                     "artist_name": artist_name or "",
@@ -30830,6 +31001,9 @@ def api_library_digest():
 
     limit = max(1, min(36, _parse_int_loose(request.args.get("limit"), 12)))
     trigger = str(request.args.get("trigger", "1")).strip().lower() in {"1", "true", "yes"}
+    include_unmatched = _library_include_unmatched_effective()
+    album_match_sql = _library_albums_match_where(include_unmatched, "alb")
+    candidate_limit = max(int(limit), min(1000, int(limit) * 12))
 
     conn = _files_pg_connect()
     if conn is None:
@@ -30851,6 +31025,7 @@ def api_library_digest():
                     COALESCE(alb.format, '') AS format,
                     alb.is_lossless,
                     alb.has_cover,
+                    alb.mb_identified,
                     ar.id AS artist_id,
                     ar.name AS artist_name,
                     ar.name_norm AS artist_norm,
@@ -30861,10 +31036,14 @@ def api_library_digest():
                 LEFT JOIN files_album_profiles pr
                        ON pr.artist_norm = ar.name_norm
                       AND pr.title_norm = alb.title_norm
-                ORDER BY alb.created_at DESC, alb.id DESC
+                WHERE """ + album_match_sql + """
+                ORDER BY
+                    CASE WHEN COALESCE(pr.short_description, '') <> '' THEN 0 ELSE 1 END ASC,
+                    COALESCE(pr.updated_at, alb.created_at) DESC,
+                    alb.id DESC
                 LIMIT %s
                 """,
-                (int(limit),),
+                (int(candidate_limit),),
             )
             rows = cur.fetchall()
 
@@ -30885,6 +31064,7 @@ def api_library_digest():
             fmt,
             is_lossless,
             has_cover,
+            mb_identified,
             artist_id,
             artist_name,
             artist_norm,
@@ -30957,6 +31137,7 @@ def api_library_digest():
                     "track_count": int(track_count or 0),
                     "format": (fmt or "").strip() or None,
                     "is_lossless": bool(is_lossless),
+                    "mb_identified": bool(mb_identified),
                     "thumb": thumb,
                     "artist_id": arid,
                     "artist_name": artist_name or "",
@@ -30989,7 +31170,7 @@ def api_library_digest():
         payload = {
             "limit": int(limit),
             "generated_at": int(time.time()),
-            "albums": albums_with_reviews,
+            "albums": albums_with_reviews[: int(limit)],
             "enrichment": {
                 "triggered": bool(triggered),
                 "missing_total": int(missing_total),
@@ -31122,8 +31303,11 @@ def api_library_top_artists():
         return jsonify({"artists": [], "error": err or "Files index unavailable"}), 503
     limit = max(1, min(60, _parse_int_loose(request.args.get("limit"), 18)))
     days = max(0, min(3650, _parse_int_loose(request.args.get("days"), 0)))
+    include_unmatched = _library_include_unmatched_effective()
+    album_match_sql = _library_albums_match_where(include_unmatched, "alb")
+    album_count_sql = _library_albums_match_where(include_unmatched, "alb_cnt")
 
-    cache_key = f"library:top_artists:{limit}:{days}"
+    cache_key = f"library:top_artists:{limit}:{days}:{_library_cache_unmatched_suffix(include_unmatched)}"
     cached = _files_cache_get_json(cache_key)
     if cached is not None:
         return jsonify(cached)
@@ -31140,15 +31324,23 @@ def api_library_top_artists():
                     SELECT
                         ar.id,
                         ar.name,
-                        ar.album_count,
+                        (
+                            SELECT COUNT(*)
+                            FROM files_albums alb_cnt
+                            WHERE alb_cnt.artist_id = ar.id
+                              AND """ + album_count_sql + """
+                        ) AS album_count,
                         ar.has_image,
                         COALESCE(SUM(CASE WHEN e.event_type IN ('play_complete', 'like') THEN 1 ELSE 0 END), 0) AS completion_count,
                         COALESCE(SUM(CASE WHEN e.event_type IN ('play_start', 'play_partial', 'play_complete', 'like') THEN 1 ELSE 0 END), 0) AS play_events
                     FROM files_reco_events e
-                    JOIN files_artists ar ON ar.id = e.artist_id
+                    JOIN files_tracks tr ON tr.id = e.track_id
+                    JOIN files_albums alb ON alb.id = tr.album_id
+                    JOIN files_artists ar ON ar.id = alb.artist_id
                     WHERE e.created_at >= (NOW() - (%s || ' days')::INTERVAL)
+                      AND """ + album_match_sql + """
                     GROUP BY ar.id
-                    ORDER BY completion_count DESC, play_events DESC, ar.album_count DESC, ar.name ASC
+                    ORDER BY completion_count DESC, play_events DESC, album_count DESC, ar.name ASC
                     LIMIT %s
                     """,
                     (int(days), int(limit)),
@@ -31159,7 +31351,12 @@ def api_library_top_artists():
                     SELECT
                         ar.id,
                         ar.name,
-                        ar.album_count,
+                        (
+                            SELECT COUNT(*)
+                            FROM files_albums alb_cnt
+                            WHERE alb_cnt.artist_id = ar.id
+                              AND """ + album_count_sql + """
+                        ) AS album_count,
                         ar.has_image,
                         COALESCE(SUM(st.completion_count), 0) AS completion_count,
                         COALESCE(SUM(st.play_count), 0) AS play_count
@@ -31167,8 +31364,9 @@ def api_library_top_artists():
                     JOIN files_tracks tr ON tr.id = st.track_id
                     JOIN files_albums alb ON alb.id = tr.album_id
                     JOIN files_artists ar ON ar.id = alb.artist_id
+                    WHERE """ + album_match_sql + """
                     GROUP BY ar.id
-                    ORDER BY completion_count DESC, play_count DESC, ar.album_count DESC, ar.name ASC
+                    ORDER BY completion_count DESC, play_count DESC, album_count DESC, ar.name ASC
                     LIMIT %s
                     """,
                     (int(limit),),
@@ -31199,6 +31397,73 @@ def api_library_top_artists():
         conn.close()
 
 
+@app.get("/api/library/artists/recent")
+def api_library_recent_artists():
+    """Return recently added artists based on latest album import date (Files mode only)."""
+    if _get_library_mode() != "files":
+        return jsonify({"artists": [], "error": "Files mode required"}), 400
+    ok, err = _ensure_files_index_ready()
+    if not ok:
+        return jsonify({"artists": [], "error": err or "Files index unavailable"}), 503
+    limit = max(1, min(60, _parse_int_loose(request.args.get("limit"), 18)))
+    offset = max(0, _parse_int_loose(request.args.get("offset"), 0))
+    include_unmatched = _library_include_unmatched_effective()
+    album_match_sql = _library_albums_match_where(include_unmatched, "alb")
+    cache_key = f"library:artists:recent:{limit}:{offset}:{_library_cache_unmatched_suffix(include_unmatched)}"
+    cached = _files_cache_get_json(cache_key)
+    if cached is not None:
+        return jsonify(cached)
+
+    conn = _files_pg_connect()
+    if conn is None:
+        return jsonify({"artists": [], "error": "PostgreSQL unavailable"}), 503
+    try:
+        base_url = request.url_root.rstrip("/")
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    ar.id,
+                    ar.name,
+                    (ar.has_image OR COALESCE(ext.image_path, '') <> '') AS has_image,
+                    COUNT(*)::BIGINT AS album_count,
+                    EXTRACT(EPOCH FROM MAX(alb.created_at))::BIGINT AS last_added_at
+                FROM files_albums alb
+                JOIN files_artists ar ON ar.id = alb.artist_id
+                LEFT JOIN files_external_artist_images ext ON ext.name_norm = ar.name_norm
+                WHERE """
+                + album_match_sql
+                + """
+                GROUP BY ar.id, ar.name, ar.has_image, ext.image_path
+                ORDER BY MAX(alb.created_at) DESC, ar.name ASC
+                LIMIT %s OFFSET %s
+                """,
+                (int(limit), int(offset)),
+            )
+            rows = cur.fetchall()
+
+        artists = []
+        for artist_id, name, has_image, album_count, last_added_at in rows:
+            aid = int(artist_id or 0)
+            if aid <= 0:
+                continue
+            artists.append(
+                {
+                    "artist_id": aid,
+                    "artist_name": name or "",
+                    "album_count": int(album_count or 0),
+                    "thumb": f"{base_url}/api/library/files/artist/{aid}/image?size=192" if bool(has_image) else None,
+                    "last_added_at": int(last_added_at or 0),
+                }
+            )
+
+        payload = {"artists": artists, "limit": int(limit), "offset": int(offset)}
+        _files_cache_set_json(cache_key, payload, ttl=30)
+        return jsonify(payload)
+    finally:
+        conn.close()
+
+
 @app.get("/api/library/facets")
 def api_library_facets():
     """Return library facets (genres/labels/years) for discovery chips (Files mode only)."""
@@ -31210,8 +31475,10 @@ def api_library_facets():
     limit_genres = max(1, min(80, _parse_int_loose(request.args.get("limit_genres"), 24)))
     limit_labels = max(1, min(80, _parse_int_loose(request.args.get("limit_labels"), 24)))
     limit_years = max(1, min(200, _parse_int_loose(request.args.get("limit_years"), 50)))
+    include_unmatched = _library_include_unmatched_effective()
+    album_match_sql = _library_albums_match_where(include_unmatched, "alb")
 
-    cache_key = f"library:facets:{limit_genres}:{limit_labels}:{limit_years}"
+    cache_key = f"library:facets:{limit_genres}:{limit_labels}:{limit_years}:{_library_cache_unmatched_suffix(include_unmatched)}"
     cached = _files_cache_get_json(cache_key)
     if cached is not None:
         return jsonify(cached)
@@ -31231,6 +31498,7 @@ def api_library_facets():
                     FROM files_albums alb
                     CROSS JOIN LATERAL jsonb_array_elements_text(COALESCE(alb.tags_json, '[]')::jsonb) AS g(value)
                     WHERE COALESCE(TRIM(g.value), '') <> ''
+                      AND """ + album_match_sql + """
                     UNION ALL
                     -- Fallback: legacy single-genre column when tags_json is empty
                     SELECT
@@ -31238,6 +31506,7 @@ def api_library_facets():
                         TRIM(alb.genre) AS genre_disp
                     FROM files_albums alb
                     WHERE COALESCE(TRIM(alb.genre), '') <> ''
+                      AND """ + album_match_sql + """
                       AND COALESCE(alb.tags_json, '[]') = '[]'
                 ),
                 norm_tokens AS (
@@ -31277,9 +31546,10 @@ def api_library_facets():
             cur.execute(
                 """
                 WITH label_tokens AS (
-                    SELECT TRIM(COALESCE(label, '')) AS label_disp
-                    FROM files_albums
-                    WHERE COALESCE(TRIM(label), '') <> ''
+                    SELECT TRIM(COALESCE(alb.label, '')) AS label_disp
+                    FROM files_albums alb
+                    WHERE COALESCE(TRIM(alb.label), '') <> ''
+                      AND """ + album_match_sql + """
                 ),
                 norm_tokens AS (
                     SELECT LOWER(label_disp) AS label_norm, label_disp
@@ -31315,8 +31585,9 @@ def api_library_facets():
             cur.execute(
                 """
                 SELECT year, COUNT(*) AS c
-                FROM files_albums
+                FROM files_albums alb
                 WHERE year IS NOT NULL AND year > 0
+                  AND """ + album_match_sql + """
                 GROUP BY year
                 ORDER BY year DESC
                 LIMIT %s
@@ -31346,8 +31617,10 @@ def api_library_genres_suggest():
     year = _parse_int_loose(request.args.get("year"), 0)
     limit = max(1, min(80, _parse_int_loose(request.args.get("limit"), 16)))
     refresh = bool(_parse_bool(request.args.get("refresh")))
+    include_unmatched = _library_include_unmatched_effective()
+    album_match_sql = _library_albums_match_where(include_unmatched, "alb")
 
-    cache_key = f"library:genres:suggest:{query.lower()}:{label.lower()}:{int(year or 0)}:{limit}"
+    cache_key = f"library:genres:suggest:{query.lower()}:{label.lower()}:{int(year or 0)}:{limit}:{_library_cache_unmatched_suffix(include_unmatched)}"
     if not refresh:
         cached = _files_cache_get_json(cache_key)
         if cached is not None:
@@ -31357,7 +31630,7 @@ def api_library_genres_suggest():
     if conn is None:
         return jsonify({"query": query, "genres": [], "error": "PostgreSQL unavailable"}), 503
     try:
-        album_filters = ["1=1"]
+        album_filters = ["1=1", album_match_sql]
         album_params: list = []
         if year and int(year) > 0:
             album_filters.append("COALESCE(alb.year, 0) = %s")
@@ -31499,8 +31772,10 @@ def api_library_labels_suggest():
     year = _parse_int_loose(request.args.get("year"), 0)
     limit = max(1, min(80, _parse_int_loose(request.args.get("limit"), 16)))
     refresh = bool(_parse_bool(request.args.get("refresh")))
+    include_unmatched = _library_include_unmatched_effective()
+    album_match_sql = _library_albums_match_where(include_unmatched, "alb")
 
-    cache_key = f"library:labels:suggest:{query.lower()}:{genre.lower()}:{int(year or 0)}:{limit}"
+    cache_key = f"library:labels:suggest:{query.lower()}:{genre.lower()}:{int(year or 0)}:{limit}:{_library_cache_unmatched_suffix(include_unmatched)}"
     if not refresh:
         cached = _files_cache_get_json(cache_key)
         if cached is not None:
@@ -31510,7 +31785,7 @@ def api_library_labels_suggest():
     if conn is None:
         return jsonify({"query": query, "labels": [], "error": "PostgreSQL unavailable"}), 503
     try:
-        album_filters = ["1=1"]
+        album_filters = ["1=1", album_match_sql]
         album_params: list = []
         if year and int(year) > 0:
             album_filters.append("COALESCE(alb.year, 0) = %s")
@@ -31641,14 +31916,16 @@ def api_library_genres():
     limit = max(1, min(200, _parse_int_loose(request.args.get("limit"), 80)))
     offset = max(0, _parse_int_loose(request.args.get("offset"), 0))
     refresh = bool(_parse_bool(request.args.get("refresh")))
+    include_unmatched = _library_include_unmatched_effective()
+    album_match_sql = _library_albums_match_where(include_unmatched, "alb")
 
-    cache_key = f"library:genres:list:{search.lower()}:{label.lower()}:{int(year or 0)}:{limit}:{offset}"
+    cache_key = f"library:genres:list:{search.lower()}:{label.lower()}:{int(year or 0)}:{limit}:{offset}:{_library_cache_unmatched_suffix(include_unmatched)}"
     if not refresh:
         cached = _files_cache_get_json(cache_key)
         if cached is not None:
             return jsonify(cached)
 
-    album_filters = ["1=1"]
+    album_filters = ["1=1", album_match_sql]
     album_params: list = []
     if year and int(year) > 0:
         album_filters.append("COALESCE(alb.year, 0) = %s")
@@ -31792,14 +32069,16 @@ def api_library_labels():
     limit = max(1, min(200, _parse_int_loose(request.args.get("limit"), 80)))
     offset = max(0, _parse_int_loose(request.args.get("offset"), 0))
     refresh = bool(_parse_bool(request.args.get("refresh")))
+    include_unmatched = _library_include_unmatched_effective()
+    album_match_sql = _library_albums_match_where(include_unmatched, "alb")
 
-    cache_key = f"library:labels:list:{search.lower()}:{genre.lower()}:{int(year or 0)}:{limit}:{offset}"
+    cache_key = f"library:labels:list:{search.lower()}:{genre.lower()}:{int(year or 0)}:{limit}:{offset}:{_library_cache_unmatched_suffix(include_unmatched)}"
     if not refresh:
         cached = _files_cache_get_json(cache_key)
         if cached is not None:
             return jsonify(cached)
 
-    album_filters = ["1=1"]
+    album_filters = ["1=1", album_match_sql]
     album_params: list = []
     if year and int(year) > 0:
         album_filters.append("COALESCE(alb.year, 0) = %s")
@@ -31918,7 +32197,9 @@ def api_library_genre_labels(genre: str):
         return jsonify({"genre": "", "album_count": 0, "labels": [], "error": "Invalid genre"}), 400
     limit = max(1, min(200, _parse_int_loose(request.args.get("limit"), 80)))
     refresh = bool(_parse_bool(request.args.get("refresh")))
-    cache_key = f"library:genre:labels:{g.lower()}:{limit}"
+    include_unmatched = _library_include_unmatched_effective()
+    album_match_sql = _library_albums_match_where(include_unmatched, "alb")
+    cache_key = f"library:genre:labels:{g.lower()}:{limit}:{_library_cache_unmatched_suffix(include_unmatched)}"
     if not refresh:
         cached = _files_cache_get_json(cache_key)
         if cached is not None:
@@ -31939,12 +32220,14 @@ def api_library_genre_labels(genre: str):
                         FROM jsonb_array_elements_text(COALESCE(alb.tags_json, '[]')::jsonb) AS gg(value)
                         WHERE lower(trim(gg.value)) = lower(%s)
                     )
+                      AND """ + album_match_sql + """
                     UNION
                     SELECT DISTINCT alb.id AS album_id
                     FROM files_albums alb
                     WHERE COALESCE(alb.tags_json, '[]') = '[]'
                       AND lower(trim(COALESCE(alb.genre, ''))) = lower(%s)
                       AND COALESCE(trim(alb.genre), '') <> ''
+                      AND """ + album_match_sql + """
                 )
                 SELECT COUNT(*) FROM matched_albums
                 """,
@@ -31962,12 +32245,14 @@ def api_library_genre_labels(genre: str):
                         FROM jsonb_array_elements_text(COALESCE(alb.tags_json, '[]')::jsonb) AS gg(value)
                         WHERE lower(trim(gg.value)) = lower(%s)
                     )
+                      AND """ + album_match_sql + """
                     UNION
                     SELECT DISTINCT alb.id AS album_id
                     FROM files_albums alb
                     WHERE COALESCE(alb.tags_json, '[]') = '[]'
                       AND lower(trim(COALESCE(alb.genre, ''))) = lower(%s)
                       AND COALESCE(trim(alb.genre), '') <> ''
+                      AND """ + album_match_sql + """
                 ),
                 label_tokens AS (
                     SELECT TRIM(COALESCE(alb.label, '')) AS label_disp
@@ -32026,8 +32311,10 @@ def api_library_recently_played_albums():
     days = max(7, min(365, _parse_int_loose(request.args.get("days"), 90)))
     limit = max(1, min(60, _parse_int_loose(request.args.get("limit"), 18)))
     refresh = bool(_parse_bool(request.args.get("refresh")))
+    include_unmatched = _library_include_unmatched_effective()
+    album_match_sql = _library_albums_match_where(include_unmatched, "alb")
 
-    cache_key = f"library:recently_played_albums:{days}:{limit}"
+    cache_key = f"library:recently_played_albums:{days}:{limit}:{_library_cache_unmatched_suffix(include_unmatched)}"
     if not refresh:
         cached = _files_cache_get_json(cache_key)
         if cached is not None:
@@ -32062,7 +32349,9 @@ def api_library_recently_played_albums():
                     MAX(e.created_at) AS last_played_at
                 FROM {ev_table} e
                 JOIN files_tracks t ON t.id = e.track_id
+                JOIN files_albums alb ON alb.id = t.album_id
                 WHERE {ev_user_filter}
+                  AND {album_match_sql}
                   AND e.created_at >= NOW() - (%s || ' days')::interval
                   AND COALESCE(e.played_seconds, 0) >= 12
                 GROUP BY t.album_id
@@ -32104,6 +32393,7 @@ def api_library_recently_played_albums():
                         COALESCE(alb.format, '') AS format,
                         alb.is_lossless,
                         alb.has_cover,
+                        alb.mb_identified,
                         ar.id AS artist_id,
                         ar.name AS artist_name,
                         COALESCE(pr.short_description, '') AS short_description,
@@ -32115,12 +32405,13 @@ def api_library_recently_played_albums():
                     LEFT JOIN files_album_profiles pr
                            ON pr.artist_norm = ar.name_norm
                           AND pr.title_norm = alb.title_norm
+                    WHERE """ + album_match_sql + """
                     ORDER BY ids.ord ASC
                     """,
                     (album_ids,),
                 )
                 alb_rows = cur.fetchall()
-                for album_id, title, year, genre, label, tags_json, track_count, fmt, is_lossless, has_cover, artist_id, artist_name, short_desc, profile_source, _ord in alb_rows:
+                for album_id, title, year, genre, label, tags_json, track_count, fmt, is_lossless, has_cover, mb_identified, artist_id, artist_name, short_desc, profile_source, _ord in alb_rows:
                     aid = int(album_id or 0)
                     arid = int(artist_id or 0)
                     thumb = f"{base_url}/api/library/files/album/{aid}/cover?size=512" if bool(has_cover) else None
@@ -32164,6 +32455,7 @@ def api_library_recently_played_albums():
                             "track_count": int(track_count or 0),
                             "format": (fmt or "").strip() or None,
                             "is_lossless": bool(is_lossless),
+                            "mb_identified": bool(mb_identified),
                             "thumb": thumb,
                             "artist_id": arid,
                             "artist_name": artist_name or "",
@@ -32879,7 +33171,9 @@ def api_library_reco_for_you():
 def api_library_artist_detail(artist_id):
     """Return detailed information about an artist including all albums with images and types."""
     if _get_library_mode() == "files":
-        cache_key = f"library:artist:{artist_id}"
+        include_unmatched = _library_include_unmatched_effective()
+        album_match_sql = _library_albums_match_where(include_unmatched, "alb")
+        cache_key = f"library:artist:{artist_id}:{_library_cache_unmatched_suffix(include_unmatched)}"
         cached = _files_cache_get_json(cache_key)
         if cached is not None:
             return jsonify(cached)
@@ -32910,8 +33204,9 @@ def api_library_artist_detail(artist_id):
                         discogs_release_id, lastfm_album_mbid, bandcamp_album_url, metadata_source,
                         expected_track_count, actual_track_count, missing_indices_json,
                         COUNT(*) OVER (PARTITION BY title_norm) AS dup_count
-                    FROM files_albums
-                    WHERE artist_id = %s
+                    FROM files_albums alb
+                    WHERE alb.artist_id = %s
+                      AND """ + album_match_sql + """
                     ORDER BY COALESCE(year, 0) DESC, title ASC
                     """,
                     (artist_id,),

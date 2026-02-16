@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { useLocation, useNavigate } from 'react-router-dom';
+import { useLocation, useNavigate, useOutletContext } from 'react-router-dom';
 import { Loader2, UserRound } from 'lucide-react';
 
 import { Badge } from '@/components/ui/badge';
@@ -7,10 +7,12 @@ import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { useLibraryQuery } from '@/hooks/useLibraryQuery';
 import * as api from '@/lib/api';
+import type { LibraryOutletContext } from '@/pages/LibraryLayout';
 
 export default function LibraryArtists() {
   const navigate = useNavigate();
   const location = useLocation();
+  const { includeUnmatched } = useOutletContext<LibraryOutletContext>();
   const { search, genre, label, year } = useLibraryQuery();
 
   const [loading, setLoading] = useState(false);
@@ -32,6 +34,7 @@ export default function LibraryArtists() {
         genre: genre || undefined,
         label: label || undefined,
         year: year ?? undefined,
+        includeUnmatched,
         limit,
         offset: opts.pageOffset,
       });
@@ -51,12 +54,12 @@ export default function LibraryArtists() {
     } finally {
       if (rid === requestIdRef.current) setLoading(false);
     }
-  }, [genre, label, limit, search, year]);
+  }, [genre, includeUnmatched, label, limit, search, year]);
 
   useEffect(() => {
     setOffset(0);
     void fetchArtists({ reset: true, pageOffset: 0 });
-  }, [search, genre, label, year, fetchArtists]);
+  }, [search, genre, label, year, includeUnmatched, fetchArtists]);
 
   const canLoadMore = artists.length < total && !loading;
 
@@ -133,4 +136,3 @@ export default function LibraryArtists() {
     </div>
   );
 }
-

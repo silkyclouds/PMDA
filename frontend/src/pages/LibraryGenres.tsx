@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { useLocation, useNavigate } from 'react-router-dom';
+import { useLocation, useNavigate, useOutletContext } from 'react-router-dom';
 import { Loader2, Tag } from 'lucide-react';
 
 import { Badge } from '@/components/ui/badge';
@@ -8,10 +8,12 @@ import { Card } from '@/components/ui/card';
 import { useLibraryQuery } from '@/hooks/useLibraryQuery';
 import * as api from '@/lib/api';
 import { cn } from '@/lib/utils';
+import type { LibraryOutletContext } from '@/pages/LibraryLayout';
 
 export default function LibraryGenres() {
   const navigate = useNavigate();
   const location = useLocation();
+  const { includeUnmatched } = useOutletContext<LibraryOutletContext>();
   const { search, label, year } = useLibraryQuery();
 
   const [loading, setLoading] = useState(false);
@@ -32,6 +34,7 @@ export default function LibraryGenres() {
         search: search.trim() || undefined,
         label: label || undefined,
         year: year ?? undefined,
+        includeUnmatched,
         limit,
         offset: opts.pageOffset,
       });
@@ -51,12 +54,12 @@ export default function LibraryGenres() {
     } finally {
       if (rid === requestIdRef.current) setLoading(false);
     }
-  }, [label, limit, search, year]);
+  }, [includeUnmatched, label, limit, search, year]);
 
   useEffect(() => {
     setOffset(0);
     void fetchGenres({ reset: true, pageOffset: 0 });
-  }, [search, label, year, fetchGenres]);
+  }, [search, label, year, includeUnmatched, fetchGenres]);
 
   const canLoadMore = genres.length < total && !loading;
 
@@ -120,4 +123,3 @@ export default function LibraryGenres() {
     </div>
   );
 }
-

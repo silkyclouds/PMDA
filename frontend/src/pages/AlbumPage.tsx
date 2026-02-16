@@ -32,7 +32,7 @@ export default function AlbumPage() {
   const navigate = useNavigate();
   const params = useParams<{ albumId: string }>();
   const albumId = Number(params.albumId);
-  const { startPlayback } = usePlayback();
+  const { startPlayback, setCurrentTrack } = usePlayback();
 
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -84,6 +84,14 @@ export default function AlbumPage() {
     if (!data) return;
     if (playbackTracks.length === 0) return;
     startPlayback(data.album_id, data.title || 'Album', data.cover_url || null, playbackTracks);
+  };
+
+  const handlePlayTrack = (index: number) => {
+    if (!data) return;
+    if (playbackTracks.length === 0) return;
+    if (index < 0 || index >= playbackTracks.length) return;
+    startPlayback(data.album_id, data.title || 'Album', data.cover_url || null, playbackTracks);
+    setCurrentTrack(playbackTracks[index]);
   };
 
   if (loading) {
@@ -299,8 +307,20 @@ export default function AlbumPage() {
                           ) : null}
                         </div>
                       </div>
-                      <div className="w-16 text-right text-xs tabular-nums text-muted-foreground shrink-0">
-                        {formatDuration(t.duration_sec || 0)}
+                      <div className="flex items-center gap-2 shrink-0">
+                        <Button
+                          type="button"
+                          size="icon"
+                          variant="ghost"
+                          className="h-8 w-8 rounded-full"
+                          onClick={() => handlePlayTrack(idx)}
+                          title="Play track"
+                        >
+                          <Play className="h-4 w-4" />
+                        </Button>
+                        <div className="w-16 text-right text-xs tabular-nums text-muted-foreground">
+                          {formatDuration(t.duration_sec || 0)}
+                        </div>
                       </div>
                     </div>
                   );

@@ -482,6 +482,18 @@ function SettingsPage() {
                     </div>
                   </div>
                 </div>
+                <div className="flex items-center justify-between gap-3 rounded-lg border border-border/60 p-3">
+                  <div className="space-y-1">
+                    <Label>Include non matched music in PMDA library</Label>
+                    <p className="text-xs text-muted-foreground">
+                      Off: only formally identified albums are shown. On: unmatched albums are also visible with warning badges.
+                    </p>
+                  </div>
+                  <Switch
+                    checked={Boolean(config.LIBRARY_INCLUDE_UNMATCHED)}
+                    onCheckedChange={(checked) => updateConfig({ LIBRARY_INCLUDE_UNMATCHED: Boolean(checked) })}
+                  />
+                </div>
                 <div className="space-y-2">
                   <Label>Media cache folder</Label>
                   <p className="text-xs text-muted-foreground">
@@ -751,6 +763,25 @@ function SettingsPage() {
                     placeholder="Fanart.tv API key"
                     value={String(config.FANART_API_KEY ?? '')}
                     onChange={(e) => updateConfig({ FANART_API_KEY: e.target.value })}
+                  />
+                </div>
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between gap-3">
+                    <Label htmlFor="serper-key">Serper API key (optional)</Label>
+                    <a
+                      href="https://serper.dev/"
+                      target="_blank"
+                      rel="noreferrer"
+                      className="text-xs text-primary inline-flex items-center gap-1 hover:underline"
+                    >
+                      Create API key <ExternalLink className="w-3 h-3" />
+                    </a>
+                  </div>
+                  <PasswordInput
+                    id="serper-key"
+                    placeholder="Serper.dev API key"
+                    value={String(config.SERPER_API_KEY ?? '')}
+                    onChange={(e) => updateConfig({ SERPER_API_KEY: e.target.value })}
                   />
                 </div>
               </CardContent>

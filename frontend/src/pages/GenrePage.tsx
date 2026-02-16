@@ -1,16 +1,29 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { useNavigate, useParams } from 'react-router-dom';
-import { ArrowLeft, Music } from 'lucide-react';
+import { useLocation, useNavigate, useOutletContext, useParams } from 'react-router-dom';
+import { ArrowLeft, Music, Play, UserRound } from 'lucide-react';
 
 import { AspectRatio } from '@/components/ui/aspect-ratio';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { ScrollArea } from '@/components/ui/scroll-area';
+import { usePlayback } from '@/contexts/PlaybackContext';
+import { useToast } from '@/hooks/use-toast';
+import { cn } from '@/lib/utils';
 import * as api from '@/lib/api';
+import type { TrackInfo } from '@/components/library/AudioPlayer';
+import type { LibraryOutletContext } from '@/pages/LibraryLayout';
+
+function isUnmatchedAlbum(album: api.LibraryAlbumItem): boolean {
+  return album.mb_identified === false;
+}
 
 export default function GenrePage() {
   const navigate = useNavigate();
+  const location = useLocation();
+  const { includeUnmatched } = useOutletContext<LibraryOutletContext>();
+  const { startPlayback, setCurrentTrack } = usePlayback();
+  const { toast } = useToast();
   const params = useParams<{ genre: string }>();
   const genre = decodeURIComponent(String(params.genre || '')).trim();
 
@@ -35,11 +48,11 @@ export default function GenrePage() {
     setError(null);
     try {
       const [albumsRes, labelsRes] = await Promise.all([
-        api.getLibraryAlbums({ genre, sort: 'year_desc', limit: 120, offset }),
+        api.getLibraryAlbums({ genre, sort: 'year_desc', limit: 120, offset, includeUnmatched }),
         (async () => {
           setLabelsLoading(true);
           try {
-            return await api.getLibraryGenreLabels(genre, 120);
+            return await api.getLibraryGenreLabels(genre, 120, false, { includeUnmatched });
           } finally {
             setLabelsLoading(false);
           }
@@ -58,11 +71,33 @@ export default function GenrePage() {
     } finally {
       setLoading(false);
     }
-  }, [genre, offset]);
+  }, [genre, includeUnmatched, offset]);
 
   useEffect(() => {
     void load();
   }, [load]);
+
+  const handlePlayAlbum = useCallback(async (albumId: number, fallbackTitle: string, fallbackThumb?: string | null) => {
+    try {
+      const response = await fetch(`/api/library/album/${albumId}/tracks`);
+      if (!response.ok) throw new Error('Failed to load tracks');
+      const data = await response.json();
+      const tracksList: TrackInfo[] = data.tracks || [];
+      if (tracksList.length === 0) {
+        toast({ title: 'No tracks', description: 'This album has no playable tracks.', variant: 'destructive' });
+        return;
+      }
+      const albumThumb = data.album_thumb || fallbackThumb || null;
+      startPlayback(albumId, fallbackTitle || 'Album', albumThumb, tracksList);
+      setCurrentTrack(tracksList[0]);
+    } catch (error) {
+      toast({
+        title: 'Error',
+        description: error instanceof Error ? error.message : 'Failed to load tracks',
+        variant: 'destructive',
+      });
+    }
+  }, [setCurrentTrack, startPlayback, toast]);
 
   const canPrev = offset > 0;
   const canNext = offset + albums.length < total;
@@ -74,7 +109,7 @@ export default function GenrePage() {
   return (
     <div className="container py-6 space-y-6">
       <div className="flex items-center justify-between gap-3">
-        <Button variant="ghost" className="gap-2" onClick={() => navigate('/library')}>
+        <Button variant="ghost" className="gap-2" onClick={() => navigate(`/library${location.search || ''}`)}>
           <ArrowLeft className="w-4 h-4" />
           Back to Library
         </Button>
@@ -108,7 +143,7 @@ export default function GenrePage() {
                       key={`genre-lab-${l.label}`}
                       type="button"
                       className="inline-flex items-center gap-2 rounded-full border border-border/60 bg-muted/40 px-3 py-1.5 text-[11px] hover:bg-muted transition-colors"
-                      onClick={() => navigate(`/library/label/${encodeURIComponent(l.label)}`)}
+                      onClick={() => navigate(`/library/label/${encodeURIComponent(l.label)}${location.search || ''}`)}
                       title="Open label"
                     >
                       <span className="truncate max-w-[16rem]">{l.label}</span>
@@ -146,14 +181,26 @@ export default function GenrePage() {
         ) : (
           <div className="grid gap-4" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(10.5rem, 1fr))' }}>
             {albums.map((a) => (
-              <button
+              <div
                 key={`genre-alb-${a.album_id}`}
-                type="button"
                 className="text-left group"
-                onClick={() => navigate(`/library/album/${a.album_id}`)}
+                role="button"
+                tabIndex={0}
+                onClick={() => navigate(`/library/album/${a.album_id}${location.search || ''}`)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    navigate(`/library/album/${a.album_id}${location.search || ''}`);
+                  }
+                }}
                 title="Open album"
               >
-                <div className="relative overflow-hidden rounded-2xl border border-border/60 bg-card shadow-sm">
+                <div
+                  className={cn(
+                    'relative overflow-hidden rounded-2xl border border-border/60 bg-card shadow-sm',
+                    isUnmatchedAlbum(a) && 'ring-1 ring-amber-500/45 shadow-[0_0_0_1px_rgba(245,158,11,0.25),0_0_24px_rgba(245,158,11,0.14)]',
+                  )}
+                >
                   <AspectRatio ratio={1} className="bg-muted">
                     {a.thumb ? (
                       <img src={a.thumb} alt={a.title} className="w-full h-full object-cover" />
@@ -162,7 +209,43 @@ export default function GenrePage() {
                         <Music className="w-10 h-10 text-muted-foreground" />
                       </div>
                     )}
+                    {isUnmatchedAlbum(a) ? (
+                      <div className="absolute top-2 left-2">
+                        <Badge variant="outline" className="text-[10px] border-amber-500/50 text-amber-700 bg-background/75 backdrop-blur dark:text-amber-300">
+                          Unmatched
+                        </Badge>
+                      </div>
+                    ) : null}
                     <div className="absolute inset-0 opacity-0 group-hover:opacity-100 transition-opacity bg-black/25" />
+                    <div className="absolute inset-x-0 bottom-0 p-3 opacity-0 group-hover:opacity-100 transition-opacity">
+                      <div className="flex items-center justify-between gap-2">
+                        <Button
+                          size="sm"
+                          className="h-9 rounded-full gap-2"
+                          onClick={(e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            void handlePlayAlbum(a.album_id, a.title, a.thumb);
+                          }}
+                        >
+                          <Play className="h-4 w-4" />
+                          Play
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="h-9 rounded-full"
+                          onClick={(e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            navigate(`/library/artist/${a.artist_id}${location.search || ''}`);
+                          }}
+                          title="Open artist"
+                        >
+                          <UserRound className="h-4 w-4" />
+                        </Button>
+                      </div>
+                    </div>
                   </AspectRatio>
                   <div className="p-3 space-y-1.5">
                     <div className="text-sm font-semibold truncate">{a.title}</div>
@@ -172,7 +255,7 @@ export default function GenrePage() {
                       onClick={(e) => {
                         e.preventDefault();
                         e.stopPropagation();
-                        navigate(`/library/artist/${a.artist_id}`);
+                        navigate(`/library/artist/${a.artist_id}${location.search || ''}`);
                       }}
                       title="Open artist"
                     >
@@ -185,6 +268,11 @@ export default function GenrePage() {
                       <Badge variant="outline" className="text-[10px]">
                         {a.track_count}t
                       </Badge>
+                      {isUnmatchedAlbum(a) ? (
+                        <Badge variant="outline" className="text-[10px] border-amber-500/50 text-amber-700 dark:text-amber-300">
+                          Verify tags
+                        </Badge>
+                      ) : null}
                       {a.label ? (
                         <Badge
                           variant="outline"
@@ -192,7 +280,7 @@ export default function GenrePage() {
                           onClick={(e) => {
                             e.preventDefault();
                             e.stopPropagation();
-                            navigate(`/library/label/${encodeURIComponent(a.label || '')}`);
+                            navigate(`/library/label/${encodeURIComponent(a.label || '')}${location.search || ''}`);
                           }}
                           title="Open label"
                         >
@@ -202,7 +290,7 @@ export default function GenrePage() {
                     </div>
                   </div>
                 </div>
-              </button>
+              </div>
             ))}
           </div>
         )}
@@ -210,4 +298,3 @@ export default function GenrePage() {
     </div>
   );
 }
-

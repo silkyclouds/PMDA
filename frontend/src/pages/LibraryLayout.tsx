@@ -7,12 +7,18 @@ import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { Switch } from '@/components/ui/switch';
 import { cn } from '@/lib/utils';
 import * as api from '@/lib/api';
 import { FacetSuggestInput } from '@/components/library/FacetSuggestInput';
 import { useLibraryQuery } from '@/hooks/useLibraryQuery';
 
 type LibraryTabKey = 'home' | 'artists' | 'albums' | 'genres' | 'labels';
+
+export interface LibraryOutletContext {
+  includeUnmatched: boolean;
+  stats: api.LibraryStats | null;
+}
 
 function activeTabFromPath(pathname: string): LibraryTabKey {
   const p = pathname || '';
@@ -28,11 +34,12 @@ export default function LibraryLayout() {
   const navigate = useNavigate();
   const location = useLocation();
   const tab = activeTabFromPath(location.pathname);
-  const { search, genre, label, year, patch, clearFilters } = useLibraryQuery();
+  const { search, genre, label, year, includeUnmatched: includeUnmatchedQuery, patch, clearFilters } = useLibraryQuery();
 
   const [stats, setStats] = useState<api.LibraryStats | null>(null);
   const [facetsLoading, setFacetsLoading] = useState(false);
   const [years, setYears] = useState<api.LibraryFacetYearItem[]>([]);
+  const [configIncludeUnmatched, setConfigIncludeUnmatched] = useState<boolean>(false);
 
   const [filtersOpen, setFiltersOpen] = useState(false);
 
@@ -42,6 +49,24 @@ export default function LibraryLayout() {
   useEffect(() => {
     setSearchDraft(search);
   }, [search]);
+
+  useEffect(() => {
+    let cancelled = false;
+    api.getConfig()
+      .then((cfg) => {
+        if (cancelled) return;
+        setConfigIncludeUnmatched(Boolean(cfg.LIBRARY_INCLUDE_UNMATCHED));
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setConfigIncludeUnmatched(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const includeUnmatched = includeUnmatchedQuery ?? configIncludeUnmatched;
 
   useEffect(() => {
     if (searchDebounceRef.current) clearTimeout(searchDebounceRef.current);
@@ -54,15 +79,16 @@ export default function LibraryLayout() {
   }, [searchDraft, patch]);
 
   useEffect(() => {
-    api.getLibraryStats().then(setStats).catch(() => setStats(null));
-  }, []);
+    // Header counts on Home must always reflect formally identified items only.
+    api.getLibraryStats({ includeUnmatched: false }).then(setStats).catch(() => setStats(null));
+  }, [location.pathname, location.search]);
 
   useEffect(() => {
     let cancelled = false;
     const run = async () => {
       try {
         setFacetsLoading(true);
-        const f = await api.getLibraryFacets();
+        const f = await api.getLibraryFacets({ includeUnmatched });
         if (!cancelled) setYears(Array.isArray(f.years) ? f.years : []);
       } catch {
         if (!cancelled) setYears([]);
@@ -74,7 +100,7 @@ export default function LibraryLayout() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [includeUnmatched]);
 
   const gotoTab = useCallback(
     (target: LibraryTabKey) => {
@@ -87,18 +113,18 @@ export default function LibraryLayout() {
 
   const fetchGenreSuggestions = useCallback(
     async (q: string) => {
-      const res = await api.suggestLibraryGenres(q, 16, false, { label, year });
+      const res = await api.suggestLibraryGenres(q, 16, false, { label, year, includeUnmatched });
       return Array.isArray(res.genres) ? res.genres : [];
     },
-    [label, year]
+    [includeUnmatched, label, year]
   );
 
   const fetchLabelSuggestions = useCallback(
     async (q: string) => {
-      const res = await api.suggestLibraryLabels(q, 16, false, { genre, year });
+      const res = await api.suggestLibraryLabels(q, 16, false, { genre, year, includeUnmatched });
       return Array.isArray(res.labels) ? res.labels : [];
     },
-    [genre, year]
+    [genre, includeUnmatched, year]
   );
 
   const showGenreFilter = tab !== 'genres';
@@ -125,13 +151,7 @@ export default function LibraryLayout() {
               <div className="min-w-0">
                 <h1 className="text-3xl md:text-4xl font-bold tracking-tight">Library</h1>
                 <p className="text-sm text-muted-foreground mt-1">
-                  {stats ? (
-                    <>
-                      {stats.artists.toLocaleString()} artists · {stats.albums.toLocaleString()} albums
-                    </>
-                  ) : (
-                    'Browse your local library'
-                  )}
+                  Browse your local library
                 </p>
                 {activeBadges.length > 0 ? (
                   <div className="mt-3 flex flex-wrap items-center gap-2">
@@ -193,7 +213,7 @@ export default function LibraryLayout() {
                   <Input
                     value={searchDraft}
                     onChange={(e) => setSearchDraft(e.target.value)}
-                    placeholder="Search artists, albums, genres, labels…"
+                    placeholder="Search artists, albums, tracks, genres, labels…"
                     className="pl-9 pr-9 h-11 bg-background/80"
                   />
                   {searchDraft ? (
@@ -208,6 +228,13 @@ export default function LibraryLayout() {
                   ) : null}
                 </div>
                 <div className="flex items-center gap-2">
+                  <div className="flex items-center gap-2 rounded-lg border border-border/60 bg-background/80 px-3 py-2">
+                    <Switch
+                      checked={includeUnmatched}
+                      onCheckedChange={(checked) => patch({ includeUnmatched: Boolean(checked) }, { replace: true })}
+                    />
+                    <span className="text-xs text-muted-foreground">Include non matched</span>
+                  </div>
                   <Button
                     type="button"
                     variant="outline"
@@ -280,7 +307,7 @@ export default function LibraryLayout() {
         </div>
       </div>
 
-      <Outlet />
+      <Outlet context={{ includeUnmatched, stats }} />
     </>
   );
 }

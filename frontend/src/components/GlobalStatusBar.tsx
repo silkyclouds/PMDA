@@ -70,6 +70,10 @@ export function GlobalStatusBar() {
     };
   }, [showLogs, isScanning]);
 
+  if (!isScanning && !isDeduping) {
+    return null;
+  }
+
   return (
     <div className="sticky top-[61px] z-40 border-b border-border/80 bg-gradient-to-r from-card via-card to-card/95 backdrop-blur supports-[backdrop-filter]:bg-card/90">
       <div className="container">

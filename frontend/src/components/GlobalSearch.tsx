@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type KeyboardEventHandler } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useLocation, useNavigate } from 'react-router-dom';
 import { Disc3, Loader2, Music2, Search, UserRound } from 'lucide-react';
 import { Input } from '@/components/ui/input';
 import { cn } from '@/lib/utils';
@@ -8,14 +8,40 @@ import * as api from '@/lib/api';
 
 export function GlobalSearch() {
   const navigate = useNavigate();
+  const location = useLocation();
   const rootRef = useRef<HTMLDivElement | null>(null);
   const [query, setQuery] = useState('');
   const [items, setItems] = useState<LibrarySearchSuggestionItem[]>([]);
   const [open, setOpen] = useState(false);
   const [loading, setLoading] = useState(false);
   const [activeIndex, setActiveIndex] = useState(0);
+  const [configIncludeUnmatched, setConfigIncludeUnmatched] = useState(false);
 
   const trimmed = query.trim();
+  const includeUnmatchedFromUrl = useMemo(() => {
+    if (!location.pathname.startsWith('/library')) return null;
+    const raw = new URLSearchParams(location.search).get('include_unmatched');
+    if (raw == null || raw === '') return null;
+    const low = raw.toLowerCase();
+    if (['1', 'true', 'yes', 'on'].includes(low)) return true;
+    if (['0', 'false', 'no', 'off'].includes(low)) return false;
+    return null;
+  }, [location.pathname, location.search]);
+  const includeUnmatched = includeUnmatchedFromUrl ?? configIncludeUnmatched;
+
+  useEffect(() => {
+    let cancelled = false;
+    api.getConfig()
+      .then((cfg) => {
+        if (!cancelled) setConfigIncludeUnmatched(Boolean(cfg.LIBRARY_INCLUDE_UNMATCHED));
+      })
+      .catch(() => {
+        if (!cancelled) setConfigIncludeUnmatched(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     if (!trimmed) {
@@ -27,7 +53,7 @@ export function GlobalSearch() {
     const id = setTimeout(async () => {
       setLoading(true);
       try {
-        const res = await api.getLibrarySearchSuggest(trimmed, 12);
+        const res = await api.getLibrarySearchSuggestWithOptions(trimmed, 12, { includeUnmatched });
         if (cancelled) return;
         setItems(Array.isArray(res.items) ? res.items : []);
         setOpen(true);
@@ -45,7 +71,7 @@ export function GlobalSearch() {
       cancelled = true;
       clearTimeout(id);
     };
-  }, [trimmed]);
+  }, [includeUnmatched, trimmed]);
 
   useEffect(() => {
     const onPointerDown = (evt: MouseEvent) => {
@@ -68,8 +94,12 @@ export function GlobalSearch() {
 
   const goToItem = (item: LibrarySearchSuggestionItem | undefined) => {
     if (!item) return;
-    // PMDA library UX: prefer deep-linking to the artist page (album/track pages can be added later).
-    if (item.artist_id) {
+    if (item.type === 'track' && item.album_id) {
+      const trackParam = item.track_id && item.track_id > 0 ? `?track_id=${item.track_id}` : '';
+      navigate(`/library/album/${item.album_id}${trackParam}`);
+    } else if (item.type === 'album' && item.album_id) {
+      navigate(`/library/album/${item.album_id}`);
+    } else if (item.artist_id) {
       navigate(`/library/artist/${item.artist_id}`);
     } else {
       navigate('/library');

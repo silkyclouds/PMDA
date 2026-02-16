@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useNavigate, useParams } from 'react-router-dom';
-import { ArrowLeft, Calendar, ChevronDown, ChevronUp, Disc3, ExternalLink, Heart, Loader2, Music, RefreshCw, Sparkles, Users } from 'lucide-react';
+import { useLocation, useNavigate, useParams } from 'react-router-dom';
+import { ArrowLeft, Calendar, ChevronDown, ChevronUp, Disc3, ExternalLink, Heart, Loader2, Music, Play, RefreshCw, Sparkles, Users } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Card, CardContent } from '@/components/ui/card';
@@ -12,6 +12,8 @@ import { FormatBadge } from '@/components/FormatBadge';
 import * as api from '@/lib/api';
 import { useToast } from '@/hooks/use-toast';
 import { ConcertsMiniMap } from '@/components/concerts/ConcertsMiniMap';
+import { usePlayback } from '@/contexts/PlaybackContext';
+import type { TrackInfo } from '@/components/library/AudioPlayer';
 
 interface SimilarArtist {
   name: string;
@@ -40,6 +42,7 @@ interface AlbumInfo {
   thumb?: string;
   format?: string;
   is_lossless?: boolean;
+  mb_identified?: boolean;
   short_description?: string;
 }
 
@@ -105,6 +108,10 @@ function toCoord(s?: string): number | null {
   return Number.isFinite(n) ? n : null;
 }
 
+function isUnmatchedAlbum(album: AlbumInfo): boolean {
+  return album.mb_identified === false;
+}
+
 function haversineKm(a: { lat: number; lon: number }, b: { lat: number; lon: number }) {
   const R = 6371;
   const toRad = (deg: number) => (deg * Math.PI) / 180;
@@ -118,6 +125,8 @@ function haversineKm(a: { lat: number; lon: number }, b: { lat: number; lon: num
 
 export default function ArtistPage() {
   const navigate = useNavigate();
+  const location = useLocation();
+  const { startPlayback, setCurrentTrack } = usePlayback();
   const params = useParams<{ artistId: string }>();
   const artistId = Number(params.artistId);
   const { toast } = useToast();
@@ -356,14 +365,36 @@ export default function ArtistPage() {
       const exact = items.find((it) => it.type === 'artist' && (it.title || '').trim().toLowerCase() === norm);
       const best = exact || items.find((it) => it.type === 'artist');
       if (best?.artist_id && best.artist_id > 0) {
-        navigate(`/library/artist/${best.artist_id}`);
+        navigate(`/library/artist/${best.artist_id}${location.search || ''}`);
         return;
       }
       toast({ title: 'Not found', description: `No artist matched "${q}".`, variant: 'destructive' });
     } catch {
       toast({ title: 'Search failed', description: `Could not resolve "${q}".`, variant: 'destructive' });
     }
-  }, [navigate, toast]);
+  }, [location.search, navigate, toast]);
+
+  const handlePlayAlbum = useCallback(async (albumId: number, fallbackTitle: string, fallbackThumb?: string | null) => {
+    try {
+      const response = await fetch(`/api/library/album/${albumId}/tracks`);
+      if (!response.ok) throw new Error('Failed to load tracks');
+      const data = await response.json();
+      const tracksList: TrackInfo[] = data.tracks || [];
+      if (tracksList.length === 0) {
+        toast({ title: 'No tracks', description: 'This album has no playable tracks.', variant: 'destructive' });
+        return;
+      }
+      const albumThumb = data.album_thumb || fallbackThumb || null;
+      startPlayback(albumId, fallbackTitle || 'Album', albumThumb, tracksList);
+      setCurrentTrack(tracksList[0]);
+    } catch (error) {
+      toast({
+        title: 'Error',
+        description: error instanceof Error ? error.message : 'Failed to load tracks',
+        variant: 'destructive',
+      });
+    }
+  }, [setCurrentTrack, startPlayback, toast]);
 
   const refreshArtistAnalysis = useCallback(async () => {
     if (!Number.isFinite(artistId) || artistId <= 0) return;
@@ -566,7 +597,7 @@ export default function ArtistPage() {
         <Card>
           <CardContent className="p-8 space-y-4 text-center">
             <p className="text-muted-foreground">{error || 'Artist not found'}</p>
-            <Button variant="outline" onClick={() => navigate('/library')}>
+            <Button variant="outline" onClick={() => navigate(`/library${location.search || ''}`)}>
               Back to Library
             </Button>
           </CardContent>
@@ -626,7 +657,7 @@ export default function ArtistPage() {
   return (
     <div className="container py-6 space-y-6">
         <div className="flex items-center justify-between gap-3">
-          <Button variant="ghost" className="gap-2" onClick={() => navigate('/library')}>
+          <Button variant="ghost" className="gap-2" onClick={() => navigate(`/library${location.search || ''}`)}>
             <ArrowLeft className="w-4 h-4" />
             Back to Library
           </Button>
@@ -944,7 +975,7 @@ export default function ArtistPage() {
                           size="sm"
                           variant="secondary"
                           className="h-6 px-2 text-[11px]"
-                          onClick={() => navigate(`/library/label/${encodeURIComponent(x)}`)}
+                          onClick={() => navigate(`/library/label/${encodeURIComponent(x)}${location.search || ''}`)}
                           title="Open label"
                         >
                           {x}
@@ -980,25 +1011,26 @@ export default function ArtistPage() {
 	              <ScrollArea className="w-full whitespace-nowrap">
 	                <div className="flex gap-4 pb-2">
 	                  {grouped[type].map((album) => (
-	                    <Card
-	                      key={album.album_id}
-	                      className={cn(
-	                        "w-[200px] shrink-0 overflow-hidden border-border/70 cursor-pointer hover:bg-muted/40 transition-colors"
-	                      )}
-	                      role="button"
-	                      tabIndex={0}
-	                      onClick={() => navigate(`/library/album/${album.album_id}`)}
-	                      onKeyDown={(e) => {
-	                        if (e.key === "Enter" || e.key === " ") {
-	                          e.preventDefault();
-	                          navigate(`/library/album/${album.album_id}`);
-	                        }
-	                      }}
-	                      title="Open album"
-	                    >
-	                      <AspectRatio
-	                        ratio={1}
-	                        className="bg-muted"
+                    <Card
+                      key={album.album_id}
+                      className={cn(
+                        "group w-[200px] shrink-0 overflow-hidden border-border/70 cursor-pointer hover:bg-muted/40 transition-colors",
+                        isUnmatchedAlbum(album) && 'ring-1 ring-amber-500/45 shadow-[0_0_0_1px_rgba(245,158,11,0.25),0_0_24px_rgba(245,158,11,0.14)]',
+                      )}
+                      role="button"
+                      tabIndex={0}
+                      onClick={() => navigate(`/library/album/${album.album_id}${location.search || ''}`)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.preventDefault();
+                          navigate(`/library/album/${album.album_id}${location.search || ''}`);
+                        }
+                      }}
+                      title="Open album"
+                    >
+                      <AspectRatio
+                        ratio={1}
+                        className="bg-muted"
                         draggable
                         onDragStart={(e) => {
                           try {
@@ -1017,6 +1049,27 @@ export default function ArtistPage() {
                             <Music className="w-10 h-10 text-muted-foreground" />
                           </div>
                         )}
+                        {isUnmatchedAlbum(album) ? (
+                          <div className="absolute top-2 left-2">
+                            <Badge variant="outline" className="text-[10px] border-amber-500/50 text-amber-700 bg-background/75 backdrop-blur dark:text-amber-300">
+                              Unmatched
+                            </Badge>
+                          </div>
+                        ) : null}
+                        <div className="absolute inset-x-0 bottom-0 p-2.5 opacity-0 group-hover:opacity-100 transition-opacity">
+                          <Button
+                            size="sm"
+                            className="h-8 w-full gap-2 rounded-full"
+                            onClick={(e) => {
+                              e.preventDefault();
+                              e.stopPropagation();
+                              void handlePlayAlbum(album.album_id, album.title, album.thumb);
+                            }}
+                          >
+                            <Play className="h-4 w-4" />
+                            Play
+                          </Button>
+                        </div>
                       </AspectRatio>
                       <CardContent className="p-3 space-y-2">
                         <h3 className="text-sm font-semibold truncate" title={album.title}>
@@ -1031,6 +1084,11 @@ export default function ArtistPage() {
                           <Badge variant={album.is_lossless ? 'secondary' : 'outline'} className="text-[10px]">
                             {album.is_lossless ? 'Lossless' : 'Lossy'}
                           </Badge>
+                          {isUnmatchedAlbum(album) ? (
+                            <Badge variant="outline" className="text-[10px] border-amber-500/50 text-amber-700 dark:text-amber-300">
+                              Verify tags
+                            </Badge>
+                          ) : null}
                         </div>
                         {album.short_description && (
                           <p className={cn('text-[11px] text-muted-foreground line-clamp-3')}>
@@ -1068,7 +1126,7 @@ export default function ArtistPage() {
 	                  tabIndex={0}
 	                  onClick={() => {
 	                    if (artist.artist_id) {
-	                      navigate(`/library/artist/${artist.artist_id}`);
+	                      navigate(`/library/artist/${artist.artist_id}${location.search || ''}`);
 	                      return;
 	                    }
 	                    const href = `https://bandcamp.com/search?q=${encodeURIComponent(artist.name || '')}`;
@@ -1078,7 +1136,7 @@ export default function ArtistPage() {
 	                    if (e.key === "Enter" || e.key === " ") {
 	                      e.preventDefault();
 	                      if (artist.artist_id) {
-	                        navigate(`/library/artist/${artist.artist_id}`);
+	                        navigate(`/library/artist/${artist.artist_id}${location.search || ''}`);
 	                      } else {
 	                        const href = `https://bandcamp.com/search?q=${encodeURIComponent(artist.name || '')}`;
 	                        window.open(href, '_blank', 'noopener,noreferrer');

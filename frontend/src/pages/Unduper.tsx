@@ -82,7 +82,7 @@ export default function Unduper() {
   });
   const { data: libraryStats, error: libraryStatsError } = useQuery({
     queryKey: ['library-stats'],
-    queryFn: getLibraryStats,
+    queryFn: () => getLibraryStats(),
     staleTime: 60000,
     retry: 2,
   });

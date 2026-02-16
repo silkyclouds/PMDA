@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useLocation, useNavigate } from 'react-router-dom';
+import { useLocation, useNavigate, useOutletContext } from 'react-router-dom';
 import { Heart, Loader2, Music, Play, UserRound } from 'lucide-react';
 
 import { AspectRatio } from '@/components/ui/aspect-ratio';
@@ -15,6 +15,7 @@ import { useLibraryQuery } from '@/hooks/useLibraryQuery';
 import { cn } from '@/lib/utils';
 import * as api from '@/lib/api';
 import type { TrackInfo } from '@/components/library/AudioPlayer';
+import type { LibraryOutletContext } from '@/pages/LibraryLayout';
 
 type SortMode = 'recent' | 'year_desc' | 'alpha' | 'artist';
 
@@ -37,9 +38,14 @@ function normalizeGenreBadges(album: api.LibraryAlbumItem): string[] {
   return out;
 }
 
+function isUnmatchedAlbum(album: api.LibraryAlbumItem): boolean {
+  return album.mb_identified === false;
+}
+
 export default function LibraryAlbums() {
   const navigate = useNavigate();
   const location = useLocation();
+  const { includeUnmatched } = useOutletContext<LibraryOutletContext>();
   const { toast } = useToast();
   const { startPlayback, setCurrentTrack } = usePlayback();
   const { search, genre, label, year } = useLibraryQuery();
@@ -115,6 +121,7 @@ export default function LibraryAlbums() {
         genre: genre || undefined,
         label: label || undefined,
         year: year ?? undefined,
+        includeUnmatched,
       });
       if (rid !== requestIdRef.current) return;
       const list = Array.isArray(data.albums) ? data.albums : [];
@@ -133,7 +140,7 @@ export default function LibraryAlbums() {
     } finally {
       if (rid === requestIdRef.current) setAlbumLoading(false);
     }
-  }, [genre, hydrateAlbumLikes, label, limit, search, sort, year]);
+  }, [genre, hydrateAlbumLikes, includeUnmatched, label, limit, search, sort, year]);
 
   useEffect(() => {
     try {
@@ -146,7 +153,7 @@ export default function LibraryAlbums() {
   useEffect(() => {
     setOffset(0);
     void fetchAlbums({ reset: true, pageOffset: 0 });
-  }, [search, genre, label, year, sort, fetchAlbums]);
+  }, [search, genre, label, year, sort, includeUnmatched, fetchAlbums]);
 
   const handlePlayAlbum = async (albumId: number, fallbackTitle: string, fallbackThumb?: string | null) => {
     try {
@@ -225,7 +232,10 @@ export default function LibraryAlbums() {
       <div className="grid gap-4" style={{ gridTemplateColumns }}>
         {albums.map((a) => (
           <div key={`alb-${a.album_id}`} className="group">
-            <div className="relative overflow-hidden rounded-2xl border border-border/60 bg-card shadow-sm">
+            <div className={cn(
+              'relative overflow-hidden rounded-2xl border border-border/60 bg-card shadow-sm',
+              isUnmatchedAlbum(a) && 'ring-1 ring-amber-500/45 shadow-[0_0_0_1px_rgba(245,158,11,0.25),0_0_24px_rgba(245,158,11,0.14)]'
+            )}>
               <AspectRatio
                 ratio={1}
                 className="bg-muted"
@@ -247,6 +257,13 @@ export default function LibraryAlbums() {
                     <Music className="w-10 h-10 text-muted-foreground" />
                   </div>
                 )}
+                {isUnmatchedAlbum(a) ? (
+                  <div className="absolute top-2 left-2">
+                    <Badge variant="outline" className="text-[10px] border-amber-500/50 text-amber-700 bg-background/75 backdrop-blur dark:text-amber-300">
+                      Unmatched
+                    </Badge>
+                  </div>
+                ) : null}
                 <div className="absolute inset-0 opacity-0 group-hover:opacity-100 transition-opacity bg-black/35" />
                 <div className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity">
                   <Button
@@ -304,6 +321,11 @@ export default function LibraryAlbums() {
                   <Badge variant="outline" className="text-[10px]">
                     {a.track_count}t
                   </Badge>
+                  {isUnmatchedAlbum(a) ? (
+                    <Badge variant="outline" className="text-[10px] border-amber-500/50 text-amber-700 dark:text-amber-300">
+                      Verify tags
+                    </Badge>
+                  ) : null}
                 </div>
 
                 {(normalizeGenreBadges(a).length > 0 || a.label) ? (

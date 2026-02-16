@@ -6,12 +6,21 @@ export interface LibraryQueryState {
   genre: string;
   label: string;
   year: number | null;
+  includeUnmatched: boolean | null;
 }
 
 function parseYear(raw: string | null): number | null {
   if (!raw) return null;
   const n = Number(raw);
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : null;
+}
+
+function parseBoolParam(raw: string | null): boolean | null {
+  if (raw == null || raw === '') return null;
+  const v = String(raw).trim().toLowerCase();
+  if (['1', 'true', 'yes', 'on'].includes(v)) return true;
+  if (['0', 'false', 'no', 'off'].includes(v)) return false;
+  return null;
 }
 
 export function useLibraryQuery() {
@@ -23,6 +32,7 @@ export function useLibraryQuery() {
       genre: (sp.get('genre') || '').trim(),
       label: (sp.get('label') || '').trim(),
       year: parseYear(sp.get('year')),
+      includeUnmatched: parseBoolParam(sp.get('include_unmatched')),
     };
   }, [sp]);
 
@@ -49,6 +59,11 @@ export function useLibraryQuery() {
         if (y && Number.isFinite(y) && y > 0) next.set('year', String(Math.floor(y)));
         else next.delete('year');
       }
+      if (updates.includeUnmatched !== undefined) {
+        const v = updates.includeUnmatched;
+        if (v == null) next.delete('include_unmatched');
+        else next.set('include_unmatched', v ? '1' : '0');
+      }
       setSp(next, { replace: Boolean(opts?.replace) });
     },
     [setSp, sp]
@@ -69,4 +84,3 @@ export function useLibraryQuery() {
     clearAll,
   };
 }
-

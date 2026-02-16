@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { useLocation, useNavigate } from 'react-router-dom';
+import { useLocation, useNavigate, useOutletContext } from 'react-router-dom';
 import { Building2, Loader2 } from 'lucide-react';
 
 import { Badge } from '@/components/ui/badge';
@@ -8,10 +8,12 @@ import { Card } from '@/components/ui/card';
 import { useLibraryQuery } from '@/hooks/useLibraryQuery';
 import * as api from '@/lib/api';
 import { cn } from '@/lib/utils';
+import type { LibraryOutletContext } from '@/pages/LibraryLayout';
 
 export default function LibraryLabels() {
   const navigate = useNavigate();
   const location = useLocation();
+  const { includeUnmatched } = useOutletContext<LibraryOutletContext>();
   const { search, genre, year } = useLibraryQuery();
 
   const [loading, setLoading] = useState(false);
@@ -32,6 +34,7 @@ export default function LibraryLabels() {
         search: search.trim() || undefined,
         genre: genre || undefined,
         year: year ?? undefined,
+        includeUnmatched,
         limit,
         offset: opts.pageOffset,
       });
@@ -51,12 +54,12 @@ export default function LibraryLabels() {
     } finally {
       if (rid === requestIdRef.current) setLoading(false);
     }
-  }, [genre, limit, search, year]);
+  }, [genre, includeUnmatched, limit, search, year]);
 
   useEffect(() => {
     setOffset(0);
     void fetchLabels({ reset: true, pageOffset: 0 });
-  }, [search, genre, year, fetchLabels]);
+  }, [search, genre, year, includeUnmatched, fetchLabels]);
 
   const canLoadMore = labels.length < total && !loading;
 
@@ -120,4 +123,3 @@ export default function LibraryLabels() {
     </div>
   );
 }
-
