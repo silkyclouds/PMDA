@@ -906,7 +906,16 @@ def _check_required_tags(meta: dict, required_tags: list, edition: dict | None =
         meta_keys = TAG_META_KEYS.get(key, [key])
         if not any((meta or {}).get(k) for k in meta_keys):
             missing.append(tag)
-    return missing
+    # Genre is useful but non-blocking for completeness.
+    out: list[str] = []
+    for tag in missing:
+        key = str(tag or "").strip().lower()
+        if not key:
+            continue
+        if key == "genre":
+            continue
+        out.append(tag)
+    return out
 
 
 def _parse_skip_folders(val):
@@ -6634,7 +6643,7 @@ def _rebuild_files_library_index(reason: str = "manual", wait_if_running: bool =
                         "is_lossless": bool(is_lossless),
                         "has_cover": bool(has_cover),
                         "cover_path": str(cover_path) if cover_path else "",
-                        "mb_identified": bool(identity_fields["has_mbid"]),
+                        "mb_identified": bool(identity_fields["has_identity"]),
                         "musicbrainz_release_group_id": mbid,
                         "track_count": actual_track_count,
                         "total_duration_sec": total_duration_sec,
@@ -6651,6 +6660,10 @@ def _rebuild_files_library_index(reason: str = "manual", wait_if_running: bool =
                         "metadata_source": identity_fields["identity_provider"] or identity_fields["metadata_source"],
                     }
                 )
+
+        # Fill missing genres from dominant artist genres (when available), and keep
+        # missing-required tags aligned with non-blocking genre behavior.
+        _apply_genre_defaults_to_albums_payload(albums_payload)
 
         _files_index_set_state(phase="writing", artists=len(artists_map), albums=len(albums_payload))
 
@@ -18412,6 +18425,187 @@ def _extract_musicbrainz_id_from_meta(meta: dict | None) -> str:
     return ""
 
 
+def _has_trusted_album_identity(
+    *,
+    musicbrainz_id: str | None = None,
+    discogs_release_id: str | None = None,
+    lastfm_album_mbid: str | None = None,
+    bandcamp_album_url: str | None = None,
+) -> bool:
+    """Return True when we have a provider identifier from a trusted music source."""
+    return bool(
+        str(musicbrainz_id or "").strip()
+        or str(discogs_release_id or "").strip()
+        or str(lastfm_album_mbid or "").strip()
+        or str(bandcamp_album_url or "").strip()
+    )
+
+
+def _extract_artist_mbid_from_mb_payload(payload: dict | None) -> str:
+    """Best-effort extraction of first artist MBID from MB release/release-group payload."""
+    if not isinstance(payload, dict):
+        return ""
+    for item in (payload.get("artist-credit") or []):
+        if not isinstance(item, dict):
+            continue
+        artist = item.get("artist") or {}
+        if isinstance(artist, dict):
+            aid = str(artist.get("id") or "").strip()
+            if aid:
+                return aid
+    return ""
+
+
+def _resolve_artist_mbid_for_fanart(
+    *,
+    artist_name: str,
+    artist_mbid: str | None = None,
+    musicbrainz_id: str | None = None,
+    discogs_release_id: str | None = None,
+    lastfm_album_mbid: str | None = None,
+    bandcamp_album_url: str | None = None,
+) -> str:
+    """
+    Resolve artist MBID for Fanart.tv.
+    Fanart requires an artist MBID, so when we have a trusted album identity but no artist MBID yet,
+    we resolve it from MB release/release-group or Last.fm artist info.
+    """
+    mbid = str(artist_mbid or "").strip()
+    if len(mbid) == 36:
+        return mbid
+
+    trusted = _has_trusted_album_identity(
+        musicbrainz_id=musicbrainz_id,
+        discogs_release_id=discogs_release_id,
+        lastfm_album_mbid=lastfm_album_mbid,
+        bandcamp_album_url=bandcamp_album_url,
+    )
+    if not trusted:
+        return ""
+
+    release_like_ids: list[str] = []
+    for candidate in (musicbrainz_id, lastfm_album_mbid):
+        cid = str(candidate or "").strip()
+        if cid and cid not in release_like_ids:
+            release_like_ids.append(cid)
+
+    for rel_id in release_like_ids:
+        if len(rel_id) != 36 or not USE_MUSICBRAINZ:
+            continue
+        # Try as release first, then as release-group.
+        try:
+            release_data = musicbrainzngs.get_release_by_id(rel_id, includes=["artists"])["release"]
+            aid = _extract_artist_mbid_from_mb_payload(release_data)
+            if aid:
+                return aid
+        except Exception:
+            pass
+        try:
+            rg_data = musicbrainzngs.get_release_group_by_id(rel_id, includes=["artist-credits"])["release-group"]
+            aid = _extract_artist_mbid_from_mb_payload(rg_data)
+            if aid:
+                return aid
+        except Exception:
+            pass
+
+    # Last resort: Last.fm artist MBID (name-based), gated by trusted identity above.
+    if USE_LASTFM:
+        try:
+            lf = _fetch_lastfm_artist_info(artist_name) or {}
+            aid = str(lf.get("mbid") or "").strip()
+            if aid and len(aid) == 36:
+                return aid
+        except Exception:
+            pass
+
+    return ""
+
+
+def _dominant_genre_by_artist(albums_payload: list[dict]) -> dict[str, str]:
+    """Compute dominant genre per artist from already-discovered album payload."""
+    counts: dict[str, dict[str, int]] = defaultdict(dict)
+    canon: dict[str, dict[str, str]] = defaultdict(dict)
+    for album in albums_payload or []:
+        artist_norm = str(album.get("artist_norm") or "").strip()
+        if not artist_norm:
+            continue
+
+        tokens: list[str] = []
+        genre_raw = str(album.get("genre") or "").strip()
+        if genre_raw:
+            tokens.extend(_split_genre_values(genre_raw))
+        else:
+            try:
+                tags_raw = album.get("tags_json") or "[]"
+                parsed = json.loads(tags_raw) if isinstance(tags_raw, str) else (tags_raw or [])
+                if isinstance(parsed, list):
+                    tokens.extend([str(x or "").strip() for x in parsed if str(x or "").strip()])
+            except Exception:
+                pass
+        if not tokens:
+            continue
+        inferred = _infer_genre_from_bandcamp_tags(tokens)
+        chosen = str(inferred or (tokens[0] if tokens else "")).strip()
+        if not chosen:
+            continue
+        key = chosen.lower()
+        counts[artist_norm][key] = int(counts[artist_norm].get(key, 0)) + 1
+        canon[artist_norm][key] = chosen
+
+    out: dict[str, str] = {}
+    for artist_norm, gcounts in counts.items():
+        if not gcounts:
+            continue
+        key = max(gcounts.items(), key=lambda kv: (int(kv[1]), kv[0]))[0]
+        val = str(canon.get(artist_norm, {}).get(key) or "").strip()
+        if val:
+            out[artist_norm] = val
+    return out
+
+
+def _apply_genre_defaults_to_albums_payload(albums_payload: list[dict]) -> None:
+    """Backfill missing genre from artist dominant genre and keep missing-required in sync."""
+    if not albums_payload:
+        return
+    dominant = _dominant_genre_by_artist(albums_payload)
+    for album in albums_payload:
+        artist_norm = str(album.get("artist_norm") or "").strip()
+        if artist_norm and not str(album.get("genre") or "").strip():
+            fallback = str(dominant.get(artist_norm) or "").strip()
+            if fallback:
+                album["genre"] = fallback
+                # Keep raw tags aligned enough for later profile/genre displays.
+                try:
+                    tags_raw = album.get("tags_json") or "[]"
+                    tags = json.loads(tags_raw) if isinstance(tags_raw, str) else (tags_raw or [])
+                    if not isinstance(tags, list):
+                        tags = []
+                    if fallback.lower() not in {str(t or "").strip().lower() for t in tags}:
+                        tags.insert(0, fallback)
+                        album["tags_json"] = json.dumps(tags[:20])
+                except Exception:
+                    pass
+                try:
+                    primary_raw = album.get("primary_tags_json") or "{}"
+                    primary = json.loads(primary_raw) if isinstance(primary_raw, str) else (primary_raw or {})
+                    if isinstance(primary, dict) and not str(primary.get("genre") or "").strip():
+                        primary["genre"] = fallback
+                        album["primary_tags_json"] = json.dumps(primary, default=str)
+                except Exception:
+                    pass
+
+        # Genre is non-blocking for completeness: remove it from missing_required list if present.
+        try:
+            missing_raw = album.get("missing_required_tags_json") or "[]"
+            missing = json.loads(missing_raw) if isinstance(missing_raw, str) else (missing_raw or [])
+            if not isinstance(missing, list):
+                missing = []
+        except Exception:
+            missing = []
+        filtered = [m for m in missing if str(m or "").strip().lower() != "genre"]
+        album["missing_required_tags_json"] = json.dumps(filtered)
+
+
 def _extract_files_identity_fields(
     *,
     tags: dict | None = None,
@@ -18465,22 +18659,24 @@ def _extract_files_identity_fields(
         or ""
     )
     metadata_source = _normalize_identity_provider(str(metadata_source_raw or ""))
+    has_identity = _has_trusted_album_identity(
+        musicbrainz_id=mbid,
+        discogs_release_id=discogs_release_id,
+        lastfm_album_mbid=lastfm_album_mbid,
+        bandcamp_album_url=bandcamp_album_url,
+    )
     identity_provider = ""
-    if mbid:
-        identity_provider = "musicbrainz"
-    elif metadata_source in {"musicbrainz", "discogs", "lastfm", "bandcamp"}:
-        identity_provider = metadata_source
-    elif discogs_release_id:
-        identity_provider = "discogs"
-    elif lastfm_album_mbid:
-        identity_provider = "lastfm"
-    elif bandcamp_album_url:
-        identity_provider = "bandcamp"
-    elif bool(cached.get("has_identity")):
-        identity_provider = _normalize_identity_provider(str(cached.get("identity_provider") or "")) or ""
-    has_identity = bool(identity_provider)
-    if not has_identity and bool(cached.get("has_identity")):
-        has_identity = True
+    if has_identity:
+        if mbid:
+            identity_provider = "musicbrainz"
+        elif discogs_release_id:
+            identity_provider = "discogs"
+        elif lastfm_album_mbid:
+            identity_provider = "lastfm"
+        elif bandcamp_album_url:
+            identity_provider = "bandcamp"
+        elif metadata_source in {"musicbrainz", "discogs", "lastfm", "bandcamp"}:
+            identity_provider = metadata_source
     return {
         "musicbrainz_id": mbid,
         "has_mbid": bool(mbid),
@@ -19103,18 +19299,33 @@ def _publish_files_library_artist_from_items(
                         if len(missing_indices) > 5000:
                             missing_indices = missing_indices[:5000]
                             break
+        album_id = _parse_int_loose(item.get("album_id"), 0)
+        result = results_by_album_id.get(album_id, {})
         mbid = (
             (item.get("musicbrainz_id") or "").strip()
             or _extract_musicbrainz_id_from_meta(tags)
             or ""
         )
+        discogs_release_id = (
+            result.get("discogs_release_id")
+            or item.get("discogs_release_id")
+            or ""
+        ).strip()
+        lastfm_album_mbid = (
+            result.get("lastfm_album_mbid")
+            or item.get("lastfm_album_mbid")
+            or ""
+        ).strip()
+        bandcamp_album_url = (
+            result.get("bandcamp_album_url")
+            or item.get("bandcamp_album_url")
+            or ""
+        ).strip()
         missing_required = _check_required_tags(
             tags,
             REQUIRED_TAGS,
             edition={"tracks": [{"title": t.get("title"), "index": t.get("track_num")} for t in track_entries]},
         )
-        album_id = _parse_int_loose(item.get("album_id"), 0)
-        result = results_by_album_id.get(album_id, {})
         pmda_provider = (tags.get(PMDA_MATCH_PROVIDER_TAG) or "").strip()
         rows.append(
             {
@@ -19135,23 +19346,16 @@ def _publish_files_library_artist_from_items(
                 "cover_path": str(cover_path) if cover_path else "",
                 "has_artist_image": has_artist_image,
                 "artist_image_path": str(artist_image_path) if artist_image_path else "",
-                "mb_identified": bool(mbid),
+                "mb_identified": _has_trusted_album_identity(
+                    musicbrainz_id=mbid,
+                    discogs_release_id=discogs_release_id,
+                    lastfm_album_mbid=lastfm_album_mbid,
+                    bandcamp_album_url=bandcamp_album_url,
+                ),
                 "musicbrainz_release_group_id": mbid,
-                "discogs_release_id": (
-                    result.get("discogs_release_id")
-                    or item.get("discogs_release_id")
-                    or ""
-                ).strip(),
-                "lastfm_album_mbid": (
-                    result.get("lastfm_album_mbid")
-                    or item.get("lastfm_album_mbid")
-                    or ""
-                ).strip(),
-                "bandcamp_album_url": (
-                    result.get("bandcamp_album_url")
-                    or item.get("bandcamp_album_url")
-                    or ""
-                ).strip(),
+                "discogs_release_id": discogs_release_id,
+                "lastfm_album_mbid": lastfm_album_mbid,
+                "bandcamp_album_url": bandcamp_album_url,
                 "primary_metadata_source": (
                     (
                         result.get("provider_used")
@@ -19175,6 +19379,7 @@ def _publish_files_library_artist_from_items(
                 "updated_at": now,
             }
         )
+    _apply_genre_defaults_to_albums_payload(rows)
     inserted = _upsert_files_library_published_rows(rows)
     if inserted:
         logging.debug("Published %d album(s) for artist '%s' to files_library_published_albums", inserted, artist_name)
@@ -19257,6 +19462,10 @@ def _rows_to_files_library_payload(rows: list[tuple]) -> tuple[dict[str, dict], 
                 tracks = []
         except Exception:
             tracks = []
+        musicbrainz_id = (row[17] or "").strip()
+        discogs_release_id = (row[27] or "").strip()
+        lastfm_album_mbid = (row[28] or "").strip()
+        bandcamp_album_url = (row[29] or "").strip()
         albums_payload.append(
             {
                 "artist_norm": artist_norm,
@@ -19272,8 +19481,13 @@ def _rows_to_files_library_payload(rows: list[tuple]) -> tuple[dict[str, dict], 
                 "is_lossless": bool(row[11]),
                 "has_cover": bool(row[12]),
                 "cover_path": (row[13] or "").strip(),
-                "mb_identified": bool(row[16]),
-                "musicbrainz_release_group_id": (row[17] or "").strip(),
+                "mb_identified": _has_trusted_album_identity(
+                    musicbrainz_id=musicbrainz_id,
+                    discogs_release_id=discogs_release_id,
+                    lastfm_album_mbid=lastfm_album_mbid,
+                    bandcamp_album_url=bandcamp_album_url,
+                ),
+                "musicbrainz_release_group_id": musicbrainz_id,
                 "track_count": int(row[18] or 0),
                 "total_duration_sec": int(row[19] or 0),
                 "is_broken": bool(row[20]),
@@ -19283,12 +19497,13 @@ def _rows_to_files_library_payload(rows: list[tuple]) -> tuple[dict[str, dict], 
                 "missing_required_tags_json": row[24] or "[]",
                 "primary_tags_json": row[25] or "{}",
                 "tracks": tracks,
-                "discogs_release_id": (row[27] or "").strip(),
-                "lastfm_album_mbid": (row[28] or "").strip(),
-                "bandcamp_album_url": (row[29] or "").strip(),
+                "discogs_release_id": discogs_release_id,
+                "lastfm_album_mbid": lastfm_album_mbid,
+                "bandcamp_album_url": bandcamp_album_url,
                 "metadata_source": _normalize_identity_provider((row[30] or "").strip()),
             }
         )
+    _apply_genre_defaults_to_albums_payload(albums_payload)
     return artists_map, albums_payload, len(albums_payload)
 
 
@@ -26880,7 +27095,12 @@ def _library_include_unmatched_effective() -> bool:
 def _library_albums_match_where(include_unmatched: bool, alias: str = "alb") -> str:
     if include_unmatched:
         return "1=1"
-    return f"COALESCE({alias}.mb_identified, FALSE) = TRUE"
+    return (
+        "("
+        f"COALESCE(NULLIF({alias}.musicbrainz_release_group_id, ''), NULLIF({alias}.discogs_release_id, ''), "
+        f"NULLIF({alias}.lastfm_album_mbid, ''), NULLIF({alias}.bandcamp_album_url, '')) IS NOT NULL"
+        ")"
+    )
 
 
 def _library_cache_unmatched_suffix(include_unmatched: bool) -> str:
@@ -36869,7 +37089,12 @@ def _fetch_artist_image_web(artist_name: str) -> Optional[str]:
     return None
 
 
-def _fetch_and_save_artist_image(artist_name: str, artist_folder: Path, artist_mbid: Optional[str] = None) -> Optional[str]:
+def _fetch_and_save_artist_image(
+    artist_name: str,
+    artist_folder: Path,
+    artist_mbid: Optional[str] = None,
+    identity_fields: Optional[dict] = None,
+) -> Optional[str]:
     """
     Fetch artist image from MB, then Last.fm, then Discogs and save to artist_folder (artist.jpg).
     Skips if artist_folder already has a dedicated artist image.
@@ -36879,15 +37104,26 @@ def _fetch_and_save_artist_image(artist_name: str, artist_folder: Path, artist_m
         return None
     if _artist_folder_has_image(artist_folder):
         return None
-    if not USE_MUSICBRAINZ and not USE_LASTFM and not USE_DISCOGS:
+    fanart_key = (getattr(sys.modules[__name__], "FANART_API_KEY", "") or "").strip()
+    if not USE_MUSICBRAINZ and not USE_LASTFM and not USE_DISCOGS and not fanart_key:
         return None
-    # Try MusicBrainz first (if we have MBID)
-    if artist_mbid and USE_MUSICBRAINZ:
-        if _fetch_and_save_artist_image_mb(artist_mbid, artist_folder):
+    identity_fields = dict(identity_fields or {})
+    mb_artist_for_fanart = _resolve_artist_mbid_for_fanart(
+        artist_name=artist_name,
+        artist_mbid=artist_mbid,
+        musicbrainz_id=identity_fields.get("musicbrainz_release_group_id") or identity_fields.get("musicbrainz_id"),
+        discogs_release_id=identity_fields.get("discogs_release_id"),
+        lastfm_album_mbid=identity_fields.get("lastfm_album_mbid"),
+        bandcamp_album_url=identity_fields.get("bandcamp_album_url"),
+    )
+
+    # Try MusicBrainz first (if we have an artist MBID)
+    if mb_artist_for_fanart and USE_MUSICBRAINZ:
+        if _fetch_and_save_artist_image_mb(mb_artist_for_fanart, artist_folder):
             return "musicbrainz"
     # Fanart.tv (MBID-based) – optional but often high-quality.
-    if artist_mbid:
-        url = _fetch_artist_image_fanart(artist_mbid)
+    if mb_artist_for_fanart:
+        url = _fetch_artist_image_fanart(mb_artist_for_fanart)
         if url:
             try:
                 resp = requests.get(url, timeout=10, allow_redirects=True)
@@ -38328,7 +38564,17 @@ def _improve_single_album(album_id: int, db_conn, known_release_group_id: Option
     if tags_updated or cover_saved:
         artist_folder = folder.parent
         had_artist_image = (artist_folder / "artist.jpg").exists()
-        artist_provider = _fetch_and_save_artist_image(artist_name, artist_folder, artist_mbid)
+        artist_provider = _fetch_and_save_artist_image(
+            artist_name,
+            artist_folder,
+            artist_mbid,
+            identity_fields={
+                "musicbrainz_release_group_id": release_mbid,
+                "discogs_release_id": discogs_release_id,
+                "lastfm_album_mbid": lastfm_album_mbid,
+                "bandcamp_album_url": bandcamp_album_url,
+            },
+        )
         if artist_provider:
             pmda_artist_provider = artist_provider
             steps.append("Fetched and saved artist image")
@@ -38957,7 +39203,17 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
     external_cached_path: Optional[str] = None
     if tags_updated or cover_saved:
         if artist_folder:
-            artist_provider = _fetch_and_save_artist_image(artist_name, artist_folder, artist_mbid)
+            artist_provider = _fetch_and_save_artist_image(
+                artist_name,
+                artist_folder,
+                artist_mbid,
+                identity_fields={
+                    "musicbrainz_release_group_id": release_mbid,
+                    "discogs_release_id": discogs_release_id,
+                    "lastfm_album_mbid": lastfm_album_mbid,
+                    "bandcamp_album_url": bandcamp_album_url,
+                },
+            )
             if artist_provider:
                 pmda_artist_provider = artist_provider
                 steps.append("Fetched and saved artist image")
@@ -38982,8 +39238,16 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
                     url = ""
                     prov = ""
                     try:
-                        if artist_mbid:
-                            url = (_fetch_artist_image_fanart(artist_mbid) or "").strip()
+                        fanart_artist_mbid = _resolve_artist_mbid_for_fanart(
+                            artist_name=artist_name,
+                            artist_mbid=artist_mbid,
+                            musicbrainz_id=release_mbid,
+                            discogs_release_id=discogs_release_id,
+                            lastfm_album_mbid=lastfm_album_mbid,
+                            bandcamp_album_url=bandcamp_album_url,
+                        )
+                        if fanart_artist_mbid:
+                            url = (_fetch_artist_image_fanart(fanart_artist_mbid) or "").strip()
                             if url:
                                 prov = "fanart"
                     except Exception:
