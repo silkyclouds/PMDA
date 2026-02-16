@@ -27126,6 +27126,7 @@ def api_config_get():
     # Local self-hosted UX: keep inputs masked by default in the UI component, but provide the
     # actual value so the "eye" toggle can reveal the key when explicitly requested by the user.
     payload.update({
+        "PLEX_TOKEN": str(plex_token_eff or ""),
         "OPENAI_API_KEY": str(openai_key_eff or ""),
         "ANTHROPIC_API_KEY": str(anthropic_key_eff or ""),
         "GOOGLE_API_KEY": str(google_key_eff or ""),
