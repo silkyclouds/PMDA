@@ -17,7 +17,7 @@ import type { LibraryOutletContext } from '@/pages/LibraryLayout';
 export default function LibraryHome() {
   const navigate = useNavigate();
   const location = useLocation();
-  const { includeUnmatched, stats } = useOutletContext<LibraryOutletContext>();
+  const { includeUnmatched } = useOutletContext<LibraryOutletContext>();
   const { toast } = useToast();
   const { startPlayback, setCurrentTrack, recommendationSessionId, session } = usePlayback();
 
@@ -193,21 +193,6 @@ export default function LibraryHome() {
 
   return (
     <div className="container pb-6 space-y-6">
-      <Card className="border-border/60">
-        <CardContent className="p-4 sm:p-5">
-          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
-            <div className="space-y-2">
-              <div className="text-xs uppercase tracking-wide text-muted-foreground">Library</div>
-              <div className="text-sm text-muted-foreground">
-                <span className="font-semibold text-foreground">
-                  {stats ? `${stats.artists.toLocaleString()} artists · ${stats.albums.toLocaleString()} albums` : 'Loading...'}
-                </span>
-              </div>
-            </div>
-          </div>
-        </CardContent>
-      </Card>
-
       {/* Discover */}
       <Card className="border-border/60 overflow-hidden">
         <CardHeader className="pb-3">

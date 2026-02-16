@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState, type SyntheticEvent } from 'react';
 import { Music } from 'lucide-react';
 
 type ArtworkSourcePhase = 'album' | 'artist' | 'none';
@@ -63,6 +63,14 @@ export function AlbumArtwork({
     setSrc(null);
   };
 
+  const onLoad = (e: SyntheticEvent<HTMLImageElement>) => {
+    const img = e.currentTarget;
+    if (phase === 'album' && artistUrl && img.naturalWidth <= 2 && img.naturalHeight <= 2) {
+      setPhase('artist');
+      setSrc(artistUrl);
+    }
+  };
+
   if (src) {
     return (
       <img
@@ -71,6 +79,7 @@ export function AlbumArtwork({
         loading="lazy"
         decoding="async"
         className={imageClassName}
+        onLoad={onLoad}
         onError={onError}
       />
     );

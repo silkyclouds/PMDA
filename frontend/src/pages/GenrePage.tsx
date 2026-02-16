@@ -111,7 +111,7 @@ export default function GenrePage() {
   }, [labels]);
   const gridTemplateColumns = useMemo(() => {
     const col = Math.max(140, Math.min(340, Math.floor(coverSize)));
-    return `repeat(auto-fill, minmax(${col}px, 1fr))`;
+    return `repeat(auto-fill, minmax(${col}px, ${col}px))`;
   }, [coverSize]);
 
   return (
@@ -187,7 +187,7 @@ export default function GenrePage() {
             <CardContent className="p-8 text-sm text-muted-foreground">No albums found for this genre.</CardContent>
           </Card>
         ) : (
-          <div className="grid gap-4" style={{ gridTemplateColumns }}>
+          <div className="grid gap-4 justify-start" style={{ gridTemplateColumns }}>
             {albums.map((a) => (
               <div
                 key={`genre-alb-${a.album_id}`}

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
-import { BarChart3, Library, ListMusic, Plus, Scan, Settings2, Wrench } from 'lucide-react';
+import { BarChart3, Building2, Disc3, House, Library, ListMusic, Plus, Scan, Settings2, Tags, Users, Wrench } from 'lucide-react';
 
 import * as api from '@/lib/api';
 import { cn } from '@/lib/utils';
@@ -83,16 +83,24 @@ export function AppSidebar() {
   }, [refreshPlaylists]);
 
   const mainItems = useMemo(
+    () => [{ to: '/library', label: 'Library', icon: Library }],
+    []
+  );
+
+  const librarySubItems = useMemo(
     () => [
-      { to: '/', label: 'Scan', icon: Scan },
-      { to: '/library', label: 'Library', icon: Library },
-      { to: '/library/playlists', label: 'Playlists', icon: ListMusic },
+      { to: '/library', label: 'Home', icon: House },
+      { to: '/library/artists', label: 'Artists', icon: Users },
+      { to: '/library/albums', label: 'Albums', icon: Disc3 },
+      { to: '/library/genres', label: 'Genres', icon: Tags },
+      { to: '/library/labels', label: 'Labels', icon: Building2 },
     ],
     []
   );
 
   const adminItems = useMemo(
     () => [
+      { to: '/scan', label: 'Scan', icon: Scan },
       { to: '/tools', label: 'Tools', icon: Wrench },
       { to: '/statistics', label: 'Statistics', icon: BarChart3 },
       { to: '/settings', label: 'Settings', icon: Settings2 },
@@ -159,6 +167,44 @@ export function AppSidebar() {
                   </SidebarMenuItem>
                 );
               })}
+
+              <SidebarMenuItem className="group-data-[collapsible=icon]:hidden">
+                <div className="pt-0.5" />
+              </SidebarMenuItem>
+              {librarySubItems.map((it) => {
+                const Icon = it.icon;
+                const path = location.pathname || '';
+                const active =
+                  (it.to === '/library' && (path === '/library' || path === '/library/')) ||
+                  (it.to === '/library/artists' && (path.startsWith('/library/artists') || path.startsWith('/library/artist/'))) ||
+                  (it.to === '/library/albums' && (path.startsWith('/library/albums') || path.startsWith('/library/album/'))) ||
+                  (it.to === '/library/genres' && (path.startsWith('/library/genres') || path.startsWith('/library/genre/'))) ||
+                  (it.to === '/library/labels' && (path.startsWith('/library/labels') || path.startsWith('/library/label/')));
+                return (
+                  <SidebarMenuItem key={`library-sub-${it.to}`}>
+                    <SidebarMenuButton
+                      isActive={active}
+                      tooltip={it.label}
+                      size="sm"
+                      className="ml-5 group-data-[collapsible=icon]:hidden"
+                      onClick={() => navigate(it.to)}
+                    >
+                      <Icon className="h-3.5 w-3.5" />
+                      <span>{it.label}</span>
+                    </SidebarMenuButton>
+                  </SidebarMenuItem>
+                );
+              })}
+              <SidebarMenuItem>
+                <SidebarMenuButton
+                  isActive={isPathActive(location.pathname, '/library/playlists')}
+                  tooltip="Playlists"
+                  onClick={() => navigate('/library/playlists')}
+                >
+                  <ListMusic className="h-4 w-4" />
+                  <span>Playlists</span>
+                </SidebarMenuButton>
+              </SidebarMenuItem>
             </SidebarMenu>
           </SidebarGroupContent>
         </SidebarGroup>
@@ -253,4 +299,3 @@ export function AppSidebar() {
     </Sidebar>
   );
 }
-

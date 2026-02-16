@@ -46,7 +46,8 @@ function AppRoutesWithPlayer() {
       <ScanFinishedInvalidator />
       <Routes>
         <Route element={<AppLayout />}>
-          <Route path="/" element={<Scan />} />
+          <Route path="/" element={<Navigate to="/library" replace />} />
+          <Route path="/scan" element={<Scan />} />
           <Route path="/unduper" element={<Navigate to="/tools" replace />} />
           <Route path="/history" element={<Navigate to="/tools" replace />} />
           <Route path="/statistics" element={<Statistics />} />
@@ -55,6 +56,7 @@ function AppRoutesWithPlayer() {
           <Route path="/tools" element={<Tools />} />
           <Route path="/library" element={<LibraryLayout />}>
             <Route index element={<LibraryHome />} />
+            <Route path="home" element={<LibraryHome />} />
             <Route path="artists" element={<LibraryArtists />} />
             <Route path="albums" element={<LibraryAlbums />} />
             <Route path="genres" element={<LibraryGenres />} />

@@ -78,7 +78,7 @@ export default function LibraryAlbums() {
 
   const gridTemplateColumns = useMemo(() => {
     const col = Math.max(140, Math.min(340, Math.floor(coverSize)));
-    return `repeat(auto-fill, minmax(${col}px, 1fr))`;
+    return `repeat(auto-fill, minmax(${col}px, ${col}px))`;
   }, [coverSize]);
 
   const hydrateAlbumLikes = useCallback(async (ids: number[]) => {
@@ -271,7 +271,7 @@ export default function LibraryAlbums() {
         </Card>
       ) : null}
 
-      <div className="grid gap-4" style={{ gridTemplateColumns }}>
+      <div className="grid gap-4 justify-start" style={{ gridTemplateColumns }}>
         {albums.map((a) => (
           <div key={`alb-${a.album_id}`} className="group">
             <div className={cn(

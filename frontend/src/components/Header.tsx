@@ -1,6 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
-import { Settings, RefreshCw } from 'lucide-react';
-import { useNavigate } from 'react-router-dom';
+import { RefreshCw } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { WelcomeModal } from '@/components/WelcomeModal';
 import { ThemeToggle } from '@/components/ThemeToggle';
@@ -64,7 +63,6 @@ function RebootCountdown({ onComplete, onProgress }: { onComplete: () => void; o
 }
 
 export function Header() {
-  const navigate = useNavigate();
   const [showSettings, setShowSettings] = useState(false);
   const [isRebooting, setIsRebooting] = useState(false);
   const [rebootCountdown, setRebootCountdown] = useState(30);
@@ -84,44 +82,21 @@ export function Header() {
     }).catch(() => {});
   }, []);
 
-  const handleSettingsClick = () => {
-    if (isConfigured === true) {
-      navigate('/settings');
-      return;
-    }
-    if (hasWelcomeCookie()) {
-      navigate('/settings');
-      return;
-    }
-    setShowSettings(true);
-  };
-
   return (
     <>
       <header className="sticky top-0 z-50 border-b border-border bg-card/95 backdrop-blur supports-[backdrop-filter]:bg-card/80">
         <div className="container py-3">
-          <div className="flex items-center justify-between">
-            {/* Logo */}
-            <div className="flex items-center gap-3">
-              <SidebarTrigger className="h-9 w-9" />
-              <Logo size="md" />
+          <div className="space-y-3">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <SidebarTrigger className="h-9 w-9" />
+                <Logo size="md" />
+              </div>
+              <div className="flex items-center gap-2">
+                <ThemeToggle />
+              </div>
             </div>
-
-            <GlobalSearch />
-
-            {/* Right actions */}
-            <div className="flex items-center gap-2">
-              <ThemeToggle />
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={handleSettingsClick}
-                className="flex items-center gap-2 text-muted-foreground hover:text-foreground"
-              >
-                <Settings className="w-4 h-4" />
-                <span className="hidden sm:inline">Settings</span>
-              </Button>
-            </div>
+            <GlobalSearch className="max-w-none" />
           </div>
         </div>
       </header>

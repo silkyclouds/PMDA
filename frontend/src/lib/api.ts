@@ -984,6 +984,7 @@ export async function getLibraryAlbums(options?: {
 export interface LibraryFacetItem {
   value: string;
   count: number;
+  thumb?: string | null;
 }
 
 export interface LibraryFacetYearItem {

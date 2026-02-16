@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { matchPath, useLocation, useNavigate } from 'react-router-dom';
-import { Bot, Loader2, Send, Sparkles } from 'lucide-react';
+import { Bot, Loader2, MessageCircle, Send, Sparkles } from 'lucide-react';
 
 import { cn } from '@/lib/utils';
 import * as api from '@/lib/api';
@@ -79,7 +79,6 @@ export function AssistantDock({ bottomOffsetPx = 16 }: { bottomOffsetPx?: number
   const [draft, setDraft] = useState('');
   const [contextLabel, setContextLabel] = useState<string>('');
 
-  const inputRef = useRef<HTMLInputElement | null>(null);
   const panelInputRef = useRef<HTMLInputElement | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
 
@@ -239,63 +238,31 @@ export function AssistantDock({ bottomOffsetPx = 16 }: { bottomOffsetPx?: number
   const pill = (
     <div
       className={cn(
-        'fixed right-4 z-[70] w-[min(420px,calc(100vw-2rem))]',
+        'fixed right-4 z-[70]',
         'pointer-events-auto',
       )}
       style={{ bottom: bottomOffsetPx }}
     >
-      <div
+      <Button
+        type="button"
+        size="icon"
         className={cn(
-          'group relative flex items-center gap-2 rounded-full border bg-background/75 backdrop-blur-md shadow-[0_10px_40px_rgba(0,0,0,0.18)]',
-          'dark:bg-zinc-950/60',
-          'border-border/60',
-          'px-3 py-2',
+          'relative h-12 w-12 rounded-full border border-border/60',
+          'bg-background/85 backdrop-blur-md shadow-[0_10px_30px_rgba(0,0,0,0.2)]',
+          'hover:scale-[1.02] transition'
         )}
+        onClick={() => setOpen(true)}
+        title={assistantOnline ? 'Open PMDA assistant' : offlineReason || 'Assistant unavailable'}
       >
-        <div className="relative">
-          <Sparkles className={cn('h-4 w-4', assistantOnline ? 'text-amber-500' : 'text-muted-foreground')} />
-          <span
-            className={cn(
-              'absolute -right-1 -bottom-1 h-2 w-2 rounded-full border border-background',
-              assistantOnline ? 'bg-emerald-500' : 'bg-zinc-500',
-            )}
-            title={assistantOnline ? 'Assistant online' : 'Assistant offline'}
-          />
-        </div>
-        <Input
-          ref={inputRef}
-          value={draft}
-          onChange={(e) => setDraft(e.target.value)}
-          onFocus={() => setOpen(true)}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter') {
-              e.preventDefault();
-              setOpen(true);
-              void submit();
-            }
-          }}
-          placeholder={assistantOnline ? 'Ask PMDA…' : offlineReason || 'Assistant unavailable'}
-          disabled={!assistantOnline || sending}
+        <MessageCircle className={cn('h-5 w-5', assistantOnline ? 'text-primary' : 'text-muted-foreground')} />
+        <Sparkles className={cn('absolute -bottom-1 -left-1 h-3.5 w-3.5', assistantOnline ? 'text-amber-400' : 'text-muted-foreground')} />
+        <span
           className={cn(
-            'h-9 border-0 bg-transparent px-0 shadow-none focus-visible:ring-0',
-            'placeholder:text-muted-foreground/80',
+            'absolute -top-0.5 -right-0.5 h-2.5 w-2.5 rounded-full border border-background',
+            assistantOnline ? 'bg-emerald-500' : 'bg-zinc-500',
           )}
         />
-        <Button
-          type="button"
-          size="icon"
-          variant="ghost"
-          className="h-9 w-9 rounded-full"
-          onClick={() => {
-            setOpen(true);
-            void submit();
-          }}
-          disabled={!assistantOnline || sending || !draft.trim()}
-          title="Send"
-        >
-          {sending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
-        </Button>
-      </div>
+      </Button>
     </div>
   );
 

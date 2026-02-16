@@ -32588,21 +32588,21 @@ def api_library_labels():
 
             cur.execute(
                 f"""
-                WITH label_tokens AS (
-                    SELECT TRIM(COALESCE(alb.label, '')) AS label_disp
+                WITH album_rows AS (
+                    SELECT
+                        alb.id AS album_id,
+                        TRIM(COALESCE(alb.label, '')) AS label_disp,
+                        LOWER(TRIM(COALESCE(alb.label, ''))) AS label_norm,
+                        COALESCE(alb.has_cover, FALSE) AS has_cover,
+                        COALESCE(alb.updated_at, alb.created_at, NOW()) AS recency
                     FROM files_albums alb
                     WHERE COALESCE(TRIM(alb.label), '') <> ''
                       AND {" AND ".join(album_filters)}
                       AND (%s = '' OR TRIM(COALESCE(alb.label, '')) ILIKE %s)
                 ),
-                norm_tokens AS (
-                    SELECT LOWER(label_disp) AS label_norm, label_disp
-                    FROM label_tokens
-                    WHERE COALESCE(label_disp, '') <> ''
-                ),
                 counts AS (
                     SELECT label_norm, COUNT(*) AS c
-                    FROM norm_tokens
+                    FROM album_rows
                     GROUP BY label_norm
                 ),
                 best_disp AS (
@@ -32613,12 +32613,24 @@ def api_library_labels():
                             PARTITION BY label_norm
                             ORDER BY COUNT(*) DESC, LENGTH(label_disp) DESC, label_disp ASC
                         ) AS rn
-                    FROM norm_tokens
+                    FROM album_rows
                     GROUP BY label_norm, label_disp
+                ),
+                cover_pick AS (
+                    SELECT
+                        label_norm,
+                        album_id,
+                        has_cover,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY label_norm
+                            ORDER BY has_cover DESC, recency DESC, album_id DESC
+                        ) AS rn
+                    FROM album_rows
                 )
-                SELECT b.label_disp AS label, c.c
+                SELECT b.label_disp AS label, c.c, cp.album_id, cp.has_cover
                 FROM counts c
                 JOIN best_disp b ON b.label_norm = c.label_norm AND b.rn = 1
+                LEFT JOIN cover_pick cp ON cp.label_norm = c.label_norm AND cp.rn = 1
                 ORDER BY c.c DESC, label ASC
                 LIMIT %s OFFSET %s
                 """,
@@ -32626,7 +32638,19 @@ def api_library_labels():
             )
             rows = cur.fetchall()
 
-        labels = [{"value": (r[0] or "").strip(), "count": int(r[1] or 0)} for r in rows if str(r[0] or "").strip()]
+        base_url = request.url_root.rstrip("/")
+        labels = []
+        for r in rows:
+            label_value = str((r[0] or "")).strip()
+            if not label_value:
+                continue
+            count = int(r[1] or 0)
+            album_id = int(r[2] or 0)
+            has_cover = bool(r[3]) if len(r) > 3 else False
+            thumb = None
+            if album_id > 0 and has_cover:
+                thumb = f"{base_url}/api/library/files/album/{album_id}/cover?size=96"
+            labels.append({"value": label_value, "count": count, "thumb": thumb})
         payload = {"labels": labels, "total": total, "limit": int(limit), "offset": int(offset)}
         _files_cache_set_json(cache_key, payload, ttl=45)
         return jsonify(payload)

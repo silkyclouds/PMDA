@@ -6,7 +6,7 @@ import { cn } from '@/lib/utils';
 import type { LibrarySearchSuggestionItem } from '@/lib/api';
 import * as api from '@/lib/api';
 
-export function GlobalSearch() {
+export function GlobalSearch({ className }: { className?: string }) {
   const navigate = useNavigate();
   const rootRef = useRef<HTMLDivElement | null>(null);
   const [query, setQuery] = useState('');
@@ -119,7 +119,7 @@ export function GlobalSearch() {
   };
 
   return (
-    <div ref={rootRef} className="relative hidden lg:block w-[24rem] xl:w-[28rem]">
+    <div ref={rootRef} className={cn('relative w-full max-w-[28rem]', className)}>
       <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground pointer-events-none" />
       <Input
         value={query}

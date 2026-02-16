@@ -672,26 +672,26 @@ export default function ArtistPage() {
 
         <Card className="overflow-hidden border-border/70">
           <div className="relative">
-            <div className="absolute inset-0 bg-gradient-to-r from-background via-background/90 to-background/70 z-10" />
+            <div className="absolute inset-0 bg-gradient-to-r from-background via-background/88 to-background/55 z-10" />
             {heroImage ? (
-              <img src={heroImage} alt={details.artist_name} className="w-full h-64 object-cover blur-[1px] scale-105" />
+              <img src={heroImage} alt={details.artist_name} className="w-full h-80 md:h-96 object-cover blur-[1px] scale-[1.03]" />
             ) : (
-              <div className="h-64 bg-gradient-to-br from-zinc-900 via-zinc-800 to-zinc-900" />
+              <div className="h-80 md:h-96 bg-gradient-to-br from-zinc-900 via-zinc-800 to-zinc-900" />
             )}
             <div className="absolute inset-0 z-20 p-6 md:p-8 flex items-end">
-              <div className="grid grid-cols-1 md:grid-cols-[8.5rem,1fr] gap-5 w-full items-end">
-                <div className="w-28 h-28 md:w-36 md:h-36 rounded-3xl overflow-hidden border border-border/60 bg-muted shrink-0 shadow-sm">
+              <div className="grid grid-cols-1 md:grid-cols-[12rem,1fr] gap-6 w-full items-end">
+                <div className="w-40 h-40 md:w-52 md:h-52 lg:w-56 lg:h-56 rounded-3xl overflow-hidden border border-border/60 bg-muted shrink-0 shadow-[0_24px_60px_rgba(0,0,0,0.35)]">
                   {heroImage ? (
                     <img src={heroImage} alt={details.artist_name} className="w-full h-full object-cover animate-in fade-in-0 duration-300" />
                   ) : (
                     <div className="w-full h-full flex items-center justify-center">
-                      <Music className="w-8 h-8 text-muted-foreground" />
+                      <Music className="w-12 h-12 text-muted-foreground" />
                     </div>
                   )}
                 </div>
                 <div className="min-w-0">
-                  <h1 className="text-3xl md:text-4xl font-bold tracking-tight truncate">{details.artist_name}</h1>
-                  <p className="text-sm text-muted-foreground mt-1">
+                  <h1 className="text-4xl md:text-5xl font-bold tracking-tight truncate">{details.artist_name}</h1>
+                  <p className="text-base text-muted-foreground mt-1.5">
                     {details.total_albums.toLocaleString()} album{details.total_albums !== 1 ? 's' : ''}
                   </p>
                   {tags.length > 0 && (
