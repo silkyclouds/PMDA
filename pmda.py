@@ -12037,6 +12037,7 @@ def _first_cover_path(folder: Path) -> Optional[Path]:
     if not folder or not folder.is_dir():
         return None
     try:
+        generic_images: list[Path] = []
         for name in _COVER_NAMES:
             p = folder / name
             if p.is_file():
@@ -12044,8 +12045,15 @@ def _first_cover_path(folder: Path) -> Optional[Path]:
         for p in sorted(folder.iterdir(), key=lambda x: x.name.lower()):
             if not p.is_file():
                 continue
+            if p.suffix.lower() not in _COVER_EXTS:
+                continue
             if _is_probable_cover_filename(p.name):
                 return p
+            generic_images.append(p)
+        # Some releases ship a single image file with a non-standard name
+        # (e.g. "00_release.jpg", "p1.jpg"). Treat it as cover.
+        if len(generic_images) == 1:
+            return generic_images[0]
         return None
     except OSError:
         return None
@@ -29943,6 +29951,8 @@ def api_library_discover():
                     COALESCE(alb.format, '') AS format,
                     alb.is_lossless,
                     alb.has_cover,
+                    COALESCE(alb.cover_path, '') AS cover_path,
+                    COALESCE(alb.folder_path, '') AS folder_path,
                     alb.mb_identified,
                     ar.id AS artist_id,
                     ar.name AS artist_name,
@@ -31303,6 +31313,8 @@ def api_library_albums():
                     COALESCE(alb.format, '') AS format,
                     alb.is_lossless,
                     alb.has_cover,
+                    COALESCE(alb.cover_path, '') AS cover_path,
+                    COALESCE(alb.folder_path, '') AS folder_path,
                     alb.mb_identified,
                     ar.id AS artist_id,
                     ar.name AS artist_name,
@@ -31323,10 +31335,27 @@ def api_library_albums():
 
         base_url = request.url_root.rstrip("/")
         albums = []
-        for album_id, title, year, genre, label, tags_json, track_count, fmt, is_lossless, has_cover, mb_identified, artist_id, artist_name, short_desc, profile_source in rows:
+        cover_updates: list[tuple[str, int]] = []
+        for album_id, title, year, genre, label, tags_json, track_count, fmt, is_lossless, has_cover, cover_path_raw, folder_path_raw, mb_identified, artist_id, artist_name, short_desc, profile_source in rows:
             aid = int(album_id or 0)
             arid = int(artist_id or 0)
-            thumb = f"{base_url}/api/library/files/album/{aid}/cover?size=512" if bool(has_cover) else None
+            has_cover_effective = bool(has_cover)
+            if not has_cover_effective:
+                try:
+                    cover_raw = str(cover_path_raw or "").strip()
+                    cover_path = path_for_fs_access(Path(cover_raw)) if cover_raw else None
+                    if cover_path and cover_path.exists() and cover_path.is_file():
+                        has_cover_effective = True
+                    else:
+                        folder_raw = str(folder_path_raw or "").strip()
+                        folder_path = path_for_fs_access(Path(folder_raw)) if folder_raw else None
+                        fallback_cover = _first_cover_path(folder_path) if folder_path else None
+                        if fallback_cover and fallback_cover.exists() and fallback_cover.is_file():
+                            has_cover_effective = True
+                            cover_updates.append((str(fallback_cover), aid))
+                except Exception:
+                    has_cover_effective = bool(has_cover)
+            thumb = f"{base_url}/api/library/files/album/{aid}/cover?size=512" if has_cover_effective else None
             short_desc_clean = (short_desc or "").strip()
             # Parsed list of genres for UI badges (multi-genre albums).
             genres_list: list[str] = []
@@ -31370,6 +31399,7 @@ def api_library_albums():
                     "format": (fmt or "").strip() or None,
                     "is_lossless": bool(is_lossless),
                     "mb_identified": bool(mb_identified),
+                    "has_cover": has_cover_effective,
                     "thumb": thumb,
                     "artist_id": arid,
                     "artist_name": artist_name or "",
@@ -31377,6 +31407,24 @@ def api_library_albums():
                     "profile_source": (profile_source or "").strip() or None,
                 }
             )
+
+        if cover_updates:
+            try:
+                with conn.transaction():
+                    with conn.cursor() as wcur:
+                        wcur.executemany(
+                            """
+                            UPDATE files_albums
+                            SET has_cover = TRUE,
+                                cover_path = %s,
+                                updated_at = NOW()
+                            WHERE id = %s
+                            """,
+                            cover_updates,
+                        )
+                _files_cache_invalidate_all()
+            except Exception:
+                logging.debug("Unable to persist cover fallback updates in /api/library/albums", exc_info=True)
 
         payload = {"albums": albums, "total": total, "limit": limit, "offset": offset}
         _files_cache_set_json(cache_key, payload, ttl=20)
@@ -33602,7 +33650,7 @@ def api_library_artist_detail(artist_id):
                     """
                     SELECT
                         id, title, title_norm, year, date_text, track_count, is_broken, format, is_lossless,
-                        has_cover, mb_identified, musicbrainz_release_group_id,
+                        has_cover, COALESCE(cover_path, ''), COALESCE(folder_path, ''), mb_identified, musicbrainz_release_group_id,
                         discogs_release_id, lastfm_album_mbid, bandcamp_album_url, metadata_source,
                         expected_track_count, actual_track_count, missing_indices_json,
                         COUNT(*) OVER (PARTITION BY title_norm) AS dup_count
@@ -33629,6 +33677,7 @@ def api_library_artist_detail(artist_id):
             stats_no_cover = 0
             stats_mb = 0
             stats_broken = 0
+            cover_updates: list[tuple[str, int]] = []
             for row in rows:
                 album_id = int(row[0])
                 title_norm = str(row[2] or "")
@@ -33637,21 +33686,38 @@ def api_library_artist_detail(artist_id):
                 fmt = (row[7] or "").strip() or None
                 is_lossless = bool(row[8])
                 has_cover = bool(row[9])
-                mb_identified = bool(row[10])
-                mbid = (row[11] or "").strip() or None
-                discogs_release_id = (row[12] or "").strip() or None
-                lastfm_album_mbid = (row[13] or "").strip() or None
-                bandcamp_album_url = (row[14] or "").strip() or None
-                metadata_source = (row[15] or "").strip() or None
-                expected_track_count = row[16]
-                actual_track_count = row[17]
-                missing_indices_raw = row[18] or "[]"
-                dup_count = int(row[19] or 0)
+                cover_path_raw = (row[10] or "").strip()
+                folder_path_raw = (row[11] or "").strip()
+                mb_identified = bool(row[12])
+                mbid = (row[13] or "").strip() or None
+                discogs_release_id = (row[14] or "").strip() or None
+                lastfm_album_mbid = (row[15] or "").strip() or None
+                bandcamp_album_url = (row[16] or "").strip() or None
+                metadata_source = (row[17] or "").strip() or None
+                expected_track_count = row[18]
+                actual_track_count = row[19]
+                missing_indices_raw = row[20] or "[]"
+                dup_count = int(row[21] or 0)
                 album_profile = album_profile_map.get(title_norm, {}) if title_norm else {}
+
+                has_cover_effective = has_cover
+                if not has_cover_effective:
+                    try:
+                        cp = path_for_fs_access(Path(cover_path_raw)) if cover_path_raw else None
+                        if cp and cp.exists() and cp.is_file():
+                            has_cover_effective = True
+                        else:
+                            fp = path_for_fs_access(Path(folder_path_raw)) if folder_path_raw else None
+                            fallback_cover = _first_cover_path(fp) if fp else None
+                            if fallback_cover and fallback_cover.exists() and fallback_cover.is_file():
+                                has_cover_effective = True
+                                cover_updates.append((str(fallback_cover), album_id))
+                    except Exception:
+                        has_cover_effective = has_cover
 
                 if dup_count > 1:
                     stats_duplicates += 1
-                if not has_cover:
+                if not has_cover_effective:
                     stats_no_cover += 1
                 if mb_identified:
                     stats_mb += 1
@@ -33677,8 +33743,8 @@ def api_library_artist_detail(artist_id):
                         "missing_indices": missing_indices if isinstance(missing_indices, list) else [],
                     }
 
-                thumb_url_files = f"{request.url_root.rstrip('/')}/api/library/files/album/{album_id}/cover" if has_cover else None
-                can_improve = (not is_lossless) or (not has_cover) or (not mb_identified) or is_broken
+                thumb_url_files = f"{request.url_root.rstrip('/')}/api/library/files/album/{album_id}/cover" if has_cover_effective else None
+                can_improve = (not is_lossless) or (not has_cover_effective) or (not mb_identified) or is_broken
                 albums.append({
                     "album_id": album_id,
                     "title": row[1] or "",
@@ -33690,7 +33756,7 @@ def api_library_artist_detail(artist_id):
                     "type": album_type,
                     "format": fmt,
                     "is_lossless": is_lossless,
-                    "thumb_empty": not has_cover,
+                    "thumb_empty": not has_cover_effective,
                     "mb_identified": mb_identified,
                     "musicbrainz_release_group_id": mbid,
                     "discogs_release_id": discogs_release_id,
@@ -33704,6 +33770,24 @@ def api_library_artist_detail(artist_id):
                     "short_description": album_profile.get("short_description"),
                     "description_source": album_profile.get("source"),
                 })
+
+            if cover_updates:
+                try:
+                    with conn.transaction():
+                        with conn.cursor() as wcur:
+                            wcur.executemany(
+                                """
+                                UPDATE files_albums
+                                SET has_cover = TRUE,
+                                    cover_path = %s,
+                                    updated_at = NOW()
+                                WHERE id = %s
+                                """,
+                                cover_updates,
+                            )
+                    _files_cache_invalidate_all()
+                except Exception:
+                    logging.debug("Unable to persist cover fallback updates in /api/library/artist", exc_info=True)
 
             artist_thumb = None
             base_url = request.url_root.rstrip("/")
@@ -35766,15 +35850,40 @@ def api_library_files_album_cover(album_id):
     if conn is None:
         return jsonify({"error": "PostgreSQL unavailable"}), 503
     try:
+        folder_raw = ""
         with conn.cursor() as cur:
-            cur.execute("SELECT cover_path FROM files_albums WHERE id = %s", (album_id,))
+            cur.execute("SELECT cover_path, folder_path FROM files_albums WHERE id = %s", (album_id,))
             row = cur.fetchone()
             cover_raw = (row[0] or "").strip() if row else ""
+            folder_raw = (row[1] or "").strip() if row else ""
             if cover_raw:
                 cover_path = path_for_fs_access(Path(cover_raw))
                 if cover_path.exists() and cover_path.is_file():
                     cached = _ensure_cached_image_for_path(cover_path, kind="album", max_px=size)
                     to_send = cached or cover_path
+                    return send_file(str(to_send), as_attachment=False, conditional=True)
+            if folder_raw:
+                folder_path = path_for_fs_access(Path(folder_raw))
+                detected_cover = _first_cover_path(folder_path)
+                if detected_cover and detected_cover.exists() and detected_cover.is_file():
+                    cached = _ensure_cached_image_for_path(detected_cover, kind="album", max_px=size)
+                    to_send = cached or detected_cover
+                    try:
+                        with conn.transaction():
+                            with conn.cursor() as wcur:
+                                wcur.execute(
+                                    """
+                                    UPDATE files_albums
+                                    SET has_cover = TRUE,
+                                        cover_path = %s,
+                                        updated_at = NOW()
+                                    WHERE id = %s
+                                    """,
+                                    (str(detected_cover), int(album_id)),
+                                )
+                        _files_cache_invalidate_all()
+                    except Exception:
+                        logging.debug("Unable to persist folder cover for album_id=%s", album_id, exc_info=True)
                     return send_file(str(to_send), as_attachment=False, conditional=True)
             # Fallback to embedded cover from the first tracks (some releases only embed
             # art on a subset of files).

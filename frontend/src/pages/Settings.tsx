@@ -482,18 +482,6 @@ function SettingsPage() {
                     </div>
                   </div>
                 </div>
-                <div className="flex items-center justify-between gap-3 rounded-lg border border-border/60 p-3">
-                  <div className="space-y-1">
-                    <Label>Include non matched music in PMDA library</Label>
-                    <p className="text-xs text-muted-foreground">
-                      Off: only formally identified albums are shown. On: unmatched albums are also visible with warning badges.
-                    </p>
-                  </div>
-                  <Switch
-                    checked={Boolean(config.LIBRARY_INCLUDE_UNMATCHED)}
-                    onCheckedChange={(checked) => updateConfig({ LIBRARY_INCLUDE_UNMATCHED: Boolean(checked) })}
-                  />
-                </div>
                 <div className="space-y-2">
                   <Label>Media cache folder</Label>
                   <p className="text-xs text-muted-foreground">

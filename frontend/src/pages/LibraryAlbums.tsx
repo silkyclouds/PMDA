@@ -38,10 +38,6 @@ function normalizeGenreBadges(album: api.LibraryAlbumItem): string[] {
   return out;
 }
 
-function isUnmatchedAlbum(album: api.LibraryAlbumItem): boolean {
-  return album.mb_identified === false;
-}
-
 export default function LibraryAlbums() {
   const navigate = useNavigate();
   const location = useLocation();
@@ -73,6 +69,11 @@ export default function LibraryAlbums() {
   const requestIdRef = useRef(0);
   const sentinelRef = useRef<HTMLDivElement | null>(null);
   const loadingMoreRef = useRef(false);
+  const albumLikesRef = useRef<Record<number, boolean>>({});
+
+  useEffect(() => {
+    albumLikesRef.current = albumLikes;
+  }, [albumLikes]);
 
   const gridTemplateColumns = useMemo(() => {
     const col = Math.max(140, Math.min(340, Math.floor(coverSize)));
@@ -82,7 +83,7 @@ export default function LibraryAlbums() {
   const hydrateAlbumLikes = useCallback(async (ids: number[]) => {
     const unique = Array.from(new Set(ids.filter((x) => Number.isFinite(x) && x > 0)));
     if (unique.length === 0) return;
-    const unknown = unique.filter((id) => albumLikes[id] === undefined);
+    const unknown = unique.filter((id) => albumLikesRef.current[id] === undefined);
     if (unknown.length === 0) return;
     try {
       const res = await api.getLikes('album', unknown);
@@ -92,7 +93,7 @@ export default function LibraryAlbums() {
     } catch {
       // ignore
     }
-  }, [albumLikes]);
+  }, []);
 
   const toggleAlbumLike = useCallback(async (albumId: number) => {
     const current = Boolean(albumLikes[albumId]);
@@ -128,7 +129,18 @@ export default function LibraryAlbums() {
       if (rid !== requestIdRef.current) return;
       const list = Array.isArray(data.albums) ? data.albums : [];
       setTotalAlbums(typeof data.total === 'number' ? data.total : 0);
-      setAlbums((prev) => (opts.reset ? list : [...prev, ...list]));
+      setAlbums((prev) => {
+        if (opts.reset) return list;
+        if (!prev.length) return list;
+        const seen = new Set(prev.map((a) => a.album_id));
+        const merged = [...prev];
+        for (const item of list) {
+          if (seen.has(item.album_id)) continue;
+          seen.add(item.album_id);
+          merged.push(item);
+        }
+        return merged;
+      });
       setOffset(opts.pageOffset + list.length);
       void hydrateAlbumLikes(list.map((a) => a.album_id));
     } catch (e) {
@@ -262,8 +274,7 @@ export default function LibraryAlbums() {
         {albums.map((a) => (
           <div key={`alb-${a.album_id}`} className="group">
             <div className={cn(
-              'relative overflow-hidden rounded-2xl border border-border/60 bg-card shadow-sm',
-              isUnmatchedAlbum(a) && 'ring-1 ring-amber-500/45 shadow-[0_0_0_1px_rgba(245,158,11,0.25),0_0_24px_rgba(245,158,11,0.14)]'
+              'relative overflow-hidden rounded-2xl border border-border/60 bg-card shadow-sm'
             )}>
               <AspectRatio
                 ratio={1}
@@ -280,19 +291,12 @@ export default function LibraryAlbums() {
                 }}
               >
                 {a.thumb ? (
-                  <img src={a.thumb} alt={a.title} className="w-full h-full object-cover animate-in fade-in-0 duration-300" />
+                  <img src={a.thumb} alt={a.title} loading="lazy" decoding="async" className="w-full h-full object-cover animate-in fade-in-0 duration-300" />
                 ) : (
                   <div className="w-full h-full flex items-center justify-center">
                     <Music className="w-10 h-10 text-muted-foreground" />
                   </div>
                 )}
-                {isUnmatchedAlbum(a) ? (
-                  <div className="absolute top-2 left-2">
-                    <Badge variant="outline" className="text-[10px] border-amber-500/50 text-amber-700 bg-background/75 backdrop-blur dark:text-amber-300">
-                      Unmatched
-                    </Badge>
-                  </div>
-                ) : null}
                 <div className="absolute inset-0 opacity-0 group-hover:opacity-100 transition-opacity bg-black/35" />
                 <div className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity">
                   <Button
@@ -350,11 +354,6 @@ export default function LibraryAlbums() {
                   <Badge variant="outline" className="text-[10px]">
                     {a.track_count}t
                   </Badge>
-                  {isUnmatchedAlbum(a) ? (
-                    <Badge variant="outline" className="text-[10px] border-amber-500/50 text-amber-700 dark:text-amber-300">
-                      Verify tags
-                    </Badge>
-                  ) : null}
                 </div>
 
                 {(normalizeGenreBadges(a).length > 0 || a.label) ? (
@@ -407,7 +406,7 @@ export default function LibraryAlbums() {
 
       <div ref={sentinelRef} className="h-8" />
       <div className="flex items-center justify-center py-2 text-xs text-muted-foreground">
-        {canLoadMore ? (albumLoading ? <span className="inline-flex items-center gap-2"><Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading more…</span> : 'Scroll to load more') : 'All loaded'}
+        {albumLoading && albums.length > 0 ? <span className="inline-flex items-center gap-2"><Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading more…</span> : null}
       </div>
     </div>
   );

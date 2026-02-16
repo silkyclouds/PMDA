@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useLocation, useNavigate, useOutletContext, useParams } from 'react-router-dom';
+import { useLocation, useNavigate, useParams } from 'react-router-dom';
 import { ArrowLeft, Calendar, ChevronDown, ChevronUp, Disc3, ExternalLink, Heart, Loader2, Music, Play, RefreshCw, Sparkles, Users } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
@@ -108,10 +108,6 @@ function toCoord(s?: string): number | null {
   return Number.isFinite(n) ? n : null;
 }
 
-function isUnmatchedAlbum(album: AlbumInfo): boolean {
-  return album.mb_identified === false;
-}
-
 function haversineKm(a: { lat: number; lon: number }, b: { lat: number; lon: number }) {
   const R = 6371;
   const toRad = (deg: number) => (deg * Math.PI) / 180;
@@ -126,7 +122,6 @@ function haversineKm(a: { lat: number; lon: number }, b: { lat: number; lon: num
 export default function ArtistPage() {
   const navigate = useNavigate();
   const location = useLocation();
-  const { includeUnmatched: includeUnmatchedContext } = useOutletContext<{ includeUnmatched: boolean }>();
   const { startPlayback, setCurrentTrack } = usePlayback();
   const params = useParams<{ artistId: string }>();
   const artistId = Number(params.artistId);
@@ -153,14 +148,7 @@ export default function ArtistPage() {
   const [descExpanded, setDescExpanded] = useState(false);
   const [refreshAllBusy, setRefreshAllBusy] = useState(false);
   const [concertFilter, setConcertFilter] = useState<{ enabled: boolean; lat: number | null; lon: number | null; radiusKm: number } | null>(null);
-  const includeUnmatchedParam = useMemo(() => {
-    const raw = new URLSearchParams(location.search || '').get('include_unmatched');
-    if (raw == null) return includeUnmatchedContext ? '1' : '0';
-    const low = String(raw || '').trim().toLowerCase();
-    if (['1', 'true', 'yes', 'on'].includes(low)) return '1';
-    if (['0', 'false', 'no', 'off'].includes(low)) return '0';
-    return includeUnmatchedContext ? '1' : '0';
-  }, [includeUnmatchedContext, location.search]);
+  const includeUnmatchedParam = '1';
   const appendIncludeUnmatched = useCallback((url: string) => {
     return `${url}${url.includes('?') ? '&' : '?'}include_unmatched=${includeUnmatchedParam}`;
   }, [includeUnmatchedParam]);
@@ -1025,10 +1013,7 @@ export default function ArtistPage() {
 	                  {grouped[type].map((album) => (
                     <Card
                       key={album.album_id}
-                      className={cn(
-                        "group w-[200px] shrink-0 overflow-hidden border-border/70 cursor-pointer hover:bg-muted/40 transition-colors",
-                        isUnmatchedAlbum(album) && 'ring-1 ring-amber-500/45 shadow-[0_0_0_1px_rgba(245,158,11,0.25),0_0_24px_rgba(245,158,11,0.14)]',
-                      )}
+                      className="group w-[200px] shrink-0 overflow-hidden border-border/70 cursor-pointer hover:bg-muted/40 transition-colors"
                       role="button"
                       tabIndex={0}
                       onClick={() => navigate(`/library/album/${album.album_id}${location.search || ''}`)}
@@ -1055,19 +1040,12 @@ export default function ArtistPage() {
                         }}
                       >
                         {album.thumb ? (
-                          <img src={album.thumb} alt={album.title} className="w-full h-full object-cover animate-in fade-in-0 duration-300" />
+                          <img src={album.thumb} alt={album.title} loading="lazy" decoding="async" className="w-full h-full object-cover animate-in fade-in-0 duration-300" />
                         ) : (
                           <div className="w-full h-full flex items-center justify-center">
                             <Music className="w-10 h-10 text-muted-foreground" />
                           </div>
                         )}
-                        {isUnmatchedAlbum(album) ? (
-                          <div className="absolute top-2 left-2">
-                            <Badge variant="outline" className="text-[10px] border-amber-500/50 text-amber-700 bg-background/75 backdrop-blur dark:text-amber-300">
-                              Unmatched
-                            </Badge>
-                          </div>
-                        ) : null}
                         <div className="absolute inset-x-0 bottom-0 p-2.5 opacity-0 group-hover:opacity-100 transition-opacity">
                           <Button
                             size="sm"
@@ -1096,11 +1074,6 @@ export default function ArtistPage() {
                           <Badge variant={album.is_lossless ? 'secondary' : 'outline'} className="text-[10px]">
                             {album.is_lossless ? 'Lossless' : 'Lossy'}
                           </Badge>
-                          {isUnmatchedAlbum(album) ? (
-                            <Badge variant="outline" className="text-[10px] border-amber-500/50 text-amber-700 dark:text-amber-300">
-                              Verify tags
-                            </Badge>
-                          ) : null}
                         </div>
                         {album.short_description && (
                           <p className={cn('text-[11px] text-muted-foreground line-clamp-3')}>

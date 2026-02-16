@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type KeyboardEventHandler } from 'react';
-import { useLocation, useNavigate } from 'react-router-dom';
+import { useNavigate } from 'react-router-dom';
 import { Disc3, Loader2, Music2, Search, UserRound } from 'lucide-react';
 import { Input } from '@/components/ui/input';
 import { cn } from '@/lib/utils';
@@ -8,40 +8,15 @@ import * as api from '@/lib/api';
 
 export function GlobalSearch() {
   const navigate = useNavigate();
-  const location = useLocation();
   const rootRef = useRef<HTMLDivElement | null>(null);
   const [query, setQuery] = useState('');
   const [items, setItems] = useState<LibrarySearchSuggestionItem[]>([]);
   const [open, setOpen] = useState(false);
   const [loading, setLoading] = useState(false);
   const [activeIndex, setActiveIndex] = useState(0);
-  const [configIncludeUnmatched, setConfigIncludeUnmatched] = useState(false);
 
   const trimmed = query.trim();
-  const includeUnmatchedFromUrl = useMemo(() => {
-    if (!location.pathname.startsWith('/library')) return null;
-    const raw = new URLSearchParams(location.search).get('include_unmatched');
-    if (raw == null || raw === '') return null;
-    const low = raw.toLowerCase();
-    if (['1', 'true', 'yes', 'on'].includes(low)) return true;
-    if (['0', 'false', 'no', 'off'].includes(low)) return false;
-    return null;
-  }, [location.pathname, location.search]);
-  const includeUnmatched = includeUnmatchedFromUrl ?? configIncludeUnmatched;
-
-  useEffect(() => {
-    let cancelled = false;
-    api.getConfig()
-      .then((cfg) => {
-        if (!cancelled) setConfigIncludeUnmatched(Boolean(cfg.LIBRARY_INCLUDE_UNMATCHED));
-      })
-      .catch(() => {
-        if (!cancelled) setConfigIncludeUnmatched(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+  const includeUnmatched = true;
 
   useEffect(() => {
     if (!trimmed) {

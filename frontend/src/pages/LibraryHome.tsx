@@ -7,31 +7,11 @@ import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { AspectRatio } from '@/components/ui/aspect-ratio';
 import { Carousel, CarouselContent, CarouselItem, CarouselNext, CarouselPrevious } from '@/components/ui/carousel';
-import { cn } from '@/lib/utils';
 import { usePlayback } from '@/contexts/PlaybackContext';
 import { useToast } from '@/hooks/use-toast';
 import * as api from '@/lib/api';
 import type { TrackInfo } from '@/components/library/AudioPlayer';
 import type { LibraryOutletContext } from '@/pages/LibraryLayout';
-
-function isUnmatchedAlbum(album: api.LibraryAlbumItem): boolean {
-  return album.mb_identified === false;
-}
-
-function unmatchedAlbumCardClass(album: api.LibraryAlbumItem): string {
-  return isUnmatchedAlbum(album)
-    ? 'ring-1 ring-amber-500/45 shadow-[0_0_0_1px_rgba(245,158,11,0.25),0_0_24px_rgba(245,158,11,0.14)]'
-    : '';
-}
-
-function unmatchedBadge(album: api.LibraryAlbumItem) {
-  if (!isUnmatchedAlbum(album)) return null;
-  return (
-    <Badge variant="outline" className="text-[10px] border-amber-500/50 text-amber-700 bg-background/75 backdrop-blur dark:text-amber-300">
-      Unmatched
-    </Badge>
-  );
-}
 
 export default function LibraryHome() {
   const navigate = useNavigate();
@@ -59,7 +39,6 @@ export default function LibraryHome() {
   const [recentlyPlayedLoading, setRecentlyPlayedLoading] = useState(false);
   const [recentlyPlayedError, setRecentlyPlayedError] = useState<string | null>(null);
   const [recentlyPlayedAlbums, setRecentlyPlayedAlbums] = useState<api.RecentlyPlayedAlbumItem[]>([]);
-  const [statsAll, setStatsAll] = useState<api.LibraryStats | null>(null);
 
   const loadRecommendations = useCallback(async () => {
     if (!recommendationSessionId) return;
@@ -153,22 +132,6 @@ export default function LibraryHome() {
     void loadRecommendations();
   }, [loadRecommendations]);
 
-  useEffect(() => {
-    let cancelled = false;
-    api.getLibraryStats({ includeUnmatched: true })
-      .then((res) => {
-        if (cancelled) return;
-        setStatsAll(res);
-      })
-      .catch(() => {
-        if (cancelled) return;
-        setStatsAll(null);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [includeUnmatched]);
-
   const handlePlayAlbum = async (albumId: number, fallbackTitle: string, fallbackThumb?: string | null) => {
     try {
       const response = await fetch(`/api/library/album/${albumId}/tracks`);
@@ -233,26 +196,13 @@ export default function LibraryHome() {
         <CardContent className="p-4 sm:p-5">
           <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
             <div className="space-y-2">
-              <div className="text-xs uppercase tracking-wide text-muted-foreground">Identified Library</div>
+              <div className="text-xs uppercase tracking-wide text-muted-foreground">Library</div>
               <div className="text-sm text-muted-foreground">
-                Matched: <span className="font-semibold text-foreground">{stats ? `${stats.artists.toLocaleString()} artists · ${stats.albums.toLocaleString()} albums` : 'Loading...'}</span>
-              </div>
-              <div className="text-sm text-muted-foreground">
-                Non matched: <span className="font-semibold text-foreground">{stats && statsAll ? `${Math.max(0, (statsAll.artists || 0) - (stats.artists || 0)).toLocaleString()} artists · ${Math.max(0, (statsAll.albums || 0) - (stats.albums || 0)).toLocaleString()} albums` : 'Loading...'}</span>
-              </div>
-              <div className="text-sm text-muted-foreground">
-                Displayed: <span className="font-semibold text-foreground">
-                  {includeUnmatched
-                    ? (statsAll ? `${statsAll.artists.toLocaleString()} artists · ${statsAll.albums.toLocaleString()} albums` : 'Loading...')
-                    : (stats ? `${stats.artists.toLocaleString()} artists · ${stats.albums.toLocaleString()} albums` : 'Loading...')}
+                <span className="font-semibold text-foreground">
+                  {stats ? `${stats.artists.toLocaleString()} artists · ${stats.albums.toLocaleString()} albums` : 'Loading...'}
                 </span>
               </div>
             </div>
-            {!includeUnmatched ? (
-              <Badge variant="secondary" className="text-[10px]">Strict matched only</Badge>
-            ) : (
-              <Badge variant="outline" className="text-[10px]">Including non matched</Badge>
-            )}
           </div>
         </CardContent>
       </Card>
@@ -344,7 +294,7 @@ export default function LibraryHome() {
                     {sec.albums.map((a) => (
                       <CarouselItem key={`disc-${sec.key}-${a.album_id}`} className="basis-[160px] sm:basis-[190px] md:basis-[220px] pl-3">
                         <div className="group">
-                          <Card className={cn('overflow-hidden border-border/60', unmatchedAlbumCardClass(a))}>
+                          <Card className="overflow-hidden border-border/60">
                             <AspectRatio
                               ratio={1}
                               className="bg-muted"
@@ -360,20 +310,16 @@ export default function LibraryHome() {
                               }}
                             >
                               {a.thumb ? (
-                                <img src={a.thumb} alt={a.title} className="w-full h-full object-cover animate-in fade-in-0 duration-300" />
+                                <img src={a.thumb} alt={a.title} loading="lazy" decoding="async" className="w-full h-full object-cover animate-in fade-in-0 duration-300" />
                               ) : (
                                 <div className="w-full h-full flex items-center justify-center">
                                   <Music className="w-10 h-10 text-muted-foreground" />
                                 </div>
                               )}
-                              {isUnmatchedAlbum(a) ? <div className="absolute top-2 left-2">{unmatchedBadge(a)}</div> : null}
                               <button
                                 type="button"
                                 onClick={() => void handlePlayAlbum(a.album_id, a.title, a.thumb)}
-                                className={cn(
-                                  'absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity',
-                                  'bg-black/35',
-                                )}
+                                className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity bg-black/35"
                                 title="Play"
                               >
                                 <div className="h-12 w-12 rounded-full bg-white/15 backdrop-blur-sm border border-white/20 flex items-center justify-center">
@@ -406,11 +352,6 @@ export default function LibraryHome() {
                                 <Badge variant="outline" className="text-[10px] shrink-0">
                                   {a.year ?? '—'}
                                 </Badge>
-                                {isUnmatchedAlbum(a) ? (
-                                  <Badge variant="outline" className="text-[10px] border-amber-500/50 text-amber-700 dark:text-amber-300">
-                                    Verify tags
-                                  </Badge>
-                                ) : null}
                               </div>
                             </CardContent>
                           </Card>
@@ -646,23 +587,19 @@ export default function LibraryHome() {
                 {recentlyPlayedAlbums.map((a) => (
                   <CarouselItem key={`rplay-${a.album_id}`} className="basis-[160px] sm:basis-[190px] md:basis-[220px] pl-3">
                     <div className="group">
-                      <Card className={cn('overflow-hidden border-border/60', unmatchedAlbumCardClass(a))}>
+                      <Card className="overflow-hidden border-border/60">
                         <AspectRatio ratio={1} className="bg-muted">
                           {a.thumb ? (
-                            <img src={a.thumb} alt={a.title} className="w-full h-full object-cover animate-in fade-in-0 duration-300" />
+                            <img src={a.thumb} alt={a.title} loading="lazy" decoding="async" className="w-full h-full object-cover animate-in fade-in-0 duration-300" />
                           ) : (
                             <div className="w-full h-full flex items-center justify-center">
                               <Music className="w-10 h-10 text-muted-foreground" />
                             </div>
                           )}
-                          {isUnmatchedAlbum(a) ? <div className="absolute top-2 left-2">{unmatchedBadge(a)}</div> : null}
                           <button
                             type="button"
                             onClick={() => void handlePlayAlbum(a.album_id, a.title, a.thumb)}
-                            className={cn(
-                              'absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity',
-                              'bg-black/35',
-                            )}
+                            className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity bg-black/35"
                             title="Play"
                           >
                             <div className="h-12 w-12 rounded-full bg-white/15 backdrop-blur-sm border border-white/20 flex items-center justify-center">
@@ -695,11 +632,6 @@ export default function LibraryHome() {
                             <Badge variant="outline" className="text-[10px] shrink-0">
                               {a.year ?? '—'}
                             </Badge>
-                            {isUnmatchedAlbum(a) ? (
-                              <Badge variant="outline" className="text-[10px] border-amber-500/50 text-amber-700 dark:text-amber-300">
-                                Verify tags
-                              </Badge>
-                            ) : null}
                           </div>
                         </CardContent>
                       </Card>
@@ -744,23 +676,19 @@ export default function LibraryHome() {
                 {recentAlbums.map((a) => (
                   <CarouselItem key={`recent-${a.album_id}`} className="basis-[160px] sm:basis-[190px] md:basis-[220px] pl-3">
                     <div className="group">
-                      <Card className={cn('overflow-hidden border-border/60', unmatchedAlbumCardClass(a))}>
+                      <Card className="overflow-hidden border-border/60">
                         <AspectRatio ratio={1} className="bg-muted">
                           {a.thumb ? (
-                            <img src={a.thumb} alt={a.title} className="w-full h-full object-cover animate-in fade-in-0 duration-300" />
+                            <img src={a.thumb} alt={a.title} loading="lazy" decoding="async" className="w-full h-full object-cover animate-in fade-in-0 duration-300" />
                           ) : (
                             <div className="w-full h-full flex items-center justify-center">
                               <Music className="w-10 h-10 text-muted-foreground" />
                             </div>
                           )}
-                          {isUnmatchedAlbum(a) ? <div className="absolute top-2 left-2">{unmatchedBadge(a)}</div> : null}
                           <button
                             type="button"
                             onClick={() => void handlePlayAlbum(a.album_id, a.title, a.thumb)}
-                            className={cn(
-                              'absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity',
-                              'bg-black/35',
-                            )}
+                            className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity bg-black/35"
                             title="Play"
                           >
                             <div className="h-12 w-12 rounded-full bg-white/15 backdrop-blur-sm border border-white/20 flex items-center justify-center">
@@ -793,11 +721,6 @@ export default function LibraryHome() {
                             <Badge variant="outline" className="text-[10px] shrink-0">
                               {a.year ?? '—'}
                             </Badge>
-                            {isUnmatchedAlbum(a) ? (
-                              <Badge variant="outline" className="text-[10px] border-amber-500/50 text-amber-700 dark:text-amber-300">
-                                Verify tags
-                              </Badge>
-                            ) : null}
                           </div>
                         </CardContent>
                       </Card>
