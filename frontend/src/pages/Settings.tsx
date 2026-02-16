@@ -784,6 +784,25 @@ function SettingsPage() {
                     onChange={(e) => updateConfig({ SERPER_API_KEY: e.target.value })}
                   />
                 </div>
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between gap-3">
+                    <Label htmlFor="acoustid-key">AcoustID API key (optional)</Label>
+                    <a
+                      href="https://acoustid.org/new-application"
+                      target="_blank"
+                      rel="noreferrer"
+                      className="text-xs text-primary inline-flex items-center gap-1 hover:underline"
+                    >
+                      Create API key <ExternalLink className="w-3 h-3" />
+                    </a>
+                  </div>
+                  <PasswordInput
+                    id="acoustid-key"
+                    placeholder="AcoustID API key"
+                    value={String(config.ACOUSTID_API_KEY ?? '')}
+                    onChange={(e) => updateConfig({ ACOUSTID_API_KEY: e.target.value })}
+                  />
+                </div>
               </CardContent>
             </Card>
 

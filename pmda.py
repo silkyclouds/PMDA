@@ -27123,6 +27123,26 @@ def api_config_get():
         "CONCERTS_RADIUS_KM": str(get_setting("CONCERTS_RADIUS_KM", "150") or "").strip() or "150",
     }
 
+    # Local self-hosted UX: keep inputs masked by default in the UI component, but provide the
+    # actual value so the "eye" toggle can reveal the key when explicitly requested by the user.
+    payload.update({
+        "OPENAI_API_KEY": str(openai_key_eff or ""),
+        "ANTHROPIC_API_KEY": str(anthropic_key_eff or ""),
+        "GOOGLE_API_KEY": str(google_key_eff or ""),
+        "DISCOGS_USER_TOKEN": str(discogs_token_eff or ""),
+        "LASTFM_API_KEY": str(lastfm_key_eff or ""),
+        "LASTFM_API_SECRET": str(lastfm_secret_eff or ""),
+        "FANART_API_KEY": str(fanart_key_eff or ""),
+        "THEAUDIODB_API_KEY": str(theaudiodb_key_eff or ""),
+        "SERPER_API_KEY": str(serper_key_eff or ""),
+        "ACOUSTID_API_KEY": str(acoustid_key_eff or ""),
+        "LIDARR_API_KEY": str(lidarr_key_eff or ""),
+        "AUTOBRR_API_KEY": str(autobrr_key_eff or ""),
+        "JELLYFIN_API_KEY": str(jellyfin_key_eff or ""),
+        "NAVIDROME_PASSWORD": str(navidrome_pass_eff or ""),
+        "NAVIDROME_API_KEY": str(navidrome_key_eff or ""),
+    })
+
     return jsonify(payload)
 
 
