@@ -4221,6 +4221,42 @@ def _files_pg_init_schema() -> bool:
             cur.execute("CREATE INDEX IF NOT EXISTS idx_files_albums_title_norm ON files_albums(title_norm)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_files_albums_genre ON files_albums(genre)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_files_albums_label ON files_albums(label)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_files_albums_recent ON files_albums(created_at DESC, id DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_files_albums_updated_recent ON files_albums(updated_at DESC, id DESC)")
+            matched_identity_expr = (
+                "COALESCE(NULLIF(musicbrainz_release_group_id, ''), NULLIF(discogs_release_id, ''), "
+                "NULLIF(lastfm_album_mbid, ''), NULLIF(bandcamp_album_url, '')) IS NOT NULL"
+            )
+            # Partial indexes for "matched-only" library mode at large scale.
+            # These avoid full scans when filtering strictly on provider IDs.
+            cur.execute(
+                f"""
+                CREATE INDEX IF NOT EXISTS idx_files_albums_matched_recent
+                ON files_albums(created_at DESC, id DESC)
+                WHERE {matched_identity_expr}
+                """
+            )
+            cur.execute(
+                f"""
+                CREATE INDEX IF NOT EXISTS idx_files_albums_matched_artist
+                ON files_albums(artist_id, id DESC)
+                WHERE {matched_identity_expr}
+                """
+            )
+            cur.execute(
+                f"""
+                CREATE INDEX IF NOT EXISTS idx_files_albums_matched_year
+                ON files_albums(year DESC, id DESC)
+                WHERE {matched_identity_expr} AND year IS NOT NULL
+                """
+            )
+            cur.execute(
+                f"""
+                CREATE INDEX IF NOT EXISTS idx_files_albums_matched_label
+                ON files_albums(label)
+                WHERE {matched_identity_expr} AND COALESCE(TRIM(label), '') <> ''
+                """
+            )
             cur.execute("CREATE INDEX IF NOT EXISTS idx_files_tracks_album_id ON files_tracks(album_id)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_files_tracks_title ON files_tracks(title)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_files_tracks_order ON files_tracks(album_id, disc_num, track_num, id)")
