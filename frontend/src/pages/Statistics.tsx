@@ -951,10 +951,10 @@ export default function Statistics() {
                   delta={<DeltaPill current={current.spaceSavedMb} previous={previous.spaceSavedMb} suffix=" MB" />}
                 />
                 <StatCard
-                  title="Matched Albums"
+                  title="Matched During Scan"
                   icon={<Database className="w-4 h-4 text-primary" />}
                   value={`${current.matchedAlbums.toLocaleString()} / ${current.albumsScanned.toLocaleString()}`}
-                  description={`${formatPercent(current.matchedAlbums, current.albumsScanned)} matched via MB/fallbacks`}
+                  description={`${formatPercent(current.matchedAlbums, current.albumsScanned)} matched by MB/provider decisions during this run (cache fast-skip may already be matched)`}
                   delta={<DeltaPill current={current.matchedAlbums} previous={previous.matchedAlbums} />}
                 />
                 <StatCard

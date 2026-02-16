@@ -11987,22 +11987,47 @@ def _is_probable_cover_filename(name: str) -> bool:
         return True
     return False
 
+def _extract_embedded_cover_from_folder(
+    folder: Path,
+    *,
+    max_audio_files: int = 6,
+) -> Optional[tuple[bytes, str]]:
+    """
+    Extract embedded cover bytes from one of the first audio files in a folder.
+    We do not rely only on the first track because some releases embed art only on
+    a subset of files.
+    """
+    if not folder or not folder.is_dir():
+        return None
+    try:
+        checked = 0
+        for p in sorted(folder.rglob("*")):
+            if not AUDIO_RE.search(p.name):
+                continue
+            embedded = _extract_embedded_cover_from_audio(p)
+            if embedded:
+                return embedded
+            checked += 1
+            if checked >= max(1, int(max_audio_files or 1)):
+                break
+    except OSError:
+        return None
+    return None
+
+
 def album_folder_has_cover(folder: Path) -> bool:
     """
     Return True if the album folder has a cover image.
     Priority:
     1) common image files in folder (cover/front/folder/artwork...)
-    2) embedded cover in first audio file (ID3 APIC / FLAC picture / MP4 covr)
+    2) embedded cover in one of the first audio files
     """
     if not folder or not folder.is_dir():
         return False
     try:
         if _first_cover_path(folder):
             return True
-        first_audio = next((p for p in sorted(folder.rglob("*")) if AUDIO_RE.search(p.name)), None)
-        if not first_audio:
-            return False
-        return bool(_extract_embedded_cover_from_audio(first_audio))
+        return bool(_extract_embedded_cover_from_folder(folder, max_audio_files=6))
     except OSError:
         return False
 
@@ -12076,13 +12101,7 @@ def _get_local_cover_data_uri_for_vision(folder: Path) -> Optional[str]:
     if cover_path:
         return _encode_local_cover_to_data_uri(cover_path)
     try:
-        first_audio = next(
-            (p for p in sorted(folder.rglob("*")) if AUDIO_RE.search(p.name)),
-            None,
-        )
-        if not first_audio:
-            return None
-        result = _extract_embedded_cover_from_audio(first_audio)
+        result = _extract_embedded_cover_from_folder(folder, max_audio_files=6)
         if not result:
             return None
         data, mime = result
@@ -14068,7 +14087,7 @@ def _browse_mb_rg_by_artist(artist: str, album_norm: str) -> List[dict]:
 
 def _fetch_album_provider_fallbacks_parallel(artist: str, album_title: str) -> dict:
     """
-    Fetch album metadata fallbacks concurrently (Discogs, Last.fm, Bandcamp).
+    Fetch album metadata fallbacks concurrently (Discogs, Bandcamp, Last.fm).
     Returns a dict with raw provider payloads and an `extra_sources` list for AI disambiguation.
     """
     out = {
@@ -14096,35 +14115,35 @@ def _fetch_album_provider_fallbacks_parallel(artist: str, album_title: str) -> d
                 )
             except Exception as e:
                 logging.debug("[Providers] discogs fetch failed for %r - %r: %s", artist_name, title, e)
-        if USE_LASTFM:
-            try:
-                out["lastfm"] = fetch_provider_album_lookup_cached(
-                    "lastfm",
-                    artist_name,
-                    title,
-                    _fetch_lastfm_album_info,
-                )
-            except Exception as e:
-                logging.debug("[Providers] lastfm fetch failed for %r - %r: %s", artist_name, title, e)
-        if USE_BANDCAMP:
-            try:
-                out["bandcamp"] = fetch_provider_album_lookup_cached(
-                    "bandcamp",
-                    artist_name,
-                    title,
-                    _fetch_bandcamp_album_info,
-                )
-            except Exception as e:
-                logging.debug("[Providers] bandcamp fetch failed for %r - %r: %s", artist_name, title, e)
+            if USE_BANDCAMP:
+                try:
+                    out["bandcamp"] = fetch_provider_album_lookup_cached(
+                        "bandcamp",
+                        artist_name,
+                        title,
+                        _fetch_bandcamp_album_info,
+                    )
+                except Exception as e:
+                    logging.debug("[Providers] bandcamp fetch failed for %r - %r: %s", artist_name, title, e)
+            if USE_LASTFM:
+                try:
+                    out["lastfm"] = fetch_provider_album_lookup_cached(
+                        "lastfm",
+                        artist_name,
+                        title,
+                        _fetch_lastfm_album_info,
+                    )
+                except Exception as e:
+                    logging.debug("[Providers] lastfm fetch failed for %r - %r: %s", artist_name, title, e)
     else:
         tasks = {}
         with ThreadPoolExecutor(max_workers=3, thread_name_prefix="pmda-provider-fallback") as pool:
             if USE_DISCOGS:
                 tasks[pool.submit(fetch_provider_album_lookup_cached, "discogs", artist_name, title, _fetch_discogs_release)] = "discogs"
-            if USE_LASTFM:
-                tasks[pool.submit(fetch_provider_album_lookup_cached, "lastfm", artist_name, title, _fetch_lastfm_album_info)] = "lastfm"
             if USE_BANDCAMP:
                 tasks[pool.submit(fetch_provider_album_lookup_cached, "bandcamp", artist_name, title, _fetch_bandcamp_album_info)] = "bandcamp"
+            if USE_LASTFM:
+                tasks[pool.submit(fetch_provider_album_lookup_cached, "lastfm", artist_name, title, _fetch_lastfm_album_info)] = "lastfm"
 
             for fut in as_completed(tasks):
                 key = tasks[fut]
@@ -14142,15 +14161,6 @@ def _fetch_album_provider_fallbacks_parallel(artist: str, album_title: str) -> d
                 "artist_name": discogs_info.get("artist_name"),
             }
         )
-    lastfm_info = out.get("lastfm")
-    if lastfm_info:
-        out["extra_sources"].append(
-            {
-                "source": "Last.fm",
-                "title": lastfm_info.get("title"),
-                "artist": lastfm_info.get("artist"),
-            }
-        )
     bandcamp_info = out.get("bandcamp")
     if bandcamp_info:
         out["extra_sources"].append(
@@ -14158,6 +14168,15 @@ def _fetch_album_provider_fallbacks_parallel(artist: str, album_title: str) -> d
                 "source": "Bandcamp",
                 "title": bandcamp_info.get("title"),
                 "artist_name": bandcamp_info.get("artist_name"),
+            }
+        )
+    lastfm_info = out.get("lastfm")
+    if lastfm_info:
+        out["extra_sources"].append(
+            {
+                "source": "Last.fm",
+                "title": lastfm_info.get("title"),
+                "artist": lastfm_info.get("artist"),
             }
         )
     return out
@@ -14310,10 +14329,14 @@ def _build_provider_identity_candidates(
     provider_payloads: dict,
 ) -> list[dict]:
     """
-    Build scored provider identity candidates (Discogs/Last.fm/Bandcamp).
+    Build scored provider identity candidates (Discogs/Bandcamp/Last.fm).
+    Priority is intentionally biased toward Discogs, then Bandcamp, then Last.fm
+    for equivalent confidence bands.
     """
     out: list[dict] = []
-    provider_order = ("discogs", "lastfm", "bandcamp")
+    provider_order = ("discogs", "bandcamp", "lastfm")
+    provider_rank = {"discogs": 0, "bandcamp": 1, "lastfm": 2}
+    provider_bias = {"discogs": 0.03, "bandcamp": 0.02, "lastfm": 0.0}
     for provider in provider_order:
         payload = provider_payloads.get(provider)
         if not isinstance(payload, dict):
@@ -14344,6 +14367,7 @@ def _build_provider_identity_candidates(
             except Exception:
                 track_score = 0.0
         confidence = round((title_score * 0.55) + (artist_score * 0.20) + (track_score * 0.25), 4)
+        confidence = round(min(1.0, confidence + float(provider_bias.get(provider, 0.0))), 4)
         provider_id = _provider_candidate_id(payload, provider)
         out.append(
             {
@@ -14360,7 +14384,13 @@ def _build_provider_identity_candidates(
                 "strict_reason": strict_reason,
             }
         )
-    out.sort(key=lambda c: (-float(c.get("confidence") or 0.0), -float(c.get("track_score") or 0.0), str(c.get("provider") or "")))
+    out.sort(
+        key=lambda c: (
+            -float(c.get("confidence") or 0.0),
+            -float(c.get("track_score") or 0.0),
+            int(provider_rank.get(str(c.get("provider") or "").strip().lower(), 99)),
+        )
+    )
     return out
 
 
@@ -16735,7 +16765,8 @@ def scan_duplicates(
                         e.pop("rg_info_source", None)
                         logging.info("[Artist %s] Edition %s: cleared MB assign (live album but RG is not type Live)", artist, e.get("album_id"))
 
-            # Fallback when MusicBrainz found nothing: try Discogs, Last.fm, Bandcamp for metadata (and optionally MB ID from Last.fm)
+            # Fallback when MusicBrainz found nothing: try Discogs, Bandcamp, then Last.fm for metadata
+            # (and optionally MB ID from Last.fm as the last resort).
             title_raw = e.get("title_raw") or e.get("plex_title") or album_norm
             if not rg_info:
                 fallback_sources = []
@@ -16786,73 +16817,27 @@ def scan_duplicates(
                         )
                         provider_payloads[provider_key] = None
 
-                # Start with Last.fm only (fast, often provides cover + MBID). Fetch Discogs/Bandcamp only when needed.
-                _ensure_provider_payload("lastfm")
+                # Fetch providers in deterministic priority:
+                # MB -> Discogs -> Bandcamp -> Last.fm.
+                # We avoid short-circuiting on Last.fm MBID before arbitration so Discogs/Bandcamp
+                # can win when they provide a stricter identity.
+                for provider_key in ("discogs", "bandcamp", "lastfm"):
+                    _ensure_provider_payload(provider_key)
 
-                # Keep any already-prefetched Discogs/Bandcamp payloads (but do not fetch them eagerly).
                 discogs_info = provider_payloads.get("discogs")
                 if isinstance(discogs_info, dict):
                     e["fallback_discogs"] = discogs_info
                     fallback_sources.append("Discogs")
 
-                lastfm_info = provider_payloads.get("lastfm")
-                if isinstance(lastfm_info, dict):
-                    e["fallback_lastfm"] = lastfm_info
-                    fallback_sources.append("Last.fm")
-                    lfm_mbid = (lastfm_info.get("mbid") or "").strip()
-                    if lfm_mbid:
-                        try:
-                            rg_info, _ = fetch_mb_release_group_info(lfm_mbid)
-                            if rg_info:
-                                strict_ok_src, strict_reason_src = _strict_identity_match_details(
-                                    local_artist=artist,
-                                    local_title=title_raw,
-                                    candidate_artist=lastfm_info.get("artist") or lastfm_info.get("artist_name") or "",
-                                    candidate_title=lastfm_info.get("title") or lastfm_info.get("album") or "",
-                                )
-                                strict_ok_mb, strict_reason_mb = _strict_identity_match_details(
-                                    local_artist=artist,
-                                    local_title=title_raw,
-                                    candidate_artist=_extract_mb_artist_names(rg_info),
-                                    candidate_title=rg_info.get("title") or "",
-                                )
-                                if not strict_ok_src or not strict_ok_mb:
-                                    log_mb(
-                                        "Album %s – \"%s\": Last.fm MBID %s rejected (source=%s; mb=%s)",
-                                        artist,
-                                        title_raw,
-                                        lfm_mbid,
-                                        strict_reason_src,
-                                        strict_reason_mb,
-                                    )
-                                    raise RuntimeError("strict identity mismatch")
-                                e["rg_info"] = rg_info
-                                e["musicbrainz_id"] = lfm_mbid
-                                e["rg_info_source"] = "lastfm_fallback"
-                                e["primary_metadata_source"] = "lastfm"
-                                e["lastfm_album_mbid"] = lfm_mbid
-                                if not isinstance(e.get("meta"), dict):
-                                    e["meta"] = {}
-                                e["meta"]["primary_metadata_source"] = "lastfm"
-                                e["meta"][PMDA_MATCH_PROVIDER_TAG] = "lastfm"
-                                e["meta"]["lastfm_album_mbid"] = lfm_mbid
-                                with lock:
-                                    state["scan_lastfm_matched"] = state.get("scan_lastfm_matched", 0) + 1
-                                    if artist in state.get("scan_active_artists", {}) and e["album_id"] == state["scan_active_artists"][artist].get("current_album", {}).get("album_id"):
-                                        state["scan_active_artists"][artist]["current_album"]["status_details"] = "MusicBrainz ID from Last.fm"
-                                        state["scan_active_artists"][artist]["current_album"]["step_summary"] = (
-                                            f"Last.fm: MusicBrainz release group (id: {lfm_mbid})"
-                                        )
-                                logging.debug("[Artist %s] Edition %s MB ID from Last.fm mbid: %s", artist, e["album_id"], lfm_mbid)
-                        except RuntimeError:
-                            pass
-                        except Exception:
-                            pass
-
                 bandcamp_info = provider_payloads.get("bandcamp")
                 if isinstance(bandcamp_info, dict):
                     e["fallback_bandcamp"] = bandcamp_info
                     fallback_sources.append("Bandcamp")
+
+                lastfm_info = provider_payloads.get("lastfm")
+                if isinstance(lastfm_info, dict):
+                    e["fallback_lastfm"] = lastfm_info
+                    fallback_sources.append("Last.fm")
 
                 if fallback_sources and artist in state.get("scan_active_artists", {}) and e["album_id"] == state["scan_active_artists"][artist].get("current_album", {}).get("album_id"):
                     with lock:
@@ -16976,6 +16961,65 @@ def scan_duplicates(
                             float(arbitration.get("artist_score") or 0.0),
                             float(arbitration.get("track_score") or 0.0),
                         )
+                    # Last resort in provider chain: if arbitration still produced no match,
+                    # allow a strict Last.fm MBID lift.
+                    if not rg_info:
+                        lastfm_info = provider_payloads.get("lastfm")
+                        if isinstance(lastfm_info, dict):
+                            lfm_mbid = (lastfm_info.get("mbid") or "").strip()
+                            if lfm_mbid:
+                                try:
+                                    rg_info, _ = fetch_mb_release_group_info(lfm_mbid)
+                                    if rg_info:
+                                        strict_ok_src, strict_reason_src = _strict_identity_match_details(
+                                            local_artist=artist,
+                                            local_title=title_raw,
+                                            candidate_artist=lastfm_info.get("artist") or lastfm_info.get("artist_name") or "",
+                                            candidate_title=lastfm_info.get("title") or lastfm_info.get("album") or "",
+                                        )
+                                        strict_ok_mb, strict_reason_mb = _strict_identity_match_details(
+                                            local_artist=artist,
+                                            local_title=title_raw,
+                                            candidate_artist=_extract_mb_artist_names(rg_info),
+                                            candidate_title=rg_info.get("title") or "",
+                                        )
+                                        if not strict_ok_src or not strict_ok_mb:
+                                            log_mb(
+                                                "Album %s – \"%s\": Last.fm MBID %s rejected (source=%s; mb=%s)",
+                                                artist,
+                                                title_raw,
+                                                lfm_mbid,
+                                                strict_reason_src,
+                                                strict_reason_mb,
+                                            )
+                                            raise RuntimeError("strict identity mismatch")
+                                        e["rg_info"] = rg_info
+                                        e["musicbrainz_id"] = lfm_mbid
+                                        e["rg_info_source"] = "lastfm_fallback"
+                                        e["primary_metadata_source"] = "lastfm"
+                                        e["lastfm_album_mbid"] = lfm_mbid
+                                        if not isinstance(e.get("meta"), dict):
+                                            e["meta"] = {}
+                                        e["meta"]["primary_metadata_source"] = "lastfm"
+                                        e["meta"][PMDA_MATCH_PROVIDER_TAG] = "lastfm"
+                                        e["meta"]["lastfm_album_mbid"] = lfm_mbid
+                                        with lock:
+                                            state["scan_lastfm_matched"] = state.get("scan_lastfm_matched", 0) + 1
+                                            if artist in state.get("scan_active_artists", {}) and e["album_id"] == state["scan_active_artists"][artist].get("current_album", {}).get("album_id"):
+                                                state["scan_active_artists"][artist]["current_album"]["status_details"] = "MusicBrainz ID from Last.fm"
+                                                state["scan_active_artists"][artist]["current_album"]["step_summary"] = (
+                                                    f"Last.fm: MusicBrainz release group (id: {lfm_mbid})"
+                                                )
+                                        logging.debug(
+                                            "[Artist %s] Edition %s MB ID from Last.fm mbid (last resort): %s",
+                                            artist,
+                                            e["album_id"],
+                                            lfm_mbid,
+                                        )
+                                except RuntimeError:
+                                    pass
+                                except Exception:
+                                    pass
             # Increment MB-done count for this edition (whether we found rg_info or not)
             with lock:
                 state["scan_mb_done_count"] = state.get("scan_mb_done_count", 0) + 1
@@ -22642,10 +22686,10 @@ def background_scan():
                 f"7. Discogs fallback: {'enabled, ' + str(scan_discogs_matched) + ' matched' if getattr(sys.modules[__name__], 'USE_DISCOGS', False) else 'disabled'}."
             )
             steps_executed.append(
-                f"8. Last.fm fallback: {'enabled, ' + str(scan_lastfm_matched) + ' matched' if getattr(sys.modules[__name__], 'USE_LASTFM', False) else 'disabled'}."
+                f"8. Bandcamp fallback: {'enabled, ' + str(scan_bandcamp_matched) + ' matched' if getattr(sys.modules[__name__], 'USE_BANDCAMP', False) else 'disabled'}."
             )
             steps_executed.append(
-                f"9. Bandcamp fallback: {'enabled, ' + str(scan_bandcamp_matched) + ' matched' if getattr(sys.modules[__name__], 'USE_BANDCAMP', False) else 'disabled'}."
+                f"9. Last.fm fallback: {'enabled, ' + str(scan_lastfm_matched) + ' matched' if getattr(sys.modules[__name__], 'USE_LASTFM', False) else 'disabled'}."
             )
             # REQUIRED_TAGS from settings = single source of truth
             req_tags = getattr(sys.modules[__name__], "REQUIRED_TAGS", ["artist", "album", "genre", "year"])
@@ -35732,51 +35776,58 @@ def api_library_files_album_cover(album_id):
                     cached = _ensure_cached_image_for_path(cover_path, kind="album", max_px=size)
                     to_send = cached or cover_path
                     return send_file(str(to_send), as_attachment=False, conditional=True)
-            # Fallback to embedded cover from first track
+            # Fallback to embedded cover from the first tracks (some releases only embed
+            # art on a subset of files).
             cur.execute(
                 """
                 SELECT file_path
                 FROM files_tracks
                 WHERE album_id = %s
                 ORDER BY disc_num ASC, track_num ASC, id ASC
-                LIMIT 1
+                LIMIT 12
                 """,
                 (album_id,),
             )
-            tr_row = cur.fetchone()
-        if tr_row and (tr_row[0] or "").strip():
-            first_track = path_for_fs_access(Path(tr_row[0]))
-            embedded = _extract_embedded_cover_from_audio(first_track)
+            tr_rows = cur.fetchall() or []
+        embedded = None
+        for tr_row in tr_rows:
+            track_raw = str((tr_row[0] if isinstance(tr_row, (list, tuple)) else tr_row) or "").strip()
+            if not track_raw:
+                continue
+            track_path = path_for_fs_access(Path(track_raw))
+            embedded = _extract_embedded_cover_from_audio(track_path)
             if embedded:
-                raw, mime = embedded
-                master_cached = _ensure_cached_image_from_bytes(
-                    raw,
-                    mime,
-                    kind="embedded",
-                    cache_key_hint=f"album-{album_id}-master",
-                    max_px=1600,
-                )
-                if master_cached and master_cached.exists():
-                    try:
-                        with conn.transaction():
-                            with conn.cursor() as cur:
-                                cur.execute(
-                                    """
-                                    UPDATE files_albums
-                                    SET has_cover = TRUE,
-                                        cover_path = %s,
-                                        updated_at = NOW()
-                                    WHERE id = %s
-                                    """,
-                                    (str(master_cached), int(album_id)),
-                                )
-                        _files_cache_invalidate_all()
-                    except Exception:
-                        logging.debug("Unable to persist embedded cover for album_id=%s", album_id, exc_info=True)
-                    sized = _ensure_cached_image_for_path(master_cached, kind="album", max_px=size)
-                    to_send = sized or master_cached
-                    return send_file(str(to_send), as_attachment=False, conditional=True)
-                return Response(raw, headers={"Content-Type": mime})
+                break
+        if embedded:
+            raw, mime = embedded
+            master_cached = _ensure_cached_image_from_bytes(
+                raw,
+                mime,
+                kind="embedded",
+                cache_key_hint=f"album-{album_id}-master",
+                max_px=1600,
+            )
+            if master_cached and master_cached.exists():
+                try:
+                    with conn.transaction():
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                """
+                                UPDATE files_albums
+                                SET has_cover = TRUE,
+                                    cover_path = %s,
+                                    updated_at = NOW()
+                                WHERE id = %s
+                                """,
+                                (str(master_cached), int(album_id)),
+                            )
+                    _files_cache_invalidate_all()
+                except Exception:
+                    logging.debug("Unable to persist embedded cover for album_id=%s", album_id, exc_info=True)
+                sized = _ensure_cached_image_for_path(master_cached, kind="album", max_px=size)
+                to_send = sized or master_cached
+                return send_file(str(to_send), as_attachment=False, conditional=True)
+            return Response(raw, headers={"Content-Type": mime})
         # Avoid noisy 404s in the browser console: return a tiny transparent placeholder.
         # The UI still shows a "no cover" state (based on has_cover), but the image request won't error.
         try:
@@ -38412,6 +38463,71 @@ def _improve_single_album(album_id: int, db_conn, known_release_group_id: Option
                     logging.warning("improve-album: Discogs cover fetch failed: %s", e)
             if tags_updated or cover_saved:
                 provider_used = "discogs"
+
+    # Priority cover pass: Bandcamp before Last.fm.
+    # Many niche/self-released catalogs exist only on Bandcamp, so try it first for missing covers.
+    if USE_BANDCAMP and not has_cover_now:
+        bandcamp_cover_info = _fetch_bandcamp_album_info(artist_name, album_title_str)
+        bandcamp_cover_strict_ok = False
+        if bandcamp_cover_info:
+            strict_ok, strict_reason = _strict_identity_match_details(
+                local_artist=artist_name,
+                local_title=album_title_str,
+                candidate_artist=bandcamp_cover_info.get("artist_name") or "",
+                candidate_title=bandcamp_cover_info.get("title") or "",
+            )
+            if not strict_ok:
+                logging.info(
+                    "Fix-all [album_id=%s] Bandcamp cover candidate rejected for %s / %s (%s)",
+                    album_id,
+                    artist_name,
+                    album_title_str,
+                    strict_reason,
+                )
+                bandcamp_cover_info = None
+            else:
+                bandcamp_cover_strict_ok = True
+        if bandcamp_cover_info and bandcamp_cover_info.get("cover_url"):
+            try:
+                bandcamp_album_url = str(
+                    bandcamp_cover_info.get("album_url") or bandcamp_cover_info.get("url") or bandcamp_album_url or ""
+                ).strip()
+                best_cover = _download_best_cover_image(
+                    "Bandcamp",
+                    bandcamp_cover_info.get("cover_url"),
+                    cover_candidates=bandcamp_cover_info.get("cover_candidates") or [],
+                    headers={"User-Agent": "PMDA/1.0 (metadata fallback)"},
+                )
+                if best_cover:
+                    content, mime, _url_used = best_cover
+                    use_vision = bool(USE_AI_VISION_BEFORE_COVER_INJECT) and (not bandcamp_cover_strict_ok)
+                    if use_vision:
+                        accepted = _vision_verify_cover_before_inject(content, mime, artist_name, album_title_str, "Bandcamp")
+                    else:
+                        accepted = True
+                    if accepted:
+                        cover_path = folder / "cover.jpg"
+                        with open(cover_path, "wb") as f:
+                            f.write(content)
+                        cover_saved = True
+                        has_cover_now = True
+                        cover_outcome = "Bandcamp_saved"
+                        try:
+                            _files_watcher_suppress_folder(folder, seconds=120.0, reason="cover_write")
+                        except Exception:
+                            pass
+                        log_cov("Fix-all [album_id=%s] source=Bandcamp saved cover to %s", album_id, cover_path)
+                        steps.append("Fetched and saved cover art from Bandcamp")
+                        _embed_cover_in_audio_files(cover_path, audio_files)
+                        try:
+                            with lock:
+                                state["scan_cover_from_bandcamp"] = state.get("scan_cover_from_bandcamp", 0) + 1
+                        except Exception:
+                            pass
+                        if provider_used is None:
+                            provider_used = "bandcamp"
+            except Exception as e:
+                logging.warning("improve-album: Bandcamp priority cover fetch failed: %s", e)
 
     # Always allow Last.fm when some required tags (e.g. genre) are still missing,
     # even if MusicBrainz already provided basic tags.

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useLocation, useNavigate, useParams } from 'react-router-dom';
+import { useLocation, useNavigate, useOutletContext, useParams } from 'react-router-dom';
 import { ArrowLeft, Calendar, ChevronDown, ChevronUp, Disc3, ExternalLink, Heart, Loader2, Music, Play, RefreshCw, Sparkles, Users } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
@@ -126,6 +126,7 @@ function haversineKm(a: { lat: number; lon: number }, b: { lat: number; lon: num
 export default function ArtistPage() {
   const navigate = useNavigate();
   const location = useLocation();
+  const { includeUnmatched: includeUnmatchedContext } = useOutletContext<{ includeUnmatched: boolean }>();
   const { startPlayback, setCurrentTrack } = usePlayback();
   const params = useParams<{ artistId: string }>();
   const artistId = Number(params.artistId);
@@ -154,14 +155,13 @@ export default function ArtistPage() {
   const [concertFilter, setConcertFilter] = useState<{ enabled: boolean; lat: number | null; lon: number | null; radiusKm: number } | null>(null);
   const includeUnmatchedParam = useMemo(() => {
     const raw = new URLSearchParams(location.search || '').get('include_unmatched');
-    if (raw == null) return null;
+    if (raw == null) return includeUnmatchedContext ? '1' : '0';
     const low = String(raw || '').trim().toLowerCase();
     if (['1', 'true', 'yes', 'on'].includes(low)) return '1';
     if (['0', 'false', 'no', 'off'].includes(low)) return '0';
-    return null;
-  }, [location.search]);
+    return includeUnmatchedContext ? '1' : '0';
+  }, [includeUnmatchedContext, location.search]);
   const appendIncludeUnmatched = useCallback((url: string) => {
-    if (includeUnmatchedParam == null) return url;
     return `${url}${url.includes('?') ? '&' : '?'}include_unmatched=${includeUnmatchedParam}`;
   }, [includeUnmatchedParam]);
 
