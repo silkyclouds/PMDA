@@ -7062,7 +7062,7 @@ def _ensure_files_index_ready() -> tuple[bool, Optional[str]]:
 
 
 def _files_backfill_trusted_match_flags() -> int:
-    """Backfill files_albums.mb_identified from trusted provider IDs for legacy rows."""
+    """Backfill files_albums legacy flags for trusted identity and non-blocking genre completeness."""
     conn = _files_pg_connect()
     if conn is None:
         return 0
@@ -7084,8 +7084,34 @@ def _files_backfill_trusted_match_flags() -> int:
                     """
                 )
                 changed = int(cur.rowcount or 0)
+                # Legacy rows may still mark only "genre" as missing; genre is non-blocking now.
+                cur.execute(
+                    """
+                    SELECT id, COALESCE(missing_required_tags_json, '[]')
+                    FROM files_albums
+                    WHERE COALESCE(missing_required_tags_json, '') <> ''
+                      AND missing_required_tags_json <> '[]'
+                    """
+                )
+                tag_updates: list[tuple[str, int]] = []
+                for album_id, raw_missing in cur.fetchall():
+                    try:
+                        parsed = json.loads(raw_missing) if raw_missing else []
+                    except Exception:
+                        parsed = []
+                    if not isinstance(parsed, list):
+                        parsed = []
+                    filtered = [m for m in parsed if str(m or "").strip().lower() != "genre"]
+                    if filtered != parsed:
+                        tag_updates.append((json.dumps(filtered), int(album_id)))
+                if tag_updates:
+                    cur.executemany(
+                        "UPDATE files_albums SET missing_required_tags_json = %s WHERE id = %s",
+                        tag_updates,
+                    )
+                    changed += len(tag_updates)
         if changed > 0:
-            logging.info("Files index: backfilled trusted match flag on %d album row(s).", changed)
+            logging.info("Files index: backfilled trusted identity/completeness flags on %d album row(s).", changed)
     except Exception:
         logging.debug("Failed to backfill trusted match flags", exc_info=True)
     finally:
