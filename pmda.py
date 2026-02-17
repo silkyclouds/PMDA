@@ -30672,9 +30672,28 @@ def api_library_stats():
         cached = _files_cache_get_json(cache_key)
         if cached is not None:
             return jsonify(cached)
-        ok, err = _ensure_files_index_ready()
-        if not ok:
-            return jsonify({"error": err or "Files index unavailable"}), 503
+        # Never block UI endpoints on a full bootstrap index rebuild.
+        # If index is empty/running, return immediate zero payload and keep/restart
+        # indexing asynchronously in background.
+        indexed_artists, indexed_albums, indexed_tracks = _files_index_read_counts()
+        index_state = _files_index_get_state() or {}
+        index_running = bool(index_state.get("running"))
+        if indexed_albums <= 0 or indexed_tracks <= 0:
+            if not index_running:
+                _trigger_files_index_rebuild_async(reason="api_library_stats_bootstrap")
+                index_state = _files_index_get_state() or {}
+                index_running = bool(index_state.get("running"))
+            return jsonify(
+                {
+                    "artists": 0,
+                    "albums": 0,
+                    "tracks": 0,
+                    "index_running": index_running,
+                    "index_phase": str(index_state.get("phase") or ""),
+                }
+            )
+        if not _files_pg_init_schema():
+            return jsonify({"error": "PostgreSQL unavailable"}), 503
         conn = _files_pg_connect()
         if conn is None:
             return jsonify({"error": "PostgreSQL unavailable"}), 503
@@ -30752,9 +30771,37 @@ def api_library_stats_library():
     cached = _files_cache_get_json(cache_key)
     if cached is not None:
         return jsonify(cached)
-    ok, err = _ensure_files_index_ready()
-    if not ok:
-        return jsonify({"error": err or "Files index unavailable"}), 503
+    # Never block this endpoint while index bootstrap parses huge libraries.
+    indexed_artists, indexed_albums, indexed_tracks = _files_index_read_counts()
+    index_state = _files_index_get_state() or {}
+    index_running = bool(index_state.get("running"))
+    if indexed_albums <= 0 or indexed_tracks <= 0:
+        if not index_running:
+            _trigger_files_index_rebuild_async(reason="api_library_stats_library_bootstrap")
+            index_state = _files_index_get_state() or {}
+            index_running = bool(index_state.get("running"))
+        return jsonify(
+            {
+                "artists": 0,
+                "albums": 0,
+                "tracks": 0,
+                "years": [],
+                "growth": [],
+                "formats": [],
+                "quality": {
+                    "lossless": 0,
+                    "lossy": 0,
+                    "with_cover": 0,
+                    "without_cover": 0,
+                },
+                "genres": [],
+                "labels": [],
+                "index_running": index_running,
+                "index_phase": str(index_state.get("phase") or ""),
+            }
+        )
+    if not _files_pg_init_schema():
+        return jsonify({"error": "PostgreSQL unavailable"}), 503
     conn = _files_pg_connect()
     if conn is None:
         return jsonify({"error": "PostgreSQL unavailable"}), 503
