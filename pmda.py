@@ -29626,6 +29626,27 @@ def api_duplicates():
 
 @app.get("/api/progress")
 def api_progress():
+    now_ts = time.time()
+    mod = sys.modules[__name__]
+    cache_obj = getattr(mod, "_API_PROGRESS_CACHE", None)
+    if isinstance(cache_obj, dict):
+        cached_payload = cache_obj.get("payload")
+        try:
+            cached_ts = float(cache_obj.get("ts") or 0.0)
+        except Exception:
+            cached_ts = 0.0
+        if isinstance(cached_payload, dict):
+            age = now_ts - cached_ts
+            # Coalesce bursts of concurrent polling requests from multiple UI components.
+            if 0.0 <= age < 0.75:
+                return jsonify(cached_payload)
+            # When the shared state lock is currently contended, serve a recent stale snapshot
+            # instead of piling up blocked requests in the browser.
+            if lock.locked() and 0.0 <= age < 15.0:
+                stale_payload = dict(cached_payload)
+                stale_payload["stale"] = True
+                return jsonify(stale_payload)
+
     with lock:
         # Do NOT set scanning=False here when progress >= total. The scan thread still runs
         # the AI batch and finally block (save_scan_to_db, scan_history) after progress hits
@@ -29830,96 +29851,98 @@ def api_progress():
         except Exception as e:
             logging.debug("api_progress: could not load last_scan_summary: %s", e)
     
-    return jsonify(
-        scanning=scanning,
-        progress=progress,
-        total=total,
-        effective_progress=effective_progress,
-        status=status,
-        phase=phase,
-        current_step=current_step,
-        ai_provider=ai_provider_display,
-        ai_model=ai_model_display,
+    payload = {
+        "scanning": scanning,
+        "progress": progress,
+        "total": total,
+        "effective_progress": effective_progress,
+        "status": status,
+        "phase": phase,
+        "current_step": current_step,
+        "ai_provider": ai_provider_display,
+        "ai_model": ai_model_display,
         # Scan details
-        artists_processed=artists_processed,
-        artists_total=artists_total,
-        detected_artists_total=detected_artists_total,
-        detected_albums_total=detected_albums_total,
-        resume_skipped_artists=resume_skipped_artists,
-        resume_skipped_albums=resume_skipped_albums,
-        ai_used_count=ai_used_count,
-        mb_used_count=mb_used_count,
-        ai_enabled=ai_enabled,
-        mb_enabled=mb_enabled,
+        "artists_processed": artists_processed,
+        "artists_total": artists_total,
+        "detected_artists_total": detected_artists_total,
+        "detected_albums_total": detected_albums_total,
+        "resume_skipped_artists": resume_skipped_artists,
+        "resume_skipped_albums": resume_skipped_albums,
+        "ai_used_count": ai_used_count,
+        "mb_used_count": mb_used_count,
+        "ai_enabled": ai_enabled,
+        "mb_enabled": mb_enabled,
         # Cache statistics
-        audio_cache_hits=audio_cache_hits,
-        audio_cache_misses=audio_cache_misses,
-        mb_cache_hits=mb_cache_hits,
-        mb_cache_misses=mb_cache_misses,
+        "audio_cache_hits": audio_cache_hits,
+        "audio_cache_misses": audio_cache_misses,
+        "mb_cache_hits": mb_cache_hits,
+        "mb_cache_misses": mb_cache_misses,
         # Detailed statistics
-        duplicate_groups_count=duplicate_groups_count,
-        total_duplicates_count=total_duplicates_count,
-        broken_albums_count=broken_albums_count,
-        missing_albums_count=missing_albums_count,
-        albums_without_artist_image=albums_without_artist_image,
-        albums_without_album_image=albums_without_album_image,
-        albums_without_complete_tags=albums_without_complete_tags,
-        albums_without_mb_id=albums_without_mb_id,
-        albums_without_artist_mb_id=albums_without_artist_mb_id,
-        format_done_count=format_done_count,
-        mb_done_count=mb_done_count,
+        "duplicate_groups_count": duplicate_groups_count,
+        "total_duplicates_count": total_duplicates_count,
+        "broken_albums_count": broken_albums_count,
+        "missing_albums_count": missing_albums_count,
+        "albums_without_artist_image": albums_without_artist_image,
+        "albums_without_album_image": albums_without_album_image,
+        "albums_without_complete_tags": albums_without_complete_tags,
+        "albums_without_mb_id": albums_without_mb_id,
+        "albums_without_artist_mb_id": albums_without_artist_mb_id,
+        "format_done_count": format_done_count,
+        "mb_done_count": mb_done_count,
         # Settings visible in scanner (e.g. link to configure)
-        mb_retry_not_found=getattr(sys.modules[__name__], "MB_RETRY_NOT_FOUND", False),
+        "mb_retry_not_found": getattr(sys.modules[__name__], "MB_RETRY_NOT_FOUND", False),
         # ETA
-        eta_seconds=eta_seconds,
-        threads_in_use=threads_in_use,
-        active_artists=active_artists_list,
-        last_scan_summary=last_scan_summary,
-        scan_steps_log=scan_steps_log,
-        scan_type=current_scan_type,
-        scan_resume_run_id=scan_resume_run_id,
-        finalizing=finalizing,
-        deduping=deduping,
-        dedupe_progress=dedupe_progress,
-        dedupe_total=dedupe_total,
-        dedupe_current_group=dedupe_current_group,
-        auto_move_enabled=auto_move_enabled,
-        paths_status=_paths_rw_status(),
+        "eta_seconds": eta_seconds,
+        "threads_in_use": threads_in_use,
+        "active_artists": active_artists_list,
+        "last_scan_summary": last_scan_summary,
+        "scan_steps_log": scan_steps_log,
+        "scan_type": current_scan_type,
+        "scan_resume_run_id": scan_resume_run_id,
+        "finalizing": finalizing,
+        "deduping": deduping,
+        "dedupe_progress": dedupe_progress,
+        "dedupe_total": dedupe_total,
+        "dedupe_current_group": dedupe_current_group,
+        "auto_move_enabled": auto_move_enabled,
+        "paths_status": _paths_rw_status(),
         # IA analysis step: current group label and N/M progress
-        scan_ai_batch_total=scan_ai_batch_total,
-        scan_ai_batch_processed=scan_ai_batch_processed,
-        scan_ai_current_label=scan_ai_current_label,
-        total_albums=total_albums,
-        post_processing=scan_post_processing,
-        post_processing_done=scan_post_done,
-        post_processing_total=scan_post_total,
-        post_processing_current_artist=scan_post_current_artist,
-        post_processing_current_album=scan_post_current_album,
-        scan_discovery_running=scan_discovery_running,
-        scan_discovery_current_root=scan_discovery_current_root,
-        scan_discovery_roots_done=scan_discovery_roots_done,
-        scan_discovery_roots_total=scan_discovery_roots_total,
-        scan_discovery_files_found=scan_discovery_files_found,
-        scan_discovery_folders_found=scan_discovery_folders_found,
-        scan_discovery_albums_found=scan_discovery_albums_found,
-        scan_discovery_artists_found=scan_discovery_artists_found,
-        files_watcher_running=bool(files_watcher_state.get("running")),
-        files_watcher_roots=list(files_watcher_state.get("roots") or []),
-        files_watcher_dirty_count=int(files_watcher_state.get("dirty_count") or 0),
-        files_watcher_last_event_at=files_watcher_state.get("last_event_at"),
-        files_watcher_last_event_path=files_watcher_state.get("last_event_path"),
-        scan_discogs_matched=scan_discogs_matched,
-        scan_lastfm_matched=scan_lastfm_matched,
-        scan_bandcamp_matched=scan_bandcamp_matched,
-        scan_start_time=scan_start_time,
-        scan_pipeline_flags=scan_pipeline_flags,
-        scan_pipeline_sync_target=scan_pipeline_sync_target,
-        scan_incomplete_moved_count=scan_incomplete_moved_count,
-        scan_incomplete_moved_mb=scan_incomplete_moved_mb,
-        scan_player_sync_target=scan_player_sync_target,
-        scan_player_sync_ok=scan_player_sync_ok,
-        scan_player_sync_message=scan_player_sync_message,
-    )
+        "scan_ai_batch_total": scan_ai_batch_total,
+        "scan_ai_batch_processed": scan_ai_batch_processed,
+        "scan_ai_current_label": scan_ai_current_label,
+        "total_albums": total_albums,
+        "post_processing": scan_post_processing,
+        "post_processing_done": scan_post_done,
+        "post_processing_total": scan_post_total,
+        "post_processing_current_artist": scan_post_current_artist,
+        "post_processing_current_album": scan_post_current_album,
+        "scan_discovery_running": scan_discovery_running,
+        "scan_discovery_current_root": scan_discovery_current_root,
+        "scan_discovery_roots_done": scan_discovery_roots_done,
+        "scan_discovery_roots_total": scan_discovery_roots_total,
+        "scan_discovery_files_found": scan_discovery_files_found,
+        "scan_discovery_folders_found": scan_discovery_folders_found,
+        "scan_discovery_albums_found": scan_discovery_albums_found,
+        "scan_discovery_artists_found": scan_discovery_artists_found,
+        "files_watcher_running": bool(files_watcher_state.get("running")),
+        "files_watcher_roots": list(files_watcher_state.get("roots") or []),
+        "files_watcher_dirty_count": int(files_watcher_state.get("dirty_count") or 0),
+        "files_watcher_last_event_at": files_watcher_state.get("last_event_at"),
+        "files_watcher_last_event_path": files_watcher_state.get("last_event_path"),
+        "scan_discogs_matched": scan_discogs_matched,
+        "scan_lastfm_matched": scan_lastfm_matched,
+        "scan_bandcamp_matched": scan_bandcamp_matched,
+        "scan_start_time": scan_start_time,
+        "scan_pipeline_flags": scan_pipeline_flags,
+        "scan_pipeline_sync_target": scan_pipeline_sync_target,
+        "scan_incomplete_moved_count": scan_incomplete_moved_count,
+        "scan_incomplete_moved_mb": scan_incomplete_moved_mb,
+        "scan_player_sync_target": scan_player_sync_target,
+        "scan_player_sync_ok": scan_player_sync_ok,
+        "scan_player_sync_message": scan_player_sync_message,
+    }
+    setattr(mod, "_API_PROGRESS_CACHE", {"ts": time.time(), "payload": payload})
+    return jsonify(payload)
 
 
 def _tail_log_lines(path: Path, lines: int = 200, max_bytes: int = 512 * 1024) -> list[str]:
@@ -34045,9 +34068,6 @@ def api_library_playlists():
     """List local playlists (Files mode only)."""
     if _get_library_mode() != "files":
         return jsonify({"playlists": [], "error": "Files mode required"}), 400
-    ok, err = _ensure_files_index_ready()
-    if not ok:
-        return jsonify({"playlists": [], "error": err or "Files index unavailable"}), 503
     conn = _files_pg_connect()
     if conn is None:
         return jsonify({"playlists": [], "error": "PostgreSQL unavailable"}), 503
