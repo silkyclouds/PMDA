@@ -40155,7 +40155,7 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
             steps.append("Backup skipped: copy failed")
 
     first_audio = audio_files[0]
-    current_tags = extract_tags(first_audio)
+    current_tags = dict(extract_tags(first_audio) or {})
     release_mbid = current_tags.get("musicbrainz_releasegroupid") or current_tags.get("musicbrainz_releaseid")
     # Compute which required tags are currently missing on the first audio file.
     # This lets us decide when to call Last.fm/Bandcamp even if MusicBrainz already provided basic tags.
@@ -40163,6 +40163,109 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
         missing_required = _check_required_tags(current_tags, REQUIRED_TAGS, edition=None)
     except Exception:
         missing_required = []
+
+    # Global strict commit gate (100% match required): artist + album + provider id +
+    # exact track count + exact positional track titles.
+    strict_tracks: list[dict] = []
+    for order, audio_path in enumerate(audio_files, start=1):
+        try:
+            meta_i = dict(extract_tags(audio_path) or {})
+        except Exception:
+            meta_i = {}
+        title_i = (
+            str(
+                meta_i.get("title")
+                or meta_i.get("tit2")
+                or meta_i.get("track_title")
+                or ""
+            ).strip()
+            or audio_path.stem
+        )
+        idx_i = (
+            _parse_int_loose(
+                meta_i.get("track")
+                or meta_i.get("tracknumber")
+                or meta_i.get("trck"),
+                order,
+            )
+            or order
+        )
+        disc_i = (
+            _parse_int_loose(
+                meta_i.get("disc")
+                or meta_i.get("discnumber")
+                or meta_i.get("disc_num")
+                or meta_i.get("tpas"),
+                1,
+            )
+            or 1
+        )
+        strict_tracks.append(
+            {
+                "title": title_i,
+                "idx": idx_i,
+                "disc": disc_i,
+            }
+        )
+    strict_edition = {
+        "tracks": strict_tracks,
+        "meta": current_tags,
+        "musicbrainz_id": str(release_mbid or current_tags.get("musicbrainz_releasegroupid") or current_tags.get("musicbrainz_releaseid") or "").strip(),
+        "discogs_release_id": str(current_tags.get("discogs_release_id") or "").strip(),
+        "bandcamp_album_url": str(current_tags.get("bandcamp_album_url") or "").strip(),
+        "lastfm_album_mbid": str(current_tags.get("lastfm_album_mbid") or "").strip(),
+    }
+    strict_verdict = _strict_validate_edition_match(
+        artist_name=artist_name,
+        album_title=album_title_str,
+        edition=strict_edition,
+    )
+    strict_ok, strict_reason = _strict_mutation_allowed(strict_verdict)
+    if not strict_ok:
+        reason = strict_reason or "strict_match_missing"
+        steps.append(f"Mutation blocked: {reason}")
+        return {
+            "steps": steps,
+            "summary": f"No mutation applied (strict gate): {reason}.",
+            "tags_updated": False,
+            "cover_saved": False,
+            "provider_used": None,
+            "dupes_in_folder": dupes_in_folder,
+            "files_updated": 0,
+            "pmda_matched": False,
+            "pmda_cover": False,
+            "pmda_artist_image": False,
+            "pmda_complete": False,
+            "pmda_match_provider": None,
+            "pmda_cover_provider": None,
+            "pmda_artist_provider": None,
+            "discogs_release_id": "",
+            "lastfm_album_mbid": "",
+            "bandcamp_album_url": "",
+            "strict_match_verified": False,
+            "strict_match_provider": "",
+            "strict_reject_reason": reason,
+            "strict_tracklist_score": 0.0,
+            "mutation_blocked": True,
+            "mutation_blocked_reason": reason,
+        }
+    strict_provider = _normalize_identity_provider(str(strict_verdict.get("strict_match_provider") or ""))
+    strict_provider_label = {
+        "musicbrainz": "MusicBrainz",
+        "discogs": "Discogs",
+        "bandcamp": "Bandcamp",
+        "lastfm": "Last.fm",
+    }.get(strict_provider, strict_provider or "provider")
+    steps.append(f"Strict match verified (100%): {strict_provider_label}")
+    strict_provider_id = str(strict_verdict.get("provider_id") or "").strip()
+    if strict_provider == "musicbrainz" and strict_provider_id:
+        release_mbid = strict_provider_id
+    elif strict_provider == "discogs" and strict_provider_id:
+        discogs_release_id = strict_provider_id
+    elif strict_provider == "bandcamp" and strict_provider_id:
+        bandcamp_album_url = strict_provider_id
+    elif strict_provider == "lastfm" and strict_provider_id:
+        lastfm_album_mbid = strict_provider_id
 
     if not release_mbid and USE_MUSICBRAINZ:
         album_norm = norm_album(album_title_str)
@@ -40754,6 +40857,10 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
         "discogs_release_id": discogs_release_id,
         "lastfm_album_mbid": lastfm_album_mbid,
         "bandcamp_album_url": bandcamp_album_url,
+        "strict_match_verified": bool(strict_verdict.get("strict_match_verified")),
+        "strict_match_provider": strict_provider,
+        "strict_reject_reason": str(strict_verdict.get("strict_reject_reason") or "").strip(),
+        "strict_tracklist_score": float(strict_verdict.get("strict_tracklist_score") or 0.0),
         "mutation_blocked": False,
         "mutation_blocked_reason": "",
     }
