@@ -13,6 +13,7 @@ import { AlbumArtwork } from '@/components/library/AlbumArtwork';
 import { usePlayback } from '@/contexts/PlaybackContext';
 import { useToast } from '@/hooks/use-toast';
 import { useLibraryQuery } from '@/hooks/useLibraryQuery';
+import { useIsMobile } from '@/hooks/use-mobile';
 import { cn } from '@/lib/utils';
 import * as api from '@/lib/api';
 import type { TrackInfo } from '@/components/library/AudioPlayer';
@@ -40,6 +41,7 @@ function normalizeGenreBadges(album: api.LibraryAlbumItem): string[] {
 }
 
 export default function LibraryAlbums() {
+  const isMobile = useIsMobile();
   const navigate = useNavigate();
   const location = useLocation();
   const { includeUnmatched } = useOutletContext<LibraryOutletContext>();
@@ -78,9 +80,10 @@ export default function LibraryAlbums() {
   }, [albumLikes]);
 
   const gridTemplateColumns = useMemo(() => {
+    if (isMobile) return 'repeat(2, minmax(0, 1fr))';
     const col = Math.max(140, Math.min(340, Math.floor(coverSize)));
     return `repeat(auto-fill, minmax(${col}px, ${col}px))`;
-  }, [coverSize]);
+  }, [coverSize, isMobile]);
 
   const hydrateAlbumLikes = useCallback(async (ids: number[]) => {
     const unique = Array.from(new Set(ids.filter((x) => Number.isFinite(x) && x > 0)));
@@ -238,7 +241,7 @@ export default function LibraryAlbums() {
 
         <div className="flex flex-col sm:flex-row sm:items-center gap-3">
           <Select value={sort} onValueChange={(v) => setSort(v as SortMode)}>
-            <SelectTrigger className="w-[180px] h-10 bg-background/80">
+            <SelectTrigger className="w-full sm:w-[180px] h-10 bg-background/80">
               <SelectValue placeholder="Sort" />
             </SelectTrigger>
             <SelectContent>
@@ -298,7 +301,7 @@ export default function LibraryAlbums() {
               >
                 <AlbumArtwork albumThumb={a.thumb} artistId={a.artist_id} alt={a.title} size={512} />
                 <div className="absolute inset-0 opacity-0 group-hover:opacity-100 transition-opacity bg-black/35" />
-                <div className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity">
+                <div className="absolute top-2 right-2 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity">
                   <Button
                     type="button"
                     size="icon"
@@ -310,7 +313,7 @@ export default function LibraryAlbums() {
                     <Heart className={cn('h-4 w-4', albumLikes[a.album_id] ? 'fill-current' : '')} />
                   </Button>
                 </div>
-                <div className="absolute inset-x-0 bottom-0 p-3 opacity-0 group-hover:opacity-100 transition-opacity">
+                <div className="absolute inset-x-0 bottom-0 p-3 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity">
                   <div className="flex items-center justify-between gap-2">
                     <Button size="sm" className="h-9 rounded-full gap-2" onClick={() => void handlePlayAlbum(a.album_id, a.title, a.thumb)}>
                       <Play className="h-4 w-4" />

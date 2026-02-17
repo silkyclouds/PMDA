@@ -168,17 +168,16 @@ function normalizeScan(entry: ScanHistoryEntry): ScanSnapshot {
   const withoutCover = n(summary?.albums_without_album_image ?? entry.albums_without_album_image);
   const withoutArtistImage = n(summary?.albums_without_artist_image ?? entry.albums_without_artist_image);
   const albumsWithMbId = n(
-    summary?.albums_with_mb_id ?? Math.max(0, albumsScanned - n(summary?.albums_without_mb_id ?? entry.albums_without_mb_id)),
+    summary?.strict_matched_albums
+      ?? summary?.albums_with_mb_id
+      ?? Math.max(0, albumsScanned - n(summary?.albums_without_mb_id ?? entry.albums_without_mb_id)),
   );
 
   const discogsMatches = n(summary?.scan_discogs_matched);
   const lastfmMatches = n(summary?.scan_lastfm_matched);
   const bandcampMatches = n(summary?.scan_bandcamp_matched);
 
-  const matchedAlbums = Math.min(
-    albumsScanned,
-    Math.max(0, albumsWithMbId + discogsMatches + lastfmMatches + bandcampMatches),
-  );
+  const matchedAlbums = Math.min(albumsScanned, Math.max(0, albumsWithMbId));
 
   return {
     scanId: entry.scan_id,
@@ -224,10 +223,7 @@ function normalizeLiveScan(progress: ScanProgress, fallbackStartTime: number): S
   const discogsMatches = n(progress.scan_discogs_matched);
   const lastfmMatches = n(progress.scan_lastfm_matched);
   const bandcampMatches = n(progress.scan_bandcamp_matched);
-  const matchedAlbums = Math.min(
-    totalAlbums,
-    Math.max(0, albumsWithMbId + discogsMatches + lastfmMatches + bandcampMatches),
-  );
+  const matchedAlbums = Math.min(totalAlbums, Math.max(0, albumsWithMbId));
   const startTime = n(progress.scan_start_time ?? fallbackStartTime);
   const now = Math.floor(Date.now() / 1000);
   const durationSeconds = startTime > 0 ? Math.max(0, now - startTime) : 0;
@@ -544,12 +540,16 @@ export default function Statistics() {
   }, [scansChrono]);
 
   const metadataProvidersData = useMemo(() => {
+    const mbProviderMatches = Math.max(
+      0,
+      current.albumsWithMbId - current.discogsMatches - current.lastfmMatches - current.bandcampMatches,
+    );
     return {
       labels: ['MusicBrainz', 'Discogs', 'Last.fm', 'Bandcamp'],
       datasets: [
         {
           data: [
-            current.albumsWithMbId,
+            mbProviderMatches,
             current.discogsMatches,
             current.lastfmMatches,
             current.bandcampMatches,
@@ -568,13 +568,17 @@ export default function Statistics() {
   }, [current.albumsWithMbId, current.discogsMatches, current.lastfmMatches, current.bandcampMatches]);
 
   const metadataProvidersBarData = useMemo(() => {
+    const mbProviderMatches = Math.max(
+      0,
+      current.albumsWithMbId - current.discogsMatches - current.lastfmMatches - current.bandcampMatches,
+    );
     return {
       labels: ['MusicBrainz', 'Discogs', 'Last.fm', 'Bandcamp'],
       datasets: [
         {
           label: 'Matched albums',
           data: [
-            current.albumsWithMbId,
+            mbProviderMatches,
             current.discogsMatches,
             current.lastfmMatches,
             current.bandcampMatches,
@@ -954,7 +958,7 @@ export default function Statistics() {
                   title="Matched During Scan"
                   icon={<Database className="w-4 h-4 text-primary" />}
                   value={`${current.matchedAlbums.toLocaleString()} / ${current.albumsScanned.toLocaleString()}`}
-                  description={`${formatPercent(current.matchedAlbums, current.albumsScanned)} matched by MB/provider decisions during this run (cache fast-skip may already be matched)`}
+                  description={`${formatPercent(current.matchedAlbums, current.albumsScanned)} strict 100% matches (artist + album + full tracklist exact)`}
                   delta={<DeltaPill current={current.matchedAlbums} previous={previous.matchedAlbums} />}
                 />
                 <StatCard
@@ -987,7 +991,7 @@ export default function Statistics() {
             <TabsContent value="metadata" className="space-y-4">
               <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                 <StatCard
-                  title="MB Coverage"
+                  title="Strict Coverage"
                   icon={<Database className="w-4 h-4 text-primary" />}
                   value={`${current.albumsWithMbId.toLocaleString()} / ${current.albumsScanned.toLocaleString()}`}
                   description={formatPercent(current.albumsWithMbId, current.albumsScanned)}

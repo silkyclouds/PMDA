@@ -656,8 +656,8 @@ export default function ArtistPage() {
   };
 
   return (
-    <div className="container py-6 space-y-6">
-        <div className="flex items-center justify-between gap-3">
+    <div className="container py-4 md:py-6 space-y-5 md:space-y-6">
+        <div className="flex flex-wrap items-start justify-between gap-3">
           <Button variant="ghost" className="gap-2" onClick={() => navigate(`/library${location.search || ''}`)}>
             <ArrowLeft className="w-4 h-4" />
             Back to Library
@@ -673,14 +673,14 @@ export default function ArtistPage() {
         <Card className="overflow-hidden border-border/70">
           <div className="relative">
             <div className="absolute inset-0 bg-gradient-to-r from-background via-background/88 to-background/55 z-10" />
-            {heroImage ? (
-              <img src={heroImage} alt={details.artist_name} className="w-full h-80 md:h-96 object-cover blur-[1px] scale-[1.03]" />
+              {heroImage ? (
+              <img src={heroImage} alt={details.artist_name} className="w-full h-64 md:h-96 object-cover blur-[1px] scale-[1.03]" />
             ) : (
-              <div className="h-80 md:h-96 bg-gradient-to-br from-zinc-900 via-zinc-800 to-zinc-900" />
+              <div className="h-64 md:h-96 bg-gradient-to-br from-zinc-900 via-zinc-800 to-zinc-900" />
             )}
             <div className="absolute inset-0 z-20 p-6 md:p-8 flex items-end">
               <div className="grid grid-cols-1 md:grid-cols-[12rem,1fr] gap-6 w-full items-end">
-                <div className="w-40 h-40 md:w-52 md:h-52 lg:w-56 lg:h-56 rounded-3xl overflow-hidden border border-border/60 bg-muted shrink-0 shadow-[0_24px_60px_rgba(0,0,0,0.35)]">
+	                <div className="w-28 h-28 sm:w-36 sm:h-36 md:w-52 md:h-52 lg:w-56 lg:h-56 rounded-3xl overflow-hidden border border-border/60 bg-muted shrink-0 shadow-[0_24px_60px_rgba(0,0,0,0.35)]">
                   {heroImage ? (
                     <img src={heroImage} alt={details.artist_name} className="w-full h-full object-cover animate-in fade-in-0 duration-300" />
                   ) : (
@@ -690,7 +690,7 @@ export default function ArtistPage() {
                   )}
                 </div>
                 <div className="min-w-0">
-                  <h1 className="text-4xl md:text-5xl font-bold tracking-tight truncate">{details.artist_name}</h1>
+	                  <h1 className="text-2xl sm:text-3xl md:text-5xl font-bold tracking-tight truncate">{details.artist_name}</h1>
                   <p className="text-base text-muted-foreground mt-1.5">
                     {details.total_albums.toLocaleString()} album{details.total_albums !== 1 ? 's' : ''}
                   </p>
@@ -782,7 +782,7 @@ export default function ArtistPage() {
         {/* Concerts */}
         <Card className="border-border/70">
           <CardContent className="p-5 space-y-4">
-            <div className="flex items-start justify-between gap-4">
+            <div className="flex flex-wrap items-start justify-between gap-4">
               <div className="space-y-1">
                 <div className="flex items-center gap-2">
                   <Calendar className="w-4 h-4 text-primary" />
@@ -877,7 +877,7 @@ export default function ArtistPage() {
         {/* Connections / Facts */}
         <Card className="border-border/70">
           <CardContent className="p-5 space-y-4">
-            <div className="flex items-start justify-between gap-4">
+            <div className="flex flex-wrap items-start justify-between gap-4">
               <div className="space-y-1">
                 <div className="flex items-center gap-2">
                   <Users className="w-4 h-4 text-primary" />
@@ -1041,7 +1041,7 @@ export default function ArtistPage() {
                           }}
                         >
                           <AlbumArtwork albumThumb={album.thumb} artistId={artistId} alt={album.title} size={512} />
-                          <div className="absolute inset-x-0 bottom-0 p-2.5 opacity-0 group-hover:opacity-100 transition-opacity">
+                          <div className="absolute inset-x-0 bottom-0 p-2.5 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity">
                             <Button
                               size="sm"
                               className="h-8 w-full gap-2 rounded-full"

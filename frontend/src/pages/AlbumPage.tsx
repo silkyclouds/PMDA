@@ -248,13 +248,13 @@ export default function AlbumPage() {
   const showReviewToggle = wordCount(reviewText) >= 80 || reviewText.length >= 420;
 
   return (
-    <div className="container py-6 space-y-6">
-      <div className="flex items-center justify-between gap-3">
+    <div className="container py-4 md:py-6 space-y-5 md:space-y-6">
+      <div className="flex flex-wrap items-start justify-between gap-3">
         <Button variant="ghost" className="gap-2" onClick={() => navigate(`/library/artist/${data.artist_id}`)}>
           <ArrowLeft className="w-4 h-4" />
           Back to Artist
         </Button>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           {data.label ? (
             <Button
               size="sm"
@@ -355,7 +355,7 @@ export default function AlbumPage() {
                 <CollapsibleContent>
                   <p className="text-sm leading-relaxed text-muted-foreground whitespace-pre-wrap">{reviewText}</p>
                 </CollapsibleContent>
-                <div className="flex items-center justify-between gap-3">
+                <div className="flex flex-wrap items-center justify-between gap-3">
                   {reviewSource ? (
                     <Badge variant="outline" className="text-[10px]">
                       Source: {reviewSource}
@@ -381,7 +381,7 @@ export default function AlbumPage() {
 
       <Card className="border-border/70">
         <CardContent className="p-5 space-y-3">
-          <div className="flex items-center justify-between gap-3">
+          <div className="flex flex-wrap items-start justify-between gap-3">
             <div className="min-w-0">
               <h2 className="text-lg font-semibold">Tracks</h2>
               <p className="text-xs text-muted-foreground mt-1">
@@ -393,7 +393,7 @@ export default function AlbumPage() {
           {trackRows.length === 0 ? (
             <p className="text-sm text-muted-foreground">No tracks found for this album.</p>
           ) : (
-            <ScrollArea className="h-[460px] md:h-[600px]">
+            <ScrollArea className="h-[58svh] md:h-[600px]">
               <Table className="min-w-[920px]">
                 <TableHeader>
                   <TableRow className="hover:bg-transparent">

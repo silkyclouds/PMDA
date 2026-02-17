@@ -304,6 +304,9 @@ export interface LastScanSummary {
   mb_cache_misses?: number;
   lossy_count?: number;
   lossless_count?: number;
+  strict_total_albums?: number;
+  strict_matched_albums?: number;
+  strict_unmatched_albums?: number;
   albums_with_mb_id?: number;
   /** When auto-move ran this scan: number of duplicate albums moved. */
   dupes_moved_this_scan?: number;
@@ -653,6 +656,9 @@ export interface ScanHistorySummaryJson {
   mb_cache_misses?: number;
   lossy_count?: number;
   lossless_count?: number;
+  strict_total_albums?: number;
+  strict_matched_albums?: number;
+  strict_unmatched_albums?: number;
   albums_with_mb_id?: number;
   dupes_moved_this_scan?: number;
   space_saved_mb_this_scan?: number;
@@ -1940,6 +1946,11 @@ export async function saveConfig(config: Partial<PMDAConfig>): Promise<{ status:
 /** Files backend: start rebuild of export library (hardlinks/symlinks/copies/moves). */
 export async function postFilesExportRebuild(): Promise<{ status: string; message?: string }> {
   return fetchApi<{ status: string; message?: string }>('/api/files/export/rebuild', { method: 'POST' });
+}
+
+/** Files backend: drop and rebuild the indexed library from FILES_ROOTS. */
+export async function postLibraryFilesIndexRebuild(): Promise<{ status: string; message?: string; progress?: unknown }> {
+  return fetchApi<{ status: string; message?: string; progress?: unknown }>('/api/library/files-index/rebuild', { method: 'POST' });
 }
 
 /** Files backend: export progress (running, tracks_done, total_tracks, albums_done, total_albums, error). */

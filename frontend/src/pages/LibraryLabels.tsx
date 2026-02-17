@@ -149,8 +149,12 @@ export default function LibraryLabels() {
       </Card>
 
       <div ref={sentinelRef} className="h-6" />
-      <div className="flex items-center justify-center py-2 text-xs text-muted-foreground">
-        {canLoadMore ? (appending ? <span className="inline-flex items-center gap-2"><Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading more…</span> : 'Scroll to load more') : 'All loaded'}
+      <div className="flex min-h-6 items-center justify-center py-2 text-xs text-muted-foreground">
+        {appending ? (
+          <span className="inline-flex items-center gap-2">
+            <Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading more…
+          </span>
+        ) : total > 0 && !canLoadMore ? 'All loaded' : null}
       </div>
     </div>
   );

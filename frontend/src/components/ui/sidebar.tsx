@@ -1,7 +1,7 @@
 import * as React from "react";
 import { Slot } from "@radix-ui/react-slot";
 import { VariantProps, cva } from "class-variance-authority";
-import { Menu, PanelLeft } from "lucide-react";
+import { Menu } from "lucide-react";
 
 import { useIsMobile } from "@/hooks/use-mobile";
 import { cn } from "@/lib/utils";
@@ -18,6 +18,19 @@ const SIDEBAR_WIDTH = "16rem";
 const SIDEBAR_WIDTH_MOBILE = "min(88vw, 22rem)";
 const SIDEBAR_WIDTH_ICON = "3rem";
 const SIDEBAR_KEYBOARD_SHORTCUT = "b";
+
+function readSidebarStateFromCookie(defaultOpen: boolean): boolean {
+  if (typeof document === "undefined") return defaultOpen;
+  const raw = document.cookie
+    .split(";")
+    .map((entry) => entry.trim())
+    .find((entry) => entry.startsWith(`${SIDEBAR_COOKIE_NAME}=`));
+  if (!raw) return defaultOpen;
+  const value = raw.split("=")[1];
+  if (value === "true") return true;
+  if (value === "false") return false;
+  return defaultOpen;
+}
 
 type SidebarContext = {
   state: "expanded" | "collapsed";
@@ -53,7 +66,7 @@ const SidebarProvider = React.forwardRef<
 
   // This is the internal state of the sidebar.
   // We use openProp and setOpenProp for control from outside the component.
-  const [_open, _setOpen] = React.useState(defaultOpen);
+  const [_open, _setOpen] = React.useState(() => readSidebarStateFromCookie(defaultOpen));
   const open = openProp ?? _open;
   const setOpen = React.useCallback(
     (value: boolean | ((value: boolean) => boolean)) => {
@@ -228,7 +241,7 @@ const SidebarTrigger = React.forwardRef<React.ElementRef<typeof Button>, React.C
         size="icon"
         className={cn(
           "h-9 w-9 rounded-xl border border-border/60 bg-background/70 backdrop-blur-sm hover:bg-accent/70",
-          isMobile ? "shadow-sm" : "h-8 w-8 rounded-lg border-none bg-transparent shadow-none",
+          isMobile ? "shadow-sm" : "border-border/50 bg-card/65 shadow-sm",
           className
         )}
         onClick={(event) => {
@@ -237,7 +250,7 @@ const SidebarTrigger = React.forwardRef<React.ElementRef<typeof Button>, React.C
         }}
         {...props}
       >
-        {isMobile ? <Menu className="h-4 w-4" /> : <PanelLeft className="h-4 w-4" />}
+        <Menu className="h-4 w-4" />
         <span className="sr-only">Toggle Sidebar</span>
       </Button>
     );

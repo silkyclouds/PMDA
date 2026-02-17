@@ -9,11 +9,13 @@ import { Card, CardContent } from '@/components/ui/card';
 import { AlbumArtwork } from '@/components/library/AlbumArtwork';
 import { usePlayback } from '@/contexts/PlaybackContext';
 import { useToast } from '@/hooks/use-toast';
+import { useIsMobile } from '@/hooks/use-mobile';
 import * as api from '@/lib/api';
 import type { TrackInfo } from '@/components/library/AudioPlayer';
 import type { LibraryOutletContext } from '@/pages/LibraryLayout';
 
 export default function LabelPage() {
+  const isMobile = useIsMobile();
   const navigate = useNavigate();
   const location = useLocation();
   const { includeUnmatched } = useOutletContext<LibraryOutletContext>();
@@ -94,15 +96,16 @@ export default function LabelPage() {
       .slice(0, 60);
   }, [albums]);
   const gridTemplateColumns = useMemo(() => {
+    if (isMobile) return 'repeat(2, minmax(0, 1fr))';
     const col = Math.max(140, Math.min(340, Math.floor(coverSize)));
     return `repeat(auto-fill, minmax(${col}px, ${col}px))`;
-  }, [coverSize]);
+  }, [coverSize, isMobile]);
 
   const canPrev = offset > 0;
   const canNext = offset + albums.length < total;
 
   return (
-    <div className="container py-6 space-y-6">
+    <div className="container py-4 md:py-6 space-y-5 md:space-y-6">
       <div className="flex items-center justify-between gap-3">
         <Button variant="ghost" className="gap-2" onClick={() => navigate(`/library${location.search || ''}`)}>
           <ArrowLeft className="w-4 h-4" />
@@ -145,7 +148,7 @@ export default function LabelPage() {
       </Card>
 
       <div className="space-y-3">
-        <div className="flex items-center justify-between gap-3">
+        <div className="flex flex-wrap items-start justify-between gap-3">
           <h2 className="text-lg font-semibold">Releases</h2>
           <div className="flex items-center gap-2">
             <Button size="sm" variant="outline" disabled={!canPrev || loading} onClick={() => setOffset(Math.max(0, offset - 120))}>
@@ -193,8 +196,8 @@ export default function LabelPage() {
                       size={512}
                       imageClassName="w-full h-full object-cover"
                     />
-                    <div className="absolute inset-0 opacity-0 group-hover:opacity-100 transition-opacity bg-black/25" />
-                    <div className="absolute inset-x-0 bottom-0 p-3 opacity-0 group-hover:opacity-100 transition-opacity">
+                    <div className="absolute inset-0 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity bg-black/25" />
+                    <div className="absolute inset-x-0 bottom-0 p-3 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity">
                       <div className="flex items-center justify-between gap-2">
                         <Button
                           size="sm"

@@ -196,7 +196,7 @@ export default function LibraryHome() {
       {/* Discover */}
       <Card className="pmda-shelf overflow-hidden animate-in fade-in-0 slide-in-from-bottom-2 duration-300">
         <CardHeader className="pb-3">
-          <div className="flex items-center justify-between gap-3">
+          <div className="flex flex-wrap items-start justify-between gap-3">
             <div className="space-y-1">
               <CardTitle className="text-base flex items-center gap-2">
                 <Flame className="h-4 w-4 text-primary" />
@@ -209,7 +209,7 @@ export default function LibraryHome() {
               size="sm"
               onClick={() => void loadDiscover({ refresh: true })}
               disabled={discoverLoading}
-              className="gap-1.5"
+              className="h-9 gap-1.5 shrink-0"
               title="Refresh personalized discover feed"
             >
               {discoverLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
@@ -299,10 +299,10 @@ export default function LibraryHome() {
                               <button
                                 type="button"
                                 onClick={() => void handlePlayAlbum(a.album_id, a.title, a.thumb)}
-                                className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity bg-black/35"
+                                className="absolute inset-0 flex items-center justify-center opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity bg-black/35"
                                 title="Play"
                               >
-                                <div className="h-12 w-12 rounded-full bg-white/15 backdrop-blur-sm border border-white/20 flex items-center justify-center">
+                                <div className="h-10 w-10 sm:h-12 sm:w-12 rounded-full bg-white/15 backdrop-blur-sm border border-white/20 flex items-center justify-center">
                                   <Play className="h-5 w-5 text-white fill-white" />
                                 </div>
                               </button>
@@ -353,7 +353,7 @@ export default function LibraryHome() {
       {/* For You */}
       <Card className="pmda-shelf overflow-hidden animate-in fade-in-0 slide-in-from-bottom-2 duration-300">
         <CardHeader className="pb-3">
-          <div className="flex items-center justify-between gap-3">
+          <div className="flex flex-wrap items-start justify-between gap-3">
             <div className="space-y-1">
               <CardTitle className="text-base flex items-center gap-2">
                 <Sparkles className="h-4 w-4 text-primary" />
@@ -361,7 +361,7 @@ export default function LibraryHome() {
               </CardTitle>
               <CardDescription>Personalized track picks from your listening history.</CardDescription>
             </div>
-            <Button variant="outline" size="sm" onClick={() => void loadRecommendations()} disabled={recoLoading} className="gap-1.5">
+            <Button variant="outline" size="sm" onClick={() => void loadRecommendations()} disabled={recoLoading} className="h-9 gap-1.5 shrink-0">
               {recoLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
               Refresh
             </Button>
@@ -413,12 +413,12 @@ export default function LibraryHome() {
       {/* Top Artists */}
       <Card className="pmda-shelf overflow-hidden animate-in fade-in-0 slide-in-from-bottom-2 duration-300">
         <CardHeader className="pb-3">
-          <div className="flex items-center justify-between gap-3">
+          <div className="flex flex-wrap items-start justify-between gap-3">
             <div className="space-y-1">
               <CardTitle className="text-base">Top Artists</CardTitle>
               <CardDescription>Most played from your local listening stats.</CardDescription>
             </div>
-            <Button variant="outline" size="sm" onClick={() => void loadTopArtists()} disabled={topArtistsLoading} className="gap-1.5">
+            <Button variant="outline" size="sm" onClick={() => void loadTopArtists()} disabled={topArtistsLoading} className="h-9 gap-1.5 shrink-0">
               {topArtistsLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
               Refresh
             </Button>
@@ -475,12 +475,12 @@ export default function LibraryHome() {
       {/* Recently Added Artists */}
       <Card className="pmda-shelf overflow-hidden animate-in fade-in-0 slide-in-from-bottom-2 duration-300">
         <CardHeader className="pb-3">
-          <div className="flex items-center justify-between gap-3">
+          <div className="flex flex-wrap items-start justify-between gap-3">
             <div className="space-y-1">
               <CardTitle className="text-base">Recently Added Artists</CardTitle>
               <CardDescription>Artists with the most recent imports.</CardDescription>
             </div>
-            <Button variant="outline" size="sm" onClick={() => void loadRecentArtists()} disabled={recentArtistsLoading} className="gap-1.5">
+            <Button variant="outline" size="sm" onClick={() => void loadRecentArtists()} disabled={recentArtistsLoading} className="h-9 gap-1.5 shrink-0">
               {recentArtistsLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
               Refresh
             </Button>
@@ -536,7 +536,7 @@ export default function LibraryHome() {
       {/* Recently Played */}
       <Card className="pmda-shelf overflow-hidden animate-in fade-in-0 slide-in-from-bottom-2 duration-300">
         <CardHeader className="pb-3">
-          <div className="flex items-center justify-between gap-3">
+          <div className="flex flex-wrap items-start justify-between gap-3">
             <div className="space-y-1">
               <CardTitle className="text-base">Recently Played</CardTitle>
               <CardDescription>What you played lately, across the whole library.</CardDescription>
@@ -546,7 +546,7 @@ export default function LibraryHome() {
               size="sm"
               onClick={() => void loadRecentlyPlayed({ refresh: true })}
               disabled={recentlyPlayedLoading}
-              className="gap-1.5"
+              className="h-9 gap-1.5 shrink-0"
             >
               {recentlyPlayedLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
               Refresh
@@ -573,10 +573,10 @@ export default function LibraryHome() {
                           <button
                             type="button"
                             onClick={() => void handlePlayAlbum(a.album_id, a.title, a.thumb)}
-                            className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity bg-black/35"
+                            className="absolute inset-0 flex items-center justify-center opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity bg-black/35"
                             title="Play"
                           >
-                            <div className="h-12 w-12 rounded-full bg-white/15 backdrop-blur-sm border border-white/20 flex items-center justify-center">
+                            <div className="h-10 w-10 sm:h-12 sm:w-12 rounded-full bg-white/15 backdrop-blur-sm border border-white/20 flex items-center justify-center">
                               <Play className="h-5 w-5 text-white fill-white" />
                             </div>
                           </button>
@@ -625,12 +625,12 @@ export default function LibraryHome() {
       {/* Recently Added */}
       <Card className="pmda-shelf overflow-hidden animate-in fade-in-0 slide-in-from-bottom-2 duration-300">
         <CardHeader className="pb-3">
-          <div className="flex items-center justify-between gap-3">
+          <div className="flex flex-wrap items-start justify-between gap-3">
             <div className="space-y-1">
               <CardTitle className="text-base">Recently Added</CardTitle>
               <CardDescription>Fresh imports from your storage.</CardDescription>
             </div>
-            <Button variant="outline" size="sm" onClick={() => void loadRecent()} disabled={recentLoading} className="gap-1.5">
+            <Button variant="outline" size="sm" onClick={() => void loadRecent()} disabled={recentLoading} className="h-9 gap-1.5 shrink-0">
               {recentLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
               Refresh
             </Button>
@@ -656,10 +656,10 @@ export default function LibraryHome() {
                           <button
                             type="button"
                             onClick={() => void handlePlayAlbum(a.album_id, a.title, a.thumb)}
-                            className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity bg-black/35"
+                            className="absolute inset-0 flex items-center justify-center opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity bg-black/35"
                             title="Play"
                           >
-                            <div className="h-12 w-12 rounded-full bg-white/15 backdrop-blur-sm border border-white/20 flex items-center justify-center">
+                            <div className="h-10 w-10 sm:h-12 sm:w-12 rounded-full bg-white/15 backdrop-blur-sm border border-white/20 flex items-center justify-center">
                               <Play className="h-5 w-5 text-white fill-white" />
                             </div>
                           </button>

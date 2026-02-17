@@ -15,6 +15,17 @@ import { PasswordInput } from '@/components/ui/password-input';
 import { FolderBrowserInput } from '@/components/settings/FolderBrowserInput';
 import { Switch } from '@/components/ui/switch';
 import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from '@/components/ui/alert-dialog';
+import {
   Select,
   SelectContent,
   SelectItem,
@@ -103,6 +114,7 @@ function SettingsPage() {
   const [openaiModelsLoading, setOpenaiModelsLoading] = useState(false);
   const [openaiModels, setOpenaiModels] = useState<string[]>([]);
   const [openaiModelsError, setOpenaiModelsError] = useState<string | null>(null);
+  const [rebuildIndexLoading, setRebuildIndexLoading] = useState(false);
   const openaiModelsKeyRef = useRef<string>('');
 
   const getApiErrorMessage = (e: unknown): string | null => {
@@ -302,6 +314,29 @@ function SettingsPage() {
   }, [config.FILES_ROOTS, setFilesRoots]);
   const [pendingFilesRoot, setPendingFilesRoot] = useState('/music');
 
+  const handleRebuildFilesIndex = useCallback(async () => {
+    if (rebuildIndexLoading) return;
+    if (filesRoots.length === 0) {
+      toast.error('Configure at least one music folder before rebuilding the index.');
+      return;
+    }
+    setRebuildIndexLoading(true);
+    try {
+      const res = await api.postLibraryFilesIndexRebuild();
+      if (res.status === 'started') {
+        toast.success('Library index rebuild started from configured music folders.');
+      } else if (res.status === 'already_running') {
+        toast.info('A library index rebuild is already running.');
+      } else {
+        toast.info(res.message || 'Library index rebuild request sent.');
+      }
+    } catch (e) {
+      toast.error(getApiErrorMessage(e) || (e instanceof Error ? e.message : 'Failed to start library index rebuild'));
+    } finally {
+      setRebuildIndexLoading(false);
+    }
+  }, [filesRoots.length, getApiErrorMessage, rebuildIndexLoading]);
+
   useEffect(() => {
     if (!pendingFilesRoot.trim()) {
       setPendingFilesRoot(filesRoots[0] ?? '/music');
@@ -433,7 +468,51 @@ function SettingsPage() {
               </CardHeader>
               <CardContent className="space-y-4">
                 <div className="space-y-2">
-                  <Label>Music folders</Label>
+                  <div className="flex items-center justify-between gap-3">
+                    <Label>Music folders</Label>
+                    <AlertDialog>
+                      <AlertDialogTrigger asChild>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          className="gap-2 shrink-0"
+                          disabled={filesRoots.length === 0 || rebuildIndexLoading}
+                        >
+                          {rebuildIndexLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
+                          Rebuild index
+                        </Button>
+                      </AlertDialogTrigger>
+                      <AlertDialogContent className="max-w-lg">
+                        <AlertDialogHeader>
+                          <AlertDialogTitle>Rebuild library index from scratch?</AlertDialogTitle>
+                          <AlertDialogDescription>
+                            This will clear the current files-library index and rebuild everything from the configured music folders.
+                            Existing indexed entries will be removed before re-indexing.
+                          </AlertDialogDescription>
+                        </AlertDialogHeader>
+                        <div className="rounded-md border border-border bg-muted/30 p-3 text-xs text-muted-foreground space-y-1">
+                          <p className="font-medium text-foreground">Sources used for rebuild</p>
+                          {filesRoots.map((rootPath) => (
+                            <p key={`rebuild-${rootPath}`} className="font-mono truncate" title={rootPath}>{rootPath}</p>
+                          ))}
+                        </div>
+                        <AlertDialogFooter>
+                          <AlertDialogCancel disabled={rebuildIndexLoading}>Cancel</AlertDialogCancel>
+                          <AlertDialogAction onClick={handleRebuildFilesIndex} disabled={rebuildIndexLoading}>
+                            {rebuildIndexLoading ? (
+                              <span className="inline-flex items-center gap-2">
+                                <Loader2 className="w-4 h-4 animate-spin" />
+                                Rebuilding...
+                              </span>
+                            ) : (
+                              'Yes, rebuild from scratch'
+                            )}
+                          </AlertDialogAction>
+                        </AlertDialogFooter>
+                      </AlertDialogContent>
+                    </AlertDialog>
+                  </div>
                   <p className="text-xs text-muted-foreground">
                     Add one or more source folders to scan (container paths).
                   </p>

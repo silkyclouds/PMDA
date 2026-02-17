@@ -15,6 +15,7 @@ type CarouselProps = {
   plugins?: CarouselPlugin;
   orientation?: "horizontal" | "vertical";
   setApi?: (api: CarouselApi) => void;
+  effect?: "none" | "tilt3d";
 };
 
 type CarouselContextProps = {
@@ -24,6 +25,7 @@ type CarouselContextProps = {
   scrollNext: () => void;
   canScrollPrev: boolean;
   canScrollNext: boolean;
+  effect: "none" | "tilt3d";
 } & CarouselProps;
 
 const CarouselContext = React.createContext<CarouselContextProps | null>(null);
@@ -39,7 +41,8 @@ function useCarousel() {
 }
 
 const Carousel = React.forwardRef<HTMLDivElement, React.HTMLAttributes<HTMLDivElement> & CarouselProps>(
-  ({ orientation = "horizontal", opts, setApi, plugins, className, children, ...props }, ref) => {
+  ({ orientation = "horizontal", opts, setApi, plugins, effect, className, children, ...props }, ref) => {
+    const resolvedEffect = effect ?? (orientation === "horizontal" ? "tilt3d" : "none");
     const [carouselRef, api] = useEmblaCarousel(
       {
         ...opts,
@@ -50,6 +53,43 @@ const Carousel = React.forwardRef<HTMLDivElement, React.HTMLAttributes<HTMLDivEl
     const [canScrollPrev, setCanScrollPrev] = React.useState(false);
     const [canScrollNext, setCanScrollNext] = React.useState(false);
 
+    const resetSlideStyles = React.useCallback((carouselApi: CarouselApi | undefined) => {
+      if (!carouselApi) return;
+      for (const node of carouselApi.slideNodes()) {
+        node.style.transform = "";
+        node.style.opacity = "";
+        node.style.willChange = "";
+      }
+    }, []);
+
+    const applyTilt3dEffect = React.useCallback((carouselApi: CarouselApi) => {
+      if (!carouselApi || resolvedEffect !== "tilt3d" || orientation !== "horizontal") {
+        resetSlideStyles(carouselApi);
+        return;
+      }
+      if (typeof window !== "undefined" && window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+        resetSlideStyles(carouselApi);
+        return;
+      }
+      const snaps = carouselApi.scrollSnapList();
+      const progress = carouselApi.scrollProgress();
+      const nodes = carouselApi.slideNodes();
+      for (let index = 0; index < nodes.length; index += 1) {
+        const node = nodes[index];
+        const snap = snaps[index] ?? 0;
+        const delta = Math.max(-1.2, Math.min(1.2, (snap - progress) * 1.8));
+        const abs = Math.abs(delta);
+        const rotateY = delta * 18;
+        const depth = (1 - abs) * 24;
+        const scale = Math.max(0.86, 1 - abs * 0.14);
+        const opacity = Math.max(0.55, 1 - abs * 0.35);
+
+        node.style.willChange = "transform, opacity";
+        node.style.transform = `perspective(1600px) translateZ(${depth}px) rotateY(${rotateY}deg) scale(${scale})`;
+        node.style.opacity = `${opacity}`;
+      }
+    }, [orientation, resetSlideStyles, resolvedEffect]);
+
     const onSelect = React.useCallback((api: CarouselApi) => {
       if (!api) {
         return;
@@ -57,7 +97,13 @@ const Carousel = React.forwardRef<HTMLDivElement, React.HTMLAttributes<HTMLDivEl
 
       setCanScrollPrev(api.canScrollPrev());
       setCanScrollNext(api.canScrollNext());
-    }, []);
+      applyTilt3dEffect(api);
+    }, [applyTilt3dEffect]);
+
+    const onScroll = React.useCallback((api: CarouselApi) => {
+      if (!api) return;
+      applyTilt3dEffect(api);
+    }, [applyTilt3dEffect]);
 
     const scrollPrev = React.useCallback(() => {
       api?.scrollPrev();
@@ -96,11 +142,15 @@ const Carousel = React.forwardRef<HTMLDivElement, React.HTMLAttributes<HTMLDivEl
       onSelect(api);
       api.on("reInit", onSelect);
       api.on("select", onSelect);
+      api.on("scroll", onScroll);
 
       return () => {
         api?.off("select", onSelect);
+        api?.off("reInit", onSelect);
+        api?.off("scroll", onScroll);
+        resetSlideStyles(api);
       };
-    }, [api, onSelect]);
+    }, [api, onScroll, onSelect, resetSlideStyles]);
 
     return (
       <CarouselContext.Provider
@@ -113,6 +163,7 @@ const Carousel = React.forwardRef<HTMLDivElement, React.HTMLAttributes<HTMLDivEl
           scrollNext,
           canScrollPrev,
           canScrollNext,
+          effect: resolvedEffect,
         }}
       >
         <div
@@ -136,7 +187,7 @@ const CarouselContent = React.forwardRef<HTMLDivElement, React.HTMLAttributes<HT
     const { carouselRef, orientation } = useCarousel();
 
     return (
-      <div ref={carouselRef} className="overflow-hidden">
+      <div ref={carouselRef} className={cn("overflow-hidden", orientation === "horizontal" && "py-2")}>
         <div
           ref={ref}
           className={cn("flex", orientation === "horizontal" ? "-ml-4" : "-mt-4 flex-col", className)}
@@ -150,14 +201,19 @@ CarouselContent.displayName = "CarouselContent";
 
 const CarouselItem = React.forwardRef<HTMLDivElement, React.HTMLAttributes<HTMLDivElement>>(
   ({ className, ...props }, ref) => {
-    const { orientation } = useCarousel();
+    const { orientation, effect } = useCarousel();
 
     return (
       <div
         ref={ref}
         role="group"
         aria-roledescription="slide"
-        className={cn("min-w-0 shrink-0 grow-0 basis-full", orientation === "horizontal" ? "pl-4" : "pt-4", className)}
+        className={cn(
+          "min-w-0 shrink-0 grow-0 basis-full",
+          orientation === "horizontal" ? "pl-4" : "pt-4",
+          effect === "tilt3d" && orientation === "horizontal" ? "transform-gpu transition-[transform,opacity] duration-300 ease-out" : null,
+          className
+        )}
         {...props}
       />
     );

@@ -138,7 +138,7 @@ export function AppSidebar() {
   };
 
   return (
-    <Sidebar collapsible="icon" variant="sidebar">
+    <Sidebar collapsible="offcanvas" variant="sidebar">
       <SidebarHeader>
         <div className="flex items-center gap-2 px-2 py-1.5">
           <Logo showText={false} size="sm" />
