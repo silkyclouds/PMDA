@@ -398,7 +398,10 @@ export default function LibraryBrowser() {
 
   useEffect(() => {
     let active = true;
+    let pollInFlight = false;
     const poll = async () => {
+      if (pollInFlight) return;
+      pollInFlight = true;
       try {
         const progress = await api.getScanProgress();
         if (!active) return;
@@ -410,6 +413,8 @@ export default function LibraryBrowser() {
       } catch {
         if (!active) return;
         setScanRunning(false);
+      } finally {
+        pollInFlight = false;
       }
     };
     poll();

@@ -734,36 +734,106 @@ const isApiError = (error: unknown): error is ApiError => {
   return error instanceof Error && typeof (error as ApiError).response !== 'undefined';
 };
 
-// API Functions
-async function fetchApi<T>(endpoint: string, options?: RequestInit): Promise<T> {
-  const response = await fetch(`${API_BASE_URL}${endpoint}`, {
-    ...options,
-    headers: {
-      'Content-Type': 'application/json',
-      ...options?.headers,
-    },
-  });
-  
-  if (!response.ok) {
-    const error = new Error(`API Error: ${response.status} ${response.statusText}`) as ApiError;
-    error.response = response;
-    try {
-      const data = await response.json();
-      error.body = data;
-    } catch {
-      error.body = {};
-    }
-    throw error;
+const GET_REQUEST_TIMEOUT_MS = 12000;
+const inFlightGetRequests = new Map<string, Promise<unknown>>();
+
+function createFetchSignal(
+  externalSignal?: AbortSignal,
+  timeoutMs: number = 0,
+): { signal?: AbortSignal; cleanup: () => void } {
+  if (!externalSignal && timeoutMs <= 0) {
+    return { signal: undefined, cleanup: () => {} };
   }
 
-  if (response.status === 204) {
+  const controller = new AbortController();
+  let timeoutId: ReturnType<typeof setTimeout> | null = null;
+  const onExternalAbort = () => {
+    if (!controller.signal.aborted) controller.abort();
+  };
+
+  if (externalSignal) {
+    if (externalSignal.aborted) {
+      controller.abort();
+    } else {
+      externalSignal.addEventListener('abort', onExternalAbort, { once: true });
+    }
+  }
+
+  if (timeoutMs > 0) {
+    timeoutId = setTimeout(() => {
+      if (!controller.signal.aborted) controller.abort();
+    }, timeoutMs);
+  }
+
+  return {
+    signal: controller.signal,
+    cleanup: () => {
+      if (timeoutId) clearTimeout(timeoutId);
+      if (externalSignal) externalSignal.removeEventListener('abort', onExternalAbort);
+    },
+  };
+}
+
+async function executeFetchApi<T>(endpoint: string, options?: RequestInit): Promise<T> {
+  const method = String(options?.method ?? 'GET').toUpperCase();
+  const timeoutMs = method === 'GET' ? GET_REQUEST_TIMEOUT_MS : 0;
+  const { signal, cleanup } = createFetchSignal(options?.signal, timeoutMs);
+  let timedOut = false;
+  try {
+    const response = await fetch(`${API_BASE_URL}${endpoint}`, {
+      ...options,
+      signal: signal ?? options?.signal,
+      headers: {
+        'Content-Type': 'application/json',
+        ...options?.headers,
+      },
+    });
+    
+    if (!response.ok) {
+      const error = new Error(`API Error: ${response.status} ${response.statusText}`) as ApiError;
+      error.response = response;
+      try {
+        const data = await response.json();
+        error.body = data;
+      } catch {
+        error.body = {};
+      }
+      throw error;
+    }
+
+    if (response.status === 204) {
+      return undefined as T;
+    }
+    const ct = response.headers.get('content-type');
+    if (ct?.includes('application/json')) {
+      return response.json();
+    }
     return undefined as T;
+  } catch (error) {
+    timedOut = Boolean((error as { name?: string } | null)?.name === 'AbortError');
+    if (timedOut) {
+      throw new Error(`API timeout after ${Math.round(timeoutMs / 1000)}s for ${endpoint}`);
+    }
+    throw error;
+  } finally {
+    cleanup();
   }
-  const ct = response.headers.get('content-type');
-  if (ct?.includes('application/json')) {
-    return response.json();
+}
+
+// API Functions
+async function fetchApi<T>(endpoint: string, options?: RequestInit): Promise<T> {
+  const method = String(options?.method ?? 'GET').toUpperCase();
+  if (method !== 'GET') {
+    return executeFetchApi<T>(endpoint, options);
   }
-  return undefined as T;
+  const key = `${method}:${API_BASE_URL}${endpoint}`;
+  const inFlight = inFlightGetRequests.get(key) as Promise<T> | undefined;
+  if (inFlight) return inFlight;
+  const request = executeFetchApi<T>(endpoint, options).finally(() => {
+    inFlightGetRequests.delete(key);
+  });
+  inFlightGetRequests.set(key, request as Promise<unknown>);
+  return request;
 }
 
 // Library stats (for Unduper when no scan results)

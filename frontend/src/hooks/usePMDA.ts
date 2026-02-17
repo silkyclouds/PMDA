@@ -43,8 +43,11 @@ const DEFAULT_SCAN_PROGRESS: ScanProgress = {
 export function useScanProgress() {
   const [progress, setProgress] = useState<ScanProgress>(DEFAULT_SCAN_PROGRESS);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const fetchInFlightRef = useRef(false);
 
   const fetchProgress = useCallback(async () => {
+    if (fetchInFlightRef.current) return null;
+    fetchInFlightRef.current = true;
     try {
       const data = await api.getScanProgress();
       let inc: api.IncompleteScanProgress | null = null;
@@ -87,6 +90,8 @@ export function useScanProgress() {
       return DEFAULT_SCAN_PROGRESS;
     } catch {
       return null;
+    } finally {
+      fetchInFlightRef.current = false;
     }
   }, []);
 

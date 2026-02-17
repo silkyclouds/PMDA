@@ -31,7 +31,15 @@ import { ScanFinishedInvalidator } from "./components/ScanFinishedInvalidator";
 import { AssistantDock } from "./components/assistant/AssistantDock";
 import { AppLayout } from "./components/layout/AppLayout";
 
-const queryClient = new QueryClient();
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      retry: 1,
+      retryDelay: 1200,
+      refetchOnWindowFocus: false,
+    },
+  },
+});
 
 function PlaylistLegacyRedirect() {
   const { playlistId } = useParams();

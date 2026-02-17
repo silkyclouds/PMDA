@@ -14,6 +14,7 @@ export function ScanFinishedInvalidator() {
   const wasDedupingRef = useRef(false);
   const lastIdleInvalidateRef = useRef(0);
   const idleInvalidateDoneRef = useRef(false);
+  const checkInFlightRef = useRef(false);
 
   useEffect(() => {
     // On mount (e.g. after refresh), invalidate so we refetch and show fresh stats/dupes
@@ -21,6 +22,8 @@ export function ScanFinishedInvalidator() {
     queryClient.invalidateQueries({ queryKey: ['scan-progress'] });
 
     const check = async () => {
+      if (checkInFlightRef.current) return;
+      checkInFlightRef.current = true;
       try {
         // Check scan progress
         const scanData = await api.getScanProgress();
@@ -64,6 +67,8 @@ export function ScanFinishedInvalidator() {
         wasDedupingRef.current = deduping;
       } catch {
         // Ignore fetch errors (e.g. server busy or wrong origin)
+      } finally {
+        checkInFlightRef.current = false;
       }
     };
     check();
