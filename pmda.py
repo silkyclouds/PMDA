@@ -31008,6 +31008,14 @@ def api_library_stats_library():
             # Labels distribution.
             cur.execute(
                 """
+                SELECT COUNT(DISTINCT TRIM(COALESCE(label, '')))
+                FROM files_albums
+                WHERE COALESCE(trim(label), '') <> ''
+                """
+            )
+            labels_total = int((cur.fetchone() or [0])[0] or 0)
+            cur.execute(
+                """
                 SELECT TRIM(COALESCE(label, '')) AS label, COUNT(*) AS c
                 FROM files_albums
                 WHERE COALESCE(trim(label), '') <> ''
@@ -31094,7 +31102,7 @@ def api_library_stats_library():
                         "tracks": root_tracks,
                         "albums_pct": round((root_albums / albums) * 100.0, 2) if albums > 0 else 0.0,
                         "artists_pct": round((root_artists / artists) * 100.0, 2) if artists > 0 else 0.0,
-                        "labels_pct": round((root_labels / max(1, len(labels))) * 100.0, 2) if labels else 0.0,
+                        "labels_pct": round((root_labels / max(1, labels_total)) * 100.0, 2) if labels_total > 0 else 0.0,
                     }
                 )
 
@@ -31151,7 +31159,7 @@ def api_library_stats_library():
                             "tracks": unknown_tracks,
                             "albums_pct": round((unknown_albums / albums) * 100.0, 2) if albums > 0 else 0.0,
                             "artists_pct": round((unknown_artists / artists) * 100.0, 2) if artists > 0 else 0.0,
-                            "labels_pct": round((unknown_labels / max(1, len(labels))) * 100.0, 2) if labels else 0.0,
+                            "labels_pct": round((unknown_labels / max(1, labels_total)) * 100.0, 2) if labels_total > 0 else 0.0,
                         }
                     )
             source_paths.sort(key=lambda item: int(item.get("albums") or 0), reverse=True)
