@@ -145,6 +145,25 @@ export default function Tools() {
             Refresh
           </Button>
         </div>
+        <Card>
+          <CardContent className="py-4 flex flex-wrap items-center gap-2">
+            <Button
+              size="sm"
+              className="gap-1.5 bg-amber-500/90 hover:bg-amber-500 text-black border border-amber-300/30"
+              onClick={() => navigate('/broken-albums')}
+            >
+              Review incompletes
+            </Button>
+            <Button
+              size="sm"
+              className="gap-1.5 bg-amber-500/90 hover:bg-amber-500 text-black border border-amber-300/30"
+              onClick={() => navigate('/tools/duplicates')}
+            >
+              Fine-check duplicates
+            </Button>
+            <Badge variant="outline">Quick actions</Badge>
+          </CardContent>
+        </Card>
 
         {loadingHistory ? (
           <div className="flex items-center justify-center py-16">
@@ -206,15 +225,6 @@ export default function Tools() {
                 <Badge variant="outline">{selectedRun.duplicates_found} duplicate group(s)</Badge>
                 <Badge variant="outline">{selectedRun.albums_moved} moved</Badge>
                 <Badge variant="outline">runtime {fmtDurationSeconds(selectedDurationSeconds)}</Badge>
-                <Button
-                  type="button"
-                  size="sm"
-                  variant="outline"
-                  className="h-7"
-                  onClick={() => navigate('/tools/duplicates')}
-                >
-                  Fine-check duplicates
-                </Button>
               </CardContent>
             </Card>
 
@@ -250,6 +260,13 @@ export default function Tools() {
                   </div>
                   <div className="flex items-center gap-2">
                     <Button
+                      size="sm"
+                      className="gap-1.5 bg-amber-500/90 hover:bg-amber-500 text-black border border-amber-300/30"
+                      onClick={() => navigate('/broken-albums')}
+                    >
+                      Review incompletes
+                    </Button>
+                    <Button
                       variant="outline"
                       size="sm"
                       className="gap-1.5"
@@ -275,6 +292,13 @@ export default function Tools() {
               </CardHeader>
               <CardContent className="space-y-3">
                 <div className="flex items-center gap-2">
+                  <Button
+                    size="sm"
+                    className="gap-1.5 bg-amber-500/90 hover:bg-amber-500 text-black border border-amber-300/30"
+                    onClick={() => navigate('/tools/duplicates')}
+                  >
+                    Fine-check duplicates
+                  </Button>
                   <Button
                     variant="outline"
                     size="sm"

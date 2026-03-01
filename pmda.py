@@ -3064,6 +3064,14 @@ def init_state_db():
         cur.execute("ALTER TABLE duplicates_best ADD COLUMN track_count INTEGER")
     if "match_verified_by_ai" not in cols:
         cur.execute("ALTER TABLE duplicates_best ADD COLUMN match_verified_by_ai INTEGER DEFAULT 0")
+    if "dupe_signal" not in cols:
+        cur.execute("ALTER TABLE duplicates_best ADD COLUMN dupe_signal TEXT")
+    if "no_move" not in cols:
+        cur.execute("ALTER TABLE duplicates_best ADD COLUMN no_move INTEGER DEFAULT 0")
+    if "manual_review" not in cols:
+        cur.execute("ALTER TABLE duplicates_best ADD COLUMN manual_review INTEGER DEFAULT 0")
+    if "same_folder" not in cols:
+        cur.execute("ALTER TABLE duplicates_best ADD COLUMN same_folder INTEGER DEFAULT 0")
     # Add indexes for faster lookups
     try:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_duplicates_best_artist ON duplicates_best(artist)")
@@ -11834,6 +11842,66 @@ def get_primary_format(folder: Path) -> str:
 def thumb_url(album_id: int) -> str:
     return f"{PLEX_HOST}/library/metadata/{album_id}/thumb?X-Plex-Token={PLEX_TOKEN}"
 
+
+def _files_album_id_for_folder(folder: Path | str) -> int:
+    """Resolve Files-mode album id from folder path (best effort)."""
+    try:
+        if _get_library_mode() != "files":
+            return 0
+    except Exception:
+        return 0
+    try:
+        key = _album_folder_cache_key(folder)
+    except Exception:
+        key = str(folder or "")
+    if not key:
+        return 0
+    conn = _files_pg_connect()
+    if conn is None:
+        return 0
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM files_albums WHERE folder_path = %s LIMIT 1", (key,))
+            row = cur.fetchone()
+            return int(row[0] or 0) if row else 0
+    except Exception:
+        return 0
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _duplicate_album_thumb_url(album_id: int, folder_path: Path | str | None = None) -> str:
+    """
+    Return a duplicate-table thumbnail URL that works in both library modes.
+    """
+    try:
+        aid = int(album_id or 0)
+    except Exception:
+        aid = 0
+    if aid <= 0:
+        return ""
+    if _get_library_mode() == "files":
+        resolved_id = aid
+        if folder_path:
+            try:
+                mapped = _files_album_id_for_folder(folder_path)
+            except Exception:
+                mapped = 0
+            if mapped > 0:
+                resolved_id = mapped
+        if resolved_id <= 0:
+            return ""
+        try:
+            base = request.url_root.rstrip("/")
+        except Exception:
+            base = ""
+        path = f"/api/library/files/album/{resolved_id}/cover?size=128"
+        return f"{base}{path}" if base else path
+    return thumb_url(aid)
+
 def build_cards() -> list[dict]:
     """
     Convert the live state["duplicates"] structure into the list of card
@@ -11858,7 +11926,7 @@ def build_cards() -> list[dict]:
                     "artist": artist,
                     "album_id": best["album_id"],
                     "n": len(g["losers"]) + 1,
-                    "best_thumb": thumb_url(best["album_id"]),
+                    "best_thumb": _duplicate_album_thumb_url(best["album_id"], best.get("folder")),
                     "best_title": best["title_raw"],
                     "best_fmt": best_fmt,
                     "formats": [best_fmt]
@@ -18704,8 +18772,9 @@ def save_scan_artist_to_db(artist_name: str, groups: List[dict]) -> int:
         cur.execute("""
               INSERT OR IGNORE INTO duplicates_best
                 (artist, album_id, title_raw, album_norm, folder,
-                 fmt_text, br, sr, bd, dur, discs, rationale, merge_list, ai_used, meta_json, ai_provider, ai_model, evidence_json, size_mb, track_count, match_verified_by_ai)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 fmt_text, br, sr, bd, dur, discs, rationale, merge_list, ai_used, meta_json, ai_provider, ai_model, evidence_json, size_mb, track_count, match_verified_by_ai,
+                 dupe_signal, no_move, manual_review, same_folder)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           """, (
               artist_name,
               best["album_id"],
@@ -18728,6 +18797,10 @@ def save_scan_artist_to_db(artist_name: str, groups: List[dict]) -> int:
               best_size_mb,
               best_track_count,
               1 if best.get("match_verified_by_ai") else 0,
+              str(g.get("dupe_signal") or ""),
+              1 if bool(g.get("no_move")) else 0,
+              1 if bool(g.get("manual_review")) else 0,
+              1 if bool(g.get("same_folder")) else 0,
           ))
         for e in g["losers"]:
             size_mb = folder_size(e["folder"]) // (1024 * 1024)
@@ -18962,8 +19035,9 @@ def save_scan_to_db(scan_results: Dict[str, List[dict]]):
             cur.execute("""
                   INSERT OR IGNORE INTO duplicates_best
                     (artist, album_id, title_raw, album_norm, folder,
-                     fmt_text, br, sr, bd, dur, discs, rationale, merge_list, ai_used, meta_json, ai_provider, ai_model, evidence_json, size_mb, track_count, match_verified_by_ai)
-                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     fmt_text, br, sr, bd, dur, discs, rationale, merge_list, ai_used, meta_json, ai_provider, ai_model, evidence_json, size_mb, track_count, match_verified_by_ai,
+                     dupe_signal, no_move, manual_review, same_folder)
+                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
               """, (
                   artist,
                   best['album_id'],
@@ -18986,6 +19060,10 @@ def save_scan_to_db(scan_results: Dict[str, List[dict]]):
                   best_size_mb,
                   best_track_count,
                   1 if best.get('match_verified_by_ai') else 0,
+                  str(g.get("dupe_signal") or ""),
+                  1 if bool(g.get("no_move")) else 0,
+                  1 if bool(g.get("manual_review")) else 0,
+                  1 if bool(g.get("same_folder")) else 0,
               ))
 
             # All "loser" editions
@@ -19060,6 +19138,10 @@ def load_scan_from_db() -> Dict[str, List[dict]]:
         best_cols = {r[1] for r in cur.fetchall()}
         has_match_verified = "match_verified_by_ai" in best_cols
         has_evidence_json = "evidence_json" in best_cols
+        has_dupe_signal = "dupe_signal" in best_cols
+        has_no_move = "no_move" in best_cols
+        has_manual_review = "manual_review" in best_cols
+        has_same_folder = "same_folder" in best_cols
         cur.execute(
             """
             SELECT artist, album_id, title_raw, album_norm, folder,
@@ -19068,6 +19150,10 @@ def load_scan_from_db() -> Dict[str, List[dict]]:
             """ + (", evidence_json" if has_evidence_json else "") + """
                    , size_mb, track_count
             """ + (", match_verified_by_ai" if has_match_verified else "") + """
+            """ + (", dupe_signal" if has_dupe_signal else "") + """
+            """ + (", no_move" if has_no_move else "") + """
+            """ + (", manual_review" if has_manual_review else "") + """
+            """ + (", same_folder" if has_same_folder else "") + """
             FROM   duplicates_best
             """
         )
@@ -19148,6 +19234,14 @@ def load_scan_from_db() -> Dict[str, List[dict]]:
         track_count = row[idx] if len(row) > idx else None
         idx += 1
         match_verified_by_ai = bool(row[idx]) if has_match_verified and len(row) > idx else False
+        idx += 1 if has_match_verified else 0
+        dupe_signal = str(row[idx] or "") if has_dupe_signal and len(row) > idx else ""
+        idx += 1 if has_dupe_signal else 0
+        no_move = bool(row[idx]) if has_no_move and len(row) > idx else False
+        idx += 1 if has_no_move else 0
+        manual_review = bool(row[idx]) if has_manual_review and len(row) > idx else False
+        idx += 1 if has_manual_review else 0
+        same_folder = bool(row[idx]) if has_same_folder and len(row) > idx else False
         try:
             dupe_evidence = json.loads(evidence_raw) if evidence_raw else []
             if not isinstance(dupe_evidence, list):
@@ -19194,6 +19288,10 @@ def load_scan_from_db() -> Dict[str, List[dict]]:
                 "album_id": aid,
                 "best": best_entry,
                 "losers": losers,
+                "dupe_signal": dupe_signal,
+                "no_move": bool(no_move),
+                "manual_review": bool(manual_review),
+                "same_folder": bool(same_folder),
             }
         )
 
@@ -21679,9 +21777,6 @@ def _auto_move_incomplete_albums_for_scan(
         for e in (editions or []):
             if not e.get("is_broken"):
                 continue
-            strict_ok, _strict_reason = _strict_mutation_allowed(e)
-            if not strict_ok:
-                continue
             folder = e.get("folder")
             if not folder:
                 continue
@@ -21699,27 +21794,6 @@ def _auto_move_incomplete_albums_for_scan(
 
     if not candidates:
         return result
-
-    def _files_forget_album_folder(folder: Path | str) -> None:
-        """Remove a moved/deleted album folder from Files-mode caches/index payload tables."""
-        try:
-            if _get_library_mode() != "files":
-                return
-        except Exception:
-            return
-        try:
-            key = _album_folder_cache_key(folder)
-        except Exception:
-            key = str(folder)
-        try:
-            con2 = sqlite3.connect(str(STATE_DB_FILE), timeout=10)
-            cur2 = con2.cursor()
-            cur2.execute("DELETE FROM files_album_scan_cache WHERE folder_path = ?", (key,))
-            cur2.execute("DELETE FROM files_library_published_albums WHERE folder_path = ?", (key,))
-            con2.commit()
-            con2.close()
-        except Exception:
-            logging.debug("Files cache/published cleanup failed for %s", key, exc_info=True)
 
     try:
         con = sqlite3.connect(str(STATE_DB_FILE), timeout=20)
@@ -21757,7 +21831,7 @@ def _auto_move_incomplete_albums_for_scan(
                     _files_watcher_suppress_folder(dst, seconds=180.0, reason="pmda_move_incomplete")
                 except Exception:
                     pass
-                _files_forget_album_folder(src_folder)
+                _files_forget_album_folder_global(src_folder)
                 result["moved"] += 1
                 result["size_mb"] += size_mb
                 if cur is not None:
@@ -24024,7 +24098,176 @@ def fetch_cover_as_base64(album_id: int) -> Optional[str]:
         pass
     return None
 
-def perform_dedupe(group: dict, best_folders: set = None) -> List[dict]:
+
+def _files_forget_album_folder_global(folder: Path | str) -> bool:
+    """
+    Remove one moved folder from Files-mode caches and live PostgreSQL index.
+    Returns True when at least one row/cache entry was removed.
+    """
+    try:
+        if _get_library_mode() != "files":
+            return False
+    except Exception:
+        return False
+
+    changed = False
+    try:
+        key = _album_folder_cache_key(folder)
+    except Exception:
+        key = str(folder)
+
+    # 1) SQLite scan/published caches
+    try:
+        con = sqlite3.connect(str(STATE_DB_FILE), timeout=10)
+        cur = con.cursor()
+        cur.execute("DELETE FROM files_album_scan_cache WHERE folder_path = ?", (key,))
+        changed = changed or int(cur.rowcount or 0) > 0
+        cur.execute("DELETE FROM files_library_published_albums WHERE folder_path = ?", (key,))
+        changed = changed or int(cur.rowcount or 0) > 0
+        con.commit()
+        con.close()
+    except Exception:
+        logging.debug("Files cache/published cleanup failed for %s", key, exc_info=True)
+
+    # 2) PostgreSQL live index
+    candidates: list[str] = []
+    for raw in (folder, key):
+        txt = str(raw or "").strip()
+        if txt:
+            candidates.append(txt)
+            try:
+                candidates.append(str(path_for_fs_access(Path(txt)).resolve()))
+            except Exception:
+                pass
+    candidate_paths = sorted({c for c in candidates if c})
+    if candidate_paths:
+        conn_pg = _files_pg_connect()
+        if conn_pg is not None:
+            try:
+                with conn_pg.transaction():
+                    with conn_pg.cursor() as cur_pg:
+                        cur_pg.execute(
+                            "SELECT id, artist_id FROM files_albums WHERE folder_path = ANY(%s)",
+                            (candidate_paths,),
+                        )
+                        rows = cur_pg.fetchall() or []
+                        if rows:
+                            album_ids = [int(r[0]) for r in rows if int(r[0] or 0) > 0]
+                            artist_ids = sorted({int(r[1]) for r in rows if int(r[1] or 0) > 0})
+                            if album_ids:
+                                cur_pg.execute("DELETE FROM files_albums WHERE id = ANY(%s)", (album_ids,))
+                                changed = changed or int(cur_pg.rowcount or 0) > 0
+                            if artist_ids:
+                                cur_pg.execute(
+                                    """
+                                    UPDATE files_artists a
+                                    SET album_count = s.album_count,
+                                        track_count = s.track_count,
+                                        broken_albums_count = s.broken_albums_count,
+                                        updated_at = NOW()
+                                    FROM (
+                                        SELECT
+                                            artist_id,
+                                            COUNT(*) AS album_count,
+                                            COALESCE(SUM(track_count), 0) AS track_count,
+                                            COALESCE(SUM(CASE WHEN is_broken THEN 1 ELSE 0 END), 0) AS broken_albums_count
+                                        FROM files_albums
+                                        WHERE artist_id = ANY(%s)
+                                        GROUP BY artist_id
+                                    ) s
+                                    WHERE a.id = s.artist_id
+                                    """,
+                                    (artist_ids,),
+                                )
+                                cur_pg.execute(
+                                    """
+                                    UPDATE files_artists a
+                                    SET album_count = 0,
+                                        track_count = 0,
+                                        broken_albums_count = 0,
+                                        updated_at = NOW()
+                                    WHERE a.id = ANY(%s)
+                                      AND NOT EXISTS (
+                                          SELECT 1
+                                          FROM files_albums alb
+                                          WHERE alb.artist_id = a.id
+                                      )
+                                    """,
+                                    (artist_ids,),
+                                )
+            except Exception:
+                logging.debug("Files PG cleanup failed for folder=%s", key, exc_info=True)
+            finally:
+                try:
+                    conn_pg.close()
+                except Exception:
+                    pass
+
+    if changed:
+        _files_cache_invalidate_all()
+    return changed
+
+
+def _duplicate_tracks_from_folder(folder: Path, edition_payload: dict | None = None) -> list[dict]:
+    """
+    Build a best-effort track list from folder audio files for duplicate detail modal.
+    Used when DB-backed track fetch is unavailable for an edition.
+    """
+    if not folder or not folder.exists() or not folder.is_dir():
+        return []
+    item = edition_payload if isinstance(edition_payload, dict) else {}
+    try:
+        entries = _files_build_track_entries_from_item(item, folder)
+    except Exception:
+        entries = []
+    out: list[dict] = []
+    for i, tr in enumerate(entries):
+        title = str(tr.get("title") or "").strip() or f"Track {i + 1}"
+        dur_sec = int(tr.get("duration_sec") or 0)
+        raw_br = int(tr.get("bitrate") or 0)
+        br_kbps = raw_br if 0 < raw_br < 100000 else (raw_br // 1000 if raw_br >= 100000 else None)
+        out.append(
+            {
+                "idx": int(tr.get("track_num") or (i + 1)),
+                "title": title,
+                "name": title,
+                "dur": max(0, dur_sec) * 1000,
+                "duration": max(0, dur_sec),
+                "format": str(tr.get("format") or "").strip() or None,
+                "bitrate": br_kbps,
+                "is_bonus": False,
+                "path": str(tr.get("file_path") or "").strip() or None,
+            }
+        )
+    return out
+
+
+def _duplicate_cover_data_for_edition(edition_payload: dict) -> Optional[str]:
+    """
+    Resolve duplicate edition cover as data URI:
+    1) local cover file / embedded cover from folder
+    2) Plex thumb fallback (when album_id maps to Plex metadata)
+    """
+    folder_path = None
+    try:
+        folder_raw = str((edition_payload or {}).get("folder") or "").strip()
+        if folder_raw:
+            folder_path = path_for_fs_access(Path(folder_raw))
+    except Exception:
+        folder_path = None
+    if folder_path and folder_path.exists() and folder_path.is_dir():
+        local_cover = _get_local_cover_data_uri_for_vision(folder_path)
+        if local_cover:
+            return local_cover
+    try:
+        aid = int((edition_payload or {}).get("album_id") or 0)
+    except Exception:
+        aid = 0
+    if aid > 0:
+        return fetch_cover_as_base64(aid)
+    return None
+
+def perform_dedupe(group: dict, best_folders: set = None, manual_override: bool = False) -> List[dict]:
     """
     Move each "loser" folder out to DUPE_ROOT, delete metadata in Plex,
     and return a list of dicts describing each moved item.
@@ -24034,52 +24277,31 @@ def perform_dedupe(group: dict, best_folders: set = None) -> List[dict]:
     moved_items: List[dict] = []
     artist = group["artist"]
     best_title = group["best"]["title_raw"]
-    best_ok, best_reason = _strict_mutation_allowed(group.get("best") if isinstance(group.get("best"), dict) else {})
-    if not best_ok:
+    if (not manual_override) and (
+        bool(group.get("no_move")) or bool(group.get("manual_review")) or bool(group.get("same_folder"))
+    ):
         logging.info(
-            "perform_dedupe(): skipped group for artist=%s album=%s (strict gate: %s)",
+            "perform_dedupe(): skipped group for artist=%s album=%s (auto dedupe guard: no_move/manual_review/same_folder)",
             artist,
             best_title,
-            best_reason or "strict_match_missing",
         )
         return moved_items
     if best_folders is None:
         best_folders = set()
-
-    def _files_forget_album_folder(folder: Path | str) -> None:
-        """Remove a moved/deleted album folder from Files-mode caches/index payload tables."""
-        try:
-            if _get_library_mode() != "files":
-                return
-        except Exception:
-            return
-        try:
-            key = _album_folder_cache_key(folder)
-        except Exception:
-            key = str(folder)
-        try:
-            con = sqlite3.connect(str(STATE_DB_FILE), timeout=10)
-            cur = con.cursor()
-            cur.execute("DELETE FROM files_album_scan_cache WHERE folder_path = ?", (key,))
-            cur.execute("DELETE FROM files_library_published_albums WHERE folder_path = ?", (key,))
-            con.commit()
-            con.close()
-        except Exception:
-            logging.debug("Files cache/published cleanup failed for %s", key, exc_info=True)
+    best_folder = None
+    try:
+        best_folder = path_for_fs_access(Path(group.get("best", {}).get("folder")))
+    except Exception:
+        best_folder = None
 
     num_losers = len(group["losers"])
     for idx, loser in enumerate(group["losers"], 1):
-        loser_ok, loser_reason = _strict_mutation_allowed(loser if isinstance(loser, dict) else {})
-        if not loser_ok:
-            logging.info(
-                "perform_dedupe(): skipping loser album_id=%s (strict gate: %s)",
-                loser.get("album_id") if isinstance(loser, dict) else None,
-                loser_reason or "strict_match_missing",
-            )
-            continue
         src_folder = Path(loser["folder"])
         # Never move a folder that is any group's best (safeguard when duplicate groups exist)
         src_resolved = path_for_fs_access(src_folder)
+        if best_folder and src_resolved and str(src_resolved) == str(best_folder):
+            logging.warning("perform_dedupe(): skipping loser (same folder as best) – %s", src_folder)
+            continue
         if best_folders and src_resolved and str(src_resolved) in best_folders:
             logging.warning("perform_dedupe(): skipping loser (folder is another group's best) – %s", src_folder)
             continue
@@ -24111,7 +24333,7 @@ def perform_dedupe(group: dict, best_folders: set = None) -> List[dict]:
             except Exception:
                 pass
             # Keep Files-mode browsing consistent: the loser is now outside FILES_ROOTS.
-            _files_forget_album_folder(src_folder)
+            _files_forget_album_folder_global(src_folder)
             with lock:
                 state["dedupe_last_write"] = {"path": str(dst), "at": time.time()}
             logging.info("Moved to /dupes: %s", dst)
@@ -24287,7 +24509,7 @@ def _build_card_list(dup_dict) -> list[dict]:
                 "artist": artist,
                 "album_id": best["album_id"],
                 "n": len(existing_losers) + 1,
-                "best_thumb": thumb_url(best["album_id"]),
+                "best_thumb": _duplicate_album_thumb_url(best["album_id"], folder_path),
                 "best_title": display_title,
                 "best_fmt": best_fmt,
                 "formats": formats,
@@ -24298,7 +24520,7 @@ def _build_card_list(dup_dict) -> list[dict]:
                 "size_mb": size_mb,
                 "track_count": track_count,
                 "path": str(folder_path),
-                "no_move": False,
+                "no_move": bool(g.get("no_move") or g.get("manual_review") or g.get("same_folder")),
                 "match_verified_by_ai": bool(best.get("match_verified_by_ai", False)),
             })
     if db_conn:
@@ -29577,6 +29799,216 @@ def get_duplicate_groups_from_library():
         db_conn.close()
 
 
+def _group_contains_album_id(group: dict, album_id: int) -> bool:
+    """Return True when album_id matches this duplicate group best or one of its losers."""
+    try:
+        target = int(album_id)
+    except Exception:
+        return False
+    if int(group.get("album_id") or 0) == target:
+        return True
+    best = group.get("best") or {}
+    if int(best.get("album_id") or 0) == target:
+        return True
+    for loser in group.get("losers", []) or []:
+        if int((loser or {}).get("album_id") or 0) == target:
+            return True
+    return False
+
+
+def _build_library_duplicate_group_for_artist_album(artist_name: str, album_id: int) -> dict | None:
+    """
+    Build a duplicate group directly from current library metadata (artist + normalized album title).
+    This enables manual dedupe from Tools even when auto-move is disabled and no scan group exists.
+    """
+    if not PLEX_CONFIGURED or not SECTION_IDS:
+        return None
+    db_conn = plex_connect()
+    try:
+        row = db_conn.execute(
+            "SELECT title, parent_id FROM metadata_items WHERE id = ? AND metadata_type = 9",
+            (int(album_id),),
+        ).fetchone()
+        if not row:
+            return None
+        target_title = (row[0] or "").strip()
+        parent_id = row[1]
+        artist_title = artist_name
+        if parent_id:
+            r_art = db_conn.execute(
+                "SELECT title FROM metadata_items WHERE id = ?",
+                (int(parent_id),),
+            ).fetchone()
+            if r_art and r_art[0]:
+                artist_title = str(r_art[0]).strip()
+        if not artist_title:
+            return None
+
+        normalize_parenthetical = bool(
+            _parse_bool(_get_config_from_db("NORMALIZE_PARENTHETICAL_FOR_DEDUPE") or "true")
+        )
+        target_norm = norm_album_for_dedup(target_title or "", normalize_parenthetical)
+        if not target_norm:
+            return None
+
+        ph = ",".join("?" for _ in SECTION_IDS)
+        rows = db_conn.execute(
+            f"""
+            SELECT alb.id, alb.title
+            FROM metadata_items alb
+            LEFT JOIN metadata_items art ON art.id = alb.parent_id
+            WHERE alb.metadata_type = 9
+              AND alb.library_section_id IN ({ph})
+              AND COALESCE(art.title, '') = ?
+            """,
+            list(SECTION_IDS) + [artist_title],
+        ).fetchall()
+        album_ids = [
+            int(aid)
+            for aid, title in rows
+            if norm_album_for_dedup(title or "", normalize_parenthetical) == target_norm
+        ]
+        album_ids = sorted(set(album_ids))
+        if len(album_ids) < 2:
+            return None
+
+        editions: list[dict] = []
+        for aid in album_ids:
+            folder = first_part_path(db_conn, aid)
+            if not folder:
+                continue
+            try:
+                folder_path = Path(folder)
+            except Exception:
+                continue
+            if not folder_path.exists():
+                continue
+            tracks = get_tracks(db_conn, aid)
+            if not tracks:
+                continue
+            fmt_score, br, sr, bd, _cache_hit = analyse_format(folder_path)
+            first_audio = next((p for p in folder_path.rglob("*") if AUDIO_RE.search(p.name)), None)
+            meta_tags = extract_tags(first_audio) if first_audio else {}
+            plex_title = album_title(db_conn, aid) or ""
+            title_raw, title_source = derive_album_title(plex_title, meta_tags, folder_path, aid)
+            album_norm_value = norm_album_for_dedup(title_raw, normalize_parenthetical)
+            plex_norm_value = (
+                norm_album_for_dedup(plex_title, normalize_parenthetical)
+                if plex_title
+                else album_norm_value
+            )
+            editions.append(
+                {
+                    "album_id": aid,
+                    "title_raw": title_raw,
+                    "album_norm": album_norm_value,
+                    "plex_norm": plex_norm_value,
+                    "artist": artist_title,
+                    "folder": folder_path,
+                    "tracks": tracks,
+                    "file_count": sum(1 for f in folder_path.rglob("*") if AUDIO_RE.search(f.name)),
+                    "sig": signature(tracks),
+                    "titles": {t.title for t in tracks},
+                    "dur": sum(t.dur for t in tracks),
+                    "fmt_score": fmt_score,
+                    "br": br,
+                    "sr": sr,
+                    "bd": bd,
+                    "discs": len({t.disc for t in tracks}),
+                    "meta": meta_tags,
+                    "invalid": False,
+                    "title_source": title_source,
+                    "plex_title": plex_title,
+                }
+            )
+
+        if len(editions) < 2:
+            return None
+        best = choose_best(editions, defer_ai=True) or editions[0]
+        losers = [e for e in editions if int(e.get("album_id") or 0) != int(best.get("album_id") or 0)]
+        if not losers:
+            return None
+
+        folder_keys = set()
+        for e in [best] + losers:
+            try:
+                folder_keys.add(str(path_for_fs_access(Path(str(e.get("folder") or ""))).resolve()))
+            except Exception:
+                continue
+        same_folder = len(folder_keys) == 1 and bool(folder_keys)
+        signal = "same_folder" if same_folder else "library_only"
+        evidence = [f"TITLE_STRICT:{target_norm}", "LIBRARY_GROUP"]
+        if same_folder:
+            evidence.append("SAME_FOLDER_DUPLICATE")
+
+        return {
+            "artist": artist_title,
+            "album_id": int(best.get("album_id") or 0),
+            "best": best,
+            "losers": losers,
+            "fuzzy": True,
+            "needs_ai": False,
+            "dupe_signal": signal,
+            "dupe_evidence": evidence,
+            "no_move": bool(same_folder),
+            "manual_review": bool(same_folder),
+            "same_folder": bool(same_folder),
+        }
+    except Exception:
+        logging.debug(
+            "Failed to build library duplicate group for artist=%s album_id=%s",
+            artist_name,
+            album_id,
+            exc_info=True,
+        )
+        return None
+    finally:
+        try:
+            db_conn.close()
+        except Exception:
+            pass
+
+
+def _find_duplicate_group_by_artist_album(
+    artist_name: str,
+    album_id: int,
+    *,
+    allow_library_build: bool = False,
+) -> dict | None:
+    """Resolve one duplicate group from memory, DB snapshot, then optional library build fallback."""
+    try:
+        target_id = int(album_id)
+    except Exception:
+        return None
+    artist_norm = artist_name.replace("_", " ").strip()
+    if not artist_norm:
+        return None
+
+    with lock:
+        groups = list(state.get("duplicates", {}).get(artist_norm, []) or [])
+    for g in groups:
+        if _group_contains_album_id(g, target_id):
+            return g
+
+    loaded_groups = load_scan_from_db().get(artist_norm, []) or []
+    for g in loaded_groups:
+        if _group_contains_album_id(g, target_id):
+            with lock:
+                artist_groups = state.setdefault("duplicates", {}).setdefault(artist_norm, [])
+                if not any(_group_contains_album_id(existing, target_id) for existing in artist_groups):
+                    artist_groups.append(g)
+            return g
+
+    if not allow_library_build:
+        return None
+    built = _build_library_duplicate_group_for_artist_album(artist_norm, target_id)
+    if built:
+        with lock:
+            artist_groups = state.setdefault("duplicates", {}).setdefault(artist_norm, [])
+            artist_groups.append(built)
+    return built
+
+
 @app.get("/api/duplicates")
 def api_duplicates():
     """
@@ -29630,22 +30062,46 @@ def api_duplicates():
                 first_id = album_ids[0]
                 n = len(album_ids)
                 display_title = (norm_title or "").title() or "Unknown"
+                same_folder = False
+                best_fmt = "—"
+                best_path = ""
+                if db_plex:
+                    try:
+                        folder_keys = set()
+                        for aid in album_ids:
+                            p = first_part_path(db_plex, aid)
+                            if not p:
+                                continue
+                            try:
+                                rp = path_for_fs_access(Path(p)).resolve()
+                                folder_keys.add(str(rp))
+                            except Exception:
+                                folder_keys.add(str(p))
+                        same_folder = len(folder_keys) == 1 and bool(folder_keys)
+                        if folder_keys:
+                            best_path = sorted(folder_keys)[0]
+                            best_fmt = get_primary_format(Path(best_path))
+                    except Exception:
+                        same_folder = False
+                        best_fmt = "—"
+                        best_path = ""
                 cards.append({
                     "artist_key": artist.replace(" ", "_"),
                     "artist": artist,
                     "album_id": first_id,
                     "n": n,
-                    "best_thumb": thumb_url(first_id),
+                    "best_thumb": _duplicate_album_thumb_url(first_id),
                     "best_title": display_title,
-                    "best_fmt": "—",
-                    "formats": ["—"] * n,
+                    "best_fmt": best_fmt,
+                    "formats": [best_fmt] + ["—"] * max(0, n - 1),
                     "used_ai": False,
                     "ai_provider": "",
                     "ai_model": "",
                     "size": 0,
                     "size_mb": 0,
                     "track_count": 0,
-                    "path": "",
+                    "path": best_path,
+                    # Library-only groups are shown for manual review in Unduper.
                     "no_move": True,
                 })
             if db_plex:
@@ -30663,7 +31119,9 @@ def api_incomplete_albums_move():
         run_id = int(run_id)
     except (TypeError, ValueError):
         return jsonify({"error": "Invalid run_id"}), 400
-    target_dir = get_setting("INCOMPLETE_ALBUMS_TARGET_DIR", "/dupes/incomplete_albums")
+    target_dir = str(_get_config_from_db("INCOMPLETE_ALBUMS_TARGET_DIR") or "/dupes/incomplete_albums").strip()
+    if not target_dir:
+        target_dir = "/dupes/incomplete_albums"
     target_path = Path(target_dir)
     target_path.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(str(STATE_DB_FILE))
@@ -42589,122 +43047,150 @@ def api_dedupe():
 
 @app.get("/details/<artist>/<int:album_id>")
 def details(artist, album_id):
-    if not PLEX_CONFIGURED:
+    if _get_library_mode() != "files" and not PLEX_CONFIGURED:
         return jsonify({"error": "Plex not configured", "requiresConfig": True}), 503
-    art = artist.replace("_", " ")
-    with lock:
-        groups = state["duplicates"].get(art)
-    if groups is None:
-        groups = load_scan_from_db().get(art, [])
-    for g in groups:
-        best_album_id_in_g = g.get("album_id") or (g.get("best", {}).get("album_id") if g.get("best") else None)
-        if best_album_id_in_g == album_id:
-            editions = [g["best"]] + g["losers"]
-            best_album_id = best_album_id_in_g
-            artist_rating_key = None
-            try:
+    art = artist.replace("_", " ").strip()
+    g = _find_duplicate_group_by_artist_album(art, album_id, allow_library_build=True)
+    if g and g.get("best") and g.get("losers"):
+        editions = [g["best"]] + g["losers"]
+        best_album_id_in_g = int(g.get("best", {}).get("album_id") or g.get("album_id") or 0)
+        best_album_id = best_album_id_in_g
+        artist_rating_key = None
+        db_conn = None
+        try:
+            if PLEX_CONFIGURED:
                 db_conn = plex_connect()
-                best_track_titles = {(t.title or "").strip().lower() for t in get_tracks(db_conn, best_album_id)}
-                # Plex Web: artist page = /library/metadata/{artist_id}; album's parent is the artist (metadata_type 9)
+            best_track_titles = (
+                {(t.title or "").strip().lower() for t in get_tracks(db_conn, best_album_id)}
+                if db_conn
+                else set()
+            )
+            # Plex Web: artist page = /library/metadata/{artist_id}; album's parent is the artist (metadata_type 9)
+            if db_conn:
                 row = db_conn.execute(
                     "SELECT parent_id FROM metadata_items WHERE id = ? AND metadata_type = 9",
                     (best_album_id,),
                 ).fetchone()
                 if row and row[0]:
                     artist_rating_key = int(row[0])
+        except Exception:
+            best_track_titles = set()
+        if not best_track_titles:
+            try:
+                best_folder = path_for_fs_access(Path(str(g.get("best", {}).get("folder") or "")))
+                best_fallback_tracks = _duplicate_tracks_from_folder(best_folder, g.get("best") or {})
+                best_track_titles = {
+                    str(t.get("title") or t.get("name") or "").strip().lower()
+                    for t in best_fallback_tracks
+                    if str(t.get("title") or t.get("name") or "").strip()
+                }
             except Exception:
                 best_track_titles = set()
-                db_conn = None
 
-            out = []
-            rationale = g["best"].get("rationale", "")
-            for i, e in enumerate(editions):
-                folder_path = path_for_fs_access(Path(e["folder"])) if e.get("folder") else None
-                is_best = i == 0
-                # Size: losers have size_mb in DB; best we compute (frontend expects bytes)
-                if is_best:
-                    size_mb = safe_folder_size(folder_path) // (1024 * 1024) if folder_path else 0
-                else:
-                    size_mb = e.get("size", 0) or (safe_folder_size(folder_path) // (1024 * 1024) if folder_path else 0)
-                size_bytes = size_mb * (1024 * 1024)
+        out = []
+        rationale = g["best"].get("rationale", "")
+        for i, e in enumerate(editions):
+            folder_path = path_for_fs_access(Path(e["folder"])) if e.get("folder") else None
+            is_best = i == 0
+            # Size: losers have size_mb in DB; best we compute (frontend expects bytes)
+            if is_best:
+                size_mb = safe_folder_size(folder_path) // (1024 * 1024) if folder_path else 0
+            else:
+                size_mb = e.get("size", 0) or (safe_folder_size(folder_path) // (1024 * 1024) if folder_path else 0)
+            size_bytes = size_mb * (1024 * 1024)
 
-                track_list = []
-                if db_conn:
-                    try:
-                        for t in get_tracks_for_details(db_conn, e["album_id"]):
-                            title_norm = (t.get("title") or t.get("name") or "").strip().lower()
-                            is_bonus = not is_best and title_norm not in best_track_titles
-                            raw_path = t.get("path")
-                            track_path = str(path_for_fs_access(Path(raw_path))) if raw_path else None
-                            track_list.append({
-                                "idx": t.get("idx", 0),
-                                "title": t.get("title") or t.get("name"),
-                                "name": t.get("name") or t.get("title"),
-                                "dur": t.get("dur", 0),
-                                "duration": t.get("duration"),
-                                "format": t.get("format"),
-                                "bitrate": t.get("bitrate"),
-                                "is_bonus": is_bonus,
-                                "path": track_path,
-                            })
-                    except Exception as track_err:
-                        logging.warning(
-                            "details: tracks failed for edition album_id=%s: %s",
-                            e["album_id"], track_err
-                        )
-
-                # Edition-level br/sr/bd: use stored values, or derive from tracks / folder so we never send 0 for real files
-                br_out = (e.get("br", 0) // 1000) if isinstance(e.get("br"), int) else (e.get("br") or 0)
-                sr_out = e.get("sr", 0) or 0
-                bd_out = e.get("bd", 0) or 0
-                if (br_out == 0 or sr_out == 0 or bd_out == 0) and track_list:
-                    # Derive bitrate from first track that has it (tracks have bitrate in kbps)
-                    br_from_tracks = next((t.get("bitrate") for t in track_list if t.get("bitrate")), None)
-                    if br_from_tracks is not None and br_out == 0:
-                        br_out = br_from_tracks if br_from_tracks < 100000 else br_from_tracks // 1000
-                if (br_out == 0 or sr_out == 0 or bd_out == 0) and folder_path:
-                    try:
-                        _fmt_score, br_bps, sr_hz, bd_val, _ = analyse_format(folder_path)
-                        if br_out == 0 and br_bps:
-                            br_out = br_bps // 1000 if br_bps >= 1000 else br_bps
-                        if sr_out == 0 and sr_hz:
-                            sr_out = sr_hz
-                        if bd_out == 0 and bd_val:
-                            bd_out = bd_val
-                    except Exception:
-                        pass
-
-                thumb_data = fetch_cover_as_base64(e["album_id"])
-                path_str = str(folder_path) if folder_path is not None else ""
-                out.append({
-                    "thumb_data": thumb_data,
-                    "title_raw": e.get("title_raw") or "",
-                    "size": size_bytes,
-                    "fmt": e.get("fmt_text", e.get("fmt", "")),
-                    "br": br_out,
-                    "sr": sr_out,
-                    "bd": bd_out,
-                    "path": path_str,
-                    "folder": path_str,
-                    "album_id": e["album_id"],
-                    "track_count": len(track_list),
-                    "tracks": track_list,
-                    "musicbrainz_id": e.get("musicbrainz_id"),  # Include MusicBrainz ID if available
-                    "match_verified_by_ai": bool(e.get("match_verified_by_ai", False)),
-                })
+            track_list = []
             if db_conn:
                 try:
-                    db_conn.close()
+                    for t in get_tracks_for_details(db_conn, e["album_id"]):
+                        title_norm = (t.get("title") or t.get("name") or "").strip().lower()
+                        is_bonus = not is_best and title_norm not in best_track_titles
+                        raw_path = t.get("path")
+                        track_path = str(path_for_fs_access(Path(raw_path))) if raw_path else None
+                        track_list.append({
+                            "idx": t.get("idx", 0),
+                            "title": t.get("title") or t.get("name"),
+                            "name": t.get("name") or t.get("title"),
+                            "dur": t.get("dur", 0),
+                            "duration": t.get("duration"),
+                            "format": t.get("format"),
+                            "bitrate": t.get("bitrate"),
+                            "is_bonus": is_bonus,
+                            "path": track_path,
+                        })
+                except Exception as track_err:
+                    logging.warning(
+                        "details: tracks failed for edition album_id=%s: %s",
+                        e["album_id"], track_err
+                    )
+            if not track_list and folder_path and folder_path.exists() and folder_path.is_dir():
+                try:
+                    track_list = _duplicate_tracks_from_folder(folder_path, e)
+                    if not is_best and best_track_titles:
+                        for t in track_list:
+                            title_norm = str(t.get("title") or t.get("name") or "").strip().lower()
+                            t["is_bonus"] = bool(title_norm and title_norm not in best_track_titles)
+                except Exception:
+                    track_list = []
+
+            # Edition-level br/sr/bd: use stored values, or derive from tracks / folder so we never send 0 for real files
+            br_out = (e.get("br", 0) // 1000) if isinstance(e.get("br"), int) else (e.get("br") or 0)
+            sr_out = e.get("sr", 0) or 0
+            bd_out = e.get("bd", 0) or 0
+            if (br_out == 0 or sr_out == 0 or bd_out == 0) and track_list:
+                # Derive bitrate from first track that has it (tracks have bitrate in kbps)
+                br_from_tracks = next((t.get("bitrate") for t in track_list if t.get("bitrate")), None)
+                if br_from_tracks is not None and br_out == 0:
+                    br_out = br_from_tracks if br_from_tracks < 100000 else br_from_tracks // 1000
+            if (br_out == 0 or sr_out == 0 or bd_out == 0) and folder_path:
+                try:
+                    _fmt_score, br_bps, sr_hz, bd_val, _ = analyse_format(folder_path)
+                    if br_out == 0 and br_bps:
+                        br_out = br_bps // 1000 if br_bps >= 1000 else br_bps
+                    if sr_out == 0 and sr_hz:
+                        sr_out = sr_hz
+                    if bd_out == 0 and bd_val:
+                        bd_out = bd_val
                 except Exception:
                     pass
-            return jsonify(
-                artist=art,
-                album=g["best"]["title_raw"],
-                artist_id=artist_rating_key,
-                editions=out,
-                rationale=rationale,
-                merge_list=g["best"].get("merge_list", []),
-            )
+
+            thumb_data = _duplicate_cover_data_for_edition(e)
+            thumb_url = ""
+            try:
+                thumb_url = _duplicate_album_thumb_url(int(e.get("album_id") or 0), folder_path)
+            except Exception:
+                thumb_url = ""
+            path_str = str(folder_path) if folder_path is not None else ""
+            out.append({
+                "thumb_data": thumb_data,
+                "thumb_url": thumb_url,
+                "title_raw": e.get("title_raw") or "",
+                "size": size_bytes,
+                "fmt": e.get("fmt_text", e.get("fmt", "")),
+                "br": br_out,
+                "sr": sr_out,
+                "bd": bd_out,
+                "path": path_str,
+                "folder": path_str,
+                "album_id": e["album_id"],
+                "track_count": len(track_list),
+                "tracks": track_list,
+                "musicbrainz_id": e.get("musicbrainz_id"),  # Include MusicBrainz ID if available
+                "match_verified_by_ai": bool(e.get("match_verified_by_ai", False)),
+            })
+        if db_conn:
+            try:
+                db_conn.close()
+            except Exception:
+                pass
+        return jsonify(
+            artist=art,
+            album=g["best"]["title_raw"],
+            artist_id=artist_rating_key,
+            editions=out,
+            rationale=rationale,
+            merge_list=g["best"].get("merge_list", []),
+        )
     return jsonify({}), 404
 
 def _normalize_edition_as_best(edition: dict, artist: str) -> dict:
@@ -42738,7 +43224,7 @@ def _run_dedupe_artist_one(art: str, album_id: int, keep_edition_album_id: Optio
         state["dedupe_progress"] = 0
         state["dedupe_total"] = 1
     try:
-        moved_list = perform_dedupe(group_copy)
+        moved_list = perform_dedupe(group_copy, manual_override=True)
         removed_count = len(moved_list)
         total_mb = sum(item["size"] for item in moved_list)
         increment_stat("removed_dupes", removed_count)
@@ -42755,13 +43241,13 @@ def _run_dedupe_artist_one(art: str, album_id: int, keep_edition_album_id: Optio
 
         with lock:
             groups = state["duplicates"].get(art, [])
-            groups[:] = [gr for gr in groups if gr["album_id"] != album_id]
+            groups[:] = [gr for gr in groups if not _group_contains_album_id(gr, album_id)]
             if not groups:
                 state["duplicates"].pop(art, None)
             con = sqlite3.connect(str(STATE_DB_FILE))
             cur = con.cursor()
-            cur.execute("DELETE FROM duplicates_best WHERE artist = ? AND album_id = ?", (art, album_id))
-            cur.execute("DELETE FROM duplicates_loser WHERE artist = ? AND album_id = ?", (art, album_id))
+            cur.execute("DELETE FROM duplicates_best WHERE artist = ? AND album_id = ?", (art, group_copy.get("album_id")))
+            cur.execute("DELETE FROM duplicates_loser WHERE artist = ? AND album_id = ?", (art, group_copy.get("album_id")))
             con.commit()
             con.close()
             sid = state.get("scan_id")
@@ -42791,37 +43277,36 @@ def dedupe_artist(artist):
     if keep_edition_album_id is not None:
         keep_edition_album_id = int(keep_edition_album_id)
 
-    group_copy = None
-    with lock:
-        groups = state["duplicates"].get(art, [])
-        for g in list(groups):
-            if g["album_id"] != album_id:
-                continue
-            if keep_edition_album_id is not None:
-                editions = [g["best"]] + g["losers"]
-                kept = None
-                losers = []
-                for e in editions:
-                    aid = e.get("album_id")
-                    if aid == keep_edition_album_id:
-                        kept = e
-                    else:
-                        losers.append(e)
-                if kept is None or not losers:
-                    return jsonify({"error": "Invalid keep_edition_album_id or no editions to remove"}), 400
-                group_copy = {
-                    "artist": art,
-                    "album_id": album_id,
-                    "best": _normalize_edition_as_best(kept, art),
-                    "losers": losers,
-                }
-            else:
-                import copy
-                group_copy = copy.deepcopy(g)
-            break
-
-    if group_copy is None:
+    g = _find_duplicate_group_by_artist_album(art, album_id, allow_library_build=True)
+    if g is None:
         return jsonify({"error": "Group not found"}), 404
+    if keep_edition_album_id is not None:
+        editions = [g.get("best", {})] + list(g.get("losers") or [])
+        kept = None
+        losers = []
+        for e in editions:
+            aid = int(e.get("album_id") or 0)
+            if aid == int(keep_edition_album_id):
+                kept = e
+            elif aid:
+                losers.append(e)
+        if kept is None or not losers:
+            return jsonify({"error": "Invalid keep_edition_album_id or no editions to remove"}), 400
+        group_copy = {
+            "artist": art,
+            "album_id": int(kept.get("album_id") or g.get("album_id") or album_id),
+            "best": _normalize_edition_as_best(kept, art),
+            "losers": losers,
+            "dupe_signal": g.get("dupe_signal"),
+            "no_move": g.get("no_move"),
+            "manual_review": g.get("manual_review"),
+            "same_folder": g.get("same_folder"),
+        }
+    else:
+        import copy
+        group_copy = copy.deepcopy(g)
+    if bool(group_copy.get("same_folder")):
+        return jsonify({"error": "Same-folder duplicates are metadata-only entries; nothing to move on disk."}), 400
 
     threading.Thread(target=_run_dedupe_artist_one, args=(art, album_id, keep_edition_album_id, group_copy), daemon=True).start()
     return jsonify(status="started", message="Deduplication started", moved=[]), 202
@@ -43046,29 +43531,35 @@ def dedupe_selected():
     artists_to_refresh = set()
 
     for sel in selected:
-        art_key, aid_str = sel.split("||", 1)
-        art = art_key.replace("_", " ")
-        album_id = int(aid_str)
+        try:
+            art_key, aid_str = sel.split("||", 1)
+            art = art_key.replace("_", " ").strip()
+            album_id = int(aid_str)
+        except Exception:
+            continue
+        g = _find_duplicate_group_by_artist_album(art, album_id, allow_library_build=True)
+        if not g:
+            logging.debug("dedupe_selected(): group not found for %s", sel)
+            continue
+        if bool(g.get("same_folder")):
+            logging.debug("dedupe_selected(): skipping same-folder group for %s", sel)
+            continue
+        logging.debug("dedupe_selected(): processing group for artist '%s', album_id=%s", art, album_id)
+        moved = perform_dedupe(g, manual_override=True)
+        moved_list.extend(moved)
+        total_moved += sum(item["size"] for item in moved)
+        removed_count += len(moved)
+        artists_to_refresh.add(art)
+        best_album_id = int(g.get("album_id") or g.get("best", {}).get("album_id") or 0)
+        loser_album_ids = [int((e or {}).get("album_id") or 0) for e in (g.get("losers") or [])]
+        loser_album_ids = [aid for aid in loser_album_ids if aid]
+        if best_album_id:
+            _remove_dedupe_group_from_db(art, best_album_id, loser_album_ids)
         with lock:
             groups = state["duplicates"].get(art, [])
-            for g in list(groups):
-                if g["album_id"] == album_id:
-                    logging.debug(f"dedupe_selected(): removing selected group for artist '{art}', album_id={album_id}")
-                    moved = perform_dedupe(g)
-                    moved_list.extend(moved)
-                    total_moved += sum(item["size"] for item in moved)
-                    removed_count += len(g["losers"])
-                    artists_to_refresh.add(art)
-                    groups.remove(g)
-                    if not groups:
-                        del state["duplicates"][art]
-                    con = sqlite3.connect(str(STATE_DB_FILE))
-                    cur = con.cursor()
-                    cur.execute("DELETE FROM duplicates_best WHERE artist = ? AND album_id = ?", (art, album_id))
-                    cur.execute("DELETE FROM duplicates_loser WHERE artist = ? AND album_id = ?", (art, album_id))
-                    con.commit()
-                    con.close()
-                    break
+            groups[:] = [gr for gr in groups if not _group_contains_album_id(gr, album_id)]
+            if not groups and art in state["duplicates"]:
+                del state["duplicates"][art]
 
     for art in artists_to_refresh:
         letter  = quote_plus(art[0].upper())

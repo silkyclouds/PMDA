@@ -11,12 +11,11 @@ import { EmptyState } from '@/components/EmptyState';
 import { Button } from '@/components/ui/button';
 import {
   useDuplicates,
-  useScanProgress,
-  useDedupeProgress,
   useScanControls,
   useDedupeActions,
   useSelection,
 } from '@/hooks/usePMDA';
+import { useScanProgressShared } from '@/hooks/useScanProgressShared';
 import { getLibraryStats } from '@/lib/api';
 import { useQuery } from '@tanstack/react-query';
 import type { DuplicateCard as DuplicateCardType, DedupeCurrentGroup } from '@/lib/api';
@@ -74,10 +73,11 @@ export default function Unduper() {
   const [dedupingId, setDedupingId] = useState<string | null>(null);
 
   // Data hooks (refetch duplicates every 2s during scan so list grows as artists finish, 1s during dedupe)
-  const { progress: scanProgress } = useScanProgress();
-  const { data: dedupeProgress } = useDedupeProgress();
+  const { progress: scanProgress, dedupeProgress } = useScanProgressShared({ pollInterval: 2500 });
+  const duplicateSource: 'scan' | 'all' = (scanProgress?.scanning || dedupeProgress?.deduping) ? 'scan' : 'all';
   const { data: duplicates = [], isLoading: loadingDuplicates } = useDuplicates({
-    refetchInterval: scanProgress?.scanning ? 2000 : dedupeProgress?.deduping ? 1000 : 10000,
+    source: duplicateSource,
+    refetchInterval: scanProgress?.scanning ? 3500 : dedupeProgress?.deduping ? 2000 : 12000,
   });
   const { data: libraryStats, error: libraryStatsError } = useQuery({
     queryKey: ['library-stats'],
@@ -170,7 +170,7 @@ export default function Unduper() {
       return dup && !dup.no_move;
     });
     if (toDedupe.length === 0) {
-      toast.error('Selected items need a scan first — run scan to choose edition to keep');
+      toast.error('Selected items require manual review before moving.');
       return;
     }
     try {

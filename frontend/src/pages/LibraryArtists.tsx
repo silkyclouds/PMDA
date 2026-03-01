@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useLocation, useNavigate, useOutletContext } from 'react-router-dom';
-import { Loader2, UserRound } from 'lucide-react';
+import { AlertTriangle, Loader2, UserRound } from 'lucide-react';
 
 import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { useLibraryQuery } from '@/hooks/useLibraryQuery';
 import * as api from '@/lib/api';
@@ -105,11 +106,22 @@ export default function LibraryArtists() {
             {total > 0 ? `${artists.length.toLocaleString()} / ${total.toLocaleString()}` : ' '}
           </div>
         </div>
-        {error ? (
-          <Badge variant="outline" className="text-xs border-destructive/50 text-destructive">
-            {error}
-          </Badge>
-        ) : null}
+        <div className="flex items-center gap-2">
+          <Button
+            type="button"
+            size="sm"
+            className="h-8 gap-1.5 bg-amber-500/90 hover:bg-amber-500 text-black border border-amber-300/30"
+            onClick={() => navigate('/broken-albums')}
+          >
+            <AlertTriangle className="w-3.5 h-3.5" />
+            Review incompletes
+          </Button>
+          {error ? (
+            <Badge variant="outline" className="text-xs border-destructive/50 text-destructive">
+              {error}
+            </Badge>
+          ) : null}
+        </div>
       </div>
 
       {loading && artists.length === 0 ? (
@@ -141,13 +153,6 @@ export default function LibraryArtists() {
                   <div className="text-xs text-muted-foreground mt-0.5">
                     {a.album_count} album{a.album_count === 1 ? '' : 's'}
                   </div>
-                  {a.broken_albums_count ? (
-                    <div className="mt-2">
-                      <Badge variant="outline" className="text-[10px] border-amber-500/40 text-amber-700 dark:text-amber-300">
-                        {a.broken_albums_count} incomplete
-                      </Badge>
-                    </div>
-                  ) : null}
                 </div>
               </div>
             </Card>

@@ -1,13 +1,15 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { ScanProgress } from '@/components/ScanProgress';
-import { useScanProgress, useScanControls, useDuplicates } from '@/hooks/usePMDA';
+import { useScanControls, useDuplicates } from '@/hooks/usePMDA';
+import { useScanProgressShared } from '@/hooks/useScanProgressShared';
 import type { ScanProgress as ScanProgressType } from '@/lib/api';
 
 type LastScanSummary = NonNullable<ScanProgressType['last_scan_summary']>;
 
 export default function Scan() {
-  const { progress: scanProgress } = useScanProgress();
+  const { progress: sharedProgress } = useScanProgressShared({ pollInterval: 2500 });
+  const scanProgress = sharedProgress ?? { scanning: false, progress: 0, total: 0, status: 'idle' as const };
   const scanControls = useScanControls();
   const queryClient = useQueryClient();
   const wasScanningRef = useRef(false);

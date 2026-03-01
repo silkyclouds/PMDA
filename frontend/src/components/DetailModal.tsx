@@ -22,7 +22,7 @@ interface DetailModalProps {
 }
 
 export function DetailModal({ artist, albumId, onClose, onDedupe, no_move, best_title }: DetailModalProps) {
-  const { data: details, isLoading, error, refetch } = useDuplicateDetails(artist, albumId, !no_move);
+  const { data: details, isLoading, error, refetch } = useDuplicateDetails(artist, albumId, true);
   const [isDeduping, setIsDeduping] = useState(false);
   const [selectedEdition, setSelectedEdition] = useState<string>('0');
   const [showTracks, setShowTracks] = useState(true);
@@ -72,6 +72,7 @@ export function DetailModal({ artist, albumId, onClose, onDedupe, no_move, best_
   const hasMergeTracks = details?.merge_list && details.merge_list.length > 0;
   const selectedEditionIndex = parseInt(selectedEdition);
   const hasTracks = details?.editions?.some(e => e.tracks && e.tracks.length > 0);
+  const hasTrackCounts = details?.editions?.some(e => (e.track_count ?? 0) > 0);
 
   return (
     <>
@@ -84,8 +85,8 @@ export function DetailModal({ artist, albumId, onClose, onDedupe, no_move, best_
         <div className="sticky top-0 z-10 flex items-center justify-between gap-4 p-4 border-b border-border bg-card">
           <div className="flex-1 min-w-0">
             <div className="flex items-center gap-3 flex-wrap">
-              <h2 className="text-lg font-semibold text-foreground truncate">
-                {no_move ? `${artist.replace(/_/g, ' ')} – ${best_title ?? 'Unknown'}` : (details?.artist || artist) + ' – ' + (details?.album || 'Loading...')}
+            <h2 className="text-lg font-semibold text-foreground truncate">
+                {(details?.artist || artist) + ' – ' + (details?.album || best_title || 'Loading...')}
               </h2>
               {details?.editions && (
                 <PlexLink 
@@ -112,24 +113,24 @@ export function DetailModal({ artist, albumId, onClose, onDedupe, no_move, best_
         {/* Body — full width, no horizontal overflow */}
         <div className="p-4 md:p-6 space-y-6 w-full min-w-0 overflow-x-hidden">
           {no_move && (
-            <div className="p-4 rounded-lg bg-muted/50 border border-border text-center text-muted-foreground">
-              <p className="font-medium text-foreground mb-1">Duplicate detected by name only</p>
-              <p className="text-sm">Run a scan to choose which edition to keep and move the others.</p>
+            <div className="p-4 rounded-lg bg-warning/5 border border-warning/20 text-warning-foreground">
+              <p className="font-medium text-foreground mb-1">Manual review recommended</p>
+              <p className="text-sm text-muted-foreground">This group was flagged as unsafe for automatic move. Verify editions before confirming.</p>
             </div>
           )}
-          {!no_move && isLoading && (
+          {isLoading && (
             <div className="flex items-center justify-center py-12">
               <Loader2 className="w-8 h-8 animate-spin text-primary" />
             </div>
           )}
 
-          {!no_move && error && (
+          {error && (
             <div className="p-4 rounded-lg bg-destructive/10 text-destructive text-center">
               Failed to load details. Please try again.
             </div>
           )}
 
-          {!no_move && details && (
+          {details && (
             <>
               {/* Rationale */}
               {rationaleItems.length > 0 && (
@@ -193,7 +194,7 @@ export function DetailModal({ artist, albumId, onClose, onDedupe, no_move, best_
               </div>
 
               {/* Track comparison table */}
-              {hasTracks && (
+              {(hasTracks || hasTrackCounts) && (
                 <div className="space-y-3">
                   <div className="flex items-center justify-between">
                     <h3 className="text-sm font-medium text-foreground flex items-center gap-2">
@@ -210,7 +211,7 @@ export function DetailModal({ artist, albumId, onClose, onDedupe, no_move, best_
                     </Button>
                   </div>
                   
-                  {showTracks && (
+                  {showTracks && hasTracks && (
                     <TrackComparisonTable
                       editions={details.editions}
                       selectedEditionIndex={selectedEditionIndex}
@@ -219,6 +220,11 @@ export function DetailModal({ artist, albumId, onClose, onDedupe, no_move, best_
                       mergeList={details.merge_list ?? []}
                       onTrackMoved={handleTrackMoved}
                     />
+                  )}
+                  {showTracks && !hasTracks && (
+                    <div className="rounded-lg border border-border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+                      Track names are unavailable for this group in cache, but track counts are present.
+                    </div>
                   )}
                 </div>
               )}
@@ -237,20 +243,18 @@ export function DetailModal({ artist, albumId, onClose, onDedupe, no_move, best_
             <Button variant="outline" onClick={onClose}>
               Cancel
             </Button>
-            {!no_move && (
-              <Button
-                onClick={handleDedupe}
-                disabled={isDeduping || isLoading}
-                className="gap-1.5"
-              >
-                {isDeduping ? (
-                  <Loader2 className="w-4 h-4 animate-spin" />
-                ) : (
-                  <Trash2 className="w-4 h-4" />
-                )}
-                Undupe
-              </Button>
-            )}
+            <Button
+              onClick={handleDedupe}
+              disabled={isDeduping || isLoading}
+              className="gap-1.5"
+            >
+              {isDeduping ? (
+                <Loader2 className="w-4 h-4 animate-spin" />
+              ) : (
+                <Trash2 className="w-4 h-4" />
+              )}
+              Undupe
+            </Button>
           </div>
         </div>
       </div>

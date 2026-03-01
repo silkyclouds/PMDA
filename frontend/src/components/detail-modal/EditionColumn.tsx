@@ -17,6 +17,7 @@ interface EditionColumnProps {
 export function EditionColumn({ edition, index, isSelected, totalEditions }: EditionColumnProps) {
   const [copied, setCopied] = useState(false);
   const [copiedMbid, setCopiedMbid] = useState(false);
+  const [coverBroken, setCoverBroken] = useState(false);
   const path = edition.path || edition.folder || '';
 
   const copyPath = async () => {
@@ -66,11 +67,12 @@ export function EditionColumn({ edition, index, isSelected, totalEditions }: Edi
 
       {/* Cover */}
       <div className="cover-image w-full aspect-square mb-3">
-        {edition.thumb_data ? (
+        {(edition.thumb_data || edition.thumb_url) && !coverBroken ? (
           <img
-            src={edition.thumb_data}
+            src={edition.thumb_data || edition.thumb_url}
             alt=""
             className="w-full h-full object-cover"
+            onError={() => setCoverBroken(true)}
           />
         ) : (
           <div className="w-full h-full flex items-center justify-center bg-muted">

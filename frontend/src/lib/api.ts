@@ -360,6 +360,7 @@ export interface Track {
 
 export interface Edition {
   thumb_data: string;
+  thumb_url?: string;
   title_raw: string;
   size: number;
   fmt: string;

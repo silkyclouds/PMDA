@@ -1,4 +1,4 @@
-import { memo } from 'react';
+import { memo, useState } from 'react';
 import { Loader2, Trash2, Sparkles, FileSearch } from 'lucide-react';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Button } from '@/components/ui/button';
@@ -36,6 +36,7 @@ const TableRow = memo(function TableRow({
   isDeduping: boolean;
   listMode: ListMode;
 }) {
+  const [coverBroken, setCoverBroken] = useState(false);
   const formatSize = (bytes: number) => {
     if (!bytes) return '—';
     const mb = bytes / (1024 * 1024);
@@ -59,12 +60,13 @@ const TableRow = memo(function TableRow({
       </td>
       <td className="px-3 py-3">
         <div className="w-10 h-10 rounded overflow-hidden bg-muted flex-shrink-0">
-          {dup.best_thumb ? (
+          {dup.best_thumb && !coverBroken ? (
             <img
               src={dup.best_thumb}
               alt=""
               className="w-full h-full object-cover"
               loading="lazy"
+              onError={() => setCoverBroken(true)}
             />
           ) : (
             <div className="w-full h-full flex items-center justify-center">
@@ -136,9 +138,15 @@ const TableRow = memo(function TableRow({
       )}
       <td className="px-3 py-3" onClick={(e) => e.stopPropagation()}>
         {dup.no_move ? (
-          <span className="text-xs text-muted-foreground" title="Run scan to choose which edition to keep">
-            Run scan
-          </span>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={onOpen}
+            className="gap-1"
+            title="Manual review required for this duplicate group"
+          >
+            Review
+          </Button>
         ) : (
           <Button
             size="sm"
