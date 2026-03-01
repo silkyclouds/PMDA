@@ -6353,7 +6353,7 @@ def _rebuild_files_library_index_for_artist(
                                 %s, %s, %s, %s, %s, %s, %s, %s, %s,
                                 %s, %s, %s, %s, %s,
                                 %s, %s, %s, %s,
-                                %s, %s, %s, %s,
+                                %s, %s, %s, %s, %s,
                                 %s, %s, %s, %s, %s,
                                 %s, %s, %s,
                                 NOW(), NOW()
@@ -6858,7 +6858,7 @@ def _rebuild_files_library_index(reason: str = "manual", wait_if_running: bool =
                                 %s, %s, %s, %s, %s, %s, %s, %s, %s,
                                 %s, %s, %s, %s, %s,
                                 %s, %s, %s, %s,
-                                %s, %s, %s, %s,
+                                %s, %s, %s, %s, %s,
                                 %s, %s, %s, %s, %s,
                                 %s, %s, %s,
                                 NOW(), NOW()
