@@ -5810,6 +5810,21 @@ def _parse_int_loose(value, default: int = 0) -> int:
         return default
 
 
+_PG_INT4_MIN = -(2**31)
+_PG_INT4_MAX = (2**31) - 1
+_PG_INT8_MIN = -(2**63)
+_PG_INT8_MAX = (2**63) - 1
+
+
+def _clamp_int(value, default: int = 0, min_value: int | None = None, max_value: int | None = None) -> int:
+    out = _parse_int_loose(value, default)
+    if min_value is not None and out < min_value:
+        return min_value
+    if max_value is not None and out > max_value:
+        return max_value
+    return out
+
+
 def _parse_float_loose(value, default: float = 0.0) -> float:
     if value is None:
         return default
@@ -6406,23 +6421,33 @@ def _rebuild_files_library_index_for_artist(
                         album_id = album_id_by_folder.get(str(album.get("folder_path") or ""))
                         if not album_id:
                             continue
-                        track_rows = [
-                            (
-                                album_id,
-                                t["file_path"],
-                                t["title"],
-                                t["disc_num"],
-                                t["track_num"],
-                                t["duration_sec"],
-                                t["format"],
-                                t["bitrate"],
-                                t["sample_rate"],
-                                t["bit_depth"],
-                                t["file_size_bytes"],
+                        track_rows = []
+                        for t in (album.get("tracks") or []):
+                            file_path = str(t.get("file_path") or "").strip()
+                            if not file_path:
+                                continue
+                            disc_num = max(1, _clamp_int(t.get("disc_num"), 1, _PG_INT4_MIN, _PG_INT4_MAX))
+                            track_num = max(0, _clamp_int(t.get("track_num"), 0, _PG_INT4_MIN, _PG_INT4_MAX))
+                            duration_sec = max(0, _clamp_int(t.get("duration_sec"), 0, _PG_INT4_MIN, _PG_INT4_MAX))
+                            bitrate = max(0, _clamp_int(t.get("bitrate"), 0, _PG_INT4_MIN, _PG_INT4_MAX))
+                            sample_rate = max(0, _clamp_int(t.get("sample_rate"), 0, _PG_INT4_MIN, _PG_INT4_MAX))
+                            bit_depth = max(0, _clamp_int(t.get("bit_depth"), 0, _PG_INT4_MIN, _PG_INT4_MAX))
+                            file_size_bytes = max(0, _clamp_int(t.get("file_size_bytes"), 0, _PG_INT8_MIN, _PG_INT8_MAX))
+                            track_rows.append(
+                                (
+                                    album_id,
+                                    file_path,
+                                    str(t.get("title") or ""),
+                                    disc_num,
+                                    track_num,
+                                    duration_sec,
+                                    str(t.get("format") or ""),
+                                    bitrate,
+                                    sample_rate,
+                                    bit_depth,
+                                    file_size_bytes,
+                                )
                             )
-                            for t in (album.get("tracks") or [])
-                            if str(t.get("file_path") or "").strip()
-                        ]
                         if not track_rows:
                             continue
                         cur.executemany(
@@ -6882,18 +6907,25 @@ def _rebuild_files_library_index(reason: str = "manual", wait_if_running: bool =
                                 continue
                             if fp in track_by_path:
                                 continue
+                            disc_num = max(1, _clamp_int(t.get("disc_num"), 1, _PG_INT4_MIN, _PG_INT4_MAX))
+                            track_num = max(0, _clamp_int(t.get("track_num"), 0, _PG_INT4_MIN, _PG_INT4_MAX))
+                            duration_sec = max(0, _clamp_int(t.get("duration_sec"), 0, _PG_INT4_MIN, _PG_INT4_MAX))
+                            bitrate = max(0, _clamp_int(t.get("bitrate"), 0, _PG_INT4_MIN, _PG_INT4_MAX))
+                            sample_rate = max(0, _clamp_int(t.get("sample_rate"), 0, _PG_INT4_MIN, _PG_INT4_MAX))
+                            bit_depth = max(0, _clamp_int(t.get("bit_depth"), 0, _PG_INT4_MIN, _PG_INT4_MAX))
+                            file_size_bytes = max(0, _clamp_int(t.get("file_size_bytes"), 0, _PG_INT8_MIN, _PG_INT8_MAX))
                             track_by_path[fp] = (
                                 album_id,
                                 fp,
                                 t.get("title") or "",
-                                t.get("disc_num") or 1,
-                                t.get("track_num") or 0,
-                                t.get("duration_sec") or 0,
+                                disc_num,
+                                track_num,
+                                duration_sec,
                                 t.get("format") or "",
-                                t.get("bitrate") or 0,
-                                t.get("sample_rate") or 0,
-                                t.get("bit_depth") or 0,
-                                t.get("file_size_bytes") or 0,
+                                bitrate,
+                                sample_rate,
+                                bit_depth,
+                                file_size_bytes,
                             )
                         track_rows = list(track_by_path.values())
                         if track_rows:
