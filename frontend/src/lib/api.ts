@@ -875,6 +875,17 @@ export interface LibraryStatsFormatItem {
   count: number;
 }
 
+export interface LibraryStatsSourcePathItem {
+  path: string;
+  albums: number;
+  artists: number;
+  labels: number;
+  tracks: number;
+  albums_pct: number;
+  artists_pct: number;
+  labels_pct: number;
+}
+
 export interface LibraryStatsLibraryResponse {
   artists: number;
   albums: number;
@@ -884,6 +895,7 @@ export interface LibraryStatsLibraryResponse {
   genres: LibraryStatsGenreItem[];
   labels: LibraryStatsLabelItem[];
   formats: LibraryStatsFormatItem[];
+  source_paths?: LibraryStatsSourcePathItem[];
   quality: {
     with_cover: number;
     without_cover: number;
@@ -894,6 +906,29 @@ export interface LibraryStatsLibraryResponse {
 
 export async function getLibraryStatsLibrary(): Promise<LibraryStatsLibraryResponse> {
   return fetchApi<LibraryStatsLibraryResponse>('/api/library/stats/library');
+}
+
+export interface ScanMovesAuditResponse {
+  scan_id: number;
+  db_path: string;
+  strict_columns_present: boolean;
+  summary: Record<string, number>;
+  strict_provider_counts: Record<string, number>;
+  examples: {
+    edition_missing_sample: string[];
+    strict_no_sample: Array<{
+      original_path: string;
+      provider?: string;
+      reject_reason?: string;
+    }>;
+  };
+}
+
+export async function getScanMovesAudit(scanId?: number): Promise<ScanMovesAuditResponse> {
+  const q = new URLSearchParams();
+  if (scanId != null && Number.isFinite(scanId) && scanId > 0) q.set('scan_id', String(Math.floor(scanId)));
+  const qs = q.toString();
+  return fetchApi<ScanMovesAuditResponse>(`/api/statistics/scan-moves-audit${qs ? `?${qs}` : ''}`);
 }
 
 export type LibraryDiscoverSectionKey = 'genre' | 'artists' | 'similar' | 'labels' | 'year' | 'random';

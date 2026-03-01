@@ -24,6 +24,7 @@ import TagFixer from "./pages/TagFixer";
 import Settings from "./pages/Settings";
 import NotFound from "./pages/NotFound";
 import Tools from "./pages/Tools";
+import Unduper from "./pages/Unduper";
 import { BrokenAlbumsList } from "./components/broken-albums/BrokenAlbumsList";
 import { PlaybackProvider, usePlayback } from "./contexts/PlaybackContext";
 import { AudioPlayer } from "./components/library/AudioPlayer";
@@ -56,12 +57,13 @@ function AppRoutesWithPlayer() {
         <Route element={<AppLayout />}>
           <Route path="/" element={<Navigate to="/library" replace />} />
           <Route path="/scan" element={<Scan />} />
-          <Route path="/unduper" element={<Navigate to="/tools" replace />} />
+          <Route path="/unduper" element={<Navigate to="/tools/duplicates" replace />} />
           <Route path="/history" element={<Navigate to="/tools" replace />} />
           <Route path="/statistics" element={<Statistics />} />
           <Route path="/statistics/listening" element={<ListeningStatsPage />} />
           <Route path="/statistics/library" element={<LibraryStatsPage />} />
           <Route path="/tools" element={<Tools />} />
+          <Route path="/tools/duplicates" element={<Unduper />} />
           <Route path="/library" element={<LibraryLayout />}>
             <Route index element={<LibraryHome />} />
             <Route path="home" element={<LibraryHome />} />

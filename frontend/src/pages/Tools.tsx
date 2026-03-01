@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { AlertTriangle, ChevronLeft, ChevronRight, Loader2, RefreshCw, Tags, Trash2, Undo2 } from 'lucide-react';
+import { useNavigate } from 'react-router-dom';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
@@ -12,7 +13,19 @@ function fmtDate(ts?: number): string {
   return new Date(ts * 1000).toLocaleString();
 }
 
+function fmtDurationSeconds(value?: number): string {
+  const sec = Math.max(0, Number(value || 0));
+  if (!sec) return '0s';
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = sec % 60;
+  if (h > 0) return `${h}h ${m}m ${s}s`;
+  if (m > 0) return `${m}m ${s}s`;
+  return `${s}s`;
+}
+
 export default function Tools() {
+  const navigate = useNavigate();
   const [restoring, setRestoring] = useState<'dedupe' | 'incomplete' | null>(null);
   const [selectedScanId, setSelectedScanId] = useState<number | null>(null);
 
@@ -54,6 +67,18 @@ export default function Tools() {
   }, [completedRuns, selectedIndex]);
 
   const selectedSummary = selectedRun?.summary_json ?? null;
+  const selectedAlbumsDone = Number(selectedRun?.albums_scanned ?? 0);
+  const selectedAlbumsTotal = Number(
+    selectedSummary?.strict_total_albums
+      ?? selectedSummary?.albums_scanned
+      ?? selectedRun?.albums_scanned
+      ?? 0,
+  );
+  const selectedDurationSeconds = Number(
+    selectedRun?.duration_seconds
+      ?? selectedSummary?.duration_seconds
+      ?? 0,
+  );
 
   const {
     data: moves,
@@ -174,10 +199,22 @@ export default function Tools() {
                 </div>
               </CardHeader>
               <CardContent className="flex flex-wrap gap-2">
-                <Badge variant="outline">{selectedRun.albums_scanned} albums scanned</Badge>
+                <Badge variant="outline">
+                  {selectedAlbumsDone.toLocaleString()} / {selectedAlbumsTotal.toLocaleString()} albums processed
+                </Badge>
                 <Badge variant="outline">{selectedRun.artists_processed}/{selectedRun.artists_total} artists processed</Badge>
                 <Badge variant="outline">{selectedRun.duplicates_found} duplicate group(s)</Badge>
                 <Badge variant="outline">{selectedRun.albums_moved} moved</Badge>
+                <Badge variant="outline">runtime {fmtDurationSeconds(selectedDurationSeconds)}</Badge>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  className="h-7"
+                  onClick={() => navigate('/tools/duplicates')}
+                >
+                  Fine-check duplicates
+                </Button>
               </CardContent>
             </Card>
 

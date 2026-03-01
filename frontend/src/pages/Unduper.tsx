@@ -2,7 +2,6 @@ import { useState, useMemo, useCallback, useEffect, useRef } from 'react';
 import { Trash2, Loader2, GitMerge } from 'lucide-react';
 import { toast } from 'sonner';
 import { useQueryClient } from '@tanstack/react-query';
-import { Header } from '@/components/Header';
 import { SearchInput } from '@/components/SearchInput';
 import { ListModeToggle, type ListMode } from '@/components/ListModeToggle';
 import { DuplicateTable } from '@/components/DuplicateTable';
@@ -208,10 +207,7 @@ export default function Unduper() {
   };
 
   return (
-    <div className="min-h-screen bg-background">
-      <Header />
-
-      <main className="container py-6 space-y-6">
+    <div className="container pb-6 space-y-6">
         {/* Dedupe in progress: banner + current group detail + percent & ETA */}
         {dedupeProgress?.deduping && (
           <div className="space-y-3">
@@ -367,8 +363,6 @@ export default function Unduper() {
             />
           </>
         )}
-      </main>
-
       {selectedDuplicate && (
         <DetailModal
           artist={selectedDuplicate.artist_key}

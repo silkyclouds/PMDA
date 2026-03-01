@@ -30044,6 +30044,74 @@ def api_statistics_cache_control():
     return jsonify(_collect_cache_control_metrics(force=force))
 
 
+@app.get("/api/statistics/scan-moves-audit")
+def api_statistics_scan_moves_audit():
+    """Run scan-moves strict-match audit script and return JSON output."""
+    scan_id_raw = _parse_int_loose(request.args.get("scan_id"), 0)
+    scan_id = int(scan_id_raw or 0)
+    try:
+        if scan_id <= 0:
+            con = sqlite3.connect(str(STATE_DB_FILE))
+            cur = con.cursor()
+            cur.execute("SELECT MAX(scan_id) FROM scan_history")
+            row = cur.fetchone()
+            con.close()
+            scan_id = int((row or [0])[0] or 0)
+    except Exception as e:
+        return jsonify({"error": f"Could not resolve scan_id: {e}"}), 500
+    if scan_id <= 0:
+        return jsonify({"error": "No scan history found"}), 404
+
+    script_path = Path(__file__).resolve().parent / "tools" / "audit_scan_moves.py"
+    if not script_path.exists():
+        return jsonify({"error": f"Audit script not found: {script_path}"}), 404
+
+    try:
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(script_path),
+                "--db",
+                str(STATE_DB_FILE),
+                "--scan-id",
+                str(scan_id),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except Exception as e:
+        return jsonify({"error": f"Audit script execution failed: {e}"}), 500
+
+    if proc.returncode != 0:
+        return (
+            jsonify(
+                {
+                    "error": "Audit script failed",
+                    "scan_id": scan_id,
+                    "exit_code": int(proc.returncode),
+                    "stderr": (proc.stderr or "").strip()[:4000],
+                }
+            ),
+            500,
+        )
+    try:
+        report = json.loads((proc.stdout or "").strip() or "{}")
+    except Exception as e:
+        return (
+            jsonify(
+                {
+                    "error": f"Audit script returned invalid JSON: {e}",
+                    "scan_id": scan_id,
+                    "stdout": (proc.stdout or "").strip()[:4000],
+                }
+            ),
+            500,
+        )
+    return jsonify(report)
+
+
 @app.get("/api/scan-history")
 def api_scan_history():
     """Return list of all scan history entries."""
@@ -30851,6 +30919,7 @@ def api_library_stats_library():
                 },
                 "genres": [],
                 "labels": [],
+                "source_paths": [],
                 "index_running": index_running,
                 "index_phase": str(index_state.get("phase") or ""),
             }
@@ -30949,6 +31018,144 @@ def api_library_stats_library():
             )
             labels = [{"label": str(r[0] or "").strip(), "count": int(r[1] or 0)} for r in cur.fetchall() if str(r[0] or "").strip()]
 
+            def _norm_root_path(val: str) -> str:
+                s = re.sub(r"/+", "/", str(val or "").strip().replace("\\", "/"))
+                if not s:
+                    return ""
+                if not s.startswith("/"):
+                    s = "/" + s
+                return s.rstrip("/")
+
+            roots_raw = _parse_files_roots(
+                get_setting(
+                    "FILES_ROOTS",
+                    ",".join(FILES_ROOTS) if isinstance(FILES_ROOTS, list) else (FILES_ROOTS or ""),
+                )
+            )
+            roots_norm: list[str] = []
+            seen_roots: set[str] = set()
+            for root in roots_raw or []:
+                nr = _norm_root_path(root)
+                if not nr or nr in seen_roots:
+                    continue
+                seen_roots.add(nr)
+                roots_norm.append(nr)
+
+            source_paths: list[dict] = []
+            for root in roots_norm:
+                match_params = [root, f"{root}/%"]
+                cur.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM files_albums alb
+                    WHERE COALESCE(alb.folder_path, '') = %s
+                       OR COALESCE(alb.folder_path, '') LIKE %s
+                    """,
+                    match_params,
+                )
+                root_albums = int((cur.fetchone() or [0])[0] or 0)
+                cur.execute(
+                    """
+                    SELECT COUNT(DISTINCT alb.artist_id)
+                    FROM files_albums alb
+                    WHERE COALESCE(alb.folder_path, '') = %s
+                       OR COALESCE(alb.folder_path, '') LIKE %s
+                    """,
+                    match_params,
+                )
+                root_artists = int((cur.fetchone() or [0])[0] or 0)
+                cur.execute(
+                    """
+                    SELECT COUNT(DISTINCT lower(trim(COALESCE(alb.label, ''))))
+                    FROM files_albums alb
+                    WHERE (COALESCE(alb.folder_path, '') = %s OR COALESCE(alb.folder_path, '') LIKE %s)
+                      AND COALESCE(trim(alb.label), '') <> ''
+                    """,
+                    match_params,
+                )
+                root_labels = int((cur.fetchone() or [0])[0] or 0)
+                cur.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM files_tracks tr
+                    JOIN files_albums alb ON alb.id = tr.album_id
+                    WHERE COALESCE(alb.folder_path, '') = %s
+                       OR COALESCE(alb.folder_path, '') LIKE %s
+                    """,
+                    match_params,
+                )
+                root_tracks = int((cur.fetchone() or [0])[0] or 0)
+                source_paths.append(
+                    {
+                        "path": root,
+                        "albums": root_albums,
+                        "artists": root_artists,
+                        "labels": root_labels,
+                        "tracks": root_tracks,
+                        "albums_pct": round((root_albums / albums) * 100.0, 2) if albums > 0 else 0.0,
+                        "artists_pct": round((root_artists / artists) * 100.0, 2) if artists > 0 else 0.0,
+                        "labels_pct": round((root_labels / max(1, len(labels))) * 100.0, 2) if labels else 0.0,
+                    }
+                )
+
+            if roots_norm:
+                root_or = " OR ".join(["(COALESCE(alb.folder_path, '') = %s OR COALESCE(alb.folder_path, '') LIKE %s)"] * len(roots_norm))
+                root_params: list[str] = []
+                for root in roots_norm:
+                    root_params.extend([root, f"{root}/%"])
+                cur.execute(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM files_albums alb
+                    WHERE NOT ({root_or})
+                    """,
+                    root_params,
+                )
+                unknown_albums = int((cur.fetchone() or [0])[0] or 0)
+                if unknown_albums > 0:
+                    cur.execute(
+                        f"""
+                        SELECT COUNT(DISTINCT alb.artist_id)
+                        FROM files_albums alb
+                        WHERE NOT ({root_or})
+                        """,
+                        root_params,
+                    )
+                    unknown_artists = int((cur.fetchone() or [0])[0] or 0)
+                    cur.execute(
+                        f"""
+                        SELECT COUNT(DISTINCT lower(trim(COALESCE(alb.label, ''))))
+                        FROM files_albums alb
+                        WHERE NOT ({root_or})
+                          AND COALESCE(trim(alb.label), '') <> ''
+                        """,
+                        root_params,
+                    )
+                    unknown_labels = int((cur.fetchone() or [0])[0] or 0)
+                    cur.execute(
+                        f"""
+                        SELECT COUNT(*)
+                        FROM files_tracks tr
+                        JOIN files_albums alb ON alb.id = tr.album_id
+                        WHERE NOT ({root_or})
+                        """,
+                        root_params,
+                    )
+                    unknown_tracks = int((cur.fetchone() or [0])[0] or 0)
+                    source_paths.append(
+                        {
+                            "path": "(outside configured roots)",
+                            "albums": unknown_albums,
+                            "artists": unknown_artists,
+                            "labels": unknown_labels,
+                            "tracks": unknown_tracks,
+                            "albums_pct": round((unknown_albums / albums) * 100.0, 2) if albums > 0 else 0.0,
+                            "artists_pct": round((unknown_artists / artists) * 100.0, 2) if artists > 0 else 0.0,
+                            "labels_pct": round((unknown_labels / max(1, len(labels))) * 100.0, 2) if labels else 0.0,
+                        }
+                    )
+            source_paths.sort(key=lambda item: int(item.get("albums") or 0), reverse=True)
+
         payload = {
             "artists": artists,
             "albums": albums,
@@ -30964,6 +31171,7 @@ def api_library_stats_library():
                 "lossless": lossless,
                 "lossy": max(0, albums - lossless),
             },
+            "source_paths": source_paths,
         }
         _files_cache_set_json(cache_key, payload, ttl=30)
         return jsonify(payload)
@@ -31025,7 +31233,25 @@ def api_library_discover():
     def _album_rows_to_payload(rows: list[tuple]) -> list[dict]:
         base_url = request.url_root.rstrip("/")
         albums_out: list[dict] = []
-        for album_id, title, year, genre, label, tags_json, track_count, fmt, is_lossless, has_cover, mb_identified, artist_id, artist_name, short_desc, profile_source in rows:
+        for (
+            album_id,
+            title,
+            year,
+            genre,
+            label,
+            tags_json,
+            track_count,
+            fmt,
+            is_lossless,
+            has_cover,
+            _cover_path,
+            _folder_path,
+            mb_identified,
+            artist_id,
+            artist_name,
+            short_desc,
+            profile_source,
+        ) in rows:
             aid = int(album_id or 0)
             arid = int(artist_id or 0)
             thumb = f"{base_url}/api/library/files/album/{aid}/cover?size=512" if bool(has_cover) else None

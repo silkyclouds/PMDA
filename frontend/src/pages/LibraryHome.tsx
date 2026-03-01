@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { useLocation, useNavigate, useOutletContext } from 'react-router-dom';
-import { Flame, Loader2, Music, Play, RefreshCw, Sparkles, UserRound } from 'lucide-react';
+import { ArrowDown, ArrowUp, Flame, Loader2, Music, Play, RefreshCw, Sparkles, UserRound } from 'lucide-react';
 
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -13,6 +13,40 @@ import { useToast } from '@/hooks/use-toast';
 import * as api from '@/lib/api';
 import type { TrackInfo } from '@/components/library/AudioPlayer';
 import type { LibraryOutletContext } from '@/pages/LibraryLayout';
+
+const HOME_SECTION_KEYS = [
+  'discover',
+  'for_you',
+  'top_artists',
+  'recent_artists',
+  'recently_played',
+  'recently_added',
+] as const;
+type HomeSectionKey = (typeof HOME_SECTION_KEYS)[number];
+const HOME_SECTION_LABEL: Record<HomeSectionKey, string> = {
+  discover: 'Discover',
+  for_you: 'For You',
+  top_artists: 'Top Artists',
+  recent_artists: 'Recently Added Artists',
+  recently_played: 'Recently Played',
+  recently_added: 'Recently Added',
+};
+
+function normalizeHomeSectionOrder(raw: unknown): HomeSectionKey[] {
+  const items = Array.isArray(raw) ? raw : [];
+  const out: HomeSectionKey[] = [];
+  const seen = new Set<HomeSectionKey>();
+  for (const item of items) {
+    const key = String(item || '').trim() as HomeSectionKey;
+    if (!HOME_SECTION_KEYS.includes(key) || seen.has(key)) continue;
+    seen.add(key);
+    out.push(key);
+  }
+  for (const key of HOME_SECTION_KEYS) {
+    if (!seen.has(key)) out.push(key);
+  }
+  return out;
+}
 
 export default function LibraryHome() {
   const navigate = useNavigate();
@@ -40,6 +74,15 @@ export default function LibraryHome() {
   const [recentlyPlayedLoading, setRecentlyPlayedLoading] = useState(false);
   const [recentlyPlayedError, setRecentlyPlayedError] = useState<string | null>(null);
   const [recentlyPlayedAlbums, setRecentlyPlayedAlbums] = useState<api.RecentlyPlayedAlbumItem[]>([]);
+  const [sectionOrder, setSectionOrder] = useState<HomeSectionKey[]>(() => {
+    try {
+      const raw = localStorage.getItem('pmda_library_home_sections');
+      const parsed = raw ? JSON.parse(raw) : [];
+      return normalizeHomeSectionOrder(parsed);
+    } catch {
+      return [...HOME_SECTION_KEYS];
+    }
+  });
 
   const loadRecommendations = useCallback(async () => {
     if (!recommendationSessionId) return;
@@ -191,9 +234,74 @@ export default function LibraryHome() {
     navigate(`/library/genre/${encodeURIComponent(g)}${location.search || ''}`);
   }, [location.search, navigate]);
 
+  const moveSection = useCallback((key: HomeSectionKey, dir: -1 | 1) => {
+    setSectionOrder((prev) => {
+      const list = normalizeHomeSectionOrder(prev);
+      const idx = list.indexOf(key);
+      if (idx < 0) return list;
+      const nextIdx = idx + dir;
+      if (nextIdx < 0 || nextIdx >= list.length) return list;
+      const next = [...list];
+      const [item] = next.splice(idx, 1);
+      next.splice(nextIdx, 0, item);
+      return next;
+    });
+  }, []);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('pmda_library_home_sections', JSON.stringify(sectionOrder));
+    } catch {
+      // ignore
+    }
+  }, [sectionOrder]);
+
+  const sectionOrderStyle = useCallback((key: HomeSectionKey): { order: number } => {
+    const idx = sectionOrder.indexOf(key);
+    return { order: idx >= 0 ? idx : 999 };
+  }, [sectionOrder]);
+
   return (
-    <div className="container pb-6 space-y-5 md:space-y-6">
+    <div className="container pb-6 flex flex-col gap-5 md:gap-6">
+      <Card className="pmda-shelf overflow-hidden animate-in fade-in-0 slide-in-from-bottom-2 duration-300">
+        <CardHeader className="pb-2">
+          <CardTitle className="text-base">Home Layout</CardTitle>
+          <CardDescription>Reorder home sections.</CardDescription>
+        </CardHeader>
+        <CardContent className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-2">
+          {sectionOrder.map((key, idx) => (
+            <div key={`home-sec-order-${key}`} className="flex items-center justify-between rounded-md border border-border/70 bg-background/70 px-2.5 py-2">
+              <span className="text-sm">{HOME_SECTION_LABEL[key]}</span>
+              <div className="flex items-center gap-1">
+                <Button
+                  type="button"
+                  size="icon"
+                  variant="ghost"
+                  className="h-7 w-7"
+                  onClick={() => moveSection(key, -1)}
+                  disabled={idx === 0}
+                  title="Move up"
+                >
+                  <ArrowUp className="h-3.5 w-3.5" />
+                </Button>
+                <Button
+                  type="button"
+                  size="icon"
+                  variant="ghost"
+                  className="h-7 w-7"
+                  onClick={() => moveSection(key, 1)}
+                  disabled={idx === sectionOrder.length - 1}
+                  title="Move down"
+                >
+                  <ArrowDown className="h-3.5 w-3.5" />
+                </Button>
+              </div>
+            </div>
+          ))}
+        </CardContent>
+      </Card>
       {/* Discover */}
+      <div style={sectionOrderStyle('discover')}>
       <Card className="pmda-shelf overflow-hidden animate-in fade-in-0 slide-in-from-bottom-2 duration-300">
         <CardHeader className="pb-3">
           <div className="flex flex-wrap items-start justify-between gap-3">
@@ -349,8 +457,10 @@ export default function LibraryHome() {
           ))}
         </CardContent>
       </Card>
+      </div>
 
       {/* For You */}
+      <div style={sectionOrderStyle('for_you')}>
       <Card className="pmda-shelf overflow-hidden animate-in fade-in-0 slide-in-from-bottom-2 duration-300">
         <CardHeader className="pb-3">
           <div className="flex flex-wrap items-start justify-between gap-3">
@@ -409,8 +519,10 @@ export default function LibraryHome() {
           )}
         </CardContent>
       </Card>
+      </div>
 
       {/* Top Artists */}
+      <div style={sectionOrderStyle('top_artists')}>
       <Card className="pmda-shelf overflow-hidden animate-in fade-in-0 slide-in-from-bottom-2 duration-300">
         <CardHeader className="pb-3">
           <div className="flex flex-wrap items-start justify-between gap-3">
@@ -471,8 +583,10 @@ export default function LibraryHome() {
           )}
         </CardContent>
       </Card>
+      </div>
 
       {/* Recently Added Artists */}
+      <div style={sectionOrderStyle('recent_artists')}>
       <Card className="pmda-shelf overflow-hidden animate-in fade-in-0 slide-in-from-bottom-2 duration-300">
         <CardHeader className="pb-3">
           <div className="flex flex-wrap items-start justify-between gap-3">
@@ -532,8 +646,10 @@ export default function LibraryHome() {
           )}
         </CardContent>
       </Card>
+      </div>
 
       {/* Recently Played */}
+      <div style={sectionOrderStyle('recently_played')}>
       <Card className="pmda-shelf overflow-hidden animate-in fade-in-0 slide-in-from-bottom-2 duration-300">
         <CardHeader className="pb-3">
           <div className="flex flex-wrap items-start justify-between gap-3">
@@ -621,8 +737,10 @@ export default function LibraryHome() {
           )}
         </CardContent>
       </Card>
+      </div>
 
       {/* Recently Added */}
+      <div style={sectionOrderStyle('recently_added')}>
       <Card className="pmda-shelf overflow-hidden animate-in fade-in-0 slide-in-from-bottom-2 duration-300">
         <CardHeader className="pb-3">
           <div className="flex flex-wrap items-start justify-between gap-3">
@@ -704,6 +822,7 @@ export default function LibraryHome() {
           )}
         </CardContent>
       </Card>
+      </div>
 
     </div>
   );

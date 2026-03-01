@@ -397,6 +397,16 @@ export default function Statistics() {
     refetchInterval: (scanProgress?.scanning || scanProgress?.post_processing) ? 5000 : 15000,
     refetchIntervalInBackground: true,
   });
+  const {
+    data: libraryStats,
+    refetch: refetchLibraryStats,
+    isFetching: libraryStatsRefreshing,
+  } = useQuery({
+    queryKey: ['library-stats-library'],
+    queryFn: api.getLibraryStatsLibrary,
+    refetchInterval: (scanProgress?.scanning || scanProgress?.post_processing) ? 5000 : 30000,
+    refetchIntervalInBackground: true,
+  });
   const isLiveRunActive = Boolean(scanProgress?.scanning || scanProgress?.post_processing);
   const liveRunArtistsTotal = n(scanProgress?.artists_total);
   const liveRunAlbumsTotal = n(scanProgress?.total_albums);
@@ -421,6 +431,21 @@ export default function Statistics() {
       .sort((a, b) => n(b.start_time) - n(a.start_time));
     return entries.map(normalizeScan);
   }, [history]);
+  const latestCompletedScanId = useMemo(() => {
+    if (completedScans.length <= 0) return null;
+    return Number.isFinite(completedScans[0].scanId) ? completedScans[0].scanId : null;
+  }, [completedScans]);
+  const {
+    data: scanMovesAudit,
+    refetch: refetchScanMovesAudit,
+    isFetching: scanMovesAuditRefreshing,
+  } = useQuery({
+    queryKey: ['scan-moves-audit', latestCompletedScanId],
+    queryFn: () => api.getScanMovesAudit(latestCompletedScanId ?? undefined),
+    enabled: (latestCompletedScanId ?? 0) > 0,
+    refetchInterval: 60000,
+    refetchIntervalInBackground: true,
+  });
 
   const liveScan = useMemo(() => {
     if (!scanProgress || !isLiveRunActive) return null;
@@ -770,6 +795,34 @@ export default function Statistics() {
     cacheControl?.sqlite_state_db?.files_album_scan_cache_rows,
     cacheControl?.sqlite_state_db?.files_pending_changes_rows,
   ]);
+  const sourcePathRows = useMemo(() => {
+    const rows = Array.isArray(libraryStats?.source_paths) ? libraryStats.source_paths : [];
+    return rows.filter((row) => Number(row.albums || 0) > 0);
+  }, [libraryStats?.source_paths]);
+  const sourcePathShareData = useMemo(() => {
+    const top = sourcePathRows.slice(0, 8);
+    const labels = top.map((row) => row.path || '(unknown)');
+    const values = top.map((row) => Number(row.albums || 0));
+    return {
+      labels,
+      datasets: [
+        {
+          data: values,
+          backgroundColor: [
+            'rgba(59,130,246,0.82)',
+            'rgba(34,197,94,0.82)',
+            'rgba(249,115,22,0.82)',
+            'rgba(168,85,247,0.82)',
+            'rgba(14,165,233,0.82)',
+            'rgba(236,72,153,0.82)',
+            'rgba(234,179,8,0.82)',
+            'rgba(99,102,241,0.82)',
+          ],
+          borderWidth: 1,
+        },
+      ],
+    };
+  }, [sourcePathRows]);
 
   const redisMemoryData = useMemo(() => {
     const hasMax = redisMaxBytes > 0;
@@ -825,6 +878,23 @@ export default function Statistics() {
                 </Button>
               ))}
             </div>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="gap-2"
+              onClick={() => {
+                void Promise.all([refetchLibraryStats(), refetchScanMovesAudit(), refetchCacheControl()]);
+              }}
+              disabled={libraryStatsRefreshing || scanMovesAuditRefreshing || cacheControlRefreshing}
+            >
+              {(libraryStatsRefreshing || scanMovesAuditRefreshing || cacheControlRefreshing) ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : (
+                <RefreshCw className="h-4 w-4" />
+              )}
+              Refresh data
+            </Button>
           </div>
         </div>
 
@@ -986,6 +1056,57 @@ export default function Statistics() {
                   </div>
                 </CardContent>
               </Card>
+              <div className="grid grid-cols-1 xl:grid-cols-3 gap-4">
+                <Card className="xl:col-span-1">
+                  <CardHeader>
+                    <CardTitle className="text-sm">Albums by Source Path</CardTitle>
+                    <CardDescription>Share of albums per configured source root.</CardDescription>
+                  </CardHeader>
+                  <CardContent>
+                    <div className="h-[260px] flex items-center justify-center">
+                      <Pie data={sourcePathShareData} options={chartOptions} />
+                    </div>
+                  </CardContent>
+                </Card>
+                <Card className="xl:col-span-2">
+                  <CardHeader>
+                    <CardTitle className="text-sm">Source Path Breakdown</CardTitle>
+                    <CardDescription>Albums, artists, labels and tracks per source path.</CardDescription>
+                  </CardHeader>
+                  <CardContent>
+                    {sourcePathRows.length === 0 ? (
+                      <p className="text-sm text-muted-foreground">No source path stats available yet.</p>
+                    ) : (
+                      <div className="max-h-[260px] overflow-auto rounded-md border">
+                        <table className="w-full text-sm">
+                          <thead className="bg-muted/50 sticky top-0">
+                            <tr>
+                              <th className="text-left px-3 py-2 font-medium">Path</th>
+                              <th className="text-right px-3 py-2 font-medium">Albums</th>
+                              <th className="text-right px-3 py-2 font-medium">Artists</th>
+                              <th className="text-right px-3 py-2 font-medium">Labels</th>
+                              <th className="text-right px-3 py-2 font-medium">Tracks</th>
+                              <th className="text-right px-3 py-2 font-medium">Share</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {sourcePathRows.map((row) => (
+                              <tr key={`src-${row.path}`} className="border-t border-border">
+                                <td className="px-3 py-2 truncate max-w-[420px]" title={row.path}>{row.path}</td>
+                                <td className="px-3 py-2 text-right tabular-nums">{Number(row.albums || 0).toLocaleString()}</td>
+                                <td className="px-3 py-2 text-right tabular-nums">{Number(row.artists || 0).toLocaleString()}</td>
+                                <td className="px-3 py-2 text-right tabular-nums">{Number(row.labels || 0).toLocaleString()}</td>
+                                <td className="px-3 py-2 text-right tabular-nums">{Number(row.tracks || 0).toLocaleString()}</td>
+                                <td className="px-3 py-2 text-right tabular-nums">{Number(row.albums_pct || 0).toFixed(2)}%</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+                  </CardContent>
+                </Card>
+              </div>
             </TabsContent>
 
             <TabsContent value="metadata" className="space-y-4">
@@ -1402,6 +1523,41 @@ export default function Statistics() {
                       }}
                     />
                   </div>
+                </CardContent>
+              </Card>
+              <Card>
+                <CardHeader>
+                  <CardTitle className="text-sm">Scan Move Audit (strict gate)</CardTitle>
+                  <CardDescription>Result of `tools/audit_scan_moves.py` for latest completed scan.</CardDescription>
+                </CardHeader>
+                <CardContent className="space-y-3">
+                  {!scanMovesAudit ? (
+                    <p className="text-sm text-muted-foreground">No audit data available yet.</p>
+                  ) : (
+                    <>
+                      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">
+                        <div className="rounded-lg border border-border p-3">
+                          <p className="text-muted-foreground">Moves total</p>
+                          <p className="text-xl font-semibold tabular-nums">{Number(scanMovesAudit.summary?.moves_total ?? 0).toLocaleString()}</p>
+                        </div>
+                        <div className="rounded-lg border border-border p-3">
+                          <p className="text-muted-foreground">Dedupe strict ✅</p>
+                          <p className="text-xl font-semibold tabular-nums">{Number(scanMovesAudit.summary?.dedupe_strict_yes ?? 0).toLocaleString()}</p>
+                        </div>
+                        <div className="rounded-lg border border-border p-3">
+                          <p className="text-muted-foreground">Dedupe strict ❌</p>
+                          <p className="text-xl font-semibold tabular-nums">{Number(scanMovesAudit.summary?.dedupe_strict_no ?? 0).toLocaleString()}</p>
+                        </div>
+                        <div className="rounded-lg border border-border p-3">
+                          <p className="text-muted-foreground">Incomplete strict ❌</p>
+                          <p className="text-xl font-semibold tabular-nums">{Number(scanMovesAudit.summary?.incomplete_strict_no ?? 0).toLocaleString()}</p>
+                        </div>
+                      </div>
+                      <p className="text-xs text-muted-foreground">
+                        Scan #{scanMovesAudit.scan_id} · strict columns: {scanMovesAudit.strict_columns_present ? 'present' : 'missing'}
+                      </p>
+                    </>
+                  )}
                 </CardContent>
               </Card>
             </TabsContent>
