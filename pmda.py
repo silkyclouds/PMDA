@@ -31027,7 +31027,7 @@ def api_library_stats_library():
                 return s.rstrip("/")
 
             roots_raw = _parse_files_roots(
-                get_setting(
+                _get_config_from_db(
                     "FILES_ROOTS",
                     ",".join(FILES_ROOTS) if isinstance(FILES_ROOTS, list) else (FILES_ROOTS or ""),
                 )
