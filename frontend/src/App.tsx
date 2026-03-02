@@ -10,6 +10,7 @@ import ListeningStatsPage from "./pages/ListeningStats";
 import LibraryStatsPage from "./pages/LibraryStats";
 import LibraryLayout from "./pages/LibraryLayout";
 import LibraryHome from "./pages/LibraryHome";
+import LibraryHomeFeed from "./pages/LibraryHomeFeed";
 import LibraryAlbums from "./pages/LibraryAlbums";
 import LibraryArtists from "./pages/LibraryArtists";
 import LibraryGenres from "./pages/LibraryGenres";
@@ -67,6 +68,7 @@ function AppRoutesWithPlayer() {
           <Route path="/library" element={<LibraryLayout />}>
             <Route index element={<LibraryHome />} />
             <Route path="home" element={<LibraryHome />} />
+            <Route path="home/feed/:section" element={<LibraryHomeFeed />} />
             <Route path="artists" element={<LibraryArtists />} />
             <Route path="albums" element={<LibraryAlbums />} />
             <Route path="genres" element={<LibraryGenres />} />

@@ -8,6 +8,7 @@ interface AlbumArtworkProps {
   artistId?: number | null;
   alt: string;
   size?: number;
+  priority?: boolean;
   imageClassName?: string;
   fallbackClassName?: string;
   iconClassName?: string;
@@ -18,16 +19,30 @@ function normalizeUrl(value?: string | null): string | null {
   return txt || null;
 }
 
+function withRequestedCoverSize(url: string | null, size: number): string | null {
+  if (!url) return null;
+  const px = Math.max(64, Math.min(2048, Math.floor(size)));
+  if (!/\/api\/library\/files\/album\/\d+\/cover/i.test(url)) return url;
+  if (/([?&])size=\d+/i.test(url)) {
+    return url.replace(/([?&]size=)\d+/i, `$1${px}`);
+  }
+  return `${url}${url.includes('?') ? '&' : '?'}size=${px}`;
+}
+
 export function AlbumArtwork({
   albumThumb,
   artistId,
   alt,
   size = 512,
+  priority = false,
   imageClassName = 'w-full h-full object-cover animate-in fade-in-0 duration-300',
   fallbackClassName = 'w-full h-full flex items-center justify-center',
   iconClassName = 'w-10 h-10 text-muted-foreground',
 }: AlbumArtworkProps) {
-  const albumUrl = normalizeUrl(albumThumb);
+  const albumUrl = useMemo(
+    () => withRequestedCoverSize(normalizeUrl(albumThumb), size),
+    [albumThumb, size]
+  );
   const artistUrl = useMemo(() => {
     const id = Number(artistId || 0);
     if (!Number.isFinite(id) || id <= 0) return null;
@@ -76,7 +91,8 @@ export function AlbumArtwork({
       <img
         src={src}
         alt={alt}
-        loading="lazy"
+        loading={priority ? 'eager' : 'lazy'}
+        fetchPriority={priority ? 'high' : 'auto'}
         decoding="async"
         className={imageClassName}
         onLoad={onLoad}

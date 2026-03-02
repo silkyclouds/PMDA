@@ -1,11 +1,12 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useLocation, useNavigate, useOutletContext, useParams } from 'react-router-dom';
-import { ArrowLeft, Play, UserRound } from 'lucide-react';
+import { ArrowLeft, Loader2, Play, UserRound } from 'lucide-react';
 
 import { AspectRatio } from '@/components/ui/aspect-ratio';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
+import { ScrollArea } from '@/components/ui/scroll-area';
 import { AlbumArtwork } from '@/components/library/AlbumArtwork';
 import { usePlayback } from '@/contexts/PlaybackContext';
 import { useToast } from '@/hooks/use-toast';
@@ -24,11 +25,21 @@ export default function LabelPage() {
   const params = useParams<{ label: string }>();
   const label = decodeURIComponent(String(params.label || '')).trim();
 
-  const [loading, setLoading] = useState(true);
+  const [profileLoading, setProfileLoading] = useState(false);
+  const [profile, setProfile] = useState<api.LabelProfileResponse | null>(null);
+
+  const [loading, setLoading] = useState(false);
+  const [appending, setAppending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [albums, setAlbums] = useState<api.LibraryAlbumItem[]>([]);
   const [total, setTotal] = useState(0);
   const [offset, setOffset] = useState(0);
+  const [hasMore, setHasMore] = useState(true);
+  const limit = 120;
+
+  const sentinelRef = useRef<HTMLDivElement | null>(null);
+  const loadingMoreRef = useRef(false);
+
   const [coverSize] = useState<number>(() => {
     try {
       const raw = Number(localStorage.getItem('pmda_library_cover_size') || 220);
@@ -38,30 +49,11 @@ export default function LabelPage() {
     }
   });
 
-  const load = useCallback(async () => {
-    if (!label) {
-      setError('Invalid label');
-      setLoading(false);
-      return;
-    }
-    setLoading(true);
-    setError(null);
-    try {
-      const res = await api.getLibraryAlbums({ label, sort: 'year_desc', limit: 120, offset, includeUnmatched });
-      setAlbums(Array.isArray(res.albums) ? res.albums : []);
-      setTotal(Number(res.total || 0));
-    } catch (e) {
-      setAlbums([]);
-      setTotal(0);
-      setError(e instanceof Error ? e.message : 'Failed to load label');
-    } finally {
-      setLoading(false);
-    }
-  }, [includeUnmatched, label, offset]);
-
-  useEffect(() => {
-    void load();
-  }, [load]);
+  const gridTemplateColumns = useMemo(() => {
+    if (isMobile) return 'repeat(2, minmax(0, 1fr))';
+    const col = Math.max(140, Math.min(340, Math.floor(coverSize)));
+    return `repeat(auto-fill, minmax(${col}px, ${col}px))`;
+  }, [coverSize, isMobile]);
 
   const handlePlayAlbum = useCallback(async (albumId: number, fallbackTitle: string, fallbackThumb?: string | null) => {
     try {
@@ -76,33 +68,101 @@ export default function LabelPage() {
       const albumThumb = data.album_thumb || fallbackThumb || null;
       startPlayback(albumId, fallbackTitle || 'Album', albumThumb, tracksList);
       setCurrentTrack(tracksList[0]);
-    } catch (error) {
+    } catch (err) {
       toast({
         title: 'Error',
-        description: error instanceof Error ? error.message : 'Failed to load tracks',
+        description: err instanceof Error ? err.message : 'Failed to load tracks',
         variant: 'destructive',
       });
     }
   }, [setCurrentTrack, startPlayback, toast]);
 
-  const artists = useMemo(() => {
-    const map = new Map<number, string>();
-    for (const a of albums) {
-      if (a.artist_id > 0 && a.artist_name) map.set(a.artist_id, a.artist_name);
+  const loadProfile = useCallback(async () => {
+    if (!label) return;
+    try {
+      setProfileLoading(true);
+      const res = await api.getLabelProfile(label, { includeUnmatched, limit_artists: 24, limit_genres: 24 });
+      setProfile(res);
+    } catch {
+      setProfile(null);
+    } finally {
+      setProfileLoading(false);
     }
-    return Array.from(map.entries())
-      .map(([artist_id, artist_name]) => ({ artist_id, artist_name }))
-      .sort((a, b) => a.artist_name.localeCompare(b.artist_name))
-      .slice(0, 60);
-  }, [albums]);
-  const gridTemplateColumns = useMemo(() => {
-    if (isMobile) return 'repeat(2, minmax(0, 1fr))';
-    const col = Math.max(140, Math.min(340, Math.floor(coverSize)));
-    return `repeat(auto-fill, minmax(${col}px, ${col}px))`;
-  }, [coverSize, isMobile]);
+  }, [includeUnmatched, label]);
 
-  const canPrev = offset > 0;
-  const canNext = offset + albums.length < total;
+  const loadAlbumsPage = useCallback(async (opts: { reset: boolean }) => {
+    const pageOffset = opts.reset ? 0 : offset;
+    try {
+      if (opts.reset) {
+        setLoading(true);
+        setError(null);
+      } else {
+        setAppending(true);
+      }
+      const res = await api.getLibraryAlbums({ label, sort: 'year_desc', limit, offset: pageOffset, includeUnmatched });
+      const list = Array.isArray(res.albums) ? res.albums : [];
+      const nextTotal = Number(res.total || 0);
+      setAlbums((prev) => (opts.reset ? list : [...prev, ...list]));
+      setOffset(pageOffset + list.length);
+      setTotal(nextTotal);
+      setHasMore(pageOffset + list.length < nextTotal);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to load label');
+      if (opts.reset) {
+        setAlbums([]);
+        setOffset(0);
+        setTotal(0);
+      }
+      setHasMore(false);
+    } finally {
+      setLoading(false);
+      setAppending(false);
+    }
+  }, [includeUnmatched, label, limit, offset]);
+
+  useEffect(() => {
+    if (!label) {
+      setError('Invalid label');
+      return;
+    }
+    setAlbums([]);
+    setOffset(0);
+    setTotal(0);
+    setHasMore(true);
+    void loadProfile();
+    void loadAlbumsPage({ reset: true });
+  }, [label, loadAlbumsPage, loadProfile]);
+
+  const loadMore = useCallback(async () => {
+    if (!hasMore || loading || loadingMoreRef.current) return;
+    loadingMoreRef.current = true;
+    try {
+      await loadAlbumsPage({ reset: false });
+    } finally {
+      loadingMoreRef.current = false;
+    }
+  }, [hasMore, loadAlbumsPage, loading]);
+
+  useEffect(() => {
+    const node = sentinelRef.current;
+    if (!node) return;
+    const obs = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          if (entry.isIntersecting) {
+            void loadMore();
+            break;
+          }
+        }
+      },
+      { root: null, rootMargin: '900px 0px 900px 0px', threshold: 0.01 },
+    );
+    obs.observe(node);
+    return () => obs.disconnect();
+  }, [loadMore]);
+
+  const topArtists = useMemo(() => profile?.influential_artists || [], [profile?.influential_artists]);
+  const topGenres = useMemo(() => profile?.genres || [], [profile?.genres]);
 
   return (
     <div className="container py-4 md:py-6 space-y-5 md:space-y-6">
@@ -111,15 +171,18 @@ export default function LabelPage() {
           <ArrowLeft className="w-4 h-4" />
           Back to Library
         </Button>
+        <div className="text-xs text-muted-foreground">
+          {total > 0 ? `${Math.min(offset, total).toLocaleString()} / ${total.toLocaleString()}` : `${albums.length.toLocaleString()} loaded`}
+        </div>
       </div>
 
       <Card className="border-border/70">
-        <CardContent className="p-5 space-y-3">
+        <CardContent className="p-5 space-y-4">
           <div className="flex items-start justify-between gap-4">
             <div className="min-w-0">
               <h1 className="text-2xl font-bold truncate">{label || 'Label'}</h1>
               <p className="text-xs text-muted-foreground mt-1">
-                {total > 0 ? `${total.toLocaleString()} release${total !== 1 ? 's' : ''}` : ' '}
+                {(profile?.album_count || total || 0).toLocaleString()} release{(profile?.album_count || total || 0) !== 1 ? 's' : ''}
               </p>
             </div>
             {error ? (
@@ -129,132 +192,163 @@ export default function LabelPage() {
             ) : null}
           </div>
 
-          {artists.length > 0 ? (
-            <div className="flex flex-wrap gap-1.5">
-              {artists.map((a) => (
-                <button
-                  key={`lab-ar-${a.artist_id}`}
-                  type="button"
-                  className="text-[11px] px-2 py-1 rounded-full bg-muted/70 hover:bg-muted transition-colors"
-                  onClick={() => navigate(`/library/artist/${a.artist_id}${location.search || ''}`)}
-                  title="Open artist"
-                >
-                  {a.artist_name}
-                </button>
-              ))}
+          {profileLoading ? (
+            <div className="flex items-center gap-2 text-sm text-muted-foreground">
+              <Loader2 className="w-4 h-4 animate-spin" /> Loading label profile…
+            </div>
+          ) : profile?.description ? (
+            <div className="text-sm text-muted-foreground leading-relaxed">{profile.description}</div>
+          ) : null}
+
+          <div className="flex flex-wrap items-center gap-2">
+            {profile?.owner ? <Badge variant="secondary">Owner: {profile.owner}</Badge> : null}
+            {profile?.sub_labels?.slice(0, 8).map((sub) => (
+              <Badge key={`sub-${sub}`} variant="outline" className="text-[11px]">{sub}</Badge>
+            ))}
+          </div>
+
+          {topArtists.length > 0 ? (
+            <div className="space-y-2">
+              <div className="text-xs font-medium text-muted-foreground">Influential artists</div>
+              <ScrollArea className="w-full whitespace-nowrap">
+                <div className="flex gap-2 pb-2">
+                  {topArtists.map((a) => (
+                    <button
+                      key={`lab-top-${a.artist_id}`}
+                      type="button"
+                      className="inline-flex items-center gap-2 rounded-full border border-border/60 bg-muted/40 px-3 py-1.5 text-[11px] hover:bg-muted transition-colors"
+                      onClick={() => navigate(`/library/artist/${a.artist_id}${location.search || ''}`)}
+                      title="Open artist"
+                    >
+                      <span className="truncate max-w-[16rem]">{a.artist_name}</span>
+                      <span className="text-muted-foreground tabular-nums">{a.album_count}</span>
+                    </button>
+                  ))}
+                </div>
+              </ScrollArea>
+            </div>
+          ) : null}
+
+          {topGenres.length > 0 ? (
+            <div className="space-y-2">
+              <div className="text-xs font-medium text-muted-foreground">Genres on this label</div>
+              <ScrollArea className="w-full whitespace-nowrap">
+                <div className="flex gap-2 pb-2">
+                  {topGenres.map((g) => (
+                    <button
+                      key={`lab-gen-${g.genre}`}
+                      type="button"
+                      className="inline-flex items-center gap-2 rounded-full border border-border/60 bg-muted/40 px-3 py-1.5 text-[11px] hover:bg-muted transition-colors"
+                      onClick={() => navigate(`/library/genre/${encodeURIComponent(g.genre)}${location.search || ''}`)}
+                      title="Open genre"
+                    >
+                      <span className="truncate max-w-[16rem]">{g.genre}</span>
+                      <span className="text-muted-foreground tabular-nums">{g.count}</span>
+                    </button>
+                  ))}
+                </div>
+              </ScrollArea>
             </div>
           ) : null}
         </CardContent>
       </Card>
 
-      <div className="space-y-3">
-        <div className="flex flex-wrap items-start justify-between gap-3">
-          <h2 className="text-lg font-semibold">Releases</h2>
-          <div className="flex items-center gap-2">
-            <Button size="sm" variant="outline" disabled={!canPrev || loading} onClick={() => setOffset(Math.max(0, offset - 120))}>
-              Prev
-            </Button>
-            <Button size="sm" variant="outline" disabled={!canNext || loading} onClick={() => setOffset(offset + 120)}>
-              Next
-            </Button>
-          </div>
-        </div>
-
-        {loading && albums.length === 0 ? (
-          <Card className="border-border/70">
-            <CardContent className="p-8 text-sm text-muted-foreground">Loading…</CardContent>
-          </Card>
-        ) : albums.length === 0 ? (
-          <Card className="border-border/70">
-            <CardContent className="p-8 text-sm text-muted-foreground">No releases found for this label.</CardContent>
-          </Card>
-        ) : (
-          <div className="grid gap-4 justify-start" style={{ gridTemplateColumns }}>
-            {albums.map((a) => (
-              <div
-                key={`lab-alb-${a.album_id}`}
-                className="text-left group"
-                role="button"
-                tabIndex={0}
-                onClick={() => navigate(`/library/album/${a.album_id}${location.search || ''}`)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter' || e.key === ' ') {
-                    e.preventDefault();
-                    navigate(`/library/album/${a.album_id}${location.search || ''}`);
-                  }
-                }}
-                title="Open album"
-              >
-                <div
-                  className="relative overflow-hidden rounded-2xl border border-border/60 bg-card shadow-sm"
-                >
-                  <AspectRatio ratio={1} className="bg-muted">
-                    <AlbumArtwork
-                      albumThumb={a.thumb}
-                      artistId={a.artist_id}
-                      alt={a.title}
-                      size={512}
-                      imageClassName="w-full h-full object-cover"
-                    />
-                    <div className="absolute inset-0 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity bg-black/25" />
-                    <div className="absolute inset-x-0 bottom-0 p-3 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity">
-                      <div className="flex items-center justify-between gap-2">
-                        <Button
-                          size="sm"
-                          className="h-9 rounded-full gap-2"
-                          onClick={(e) => {
-                            e.preventDefault();
-                            e.stopPropagation();
-                            void handlePlayAlbum(a.album_id, a.title, a.thumb);
-                          }}
-                        >
-                          <Play className="h-4 w-4" />
-                          Play
-                        </Button>
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          className="h-9 rounded-full"
-                          onClick={(e) => {
-                            e.preventDefault();
-                            e.stopPropagation();
-                            navigate(`/library/artist/${a.artist_id}${location.search || ''}`);
-                          }}
-                          title="Open artist"
-                        >
-                          <UserRound className="h-4 w-4" />
-                        </Button>
-                      </div>
+      {loading && albums.length === 0 ? (
+        <Card className="border-border/70">
+          <CardContent className="p-8 text-sm text-muted-foreground">
+            <span className="inline-flex items-center gap-2">
+              <Loader2 className="w-4 h-4 animate-spin" /> Loading…
+            </span>
+          </CardContent>
+        </Card>
+      ) : albums.length === 0 ? (
+        <Card className="border-border/70">
+          <CardContent className="p-8 text-sm text-muted-foreground">No releases found for this label.</CardContent>
+        </Card>
+      ) : (
+        <div className="grid gap-4 justify-start" style={{ gridTemplateColumns }}>
+          {albums.map((a) => (
+            <div
+              key={`lab-alb-${a.album_id}`}
+              className="text-left group"
+              role="button"
+              tabIndex={0}
+              onClick={() => navigate(`/library/album/${a.album_id}${location.search || ''}`)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault();
+                  navigate(`/library/album/${a.album_id}${location.search || ''}`);
+                }
+              }}
+              title="Open album"
+            >
+              <div className="relative overflow-hidden rounded-2xl border border-border/60 bg-card shadow-sm">
+                <AspectRatio ratio={1} className="bg-muted">
+                  <AlbumArtwork albumThumb={a.thumb} artistId={a.artist_id} alt={a.title} size={320} imageClassName="w-full h-full object-cover" />
+                  <div className="absolute inset-0 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity bg-black/25" />
+                  <div className="absolute inset-x-0 bottom-0 p-3 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity">
+                    <div className="flex items-center justify-between gap-2">
+                      <Button
+                        size="sm"
+                        className="h-9 rounded-full gap-2"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          void handlePlayAlbum(a.album_id, a.title, a.thumb);
+                        }}
+                      >
+                        <Play className="h-4 w-4" />
+                        Play
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        className="h-9 rounded-full"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          navigate(`/library/artist/${a.artist_id}${location.search || ''}`);
+                        }}
+                        title="Open artist"
+                      >
+                        <UserRound className="h-4 w-4" />
+                      </Button>
                     </div>
-                  </AspectRatio>
-                  <div className="p-3 space-y-1.5">
-                    <div className="text-sm font-semibold truncate">{a.title}</div>
-                    <button
-                      type="button"
-                      className="text-xs text-muted-foreground truncate hover:underline"
-                      onClick={(e) => {
-                        e.preventDefault();
-                        e.stopPropagation();
-                        navigate(`/library/artist/${a.artist_id}${location.search || ''}`);
-                      }}
-                    >
-                      {a.artist_name}
-                    </button>
-                    <div className="flex items-center gap-1.5 flex-wrap">
-                      <Badge variant="outline" className="text-[10px]">
-                        {a.year ?? '—'}
-                      </Badge>
-                      <Badge variant="outline" className="text-[10px]">
-                        {a.track_count}t
-                      </Badge>
-                    </div>
+                  </div>
+                </AspectRatio>
+                <div className="p-3 space-y-1.5">
+                  <div className="text-sm font-semibold truncate">{a.title}</div>
+                  <button
+                    type="button"
+                    className="text-xs text-muted-foreground truncate hover:underline"
+                    onClick={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      navigate(`/library/artist/${a.artist_id}${location.search || ''}`);
+                    }}
+                  >
+                    {a.artist_name}
+                  </button>
+                  <div className="flex items-center gap-1.5 flex-wrap">
+                    <Badge variant="outline" className="text-[10px]">{a.year ?? '—'}</Badge>
+                    <Badge variant="outline" className="text-[10px]">{a.track_count}t</Badge>
                   </div>
                 </div>
               </div>
-            ))}
-          </div>
-        )}
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div ref={sentinelRef} className="h-6" />
+      <div className="flex min-h-6 items-center justify-center py-2 text-xs text-muted-foreground">
+        {appending ? (
+          <span className="inline-flex items-center gap-2">
+            <Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading more…
+          </span>
+        ) : !hasMore ? 'All loaded' : null}
       </div>
     </div>
   );
 }
+

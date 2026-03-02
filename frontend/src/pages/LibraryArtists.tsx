@@ -1,9 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useLocation, useNavigate, useOutletContext } from 'react-router-dom';
-import { AlertTriangle, Loader2, UserRound } from 'lucide-react';
+import { Loader2, UserRound } from 'lucide-react';
 
 import { Badge } from '@/components/ui/badge';
-import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { useLibraryQuery } from '@/hooks/useLibraryQuery';
 import * as api from '@/lib/api';
@@ -106,22 +105,11 @@ export default function LibraryArtists() {
             {total > 0 ? `${artists.length.toLocaleString()} / ${total.toLocaleString()}` : ' '}
           </div>
         </div>
-        <div className="flex items-center gap-2">
-          <Button
-            type="button"
-            size="sm"
-            className="h-8 gap-1.5 bg-amber-500/90 hover:bg-amber-500 text-black border border-amber-300/30"
-            onClick={() => navigate('/broken-albums')}
-          >
-            <AlertTriangle className="w-3.5 h-3.5" />
-            Review incompletes
-          </Button>
-          {error ? (
-            <Badge variant="outline" className="text-xs border-destructive/50 text-destructive">
-              {error}
-            </Badge>
-          ) : null}
-        </div>
+        {error ? (
+          <Badge variant="outline" className="text-xs border-destructive/50 text-destructive">
+            {error}
+          </Badge>
+        ) : null}
       </div>
 
       {loading && artists.length === 0 ? (

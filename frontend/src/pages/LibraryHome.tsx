@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useLocation, useNavigate, useOutletContext } from 'react-router-dom';
-import { ArrowDown, ArrowUp, Flame, Loader2, Music, Play, RefreshCw, Sparkles, UserRound } from 'lucide-react';
+import { ArrowUpRight, Flame, GripVertical, Loader2, Music, Play, RefreshCw, Sparkles, UserRound } from 'lucide-react';
 
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import { Checkbox } from '@/components/ui/checkbox';
 import { AspectRatio } from '@/components/ui/aspect-ratio';
 import { Carousel, CarouselContent, CarouselItem, CarouselNext, CarouselPrevious } from '@/components/ui/carousel';
 import { AlbumArtwork } from '@/components/library/AlbumArtwork';
@@ -74,6 +75,8 @@ export default function LibraryHome() {
   const [recentlyPlayedLoading, setRecentlyPlayedLoading] = useState(false);
   const [recentlyPlayedError, setRecentlyPlayedError] = useState<string | null>(null);
   const [recentlyPlayedAlbums, setRecentlyPlayedAlbums] = useState<api.RecentlyPlayedAlbumItem[]>([]);
+  const [homeEditMode, setHomeEditMode] = useState(false);
+  const [draggingKey, setDraggingKey] = useState<HomeSectionKey | null>(null);
   const [sectionOrder, setSectionOrder] = useState<HomeSectionKey[]>(() => {
     try {
       const raw = localStorage.getItem('pmda_library_home_sections');
@@ -82,6 +85,18 @@ export default function LibraryHome() {
     } catch {
       return [...HOME_SECTION_KEYS];
     }
+  });
+  const [hiddenSections, setHiddenSections] = useState<Record<HomeSectionKey, boolean>>(() => {
+    const out = {} as Record<HomeSectionKey, boolean>;
+    for (const key of HOME_SECTION_KEYS) out[key] = false;
+    try {
+      const raw = localStorage.getItem('pmda_library_home_sections_hidden');
+      const parsed = raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
+      for (const key of HOME_SECTION_KEYS) out[key] = Boolean(parsed?.[key]);
+    } catch {
+      // ignore
+    }
+    return out;
   });
 
   const loadRecommendations = useCallback(async () => {
@@ -234,19 +249,39 @@ export default function LibraryHome() {
     navigate(`/library/genre/${encodeURIComponent(g)}${location.search || ''}`);
   }, [location.search, navigate]);
 
-  const moveSection = useCallback((key: HomeSectionKey, dir: -1 | 1) => {
+  const moveSectionTo = useCallback((movingKey: HomeSectionKey, targetKey: HomeSectionKey) => {
     setSectionOrder((prev) => {
       const list = normalizeHomeSectionOrder(prev);
-      const idx = list.indexOf(key);
-      if (idx < 0) return list;
-      const nextIdx = idx + dir;
-      if (nextIdx < 0 || nextIdx >= list.length) return list;
+      const from = list.indexOf(movingKey);
+      const to = list.indexOf(targetKey);
+      if (from < 0 || to < 0 || from === to) return list;
       const next = [...list];
-      const [item] = next.splice(idx, 1);
-      next.splice(nextIdx, 0, item);
+      const [item] = next.splice(from, 1);
+      next.splice(to, 0, item);
       return next;
     });
   }, []);
+
+  const toggleSectionVisibility = useCallback((key: HomeSectionKey, visible: boolean) => {
+    setHiddenSections((prev) => ({ ...prev, [key]: !visible }));
+  }, []);
+
+  const openSectionPage = useCallback((key: HomeSectionKey) => {
+    const suffix = location.search || '';
+    const target =
+      key === 'discover'
+        ? '/library/home/feed/discover'
+        : key === 'for_you'
+          ? '/library/home/feed/for_you'
+          : key === 'top_artists'
+            ? '/library/home/feed/top_artists'
+            : key === 'recent_artists'
+              ? '/library/home/feed/recent_artists'
+              : key === 'recently_played'
+                ? '/library/home/feed/recently_played'
+                : '/library/home/feed/recently_added';
+    navigate(`${target}${suffix}`);
+  }, [location.search, navigate]);
 
   useEffect(() => {
     try {
@@ -256,50 +291,76 @@ export default function LibraryHome() {
     }
   }, [sectionOrder]);
 
-  const sectionOrderStyle = useCallback((key: HomeSectionKey): { order: number } => {
-    const idx = sectionOrder.indexOf(key);
-    return { order: idx >= 0 ? idx : 999 };
-  }, [sectionOrder]);
+  useEffect(() => {
+    try {
+      localStorage.setItem('pmda_library_home_sections_hidden', JSON.stringify(hiddenSections));
+    } catch {
+      // ignore
+    }
+  }, [hiddenSections]);
+
+  const visibleSectionOrder = useMemo(
+    () => sectionOrder.filter((key) => !hiddenSections[key]),
+    [hiddenSections, sectionOrder]
+  );
+
+  const sectionOrderStyle = useCallback((key: HomeSectionKey): { order: number; display?: string } => {
+    const idx = visibleSectionOrder.indexOf(key);
+    if (idx < 0) return { order: 999, display: 'none' };
+    return { order: idx };
+  }, [visibleSectionOrder]);
 
   return (
     <div className="container pb-6 flex flex-col gap-5 md:gap-6">
-      <Card className="pmda-shelf overflow-hidden animate-in fade-in-0 slide-in-from-bottom-2 duration-300">
-        <CardHeader className="pb-2">
-          <CardTitle className="text-base">Home Layout</CardTitle>
-          <CardDescription>Reorder home sections.</CardDescription>
-        </CardHeader>
-        <CardContent className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-2">
-          {sectionOrder.map((key, idx) => (
-            <div key={`home-sec-order-${key}`} className="flex items-center justify-between rounded-md border border-border/70 bg-background/70 px-2.5 py-2">
-              <span className="text-sm">{HOME_SECTION_LABEL[key]}</span>
-              <div className="flex items-center gap-1">
-                <Button
-                  type="button"
-                  size="icon"
-                  variant="ghost"
-                  className="h-7 w-7"
-                  onClick={() => moveSection(key, -1)}
-                  disabled={idx === 0}
-                  title="Move up"
+      <div className="flex items-center justify-end">
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          className="h-8 text-xs text-muted-foreground hover:text-foreground"
+          onClick={() => setHomeEditMode((v) => !v)}
+        >
+          {homeEditMode ? 'Done' : 'Reorganize home'}
+        </Button>
+      </div>
+      {homeEditMode ? (
+        <Card className="pmda-shelf overflow-hidden animate-in fade-in-0 slide-in-from-bottom-2 duration-200">
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm">Home Sections</CardTitle>
+            <CardDescription>Drag to reorder, uncheck to hide.</CardDescription>
+          </CardHeader>
+          <CardContent className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-2">
+            {sectionOrder.map((key) => {
+              const visible = !hiddenSections[key];
+              return (
+                <div
+                  key={`home-sec-order-${key}`}
+                  className="flex items-center justify-between rounded-md border border-border/70 bg-background/70 px-2.5 py-2"
+                  draggable
+                  onDragStart={() => setDraggingKey(key)}
+                  onDragOver={(e) => e.preventDefault()}
+                  onDrop={(e) => {
+                    e.preventDefault();
+                    if (draggingKey && draggingKey !== key) moveSectionTo(draggingKey, key);
+                    setDraggingKey(null);
+                  }}
+                  onDragEnd={() => setDraggingKey(null)}
                 >
-                  <ArrowUp className="h-3.5 w-3.5" />
-                </Button>
-                <Button
-                  type="button"
-                  size="icon"
-                  variant="ghost"
-                  className="h-7 w-7"
-                  onClick={() => moveSection(key, 1)}
-                  disabled={idx === sectionOrder.length - 1}
-                  title="Move down"
-                >
-                  <ArrowDown className="h-3.5 w-3.5" />
-                </Button>
-              </div>
-            </div>
-          ))}
-        </CardContent>
-      </Card>
+                  <div className="flex items-center gap-2 min-w-0">
+                    <GripVertical className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
+                    <span className="text-sm truncate">{HOME_SECTION_LABEL[key]}</span>
+                  </div>
+                  <Checkbox
+                    checked={visible}
+                    onCheckedChange={(checked) => toggleSectionVisibility(key, Boolean(checked))}
+                    aria-label={`Toggle ${HOME_SECTION_LABEL[key]}`}
+                  />
+                </div>
+              );
+            })}
+          </CardContent>
+        </Card>
+      ) : null}
       {/* Discover */}
       <div style={sectionOrderStyle('discover')}>
       <Card className="pmda-shelf overflow-hidden animate-in fade-in-0 slide-in-from-bottom-2 duration-300">
@@ -312,17 +373,28 @@ export default function LibraryHome() {
               </CardTitle>
               <CardDescription>Albums picked from your listening history.</CardDescription>
             </div>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => void loadDiscover({ refresh: true })}
-              disabled={discoverLoading}
-              className="h-9 gap-1.5 shrink-0"
-              title="Refresh personalized discover feed"
-            >
-              {discoverLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
-              Refresh
-            </Button>
+            <div className="flex items-center gap-2 shrink-0">
+              <Button
+                variant="ghost"
+                size="icon"
+                className="h-8 w-8"
+                onClick={() => openSectionPage('discover')}
+                title="Open full page"
+              >
+                <ArrowUpRight className="w-4 h-4" />
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => void loadDiscover({ refresh: true })}
+                disabled={discoverLoading}
+                className="h-9 gap-1.5"
+                title="Refresh personalized discover feed"
+              >
+                {discoverLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
+                Refresh
+              </Button>
+            </div>
           </div>
         </CardHeader>
         <CardContent className="space-y-6">
@@ -403,7 +475,7 @@ export default function LibraryHome() {
                                 }
                               }}
                             >
-                              <AlbumArtwork albumThumb={a.thumb} artistId={a.artist_id} alt={a.title} size={512} />
+                              <AlbumArtwork albumThumb={a.thumb} artistId={a.artist_id} alt={a.title} size={320} priority />
                               <button
                                 type="button"
                                 onClick={() => void handlePlayAlbum(a.album_id, a.title, a.thumb)}
@@ -471,10 +543,21 @@ export default function LibraryHome() {
               </CardTitle>
               <CardDescription>Personalized track picks from your listening history.</CardDescription>
             </div>
-            <Button variant="outline" size="sm" onClick={() => void loadRecommendations()} disabled={recoLoading} className="h-9 gap-1.5 shrink-0">
-              {recoLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
-              Refresh
-            </Button>
+            <div className="flex items-center gap-2 shrink-0">
+              <Button
+                variant="ghost"
+                size="icon"
+                className="h-8 w-8"
+                onClick={() => openSectionPage('for_you')}
+                title="Open full page"
+              >
+                <ArrowUpRight className="w-4 h-4" />
+              </Button>
+              <Button variant="outline" size="sm" onClick={() => void loadRecommendations()} disabled={recoLoading} className="h-9 gap-1.5">
+                {recoLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
+                Refresh
+              </Button>
+            </div>
           </div>
         </CardHeader>
         <CardContent>
@@ -530,10 +613,21 @@ export default function LibraryHome() {
               <CardTitle className="text-base">Top Artists</CardTitle>
               <CardDescription>Most played from your local listening stats.</CardDescription>
             </div>
-            <Button variant="outline" size="sm" onClick={() => void loadTopArtists()} disabled={topArtistsLoading} className="h-9 gap-1.5 shrink-0">
-              {topArtistsLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
-              Refresh
-            </Button>
+            <div className="flex items-center gap-2 shrink-0">
+              <Button
+                variant="ghost"
+                size="icon"
+                className="h-8 w-8"
+                onClick={() => openSectionPage('top_artists')}
+                title="Open full page"
+              >
+                <ArrowUpRight className="w-4 h-4" />
+              </Button>
+              <Button variant="outline" size="sm" onClick={() => void loadTopArtists()} disabled={topArtistsLoading} className="h-9 gap-1.5">
+                {topArtistsLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
+                Refresh
+              </Button>
+            </div>
           </div>
         </CardHeader>
         <CardContent className="pt-0">
@@ -594,10 +688,21 @@ export default function LibraryHome() {
               <CardTitle className="text-base">Recently Added Artists</CardTitle>
               <CardDescription>Artists with the most recent imports.</CardDescription>
             </div>
-            <Button variant="outline" size="sm" onClick={() => void loadRecentArtists()} disabled={recentArtistsLoading} className="h-9 gap-1.5 shrink-0">
-              {recentArtistsLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
-              Refresh
-            </Button>
+            <div className="flex items-center gap-2 shrink-0">
+              <Button
+                variant="ghost"
+                size="icon"
+                className="h-8 w-8"
+                onClick={() => openSectionPage('recent_artists')}
+                title="Open full page"
+              >
+                <ArrowUpRight className="w-4 h-4" />
+              </Button>
+              <Button variant="outline" size="sm" onClick={() => void loadRecentArtists()} disabled={recentArtistsLoading} className="h-9 gap-1.5">
+                {recentArtistsLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
+                Refresh
+              </Button>
+            </div>
           </div>
         </CardHeader>
         <CardContent className="pt-0">
@@ -657,16 +762,27 @@ export default function LibraryHome() {
               <CardTitle className="text-base">Recently Played</CardTitle>
               <CardDescription>What you played lately, across the whole library.</CardDescription>
             </div>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => void loadRecentlyPlayed({ refresh: true })}
-              disabled={recentlyPlayedLoading}
-              className="h-9 gap-1.5 shrink-0"
-            >
-              {recentlyPlayedLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
-              Refresh
-            </Button>
+            <div className="flex items-center gap-2 shrink-0">
+              <Button
+                variant="ghost"
+                size="icon"
+                className="h-8 w-8"
+                onClick={() => openSectionPage('recently_played')}
+                title="Open full page"
+              >
+                <ArrowUpRight className="w-4 h-4" />
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => void loadRecentlyPlayed({ refresh: true })}
+                disabled={recentlyPlayedLoading}
+                className="h-9 gap-1.5"
+              >
+                {recentlyPlayedLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
+                Refresh
+              </Button>
+            </div>
           </div>
         </CardHeader>
         <CardContent className="pt-0">
@@ -685,7 +801,7 @@ export default function LibraryHome() {
                     <div className="group">
                       <Card className="overflow-hidden border-border/60 bg-card/90 transition-all duration-300 hover:-translate-y-1 hover:border-primary/35 hover:shadow-card-hover">
                         <AspectRatio ratio={1} className="bg-muted">
-                          <AlbumArtwork albumThumb={a.thumb} artistId={a.artist_id} alt={a.title} size={512} />
+                          <AlbumArtwork albumThumb={a.thumb} artistId={a.artist_id} alt={a.title} size={320} priority />
                           <button
                             type="button"
                             onClick={() => void handlePlayAlbum(a.album_id, a.title, a.thumb)}
@@ -748,10 +864,21 @@ export default function LibraryHome() {
               <CardTitle className="text-base">Recently Added</CardTitle>
               <CardDescription>Fresh imports from your storage.</CardDescription>
             </div>
-            <Button variant="outline" size="sm" onClick={() => void loadRecent()} disabled={recentLoading} className="h-9 gap-1.5 shrink-0">
-              {recentLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
-              Refresh
-            </Button>
+            <div className="flex items-center gap-2 shrink-0">
+              <Button
+                variant="ghost"
+                size="icon"
+                className="h-8 w-8"
+                onClick={() => openSectionPage('recently_added')}
+                title="Open full page"
+              >
+                <ArrowUpRight className="w-4 h-4" />
+              </Button>
+              <Button variant="outline" size="sm" onClick={() => void loadRecent()} disabled={recentLoading} className="h-9 gap-1.5">
+                {recentLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
+                Refresh
+              </Button>
+            </div>
           </div>
         </CardHeader>
         <CardContent className="pt-0">
@@ -770,7 +897,7 @@ export default function LibraryHome() {
                     <div className="group">
                       <Card className="overflow-hidden border-border/60 bg-card/90 transition-all duration-300 hover:-translate-y-1 hover:border-primary/35 hover:shadow-card-hover">
                         <AspectRatio ratio={1} className="bg-muted">
-                          <AlbumArtwork albumThumb={a.thumb} artistId={a.artist_id} alt={a.title} size={512} />
+                          <AlbumArtwork albumThumb={a.thumb} artistId={a.artist_id} alt={a.title} size={320} priority />
                           <button
                             type="button"
                             onClick={() => void handlePlayAlbum(a.album_id, a.title, a.thumb)}

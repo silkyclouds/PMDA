@@ -32777,7 +32777,7 @@ def api_library_artists_suggest():
 
 @app.get("/api/library/search/suggest")
 def api_library_search_suggest():
-    """Unified typeahead search across artists, albums and tracks (Files mode)."""
+    """Unified typeahead search across artists, albums, tracks and genres (Files mode)."""
     query = (request.args.get("q") or "").strip()
     limit = max(1, min(40, _parse_int_loose(request.args.get("limit"), 12)))
     include_unmatched = _library_include_unmatched_effective()
@@ -33016,6 +33016,78 @@ def api_library_search_suggest():
                         "_score": float(row[10] or 0.0),
                         "_prefix": int(row[11] or 3),
                         "_rank": 2,
+                    }
+                )
+
+            # Genres
+            cur.execute(
+                """
+                WITH genre_tokens AS (
+                    SELECT
+                        alb.id AS album_id,
+                        TRIM(g.value) AS genre_disp
+                    FROM files_albums alb
+                    CROSS JOIN LATERAL jsonb_array_elements_text(COALESCE(alb.tags_json, '[]')::jsonb) AS g(value)
+                    WHERE COALESCE(TRIM(g.value), '') <> ''
+                      AND """
+                + album_match_sql
+                + """
+                    UNION ALL
+                    SELECT
+                        alb.id AS album_id,
+                        TRIM(alb.genre) AS genre_disp
+                    FROM files_albums alb
+                    WHERE COALESCE(TRIM(alb.genre), '') <> ''
+                      AND COALESCE(alb.tags_json, '[]') = '[]'
+                      AND """
+                + album_match_sql
+                + """
+                ),
+                norm_tokens AS (
+                    SELECT
+                        album_id,
+                        LOWER(genre_disp) AS genre_norm,
+                        genre_disp
+                    FROM genre_tokens
+                    WHERE COALESCE(genre_disp, '') <> ''
+                ),
+                counts AS (
+                    SELECT genre_norm, COUNT(DISTINCT album_id) AS c
+                    FROM norm_tokens
+                    GROUP BY genre_norm
+                ),
+                best_disp AS (
+                    SELECT
+                        genre_norm,
+                        genre_disp,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY genre_norm
+                            ORDER BY COUNT(DISTINCT album_id) DESC, LENGTH(genre_disp) DESC, genre_disp ASC
+                        ) AS rn
+                    FROM norm_tokens
+                    GROUP BY genre_norm, genre_disp
+                )
+                SELECT
+                    b.genre_disp AS genre,
+                    c.c,
+                    CASE WHEN lower(b.genre_disp) LIKE lower(%s) || '%%' THEN 0 ELSE 1 END AS prefix_rank
+                FROM counts c
+                JOIN best_disp b ON b.genre_norm = c.genre_norm AND b.rn = 1
+                WHERE b.genre_disp ILIKE %s
+                ORDER BY prefix_rank ASC, c.c DESC, genre ASC
+                LIMIT %s
+                """,
+                (query, like, int(per_kind)),
+            )
+            for row in cur.fetchall():
+                merged.append(
+                    {
+                        "type": "genre",
+                        "title": row[0] or "",
+                        "subtitle": f"{int(row[1] or 0)} album(s)",
+                        "_score": float(row[1] or 0.0),
+                        "_prefix": int(row[2] or 1),
+                        "_rank": 3,
                     }
                 )
 
@@ -33586,13 +33658,14 @@ def api_library_top_artists():
     ok, err = _ensure_files_index_ready()
     if not ok:
         return jsonify({"artists": [], "error": err or "Files index unavailable"}), 503
-    limit = max(1, min(60, _parse_int_loose(request.args.get("limit"), 18)))
+    limit = max(1, min(200, _parse_int_loose(request.args.get("limit"), 18)))
+    offset = max(0, _parse_int_loose(request.args.get("offset"), 0))
     days = max(0, min(3650, _parse_int_loose(request.args.get("days"), 0)))
     include_unmatched = _library_include_unmatched_effective()
     album_match_sql = _library_albums_match_where(include_unmatched, "alb")
     album_count_sql = _library_albums_match_where(include_unmatched, "alb_cnt")
 
-    cache_key = f"library:top_artists:{limit}:{days}:{_library_cache_unmatched_suffix(include_unmatched)}"
+    cache_key = f"library:top_artists:{limit}:{offset}:{days}:{_library_cache_unmatched_suffix(include_unmatched)}"
     cached = _files_cache_get_json(cache_key)
     if cached is not None:
         return jsonify(cached)
@@ -33602,8 +33675,27 @@ def api_library_top_artists():
         return jsonify({"artists": [], "error": "PostgreSQL unavailable"}), 503
     try:
         base_url = request.url_root.rstrip("/")
+        total = 0
         with conn.cursor() as cur:
             if days > 0:
+                cur.execute(
+                    """
+                    SELECT COUNT(*) FROM (
+                        SELECT ar.id
+                        FROM files_reco_events e
+                        JOIN files_tracks tr ON tr.id = e.track_id
+                        JOIN files_albums alb ON alb.id = tr.album_id
+                        JOIN files_artists ar ON ar.id = alb.artist_id
+                        WHERE e.created_at >= (NOW() - (%s || ' days')::INTERVAL)
+                          AND """
+                    + album_match_sql
+                    + """
+                        GROUP BY ar.id
+                    ) AS ranked
+                    """,
+                    (int(days),),
+                )
+                total = int((cur.fetchone() or [0])[0] or 0)
                 cur.execute(
                     """
                     SELECT
@@ -33626,11 +33718,27 @@ def api_library_top_artists():
                       AND """ + album_match_sql + """
                     GROUP BY ar.id
                     ORDER BY completion_count DESC, play_events DESC, album_count DESC, ar.name ASC
-                    LIMIT %s
+                    LIMIT %s OFFSET %s
                     """,
-                    (int(days), int(limit)),
+                    (int(days), int(limit), int(offset)),
                 )
             else:
+                cur.execute(
+                    """
+                    SELECT COUNT(*) FROM (
+                        SELECT ar.id
+                        FROM files_reco_track_stats st
+                        JOIN files_tracks tr ON tr.id = st.track_id
+                        JOIN files_albums alb ON alb.id = tr.album_id
+                        JOIN files_artists ar ON ar.id = alb.artist_id
+                        WHERE """
+                    + album_match_sql
+                    + """
+                        GROUP BY ar.id
+                    ) AS ranked
+                    """
+                )
+                total = int((cur.fetchone() or [0])[0] or 0)
                 cur.execute(
                     """
                     SELECT
@@ -33652,9 +33760,9 @@ def api_library_top_artists():
                     WHERE """ + album_match_sql + """
                     GROUP BY ar.id
                     ORDER BY completion_count DESC, play_count DESC, album_count DESC, ar.name ASC
-                    LIMIT %s
+                    LIMIT %s OFFSET %s
                     """,
-                    (int(limit),),
+                    (int(limit), int(offset)),
                 )
             rows = cur.fetchall()
 
@@ -33675,7 +33783,7 @@ def api_library_top_artists():
                 }
             )
 
-        payload = {"artists": artists, "limit": int(limit), "days": int(days)}
+        payload = {"artists": artists, "total": int(total), "limit": int(limit), "offset": int(offset), "days": int(days)}
         _files_cache_set_json(cache_key, payload, ttl=30)
         return jsonify(payload)
     finally:
@@ -34608,6 +34716,375 @@ def api_library_genre_labels(genre: str):
         conn.close()
 
 
+@app.get("/api/library/genre/<path:genre>/profile")
+def api_library_genre_profile(genre: str):
+    """Return profile data for a genre: description + notable artists (Files mode only)."""
+    if _get_library_mode() != "files":
+        return jsonify({"genre": genre or "", "error": "Files mode required"}), 400
+    ok, err = _ensure_files_index_ready()
+    if not ok:
+        return jsonify({"genre": genre or "", "error": err or "Files index unavailable"}), 503
+    g = (genre or "").strip()
+    if not g:
+        return jsonify({"genre": "", "error": "Invalid genre"}), 400
+    limit_artists = max(1, min(120, _parse_int_loose(request.args.get("limit_artists"), 24)))
+    refresh = bool(_parse_bool(request.args.get("refresh")))
+    include_unmatched = _library_include_unmatched_effective()
+    album_match_sql = _library_albums_match_where(include_unmatched, "alb")
+
+    cache_key = f"library:genre:profile:{g.lower()}:{limit_artists}:{_library_cache_unmatched_suffix(include_unmatched)}"
+    if not refresh:
+        cached = _files_cache_get_json(cache_key)
+        if cached is not None:
+            return jsonify(cached)
+
+    conn = _files_pg_connect()
+    if conn is None:
+        return jsonify({"genre": g, "error": "PostgreSQL unavailable"}), 503
+    try:
+        base_url = request.url_root.rstrip("/")
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                WITH matched_albums AS (
+                    SELECT DISTINCT alb.id AS album_id
+                    FROM files_albums alb
+                    WHERE EXISTS (
+                        SELECT 1
+                        FROM jsonb_array_elements_text(COALESCE(alb.tags_json, '[]')::jsonb) AS gg(value)
+                        WHERE lower(trim(gg.value)) = lower(%s)
+                    )
+                      AND """
+                + album_match_sql
+                + """
+                    UNION
+                    SELECT DISTINCT alb.id AS album_id
+                    FROM files_albums alb
+                    WHERE COALESCE(alb.tags_json, '[]') = '[]'
+                      AND lower(trim(COALESCE(alb.genre, ''))) = lower(%s)
+                      AND COALESCE(trim(alb.genre), '') <> ''
+                      AND """
+                + album_match_sql
+                + """
+                )
+                SELECT COUNT(*) FROM matched_albums
+                """,
+                (g, g),
+            )
+            album_count = int((cur.fetchone() or [0])[0] or 0)
+
+            cur.execute(
+                """
+                WITH matched_albums AS (
+                    SELECT DISTINCT alb.id AS album_id
+                    FROM files_albums alb
+                    WHERE EXISTS (
+                        SELECT 1
+                        FROM jsonb_array_elements_text(COALESCE(alb.tags_json, '[]')::jsonb) AS gg(value)
+                        WHERE lower(trim(gg.value)) = lower(%s)
+                    )
+                      AND """
+                + album_match_sql
+                + """
+                    UNION
+                    SELECT DISTINCT alb.id AS album_id
+                    FROM files_albums alb
+                    WHERE COALESCE(alb.tags_json, '[]') = '[]'
+                      AND lower(trim(COALESCE(alb.genre, ''))) = lower(%s)
+                      AND COALESCE(trim(alb.genre), '') <> ''
+                      AND """
+                + album_match_sql
+                + """
+                )
+                SELECT
+                    ar.id,
+                    ar.name,
+                    COUNT(*)::BIGINT AS release_count,
+                    (ar.has_image OR COALESCE(ext.image_path, '') <> '') AS has_image
+                FROM matched_albums m
+                JOIN files_albums alb ON alb.id = m.album_id
+                JOIN files_artists ar ON ar.id = alb.artist_id
+                LEFT JOIN files_external_artist_images ext ON ext.name_norm = ar.name_norm
+                GROUP BY ar.id, ar.name, ar.has_image, ext.image_path
+                ORDER BY release_count DESC, ar.name ASC
+                LIMIT %s
+                """,
+                (g, g, int(limit_artists)),
+            )
+            rows = cur.fetchall()
+
+        top_artists = []
+        for artist_id, artist_name, release_count, has_image in rows:
+            aid = int(artist_id or 0)
+            if aid <= 0:
+                continue
+            top_artists.append(
+                {
+                    "artist_id": aid,
+                    "artist_name": artist_name or "",
+                    "album_count": int(release_count or 0),
+                    "thumb": f"{base_url}/api/library/files/artist/{aid}/image?size=192" if bool(has_image) else None,
+                }
+            )
+
+        wiki_extract = ""
+        wiki_url = ""
+        wiki_desc = ""
+        for cand in (f"{g} music", f"{g} (music)", g):
+            try:
+                ex, url, desc = _fetch_wikipedia_intro_extract(cand, lang="en")
+            except Exception:
+                ex, url, desc = "", "", ""
+            if ex:
+                wiki_extract, wiki_url, wiki_desc = ex, url, desc
+                break
+
+        payload = {
+            "genre": g,
+            "album_count": int(album_count),
+            "description": wiki_extract or "",
+            "wiki_url": wiki_url or "",
+            "wiki_description": wiki_desc or "",
+            "top_artists": top_artists,
+            "source": "wikipedia" if wiki_extract else "",
+        }
+        _files_cache_set_json(cache_key, payload, ttl=60 * 60 * 12)
+        return jsonify(payload)
+    finally:
+        conn.close()
+
+
+@app.get("/api/library/label/<path:label>/profile")
+def api_library_label_profile(label: str):
+    """Return profile data for a label: artists, genres, sub-label hints and owner hints."""
+    if _get_library_mode() != "files":
+        return jsonify({"label": label or "", "error": "Files mode required"}), 400
+    ok, err = _ensure_files_index_ready()
+    if not ok:
+        return jsonify({"label": label or "", "error": err or "Files index unavailable"}), 503
+    raw_label = (label or "").strip()
+    if not raw_label:
+        return jsonify({"label": "", "error": "Invalid label"}), 400
+    limit_artists = max(1, min(120, _parse_int_loose(request.args.get("limit_artists"), 24)))
+    limit_genres = max(1, min(120, _parse_int_loose(request.args.get("limit_genres"), 24)))
+    refresh = bool(_parse_bool(request.args.get("refresh")))
+    include_unmatched = _library_include_unmatched_effective()
+    album_match_sql = _library_albums_match_where(include_unmatched, "alb")
+
+    cache_key = f"library:label:profile:{raw_label.lower()}:{limit_artists}:{limit_genres}:{_library_cache_unmatched_suffix(include_unmatched)}"
+    if not refresh:
+        cached = _files_cache_get_json(cache_key)
+        if cached is not None:
+            return jsonify(cached)
+
+    conn = _files_pg_connect()
+    if conn is None:
+        return jsonify({"label": raw_label, "error": "PostgreSQL unavailable"}), 503
+    try:
+        base_url = request.url_root.rstrip("/")
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT COUNT(*)
+                FROM files_albums alb
+                WHERE lower(trim(COALESCE(alb.label, ''))) = lower(%s)
+                  AND """
+                + album_match_sql,
+                (raw_label,),
+            )
+            album_count = int((cur.fetchone() or [0])[0] or 0)
+
+            cur.execute(
+                """
+                SELECT
+                    ar.id,
+                    ar.name,
+                    COUNT(*)::BIGINT AS release_count,
+                    (ar.has_image OR COALESCE(ext.image_path, '') <> '') AS has_image
+                FROM files_albums alb
+                JOIN files_artists ar ON ar.id = alb.artist_id
+                LEFT JOIN files_external_artist_images ext ON ext.name_norm = ar.name_norm
+                WHERE lower(trim(COALESCE(alb.label, ''))) = lower(%s)
+                  AND """
+                + album_match_sql
+                + """
+                GROUP BY ar.id, ar.name, ar.has_image, ext.image_path
+                ORDER BY release_count DESC, ar.name ASC
+                LIMIT %s
+                """,
+                (raw_label, int(limit_artists)),
+            )
+            artist_rows = cur.fetchall()
+
+            cur.execute(
+                """
+                WITH matched AS (
+                    SELECT
+                        alb.id AS album_id,
+                        COALESCE(alb.tags_json, '[]')::jsonb AS tags_json,
+                        COALESCE(alb.genre, '') AS genre
+                    FROM files_albums alb
+                    WHERE lower(trim(COALESCE(alb.label, ''))) = lower(%s)
+                      AND """
+                + album_match_sql
+                + """
+                ),
+                genre_tokens AS (
+                    SELECT
+                        m.album_id,
+                        TRIM(g.value) AS genre_disp
+                    FROM matched m
+                    CROSS JOIN LATERAL jsonb_array_elements_text(m.tags_json) AS g(value)
+                    WHERE COALESCE(TRIM(g.value), '') <> ''
+                    UNION ALL
+                    SELECT
+                        m.album_id,
+                        TRIM(m.genre) AS genre_disp
+                    FROM matched m
+                    WHERE COALESCE(TRIM(m.genre), '') <> ''
+                      AND COALESCE(m.tags_json, '[]'::jsonb) = '[]'::jsonb
+                ),
+                norm_tokens AS (
+                    SELECT
+                        album_id,
+                        LOWER(genre_disp) AS genre_norm,
+                        genre_disp
+                    FROM genre_tokens
+                    WHERE COALESCE(genre_disp, '') <> ''
+                ),
+                counts AS (
+                    SELECT genre_norm, COUNT(DISTINCT album_id) AS c
+                    FROM norm_tokens
+                    GROUP BY genre_norm
+                ),
+                best_disp AS (
+                    SELECT
+                        genre_norm,
+                        genre_disp,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY genre_norm
+                            ORDER BY COUNT(DISTINCT album_id) DESC, LENGTH(genre_disp) DESC, genre_disp ASC
+                        ) AS rn
+                    FROM norm_tokens
+                    GROUP BY genre_norm, genre_disp
+                )
+                SELECT b.genre_disp AS genre, c.c
+                FROM counts c
+                JOIN best_disp b ON b.genre_norm = c.genre_norm AND b.rn = 1
+                ORDER BY c.c DESC, genre ASC
+                LIMIT %s
+                """,
+                (raw_label, int(limit_genres)),
+            )
+            genre_rows = cur.fetchall()
+
+        influential_artists = []
+        for artist_id, artist_name, release_count, has_image in artist_rows:
+            aid = int(artist_id or 0)
+            if aid <= 0:
+                continue
+            influential_artists.append(
+                {
+                    "artist_id": aid,
+                    "artist_name": artist_name or "",
+                    "album_count": int(release_count or 0),
+                    "thumb": f"{base_url}/api/library/files/artist/{aid}/image?size=192" if bool(has_image) else None,
+                }
+            )
+        genres = [{"genre": str(r[0] or "").strip(), "count": int(r[1] or 0)} for r in genre_rows if str(r[0] or "").strip()]
+
+        # Optional metadata enrichments (best-effort): Wikipedia + Discogs label graph.
+        wiki_extract = ""
+        wiki_url = ""
+        wiki_desc = ""
+        for cand in (f"{raw_label} (record label)", f"{raw_label} label", raw_label):
+            try:
+                ex, url, desc = _fetch_wikipedia_intro_extract(cand, lang="en")
+            except Exception:
+                ex, url, desc = "", "", ""
+            if ex:
+                wiki_extract, wiki_url, wiki_desc = ex, url, desc
+                break
+
+        owner = ""
+        sub_labels: list[str] = []
+        discogs_profile = ""
+        discogs_url = ""
+        try:
+            if USE_DISCOGS:
+                d = _discogs_client()
+                if d is not None:
+                    results = d.search(raw_label, type="label")
+                    page = _discogs_call("label search page=1", lambda: results.page(1))
+                    picked = None
+                    for it in page or []:
+                        data = getattr(it, "data", None)
+                        if not isinstance(data, dict):
+                            continue
+                        lab_name = str(data.get("title") or data.get("name") or "").strip()
+                        if not lab_name:
+                            continue
+                        score = _provider_identity_text_score(raw_label, lab_name)
+                        if score >= 0.78:
+                            picked = data
+                            break
+                    if isinstance(picked, dict):
+                        lid = _parse_int_loose(picked.get("id"), 0)
+                        if lid > 0:
+                            ldata = _discogs_call("label data", lambda: d.label(int(lid)).data)
+                            if isinstance(ldata, dict):
+                                parent = ldata.get("parent_label")
+                                if isinstance(parent, dict):
+                                    owner = str(parent.get("name") or "").strip()
+                                elif parent:
+                                    owner = str(parent).strip()
+                                sub_raw = ldata.get("sublabels") or []
+                                if isinstance(sub_raw, list):
+                                    for s in sub_raw:
+                                        if isinstance(s, dict):
+                                            nm = str(s.get("name") or "").strip()
+                                        else:
+                                            nm = str(s or "").strip()
+                                        if nm:
+                                            sub_labels.append(nm)
+                                discogs_profile = _strip_html_text(str(ldata.get("profile") or "")).strip()
+                                urls = ldata.get("urls") or []
+                                if isinstance(urls, list):
+                                    for u in urls:
+                                        uu = str(u or "").strip()
+                                        if uu:
+                                            discogs_url = uu
+                                            break
+        except DiscogsRateLimited:
+            pass
+        except Exception:
+            logging.debug("Label profile enrichment failed for '%s'", raw_label, exc_info=True)
+
+        # Simple owner fallback from profile text if parent_label is missing.
+        if (not owner) and discogs_profile:
+            m = re.search(r"(?:founded by|owner(?:ed)? by)\s+([^.;\n]{3,120})", discogs_profile, flags=re.IGNORECASE)
+            if m:
+                owner = m.group(1).strip()
+
+        payload = {
+            "label": raw_label,
+            "album_count": int(album_count),
+            "description": wiki_extract or "",
+            "wiki_url": wiki_url or "",
+            "wiki_description": wiki_desc or "",
+            "owner": owner or "",
+            "sub_labels": _dedupe_keep_order(sub_labels)[:60],
+            "influential_artists": influential_artists,
+            "genres": genres,
+            "discogs_profile": discogs_profile or "",
+            "discogs_url": discogs_url or "",
+        }
+        _files_cache_set_json(cache_key, payload, ttl=60 * 60 * 12)
+        return jsonify(payload)
+    finally:
+        conn.close()
+
+
 @app.get("/api/library/recently-played/albums")
 def api_library_recently_played_albums():
     """Return recently played albums based on listening telemetry (Files mode only)."""
@@ -34618,12 +35095,13 @@ def api_library_recently_played_albums():
         return jsonify({"days": 0, "limit": 0, "generated_at": int(time.time()), "albums": [], "error": err or "Files index unavailable"}), 503
 
     days = max(7, min(365, _parse_int_loose(request.args.get("days"), 90)))
-    limit = max(1, min(60, _parse_int_loose(request.args.get("limit"), 18)))
+    limit = max(1, min(200, _parse_int_loose(request.args.get("limit"), 18)))
+    offset = max(0, _parse_int_loose(request.args.get("offset"), 0))
     refresh = bool(_parse_bool(request.args.get("refresh")))
     include_unmatched = _library_include_unmatched_effective()
     album_match_sql = _library_albums_match_where(include_unmatched, "alb")
 
-    cache_key = f"library:recently_played_albums:{days}:{limit}:{_library_cache_unmatched_suffix(include_unmatched)}"
+    cache_key = f"library:recently_played_albums:{days}:{limit}:{offset}:{_library_cache_unmatched_suffix(include_unmatched)}"
     if not refresh:
         cached = _files_cache_get_json(cache_key)
         if cached is not None:
@@ -34634,6 +35112,7 @@ def api_library_recently_played_albums():
         return jsonify({"days": days, "limit": limit, "generated_at": int(time.time()), "albums": [], "error": "PostgreSQL unavailable"}), 503
     try:
         base_url = request.url_root.rstrip("/")
+        total = 0
         with conn.cursor() as cur:
             # Prefer explicit playback telemetry; fall back to reco telemetry when empty.
             cur.execute(
@@ -34653,6 +35132,24 @@ def api_library_recently_played_albums():
 
             cur.execute(
                 f"""
+                SELECT COUNT(*) FROM (
+                    SELECT t.album_id
+                    FROM {ev_table} e
+                    JOIN files_tracks t ON t.id = e.track_id
+                    JOIN files_albums alb ON alb.id = t.album_id
+                    WHERE {ev_user_filter}
+                      AND {album_match_sql}
+                      AND e.created_at >= NOW() - (%s || ' days')::interval
+                      AND COALESCE(e.played_seconds, 0) >= 12
+                    GROUP BY t.album_id
+                ) AS ranked
+                """,
+                (int(days),),
+            )
+            total = int((cur.fetchone() or [0])[0] or 0)
+
+            cur.execute(
+                f"""
                 SELECT
                     t.album_id,
                     MAX(e.created_at) AS last_played_at
@@ -34665,9 +35162,9 @@ def api_library_recently_played_albums():
                   AND COALESCE(e.played_seconds, 0) >= 12
                 GROUP BY t.album_id
                 ORDER BY last_played_at DESC
-                LIMIT %s
+                LIMIT %s OFFSET %s
                 """,
-                (int(days), int(limit)),
+                (int(days), int(limit), int(offset)),
             )
             rows = cur.fetchall()
 
@@ -34776,7 +35273,9 @@ def api_library_recently_played_albums():
 
         payload = {
             "days": int(days),
+            "total": int(total),
             "limit": int(limit),
+            "offset": int(offset),
             "generated_at": int(time.time()),
             "source": "reco" if bool(use_reco) else "playback",
             "albums": albums_out,
@@ -35411,7 +35910,8 @@ def api_library_reco_for_you():
         return jsonify({"session_id": "", "tracks": [], "error": err or "Files index unavailable"}), 503
 
     session_id = str(request.args.get("session_id") or "").strip()
-    limit = max(1, min(40, _parse_int_loose(request.args.get("limit"), 12)))
+    limit = max(1, min(120, _parse_int_loose(request.args.get("limit"), 12)))
+    offset = max(0, _parse_int_loose(request.args.get("offset"), 0))
     exclude_track_id = _parse_int_loose(request.args.get("exclude_track_id"), 0)
     if session_id and not re.match(r"^[a-zA-Z0-9._:-]{6,128}$", session_id):
         return jsonify({"error": "Invalid session_id format"}), 400
@@ -35426,17 +35926,19 @@ def api_library_reco_for_you():
             else:
                 cur.execute("SELECT COALESCE(MAX(id), 0) FROM files_reco_events")
             token = int((cur.fetchone() or [0])[0] or 0)
-        cache_key = f"library:reco:for_you:{session_id or 'global'}:{limit}:{exclude_track_id}:{token}"
+        cache_key = f"library:reco:for_you:{session_id or 'global'}:{limit}:{offset}:{exclude_track_id}:{token}"
         cached = _files_cache_get_json(cache_key)
         if cached is not None:
             return jsonify(cached)
 
         profile = _reco_build_session_profile(conn, session_id) if session_id else {"has_data": False}
-        candidate_limit = max(220, min(4000, limit * 90))
+        candidate_limit = max(220, min(4000, (offset + limit) * 90))
         candidates = _reco_fetch_candidates(conn, profile, candidate_limit)
         if exclude_track_id > 0:
             candidates = [c for c in candidates if int(c.get("track_id") or 0) != int(exclude_track_id)]
-        ranked = _reco_rank_candidates(profile, candidates, limit)
+        total = len(candidates)
+        ranked_all = _reco_rank_candidates(profile, candidates, max(1, min(4000, offset + limit)))
+        ranked = ranked_all[offset: offset + limit]
         base_url = request.url_root.rstrip("/")
         tracks = []
         for c in ranked:
@@ -35463,6 +35965,9 @@ def api_library_reco_for_you():
             )
         payload = {
             "session_id": session_id,
+            "total": int(total),
+            "limit": int(limit),
+            "offset": int(offset),
             "tracks": tracks,
             "session_event_count": int(profile.get("session_event_count") or 0),
             "algorithm": RECO_EMBED_SOURCE,
@@ -37717,7 +38222,9 @@ def api_library_files_album_cover(album_id):
                 if cover_path.exists() and cover_path.is_file():
                     cached = _ensure_cached_image_for_path(cover_path, kind="album", max_px=size)
                     to_send = cached or cover_path
-                    return send_file(str(to_send), as_attachment=False, conditional=True)
+                    resp = send_file(str(to_send), as_attachment=False, conditional=True, max_age=86400)
+                    resp.headers["Cache-Control"] = "public, max-age=86400, stale-while-revalidate=86400"
+                    return resp
             if folder_raw:
                 folder_path = path_for_fs_access(Path(folder_raw))
                 detected_cover = _first_cover_path(folder_path)
@@ -37740,7 +38247,9 @@ def api_library_files_album_cover(album_id):
                         _files_cache_invalidate_all()
                     except Exception:
                         logging.debug("Unable to persist folder cover for album_id=%s", album_id, exc_info=True)
-                    return send_file(str(to_send), as_attachment=False, conditional=True)
+                    resp = send_file(str(to_send), as_attachment=False, conditional=True, max_age=86400)
+                    resp.headers["Cache-Control"] = "public, max-age=86400, stale-while-revalidate=86400"
+                    return resp
             # Fallback to embedded cover from the first tracks (some releases only embed
             # art on a subset of files).
             cur.execute(
@@ -37791,7 +38300,9 @@ def api_library_files_album_cover(album_id):
                     logging.debug("Unable to persist embedded cover for album_id=%s", album_id, exc_info=True)
                 sized = _ensure_cached_image_for_path(master_cached, kind="album", max_px=size)
                 to_send = sized or master_cached
-                return send_file(str(to_send), as_attachment=False, conditional=True)
+                resp = send_file(str(to_send), as_attachment=False, conditional=True, max_age=86400)
+                resp.headers["Cache-Control"] = "public, max-age=86400, stale-while-revalidate=86400"
+                return resp
             return Response(raw, headers={"Content-Type": mime})
         # Avoid noisy 404s in the browser console: return a tiny transparent placeholder.
         # The UI still shows a "no cover" state (based on has_cover), but the image request won't error.
@@ -37801,7 +38312,13 @@ def api_library_files_album_cover(album_id):
             )
         except Exception:
             transparent = b""
-        return Response(transparent or b"", headers={"Content-Type": "image/png"})
+        return Response(
+            transparent or b"",
+            headers={
+                "Content-Type": "image/png",
+                "Cache-Control": "public, max-age=3600, stale-while-revalidate=3600",
+            },
+        )
     finally:
         conn.close()
 
@@ -37834,7 +38351,9 @@ def api_library_files_artist_image(artist_id):
             if img_path.exists() and img_path.is_file():
                 cached = _ensure_cached_image_for_path(img_path, kind="artist", max_px=size)
                 to_send = cached or img_path
-                return send_file(str(to_send), as_attachment=False, conditional=True)
+                resp = send_file(str(to_send), as_attachment=False, conditional=True, max_age=86400)
+                resp.headers["Cache-Control"] = "public, max-age=86400, stale-while-revalidate=86400"
+                return resp
 
         # Fallback: external cache table (keeps UI working even if files_artists wasn't updated yet).
         if name_norm:
@@ -37850,9 +38369,24 @@ def api_library_files_artist_image(artist_id):
                 if ext_path.exists() and ext_path.is_file():
                     cached = _ensure_cached_image_for_path(ext_path, kind="artist", max_px=size)
                     to_send = cached or ext_path
-                    return send_file(str(to_send), as_attachment=False, conditional=True)
+                    resp = send_file(str(to_send), as_attachment=False, conditional=True, max_age=86400)
+                    resp.headers["Cache-Control"] = "public, max-age=86400, stale-while-revalidate=86400"
+                    return resp
 
-        return jsonify({"error": "Artist image not found"}), 404
+        # Avoid noisy browser 404s for missing artist images.
+        try:
+            transparent = base64.b64decode(
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII="
+            )
+        except Exception:
+            transparent = b""
+        return Response(
+            transparent or b"",
+            headers={
+                "Content-Type": "image/png",
+                "Cache-Control": "public, max-age=3600, stale-while-revalidate=3600",
+            },
+        )
     finally:
         conn.close()
 

@@ -967,7 +967,7 @@ export async function getLibraryDiscoverWithOptions(
   return fetchApi<LibraryDiscoverResponse>(`/api/library/discover?${qs.toString()}`);
 }
 
-export type LibrarySearchItemType = 'artist' | 'album' | 'track';
+export type LibrarySearchItemType = 'artist' | 'album' | 'track' | 'genre';
 
 export interface LibrarySearchSuggestionItem {
   type: LibrarySearchItemType;
@@ -1194,7 +1194,9 @@ export interface RecentlyPlayedAlbumItem extends LibraryAlbumItem {
 
 export interface LibraryRecentlyPlayedAlbumsResponse {
   days: number;
+  total?: number;
   limit: number;
+  offset?: number;
   generated_at: number;
   source?: 'playback' | 'reco';
   albums: RecentlyPlayedAlbumItem[];
@@ -1209,11 +1211,12 @@ export async function getLibraryRecentlyPlayedAlbumsWithOptions(
   days = 90,
   limit = 18,
   refresh = false,
-  options?: { includeUnmatched?: boolean }
+  options?: { includeUnmatched?: boolean; offset?: number }
 ): Promise<LibraryRecentlyPlayedAlbumsResponse> {
   const q = new URLSearchParams();
   q.set('days', String(Math.max(7, Math.min(365, days))));
-  q.set('limit', String(Math.max(1, Math.min(60, limit))));
+  q.set('limit', String(Math.max(1, Math.min(200, limit))));
+  if (options?.offset != null) q.set('offset', String(Math.max(0, options.offset)));
   if (refresh) q.set('refresh', '1');
   if (options?.includeUnmatched != null) q.set('include_unmatched', options.includeUnmatched ? '1' : '0');
   return fetchApi<LibraryRecentlyPlayedAlbumsResponse>(`/api/library/recently-played/albums?${q.toString()}`);
@@ -1321,14 +1324,21 @@ export interface TopArtistItem {
 
 export interface TopArtistsResponse {
   artists: TopArtistItem[];
+  total?: number;
+  offset?: number;
   limit?: number;
   days?: number;
   error?: string;
 }
 
-export async function getTopArtists(limit = 18, days = 0, options?: { includeUnmatched?: boolean }): Promise<TopArtistsResponse> {
+export async function getTopArtists(
+  limit = 18,
+  days = 0,
+  options?: { includeUnmatched?: boolean; offset?: number }
+): Promise<TopArtistsResponse> {
   const q = new URLSearchParams();
-  q.set('limit', String(Math.max(1, Math.min(60, limit))));
+  q.set('limit', String(Math.max(1, Math.min(200, limit))));
+  if (options?.offset != null) q.set('offset', String(Math.max(0, options.offset)));
   if (days && days > 0) q.set('days', String(Math.max(1, Math.min(3650, days))));
   if (options?.includeUnmatched != null) q.set('include_unmatched', options.includeUnmatched ? '1' : '0');
   return fetchApi<TopArtistsResponse>(`/api/library/artists/top?${q.toString()}`);
@@ -1404,6 +1414,9 @@ export interface RecoTrack {
 
 export interface RecoForYouResponse {
   session_id: string;
+  total?: number;
+  limit?: number;
+  offset?: number;
   tracks: RecoTrack[];
   session_event_count?: number;
   algorithm?: string;
@@ -1412,13 +1425,83 @@ export interface RecoForYouResponse {
 export async function getRecommendationsForYou(
   sessionId: string,
   limit = 12,
-  excludeTrackId?: number
+  excludeTrackId?: number,
+  offset = 0
 ): Promise<RecoForYouResponse> {
   const q = new URLSearchParams();
   if (sessionId) q.set('session_id', sessionId);
-  q.set('limit', String(Math.max(1, Math.min(40, limit))));
+  q.set('limit', String(Math.max(1, Math.min(120, limit))));
+  q.set('offset', String(Math.max(0, offset)));
   if (excludeTrackId && excludeTrackId > 0) q.set('exclude_track_id', String(excludeTrackId));
   return fetchApi<RecoForYouResponse>(`/api/library/reco/for-you?${q.toString()}`);
+}
+
+export interface GenreProfileArtistItem {
+  artist_id: number;
+  artist_name: string;
+  album_count: number;
+  thumb?: string | null;
+}
+
+export interface GenreProfileResponse {
+  genre: string;
+  album_count: number;
+  description?: string;
+  wiki_url?: string;
+  wiki_description?: string;
+  source?: string;
+  top_artists: GenreProfileArtistItem[];
+  error?: string;
+}
+
+export async function getGenreProfile(
+  genre: string,
+  options?: { limit_artists?: number; refresh?: boolean; includeUnmatched?: boolean }
+): Promise<GenreProfileResponse> {
+  const q = new URLSearchParams();
+  if (options?.limit_artists != null) q.set('limit_artists', String(Math.max(1, Math.min(120, options.limit_artists))));
+  if (options?.refresh) q.set('refresh', '1');
+  if (options?.includeUnmatched != null) q.set('include_unmatched', options.includeUnmatched ? '1' : '0');
+  return fetchApi<GenreProfileResponse>(`/api/library/genre/${encodeURIComponent(genre)}/profile?${q.toString()}`);
+}
+
+export interface LabelProfileArtistItem {
+  artist_id: number;
+  artist_name: string;
+  album_count: number;
+  thumb?: string | null;
+}
+
+export interface LabelProfileGenreItem {
+  genre: string;
+  count: number;
+}
+
+export interface LabelProfileResponse {
+  label: string;
+  album_count: number;
+  description?: string;
+  wiki_url?: string;
+  wiki_description?: string;
+  owner?: string;
+  sub_labels?: string[];
+  influential_artists: LabelProfileArtistItem[];
+  genres: LabelProfileGenreItem[];
+  discogs_profile?: string;
+  discogs_url?: string;
+  error?: string;
+}
+
+export async function getLabelProfile(
+  label: string,
+  options?: { limit_artists?: number; limit_genres?: number; refresh?: boolean; includeUnmatched?: boolean }
+): Promise<LabelProfileResponse> {
+  const q = new URLSearchParams();
+  if (options?.limit_artists != null) q.set('limit_artists', String(Math.max(1, Math.min(120, options.limit_artists))));
+  if (options?.limit_genres != null) q.set('limit_genres', String(Math.max(1, Math.min(120, options.limit_genres))));
+  if (options?.refresh) q.set('refresh', '1');
+  if (options?.includeUnmatched != null) q.set('include_unmatched', options.includeUnmatched ? '1' : '0');
+  return fetchApi<LabelProfileResponse>(`/api/library/label/${encodeURIComponent(label)}/profile?${q.toString()}`);
 }
 
 export async function postRecommendationEvent(payload: {
