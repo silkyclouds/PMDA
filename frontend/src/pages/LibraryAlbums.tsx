@@ -274,7 +274,7 @@ export default function LibraryAlbums() {
       ) : null}
 
       <div className="grid gap-4 justify-start" style={{ gridTemplateColumns }}>
-        {albums.map((a) => (
+        {albums.map((a, idx) => (
           <div key={`alb-${a.album_id}`} className="group">
             <div className={cn(
               'relative overflow-hidden rounded-2xl border border-border/60 bg-card shadow-sm'
@@ -293,7 +293,7 @@ export default function LibraryAlbums() {
                   }
                 }}
               >
-                <AlbumArtwork albumThumb={a.thumb} artistId={a.artist_id} alt={a.title} size={512} />
+                <AlbumArtwork albumThumb={a.thumb} artistId={a.artist_id} alt={a.title} size={512} priority={idx < 24} />
                 <div className="absolute inset-0 opacity-0 group-hover:opacity-100 transition-opacity bg-black/35" />
                 <div className="absolute top-2 right-2 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity">
                   <Button

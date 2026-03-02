@@ -39,7 +39,7 @@ import subprocess
 import threading
 import time
 import atexit
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import NamedTuple, List, Dict, Optional, Tuple
@@ -555,6 +555,9 @@ PMDA_REDIS_DB = int((os.getenv("PMDA_REDIS_DB", "0") or "0").strip())
 PMDA_REDIS_PASSWORD = os.getenv("PMDA_REDIS_PASSWORD", "") or ""
 FILES_CACHE_PREFIX = "pmda:files:v2:"
 PMDA_MEDIA_CACHE_ROOT = (os.getenv("PMDA_MEDIA_CACHE_ROOT", "") or "").strip()
+PMDA_ARTWORK_RAM_CACHE_MB = int(max(0, _parse_int(os.getenv("PMDA_ARTWORK_RAM_CACHE_MB", "1024"), 1024) or 1024))
+PMDA_ARTWORK_RAM_CACHE_TTL_SEC = int(max(60, _parse_int(os.getenv("PMDA_ARTWORK_RAM_CACHE_TTL_SEC", "21600"), 21600) or 21600))
+PMDA_ARTWORK_RAM_CACHE_MAX_ITEM_MB = int(max(1, _parse_int(os.getenv("PMDA_ARTWORK_RAM_CACHE_MAX_ITEM_MB", "8"), 8) or 8))
 PMDA_FILES_WATCHER_ENABLED = _parse_bool(os.getenv("PMDA_FILES_WATCHER_ENABLED", "true"))
 PMDA_FILES_WATCHER_LOG_COOLDOWN_SEC = float(os.getenv("PMDA_FILES_WATCHER_LOG_COOLDOWN_SEC", "10") or "10")
 PMDA_AUTO_CHANGED_ONLY_SCAN = _parse_bool(os.getenv("PMDA_AUTO_CHANGED_ONLY_SCAN", "true"))
@@ -1248,6 +1251,9 @@ merged = {
     "EXPORT_NAMING_TEMPLATE": _get("EXPORT_NAMING_TEMPLATE", default="", cast=str),
     "EXPORT_LINK_STRATEGY": _get("EXPORT_LINK_STRATEGY", default="hardlink", cast=str),
     "MEDIA_CACHE_ROOT": _get("MEDIA_CACHE_ROOT", default=PMDA_MEDIA_CACHE_ROOT or str(CONFIG_DIR / "media_cache"), cast=str),
+    "ARTWORK_RAM_CACHE_MB": _get("ARTWORK_RAM_CACHE_MB", default=PMDA_ARTWORK_RAM_CACHE_MB, cast=lambda v: max(0, _parse_int(v, PMDA_ARTWORK_RAM_CACHE_MB) or PMDA_ARTWORK_RAM_CACHE_MB)),
+    "ARTWORK_RAM_CACHE_TTL_SEC": _get("ARTWORK_RAM_CACHE_TTL_SEC", default=PMDA_ARTWORK_RAM_CACHE_TTL_SEC, cast=lambda v: max(60, _parse_int(v, PMDA_ARTWORK_RAM_CACHE_TTL_SEC) or PMDA_ARTWORK_RAM_CACHE_TTL_SEC)),
+    "ARTWORK_RAM_CACHE_MAX_ITEM_MB": _get("ARTWORK_RAM_CACHE_MAX_ITEM_MB", default=PMDA_ARTWORK_RAM_CACHE_MAX_ITEM_MB, cast=lambda v: max(1, _parse_int(v, PMDA_ARTWORK_RAM_CACHE_MAX_ITEM_MB) or PMDA_ARTWORK_RAM_CACHE_MAX_ITEM_MB)),
 }
 # PATH_MAP and all config from _get() (SQLite only > default)
 
@@ -1261,6 +1267,9 @@ EXPORT_LINK_STRATEGY: str = str(merged.get("EXPORT_LINK_STRATEGY", "hardlink") o
 if EXPORT_LINK_STRATEGY not in {"hardlink", "symlink", "copy", "move"}:
     EXPORT_LINK_STRATEGY = "hardlink"
 MEDIA_CACHE_ROOT: str = str(merged.get("MEDIA_CACHE_ROOT", PMDA_MEDIA_CACHE_ROOT or str(CONFIG_DIR / "media_cache")) or str(CONFIG_DIR / "media_cache")).strip()
+ARTWORK_RAM_CACHE_MB: int = int(max(0, _parse_int(merged.get("ARTWORK_RAM_CACHE_MB"), PMDA_ARTWORK_RAM_CACHE_MB) or PMDA_ARTWORK_RAM_CACHE_MB))
+ARTWORK_RAM_CACHE_TTL_SEC: int = int(max(60, _parse_int(merged.get("ARTWORK_RAM_CACHE_TTL_SEC"), PMDA_ARTWORK_RAM_CACHE_TTL_SEC) or PMDA_ARTWORK_RAM_CACHE_TTL_SEC))
+ARTWORK_RAM_CACHE_MAX_ITEM_MB: int = int(max(1, _parse_int(merged.get("ARTWORK_RAM_CACHE_MAX_ITEM_MB"), PMDA_ARTWORK_RAM_CACHE_MAX_ITEM_MB) or PMDA_ARTWORK_RAM_CACHE_MAX_ITEM_MB))
 USE_MUSICBRAINZ: bool = bool(merged["USE_MUSICBRAINZ"])
 MUSICBRAINZ_EMAIL: str = merged.get("MUSICBRAINZ_EMAIL", "pmda@example.com")
 MB_QUEUE_ENABLED: bool = bool(merged.get("MB_QUEUE_ENABLED", True))
@@ -4693,11 +4702,22 @@ def _read_media_cache_usage() -> dict:
     total = _scan_dir_usage(root, max_files=PMDA_CACHE_TELEMETRY_MAX_WALK_FILES)
     album = _scan_dir_usage(album_root, max_files=PMDA_CACHE_TELEMETRY_MAX_WALK_FILES)
     artist = _scan_dir_usage(artist_root, max_files=PMDA_CACHE_TELEMETRY_MAX_WALK_FILES)
+    with _ARTWORK_RAM_CACHE_LOCK:
+        ram_entries = int(len(_ARTWORK_RAM_CACHE))
+        ram_bytes = int(_ARTWORK_RAM_CACHE_BYTES)
     return {
         "root": str(root),
         "total": total,
         "album": album,
         "artist": artist,
+        "ram_cache": {
+            "enabled": bool(_ARTWORK_RAM_CACHE_MAX_BYTES > 0),
+            "entries": ram_entries,
+            "used_bytes": ram_bytes,
+            "max_bytes": int(_ARTWORK_RAM_CACHE_MAX_BYTES),
+            "item_max_bytes": int(_ARTWORK_RAM_CACHE_MAX_ITEM_BYTES),
+            "ttl_sec": int(ARTWORK_RAM_CACHE_TTL_SEC),
+        },
     }
 
 
@@ -5653,12 +5673,181 @@ def _files_index_get_state() -> dict:
         return dict(state.get("files_index") or {})
 
 
-_MEDIA_CACHE_SIZES = (96, 320, 640)
+_MEDIA_CACHE_SIZES = (96, 192, 320, 512, 640)
+_ARTWORK_RAM_CACHE_MAX_BYTES = int(max(0, ARTWORK_RAM_CACHE_MB) * 1024 * 1024)
+_ARTWORK_RAM_CACHE_MAX_ITEM_BYTES = int(max(1, ARTWORK_RAM_CACHE_MAX_ITEM_MB) * 1024 * 1024)
+_ARTWORK_RAM_CACHE: "OrderedDict[str, dict]" = OrderedDict()
+_ARTWORK_RAM_CACHE_BYTES = 0
+_ARTWORK_RAM_CACHE_LOCK = threading.Lock()
+_TRANSPARENT_PNG_1PX = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII="
+)
+
+
+def _reconfigure_artwork_ram_cache(*, cache_mb: Optional[int] = None, ttl_sec: Optional[int] = None, item_mb: Optional[int] = None) -> None:
+    """Apply artwork RAM cache settings live and trim existing cache to new limits."""
+    global ARTWORK_RAM_CACHE_MB, ARTWORK_RAM_CACHE_TTL_SEC, ARTWORK_RAM_CACHE_MAX_ITEM_MB
+    global _ARTWORK_RAM_CACHE_MAX_BYTES, _ARTWORK_RAM_CACHE_MAX_ITEM_BYTES, _ARTWORK_RAM_CACHE_BYTES
+    if cache_mb is not None:
+        ARTWORK_RAM_CACHE_MB = int(max(0, min(65536, int(cache_mb))))
+    if ttl_sec is not None:
+        ARTWORK_RAM_CACHE_TTL_SEC = int(max(60, min(60 * 60 * 24 * 30, int(ttl_sec))))
+    if item_mb is not None:
+        ARTWORK_RAM_CACHE_MAX_ITEM_MB = int(max(1, min(64, int(item_mb))))
+
+    _ARTWORK_RAM_CACHE_MAX_BYTES = int(max(0, ARTWORK_RAM_CACHE_MB) * 1024 * 1024)
+    _ARTWORK_RAM_CACHE_MAX_ITEM_BYTES = int(max(1, ARTWORK_RAM_CACHE_MAX_ITEM_MB) * 1024 * 1024)
+
+    with _ARTWORK_RAM_CACHE_LOCK:
+        if _ARTWORK_RAM_CACHE_MAX_BYTES <= 0:
+            _ARTWORK_RAM_CACHE.clear()
+            _ARTWORK_RAM_CACHE_BYTES = 0
+            return
+        for key in list(_ARTWORK_RAM_CACHE.keys()):
+            entry = _ARTWORK_RAM_CACHE.get(key) or {}
+            if int(entry.get("blob_size") or 0) > _ARTWORK_RAM_CACHE_MAX_ITEM_BYTES:
+                old = _ARTWORK_RAM_CACHE.pop(key, None)
+                if old:
+                    _ARTWORK_RAM_CACHE_BYTES = max(0, int(_ARTWORK_RAM_CACHE_BYTES) - int(old.get("blob_size") or 0))
+        while _ARTWORK_RAM_CACHE and int(_ARTWORK_RAM_CACHE_BYTES) > _ARTWORK_RAM_CACHE_MAX_BYTES:
+            _, old = _ARTWORK_RAM_CACHE.popitem(last=False)
+            _ARTWORK_RAM_CACHE_BYTES = max(0, int(_ARTWORK_RAM_CACHE_BYTES) - int(old.get("blob_size") or 0))
 
 
 def _media_cache_root_dir() -> Path:
     root = Path((MEDIA_CACHE_ROOT or "").strip() or str(CONFIG_DIR / "media_cache"))
     return root
+
+
+def _mime_from_path(path: Path) -> str:
+    ext = str(path.suffix or "").strip().lower()
+    if ext == ".webp":
+        return "image/webp"
+    if ext in (".jpg", ".jpeg"):
+        return "image/jpeg"
+    if ext == ".png":
+        return "image/png"
+    if ext == ".gif":
+        return "image/gif"
+    return "application/octet-stream"
+
+
+def _artwork_etag_for_stat(st: os.stat_result) -> str:
+    return f"W/\"{int(st.st_mtime_ns):x}-{int(st.st_size):x}\""
+
+
+def _artwork_cache_control(max_age: int = 86400) -> str:
+    ttl = max(60, int(max_age or 86400))
+    return f"public, max-age={ttl}, stale-while-revalidate={ttl}"
+
+
+def _artwork_ram_cache_get(path: Path, st: os.stat_result) -> Optional[tuple[bytes, str]]:
+    global _ARTWORK_RAM_CACHE_BYTES
+    if _ARTWORK_RAM_CACHE_MAX_BYTES <= 0:
+        return None
+    now = time.time()
+    key = str(path)
+    with _ARTWORK_RAM_CACHE_LOCK:
+        entry = _ARTWORK_RAM_CACHE.get(key)
+        if not entry:
+            return None
+        age = now - float(entry.get("ts") or 0.0)
+        if age > float(ARTWORK_RAM_CACHE_TTL_SEC):
+            old = _ARTWORK_RAM_CACHE.pop(key, None)
+            if old:
+                _ARTWORK_RAM_CACHE_BYTES = max(0, int(_ARTWORK_RAM_CACHE_BYTES) - int(old.get("blob_size") or 0))
+            return None
+        if int(entry.get("mtime_ns") or 0) != int(getattr(st, "st_mtime_ns", 0)) or int(entry.get("size") or 0) != int(getattr(st, "st_size", 0)):
+            old = _ARTWORK_RAM_CACHE.pop(key, None)
+            if old:
+                _ARTWORK_RAM_CACHE_BYTES = max(0, int(_ARTWORK_RAM_CACHE_BYTES) - int(old.get("blob_size") or 0))
+            return None
+        _ARTWORK_RAM_CACHE.move_to_end(key)
+        blob = entry.get("blob")
+        mime = str(entry.get("mime") or "application/octet-stream")
+        if isinstance(blob, (bytes, bytearray)):
+            return (bytes(blob), mime)
+    return None
+
+
+def _artwork_ram_cache_put(path: Path, st: os.stat_result, blob: bytes, mime: str) -> None:
+    global _ARTWORK_RAM_CACHE_BYTES
+    if _ARTWORK_RAM_CACHE_MAX_BYTES <= 0:
+        return
+    if not blob:
+        return
+    size = int(len(blob))
+    if size <= 0 or size > _ARTWORK_RAM_CACHE_MAX_ITEM_BYTES:
+        return
+    key = str(path)
+    with _ARTWORK_RAM_CACHE_LOCK:
+        prev = _ARTWORK_RAM_CACHE.pop(key, None)
+        if prev:
+            _ARTWORK_RAM_CACHE_BYTES = max(0, int(_ARTWORK_RAM_CACHE_BYTES) - int(prev.get("blob_size") or 0))
+        while _ARTWORK_RAM_CACHE and (int(_ARTWORK_RAM_CACHE_BYTES) + size) > _ARTWORK_RAM_CACHE_MAX_BYTES:
+            _, old = _ARTWORK_RAM_CACHE.popitem(last=False)
+            _ARTWORK_RAM_CACHE_BYTES = max(0, int(_ARTWORK_RAM_CACHE_BYTES) - int(old.get("blob_size") or 0))
+        if (int(_ARTWORK_RAM_CACHE_BYTES) + size) > _ARTWORK_RAM_CACHE_MAX_BYTES:
+            return
+        _ARTWORK_RAM_CACHE[key] = {
+            "blob": bytes(blob),
+            "blob_size": size,
+            "mime": str(mime or "application/octet-stream"),
+            "ts": time.time(),
+            "mtime_ns": int(getattr(st, "st_mtime_ns", 0)),
+            "size": int(getattr(st, "st_size", 0)),
+        }
+        _ARTWORK_RAM_CACHE_BYTES = int(_ARTWORK_RAM_CACHE_BYTES) + size
+
+
+def _artwork_ram_cache_prime(path: Path) -> None:
+    if _ARTWORK_RAM_CACHE_MAX_BYTES <= 0:
+        return
+    try:
+        st = path.stat()
+    except Exception:
+        return
+    if int(getattr(st, "st_size", 0)) <= 0 or int(getattr(st, "st_size", 0)) > _ARTWORK_RAM_CACHE_MAX_ITEM_BYTES:
+        return
+    if _artwork_ram_cache_get(path, st) is not None:
+        return
+    try:
+        blob = path.read_bytes()
+    except Exception:
+        return
+    _artwork_ram_cache_put(path, st, blob, _mime_from_path(path))
+
+
+def _serve_image_file_cached(path: Path, *, max_age: int = 86400) -> Response:
+    st = path.stat()
+    etag = _artwork_etag_for_stat(st)
+    inm = str(request.headers.get("If-None-Match") or "").strip()
+    if inm and etag in inm:
+        resp = Response(status=304)
+        resp.headers["ETag"] = etag
+        resp.headers["Cache-Control"] = _artwork_cache_control(max_age)
+        return resp
+
+    ram_hit = _artwork_ram_cache_get(path, st)
+    if ram_hit is not None:
+        blob, mime = ram_hit
+    else:
+        blob = path.read_bytes()
+        mime = _mime_from_path(path)
+        _artwork_ram_cache_put(path, st, blob, mime)
+
+    resp = Response(blob, mimetype=mime)
+    resp.headers["ETag"] = etag
+    resp.headers["Cache-Control"] = _artwork_cache_control(max_age)
+    resp.headers["Content-Length"] = str(len(blob))
+    return resp
+
+
+def _transparent_png_response(max_age: int = 3600) -> Response:
+    resp = Response(_TRANSPARENT_PNG_1PX, mimetype="image/png")
+    resp.headers["Cache-Control"] = _artwork_cache_control(max_age)
+    resp.headers["Content-Length"] = str(len(_TRANSPARENT_PNG_1PX))
+    return resp
 
 
 def _ensure_media_cache_dirs() -> None:
@@ -5791,11 +5980,13 @@ def _precache_files_media_assets(artists_map: dict[str, dict], albums_payload: l
             out = _ensure_cached_image_for_path(p, kind="album", max_px=size)
             if out:
                 covers_done += 1
+                _artwork_ram_cache_prime(out)
     for p in artist_paths:
         for size in _MEDIA_CACHE_SIZES:
             out = _ensure_cached_image_for_path(p, kind="artist", max_px=size)
             if out:
                 artists_done += 1
+                _artwork_ram_cache_prime(out)
     return covers_done, artists_done
 
 
@@ -21606,27 +21797,59 @@ def _run_export_library() -> None:
         state["export_progress"] = {"running": True, "tracks_done": 0, "total_tracks": 0, "albums_done": 0, "total_albums": 0, "error": None}
     try:
         _, _, editions_by_id = _build_files_editions(scan_type="full")
-        strict_editions: dict[int, dict] = {}
-        skipped_not_strict = 0
+        export_editions: dict[int, dict] = {}
+        skipped_broken = 0
+        skipped_quarantine = 0
+        skipped_empty = 0
+        included_strict = 0
+        included_non_strict = 0
+        dupe_root_cfg = str(getattr(sys.modules[__name__], "DUPE_ROOT", "/dupes") or "/dupes").strip() or "/dupes"
+        incomplete_cfg = str(_get_config_from_db("INCOMPLETE_ALBUMS_TARGET_DIR") or "/dupes/incomplete_albums").strip()
+        dupe_root = path_for_fs_access(Path(dupe_root_cfg))
+        incomplete_root = path_for_fs_access(Path(incomplete_cfg))
+
+        def _path_under(path_obj: Path, root_obj: Path) -> bool:
+            try:
+                return path_obj.resolve().is_relative_to(root_obj.resolve())
+            except Exception:
+                return False
+
         for album_id, edition in (editions_by_id or {}).items():
-            ok, _reason = _strict_mutation_allowed(edition)
-            if ok:
-                strict_editions[album_id] = edition
+            if bool(edition.get("is_broken")):
+                skipped_broken += 1
+                continue
+            ordered_paths = edition.get("ordered_paths") or []
+            if not ordered_paths:
+                skipped_empty += 1
+                continue
+            folder_raw = str(edition.get("folder") or "").strip()
+            if folder_raw:
+                folder_path = path_for_fs_access(Path(folder_raw))
+                if _path_under(folder_path, dupe_root) or _path_under(folder_path, incomplete_root):
+                    skipped_quarantine += 1
+                    continue
+            export_editions[album_id] = edition
+            if bool(edition.get("strict_match_verified")):
+                included_strict += 1
             else:
-                skipped_not_strict += 1
-        if skipped_not_strict > 0:
-            logging.info(
-                "Export library: skipped %d album(s) (strict gate blocked mutation)",
-                skipped_not_strict,
-            )
-        total_tracks = sum(len(e.get("ordered_paths") or []) for e in strict_editions.values())
-        total_albums = len(strict_editions)
+                included_non_strict += 1
+        logging.info(
+            "Export library: selected %d album(s) [strict=%d, non_strict=%d], skipped [broken=%d, quarantine=%d, empty=%d]",
+            len(export_editions),
+            included_strict,
+            included_non_strict,
+            skipped_broken,
+            skipped_quarantine,
+            skipped_empty,
+        )
+        total_tracks = sum(len(e.get("ordered_paths") or []) for e in export_editions.values())
+        total_albums = len(export_editions)
         with lock:
             state["export_progress"]["total_tracks"] = total_tracks
             state["export_progress"]["total_albums"] = total_albums
         tracks_done = 0
         albums_done = 0
-        for album_id, edition in strict_editions.items():
+        for album_id, edition in export_editions.items():
             ordered_paths = edition.get("ordered_paths") or []
             for i, src in enumerate(ordered_paths):
                 if not src.exists():
@@ -28876,6 +29099,9 @@ def api_config_get():
         "EXPORT_NAMING_TEMPLATE": get_setting("EXPORT_NAMING_TEMPLATE", EXPORT_NAMING_TEMPLATE),
         "EXPORT_LINK_STRATEGY": get_setting("EXPORT_LINK_STRATEGY", EXPORT_LINK_STRATEGY),
         "MEDIA_CACHE_ROOT": get_setting("MEDIA_CACHE_ROOT", MEDIA_CACHE_ROOT),
+        "ARTWORK_RAM_CACHE_MB": int(get_setting("ARTWORK_RAM_CACHE_MB", ARTWORK_RAM_CACHE_MB) or ARTWORK_RAM_CACHE_MB),
+        "ARTWORK_RAM_CACHE_TTL_SEC": int(get_setting("ARTWORK_RAM_CACHE_TTL_SEC", ARTWORK_RAM_CACHE_TTL_SEC) or ARTWORK_RAM_CACHE_TTL_SEC),
+        "ARTWORK_RAM_CACHE_MAX_ITEM_MB": int(get_setting("ARTWORK_RAM_CACHE_MAX_ITEM_MB", ARTWORK_RAM_CACHE_MAX_ITEM_MB) or ARTWORK_RAM_CACHE_MAX_ITEM_MB),
         "AUTO_EXPORT_LIBRARY": get_setting_bool("AUTO_EXPORT_LIBRARY", AUTO_EXPORT_LIBRARY),
         "paths_status": _paths_rw_status(),
         "container_mounts": _container_mounts_status(),
@@ -29211,6 +29437,35 @@ def _apply_settings_in_memory(updates: dict):
             logging.info("MEDIA_CACHE_ROOT updated in memory: %s", MEDIA_CACHE_ROOT)
         except Exception as e:
             logging.warning("Could not initialize MEDIA_CACHE_ROOT=%s: %s", MEDIA_CACHE_ROOT, e)
+    if any(k in updates for k in ("ARTWORK_RAM_CACHE_MB", "ARTWORK_RAM_CACHE_TTL_SEC", "ARTWORK_RAM_CACHE_MAX_ITEM_MB")):
+        next_mb: Optional[int] = None
+        next_ttl: Optional[int] = None
+        next_item_mb: Optional[int] = None
+        if "ARTWORK_RAM_CACHE_MB" in updates:
+            try:
+                next_mb = max(0, min(65536, int(updates["ARTWORK_RAM_CACHE_MB"])))
+            except (ValueError, TypeError):
+                next_mb = ARTWORK_RAM_CACHE_MB
+            mod.merged["ARTWORK_RAM_CACHE_MB"] = next_mb
+        if "ARTWORK_RAM_CACHE_TTL_SEC" in updates:
+            try:
+                next_ttl = max(60, min(60 * 60 * 24 * 30, int(updates["ARTWORK_RAM_CACHE_TTL_SEC"])))
+            except (ValueError, TypeError):
+                next_ttl = ARTWORK_RAM_CACHE_TTL_SEC
+            mod.merged["ARTWORK_RAM_CACHE_TTL_SEC"] = next_ttl
+        if "ARTWORK_RAM_CACHE_MAX_ITEM_MB" in updates:
+            try:
+                next_item_mb = max(1, min(64, int(updates["ARTWORK_RAM_CACHE_MAX_ITEM_MB"])))
+            except (ValueError, TypeError):
+                next_item_mb = ARTWORK_RAM_CACHE_MAX_ITEM_MB
+            mod.merged["ARTWORK_RAM_CACHE_MAX_ITEM_MB"] = next_item_mb
+        _reconfigure_artwork_ram_cache(cache_mb=next_mb, ttl_sec=next_ttl, item_mb=next_item_mb)
+        logging.info(
+            "Artwork RAM cache updated in memory: max=%dMB ttl=%ds item_max=%dMB",
+            ARTWORK_RAM_CACHE_MB,
+            ARTWORK_RAM_CACHE_TTL_SEC,
+            ARTWORK_RAM_CACHE_MAX_ITEM_MB,
+        )
     if "IMPROVE_ALL_WORKERS" in updates:
         global IMPROVE_ALL_WORKERS
         try:
@@ -29471,6 +29726,7 @@ def api_config_put():
         "NAVIDROME_URL", "NAVIDROME_USERNAME", "NAVIDROME_PASSWORD", "NAVIDROME_API_KEY",
         "INCOMPLETE_ALBUMS_TARGET_DIR",
         "SCAN_DISABLE_CACHE",
+        "ARTWORK_RAM_CACHE_MB", "ARTWORK_RAM_CACHE_TTL_SEC", "ARTWORK_RAM_CACHE_MAX_ITEM_MB",
         # Concert discovery (UI filtering)
         "CONCERTS_FILTER_ENABLED", "CONCERTS_HOME_LAT", "CONCERTS_HOME_LON", "CONCERTS_RADIUS_KM",
         # Library backend & file-library settings
@@ -29532,6 +29788,21 @@ def api_config_put():
             updates["MB_TRACKLIST_FETCH_LIMIT"] = max(0, min(20, int(updates["MB_TRACKLIST_FETCH_LIMIT"])))
         except (ValueError, TypeError):
             updates["MB_TRACKLIST_FETCH_LIMIT"] = 2
+    if "ARTWORK_RAM_CACHE_MB" in updates:
+        try:
+            updates["ARTWORK_RAM_CACHE_MB"] = max(0, min(65536, int(updates["ARTWORK_RAM_CACHE_MB"])))
+        except (ValueError, TypeError):
+            updates["ARTWORK_RAM_CACHE_MB"] = int(max(0, ARTWORK_RAM_CACHE_MB))
+    if "ARTWORK_RAM_CACHE_TTL_SEC" in updates:
+        try:
+            updates["ARTWORK_RAM_CACHE_TTL_SEC"] = max(60, min(60 * 60 * 24 * 30, int(updates["ARTWORK_RAM_CACHE_TTL_SEC"])))
+        except (ValueError, TypeError):
+            updates["ARTWORK_RAM_CACHE_TTL_SEC"] = int(max(60, ARTWORK_RAM_CACHE_TTL_SEC))
+    if "ARTWORK_RAM_CACHE_MAX_ITEM_MB" in updates:
+        try:
+            updates["ARTWORK_RAM_CACHE_MAX_ITEM_MB"] = max(1, min(64, int(updates["ARTWORK_RAM_CACHE_MAX_ITEM_MB"])))
+        except (ValueError, TypeError):
+            updates["ARTWORK_RAM_CACHE_MAX_ITEM_MB"] = int(max(1, ARTWORK_RAM_CACHE_MAX_ITEM_MB))
     if "PROVIDER_IDENTITY_MIN_SCORE" in updates:
         try:
             updates["PROVIDER_IDENTITY_MIN_SCORE"] = max(0.0, min(1.0, float(updates["PROVIDER_IDENTITY_MIN_SCORE"])))
@@ -38288,51 +38559,91 @@ def api_library_files_album_cover(album_id):
     ok, err = _ensure_files_index_ready()
     if not ok:
         return jsonify({"error": err or "Files index unavailable"}), 503
+    lookup_key = f"artwork:album:{int(album_id)}"
+    lookup = _files_cache_get_json(lookup_key)
+    cover_raw = ""
+    folder_raw = ""
+    no_cover_cached = False
+
+    if isinstance(lookup, dict):
+        cover_raw = str(lookup.get("cover_path") or "").strip()
+        folder_raw = str(lookup.get("folder_path") or "").strip()
+        no_cover_cached = bool(lookup.get("no_cover"))
+    else:
+        conn = _files_pg_connect()
+        if conn is None:
+            return jsonify({"error": "PostgreSQL unavailable"}), 503
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT cover_path, folder_path, has_cover FROM files_albums WHERE id = %s", (album_id,))
+                row = cur.fetchone()
+            if row:
+                cover_raw = str(row[0] or "").strip()
+                folder_raw = str(row[1] or "").strip()
+                no_cover_cached = not bool(row[2])
+            _files_cache_set_json(
+                lookup_key,
+                {
+                    "cover_path": cover_raw,
+                    "folder_path": folder_raw,
+                    "no_cover": bool(no_cover_cached),
+                },
+                ttl=3600,
+            )
+        finally:
+            conn.close()
+
+    if cover_raw:
+        cover_path = path_for_fs_access(Path(cover_raw))
+        if cover_path.exists() and cover_path.is_file():
+            cached = _ensure_cached_image_for_path(cover_path, kind="album", max_px=size)
+            to_send = cached or cover_path
+            return _serve_image_file_cached(to_send, max_age=86400)
+
+    if folder_raw:
+        folder_path = path_for_fs_access(Path(folder_raw))
+        detected_cover = _first_cover_path(folder_path)
+        if detected_cover and detected_cover.exists() and detected_cover.is_file():
+            cached = _ensure_cached_image_for_path(detected_cover, kind="album", max_px=size)
+            to_send = cached or detected_cover
+            conn = _files_pg_connect()
+            if conn is not None:
+                try:
+                    with conn.transaction():
+                        with conn.cursor() as wcur:
+                            wcur.execute(
+                                """
+                                UPDATE files_albums
+                                SET has_cover = TRUE,
+                                    cover_path = %s,
+                                    updated_at = NOW()
+                                WHERE id = %s
+                                """,
+                                (str(detected_cover), int(album_id)),
+                            )
+                except Exception:
+                    logging.debug("Unable to persist folder cover for album_id=%s", album_id, exc_info=True)
+                finally:
+                    conn.close()
+            _files_cache_set_json(
+                lookup_key,
+                {
+                    "cover_path": str(detected_cover),
+                    "folder_path": folder_raw,
+                    "no_cover": False,
+                },
+                ttl=3600,
+            )
+            return _serve_image_file_cached(to_send, max_age=86400)
+
+    if no_cover_cached:
+        return _transparent_png_response(max_age=3600)
+
     conn = _files_pg_connect()
     if conn is None:
         return jsonify({"error": "PostgreSQL unavailable"}), 503
     try:
-        folder_raw = ""
         with conn.cursor() as cur:
-            cur.execute("SELECT cover_path, folder_path FROM files_albums WHERE id = %s", (album_id,))
-            row = cur.fetchone()
-            cover_raw = (row[0] or "").strip() if row else ""
-            folder_raw = (row[1] or "").strip() if row else ""
-            if cover_raw:
-                cover_path = path_for_fs_access(Path(cover_raw))
-                if cover_path.exists() and cover_path.is_file():
-                    cached = _ensure_cached_image_for_path(cover_path, kind="album", max_px=size)
-                    to_send = cached or cover_path
-                    resp = send_file(str(to_send), as_attachment=False, conditional=True, max_age=86400)
-                    resp.headers["Cache-Control"] = "public, max-age=86400, stale-while-revalidate=86400"
-                    return resp
-            if folder_raw:
-                folder_path = path_for_fs_access(Path(folder_raw))
-                detected_cover = _first_cover_path(folder_path)
-                if detected_cover and detected_cover.exists() and detected_cover.is_file():
-                    cached = _ensure_cached_image_for_path(detected_cover, kind="album", max_px=size)
-                    to_send = cached or detected_cover
-                    try:
-                        with conn.transaction():
-                            with conn.cursor() as wcur:
-                                wcur.execute(
-                                    """
-                                    UPDATE files_albums
-                                    SET has_cover = TRUE,
-                                        cover_path = %s,
-                                        updated_at = NOW()
-                                    WHERE id = %s
-                                    """,
-                                    (str(detected_cover), int(album_id)),
-                                )
-                        _files_cache_invalidate_all()
-                    except Exception:
-                        logging.debug("Unable to persist folder cover for album_id=%s", album_id, exc_info=True)
-                    resp = send_file(str(to_send), as_attachment=False, conditional=True, max_age=86400)
-                    resp.headers["Cache-Control"] = "public, max-age=86400, stale-while-revalidate=86400"
-                    return resp
-            # Fallback to embedded cover from the first tracks (some releases only embed
-            # art on a subset of files).
             cur.execute(
                 """
                 SELECT file_path
@@ -38344,25 +38655,31 @@ def api_library_files_album_cover(album_id):
                 (album_id,),
             )
             tr_rows = cur.fetchall() or []
-        embedded = None
-        for tr_row in tr_rows:
-            track_raw = str((tr_row[0] if isinstance(tr_row, (list, tuple)) else tr_row) or "").strip()
-            if not track_raw:
-                continue
-            track_path = path_for_fs_access(Path(track_raw))
-            embedded = _extract_embedded_cover_from_audio(track_path)
-            if embedded:
-                break
+    finally:
+        conn.close()
+
+    embedded = None
+    for tr_row in tr_rows:
+        track_raw = str((tr_row[0] if isinstance(tr_row, (list, tuple)) else tr_row) or "").strip()
+        if not track_raw:
+            continue
+        track_path = path_for_fs_access(Path(track_raw))
+        embedded = _extract_embedded_cover_from_audio(track_path)
         if embedded:
-            raw, mime = embedded
-            master_cached = _ensure_cached_image_from_bytes(
-                raw,
-                mime,
-                kind="embedded",
-                cache_key_hint=f"album-{album_id}-master",
-                max_px=1600,
-            )
-            if master_cached and master_cached.exists():
+            break
+
+    if embedded:
+        raw, mime = embedded
+        master_cached = _ensure_cached_image_from_bytes(
+            raw,
+            mime,
+            kind="embedded",
+            cache_key_hint=f"album-{album_id}-master",
+            max_px=1600,
+        )
+        if master_cached and master_cached.exists():
+            conn = _files_pg_connect()
+            if conn is not None:
                 try:
                     with conn.transaction():
                         with conn.cursor() as cur:
@@ -38376,32 +38693,34 @@ def api_library_files_album_cover(album_id):
                                 """,
                                 (str(master_cached), int(album_id)),
                             )
-                    _files_cache_invalidate_all()
                 except Exception:
                     logging.debug("Unable to persist embedded cover for album_id=%s", album_id, exc_info=True)
-                sized = _ensure_cached_image_for_path(master_cached, kind="album", max_px=size)
-                to_send = sized or master_cached
-                resp = send_file(str(to_send), as_attachment=False, conditional=True, max_age=86400)
-                resp.headers["Cache-Control"] = "public, max-age=86400, stale-while-revalidate=86400"
-                return resp
-            return Response(raw, headers={"Content-Type": mime})
-        # Avoid noisy 404s in the browser console: return a tiny transparent placeholder.
-        # The UI still shows a "no cover" state (based on has_cover), but the image request won't error.
-        try:
-            transparent = base64.b64decode(
-                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII="
+                finally:
+                    conn.close()
+            _files_cache_set_json(
+                lookup_key,
+                {
+                    "cover_path": str(master_cached),
+                    "folder_path": folder_raw,
+                    "no_cover": False,
+                },
+                ttl=3600,
             )
-        except Exception:
-            transparent = b""
-        return Response(
-            transparent or b"",
-            headers={
-                "Content-Type": "image/png",
-                "Cache-Control": "public, max-age=3600, stale-while-revalidate=3600",
-            },
-        )
-    finally:
-        conn.close()
+            sized = _ensure_cached_image_for_path(master_cached, kind="album", max_px=size)
+            to_send = sized or master_cached
+            return _serve_image_file_cached(to_send, max_age=86400)
+        return Response(raw, headers={"Content-Type": mime})
+
+    _files_cache_set_json(
+        lookup_key,
+        {
+            "cover_path": "",
+            "folder_path": folder_raw,
+            "no_cover": True,
+        },
+        ttl=900,
+    )
+    return _transparent_png_response(max_age=3600)
 
 
 @app.get("/api/library/files/artist/<int:artist_id>/image")
@@ -38413,63 +38732,97 @@ def api_library_files_artist_image(artist_id):
     ok, err = _ensure_files_index_ready()
     if not ok:
         return jsonify({"error": err or "Files index unavailable"}), 503
-    conn = _files_pg_connect()
-    if conn is None:
-        return jsonify({"error": "PostgreSQL unavailable"}), 503
-    try:
-        name_norm = ""
-        img_raw = ""
-        with conn.cursor() as cur:
-            cur.execute("SELECT name_norm, COALESCE(image_path, '') FROM files_artists WHERE id = %s", (artist_id,))
-            row = cur.fetchone()
-        if row:
-            name_norm = str(row[0] or "").strip()
-            img_raw = str(row[1] or "").strip()
+    lookup_key = f"artwork:artist:{int(artist_id)}"
+    lookup = _files_cache_get_json(lookup_key)
+    name_norm = ""
+    img_raw = ""
+    no_image_cached = False
 
-        # Primary: local/external path stored on the artist row.
-        if img_raw:
-            img_path = path_for_fs_access(Path(img_raw))
-            if img_path.exists() and img_path.is_file():
-                cached = _ensure_cached_image_for_path(img_path, kind="artist", max_px=size)
-                to_send = cached or img_path
-                resp = send_file(str(to_send), as_attachment=False, conditional=True, max_age=86400)
-                resp.headers["Cache-Control"] = "public, max-age=86400, stale-while-revalidate=86400"
-                return resp
-
-        # Fallback: external cache table (keeps UI working even if files_artists wasn't updated yet).
-        if name_norm:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT COALESCE(image_path, '') FROM files_external_artist_images WHERE name_norm = %s",
-                    (name_norm,),
-                )
-                erow = cur.fetchone()
-            ext_raw = str((erow[0] if erow else "") or "").strip()
-            if ext_raw:
-                ext_path = path_for_fs_access(Path(ext_raw))
-                if ext_path.exists() and ext_path.is_file():
-                    cached = _ensure_cached_image_for_path(ext_path, kind="artist", max_px=size)
-                    to_send = cached or ext_path
-                    resp = send_file(str(to_send), as_attachment=False, conditional=True, max_age=86400)
-                    resp.headers["Cache-Control"] = "public, max-age=86400, stale-while-revalidate=86400"
-                    return resp
-
-        # Avoid noisy browser 404s for missing artist images.
+    if isinstance(lookup, dict):
+        name_norm = str(lookup.get("name_norm") or "").strip()
+        img_raw = str(lookup.get("image_path") or "").strip()
+        no_image_cached = bool(lookup.get("no_image"))
+    else:
+        conn = _files_pg_connect()
+        if conn is None:
+            return jsonify({"error": "PostgreSQL unavailable"}), 503
         try:
-            transparent = base64.b64decode(
-                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII="
+            with conn.cursor() as cur:
+                cur.execute("SELECT name_norm, COALESCE(image_path, '') FROM files_artists WHERE id = %s", (artist_id,))
+                row = cur.fetchone()
+            if row:
+                name_norm = str(row[0] or "").strip()
+                img_raw = str(row[1] or "").strip()
+            _files_cache_set_json(
+                lookup_key,
+                {
+                    "name_norm": name_norm,
+                    "image_path": img_raw,
+                    "no_image": not bool(img_raw),
+                },
+                ttl=3600,
             )
-        except Exception:
-            transparent = b""
-        return Response(
-            transparent or b"",
-            headers={
-                "Content-Type": "image/png",
-                "Cache-Control": "public, max-age=3600, stale-while-revalidate=3600",
-            },
-        )
-    finally:
-        conn.close()
+        finally:
+            conn.close()
+
+    if img_raw:
+        img_path = path_for_fs_access(Path(img_raw))
+        if img_path.exists() and img_path.is_file():
+            cached = _ensure_cached_image_for_path(img_path, kind="artist", max_px=size)
+            to_send = cached or img_path
+            return _serve_image_file_cached(to_send, max_age=86400)
+
+    if name_norm:
+        ext_key = f"artwork:artist:ext:{name_norm}"
+        ext_lookup = _files_cache_get_json(ext_key)
+        ext_raw = str((ext_lookup or {}).get("image_path") or "").strip() if isinstance(ext_lookup, dict) else ""
+        if not ext_raw:
+            conn = _files_pg_connect()
+            if conn is None:
+                return jsonify({"error": "PostgreSQL unavailable"}), 503
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT COALESCE(image_path, '') FROM files_external_artist_images WHERE name_norm = %s",
+                        (name_norm,),
+                    )
+                    erow = cur.fetchone()
+                ext_raw = str((erow[0] if erow else "") or "").strip()
+                _files_cache_set_json(
+                    ext_key,
+                    {"image_path": ext_raw, "no_image": not bool(ext_raw)},
+                    ttl=3600,
+                )
+            finally:
+                conn.close()
+        if ext_raw:
+            ext_path = path_for_fs_access(Path(ext_raw))
+            if ext_path.exists() and ext_path.is_file():
+                cached = _ensure_cached_image_for_path(ext_path, kind="artist", max_px=size)
+                to_send = cached or ext_path
+                _files_cache_set_json(
+                    lookup_key,
+                    {
+                        "name_norm": name_norm,
+                        "image_path": str(ext_path),
+                        "no_image": False,
+                    },
+                    ttl=3600,
+                )
+                return _serve_image_file_cached(to_send, max_age=86400)
+
+    if no_image_cached:
+        return _transparent_png_response(max_age=3600)
+    _files_cache_set_json(
+        lookup_key,
+        {
+            "name_norm": name_norm,
+            "image_path": "",
+            "no_image": True,
+        },
+        ttl=900,
+    )
+    return _transparent_png_response(max_age=3600)
 
 
 @app.get("/api/library/external/artist-image/<path:name_norm>")
@@ -38502,7 +38855,7 @@ def api_library_external_artist_image(name_norm: str):
             return jsonify({"error": "External artist image missing"}), 404
         cached = _ensure_cached_image_for_path(p, kind="artist", max_px=size)
         to_send = cached or p
-        return send_file(str(to_send), as_attachment=False, conditional=True)
+        return _serve_image_file_cached(to_send, max_age=86400)
     finally:
         conn.close()
 

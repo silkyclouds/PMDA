@@ -572,6 +572,54 @@ function SettingsPage() {
                     placeholder="/config/media_cache"
                     selectLabel="Select media cache folder"
                   />
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                    <div className="space-y-1">
+                      <Label htmlFor="artwork-ram-cache-mb">Artwork RAM cache (MB)</Label>
+                      <Input
+                        id="artwork-ram-cache-mb"
+                        type="number"
+                        min={0}
+                        max={65536}
+                        step={128}
+                        value={config.ARTWORK_RAM_CACHE_MB ?? 1024}
+                        onChange={(e) => {
+                          const v = Number(e.target.value);
+                          updateConfig({ ARTWORK_RAM_CACHE_MB: Number.isFinite(v) ? Math.max(0, Math.min(65536, Math.round(v))) : 1024 });
+                        }}
+                      />
+                      <p className="text-[11px] text-muted-foreground">0 disables RAM cache. For your setup, 16384 = 16 GB.</p>
+                    </div>
+                    <div className="space-y-1">
+                      <Label htmlFor="artwork-ram-cache-ttl">Artwork cache TTL (sec)</Label>
+                      <Input
+                        id="artwork-ram-cache-ttl"
+                        type="number"
+                        min={60}
+                        max={2592000}
+                        step={60}
+                        value={config.ARTWORK_RAM_CACHE_TTL_SEC ?? 21600}
+                        onChange={(e) => {
+                          const v = Number(e.target.value);
+                          updateConfig({ ARTWORK_RAM_CACHE_TTL_SEC: Number.isFinite(v) ? Math.max(60, Math.min(2592000, Math.round(v))) : 21600 });
+                        }}
+                      />
+                    </div>
+                    <div className="space-y-1">
+                      <Label htmlFor="artwork-ram-cache-item-mb">Max image in RAM (MB)</Label>
+                      <Input
+                        id="artwork-ram-cache-item-mb"
+                        type="number"
+                        min={1}
+                        max={64}
+                        step={1}
+                        value={config.ARTWORK_RAM_CACHE_MAX_ITEM_MB ?? 8}
+                        onChange={(e) => {
+                          const v = Number(e.target.value);
+                          updateConfig({ ARTWORK_RAM_CACHE_MAX_ITEM_MB: Number.isFinite(v) ? Math.max(1, Math.min(64, Math.round(v))) : 8 });
+                        }}
+                      />
+                    </div>
+                  </div>
                 </div>
                 <div className="space-y-1">
                   <Label>Incomplete albums folder</Label>

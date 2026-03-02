@@ -14,6 +14,7 @@ PMDA_REDIS_HOST="${PMDA_REDIS_HOST:-127.0.0.1}"
 PMDA_REDIS_PORT="${PMDA_REDIS_PORT:-6379}"
 PMDA_REDIS_DB="${PMDA_REDIS_DB:-0}"
 PMDA_REDIS_PASSWORD="${PMDA_REDIS_PASSWORD:-}"
+PMDA_REDIS_MAXMEMORY_MB="${PMDA_REDIS_MAXMEMORY_MB:-}"
 PMDA_PID=""
 PMDA_CLEANED_UP=0
 
@@ -140,7 +141,11 @@ build_redis_args() {
   total_mem_mb="$(detect_memory_mb)"
   cpu_count="$(detect_cpu_count)"
   total_mem_mb="$(clamp_int "${total_mem_mb}" 1024 1048576)"
-  redis_maxmemory_mb="$(clamp_int $(( total_mem_mb * 15 / 100 )) 128 8192)"
+  if [ -n "${PMDA_REDIS_MAXMEMORY_MB}" ]; then
+    redis_maxmemory_mb="$(clamp_int "${PMDA_REDIS_MAXMEMORY_MB}" 128 65536)"
+  else
+    redis_maxmemory_mb="$(clamp_int $(( total_mem_mb * 15 / 100 )) 128 65536)"
+  fi
   io_threads="$(clamp_int $(( cpu_count - 1 )) 1 8)"
 
   REDIS_ARGS=(

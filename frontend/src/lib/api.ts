@@ -452,6 +452,12 @@ export interface PMDAConfig {
   EXPORT_LINK_STRATEGY?: 'hardlink' | 'symlink' | 'copy' | 'move';
   /** NVMe-friendly media cache root for pre-rendered artwork thumbnails (album/artist). */
   MEDIA_CACHE_ROOT?: string;
+  /** In-process RAM cache budget for artwork bytes (MB). 0 disables RAM artwork cache. */
+  ARTWORK_RAM_CACHE_MB?: number;
+  /** TTL (seconds) for artwork entries in in-process RAM cache. */
+  ARTWORK_RAM_CACHE_TTL_SEC?: number;
+  /** Max single artwork payload admitted in RAM cache (MB). */
+  ARTWORK_RAM_CACHE_MAX_ITEM_MB?: number;
   /** When true (Files mode), rebuild the export library automatically after a Magic scan. */
   AUTO_EXPORT_LIBRARY?: boolean;
   
