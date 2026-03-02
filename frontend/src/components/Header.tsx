@@ -6,7 +6,6 @@ import { Progress } from '@/components/ui/progress';
 import { GlobalStatusBar } from '@/components/GlobalStatusBar';
 import { GlobalSearch } from '@/components/GlobalSearch';
 import * as api from '@/lib/api';
-import { SidebarTrigger } from '@/components/ui/sidebar';
 
 const WELCOME_COOKIE = 'pmda_welcome_dismissed';
 
@@ -86,9 +85,7 @@ export function Header() {
         <div className="container py-2.5 md:py-3">
           <div className="space-y-2.5 md:space-y-3">
               <div className="flex items-center justify-between gap-2">
-                <div className="flex items-center gap-2.5 min-w-0">
-                  <SidebarTrigger />
-                </div>
+                <div className="min-w-0" />
                 <div className="flex items-center gap-1.5">
                   <ThemeToggle />
               </div>

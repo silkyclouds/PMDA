@@ -102,6 +102,32 @@ export default function Tools() {
     () => (moves || []).filter((m) => (m.move_reason || '') === 'incomplete' && !m.restored),
     [moves],
   );
+  const hasIncompleteReview = useMemo(() => {
+    const broken = Number(
+      selectedRun?.broken_albums_count
+      ?? selectedSummary?.broken_albums_count
+      ?? 0,
+    );
+    return broken > 0 || incompleteMoves.length > 0;
+  }, [incompleteMoves.length, selectedRun?.broken_albums_count, selectedSummary?.broken_albums_count]);
+  const hasDuplicateReview = useMemo(() => {
+    const dupes = Number(
+      selectedRun?.duplicates_found
+      ?? selectedRun?.duplicate_groups_count
+      ?? selectedRun?.total_duplicates_count
+      ?? selectedSummary?.duplicate_groups_count
+      ?? selectedSummary?.total_duplicates_count
+      ?? 0,
+    );
+    return dupes > 0 || dedupeMoves.length > 0;
+  }, [
+    dedupeMoves.length,
+    selectedRun?.duplicate_groups_count,
+    selectedRun?.duplicates_found,
+    selectedRun?.total_duplicates_count,
+    selectedSummary?.duplicate_groups_count,
+    selectedSummary?.total_duplicates_count,
+  ]);
 
   const restoreByReason = async (reason: 'dedupe' | 'incomplete') => {
     if (!selectedRun?.scan_id) return;
@@ -151,6 +177,7 @@ export default function Tools() {
               size="sm"
               className="gap-1.5 bg-amber-500/90 hover:bg-amber-500 text-black border border-amber-300/30"
               onClick={() => navigate('/broken-albums')}
+              disabled={!hasIncompleteReview}
             >
               Review incompletes
             </Button>
@@ -158,6 +185,7 @@ export default function Tools() {
               size="sm"
               className="gap-1.5 bg-amber-500/90 hover:bg-amber-500 text-black border border-amber-300/30"
               onClick={() => navigate('/tools/duplicates')}
+              disabled={!hasDuplicateReview}
             >
               Fine-check duplicates
             </Button>
@@ -263,6 +291,7 @@ export default function Tools() {
                       size="sm"
                       className="gap-1.5 bg-amber-500/90 hover:bg-amber-500 text-black border border-amber-300/30"
                       onClick={() => navigate('/broken-albums')}
+                      disabled={!hasIncompleteReview}
                     >
                       Review incompletes
                     </Button>
@@ -296,6 +325,7 @@ export default function Tools() {
                     size="sm"
                     className="gap-1.5 bg-amber-500/90 hover:bg-amber-500 text-black border border-amber-300/30"
                     onClick={() => navigate('/tools/duplicates')}
+                    disabled={!hasDuplicateReview}
                   >
                     Fine-check duplicates
                   </Button>

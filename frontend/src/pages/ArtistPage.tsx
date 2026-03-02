@@ -610,6 +610,13 @@ export default function ArtistPage() {
   const tags = (profile?.tags || []).slice(0, 8);
   const similar = ((fallbackSimilar && fallbackSimilar.length > 0) ? fallbackSimilar : (profile?.similar_artists || [])).slice(0, 12);
   const heroImage = details.artist_thumb || null;
+  const profileText = (
+    profile?.bio
+    || profile?.short_bio
+    || details.artist_profile?.bio
+    || details.artist_profile?.short_bio
+    || ''
+  ).trim();
   const originalText = (summary?.original?.text || '').trim();
   const aiText = (summary?.ai?.text || '').trim();
   const chosenDescription = (() => {
@@ -622,6 +629,13 @@ export default function ArtistPage() {
     }
     if (originalText) {
       return { text: originalText, source: summary?.original?.source || '', updated_at: summary?.original?.updated_at || 0 };
+    }
+    if (profileText) {
+      return {
+        text: profileText,
+        source: profile?.source || details.artist_profile?.source || '',
+        updated_at: profile?.updated_at || details.artist_profile?.updated_at || 0,
+      };
     }
     return { text: '', source: '', updated_at: 0 };
   })();
@@ -672,14 +686,15 @@ export default function ArtistPage() {
 
         <Card className="overflow-hidden border-border/70">
           <div className="relative">
-            <div className="absolute inset-0 bg-gradient-to-r from-background via-background/88 to-background/55 z-10" />
-              {heroImage ? (
-              <img src={heroImage} alt={details.artist_name} className="w-full h-64 md:h-96 object-cover blur-[1px] scale-[1.03]" />
+            <div className="absolute inset-0 z-10 bg-background/42 backdrop-blur-xl" />
+            <div className="absolute inset-0 z-10 bg-gradient-to-r from-background/96 via-background/80 to-background/58" />
+            {heroImage ? (
+              <img src={heroImage} alt={details.artist_name} className="w-full h-64 md:h-96 object-cover blur-[2.5px] scale-[1.04]" />
             ) : (
               <div className="h-64 md:h-96 bg-gradient-to-br from-zinc-900 via-zinc-800 to-zinc-900" />
             )}
             <div className="absolute inset-0 z-20 p-6 md:p-8 flex items-end">
-              <div className="grid grid-cols-1 md:grid-cols-[12rem,1fr] gap-6 w-full items-end">
+              <div className="grid grid-cols-1 md:grid-cols-[13rem,minmax(0,1fr)] gap-8 w-full items-center">
 	                <div className="w-28 h-28 sm:w-36 sm:h-36 md:w-52 md:h-52 lg:w-56 lg:h-56 rounded-3xl overflow-hidden border border-border/60 bg-muted shrink-0 shadow-[0_24px_60px_rgba(0,0,0,0.35)]">
                   {heroImage ? (
                     <img src={heroImage} alt={details.artist_name} className="w-full h-full object-cover animate-in fade-in-0 duration-300" />
@@ -689,7 +704,7 @@ export default function ArtistPage() {
                     </div>
                   )}
                 </div>
-                <div className="min-w-0">
+                <div className="min-w-0 md:pl-2">
 	                  <h1 className="text-2xl sm:text-3xl md:text-5xl font-bold tracking-tight truncate">{details.artist_name}</h1>
                   <p className="text-base text-muted-foreground mt-1.5">
                     {details.total_albums.toLocaleString()} album{details.total_albums !== 1 ? 's' : ''}

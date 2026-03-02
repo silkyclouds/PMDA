@@ -21,6 +21,7 @@ import {
   SidebarMenuItem,
   SidebarRail,
   SidebarSeparator,
+  SidebarTrigger,
 } from '@/components/ui/sidebar';
 import { Logo } from '@/components/Logo';
 import { useIsMobile } from '@/hooks/use-mobile';
@@ -65,6 +66,7 @@ export function AppSidebar() {
   const [playlists, setPlaylists] = useState<api.PlaylistSummary[]>([]);
   const [loadingPlaylists, setLoadingPlaylists] = useState(false);
   const [dragOverPlaylistId, setDragOverPlaylistId] = useState<number | null>(null);
+  const [toolsBadgeCount, setToolsBadgeCount] = useState(0);
 
   const refreshPlaylists = useCallback(async () => {
     try {
@@ -78,11 +80,39 @@ export function AppSidebar() {
     }
   }, []);
 
+  const refreshToolsBadge = useCallback(async () => {
+    try {
+      const runs = await api.getScanHistory();
+      const completed = (Array.isArray(runs) ? runs : [])
+        .filter((r) => r.status === 'completed')
+        .sort((a, b) => Number(b.scan_id) - Number(a.scan_id));
+      const latest = completed[0];
+      const dedupeCount = Number(
+        latest?.duplicates_found
+          ?? latest?.duplicate_groups_count
+          ?? latest?.total_duplicates_count
+          ?? 0,
+      );
+      const incompleteCount = Number(
+        latest?.broken_albums_count
+          ?? latest?.summary_json?.broken_albums_count
+          ?? 0,
+      );
+      setToolsBadgeCount(Math.max(0, dedupeCount) + Math.max(0, incompleteCount));
+    } catch {
+      setToolsBadgeCount(0);
+    }
+  }, []);
+
   useEffect(() => {
     void refreshPlaylists();
-    const t = setInterval(() => void refreshPlaylists(), 60_000);
+    void refreshToolsBadge();
+    const t = setInterval(() => {
+      void refreshPlaylists();
+      void refreshToolsBadge();
+    }, 60_000);
     return () => clearInterval(t);
-  }, [refreshPlaylists]);
+  }, [refreshPlaylists, refreshToolsBadge]);
 
   const mainItems = useMemo(
     () => [{ to: '/library', label: 'Library', icon: Library }],
@@ -138,13 +168,13 @@ export function AppSidebar() {
   };
 
   return (
-    <Sidebar collapsible="offcanvas" variant="sidebar">
+    <Sidebar collapsible="icon" variant="sidebar">
       <SidebarHeader>
         <div className="flex items-center gap-2 px-2 py-1.5">
+          <SidebarTrigger className="h-8 w-8 rounded-lg" />
           <Logo showText={false} size="sm" />
           <div className="min-w-0 group-data-[collapsible=icon]:hidden">
             <div className="font-semibold leading-tight">PMDA</div>
-            <div className="text-[11px] text-muted-foreground leading-tight">Local library</div>
           </div>
         </div>
       </SidebarHeader>
@@ -279,11 +309,16 @@ export function AppSidebar() {
                 const Icon = it.icon;
                 const active = isPathActive(location.pathname, it.to);
                 return (
-                  <SidebarMenuItem key={it.to}>
+                  <SidebarMenuItem key={it.to} className="relative">
                     <SidebarMenuButton isActive={active} tooltip={it.label} onClick={() => navigate(it.to)}>
                       <Icon className="h-4 w-4" />
                       <span>{it.label}</span>
                     </SidebarMenuButton>
+                    {it.to === '/tools' && toolsBadgeCount > 0 ? (
+                      <SidebarMenuBadge className="text-[10px]">
+                        {toolsBadgeCount > 99 ? '99+' : toolsBadgeCount}
+                      </SidebarMenuBadge>
+                    ) : null}
                   </SidebarMenuItem>
                 );
               })}

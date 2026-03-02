@@ -959,6 +959,15 @@ def _parse_files_roots(val) -> list[str]:
     - JSON array strings
     - corrupted double-encoded JSON strings (e.g. "[\"[\\\"/music\\\"]\"]")
     """
+    def _norm_root(p: str) -> str:
+        raw = str(p or "").strip()
+        if not raw:
+            return ""
+        if raw == "/":
+            return raw
+        # Keep mount semantics stable while deduplicating trailing-slash variants.
+        return raw.rstrip("/") or raw
+
     out: list[str] = []
     queue: list = [val]
     seen: set[str] = set()
@@ -993,15 +1002,19 @@ def _parse_files_roots(val) -> list[str]:
                     queue.extend(parts)
                     continue
 
-            if s and s not in seen and not s.startswith("["):
-                seen.add(s)
-                out.append(s)
+            if s and not s.startswith("["):
+                normalized = _norm_root(s)
+                if normalized and normalized not in seen:
+                    seen.add(normalized)
+                    out.append(normalized)
             continue
 
         s = str(item).strip()
-        if s and s not in seen and not s.startswith("["):
-            seen.add(s)
-            out.append(s)
+        if s and not s.startswith("["):
+            normalized = _norm_root(s)
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                out.append(normalized)
 
     return out
 
@@ -45092,13 +45105,22 @@ if __name__ == "__main__":
     def run_server():
         app.run(host="0.0.0.0", port=WEBUI_PORT, threaded=True, use_reloader=False)
 
-    # Fast checks before server (can SystemExit)
+    # Fast checks before server (must never hard-exit files mode).
     if PLEX_CONFIGURED:
-        _validate_plex_connection()
-        if not _self_diag():
-            raise SystemExit("Self‑diagnostic failed – please fix the issues above and restart PMDA.")
+        try:
+            _validate_plex_connection()
+        except Exception:
+            logging.warning("Plex connection precheck failed (non-fatal).", exc_info=True)
+        if _get_library_mode() == "plex":
+            try:
+                if not _self_diag():
+                    logging.error("Self-diagnostic failed in Plex mode (continuing so UI stays available).")
+            except Exception:
+                logging.warning("Self-diagnostic crashed in Plex mode (non-fatal).", exc_info=True)
+        else:
+            logging.info("Skipping Plex self-diagnostic at startup (LIBRARY_MODE=files).")
     else:
-        logging.info("Skipping startup checks (Plex not configured – use Settings to configure).")
+        logging.info("Skipping Plex startup checks (Plex not configured – use Settings to configure).")
 
     server_thread = threading.Thread(target=run_server, daemon=False)
     server_thread.start()

@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Save, Loader2, Check, FolderOutput, RefreshCw, Plus, X, Database, Sparkles, ExternalLink, Copy, MapPin } from 'lucide-react';
+import { Save, Loader2, Check, FolderOutput, RefreshCw, Plus, X, Database, Sparkles, ExternalLink, Copy, MapPin, ChevronDown } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { toast } from 'sonner';
 import { NotificationSettings } from '@/components/settings/NotificationSettings';
@@ -32,6 +32,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
 
 const SETTINGS_SECTIONS: { id: string; label: string }[] = [
   { id: 'settings-files-export', label: 'Folders' },
@@ -43,6 +44,13 @@ const SETTINGS_SECTIONS: { id: string; label: string }[] = [
 ];
 
 function parsePathListValue(value: unknown): string[] {
+  const normalizeFolderPath = (input: string): string => {
+    const raw = String(input || '').trim();
+    if (!raw) return '';
+    if (raw === '/') return '/';
+    return raw.replace(/\/+$/, '') || raw;
+  };
+
   const out: string[] = [];
   const seen = new Set<string>();
   const queue: unknown[] = [value];
@@ -75,13 +83,14 @@ function parsePathListValue(value: unknown): string[] {
           continue;
         }
       }
-      if (!seen.has(s) && !s.startsWith('[')) {
-        seen.add(s);
-        out.push(s);
+      const normalized = normalizeFolderPath(s);
+      if (normalized && !seen.has(normalized) && !normalized.startsWith('[')) {
+        seen.add(normalized);
+        out.push(normalized);
       }
       continue;
     }
-    const s = String(item).trim();
+    const s = normalizeFolderPath(String(item));
     if (s && !seen.has(s) && !s.startsWith('[')) {
       seen.add(s);
       out.push(s);
@@ -92,7 +101,7 @@ function parsePathListValue(value: unknown): string[] {
 }
 
 function serializePathList(paths: string[]): string {
-  return paths.map((p) => p.trim()).filter(Boolean).join(', ');
+  return parsePathListValue(paths).join(', ');
 }
 
 function SettingsPage() {
@@ -115,6 +124,7 @@ function SettingsPage() {
   const [openaiModels, setOpenaiModels] = useState<string[]>([]);
   const [openaiModelsError, setOpenaiModelsError] = useState<string | null>(null);
   const [rebuildIndexLoading, setRebuildIndexLoading] = useState(false);
+  const [advancedFoldersOpen, setAdvancedFoldersOpen] = useState(false);
   const openaiModelsKeyRef = useRef<string>('');
 
   const getApiErrorMessage = (e: unknown): string | null => {
@@ -301,7 +311,7 @@ function SettingsPage() {
   }, [updateConfig]);
 
   const addFilesRoot = useCallback((path: string) => {
-    const clean = path.trim();
+    const clean = parsePathListValue([path])[0] || '';
     if (!clean) return;
     const current = parsePathListValue(config.FILES_ROOTS);
     if (current.includes(clean)) return;
@@ -572,102 +582,118 @@ function SettingsPage() {
                     placeholder="/config/media_cache"
                     selectLabel="Select media cache folder"
                   />
-                  <div className="rounded-md border border-border/70 p-3 space-y-3 bg-muted/20">
-                    <div className="flex items-start justify-between gap-3">
-                      <div className="space-y-1">
-                        <Label htmlFor="artwork-ram-auto">Auto RAM tuning</Label>
-                        <p className="text-[11px] text-muted-foreground">
-                          PMDA recalculates artwork RAM cache from available memory every few minutes. You can cap it below.
-                        </p>
-                      </div>
-                      <Switch
-                        id="artwork-ram-auto"
-                        checked={Boolean(config.ARTWORK_RAM_CACHE_AUTO ?? true)}
-                        onCheckedChange={(checked) => updateConfig({ ARTWORK_RAM_CACHE_AUTO: checked })}
-                      />
+                  <Collapsible open={advancedFoldersOpen} onOpenChange={setAdvancedFoldersOpen}>
+                    <div className="rounded-md border border-border/70 bg-muted/20">
+                      <CollapsibleTrigger asChild>
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          className="w-full justify-between rounded-none px-3 py-2 text-left"
+                        >
+                          <span className="text-sm font-medium">Advanced cache settings</span>
+                          <ChevronDown className={`w-4 h-4 transition-transform ${advancedFoldersOpen ? 'rotate-180' : ''}`} />
+                        </Button>
+                      </CollapsibleTrigger>
+                      <CollapsibleContent>
+                        <div className="p-3 space-y-3 border-t border-border/60">
+                          <div className="flex items-start justify-between gap-3">
+                            <div className="space-y-1">
+                              <Label htmlFor="artwork-ram-auto">Auto RAM tuning</Label>
+                              <p className="text-[11px] text-muted-foreground">
+                                PMDA recalculates artwork RAM cache from available memory every few minutes. You can cap it below.
+                              </p>
+                            </div>
+                            <Switch
+                              id="artwork-ram-auto"
+                              checked={Boolean(config.ARTWORK_RAM_CACHE_AUTO ?? true)}
+                              onCheckedChange={(checked) => updateConfig({ ARTWORK_RAM_CACHE_AUTO: checked })}
+                            />
+                          </div>
+                          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                            <div className="space-y-1">
+                              <Label htmlFor="artwork-ram-auto-max-mb">Auto max RAM (MB)</Label>
+                              <Input
+                                id="artwork-ram-auto-max-mb"
+                                type="number"
+                                min={0}
+                                max={65536}
+                                step={256}
+                                value={config.ARTWORK_RAM_CACHE_AUTO_MAX_MB ?? 0}
+                                onChange={(e) => {
+                                  const v = Number(e.target.value);
+                                  updateConfig({ ARTWORK_RAM_CACHE_AUTO_MAX_MB: Number.isFinite(v) ? Math.max(0, Math.min(65536, Math.round(v))) : 0 });
+                                }}
+                              />
+                              <p className="text-[11px] text-muted-foreground">Set `16384` to reserve max 16 GB for PMDA artwork cache. `0` = no cap.</p>
+                            </div>
+                            <div className="space-y-1">
+                              <Label htmlFor="artwork-ram-auto-interval">Auto tune interval (sec)</Label>
+                              <Input
+                                id="artwork-ram-auto-interval"
+                                type="number"
+                                min={30}
+                                max={3600}
+                                step={30}
+                                value={config.ARTWORK_RAM_CACHE_AUTO_INTERVAL_SEC ?? 120}
+                                onChange={(e) => {
+                                  const v = Number(e.target.value);
+                                  updateConfig({ ARTWORK_RAM_CACHE_AUTO_INTERVAL_SEC: Number.isFinite(v) ? Math.max(30, Math.min(3600, Math.round(v))) : 120 });
+                                }}
+                              />
+                            </div>
+                          </div>
+                          <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                            <div className="space-y-1">
+                              <Label htmlFor="artwork-ram-cache-mb">Artwork RAM cache (MB)</Label>
+                              <Input
+                                id="artwork-ram-cache-mb"
+                                type="number"
+                                min={0}
+                                max={65536}
+                                step={128}
+                                value={config.ARTWORK_RAM_CACHE_MB ?? 1024}
+                                onChange={(e) => {
+                                  const v = Number(e.target.value);
+                                  updateConfig({ ARTWORK_RAM_CACHE_MB: Number.isFinite(v) ? Math.max(0, Math.min(65536, Math.round(v))) : 1024 });
+                                }}
+                              />
+                              <p className="text-[11px] text-muted-foreground">Manual baseline/fallback. When auto tuning is ON, PMDA adjusts this value dynamically.</p>
+                            </div>
+                            <div className="space-y-1">
+                              <Label htmlFor="artwork-ram-cache-ttl">Artwork cache TTL (sec)</Label>
+                              <Input
+                                id="artwork-ram-cache-ttl"
+                                type="number"
+                                min={60}
+                                max={2592000}
+                                step={60}
+                                value={config.ARTWORK_RAM_CACHE_TTL_SEC ?? 21600}
+                                onChange={(e) => {
+                                  const v = Number(e.target.value);
+                                  updateConfig({ ARTWORK_RAM_CACHE_TTL_SEC: Number.isFinite(v) ? Math.max(60, Math.min(2592000, Math.round(v))) : 21600 });
+                                }}
+                              />
+                            </div>
+                            <div className="space-y-1">
+                              <Label htmlFor="artwork-ram-cache-item-mb">Max image in RAM (MB)</Label>
+                              <Input
+                                id="artwork-ram-cache-item-mb"
+                                type="number"
+                                min={1}
+                                max={64}
+                                step={1}
+                                value={config.ARTWORK_RAM_CACHE_MAX_ITEM_MB ?? 8}
+                                onChange={(e) => {
+                                  const v = Number(e.target.value);
+                                  updateConfig({ ARTWORK_RAM_CACHE_MAX_ITEM_MB: Number.isFinite(v) ? Math.max(1, Math.min(64, Math.round(v))) : 8 });
+                                }}
+                              />
+                            </div>
+                          </div>
+                        </div>
+                      </CollapsibleContent>
                     </div>
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                      <div className="space-y-1">
-                        <Label htmlFor="artwork-ram-auto-max-mb">Auto max RAM (MB)</Label>
-                        <Input
-                          id="artwork-ram-auto-max-mb"
-                          type="number"
-                          min={0}
-                          max={65536}
-                          step={256}
-                          value={config.ARTWORK_RAM_CACHE_AUTO_MAX_MB ?? 0}
-                          onChange={(e) => {
-                            const v = Number(e.target.value);
-                            updateConfig({ ARTWORK_RAM_CACHE_AUTO_MAX_MB: Number.isFinite(v) ? Math.max(0, Math.min(65536, Math.round(v))) : 0 });
-                          }}
-                        />
-                        <p className="text-[11px] text-muted-foreground">Set `16384` to reserve max 16 GB for PMDA artwork cache. `0` = no cap.</p>
-                      </div>
-                      <div className="space-y-1">
-                        <Label htmlFor="artwork-ram-auto-interval">Auto tune interval (sec)</Label>
-                        <Input
-                          id="artwork-ram-auto-interval"
-                          type="number"
-                          min={30}
-                          max={3600}
-                          step={30}
-                          value={config.ARTWORK_RAM_CACHE_AUTO_INTERVAL_SEC ?? 120}
-                          onChange={(e) => {
-                            const v = Number(e.target.value);
-                            updateConfig({ ARTWORK_RAM_CACHE_AUTO_INTERVAL_SEC: Number.isFinite(v) ? Math.max(30, Math.min(3600, Math.round(v))) : 120 });
-                          }}
-                        />
-                      </div>
-                    </div>
-                  </div>
-                  <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-                    <div className="space-y-1">
-                      <Label htmlFor="artwork-ram-cache-mb">Artwork RAM cache (MB)</Label>
-                      <Input
-                        id="artwork-ram-cache-mb"
-                        type="number"
-                        min={0}
-                        max={65536}
-                        step={128}
-                        value={config.ARTWORK_RAM_CACHE_MB ?? 1024}
-                        onChange={(e) => {
-                          const v = Number(e.target.value);
-                          updateConfig({ ARTWORK_RAM_CACHE_MB: Number.isFinite(v) ? Math.max(0, Math.min(65536, Math.round(v))) : 1024 });
-                        }}
-                      />
-                      <p className="text-[11px] text-muted-foreground">Manual baseline/fallback. When auto tuning is ON, PMDA adjusts this value dynamically.</p>
-                    </div>
-                    <div className="space-y-1">
-                      <Label htmlFor="artwork-ram-cache-ttl">Artwork cache TTL (sec)</Label>
-                      <Input
-                        id="artwork-ram-cache-ttl"
-                        type="number"
-                        min={60}
-                        max={2592000}
-                        step={60}
-                        value={config.ARTWORK_RAM_CACHE_TTL_SEC ?? 21600}
-                        onChange={(e) => {
-                          const v = Number(e.target.value);
-                          updateConfig({ ARTWORK_RAM_CACHE_TTL_SEC: Number.isFinite(v) ? Math.max(60, Math.min(2592000, Math.round(v))) : 21600 });
-                        }}
-                      />
-                    </div>
-                    <div className="space-y-1">
-                      <Label htmlFor="artwork-ram-cache-item-mb">Max image in RAM (MB)</Label>
-                      <Input
-                        id="artwork-ram-cache-item-mb"
-                        type="number"
-                        min={1}
-                        max={64}
-                        step={1}
-                        value={config.ARTWORK_RAM_CACHE_MAX_ITEM_MB ?? 8}
-                        onChange={(e) => {
-                          const v = Number(e.target.value);
-                          updateConfig({ ARTWORK_RAM_CACHE_MAX_ITEM_MB: Number.isFinite(v) ? Math.max(1, Math.min(64, Math.round(v))) : 8 });
-                        }}
-                      />
-                    </div>
-                  </div>
+                  </Collapsible>
                 </div>
                 <div className="space-y-1">
                   <Label>Incomplete albums folder</Label>
