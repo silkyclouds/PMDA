@@ -7,6 +7,7 @@ import { cn } from '@/lib/utils';
 import * as api from '@/lib/api';
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Badge } from '@/components/ui/badge';
+import { useTheme } from 'next-themes';
 
 export interface TrackInfo {
   track_id: number;
@@ -65,6 +66,8 @@ export function AudioPlayer({
 
   const currentIndex = currentTrack ? tracks.findIndex((t) => t.track_id === currentTrack.track_id) : -1;
   const displayDuration = duration > 0 ? duration : (currentTrack?.duration ?? 0);
+  const { resolvedTheme } = useTheme();
+  const isLightTheme = resolvedTheme === 'light';
 
   const sendRecoEvent = (eventType: api.RecoEventType, track: TrackInfo | null, playedSeconds?: number) => {
     if (!track || !recommendationSessionId) return;
@@ -471,40 +474,61 @@ export function AudioPlayer({
       </div>
 
       <Dialog open={showNowPlaying} onOpenChange={setShowNowPlaying}>
-        <DialogContent className="w-[100dvw] h-[100dvh] max-w-none p-0 overflow-hidden rounded-none border-0">
-          <div className="relative h-full text-white">
-            <div className="absolute inset-0 bg-zinc-950" />
+        <DialogContent className="w-[100dvw] h-[100dvh] max-w-none p-0 overflow-y-auto rounded-none border-0">
+          <div className={cn("relative min-h-full", isLightTheme ? "text-foreground" : "text-white")}>
+            <div className={cn("absolute inset-0", isLightTheme ? "bg-slate-100" : "bg-zinc-950")} />
             {(albumThumb && !coverError) ? (
               <img
                 src={albumThumb}
                 alt=""
-                className="absolute inset-0 h-full w-full object-cover blur-3xl scale-110 opacity-25"
+                className={cn(
+                  "absolute inset-0 h-full w-full object-cover blur-3xl scale-110",
+                  isLightTheme ? "opacity-15" : "opacity-25"
+                )}
                 onError={() => setCoverError(true)}
               />
             ) : null}
-            <div className="absolute inset-0 bg-gradient-to-b from-black/25 via-black/70 to-black" />
+            <div
+              className={cn(
+                "absolute inset-0",
+                isLightTheme
+                  ? "bg-gradient-to-b from-white/55 via-white/88 to-white"
+                  : "bg-gradient-to-b from-black/25 via-black/70 to-black"
+              )}
+            />
             <div className="absolute inset-0 opacity-50 pointer-events-none">
               <div className="absolute -top-24 -right-20 h-80 w-80 rounded-full bg-amber-500/10 blur-3xl" />
               <div className="absolute -bottom-28 -left-24 h-80 w-80 rounded-full bg-sky-500/10 blur-3xl" />
             </div>
 
             <div className="relative z-10 h-full flex flex-col">
-              <div className="flex items-center justify-between gap-3 px-4 md:px-6 py-3 border-b border-white/10 bg-black/25 backdrop-blur-sm">
+              <div
+                className={cn(
+                  "flex items-center justify-between gap-3 px-4 md:px-6 py-3 border-b backdrop-blur-sm",
+                  isLightTheme ? "border-border/70 bg-white/60" : "border-white/10 bg-black/25"
+                )}
+              >
                 <DialogHeader className="space-y-0">
-                  <DialogTitle className="text-white">Now Playing</DialogTitle>
+                  <DialogTitle className={cn(isLightTheme ? "text-foreground" : "text-white")}>Now Playing</DialogTitle>
                   <DialogDescription className="sr-only">
                     Full-screen player showing the current track and the queued track list.
                   </DialogDescription>
                 </DialogHeader>
                 <div className="flex items-center gap-2">
-                  <Badge className="bg-white/10 text-white border-white/10 hidden sm:inline-flex" variant="outline">
+                  <Badge
+                    className={cn(
+                      "hidden sm:inline-flex",
+                      isLightTheme ? "bg-background/75 text-foreground border-border/60" : "bg-white/10 text-white border-white/10"
+                    )}
+                    variant="outline"
+                  >
                     {tracks.length} tracks
                   </Badge>
                   <Button
                     type="button"
                     variant="ghost"
                     size="icon"
-                    className="h-9 w-9 text-white hover:bg-white/10"
+                    className={cn("h-9 w-9", isLightTheme ? "text-foreground hover:bg-black/5" : "text-white hover:bg-white/10")}
                     onClick={() => setShowNowPlaying(false)}
                     title="Collapse"
                   >
@@ -516,23 +540,33 @@ export function AudioPlayer({
               <div className="flex-1 min-h-0 overflow-hidden flex flex-col">
                 {/* Top: big cover + controls */}
                 <div className="p-6 md:p-10 flex flex-col items-center gap-6">
-                  <div className="relative w-[min(82vw,520px)] aspect-square rounded-3xl overflow-hidden bg-zinc-900 border border-white/10 shadow-[0_30px_110px_rgba(0,0,0,0.65)]">
+                  <div
+                    className={cn(
+                      "relative w-[min(82vw,520px)] aspect-square rounded-3xl overflow-hidden border shadow-[0_20px_72px_rgba(0,0,0,0.28)]",
+                      isLightTheme ? "bg-card border-border/60" : "bg-zinc-900 border-white/10 shadow-[0_30px_110px_rgba(0,0,0,0.65)]"
+                    )}
+                  >
                     {(albumThumb && !coverError) ? (
                       <img src={albumThumb} alt="" className="absolute inset-0 h-full w-full object-cover animate-in fade-in-0 duration-300" />
                     ) : (
                       <div className="absolute inset-0 flex items-center justify-center">
-                        <Music className="h-20 w-20 text-zinc-600" />
+                        <Music className={cn("h-20 w-20", isLightTheme ? "text-muted-foreground/70" : "text-zinc-600")} />
                       </div>
                     )}
-                    <div className="absolute inset-0 bg-gradient-to-t from-black/65 via-black/20 to-transparent" />
+                    <div
+                      className={cn(
+                        "absolute inset-0",
+                        isLightTheme ? "bg-gradient-to-t from-black/30 via-black/5 to-transparent" : "bg-gradient-to-t from-black/65 via-black/20 to-transparent"
+                      )}
+                    />
                   </div>
 
                   <div className="text-center space-y-1 max-w-[860px]">
-                    <div className="text-white/70 text-sm truncate">{currentTrack?.artist ?? ''}</div>
-                    <div className="text-white text-3xl md:text-4xl font-semibold tracking-tight truncate">
+                    <div className={cn("text-sm truncate", isLightTheme ? "text-muted-foreground" : "text-white/70")}>{currentTrack?.artist ?? ''}</div>
+                    <div className={cn("text-3xl md:text-4xl font-semibold tracking-tight truncate", isLightTheme ? "text-foreground" : "text-white")}>
                       {currentTrack?.title ?? '—'}
                     </div>
-                    <div className="text-white/55 text-sm truncate">{albumTitle}</div>
+                    <div className={cn("text-sm truncate", isLightTheme ? "text-muted-foreground/90" : "text-white/55")}>{albumTitle}</div>
                   </div>
 
                   <div className="w-full max-w-[780px] space-y-2">
@@ -541,9 +575,12 @@ export function AudioPlayer({
                       max={Math.max(1, displayDuration)}
                       step={1}
                       onValueChange={handleSeek}
-                      className="w-full [&_[data-orientation=horizontal]]:bg-white/15"
+                      className={cn(
+                        "w-full",
+                        isLightTheme ? "[&_[data-orientation=horizontal]]:bg-black/10" : "[&_[data-orientation=horizontal]]:bg-white/15"
+                      )}
                     />
-                    <div className="flex items-center justify-between text-xs text-white/60 tabular-nums">
+                    <div className={cn("flex items-center justify-between text-xs tabular-nums", isLightTheme ? "text-muted-foreground" : "text-white/60")}>
                       <span>{formatDuration(currentTime)}</span>
                       <span>{formatDuration(displayDuration)}</span>
                     </div>
@@ -553,7 +590,7 @@ export function AudioPlayer({
                     <Button
                       variant="ghost"
                       size="icon"
-                      className="h-11 w-11 rounded-full text-white hover:bg-white/10"
+                      className={cn("h-11 w-11 rounded-full", isLightTheme ? "text-foreground hover:bg-black/5" : "text-white hover:bg-white/10")}
                       onClick={prevTrack}
                       disabled={currentIndex <= 0}
                       title="Previous"
@@ -563,7 +600,12 @@ export function AudioPlayer({
                     <Button
                       variant="secondary"
                       size="icon"
-                      className="h-16 w-16 rounded-full bg-white/15 text-white hover:bg-white/20 border border-white/20"
+                      className={cn(
+                        "h-16 w-16 rounded-full border",
+                        isLightTheme
+                          ? "bg-background/80 text-foreground hover:bg-background border-border/60"
+                          : "bg-white/15 text-white hover:bg-white/20 border-white/20"
+                      )}
                       onClick={togglePlayPause}
                       title={isPlaying ? 'Pause' : 'Play'}
                     >
@@ -572,7 +614,7 @@ export function AudioPlayer({
                     <Button
                       variant="ghost"
                       size="icon"
-                      className="h-11 w-11 rounded-full text-white hover:bg-white/10"
+                      className={cn("h-11 w-11 rounded-full", isLightTheme ? "text-foreground hover:bg-black/5" : "text-white hover:bg-white/10")}
                       onClick={nextTrack}
                       disabled={currentIndex < 0 || currentIndex >= tracks.length - 1}
                       title="Next"
@@ -583,7 +625,11 @@ export function AudioPlayer({
                       <Button
                         variant="ghost"
                         size="icon"
-                        className={cn("h-10 w-10 rounded-full text-white hover:bg-white/10", trackLiked ? "text-emerald-300" : "")}
+                        className={cn(
+                          "h-10 w-10 rounded-full",
+                          isLightTheme ? "text-foreground hover:bg-black/5" : "text-white hover:bg-white/10",
+                          trackLiked ? "text-emerald-300" : ""
+                        )}
                         onClick={() => void toggleTrackLike()}
                         title={trackLiked ? "Liked" : "Like"}
                       >
@@ -592,7 +638,7 @@ export function AudioPlayer({
                       <Button
                         variant="ghost"
                         size="icon"
-                        className="h-10 w-10 rounded-full text-white hover:bg-white/10"
+                        className={cn("h-10 w-10 rounded-full", isLightTheme ? "text-foreground hover:bg-black/5" : "text-white hover:bg-white/10")}
                         onClick={() => void dislikeTrack()}
                         title="Dislike"
                       >
@@ -603,10 +649,15 @@ export function AudioPlayer({
                 </div>
 
                 {/* Bottom: track list */}
-                <div className="flex-1 min-h-0 border-t border-white/10 bg-black/25 flex flex-col">
+                <div
+                  className={cn(
+                    "flex-1 min-h-0 border-t flex flex-col",
+                    isLightTheme ? "border-border/70 bg-white/55" : "border-white/10 bg-black/25"
+                  )}
+                >
                   <div className="px-4 md:px-6 py-3 flex items-center justify-between gap-3">
-                    <div className="text-sm font-medium text-white/85">Tracks</div>
-                    <div className="text-xs text-white/55 tabular-nums">
+                    <div className={cn("text-sm font-medium", isLightTheme ? "text-foreground" : "text-white/85")}>Tracks</div>
+                    <div className={cn("text-xs tabular-nums", isLightTheme ? "text-muted-foreground" : "text-white/55")}>
                       {currentIndex >= 0 ? `${currentIndex + 1}/${tracks.length}` : `${tracks.length}`}
                     </div>
                   </div>
@@ -628,15 +679,16 @@ export function AudioPlayer({
                             }
                           }}
                           className={cn(
-                            'flex w-full items-center gap-3 rounded-xl px-3 py-2 text-left text-sm transition-colors hover:bg-white/10',
+                            'flex w-full items-center gap-3 rounded-xl px-3 py-2 text-left text-sm transition-colors',
+                            isLightTheme ? 'hover:bg-black/5' : 'hover:bg-white/10',
                             'cursor-grab active:cursor-grabbing',
-                            currentTrack?.track_id === track.track_id && 'bg-white/10 text-white'
+                            currentTrack?.track_id === track.track_id && (isLightTheme ? 'bg-black/10 text-foreground' : 'bg-white/10 text-white')
                           )}
                         >
-                          <GripVertical className="h-4 w-4 text-white/25 shrink-0" />
-                          <span className="w-10 shrink-0 text-white/45 tabular-nums">{track.index}</span>
-                          <span className="min-w-0 flex-1 truncate text-white/90">{track.title}</span>
-                          <span className="shrink-0 text-xs text-white/45 tabular-nums">{formatDuration(track.duration)}</span>
+                          <GripVertical className={cn("h-4 w-4 shrink-0", isLightTheme ? "text-muted-foreground/50" : "text-white/25")} />
+                          <span className={cn("w-10 shrink-0 tabular-nums", isLightTheme ? "text-muted-foreground/80" : "text-white/45")}>{track.index}</span>
+                          <span className={cn("min-w-0 flex-1 truncate", isLightTheme ? "text-foreground/95" : "text-white/90")}>{track.title}</span>
+                          <span className={cn("shrink-0 text-xs tabular-nums", isLightTheme ? "text-muted-foreground/80" : "text-white/45")}>{formatDuration(track.duration)}</span>
                         </button>
                       ))}
                     </div>

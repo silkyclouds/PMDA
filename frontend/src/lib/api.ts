@@ -458,6 +458,12 @@ export interface PMDAConfig {
   ARTWORK_RAM_CACHE_TTL_SEC?: number;
   /** Max single artwork payload admitted in RAM cache (MB). */
   ARTWORK_RAM_CACHE_MAX_ITEM_MB?: number;
+  /** Auto-tune artwork RAM cache from currently available memory. */
+  ARTWORK_RAM_CACHE_AUTO?: boolean;
+  /** Optional hard cap for auto artwork RAM cache (MB). 0 = no explicit cap. */
+  ARTWORK_RAM_CACHE_AUTO_MAX_MB?: number;
+  /** Auto-tune interval (seconds). */
+  ARTWORK_RAM_CACHE_AUTO_INTERVAL_SEC?: number;
   /** When true (Files mode), rebuild the export library automatically after a Magic scan. */
   AUTO_EXPORT_LIBRARY?: boolean;
   

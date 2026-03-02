@@ -558,6 +558,9 @@ PMDA_MEDIA_CACHE_ROOT = (os.getenv("PMDA_MEDIA_CACHE_ROOT", "") or "").strip()
 PMDA_ARTWORK_RAM_CACHE_MB = int(max(0, _parse_int(os.getenv("PMDA_ARTWORK_RAM_CACHE_MB", "1024"), 1024) or 1024))
 PMDA_ARTWORK_RAM_CACHE_TTL_SEC = int(max(60, _parse_int(os.getenv("PMDA_ARTWORK_RAM_CACHE_TTL_SEC", "21600"), 21600) or 21600))
 PMDA_ARTWORK_RAM_CACHE_MAX_ITEM_MB = int(max(1, _parse_int(os.getenv("PMDA_ARTWORK_RAM_CACHE_MAX_ITEM_MB", "8"), 8) or 8))
+PMDA_ARTWORK_RAM_CACHE_AUTO = _parse_bool(os.getenv("PMDA_ARTWORK_RAM_CACHE_AUTO", "true"))
+PMDA_ARTWORK_RAM_CACHE_AUTO_MAX_MB = int(max(0, _parse_int(os.getenv("PMDA_ARTWORK_RAM_CACHE_AUTO_MAX_MB", "0"), 0) or 0))
+PMDA_ARTWORK_RAM_CACHE_AUTO_INTERVAL_SEC = int(max(30, _parse_int(os.getenv("PMDA_ARTWORK_RAM_CACHE_AUTO_INTERVAL_SEC", "120"), 120) or 120))
 PMDA_FILES_WATCHER_ENABLED = _parse_bool(os.getenv("PMDA_FILES_WATCHER_ENABLED", "true"))
 PMDA_FILES_WATCHER_LOG_COOLDOWN_SEC = float(os.getenv("PMDA_FILES_WATCHER_LOG_COOLDOWN_SEC", "10") or "10")
 PMDA_AUTO_CHANGED_ONLY_SCAN = _parse_bool(os.getenv("PMDA_AUTO_CHANGED_ONLY_SCAN", "true"))
@@ -1254,6 +1257,9 @@ merged = {
     "ARTWORK_RAM_CACHE_MB": _get("ARTWORK_RAM_CACHE_MB", default=PMDA_ARTWORK_RAM_CACHE_MB, cast=lambda v: max(0, _parse_int(v, PMDA_ARTWORK_RAM_CACHE_MB) or PMDA_ARTWORK_RAM_CACHE_MB)),
     "ARTWORK_RAM_CACHE_TTL_SEC": _get("ARTWORK_RAM_CACHE_TTL_SEC", default=PMDA_ARTWORK_RAM_CACHE_TTL_SEC, cast=lambda v: max(60, _parse_int(v, PMDA_ARTWORK_RAM_CACHE_TTL_SEC) or PMDA_ARTWORK_RAM_CACHE_TTL_SEC)),
     "ARTWORK_RAM_CACHE_MAX_ITEM_MB": _get("ARTWORK_RAM_CACHE_MAX_ITEM_MB", default=PMDA_ARTWORK_RAM_CACHE_MAX_ITEM_MB, cast=lambda v: max(1, _parse_int(v, PMDA_ARTWORK_RAM_CACHE_MAX_ITEM_MB) or PMDA_ARTWORK_RAM_CACHE_MAX_ITEM_MB)),
+    "ARTWORK_RAM_CACHE_AUTO": _get("ARTWORK_RAM_CACHE_AUTO", default=PMDA_ARTWORK_RAM_CACHE_AUTO, cast=_parse_bool),
+    "ARTWORK_RAM_CACHE_AUTO_MAX_MB": _get("ARTWORK_RAM_CACHE_AUTO_MAX_MB", default=PMDA_ARTWORK_RAM_CACHE_AUTO_MAX_MB, cast=lambda v: max(0, _parse_int(v, PMDA_ARTWORK_RAM_CACHE_AUTO_MAX_MB) or PMDA_ARTWORK_RAM_CACHE_AUTO_MAX_MB)),
+    "ARTWORK_RAM_CACHE_AUTO_INTERVAL_SEC": _get("ARTWORK_RAM_CACHE_AUTO_INTERVAL_SEC", default=PMDA_ARTWORK_RAM_CACHE_AUTO_INTERVAL_SEC, cast=lambda v: max(30, _parse_int(v, PMDA_ARTWORK_RAM_CACHE_AUTO_INTERVAL_SEC) or PMDA_ARTWORK_RAM_CACHE_AUTO_INTERVAL_SEC)),
 }
 # PATH_MAP and all config from _get() (SQLite only > default)
 
@@ -1270,6 +1276,9 @@ MEDIA_CACHE_ROOT: str = str(merged.get("MEDIA_CACHE_ROOT", PMDA_MEDIA_CACHE_ROOT
 ARTWORK_RAM_CACHE_MB: int = int(max(0, _parse_int(merged.get("ARTWORK_RAM_CACHE_MB"), PMDA_ARTWORK_RAM_CACHE_MB) or PMDA_ARTWORK_RAM_CACHE_MB))
 ARTWORK_RAM_CACHE_TTL_SEC: int = int(max(60, _parse_int(merged.get("ARTWORK_RAM_CACHE_TTL_SEC"), PMDA_ARTWORK_RAM_CACHE_TTL_SEC) or PMDA_ARTWORK_RAM_CACHE_TTL_SEC))
 ARTWORK_RAM_CACHE_MAX_ITEM_MB: int = int(max(1, _parse_int(merged.get("ARTWORK_RAM_CACHE_MAX_ITEM_MB"), PMDA_ARTWORK_RAM_CACHE_MAX_ITEM_MB) or PMDA_ARTWORK_RAM_CACHE_MAX_ITEM_MB))
+ARTWORK_RAM_CACHE_AUTO: bool = bool(merged.get("ARTWORK_RAM_CACHE_AUTO", PMDA_ARTWORK_RAM_CACHE_AUTO))
+ARTWORK_RAM_CACHE_AUTO_MAX_MB: int = int(max(0, _parse_int(merged.get("ARTWORK_RAM_CACHE_AUTO_MAX_MB"), PMDA_ARTWORK_RAM_CACHE_AUTO_MAX_MB) or PMDA_ARTWORK_RAM_CACHE_AUTO_MAX_MB))
+ARTWORK_RAM_CACHE_AUTO_INTERVAL_SEC: int = int(max(30, _parse_int(merged.get("ARTWORK_RAM_CACHE_AUTO_INTERVAL_SEC"), PMDA_ARTWORK_RAM_CACHE_AUTO_INTERVAL_SEC) or PMDA_ARTWORK_RAM_CACHE_AUTO_INTERVAL_SEC))
 USE_MUSICBRAINZ: bool = bool(merged["USE_MUSICBRAINZ"])
 MUSICBRAINZ_EMAIL: str = merged.get("MUSICBRAINZ_EMAIL", "pmda@example.com")
 MB_QUEUE_ENABLED: bool = bool(merged.get("MB_QUEUE_ENABLED", True))
@@ -4621,6 +4630,42 @@ def _read_container_memory_stats() -> dict:
     }
 
 
+def _read_host_mem_available_bytes() -> int:
+    meminfo = Path("/proc/meminfo")
+    if not meminfo.exists():
+        return 0
+    try:
+        for line in meminfo.read_text(encoding="utf-8", errors="ignore").splitlines():
+            if not line.startswith("MemAvailable:"):
+                continue
+            # e.g. "MemAvailable:   23623452 kB"
+            parts = line.split()
+            if len(parts) >= 2:
+                return max(0, int(parts[1]) * 1024)
+    except Exception:
+        return 0
+    return 0
+
+
+def _effective_available_memory_bytes() -> int:
+    """
+    Conservative "currently available" memory budget.
+    Uses the minimum of cgroup-available and host MemAvailable when both exist.
+    """
+    stats = _read_container_memory_stats()
+    candidates: list[int] = []
+    cgroup_current = int(stats.get("current_bytes") or 0)
+    cgroup_limit = int(stats.get("limit_bytes") or 0)
+    if cgroup_limit > 0:
+        candidates.append(max(0, cgroup_limit - cgroup_current))
+    host_available = _read_host_mem_available_bytes()
+    if host_available > 0:
+        candidates.append(host_available)
+    if not candidates:
+        return 0
+    return max(0, min(candidates))
+
+
 def _path_size_bytes(path: Path) -> int:
     try:
         return int(path.stat().st_size)
@@ -5679,6 +5724,9 @@ _ARTWORK_RAM_CACHE_MAX_ITEM_BYTES = int(max(1, ARTWORK_RAM_CACHE_MAX_ITEM_MB) * 
 _ARTWORK_RAM_CACHE: "OrderedDict[str, dict]" = OrderedDict()
 _ARTWORK_RAM_CACHE_BYTES = 0
 _ARTWORK_RAM_CACHE_LOCK = threading.Lock()
+_ARTWORK_RAM_CACHE_AUTO_THREAD: Optional[threading.Thread] = None
+_ARTWORK_RAM_CACHE_AUTO_LOCK = threading.Lock()
+_ARTWORK_RAM_CACHE_AUTO_LAST_APPLIED_MB: Optional[int] = None
 _TRANSPARENT_PNG_1PX = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII="
 )
@@ -5712,6 +5760,66 @@ def _reconfigure_artwork_ram_cache(*, cache_mb: Optional[int] = None, ttl_sec: O
         while _ARTWORK_RAM_CACHE and int(_ARTWORK_RAM_CACHE_BYTES) > _ARTWORK_RAM_CACHE_MAX_BYTES:
             _, old = _ARTWORK_RAM_CACHE.popitem(last=False)
             _ARTWORK_RAM_CACHE_BYTES = max(0, int(_ARTWORK_RAM_CACHE_BYTES) - int(old.get("blob_size") or 0))
+
+
+def _compute_auto_artwork_ram_target_mb() -> int:
+    """
+    Compute a dynamic RAM cache budget from currently available memory.
+    Uses ~75% of available bytes (cgroup-aware), optionally capped by user setting.
+    """
+    available_bytes = _effective_available_memory_bytes()
+    if available_bytes <= 0:
+        target_mb = int(max(0, ARTWORK_RAM_CACHE_MB))
+    else:
+        target_mb = int((float(available_bytes) * 0.75) / (1024.0 * 1024.0))
+        target_mb = max(256, target_mb)
+    if int(ARTWORK_RAM_CACHE_AUTO_MAX_MB or 0) > 0:
+        target_mb = min(target_mb, int(ARTWORK_RAM_CACHE_AUTO_MAX_MB))
+    return int(max(0, min(65536, target_mb)))
+
+
+def _apply_auto_artwork_ram_target(*, force: bool = False) -> int:
+    """
+    Apply auto RAM target when enabled.
+    Returns the applied/active cache size in MB.
+    """
+    global _ARTWORK_RAM_CACHE_AUTO_LAST_APPLIED_MB
+    if not bool(ARTWORK_RAM_CACHE_AUTO):
+        return int(max(0, ARTWORK_RAM_CACHE_MB))
+    target_mb = _compute_auto_artwork_ram_target_mb()
+    current_mb = int(max(0, ARTWORK_RAM_CACHE_MB))
+    delta = abs(target_mb - current_mb)
+    threshold = max(256, int(current_mb * 0.15))
+    if (not force) and delta < threshold:
+        return current_mb
+    _reconfigure_artwork_ram_cache(cache_mb=target_mb)
+    _ARTWORK_RAM_CACHE_AUTO_LAST_APPLIED_MB = target_mb
+    return target_mb
+
+
+def _artwork_ram_cache_auto_worker() -> None:
+    while True:
+        try:
+            if bool(ARTWORK_RAM_CACHE_AUTO):
+                _apply_auto_artwork_ram_target()
+        except Exception:
+            logging.debug("Artwork RAM auto-tune iteration failed", exc_info=True)
+        # Read dynamic interval every loop so settings apply live.
+        sleep_sec = int(max(30, ARTWORK_RAM_CACHE_AUTO_INTERVAL_SEC or 120))
+        time.sleep(sleep_sec)
+
+
+def _start_artwork_ram_cache_auto_worker() -> None:
+    global _ARTWORK_RAM_CACHE_AUTO_THREAD
+    with _ARTWORK_RAM_CACHE_AUTO_LOCK:
+        if _ARTWORK_RAM_CACHE_AUTO_THREAD and _ARTWORK_RAM_CACHE_AUTO_THREAD.is_alive():
+            return
+        _ARTWORK_RAM_CACHE_AUTO_THREAD = threading.Thread(
+            target=_artwork_ram_cache_auto_worker,
+            daemon=True,
+            name="artwork-ram-auto",
+        )
+        _ARTWORK_RAM_CACHE_AUTO_THREAD.start()
 
 
 def _media_cache_root_dir() -> Path:
@@ -29102,6 +29210,9 @@ def api_config_get():
         "ARTWORK_RAM_CACHE_MB": int(get_setting("ARTWORK_RAM_CACHE_MB", ARTWORK_RAM_CACHE_MB) or ARTWORK_RAM_CACHE_MB),
         "ARTWORK_RAM_CACHE_TTL_SEC": int(get_setting("ARTWORK_RAM_CACHE_TTL_SEC", ARTWORK_RAM_CACHE_TTL_SEC) or ARTWORK_RAM_CACHE_TTL_SEC),
         "ARTWORK_RAM_CACHE_MAX_ITEM_MB": int(get_setting("ARTWORK_RAM_CACHE_MAX_ITEM_MB", ARTWORK_RAM_CACHE_MAX_ITEM_MB) or ARTWORK_RAM_CACHE_MAX_ITEM_MB),
+        "ARTWORK_RAM_CACHE_AUTO": get_setting_bool("ARTWORK_RAM_CACHE_AUTO", ARTWORK_RAM_CACHE_AUTO),
+        "ARTWORK_RAM_CACHE_AUTO_MAX_MB": int(get_setting("ARTWORK_RAM_CACHE_AUTO_MAX_MB", ARTWORK_RAM_CACHE_AUTO_MAX_MB) or ARTWORK_RAM_CACHE_AUTO_MAX_MB),
+        "ARTWORK_RAM_CACHE_AUTO_INTERVAL_SEC": int(get_setting("ARTWORK_RAM_CACHE_AUTO_INTERVAL_SEC", ARTWORK_RAM_CACHE_AUTO_INTERVAL_SEC) or ARTWORK_RAM_CACHE_AUTO_INTERVAL_SEC),
         "AUTO_EXPORT_LIBRARY": get_setting_bool("AUTO_EXPORT_LIBRARY", AUTO_EXPORT_LIBRARY),
         "paths_status": _paths_rw_status(),
         "container_mounts": _container_mounts_status(),
@@ -29437,10 +29548,21 @@ def _apply_settings_in_memory(updates: dict):
             logging.info("MEDIA_CACHE_ROOT updated in memory: %s", MEDIA_CACHE_ROOT)
         except Exception as e:
             logging.warning("Could not initialize MEDIA_CACHE_ROOT=%s: %s", MEDIA_CACHE_ROOT, e)
-    if any(k in updates for k in ("ARTWORK_RAM_CACHE_MB", "ARTWORK_RAM_CACHE_TTL_SEC", "ARTWORK_RAM_CACHE_MAX_ITEM_MB")):
+    if any(
+        k in updates
+        for k in (
+            "ARTWORK_RAM_CACHE_MB",
+            "ARTWORK_RAM_CACHE_TTL_SEC",
+            "ARTWORK_RAM_CACHE_MAX_ITEM_MB",
+            "ARTWORK_RAM_CACHE_AUTO",
+            "ARTWORK_RAM_CACHE_AUTO_MAX_MB",
+            "ARTWORK_RAM_CACHE_AUTO_INTERVAL_SEC",
+        )
+    ):
         next_mb: Optional[int] = None
         next_ttl: Optional[int] = None
         next_item_mb: Optional[int] = None
+        global ARTWORK_RAM_CACHE_AUTO, ARTWORK_RAM_CACHE_AUTO_MAX_MB, ARTWORK_RAM_CACHE_AUTO_INTERVAL_SEC
         if "ARTWORK_RAM_CACHE_MB" in updates:
             try:
                 next_mb = max(0, min(65536, int(updates["ARTWORK_RAM_CACHE_MB"])))
@@ -29459,12 +29581,34 @@ def _apply_settings_in_memory(updates: dict):
             except (ValueError, TypeError):
                 next_item_mb = ARTWORK_RAM_CACHE_MAX_ITEM_MB
             mod.merged["ARTWORK_RAM_CACHE_MAX_ITEM_MB"] = next_item_mb
+        if "ARTWORK_RAM_CACHE_AUTO" in updates:
+            ARTWORK_RAM_CACHE_AUTO = bool(_parse_bool(updates["ARTWORK_RAM_CACHE_AUTO"]))
+            mod.merged["ARTWORK_RAM_CACHE_AUTO"] = ARTWORK_RAM_CACHE_AUTO
+        if "ARTWORK_RAM_CACHE_AUTO_MAX_MB" in updates:
+            try:
+                ARTWORK_RAM_CACHE_AUTO_MAX_MB = max(0, min(65536, int(updates["ARTWORK_RAM_CACHE_AUTO_MAX_MB"])))
+            except (ValueError, TypeError):
+                pass
+            mod.merged["ARTWORK_RAM_CACHE_AUTO_MAX_MB"] = ARTWORK_RAM_CACHE_AUTO_MAX_MB
+        if "ARTWORK_RAM_CACHE_AUTO_INTERVAL_SEC" in updates:
+            try:
+                ARTWORK_RAM_CACHE_AUTO_INTERVAL_SEC = max(30, min(3600, int(updates["ARTWORK_RAM_CACHE_AUTO_INTERVAL_SEC"])))
+            except (ValueError, TypeError):
+                pass
+            mod.merged["ARTWORK_RAM_CACHE_AUTO_INTERVAL_SEC"] = ARTWORK_RAM_CACHE_AUTO_INTERVAL_SEC
         _reconfigure_artwork_ram_cache(cache_mb=next_mb, ttl_sec=next_ttl, item_mb=next_item_mb)
+        _start_artwork_ram_cache_auto_worker()
+        if ARTWORK_RAM_CACHE_AUTO:
+            applied = _apply_auto_artwork_ram_target(force=True)
+            logging.info("Artwork RAM auto-tune applied: %dMB (cap=%dMB interval=%ss)", applied, ARTWORK_RAM_CACHE_AUTO_MAX_MB, ARTWORK_RAM_CACHE_AUTO_INTERVAL_SEC)
         logging.info(
-            "Artwork RAM cache updated in memory: max=%dMB ttl=%ds item_max=%dMB",
+            "Artwork RAM cache updated in memory: max=%dMB ttl=%ds item_max=%dMB auto=%s cap=%dMB interval=%ss",
             ARTWORK_RAM_CACHE_MB,
             ARTWORK_RAM_CACHE_TTL_SEC,
             ARTWORK_RAM_CACHE_MAX_ITEM_MB,
+            ARTWORK_RAM_CACHE_AUTO,
+            ARTWORK_RAM_CACHE_AUTO_MAX_MB,
+            ARTWORK_RAM_CACHE_AUTO_INTERVAL_SEC,
         )
     if "IMPROVE_ALL_WORKERS" in updates:
         global IMPROVE_ALL_WORKERS
@@ -29727,6 +29871,7 @@ def api_config_put():
         "INCOMPLETE_ALBUMS_TARGET_DIR",
         "SCAN_DISABLE_CACHE",
         "ARTWORK_RAM_CACHE_MB", "ARTWORK_RAM_CACHE_TTL_SEC", "ARTWORK_RAM_CACHE_MAX_ITEM_MB",
+        "ARTWORK_RAM_CACHE_AUTO", "ARTWORK_RAM_CACHE_AUTO_MAX_MB", "ARTWORK_RAM_CACHE_AUTO_INTERVAL_SEC",
         # Concert discovery (UI filtering)
         "CONCERTS_FILTER_ENABLED", "CONCERTS_HOME_LAT", "CONCERTS_HOME_LON", "CONCERTS_RADIUS_KM",
         # Library backend & file-library settings
@@ -29803,6 +29948,18 @@ def api_config_put():
             updates["ARTWORK_RAM_CACHE_MAX_ITEM_MB"] = max(1, min(64, int(updates["ARTWORK_RAM_CACHE_MAX_ITEM_MB"])))
         except (ValueError, TypeError):
             updates["ARTWORK_RAM_CACHE_MAX_ITEM_MB"] = int(max(1, ARTWORK_RAM_CACHE_MAX_ITEM_MB))
+    if "ARTWORK_RAM_CACHE_AUTO" in updates:
+        updates["ARTWORK_RAM_CACHE_AUTO"] = bool(_parse_bool(updates["ARTWORK_RAM_CACHE_AUTO"]))
+    if "ARTWORK_RAM_CACHE_AUTO_MAX_MB" in updates:
+        try:
+            updates["ARTWORK_RAM_CACHE_AUTO_MAX_MB"] = max(0, min(65536, int(updates["ARTWORK_RAM_CACHE_AUTO_MAX_MB"])))
+        except (ValueError, TypeError):
+            updates["ARTWORK_RAM_CACHE_AUTO_MAX_MB"] = int(max(0, ARTWORK_RAM_CACHE_AUTO_MAX_MB))
+    if "ARTWORK_RAM_CACHE_AUTO_INTERVAL_SEC" in updates:
+        try:
+            updates["ARTWORK_RAM_CACHE_AUTO_INTERVAL_SEC"] = max(30, min(3600, int(updates["ARTWORK_RAM_CACHE_AUTO_INTERVAL_SEC"])))
+        except (ValueError, TypeError):
+            updates["ARTWORK_RAM_CACHE_AUTO_INTERVAL_SEC"] = int(max(30, ARTWORK_RAM_CACHE_AUTO_INTERVAL_SEC))
     if "PROVIDER_IDENTITY_MIN_SCORE" in updates:
         try:
             updates["PROVIDER_IDENTITY_MIN_SCORE"] = max(0.0, min(1.0, float(updates["PROVIDER_IDENTITY_MIN_SCORE"])))
@@ -38086,12 +38243,11 @@ def api_library_album_tracks(album_id):
                     (album_id,),
                 )
                 rows = cur.fetchall()
-            # If durations are missing (0), compute them on-demand via ffprobe and persist.
-            # This keeps the Files index lightweight while ensuring the player UI shows real durations.
-            duration_overrides = _files_fix_missing_album_track_durations(
-                conn,
-                album_id=int(album_id),
+            _schedule_album_detail_enrichment(
+                int(album_id),
                 rows=[(int(r[0] or 0), int(r[2] or 0), str(r[4] or "")) for r in rows],
+                has_cover=bool(has_cover),
+                cover_path_raw="",
             )
             base_url = request.url_root.rstrip("/")
             tracks = [
@@ -38100,13 +38256,13 @@ def api_library_album_tracks(album_id):
                     "title": r[1] or "",
                     "artist": artist_name,
                     "album": album_title,
-                    "duration": int(duration_overrides.get(int(r[0] or 0)) or (r[2] or 0) or 0),
+                    "duration": int(r[2] or 0),
                     "index": int(r[3] or 0),
                     "file_url": f"{base_url}/api/library/track/{int(r[0])}/stream",
                 }
                 for r in rows
             ]
-            album_thumb = f"{base_url}/api/library/files/album/{album_id}/cover?size=320" if has_cover else None
+            album_thumb = f"{base_url}/api/library/files/album/{album_id}/cover?size=320"
             return jsonify({"tracks": tracks, "album_thumb": album_thumb})
         finally:
             conn.close()
@@ -38216,6 +38372,101 @@ def _files_fix_missing_album_track_durations(conn, *, album_id: int, rows: list[
         return duration_overrides
     except Exception:
         return {}
+
+
+_ALBUM_DETAIL_ENRICH_INFLIGHT: set[int] = set()
+_ALBUM_DETAIL_ENRICH_LAST_TS: dict[int, float] = {}
+_ALBUM_DETAIL_ENRICH_LOCK = threading.Lock()
+_ALBUM_DETAIL_ENRICH_COOLDOWN_SEC = 60 * 15
+
+
+def _run_album_detail_enrichment(album_id: int, *, rows: list[tuple[int, int, str]], has_cover: bool, cover_path_raw: str) -> None:
+    """
+    Background enrichment for album detail:
+    - fill missing track durations via ffprobe
+    - try embedded cover extraction if album has no persisted cover
+    """
+    album_id = int(album_id or 0)
+    if album_id <= 0:
+        return
+    conn = _files_pg_connect()
+    if conn is None:
+        return
+    try:
+        _files_fix_missing_album_track_durations(conn, album_id=album_id, rows=rows)
+        if bool(has_cover) or str(cover_path_raw or "").strip():
+            return
+        # Embedded cover fallback: first readable track only.
+        first_track = None
+        for _tid, _dur, raw_path in (rows or []):
+            p = path_for_fs_access(Path(str(raw_path or "")))
+            if p.exists() and p.is_file():
+                first_track = p
+                break
+        if first_track is None:
+            return
+        embedded = _extract_embedded_cover_from_audio(first_track)
+        if not embedded:
+            return
+        raw, mime = embedded
+        master_cached = _ensure_cached_image_from_bytes(
+            raw,
+            mime,
+            kind="embedded",
+            cache_key_hint=f"album-{album_id}-master",
+            max_px=1600,
+        )
+        if not master_cached or not master_cached.exists():
+            return
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE files_albums
+                    SET has_cover = TRUE,
+                        cover_path = %s,
+                        updated_at = NOW()
+                    WHERE id = %s
+                    """,
+                    (str(master_cached), int(album_id)),
+                )
+        _files_cache_invalidate_all()
+    except Exception:
+        logging.debug("Album detail enrichment failed for album_id=%s", album_id, exc_info=True)
+    finally:
+        conn.close()
+        with _ALBUM_DETAIL_ENRICH_LOCK:
+            _ALBUM_DETAIL_ENRICH_INFLIGHT.discard(album_id)
+            _ALBUM_DETAIL_ENRICH_LAST_TS[album_id] = time.time()
+
+
+def _schedule_album_detail_enrichment(album_id: int, *, rows: list[tuple[int, int, str]], has_cover: bool, cover_path_raw: str) -> None:
+    album_id = int(album_id or 0)
+    if album_id <= 0:
+        return
+    need_duration = any(int(dur or 0) <= 0 for _tid, dur, _fpath in (rows or []))
+    need_cover = not bool(has_cover or str(cover_path_raw or "").strip())
+    if not (need_duration or need_cover):
+        return
+    now = time.time()
+    with _ALBUM_DETAIL_ENRICH_LOCK:
+        if album_id in _ALBUM_DETAIL_ENRICH_INFLIGHT:
+            return
+        last_ts = float(_ALBUM_DETAIL_ENRICH_LAST_TS.get(album_id) or 0.0)
+        if (now - last_ts) < float(_ALBUM_DETAIL_ENRICH_COOLDOWN_SEC):
+            return
+        _ALBUM_DETAIL_ENRICH_INFLIGHT.add(album_id)
+    threading.Thread(
+        target=_run_album_detail_enrichment,
+        kwargs={
+            "album_id": album_id,
+            "rows": list(rows or []),
+            "has_cover": bool(has_cover),
+            "cover_path_raw": str(cover_path_raw or ""),
+        },
+        daemon=True,
+        name=f"album-enrich-{album_id}",
+    ).start()
 
 
 @app.get("/api/library/album/<int:album_id>")
@@ -38340,7 +38591,7 @@ def api_library_album_detail(album_id: int):
 
         has_cover_effective = bool(has_cover)
         cover_path_effective = str(cover_path_raw or "").strip()
-        if cover_path_effective and not has_cover_effective:
+        if cover_path_effective:
             try:
                 cp = path_for_fs_access(Path(cover_path_effective))
                 if cp.exists() and cp.is_file():
@@ -38348,49 +38599,13 @@ def api_library_album_detail(album_id: int):
             except Exception:
                 pass
 
-        cover_persist_needed = False
-        if not has_cover_effective and track_rows:
-            try:
-                first_track_path = path_for_fs_access(Path(str(track_rows[0][10] or "")))
-                embedded = _extract_embedded_cover_from_audio(first_track_path)
-            except Exception:
-                embedded = None
-            if embedded:
-                raw, mime = embedded
-                master_cached = _ensure_cached_image_from_bytes(
-                    raw,
-                    mime,
-                    kind="embedded",
-                    cache_key_hint=f"album-{album_id}-master",
-                    max_px=1600,
-                )
-                if master_cached and master_cached.exists():
-                    cover_path_effective = str(master_cached)
-                has_cover_effective = True
-                cover_persist_needed = True
-
-        if cover_persist_needed:
-            try:
-                with conn.transaction():
-                    with conn.cursor() as cur:
-                        cur.execute(
-                            """
-                            UPDATE files_albums
-                            SET has_cover = TRUE,
-                                cover_path = %s,
-                                updated_at = NOW()
-                            WHERE id = %s
-                            """,
-                            (cover_path_effective, int(album_id)),
-                        )
-                _files_cache_invalidate_all()
-            except Exception:
-                logging.debug("Unable to persist embedded cover state for album_id=%s", album_id, exc_info=True)
-
-        duration_overrides = _files_fix_missing_album_track_durations(
-            conn,
-            album_id=int(album_id),
-            rows=[(int(r[0] or 0), int(r[4] or 0), str(r[10] or "")) for r in track_rows],
+        # Keep this endpoint fast: background enrichment handles missing durations/embedded cover.
+        enrich_rows = [(int(r[0] or 0), int(r[4] or 0), str(r[10] or "")) for r in track_rows]
+        _schedule_album_detail_enrichment(
+            int(album_id),
+            rows=enrich_rows,
+            has_cover=bool(has_cover_effective),
+            cover_path_raw=cover_path_effective,
         )
 
         base_url = request.url_root.rstrip("/")
@@ -38400,7 +38615,7 @@ def api_library_album_detail(album_id: int):
             title = str(r[1] or "").strip()
             disc_num = int(r[2] or 0)
             track_num = int(r[3] or 0)
-            dur = int(duration_overrides.get(tid) or (r[4] or 0) or 0)
+            dur = int(r[4] or 0)
             t_fmt = (r[5] or "").strip()
             bitrate = int(r[6] or 0)
             sample_rate = int(r[7] or 0)
@@ -38443,7 +38658,8 @@ def api_library_album_detail(album_id: int):
         if total_duration_sec <= 0 and tracks:
             total_duration_sec = sum(int(t.get("duration_sec") or 0) for t in tracks)
 
-        cover_url = f"{base_url}/api/library/files/album/{album_id}/cover?size=640" if bool(has_cover_effective) else None
+        # Always expose the cover endpoint; it can still resolve folder/embedded art lazily.
+        cover_url = f"{base_url}/api/library/files/album/{album_id}/cover?size=640"
 
         payload = {
             "album_id": int(album_id),
@@ -44901,6 +45117,13 @@ if __name__ == "__main__":
     server_thread = threading.Thread(target=run_server, daemon=False)
     server_thread.start()
     logging.info("Web UI listening on http://0.0.0.0:%s", WEBUI_PORT)
+    _start_artwork_ram_cache_auto_worker()
+    if ARTWORK_RAM_CACHE_AUTO:
+        try:
+            applied = _apply_auto_artwork_ram_target(force=True)
+            logging.info("Artwork RAM auto-tune initialized at %dMB (cap=%dMB, interval=%ss)", applied, ARTWORK_RAM_CACHE_AUTO_MAX_MB, ARTWORK_RAM_CACHE_AUTO_INTERVAL_SEC)
+        except Exception:
+            logging.debug("Artwork RAM auto-tune init failed", exc_info=True)
 
     def run_cross_check_background():
         if _get_library_mode() == "files":

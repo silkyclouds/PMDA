@@ -5,7 +5,6 @@ import { ArrowLeft, Calendar, ExternalLink, ListPlus, Loader2, Music, Play, Plus
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
-import { ScrollArea } from '@/components/ui/scroll-area';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
@@ -279,7 +278,7 @@ export default function AlbumPage() {
           {data.cover_url ? (
             <img src={data.cover_url} alt={data.title} className="w-full h-64 object-cover blur-[1px] scale-105" />
           ) : (
-            <div className="h-64 bg-gradient-to-br from-zinc-900 via-zinc-800 to-zinc-900" />
+            <div className="h-64 bg-gradient-to-br from-muted via-muted/70 to-accent/20" />
           )}
           <div className="absolute inset-0 z-20 p-6 md:p-8 flex items-end">
             <div className="grid grid-cols-1 md:grid-cols-[8.5rem,1fr] gap-5 w-full items-end">
@@ -393,7 +392,7 @@ export default function AlbumPage() {
           {trackRows.length === 0 ? (
             <p className="text-sm text-muted-foreground">No tracks found for this album.</p>
           ) : (
-            <ScrollArea className="h-[58svh] md:h-[600px]">
+            <div className="max-h-[min(62svh,640px)] overflow-auto rounded-md border border-border/60">
               <Table className="min-w-[920px]">
                 <TableHeader>
                   <TableRow className="hover:bg-transparent">
@@ -515,7 +514,7 @@ export default function AlbumPage() {
                   })}
                 </TableBody>
               </Table>
-            </ScrollArea>
+            </div>
           )}
         </CardContent>
       </Card>

@@ -572,6 +572,54 @@ function SettingsPage() {
                     placeholder="/config/media_cache"
                     selectLabel="Select media cache folder"
                   />
+                  <div className="rounded-md border border-border/70 p-3 space-y-3 bg-muted/20">
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="space-y-1">
+                        <Label htmlFor="artwork-ram-auto">Auto RAM tuning</Label>
+                        <p className="text-[11px] text-muted-foreground">
+                          PMDA recalculates artwork RAM cache from available memory every few minutes. You can cap it below.
+                        </p>
+                      </div>
+                      <Switch
+                        id="artwork-ram-auto"
+                        checked={Boolean(config.ARTWORK_RAM_CACHE_AUTO ?? true)}
+                        onCheckedChange={(checked) => updateConfig({ ARTWORK_RAM_CACHE_AUTO: checked })}
+                      />
+                    </div>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                      <div className="space-y-1">
+                        <Label htmlFor="artwork-ram-auto-max-mb">Auto max RAM (MB)</Label>
+                        <Input
+                          id="artwork-ram-auto-max-mb"
+                          type="number"
+                          min={0}
+                          max={65536}
+                          step={256}
+                          value={config.ARTWORK_RAM_CACHE_AUTO_MAX_MB ?? 0}
+                          onChange={(e) => {
+                            const v = Number(e.target.value);
+                            updateConfig({ ARTWORK_RAM_CACHE_AUTO_MAX_MB: Number.isFinite(v) ? Math.max(0, Math.min(65536, Math.round(v))) : 0 });
+                          }}
+                        />
+                        <p className="text-[11px] text-muted-foreground">Set `16384` to reserve max 16 GB for PMDA artwork cache. `0` = no cap.</p>
+                      </div>
+                      <div className="space-y-1">
+                        <Label htmlFor="artwork-ram-auto-interval">Auto tune interval (sec)</Label>
+                        <Input
+                          id="artwork-ram-auto-interval"
+                          type="number"
+                          min={30}
+                          max={3600}
+                          step={30}
+                          value={config.ARTWORK_RAM_CACHE_AUTO_INTERVAL_SEC ?? 120}
+                          onChange={(e) => {
+                            const v = Number(e.target.value);
+                            updateConfig({ ARTWORK_RAM_CACHE_AUTO_INTERVAL_SEC: Number.isFinite(v) ? Math.max(30, Math.min(3600, Math.round(v))) : 120 });
+                          }}
+                        />
+                      </div>
+                    </div>
+                  </div>
                   <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
                     <div className="space-y-1">
                       <Label htmlFor="artwork-ram-cache-mb">Artwork RAM cache (MB)</Label>
@@ -587,7 +635,7 @@ function SettingsPage() {
                           updateConfig({ ARTWORK_RAM_CACHE_MB: Number.isFinite(v) ? Math.max(0, Math.min(65536, Math.round(v))) : 1024 });
                         }}
                       />
-                      <p className="text-[11px] text-muted-foreground">0 disables RAM cache. For your setup, 16384 = 16 GB.</p>
+                      <p className="text-[11px] text-muted-foreground">Manual baseline/fallback. When auto tuning is ON, PMDA adjusts this value dynamically.</p>
                     </div>
                     <div className="space-y-1">
                       <Label htmlFor="artwork-ram-cache-ttl">Artwork cache TTL (sec)</Label>

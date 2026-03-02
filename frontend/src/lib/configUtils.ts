@@ -77,6 +77,9 @@ export function normalizeConfigForUI(raw: Partial<PMDAConfig>): Partial<PMDAConf
   if (out.ARTWORK_RAM_CACHE_MB !== undefined) out.ARTWORK_RAM_CACHE_MB = Math.max(0, Math.min(65536, Number(out.ARTWORK_RAM_CACHE_MB) || 0));
   if (out.ARTWORK_RAM_CACHE_TTL_SEC !== undefined) out.ARTWORK_RAM_CACHE_TTL_SEC = Math.max(60, Math.min(60 * 60 * 24 * 30, Number(out.ARTWORK_RAM_CACHE_TTL_SEC) || 21600));
   if (out.ARTWORK_RAM_CACHE_MAX_ITEM_MB !== undefined) out.ARTWORK_RAM_CACHE_MAX_ITEM_MB = Math.max(1, Math.min(64, Number(out.ARTWORK_RAM_CACHE_MAX_ITEM_MB) || 8));
+  if (out.ARTWORK_RAM_CACHE_AUTO !== undefined) out.ARTWORK_RAM_CACHE_AUTO = toBool(out.ARTWORK_RAM_CACHE_AUTO);
+  if (out.ARTWORK_RAM_CACHE_AUTO_MAX_MB !== undefined) out.ARTWORK_RAM_CACHE_AUTO_MAX_MB = Math.max(0, Math.min(65536, Number(out.ARTWORK_RAM_CACHE_AUTO_MAX_MB) || 0));
+  if (out.ARTWORK_RAM_CACHE_AUTO_INTERVAL_SEC !== undefined) out.ARTWORK_RAM_CACHE_AUTO_INTERVAL_SEC = Math.max(30, Math.min(3600, Number(out.ARTWORK_RAM_CACHE_AUTO_INTERVAL_SEC) || 120));
   if (out.USE_ACOUSTID !== undefined) out.USE_ACOUSTID = toBool(out.USE_ACOUSTID);
   if (out.USE_ACOUSTID_WHEN_TAGGED !== undefined) out.USE_ACOUSTID_WHEN_TAGGED = toBool(out.USE_ACOUSTID_WHEN_TAGGED);
   if (out.MB_RETRY_NOT_FOUND !== undefined) out.MB_RETRY_NOT_FOUND = toBool(out.MB_RETRY_NOT_FOUND);
