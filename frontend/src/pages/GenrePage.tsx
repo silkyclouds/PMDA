@@ -15,6 +15,31 @@ import * as api from '@/lib/api';
 import type { TrackInfo } from '@/components/library/AudioPlayer';
 import type { LibraryOutletContext } from '@/pages/LibraryLayout';
 
+function dedupeAlbumsById(items: api.LibraryAlbumItem[]): api.LibraryAlbumItem[] {
+  const out: api.LibraryAlbumItem[] = [];
+  const seen = new Set<number>();
+  for (const item of items) {
+    const id = Number(item?.album_id || 0);
+    if (!Number.isFinite(id) || id <= 0 || seen.has(id)) continue;
+    seen.add(id);
+    out.push(item);
+  }
+  return out;
+}
+
+function mergeAlbumsById(existing: api.LibraryAlbumItem[], incoming: api.LibraryAlbumItem[]): api.LibraryAlbumItem[] {
+  if (!existing.length) return dedupeAlbumsById(incoming);
+  const out = [...existing];
+  const seen = new Set(existing.map((item) => Number(item.album_id || 0)));
+  for (const item of incoming) {
+    const id = Number(item?.album_id || 0);
+    if (!Number.isFinite(id) || id <= 0 || seen.has(id)) continue;
+    seen.add(id);
+    out.push(item);
+  }
+  return out;
+}
+
 export default function GenrePage() {
   const isMobile = useIsMobile();
   const navigate = useNavigate();
@@ -42,6 +67,7 @@ export default function GenrePage() {
 
   const sentinelRef = useRef<HTMLDivElement | null>(null);
   const loadingMoreRef = useRef(false);
+  const requestIdRef = useRef(0);
 
   const [coverSize] = useState<number>(() => {
     try {
@@ -105,8 +131,9 @@ export default function GenrePage() {
     }
   }, [genre, includeUnmatched]);
 
-  const loadAlbumsPage = useCallback(async (opts: { reset: boolean }) => {
-    const pageOffset = opts.reset ? 0 : offset;
+  const loadAlbumsPage = useCallback(async (opts: { reset: boolean; pageOffset: number }) => {
+    const rid = ++requestIdRef.current;
+    const pageOffset = Math.max(0, Number(opts.pageOffset || 0));
     try {
       if (opts.reset) {
         setLoading(true);
@@ -115,13 +142,16 @@ export default function GenrePage() {
         setAppending(true);
       }
       const res = await api.getLibraryAlbums({ genre, sort: 'year_desc', limit, offset: pageOffset, includeUnmatched });
-      const list = Array.isArray(res.albums) ? res.albums : [];
+      if (rid !== requestIdRef.current) return;
+      const listRaw = Array.isArray(res.albums) ? res.albums : [];
+      const list = dedupeAlbumsById(listRaw);
       const nextTotal = Number(res.total || 0);
-      setAlbums((prev) => (opts.reset ? list : [...prev, ...list]));
-      setOffset(pageOffset + list.length);
+      setAlbums((prev) => (opts.reset ? list : mergeAlbumsById(prev, list)));
+      setOffset(pageOffset + listRaw.length);
       setTotal(nextTotal);
-      setHasMore(pageOffset + list.length < nextTotal);
+      setHasMore(pageOffset + listRaw.length < nextTotal);
     } catch (err) {
+      if (rid !== requestIdRef.current) return;
       setError(err instanceof Error ? err.message : 'Failed to load genre');
       if (opts.reset) {
         setAlbums([]);
@@ -130,10 +160,12 @@ export default function GenrePage() {
       }
       setHasMore(false);
     } finally {
-      setLoading(false);
-      setAppending(false);
+      if (rid === requestIdRef.current) {
+        setLoading(false);
+        setAppending(false);
+      }
     }
-  }, [genre, includeUnmatched, limit, offset]);
+  }, [genre, includeUnmatched, limit]);
 
   useEffect(() => {
     if (!genre) {
@@ -144,19 +176,20 @@ export default function GenrePage() {
     setOffset(0);
     setTotal(0);
     setHasMore(true);
+    loadingMoreRef.current = false;
     void loadProfile();
-    void loadAlbumsPage({ reset: true });
-  }, [genre, loadAlbumsPage, loadProfile]);
+    void loadAlbumsPage({ reset: true, pageOffset: 0 });
+  }, [genre, includeUnmatched, loadAlbumsPage, loadProfile]);
 
   const loadMore = useCallback(async () => {
     if (!hasMore || loading || loadingMoreRef.current) return;
     loadingMoreRef.current = true;
     try {
-      await loadAlbumsPage({ reset: false });
+      await loadAlbumsPage({ reset: false, pageOffset: offset });
     } finally {
       loadingMoreRef.current = false;
     }
-  }, [hasMore, loadAlbumsPage, loading]);
+  }, [hasMore, loadAlbumsPage, loading, offset]);
 
   useEffect(() => {
     const node = sentinelRef.current;
@@ -326,7 +359,7 @@ export default function GenrePage() {
                   </div>
                 </AspectRatio>
                 <div className="p-3 space-y-1.5">
-                  <div className="text-sm font-semibold truncate">{a.title}</div>
+                  <div className="text-sm font-semibold leading-snug line-clamp-2 min-h-[2.4rem]" title={a.title}>{a.title}</div>
                   <button
                     type="button"
                     className="text-xs text-muted-foreground truncate hover:underline"
@@ -375,4 +408,3 @@ export default function GenrePage() {
     </div>
   );
 }
-

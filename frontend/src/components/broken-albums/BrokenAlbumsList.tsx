@@ -3,7 +3,6 @@ import { AlertCircle, Music, Loader2 } from 'lucide-react';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Alert, AlertDescription } from '@/components/ui/alert';
-import { Header } from '@/components/Header';
 import * as api from '@/lib/api';
 import { useToast } from '@/hooks/use-toast';
 
@@ -33,9 +32,7 @@ export function BrokenAlbumsList() {
   };
 
   return (
-    <>
-      <Header />
-      <div className="container py-6 space-y-4">
+    <div className="container py-6 space-y-4">
         <div className="flex items-center justify-between">
           <div>
             <h2 className="text-2xl font-bold">Incomplete Albums</h2>
@@ -116,6 +113,5 @@ export function BrokenAlbumsList() {
           </div>
         )}
       </div>
-    </>
   );
 }

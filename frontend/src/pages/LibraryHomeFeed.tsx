@@ -39,6 +39,84 @@ function asFeedSection(raw: string): FeedSection {
   return 'recently_added';
 }
 
+function dedupeAlbumsById(items: api.LibraryAlbumItem[]): api.LibraryAlbumItem[] {
+  const out: api.LibraryAlbumItem[] = [];
+  const seen = new Set<number>();
+  for (const item of items) {
+    const id = Number(item?.album_id || 0);
+    if (!Number.isFinite(id) || id <= 0 || seen.has(id)) continue;
+    seen.add(id);
+    out.push(item);
+  }
+  return out;
+}
+
+function mergeAlbumsById(existing: api.LibraryAlbumItem[], incoming: api.LibraryAlbumItem[]): api.LibraryAlbumItem[] {
+  if (!existing.length) return dedupeAlbumsById(incoming);
+  const out = [...existing];
+  const seen = new Set(existing.map((item) => Number(item.album_id || 0)));
+  for (const item of incoming) {
+    const id = Number(item?.album_id || 0);
+    if (!Number.isFinite(id) || id <= 0 || seen.has(id)) continue;
+    seen.add(id);
+    out.push(item);
+  }
+  return out;
+}
+
+function dedupeArtistsById(items: Array<api.TopArtistItem | api.RecentlyAddedArtistItem>) {
+  const out: Array<api.TopArtistItem | api.RecentlyAddedArtistItem> = [];
+  const seen = new Set<number>();
+  for (const item of items) {
+    const id = Number((item as { artist_id?: number })?.artist_id || 0);
+    if (!Number.isFinite(id) || id <= 0 || seen.has(id)) continue;
+    seen.add(id);
+    out.push(item);
+  }
+  return out;
+}
+
+function mergeArtistsById(
+  existing: Array<api.TopArtistItem | api.RecentlyAddedArtistItem>,
+  incoming: Array<api.TopArtistItem | api.RecentlyAddedArtistItem>,
+) {
+  if (!existing.length) return dedupeArtistsById(incoming);
+  const out = [...existing];
+  const seen = new Set(existing.map((item) => Number((item as { artist_id?: number })?.artist_id || 0)));
+  for (const item of incoming) {
+    const id = Number((item as { artist_id?: number })?.artist_id || 0);
+    if (!Number.isFinite(id) || id <= 0 || seen.has(id)) continue;
+    seen.add(id);
+    out.push(item);
+  }
+  return out;
+}
+
+function dedupeTracks(items: api.RecoTrack[]): api.RecoTrack[] {
+  const out: api.RecoTrack[] = [];
+  const seen = new Set<string>();
+  for (const item of items) {
+    const key = `${Number(item?.track_id || 0)}:${Number(item?.album_id || 0)}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(item);
+  }
+  return out;
+}
+
+function mergeTracks(existing: api.RecoTrack[], incoming: api.RecoTrack[]): api.RecoTrack[] {
+  if (!existing.length) return dedupeTracks(incoming);
+  const out = [...existing];
+  const seen = new Set(existing.map((item) => `${Number(item?.track_id || 0)}:${Number(item?.album_id || 0)}`));
+  for (const item of incoming) {
+    const key = `${Number(item?.track_id || 0)}:${Number(item?.album_id || 0)}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(item);
+  }
+  return out;
+}
+
 export default function LibraryHomeFeed() {
   const navigate = useNavigate();
   const location = useLocation();
@@ -62,7 +140,13 @@ export default function LibraryHomeFeed() {
 
   const sentinelRef = useRef<HTMLDivElement | null>(null);
   const loadingMoreRef = useRef(false);
+  const requestIdRef = useRef(0);
+  const currentTrackIdRef = useRef<number | null>(null);
   const pageSize = 120;
+
+  useEffect(() => {
+    currentTrackIdRef.current = Number(session?.currentTrack?.track_id || 0) || null;
+  }, [session?.currentTrack?.track_id]);
 
   const coverSize = useMemo(() => {
     try {
@@ -123,8 +207,9 @@ export default function LibraryHomeFeed() {
     }
   }, [setCurrentTrack, startPlayback, toast]);
 
-  const loadSectionPage = useCallback(async (opts: { reset: boolean }) => {
-    const pageOffset = opts.reset ? 0 : offset;
+  const loadSectionPage = useCallback(async (opts: { reset: boolean; pageOffset: number }) => {
+    const rid = ++requestIdRef.current;
+    const pageOffset = Math.max(0, Number(opts.pageOffset || 0));
     try {
       if (opts.reset) {
         setLoading(true);
@@ -135,56 +220,69 @@ export default function LibraryHomeFeed() {
 
       if (section === 'recently_added') {
         const res = await api.getLibraryAlbums({ sort: 'recent', limit: pageSize, offset: pageOffset, includeUnmatched });
-        const list = Array.isArray(res.albums) ? res.albums : [];
-        setAlbums((prev) => (opts.reset ? list : [...prev, ...list]));
-        setOffset(pageOffset + list.length);
+        if (rid !== requestIdRef.current) return;
+        const listRaw = Array.isArray(res.albums) ? res.albums : [];
+        const list = dedupeAlbumsById(listRaw);
+        setAlbums((prev) => (opts.reset ? list : mergeAlbumsById(prev, list)));
+        setOffset(pageOffset + listRaw.length);
         setTotal(typeof res.total === 'number' ? res.total : 0);
-        setHasMore(pageOffset + list.length < Number(res.total || 0));
+        setHasMore(pageOffset + listRaw.length < Number(res.total || 0));
       } else if (section === 'recently_played') {
         const res = await api.getLibraryRecentlyPlayedAlbumsWithOptions(365, pageSize, false, { includeUnmatched, offset: pageOffset });
-        const list = Array.isArray(res.albums) ? res.albums : [];
-        setAlbums((prev) => (opts.reset ? list : [...prev, ...list]));
+        if (rid !== requestIdRef.current) return;
+        const listRaw = Array.isArray(res.albums) ? res.albums : [];
+        const list = dedupeAlbumsById(listRaw);
+        setAlbums((prev) => (opts.reset ? list : mergeAlbumsById(prev, list)));
         const nextTotal = Number(res.total || 0);
-        setOffset(pageOffset + list.length);
+        setOffset(pageOffset + listRaw.length);
         setTotal(nextTotal);
-        setHasMore(pageOffset + list.length < nextTotal);
+        setHasMore(pageOffset + listRaw.length < nextTotal);
       } else if (section === 'discover') {
         const res = await api.getLibraryDiscoverWithOptions(90, 36, !opts.reset, { includeUnmatched });
-        const chunk = (res.sections || []).flatMap((s) => (Array.isArray(s.albums) ? s.albums : []));
+        if (rid !== requestIdRef.current) return;
+        const chunk = dedupeAlbumsById((res.sections || []).flatMap((s) => (Array.isArray(s.albums) ? s.albums : [])));
         setAlbums((prev) => {
-          const seen = new Set(prev.map((a) => a.album_id));
-          const add = chunk.filter((a) => !seen.has(a.album_id));
-          setOffset((opts.reset ? 0 : prev.length) + add.length);
-          setHasMore(add.length > 0);
-          return opts.reset ? add : [...prev, ...add];
+          const base = opts.reset ? [] : prev;
+          const merged = mergeAlbumsById(base, chunk);
+          const add = merged.length - base.length;
+          setOffset((opts.reset ? 0 : base.length) + add);
+          setHasMore(add > 0);
+          return merged;
         });
         setTotal(null);
       } else if (section === 'top_artists') {
         const res = await api.getTopArtists(pageSize, 0, { includeUnmatched, offset: pageOffset });
-        const list = Array.isArray(res.artists) ? res.artists : [];
-        setArtists((prev) => (opts.reset ? list : [...prev, ...list]));
+        if (rid !== requestIdRef.current) return;
+        const listRaw = Array.isArray(res.artists) ? res.artists : [];
+        const list = dedupeArtistsById(listRaw);
+        setArtists((prev) => (opts.reset ? list : mergeArtistsById(prev, list)));
         const nextTotal = Number(res.total || 0);
-        setOffset(pageOffset + list.length);
+        setOffset(pageOffset + listRaw.length);
         setTotal(nextTotal);
-        setHasMore(pageOffset + list.length < nextTotal);
+        setHasMore(pageOffset + listRaw.length < nextTotal);
       } else if (section === 'recent_artists') {
         const res = await api.getRecentlyAddedArtists(pageSize, pageOffset, { includeUnmatched });
-        const list = Array.isArray(res.artists) ? res.artists : [];
-        setArtists((prev) => (opts.reset ? list : [...prev, ...list]));
-        setOffset(pageOffset + list.length);
+        if (rid !== requestIdRef.current) return;
+        const listRaw = Array.isArray(res.artists) ? res.artists : [];
+        const list = dedupeArtistsById(listRaw);
+        setArtists((prev) => (opts.reset ? list : mergeArtistsById(prev, list)));
+        setOffset(pageOffset + listRaw.length);
         setTotal(null);
-        setHasMore(list.length >= pageSize);
+        setHasMore(listRaw.length >= pageSize);
       } else {
-        const excludeTrackId = session?.currentTrack?.track_id;
+        const excludeTrackId = currentTrackIdRef.current ?? undefined;
         const res = await api.getRecommendationsForYou(recommendationSessionId || '', pageSize, excludeTrackId, pageOffset);
-        const list = Array.isArray(res.tracks) ? res.tracks : [];
-        setTracks((prev) => (opts.reset ? list : [...prev, ...list]));
+        if (rid !== requestIdRef.current) return;
+        const listRaw = Array.isArray(res.tracks) ? res.tracks : [];
+        const list = dedupeTracks(listRaw);
+        setTracks((prev) => (opts.reset ? list : mergeTracks(prev, list)));
         const nextTotal = Number(res.total || 0);
-        setOffset(pageOffset + list.length);
+        setOffset(pageOffset + listRaw.length);
         setTotal(nextTotal);
-        setHasMore(pageOffset + list.length < nextTotal);
+        setHasMore(pageOffset + listRaw.length < nextTotal);
       }
     } catch (err) {
+      if (rid !== requestIdRef.current) return;
       setError(err instanceof Error ? err.message : 'Failed to load section');
       if (opts.reset) {
         setAlbums([]);
@@ -194,10 +292,12 @@ export default function LibraryHomeFeed() {
       }
       setHasMore(false);
     } finally {
-      setLoading(false);
-      setAppending(false);
+      if (rid === requestIdRef.current) {
+        setLoading(false);
+        setAppending(false);
+      }
     }
-  }, [includeUnmatched, offset, pageSize, recommendationSessionId, section, session?.currentTrack?.track_id]);
+  }, [includeUnmatched, pageSize, recommendationSessionId, section]);
 
   useEffect(() => {
     setAlbums([]);
@@ -207,18 +307,18 @@ export default function LibraryHomeFeed() {
     setTotal(null);
     setHasMore(true);
     loadingMoreRef.current = false;
-    void loadSectionPage({ reset: true });
-  }, [section, loadSectionPage]);
+    void loadSectionPage({ reset: true, pageOffset: 0 });
+  }, [section, includeUnmatched, loadSectionPage]);
 
   const loadMore = useCallback(async () => {
     if (!hasMore || loading || loadingMoreRef.current) return;
     loadingMoreRef.current = true;
     try {
-      await loadSectionPage({ reset: false });
+      await loadSectionPage({ reset: false, pageOffset: offset });
     } finally {
       loadingMoreRef.current = false;
     }
-  }, [hasMore, loading, loadSectionPage]);
+  }, [hasMore, loading, loadSectionPage, offset]);
 
   useEffect(() => {
     const node = sentinelRef.current;
@@ -294,7 +394,7 @@ export default function LibraryHomeFeed() {
                   </button>
                 </AspectRatio>
                 <CardContent className="p-3 space-y-1.5">
-                  <div className="text-sm font-semibold truncate">{a.title}</div>
+                  <div className="text-sm font-semibold leading-snug line-clamp-2 min-h-[2.4rem]" title={a.title}>{a.title}</div>
                   <button
                     type="button"
                     className="text-xs text-muted-foreground truncate hover:underline"
@@ -392,4 +492,3 @@ export default function LibraryHomeFeed() {
     </div>
   );
 }
-

@@ -40,6 +40,18 @@ function normalizeGenreBadges(album: api.LibraryAlbumItem): string[] {
   return out;
 }
 
+function dedupeAlbumsById(items: api.LibraryAlbumItem[]): api.LibraryAlbumItem[] {
+  const out: api.LibraryAlbumItem[] = [];
+  const seen = new Set<number>();
+  for (const item of items) {
+    const id = Number(item?.album_id || 0);
+    if (!Number.isFinite(id) || id <= 0 || seen.has(id)) continue;
+    seen.add(id);
+    out.push(item);
+  }
+  return out;
+}
+
 export default function LibraryAlbums() {
   const isMobile = useIsMobile();
   const navigate = useNavigate();
@@ -134,7 +146,8 @@ export default function LibraryAlbums() {
         includeUnmatched,
       });
       if (rid !== requestIdRef.current) return;
-      const list = Array.isArray(data.albums) ? data.albums : [];
+      const listRaw = Array.isArray(data.albums) ? data.albums : [];
+      const list = dedupeAlbumsById(listRaw);
       setTotalAlbums(typeof data.total === 'number' ? data.total : 0);
       setAlbums((prev) => {
         if (opts.reset) return list;
@@ -148,7 +161,7 @@ export default function LibraryAlbums() {
         }
         return merged;
       });
-      setOffset(opts.pageOffset + list.length);
+      setOffset(opts.pageOffset + listRaw.length);
       void hydrateAlbumLikes(list.map((a) => a.album_id));
     } catch (e) {
       if (rid !== requestIdRef.current) return;
@@ -330,7 +343,7 @@ export default function LibraryAlbums() {
                 <div className="min-w-0">
                   <button
                     type="button"
-                    className="text-sm font-semibold truncate hover:underline text-left w-full"
+                    className="text-sm font-semibold leading-snug line-clamp-2 min-h-[2.4rem] hover:underline text-left w-full"
                     title="Open album"
                     onClick={() => navigate(`/library/album/${a.album_id}${location.search || ''}`)}
                   >
