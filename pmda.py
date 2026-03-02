@@ -3622,6 +3622,7 @@ def migrate_settings_from_state_db():
         init_settings_db()
         con_cfg = sqlite3.connect(str(SETTINGS_DB_FILE))
         cur_cfg = con_cfg.cursor()
+        inserted = 0
         # Copy all keys except last_completed_scan_id (runtime-only)
         for key, value in rows:
             if key == "last_completed_scan_id":
@@ -3630,9 +3631,14 @@ def migrate_settings_from_state_db():
                 "INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?)",
                 (key, value),
             )
+            if cur_cfg.rowcount and cur_cfg.rowcount > 0:
+                inserted += int(cur_cfg.rowcount)
         con_cfg.commit()
         con_cfg.close()
-        logging.info("Migrated legacy settings from state.db to settings.db")
+        if inserted > 0:
+            logging.info("Migrated %d legacy setting(s) from state.db to settings.db", inserted)
+        else:
+            logging.debug("Legacy settings migration skipped (nothing new to import).")
     except Exception as e:
         logging.warning("Failed to migrate settings from state.db to settings.db: %s", e)
 
