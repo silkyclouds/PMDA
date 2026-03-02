@@ -12745,6 +12745,18 @@ def _dupe_jaccard(a: set[str], b: set[str]) -> float:
     return (float(inter) / float(union)) if union else 0.0
 
 
+def _dupe_track_title_containment(a: set[str], b: set[str]) -> float:
+    """
+    Containment score for truncated releases:
+    |A∩B| / min(|A|, |B|). 1.0 means the smaller set is fully contained.
+    """
+    if not a or not b:
+        return 0.0
+    inter = len(a & b)
+    denom = min(len(a), len(b))
+    return (float(inter) / float(denom)) if denom else 0.0
+
+
 def _dupe_track_count_ratio(a_tracks: list, b_tracks: list) -> float:
     a_n = len(a_tracks or [])
     b_n = len(b_tracks or [])
@@ -13109,6 +13121,11 @@ def _dupe_get_discogs_id(e: dict) -> str:
         v = (meta.get("discogs_release_id") or meta.get("discogs_releaseid") or "").strip()
         if v:
             return v
+    fb = e.get("fallback_discogs")
+    if isinstance(fb, dict):
+        v = str(fb.get("release_id") or fb.get("master_id") or "").strip()
+        if v:
+            return v
     return ""
 
 
@@ -13121,6 +13138,11 @@ def _dupe_get_lastfm_mbid(e: dict) -> str:
         v = (meta.get("lastfm_album_mbid") or "").strip()
         if v:
             return v
+    fb = e.get("fallback_lastfm")
+    if isinstance(fb, dict):
+        v = str(fb.get("mbid") or "").strip()
+        if v:
+            return v
     return ""
 
 
@@ -13131,6 +13153,11 @@ def _dupe_get_bandcamp_url(e: dict) -> str:
     meta = e.get("meta") or {}
     if isinstance(meta, dict):
         v = (meta.get("bandcamp_album_url") or "").strip()
+        if v:
+            return v
+    fb = e.get("fallback_bandcamp")
+    if isinstance(fb, dict):
+        v = str(fb.get("album_url") or fb.get("url") or "").strip()
         if v:
             return v
     return ""
@@ -13299,6 +13326,8 @@ def _dupe_split_editions_by_similarity(
     min_ratio: float = 0.75,
     allow_audio_fp: bool = True,
     audio_min_overlap: float = 0.87,
+    partial_containment_min: float = 0.98,
+    partial_ratio_max: float = 0.45,
 ) -> list[list[dict]]:
     """
     Split a noisy candidate group into one or more coherent clusters using track-title
@@ -13351,6 +13380,11 @@ def _dupe_split_editions_by_similarity(
         for j in range(i + 1, n):
             ratio = _dupe_track_count_ratio(track_lists[i], track_lists[j])
             if ratio < 0.55:
+                # Truncated duplicate rescue: strong title containment + very low count ratio.
+                # This catches 1-track/3-track partial copies of full releases.
+                containment = _dupe_track_title_containment(title_sets[i], title_sets[j])
+                if containment >= float(partial_containment_min) and ratio <= float(partial_ratio_max):
+                    union(i, j)
                 continue
             jac = _dupe_jaccard(title_sets[i], title_sets[j])
             if jac >= float(min_jaccard) and ratio >= float(min_ratio):
@@ -21913,12 +21947,16 @@ def _mark_broken_from_dupe_groups(
     editions_by_artist: dict[str, list[dict]] | None,
     *,
     ratio_threshold: float = 0.90,
+    require_exact_identity: bool = True,
 ) -> int:
     """
     Heuristic: if a dupe group's best edition has notably more tracks than a loser,
     mark that loser as broken so the incomplete-move step can quarantine it.
 
-    This catches tail-truncated albums even when provider/MB expected track count is unknown.
+    Safety:
+    - By default requires at least one exact provider identity token overlap
+      (Discogs release, Last.fm MBID, Bandcamp URL, or MB release ID).
+    - This catches tail-truncated albums while avoiding broad "same title" false positives.
     """
     if not all_results or not editions_by_artist:
         return 0
@@ -21937,6 +21975,22 @@ def _mark_broken_from_dupe_groups(
                 aid = 0
             if aid > 0:
                 by_id[aid] = e
+
+    def _identity_tokens(edition: dict) -> set[str]:
+        tokens: set[str] = set()
+        mb_rel = (_dupe_get_mb_release_id(edition) or "").strip().lower()
+        if mb_rel:
+            tokens.add(f"mb_rel:{mb_rel}")
+        discogs_id = (_dupe_get_discogs_id(edition) or "").strip()
+        if discogs_id:
+            tokens.add(f"discogs:{discogs_id}")
+        lastfm_mbid = (_dupe_get_lastfm_mbid(edition) or "").strip().lower()
+        if lastfm_mbid:
+            tokens.add(f"lastfm:{lastfm_mbid}")
+        bandcamp_url = (_dupe_get_bandcamp_url(edition) or "").strip().rstrip("/").lower()
+        if bandcamp_url:
+            tokens.add(f"bandcamp:{bandcamp_url}")
+        return tokens
 
     def _track_indices(edition: dict) -> list[int]:
         idxs: list[int] = []
@@ -22032,6 +22086,8 @@ def _mark_broken_from_dupe_groups(
             losers = (g.get("losers") or []) if isinstance(g, dict) else []
             if not isinstance(best, dict) or not losers:
                 continue
+            best_ids = _identity_tokens(best)
+            best_track_set = _dupe_track_title_set(best.get("tracks") or [])
             best_idxs = _track_indices(best)
             try:
                 best_count = int(
@@ -22064,6 +22120,12 @@ def _mark_broken_from_dupe_groups(
                     loser_count = 0
                 if loser_count <= 0:
                     continue
+                if loser_count >= best_count:
+                    continue
+                if require_exact_identity:
+                    loser_ids = _identity_tokens(loser)
+                    if not (best_ids and loser_ids and (best_ids & loser_ids)):
+                        continue
 
                 # Prefer an index-based "missing in the middle" signal: missing indices <= max(loser_idx).
                 missing_mid = []
@@ -22080,6 +22142,11 @@ def _mark_broken_from_dupe_groups(
                 # Fallback: only mark as broken on track-count ratio when indices are unavailable.
                 if (not missing_mid) and best_count > 0:
                     if (loser_count / best_count) >= thr:
+                        continue
+                    # Additional containment guard when using count-ratio fallback.
+                    loser_track_set = _dupe_track_title_set(loser.get("tracks") or [])
+                    containment = _dupe_track_title_containment(best_track_set, loser_track_set)
+                    if containment < 0.98:
                         continue
                 # Mark loser (group dict) and the canonical edition dict (by album_id) so later steps agree.
                 try:
@@ -23204,9 +23271,23 @@ def background_scan():
                 save_scan_editions_to_db(_scan_id, all_editions_by_artist)
         except Exception as e:
             logging.warning("save_scan_editions_to_db in finally failed: %s", e)
-        # Safety rule: do not infer "broken/incomplete" state from duplicate groups.
-        # Incomplete moves must only use deterministic broken detection computed per-edition
-        # (track index gaps, etc.). This avoids large false positives and unintended mass moves.
+        # Mark clearly truncated duplicate losers as "broken" before incomplete move.
+        # Safety is enforced inside _mark_broken_from_dupe_groups via exact provider identity overlap.
+        try:
+            marked_from_dupes = _mark_broken_from_dupe_groups(
+                all_results,
+                all_editions_by_artist,
+                ratio_threshold=0.90,
+                require_exact_identity=True,
+            )
+            if marked_from_dupes:
+                logging.info(
+                    "Pipeline step incomplete-move prep: marked %d truncated duplicate loser(s) as broken (exact provider identity)",
+                    int(marked_from_dupes),
+                )
+        except Exception:
+            logging.exception("Pipeline step incomplete-move prep failed")
+
         # Pipeline step: move incomplete albums to configured quarantine folder.
         # Run this *before* dedupe so "broken" variants don't get moved as dupes.
         incomplete_move_result = {"moved": 0, "size_mb": 0, "errors": 0}
