@@ -11,34 +11,10 @@ import { AlbumArtwork } from '@/components/library/AlbumArtwork';
 import { usePlayback } from '@/contexts/PlaybackContext';
 import { useToast } from '@/hooks/use-toast';
 import { useIsMobile } from '@/hooks/use-mobile';
+import { dedupeAlbumsForDisplay, mergeAlbumsForDisplay } from '@/lib/albumDisplayDedupe';
 import * as api from '@/lib/api';
 import type { TrackInfo } from '@/components/library/AudioPlayer';
 import type { LibraryOutletContext } from '@/pages/LibraryLayout';
-
-function dedupeAlbumsById(items: api.LibraryAlbumItem[]): api.LibraryAlbumItem[] {
-  const out: api.LibraryAlbumItem[] = [];
-  const seen = new Set<number>();
-  for (const item of items) {
-    const id = Number(item?.album_id || 0);
-    if (!Number.isFinite(id) || id <= 0 || seen.has(id)) continue;
-    seen.add(id);
-    out.push(item);
-  }
-  return out;
-}
-
-function mergeAlbumsById(existing: api.LibraryAlbumItem[], incoming: api.LibraryAlbumItem[]): api.LibraryAlbumItem[] {
-  if (!existing.length) return dedupeAlbumsById(incoming);
-  const out = [...existing];
-  const seen = new Set(existing.map((item) => Number(item.album_id || 0)));
-  for (const item of incoming) {
-    const id = Number(item?.album_id || 0);
-    if (!Number.isFinite(id) || id <= 0 || seen.has(id)) continue;
-    seen.add(id);
-    out.push(item);
-  }
-  return out;
-}
 
 export default function LabelPage() {
   const isMobile = useIsMobile();
@@ -129,9 +105,9 @@ export default function LabelPage() {
       const res = await api.getLibraryAlbums({ label, sort: 'year_desc', limit, offset: pageOffset, includeUnmatched });
       if (rid !== requestIdRef.current) return;
       const listRaw = Array.isArray(res.albums) ? res.albums : [];
-      const list = dedupeAlbumsById(listRaw);
+      const list = dedupeAlbumsForDisplay(listRaw);
       const nextTotal = Number(res.total || 0);
-      setAlbums((prev) => (opts.reset ? list : mergeAlbumsById(prev, list)));
+      setAlbums((prev) => (opts.reset ? list : mergeAlbumsForDisplay(prev, list)));
       setOffset(pageOffset + listRaw.length);
       setTotal(nextTotal);
       setHasMore(pageOffset + listRaw.length < nextTotal);
@@ -350,7 +326,7 @@ export default function LabelPage() {
                   </div>
                 </AspectRatio>
                 <div className="p-3 space-y-1.5">
-                  <div className="text-sm font-semibold leading-snug line-clamp-2 min-h-[2.4rem]" title={a.title}>{a.title}</div>
+                  <div className="text-sm font-semibold leading-snug line-clamp-3 min-h-[3.6rem]" title={a.title}>{a.title}</div>
                   <button
                     type="button"
                     className="text-xs text-muted-foreground truncate hover:underline"

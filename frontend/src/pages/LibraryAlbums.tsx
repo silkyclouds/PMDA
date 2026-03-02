@@ -14,6 +14,7 @@ import { usePlayback } from '@/contexts/PlaybackContext';
 import { useToast } from '@/hooks/use-toast';
 import { useLibraryQuery } from '@/hooks/useLibraryQuery';
 import { useIsMobile } from '@/hooks/use-mobile';
+import { dedupeAlbumsForDisplay, mergeAlbumsForDisplay } from '@/lib/albumDisplayDedupe';
 import { cn } from '@/lib/utils';
 import * as api from '@/lib/api';
 import type { TrackInfo } from '@/components/library/AudioPlayer';
@@ -36,18 +37,6 @@ function normalizeGenreBadges(album: api.LibraryAlbumItem): string[] {
     if (seen.has(key)) continue;
     seen.add(key);
     out.push(txt);
-  }
-  return out;
-}
-
-function dedupeAlbumsById(items: api.LibraryAlbumItem[]): api.LibraryAlbumItem[] {
-  const out: api.LibraryAlbumItem[] = [];
-  const seen = new Set<number>();
-  for (const item of items) {
-    const id = Number(item?.album_id || 0);
-    if (!Number.isFinite(id) || id <= 0 || seen.has(id)) continue;
-    seen.add(id);
-    out.push(item);
   }
   return out;
 }
@@ -147,19 +136,11 @@ export default function LibraryAlbums() {
       });
       if (rid !== requestIdRef.current) return;
       const listRaw = Array.isArray(data.albums) ? data.albums : [];
-      const list = dedupeAlbumsById(listRaw);
+      const list = dedupeAlbumsForDisplay(listRaw);
       setTotalAlbums(typeof data.total === 'number' ? data.total : 0);
       setAlbums((prev) => {
         if (opts.reset) return list;
-        if (!prev.length) return list;
-        const seen = new Set(prev.map((a) => a.album_id));
-        const merged = [...prev];
-        for (const item of list) {
-          if (seen.has(item.album_id)) continue;
-          seen.add(item.album_id);
-          merged.push(item);
-        }
-        return merged;
+        return mergeAlbumsForDisplay(prev, list);
       });
       setOffset(opts.pageOffset + listRaw.length);
       void hydrateAlbumLikes(list.map((a) => a.album_id));
@@ -211,7 +192,7 @@ export default function LibraryAlbums() {
     }
   };
 
-  const canLoadMore = albums.length < totalAlbums && !albumLoading;
+  const canLoadMore = offset < totalAlbums && !albumLoading;
   const loadMore = useCallback(async () => {
     if (!canLoadMore || loadingMoreRef.current) return;
     loadingMoreRef.current = true;
@@ -343,7 +324,7 @@ export default function LibraryAlbums() {
                 <div className="min-w-0">
                   <button
                     type="button"
-                    className="text-sm font-semibold leading-snug line-clamp-2 min-h-[2.4rem] hover:underline text-left w-full"
+                    className="text-sm font-semibold leading-snug line-clamp-3 min-h-[3.6rem] hover:underline text-left w-full"
                     title="Open album"
                     onClick={() => navigate(`/library/album/${a.album_id}${location.search || ''}`)}
                   >

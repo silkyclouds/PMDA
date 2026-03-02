@@ -11,6 +11,7 @@ import type { TrackInfo } from '@/components/library/AudioPlayer';
 import { usePlayback } from '@/contexts/PlaybackContext';
 import { useToast } from '@/hooks/use-toast';
 import { useIsMobile } from '@/hooks/use-mobile';
+import { dedupeAlbumsForDisplay, mergeAlbumsForDisplay } from '@/lib/albumDisplayDedupe';
 import * as api from '@/lib/api';
 import type { LibraryOutletContext } from '@/pages/LibraryLayout';
 
@@ -37,31 +38,6 @@ function asFeedSection(raw: string): FeedSection {
   if (value === 'recent_artists') return 'recent_artists';
   if (value === 'recently_played') return 'recently_played';
   return 'recently_added';
-}
-
-function dedupeAlbumsById(items: api.LibraryAlbumItem[]): api.LibraryAlbumItem[] {
-  const out: api.LibraryAlbumItem[] = [];
-  const seen = new Set<number>();
-  for (const item of items) {
-    const id = Number(item?.album_id || 0);
-    if (!Number.isFinite(id) || id <= 0 || seen.has(id)) continue;
-    seen.add(id);
-    out.push(item);
-  }
-  return out;
-}
-
-function mergeAlbumsById(existing: api.LibraryAlbumItem[], incoming: api.LibraryAlbumItem[]): api.LibraryAlbumItem[] {
-  if (!existing.length) return dedupeAlbumsById(incoming);
-  const out = [...existing];
-  const seen = new Set(existing.map((item) => Number(item.album_id || 0)));
-  for (const item of incoming) {
-    const id = Number(item?.album_id || 0);
-    if (!Number.isFinite(id) || id <= 0 || seen.has(id)) continue;
-    seen.add(id);
-    out.push(item);
-  }
-  return out;
 }
 
 function dedupeArtistsById(items: Array<api.TopArtistItem | api.RecentlyAddedArtistItem>) {
@@ -222,8 +198,8 @@ export default function LibraryHomeFeed() {
         const res = await api.getLibraryAlbums({ sort: 'recent', limit: pageSize, offset: pageOffset, includeUnmatched });
         if (rid !== requestIdRef.current) return;
         const listRaw = Array.isArray(res.albums) ? res.albums : [];
-        const list = dedupeAlbumsById(listRaw);
-        setAlbums((prev) => (opts.reset ? list : mergeAlbumsById(prev, list)));
+        const list = dedupeAlbumsForDisplay(listRaw);
+        setAlbums((prev) => (opts.reset ? list : mergeAlbumsForDisplay(prev, list)));
         setOffset(pageOffset + listRaw.length);
         setTotal(typeof res.total === 'number' ? res.total : 0);
         setHasMore(pageOffset + listRaw.length < Number(res.total || 0));
@@ -231,8 +207,8 @@ export default function LibraryHomeFeed() {
         const res = await api.getLibraryRecentlyPlayedAlbumsWithOptions(365, pageSize, false, { includeUnmatched, offset: pageOffset });
         if (rid !== requestIdRef.current) return;
         const listRaw = Array.isArray(res.albums) ? res.albums : [];
-        const list = dedupeAlbumsById(listRaw);
-        setAlbums((prev) => (opts.reset ? list : mergeAlbumsById(prev, list)));
+        const list = dedupeAlbumsForDisplay(listRaw);
+        setAlbums((prev) => (opts.reset ? list : mergeAlbumsForDisplay(prev, list)));
         const nextTotal = Number(res.total || 0);
         setOffset(pageOffset + listRaw.length);
         setTotal(nextTotal);
@@ -240,10 +216,10 @@ export default function LibraryHomeFeed() {
       } else if (section === 'discover') {
         const res = await api.getLibraryDiscoverWithOptions(90, 36, !opts.reset, { includeUnmatched });
         if (rid !== requestIdRef.current) return;
-        const chunk = dedupeAlbumsById((res.sections || []).flatMap((s) => (Array.isArray(s.albums) ? s.albums : [])));
+        const chunk = dedupeAlbumsForDisplay((res.sections || []).flatMap((s) => (Array.isArray(s.albums) ? s.albums : [])));
         setAlbums((prev) => {
           const base = opts.reset ? [] : prev;
-          const merged = mergeAlbumsById(base, chunk);
+          const merged = mergeAlbumsForDisplay(base, chunk);
           const add = merged.length - base.length;
           setOffset((opts.reset ? 0 : base.length) + add);
           setHasMore(add > 0);
@@ -394,7 +370,7 @@ export default function LibraryHomeFeed() {
                   </button>
                 </AspectRatio>
                 <CardContent className="p-3 space-y-1.5">
-                  <div className="text-sm font-semibold leading-snug line-clamp-2 min-h-[2.4rem]" title={a.title}>{a.title}</div>
+                  <div className="text-sm font-semibold leading-snug line-clamp-3 min-h-[3.6rem]" title={a.title}>{a.title}</div>
                   <button
                     type="button"
                     className="text-xs text-muted-foreground truncate hover:underline"

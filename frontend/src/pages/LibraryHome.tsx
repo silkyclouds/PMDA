@@ -496,7 +496,7 @@ export default function LibraryHome() {
                                     className="block min-w-0 text-left hover:underline"
                                     title="Open album"
                                   >
-                                    <p className="text-sm font-semibold leading-snug line-clamp-2 min-h-[2.4rem]" title={a.title}>
+                                    <p className="text-sm font-semibold leading-snug line-clamp-3 min-h-[3.6rem]" title={a.title}>
                                       {a.title}
                                     </p>
                                   </button>
@@ -822,7 +822,7 @@ export default function LibraryHome() {
                                 className="block min-w-0 text-left hover:underline"
                                 title="Open album"
                               >
-                                <p className="text-sm font-semibold leading-snug line-clamp-2 min-h-[2.4rem]" title={a.title}>
+                                <p className="text-sm font-semibold leading-snug line-clamp-3 min-h-[3.6rem]" title={a.title}>
                                   {a.title}
                                 </p>
                               </button>
@@ -918,7 +918,7 @@ export default function LibraryHome() {
                                 className="block min-w-0 text-left hover:underline"
                                 title="Open album"
                               >
-                                <p className="text-sm font-semibold leading-snug line-clamp-2 min-h-[2.4rem]" title={a.title}>
+                                <p className="text-sm font-semibold leading-snug line-clamp-3 min-h-[3.6rem]" title={a.title}>
                                   {a.title}
                                 </p>
                               </button>
