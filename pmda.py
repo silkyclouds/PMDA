@@ -5719,6 +5719,7 @@ def _files_index_get_state() -> dict:
 
 
 _MEDIA_CACHE_SIZES = (96, 192, 320, 512, 640)
+_MEDIA_CACHE_MASTER_PX = 1600
 _ARTWORK_RAM_CACHE_MAX_BYTES = int(max(0, ARTWORK_RAM_CACHE_MB) * 1024 * 1024)
 _ARTWORK_RAM_CACHE_MAX_ITEM_BYTES = int(max(1, ARTWORK_RAM_CACHE_MAX_ITEM_MB) * 1024 * 1024)
 _ARTWORK_RAM_CACHE: "OrderedDict[str, dict]" = OrderedDict()
@@ -6059,6 +6060,89 @@ def _ensure_cached_image_from_bytes(
     except Exception as e:
         logging.debug("Embedded media cache generation failed: %s", e)
         return None
+
+
+def _existing_file_path(raw: str) -> Optional[Path]:
+    txt = str(raw or "").strip()
+    if not txt:
+        return None
+    try:
+        p = path_for_fs_access(Path(txt))
+    except Exception:
+        p = Path(txt)
+    if p.exists() and p.is_file():
+        return p
+    return None
+
+
+def _promote_files_media_paths_to_cache(artists_map: dict[str, dict], albums_payload: list[dict]) -> tuple[int, int]:
+    """
+    Force files-library media paths to point to NVMe cache masters so UI serving does
+    not depend on source HDD spin-up.
+    """
+    _ensure_media_cache_dirs()
+    root_dirs = _files_root_dir_strings()
+    artist_folder_hints: dict[str, Path] = {}
+    covers_promoted = 0
+    artists_promoted = 0
+
+    for album in albums_payload:
+        artist_norm = str(album.get("artist_norm") or "").strip()
+        folder_path = None
+        folder_raw = str(album.get("folder_path") or "").strip()
+        if folder_raw:
+            try:
+                folder_path = path_for_fs_access(Path(folder_raw))
+            except Exception:
+                folder_path = None
+        if artist_norm and folder_path and folder_path.exists() and folder_path.is_dir() and artist_norm not in artist_folder_hints:
+            artist_name = str((artists_map.get(artist_norm) or {}).get("name") or "").strip()
+            hint = _files_guess_artist_folder(folder_path, artist_name or "Unknown Artist", root_dirs=root_dirs)
+            if hint and hint.exists() and hint.is_dir():
+                artist_folder_hints[artist_norm] = hint
+
+        source_cover = _existing_file_path(str(album.get("cover_path") or ""))
+        if source_cover is None and folder_path and folder_path.exists() and folder_path.is_dir():
+            detected = _first_cover_path(folder_path)
+            if detected and detected.exists() and detected.is_file():
+                source_cover = detected
+
+        if source_cover is None:
+            album["has_cover"] = False
+            album["cover_path"] = ""
+            continue
+
+        master_cover = _ensure_cached_image_for_path(source_cover, kind="album", max_px=_MEDIA_CACHE_MASTER_PX)
+        if master_cover and master_cover.exists() and master_cover.is_file():
+            album["cover_path"] = str(master_cover)
+        else:
+            album["cover_path"] = str(source_cover)
+        album["has_cover"] = True
+        covers_promoted += 1
+
+    for artist_norm, data in artists_map.items():
+        source_image = _existing_file_path(str((data or {}).get("image_path") or ""))
+        if source_image is None:
+            hint = artist_folder_hints.get(str(artist_norm or "").strip())
+            if hint and hint.exists() and hint.is_dir():
+                detected = _first_artist_image_path(hint)
+                if detected and detected.exists() and detected.is_file():
+                    source_image = detected
+
+        if source_image is None:
+            data["has_image"] = False
+            data["image_path"] = ""
+            continue
+
+        master_image = _ensure_cached_image_for_path(source_image, kind="artist", max_px=_MEDIA_CACHE_MASTER_PX)
+        if master_image and master_image.exists() and master_image.is_file():
+            data["image_path"] = str(master_image)
+        else:
+            data["image_path"] = str(source_image)
+        data["has_image"] = True
+        artists_promoted += 1
+
+    return covers_promoted, artists_promoted
 
 
 def _precache_files_media_assets(artists_map: dict[str, dict], albums_payload: list[dict]) -> tuple[int, int]:
@@ -6576,6 +6660,9 @@ def _rebuild_files_library_index_for_artist(
                 "source": "published_rows_artist_cleanup",
             }
 
+        _files_index_set_state(phase="media_prepare")
+        covers_promoted, artists_promoted = _promote_files_media_paths_to_cache(artists_map, albums_payload)
+
         total_tracks = 0
         embeddings_upserted = 0
         conn = _files_pg_connect()
@@ -6838,13 +6925,15 @@ def _rebuild_files_library_index_for_artist(
             error=None,
         )
         logging.info(
-            "Files library index upserted (%s, artist=%s): %d album(s), %d track row(s), %d embedding(s) in %.2fs (cached covers=%d, artist images=%d)",
+            "Files library index upserted (%s, artist=%s): %d album(s), %d track row(s), %d embedding(s) in %.2fs (promoted covers=%d, promoted artist images=%d, cached covers=%d, artist images=%d)",
             reason,
             artist_name,
             len(albums_payload),
             total_tracks,
             embeddings_upserted,
             elapsed,
+            covers_promoted,
+            artists_promoted,
             covers_cached,
             artists_cached,
         )
@@ -7086,6 +7175,9 @@ def _rebuild_files_library_index(reason: str = "manual", wait_if_running: bool =
         # missing-required tags aligned with non-blocking genre behavior.
         _apply_genre_defaults_to_albums_payload(albums_payload)
 
+        _files_index_set_state(phase="media_prepare")
+        covers_promoted, artists_promoted = _promote_files_media_paths_to_cache(artists_map, albums_payload)
+
         _files_index_set_state(phase="writing", artists=len(artists_map), albums=len(albums_payload))
 
         conn = _files_pg_connect()
@@ -7307,7 +7399,7 @@ def _rebuild_files_library_index(reason: str = "manual", wait_if_running: bool =
             error=None,
         )
         logging.info(
-            "Files library index rebuilt (%s, source=%s): %d artist(s), %d album(s), %d track(s), %d embedding(s) in %.2fs (cached covers=%d, artist images=%d)",
+            "Files library index rebuilt (%s, source=%s): %d artist(s), %d album(s), %d track(s), %d embedding(s) in %.2fs (promoted covers=%d, promoted artist images=%d, cached covers=%d, artist images=%d)",
             reason,
             payload_source,
             len(artists_map),
@@ -7315,6 +7407,8 @@ def _rebuild_files_library_index(reason: str = "manual", wait_if_running: bool =
             sum(len(a["tracks"]) for a in albums_payload),
             reco_embeddings_count,
             elapsed,
+            covers_promoted,
+            artists_promoted,
             covers_cached,
             artists_cached,
         )
@@ -38816,116 +38910,8 @@ def api_library_files_album_cover(album_id):
             to_send = cached or cover_path
             return _serve_image_file_cached(to_send, max_age=86400)
 
-    if folder_raw:
-        folder_path = path_for_fs_access(Path(folder_raw))
-        detected_cover = _first_cover_path(folder_path)
-        if detected_cover and detected_cover.exists() and detected_cover.is_file():
-            cached = _ensure_cached_image_for_path(detected_cover, kind="album", max_px=size)
-            to_send = cached or detected_cover
-            conn = _files_pg_connect()
-            if conn is not None:
-                try:
-                    with conn.transaction():
-                        with conn.cursor() as wcur:
-                            wcur.execute(
-                                """
-                                UPDATE files_albums
-                                SET has_cover = TRUE,
-                                    cover_path = %s,
-                                    updated_at = NOW()
-                                WHERE id = %s
-                                """,
-                                (str(detected_cover), int(album_id)),
-                            )
-                except Exception:
-                    logging.debug("Unable to persist folder cover for album_id=%s", album_id, exc_info=True)
-                finally:
-                    conn.close()
-            _files_cache_set_json(
-                lookup_key,
-                {
-                    "cover_path": str(detected_cover),
-                    "folder_path": folder_raw,
-                    "no_cover": False,
-                },
-                ttl=3600,
-            )
-            return _serve_image_file_cached(to_send, max_age=86400)
-
     if no_cover_cached:
         return _transparent_png_response(max_age=3600)
-
-    conn = _files_pg_connect()
-    if conn is None:
-        return jsonify({"error": "PostgreSQL unavailable"}), 503
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT file_path
-                FROM files_tracks
-                WHERE album_id = %s
-                ORDER BY disc_num ASC, track_num ASC, id ASC
-                LIMIT 12
-                """,
-                (album_id,),
-            )
-            tr_rows = cur.fetchall() or []
-    finally:
-        conn.close()
-
-    embedded = None
-    for tr_row in tr_rows:
-        track_raw = str((tr_row[0] if isinstance(tr_row, (list, tuple)) else tr_row) or "").strip()
-        if not track_raw:
-            continue
-        track_path = path_for_fs_access(Path(track_raw))
-        embedded = _extract_embedded_cover_from_audio(track_path)
-        if embedded:
-            break
-
-    if embedded:
-        raw, mime = embedded
-        master_cached = _ensure_cached_image_from_bytes(
-            raw,
-            mime,
-            kind="embedded",
-            cache_key_hint=f"album-{album_id}-master",
-            max_px=1600,
-        )
-        if master_cached and master_cached.exists():
-            conn = _files_pg_connect()
-            if conn is not None:
-                try:
-                    with conn.transaction():
-                        with conn.cursor() as cur:
-                            cur.execute(
-                                """
-                                UPDATE files_albums
-                                SET has_cover = TRUE,
-                                    cover_path = %s,
-                                    updated_at = NOW()
-                                WHERE id = %s
-                                """,
-                                (str(master_cached), int(album_id)),
-                            )
-                except Exception:
-                    logging.debug("Unable to persist embedded cover for album_id=%s", album_id, exc_info=True)
-                finally:
-                    conn.close()
-            _files_cache_set_json(
-                lookup_key,
-                {
-                    "cover_path": str(master_cached),
-                    "folder_path": folder_raw,
-                    "no_cover": False,
-                },
-                ttl=3600,
-            )
-            sized = _ensure_cached_image_for_path(master_cached, kind="album", max_px=size)
-            to_send = sized or master_cached
-            return _serve_image_file_cached(to_send, max_age=86400)
-        return Response(raw, headers={"Content-Type": mime})
 
     _files_cache_set_json(
         lookup_key,
