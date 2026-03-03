@@ -12,6 +12,7 @@ import { Separator } from '@/components/ui/separator';
 import { Label } from '@/components/ui/label';
 import { Input } from '@/components/ui/input';
 import { PasswordInput } from '@/components/ui/password-input';
+import { Slider } from '@/components/ui/slider';
 import { FolderBrowserInput } from '@/components/settings/FolderBrowserInput';
 import { Switch } from '@/components/ui/switch';
 import {
@@ -41,6 +42,28 @@ const SETTINGS_SECTIONS: { id: string; label: string }[] = [
   { id: 'settings-providers', label: 'Metadata providers' },
   { id: 'settings-concerts', label: 'Concerts' },
   { id: 'settings-notifications', label: 'Notifications' },
+];
+
+const AI_USAGE_LEVELS: Array<{
+  value: NonNullable<PMDAConfig['AI_USAGE_LEVEL']>;
+  label: string;
+  description: string;
+}> = [
+  {
+    value: 'limited',
+    label: 'Limited',
+    description: 'AI uniquement sur cas réellement ambigus; pas de vision, pas de recherche web MBID, pas d’arbitrage IA des dupes.',
+  },
+  {
+    value: 'medium',
+    label: 'Medium',
+    description: 'Équilibre coût/précision: vérification IA des matches + aide provider identity; vision et web MBID restent désactivés.',
+  },
+  {
+    value: 'aggressive',
+    label: 'Aggressive',
+    description: 'Utilisation IA maximale: vérification + matching + vision + web MBID + arbitrage des dupes.',
+  },
 ];
 
 function parsePathListValue(value: unknown): string[] {
@@ -305,6 +328,12 @@ function SettingsPage() {
     }, 350);
   }, [flushSave]);
   const filesRoots = parsePathListValue(config.FILES_ROOTS);
+  const selectedAiLevel = (() => {
+    const raw = String(config.AI_USAGE_LEVEL || 'medium').trim().toLowerCase();
+    return AI_USAGE_LEVELS.find((lvl) => lvl.value === raw)?.value || 'medium';
+  })();
+  const selectedAiLevelIndex = Math.max(0, AI_USAGE_LEVELS.findIndex((lvl) => lvl.value === selectedAiLevel));
+  const selectedAiLevelMeta = AI_USAGE_LEVELS[selectedAiLevelIndex] || AI_USAGE_LEVELS[1];
 
   const setFilesRoots = useCallback((roots: string[]) => {
     updateConfig({ FILES_ROOTS: serializePathList(roots) });
@@ -873,6 +902,24 @@ function SettingsPage() {
 	                  {openaiModelsError && (
 	                    <p className="text-xs text-destructive">{openaiModelsError}</p>
 	                  )}
+                    <div className="mt-4 space-y-3 rounded-lg border border-border/60 bg-muted/30 p-3">
+                      <div className="flex items-center justify-between gap-2">
+                        <Label>AI usage level</Label>
+                        <span className="text-xs font-medium text-muted-foreground">{selectedAiLevelMeta.label}</span>
+                      </div>
+                      <Slider
+                        min={0}
+                        max={2}
+                        step={1}
+                        value={[selectedAiLevelIndex]}
+                        onValueChange={(values) => {
+                          const idx = Math.max(0, Math.min(2, Number(values?.[0] ?? 1)));
+                          const level = AI_USAGE_LEVELS[idx]?.value ?? 'medium';
+                          updateConfig({ AI_USAGE_LEVEL: level });
+                        }}
+                      />
+                      <p className="text-xs text-muted-foreground">{selectedAiLevelMeta.description}</p>
+                    </div>
 	                </div>
 	              </CardContent>
 	            </Card>

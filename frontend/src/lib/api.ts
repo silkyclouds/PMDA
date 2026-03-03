@@ -469,6 +469,8 @@ export interface PMDAConfig {
   
   // AI Provider
   AI_PROVIDER: 'openai' | 'anthropic' | 'google' | 'ollama';
+  /** Global AI usage profile across matching/dedupe/vision flow. */
+  AI_USAGE_LEVEL?: 'limited' | 'medium' | 'aggressive';
   OPENAI_API_KEY: string;
   OPENAI_MODEL: string;
   OPENAI_MODEL_FALLBACKS: string;
@@ -491,6 +493,8 @@ export interface PMDAConfig {
   USE_AI_FOR_MB_MATCH?: boolean;
   /** Use AI to verify MusicBrainz match (artist, title, track count/titles). Can recover e.g. "Volume I" vs "volume i". */
   USE_AI_FOR_MB_VERIFY?: boolean;
+  /** Use AI arbitration for ambiguous duplicate groups. */
+  USE_AI_FOR_DEDUPE?: boolean;
   /** After AI text match, compare local cover to Cover Art Archive (vision). Reject match if "No". */
   USE_AI_VISION_FOR_COVER?: boolean;
   /** Minimum AI confidence (0–100). Below this, reject match and try other sources. 0 = accept all. */
@@ -642,6 +646,11 @@ export interface ScanHistorySummaryJson {
   ai_connection_ok?: boolean;
   ai_groups_count?: number;
   mb_verified_by_ai?: number;
+  ai_calls_total?: number;
+  ai_calls_provider_identity?: number;
+  ai_calls_mb_verify?: number;
+  ai_calls_web_mbid?: number;
+  ai_calls_vision?: number;
   // Duplicate decision telemetry
   duplicate_groups_total?: number;
   duplicate_groups_saved?: number;

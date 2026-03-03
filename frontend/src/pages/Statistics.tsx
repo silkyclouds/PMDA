@@ -59,7 +59,7 @@ const PERIODS = [
 ] as const;
 
 type PeriodKey = (typeof PERIODS)[number]['key'];
-type StatsTab = 'overview' | 'metadata' | 'quality' | 'operations';
+type StatsTab = 'overview' | 'metadata' | 'quality' | 'operations' | 'ai';
 
 interface ScanSnapshot {
   scanId: number;
@@ -88,6 +88,12 @@ interface ScanSnapshot {
   audioCacheMisses: number;
   mbCacheHits: number;
   mbCacheMisses: number;
+  aiCallsTotal: number;
+  aiCallsProviderIdentity: number;
+  aiCallsMbVerify: number;
+  aiCallsWebMbid: number;
+  aiCallsVision: number;
+  aiErrorsTotal: number;
 }
 
 interface AggregateStats {
@@ -115,6 +121,12 @@ interface AggregateStats {
   audioCacheMisses: number;
   mbCacheHits: number;
   mbCacheMisses: number;
+  aiCallsTotal: number;
+  aiCallsProviderIdentity: number;
+  aiCallsMbVerify: number;
+  aiCallsWebMbid: number;
+  aiCallsVision: number;
+  aiErrorsTotal: number;
 }
 
 function n(value: number | null | undefined): number {
@@ -206,6 +218,12 @@ function normalizeScan(entry: ScanHistoryEntry): ScanSnapshot {
     audioCacheMisses: n(summary?.audio_cache_misses),
     mbCacheHits: n(summary?.mb_cache_hits),
     mbCacheMisses: n(summary?.mb_cache_misses),
+    aiCallsTotal: n(summary?.ai_calls_total),
+    aiCallsProviderIdentity: n(summary?.ai_calls_provider_identity),
+    aiCallsMbVerify: n(summary?.ai_calls_mb_verify),
+    aiCallsWebMbid: n(summary?.ai_calls_web_mbid),
+    aiCallsVision: n(summary?.ai_calls_vision),
+    aiErrorsTotal: Array.isArray(summary?.ai_errors) ? summary!.ai_errors!.length : 0,
   };
 }
 
@@ -255,6 +273,12 @@ function normalizeLiveScan(progress: ScanProgress, fallbackStartTime: number): S
     audioCacheMisses: n(progress.audio_cache_misses),
     mbCacheHits: n(progress.mb_cache_hits),
     mbCacheMisses: n(progress.mb_cache_misses),
+    aiCallsTotal: 0,
+    aiCallsProviderIdentity: 0,
+    aiCallsMbVerify: 0,
+    aiCallsWebMbid: 0,
+    aiCallsVision: 0,
+    aiErrorsTotal: 0,
   };
 }
 
@@ -285,6 +309,12 @@ function aggregate(scans: ScanSnapshot[]): AggregateStats {
       acc.audioCacheMisses += scan.audioCacheMisses;
       acc.mbCacheHits += scan.mbCacheHits;
       acc.mbCacheMisses += scan.mbCacheMisses;
+      acc.aiCallsTotal += scan.aiCallsTotal;
+      acc.aiCallsProviderIdentity += scan.aiCallsProviderIdentity;
+      acc.aiCallsMbVerify += scan.aiCallsMbVerify;
+      acc.aiCallsWebMbid += scan.aiCallsWebMbid;
+      acc.aiCallsVision += scan.aiCallsVision;
+      acc.aiErrorsTotal += scan.aiErrorsTotal;
       return acc;
     },
     {
@@ -312,6 +342,12 @@ function aggregate(scans: ScanSnapshot[]): AggregateStats {
       audioCacheMisses: 0,
       mbCacheHits: 0,
       mbCacheMisses: 0,
+      aiCallsTotal: 0,
+      aiCallsProviderIdentity: 0,
+      aiCallsMbVerify: 0,
+      aiCallsWebMbid: 0,
+      aiCallsVision: 0,
+      aiErrorsTotal: 0,
     },
   );
 }
@@ -620,6 +656,61 @@ export default function Statistics() {
       ],
     };
   }, [current.albumsWithMbId, current.discogsMatches, current.lastfmMatches, current.bandcampMatches]);
+
+  const aiCallsBreakdownData = useMemo(() => {
+    return {
+      labels: ['Provider identity', 'MB verify', 'Web MBID', 'Vision'],
+      datasets: [
+        {
+          data: [
+            current.aiCallsProviderIdentity,
+            current.aiCallsMbVerify,
+            current.aiCallsWebMbid,
+            current.aiCallsVision,
+          ],
+          backgroundColor: [
+            'rgba(59,130,246,0.82)',
+            'rgba(34,197,94,0.82)',
+            'rgba(249,115,22,0.82)',
+            'rgba(168,85,247,0.82)',
+          ],
+          borderColor: ['#2563eb', '#16a34a', '#ea580c', '#9333ea'],
+          borderWidth: 1,
+        },
+      ],
+    };
+  }, [
+    current.aiCallsMbVerify,
+    current.aiCallsProviderIdentity,
+    current.aiCallsVision,
+    current.aiCallsWebMbid,
+  ]);
+
+  const aiCallsTrendData = useMemo(() => {
+    return {
+      labels: scansChrono.map((scan) => format(new Date(scan.startTime * 1000), 'MM-dd HH:mm')),
+      datasets: [
+        {
+          label: 'Total AI calls',
+          data: scansChrono.map((scan) => scan.aiCallsTotal),
+          borderColor: '#2563eb',
+          backgroundColor: 'rgba(37,99,235,0.18)',
+          tension: 0.25,
+          fill: true,
+          borderWidth: 2,
+        },
+        {
+          label: 'AI errors',
+          data: scansChrono.map((scan) => scan.aiErrorsTotal),
+          borderColor: '#dc2626',
+          backgroundColor: 'rgba(220,38,38,0.18)',
+          tension: 0.25,
+          fill: true,
+          borderWidth: 2,
+        },
+      ],
+    };
+  }, [scansChrono]);
 
   const qualityCoverageData = useMemo(() => {
     return {
@@ -978,7 +1069,7 @@ export default function Statistics() {
           </Card>
         ) : (
           <Tabs value={activeTab} onValueChange={(v) => setActiveTab(v as StatsTab)}>
-            <TabsList className="grid grid-cols-2 md:grid-cols-4 w-full md:w-auto rounded-xl bg-muted/60 border border-border p-1 shadow-sm">
+            <TabsList className="grid grid-cols-2 md:grid-cols-5 w-full md:w-auto rounded-xl bg-muted/60 border border-border p-1 shadow-sm">
               <TabsTrigger value="overview" className="gap-2 rounded-lg">
                 <BarChart3 className="w-4 h-4" />
                 Overview
@@ -986,6 +1077,10 @@ export default function Statistics() {
               <TabsTrigger value="metadata" className="gap-2 rounded-lg">
                 <Database className="w-4 h-4" />
                 Metadata
+              </TabsTrigger>
+              <TabsTrigger value="ai" className="gap-2 rounded-lg">
+                <Sparkles className="w-4 h-4" />
+                AI
               </TabsTrigger>
               <TabsTrigger value="quality" className="gap-2 rounded-lg">
                 <Sparkles className="w-4 h-4" />
@@ -1179,6 +1274,79 @@ export default function Statistics() {
                       }}
                     />
                   </div>
+                </CardContent>
+              </Card>
+            </TabsContent>
+
+            <TabsContent value="ai" className="space-y-4">
+              <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
+                <StatCard
+                  title="Total AI Calls"
+                  icon={<Sparkles className="w-4 h-4 text-primary" />}
+                  value={current.aiCallsTotal.toLocaleString()}
+                  description={`${formatPercent(current.aiCallsTotal, Math.max(1, current.albumsScanned))} calls vs albums scanned`}
+                  delta={<DeltaPill current={current.aiCallsTotal} previous={previous.aiCallsTotal} />}
+                />
+                <StatCard
+                  title="Provider Identity"
+                  icon={<Database className="w-4 h-4 text-info" />}
+                  value={current.aiCallsProviderIdentity.toLocaleString()}
+                  description="Discogs/Last.fm/Bandcamp arbitration"
+                  delta={<DeltaPill current={current.aiCallsProviderIdentity} previous={previous.aiCallsProviderIdentity} />}
+                />
+                <StatCard
+                  title="MB Verify + Web"
+                  icon={<Server className="w-4 h-4 text-secondary" />}
+                  value={(current.aiCallsMbVerify + current.aiCallsWebMbid).toLocaleString()}
+                  description={`MB verify: ${current.aiCallsMbVerify.toLocaleString()} · Web MBID: ${current.aiCallsWebMbid.toLocaleString()}`}
+                  delta={
+                    <DeltaPill
+                      current={current.aiCallsMbVerify + current.aiCallsWebMbid}
+                      previous={previous.aiCallsMbVerify + previous.aiCallsWebMbid}
+                    />
+                  }
+                />
+                <StatCard
+                  title="Vision Calls"
+                  icon={<Image className="w-4 h-4 text-warning" />}
+                  value={current.aiCallsVision.toLocaleString()}
+                  description={`AI errors: ${current.aiErrorsTotal.toLocaleString()}`}
+                  delta={<DeltaPill current={current.aiCallsVision} previous={previous.aiCallsVision} />}
+                />
+              </div>
+
+              <Card>
+                <CardHeader>
+                  <CardTitle className="text-sm">AI calls breakdown</CardTitle>
+                  <CardDescription>How AI usage is distributed across PMDA features.</CardDescription>
+                </CardHeader>
+                <CardContent>
+                  <div className="h-[260px] flex items-center justify-center">
+                    <Doughnut data={aiCallsBreakdownData} options={{ ...chartOptions, cutout: '60%' }} />
+                  </div>
+                </CardContent>
+              </Card>
+
+              <Card>
+                <CardHeader>
+                  <CardTitle className="text-sm">AI activity trend</CardTitle>
+                  <CardDescription>Calls and errors by scan.</CardDescription>
+                </CardHeader>
+                <CardContent>
+                  <div className="h-[260px]">
+                    <Line data={aiCallsTrendData} options={chartOptions} />
+                  </div>
+                </CardContent>
+              </Card>
+
+              <Card>
+                <CardHeader>
+                  <CardTitle className="text-sm">Cost telemetry status</CardTitle>
+                </CardHeader>
+                <CardContent>
+                  <p className="text-sm text-muted-foreground">
+                    PMDA tracks AI call volumes per scan (shown above). Token-level and exact USD cost tracking are not persisted yet in this build.
+                  </p>
                 </CardContent>
               </Card>
             </TabsContent>

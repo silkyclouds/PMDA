@@ -115,5 +115,9 @@ export function normalizeConfigForUI(raw: Partial<PMDAConfig>): Partial<PMDAConf
     const target = String(out.PIPELINE_PLAYER_TARGET).trim().toLowerCase();
     out.PIPELINE_PLAYER_TARGET = (['none', 'plex', 'jellyfin', 'navidrome'].includes(target) ? target : 'none') as PMDAConfig['PIPELINE_PLAYER_TARGET'];
   }
+  if (out.AI_USAGE_LEVEL != null) {
+    const level = String(out.AI_USAGE_LEVEL).trim().toLowerCase();
+    out.AI_USAGE_LEVEL = (['limited', 'medium', 'aggressive'].includes(level) ? level : 'medium') as PMDAConfig['AI_USAGE_LEVEL'];
+  }
   return out;
 }

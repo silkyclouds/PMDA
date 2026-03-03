@@ -170,9 +170,9 @@ export function AppSidebar() {
   return (
     <Sidebar collapsible="icon" variant="sidebar">
       <SidebarHeader>
-        <div className="flex items-center gap-2 px-2 py-1.5">
+        <div className="flex items-center gap-2 px-2 py-1.5 group-data-[collapsible=icon]:justify-center group-data-[collapsible=icon]:px-1">
           <SidebarTrigger className="h-8 w-8 rounded-lg" />
-          <Logo showText={false} size="sm" />
+          <Logo showText={false} size="sm" className="group-data-[collapsible=icon]:hidden" />
           <div className="min-w-0 group-data-[collapsible=icon]:hidden">
             <div className="font-semibold leading-tight">PMDA</div>
           </div>
@@ -219,7 +219,7 @@ export function AppSidebar() {
                       isActive={active}
                       tooltip={it.label}
                       size="sm"
-                      className="ml-5 group-data-[collapsible=icon]:hidden"
+                      className="ml-5 group-data-[collapsible=icon]:ml-0"
                       onClick={() => navigate(it.to)}
                     >
                       <Icon className="h-3.5 w-3.5" />
@@ -259,12 +259,8 @@ export function AppSidebar() {
           </SidebarGroupAction>
           <SidebarGroupContent>
             {loadingPlaylists && visiblePlaylistItems.length === 0 ? (
-              <div className="px-2 py-2 text-xs text-muted-foreground">Loading…</div>
-            ) : visiblePlaylistItems.length === 0 ? (
-              <div className="px-2 py-2 text-xs text-muted-foreground">
-                No playlists yet. Create one and drag tracks here.
-              </div>
-            ) : (
+              <div className="px-2 py-2 text-xs text-muted-foreground group-data-[collapsible=icon]:hidden">Loading…</div>
+            ) : visiblePlaylistItems.length === 0 ? null : (
               <SidebarMenu>
                 {visiblePlaylistItems.map((pl) => {
                   const active = isPathActive(location.pathname, `/library/playlists/${pl.playlist_id}`);

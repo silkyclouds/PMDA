@@ -454,16 +454,15 @@ export default function ArtistPage() {
   };
 
   useEffect(() => {
-    if (!details) return;
+    if (!details || !profileEnriching) return;
     let cancelled = false;
     let attempts = 0;
     let timer: ReturnType<typeof setTimeout> | null = null;
 
     const run = async () => {
       attempts += 1;
-      const refreshing = attempts === 1;
-      const stillEnriching = await fetchProfile(refreshing);
-      if (!cancelled && stillEnriching && attempts < 12) {
+      const stillEnriching = await fetchProfile(false);
+      if (!cancelled && stillEnriching && attempts < 20) {
         timer = setTimeout(run, 1500);
       }
     };
@@ -473,7 +472,7 @@ export default function ArtistPage() {
       cancelled = true;
       if (timer) clearTimeout(timer);
     };
-  }, [details, fetchProfile]);
+  }, [details, fetchProfile, profileEnriching]);
 
   useEffect(() => {
     if (!details) return;

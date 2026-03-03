@@ -1125,6 +1125,7 @@ merged = {
     "AI_PROVIDER": _get("AI_PROVIDER", default="openai", cast=str),
     "OPENAI_API_KEY": _get("OPENAI_API_KEY", default="",                                cast=str),
     "OPENAI_MODEL":   _get("OPENAI_MODEL",   default="gpt-4",                           cast=str),
+    "AI_USAGE_LEVEL": _get("AI_USAGE_LEVEL", default="medium",                          cast=str),
     "ANTHROPIC_API_KEY": _get("ANTHROPIC_API_KEY", default="", cast=str),
     "GOOGLE_API_KEY": _get("GOOGLE_API_KEY", default="", cast=str),
     "OLLAMA_URL": _get("OLLAMA_URL", default="http://localhost:11434", cast=str),
@@ -1220,6 +1221,7 @@ merged = {
     "NAVIDROME_API_KEY": _get("NAVIDROME_API_KEY", default="", cast=str),
     "USE_AI_FOR_MB_MATCH": _get("USE_AI_FOR_MB_MATCH", default=True, cast=_parse_bool),
     "USE_AI_FOR_MB_VERIFY": _get("USE_AI_FOR_MB_VERIFY", default=True, cast=_parse_bool),
+    "USE_AI_FOR_DEDUPE": _get("USE_AI_FOR_DEDUPE", default=True, cast=_parse_bool),
     "USE_AI_VISION_FOR_COVER": _get("USE_AI_VISION_FOR_COVER", default=True, cast=_parse_bool),
     "AI_CONFIDENCE_MIN": _get("AI_CONFIDENCE_MIN", default=50, cast=lambda x: int(x) if x is not None and str(x).strip().isdigit() else 50),
     "OPENAI_VISION_MODEL": _get("OPENAI_VISION_MODEL", default="", cast=str),
@@ -1350,8 +1352,10 @@ NAVIDROME_URL: str = str(merged.get("NAVIDROME_URL", "") or "").strip()
 NAVIDROME_USERNAME: str = str(merged.get("NAVIDROME_USERNAME", "") or "").strip()
 NAVIDROME_PASSWORD: str = str(merged.get("NAVIDROME_PASSWORD", "") or "").strip()
 NAVIDROME_API_KEY: str = str(merged.get("NAVIDROME_API_KEY", "") or "").strip()
+AI_USAGE_LEVEL: str = str(merged.get("AI_USAGE_LEVEL", "medium") or "medium").strip().lower()
 USE_AI_FOR_MB_MATCH: bool = bool(merged.get("USE_AI_FOR_MB_MATCH", True))
 USE_AI_FOR_MB_VERIFY: bool = bool(merged.get("USE_AI_FOR_MB_VERIFY", True))
+USE_AI_FOR_DEDUPE: bool = bool(merged.get("USE_AI_FOR_DEDUPE", True))
 USE_AI_VISION_FOR_COVER: bool = bool(merged.get("USE_AI_VISION_FOR_COVER", True))
 AI_CONFIDENCE_MIN: int = int(merged.get("AI_CONFIDENCE_MIN", 50))
 OPENAI_VISION_MODEL: str = str(merged.get("OPENAI_VISION_MODEL", "") or "").strip()
@@ -1393,6 +1397,81 @@ ARTIST_CREDIT_MODE: str = str(merged.get("ARTIST_CREDIT_MODE", "picard_like_defa
 LIVE_DEDUPE_MODE: str = str(merged.get("LIVE_DEDUPE_MODE", "safe") or "safe").strip().lower()
 
 
+def _normalize_ai_usage_level(value: str | None) -> str:
+    raw = str(value or "").strip().lower()
+    if raw in {"limited", "medium", "aggressive"}:
+        return raw
+    return "medium"
+
+
+def _ai_usage_level_overrides(level: str) -> dict[str, bool]:
+    normalized = _normalize_ai_usage_level(level)
+    if normalized == "limited":
+        return {
+            "USE_AI_FOR_MB_MATCH": False,
+            "USE_AI_FOR_MB_VERIFY": True,
+            "USE_AI_FOR_DEDUPE": False,
+            "USE_AI_VISION_FOR_COVER": False,
+            "USE_AI_VISION_BEFORE_COVER_INJECT": False,
+            "USE_WEB_SEARCH_FOR_MB": False,
+            "PROVIDER_IDENTITY_USE_AI": False,
+        }
+    if normalized == "aggressive":
+        return {
+            "USE_AI_FOR_MB_MATCH": True,
+            "USE_AI_FOR_MB_VERIFY": True,
+            "USE_AI_FOR_DEDUPE": True,
+            "USE_AI_VISION_FOR_COVER": True,
+            "USE_AI_VISION_BEFORE_COVER_INJECT": True,
+            "USE_WEB_SEARCH_FOR_MB": True,
+            "PROVIDER_IDENTITY_USE_AI": True,
+        }
+    return {
+        "USE_AI_FOR_MB_MATCH": False,
+        "USE_AI_FOR_MB_VERIFY": True,
+        "USE_AI_FOR_DEDUPE": True,
+        "USE_AI_VISION_FOR_COVER": False,
+        "USE_AI_VISION_BEFORE_COVER_INJECT": False,
+        "USE_WEB_SEARCH_FOR_MB": False,
+        "PROVIDER_IDENTITY_USE_AI": True,
+    }
+
+
+def _apply_ai_usage_level(level: str | None = None) -> str:
+    """
+    One single UX control for AI usage across the pipeline.
+    limited: cheapest/safest AI usage
+    medium: balanced defaults
+    aggressive: maximum AI assistance
+    """
+    global AI_USAGE_LEVEL
+    global USE_AI_FOR_MB_MATCH, USE_AI_FOR_MB_VERIFY, USE_AI_FOR_DEDUPE
+    global USE_AI_VISION_FOR_COVER, USE_AI_VISION_BEFORE_COVER_INJECT
+    global USE_WEB_SEARCH_FOR_MB, PROVIDER_IDENTITY_USE_AI
+
+    normalized = _normalize_ai_usage_level(level if level is not None else AI_USAGE_LEVEL)
+    AI_USAGE_LEVEL = normalized
+
+    overrides = _ai_usage_level_overrides(normalized)
+    USE_AI_FOR_MB_MATCH = bool(overrides["USE_AI_FOR_MB_MATCH"])
+    USE_AI_FOR_MB_VERIFY = bool(overrides["USE_AI_FOR_MB_VERIFY"])
+    USE_AI_FOR_DEDUPE = bool(overrides["USE_AI_FOR_DEDUPE"])
+    USE_AI_VISION_FOR_COVER = bool(overrides["USE_AI_VISION_FOR_COVER"])
+    USE_AI_VISION_BEFORE_COVER_INJECT = bool(overrides["USE_AI_VISION_BEFORE_COVER_INJECT"])
+    USE_WEB_SEARCH_FOR_MB = bool(overrides["USE_WEB_SEARCH_FOR_MB"])
+    PROVIDER_IDENTITY_USE_AI = bool(overrides["PROVIDER_IDENTITY_USE_AI"])
+
+    merged["AI_USAGE_LEVEL"] = normalized
+    merged["USE_AI_FOR_MB_MATCH"] = USE_AI_FOR_MB_MATCH
+    merged["USE_AI_FOR_MB_VERIFY"] = USE_AI_FOR_MB_VERIFY
+    merged["USE_AI_FOR_DEDUPE"] = USE_AI_FOR_DEDUPE
+    merged["USE_AI_VISION_FOR_COVER"] = USE_AI_VISION_FOR_COVER
+    merged["USE_AI_VISION_BEFORE_COVER_INJECT"] = USE_AI_VISION_BEFORE_COVER_INJECT
+    merged["USE_WEB_SEARCH_FOR_MB"] = USE_WEB_SEARCH_FOR_MB
+    merged["PROVIDER_IDENTITY_USE_AI"] = PROVIDER_IDENTITY_USE_AI
+    return normalized
+
+
 def _apply_forced_runtime_defaults():
     """
     Keep UX simple without silently re-enabling costly features.
@@ -1410,6 +1489,7 @@ def _apply_forced_runtime_defaults():
 
 
 _apply_forced_runtime_defaults()
+_apply_ai_usage_level(AI_USAGE_LEVEL)
 SKIP_MB_FOR_LIVE_ALBUMS: bool = bool(merged.get("SKIP_MB_FOR_LIVE_ALBUMS", True))
 TRACKLIST_MATCH_MIN: float = float(merged.get("TRACKLIST_MATCH_MIN", 0.8))
 LIVE_ALBUMS_MB_STRICT: bool = bool(merged.get("LIVE_ALBUMS_MB_STRICT", False))
@@ -8631,6 +8711,14 @@ def _enqueue_files_profile_enrichment(artist_name: str, artist_norm: str, albums
         name=f"profile-enrich-{artist_norm[:24]}",
     ).start()
     return True
+
+
+def _files_profile_job_is_active(artist_norm: str) -> bool:
+    key = str(artist_norm or "").strip().lower()
+    if not key:
+        return False
+    with _files_profile_jobs_lock:
+        return key in _files_profile_jobs_active
 
 
 _files_similar_images_jobs_lock = threading.Lock()
@@ -16688,7 +16776,7 @@ def choose_best(editions: List[dict], defer_ai: bool = False) -> dict | None:
         return h_best
 
     # 3) AI path for ambiguous groups.
-    if ai_provider_ready:
+    if ai_provider_ready and bool(getattr(sys.modules[__name__], "USE_AI_FOR_DEDUPE", True)):
         if defer_ai:
             return None
 
@@ -29204,6 +29292,7 @@ def api_config_get():
         "CROSSCHECK_SAMPLES": get_setting("CROSSCHECK_SAMPLES", CROSSCHECK_SAMPLES),
         "FORMAT_PREFERENCE": _parse_format_preference(get_setting("FORMAT_PREFERENCE", FORMAT_PREFERENCE)),
         "AI_PROVIDER": get_setting("AI_PROVIDER", AI_PROVIDER),
+        "AI_USAGE_LEVEL": _normalize_ai_usage_level(get_setting("AI_USAGE_LEVEL", AI_USAGE_LEVEL)),
         "OPENAI_API_KEY": "***" if _is_set(openai_key_eff) else "",
         "OPENAI_API_KEY_SET": _is_set(openai_key_eff),
         "OPENAI_MODEL": get_setting("OPENAI_MODEL", OPENAI_MODEL),
@@ -29245,13 +29334,14 @@ def api_config_get():
         "PROVIDER_CACHE_FOUND_TTL_SEC": get_setting("PROVIDER_CACHE_FOUND_TTL_SEC", PROVIDER_CACHE_FOUND_TTL_SEC),
         "PROVIDER_CACHE_NOT_FOUND_TTL_SEC": get_setting("PROVIDER_CACHE_NOT_FOUND_TTL_SEC", PROVIDER_CACHE_NOT_FOUND_TTL_SEC),
         "PROVIDER_CACHE_ERROR_TTL_SEC": get_setting("PROVIDER_CACHE_ERROR_TTL_SEC", PROVIDER_CACHE_ERROR_TTL_SEC),
-        "USE_AI_FOR_MB_MATCH": get_setting_bool("USE_AI_FOR_MB_MATCH", USE_AI_FOR_MB_MATCH),
-        "USE_AI_FOR_MB_VERIFY": get_setting_bool("USE_AI_FOR_MB_VERIFY", USE_AI_FOR_MB_VERIFY),
-        "USE_AI_VISION_FOR_COVER": get_setting_bool("USE_AI_VISION_FOR_COVER", USE_AI_VISION_FOR_COVER),
+        "USE_AI_FOR_MB_MATCH": bool(USE_AI_FOR_MB_MATCH),
+        "USE_AI_FOR_MB_VERIFY": bool(USE_AI_FOR_MB_VERIFY),
+        "USE_AI_FOR_DEDUPE": bool(USE_AI_FOR_DEDUPE),
+        "USE_AI_VISION_FOR_COVER": bool(USE_AI_VISION_FOR_COVER),
         "AI_CONFIDENCE_MIN": max(0, min(100, int(get_setting("AI_CONFIDENCE_MIN", AI_CONFIDENCE_MIN) or 50))),
         "OPENAI_VISION_MODEL": get_setting("OPENAI_VISION_MODEL", OPENAI_VISION_MODEL),
-        "USE_AI_VISION_BEFORE_COVER_INJECT": get_setting_bool("USE_AI_VISION_BEFORE_COVER_INJECT", USE_AI_VISION_BEFORE_COVER_INJECT),
-        "USE_WEB_SEARCH_FOR_MB": get_setting_bool("USE_WEB_SEARCH_FOR_MB", USE_WEB_SEARCH_FOR_MB),
+        "USE_AI_VISION_BEFORE_COVER_INJECT": bool(USE_AI_VISION_BEFORE_COVER_INJECT),
+        "USE_WEB_SEARCH_FOR_MB": bool(USE_WEB_SEARCH_FOR_MB),
         "SERPER_API_KEY": "***" if _is_set(serper_key_eff) else "",
         "SERPER_API_KEY_SET": _is_set(serper_key_eff),
         "USE_ACOUSTID": True,
@@ -29540,6 +29630,9 @@ def _apply_settings_in_memory(updates: dict):
     if "USE_AI_FOR_MB_VERIFY" in updates:
         global USE_AI_FOR_MB_VERIFY
         USE_AI_FOR_MB_VERIFY = bool(_parse_bool(updates["USE_AI_FOR_MB_VERIFY"]))
+    if "USE_AI_FOR_DEDUPE" in updates:
+        global USE_AI_FOR_DEDUPE
+        USE_AI_FOR_DEDUPE = bool(_parse_bool(updates["USE_AI_FOR_DEDUPE"]))
     if "USE_AI_VISION_FOR_COVER" in updates:
         global USE_AI_VISION_FOR_COVER
         USE_AI_VISION_FOR_COVER = bool(_parse_bool(updates["USE_AI_VISION_FOR_COVER"]))
@@ -29559,6 +29652,11 @@ def _apply_settings_in_memory(updates: dict):
     if "USE_WEB_SEARCH_FOR_MB" in updates:
         global USE_WEB_SEARCH_FOR_MB
         USE_WEB_SEARCH_FOR_MB = bool(_parse_bool(updates["USE_WEB_SEARCH_FOR_MB"]))
+    if "AI_USAGE_LEVEL" in updates:
+        global AI_USAGE_LEVEL
+        AI_USAGE_LEVEL = _normalize_ai_usage_level(str(updates.get("AI_USAGE_LEVEL") or "medium"))
+        _apply_ai_usage_level(AI_USAGE_LEVEL)
+        logging.info("AI_USAGE_LEVEL updated in memory: %s", AI_USAGE_LEVEL)
     if "SERPER_API_KEY" in updates:
         global SERPER_API_KEY
         v = str(updates.get("SERPER_API_KEY") or "").strip()
@@ -29962,13 +30060,13 @@ def api_config_put():
     allowed = {
         "PLEX_HOST", "PLEX_TOKEN", "PLEX_BASE_PATH", "PLEX_DB_PATH", "SECTION_IDS", "PATH_MAP",
         "DUPE_ROOT", "PMDA_CONFIG_DIR", "MUSIC_PARENT_PATH",
-        "SCAN_THREADS", "LOG_LEVEL", "LOG_FILE", "AI_PROVIDER", "OPENAI_API_KEY", "OPENAI_MODEL",
+        "SCAN_THREADS", "LOG_LEVEL", "LOG_FILE", "AI_PROVIDER", "AI_USAGE_LEVEL", "OPENAI_API_KEY", "OPENAI_MODEL",
         "OPENAI_MODEL_FALLBACKS", "ANTHROPIC_API_KEY", "GOOGLE_API_KEY", "OLLAMA_URL",
         "DISCORD_WEBHOOK", "USE_MUSICBRAINZ", "MUSICBRAINZ_EMAIL", "MB_RETRY_NOT_FOUND",
         "MB_SEARCH_ALBUM_TIMEOUT_SEC", "MB_CANDIDATE_FETCH_LIMIT", "MB_TRACKLIST_FETCH_LIMIT", "MB_FAST_FALLBACK_MODE",
         "PROVIDER_IDENTITY_STRICT", "PROVIDER_IDENTITY_USE_AI", "PROVIDER_IDENTITY_MIN_SCORE", "PROVIDER_IDENTITY_SCORE_MARGIN",
         "PROVIDER_CACHE_FOUND_TTL_SEC", "PROVIDER_CACHE_NOT_FOUND_TTL_SEC", "PROVIDER_CACHE_ERROR_TTL_SEC",
-        "USE_AI_FOR_MB_MATCH", "USE_AI_FOR_MB_VERIFY",
+        "USE_AI_FOR_MB_MATCH", "USE_AI_FOR_MB_VERIFY", "USE_AI_FOR_DEDUPE",
         "USE_AI_VISION_FOR_COVER", "AI_CONFIDENCE_MIN", "OPENAI_VISION_MODEL", "USE_AI_VISION_BEFORE_COVER_INJECT", "USE_WEB_SEARCH_FOR_MB", "SERPER_API_KEY",
         "USE_ACOUSTID", "ACOUSTID_API_KEY", "USE_ACOUSTID_WHEN_TAGGED",
         "SKIP_FOLDERS", "CROSS_LIBRARY_DEDUPE", "CROSSCHECK_SAMPLES", "DISABLE_PATH_CROSSCHECK",
@@ -30013,6 +30111,10 @@ def api_config_put():
         updates["EXPORT_LINK_STRATEGY"] = strategy if strategy in {"hardlink", "symlink", "copy", "move"} else "hardlink"
     if "PIPELINE_PLAYER_TARGET" in updates:
         updates["PIPELINE_PLAYER_TARGET"] = _normalize_player_target(updates["PIPELINE_PLAYER_TARGET"])
+    if "AI_USAGE_LEVEL" in updates:
+        normalized_level = _normalize_ai_usage_level(str(updates.get("AI_USAGE_LEVEL") or "medium"))
+        updates["AI_USAGE_LEVEL"] = normalized_level
+        updates.update(_ai_usage_level_overrides(normalized_level))
     if "JELLYFIN_URL" in updates:
         updates["JELLYFIN_URL"] = _normalize_http_base_url(updates["JELLYFIN_URL"])
     if "NAVIDROME_URL" in updates:
@@ -36649,11 +36751,7 @@ def api_library_artist_detail(artist_id):
             artist_profile = _files_get_artist_profile_cached(artist_name, artist_norm)
             title_norms = [str(r[2] or "") for r in rows if str(r[2] or "").strip()]
             album_profile_map = _files_get_album_profiles_cached(artist_norm, title_norms)
-            profile_enriching = _enqueue_files_profile_enrichment(
-                artist_name,
-                artist_norm,
-                [(str(r[1] or ""), str(r[2] or "")) for r in rows],
-            )
+            profile_enriching = _files_profile_job_is_active(artist_norm)
 
             albums = []
             stats_duplicates = 0
@@ -37170,10 +37268,9 @@ def api_library_artist_profile(artist_id: int):
             albums = [(str(r[0] or ""), str(r[1] or "")) for r in cur.fetchall()]
         profile = _files_get_artist_profile_cached(artist_name, artist_norm)
         force_refresh = str(request.args.get("refresh", "")).strip().lower() in {"1", "true", "yes"}
-        should_enrich = force_refresh or (not bool(profile.get("short_bio"))) or bool(profile.get("stale"))
-        enriching = False
-        if should_enrich:
-            enriching = _enqueue_files_profile_enrichment(artist_name, artist_norm, albums)
+        enriching = _files_profile_job_is_active(artist_norm)
+        if force_refresh:
+            enriching = _enqueue_files_profile_enrichment(artist_name, artist_norm, albums) or enriching
 
         # Attach local IDs + images to similar artists.
         base_url = request.url_root.rstrip("/")
