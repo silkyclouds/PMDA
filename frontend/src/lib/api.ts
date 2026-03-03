@@ -182,6 +182,12 @@ export interface CacheControlMetrics {
   };
   redis: {
     available: boolean;
+    mode?: string;
+    reason?: string;
+    last_error?: string;
+    last_ok_ts?: number;
+    local_cache_enabled?: boolean;
+    local_cache_keys?: number;
     host: string;
     port: number;
     db: number;
@@ -198,6 +204,10 @@ export interface CacheControlMetrics {
   };
   postgres: {
     available: boolean;
+    mode?: string;
+    reason?: string;
+    last_error?: string;
+    last_ok_ts?: number;
     db_size_bytes: number;
     db_cache_hit_rate_pct?: number | null;
     numbackends: number;
@@ -262,6 +272,9 @@ export interface CacheControlMetrics {
   };
   files_watcher: {
     running: boolean;
+    enabled?: boolean;
+    available?: boolean;
+    reason?: string;
     roots: string[];
     dirty_count: number;
     last_event_at?: number | null;
@@ -759,6 +772,10 @@ const isApiError = (error: unknown): error is ApiError => {
 const GET_REQUEST_TIMEOUT_MS = 12000;
 const inFlightGetRequests = new Map<string, Promise<unknown>>();
 
+type FetchApiRequestInit = RequestInit & {
+  timeoutMs?: number;
+};
+
 function createFetchSignal(
   externalSignal?: AbortSignal,
   timeoutMs: number = 0,
@@ -796,18 +813,20 @@ function createFetchSignal(
   };
 }
 
-async function executeFetchApi<T>(endpoint: string, options?: RequestInit): Promise<T> {
+async function executeFetchApi<T>(endpoint: string, options?: FetchApiRequestInit): Promise<T> {
   const method = String(options?.method ?? 'GET').toUpperCase();
-  const timeoutMs = method === 'GET' ? GET_REQUEST_TIMEOUT_MS : 0;
-  const { signal, cleanup } = createFetchSignal(options?.signal, timeoutMs);
+  const customTimeout = Number(options?.timeoutMs || 0);
+  const timeoutMs = method === 'GET' ? (customTimeout > 0 ? customTimeout : GET_REQUEST_TIMEOUT_MS) : Math.max(0, customTimeout);
+  const { timeoutMs: _ignoredTimeoutMs, ...requestOptions } = options || {};
+  const { signal, cleanup } = createFetchSignal(requestOptions?.signal, timeoutMs);
   let timedOut = false;
   try {
     const response = await fetch(`${API_BASE_URL}${endpoint}`, {
-      ...options,
-      signal: signal ?? options?.signal,
+      ...requestOptions,
+      signal: signal ?? requestOptions?.signal,
       headers: {
         'Content-Type': 'application/json',
-        ...options?.headers,
+        ...requestOptions?.headers,
       },
     });
     
@@ -843,12 +862,13 @@ async function executeFetchApi<T>(endpoint: string, options?: RequestInit): Prom
 }
 
 // API Functions
-async function fetchApi<T>(endpoint: string, options?: RequestInit): Promise<T> {
+async function fetchApi<T>(endpoint: string, options?: FetchApiRequestInit): Promise<T> {
   const method = String(options?.method ?? 'GET').toUpperCase();
   if (method !== 'GET') {
     return executeFetchApi<T>(endpoint, options);
   }
-  const key = `${method}:${API_BASE_URL}${endpoint}`;
+  const timeoutKey = Number(options?.timeoutMs || 0);
+  const key = `${method}:${API_BASE_URL}${endpoint}:timeout=${timeoutKey}`;
   const inFlight = inFlightGetRequests.get(key) as Promise<T> | undefined;
   if (inFlight) return inFlight;
   const request = executeFetchApi<T>(endpoint, options).finally(() => {
@@ -1727,7 +1747,9 @@ export interface AlbumDetailResponse {
 }
 
 export async function getAlbumDetail(albumId: number): Promise<AlbumDetailResponse> {
-  return fetchApi<AlbumDetailResponse>(`/api/library/album/${encodeURIComponent(String(albumId))}`);
+  return fetchApi<AlbumDetailResponse>(`/api/library/album/${encodeURIComponent(String(albumId))}`, {
+    timeoutMs: 30000,
+  });
 }
 
 export interface PlaylistSummary {

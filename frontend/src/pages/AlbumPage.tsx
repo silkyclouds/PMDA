@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { ArrowLeft, Calendar, ExternalLink, ListPlus, Loader2, Music, Play, Plus } from 'lucide-react';
 
@@ -91,6 +91,7 @@ export default function AlbumPage() {
   const [playlistsLoading, setPlaylistsLoading] = useState(false);
   const [playlists, setPlaylists] = useState<api.PlaylistSummary[]>([]);
   const [addingTrackId, setAddingTrackId] = useState<number | null>(null);
+  const durationRefreshAttemptsRef = useRef(0);
 
   const load = useCallback(async () => {
     if (!Number.isFinite(albumId) || albumId <= 0) {
@@ -114,6 +115,37 @@ export default function AlbumPage() {
   useEffect(() => {
     void load();
   }, [load]);
+
+  useEffect(() => {
+    durationRefreshAttemptsRef.current = 0;
+  }, [albumId]);
+
+  useEffect(() => {
+    if (!Number.isFinite(albumId) || albumId <= 0) return;
+    if (!data || loading) return;
+    const hasMissingDurations = (data.tracks || []).some((t) => Number(t.duration_sec || 0) <= 0);
+    if (!hasMissingDurations) return;
+    if (durationRefreshAttemptsRef.current > 0) return;
+
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const run = async () => {
+      if (cancelled) return;
+      durationRefreshAttemptsRef.current += 1;
+      try {
+        const refreshed = await api.getAlbumDetail(albumId);
+        if (!cancelled) setData(refreshed);
+      } catch {
+        // Best-effort refresh only.
+      }
+    };
+
+    timer = setTimeout(run, 1100);
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [albumId, data, loading]);
 
   const loadPlaylists = useCallback(async () => {
     setPlaylistsLoading(true);
@@ -274,11 +306,12 @@ export default function AlbumPage() {
 
       <Card className="overflow-hidden border-border/70">
         <div className="relative">
-          <div className="absolute inset-0 bg-gradient-to-r from-background via-background/90 to-background/70 z-10" />
+          <div className="absolute inset-0 z-10 bg-background/40 backdrop-blur-2xl" />
+          <div className="absolute inset-0 z-10 bg-gradient-to-r from-background/96 via-background/78 to-background/62" />
           {data.cover_url ? (
-            <img src={data.cover_url} alt={data.title} className="w-full h-64 object-cover blur-[1px] scale-105" />
+            <img src={data.cover_url} alt={data.title} className="w-full h-64 md:h-72 object-cover blur-[2.2px] scale-[1.08]" />
           ) : (
-            <div className="h-64 bg-gradient-to-br from-muted via-muted/70 to-accent/20" />
+            <div className="h-64 md:h-72 bg-gradient-to-br from-muted via-muted/70 to-accent/20" />
           )}
           <div className="absolute inset-0 z-20 p-6 md:p-8 flex items-end">
             <div className="grid grid-cols-1 md:grid-cols-[8.5rem,1fr] gap-5 w-full items-end">
@@ -392,7 +425,7 @@ export default function AlbumPage() {
           {trackRows.length === 0 ? (
             <p className="text-sm text-muted-foreground">No tracks found for this album.</p>
           ) : (
-            <div className="max-h-[min(62svh,640px)] overflow-auto rounded-md border border-border/60">
+            <div className="overflow-x-auto rounded-md border border-border/60">
               <Table className="min-w-[920px]">
                 <TableHeader>
                   <TableRow className="hover:bg-transparent">

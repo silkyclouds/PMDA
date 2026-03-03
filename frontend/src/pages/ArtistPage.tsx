@@ -7,6 +7,7 @@ import { Card, CardContent } from '@/components/ui/card';
 import { AspectRatio } from '@/components/ui/aspect-ratio';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
 import { Carousel, CarouselContent, CarouselItem, CarouselNext, CarouselPrevious } from '@/components/ui/carousel';
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { AlbumArtwork } from '@/components/library/AlbumArtwork';
 import { cn } from '@/lib/utils';
 import { FormatBadge } from '@/components/FormatBadge';
@@ -135,6 +136,7 @@ export default function ArtistPage() {
   const [details, setDetails] = useState<ArtistDetailResponse | null>(null);
   const [profile, setProfile] = useState<ArtistProfile | null>(null);
   const [profileEnriching, setProfileEnriching] = useState(false);
+  const [profileEnrichState, setProfileEnrichState] = useState<'idle' | 'running' | 'done' | 'timeout'>('idle');
   const [fallbackSimilar, setFallbackSimilar] = useState<SimilarArtist[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [summary, setSummary] = useState<api.ArtistSummaryPayload | null>(null);
@@ -149,6 +151,7 @@ export default function ArtistPage() {
   const [descExpanded, setDescExpanded] = useState(false);
   const [refreshAllBusy, setRefreshAllBusy] = useState(false);
   const [concertFilter, setConcertFilter] = useState<{ enabled: boolean; lat: number | null; lon: number | null; radiusKm: number } | null>(null);
+  const [showConcertsModal, setShowConcertsModal] = useState(false);
   const includeUnmatchedParam = '1';
   const appendIncludeUnmatched = useCallback((url: string) => {
     return `${url}${url.includes('?') ? '&' : '?'}include_unmatched=${includeUnmatchedParam}`;
@@ -168,7 +171,9 @@ export default function ArtistPage() {
       const data = (await res.json()) as ArtistDetailResponse;
       setDetails(data);
       setProfile(data.artist_profile ?? null);
-      setProfileEnriching(Boolean(data.profile_enriching));
+      const enriching = Boolean(data.profile_enriching);
+      setProfileEnriching(enriching);
+      setProfileEnrichState(enriching ? 'running' : 'done');
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to load artist');
     } finally {
@@ -186,8 +191,10 @@ export default function ArtistPage() {
         if (data.profile) {
           setProfile(data.profile);
         }
-        setProfileEnriching(Boolean(data.enriching));
-        return Boolean(data.enriching);
+        const enriching = Boolean(data.enriching);
+        setProfileEnriching(enriching);
+        setProfileEnrichState(enriching ? 'running' : 'done');
+        return enriching;
       } catch {
         return false;
       }
@@ -346,8 +353,7 @@ export default function ArtistPage() {
     if (!Number.isFinite(artistId) || artistId <= 0) return;
     try {
       setSummaryLoading(true);
-      const lang = (navigator.language || '').toLowerCase().startsWith('fr') ? 'fr' : 'en';
-      await api.generateArtistAiSummary(artistId, lang);
+      await api.generateArtistAiSummary(artistId, 'en');
       await loadSummary();
     } catch {
       // Best-effort: if AI is not configured, we still show provider descriptions.
@@ -464,6 +470,9 @@ export default function ArtistPage() {
       const stillEnriching = await fetchProfile(false);
       if (!cancelled && stillEnriching && attempts < 20) {
         timer = setTimeout(run, 1500);
+      } else if (!cancelled && attempts >= 20) {
+        setProfileEnriching(false);
+        setProfileEnrichState('timeout');
       }
     };
     run();
@@ -651,10 +660,31 @@ export default function ArtistPage() {
   };
   const factsAka = getFactsArray('aka');
   const factsAliases = getFactsArray('aliases');
+  const factsMonikers = getFactsArray('monikers');
+  const factsGenres = getFactsArray('genres');
   const factsGroups = getFactsArray('member_of');
   const factsCollabs = getFactsArray('collaborated_with');
   const factsLabels = getFactsArray('labels');
   const factsCities = getFactsArray('notable_cities');
+  const factsDied = [
+    ...getFactsArray('death_date'),
+    ...getFactsArray('died'),
+    ...getFactsArray('deceased'),
+    ...getFactsArray('is_dead'),
+  ];
+  const connectionCount =
+    factsAka.length
+    + factsAliases.length
+    + factsMonikers.length
+    + factsGroups.length
+    + factsCollabs.length
+    + factsLabels.length
+    + factsCities.length;
+  const profileGenres = (profile?.tags || []).map((x) => String(x || '').trim()).filter(Boolean);
+  const normalizedGenres = Array.from(new Set([...factsGenres, ...profileGenres])).slice(0, 10);
+  const isDeceased =
+    factsDied.length > 0
+    || /(^|\W)(died|deceased|passed away|late)(\W|$)/i.test(displayText.slice(0, 1600));
 
   const formatConcertDate = (dt?: string) => {
     const raw = (dt || '').trim();
@@ -681,20 +711,25 @@ export default function ArtistPage() {
               Enriching profile
             </Badge>
           )}
+          {!profileEnriching && profileEnrichState === 'timeout' ? (
+            <Badge variant="outline" className="gap-1.5" title="Background enrichment timed out for this attempt.">
+              Enrichment timed out
+            </Badge>
+          ) : null}
         </div>
 
         <Card className="overflow-hidden border-border/70">
           <div className="relative">
-            <div className="absolute inset-0 z-10 bg-background/42 backdrop-blur-xl" />
-            <div className="absolute inset-0 z-10 bg-gradient-to-r from-background/96 via-background/80 to-background/58" />
+            <div className="absolute inset-0 z-10 bg-background/40 backdrop-blur-2xl" />
+            <div className="absolute inset-0 z-10 bg-gradient-to-r from-background/96 via-background/78 to-background/62" />
             {heroImage ? (
               <img src={heroImage} alt={details.artist_name} className="w-full h-64 md:h-96 object-cover blur-[2.5px] scale-[1.04]" />
             ) : (
               <div className="h-64 md:h-96 bg-gradient-to-br from-zinc-900 via-zinc-800 to-zinc-900" />
             )}
             <div className="absolute inset-0 z-20 p-6 md:p-8 flex items-end">
-              <div className="grid grid-cols-1 md:grid-cols-[13rem,minmax(0,1fr)] gap-8 w-full items-center">
-	                <div className="w-28 h-28 sm:w-36 sm:h-36 md:w-52 md:h-52 lg:w-56 lg:h-56 rounded-3xl overflow-hidden border border-border/60 bg-muted shrink-0 shadow-[0_24px_60px_rgba(0,0,0,0.35)]">
+              <div className="grid grid-cols-1 md:grid-cols-[15rem,minmax(0,1fr)] gap-8 md:gap-14 w-full items-center">
+                <div className="w-28 h-28 sm:w-36 sm:h-36 md:w-56 md:h-56 lg:w-60 lg:h-60 rounded-3xl overflow-hidden border border-border/60 bg-muted shrink-0 shadow-[0_24px_60px_rgba(0,0,0,0.35)]">
                   {heroImage ? (
                     <img src={heroImage} alt={details.artist_name} className="w-full h-full object-cover animate-in fade-in-0 duration-300" />
                   ) : (
@@ -704,7 +739,7 @@ export default function ArtistPage() {
                   )}
                 </div>
                 <div className="min-w-0 md:pl-2">
-	                  <h1 className="text-2xl sm:text-3xl md:text-5xl font-bold tracking-tight truncate">{details.artist_name}</h1>
+                  <h1 className="text-2xl sm:text-3xl md:text-5xl font-bold tracking-tight leading-tight">{details.artist_name}</h1>
                   <p className="text-base text-muted-foreground mt-1.5">
                     {details.total_albums.toLocaleString()} album{details.total_albums !== 1 ? 's' : ''}
                   </p>
@@ -793,228 +828,242 @@ export default function ArtistPage() {
           </CardContent>
         </Card>
 
-        {/* Concerts */}
         <Card className="border-border/70">
           <CardContent className="p-5 space-y-4">
-            <div className="flex flex-wrap items-start justify-between gap-4">
-              <div className="space-y-1">
-                <div className="flex items-center gap-2">
-                  <Calendar className="w-4 h-4 text-primary" />
-                  <p className="font-medium">Upcoming Concerts</p>
-                  {concertsMeta?.provider ? (
-                    <Badge variant="outline" className="text-[10px]">
-                      {concertsMeta.provider}
-                    </Badge>
-                  ) : null}
-                </div>
-                <p className="text-xs text-muted-foreground">
-                  {concertsMeta?.updated_at ? `Updated ${formatUpdated(concertsMeta.updated_at)}.` : ' '}
-                  {concertsMeta?.source_url ? (
-                    <a href={concertsMeta.source_url} target="_blank" rel="noreferrer" className="underline underline-offset-2">
-                      Provider page
-                    </a>
-                  ) : null}
-                  {concertHome ? (
-                    <>
-                      {' '}
-                      <span className="text-muted-foreground">
-                        Filter: {Math.round(concertHome.radiusKm)} km
-                      </span>
-                      {' '}
-                      <button
-                        type="button"
-                        className="underline underline-offset-2"
-                        onClick={() => navigate('/settings#settings-concerts')}
-                      >
-                        Settings
-                      </button>
-                    </>
-                  ) : null}
-                </p>
-              </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="h-8 gap-2"
+                onClick={() => setShowConcertsModal(true)}
+              >
+                <Calendar className="h-3.5 w-3.5" />
+                Concerts
+                <Badge variant={concertList.events.length > 0 ? 'secondary' : 'outline'} className="h-5 px-1.5 text-[10px]">
+                  {concertList.events.length}
+                </Badge>
+              </Button>
+              <Badge variant="outline" className="h-8 px-2.5 text-[11px] gap-1.5">
+                <Users className="h-3.5 w-3.5" />
+                Connections: {connectionCount}
+              </Badge>
+              {isDeceased ? (
+                <Badge
+                  variant="secondary"
+                  className="h-8 px-2.5 text-[11px]"
+                  title="At best you'll see a cover band."
+                >
+                  No more concerts
+                </Badge>
+              ) : null}
+              {factsLoading ? (
+                <Badge variant="outline" className="h-8 px-2.5 text-[11px] gap-1.5">
+                  <Loader2 className="h-3 w-3 animate-spin" />
+                  Updating facts
+                </Badge>
+              ) : null}
             </div>
 
-            {concertList.events.length > 0 ? (
-              <ConcertsMiniMap
-                events={concertList.events}
-                home={concertHome ? { lat: concertHome.lat, lon: concertHome.lon, radiusKm: concertHome.radiusKm } : null}
-              />
-            ) : null}
+            <div className="space-y-2">
+              {normalizedGenres.length > 0 ? (
+                <div className="flex flex-wrap gap-1.5">
+                  {normalizedGenres.map((g) => (
+                    <Button
+                      key={`genre-${g}`}
+                      type="button"
+                      size="sm"
+                      variant="secondary"
+                      className="h-6 px-2 text-[11px]"
+                      title="Open genre"
+                      onClick={() => navigate(`/library/genre/${encodeURIComponent(g)}${location.search || ''}`)}
+                    >
+                      {g}
+                    </Button>
+                  ))}
+                </div>
+              ) : null}
 
-            {concertHome && concertList.hiddenNoCoords > 0 ? (
-              <p className="text-xs text-muted-foreground">
-                {concertList.hiddenNoCoords} event{concertList.hiddenNoCoords !== 1 ? 's' : ''} could not be located and were hidden by the radius filter.
-              </p>
-            ) : null}
+              {factsLabels.length > 0 ? (
+                <div className="flex flex-wrap gap-1.5">
+                  {factsLabels.slice(0, 12).map((x) => (
+                    <Button
+                      key={`lab-${x}`}
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      className="h-6 px-2 text-[11px]"
+                      onClick={() => navigate(`/library/label/${encodeURIComponent(x)}${location.search || ''}`)}
+                      title="Open label"
+                    >
+                      {x}
+                    </Button>
+                  ))}
+                </div>
+              ) : null}
 
-            {concertsLoading && concerts.length === 0 ? (
-              <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                <Loader2 className="h-4 w-4 animate-spin" />
-                Loading concerts…
-              </div>
-            ) : concertsError ? (
-              <p className="text-sm text-destructive">{concertsError}</p>
-            ) : concertList.events.length === 0 ? (
-              <p className="text-sm text-muted-foreground">
-                {concertHome ? 'No upcoming concerts found within your radius.' : 'No upcoming concerts found.'}
-              </p>
-            ) : (
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                {concertList.events.slice(0, 8).map((ev, idx) => {
-                  const venue = ev.venue || { name: '', city: '' };
-                  const where = [venue.city, venue.region, venue.country].filter(Boolean).join(', ');
-                  return (
-                    <div key={`${ev.id || idx}`} className="rounded-xl border border-border/60 bg-card p-4 flex items-start justify-between gap-3">
-                      <div className="min-w-0">
-                        <div className="text-sm font-medium truncate">{formatConcertDate(ev.datetime) || 'TBA'}</div>
-                        <div className="text-xs text-muted-foreground mt-1 truncate">
-                          {venue.name ? venue.name : 'Venue TBA'}
-                          {where ? ` · ${where}` : ''}
+              {(factsMonikers.length > 0 || factsAka.length > 0 || factsAliases.length > 0) ? (
+                <div className="flex flex-wrap gap-1.5">
+                  {[...factsMonikers, ...factsAka, ...factsAliases].slice(0, 16).map((x) => (
+                    <Button
+                      key={`alias-${x}`}
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      className="h-6 px-2 text-[11px]"
+                      onClick={() => void openArtistByName(x)}
+                      title="Open artist"
+                    >
+                      {x}
+                    </Button>
+                  ))}
+                </div>
+              ) : null}
+            </div>
+
+            <Collapsible defaultOpen={false}>
+              <CollapsibleTrigger asChild>
+                <Button type="button" variant="ghost" size="sm" className="gap-1.5 px-0">
+                  <ChevronDown className="h-4 w-4" />
+                  Show connection details
+                </Button>
+              </CollapsibleTrigger>
+              <CollapsibleContent className="pt-2">
+                {connectionCount === 0 ? (
+                  <p className="text-sm text-muted-foreground">
+                    No connections found yet. Use Refresh to analyze labels, collaborations, and related acts.
+                  </p>
+                ) : (
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    {factsGroups.length > 0 ? (
+                      <div className="space-y-2">
+                        <div className="text-xs font-medium text-muted-foreground">Groups</div>
+                        <div className="flex flex-wrap gap-1.5">
+                          {factsGroups.map((x) => (
+                            <Button
+                              key={`grp-${x}`}
+                              type="button"
+                              size="sm"
+                              variant="secondary"
+                              className="h-6 px-2 text-[11px]"
+                              onClick={() => void openArtistByName(x)}
+                              title="Open artist"
+                            >
+                              {x}
+                            </Button>
+                          ))}
                         </div>
                       </div>
-                      {ev.url ? (
-                        <a href={ev.url} target="_blank" rel="noreferrer">
-                          <Button variant="outline" size="sm" className="gap-1.5">
-                            Tickets
-                            <ExternalLink className="h-3.5 w-3.5" />
-                          </Button>
-                        </a>
-                      ) : null}
-                    </div>
-                  );
-                })}
-              </div>
-            )}
+                    ) : null}
+                    {factsCollabs.length > 0 ? (
+                      <div className="space-y-2">
+                        <div className="text-xs font-medium text-muted-foreground">Collaborations</div>
+                        <div className="flex flex-wrap gap-1.5">
+                          {factsCollabs.map((x) => (
+                            <Button
+                              key={`col-${x}`}
+                              type="button"
+                              size="sm"
+                              variant="secondary"
+                              className="h-6 px-2 text-[11px]"
+                              onClick={() => void openArtistByName(x)}
+                              title="Open artist"
+                            >
+                              {x}
+                            </Button>
+                          ))}
+                        </div>
+                      </div>
+                    ) : null}
+                    {factsCities.length > 0 ? (
+                      <div className="space-y-2">
+                        <div className="text-xs font-medium text-muted-foreground">Cities</div>
+                        <div className="flex flex-wrap gap-1.5">
+                          {factsCities.map((x) => (
+                            <Badge key={`city-${x}`} variant="secondary" className="text-[11px]">
+                              {x}
+                            </Badge>
+                          ))}
+                        </div>
+                      </div>
+                    ) : null}
+                  </div>
+                )}
+              </CollapsibleContent>
+            </Collapsible>
           </CardContent>
         </Card>
 
-        {/* Connections / Facts */}
-        <Card className="border-border/70">
-          <CardContent className="p-5 space-y-4">
-            <div className="flex flex-wrap items-start justify-between gap-4">
-              <div className="space-y-1">
-                <div className="flex items-center gap-2">
-                  <Users className="w-4 h-4 text-primary" />
-                  <p className="font-medium">Connections</p>
-                  {factsLoading ? (
-                    <Badge variant="outline" className="gap-1.5 text-[10px]">
-                      <Loader2 className="h-3 w-3 animate-spin" />
-                      Updating
-                    </Badge>
-                  ) : null}
+        <Dialog open={showConcertsModal} onOpenChange={setShowConcertsModal}>
+          <DialogContent className="max-w-4xl max-h-[86vh] overflow-y-auto">
+            <DialogHeader>
+              <DialogTitle className="flex items-center gap-2">
+                <Calendar className="w-4 h-4 text-primary" />
+                Upcoming Concerts
+                <Badge variant="outline" className="text-[10px]">
+                  {concertList.events.length}
+                </Badge>
+                {concertsMeta?.provider ? (
+                  <Badge variant="outline" className="text-[10px]">
+                    {concertsMeta.provider}
+                  </Badge>
+                ) : null}
+              </DialogTitle>
+              <DialogDescription>
+                {concertsMeta?.updated_at ? `Updated ${formatUpdated(concertsMeta.updated_at)}.` : 'No update timestamp.'}
+                {concertHome ? ` Radius filter: ${Math.round(concertHome.radiusKm)} km.` : ''}
+              </DialogDescription>
+            </DialogHeader>
+            <div className="space-y-4">
+              {concertList.events.length > 0 ? (
+                <ConcertsMiniMap
+                  events={concertList.events}
+                  home={concertHome ? { lat: concertHome.lat, lon: concertHome.lon, radiusKm: concertHome.radiusKm } : null}
+                />
+              ) : null}
+              {concertsLoading && concerts.length === 0 ? (
+                <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                  Loading concerts…
                 </div>
-                <p className="text-xs text-muted-foreground">
-                  {facts?.updated_at ? `Updated ${formatUpdated(facts.updated_at)}.` : ' '}
+              ) : concertsError ? (
+                <p className="text-sm text-destructive">{concertsError}</p>
+              ) : concertList.events.length === 0 ? (
+                <p className="text-sm text-muted-foreground">
+                  {isDeceased
+                    ? 'No concerts expected. At best you will see a tribute band.'
+                    : (concertHome ? 'No upcoming concerts found within your radius.' : 'No upcoming concerts found.')}
                 </p>
-              </div>
+              ) : (
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                  {concertList.events.map((ev, idx) => {
+                    const venue = ev.venue || { name: '', city: '' };
+                    const where = [venue.city, venue.region, venue.country].filter(Boolean).join(', ');
+                    return (
+                      <div key={`${ev.id || idx}`} className="rounded-xl border border-border/60 bg-card p-4 flex items-start justify-between gap-3">
+                        <div className="min-w-0">
+                          <div className="text-sm font-medium truncate">{formatConcertDate(ev.datetime) || 'TBA'}</div>
+                          <div className="text-xs text-muted-foreground mt-1 truncate">
+                            {venue.name ? venue.name : 'Venue TBA'}
+                            {where ? ` · ${where}` : ''}
+                          </div>
+                        </div>
+                        {ev.url ? (
+                          <a href={ev.url} target="_blank" rel="noreferrer">
+                            <Button variant="outline" size="sm" className="gap-1.5">
+                              Tickets
+                              <ExternalLink className="h-3.5 w-3.5" />
+                            </Button>
+                          </a>
+                        ) : null}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
             </div>
-
-            {(factsAka.length + factsAliases.length + factsGroups.length + factsCollabs.length + factsLabels.length + factsCities.length) === 0 ? (
-              <p className="text-sm text-muted-foreground">
-                No connections found yet. Use Refresh to analyze the artist and populate labels, collaborations, and related acts.
-              </p>
-            ) : (
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                {factsAka.length > 0 ? (
-                  <div className="space-y-2">
-                    <div className="text-xs font-medium text-muted-foreground">AKA</div>
-                    <div className="flex flex-wrap gap-1.5">
-                      {factsAka.map((x) => (
-                        <Badge key={`aka-${x}`} variant="secondary" className="text-[11px]">
-                          {x}
-                        </Badge>
-                      ))}
-                    </div>
-                  </div>
-                ) : null}
-                {factsAliases.length > 0 ? (
-                  <div className="space-y-2">
-                    <div className="text-xs font-medium text-muted-foreground">Aliases</div>
-                    <div className="flex flex-wrap gap-1.5">
-                      {factsAliases.map((x) => (
-                        <Badge key={`alias-${x}`} variant="secondary" className="text-[11px]">
-                          {x}
-                        </Badge>
-                      ))}
-                    </div>
-                  </div>
-                ) : null}
-                {factsGroups.length > 0 ? (
-                  <div className="space-y-2">
-                    <div className="text-xs font-medium text-muted-foreground">Groups</div>
-                    <div className="flex flex-wrap gap-1.5">
-                      {factsGroups.map((x) => (
-                        <Button
-                          key={`grp-${x}`}
-                          type="button"
-                          size="sm"
-                          variant="secondary"
-                          className="h-6 px-2 text-[11px]"
-                          onClick={() => void openArtistByName(x)}
-                          title="Open artist"
-                        >
-                          {x}
-                        </Button>
-                      ))}
-                    </div>
-                  </div>
-                ) : null}
-                {factsCollabs.length > 0 ? (
-                  <div className="space-y-2">
-                    <div className="text-xs font-medium text-muted-foreground">Collaborations</div>
-                    <div className="flex flex-wrap gap-1.5">
-                      {factsCollabs.map((x) => (
-                        <Button
-                          key={`col-${x}`}
-                          type="button"
-                          size="sm"
-                          variant="secondary"
-                          className="h-6 px-2 text-[11px]"
-                          onClick={() => void openArtistByName(x)}
-                          title="Open artist"
-                        >
-                          {x}
-                        </Button>
-                      ))}
-                    </div>
-                  </div>
-                ) : null}
-                {factsLabels.length > 0 ? (
-                  <div className="space-y-2">
-                    <div className="text-xs font-medium text-muted-foreground">Labels</div>
-                    <div className="flex flex-wrap gap-1.5">
-                      {factsLabels.map((x) => (
-                        <Button
-                          key={`lab-${x}`}
-                          type="button"
-                          size="sm"
-                          variant="secondary"
-                          className="h-6 px-2 text-[11px]"
-                          onClick={() => navigate(`/library/label/${encodeURIComponent(x)}${location.search || ''}`)}
-                          title="Open label"
-                        >
-                          {x}
-                        </Button>
-                      ))}
-                    </div>
-                  </div>
-                ) : null}
-                {factsCities.length > 0 ? (
-                  <div className="space-y-2">
-                    <div className="text-xs font-medium text-muted-foreground">Cities</div>
-                    <div className="flex flex-wrap gap-1.5">
-                      {factsCities.map((x) => (
-                        <Badge key={`city-${x}`} variant="secondary" className="text-[11px]">
-                          {x}
-                        </Badge>
-                      ))}
-                    </div>
-                  </div>
-                ) : null}
-              </div>
-            )}
-          </CardContent>
-        </Card>
+          </DialogContent>
+        </Dialog>
 
         <div className="space-y-6">
           {sortedTypes.map((type) => (

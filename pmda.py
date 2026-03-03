@@ -570,6 +570,7 @@ PMDA_AUTO_CHANGED_ONLY_SCAN_MIN_PENDING = int(os.getenv("PMDA_AUTO_CHANGED_ONLY_
 PMDA_CACHE_TELEMETRY_TTL_SEC = float(os.getenv("PMDA_CACHE_TELEMETRY_TTL_SEC", "15") or "15")
 PMDA_CACHE_TELEMETRY_MAX_WALK_FILES = int(os.getenv("PMDA_CACHE_TELEMETRY_MAX_WALK_FILES", "400000") or "400000")
 PMDA_CACHE_TELEMETRY_MAX_REDIS_SCAN_KEYS = int(os.getenv("PMDA_CACHE_TELEMETRY_MAX_REDIS_SCAN_KEYS", "200000") or "200000")
+PMDA_FILES_LOCAL_CACHE_MAX_KEYS = int(max(1000, _parse_int(os.getenv("PMDA_FILES_LOCAL_CACHE_MAX_KEYS", "200000"), 200000) or 200000))
 RECO_EMBED_DIM = 64
 RECO_EMBED_SOURCE = "pmda_hash_v1"
 
@@ -4022,8 +4023,15 @@ init_cache_db()
 # ───────────────────── Files Library Index (PostgreSQL + Redis) ─────────────────────
 _FILES_PG_SCHEMA_READY = False
 _FILES_REDIS_CLIENT = None
+_FILES_CACHE_LOCAL_ENABLED = True
+_FILES_LOCAL_CACHE: "OrderedDict[str, dict]" = OrderedDict()
+_FILES_LOCAL_CACHE_LOCK = threading.Lock()
 _CACHE_TELEMETRY_SNAPSHOT = {"ts": 0.0, "payload": None}
 _CACHE_TELEMETRY_LOCK = threading.Lock()
+_FILES_REDIS_LAST_ERROR = ""
+_FILES_REDIS_LAST_OK_TS = 0.0
+_FILES_PG_LAST_ERROR = ""
+_FILES_PG_LAST_OK_TS = 0.0
 
 _LOSSLESS_FORMATS = {"FLAC", "ALAC", "APE", "WV", "WAV", "AIFF", "DSF"}
 _ARTIST_IMAGE_NAMES = (
@@ -4041,11 +4049,17 @@ def _files_pg_dsn() -> str:
 
 
 def _files_pg_connect(*, autocommit: bool = True):
+    global _FILES_PG_LAST_ERROR, _FILES_PG_LAST_OK_TS
     if psycopg is None:
+        _FILES_PG_LAST_ERROR = "psycopg_not_installed"
         return None
     try:
-        return psycopg.connect(_files_pg_dsn(), autocommit=autocommit)
+        conn = psycopg.connect(_files_pg_dsn(), autocommit=autocommit)
+        _FILES_PG_LAST_OK_TS = time.time()
+        _FILES_PG_LAST_ERROR = ""
+        return conn
     except Exception as e:
+        _FILES_PG_LAST_ERROR = str(e)
         logging.warning("Files PG connection failed: %s", e)
         return None
 
@@ -4602,8 +4616,9 @@ def _files_migrate_external_artist_images_norm_keys(cur) -> None:
 
 
 def _files_redis_client():
-    global _FILES_REDIS_CLIENT
+    global _FILES_REDIS_CLIENT, _FILES_REDIS_LAST_ERROR, _FILES_REDIS_LAST_OK_TS
     if redis_lib is None:
+        _FILES_REDIS_LAST_ERROR = "redis_library_not_installed"
         return None
     if _FILES_REDIS_CLIENT is not None:
         return _FILES_REDIS_CLIENT
@@ -4618,16 +4633,53 @@ def _files_redis_client():
             socket_timeout=0.3,
         )
         _FILES_REDIS_CLIENT.ping()
+        _FILES_REDIS_LAST_OK_TS = time.time()
+        _FILES_REDIS_LAST_ERROR = ""
     except Exception as e:
+        _FILES_REDIS_LAST_ERROR = str(e)
         logging.debug("Redis cache unavailable for files library: %s", e)
         _FILES_REDIS_CLIENT = None
     return _FILES_REDIS_CLIENT
 
 
+def _files_local_cache_get(cache_key: str):
+    if not _FILES_CACHE_LOCAL_ENABLED:
+        return None
+    now = time.time()
+    with _FILES_LOCAL_CACHE_LOCK:
+        entry = _FILES_LOCAL_CACHE.get(cache_key)
+        if not entry:
+            return None
+        exp = float(entry.get("exp") or 0.0)
+        if exp > 0.0 and now > exp:
+            _FILES_LOCAL_CACHE.pop(cache_key, None)
+            return None
+        payload = entry.get("payload")
+        _FILES_LOCAL_CACHE.move_to_end(cache_key)
+        return payload
+
+
+def _files_local_cache_set(cache_key: str, payload, ttl: int = 60) -> None:
+    if not _FILES_CACHE_LOCAL_ENABLED:
+        return
+    now = time.time()
+    exp = now + max(1, int(ttl or 60))
+    with _FILES_LOCAL_CACHE_LOCK:
+        _FILES_LOCAL_CACHE[cache_key] = {"payload": payload, "exp": exp}
+        _FILES_LOCAL_CACHE.move_to_end(cache_key)
+        while len(_FILES_LOCAL_CACHE) > PMDA_FILES_LOCAL_CACHE_MAX_KEYS:
+            _FILES_LOCAL_CACHE.popitem(last=False)
+
+
+def _files_local_cache_clear() -> None:
+    with _FILES_LOCAL_CACHE_LOCK:
+        _FILES_LOCAL_CACHE.clear()
+
+
 def _files_cache_get_json(cache_key: str):
     cli = _files_redis_client()
     if cli is None:
-        return None
+        return _files_local_cache_get(cache_key)
     try:
         raw = cli.get(FILES_CACHE_PREFIX + cache_key)
         if not raw:
@@ -4640,14 +4692,16 @@ def _files_cache_get_json(cache_key: str):
 def _files_cache_set_json(cache_key: str, payload, ttl: int = 60) -> None:
     cli = _files_redis_client()
     if cli is None:
+        _files_local_cache_set(cache_key, payload, ttl=ttl)
         return
     try:
         cli.setex(FILES_CACHE_PREFIX + cache_key, ttl, json.dumps(payload))
     except Exception:
-        pass
+        _files_local_cache_set(cache_key, payload, ttl=ttl)
 
 
 def _files_cache_invalidate_all() -> None:
+    _files_local_cache_clear()
     cli = _files_redis_client()
     if cli is None:
         return
@@ -4964,6 +5018,12 @@ def _read_redis_cache_metrics() -> dict:
         "host": PMDA_REDIS_HOST,
         "port": PMDA_REDIS_PORT,
         "db": PMDA_REDIS_DB,
+        "mode": "local" if bool(_FILES_CACHE_LOCAL_ENABLED) else "none",
+        "reason": "",
+        "last_error": str(_FILES_REDIS_LAST_ERROR or ""),
+        "last_ok_ts": float(_FILES_REDIS_LAST_OK_TS or 0.0),
+        "local_cache_enabled": bool(_FILES_CACHE_LOCAL_ENABLED),
+        "local_cache_keys": 0,
         "db_keys": 0,
         "pmda_prefix_keys": 0,
         "pmda_prefix_scan_truncated": False,
@@ -4975,10 +5035,29 @@ def _read_redis_cache_metrics() -> dict:
         "keyspace_misses": 0,
         "keyspace_hit_rate_pct": None,
     }
+    try:
+        with _FILES_LOCAL_CACHE_LOCK:
+            out["local_cache_keys"] = int(len(_FILES_LOCAL_CACHE))
+    except Exception:
+        out["local_cache_keys"] = 0
     cli = _files_redis_client()
     if cli is None:
+        if not bool(_FILES_CACHE_LOCAL_ENABLED):
+            out["mode"] = "none"
+            out["reason"] = "redis_unavailable_no_local_cache"
+        elif redis_lib is None:
+            out["mode"] = "local"
+            out["reason"] = "redis_library_not_installed"
+        elif str(PMDA_REDIS_HOST or "").strip() in {"", "127.0.0.1", "localhost"}:
+            out["mode"] = "local"
+            out["reason"] = "redis_unavailable_fallback_local_cache"
+        else:
+            out["mode"] = "local"
+            out["reason"] = "redis_connection_failed_fallback_local_cache"
         return out
     out["available"] = True
+    out["mode"] = "redis"
+    out["reason"] = ""
     try:
         out["db_keys"] = _safe_int(cli.dbsize(), 0)
     except Exception:
@@ -5021,18 +5100,36 @@ def _read_redis_cache_metrics() -> dict:
 def _read_pg_cache_metrics() -> dict:
     out = {
         "available": False,
+        "mode": "none",
+        "reason": "",
+        "last_error": str(_FILES_PG_LAST_ERROR or ""),
+        "last_ok_ts": float(_FILES_PG_LAST_OK_TS or 0.0),
         "db_size_bytes": 0,
         "db_cache_hit_rate_pct": None,
         "numbackends": 0,
         "table_estimated_rows": {},
         "table_total_bytes": {},
     }
+    if _get_library_mode() != "files":
+        out["mode"] = "disabled"
+        out["reason"] = "library_mode_not_files"
+        return out
+    if psycopg is None:
+        out["mode"] = "none"
+        out["reason"] = "psycopg_not_installed"
+        return out
     if not _files_pg_init_schema():
+        out["mode"] = "none"
+        out["reason"] = str(_FILES_PG_LAST_ERROR or "pg_init_schema_failed")
         return out
     conn = _files_pg_connect()
     if conn is None:
+        out["mode"] = "none"
+        out["reason"] = str(_FILES_PG_LAST_ERROR or "pg_connection_failed")
         return out
     out["available"] = True
+    out["mode"] = "postgres"
+    out["reason"] = ""
     try:
         with conn.cursor() as cur:
             cur.execute("SELECT pg_database_size(current_database())")
@@ -5131,6 +5228,9 @@ def _collect_cache_control_metrics(force: bool = False) -> dict:
             "dirty_count": _safe_int(files_watcher_state.get("dirty_count"), 0),
             "last_event_at": files_watcher_state.get("last_event_at"),
             "last_event_path": files_watcher_state.get("last_event_path"),
+            "enabled": bool(PMDA_FILES_WATCHER_ENABLED),
+            "available": bool(_files_watcher_available()),
+            "reason": str(files_watcher_state.get("reason") or ""),
         },
     }
 
@@ -5371,12 +5471,19 @@ def _resolve_album_folders_from_event_path(raw_path: str) -> list[str]:
     return out
 
 
-def _update_files_watcher_state(*, running: bool, roots: list[str] | None = None) -> None:
+def _update_files_watcher_state(
+    *,
+    running: bool,
+    roots: list[str] | None = None,
+    reason: str | None = None,
+) -> None:
     with lock:
         fw = dict(state.get("files_watcher") or {})
         fw["running"] = bool(running)
         if roots is not None:
             fw["roots"] = [str(r) for r in roots]
+        if reason is not None:
+            fw["reason"] = str(reason).strip()
         state["files_watcher"] = fw
 
 
@@ -5438,29 +5545,32 @@ def _stop_files_watcher() -> None:
         obs = _files_watcher_observer
         _files_watcher_observer = None
     if obs is None:
-        _update_files_watcher_state(running=False)
+        _update_files_watcher_state(running=False, reason="stopped")
         return
     try:
         obs.stop()
         obs.join(timeout=3)
     except Exception:
         logging.debug("Failed to stop files watcher cleanly", exc_info=True)
-    _update_files_watcher_state(running=False)
+    _update_files_watcher_state(running=False, reason="stopped")
 
 
 def _restart_files_watcher_if_needed() -> bool:
     if not PMDA_FILES_WATCHER_ENABLED:
         _stop_files_watcher()
+        _update_files_watcher_state(running=False, roots=list(FILES_ROOTS), reason="disabled_by_setting")
         return False
     if _get_library_mode() != "files":
         _stop_files_watcher()
+        _update_files_watcher_state(running=False, roots=list(FILES_ROOTS), reason="disabled_non_files_mode")
         return False
     if not FILES_ROOTS:
         _stop_files_watcher()
+        _update_files_watcher_state(running=False, roots=[], reason="disabled_no_roots")
         return False
     if not _files_watcher_available():
         logging.info("FILES watcher unavailable (watchdog not installed); changed-only uses discovery fallback.")
-        _update_files_watcher_state(running=False, roots=list(FILES_ROOTS))
+        _update_files_watcher_state(running=False, roots=list(FILES_ROOTS), reason="watchdog_unavailable")
         return False
 
     _stop_files_watcher()
@@ -5479,18 +5589,19 @@ def _restart_files_watcher_if_needed() -> bool:
         except Exception:
             logging.debug("Failed to watch root %s", p, exc_info=True)
     if not valid_roots:
-        _update_files_watcher_state(running=False, roots=list(FILES_ROOTS))
+        _update_files_watcher_state(running=False, roots=list(FILES_ROOTS), reason="no_valid_roots")
         return False
     try:
         obs.start()
     except Exception:
         logging.warning("Unable to start files watcher; falling back to discovery scan.")
+        _update_files_watcher_state(running=False, roots=list(FILES_ROOTS), reason="observer_start_failed")
         return False
 
     global _files_watcher_observer
     with _files_watcher_lock:
         _files_watcher_observer = obs
-    _update_files_watcher_state(running=True, roots=valid_roots)
+    _update_files_watcher_state(running=True, roots=valid_roots, reason="running")
     logging.info("FILES watcher started on %d root(s): %s", len(valid_roots), ", ".join(valid_roots))
     _start_auto_changed_only_scan_scheduler()
     return True
@@ -5927,6 +6038,20 @@ def _media_cache_root_dir() -> Path:
     return root
 
 
+def _path_is_within(base: Path, candidate: Path) -> bool:
+    try:
+        candidate.resolve().relative_to(base.resolve())
+        return True
+    except Exception:
+        return False
+
+
+def _is_media_cache_file(path: Path, *, kind: str | None = None) -> bool:
+    root = _media_cache_root_dir()
+    target_root = root / kind if kind else root
+    return _path_is_within(target_root, path)
+
+
 def _mime_from_path(path: Path) -> str:
     ext = str(path.suffix or "").strip().lower()
     if ext == ".webp":
@@ -6206,18 +6331,41 @@ def _promote_files_media_paths_to_cache(artists_map: dict[str, dict], albums_pay
             if detected and detected.exists() and detected.is_file():
                 source_cover = detected
 
+        if source_cover is None and folder_path and folder_path.exists() and folder_path.is_dir():
+            try:
+                embedded = _extract_embedded_cover_from_folder(folder_path, max_audio_files=8)
+            except Exception:
+                embedded = None
+            if embedded:
+                raw, mime = embedded
+                cache_hint = str(album.get("album_id") or album.get("title_norm") or folder_path)
+                cached_cover = _ensure_cached_image_from_bytes(
+                    raw,
+                    mime,
+                    kind="album",
+                    cache_key_hint=f"promote:{cache_hint}",
+                    max_px=_MEDIA_CACHE_MASTER_PX,
+                )
+                if cached_cover and cached_cover.exists() and cached_cover.is_file():
+                    album["cover_path"] = str(cached_cover)
+                    album["has_cover"] = True
+                    covers_promoted += 1
+                    continue
+
         if source_cover is None:
             album["has_cover"] = False
             album["cover_path"] = ""
             continue
 
         master_cover = _ensure_cached_image_for_path(source_cover, kind="album", max_px=_MEDIA_CACHE_MASTER_PX)
-        if master_cover and master_cover.exists() and master_cover.is_file():
+        if master_cover and master_cover.exists() and master_cover.is_file() and _is_media_cache_file(master_cover, kind="album"):
             album["cover_path"] = str(master_cover)
+            album["has_cover"] = True
+            covers_promoted += 1
         else:
-            album["cover_path"] = str(source_cover)
-        album["has_cover"] = True
-        covers_promoted += 1
+            # Cache-only policy: do not persist source-disk paths for request-time serving.
+            album["cover_path"] = ""
+            album["has_cover"] = False
 
     for artist_norm, data in artists_map.items():
         source_image = _existing_file_path(str((data or {}).get("image_path") or ""))
@@ -6234,12 +6382,13 @@ def _promote_files_media_paths_to_cache(artists_map: dict[str, dict], albums_pay
             continue
 
         master_image = _ensure_cached_image_for_path(source_image, kind="artist", max_px=_MEDIA_CACHE_MASTER_PX)
-        if master_image and master_image.exists() and master_image.is_file():
+        if master_image and master_image.exists() and master_image.is_file() and _is_media_cache_file(master_image, kind="artist"):
             data["image_path"] = str(master_image)
+            data["has_image"] = True
+            artists_promoted += 1
         else:
-            data["image_path"] = str(source_image)
-        data["has_image"] = True
-        artists_promoted += 1
+            data["image_path"] = ""
+            data["has_image"] = False
 
     return covers_promoted, artists_promoted
 
@@ -7139,7 +7288,9 @@ def _rebuild_files_library_index(reason: str = "manual", wait_if_running: bool =
                     )
                     disc_num = _parse_int_loose(tags.get("disc") or tags.get("discnumber"), 1) or 1
                     track_num = _parse_int_loose(tags.get("track") or tags.get("tracknumber"), 0)
-                    duration_sec = int(max(0.0, _parse_float_loose(tags.get("duration"), 0.0)))
+                    duration_sec = int(max(0.0, _parse_duration_seconds_loose(tags.get("duration"), 0.0)))
+                    if duration_sec <= 0:
+                        duration_sec = int(max(0, _run_ffprobe_duration_sec(str(p))))
                     bitrate = _parse_int_loose(tags.get("bitrate") or tags.get("bit_rate"), 0)
                     sample_rate = _parse_int_loose(tags.get("sample_rate") or tags.get("samplerate"), 0)
                     bit_depth = _parse_int_loose(tags.get("bit_depth") or tags.get("bits_per_sample"), 0)
@@ -7640,6 +7791,33 @@ def _rebuild_files_reco_embeddings(reason: str = "manual", wait_if_running: bool
         files_index_lock.release()
 
 
+_FILES_RECO_EMBED_BACKFILL_LOCK = threading.Lock()
+_FILES_RECO_EMBED_BACKFILL_RUNNING = False
+
+
+def _enqueue_files_reco_embedding_backfill(reason: str = "auto_backfill_missing_embeddings") -> bool:
+    global _FILES_RECO_EMBED_BACKFILL_RUNNING
+    with _FILES_RECO_EMBED_BACKFILL_LOCK:
+        if _FILES_RECO_EMBED_BACKFILL_RUNNING:
+            return False
+        _FILES_RECO_EMBED_BACKFILL_RUNNING = True
+
+    def _runner() -> None:
+        global _FILES_RECO_EMBED_BACKFILL_RUNNING
+        try:
+            result = _rebuild_files_reco_embeddings(reason=reason, wait_if_running=True)
+            if not bool(result.get("ok")):
+                logging.warning("Files reco embedding auto-backfill failed: %s", result.get("error"))
+        except Exception:
+            logging.debug("Files reco embedding auto-backfill thread crashed", exc_info=True)
+        finally:
+            with _FILES_RECO_EMBED_BACKFILL_LOCK:
+                _FILES_RECO_EMBED_BACKFILL_RUNNING = False
+
+    threading.Thread(target=_runner, daemon=True, name="files-reco-embed-backfill").start()
+    return True
+
+
 def _ensure_files_index_ready() -> tuple[bool, Optional[str]]:
     if _get_library_mode() != "files":
         return False, "LIBRARY_MODE is not 'files'"
@@ -7669,19 +7847,13 @@ def _ensure_files_index_ready() -> tuple[bool, Optional[str]]:
         track_count, embedding_count = _files_index_read_track_and_embedding_counts()
         min_expected = max(1, int(track_count * 0.85)) if track_count > 0 else 0
         if track_count > 0 and embedding_count < min_expected:
-            if files_index_lock.locked():
-                return True, None
-            logging.info(
-                "Files reco embeddings below threshold (%d/%d). Rebuilding embeddings...",
-                embedding_count,
-                track_count,
-            )
-            result = _rebuild_files_reco_embeddings(
-                reason="auto_backfill_missing_embeddings",
-                wait_if_running=True,
-            )
-            if not result.get("ok"):
-                logging.warning("Files reco embedding auto-backfill failed: %s", result.get("error"))
+            if not files_index_lock.locked():
+                logging.info(
+                    "Files reco embeddings below threshold (%d/%d). Scheduling async embeddings backfill...",
+                    embedding_count,
+                    track_count,
+                )
+                _enqueue_files_reco_embedding_backfill(reason="auto_backfill_missing_embeddings")
         return True, None
     result = _rebuild_files_library_index(reason="auto_bootstrap", wait_if_running=True)
     if not result.get("ok"):
@@ -12891,7 +13063,7 @@ def extract_tags(audio_path: Path) -> dict[str, str]:
         out = subprocess.check_output(
             [
                 "ffprobe", "-v", "error",
-                "-show_entries", "format_tags",
+                "-show_entries", "format_tags:format=duration",
                 "-of", "default=noprint_wrappers=1",
                 str(audio_path)
             ],
@@ -12907,6 +13079,11 @@ def extract_tags(audio_path: Path) -> dict[str, str]:
                 if k.startswith("TAG:"):
                     k = k[4:]
                 tags[k.lower()] = v.strip()
+        duration_sec = _parse_duration_seconds_loose(tags.get("duration"), 0.0)
+        if duration_sec <= 0:
+            duration_sec = float(_run_ffprobe_duration_sec(str(audio_path)) or 0)
+        if duration_sec > 0:
+            tags["duration"] = str(int(max(1, round(duration_sec))))
         return tags
     except Exception:
         return {}
@@ -13090,9 +13267,23 @@ def _run_ffprobe_duration_sec(fpath: str) -> int:
     try:
         out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, text=True, timeout=20).strip()
         if not out:
-            return 0
-        return int(max(0.0, float(out)))
+            raise RuntimeError("ffprobe returned empty duration")
+        parsed = int(max(0.0, float(out)))
+        if parsed > 0:
+            return parsed
+        raise RuntimeError("ffprobe returned non-positive duration")
     except Exception:
+        # Fallback: mutagen parser is slower than ffprobe but still in-process and
+        # significantly better than keeping 0:00 durations forever.
+        try:
+            from mutagen import File as MutagenFile
+
+            mf = MutagenFile(fpath)
+            length = float(getattr(getattr(mf, "info", None), "length", 0.0) or 0.0)
+            if length > 0:
+                return int(max(1.0, round(length)))
+        except Exception:
+            pass
         return 0
 
 def analyse_format(folder: Path) -> tuple[int, int, int, int, bool]:
@@ -33966,7 +34157,6 @@ def api_library_albums():
 
         base_url = request.url_root.rstrip("/")
         albums = []
-        cover_updates: list[tuple[str, int]] = []
         for album_id, title, year, genre, label, tags_json, track_count, fmt, is_lossless, has_cover, cover_path_raw, folder_path_raw, mb_identified, artist_id, artist_name, short_desc, profile_source in rows:
             aid = int(album_id or 0)
             arid = int(artist_id or 0)
@@ -33975,15 +34165,8 @@ def api_library_albums():
                 try:
                     cover_raw = str(cover_path_raw or "").strip()
                     cover_path = path_for_fs_access(Path(cover_raw)) if cover_raw else None
-                    if cover_path and cover_path.exists() and cover_path.is_file():
+                    if cover_path and cover_path.exists() and cover_path.is_file() and _is_media_cache_file(cover_path, kind="album"):
                         has_cover_effective = True
-                    else:
-                        folder_raw = str(folder_path_raw or "").strip()
-                        folder_path = path_for_fs_access(Path(folder_raw)) if folder_raw else None
-                        fallback_cover = _first_cover_path(folder_path) if folder_path else None
-                        if fallback_cover and fallback_cover.exists() and fallback_cover.is_file():
-                            has_cover_effective = True
-                            cover_updates.append((str(fallback_cover), aid))
                 except Exception:
                     has_cover_effective = bool(has_cover)
             thumb = f"{base_url}/api/library/files/album/{aid}/cover?size=512" if has_cover_effective else None
@@ -34038,24 +34221,6 @@ def api_library_albums():
                     "profile_source": (profile_source or "").strip() or None,
                 }
             )
-
-        if cover_updates:
-            try:
-                with conn.transaction():
-                    with conn.cursor() as wcur:
-                        wcur.executemany(
-                            """
-                            UPDATE files_albums
-                            SET has_cover = TRUE,
-                                cover_path = %s,
-                                updated_at = NOW()
-                            WHERE id = %s
-                            """,
-                            cover_updates,
-                        )
-                _files_cache_invalidate_all()
-            except Exception:
-                logging.debug("Unable to persist cover fallback updates in /api/library/albums", exc_info=True)
 
         payload = {"albums": albums, "total": total, "limit": limit, "offset": offset}
         _files_cache_set_json(cache_key, payload, ttl=20)
@@ -36758,7 +36923,6 @@ def api_library_artist_detail(artist_id):
             stats_no_cover = 0
             stats_mb = 0
             stats_broken = 0
-            cover_updates: list[tuple[str, int]] = []
             for row in rows:
                 album_id = int(row[0])
                 title_norm = str(row[2] or "")
@@ -36785,14 +36949,8 @@ def api_library_artist_detail(artist_id):
                 if not has_cover_effective:
                     try:
                         cp = path_for_fs_access(Path(cover_path_raw)) if cover_path_raw else None
-                        if cp and cp.exists() and cp.is_file():
+                        if cp and cp.exists() and cp.is_file() and _is_media_cache_file(cp, kind="album"):
                             has_cover_effective = True
-                        else:
-                            fp = path_for_fs_access(Path(folder_path_raw)) if folder_path_raw else None
-                            fallback_cover = _first_cover_path(fp) if fp else None
-                            if fallback_cover and fallback_cover.exists() and fallback_cover.is_file():
-                                has_cover_effective = True
-                                cover_updates.append((str(fallback_cover), album_id))
                     except Exception:
                         has_cover_effective = has_cover
 
@@ -36852,24 +37010,6 @@ def api_library_artist_detail(artist_id):
                     "description_source": album_profile.get("source"),
                 })
 
-            if cover_updates:
-                try:
-                    with conn.transaction():
-                        with conn.cursor() as wcur:
-                            wcur.executemany(
-                                """
-                                UPDATE files_albums
-                                SET has_cover = TRUE,
-                                    cover_path = %s,
-                                    updated_at = NOW()
-                                WHERE id = %s
-                                """,
-                                cover_updates,
-                            )
-                    _files_cache_invalidate_all()
-                except Exception:
-                    logging.debug("Unable to persist cover fallback updates in /api/library/artist", exc_info=True)
-
             artist_thumb = None
             base_url = request.url_root.rstrip("/")
             if has_artist_image and artist_image_path:
@@ -36884,7 +37024,7 @@ def api_library_artist_detail(artist_id):
                         )
                         erow = cur.fetchone()
                     ext_path = (erow[0] or "").strip() if erow else ""
-                    if ext_path and Path(ext_path).exists():
+                    if ext_path and Path(ext_path).exists() and _is_media_cache_file(Path(ext_path), kind="artist"):
                         artist_thumb = f"{base_url}/api/library/external/artist-image/{quote(artist_norm, safe='')}?size=320"
                 except Exception:
                     pass
@@ -38896,7 +39036,9 @@ def api_library_album_detail(album_id: int):
             },
             "tracks": tracks,
         }
-        _files_cache_set_json(cache_key, payload, ttl=30)
+        missing_duration = any(int(t.get("duration_sec") or 0) <= 0 for t in tracks)
+        payload_ttl = 20 if missing_duration else 300
+        _files_cache_set_json(cache_key, payload, ttl=payload_ttl)
         return jsonify(payload)
     finally:
         conn.close()
@@ -39021,13 +39163,15 @@ def api_library_files_album_cover(album_id):
 
     if cover_raw:
         cover_path = path_for_fs_access(Path(cover_raw))
-        if cover_path.exists() and cover_path.is_file():
+        if cover_path.exists() and cover_path.is_file() and _is_media_cache_file(cover_path, kind="album"):
             cached = _ensure_cached_image_for_path(cover_path, kind="album", max_px=size)
             to_send = cached or cover_path
             return _serve_image_file_cached(to_send, max_age=86400)
-
-    if no_cover_cached:
-        return _transparent_png_response(max_age=3600)
+        logging.debug(
+            "cache_miss_no_runtime_fallback: album_id=%s cover_path=%s",
+            int(album_id),
+            str(cover_path),
+        )
 
     _files_cache_set_json(
         lookup_key,
@@ -39036,7 +39180,7 @@ def api_library_files_album_cover(album_id):
             "folder_path": folder_raw,
             "no_cover": True,
         },
-        ttl=900,
+        ttl=3600 if no_cover_cached else 900,
     )
     return _transparent_png_response(max_age=3600)
 
@@ -39085,10 +39229,15 @@ def api_library_files_artist_image(artist_id):
 
     if img_raw:
         img_path = path_for_fs_access(Path(img_raw))
-        if img_path.exists() and img_path.is_file():
+        if img_path.exists() and img_path.is_file() and _is_media_cache_file(img_path, kind="artist"):
             cached = _ensure_cached_image_for_path(img_path, kind="artist", max_px=size)
             to_send = cached or img_path
             return _serve_image_file_cached(to_send, max_age=86400)
+        logging.debug(
+            "cache_miss_no_runtime_fallback: artist_id=%s image_path=%s",
+            int(artist_id),
+            str(img_path),
+        )
 
     if name_norm:
         ext_key = f"artwork:artist:ext:{name_norm}"
@@ -39115,7 +39264,7 @@ def api_library_files_artist_image(artist_id):
                 conn.close()
         if ext_raw:
             ext_path = path_for_fs_access(Path(ext_raw))
-            if ext_path.exists() and ext_path.is_file():
+            if ext_path.exists() and ext_path.is_file() and _is_media_cache_file(ext_path, kind="artist"):
                 cached = _ensure_cached_image_for_path(ext_path, kind="artist", max_px=size)
                 to_send = cached or ext_path
                 _files_cache_set_json(
@@ -39128,6 +39277,11 @@ def api_library_files_artist_image(artist_id):
                     ttl=3600,
                 )
                 return _serve_image_file_cached(to_send, max_age=86400)
+            logging.debug(
+                "cache_miss_no_runtime_fallback: artist_id=%s external_image_path=%s",
+                int(artist_id),
+                str(ext_path),
+            )
 
     if no_image_cached:
         return _transparent_png_response(max_age=3600)
@@ -39169,7 +39323,7 @@ def api_library_external_artist_image(name_norm: str):
         if not img_raw:
             return jsonify({"error": "External artist image not found"}), 404
         p = Path(img_raw)
-        if not p.exists() or not p.is_file():
+        if not p.exists() or not p.is_file() or not _is_media_cache_file(p, kind="artist"):
             return jsonify({"error": "External artist image missing"}), 404
         cached = _ensure_cached_image_for_path(p, kind="artist", max_px=size)
         to_send = cached or p

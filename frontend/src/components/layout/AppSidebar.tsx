@@ -244,7 +244,7 @@ export function AppSidebar() {
 
         <SidebarSeparator />
 
-        <SidebarGroup className={cn(isMobile ? 'pt-1' : '')}>
+        <SidebarGroup className={cn(isMobile ? 'pt-1' : '', 'group-data-[collapsible=icon]:hidden')}>
           <SidebarGroupLabel>Playlists</SidebarGroupLabel>
           <SidebarGroupAction asChild title="New playlist">
             <Button
@@ -323,11 +323,7 @@ export function AppSidebar() {
         </SidebarGroup>
       </SidebarContent>
 
-      <SidebarFooter>
-        <div className="hidden md:block px-2 py-1 text-[11px] text-muted-foreground group-data-[collapsible=icon]:hidden">
-          Tip: drag a track from Now Playing queue onto a playlist.
-        </div>
-      </SidebarFooter>
+      <SidebarFooter />
 
       <SidebarRail />
     </Sidebar>

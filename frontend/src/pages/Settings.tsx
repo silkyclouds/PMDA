@@ -52,17 +52,17 @@ const AI_USAGE_LEVELS: Array<{
   {
     value: 'limited',
     label: 'Limited',
-    description: 'AI uniquement sur cas réellement ambigus; pas de vision, pas de recherche web MBID, pas d’arbitrage IA des dupes.',
+    description: 'AI only for truly ambiguous cases; no vision, no web MBID search, no AI duplicate arbitration.',
   },
   {
     value: 'medium',
     label: 'Medium',
-    description: 'Équilibre coût/précision: vérification IA des matches + aide provider identity; vision et web MBID restent désactivés.',
+    description: 'Balanced cost/accuracy: AI match verification + provider identity assistance; vision and web MBID stay disabled.',
   },
   {
     value: 'aggressive',
     label: 'Aggressive',
-    description: 'Utilisation IA maximale: vérification + matching + vision + web MBID + arbitrage des dupes.',
+    description: 'Maximum AI usage: verification + matching + vision + web MBID + duplicate arbitration.',
   },
 ];
 

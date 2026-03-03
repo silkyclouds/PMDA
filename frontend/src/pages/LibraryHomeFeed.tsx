@@ -337,60 +337,70 @@ export default function LibraryHomeFeed() {
 
       {ALBUM_FEEDS.has(section) ? (
         <div className="grid gap-4 justify-start" style={{ gridTemplateColumns }}>
-          {albums.map((a) => (
-            <div
-              key={`hf-alb-${section}-${a.album_id}`}
-              role="button"
-              tabIndex={0}
-              className="group text-left"
-              onClick={() => navigate(`/library/album/${a.album_id}${location.search || ''}`)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' || e.key === ' ') {
-                  e.preventDefault();
-                  navigate(`/library/album/${a.album_id}${location.search || ''}`);
-                }
-              }}
-            >
-              <Card className="overflow-hidden border-border/60 bg-card/90">
-                <AspectRatio ratio={1} className="bg-muted">
-                  <AlbumArtwork albumThumb={a.thumb} artistId={a.artist_id} alt={a.title} size={320} />
-                  <button
-                    type="button"
-                    onClick={(e) => {
-                      e.preventDefault();
-                      e.stopPropagation();
-                      void handlePlayAlbum(a.album_id, a.title, a.thumb);
-                    }}
-                    className="absolute inset-0 flex items-center justify-center opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity bg-black/30"
-                    title="Play"
-                  >
-                    <div className="h-10 w-10 rounded-full bg-white/20 backdrop-blur-sm border border-white/20 flex items-center justify-center">
-                      <Play className="h-5 w-5 text-white fill-white" />
+          {albums.map((a) => {
+            const primaryGenre = String(a.genre || '')
+              .split(/[;,/|]+/g)
+              .map((x) => x.trim())
+              .find(Boolean) || '';
+            return (
+              <div
+                key={`hf-alb-${section}-${a.album_id}`}
+                role="button"
+                tabIndex={0}
+                className="group text-left"
+                onClick={() => navigate(`/library/album/${a.album_id}${location.search || ''}`)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    navigate(`/library/album/${a.album_id}${location.search || ''}`);
+                  }
+                }}
+              >
+                <Card className="overflow-hidden border-border/60 bg-card/90">
+                  <AspectRatio ratio={1} className="bg-muted">
+                    <AlbumArtwork albumThumb={a.thumb} artistId={a.artist_id} alt={a.title} size={320} />
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        void handlePlayAlbum(a.album_id, a.title, a.thumb);
+                      }}
+                      className="absolute inset-0 flex items-center justify-center opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity bg-black/30"
+                      title="Play"
+                    >
+                      <div className="h-10 w-10 rounded-full bg-white/20 backdrop-blur-sm border border-white/20 flex items-center justify-center">
+                        <Play className="h-5 w-5 text-white fill-white" />
+                      </div>
+                    </button>
+                  </AspectRatio>
+                  <CardContent className="p-3 space-y-1.5">
+                    <div className="text-sm font-semibold leading-snug line-clamp-4 min-h-[4.6rem]" title={a.title}>{a.title}</div>
+                    <button
+                      type="button"
+                      className="text-xs text-muted-foreground truncate hover:underline"
+                      onClick={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        navigate(`/library/artist/${a.artist_id}${location.search || ''}`);
+                      }}
+                      title="Open artist"
+                    >
+                      {a.artist_name}
+                    </button>
+                    <div className="flex items-center gap-1.5 flex-wrap">
+                      <Badge variant="outline" className="text-[10px]">{a.year ?? '—'}</Badge>
+                      <Badge variant="outline" className="text-[10px]">{a.track_count}t</Badge>
                     </div>
-                  </button>
-                </AspectRatio>
-                <CardContent className="p-3 space-y-1.5">
-                  <div className="text-sm font-semibold leading-snug line-clamp-3 min-h-[3.6rem]" title={a.title}>{a.title}</div>
-                  <button
-                    type="button"
-                    className="text-xs text-muted-foreground truncate hover:underline"
-                    onClick={(e) => {
-                      e.preventDefault();
-                      e.stopPropagation();
-                      navigate(`/library/artist/${a.artist_id}${location.search || ''}`);
-                    }}
-                    title="Open artist"
-                  >
-                    {a.artist_name}
-                  </button>
-                  <div className="flex items-center gap-1.5 flex-wrap">
-                    <Badge variant="outline" className="text-[10px]">{a.year ?? '—'}</Badge>
-                    <Badge variant="outline" className="text-[10px]">{a.track_count}t</Badge>
-                  </div>
-                </CardContent>
-              </Card>
-            </div>
-          ))}
+                    <div className="flex items-center gap-1.5 flex-wrap">
+                      {primaryGenre ? <Badge variant="secondary" className="text-[10px]">{primaryGenre}</Badge> : null}
+                      {a.label ? <Badge variant="outline" className="text-[10px]">{a.label}</Badge> : null}
+                    </div>
+                  </CardContent>
+                </Card>
+              </div>
+            );
+          })}
         </div>
       ) : null}
 

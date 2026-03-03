@@ -821,6 +821,47 @@ export default function Statistics() {
     + n(cacheControl?.sqlite_state_db?.shm_bytes);
   const mediaCacheBytes = n(cacheControl?.media_cache?.total?.bytes_total);
   const postgresDbBytes = n(cacheControl?.postgres?.db_size_bytes);
+  const hasTelemetry = Boolean(cacheControl && Number(cacheControl.generated_at || 0) > 0);
+
+  const redisStatus = useMemo(() => {
+    if (!hasTelemetry) return { label: 'unknown', variant: 'outline' as const, reason: '' };
+    const mode = String(cacheControl?.redis?.mode || '').trim().toLowerCase();
+    const reason = String(cacheControl?.redis?.reason || '').trim();
+    const available = cacheControl?.redis?.available === true;
+    if (available || mode === 'redis') return { label: 'redis', variant: 'secondary' as const, reason };
+    if (mode === 'local') return { label: 'local-fallback', variant: 'secondary' as const, reason };
+    if (mode === 'none' || mode === 'disabled') return { label: 'disabled', variant: 'outline' as const, reason };
+    return { label: 'unavailable', variant: 'outline' as const, reason };
+  }, [cacheControl?.redis?.available, cacheControl?.redis?.mode, cacheControl?.redis?.reason, hasTelemetry]);
+
+  const postgresStatus = useMemo(() => {
+    if (!hasTelemetry) return { label: 'unknown', variant: 'outline' as const, reason: '' };
+    const mode = String(cacheControl?.postgres?.mode || '').trim().toLowerCase();
+    const reason = String(cacheControl?.postgres?.reason || '').trim();
+    const available = cacheControl?.postgres?.available === true;
+    if (available || mode === 'postgres') return { label: 'postgres', variant: 'secondary' as const, reason };
+    if (mode === 'disabled') return { label: 'disabled', variant: 'outline' as const, reason };
+    if (mode === 'none') return { label: 'unavailable', variant: 'outline' as const, reason };
+    return { label: 'unknown', variant: 'outline' as const, reason };
+  }, [cacheControl?.postgres?.available, cacheControl?.postgres?.mode, cacheControl?.postgres?.reason, hasTelemetry]);
+
+  const watcherStatus = useMemo(() => {
+    if (!hasTelemetry) return { label: 'unknown', variant: 'outline' as const, reason: '' };
+    const running = cacheControl?.files_watcher?.running === true;
+    const enabled = cacheControl?.files_watcher?.enabled !== false;
+    const available = cacheControl?.files_watcher?.available !== false;
+    const reason = String(cacheControl?.files_watcher?.reason || '').trim();
+    if (running) return { label: 'running', variant: 'secondary' as const, reason };
+    if (!enabled) return { label: 'disabled', variant: 'outline' as const, reason: reason || 'disabled_by_setting' };
+    if (!available) return { label: 'unavailable', variant: 'outline' as const, reason: reason || 'watchdog_unavailable' };
+    return { label: 'stopped', variant: 'outline' as const, reason };
+  }, [
+    cacheControl?.files_watcher?.available,
+    cacheControl?.files_watcher?.enabled,
+    cacheControl?.files_watcher?.reason,
+    cacheControl?.files_watcher?.running,
+    hasTelemetry,
+  ]);
 
   const cacheStorageData = useMemo(() => {
     return {
@@ -1515,14 +1556,23 @@ export default function Statistics() {
                     <Badge variant={cacheControl?.cache_policies?.mb_disable_cache ? 'destructive' : 'secondary'}>
                       MB_DISABLE_CACHE: {cacheControl?.cache_policies?.mb_disable_cache ? 'ON' : 'OFF'}
                     </Badge>
-                    <Badge variant={cacheControl?.redis?.available ? 'secondary' : 'outline'}>
-                      Redis: {cacheControl?.redis?.available ? 'connected' : 'offline'}
+                    <Badge
+                      variant={redisStatus.variant}
+                      title={redisStatus.reason ? `Reason: ${redisStatus.reason}` : undefined}
+                    >
+                      Redis: {redisStatus.label}
                     </Badge>
-                    <Badge variant={cacheControl?.postgres?.available ? 'secondary' : 'outline'}>
-                      PostgreSQL: {cacheControl?.postgres?.available ? 'connected' : 'offline'}
+                    <Badge
+                      variant={postgresStatus.variant}
+                      title={postgresStatus.reason ? `Reason: ${postgresStatus.reason}` : undefined}
+                    >
+                      PostgreSQL: {postgresStatus.label}
                     </Badge>
-                    <Badge variant={cacheControl?.files_watcher?.running ? 'secondary' : 'outline'}>
-                      Watcher: {cacheControl?.files_watcher?.running ? 'running' : 'stopped'}
+                    <Badge
+                      variant={watcherStatus.variant}
+                      title={watcherStatus.reason ? `Reason: ${watcherStatus.reason}` : undefined}
+                    >
+                      Watcher: {watcherStatus.label}
                     </Badge>
                   </div>
                   <p className="text-xs text-muted-foreground">
