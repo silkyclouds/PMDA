@@ -45675,18 +45675,19 @@ if __name__ == "__main__":
 
     # Fast checks before server (must never hard-exit files mode).
     if PLEX_CONFIGURED:
-        try:
-            _validate_plex_connection()
-        except Exception:
-            logging.warning("Plex connection precheck failed (non-fatal).", exc_info=True)
-        if _get_library_mode() == "plex":
+        startup_mode = _get_library_mode()
+        if startup_mode == "plex":
+            try:
+                _validate_plex_connection()
+            except Exception:
+                logging.warning("Plex connection precheck failed (non-fatal).", exc_info=True)
             try:
                 if not _self_diag():
                     logging.error("Self-diagnostic failed in Plex mode (continuing so UI stays available).")
             except Exception:
                 logging.warning("Self-diagnostic crashed in Plex mode (non-fatal).", exc_info=True)
         else:
-            logging.info("Skipping Plex self-diagnostic at startup (LIBRARY_MODE=files).")
+            logging.info("Skipping Plex startup checks (LIBRARY_MODE=%s).", startup_mode or "files")
     else:
         logging.info("Skipping Plex startup checks (Plex not configured – use Settings to configure).")
 
