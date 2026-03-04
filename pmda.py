@@ -30,8 +30,11 @@ import ast
 import html
 import json
 import os
+import secrets
 import shutil
 import uuid
+import ipaddress
+import tempfile
 import filecmp
 import errno
 import sqlite3
@@ -39,7 +42,7 @@ import subprocess
 import threading
 import time
 import atexit
-from collections import defaultdict, OrderedDict
+from collections import defaultdict, OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import NamedTuple, List, Dict, Optional, Tuple
@@ -182,7 +185,7 @@ except ImportError:
     Observer = None  # type: ignore[assignment]
 
 
-from flask import Flask, request, jsonify, send_from_directory, redirect, Response, send_file
+from flask import Flask, request, jsonify, send_from_directory, redirect, Response, send_file, g, after_this_request
 
 app = Flask(__name__)
 
@@ -190,12 +193,40 @@ app = Flask(__name__)
 _FRONTEND_DIST = os.path.join(os.path.dirname(os.path.abspath(__file__)), "frontend", "dist")
 _HAS_STATIC_UI = os.path.isdir(_FRONTEND_DIST)
 
-# CORS: allow frontend (e.g. dev server on port 3000 or 8080) to call the API
+# CORS: locked down by explicit origin allow-list.
+_DEFAULT_CORS_ORIGINS = {
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:8080",
+    "http://127.0.0.1:8080",
+}
+_env_cors = (os.getenv("PMDA_ALLOWED_ORIGINS", "") or "").strip()
+if _env_cors:
+    _ALLOWED_CORS_ORIGINS = {o.strip().rstrip("/") for o in _env_cors.split(",") if o.strip()}
+else:
+    _ALLOWED_CORS_ORIGINS = set(_DEFAULT_CORS_ORIGINS)
+
+@app.before_request
+def _cors_preflight():
+    if request.method == "OPTIONS":
+        resp = Response(status=204)
+        return _cors_headers(resp)
+    return None
+
 @app.after_request
 def _cors_headers(response):
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, OPTIONS"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    origin = (request.headers.get("Origin") or "").strip().rstrip("/")
+    if origin and origin in _ALLOWED_CORS_ORIGINS:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Vary"] = "Origin"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
+    if str(request.path or "").startswith("/api/auth/"):
+        response.headers["Cache-Control"] = "no-store"
     return response
 
 # Ensure LOG_LEVEL exists for initial logging setup (effective level from SQLite applied later via merged)
@@ -543,6 +574,23 @@ DROP_ALBUMS_BASE = CONFIG_DIR / "drop_albums"
 DROP_MAX_FILES = 50
 DROP_MAX_BYTES = 500 * 1024 * 1024  # 500 MB
 
+# Auth / sessions
+AUTH_PASSWORD_MIN_LEN = max(10, int(os.getenv("PMDA_AUTH_PASSWORD_MIN_LEN", "12") or "12"))
+AUTH_PASSWORD_MAX_LEN = 256
+AUTH_PBKDF2_ITERATIONS = max(150_000, int(os.getenv("PMDA_AUTH_PBKDF2_ITERATIONS", "260000") or "260000"))
+AUTH_SESSION_TTL_SEC = max(900, int(os.getenv("PMDA_AUTH_SESSION_TTL_SEC", "43200") or "43200"))  # default 12h
+AUTH_TOKEN_PEPPER = os.getenv("PMDA_AUTH_TOKEN_PEPPER", "") or ""
+AUTH_DISABLE = _parse_bool(os.getenv("PMDA_AUTH_DISABLE", "false"))
+AUTH_LOGIN_RATE_LIMIT_WINDOW_SEC = max(60, int(os.getenv("PMDA_AUTH_LOGIN_RATE_LIMIT_WINDOW_SEC", "300") or "300"))
+AUTH_LOGIN_RATE_LIMIT_IP_MAX_ATTEMPTS = max(3, int(os.getenv("PMDA_AUTH_LOGIN_RATE_LIMIT_IP_MAX_ATTEMPTS", "20") or "20"))
+AUTH_LOGIN_RATE_LIMIT_USER_MAX_ATTEMPTS = max(3, int(os.getenv("PMDA_AUTH_LOGIN_RATE_LIMIT_USER_MAX_ATTEMPTS", "10") or "10"))
+AUTH_BOOTSTRAP_RATE_LIMIT_IP_MAX_ATTEMPTS = max(3, int(os.getenv("PMDA_AUTH_BOOTSTRAP_RATE_LIMIT_IP_MAX_ATTEMPTS", "10") or "10"))
+AUTH_ALLOW_PUBLIC_BOOTSTRAP = _parse_bool(os.getenv("PMDA_AUTH_ALLOW_PUBLIC_BOOTSTRAP", "false"))
+AUTH_TRUST_PROXY_HEADERS = _parse_bool(os.getenv("PMDA_AUTH_TRUST_PROXY_HEADERS", "false"))
+
+_AUTH_RATE_LIMIT_LOCK = threading.Lock()
+_AUTH_RATE_LIMIT_BUCKETS: dict[tuple[str, str], deque[int]] = {}
+
 # Files-mode all-in-one data services (embedded in container entrypoint)
 PMDA_PG_HOST = (os.getenv("PMDA_PG_HOST", "127.0.0.1") or "127.0.0.1").strip()
 PMDA_PG_PORT = int((os.getenv("PMDA_PG_PORT", "5432") or "5432").strip())
@@ -573,6 +621,385 @@ PMDA_CACHE_TELEMETRY_MAX_REDIS_SCAN_KEYS = int(os.getenv("PMDA_CACHE_TELEMETRY_M
 PMDA_FILES_LOCAL_CACHE_MAX_KEYS = int(max(1000, _parse_int(os.getenv("PMDA_FILES_LOCAL_CACHE_MAX_KEYS", "200000"), 200000) or 200000))
 RECO_EMBED_DIM = 64
 RECO_EMBED_SOURCE = "pmda_hash_v1"
+
+
+def _auth_now_ts() -> int:
+    return int(time.time())
+
+
+def _auth_db_connect() -> sqlite3.Connection:
+    con = sqlite3.connect(str(SETTINGS_DB_FILE), timeout=10)
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def _auth_password_hash(password: str, salt_hex: str) -> str:
+    pwd = (password or "").encode("utf-8", errors="ignore")
+    salt = bytes.fromhex(salt_hex)
+    dk = hashlib.pbkdf2_hmac("sha256", pwd, salt, AUTH_PBKDF2_ITERATIONS, dklen=32)
+    return dk.hex()
+
+
+def _auth_make_password_hash(password: str) -> tuple[str, str]:
+    salt_hex = secrets.token_hex(16)
+    return _auth_password_hash(password, salt_hex), salt_hex
+
+
+def _auth_verify_password(password: str, password_hash: str, salt_hex: str) -> bool:
+    if not password_hash or not salt_hex:
+        return False
+    try:
+        calc = _auth_password_hash(password, salt_hex)
+        return bool(secrets.compare_digest(calc, str(password_hash)))
+    except Exception:
+        return False
+
+
+def _auth_token_hash(raw_token: str) -> str:
+    payload = f"{AUTH_TOKEN_PEPPER}:{raw_token}" if AUTH_TOKEN_PEPPER else raw_token
+    return hashlib.sha256(payload.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def _auth_public_user(row: sqlite3.Row | dict | None) -> dict:
+    if not row:
+        return {}
+    return {
+        "id": int(row["id"]),
+        "username": str(row["username"] or ""),
+        "is_admin": bool(int(row["is_admin"] or 0)),
+        "can_download": bool(int(row["can_download"] or 0)),
+        "is_active": bool(int(row["is_active"] or 0)),
+        "created_at": int(row["created_at"] or 0),
+        "updated_at": int(row["updated_at"] or 0),
+        "last_login_at": int(row["last_login_at"] or 0) if row["last_login_at"] is not None else None,
+    }
+
+
+def _auth_validate_username(username: str) -> tuple[bool, str]:
+    raw = str(username or "").strip()
+    if not raw:
+        return False, "Username is required"
+    if len(raw) < 3 or len(raw) > 48:
+        return False, "Username must be between 3 and 48 characters"
+    if not re.fullmatch(r"[a-zA-Z0-9._-]+", raw):
+        return False, "Username may only contain letters, numbers, dot, underscore, and dash"
+    return True, raw
+
+
+def _auth_validate_password(password: str) -> tuple[bool, str]:
+    raw = str(password or "")
+    if len(raw) < AUTH_PASSWORD_MIN_LEN:
+        return False, f"Password must be at least {AUTH_PASSWORD_MIN_LEN} characters"
+    if len(raw) > AUTH_PASSWORD_MAX_LEN:
+        return False, f"Password must be at most {AUTH_PASSWORD_MAX_LEN} characters"
+    return True, ""
+
+
+def _auth_get_user_by_username(username: str) -> Optional[sqlite3.Row]:
+    u = str(username or "").strip()
+    if not u:
+        return None
+    con = _auth_db_connect()
+    try:
+        cur = con.cursor()
+        cur.execute(
+            """
+            SELECT id, username, password_hash, password_salt, is_admin, can_download, is_active, created_at, updated_at, last_login_at
+            FROM auth_users
+            WHERE username = ?
+            LIMIT 1
+            """,
+            (u,),
+        )
+        row = cur.fetchone()
+        return row
+    finally:
+        con.close()
+
+
+def _auth_get_user_by_id(user_id: int) -> Optional[sqlite3.Row]:
+    try:
+        uid = int(user_id)
+    except Exception:
+        return None
+    if uid <= 0:
+        return None
+    con = _auth_db_connect()
+    try:
+        cur = con.cursor()
+        cur.execute(
+            """
+            SELECT id, username, password_hash, password_salt, is_admin, can_download, is_active, created_at, updated_at, last_login_at
+            FROM auth_users
+            WHERE id = ?
+            LIMIT 1
+            """,
+            (uid,),
+        )
+        row = cur.fetchone()
+        return row
+    finally:
+        con.close()
+
+
+def _auth_bootstrap_required() -> bool:
+    if AUTH_DISABLE:
+        return False
+    con = _auth_db_connect()
+    try:
+        cur = con.cursor()
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM auth_users
+            WHERE is_active = 1 AND is_admin = 1
+            """
+        )
+        row = cur.fetchone()
+        count = int((row[0] if row else 0) or 0)
+        return count <= 0
+    except Exception:
+        # Fail closed: force bootstrap flow if auth tables are unexpectedly unavailable.
+        return True
+    finally:
+        con.close()
+
+
+def _auth_count_admin_users(con: sqlite3.Connection) -> int:
+    cur = con.cursor()
+    cur.execute("SELECT COUNT(*) FROM auth_users WHERE is_active = 1 AND is_admin = 1")
+    row = cur.fetchone()
+    return int((row[0] if row else 0) or 0)
+
+
+def _auth_create_user(
+    *,
+    username: str,
+    password: str,
+    is_admin: bool,
+    can_download: bool,
+    is_active: bool = True,
+) -> tuple[bool, str, Optional[dict]]:
+    ok_u, user_or_msg = _auth_validate_username(username)
+    if not ok_u:
+        return False, user_or_msg, None
+    ok_p, p_msg = _auth_validate_password(password)
+    if not ok_p:
+        return False, p_msg, None
+    username_clean = user_or_msg
+    password_hash, salt_hex = _auth_make_password_hash(password)
+    now = _auth_now_ts()
+    con = _auth_db_connect()
+    try:
+        cur = con.cursor()
+        cur.execute(
+            """
+            INSERT INTO auth_users(
+                username, password_hash, password_salt, is_admin, can_download, is_active, created_at, updated_at
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                username_clean,
+                password_hash,
+                salt_hex,
+                1 if is_admin else 0,
+                1 if can_download else 0,
+                1 if is_active else 0,
+                now,
+                now,
+            ),
+        )
+        user_id = int(cur.lastrowid or 0)
+        con.commit()
+    except sqlite3.IntegrityError:
+        con.rollback()
+        return False, "Username already exists", None
+    except Exception as e:
+        con.rollback()
+        return False, f"User creation failed: {e}", None
+    finally:
+        con.close()
+    row = _auth_get_user_by_id(user_id)
+    return True, "ok", _auth_public_user(row)
+
+
+def _auth_create_session(user_id: int, *, ip: str = "", user_agent: str = "") -> tuple[str, int]:
+    raw_token = secrets.token_urlsafe(48)
+    token_hash = _auth_token_hash(raw_token)
+    now = _auth_now_ts()
+    expires = now + AUTH_SESSION_TTL_SEC
+    con = _auth_db_connect()
+    try:
+        cur = con.cursor()
+        cur.execute("DELETE FROM auth_sessions WHERE expires_at <= ?", (now,))
+        cur.execute(
+            """
+            INSERT OR REPLACE INTO auth_sessions(
+                token_hash, user_id, created_at, expires_at, last_used_at, ip, user_agent
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?)
+            """,
+            (token_hash, int(user_id), now, expires, now, str(ip or "")[:120], str(user_agent or "")[:240]),
+        )
+        con.commit()
+    finally:
+        con.close()
+    return raw_token, expires
+
+
+def _auth_touch_login(user_id: int, *, ip: str = "") -> None:
+    con = _auth_db_connect()
+    try:
+        cur = con.cursor()
+        cur.execute(
+            "UPDATE auth_users SET last_login_at = ?, updated_at = ? WHERE id = ?",
+            (_auth_now_ts(), _auth_now_ts(), int(user_id)),
+        )
+        con.commit()
+    except Exception:
+        con.rollback()
+    finally:
+        con.close()
+
+
+def _auth_rate_limit_key(kind: str, key: str) -> tuple[str, str]:
+    return (str(kind or "").strip().lower(), str(key or "").strip().lower())
+
+
+def _auth_rate_limit_prune(now_ts: int) -> None:
+    cutoff = now_ts - AUTH_LOGIN_RATE_LIMIT_WINDOW_SEC
+    stale_keys: list[tuple[str, str]] = []
+    for bucket_key, timestamps in _AUTH_RATE_LIMIT_BUCKETS.items():
+        while timestamps and int(timestamps[0]) < cutoff:
+            timestamps.popleft()
+        if not timestamps:
+            stale_keys.append(bucket_key)
+    for bucket_key in stale_keys:
+        _AUTH_RATE_LIMIT_BUCKETS.pop(bucket_key, None)
+
+
+def _auth_rate_limit_is_blocked(kind: str, key: str, *, max_attempts: int) -> bool:
+    now_ts = _auth_now_ts()
+    bucket_key = _auth_rate_limit_key(kind, key)
+    if not bucket_key[1]:
+        return False
+    with _AUTH_RATE_LIMIT_LOCK:
+        _auth_rate_limit_prune(now_ts)
+        timestamps = _AUTH_RATE_LIMIT_BUCKETS.get(bucket_key)
+        if not timestamps:
+            return False
+        return len(timestamps) >= max(1, int(max_attempts or 1))
+
+
+def _auth_rate_limit_record_failure(kind: str, key: str) -> None:
+    now_ts = _auth_now_ts()
+    bucket_key = _auth_rate_limit_key(kind, key)
+    if not bucket_key[1]:
+        return
+    with _AUTH_RATE_LIMIT_LOCK:
+        _auth_rate_limit_prune(now_ts)
+        timestamps = _AUTH_RATE_LIMIT_BUCKETS.get(bucket_key)
+        if timestamps is None:
+            timestamps = deque()
+            _AUTH_RATE_LIMIT_BUCKETS[bucket_key] = timestamps
+        timestamps.append(now_ts)
+
+
+def _auth_rate_limit_clear(kind: str, key: str) -> None:
+    bucket_key = _auth_rate_limit_key(kind, key)
+    if not bucket_key[1]:
+        return
+    with _AUTH_RATE_LIMIT_LOCK:
+        _AUTH_RATE_LIMIT_BUCKETS.pop(bucket_key, None)
+
+
+def _auth_get_bearer_token() -> str:
+    authz = (request.headers.get("Authorization") or "").strip()
+    if authz.lower().startswith("bearer "):
+        return authz[7:].strip()
+    return ""
+
+
+def _auth_client_ip() -> str:
+    if AUTH_TRUST_PROXY_HEADERS:
+        forwarded = str(request.headers.get("X-Forwarded-For") or "").strip()
+        if forwarded:
+            return str(forwarded.split(",", 1)[0] or "").strip()
+    return str(request.remote_addr or "").strip()
+
+
+def _auth_ip_is_private_or_loopback(ip_value: str) -> bool:
+    raw = str(ip_value or "").strip()
+    if not raw:
+        return False
+    if raw.lower().startswith("::ffff:"):
+        raw = raw[7:]
+    try:
+        addr = ipaddress.ip_address(raw)
+        return bool(addr.is_private or addr.is_loopback)
+    except ValueError:
+        return False
+
+
+def _auth_resolve_session(raw_token: str) -> Optional[dict]:
+    token = str(raw_token or "").strip()
+    if not token:
+        return None
+    now = _auth_now_ts()
+    token_hash = _auth_token_hash(token)
+    con = _auth_db_connect()
+    try:
+        cur = con.cursor()
+        cur.execute(
+            """
+            SELECT
+                s.user_id,
+                s.expires_at,
+                u.id,
+                u.username,
+                u.is_admin,
+                u.can_download,
+                u.is_active,
+                u.created_at,
+                u.updated_at,
+                u.last_login_at
+            FROM auth_sessions s
+            JOIN auth_users u ON u.id = s.user_id
+            WHERE s.token_hash = ?
+            LIMIT 1
+            """,
+            (token_hash,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        expires_at = int(row["expires_at"] or 0)
+        if expires_at <= now:
+            cur.execute("DELETE FROM auth_sessions WHERE token_hash = ?", (token_hash,))
+            con.commit()
+            return None
+        if not bool(int(row["is_active"] or 0)):
+            return None
+        cur.execute("UPDATE auth_sessions SET last_used_at = ? WHERE token_hash = ?", (now, token_hash))
+        con.commit()
+        return _auth_public_user(row)
+    finally:
+        con.close()
+
+
+def _auth_delete_session(raw_token: str) -> None:
+    token = str(raw_token or "").strip()
+    if not token:
+        return
+    token_hash = _auth_token_hash(token)
+    con = _auth_db_connect()
+    try:
+        cur = con.cursor()
+        cur.execute("DELETE FROM auth_sessions WHERE token_hash = ?", (token_hash,))
+        con.commit()
+    finally:
+        con.close()
 
 
 def _get_from_sqlite(key: str, default=None):
@@ -3677,6 +4104,51 @@ def init_settings_db():
             value TEXT
         )
     """)
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS auth_users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            password_salt TEXT NOT NULL,
+            is_admin INTEGER NOT NULL DEFAULT 0,
+            can_download INTEGER NOT NULL DEFAULT 0,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            last_login_at INTEGER
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS auth_sessions (
+            token_hash TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
+            last_used_at INTEGER NOT NULL,
+            ip TEXT,
+            user_agent TEXT,
+            FOREIGN KEY(user_id) REFERENCES auth_users(id) ON DELETE CASCADE
+        )
+        """
+    )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_auth_users_admin_active ON auth_users(is_admin, is_active)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_auth_users_username ON auth_users(username)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_auth_sessions_user ON auth_sessions(user_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_auth_sessions_expires ON auth_sessions(expires_at)")
+
+    # Backward-compatible schema upgrades.
+    cur.execute("PRAGMA table_info(auth_users)")
+    auth_user_cols = {r[1] for r in cur.fetchall()}
+    if "can_download" not in auth_user_cols:
+        cur.execute("ALTER TABLE auth_users ADD COLUMN can_download INTEGER NOT NULL DEFAULT 0")
+    if "is_active" not in auth_user_cols:
+        cur.execute("ALTER TABLE auth_users ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1")
+    if "last_login_at" not in auth_user_cols:
+        cur.execute("ALTER TABLE auth_users ADD COLUMN last_login_at INTEGER")
+
     con.commit()
     con.close()
 
@@ -3722,6 +4194,101 @@ def migrate_settings_from_state_db():
             logging.debug("Legacy settings migration skipped (nothing new to import).")
     except Exception as e:
         logging.warning("Failed to migrate settings from state.db to settings.db: %s", e)
+
+
+def _auth_is_protected_path(path: str) -> bool:
+    p = str(path or "")
+    return (
+        p.startswith("/api/")
+        or p.startswith("/scan/")
+        or p.startswith("/dedupe/")
+        or p.startswith("/details/")
+    )
+
+
+def _auth_is_public_path(path: str) -> bool:
+    p = str(path or "")
+    return p in {
+        "/api/auth/bootstrap/status",
+        "/api/auth/bootstrap",
+        "/api/auth/login",
+        "/api/ui/build",
+    }
+
+
+def _auth_is_self_path(path: str) -> bool:
+    p = str(path or "")
+    return p in {
+        "/api/auth/me",
+        "/api/auth/logout",
+    }
+
+
+def _auth_non_admin_library_allowed(path: str, method: str, can_download: bool) -> bool:
+    p = str(path or "")
+    m = str(method or "GET").upper()
+    if m != "GET":
+        return False
+    if p == "/api/config":
+        return True
+    if not p.startswith("/api/library/"):
+        return False
+    # Optional permission gate for future explicit download endpoint.
+    if p.endswith("/download") and not bool(can_download):
+        return False
+    return True
+
+
+@app.before_request
+def _auth_guard():
+    # CORS preflight handled by dedicated hook.
+    if request.method == "OPTIONS":
+        return None
+
+    # Default anonymous context.
+    g.current_user = None
+
+    if AUTH_DISABLE:
+        g.current_user = {
+            "id": 0,
+            "username": "auth_disabled",
+            "is_admin": True,
+            "can_download": True,
+            "is_active": True,
+        }
+        return None
+
+    path = request.path or ""
+    if not _auth_is_protected_path(path):
+        return None
+
+    if _auth_is_public_path(path):
+        return None
+
+    if _auth_bootstrap_required():
+        return jsonify({"error": "Bootstrap required. Create the initial admin user first."}), 428
+
+    raw_token = _auth_get_bearer_token()
+    if not raw_token:
+        return jsonify({"error": "Authentication required"}), 401
+
+    user = _auth_resolve_session(raw_token)
+    if not user:
+        return jsonify({"error": "Invalid or expired session"}), 401
+
+    g.current_user = user
+
+    # Allow current-user endpoints regardless of role.
+    if _auth_is_self_path(path):
+        return None
+
+    if bool(user.get("is_admin")):
+        return None
+
+    if _auth_non_admin_library_allowed(path, request.method, bool(user.get("can_download"))):
+        return None
+
+    return jsonify({"error": "Forbidden: admin access required"}), 403
 
 def get_stat(key: str) -> int:
     con = sqlite3.connect(str(STATE_DB_FILE))
@@ -27542,23 +28109,6 @@ def clear_scan():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
-# ────────────────────────── Wizard / Web UI helpers ─────────────────────────
-
-@app.get("/api/plex/check")
-def api_plex_check_get():
-    """Test Plex connection using current server config (PLEX_HOST, PLEX_TOKEN)."""
-    return _do_plex_check(PLEX_HOST, PLEX_TOKEN)
-
-
-@app.post("/api/plex/check")
-def api_plex_check_post():
-    """Test Plex connection; optional body { PLEX_HOST, PLEX_TOKEN } to test before saving."""
-    data = request.get_json(silent=True) or {}
-    host = (data.get("PLEX_HOST") or "").strip() or PLEX_HOST
-    token = (data.get("PLEX_TOKEN") or "").strip() or PLEX_TOKEN
-    return _do_plex_check(host, token)
-
-
 def _do_plex_check(host: str, token: str):
     if not host or not token:
         return jsonify({"success": False, "message": "PLEX_HOST and PLEX_TOKEN are required"}), 400
@@ -27820,952 +28370,6 @@ def api_player_refresh():
     target = _effective_player_target(data.get("target"))
     ok, msg = _trigger_player_refresh_by_target(target)
     return jsonify({"success": ok, "target": target, "message": msg}), (200 if ok else 400)
-
-
-@app.post("/api/plex/refresh")
-def api_plex_refresh():
-    """
-    Trigger a Plex library scan (refresh) for all configured SECTION_IDS.
-    Use after adding or changing files in the music root (e.g. after creating pmda_tests set)
-    so Plex indexes the new folders before running a PMDA scan.
-    """
-    _reload_section_ids_from_db()
-    if not SECTION_IDS:
-        return jsonify({"success": False, "message": "No library sections configured. Set SECTION_IDS in Settings."}), 400
-    refreshed = []
-    errors = []
-    for sid in SECTION_IDS:
-        try:
-            plex_api(f"/library/sections/{sid}/refresh", method="GET")
-            refreshed.append(sid)
-        except Exception as e:
-            errors.append({"section_id": sid, "error": str(e)})
-    if errors and not refreshed:
-        return jsonify({"success": False, "message": "Refresh failed for all sections", "errors": errors}), 502
-    return jsonify({
-        "success": True,
-        "sections_refreshed": refreshed,
-        "message": f"Plex refresh triggered for section(s) {refreshed}" + (f"; {len(errors)} error(s)" if errors else ""),
-        "errors": errors if errors else None,
-    })
-
-
-# ─── Plex.tv PIN auth (Tautulli-style: no manual token) ─────────────────────
-PLEX_PIN_HEADERS = {
-    "X-Plex-Client-Identifier": "pmda-webui-1",
-    "X-Plex-Product": "PMDA",
-    "X-Plex-Version": "1.0",
-    "X-Plex-Device": "Web",
-    "X-Plex-Platform": "Web",
-    "Accept": "application/json",
-}
-
-
-@app.post("/api/plex/pin")
-def api_plex_pin_create():
-    """
-    Create a Plex.tv PIN for sign-in (like Tautulli "Fetch New Token").
-    User opens https://www.plex.tv/link, enters the returned code; we poll GET /api/plex/pin?id=... for the token.
-    No auth required. Returns { id, code, link_url }.
-    """
-    # strong=false (default) → 4-character code for plex.tv/link; strong=true → long code for other flows
-    url = "https://plex.tv/api/v2/pins"
-    try:
-        resp = requests.post(url, headers=PLEX_PIN_HEADERS, timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
-        pin_id = data.get("id")
-        code = data.get("code", "")
-        if not pin_id:
-            return jsonify({"success": False, "message": "Plex did not return a PIN id"}), 502
-        return jsonify({
-            "success": True,
-            "id": pin_id,
-            "code": code,
-            "link_url": "https://www.plex.tv/link/",
-        })
-    except requests.exceptions.ConnectionError:
-        return jsonify({"success": False, "message": "Cannot reach plex.tv. Check network and DNS."}), 502
-    except requests.exceptions.Timeout:
-        return jsonify({"success": False, "message": "Request to plex.tv timed out."}), 502
-    except (requests.RequestException, ValueError) as e:
-        return jsonify({"success": False, "message": str(e)}), 502
-
-
-@app.get("/api/plex/pin")
-def api_plex_pin_poll():
-    """
-    Poll PIN status. Query param: id (pin id from POST /api/plex/pin).
-    Returns { status: 'waiting' } or { status: 'linked', token } when user has signed in on plex.tv/link.
-    """
-    pin_id = request.args.get("id", "").strip()
-    if not pin_id:
-        return jsonify({"success": False, "status": "error", "message": "Missing id"}), 400
-    url = f"https://plex.tv/api/v2/pins/{pin_id}"
-    try:
-        resp = requests.get(url, headers=PLEX_PIN_HEADERS, timeout=10)
-        if resp.status_code == 404:
-            return jsonify({"success": True, "status": "expired", "message": "PIN expired"})
-        resp.raise_for_status()
-        data = resp.json()
-        token = data.get("authToken")
-        if token:
-            return jsonify({"success": True, "status": "linked", "token": token})
-        return jsonify({"success": True, "status": "waiting"})
-    except requests.exceptions.ConnectionError:
-        return jsonify({"success": False, "status": "error", "message": "Cannot reach plex.tv"}), 502
-    except requests.exceptions.Timeout:
-        return jsonify({"success": False, "status": "error", "message": "Request timed out"}), 502
-    except (requests.RequestException, ValueError) as e:
-        return jsonify({"success": False, "status": "error", "message": str(e)}), 502
-
-
-def _is_lan_address(address: str) -> bool:
-    """True if address looks like a classic LAN IP (192.168.x.x or 10.x.x.x), not Docker (172.16-31)."""
-    if not address:
-        return False
-    parts = address.split(".")
-    if len(parts) != 4:
-        return False
-    try:
-        a, b, c, d = (int(x) for x in parts)
-        if 0 <= a <= 255 and 0 <= b <= 255 and 0 <= c <= 255 and 0 <= d <= 255:
-            if (a == 192 and b == 168) or (a == 10):
-                return True
-            if a == 172 and 16 <= b <= 31:  # Docker/private
-                return False
-    except (ValueError, TypeError):
-        pass
-    return False
-
-
-def _parse_plex_resources_xml(text: str) -> list:
-    """Parse plex.tv /api/resources XML (MediaContainer > Device > Connection). Same flow as Tautulli.
-    Returns list of { name, uri, address, port, scheme, localAddresses, machineIdentifier }.
-    One entry per Device; prefers LAN URL (192.168.x.x / 10.x.x.x) over Docker/plex.direct so the UI shows a reachable URL.
-    """
-    text = re.sub(r"&(?!(?:amp|lt|gt|quot|apos|#\d+|#x[0-9a-fA-F]+);)", "&amp;", text)
-    servers = []
-    try:
-        root = ET.fromstring(text)
-    except Exception:
-        return []
-    for device in root.iter("Device"):
-        attr = device.attrib
-        provides = (attr.get("provides") or "").strip().lower()
-        if "server" not in provides:
-            continue
-        owned = attr.get("owned", "0")
-        if owned != "1":
-            continue
-        name = attr.get("name", "Plex")
-        client_id = attr.get("clientIdentifier", "")
-        connections = []
-        for conn in device.iter("Connection"):
-            c = conn.attrib
-            uri = (c.get("uri") or "").strip()
-            if not uri or not uri.startswith("http"):
-                continue
-            address = (c.get("address") or "").strip()
-            port = (c.get("port") or "32400").strip()
-            if port == "0":
-                port = "32400"
-            scheme = "https" if uri.startswith("https") else "http"
-            is_local = (c.get("local") or "").strip() == "1"
-            is_lan = _is_lan_address(address)
-            # Prefer: (1) local + LAN IP, (2) local + not Docker, (3) LAN IP, (4) local, (5) any
-            if is_local and is_lan:
-                rank = 0
-            elif is_local and address and not (address.startswith("172.") and _is_private_172(address)):
-                rank = 1
-            elif is_lan:
-                rank = 2
-            elif is_local:
-                rank = 3
-            else:
-                rank = 4
-            connections.append((rank, address, port, scheme, uri))
-        if not connections:
-            continue
-        connections.sort(key=lambda x: (x[0], x[1] or "zzz"))
-        _, address, port, scheme, uri = connections[0]
-        # Build a clean URL with dots (not plex.direct with dashes) when we have a real IP
-        if address and re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", address):
-            display_uri = f"{scheme}://{address}:{port}"
-        else:
-            display_uri = uri
-        servers.append({
-            "name": name,
-            "uri": display_uri,
-            "address": address,
-            "port": port,
-            "scheme": scheme,
-            "localAddresses": address,
-            "machineIdentifier": client_id,
-        })
-    return servers
-
-
-def _is_private_172(address: str) -> bool:
-    """True if address is in 172.16.0.0/12 (e.g. Docker)."""
-    parts = address.split(".")
-    if len(parts) != 4:
-        return False
-    try:
-        a, b, *_ = (int(x) for x in parts)
-        return a == 172 and 16 <= b <= 31
-    except (ValueError, TypeError):
-        return False
-
-
-def _parse_plex_servers_xml(text: str) -> list:
-    """Parse plex.tv servers XML; fix unescaped & and extract Server elements. Returns list of dicts."""
-    text = re.sub(r"&(?!(?:amp|lt|gt|quot|apos|#\d+|#x[0-9a-fA-F]+);)", "&amp;", text)
-
-    def _extract_servers_regex() -> list:
-        servers = []
-        for m in re.finditer(r"<Server\s+([^>]+)/?>", text, re.DOTALL):
-            attrs_str = m.group(1)
-            attrs = {}
-            for a in re.finditer(r'(\w+)="([^"]*)"', attrs_str):
-                attrs[a.group(1)] = a.group(2).replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
-            name = attrs.get("name", "Plex")
-            port = attrs.get("port", "32400")
-            if port == "0":
-                port = "32400"
-            scheme = attrs.get("scheme", "http")
-            address = (attrs.get("address") or "").strip()
-            local_addresses = (attrs.get("localAddresses") or "").strip()
-            if local_addresses:
-                first_local = local_addresses.split(",")[0].strip()
-                host = first_local or address or "localhost"
-            else:
-                host = address or "localhost"
-            uri = f"{scheme}://{host}:{port}" if host else ""
-            servers.append({
-                "name": name,
-                "uri": uri,
-                "address": address,
-                "port": port,
-                "scheme": scheme,
-                "localAddresses": local_addresses,
-                "machineIdentifier": attrs.get("machineIdentifier", ""),
-            })
-        return servers
-
-    try:
-        root = ET.fromstring(text)
-    except Exception:
-        return _extract_servers_regex()
-    servers = []
-    for server in root.iter("Server"):
-        attrs = server.attrib
-        name = attrs.get("name", "Plex")
-        port = attrs.get("port", "32400")
-        if port == "0":
-            port = "32400"
-        scheme = attrs.get("scheme", "http")
-        address = attrs.get("address", "").strip()
-        local_addresses = (attrs.get("localAddresses") or "").strip()
-        if local_addresses:
-            first_local = local_addresses.split(",")[0].strip()
-            host = first_local or address or "localhost"
-        else:
-            host = address or "localhost"
-        uri = f"{scheme}://{host}:{port}" if host else ""
-        servers.append({
-            "name": name,
-            "uri": uri,
-            "address": address,
-            "port": port,
-            "scheme": scheme,
-            "localAddresses": local_addresses,
-            "machineIdentifier": attrs.get("machineIdentifier", ""),
-        })
-    return servers
-
-
-@app.post("/api/plex/servers")
-def api_plex_servers():
-    """
-    List Plex servers for the current account (Tautulli-style).
-    Body: { "PLEX_TOKEN": "..." }. Returns list of { name, uri, localAddresses, port, ... }.
-    Tries plex.tv API v2 (JSON) first, then falls back to servers.xml (XML).
-    """
-    data = request.get_json(silent=True) or {}
-    token = (data.get("PLEX_TOKEN") or data.get("token") or "").strip()
-    if not token:
-        return jsonify({"success": False, "servers": [], "message": "PLEX_TOKEN is required"}), 400
-    headers = {"X-Plex-Token": token, "Accept": "application/json"}
-
-    def _build_servers_from_servers_json(data: dict) -> list:
-        """Build server list from Plex GET /servers JSON (MediaContainer.Server[]).
-        Docs: https://plexapi.dev/api-reference/server/get-server-list
-        """
-        servers = []
-        if not isinstance(data, dict):
-            return servers
-        media = data.get("MediaContainer", data.get("mediaContainer"))
-        if not isinstance(media, dict):
-            return servers
-        items = media.get("Server") or media.get("server") or []
-        if not isinstance(items, list):
-            items = [items] if items else []
-        for s in items:
-            if not isinstance(s, dict):
-                continue
-            def _g(k, default=None):
-                return s.get(k) or s.get(k[0].upper() + k[1:] if k else k) or default
-            name = _g("name", "Plex")
-            port = str(_g("port") or "32400")
-            if port == "0":
-                port = "32400"
-            scheme = (str(_g("scheme") or "http")).strip().lower()
-            if scheme not in ("http", "https"):
-                scheme = "http"
-            host = (str(_g("host") or _g("address") or "")).strip()
-            address = (str(_g("address") or host or "")).strip()
-            local_addresses = (str(_g("localAddresses") or address or "")).strip()
-            if local_addresses:
-                host = local_addresses.split(",")[0].strip() or host
-            if not host:
-                continue
-            uri = f"{scheme}://{host}:{port}"
-            servers.append({
-                "name": name,
-                "uri": uri,
-                "address": address,
-                "port": port,
-                "scheme": scheme,
-                "localAddresses": local_addresses,
-                "machineIdentifier": str(_g("machineIdentifier") or ""),
-            })
-        return servers
-
-    try:
-        seen_machine_ids: set[str] = set()
-        servers: list[dict] = []
-
-        # 1) servers.xml first — often returns all servers (including multiple instances on same host, e.g. :32400 + :32401)
-        resp_xml = requests.get(
-            f"https://plex.tv/servers.xml?includeLite=1&X-Plex-Token={requests.utils.quote(token, safe='')}",
-            headers={"X-Plex-Token": token},
-            timeout=15,
-        )
-        if resp_xml.status_code == 401:
-            return jsonify({"success": False, "servers": [], "message": "Invalid Plex token"}), 401
-        if resp_xml.ok:
-            try:
-                from_xml = _parse_plex_servers_xml(resp_xml.text)
-                for s in from_xml:
-                    mid = (s.get("machineIdentifier") or "").strip()
-                    if not mid or mid in seen_machine_ids:
-                        continue
-                    servers.append(s)
-                    seen_machine_ids.add(mid)
-            except Exception:
-                pass
-
-        # 2) GET https://plex.tv/api/resources?includeHttps=1 — merge in any device not yet listed (by machineIdentifier)
-        resp_resources = requests.get(
-            "https://plex.tv/api/resources?includeHttps=1",
-            headers={"X-Plex-Token": token},
-            timeout=15,
-        )
-        if resp_resources.status_code == 401:
-            return jsonify({"success": False, "servers": [], "message": "Invalid Plex token"}), 401
-        if resp_resources.ok:
-            from_resources = _parse_plex_resources_xml(resp_resources.text)
-            for s in from_resources:
-                mid = (s.get("machineIdentifier") or "").strip()
-                if not mid or mid in seen_machine_ids:
-                    continue
-                # Avoid duplicate by (name, port) in case machineIdentifier differs
-                if any(x.get("name") == s.get("name") and x.get("port") == s.get("port") for x in servers):
-                    continue
-                servers.append(s)
-                seen_machine_ids.add(mid)
-
-        # 3) GET https://plex.tv/servers (JSON or XML) — merge any remaining
-        resp = requests.get("https://plex.tv/servers", headers=headers, timeout=15)
-        if resp.status_code != 401 and resp.ok:
-            ct = (resp.headers.get("Content-Type") or "").lower()
-            if "json" in ct:
-                try:
-                    data = resp.json()
-                    for s in _build_servers_from_servers_json(data):
-                        mid = (s.get("machineIdentifier") or "").strip()
-                        if mid and mid not in seen_machine_ids:
-                            servers.append(s)
-                            seen_machine_ids.add(mid)
-                except (ValueError, TypeError, KeyError):
-                    pass
-            for s in _parse_plex_servers_xml(resp.text):
-                mid = (s.get("machineIdentifier") or "").strip()
-                if mid and mid not in seen_machine_ids:
-                    servers.append(s)
-                    seen_machine_ids.add(mid)
-
-        if servers:
-            return jsonify({"success": True, "servers": servers})
-        # Empty list: token accepted but no servers linked to account
-        return jsonify({
-            "success": True,
-            "servers": [],
-            "message": "No Plex servers found for this account. Link your server at plex.tv or check the token.",
-        })
-
-    except requests.exceptions.ConnectionError:
-        return jsonify({"success": False, "servers": [], "message": "Cannot reach plex.tv. Check network and DNS from the machine running PMDA (e.g. Docker has outbound internet)."}), 502
-    except requests.exceptions.Timeout:
-        return jsonify({"success": False, "servers": [], "message": "Request to plex.tv timed out. Check network."}), 502
-    except requests.RequestException as e:
-        return jsonify({"success": False, "servers": [], "message": str(e)}), 502
-
-
-# ─── Plex database path hints (official locations by platform / image) ─────────
-# Full paths to the folder containing com.plexapp.plugins.library.db (for wizard help)
-# Source: https://support.plex.tv/articles/202915258-where-is-the-plex-media-server-data-directory-located/
-PLEX_DATABASE_PATH_HINTS: list[dict] = [
-    {"platform": "Docker (generic)", "path": "<config_mount>/Library/Application Support/Plex Media Server/Plug-in Support/Databases", "note": "Mount the host path that maps to /config in the Plex container."},
-    {"platform": "plexinc/pms-docker", "path": "<config_volume>/Library/Application Support/Plex Media Server/Plug-in Support/Databases", "note": "Same as Docker generic; -v host_path:/config."},
-    {"platform": "linuxserver/plex", "path": "<config_volume>/Library/Application Support/Plex Media Server/Plug-in Support/Databases", "note": "Same as Docker generic."},
-    {"platform": "Debian / Ubuntu / Fedora / CentOS", "path": "/var/lib/plexmediaserver/Library/Application Support/Plex Media Server/Plug-in Support/Databases", "note": "Native Linux package."},
-    {"platform": "FreeBSD", "path": "/usr/local/plexdata/Plex Media Server/Plug-in Support/Databases", "note": "Native install."},
-    {"platform": "macOS", "path": "~/Library/Application Support/Plex Media Server/Plug-in Support/Databases", "note": "Expand ~ to your home."},
-    {"platform": "Windows", "path": "%LOCALAPPDATA%\\Plex Media Server\\Plug-in Support\\Databases", "note": "Per-user (account running Plex)."},
-    {"platform": "Synology DSM 7", "path": "/volume1/PlexMediaServer/AppData/Plex Media Server/Plug-in Support/Databases", "note": "Volume name may vary."},
-    {"platform": "Synology DSM 6", "path": "/volume1/Plex/Library/Application Support/Plex Media Server/Plug-in Support/Databases", "note": "Volume name may vary."},
-    {"platform": "QNAP", "path": "<Install_path>/Library/Plex Media Server/Plug-in Support/Databases", "note": "Install_path from: getcfg -f /etc/config/qpkg.conf PlexMediaServer Install_path."},
-    {"platform": "ASUSTOR", "path": "/volume1/Plex/Library/Plug-in Support/Databases", "note": "Under Plex data directory."},
-    {"platform": "FreeNAS 11.3+", "path": "${JAIL_ROOT}/Plex Media Server/Plug-in Support/Databases", "note": "JAIL_ROOT is the jail root."},
-    {"platform": "Snap", "path": "/var/snap/plexmediaserver/common/Library/Application Support/Plex Media Server/Plug-in Support/Databases", "note": "Snap package."},
-    {"platform": "ReadyNAS", "path": "/apps/plexmediaserver/MediaLibrary/Plex Media Server/Plug-in Support/Databases", "note": ""},
-    {"platform": "TerraMaster", "path": "/Volume1/Plex/Library/Application Support/Plex Media Server/Plug-in Support/Databases", "note": ""},
-]
-
-
-def _gdm_discover_servers(timeout_sec: float = 2.0) -> list[dict]:
-    """
-    Discover Plex Media Servers on the local network via GDM (Good Day Mate) multicast.
-    Sends M-SEARCH to 239.0.0.250:32414 and parses HTTP/1.0 200 OK responses.
-    Returns list of dicts with name, uri (http://ip:port), address, port.
-    """
-    gdm_ip, gdm_port = "239.0.0.250", 32414
-    msg = b"M-SEARCH * HTTP/1.0"
-    seen: set[str] = set()
-    result: list[dict] = []
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, struct.pack("B", 2))
-    sock.settimeout(0.5)
-    try:
-        sock.sendto(msg, (gdm_ip, gdm_port))
-        deadline = time.time() + timeout_sec
-        while time.time() < deadline:
-            try:
-                bdata, from_addr = sock.recvfrom(1024)
-            except socket.timeout:
-                continue
-            data = bdata.decode("utf-8", errors="replace")
-            lines = data.splitlines()
-            if not lines or "200 OK" not in lines[0]:
-                continue
-            ddata: dict[str, str] = {}
-            for line in lines[1:]:
-                if ":" in line:
-                    k, _, v = line.partition(":")
-                    ddata[k.strip()] = v.strip()
-            if ddata.get("Content-Type") != "plex/media-server":
-                continue
-            rid = ddata.get("Resource-Identifier") or ""
-            if rid in seen:
-                continue
-            seen.add(rid)
-            name = ddata.get("Name", "Plex Media Server")
-            port = ddata.get("Port", "32400")
-            from_ip = from_addr[0]
-            uri = f"http://{from_ip}:{port}"
-            result.append({
-                "name": name,
-                "uri": uri,
-                "address": from_ip,
-                "port": port,
-                "scheme": "http",
-                "localAddresses": from_ip,
-                "machineIdentifier": rid,
-            })
-    except Exception as e:
-        logging.warning("GDM discover failed: %s", e)
-    finally:
-        sock.close()
-    return result
-
-
-def _probe_plex_at(host: str, port: int) -> dict | None:
-    """
-    Probe a single host:port to see if Plex is listening (GET /identity).
-    Returns a server dict like GDM format, or None if not Plex / unreachable.
-    """
-    url = f"http://{host}:{port}/identity"
-    try:
-        resp = requests.get(url, timeout=2)
-        if resp.status_code != 200:
-            return None
-        root = ET.fromstring(resp.text)
-        if root.tag != "MediaContainer":
-            return None
-        rid = root.attrib.get("machineIdentifier", "")
-        version = root.attrib.get("version", "")
-        name = f"Plex Media Server ({host}:{port})"
-        uri = f"http://{host}:{port}"
-        return {
-            "name": name,
-            "uri": uri,
-            "address": host,
-            "port": str(port),
-            "scheme": "http",
-            "localAddresses": host,
-            "machineIdentifier": rid,
-        }
-    except Exception:
-        return None
-
-
-def _discover_via_host_fallback(host_str: str, extra_ports: list[int] | None = None) -> list[dict]:
-    """
-    When GDM fails (e.g. in Docker, multicast is not forwarded), try the host
-    the user used to reach PMDA (from Host header) and the Docker gateway (172.17.0.1).
-    Tries common Plex ports 32400, 32401, 32402 and any extra_ports.
-    """
-    ports = [32400, 32401, 32402]
-    if extra_ports:
-        ports = list(dict.fromkeys(ports + list(extra_ports)))
-    candidates: list[str] = []
-    host = (host_str or "").strip()
-    if host and not host.startswith("["):
-        if ":" in host:
-            host = host.rsplit(":", 1)[0]
-        if host and host not in ("localhost", "127.0.0.1"):
-            candidates.append(host)
-    # From inside Docker, the host is often reachable via the bridge gateway
-    candidates.append("172.17.0.1")
-    result: list[dict] = []
-    seen_uris: set[str] = set()
-    for h in candidates:
-        for port in ports:
-            entry = _probe_plex_at(h, port)
-            if entry and entry["uri"] not in seen_uris:
-                result.append(entry)
-                seen_uris.add(entry["uri"])
-    return result
-
-
-def _parse_port_from_url(url: str) -> int | None:
-    """Extract port from http(s)://host:port if present."""
-    if not url or not isinstance(url, str):
-        return None
-    url = url.strip()
-    for prefix in ("https://", "http://"):
-        if url.startswith(prefix):
-            url = url[len(prefix) :].split("/")[0]
-            break
-    if ":" in url:
-        try:
-            return int(url.rsplit(":", 1)[1])
-        except ValueError:
-            return None
-    return None
-
-
-def _subnet_ips_24(ip_str: str) -> list[str]:
-    """
-    Given an IPv4 address, return a list of all /24 host IPs (x.y.z.1 .. x.y.z.254).
-    Returns [] if the string is not a valid IPv4.
-    """
-    parts = ip_str.strip().split(".")
-    if len(parts) != 4:
-        return []
-    try:
-        a, b, c, _ = (int(p) for p in parts)
-        if not all(0 <= x <= 255 for x in (a, b, c)):
-            return []
-        return [f"{a}.{b}.{c}.{i}" for i in range(1, 255)]
-    except ValueError:
-        return []
-
-
-def _discover_via_subnet(client_ip: str, ports: list[int] | None = None) -> list[dict]:
-    """
-    Scan the client's /24 subnet for Plex (ports 32400, 32401, 32402 by default).
-    Uses a thread pool and short timeouts to complete in a few seconds.
-    """
-    if not client_ip or client_ip.startswith("127.") or client_ip == "::1":
-        return []
-    ips = _subnet_ips_24(client_ip)
-    if not ips:
-        return []
-    port_list = ports or [32400, 32401, 32402]
-    seen_uris: set[str] = set()
-    result: list[dict] = []
-    max_workers = 48
-
-    def probe(host: str, port: int) -> dict | None:
-        return _probe_plex_at(host, port)
-
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = {ex.submit(probe, ip, port): (ip, port) for ip in ips for port in port_list}
-        for future in as_completed(futures, timeout=60):
-            try:
-                entry = future.result()
-                if entry and entry["uri"] not in seen_uris:
-                    result.append(entry)
-                    seen_uris.add(entry["uri"])
-            except Exception:
-                pass
-    return result
-
-
-@app.get("/api/plex/client-ip")
-def api_plex_client_ip():
-    """
-    Return the IP address of the client that is viewing the WebUI.
-    Uses X-Forwarded-For (first hop) when behind a proxy, else request.remote_addr.
-    Allows the frontend to request a discovery scan of that client's subnet (same LAN).
-    """
-    forwarded = request.headers.get("X-Forwarded-For")
-    if forwarded:
-        client_ip = forwarded.split(",")[0].strip()
-    else:
-        client_ip = request.remote_addr or ""
-    return jsonify({"client_ip": client_ip})
-
-
-@app.get("/api/plex/discover")
-@app.post("/api/plex/discover")
-def api_plex_discover():
-    """
-    Discover Plex Media Servers: GDM multicast first, then fallback to probing
-    the host the user used to reach PMDA and Docker gateway 172.17.0.1 (ports 32400–32402).
-    POST body may include:
-      - "PLEX_HOST": "..." to add that URL's port to the probe list;
-      - "client_ip": "x.y.z.w" to scan the client's /24 subnet (same LAN as the machine viewing the WebUI).
-    No token required. Returns same shape as /api/plex/servers: { success, servers: [ { name, uri, ... } ] }.
-    """
-    servers = _gdm_discover_servers()
-    extra_ports: list[int] = []
-    client_ip: str | None = None
-    try:
-        data = request.get_json(silent=True) or {}
-        if data.get("PLEX_HOST"):
-            p = _parse_port_from_url(str(data.get("PLEX_HOST", "")))
-            if p and p not in (32400, 32401, 32402):
-                extra_ports.append(p)
-        client_ip = (data.get("client_ip") or "").strip() or None
-    except Exception:
-        pass
-    try:
-        host_header = request.headers.get("Host") or request.host or ""
-        fallback = _discover_via_host_fallback(host_header, extra_ports=extra_ports or None)
-        seen_uris = {s["uri"] for s in servers}
-        for s in fallback:
-            if s["uri"] not in seen_uris:
-                servers.append(s)
-                seen_uris.add(s["uri"])
-    except Exception as e:
-        logging.debug("Discover host fallback failed: %s", e)
-    if client_ip:
-        try:
-            subnet_servers = _discover_via_subnet(client_ip)
-            seen_uris = {s["uri"] for s in servers}
-            for s in subnet_servers:
-                if s["uri"] not in seen_uris:
-                    servers.append(s)
-                    seen_uris.add(s["uri"])
-        except Exception as e:
-            logging.debug("Discover subnet failed: %s", e)
-    return jsonify({"success": True, "servers": servers})
-
-
-@app.get("/api/plex/database-paths")
-def api_plex_database_paths():
-    """
-    Return common Plex database directory locations (by platform / image)
-    so the wizard can suggest where to mount or point to.
-    """
-    return jsonify({"success": True, "paths": PLEX_DATABASE_PATH_HINTS})
-
-
-@app.get("/api/plex/verify-db")
-def api_plex_verify_db():
-    """
-    Verify that the current Plex DB file exists and is readable (e.g. open read-only and run a trivial query).
-    Returns { success: true } or { success: false, message: "..." }.
-    """
-    if not Path(PLEX_DB_FILE).exists():
-        return jsonify({"success": False, "message": "Plex database file not found at " + PLEX_DB_FILE}), 200
-    try:
-        con = sqlite3.connect(f"file:{PLEX_DB_FILE}?mode=ro", uri=True, timeout=5)
-        con.execute("SELECT 1 FROM metadata_items LIMIT 1")
-        con.close()
-    except sqlite3.OperationalError as e:
-        return jsonify({"success": False, "message": "Plex database not readable or invalid: " + str(e)}), 200
-    except Exception as e:
-        return jsonify({"success": False, "message": str(e)}), 200
-    return jsonify({"success": True})
-
-
-@app.post("/api/autodetect/libraries")
-def api_autodetect_libraries():
-    """Return list of Plex libraries (sections) for the wizard. Uses config or optional body { PLEX_HOST, PLEX_TOKEN }."""
-    data = request.get_json(silent=True) or {}
-    host = (data.get("PLEX_HOST") or "").strip() or PLEX_HOST
-    token = (data.get("PLEX_TOKEN") or "").strip() or PLEX_TOKEN
-    if not host or not token:
-        return jsonify({"success": False, "libraries": [], "message": "PLEX_HOST and PLEX_TOKEN required"}), 400
-    url = f"{host.rstrip('/')}/library/sections"
-    try:
-        resp = requests.get(url, headers={"X-Plex-Token": token}, timeout=10)
-        resp.raise_for_status()
-        root = ET.fromstring(resp.text)
-        libraries = []
-        for d in root.iter("Directory"):
-            libraries.append({
-                "id": d.attrib.get("key", ""),
-                "name": d.attrib.get("title", ""),
-                "type": d.attrib.get("type", ""),
-            })
-        return jsonify({"success": True, "libraries": libraries})
-    except Exception as e:
-        logging.warning("Autodetect libraries failed: %s", e)
-        return jsonify({"success": False, "libraries": [], "message": str(e)})
-
-
-@app.post("/api/autodetect/paths")
-def api_autodetect_paths():
-    """Discover PATH_MAP from Plex for given sections. Uses config or optional body { PLEX_HOST, PLEX_TOKEN, SECTION_IDS }."""
-    data = request.get_json(silent=True) or {}
-    host = (data.get("PLEX_HOST") or "").strip() or PLEX_HOST
-    token = (data.get("PLEX_TOKEN") or "").strip() or PLEX_TOKEN
-    section_ids = data.get("SECTION_IDS")
-    if section_ids is None:
-        section_ids = list(SECTION_IDS)
-    elif isinstance(section_ids, str):
-        section_ids = [int(x.strip()) for x in section_ids.split(",") if x.strip()]
-    elif isinstance(section_ids, list):
-        section_ids = [int(x) for x in section_ids]
-    if not host or not token:
-        return jsonify({"success": False, "paths": {}, "message": "PLEX_HOST and PLEX_TOKEN required"}), 400
-    if not section_ids:
-        return jsonify({"success": False, "paths": {}, "message": "No SECTION_IDS provided"}), 400
-    paths = {}
-    errors = []
-    for sid in section_ids:
-        try:
-            part = _discover_path_map(host, token, sid)
-            paths.update(part)
-        except Exception as e:
-            logging.warning("Autodetect paths failed for section %s: %s", sid, e)
-            errors.append(f"Section {sid}: {e}")
-    if not paths and errors:
-        return jsonify({"success": False, "paths": {}, "message": "; ".join(errors)})
-    return jsonify({"success": True, "paths": paths, "message": "; ".join(errors) if errors else None})
-
-
-def _path_map_from_verify_body(raw):
-    """Parse PATH_MAP from verify request: dict, or string with key=value lines or key:value pairs."""
-    if isinstance(raw, dict):
-        return {str(k): str(v) for k, v in raw.items()}
-    if raw is None:
-        return None
-    s = str(raw).strip()
-    if not s:
-        return {}
-    if s.startswith("{"):
-        try:
-            data = json.loads(s)
-            return {str(k): str(v) for k, v in data.items()}
-        except json.JSONDecodeError:
-            pass
-    out = {}
-    for line in s.replace(",", "\n").splitlines():
-        line = line.strip()
-        if "=" in line:
-            k, _, v = line.partition("=")
-            if k.strip():
-                out[k.strip()] = v.strip()
-        elif ":" in line:
-            k, _, v = line.partition(":")
-            if k.strip():
-                out[k.strip()] = v.strip()
-    return out
-
-
-@app.post("/api/paths/discover")
-def api_paths_discover():
-    """
-    Discover actual container paths for each Plex library root by content matching: sample files
-    from Plex DB and find which subdir of MUSIC_PARENT_PATH contains them. Body: PATH_MAP
-    (required, e.g. from autodetect/paths), PLEX_DB_PATH?, MUSIC_PARENT_PATH?, CROSSCHECK_SAMPLES?.
-    Returns { success, paths: discovered map, results: list of result dicts }.
-    """
-    data = request.get_json(silent=True) or {}
-    path_map_raw = data.get("PATH_MAP")
-    path_map = _path_map_from_verify_body(path_map_raw) if path_map_raw is not None else {}
-    if not path_map:
-        return jsonify({
-            "success": False,
-            "paths": {},
-            "results": [],
-            "message": "PATH_MAP is required and must not be empty",
-        }), 400
-    db_path = (data.get("PLEX_DB_PATH") or "").strip() or merged.get("PLEX_DB_PATH") or ""
-    if not db_path:
-        db_path = "/database"
-    db_file = str(Path(db_path) / "com.plexapp.plugins.library.db")
-    music_root = (data.get("MUSIC_PARENT_PATH") or "").strip() or merged.get("MUSIC_PARENT_PATH") or "/music"
-    samples = max(1, int(data.get("CROSSCHECK_SAMPLES") or CROSSCHECK_SAMPLES or 15))
-    if not Path(db_file).exists():
-        return jsonify({
-            "success": False,
-            "paths": {},
-            "results": [],
-            "message": f"Plex DB not found: {db_file}",
-        }), 400
-    music_path = Path(music_root)
-    if not music_path.exists() or not music_path.is_dir():
-        return jsonify({
-            "success": False,
-            "paths": {},
-            "results": [],
-            "message": f"Music parent path not found or not a directory: {music_root}",
-        }), 400
-    out = _discover_bindings_by_content(path_map, db_file, music_root, samples)
-    if out is None:
-        return jsonify({
-            "success": False,
-            "paths": {},
-            "results": [],
-            "message": "Discover by content failed",
-        }), 500
-    discovered_map, results = out
-    return jsonify({
-        "success": True,
-        "paths": discovered_map,
-        "results": results,
-    })
-
-
-@app.post("/api/paths/discover-one")
-def api_paths_discover_one():
-    """
-    Discover the actual container path for a single Plex root by content matching.
-    Body: { plex_root (required), PLEX_DB_PATH?, MUSIC_PARENT_PATH?, CROSSCHECK_SAMPLES? }.
-    Returns { success, host_root?, result } so the UI can show progress per mapping.
-    """
-    data = request.get_json(silent=True) or {}
-    plex_root = (data.get("plex_root") or "").strip()
-    if not plex_root:
-        return jsonify({"success": False, "host_root": None, "result": None, "message": "plex_root is required"}), 400
-    # Always use the effective Plex DB file currently configured in memory.
-    # merged["PLEX_DB_PATH"] may be stale compared to PLEX_DB_FILE (which is
-    # updated by the auto-discovery logic at startup), so we rely on PLEX_DB_FILE
-    # here instead of reconstructing the path manually.
-    db_file = str(getattr(sys.modules[__name__], "PLEX_DB_FILE", PLEX_DB_FILE))
-    music_root = (data.get("MUSIC_PARENT_PATH") or "").strip() or merged.get("MUSIC_PARENT_PATH") or "/music"
-    samples = max(1, int(data.get("CROSSCHECK_SAMPLES") or CROSSCHECK_SAMPLES or 15))
-    out = _discover_one_binding(plex_root, db_file, music_root, samples)
-    if out is None:
-        return jsonify({
-            "success": False,
-            "host_root": None,
-            "result": None,
-            "message": "Discover failed (DB or music root invalid)",
-        }), 500
-    host_root, result = out
-    success = host_root is not None
-    return jsonify({
-        "success": success,
-        "host_root": host_root,
-        "result": result,
-        "message": (result.get("message") or "") if not success and isinstance(result, dict) else None,
-    })
-
-
-# Last path verification result (for GET /api/paths/verify/last)
-_last_path_verify_result: list = []
-_last_path_verify_at: float = 0.0
-
-
-@app.get("/api/paths/verify/last")
-def api_paths_verify_last():
-    """Return the last path verification result and timestamp (from last POST /api/paths/verify)."""
-    return jsonify({"results": _last_path_verify_result, "at": _last_path_verify_at if _last_path_verify_at else None})
-
-
-@app.post("/api/paths/verify")
-def api_paths_verify():
-    """
-    Verify PATH_MAP bindings by sampling tracks from the Plex DB and checking file existence.
-    Body: { PATH_MAP?, PLEX_DB_PATH?, CROSSCHECK_SAMPLES? }. Returns list of { plex_root, host_root, status, samples_checked, message }.
-    Does not modify config.
-    """
-    global _last_path_verify_result, _last_path_verify_at
-    raw_json = request.get_json(silent=True)
-    data = raw_json if isinstance(raw_json, dict) else {}
-    if raw_json is None:
-        logging.warning("Paths verify: request body is not valid JSON (Content-Type: %s)", request.content_type)
-    logging.info(
-        "Paths verify: request body keys=%s, PATH_MAP type=%s",
-        list(data.keys()), type(data.get("PATH_MAP")).__name__ if "PATH_MAP" in data else "missing",
-    )
-    path_map_raw = data.get("PATH_MAP")
-    path_map = _path_map_from_verify_body(path_map_raw)
-    if path_map is None:
-        path_map = dict(getattr(sys.modules[__name__], "PATH_MAP", {}))
-        logging.info("Paths verify: no PATH_MAP in body, using server config → %d entries", len(path_map))
-    elif not path_map and path_map_raw is not None:
-        path_map = dict(getattr(sys.modules[__name__], "PATH_MAP", {}))
-        logging.info(
-            "Paths verify: parsed PATH_MAP from body was empty (raw type=%s), using server config → %d entries",
-            type(path_map_raw).__name__, len(path_map),
-        )
-    if not path_map:
-        logging.warning(
-            "Paths verify: returning 400 – PATH_MAP is empty (body keys=%s)",
-            list(data.keys()),
-        )
-        return jsonify({"success": False, "results": [], "message": "PATH_MAP is empty"}), 400
-    # Use the effective Plex DB file currently configured in memory (PLEX_DB_FILE)
-    # instead of merged["PLEX_DB_PATH"], which may be out of sync with discovery.
-    db_file = str(getattr(sys.modules[__name__], "PLEX_DB_FILE", PLEX_DB_FILE))
-    samples = max(0, int(data.get("CROSSCHECK_SAMPLES") or CROSSCHECK_SAMPLES))
-    if not Path(db_file).exists():
-        logging.warning(
-            "Paths verify: returning 400 – Plex DB not found at %s (PLEX_DB_PATH=%s)",
-            db_file, db_path,
-        )
-        return jsonify({"success": False, "results": [], "message": f"Plex DB not found: {db_file}"}), 400
-    try:
-        results = _run_path_verification(path_map, db_file, samples or CROSSCHECK_SAMPLES)
-    except Exception as e:
-        logging.warning("Paths verify exception: %s", e)
-        return jsonify({"success": False, "results": [], "message": str(e) or "Path verification failed"}), 500
-    if results is None:
-        return jsonify({"success": False, "results": [], "message": "Path verification failed"}), 500
-    _last_path_verify_result = list(results)
-    _last_path_verify_at = time.time()
-    has_failures = any(r.get("status") == "fail" for r in results)
-    hint = None
-    if has_failures:
-        hint = (
-            "Files were not found inside the container. Start Docker with a volume mount from your "
-            "host music folder to the path shown above (e.g. -v /path/on/host/music:/music). "
-            "Use the same path as 'Path to parent folder (music root)' in this step."
-        )
-    out = {"success": True, "results": results}
-    if hint:
-        out["hint"] = hint
-    return jsonify(out)
 
 
 @app.post("/api/openai/check")
@@ -29477,6 +29081,258 @@ def api_ai_models():
         return jsonify({"error": f"Unknown AI provider: {provider}"}), 400
 
 
+@app.get("/api/auth/bootstrap/status")
+def api_auth_bootstrap_status():
+    return jsonify({"bootstrap_required": bool(_auth_bootstrap_required())})
+
+
+@app.post("/api/auth/bootstrap")
+def api_auth_bootstrap():
+    if AUTH_DISABLE:
+        return jsonify({"error": "Auth is disabled by PMDA_AUTH_DISABLE"}), 400
+    if not _auth_bootstrap_required():
+        return jsonify({"error": "Bootstrap already completed"}), 409
+    client_ip = _auth_client_ip().lower()
+    if not AUTH_ALLOW_PUBLIC_BOOTSTRAP and not _auth_ip_is_private_or_loopback(client_ip):
+        return jsonify({"error": "Bootstrap is restricted to private/local network addresses."}), 403
+    if _auth_rate_limit_is_blocked("bootstrap_ip", client_ip, max_attempts=AUTH_BOOTSTRAP_RATE_LIMIT_IP_MAX_ATTEMPTS):
+        return jsonify({"error": "Too many bootstrap attempts. Please wait and retry."}), 429
+    data = request.get_json(silent=True) or {}
+    username = str(data.get("username") or "").strip()
+    password = str(data.get("password") or "")
+    password_confirm = str(data.get("password_confirm") or password)
+    if password != password_confirm:
+        _auth_rate_limit_record_failure("bootstrap_ip", client_ip)
+        return jsonify({"error": "Passwords do not match"}), 400
+    ok, msg, user = _auth_create_user(
+        username=username,
+        password=password,
+        is_admin=True,
+        can_download=True,
+        is_active=True,
+    )
+    if not ok:
+        _auth_rate_limit_record_failure("bootstrap_ip", client_ip)
+        return jsonify({"error": msg}), 400
+    _auth_rate_limit_clear("bootstrap_ip", client_ip)
+    return jsonify({"ok": True, "message": "Admin account created", "user": user})
+
+
+@app.post("/api/auth/login")
+def api_auth_login():
+    if AUTH_DISABLE:
+        return jsonify({"error": "Auth is disabled by PMDA_AUTH_DISABLE"}), 400
+    if _auth_bootstrap_required():
+        return jsonify({"error": "Bootstrap required. Create the initial admin user first."}), 428
+    data = request.get_json(silent=True) or {}
+    username = str(data.get("username") or "").strip()
+    password = str(data.get("password") or "")
+    client_ip = _auth_client_ip().lower()
+    username_key = username.lower()
+    if _auth_rate_limit_is_blocked("login_ip", client_ip, max_attempts=AUTH_LOGIN_RATE_LIMIT_IP_MAX_ATTEMPTS):
+        return jsonify({"error": "Too many failed login attempts. Please wait and retry."}), 429
+    if username_key and _auth_rate_limit_is_blocked("login_user", username_key, max_attempts=AUTH_LOGIN_RATE_LIMIT_USER_MAX_ATTEMPTS):
+        return jsonify({"error": "Too many failed login attempts. Please wait and retry."}), 429
+    if not username or not password:
+        return jsonify({"error": "username and password are required"}), 400
+    row = _auth_get_user_by_username(username)
+    if not row:
+        _auth_rate_limit_record_failure("login_ip", client_ip)
+        _auth_rate_limit_record_failure("login_user", username_key)
+        return jsonify({"error": "Invalid credentials"}), 401
+    if not bool(int(row["is_active"] or 0)):
+        _auth_rate_limit_record_failure("login_ip", client_ip)
+        _auth_rate_limit_record_failure("login_user", username_key)
+        return jsonify({"error": "Invalid credentials"}), 401
+    if not _auth_verify_password(password, str(row["password_hash"] or ""), str(row["password_salt"] or "")):
+        _auth_rate_limit_record_failure("login_ip", client_ip)
+        _auth_rate_limit_record_failure("login_user", username_key)
+        return jsonify({"error": "Invalid credentials"}), 401
+    token, expires_at = _auth_create_session(
+        int(row["id"]),
+        ip=_auth_client_ip(),
+        user_agent=str(request.headers.get("User-Agent") or ""),
+    )
+    _auth_touch_login(int(row["id"]), ip=_auth_client_ip())
+    _auth_rate_limit_clear("login_ip", client_ip)
+    _auth_rate_limit_clear("login_user", username_key)
+    user = _auth_public_user(_auth_get_user_by_id(int(row["id"])))
+    return jsonify({"ok": True, "token": token, "expires_at": int(expires_at), "user": user})
+
+
+@app.get("/api/auth/me")
+def api_auth_me():
+    user = dict(getattr(g, "current_user", {}) or {})
+    if not user:
+        return jsonify({"error": "Not authenticated"}), 401
+    return jsonify({"ok": True, "user": user})
+
+
+@app.post("/api/auth/logout")
+def api_auth_logout():
+    raw_token = _auth_get_bearer_token()
+    if raw_token:
+        _auth_delete_session(raw_token)
+    return jsonify({"ok": True})
+
+
+@app.get("/api/admin/users")
+def api_admin_users_get():
+    if AUTH_DISABLE:
+        return jsonify({"users": []})
+    con = _auth_db_connect()
+    try:
+        cur = con.cursor()
+        cur.execute(
+            """
+            SELECT id, username, is_admin, can_download, is_active, created_at, updated_at, last_login_at
+            FROM auth_users
+            ORDER BY is_admin DESC, username ASC
+            """
+        )
+        rows = cur.fetchall()
+        users = [_auth_public_user(r) for r in rows]
+        return jsonify({"users": users})
+    finally:
+        con.close()
+
+
+@app.post("/api/admin/users")
+def api_admin_users_create():
+    if AUTH_DISABLE:
+        return jsonify({"error": "Auth is disabled by PMDA_AUTH_DISABLE"}), 400
+    data = request.get_json(silent=True) or {}
+    username = str(data.get("username") or "").strip()
+    password = str(data.get("password") or "")
+    password_confirm = str(data.get("password_confirm") or password)
+    if password != password_confirm:
+        return jsonify({"error": "Passwords do not match"}), 400
+    is_admin = bool(_parse_bool(data.get("is_admin")))
+    can_download = bool(_parse_bool(data.get("can_download")))
+    is_active = True if data.get("is_active") is None else bool(_parse_bool(data.get("is_active")))
+    ok, msg, user = _auth_create_user(
+        username=username,
+        password=password,
+        is_admin=is_admin,
+        can_download=can_download,
+        is_active=is_active,
+    )
+    if not ok:
+        return jsonify({"error": msg}), 400
+    return jsonify({"ok": True, "user": user})
+
+
+@app.put("/api/admin/users/<int:user_id>")
+def api_admin_users_update(user_id: int):
+    if AUTH_DISABLE:
+        return jsonify({"error": "Auth is disabled by PMDA_AUTH_DISABLE"}), 400
+    data = request.get_json(silent=True) or {}
+    con = _auth_db_connect()
+    try:
+        cur = con.cursor()
+        cur.execute(
+            """
+            SELECT id, username, password_hash, password_salt, is_admin, can_download, is_active, created_at, updated_at, last_login_at
+            FROM auth_users
+            WHERE id = ?
+            LIMIT 1
+            """,
+            (int(user_id),),
+        )
+        row = cur.fetchone()
+        if not row:
+            return jsonify({"error": "User not found"}), 404
+
+        username = str(row["username"] or "")
+        if "username" in data:
+            ok_u, u_msg = _auth_validate_username(data.get("username"))
+            if not ok_u:
+                return jsonify({"error": u_msg}), 400
+            username = u_msg
+
+        is_admin = bool(int(row["is_admin"] or 0))
+        can_download = bool(int(row["can_download"] or 0))
+        is_active = bool(int(row["is_active"] or 0))
+
+        if "is_admin" in data:
+            is_admin = bool(_parse_bool(data.get("is_admin")))
+        if "can_download" in data:
+            can_download = bool(_parse_bool(data.get("can_download")))
+        if "is_active" in data:
+            is_active = bool(_parse_bool(data.get("is_active")))
+
+        current_user = dict(getattr(g, "current_user", {}) or {})
+        current_user_id = int(current_user.get("id") or 0)
+
+        # Never allow removing/deactivating the last active admin.
+        if bool(int(row["is_admin"] or 0)) and (not is_admin or not is_active):
+            admin_count = _auth_count_admin_users(con)
+            if admin_count <= 1:
+                return jsonify({"error": "At least one active admin user is required"}), 400
+
+        if current_user_id > 0 and int(row["id"]) == current_user_id and not is_admin:
+            return jsonify({"error": "You cannot remove your own admin role"}), 400
+
+        password_hash = str(row["password_hash"] or "")
+        password_salt = str(row["password_salt"] or "")
+        password_changed = False
+        if "password" in data:
+            password = str(data.get("password") or "")
+            if password:
+                ok_p, p_msg = _auth_validate_password(password)
+                if not ok_p:
+                    return jsonify({"error": p_msg}), 400
+                password_hash, password_salt = _auth_make_password_hash(password)
+                password_changed = True
+
+        try:
+            cur.execute(
+                """
+                UPDATE auth_users
+                SET
+                    username = ?,
+                    password_hash = ?,
+                    password_salt = ?,
+                    is_admin = ?,
+                    can_download = ?,
+                    is_active = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    username,
+                    password_hash,
+                    password_salt,
+                    1 if is_admin else 0,
+                    1 if can_download else 0,
+                    1 if is_active else 0,
+                    _auth_now_ts(),
+                    int(user_id),
+                ),
+            )
+            if password_changed:
+                # Revoke all active sessions after password reset.
+                cur.execute("DELETE FROM auth_sessions WHERE user_id = ?", (int(user_id),))
+            con.commit()
+        except sqlite3.IntegrityError:
+            con.rollback()
+            return jsonify({"error": "Username already exists"}), 400
+
+        cur.execute(
+            """
+            SELECT id, username, is_admin, can_download, is_active, created_at, updated_at, last_login_at
+            FROM auth_users
+            WHERE id = ?
+            LIMIT 1
+            """,
+            (int(user_id),),
+        )
+        updated = cur.fetchone()
+        return jsonify({"ok": True, "user": _auth_public_user(updated)})
+    finally:
+        con.close()
+
+
 def _has_settings_in_db() -> bool:
     """Check if settings exist in the configuration database (wizard was completed)."""
     try:
@@ -29771,26 +29627,6 @@ def api_config_get():
     files_roots_effective = _parse_files_roots(get_setting("FILES_ROOTS", ",".join(FILES_ROOTS) if isinstance(FILES_ROOTS, list) else (FILES_ROOTS or "")))
     configured = has_settings or bool(files_roots_effective)
 
-    # Never leak secrets to the UI (browser console/network tab). Return *_SET flags instead.
-    secret_keys = {
-        "PLEX_TOKEN",
-        "OPENAI_API_KEY",
-        "ANTHROPIC_API_KEY",
-        "GOOGLE_API_KEY",
-        "DISCOGS_USER_TOKEN",
-        "LASTFM_API_KEY",
-        "LASTFM_API_SECRET",
-        "FANART_API_KEY",
-        "THEAUDIODB_API_KEY",
-        "SERPER_API_KEY",
-        "ACOUSTID_API_KEY",
-        "LIDARR_API_KEY",
-        "AUTOBRR_API_KEY",
-        "JELLYFIN_API_KEY",
-        "NAVIDROME_PASSWORD",
-        "NAVIDROME_API_KEY",
-    }
-
     def _is_set(val) -> bool:
         return bool(str(val or "").strip())
 
@@ -29809,6 +29645,7 @@ def api_config_get():
     lidarr_key_eff = get_setting("LIDARR_API_KEY", merged.get("LIDARR_API_KEY", ""))
     autobrr_key_eff = get_setting("AUTOBRR_API_KEY", merged.get("AUTOBRR_API_KEY", ""))
     jellyfin_key_eff = get_setting("JELLYFIN_API_KEY", JELLYFIN_API_KEY)
+    discord_webhook_eff = get_setting("DISCORD_WEBHOOK", DISCORD_WEBHOOK)
     navidrome_pass_eff = get_setting("NAVIDROME_PASSWORD", NAVIDROME_PASSWORD)
     navidrome_key_eff = get_setting("NAVIDROME_API_KEY", NAVIDROME_API_KEY)
 
@@ -29899,7 +29736,8 @@ def api_config_get():
         "BROKEN_ALBUM_CONSECUTIVE_THRESHOLD": get_setting("BROKEN_ALBUM_CONSECUTIVE_THRESHOLD", BROKEN_ALBUM_CONSECUTIVE_THRESHOLD),
         "BROKEN_ALBUM_PERCENTAGE_THRESHOLD": get_setting("BROKEN_ALBUM_PERCENTAGE_THRESHOLD", BROKEN_ALBUM_PERCENTAGE_THRESHOLD),
         "REQUIRED_TAGS": ["artist", "album", "genre", "year", "tracks"],
-        "DISCORD_WEBHOOK": get_setting("DISCORD_WEBHOOK", DISCORD_WEBHOOK),
+        "DISCORD_WEBHOOK": "***" if _is_set(discord_webhook_eff) else "",
+        "DISCORD_WEBHOOK_SET": _is_set(discord_webhook_eff),
         "LOG_LEVEL": get_setting("LOG_LEVEL", LOG_LEVEL),
         "LOG_FILE": get_setting("LOG_FILE", LOG_FILE),
         "AUTO_MOVE_DUPES": get_setting_bool("AUTO_MOVE_DUPES", AUTO_MOVE_DUPES),
@@ -29967,26 +29805,19 @@ def api_config_get():
         "CONCERTS_RADIUS_KM": str(get_setting("CONCERTS_RADIUS_KM", "150") or "").strip() or "150",
     }
 
-    # Local self-hosted UX: keep inputs masked by default in the UI component, but provide the
-    # actual value so the "eye" toggle can reveal the key when explicitly requested by the user.
-    payload.update({
-        "PLEX_TOKEN": str(plex_token_eff or ""),
-        "OPENAI_API_KEY": str(openai_key_eff or ""),
-        "ANTHROPIC_API_KEY": str(anthropic_key_eff or ""),
-        "GOOGLE_API_KEY": str(google_key_eff or ""),
-        "DISCOGS_USER_TOKEN": str(discogs_token_eff or ""),
-        "LASTFM_API_KEY": str(lastfm_key_eff or ""),
-        "LASTFM_API_SECRET": str(lastfm_secret_eff or ""),
-        "FANART_API_KEY": str(fanart_key_eff or ""),
-        "THEAUDIODB_API_KEY": str(theaudiodb_key_eff or ""),
-        "SERPER_API_KEY": str(serper_key_eff or ""),
-        "ACOUSTID_API_KEY": str(acoustid_key_eff or ""),
-        "LIDARR_API_KEY": str(lidarr_key_eff or ""),
-        "AUTOBRR_API_KEY": str(autobrr_key_eff or ""),
-        "JELLYFIN_API_KEY": str(jellyfin_key_eff or ""),
-        "NAVIDROME_PASSWORD": str(navidrome_pass_eff or ""),
-        "NAVIDROME_API_KEY": str(navidrome_key_eff or ""),
-    })
+    current_user = dict(getattr(g, "current_user", {}) or {})
+    if not bool(current_user.get("is_admin")):
+        # Non-admin users only need a very small read-only subset for Library UX.
+        public_payload = {
+            "configured": configured,
+            "LIBRARY_MODE": payload.get("LIBRARY_MODE", "files"),
+            "LIBRARY_INCLUDE_UNMATCHED": bool(payload.get("LIBRARY_INCLUDE_UNMATCHED", False)),
+            "CONCERTS_FILTER_ENABLED": bool(payload.get("CONCERTS_FILTER_ENABLED", False)),
+            "CONCERTS_HOME_LAT": str(payload.get("CONCERTS_HOME_LAT", "") or "").strip(),
+            "CONCERTS_HOME_LON": str(payload.get("CONCERTS_HOME_LON", "") or "").strip(),
+            "CONCERTS_RADIUS_KM": str(payload.get("CONCERTS_RADIUS_KM", "150") or "").strip() or "150",
+        }
+        return jsonify(public_payload)
 
     return jsonify(payload)
 
@@ -39450,6 +39281,73 @@ def api_library_album_detail(album_id: int):
         return jsonify(payload)
     finally:
         conn.close()
+
+
+@app.get("/api/library/album/<int:album_id>/download")
+def api_library_album_download(album_id: int):
+    """Download a files-mode album folder as ZIP. Access is gated by auth/RBAC."""
+    if _get_library_mode() != "files":
+        return jsonify({"error": "Files mode required"}), 400
+    ok, err = _ensure_files_index_ready()
+    if not ok:
+        return jsonify({"error": err or "Files index unavailable"}), 503
+
+    album_id = int(album_id or 0)
+    if album_id <= 0:
+        return jsonify({"error": "Invalid album id"}), 400
+
+    conn = _files_pg_connect()
+    if conn is None:
+        return jsonify({"error": "PostgreSQL unavailable"}), 503
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    COALESCE(alb.folder_path, '') AS folder_path,
+                    COALESCE(alb.title, '') AS album_title,
+                    COALESCE(art.name, '') AS artist_name
+                FROM files_albums alb
+                JOIN files_artists art ON art.id = alb.artist_id
+                WHERE alb.id = %s
+                LIMIT 1
+                """,
+                (album_id,),
+            )
+            row = cur.fetchone()
+    finally:
+        conn.close()
+
+    if not row or not str(row[0] or "").strip():
+        return jsonify({"error": "Album not found"}), 404
+
+    folder_path = path_for_fs_access(Path(str(row[0] or "").strip()))
+    if not folder_path.exists() or not folder_path.is_dir():
+        return jsonify({"error": "Album folder not found"}), 404
+
+    artist_name = _sanitize_path_component(str(row[2] or "").strip() or f"artist-{album_id}")
+    album_title = _sanitize_path_component(str(row[1] or "").strip() or f"album-{album_id}")
+    archive_label = f"{artist_name} - {album_title}".strip(" -") or f"album-{album_id}"
+
+    tmp_dir = tempfile.mkdtemp(prefix=f"pmda-album-{album_id}-")
+    archive_base = os.path.join(tmp_dir, archive_label)
+    archive_path = shutil.make_archive(archive_base, "zip", root_dir=str(folder_path))
+
+    @after_this_request
+    def _cleanup_archive(response):
+        try:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
+        return response
+
+    return send_file(
+        archive_path,
+        as_attachment=True,
+        download_name=os.path.basename(archive_path),
+        mimetype="application/zip",
+        conditional=True,
+    )
 
 
 def _track_file_path(db_conn, track_id: int) -> Optional[Path]:

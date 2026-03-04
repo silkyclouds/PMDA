@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
-import { BarChart3, Building2, Disc3, House, Library, ListMusic, Plus, Scan, Settings2, Tags, Users, Wrench } from 'lucide-react';
+import { BarChart3, Building2, Disc3, House, Library, ListMusic, LogOut, Plus, Scan, Settings2, Shield, Tags, Users, Wrench } from 'lucide-react';
 
 import * as api from '@/lib/api';
+import { useAuth } from '@/contexts/AuthContext';
 import { cn } from '@/lib/utils';
 import { useToast } from '@/hooks/use-toast';
 import { Button } from '@/components/ui/button';
@@ -59,6 +60,7 @@ function parseDropPayload(e: React.DragEvent): { track_id?: number; album_id?: n
 
 export function AppSidebar() {
   const isMobile = useIsMobile();
+  const { user, isAdmin, logout } = useAuth();
   const { toast } = useToast();
   const location = useLocation();
   const navigate = useNavigate();
@@ -81,6 +83,10 @@ export function AppSidebar() {
   }, []);
 
   const refreshToolsBadge = useCallback(async () => {
+    if (!isAdmin) {
+      setToolsBadgeCount(0);
+      return;
+    }
     try {
       const runs = await api.getScanHistory();
       const completed = (Array.isArray(runs) ? runs : [])
@@ -102,7 +108,7 @@ export function AppSidebar() {
     } catch {
       setToolsBadgeCount(0);
     }
-  }, []);
+  }, [isAdmin]);
 
   useEffect(() => {
     void refreshPlaylists();
@@ -131,13 +137,17 @@ export function AppSidebar() {
   );
 
   const adminItems = useMemo(
-    () => [
-      { to: '/scan', label: 'Scan', icon: Scan },
-      { to: '/tools', label: 'Tools', icon: Wrench },
-      { to: '/statistics', label: 'Statistics', icon: BarChart3 },
-      { to: '/settings', label: 'Settings', icon: Settings2 },
-    ],
-    []
+    () =>
+      isAdmin
+        ? [
+            { to: '/scan', label: 'Scan', icon: Scan },
+            { to: '/tools', label: 'Tools', icon: Wrench },
+            { to: '/statistics', label: 'Statistics', icon: BarChart3 },
+            { to: '/settings', label: 'Settings', icon: Settings2 },
+            { to: '/admin/users', label: 'Users', icon: Shield },
+          ]
+        : [],
+    [isAdmin]
   );
 
   const playlistItems = useMemo(() => playlists.slice(0, 10), [playlists]);
@@ -147,6 +157,7 @@ export function AppSidebar() {
     e.preventDefault();
     e.stopPropagation();
     setDragOverPlaylistId(null);
+    if (!isAdmin) return;
     const payload = parseDropPayload(e);
     if (!payload) return;
     try {
@@ -165,6 +176,11 @@ export function AppSidebar() {
         variant: 'destructive',
       });
     }
+  };
+
+  const handleLogout = async () => {
+    await logout();
+    navigate('/auth/login', { replace: true });
   };
 
   return (
@@ -243,17 +259,19 @@ export function AppSidebar() {
 
         <SidebarGroup className={cn(isMobile ? 'pt-1' : '', 'group-data-[collapsible=icon]:hidden')}>
           <SidebarGroupLabel>Playlists</SidebarGroupLabel>
-          <SidebarGroupAction asChild title="New playlist">
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon"
-              className="h-7 w-7"
-              onClick={() => navigate('/library/playlists')}
-            >
-              <Plus className="h-4 w-4" />
-            </Button>
-          </SidebarGroupAction>
+          {isAdmin ? (
+            <SidebarGroupAction asChild title="New playlist">
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                className="h-7 w-7"
+                onClick={() => navigate('/library/playlists')}
+              >
+                <Plus className="h-4 w-4" />
+              </Button>
+            </SidebarGroupAction>
+          ) : null}
           <SidebarGroupContent>
             {loadingPlaylists && visiblePlaylistItems.length === 0 ? (
               <div className="px-2 py-2 text-xs text-muted-foreground group-data-[collapsible=icon]:hidden">Loading…</div>
@@ -269,6 +287,7 @@ export function AppSidebar() {
                         tooltip={pl.name}
                         onClick={() => navigate(`/library/playlists/${pl.playlist_id}`)}
                         onDragOver={(e) => {
+                          if (!isAdmin) return;
                           e.preventDefault();
                           setDragOverPlaylistId(pl.playlist_id);
                         }}
@@ -292,35 +311,49 @@ export function AppSidebar() {
           </SidebarGroupContent>
         </SidebarGroup>
 
-        <SidebarSeparator />
-
-        <SidebarGroup>
-          <SidebarGroupLabel>System</SidebarGroupLabel>
-          <SidebarGroupContent>
-            <SidebarMenu>
-              {adminItems.map((it) => {
-                const Icon = it.icon;
-                const active = isPathActive(location.pathname, it.to);
-                return (
-                  <SidebarMenuItem key={it.to} className="relative">
-                    <SidebarMenuButton isActive={active} tooltip={it.label} onClick={() => navigate(it.to)}>
-                      <Icon className="h-4 w-4" />
-                      <span>{it.label}</span>
-                    </SidebarMenuButton>
-                    {it.to === '/tools' && toolsBadgeCount > 0 ? (
-                      <SidebarMenuBadge className="text-[10px]">
-                        {toolsBadgeCount > 99 ? '99+' : toolsBadgeCount}
-                      </SidebarMenuBadge>
-                    ) : null}
-                  </SidebarMenuItem>
-                );
-              })}
-            </SidebarMenu>
-          </SidebarGroupContent>
-        </SidebarGroup>
+        {isAdmin ? (
+          <>
+            <SidebarSeparator />
+            <SidebarGroup>
+              <SidebarGroupLabel>System</SidebarGroupLabel>
+              <SidebarGroupContent>
+                <SidebarMenu>
+                  {adminItems.map((it) => {
+                    const Icon = it.icon;
+                    const active = isPathActive(location.pathname, it.to);
+                    return (
+                      <SidebarMenuItem key={it.to} className="relative">
+                        <SidebarMenuButton isActive={active} tooltip={it.label} onClick={() => navigate(it.to)}>
+                          <Icon className="h-4 w-4" />
+                          <span>{it.label}</span>
+                        </SidebarMenuButton>
+                        {it.to === '/tools' && toolsBadgeCount > 0 ? (
+                          <SidebarMenuBadge className="text-[10px]">
+                            {toolsBadgeCount > 99 ? '99+' : toolsBadgeCount}
+                          </SidebarMenuBadge>
+                        ) : null}
+                      </SidebarMenuItem>
+                    );
+                  })}
+                </SidebarMenu>
+              </SidebarGroupContent>
+            </SidebarGroup>
+          </>
+        ) : null}
       </SidebarContent>
 
-      <SidebarFooter />
+      <SidebarFooter>
+        <div className="px-2 py-2 text-xs text-muted-foreground">
+          <div className="truncate font-medium text-foreground">{user?.username || 'Unknown user'}</div>
+          <div>{isAdmin ? 'Administrator' : 'Read-only user'}</div>
+        </div>
+        <div className="px-2 pb-2">
+          <Button type="button" variant="outline" size="sm" className="w-full" onClick={() => void handleLogout()}>
+            <LogOut className="mr-2 h-3.5 w-3.5" />
+            Logout
+          </Button>
+        </div>
+      </SidebarFooter>
 
       <SidebarRail />
     </Sidebar>

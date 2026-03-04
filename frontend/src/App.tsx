@@ -2,7 +2,7 @@ import { Toaster } from "@/components/ui/toaster";
 import { Toaster as Sonner } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { BrowserRouter, Routes, Route, Navigate, useParams } from "react-router-dom";
+import { BrowserRouter, Routes, Route, Navigate, useLocation, useParams } from "react-router-dom";
 import { ThemeProvider } from "next-themes";
 import Scan from "./pages/Scan";
 import Statistics from "./pages/Statistics";
@@ -26,8 +26,12 @@ import Settings from "./pages/Settings";
 import NotFound from "./pages/NotFound";
 import Tools from "./pages/Tools";
 import Unduper from "./pages/Unduper";
+import LoginPage from "./pages/Login";
+import BootstrapAdminPage from "./pages/BootstrapAdmin";
+import AdminUsersPage from "./pages/AdminUsers";
 import { BrokenAlbumsList } from "./components/broken-albums/BrokenAlbumsList";
 import { PlaybackProvider, usePlayback } from "./contexts/PlaybackContext";
+import { AuthProvider, useAuth } from "./contexts/AuthContext";
 import { AudioPlayer } from "./components/library/AudioPlayer";
 import { ScanFinishedInvalidator } from "./components/ScanFinishedInvalidator";
 import { AssistantDock } from "./components/assistant/AssistantDock";
@@ -49,22 +53,63 @@ function PlaylistLegacyRedirect() {
   return <Navigate to={`/library/playlists/${playlistId}`} replace />;
 }
 
+function LoginRedirect() {
+  const location = useLocation();
+  const nextRaw = `${location.pathname || ""}${location.search || ""}${location.hash || ""}`;
+  const nextPath = nextRaw.startsWith("/") ? nextRaw : "/library";
+  return <Navigate to={`/auth/login?next=${encodeURIComponent(nextPath)}`} replace />;
+}
+
+function AuthLoadingScreen() {
+  return (
+    <div className="flex min-h-screen items-center justify-center bg-background p-6">
+      <p className="text-sm text-muted-foreground">Loading authentication…</p>
+    </div>
+  );
+}
+
 function AppRoutesWithPlayer() {
   const { session, setCurrentTrack, closePlayer, recommendationSessionId } = usePlayback();
+  const auth = useAuth();
+
+  if (auth.isLoading) {
+    return <AuthLoadingScreen />;
+  }
+
+  if (auth.bootstrapRequired) {
+    return (
+      <Routes>
+        <Route path="/auth/bootstrap" element={<BootstrapAdminPage />} />
+        <Route path="*" element={<Navigate to="/auth/bootstrap" replace />} />
+      </Routes>
+    );
+  }
+
+  if (!auth.user) {
+    return (
+      <Routes>
+        <Route path="/auth/login" element={<LoginPage />} />
+        <Route path="*" element={<LoginRedirect />} />
+      </Routes>
+    );
+  }
+
+  const adminOnly = (element: JSX.Element) => (auth.isAdmin ? element : <Navigate to="/library" replace />);
+
   return (
     <>
-      <ScanFinishedInvalidator />
+      {auth.isAdmin ? <ScanFinishedInvalidator /> : null}
       <Routes>
         <Route element={<AppLayout />}>
           <Route path="/" element={<Navigate to="/library" replace />} />
-          <Route path="/scan" element={<Scan />} />
-          <Route path="/unduper" element={<Navigate to="/tools/duplicates" replace />} />
-          <Route path="/history" element={<Navigate to="/tools" replace />} />
-          <Route path="/statistics" element={<Statistics />} />
-          <Route path="/statistics/listening" element={<ListeningStatsPage />} />
-          <Route path="/statistics/library" element={<LibraryStatsPage />} />
-          <Route path="/tools" element={<Tools />} />
-          <Route path="/tools/duplicates" element={<Unduper />} />
+          <Route path="/scan" element={adminOnly(<Scan />)} />
+          <Route path="/unduper" element={<Navigate to={auth.isAdmin ? "/tools/duplicates" : "/library"} replace />} />
+          <Route path="/history" element={<Navigate to={auth.isAdmin ? "/tools" : "/library"} replace />} />
+          <Route path="/statistics" element={adminOnly(<Statistics />)} />
+          <Route path="/statistics/listening" element={adminOnly(<ListeningStatsPage />)} />
+          <Route path="/statistics/library" element={adminOnly(<LibraryStatsPage />)} />
+          <Route path="/tools" element={adminOnly(<Tools />)} />
+          <Route path="/tools/duplicates" element={adminOnly(<Unduper />)} />
           <Route path="/library" element={<LibraryLayout />}>
             <Route index element={<LibraryHome />} />
             <Route path="home" element={<LibraryHome />} />
@@ -81,17 +126,18 @@ function AppRoutesWithPlayer() {
             <Route path="playlists/:playlistId" element={<PlaylistDetail />} />
             <Route path="browser" element={<Navigate to="/library" replace />} />
           </Route>
-          {/* Legacy aliases (avoid 404 on direct URL access) */}
           <Route path="/playlists" element={<Navigate to="/library/playlists" replace />} />
           <Route path="/playlists/:playlistId" element={<PlaylistLegacyRedirect />} />
-          <Route path="/tag-fixer" element={<TagFixer />} />
-          <Route path="/broken-albums" element={<BrokenAlbumsList />} />
-          <Route path="/settings" element={<Settings />} />
-          {/* ADD ALL CUSTOM ROUTES ABOVE THE CATCH-ALL "*" ROUTE */}
+          <Route path="/tag-fixer" element={adminOnly(<TagFixer />)} />
+          <Route path="/broken-albums" element={adminOnly(<BrokenAlbumsList />)} />
+          <Route path="/settings" element={adminOnly(<Settings />)} />
+          <Route path="/admin/users" element={adminOnly(<AdminUsersPage />)} />
           <Route path="*" element={<NotFound />} />
         </Route>
+        <Route path="/auth/login" element={<Navigate to="/library" replace />} />
+        <Route path="/auth/bootstrap" element={<Navigate to="/library" replace />} />
       </Routes>
-      <AssistantDock bottomOffsetPx={session ? 128 : 16} />
+      {auth.isAdmin ? <AssistantDock bottomOffsetPx={session ? 128 : 16} /> : null}
       {session && (
         <AudioPlayer
           albumId={session.albumId}
@@ -115,9 +161,11 @@ const App = () => (
         <Toaster />
         <Sonner />
         <BrowserRouter>
-          <PlaybackProvider>
-            <AppRoutesWithPlayer />
-          </PlaybackProvider>
+          <AuthProvider>
+            <PlaybackProvider>
+              <AppRoutesWithPlayer />
+            </PlaybackProvider>
+          </AuthProvider>
         </BrowserRouter>
       </TooltipProvider>
     </QueryClientProvider>

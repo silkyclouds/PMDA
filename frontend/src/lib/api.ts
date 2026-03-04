@@ -2,6 +2,86 @@
 // Empty = same origin (e.g. when served from the same Docker container). Set VITE_PMDA_API_URL for dev (must be full URL, e.g. http://192.168.3.2:5005).
 const _raw = import.meta.env.VITE_PMDA_API_URL ?? '';
 const API_BASE_URL = typeof _raw === 'string' && (_raw.startsWith('http://') || _raw.startsWith('https://')) ? _raw : '';
+const AUTH_TOKEN_STORAGE_KEY = 'pmda_auth_token';
+
+export function getAuthToken(): string {
+  try {
+    return (window.localStorage.getItem(AUTH_TOKEN_STORAGE_KEY) || '').trim();
+  } catch {
+    return '';
+  }
+}
+
+export function setAuthToken(token: string): void {
+  try {
+    const clean = String(token || '').trim();
+    if (!clean) {
+      window.localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
+      return;
+    }
+    window.localStorage.setItem(AUTH_TOKEN_STORAGE_KEY, clean);
+  } catch {
+    // ignore
+  }
+}
+
+export function clearAuthToken(): void {
+  try {
+    window.localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
+  } catch {
+    // ignore
+  }
+}
+
+function withAuthHeaders(input?: HeadersInit): HeadersInit {
+  const token = getAuthToken();
+  const headers = new Headers(input || undefined);
+  if (token && !headers.has('Authorization')) {
+    headers.set('Authorization', `Bearer ${token}`);
+  }
+  return headers;
+}
+
+let authFetchInterceptorInstalled = false;
+
+/** Attach Authorization bearer token to legacy direct fetch() calls hitting PMDA API routes. */
+export function installGlobalAuthFetchInterceptor(): void {
+  if (authFetchInterceptorInstalled || typeof window === 'undefined' || typeof window.fetch !== 'function') {
+    return;
+  }
+  const nativeFetch = window.fetch.bind(window);
+  window.fetch = (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    const requestUrl = typeof input === 'string'
+      ? input
+      : input instanceof URL
+        ? input.toString()
+        : input.url;
+    const isApiRequest = requestUrl.startsWith('/api/')
+      || requestUrl.startsWith('/scan/')
+      || requestUrl.startsWith('/dedupe/')
+      || requestUrl.startsWith('/details/')
+      || (API_BASE_URL ? requestUrl.startsWith(`${API_BASE_URL}/api/`) : false)
+      || (API_BASE_URL ? requestUrl.startsWith(`${API_BASE_URL}/scan/`) : false)
+      || (API_BASE_URL ? requestUrl.startsWith(`${API_BASE_URL}/dedupe/`) : false)
+      || (API_BASE_URL ? requestUrl.startsWith(`${API_BASE_URL}/details/`) : false);
+    if (!isApiRequest) {
+      return nativeFetch(input, init);
+    }
+    const inheritedHeaders =
+      init?.headers
+      ?? (input instanceof Request ? input.headers : undefined);
+    const headers = new Headers(withAuthHeaders(inheritedHeaders));
+    return nativeFetch(input, { ...init, headers });
+  };
+  authFetchInterceptorInstalled = true;
+}
+
+async function fetchWithAuth(endpoint: string, init?: RequestInit): Promise<Response> {
+  return fetch(`${API_BASE_URL}${endpoint}`, {
+    ...init,
+    headers: withAuthHeaders(init?.headers),
+  });
+}
 
 // Types
 export interface DuplicateCard {
@@ -588,6 +668,7 @@ export interface PMDAConfig {
   /** Radius (km) used to filter upcoming concerts (stringified int). */
   CONCERTS_RADIUS_KM?: string;
   DISCORD_WEBHOOK: string;
+  DISCORD_WEBHOOK_SET?: boolean;
   LOG_LEVEL: 'DEBUG' | 'INFO' | 'WARNING' | 'ERROR';
   LOG_FILE: string;
   AUTO_MOVE_DUPES: boolean;
@@ -849,13 +930,14 @@ async function executeFetchApi<T>(endpoint: string, options?: FetchApiRequestIni
   const { signal, cleanup } = createFetchSignal(requestOptions?.signal, timeoutMs);
   let timedOut = false;
   try {
+    const headers = new Headers(withAuthHeaders(requestOptions?.headers));
+    if (!headers.has('Content-Type')) {
+      headers.set('Content-Type', 'application/json');
+    }
     const response = await fetch(`${API_BASE_URL}${endpoint}`, {
       ...requestOptions,
       signal: signal ?? requestOptions?.signal,
-      headers: {
-        'Content-Type': 'application/json',
-        ...requestOptions?.headers,
-      },
+      headers,
     });
     
     if (!response.ok) {
@@ -1780,6 +1862,55 @@ export async function getAlbumDetail(albumId: number): Promise<AlbumDetailRespon
   });
 }
 
+function sanitizeDownloadPart(value: string): string {
+  return String(value || '')
+    .replace(/[\\/:*?"<>|]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function parseContentDispositionFilename(headerValue: string | null): string | null {
+  const raw = String(headerValue || '').trim();
+  if (!raw) return null;
+  const utf8Match = raw.match(/filename\\*=UTF-8''([^;]+)/i);
+  if (utf8Match?.[1]) {
+    try {
+      return decodeURIComponent(utf8Match[1]);
+    } catch {
+      return utf8Match[1];
+    }
+  }
+  const plainMatch = raw.match(/filename=\"?([^\";]+)\"?/i);
+  if (plainMatch?.[1]) return plainMatch[1];
+  return null;
+}
+
+export async function downloadAlbumZip(albumId: number, artistName?: string, albumTitle?: string): Promise<void> {
+  const endpoint = `/api/library/album/${encodeURIComponent(String(albumId))}/download`;
+  const response = await fetchWithAuth(endpoint, { method: 'GET' });
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({}));
+    const msg = (data as { error?: unknown }).error;
+    throw new Error(typeof msg === 'string' && msg.trim() ? msg : `Download failed (${response.status})`);
+  }
+  const blob = await response.blob();
+  const fallbackNameBase = [sanitizeDownloadPart(artistName || ''), sanitizeDownloadPart(albumTitle || '')]
+    .filter(Boolean)
+    .join(' - ') || `album-${albumId}`;
+  const filename = parseContentDispositionFilename(response.headers.get('content-disposition')) || `${fallbackNameBase}.zip`;
+  const objectUrl = window.URL.createObjectURL(blob);
+  try {
+    const anchor = document.createElement('a');
+    anchor.href = objectUrl;
+    anchor.download = filename;
+    document.body.appendChild(anchor);
+    anchor.click();
+    document.body.removeChild(anchor);
+  } finally {
+    window.URL.revokeObjectURL(objectUrl);
+  }
+}
+
 export interface PlaylistSummary {
   playlist_id: number;
   name: string;
@@ -2086,9 +2217,7 @@ export async function improveDroppedAlbum(files: File[], folderName?: string): P
   const formData = new FormData();
   files.forEach((f) => formData.append('files', f));
   if (folderName != null && folderName !== '') formData.append('folder_name', folderName);
-  const base = API_BASE_URL ? API_BASE_URL.replace(/\/$/, '') : '';
-  const url = `${base}/api/drop/improve`;
-  const res = await fetch(url, { method: 'POST', body: formData });
+  const res = await fetchWithAuth('/api/drop/improve', { method: 'POST', body: formData });
   const data = await res.json();
   if (!res.ok) {
     throw new Error(data.error || data.detail || `HTTP ${res.status}`);
@@ -2188,6 +2317,114 @@ export async function moveBonusTrack(
 /** Config response includes backend-only field configured (wizard-first). */
 export type ConfigResponse = Partial<PMDAConfig> & { configured?: boolean };
 
+export interface AuthUser {
+  id: number;
+  username: string;
+  is_admin: boolean;
+  can_download: boolean;
+  is_active: boolean;
+  created_at: number;
+  updated_at: number;
+  last_login_at?: number | null;
+}
+
+export interface AuthBootstrapStatusResponse {
+  bootstrap_required: boolean;
+}
+
+export interface AuthBootstrapRequest {
+  username: string;
+  password: string;
+  password_confirm: string;
+}
+
+export interface AuthLoginRequest {
+  username: string;
+  password: string;
+}
+
+export interface AuthLoginResponse {
+  ok: boolean;
+  token: string;
+  expires_at: number;
+  user: AuthUser;
+}
+
+export interface AuthMeResponse {
+  ok: boolean;
+  user: AuthUser;
+}
+
+export interface AdminUsersResponse {
+  users: AuthUser[];
+}
+
+export interface AdminUserCreateRequest {
+  username: string;
+  password: string;
+  password_confirm: string;
+  is_admin?: boolean;
+  can_download?: boolean;
+  is_active?: boolean;
+}
+
+export interface AdminUserUpdateRequest {
+  username?: string;
+  password?: string;
+  is_admin?: boolean;
+  can_download?: boolean;
+  is_active?: boolean;
+}
+
+export interface AdminUserMutationResponse {
+  ok: boolean;
+  user: AuthUser;
+}
+
+export async function getAuthBootstrapStatus(): Promise<AuthBootstrapStatusResponse> {
+  return fetchApi<AuthBootstrapStatusResponse>('/api/auth/bootstrap/status');
+}
+
+export async function bootstrapAdmin(payload: AuthBootstrapRequest): Promise<{ ok: boolean; message?: string; user?: AuthUser }> {
+  return fetchApi<{ ok: boolean; message?: string; user?: AuthUser }>('/api/auth/bootstrap', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function login(payload: AuthLoginRequest): Promise<AuthLoginResponse> {
+  return fetchApi<AuthLoginResponse>('/api/auth/login', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function me(): Promise<AuthMeResponse> {
+  return fetchApi<AuthMeResponse>('/api/auth/me');
+}
+
+export async function logout(): Promise<{ ok: boolean }> {
+  return fetchApi<{ ok: boolean }>('/api/auth/logout', { method: 'POST' });
+}
+
+export async function getAdminUsers(): Promise<AdminUsersResponse> {
+  return fetchApi<AdminUsersResponse>('/api/admin/users');
+}
+
+export async function createAdminUser(payload: AdminUserCreateRequest): Promise<AdminUserMutationResponse> {
+  return fetchApi<AdminUserMutationResponse>('/api/admin/users', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function updateAdminUser(userId: number, payload: AdminUserUpdateRequest): Promise<AdminUserMutationResponse> {
+  return fetchApi<AdminUserMutationResponse>(`/api/admin/users/${encodeURIComponent(String(userId))}`, {
+    method: 'PUT',
+    body: JSON.stringify(payload),
+  });
+}
+
 export async function getConfig(): Promise<ConfigResponse> {
   try {
     return await fetchApi<ConfigResponse>('/api/config');
@@ -2258,131 +2495,10 @@ export async function getFilesystemDirectories(path?: string): Promise<Filesyste
   return fetchApi<FilesystemDirectoryList>(`/api/fs/list${query}`);
 }
 
-/** Test Plex connection. Pass current form values to test before saving. */
-export async function checkPlexConnection(host?: string, token?: string): Promise<{ success: boolean; message: string; libraries?: Array<{ id: string; name: string }> }> {
-  try {
-    const body = host != null || token != null ? { PLEX_HOST: host ?? '', PLEX_TOKEN: token ?? '' } : undefined;
-    return await fetchApi<{ success: boolean; message: string; libraries?: Array<{ id: string; name: string }> }>(
-      '/api/plex/check',
-      body ? { method: 'POST', body: JSON.stringify(body) } : undefined
-    );
-  } catch (error) {
-    const msg = error instanceof Error ? error.message : 'Failed to connect to Plex server';
-    return { success: false, message: msg };
-  }
-}
-
-/** Create a Plex.tv PIN for sign-in (user goes to plex.tv/link and enters code). */
-export async function createPlexPin(): Promise<{ success: boolean; id?: number; code?: string; link_url?: string; message?: string }> {
-  try {
-    const res = await fetch(`${API_BASE_URL}/api/plex/pin`, { method: 'POST' });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) return { success: false, message: (data as { message?: string }).message || 'Failed to create PIN' };
-    return { success: true, id: (data as { id?: number }).id, code: (data as { code?: string }).code, link_url: (data as { link_url?: string }).link_url };
-  } catch (e) {
-    return { success: false, message: e instanceof Error ? e.message : 'Failed to create PIN' };
-  }
-}
-
-/** Poll PIN status; when user has linked on plex.tv/link, returns { status: 'linked', token }. */
-export async function pollPlexPin(pinId: number): Promise<{ success: boolean; status: string; token?: string; message?: string }> {
-  try {
-    const res = await fetch(`${API_BASE_URL}/api/plex/pin?id=${encodeURIComponent(pinId)}`);
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) return { success: false, status: 'error', message: (data as { message?: string }).message };
-    return { success: true, status: (data as { status?: string }).status ?? 'waiting', token: (data as { token?: string }).token, message: (data as { message?: string }).message };
-  } catch (e) {
-    return { success: false, status: 'error', message: e instanceof Error ? e.message : 'Poll failed' };
-  }
-}
-
-/** Plex server entry returned by GET plex.tv/servers (Tautulli-style). */
-export interface PlexServerEntry {
-  name: string;
-  uri: string;
-  address?: string;
-  port?: string;
-  scheme?: string;
-  localAddresses?: string;
-  machineIdentifier?: string;
-}
-
-/** List Plex servers for the given token (Plex.tv API). */
-export async function getPlexServers(token: string): Promise<{ success: boolean; servers: PlexServerEntry[]; message?: string }> {
-  try {
-    const res = await fetch(`${API_BASE_URL}/api/plex/servers`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ PLEX_TOKEN: token }),
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      return { success: false, servers: [], message: (data as { message?: string }).message || res.statusText || 'Failed to fetch Plex servers' };
-    }
-    const payload = data as { success?: boolean; servers?: PlexServerEntry[]; message?: string };
-    return payload.success !== false
-      ? { success: true, servers: payload.servers ?? [], message: payload.message }
-      : { success: false, servers: [], message: payload.message };
-  } catch (error) {
-    return { success: false, servers: [], message: error instanceof Error ? error.message : 'Failed to fetch Plex servers' };
-  }
-}
-
-/** Get the client IP (browser machine) so we can ask the backend to scan that subnet for Plex. */
-export async function getPlexClientIp(): Promise<{ client_ip: string }> {
-  const res = await fetchApi<{ client_ip: string }>('/api/plex/client-ip');
-  return res ?? { client_ip: '' };
-}
-
-/** Discover Plex servers: GDM, host fallback, and optionally subnet scan from client IP.
- *  - clientIp: scan the /24 of the machine viewing the WebUI (no URL needed).
- *  - plexHostHint: also probe the port from this URL if non-standard.
- */
-export async function getPlexDiscover(options?: { clientIp?: string; plexHostHint?: string }): Promise<{ success: boolean; servers: PlexServerEntry[]; message?: string }> {
-  try {
-    const body: { client_ip?: string; PLEX_HOST?: string } = {};
-    if (options?.clientIp) body.client_ip = options.clientIp;
-    if (options?.plexHostHint) body.PLEX_HOST = options.plexHostHint;
-    const res = await fetchApi<{ success: boolean; servers: PlexServerEntry[]; message?: string }>(
-      '/api/plex/discover',
-      Object.keys(body).length ? { method: 'POST', body: JSON.stringify(body) } : undefined
-    );
-    return res ?? { success: false, servers: [] };
-  } catch (error) {
-    return { success: false, servers: [], message: 'Discovery failed' };
-  }
-}
-
-export interface PlexDatabasePathHint {
-  platform: string;
-  path: string;
-  note: string;
-}
-
-/** Common Plex database directory locations by platform (for wizard help). */
-export async function getPlexDatabasePaths(): Promise<{ success: boolean; paths: PlexDatabasePathHint[] }> {
-  try {
-    const res = await fetchApi<{ success: boolean; paths: PlexDatabasePathHint[] }>('/api/plex/database-paths');
-    return res ?? { success: false, paths: [] };
-  } catch {
-    return { success: false, paths: [] };
-  }
-}
-
-/** Verify that PMDA has read access to the Plex database (current config). */
-export async function verifyPlexDb(): Promise<{ success: boolean; message?: string }> {
-  try {
-    const res = await fetchApi<{ success: boolean; message?: string }>('/api/plex/verify-db');
-    return res ?? { success: false, message: 'Request failed' };
-  } catch (e) {
-    return { success: false, message: e instanceof Error ? e.message : 'Request failed' };
-  }
-}
-
 export async function testMusicBrainz(useMusicBrainz?: boolean): Promise<{ success: boolean; message: string }> {
   try {
     const body = useMusicBrainz !== undefined ? { USE_MUSICBRAINZ: useMusicBrainz } : undefined;
-    const response = await fetch(`${API_BASE_URL}/api/musicbrainz/test`, {
+    const response = await fetchWithAuth('/api/musicbrainz/test', {
       method: body ? 'POST' : 'GET',
       headers: {
         'Content-Type': 'application/json',
@@ -2496,160 +2612,6 @@ export async function getAIModels(
   }
 }
 
-// Autodetection (pass config so backend uses wizard values)
-export async function autodetectPaths(body?: {
-  PLEX_HOST?: string;
-  PLEX_TOKEN?: string;
-  SECTION_IDS?: string;
-}): Promise<{ success: boolean; paths: Record<string, string>; message?: string }> {
-  try {
-    return await fetchApi('/api/autodetect/paths', {
-      method: 'POST',
-      body: JSON.stringify(body ?? {}),
-    });
-  } catch {
-    return { success: false, paths: {}, message: 'Failed to autodetect paths' };
-  }
-}
-
-export async function discoverPaths(body: {
-  PATH_MAP: Record<string, string>;
-  PLEX_DB_PATH?: string;
-  MUSIC_PARENT_PATH?: string;
-  CROSSCHECK_SAMPLES?: number;
-}): Promise<{ success: boolean; paths: Record<string, string>; results: PathVerifyResult[]; message?: string }> {
-  try {
-    const response = await fetch(`${API_BASE_URL}/api/paths/discover`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-    const data = (await response.json().catch(() => ({}))) as {
-      success?: boolean;
-      paths?: Record<string, string>;
-      results?: PathVerifyResult[];
-      message?: string;
-    };
-    if (!response.ok) {
-      return {
-        success: false,
-        paths: data.paths ?? {},
-        results: data.results ?? [],
-        message: data.message ?? `Discover failed (${response.status})`,
-      };
-    }
-    return {
-      success: true,
-      paths: data.paths ?? {},
-      results: data.results ?? [],
-      message: data.message,
-    };
-  } catch (e) {
-    return {
-      success: false,
-      paths: {},
-      results: [],
-      message: e instanceof Error ? e.message : 'Discover failed',
-    };
-  }
-}
-
-export async function discoverPathOne(body: {
-  plex_root: string;
-  PLEX_DB_PATH?: string;
-  MUSIC_PARENT_PATH?: string;
-  CROSSCHECK_SAMPLES?: number;
-}): Promise<{ success: boolean; host_root: string | null; result: PathVerifyResult | null; message?: string }> {
-  try {
-    const response = await fetch(`${API_BASE_URL}/api/paths/discover-one`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-    const data = (await response.json().catch(() => ({}))) as {
-      success?: boolean;
-      host_root?: string | null;
-      result?: PathVerifyResult | null;
-      message?: string;
-    };
-    if (!response.ok) {
-      return {
-        success: false,
-        host_root: null,
-        result: null,
-        message: data.message ?? `Discover failed (${response.status})`,
-      };
-    }
-    return {
-      success: data.success ?? true,
-      host_root: data.host_root ?? null,
-      result: data.result ?? null,
-      message: data.message,
-    };
-  } catch (e) {
-    return {
-      success: false,
-      host_root: null,
-      result: null,
-      message: e instanceof Error ? e.message : 'Discover failed',
-    };
-  }
-}
-
-export interface PathVerifyResult {
-  plex_root: string;
-  host_root: string;
-  status: 'ok' | 'fail';
-  samples_checked: number;
-  message: string;
-}
-
-export async function getPathVerifyLast(): Promise<{ results: PathVerifyResult[] | null; at: number | null }> {
-  try {
-    const response = await fetch(`${API_BASE_URL}/api/paths/verify/last`);
-    const data = (await response.json().catch(() => ({}))) as { results?: PathVerifyResult[] | null; at?: number | null };
-    return { results: data.results ?? null, at: data.at ?? null };
-  } catch {
-    return { results: null, at: null };
-  }
-}
-
-export async function verifyPaths(body: {
-  PATH_MAP?: Record<string, string>;
-  PLEX_DB_PATH?: string;
-  CROSSCHECK_SAMPLES?: number;
-}): Promise<{ success: boolean; results: PathVerifyResult[]; message?: string; hint?: string }> {
-  try {
-    const response = await fetch(`${API_BASE_URL}/api/paths/verify`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-    const data = (await response.json().catch(() => ({}))) as { success?: boolean; results?: PathVerifyResult[]; message?: string; hint?: string };
-    if (!response.ok) {
-      return {
-        success: false,
-        results: data.results ?? [],
-        message: data.message ?? `Verification failed (${response.status})`,
-        hint: data.hint,
-      };
-    }
-    return data as { success: boolean; results: PathVerifyResult[]; message?: string; hint?: string };
-  } catch (e) {
-    return { success: false, results: [], message: e instanceof Error ? e.message : 'Verification failed' };
-  }
-}
-
-export async function autodetectLibraries(plexHost?: string, plexToken?: string): Promise<{ success: boolean; libraries: Array<{ id: string; name: string; type?: string }>; message?: string }> {
-  try {
-    const body: Record<string, string> = {};
-    if (plexHost?.trim()) body.PLEX_HOST = plexHost.trim();
-    if (plexToken?.trim()) body.PLEX_TOKEN = plexToken.trim();
-    return await fetchApi('/api/autodetect/libraries', { method: 'POST', body: JSON.stringify(body) });
-  } catch {
-    return { success: false, libraries: [], message: 'Failed to autodetect libraries' };
-  }
-}
 
 // Stats calculation helper
 export function calculateStats(duplicates: DuplicateCard[], dedupeProgress: DedupeProgress) {
@@ -2724,7 +2686,7 @@ export interface LidarrConfig {
 }
 
 export async function testLidarr(url: string, apiKey: string): Promise<{ success: boolean; message: string }> {
-  const response = await fetch(`${API_BASE_URL}/api/lidarr/test`, {
+  const response = await fetchWithAuth('/api/lidarr/test', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ url, api_key: apiKey }),
@@ -2737,7 +2699,7 @@ export async function testLidarr(url: string, apiKey: string): Promise<{ success
 }
 
 export async function testAutobrr(url: string, apiKey: string): Promise<{ success: boolean; message: string }> {
-  const response = await fetch(`${API_BASE_URL}/api/autobrr/test`, {
+  const response = await fetchWithAuth('/api/autobrr/test', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ url, api_key: apiKey }),
@@ -2750,13 +2712,13 @@ export async function testAutobrr(url: string, apiKey: string): Promise<{ succes
 }
 
 export async function getBrokenAlbums(): Promise<BrokenAlbum[]> {
-  const response = await fetch(`${API_BASE_URL}/api/broken-albums`);
+  const response = await fetchWithAuth('/api/broken-albums');
   if (!response.ok) throw new Error('Failed to fetch broken albums');
   return response.json();
 }
 
 export async function addAlbumToLidarr(album: BrokenAlbum): Promise<{ success: boolean; message: string }> {
-  const response = await fetch(`${API_BASE_URL}/api/lidarr/add-album`, {
+  const response = await fetchWithAuth('/api/lidarr/add-album', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({

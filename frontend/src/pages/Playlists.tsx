@@ -4,6 +4,7 @@ import { ListMusic, Loader2, Plus } from 'lucide-react';
 
 import * as api from '@/lib/api';
 import { useToast } from '@/hooks/use-toast';
+import { useAuth } from '@/contexts/AuthContext';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from '@/components/ui/dialog';
@@ -13,6 +14,7 @@ import { Badge } from '@/components/ui/badge';
 
 export default function Playlists() {
   const navigate = useNavigate();
+  const { isAdmin } = useAuth();
   const { toast } = useToast();
 
   const [loading, setLoading] = useState(false);
@@ -70,39 +72,41 @@ export default function Playlists() {
             Local playlists stored in PostgreSQL. Drag tracks from the Now Playing queue onto a playlist in the sidebar.
           </p>
         </div>
-        <Dialog open={createOpen} onOpenChange={setCreateOpen}>
-          <DialogTrigger asChild>
-            <Button className="gap-2">
-              <Plus className="h-4 w-4" />
-              New playlist
-            </Button>
-          </DialogTrigger>
-          <DialogContent>
-            <DialogHeader>
-              <DialogTitle>Create playlist</DialogTitle>
-              <DialogDescription>Name it, then start dragging tracks into it.</DialogDescription>
-            </DialogHeader>
-            <div className="space-y-3">
-              <div className="space-y-1">
-                <div className="text-sm font-medium">Name</div>
-                <Input value={createName} onChange={(e) => setCreateName(e.target.value)} placeholder="e.g. Late-night headphones" />
-              </div>
-              <div className="space-y-1">
-                <div className="text-sm font-medium">Description (optional)</div>
-                <Textarea value={createDescription} onChange={(e) => setCreateDescription(e.target.value)} placeholder="Mood, gear, notes…" />
-              </div>
-            </div>
-            <DialogFooter>
-              <Button variant="outline" onClick={() => setCreateOpen(false)} disabled={creating}>
-                Cancel
+        {isAdmin ? (
+          <Dialog open={createOpen} onOpenChange={setCreateOpen}>
+            <DialogTrigger asChild>
+              <Button className="gap-2">
+                <Plus className="h-4 w-4" />
+                New playlist
               </Button>
-              <Button onClick={() => void create()} disabled={creating || !createName.trim()} className="gap-2">
-                {creating ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
-                Create
-              </Button>
-            </DialogFooter>
-          </DialogContent>
-        </Dialog>
+            </DialogTrigger>
+            <DialogContent>
+              <DialogHeader>
+                <DialogTitle>Create playlist</DialogTitle>
+                <DialogDescription>Name it, then start dragging tracks into it.</DialogDescription>
+              </DialogHeader>
+              <div className="space-y-3">
+                <div className="space-y-1">
+                  <div className="text-sm font-medium">Name</div>
+                  <Input value={createName} onChange={(e) => setCreateName(e.target.value)} placeholder="e.g. Late-night headphones" />
+                </div>
+                <div className="space-y-1">
+                  <div className="text-sm font-medium">Description (optional)</div>
+                  <Textarea value={createDescription} onChange={(e) => setCreateDescription(e.target.value)} placeholder="Mood, gear, notes…" />
+                </div>
+              </div>
+              <DialogFooter>
+                <Button variant="outline" onClick={() => setCreateOpen(false)} disabled={creating}>
+                  Cancel
+                </Button>
+                <Button onClick={() => void create()} disabled={creating || !createName.trim()} className="gap-2">
+                  {creating ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+                  Create
+                </Button>
+              </DialogFooter>
+            </DialogContent>
+          </Dialog>
+        ) : null}
       </div>
 
       {loading ? (
@@ -121,6 +125,7 @@ export default function Playlists() {
               <ListMusic className="h-6 w-6 text-muted-foreground" />
             </div>
             <div className="text-sm text-muted-foreground">No playlists yet.</div>
+            {!isAdmin ? <div className="text-xs text-muted-foreground">Read-only account: playlist creation is disabled.</div> : null}
           </CardContent>
         </Card>
       ) : (
@@ -157,4 +162,3 @@ export default function Playlists() {
     </div>
   );
 }
-

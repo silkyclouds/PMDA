@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
-import { ArrowLeft, Calendar, ExternalLink, ListPlus, Loader2, Music, Play, Plus } from 'lucide-react';
+import { ArrowLeft, Calendar, Download, ExternalLink, ListPlus, Loader2, Music, Play, Plus } from 'lucide-react';
 
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -12,6 +12,7 @@ import { FormatBadge } from '@/components/FormatBadge';
 import * as api from '@/lib/api';
 import { useToast } from '@/hooks/use-toast';
 import { usePlayback } from '@/contexts/PlaybackContext';
+import { useAuth } from '@/contexts/AuthContext';
 import type { TrackInfo } from '@/components/library/AudioPlayer';
 
 function formatDuration(seconds: number): string {
@@ -82,6 +83,7 @@ export default function AlbumPage() {
   const params = useParams<{ albumId: string }>();
   const albumId = Number(params.albumId);
   const { startPlayback, setCurrentTrack, queueTrack } = usePlayback();
+  const { isAdmin, canDownload } = useAuth();
   const { toast } = useToast();
 
   const [loading, setLoading] = useState(true);
@@ -91,6 +93,7 @@ export default function AlbumPage() {
   const [playlistsLoading, setPlaylistsLoading] = useState(false);
   const [playlists, setPlaylists] = useState<api.PlaylistSummary[]>([]);
   const [addingTrackId, setAddingTrackId] = useState<number | null>(null);
+  const [downloadingAlbum, setDownloadingAlbum] = useState(false);
   const durationRefreshAttemptsRef = useRef(0);
 
   const load = useCallback(async () => {
@@ -228,6 +231,23 @@ export default function AlbumPage() {
     });
   };
 
+  const handleDownloadAlbum = useCallback(async () => {
+    if (!data || downloadingAlbum) return;
+    setDownloadingAlbum(true);
+    try {
+      await api.downloadAlbumZip(data.album_id, data.artist_name, data.title);
+      toast({ title: 'Download started', description: 'Album archive is being saved.' });
+    } catch (e) {
+      toast({
+        title: 'Download failed',
+        description: e instanceof Error ? e.message : 'Unable to download this album',
+        variant: 'destructive',
+      });
+    } finally {
+      setDownloadingAlbum(false);
+    }
+  }, [data, downloadingAlbum, toast]);
+
   const handleAddTrackToPlaylist = useCallback(
     async (trackId: number, playlistId: number) => {
       if (!trackId || !playlistId) return;
@@ -295,6 +315,18 @@ export default function AlbumPage() {
               title="Open label"
             >
               {data.label}
+            </Button>
+          ) : null}
+          {(isAdmin || canDownload) ? (
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-8 gap-2"
+              onClick={() => void handleDownloadAlbum()}
+              disabled={downloadingAlbum}
+            >
+              {downloadingAlbum ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />}
+              Download
             </Button>
           ) : null}
           <Button size="sm" className="h-8 gap-2" onClick={handlePlay} disabled={playbackTracks.length === 0}>
@@ -435,7 +467,9 @@ export default function AlbumPage() {
                     <TableHead className="h-10 w-[90px] text-right text-[10px] uppercase tracking-wide">Duration</TableHead>
                     <TableHead className="h-10 w-[70px] text-right text-[10px] uppercase tracking-wide">Play</TableHead>
                     <TableHead className="h-10 w-[78px] text-right text-[10px] uppercase tracking-wide">Queue</TableHead>
-                    <TableHead className="h-10 w-[92px] text-right text-[10px] uppercase tracking-wide">Playlist</TableHead>
+                    {isAdmin ? (
+                      <TableHead className="h-10 w-[92px] text-right text-[10px] uppercase tracking-wide">Playlist</TableHead>
+                    ) : null}
                   </TableRow>
                 </TableHeader>
                 <TableBody>
@@ -501,47 +535,49 @@ export default function AlbumPage() {
                             <ListPlus className="h-4 w-4" />
                           </Button>
                         </TableCell>
-                        <TableCell className="py-3 text-right">
-                          <DropdownMenu>
-                            <DropdownMenuTrigger asChild>
-                              <Button
-                                type="button"
-                                size="icon"
-                                variant="ghost"
-                                className="h-8 w-8 rounded-full"
-                                title="Add to playlist"
-                                disabled={!canStream || addingTrackId === t.track_id}
-                              >
-                                {addingTrackId === t.track_id ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
-                              </Button>
-                            </DropdownMenuTrigger>
-                            <DropdownMenuContent align="end" className="w-64">
-                              <DropdownMenuLabel>Add to playlist</DropdownMenuLabel>
-                              <DropdownMenuSeparator />
-                              {playlistsLoading ? (
-                                <DropdownMenuItem disabled>Loading playlists…</DropdownMenuItem>
-                              ) : playlists.length === 0 ? (
-                                <DropdownMenuItem onSelect={() => navigate('/library/playlists')}>
-                                  Create a playlist
-                                </DropdownMenuItem>
-                              ) : (
-                                playlists.slice(0, 20).map((pl) => (
-                                  <DropdownMenuItem
-                                    key={`pl-add-${pl.playlist_id}`}
-                                    onSelect={() => void handleAddTrackToPlaylist(t.track_id, pl.playlist_id)}
-                                  >
-                                    <span className="truncate">{pl.name}</span>
-                                    <span className="ml-auto text-xs text-muted-foreground">{pl.item_count}</span>
+                        {isAdmin ? (
+                          <TableCell className="py-3 text-right">
+                            <DropdownMenu>
+                              <DropdownMenuTrigger asChild>
+                                <Button
+                                  type="button"
+                                  size="icon"
+                                  variant="ghost"
+                                  className="h-8 w-8 rounded-full"
+                                  title="Add to playlist"
+                                  disabled={!canStream || addingTrackId === t.track_id}
+                                >
+                                  {addingTrackId === t.track_id ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
+                                </Button>
+                              </DropdownMenuTrigger>
+                              <DropdownMenuContent align="end" className="w-64">
+                                <DropdownMenuLabel>Add to playlist</DropdownMenuLabel>
+                                <DropdownMenuSeparator />
+                                {playlistsLoading ? (
+                                  <DropdownMenuItem disabled>Loading playlists…</DropdownMenuItem>
+                                ) : playlists.length === 0 ? (
+                                  <DropdownMenuItem onSelect={() => navigate('/library/playlists')}>
+                                    Create a playlist
                                   </DropdownMenuItem>
-                                ))
-                              )}
-                              <DropdownMenuSeparator />
-                              <DropdownMenuItem onSelect={() => navigate('/library/playlists')}>
-                                Manage playlists
-                              </DropdownMenuItem>
-                            </DropdownMenuContent>
-                          </DropdownMenu>
-                        </TableCell>
+                                ) : (
+                                  playlists.slice(0, 20).map((pl) => (
+                                    <DropdownMenuItem
+                                      key={`pl-add-${pl.playlist_id}`}
+                                      onSelect={() => void handleAddTrackToPlaylist(t.track_id, pl.playlist_id)}
+                                    >
+                                      <span className="truncate">{pl.name}</span>
+                                      <span className="ml-auto text-xs text-muted-foreground">{pl.item_count}</span>
+                                    </DropdownMenuItem>
+                                  ))
+                                )}
+                                <DropdownMenuSeparator />
+                                <DropdownMenuItem onSelect={() => navigate('/library/playlists')}>
+                                  Manage playlists
+                                </DropdownMenuItem>
+                              </DropdownMenuContent>
+                            </DropdownMenu>
+                          </TableCell>
+                        ) : null}
                       </TableRow>
                     );
                   })}

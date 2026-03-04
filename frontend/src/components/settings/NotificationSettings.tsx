@@ -17,9 +17,15 @@ interface NotificationSettingsProps {
 export function NotificationSettings({ config, updateConfig, errors }: NotificationSettingsProps) {
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<{ success: boolean; message: string } | null>(null);
+  const webhookRaw = String(config.DISCORD_WEBHOOK || '');
+  const webhookMasked = webhookRaw.trim() === '***';
 
   const testDiscord = async () => {
-    const webhook = config.DISCORD_WEBHOOK?.trim();
+    const webhook = webhookRaw.trim();
+    if (webhookMasked) {
+      setTestResult({ success: false, message: 'Enter the webhook URL to run a test.' });
+      return;
+    }
     if (!webhook) {
       setTestResult({ success: false, message: 'Discord webhook URL is required' });
       return;
@@ -88,9 +94,14 @@ export function NotificationSettings({ config, updateConfig, errors }: Notificat
             <p className="text-xs text-muted-foreground">
               Optional. PMDA will send a notification to this webhook when a scan completes.
             </p>
+            {webhookMasked || config.DISCORD_WEBHOOK_SET ? (
+              <p className="text-xs text-muted-foreground">
+                A webhook is already configured. Enter a new value only if you want to rotate it.
+              </p>
+            ) : null}
           </div>
 
-          {config.DISCORD_WEBHOOK?.trim() && (
+          {config.DISCORD_WEBHOOK?.trim() && !webhookMasked && (
             <Button
               variant="secondary"
               onClick={testDiscord}

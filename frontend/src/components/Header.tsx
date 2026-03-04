@@ -6,6 +6,7 @@ import { Progress } from '@/components/ui/progress';
 import { GlobalStatusBar } from '@/components/GlobalStatusBar';
 import { GlobalSearch } from '@/components/GlobalSearch';
 import * as api from '@/lib/api';
+import { useAuth } from '@/contexts/AuthContext';
 
 const WELCOME_COOKIE = 'pmda_welcome_dismissed';
 
@@ -60,6 +61,7 @@ function RebootCountdown({ onComplete, onProgress }: { onComplete: () => void; o
 }
 
 export function Header() {
+  const { isAdmin } = useAuth();
   const [showSettings, setShowSettings] = useState(false);
   const [isRebooting, setIsRebooting] = useState(false);
   const [rebootCountdown, setRebootCountdown] = useState(30);
@@ -69,6 +71,12 @@ export function Header() {
 
   // Check if PMDA is configured and load config (for welcome modal mounts checklist)
   useEffect(() => {
+    if (!isAdmin) {
+      setShowSettings(false);
+      setIsConfigured(true);
+      setConfig(null);
+      return;
+    }
     api.getConfig().then((data) => {
       setConfig(data);
       const configured = data.configured === true;
@@ -77,7 +85,7 @@ export function Header() {
         setShowSettings(true);
       }
     }).catch(() => {});
-  }, []);
+  }, [isAdmin]);
 
   return (
     <>
@@ -96,10 +104,10 @@ export function Header() {
       </header>
       
       {/* Global status bar below header */}
-      <GlobalStatusBar />
+      {isAdmin ? <GlobalStatusBar /> : null}
 
       {/* Welcome modal when not configured */}
-      {showSettings && !isConfigured && (
+      {isAdmin && showSettings && !isConfigured && (
         <WelcomeModal
           onClose={() => {
             setWelcomeCookie();
