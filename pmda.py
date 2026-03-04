@@ -1119,82 +1119,87 @@ try:
 except Exception as e:
     logging.debug("Could not load SECTION_IDS from SQLite at startup: %s", e)
 
-try:
-    plex_host = (_get_from_sqlite("PLEX_HOST", "") or "").strip() if isinstance(_get_from_sqlite("PLEX_HOST", ""), str) else ""
-    plex_token = (_get_from_sqlite("PLEX_TOKEN", "") or "").strip() if isinstance(_get_from_sqlite("PLEX_TOKEN", ""), str) else ""
-    # Require a URL-like host so we never call Plex API with empty/invalid base
-    if not plex_host or not plex_token or not str(plex_host).strip().startswith(("http://", "https://")):
-        logging.info("PLEX_HOST or PLEX_TOKEN missing or invalid – starting in unconfigured (wizard) mode")
-    else:
-        # SECTION_IDS already loaded from SQLite above; do not use env/config
-        raw_sections = None
+_startup_library_mode_raw = _get_from_sqlite("LIBRARY_MODE", os.getenv("LIBRARY_MODE", "files"))
+_startup_library_mode = str(_startup_library_mode_raw or "files").strip().lower()
+if _startup_library_mode != "plex":
+    logging.info("Skipping startup Plex PATH_MAP discovery (LIBRARY_MODE=%s).", _startup_library_mode or "files")
+else:
+    try:
+        plex_host = (_get_from_sqlite("PLEX_HOST", "") or "").strip() if isinstance(_get_from_sqlite("PLEX_HOST", ""), str) else ""
+        plex_token = (_get_from_sqlite("PLEX_TOKEN", "") or "").strip() if isinstance(_get_from_sqlite("PLEX_TOKEN", ""), str) else ""
+        # Require a URL-like host so we never call Plex API with empty/invalid base
+        if not plex_host or not plex_token or not str(plex_host).strip().startswith(("http://", "https://")):
+            logging.info("PLEX_HOST or PLEX_TOKEN missing or invalid – starting in unconfigured (wizard) mode")
+        else:
+            # SECTION_IDS already loaded from SQLite above; do not use env/config
+            raw_sections = None
 
-        # Treat an empty string or whitespace‑only value as “not provided”
-        logging.debug("SECTION_IDS from SQLite: %r", SECTION_IDS)
+            # Treat an empty string or whitespace‑only value as “not provided”
+            logging.debug("SECTION_IDS from SQLite: %r", SECTION_IDS)
 
-        # Only auto-detect if we don't already have SECTION_IDS from SQLite (user's saved selection)
-        if not raw_sections:
-            if not SECTION_IDS:
+            # Only auto-detect if we don't already have SECTION_IDS from SQLite (user's saved selection)
+            if not raw_sections:
+                if not SECTION_IDS:
+                    try:
+                        resp = requests.get(f"{plex_host.rstrip('/')}/library/sections", headers={"X-Plex-Token": plex_token}, timeout=10)
+                        root = ET.fromstring(resp.text)
+                        SECTION_IDS = [int(d.attrib['key']) for d in root.iter("Directory") if d.attrib.get('type') == 'artist']
+                        logging.info("Auto-detected SECTION_IDS from Plex: %s", SECTION_IDS)
+                    except Exception as e:
+                        logging.error("Failed to auto-detect SECTION_IDS: %s", e)
+                        SECTION_IDS = []
+                else:
+                    logging.info("Using SECTION_IDS from SQLite (saved selection): %s", SECTION_IDS)
+            if SECTION_IDS:
                 try:
                     resp = requests.get(f"{plex_host.rstrip('/')}/library/sections", headers={"X-Plex-Token": plex_token}, timeout=10)
                     root = ET.fromstring(resp.text)
-                    SECTION_IDS = [int(d.attrib['key']) for d in root.iter("Directory") if d.attrib.get('type') == 'artist']
-                    logging.info("Auto-detected SECTION_IDS from Plex: %s", SECTION_IDS)
-                except Exception as e:
-                    logging.error("Failed to auto-detect SECTION_IDS: %s", e)
-                    SECTION_IDS = []
-            else:
-                logging.info("Using SECTION_IDS from SQLite (saved selection): %s", SECTION_IDS)
-        if SECTION_IDS:
-            try:
-                resp = requests.get(f"{plex_host.rstrip('/')}/library/sections", headers={"X-Plex-Token": plex_token}, timeout=10)
-                root = ET.fromstring(resp.text)
-                SECTION_NAMES.update({int(directory.attrib['key']): directory.attrib.get('title', '<unknown>') for directory in root.iter('Directory')})
-            except Exception:
-                pass
-            if SECTION_NAMES:
-                log_header("libraries")
+                    SECTION_NAMES.update({int(directory.attrib['key']): directory.attrib.get('title', '<unknown>') for directory in root.iter('Directory')})
+                except Exception:
+                    pass
+                if SECTION_NAMES:
+                    log_header("libraries")
+                    for sid in SECTION_IDS:
+                        name = SECTION_NAMES.get(sid, "<unknown>")
+                        logging.info("  %s (ID %d)", name, sid)
+                auto_map = {}
                 for sid in SECTION_IDS:
-                    name = SECTION_NAMES.get(sid, "<unknown>")
-                    logging.info("  %s (ID %d)", name, sid)
-            auto_map = {}
-            for sid in SECTION_IDS:
-                part = _discover_path_map(plex_host, plex_token, sid)
-                auto_map.update(part)
-            log_header("path_map discovery")
-            logging.info("Auto‑generated raw PATH_MAP from Plex: %s", auto_map)
-            raw_env_map = _parse_path_map(_get_from_sqlite("PATH_MAP") or {})
-            logging.info("Raw PATH_MAP from SQLite: %s", raw_env_map)
-            merged_map = {}
-            for cont_path, cont_val in auto_map.items():
-                mapped = False
-                for prefix, host_base in sorted(raw_env_map.items(), key=lambda item: len(item[0]), reverse=True):
-                    if cont_path.startswith(prefix):
-                        suffix = cont_path[len(prefix):].lstrip("/")
-                        merged_map[cont_path] = os.path.join(host_base, suffix)
-                        mapped = True
-                        break
-                if not mapped:
-                    merged_map[cont_path] = cont_val
-            logging.info("Merged PATH_MAP for startup: %s", merged_map)
-            log_header("volume bindings (plex → pmda → host)")
-            logging.info("%-40s | %-30s | %s", "PLEX_PATH", "PMDA_PATH", "HOST_PATH")
-            for plex_path, host_path in merged_map.items():
-                logging.info("%-40s | %-30s | %s", plex_path, host_path, host_path)
-            # Persist PATH_MAP to settings.db (single source of truth)
-            try:
-                init_settings_db()
-                con = sqlite3.connect(str(SETTINGS_DB_FILE), timeout=5)
-                con.execute("INSERT OR REPLACE INTO settings(key, value) VALUES('PATH_MAP', ?)", (json.dumps(merged_map),))
-                con.commit()
-                con.close()
-            except Exception as e:
-                logging.debug("Could not persist PATH_MAP to settings.db at discovery: %s", e)
-            logging.info("Auto-generated/updated PATH_MAP from Plex (saved to settings.db)")
-except Exception as e:
-    logging.warning("⚠️  Failed to auto‑generate PATH_MAP – %s", e)
-    SECTION_IDS = []
-    SECTION_NAMES = {}
+                    part = _discover_path_map(plex_host, plex_token, sid)
+                    auto_map.update(part)
+                log_header("path_map discovery")
+                logging.info("Auto‑generated raw PATH_MAP from Plex: %s", auto_map)
+                raw_env_map = _parse_path_map(_get_from_sqlite("PATH_MAP") or {})
+                logging.info("Raw PATH_MAP from SQLite: %s", raw_env_map)
+                merged_map = {}
+                for cont_path, cont_val in auto_map.items():
+                    mapped = False
+                    for prefix, host_base in sorted(raw_env_map.items(), key=lambda item: len(item[0]), reverse=True):
+                        if cont_path.startswith(prefix):
+                            suffix = cont_path[len(prefix):].lstrip("/")
+                            merged_map[cont_path] = os.path.join(host_base, suffix)
+                            mapped = True
+                            break
+                    if not mapped:
+                        merged_map[cont_path] = cont_val
+                logging.info("Merged PATH_MAP for startup: %s", merged_map)
+                log_header("volume bindings (plex → pmda → host)")
+                logging.info("%-40s | %-30s | %s", "PLEX_PATH", "PMDA_PATH", "HOST_PATH")
+                for plex_path, host_path in merged_map.items():
+                    logging.info("%-40s | %-30s | %s", plex_path, host_path, host_path)
+                # Persist PATH_MAP to settings.db (single source of truth)
+                try:
+                    init_settings_db()
+                    con = sqlite3.connect(str(SETTINGS_DB_FILE), timeout=5)
+                    con.execute("INSERT OR REPLACE INTO settings(key, value) VALUES('PATH_MAP', ?)", (json.dumps(merged_map),))
+                    con.commit()
+                    con.close()
+                except Exception as e:
+                    logging.debug("Could not persist PATH_MAP to settings.db at discovery: %s", e)
+                logging.info("Auto-generated/updated PATH_MAP from Plex (saved to settings.db)")
+    except Exception as e:
+        logging.warning("⚠️  Failed to auto‑generate PATH_MAP – %s", e)
+        SECTION_IDS = []
+        SECTION_NAMES = {}
 
 # (4) Merge with environment variables ----------------------------------------
 ENV_SOURCES: dict[str, str] = {}
