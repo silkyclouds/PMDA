@@ -16,6 +16,11 @@ export function GlobalStatusBar() {
     isDeduping,
     isIdle, 
     progressPercent, 
+    phase,
+    preScanActive,
+    preScanStageLabel,
+    preScanStatusLabel,
+    preScanCountersLabel,
     currentArtist,
     lastScanSummary,
     dedupePercent,
@@ -104,15 +109,19 @@ export function GlobalStatusBar() {
               <>
                 <div className="flex items-center gap-2">
                   <RefreshCw className="w-4 h-4 text-primary animate-spin" />
-                  <span className="text-sm font-medium text-foreground">Scanning</span>
+                  <span className="text-sm font-medium text-foreground">
+                    {preScanActive || phase === 'pre_scan'
+                      ? `Scanning · pre-scan${preScanActive && preScanStageLabel && preScanStageLabel !== 'pre-scan' ? ` · ${preScanStageLabel}` : ''}`
+                      : 'Scanning'}
+                  </span>
                 </div>
                 <div className="hidden sm:flex items-center gap-2 min-w-0">
                   <Progress value={progressPercent} className="w-28 h-1.5" />
                   <span className="text-xs text-muted-foreground tabular-nums font-medium">{Math.round(progressPercent)}%</span>
                 </div>
-                {currentArtist && (
+                {(preScanActive ? preScanStatusLabel : currentArtist) && (
                   <span className="hidden lg:block text-xs text-muted-foreground truncate max-w-48">
-                    {currentArtist}
+                    {preScanActive ? `${preScanStatusLabel} · ${preScanCountersLabel}` : currentArtist}
                   </span>
                 )}
               </>

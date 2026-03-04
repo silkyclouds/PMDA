@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { 
-  Menu, Scan, Package, Library, 
+  Menu, Scan, Library, 
   BarChart2, Settings, Wrench
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
@@ -59,10 +59,13 @@ export function MobileNav({ duplicateCount, onSettingsClick }: MobileNavProps) {
       <SheetContent side="left" className="w-72 p-0">
         <SheetHeader className="p-4 border-b border-border">
           <SheetTitle className="flex items-center gap-2 text-left">
-            <div className="flex items-center justify-center w-8 h-8 rounded-lg bg-primary text-primary-foreground">
-              <Package className="w-4 h-4" />
-            </div>
-            <span>PMDA</span>
+            <img
+              src="/pmda-logo-mute-v1-transparent-cropped.png"
+              alt="PMDA"
+              className="h-7 w-auto object-contain"
+              loading="eager"
+              decoding="async"
+            />
           </SheetTitle>
         </SheetHeader>
         

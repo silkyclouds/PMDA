@@ -7721,6 +7721,31 @@ def _trigger_files_index_rebuild_async(reason: str = "manual") -> bool:
     return True
 
 
+_FILES_INDEX_REBUILD_TRIGGER_LOCK = threading.Lock()
+_FILES_INDEX_REBUILD_LAST_TRIGGER: dict[str, float] = {}
+
+
+def _trigger_files_index_rebuild_async_throttled(reason: str, cooldown_sec: float = 30.0) -> bool:
+    """
+    Trigger an async files index rebuild with a small per-reason cooldown.
+    This avoids endpoint polling storms from enqueueing repeated no-op rebuilds.
+    """
+    reason_norm = str(reason or "manual").strip() or "manual"
+    now = time.time()
+    cooldown = max(1.0, float(cooldown_sec or 0.0))
+    with _FILES_INDEX_REBUILD_TRIGGER_LOCK:
+        last_ts = float(_FILES_INDEX_REBUILD_LAST_TRIGGER.get(reason_norm, 0.0) or 0.0)
+        if (now - last_ts) < cooldown:
+            return False
+        _FILES_INDEX_REBUILD_LAST_TRIGGER[reason_norm] = now
+    started = _trigger_files_index_rebuild_async(reason=reason_norm)
+    if not started:
+        with _FILES_INDEX_REBUILD_TRIGGER_LOCK:
+            # Allow a quick retry when a worker is already in-flight.
+            _FILES_INDEX_REBUILD_LAST_TRIGGER[reason_norm] = max(0.0, now - (cooldown * 0.5))
+    return started
+
+
 def _rebuild_files_reco_embeddings(reason: str = "manual", wait_if_running: bool = False) -> dict:
     if _get_library_mode() != "files":
         return {"ok": False, "error": "LIBRARY_MODE is not 'files'"}
@@ -12045,6 +12070,21 @@ state = {
     "scan_discovery_folders_found": 0,
     "scan_discovery_albums_found": 0,
     "scan_discovery_artists_found": 0,
+    "scan_discovery_stage": "idle",   # idle | filesystem | album_candidates | ready | cancelled
+    "scan_discovery_entries_scanned": 0,
+    "scan_discovery_root_entries_scanned": 0,
+    "scan_discovery_folders_done": 0,
+    "scan_discovery_folders_total": 0,
+    "scan_discovery_albums_done": 0,
+    "scan_discovery_albums_total": 0,
+    "scan_discovery_started_at": None,
+    "scan_discovery_updated_at": None,
+    # Track-level reconciliation for current/last run.
+    "scan_tracks_detected_total": 0,
+    "scan_tracks_library_kept": 0,
+    "scan_tracks_moved_dupes": 0,
+    "scan_tracks_moved_incomplete": 0,
+    "scan_tracks_unaccounted": 0,
     "improve_all": None,              # { "running": bool, "artist_id": int, "current": int, "total": int, "log": [], "result": {}, "error": str } or None
     "last_fix_all_by_provider": None, # { "musicbrainz": {identified,covers,tags}, "discogs": ..., "lastfm": ..., "bandcamp": ... } from last global fix-all run
     "last_fix_all_total_albums": 0,   # Total albums processed in that run (for N/M match display)
@@ -13095,106 +13135,165 @@ def _iter_audio_files_under_roots(
     progress_cb=None,
     progress_every: int = 250,
     heartbeat_seconds: float = 10.0,
+    stop_event: threading.Event | None = None,
 ) -> list[Path]:
     """
     Return a list of audio files under the given filesystem roots.
     This helper is backend‑agnostic and only cares about AUDIO_RE matches.
     """
-    out: list[Path] = []
-    seen_paths: set[str] = set()
-    files_found = 0
-    entries_scanned = 0
-    roots_total = len([r for r in (roots or []) if r])
-    roots_done = 0
+    roots_list = [str(r) for r in (roots or []) if r]
+    roots_total = len(roots_list)
+    if roots_total <= 0:
+        return []
+
+    progress_every = max(1, int(progress_every)) if progress_every else 0
     heartbeat_seconds = float(heartbeat_seconds or 0.0)
-    last_heartbeat = time.monotonic()
-    for root in roots:
-        if not root:
-            continue
-        base = Path(root)
-        root_entries_scanned = 0
+    progress_enabled = callable(progress_cb)
+
+    progress_lock = threading.Lock()
+    shared_entries_scanned = 0
+    shared_files_found = 0
+    shared_roots_done = 0
+
+    def _emit_progress(
+        *,
+        root: str,
+        root_entries_scanned: int,
+        delta_entries: int = 0,
+        delta_files: int = 0,
+        done_root: bool = False,
+    ) -> None:
+        nonlocal shared_entries_scanned, shared_files_found, shared_roots_done
+        if not progress_enabled:
+            return
+        with progress_lock:
+            if delta_entries:
+                shared_entries_scanned += max(0, int(delta_entries))
+            if delta_files:
+                shared_files_found += max(0, int(delta_files))
+            if done_root:
+                shared_roots_done += 1
+            payload = {
+                "root": root,
+                "roots_done": shared_roots_done,
+                "roots_total": roots_total,
+                "files_found": shared_files_found,
+                "entries_scanned": shared_entries_scanned,
+                "root_entries_scanned": max(0, int(root_entries_scanned)),
+                "done": shared_roots_done >= roots_total,
+            }
+        try:
+            progress_cb(payload)
+        except Exception:
+            pass
+
+    def _scan_single_root(root_path: str) -> list[Path]:
+        base = Path(root_path)
+        if stop_event is not None and stop_event.is_set():
+            return []
+
+        root_entries = 0
+        root_audio_found = 0
+        pending_entries = 0
+        pending_files = 0
+        interrupted = False
+        local_out: list[Path] = []
+        last_heartbeat = time.monotonic()
+
+        def _flush(*, done_root: bool = False, force: bool = False) -> None:
+            nonlocal pending_entries, pending_files, last_heartbeat
+            if not progress_enabled:
+                pending_entries = 0
+                pending_files = 0
+                return
+            if not force and not done_root and pending_entries <= 0 and pending_files <= 0:
+                return
+            _emit_progress(
+                root=str(base),
+                root_entries_scanned=root_entries,
+                delta_entries=pending_entries,
+                delta_files=pending_files,
+                done_root=done_root,
+            )
+            pending_entries = 0
+            pending_files = 0
+            last_heartbeat = time.monotonic()
+
         if not base.exists():
-            logging.debug("FILES_ROOTS entry %s does not exist; skipping", root)
-            roots_done += 1
-            if callable(progress_cb):
-                try:
-                    progress_cb(
-                        {
-                            "root": str(base),
-                            "roots_done": roots_done,
-                            "roots_total": roots_total,
-                            "files_found": files_found,
-                            "entries_scanned": entries_scanned,
-                            "root_entries_scanned": root_entries_scanned,
-                            "done": roots_done >= roots_total,
-                        }
-                    )
-                except Exception:
-                    pass
-            continue
-        for p in base.rglob("*"):
-            entries_scanned += 1
-            root_entries_scanned += 1
-            if callable(progress_cb) and heartbeat_seconds > 0:
-                now = time.monotonic()
-                if (now - last_heartbeat) >= heartbeat_seconds:
-                    last_heartbeat = now
-                    try:
-                        progress_cb(
-                            {
-                                "root": str(base),
-                                "roots_done": roots_done,
-                                "roots_total": roots_total,
-                                "files_found": files_found,
-                                "entries_scanned": entries_scanned,
-                                "root_entries_scanned": root_entries_scanned,
-                                "done": False,
-                            }
-                        )
-                    except Exception:
-                        pass
+            logging.debug("FILES_ROOTS entry %s does not exist; skipping", root_path)
+            _flush(done_root=True, force=True)
+            return local_out
+
+        stack: list[str] = [str(base)]
+        while stack:
+            if stop_event is not None and stop_event.is_set():
+                interrupted = True
+                break
+            current = stack.pop()
             try:
-                if p.is_file() and AUDIO_RE.search(p.name):
-                    sp = str(p)
-                    if sp in seen_paths:
-                        continue
-                    seen_paths.add(sp)
-                    out.append(p)
-                    files_found += 1
-                    if callable(progress_cb) and progress_every > 0 and (files_found % progress_every == 0):
+                with os.scandir(current) as it:
+                    for entry in it:
+                        if stop_event is not None and stop_event.is_set():
+                            interrupted = True
+                            break
+                        root_entries += 1
+                        pending_entries += 1
                         try:
-                            progress_cb(
-                                {
-                                    "root": str(base),
-                                    "roots_done": roots_done,
-                                    "roots_total": roots_total,
-                                    "files_found": files_found,
-                                    "entries_scanned": entries_scanned,
-                                    "root_entries_scanned": root_entries_scanned,
-                                    "done": False,
-                                }
-                            )
-                        except Exception:
-                            pass
-            except (OSError, PermissionError):
+                            if entry.is_dir(follow_symlinks=False):
+                                stack.append(entry.path)
+                            elif entry.is_file(follow_symlinks=False) and AUDIO_RE.search(entry.name):
+                                local_out.append(Path(entry.path))
+                                root_audio_found += 1
+                                pending_files += 1
+                                if progress_every > 0 and (root_audio_found % progress_every == 0):
+                                    _flush()
+                        except (OSError, PermissionError):
+                            continue
+
+                        if progress_enabled and heartbeat_seconds > 0:
+                            now = time.monotonic()
+                            if (now - last_heartbeat) >= heartbeat_seconds:
+                                _flush()
+            except (FileNotFoundError, NotADirectoryError, PermissionError, OSError):
                 continue
-        roots_done += 1
-        if callable(progress_cb):
-            try:
-                progress_cb(
-                    {
-                        "root": str(base),
-                        "roots_done": roots_done,
-                        "roots_total": roots_total,
-                        "files_found": files_found,
-                        "entries_scanned": entries_scanned,
-                        "root_entries_scanned": root_entries_scanned,
-                        "done": roots_done >= roots_total,
-                    }
-                )
-            except Exception:
-                pass
-    return out
+
+        if interrupted:
+            _flush(force=True)
+        else:
+            _flush(done_root=True, force=True)
+        return local_out
+
+    workers = 1 if roots_total <= 1 else min(2, roots_total)
+    results_by_idx: dict[int, list[Path]] = {}
+    if workers == 1:
+        for idx, root_path in enumerate(roots_list):
+            if stop_event is not None and stop_event.is_set():
+                break
+            results_by_idx[idx] = _scan_single_root(root_path)
+    else:
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="pmda-files-discovery") as pool:
+            future_to_idx = {
+                pool.submit(_scan_single_root, root_path): idx
+                for idx, root_path in enumerate(roots_list)
+            }
+            for fut in as_completed(future_to_idx):
+                idx = future_to_idx[fut]
+                try:
+                    results_by_idx[idx] = fut.result()
+                except Exception:
+                    logging.debug("FILES discovery worker failed for root index %d", idx, exc_info=True)
+                    results_by_idx[idx] = []
+
+    merged: list[Path] = []
+    seen_paths: set[str] = set()
+    for idx in range(roots_total):
+        for path in results_by_idx.get(idx, []):
+            sp = str(path)
+            if sp in seen_paths:
+                continue
+            seen_paths.add(sp)
+            merged.append(path)
+    return merged
 
 # Global ffprobe pool for parallel processing
 _ffprobe_pool: Optional[ThreadPoolExecutor] = None
@@ -20741,8 +20840,15 @@ def _reset_files_live_index_for_scan() -> None:
     if not _files_pg_init_schema():
         logging.warning("Files live index reset: PostgreSQL schema unavailable")
         return
-    acquired = files_index_lock.acquire(blocking=True)
+    # Never block scan startup behind a long-running async index bootstrap.
+    # If the lock is busy, skip PG truncate for now and let scan-driven sync refresh progressively.
+    acquired = files_index_lock.acquire(blocking=False)
     if not acquired:
+        idx_state = _files_index_get_state() or {}
+        logging.info(
+            "Files live index reset skipped PG truncate (index lock busy, phase=%s); scan will continue.",
+            str(idx_state.get("phase") or "unknown"),
+        )
         return
     try:
         conn = _files_pg_connect()
@@ -21590,6 +21696,16 @@ def _build_files_editions(scan_type: str = "full") -> tuple[list[tuple[int, str,
             state["scan_discovery_folders_found"] = 0
             state["scan_discovery_albums_found"] = 0
             state["scan_discovery_artists_found"] = 0
+            state["scan_discovery_stage"] = "idle"
+            state["scan_discovery_entries_scanned"] = 0
+            state["scan_discovery_root_entries_scanned"] = 0
+            state["scan_discovery_folders_done"] = 0
+            state["scan_discovery_folders_total"] = 0
+            state["scan_discovery_albums_done"] = 0
+            state["scan_discovery_albums_total"] = 0
+            state["scan_discovery_started_at"] = None
+            state["scan_discovery_updated_at"] = time.time()
+            state["scan_tracks_detected_total"] = 0
         return [], 0, {}
 
     skip_list = list(SKIP_FOLDERS or [])
@@ -21619,6 +21735,22 @@ def _build_files_editions(scan_type: str = "full") -> tuple[list[tuple[int, str,
     heartbeat_frames = ("|", "/", "-", "\\")
     heartbeat_idx = 0
     last_heartbeat_ts = 0.0
+    discovery_started_at = time.time()
+
+    def _set_discovery_state(**updates: object) -> None:
+        updates["scan_discovery_updated_at"] = time.time()
+        with lock:
+            for key, value in updates.items():
+                state[key] = value
+
+    def _cancel_discovery(reason: str = "cancelled") -> tuple[list[tuple[int, str, list[int]]], int, dict]:
+        _set_discovery_state(
+            scan_discovery_running=False,
+            scan_discovery_stage="cancelled",
+            scan_discovery_current_root=None,
+        )
+        _emit_files_discovery_heartbeat(reason, force=True)
+        return [], 0, {}
 
     def _emit_files_discovery_heartbeat(
         stage: str,
@@ -21761,15 +21893,28 @@ def _build_files_editions(scan_type: str = "full") -> tuple[list[tuple[int, str,
         state["scan_discovery_folders_found"] = 0
         state["scan_discovery_albums_found"] = 0
         state["scan_discovery_artists_found"] = 0
+        state["scan_discovery_stage"] = "filesystem"
+        state["scan_discovery_entries_scanned"] = 0
+        state["scan_discovery_root_entries_scanned"] = 0
+        state["scan_discovery_folders_done"] = 0
+        state["scan_discovery_folders_total"] = 0
+        state["scan_discovery_albums_done"] = 0
+        state["scan_discovery_albums_total"] = 0
+        state["scan_discovery_started_at"] = discovery_started_at
+        state["scan_discovery_updated_at"] = discovery_started_at
 
     def _on_discovery_progress(payload: dict) -> None:
         try:
-            with lock:
-                state["scan_discovery_running"] = not bool(payload.get("done"))
-                state["scan_discovery_current_root"] = payload.get("root")
-                state["scan_discovery_roots_done"] = int(payload.get("roots_done") or 0)
-                state["scan_discovery_roots_total"] = int(payload.get("roots_total") or len(roots))
-                state["scan_discovery_files_found"] = int(payload.get("files_found") or 0)
+            _set_discovery_state(
+                scan_discovery_running=not bool(payload.get("done")),
+                scan_discovery_stage="filesystem",
+                scan_discovery_current_root=payload.get("root"),
+                scan_discovery_roots_done=int(payload.get("roots_done") or 0),
+                scan_discovery_roots_total=int(payload.get("roots_total") or len(roots)),
+                scan_discovery_files_found=int(payload.get("files_found") or 0),
+                scan_discovery_entries_scanned=int(payload.get("entries_scanned") or 0),
+                scan_discovery_root_entries_scanned=int(payload.get("root_entries_scanned") or 0),
+            )
         except Exception:
             pass
         _emit_files_discovery_heartbeat(
@@ -21787,9 +21932,19 @@ def _build_files_editions(scan_type: str = "full") -> tuple[list[tuple[int, str,
     if scan_type == "changed_only" and changed_pending_folder_keys:
         folders_total_pending = len(changed_pending_folder_keys)
         for idx, folder_key in enumerate(changed_pending_folder_keys, start=1):
+            if scan_should_stop.is_set():
+                log_scan("FILES discovery cancelled during watcher queue scan.")
+                return _cancel_discovery()
             folder_path = path_for_fs_access(Path(folder_key))
             if not folder_path.exists() or not folder_path.is_dir():
                 changed_pending_deleted_folder_keys.append(folder_key)
+                _set_discovery_state(
+                    scan_discovery_running=True,
+                    scan_discovery_stage="filesystem",
+                    scan_discovery_roots_done=idx,
+                    scan_discovery_roots_total=folders_total_pending,
+                    scan_discovery_files_found=len(audio_files),
+                )
                 _emit_files_discovery_heartbeat(
                     "watcher queue scan",
                     folders_done=idx,
@@ -21810,6 +21965,13 @@ def _build_files_editions(scan_type: str = "full") -> tuple[list[tuple[int, str,
             else:
                 by_folder[folder_path].extend(album_files)
                 audio_files.extend(album_files)
+            _set_discovery_state(
+                scan_discovery_running=True,
+                scan_discovery_stage="filesystem",
+                scan_discovery_roots_done=idx,
+                scan_discovery_roots_total=folders_total_pending,
+                scan_discovery_files_found=len(audio_files),
+            )
             _emit_files_discovery_heartbeat(
                 "watcher queue scan",
                 folders_done=idx,
@@ -21823,14 +21985,26 @@ def _build_files_editions(scan_type: str = "full") -> tuple[list[tuple[int, str,
             progress_cb=_on_discovery_progress,
             progress_every=250,
             heartbeat_seconds=5.0,
+            stop_event=scan_should_stop,
         )
+        if scan_should_stop.is_set():
+            log_scan("FILES discovery cancelled during filesystem walk.")
+            return _cancel_discovery()
         for p in audio_files:
             by_folder[p.parent].append(p)
-    with lock:
-        state["scan_discovery_files_found"] = len(audio_files)
-        state["scan_discovery_folders_found"] = len(by_folder)
-        state["scan_discovery_running"] = False
-        state["scan_discovery_roots_done"] = len(roots)
+    _set_discovery_state(
+        scan_discovery_running=True,
+        scan_discovery_stage="album_candidates",
+        scan_discovery_roots_done=len(roots),
+        scan_discovery_roots_total=len(roots),
+        scan_discovery_current_root=None,
+        scan_discovery_files_found=len(audio_files),
+        scan_discovery_folders_found=len(by_folder),
+        scan_discovery_folders_done=0,
+        scan_discovery_folders_total=len(by_folder),
+        scan_discovery_albums_done=0,
+        scan_discovery_albums_total=len(by_folder),
+    )
     if changed_pending_deleted_folder_keys:
         removed_from_cache = 0
         removed_from_published = 0
@@ -21863,6 +22037,9 @@ def _build_files_editions(scan_type: str = "full") -> tuple[list[tuple[int, str,
                 "FILES changed-only: %d dirty folder(s) no longer exist on disk.",
                 len(changed_pending_deleted_folder_keys),
             )
+    if scan_should_stop.is_set():
+        log_scan("FILES discovery cancelled before album candidate planning.")
+        return _cancel_discovery()
     _emit_files_discovery_heartbeat(
         "grouped audio files",
         roots_done=len(roots),
@@ -21883,7 +22060,18 @@ def _build_files_editions(scan_type: str = "full") -> tuple[list[tuple[int, str,
     folders_total = len(by_folder)
     folders_done = 0
     for folder, paths in sorted(by_folder.items(), key=lambda x: str(x[0])):
+        if scan_should_stop.is_set():
+            log_scan("FILES discovery cancelled while building album candidates (%d/%d folders).", folders_done, folders_total)
+            return _cancel_discovery()
         folders_done += 1
+        _set_discovery_state(
+            scan_discovery_running=True,
+            scan_discovery_stage="album_candidates",
+            scan_discovery_folders_done=folders_done,
+            scan_discovery_folders_total=folders_total,
+            scan_discovery_albums_done=folders_done,
+            scan_discovery_albums_total=folders_total,
+        )
         try:
             folder_resolved = folder.resolve()
         except (OSError, RuntimeError):
@@ -21988,10 +22176,10 @@ def _build_files_editions(scan_type: str = "full") -> tuple[list[tuple[int, str,
             artist_to_album_ids[artist_name].append(album_id)
             fast_skip_marked += 1
             fast_skip_full_cached += 1
-            if (album_id % 25) == 0:
-                with lock:
-                    state["scan_discovery_albums_found"] = next_album_id - 1
-                    state["scan_discovery_artists_found"] = len(artist_to_album_ids)
+            _set_discovery_state(
+                scan_discovery_albums_found=next_album_id - 1,
+                scan_discovery_artists_found=len(artist_to_album_ids),
+            )
             _emit_files_discovery_heartbeat(
                 "building album candidates",
                 files_found=len(audio_files),
@@ -22121,10 +22309,10 @@ def _build_files_editions(scan_type: str = "full") -> tuple[list[tuple[int, str,
             "skip_heavy_processing": fast_skip_heavy,
         }
         artist_to_album_ids[artist_name].append(album_id)
-        if (album_id % 25) == 0:
-            with lock:
-                state["scan_discovery_albums_found"] = next_album_id - 1
-                state["scan_discovery_artists_found"] = len(artist_to_album_ids)
+        _set_discovery_state(
+            scan_discovery_albums_found=next_album_id - 1,
+            scan_discovery_artists_found=len(artist_to_album_ids),
+        )
         _emit_files_discovery_heartbeat(
             "building album candidates",
             files_found=len(audio_files),
@@ -22138,11 +22326,18 @@ def _build_files_editions(scan_type: str = "full") -> tuple[list[tuple[int, str,
     # Build artists_merged: (artist_id, artist_name, album_ids). For Files we use 0 as artist_id.
     artists_merged = [(0, name, ids) for name, ids in sorted(artist_to_album_ids.items(), key=lambda x: x[0].lower())]
     total_albums = next_album_id - 1
-    with lock:
-        state["scan_discovery_running"] = False
-        state["scan_discovery_current_root"] = None
-        state["scan_discovery_albums_found"] = total_albums
-        state["scan_discovery_artists_found"] = len(artists_merged)
+    _set_discovery_state(
+        scan_discovery_running=False,
+        scan_discovery_stage="ready",
+        scan_discovery_current_root=None,
+        scan_discovery_folders_done=folders_total,
+        scan_discovery_folders_total=folders_total,
+        scan_discovery_albums_done=folders_total,
+        scan_discovery_albums_total=folders_total,
+        scan_discovery_albums_found=total_albums,
+        scan_discovery_artists_found=len(artists_merged),
+        scan_tracks_detected_total=len(audio_files),
+    )
     _emit_files_discovery_heartbeat(
         "ready",
         files_found=len(audio_files),
@@ -22665,6 +22860,102 @@ def _auto_move_incomplete_albums_for_scan(
     return result
 
 
+def _compute_scan_track_reconciliation(scan_id: int | None, detected_total: int) -> dict[str, int]:
+    """
+    Compute run-level track reconciliation counters:
+    detected = library_kept + moved_dupes + moved_incomplete + unaccounted
+    """
+    detected = max(0, int(detected_total or 0))
+    out = {
+        "detected_total": detected,
+        "library_kept": 0,
+        "moved_dupes": 0,
+        "moved_incomplete": 0,
+        "unaccounted": detected,
+    }
+    if not scan_id:
+        return out
+
+    moved_dupes = 0
+    moved_incomplete = 0
+    con = None
+    try:
+        con = sqlite3.connect(str(STATE_DB_FILE), timeout=20)
+        cur = con.cursor()
+        cur.execute("PRAGMA table_info(scan_moves)")
+        move_cols = [r[1] for r in cur.fetchall()]
+        has_reason = "move_reason" in move_cols
+        if has_reason:
+            cur.execute(
+                """
+                SELECT
+                    COALESCE(SUM(
+                        CASE
+                            WHEN LOWER(COALESCE(m.move_reason, 'dedupe')) = 'dedupe'
+                            THEN COALESCE(e.actual_track_count, 0)
+                            ELSE 0
+                        END
+                    ), 0),
+                    COALESCE(SUM(
+                        CASE
+                            WHEN LOWER(COALESCE(m.move_reason, 'dedupe')) = 'incomplete'
+                            THEN COALESCE(e.actual_track_count, 0)
+                            ELSE 0
+                        END
+                    ), 0)
+                FROM scan_moves m
+                LEFT JOIN scan_editions e
+                  ON e.scan_id = m.scan_id
+                 AND e.album_id = m.album_id
+                WHERE m.scan_id = ?
+                  AND COALESCE(m.restored, 0) = 0
+                """,
+                (int(scan_id),),
+            )
+            row = cur.fetchone() or (0, 0)
+            moved_dupes = int(row[0] or 0)
+            moved_incomplete = int(row[1] or 0)
+        else:
+            cur.execute(
+                """
+                SELECT COALESCE(SUM(COALESCE(e.actual_track_count, 0)), 0)
+                FROM scan_moves m
+                LEFT JOIN scan_editions e
+                  ON e.scan_id = m.scan_id
+                 AND e.album_id = m.album_id
+                WHERE m.scan_id = ?
+                  AND COALESCE(m.restored, 0) = 0
+                """,
+                (int(scan_id),),
+            )
+            row = cur.fetchone() or (0,)
+            moved_dupes = int(row[0] or 0)
+    except Exception:
+        logging.debug("Track reconciliation: could not compute moved track counts", exc_info=True)
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+
+    library_kept = 0
+    if _get_library_mode() == "files":
+        try:
+            _artists, _albums, tracks = _files_index_read_counts()
+            library_kept = int(tracks or 0)
+        except Exception:
+            logging.debug("Track reconciliation: could not read files_tracks count", exc_info=True)
+
+    out["library_kept"] = max(0, int(library_kept))
+    out["moved_dupes"] = max(0, int(moved_dupes))
+    out["moved_incomplete"] = max(0, int(moved_incomplete))
+    out["unaccounted"] = max(
+        0,
+        out["detected_total"] - out["library_kept"] - out["moved_dupes"] - out["moved_incomplete"],
+    )
+    return out
+
+
 def _mark_broken_from_dupe_groups(
     all_results: dict,
     editions_by_artist: dict[str, list[dict]] | None,
@@ -22986,6 +23277,20 @@ def background_scan():
         state["scan_discovery_folders_found"] = 0
         state["scan_discovery_albums_found"] = 0
         state["scan_discovery_artists_found"] = 0
+        state["scan_discovery_stage"] = "filesystem" if (_get_library_mode() == "files") else "idle"
+        state["scan_discovery_entries_scanned"] = 0
+        state["scan_discovery_root_entries_scanned"] = 0
+        state["scan_discovery_folders_done"] = 0
+        state["scan_discovery_folders_total"] = 0
+        state["scan_discovery_albums_done"] = 0
+        state["scan_discovery_albums_total"] = 0
+        state["scan_discovery_started_at"] = time.time() if (_get_library_mode() == "files") else None
+        state["scan_discovery_updated_at"] = time.time() if (_get_library_mode() == "files") else None
+        state["scan_tracks_detected_total"] = 0
+        state["scan_tracks_library_kept"] = 0
+        state["scan_tracks_moved_dupes"] = 0
+        state["scan_tracks_moved_incomplete"] = 0
+        state["scan_tracks_unaccounted"] = 0
         state["scan_pipeline_flags"] = dict(pipeline_flags)
         state["scan_pipeline_sync_target"] = str(pipeline_flags.get("sync_target") or "none")
 
@@ -23011,11 +23316,13 @@ def background_scan():
         artists_merged, total_albums = _build_scan_plan(scan_type=scan_type)
         detected_artists_total = len(artists_merged)
         detected_albums_total = total_albums
+        detected_tracks_total = 0
         total_artists = detected_artists_total
         files_editions_for_resume = {}
         if _get_library_mode() == "files":
             with lock:
                 files_editions_for_resume = dict(state.get("files_editions_by_album_id") or {})
+                detected_tracks_total = int(state.get("scan_discovery_files_found") or 0)
         resume_run_id, artists_merged, resume_skipped_artists, resume_skipped_albums = _prepare_resume_scan_artists(
             _get_library_mode(),
             scan_type,
@@ -23030,6 +23337,7 @@ def background_scan():
             state["scan_detected_albums_total"] = int(detected_albums_total or 0)
             state["scan_resume_skipped_artists"] = int(resume_skipped_artists or 0)
             state["scan_resume_skipped_albums"] = int(resume_skipped_albums or 0)
+            state["scan_tracks_detected_total"] = int(detected_tracks_total or 0)
         if resume_skipped_artists:
             log_scan(
                 "Resume: skipped %d already-done artist(s), %d album(s) unchanged since last interrupted run.",
@@ -23087,6 +23395,11 @@ def background_scan():
             state["scan_detected_albums_total"] = int(detected_albums_total or 0)
             state["scan_resume_skipped_artists"] = int(resume_skipped_artists or 0)
             state["scan_resume_skipped_albums"] = int(resume_skipped_albums or 0)
+            state["scan_tracks_detected_total"] = int(detected_tracks_total or 0)
+            state["scan_tracks_library_kept"] = 0
+            state["scan_tracks_moved_dupes"] = 0
+            state["scan_tracks_moved_incomplete"] = 0
+            state["scan_tracks_unaccounted"] = 0
             state["scan_step_progress"] = 0
             # scan_step_total set after _reload_auto_move_from_db() so AUTO_MOVE_DUPES is current
             state["duplicates"].clear()
@@ -23162,6 +23475,15 @@ def background_scan():
             state["scan_discovery_folders_found"] = 0
             state["scan_discovery_albums_found"] = 0
             state["scan_discovery_artists_found"] = 0
+            state["scan_discovery_stage"] = "idle"
+            state["scan_discovery_entries_scanned"] = 0
+            state["scan_discovery_root_entries_scanned"] = 0
+            state["scan_discovery_folders_done"] = 0
+            state["scan_discovery_folders_total"] = 0
+            state["scan_discovery_albums_done"] = 0
+            state["scan_discovery_albums_total"] = 0
+            state["scan_discovery_started_at"] = None
+            state["scan_discovery_updated_at"] = time.time()
             # Preflight: store MB and AI connection status for end-of-scan summary
             mb_ok, ai_ok = _run_preflight_checks()
             state["scan_mb_connection_ok"] = mb_ok
@@ -24146,11 +24468,27 @@ def background_scan():
                 state["scan_step_progress"] = state.get("scan_step_progress", 0) + 1
         end_time = time.time()
         scan_id = None
+        detected_tracks_total = 0
         with lock:
             state["scan_progress"] = state["scan_total"]  # force 100 % before stopping
             state["scan_step_progress"] = state.get("scan_step_total", state["scan_step_progress"])  # ensure 100% for steps
             scan_id = state.get("scan_id")
             scan_start_epoch = state.get("scan_start_time") or end_time
+            detected_tracks_total = int(
+                state.get("scan_tracks_detected_total")
+                or state.get("scan_discovery_files_found")
+                or 0
+            )
+        track_reconciliation = _compute_scan_track_reconciliation(
+            int(scan_id or 0),
+            detected_tracks_total,
+        )
+        with lock:
+            state["scan_tracks_detected_total"] = int(track_reconciliation.get("detected_total") or 0)
+            state["scan_tracks_library_kept"] = int(track_reconciliation.get("library_kept") or 0)
+            state["scan_tracks_moved_dupes"] = int(track_reconciliation.get("moved_dupes") or 0)
+            state["scan_tracks_moved_incomplete"] = int(track_reconciliation.get("moved_incomplete") or 0)
+            state["scan_tracks_unaccounted"] = int(track_reconciliation.get("unaccounted") or 0)
         
         # Update scan history entry (summary_json etc.); only then mark scan done
         if scan_id:
@@ -24179,6 +24517,11 @@ def background_scan():
                 albums_moved_this_scan = state.get("last_dedupe_moved_count", 0)
                 incomplete_moved_this_scan = state.get("scan_incomplete_moved_count", 0)
                 incomplete_moved_mb_this_scan = state.get("scan_incomplete_moved_mb", 0)
+                scan_tracks_detected_total = int(state.get("scan_tracks_detected_total") or 0)
+                scan_tracks_library_kept = int(state.get("scan_tracks_library_kept") or 0)
+                scan_tracks_moved_dupes = int(state.get("scan_tracks_moved_dupes") or 0)
+                scan_tracks_moved_incomplete = int(state.get("scan_tracks_moved_incomplete") or 0)
+                scan_tracks_unaccounted = int(state.get("scan_tracks_unaccounted") or 0)
                 player_sync_target = state.get("scan_player_sync_target")
                 player_sync_ok = state.get("scan_player_sync_ok")
                 player_sync_message = state.get("scan_player_sync_message")
@@ -24335,6 +24678,11 @@ def background_scan():
                 "space_saved_mb_this_scan": space_saved_mb_this_scan,
                 "incomplete_moved_this_scan": incomplete_moved_this_scan,
                 "incomplete_moved_mb_this_scan": incomplete_moved_mb_this_scan,
+                "scan_tracks_detected_total": scan_tracks_detected_total,
+                "scan_tracks_library_kept": scan_tracks_library_kept,
+                "scan_tracks_moved_dupes": scan_tracks_moved_dupes,
+                "scan_tracks_moved_incomplete": scan_tracks_moved_incomplete,
+                "scan_tracks_unaccounted": scan_tracks_unaccounted,
                 "player_sync_target": player_sync_target,
                 "player_sync_ok": player_sync_ok,
                 "player_sync_message": player_sync_message,
@@ -24727,6 +25075,8 @@ def background_scan():
             state["scan_post_current_album"] = None
             state["scan_discovery_running"] = False
             state["scan_discovery_current_root"] = None
+            state["scan_discovery_stage"] = "idle"
+            state["scan_discovery_updated_at"] = time.time()
             state["scan_resume_run_id"] = None
             state["scanning"] = False
         logging.debug("background_scan(): finished (flag cleared)")
@@ -31141,6 +31491,15 @@ def api_progress():
         scan_discovery_folders_found = int(state.get("scan_discovery_folders_found") or 0)
         scan_discovery_albums_found = int(state.get("scan_discovery_albums_found") or 0)
         scan_discovery_artists_found = int(state.get("scan_discovery_artists_found") or 0)
+        scan_discovery_stage = str(state.get("scan_discovery_stage") or "")
+        scan_discovery_entries_scanned = int(state.get("scan_discovery_entries_scanned") or 0)
+        scan_discovery_root_entries_scanned = int(state.get("scan_discovery_root_entries_scanned") or 0)
+        scan_discovery_folders_done = int(state.get("scan_discovery_folders_done") or 0)
+        scan_discovery_folders_total = int(state.get("scan_discovery_folders_total") or 0)
+        scan_discovery_albums_done = int(state.get("scan_discovery_albums_done") or 0)
+        scan_discovery_albums_total = int(state.get("scan_discovery_albums_total") or 0)
+        scan_discovery_started_at = state.get("scan_discovery_started_at")
+        scan_discovery_updated_at = state.get("scan_discovery_updated_at")
         files_watcher_state = dict(state.get("files_watcher") or {})
         scan_discogs_matched = int(state.get("scan_discogs_matched") or 0)
         scan_lastfm_matched = int(state.get("scan_lastfm_matched") or 0)
@@ -31150,6 +31509,11 @@ def api_progress():
         scan_pipeline_sync_target = state.get("scan_pipeline_sync_target")
         scan_incomplete_moved_count = int(state.get("scan_incomplete_moved_count") or 0)
         scan_incomplete_moved_mb = int(state.get("scan_incomplete_moved_mb") or 0)
+        scan_tracks_detected_total = int(state.get("scan_tracks_detected_total") or 0)
+        scan_tracks_library_kept = int(state.get("scan_tracks_library_kept") or 0)
+        scan_tracks_moved_dupes = int(state.get("scan_tracks_moved_dupes") or 0)
+        scan_tracks_moved_incomplete = int(state.get("scan_tracks_moved_incomplete") or 0)
+        scan_tracks_unaccounted = int(state.get("scan_tracks_unaccounted") or 0)
         scan_player_sync_target = state.get("scan_player_sync_target")
         scan_player_sync_ok = state.get("scan_player_sync_ok")
         scan_player_sync_message = state.get("scan_player_sync_message")
@@ -31182,9 +31546,29 @@ def api_progress():
                 getattr(sys.modules[__name__], "AUTO_MOVE_DUPES", False),
             )
         )
+        preplan_total = int(scan_discovery_albums_total or scan_discovery_folders_total or 0)
+        preplan_done = int(scan_discovery_albums_done or scan_discovery_folders_done or 0)
+        if preplan_total > 0:
+            preplan_done = max(0, min(preplan_done, preplan_total))
+            preplan_percent = round((preplan_done / preplan_total) * 100.0, 2)
+        else:
+            preplan_percent = 0.0
+        preplan_label = f"{preplan_done}/{preplan_total}" if preplan_total > 0 else f"{preplan_done}/?"
+        pre_scan_active = bool(
+            scanning
+            and int(artists_total or 0) <= 0
+            and (
+                scan_discovery_running
+                or scan_discovery_stage in {"filesystem", "album_candidates"}
+                or preplan_total > 0
+                or scan_discovery_files_found > 0
+            )
+        )
         # Phase: derive from current_step and flags for UI (format_analysis | identification_tags | ia_analysis | finalizing | moving_dupes)
         if not scanning:
             phase = None
+        elif pre_scan_active:
+            phase = "pre_scan"
         elif deduping:
             phase = "moving_dupes"
         elif finalizing:
@@ -31327,6 +31711,19 @@ def api_progress():
         "scan_discovery_folders_found": scan_discovery_folders_found,
         "scan_discovery_albums_found": scan_discovery_albums_found,
         "scan_discovery_artists_found": scan_discovery_artists_found,
+        "scan_discovery_stage": scan_discovery_stage,
+        "scan_discovery_entries_scanned": scan_discovery_entries_scanned,
+        "scan_discovery_root_entries_scanned": scan_discovery_root_entries_scanned,
+        "scan_discovery_folders_done": scan_discovery_folders_done,
+        "scan_discovery_folders_total": scan_discovery_folders_total,
+        "scan_discovery_albums_done": scan_discovery_albums_done,
+        "scan_discovery_albums_total": scan_discovery_albums_total,
+        "scan_discovery_started_at": scan_discovery_started_at,
+        "scan_discovery_updated_at": scan_discovery_updated_at,
+        "scan_preplan_done": preplan_done,
+        "scan_preplan_total": preplan_total,
+        "scan_preplan_percent": preplan_percent,
+        "scan_preplan_label": preplan_label,
         "files_watcher_running": bool(files_watcher_state.get("running")),
         "files_watcher_roots": list(files_watcher_state.get("roots") or []),
         "files_watcher_dirty_count": int(files_watcher_state.get("dirty_count") or 0),
@@ -31340,6 +31737,11 @@ def api_progress():
         "scan_pipeline_sync_target": scan_pipeline_sync_target,
         "scan_incomplete_moved_count": scan_incomplete_moved_count,
         "scan_incomplete_moved_mb": scan_incomplete_moved_mb,
+        "scan_tracks_detected_total": scan_tracks_detected_total,
+        "scan_tracks_library_kept": scan_tracks_library_kept,
+        "scan_tracks_moved_dupes": scan_tracks_moved_dupes,
+        "scan_tracks_moved_incomplete": scan_tracks_moved_incomplete,
+        "scan_tracks_unaccounted": scan_tracks_unaccounted,
         "scan_player_sync_target": scan_player_sync_target,
         "scan_player_sync_ok": scan_player_sync_ok,
         "scan_player_sync_message": scan_player_sync_message,
@@ -32176,7 +32578,10 @@ def api_library_stats():
         index_running = bool(index_state.get("running"))
         if indexed_albums <= 0 or indexed_tracks <= 0:
             if not index_running:
-                _trigger_files_index_rebuild_async(reason="api_library_stats_bootstrap")
+                _trigger_files_index_rebuild_async_throttled(
+                    reason="api_library_stats_bootstrap",
+                    cooldown_sec=45.0,
+                )
                 index_state = _files_index_get_state() or {}
                 index_running = bool(index_state.get("running"))
             return jsonify(
@@ -32273,7 +32678,10 @@ def api_library_stats_library():
     index_running = bool(index_state.get("running"))
     if indexed_albums <= 0 or indexed_tracks <= 0:
         if not index_running:
-            _trigger_files_index_rebuild_async(reason="api_library_stats_library_bootstrap")
+            _trigger_files_index_rebuild_async_throttled(
+                reason="api_library_stats_library_bootstrap",
+                cooldown_sec=45.0,
+            )
             index_state = _files_index_get_state() or {}
             index_running = bool(index_state.get("running"))
         return jsonify(

@@ -40,8 +40,8 @@ export interface ScanProgress {
   status: 'running' | 'paused' | 'stopped' | 'idle';
   scan_type?: 'full' | 'changed_only' | 'incomplete_only';
   scan_resume_run_id?: string | null;
-  /** Current scan phase: format_analysis | identification_tags | ia_analysis | finalizing | moving_dupes | post_processing */
-  phase?: 'format_analysis' | 'identification_tags' | 'ia_analysis' | 'finalizing' | 'moving_dupes' | 'post_processing' | null;
+  /** Current scan phase: pre_scan | format_analysis | identification_tags | ia_analysis | finalizing | moving_dupes | post_processing */
+  phase?: 'pre_scan' | 'format_analysis' | 'identification_tags' | 'ia_analysis' | 'finalizing' | 'moving_dupes' | 'post_processing' | null;
   /** Micro-step for live indicators: analyzing_format | fetching_mb_id | searching_mb | comparing_versions | detecting_best | done */
   current_step?: string | null;
   /** Total albums in this scan (for N/M display in findings) */
@@ -140,6 +140,19 @@ export interface ScanProgress {
   scan_discovery_folders_found?: number;
   scan_discovery_albums_found?: number;
   scan_discovery_artists_found?: number;
+  scan_discovery_stage?: 'idle' | 'filesystem' | 'album_candidates' | 'ready' | 'cancelled' | string | null;
+  scan_discovery_entries_scanned?: number;
+  scan_discovery_root_entries_scanned?: number;
+  scan_discovery_folders_done?: number;
+  scan_discovery_folders_total?: number;
+  scan_discovery_albums_done?: number;
+  scan_discovery_albums_total?: number;
+  scan_discovery_started_at?: number | null;
+  scan_discovery_updated_at?: number | null;
+  scan_preplan_done?: number;
+  scan_preplan_total?: number;
+  scan_preplan_percent?: number;
+  scan_preplan_label?: string | null;
   scan_discogs_matched?: number;
   scan_lastfm_matched?: number;
   scan_bandcamp_matched?: number;
@@ -159,6 +172,16 @@ export interface ScanProgress {
   scan_incomplete_moved_count?: number;
   /** Total size moved for incompletes (MB) in this scan. */
   scan_incomplete_moved_mb?: number;
+  /** Tracks detected during pre-scan (filesystem walk). */
+  scan_tracks_detected_total?: number;
+  /** Tracks currently kept in live library index (files_tracks). */
+  scan_tracks_library_kept?: number;
+  /** Tracks moved by dedupe during this run. */
+  scan_tracks_moved_dupes?: number;
+  /** Tracks moved by incomplete-album quarantine during this run. */
+  scan_tracks_moved_incomplete?: number;
+  /** Residual detected tracks not accounted in kept/moved buckets. */
+  scan_tracks_unaccounted?: number;
   /** Player sync telemetry. */
   scan_player_sync_target?: string | null;
   scan_player_sync_ok?: boolean | null;
@@ -702,6 +725,11 @@ export interface ScanHistorySummaryJson {
   scan_bandcamp_matched?: number;
   incomplete_moved_this_scan?: number;
   incomplete_moved_mb_this_scan?: number;
+  scan_tracks_detected_total?: number;
+  scan_tracks_library_kept?: number;
+  scan_tracks_moved_dupes?: number;
+  scan_tracks_moved_incomplete?: number;
+  scan_tracks_unaccounted?: number;
   player_sync_target?: string;
   player_sync_ok?: boolean | null;
   player_sync_message?: string;

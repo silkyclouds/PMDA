@@ -165,6 +165,15 @@ export function ScanProgress({
     scan_discovery_folders_found = 0,
     scan_discovery_albums_found = 0,
     scan_discovery_artists_found = 0,
+    scan_discovery_stage = null,
+    scan_discovery_entries_scanned = 0,
+    scan_discovery_root_entries_scanned = 0,
+    scan_discovery_folders_done = 0,
+    scan_discovery_folders_total = 0,
+    scan_discovery_albums_done = 0,
+    scan_discovery_albums_total = 0,
+    scan_preplan_done = 0,
+    scan_preplan_total = 0,
     scan_pipeline_flags = {},
     scan_pipeline_sync_target = null,
     scan_incomplete_moved_count = 0,
@@ -176,6 +185,48 @@ export function ScanProgress({
 
   // Stage badge: use backend phase (format_analysis | identification_tags | ia_analysis | finalizing | moving_dupes | post_processing)
   const effectiveStage = phase ?? (post_processing ? 'post_processing' : (finalizing ? 'finalizing' : (deduping ? 'moving_dupes' : 'format_analysis')));
+  const preScanAlbumsTotal = Math.max(0, scan_preplan_total || scan_discovery_albums_total || scan_discovery_folders_total);
+  const preScanAlbumsDone = Math.max(0, scan_preplan_done || scan_discovery_albums_done || scan_discovery_folders_done);
+  const preScanRootsTotal = Math.max(0, scan_discovery_roots_total);
+  const preScanRootsDone = Math.max(0, scan_discovery_roots_done);
+  const preScanStage = String(scan_discovery_stage || '');
+  const preScanStageLabel = preScanStage === 'album_candidates'
+    ? 'album candidates'
+    : preScanStage === 'filesystem'
+      ? 'filesystem'
+      : preScanStage === 'ready'
+        ? 'ready'
+        : 'pre-scan';
+  const preScanActive =
+    scanning &&
+    artists_total === 0 &&
+    (
+      phase === 'pre_scan' ||
+      scan_discovery_running ||
+      scan_discovery_stage === 'filesystem' ||
+      scan_discovery_stage === 'album_candidates' ||
+      preScanAlbumsTotal > 0 ||
+      scan_discovery_files_found > 0
+    );
+  const preScanPercent = (() => {
+    if (!preScanActive) return 0;
+    if (preScanStage === 'ready') return 100;
+    if (preScanStage === 'album_candidates' || preScanAlbumsTotal > 0) {
+      const total = Math.max(1, preScanAlbumsTotal);
+      const done = Math.max(0, Math.min(preScanAlbumsDone, total));
+      return Math.floor(70 + (25 * done) / total);
+    }
+    if (preScanStage === 'filesystem' || preScanRootsTotal > 0) {
+      const total = Math.max(1, preScanRootsTotal);
+      const done = Math.max(0, Math.min(preScanRootsDone, total));
+      return Math.floor((70 * done) / total);
+    }
+    return 0;
+  })();
+  const preScanProgressTotal = preScanAlbumsTotal > 0 ? preScanAlbumsTotal : preScanRootsTotal;
+  const preScanProgressDone = preScanAlbumsTotal > 0
+    ? Math.max(0, Math.min(preScanAlbumsDone, preScanAlbumsTotal))
+    : Math.max(0, Math.min(preScanRootsDone, preScanRootsTotal));
   // Progress bar must reflect real end-to-end work.
   // During scan, include post-processing when present, otherwise use artist progress.
   const hasPostWork = scanning && (post_processing || post_processing_total > 0);
@@ -185,15 +236,23 @@ export function ScanProgress({
   const postUnitsTotal = Math.max(0, post_processing_total);
   const compositeDone = scanUnitsDone + postUnitsDone;
   const compositeTotal = scanUnitsTotal + postUnitsTotal;
-  const displayProgress = hasPostWork
+  const displayProgress = preScanActive && preScanProgressTotal > 0
+    ? preScanProgressDone
+    : hasPostWork
     ? compositeDone
     : (scanning && artists_total > 0 ? artists_processed : current);
-  const displayTotal = hasPostWork
+  const displayTotal = preScanActive && preScanProgressTotal > 0
+    ? preScanProgressTotal
+    : hasPostWork
     ? compositeTotal
     : (scanning && artists_total > 0 ? artists_total : total);
-  const percentageExact = displayTotal > 0 ? Math.min(100, (displayProgress / displayTotal) * 100) : 0;
-  // Never show 100% while backend still reports scanning=true.
-  const percentage = scanning ? Math.min(99, Math.floor(percentageExact)) : Math.round(percentageExact);
+  const percentageExact = preScanActive
+    ? preScanPercent
+    : (displayTotal > 0 ? Math.min(100, (displayProgress / displayTotal) * 100) : 0);
+  // Keep 99% clamp only for non pre-scan running phases.
+  const percentage = scanning
+    ? (preScanActive ? Math.min(100, Math.floor(percentageExact)) : Math.min(99, Math.floor(percentageExact)))
+    : Math.round(percentageExact);
 
   // Toast once when scan finishes with AI errors
   useEffect(() => {
@@ -216,10 +275,10 @@ export function ScanProgress({
       setWaitingForProgress(false);
       return;
     }
-    if (artists_total > 0 || total > 0) {
+    if (artists_total > 0 || total > 0 || preScanActive) {
       setWaitingForProgress(false);
     }
-  }, [waitingForProgress, scanning, artists_total, total]);
+  }, [waitingForProgress, scanning, artists_total, total, preScanActive]);
 
   // Poll improve-all progress when not scanning
   useEffect(() => {
@@ -298,7 +357,9 @@ export function ScanProgress({
   const showPostProcessingStep = post_processing || (post_processing_total ?? 0) > 0;
   const showDiscovery =
     scanning &&
-    (scan_discovery_running ||
+    (preScanActive ||
+      scan_discovery_running ||
+      scan_discovery_entries_scanned > 0 ||
       scan_discovery_files_found > 0 ||
       scan_discovery_folders_found > 0 ||
       (artists_total === 0 && scan_discovery_albums_found > 0));
@@ -313,9 +374,13 @@ export function ScanProgress({
   }, [canDedupe, dupesAlreadyAllMoved, improveAllRunning]);
 
   if (isCompact) {
-    const statusLabel = scanning ? (phase ? `Scanning · ${phase}` : 'Scanning') : 'Idle';
+    const statusLabel = scanning
+      ? (preScanActive ? `Scanning · pre-scan · ${preScanStageLabel}` : (phase ? `Scanning · ${phase}` : 'Scanning'))
+      : 'Idle';
     const progressLabel = scanning
-      ? `${displayProgress}/${displayTotal} artist(s)`
+      ? (preScanActive && preScanProgressTotal > 0
+        ? `Pre-scan ${preScanStageLabel} · ${displayProgress}/${displayTotal}`
+        : `${displayProgress}/${displayTotal} artist(s)`)
       : 'Ready to scan';
     return (
       <div className={cn("rounded-xl bg-card border border-border overflow-hidden", className)}>
@@ -1099,13 +1164,19 @@ export function ScanProgress({
                 <div className="flex items-baseline gap-2 min-w-0">
                   <span className="text-2xl font-bold tabular-nums text-foreground">{percentage}%</span>
                   <span className="text-sm text-muted-foreground shrink-0">
-                    {displayTotal > 0
-                      ? hasPostWork
+                    {preScanActive
+                      ? preScanAlbumsTotal > 0 && preScanStage === 'album_candidates'
+                        ? `Pre-scan · ${preScanStageLabel} · albums ${displayProgress.toLocaleString()} / ${displayTotal.toLocaleString()}`
+                        : preScanRootsTotal > 0
+                          ? `Pre-scan · ${preScanStageLabel} · roots ${preScanRootsDone.toLocaleString()} / ${preScanRootsTotal.toLocaleString()}`
+                          : `Pre-scan · ${preScanStageLabel}`
+                      : displayTotal > 0
+                        ? hasPostWork
                         ? `${scanUnitsDone.toLocaleString()} / ${scanUnitsTotal.toLocaleString()} artists · ${postUnitsDone.toLocaleString()} / ${postUnitsTotal.toLocaleString()} post`
                         : scanning && artists_total > 0
                           ? `${displayProgress.toLocaleString()} / ${displayTotal.toLocaleString()} artists`
                           : `${displayProgress.toLocaleString()} / ${displayTotal.toLocaleString()} steps`
-                      : '—'}
+                        : '—'}
                   </span>
                 </div>
                 {eta_seconds != null && eta_seconds > 0 && (
@@ -1114,7 +1185,7 @@ export function ScanProgress({
                     ~{formatETA(eta_seconds)} left
                   </div>
                 )}
-                {scanning && (eta_seconds == null || eta_seconds <= 0) && (artists_total > 0 || total > 0) && (
+                {scanning && !preScanActive && (eta_seconds == null || eta_seconds <= 0) && (artists_total > 0 || total > 0) && (
                   <span className="text-xs text-muted-foreground shrink-0">ETA calculating…</span>
                 )}
               </div>
@@ -1124,41 +1195,70 @@ export function ScanProgress({
                   style={{ width: `${percentageExact}%` }}
                 />
               </div>
+              {preScanActive && (
+                <p className="text-[11px] text-muted-foreground">
+                  Pre-scan phase: depending on library size and album count this can be long. Patience, see logs for details.
+                </p>
+              )}
             </div>
 
             {scanning && (
-              <div className="rounded-lg border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
-                <span className="font-medium text-foreground/80">Run scope</span>
-                <span className="mx-1">•</span>
-                {artists_total.toLocaleString()} artists
-                <span className="mx-1">•</span>
-                {total_albums.toLocaleString()} albums
-                {(detected_artists_total > 0 || detected_albums_total > 0) && (
-                  <>
-                    <span className="mx-1">|</span>
-                    <span className="font-medium text-foreground/80">Detected source</span>
-                    <span className="mx-1">•</span>
-                    {detected_artists_total.toLocaleString()} artists
-                    <span className="mx-1">•</span>
-                    {detected_albums_total.toLocaleString()} albums
-                  </>
-                )}
-                {(resume_skipped_artists > 0 || resume_skipped_albums > 0) && (
-                  <>
-                    <span className="mx-1">|</span>
-                    <span className="font-medium text-foreground/80">Resume skipped</span>
-                    <span className="mx-1">•</span>
-                    {resume_skipped_artists.toLocaleString()} artists
-                    <span className="mx-1">•</span>
-                    {resume_skipped_albums.toLocaleString()} albums
-                  </>
-                )}
-              </div>
+              preScanActive ? (
+                <div className="rounded-lg border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+                  <span className="font-medium text-foreground/80">Pre-scan phase</span>
+                  <span className="mx-1">•</span>
+                  stage {preScanStage || 'filesystem'}
+                  <span className="mx-1">•</span>
+                  {preScanStage === 'album_candidates' && preScanAlbumsTotal > 0
+                    ? `albums ${preScanAlbumsDone.toLocaleString()}/${preScanAlbumsTotal.toLocaleString()}`
+                    : preScanRootsTotal > 0
+                      ? `roots ${preScanRootsDone.toLocaleString()}/${preScanRootsTotal.toLocaleString()}`
+                      : 'discovering album candidates'}
+                  <span className="mx-1">•</span>
+                  found {scan_discovery_albums_found.toLocaleString()}
+                  <span className="mx-1">•</span>
+                  artists {scan_discovery_artists_found.toLocaleString()}
+                </div>
+              ) : (
+                <div className="rounded-lg border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+                  <span className="font-medium text-foreground/80">Run scope</span>
+                  <span className="mx-1">•</span>
+                  {artists_total.toLocaleString()} artists
+                  <span className="mx-1">•</span>
+                  {total_albums.toLocaleString()} albums
+                  {(detected_artists_total > 0 || detected_albums_total > 0) && (
+                    <>
+                      <span className="mx-1">|</span>
+                      <span className="font-medium text-foreground/80">Detected source</span>
+                      <span className="mx-1">•</span>
+                      {detected_artists_total.toLocaleString()} artists
+                      <span className="mx-1">•</span>
+                      {detected_albums_total.toLocaleString()} albums
+                    </>
+                  )}
+                  {(resume_skipped_artists > 0 || resume_skipped_albums > 0) && (
+                    <>
+                      <span className="mx-1">|</span>
+                      <span className="font-medium text-foreground/80">Resume skipped</span>
+                      <span className="mx-1">•</span>
+                      {resume_skipped_artists.toLocaleString()} artists
+                      <span className="mx-1">•</span>
+                      {resume_skipped_albums.toLocaleString()} albums
+                    </>
+                  )}
+                </div>
+              )
             )}
 
             {showDiscovery && (
               <div className="rounded-lg border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
                 <span className="font-medium text-foreground/80">Discovery</span>
+                {scan_discovery_stage ? (
+                  <>
+                    <span className="mx-1">•</span>
+                    stage {scan_discovery_stage}
+                  </>
+                ) : null}
                 <span className="mx-1">•</span>
                 {scan_discovery_files_found.toLocaleString()} files
                 <span className="mx-1">•</span>
@@ -1167,10 +1267,22 @@ export function ScanProgress({
                 {scan_discovery_albums_found.toLocaleString()} albums
                 <span className="mx-1">•</span>
                 {scan_discovery_artists_found.toLocaleString()} artists
+                {(scan_discovery_albums_total > 0 || scan_discovery_folders_total > 0) && (
+                  <>
+                    <span className="mx-1">|</span>
+                    candidates {(scan_discovery_albums_done || scan_discovery_folders_done).toLocaleString()}/{(scan_discovery_albums_total || scan_discovery_folders_total).toLocaleString()}
+                  </>
+                )}
                 {scan_discovery_roots_total > 0 && (
                   <>
                     <span className="mx-1">•</span>
                     roots {scan_discovery_roots_done}/{scan_discovery_roots_total}
+                  </>
+                )}
+                {scan_discovery_entries_scanned > 0 && (
+                  <>
+                    <span className="mx-1">•</span>
+                    visited {scan_discovery_entries_scanned.toLocaleString()}
                   </>
                 )}
                 {scan_discovery_current_root ? (
@@ -1183,7 +1295,7 @@ export function ScanProgress({
             )}
 
             {/* ─── Phase stepper (compact): highlight stage from backend phase ─── */}
-            {(phase || auto_move_enabled || showPostProcessingStep) && (
+            {!preScanActive && (phase || auto_move_enabled || showPostProcessingStep) && (
               <div className="flex flex-wrap items-center gap-2 text-xs">
                 <span className={cn(
                   "flex items-center gap-1.5 px-2.5 py-1 rounded-full font-medium",

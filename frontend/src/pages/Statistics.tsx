@@ -450,6 +450,34 @@ export default function Statistics() {
   const liveDetectedAlbumsTotal = n(scanProgress?.detected_albums_total);
   const liveSkippedArtists = n(scanProgress?.resume_skipped_artists);
   const liveSkippedAlbums = n(scanProgress?.resume_skipped_albums);
+  const isPreScanPhase = Boolean(isLiveRunActive && scanProgress?.phase === 'pre_scan');
+  const preScanStage = String(scanProgress?.scan_discovery_stage || '');
+  const preScanRootsDone = n(scanProgress?.scan_discovery_roots_done);
+  const preScanRootsTotal = n(scanProgress?.scan_discovery_roots_total);
+  const preScanEntriesScanned = n(scanProgress?.scan_discovery_entries_scanned);
+  const preScanFilesFound = n(scanProgress?.scan_discovery_files_found);
+  const preScanAlbumsFound = n(scanProgress?.scan_discovery_albums_found);
+  const preScanArtistsFound = n(scanProgress?.scan_discovery_artists_found);
+  const preScanProgressTotal = n(
+    scanProgress?.scan_preplan_total
+      || scanProgress?.scan_discovery_albums_total
+      || scanProgress?.scan_discovery_folders_total,
+  );
+  const preScanProgressDoneRaw = n(
+    scanProgress?.scan_preplan_done
+      || scanProgress?.scan_discovery_albums_done
+      || scanProgress?.scan_discovery_folders_done,
+  );
+  const preScanProgressDone = preScanProgressTotal > 0
+    ? Math.min(preScanProgressDoneRaw, preScanProgressTotal)
+    : preScanProgressDoneRaw;
+  const runScopePending = isPreScanPhase && liveDetectedArtistsTotal === 0 && liveDetectedAlbumsTotal === 0;
+  const liveTracksDetected = n(scanProgress?.scan_tracks_detected_total);
+  const liveTracksLibraryKept = n(scanProgress?.scan_tracks_library_kept);
+  const liveTracksMovedDupes = n(scanProgress?.scan_tracks_moved_dupes);
+  const liveTracksMovedIncomplete = n(scanProgress?.scan_tracks_moved_incomplete);
+  const liveTracksUnaccounted = n(scanProgress?.scan_tracks_unaccounted);
+  const liveTrackScopeLabel = scanProgress?.scan_type === 'changed_only' ? 'run scope (delta)' : 'run scope';
 
   useEffect(() => {
     if (isLiveRunActive) {
@@ -516,6 +544,21 @@ export default function Statistics() {
   const previous = useMemo(() => aggregate(baselineScans), [baselineScans]);
 
   const latestSelected = selectedScans[0] ?? null;
+  const latestCompletedEntry = useMemo(() => {
+    return [...history]
+      .filter((entry) => entry.entry_type === 'scan' && entry.status === 'completed' && Boolean(entry.end_time))
+      .sort((a, b) => n(b.start_time) - n(a.start_time))[0] ?? null;
+  }, [history]);
+  const latestSummaryTracksDetected = n(latestCompletedEntry?.summary_json?.scan_tracks_detected_total);
+  const latestSummaryTracksLibraryKept = n(latestCompletedEntry?.summary_json?.scan_tracks_library_kept);
+  const latestSummaryTracksMovedDupes = n(latestCompletedEntry?.summary_json?.scan_tracks_moved_dupes);
+  const latestSummaryTracksMovedIncomplete = n(latestCompletedEntry?.summary_json?.scan_tracks_moved_incomplete);
+  const latestSummaryTracksUnaccounted = n(latestCompletedEntry?.summary_json?.scan_tracks_unaccounted);
+  const hasLatestTrackReconciliation = latestSummaryTracksDetected > 0
+    || latestSummaryTracksLibraryKept > 0
+    || latestSummaryTracksMovedDupes > 0
+    || latestSummaryTracksMovedIncomplete > 0
+    || latestSummaryTracksUnaccounted > 0;
   const modeSummary = useMemo(() => {
     const counts: Record<string, number> = {};
     for (const scan of selectedScans) {
@@ -1048,46 +1091,126 @@ export default function Statistics() {
               </CardDescription>
             </CardHeader>
             <CardContent className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3 text-sm">
-              <div className="rounded-lg border border-border bg-background/70 p-3">
-                <p className="text-muted-foreground">Artists progress</p>
+              {isPreScanPhase ? (
+                <>
+                  <div className="rounded-lg border border-border bg-background/70 p-3">
+                    <p className="text-muted-foreground">Pre-scan progress</p>
+                    <p className="text-xl font-semibold tabular-nums">
+                      {preScanProgressTotal > 0
+                        ? `${preScanProgressDone.toLocaleString()} / ${preScanProgressTotal.toLocaleString()}`
+                        : preScanRootsTotal > 0
+                          ? `${preScanRootsDone.toLocaleString()} / ${preScanRootsTotal.toLocaleString()}`
+                          : `${preScanProgressDone.toLocaleString()} / ?`}
+                    </p>
+                    <p className="text-xs text-muted-foreground tabular-nums">
+                      {preScanProgressTotal > 0 ? 'albums' : 'roots'}
+                    </p>
+                  </div>
+                  <div className="rounded-lg border border-border bg-background/70 p-3">
+                    <p className="text-muted-foreground">Filesystem walk</p>
+                    <p className="text-xl font-semibold tabular-nums">
+                      {preScanEntriesScanned.toLocaleString()}
+                    </p>
+                    <p className="text-xs text-muted-foreground tabular-nums">
+                      {preScanFilesFound.toLocaleString()} audio files
+                    </p>
+                  </div>
+                  <div className="rounded-lg border border-border bg-background/70 p-3">
+                    <p className="text-muted-foreground">Discovery</p>
+                    <p className="text-xl font-semibold tabular-nums">
+                      {preScanArtistsFound.toLocaleString()} artists
+                    </p>
+                    <p className="text-xs text-muted-foreground tabular-nums">
+                      {preScanAlbumsFound.toLocaleString()} albums
+                    </p>
+                  </div>
+                  <div className="rounded-lg border border-border bg-background/70 p-3">
+                    <p className="text-muted-foreground">Run scope</p>
+                    <p className="text-xl font-semibold tabular-nums">
+                      {n(scanProgress.detected_artists_total).toLocaleString()} artists
+                    </p>
+                    <p className="text-xs text-muted-foreground tabular-nums">
+                      {n(scanProgress.detected_albums_total).toLocaleString()} albums
+                    </p>
+                    {runScopePending && (
+                      <p className="text-[11px] text-muted-foreground">pending until plan ready</p>
+                    )}
+                  </div>
+                  <div className="rounded-lg border border-border bg-background/70 p-3">
+                    <p className="text-muted-foreground">Resume skipped</p>
+                    <p className="text-xl font-semibold tabular-nums">
+                      {n(scanProgress.resume_skipped_artists).toLocaleString()} artists
+                    </p>
+                    <p className="text-xs text-muted-foreground tabular-nums">
+                      {n(scanProgress.resume_skipped_albums).toLocaleString()} albums
+                    </p>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className="rounded-lg border border-border bg-background/70 p-3">
+                    <p className="text-muted-foreground">Artists progress</p>
+                    <p className="text-xl font-semibold tabular-nums">
+                      {n(scanProgress.artists_processed).toLocaleString()} / {n(scanProgress.artists_total).toLocaleString()}
+                    </p>
+                  </div>
+                  <div className="rounded-lg border border-border bg-background/70 p-3">
+                    <p className="text-muted-foreground">Run scope</p>
+                    <p className="text-xl font-semibold tabular-nums">
+                      {n(scanProgress.artists_total).toLocaleString()} artists
+                    </p>
+                    <p className="text-xs text-muted-foreground tabular-nums">
+                      {n(scanProgress.total_albums).toLocaleString()} albums
+                    </p>
+                  </div>
+                  <div className="rounded-lg border border-border bg-background/70 p-3">
+                    <p className="text-muted-foreground">Detected source</p>
+                    <p className="text-xl font-semibold tabular-nums">
+                      {n(scanProgress.detected_artists_total).toLocaleString()} artists
+                    </p>
+                    <p className="text-xs text-muted-foreground tabular-nums">
+                      {n(scanProgress.detected_albums_total).toLocaleString()} albums
+                    </p>
+                  </div>
+                  <div className="rounded-lg border border-border bg-background/70 p-3">
+                    <p className="text-muted-foreground">Resume skipped</p>
+                    <p className="text-xl font-semibold tabular-nums">
+                      {n(scanProgress.resume_skipped_artists).toLocaleString()} artists
+                    </p>
+                    <p className="text-xs text-muted-foreground tabular-nums">
+                      {n(scanProgress.resume_skipped_albums).toLocaleString()} albums
+                    </p>
+                  </div>
+                  <div className="rounded-lg border border-border bg-background/70 p-3">
+                    <p className="text-muted-foreground">Post-processing</p>
+                    <p className="text-xl font-semibold tabular-nums">
+                      {n(scanProgress.post_processing_done).toLocaleString()} / {n(scanProgress.post_processing_total).toLocaleString()}
+                    </p>
+                  </div>
+                </>
+              )}
+            </CardContent>
+            <CardContent className="pt-0">
+              <div className="rounded-lg border border-border bg-background/70 p-3 text-sm">
+                <p className="text-muted-foreground">Track reconciliation</p>
                 <p className="text-xl font-semibold tabular-nums">
-                  {n(scanProgress.artists_processed).toLocaleString()} / {n(scanProgress.artists_total).toLocaleString()}
-                </p>
-              </div>
-              <div className="rounded-lg border border-border bg-background/70 p-3">
-                <p className="text-muted-foreground">Run scope</p>
-                <p className="text-xl font-semibold tabular-nums">
-                  {n(scanProgress.artists_total).toLocaleString()} artists
+                  {liveTracksLibraryKept.toLocaleString()} / {liveTracksDetected.toLocaleString()}
                 </p>
                 <p className="text-xs text-muted-foreground tabular-nums">
-                  {n(scanProgress.total_albums).toLocaleString()} albums
-                </p>
-              </div>
-              <div className="rounded-lg border border-border bg-background/70 p-3">
-                <p className="text-muted-foreground">Detected source</p>
-                <p className="text-xl font-semibold tabular-nums">
-                  {n(scanProgress.detected_artists_total).toLocaleString()} artists
+                  library kept / detected ({liveTrackScopeLabel})
                 </p>
                 <p className="text-xs text-muted-foreground tabular-nums">
-                  {n(scanProgress.detected_albums_total).toLocaleString()} albums
-                </p>
-              </div>
-              <div className="rounded-lg border border-border bg-background/70 p-3">
-                <p className="text-muted-foreground">Resume skipped</p>
-                <p className="text-xl font-semibold tabular-nums">
-                  {n(scanProgress.resume_skipped_artists).toLocaleString()} artists
-                </p>
-                <p className="text-xs text-muted-foreground tabular-nums">
-                  {n(scanProgress.resume_skipped_albums).toLocaleString()} albums
-                </p>
-              </div>
-              <div className="rounded-lg border border-border bg-background/70 p-3">
-                <p className="text-muted-foreground">Post-processing</p>
-                <p className="text-xl font-semibold tabular-nums">
-                  {n(scanProgress.post_processing_done).toLocaleString()} / {n(scanProgress.post_processing_total).toLocaleString()}
+                  moved dupes {liveTracksMovedDupes.toLocaleString()} · incomplete {liveTracksMovedIncomplete.toLocaleString()} · unaccounted {liveTracksUnaccounted.toLocaleString()}
                 </p>
               </div>
             </CardContent>
+            {isPreScanPhase && preScanStage === 'filesystem' && (
+              <CardContent className="pt-0">
+                <p className="text-xs text-muted-foreground">
+                  Album total becomes exact during album-candidate pass.
+                </p>
+              </CardContent>
+            )}
             {(liveSkippedArtists > 0 || liveSkippedAlbums > 0) && (
               <CardContent className="pt-0">
                 <p className="text-xs text-muted-foreground">
@@ -1174,6 +1297,14 @@ export default function Statistics() {
                   description={`${formatPercent(current.fullyComplete, current.albumsScanned)} tags + cover + artist image`}
                   delta={<DeltaPill current={current.fullyComplete} previous={previous.fullyComplete} />}
                 />
+                {hasLatestTrackReconciliation && (
+                  <StatCard
+                    title="Track Reconciliation"
+                    icon={<Database className="w-4 h-4 text-primary" />}
+                    value={`${latestSummaryTracksLibraryKept.toLocaleString()} / ${latestSummaryTracksDetected.toLocaleString()}`}
+                    description={`kept/detected · moved dupes ${latestSummaryTracksMovedDupes.toLocaleString()} · incomplete ${latestSummaryTracksMovedIncomplete.toLocaleString()} · unaccounted ${latestSummaryTracksUnaccounted.toLocaleString()}`}
+                  />
+                )}
               </div>
               <Card>
                 <CardHeader>

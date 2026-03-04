@@ -172,10 +172,7 @@ export function AppSidebar() {
       <SidebarHeader>
         <div className="flex items-center gap-2 px-2 py-1.5 group-data-[collapsible=icon]:justify-center group-data-[collapsible=icon]:px-1">
           <SidebarTrigger className="h-8 w-8 rounded-lg" />
-          <Logo showText={false} size="sm" className="group-data-[collapsible=icon]:hidden" />
-          <div className="min-w-0 group-data-[collapsible=icon]:hidden">
-            <div className="font-semibold leading-tight">PMDA</div>
-          </div>
+          <Logo variant="wordmark" size="sm" className="group-data-[collapsible=icon]:hidden" />
         </div>
       </SidebarHeader>
 

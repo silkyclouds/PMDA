@@ -11,9 +11,9 @@
   "background_color": "#0b1220",
   "icons": [
     {
-      "src": "/favicon.svg",
-      "sizes": "any",
-      "type": "image/svg+xml",
+      "src": "/favicon.ico",
+      "sizes": "16x16 32x32 48x48 64x64 128x128",
+      "type": "image/x-icon",
       "purpose": "any"
     },
     {

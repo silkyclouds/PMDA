@@ -43,6 +43,58 @@ export function useScanProgressShared(options: UseScanProgressSharedOptions = {}
 
   const isScanning = progress?.scanning ?? false;
   const isDeduping = dedupeProgress?.deduping ?? false;
+  const phase = progress?.phase ?? null;
+
+  // Pre-scan progress (FILES discovery + album candidate planning).
+  // We expose a meaningful moving percentage even before we know final album N/M.
+  const preScanAlbumsTotal = Math.max(0, progress?.scan_preplan_total || progress?.scan_discovery_albums_total || progress?.scan_discovery_folders_total || 0);
+  const preScanAlbumsDone = Math.max(0, progress?.scan_preplan_done || progress?.scan_discovery_albums_done || progress?.scan_discovery_folders_done || 0);
+  const preScanRootsTotal = Math.max(0, progress?.scan_discovery_roots_total || 0);
+  const preScanRootsDone = Math.max(0, progress?.scan_discovery_roots_done || 0);
+  const preScanEntriesScanned = Math.max(0, progress?.scan_discovery_entries_scanned || 0);
+  const preScanFilesFound = Math.max(0, progress?.scan_discovery_files_found || 0);
+  const preScanStage = String(progress?.scan_discovery_stage || '');
+  const preScanActive = isScanning && (
+    phase === 'pre_scan' ||
+    Boolean(progress?.scan_discovery_running) ||
+    preScanStage === 'filesystem' ||
+    preScanStage === 'album_candidates' ||
+    preScanAlbumsTotal > 0 ||
+    Math.max(0, progress?.scan_discovery_files_found || 0) > 0
+  );
+
+  const preScanPercent = (() => {
+    if (!preScanActive) return 0;
+    const stage = preScanStage;
+    if (stage === 'ready') return 100;
+    if (stage === 'album_candidates' || preScanAlbumsTotal > 0) {
+      const total = Math.max(1, preScanAlbumsTotal);
+      const done = Math.max(0, Math.min(preScanAlbumsDone, total));
+      return Math.floor(70 + (25 * done) / total);
+    }
+    if (stage === 'filesystem' || preScanRootsTotal > 0) {
+      const total = Math.max(1, preScanRootsTotal);
+      const done = Math.max(0, Math.min(preScanRootsDone, total));
+      return Math.floor((70 * done) / total);
+    }
+    return 0;
+  })();
+
+  const preScanStageLabel = preScanStage === 'album_candidates'
+    ? 'album candidates'
+    : preScanStage === 'filesystem'
+      ? 'filesystem'
+      : preScanStage === 'ready'
+        ? 'ready'
+        : 'pre-scan';
+
+  const preScanStatusLabel = (preScanStage === 'album_candidates' || preScanAlbumsTotal > 0)
+    ? `albums ${Math.max(0, Math.min(preScanAlbumsDone, Math.max(1, preScanAlbumsTotal))).toLocaleString()}/${Math.max(0, preScanAlbumsTotal).toLocaleString()}`
+    : preScanRootsTotal > 0
+      ? `roots ${Math.max(0, Math.min(preScanRootsDone, preScanRootsTotal)).toLocaleString()}/${preScanRootsTotal.toLocaleString()}`
+      : `${preScanEntriesScanned.toLocaleString()} entries`;
+  const preScanCountersLabel = `visited ${preScanEntriesScanned.toLocaleString()} · audio ${preScanFilesFound.toLocaleString()}`;
+
   // Bar progress: include post-processing when present so 100% means truly finished.
   const artistsProcessed = progress?.artists_processed ?? 0;
   const artistsTotal = progress?.artists_total ?? 0;
@@ -55,12 +107,16 @@ export function useScanProgressShared(options: UseScanProgressSharedOptions = {}
   const clampedPostDone = Math.max(0, Math.min(postDone, postTotal));
   const compositeDone = clampedArtistsDone + clampedPostDone;
   const compositeTotal = Math.max(0, artistsTotal) + Math.max(0, postTotal);
-  const rawPercent = hasPostWork
+  const rawPercent = preScanActive
+    ? preScanPercent
+    : hasPostWork
     ? (compositeTotal > 0 ? Math.min(100, (compositeDone / compositeTotal) * 100) : 0)
     : (isScanning && artistsTotal > 0
       ? Math.min(100, (artistsProcessed / artistsTotal) * 100)
       : (stepTotal > 0 ? Math.min(100, (stepProgress / stepTotal) * 100) : 0));
-  const progressPercent = isScanning ? Math.min(99, rawPercent) : rawPercent;
+  const progressPercent = isScanning
+    ? (preScanActive ? Math.min(100, rawPercent) : Math.min(99, rawPercent))
+    : rawPercent;
   const status = progress?.status ?? 'idle';
   
   // Dedupe progress values
@@ -142,7 +198,11 @@ export function useScanProgressShared(options: UseScanProgressSharedOptions = {}
     // Scan progress values
     progressPercent,
     status,
-    phase: progress?.phase ?? null,
+    phase,
+    preScanActive,
+    preScanStageLabel,
+    preScanStatusLabel,
+    preScanCountersLabel,
     
     // Dedupe progress values
     dedupeProgressValue,
