@@ -1,8 +1,7 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
-import { Save, Loader2, Check, FolderOutput, RefreshCw, Plus, X, Database, Sparkles, ExternalLink, Copy, MapPin, ChevronDown, AlertTriangle, Trash2 } from 'lucide-react';
+import { useState, useEffect, useRef, useCallback, type ComponentType } from 'react';
+import { Save, Loader2, Check, FolderOutput, RefreshCw, X, Database, Sparkles, ExternalLink, Copy, MapPin, ChevronDown, AlertTriangle, Trash2, SlidersHorizontal, Workflow } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { toast } from 'sonner';
-import { NotificationSettings } from '@/components/settings/NotificationSettings';
 import { IntegrationsSettings } from '@/components/settings/IntegrationsSettings';
 import { SchedulerSettings } from '@/components/settings/SchedulerSettings';
 import { SourcesAutonomySettings } from '@/components/settings/SourcesAutonomySettings';
@@ -42,17 +41,93 @@ import {
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
 
-const SETTINGS_SECTIONS: { id: string; label: string }[] = [
-  { id: 'settings-files-export', label: 'Folders' },
-  { id: 'settings-sources-autonomy', label: 'Sources & autonomy' },
-  { id: 'settings-scan-behavior', label: 'Scan behavior' },
-  { id: 'settings-pipeline', label: 'Pipeline' },
-  { id: 'settings-ai', label: 'AI' },
-  { id: 'settings-providers', label: 'Metadata providers' },
-  { id: 'settings-concerts', label: 'Concerts' },
-  { id: 'settings-notifications', label: 'In-app notifications' },
-  { id: 'settings-danger-zone', label: 'Danger zone' },
+type SettingsSection = {
+  id: string;
+  label: string;
+  icon: ComponentType<{ className?: string }>;
+  navClass: string;
+  navActiveClass: string;
+  cardClass: string;
+  iconClass: string;
+};
+
+const SETTINGS_SECTIONS: SettingsSection[] = [
+  {
+    id: 'settings-files-export',
+    label: 'Folders',
+    icon: FolderOutput,
+    navClass: 'border-cyan-300/60 bg-cyan-500/10 text-cyan-800 hover:bg-cyan-500/20 dark:border-cyan-500/30 dark:text-cyan-100',
+    navActiveClass: 'ring-1 ring-cyan-400/40 bg-cyan-500/20 dark:bg-cyan-500/25',
+    cardClass: 'border-cyan-500/20 bg-cyan-500/[0.04]',
+    iconClass: 'bg-cyan-500/20 text-cyan-700 dark:text-cyan-200',
+  },
+  {
+    id: 'settings-scan-behavior',
+    label: 'Scan behavior',
+    icon: SlidersHorizontal,
+    navClass: 'border-indigo-300/60 bg-indigo-500/10 text-indigo-800 hover:bg-indigo-500/20 dark:border-indigo-500/30 dark:text-indigo-100',
+    navActiveClass: 'ring-1 ring-indigo-400/40 bg-indigo-500/20 dark:bg-indigo-500/25',
+    cardClass: 'border-indigo-500/20 bg-indigo-500/[0.04]',
+    iconClass: 'bg-indigo-500/20 text-indigo-700 dark:text-indigo-200',
+  },
+  {
+    id: 'settings-pipeline',
+    label: 'Pipeline',
+    icon: Sparkles,
+    navClass: 'border-violet-300/60 bg-violet-500/10 text-violet-800 hover:bg-violet-500/20 dark:border-violet-500/30 dark:text-violet-100',
+    navActiveClass: 'ring-1 ring-violet-400/40 bg-violet-500/20 dark:bg-violet-500/25',
+    cardClass: 'border-violet-500/20 bg-violet-500/[0.04]',
+    iconClass: 'bg-violet-500/20 text-violet-700 dark:text-violet-200',
+  },
+  {
+    id: 'settings-ai',
+    label: 'AI',
+    icon: Sparkles,
+    navClass: 'border-fuchsia-300/60 bg-fuchsia-500/10 text-fuchsia-800 hover:bg-fuchsia-500/20 dark:border-fuchsia-500/30 dark:text-fuchsia-100',
+    navActiveClass: 'ring-1 ring-fuchsia-400/40 bg-fuchsia-500/20 dark:bg-fuchsia-500/25',
+    cardClass: 'border-fuchsia-500/20 bg-fuchsia-500/[0.04]',
+    iconClass: 'bg-fuchsia-500/20 text-fuchsia-700 dark:text-fuchsia-200',
+  },
+  {
+    id: 'settings-providers',
+    label: 'Metadata providers',
+    icon: Database,
+    navClass: 'border-sky-300/60 bg-sky-500/10 text-sky-800 hover:bg-sky-500/20 dark:border-sky-500/30 dark:text-sky-100',
+    navActiveClass: 'ring-1 ring-sky-400/40 bg-sky-500/20 dark:bg-sky-500/25',
+    cardClass: 'border-sky-500/20 bg-sky-500/[0.04]',
+    iconClass: 'bg-sky-500/20 text-sky-700 dark:text-sky-200',
+  },
+  {
+    id: 'settings-concerts',
+    label: 'Concerts',
+    icon: MapPin,
+    navClass: 'border-amber-300/60 bg-amber-500/10 text-amber-800 hover:bg-amber-500/20 dark:border-amber-500/30 dark:text-amber-100',
+    navActiveClass: 'ring-1 ring-amber-400/40 bg-amber-500/20 dark:bg-amber-500/25',
+    cardClass: 'border-amber-500/20 bg-amber-500/[0.04]',
+    iconClass: 'bg-amber-500/20 text-amber-700 dark:text-amber-200',
+  },
+  {
+    id: 'settings-danger-zone',
+    label: 'Danger zone',
+    icon: AlertTriangle,
+    navClass: 'border-rose-300/60 bg-rose-500/10 text-rose-800 hover:bg-rose-500/20 dark:border-rose-500/30 dark:text-rose-100',
+    navActiveClass: 'ring-1 ring-rose-400/40 bg-rose-500/20 dark:bg-rose-500/25',
+    cardClass: 'border-destructive/30 bg-destructive/[0.04]',
+    iconClass: 'bg-destructive/20 text-destructive',
+  },
 ];
+
+const SETTINGS_SECTION_MAP: Record<string, SettingsSection> = SETTINGS_SECTIONS.reduce<Record<string, SettingsSection>>(
+  (acc, section) => {
+    acc[section.id] = section;
+    return acc;
+  },
+  {},
+);
+
+function getSettingsSection(id: string): SettingsSection {
+  return SETTINGS_SECTION_MAP[id] || SETTINGS_SECTIONS[0]!;
+}
 
 type MaintenanceResetAction = api.MaintenanceResetAction;
 type DangerPreset = 'reset_all_keep_settings';
@@ -165,15 +240,12 @@ function parsePathListValue(value: unknown): string[] {
   return out;
 }
 
-function serializePathList(paths: string[]): string {
-  return parsePathListValue(paths).join(', ');
-}
-
 function SettingsPage() {
   const [config, setConfig] = useState<Partial<PMDAConfig>>({});
   const [isLoading, setIsLoading] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
   const [errors, setErrors] = useState<Record<string, string>>({});
+  const [activeSettingsSection, setActiveSettingsSection] = useState<string>('settings-files-export');
   const [openaiOAuth, setOpenaiOAuth] = useState<{
     sessionId: string;
     verificationUrl: string;
@@ -247,7 +319,7 @@ function SettingsPage() {
   const refreshProviderStatus = useCallback(async () => {
     setProvidersChecking(true);
     try {
-      const status = await api.getScanPreflight();
+      const status = await api.getProvidersPreflight();
       setProvidersPreflight(status);
       setProvidersPreflightAt(Date.now());
       toast.success('Provider checks completed');
@@ -260,6 +332,18 @@ function SettingsPage() {
 
   useEffect(() => {
     loadConfig();
+  }, []);
+
+  useEffect(() => {
+    const pickActiveFromHash = () => {
+      const raw = window.location.hash?.replace('#', '').trim();
+      if (!raw) return;
+      const exists = SETTINGS_SECTIONS.some((section) => section.id === raw);
+      if (exists) setActiveSettingsSection(raw);
+    };
+    pickActiveFromHash();
+    window.addEventListener('hashchange', pickActiveFromHash);
+    return () => window.removeEventListener('hashchange', pickActiveFromHash);
   }, []);
 
   // Fetch the curated list of compatible OpenAI models for the dropdown (avoids manual typing).
@@ -298,10 +382,20 @@ function SettingsPage() {
     })();
   }, [config.OPENAI_API_KEY, openaiApiModeEnabled]);
 
+  const refreshOpenAICodexStatus = useCallback(async (checkRuntime = false) => {
+    try {
+      const status = await api.getOpenAICodexOAuthStatus({ checkRuntime });
+      setOpenaiCodexStatus(status);
+      return status;
+    } catch {
+      return null;
+    }
+  }, []);
+
   const loadOptionalProviderState = useCallback(async () => {
     try {
       const [codexStatus, prefs] = await Promise.all([
-        api.getOpenAICodexOAuthStatus().catch(() => null),
+        refreshOpenAICodexStatus(false),
         api.getAIProviderPreferences().catch(() => null),
       ]);
       if (codexStatus) setOpenaiCodexStatus(codexStatus);
@@ -309,7 +403,7 @@ function SettingsPage() {
     } catch {
       // Keep Settings responsive even if optional provider checks fail.
     }
-  }, []);
+  }, [refreshOpenAICodexStatus]);
 
   const loadConfig = async () => {
     setIsLoading(true);
@@ -391,7 +485,9 @@ function SettingsPage() {
       }
       setOpenaiOAuth((prev) => prev ? { ...prev, status: 'pending', message: res.message } : prev);
     } catch (e) {
-      toast.error(getApiErrorMessage(e) || (e instanceof Error ? e.message : 'OpenAI OAuth poll failed'));
+      const message = getApiErrorMessage(e) || (e instanceof Error ? e.message : 'OpenAI OAuth poll failed');
+      setOpenaiOAuth((prev) => prev ? { ...prev, status: 'error', message } : prev);
+      toast.error(message);
     } finally {
       setOpenaiOAuthBusy(false);
     }
@@ -507,10 +603,6 @@ function SettingsPage() {
     return { variant: 'destructive', label: 'Issue', message: result.message || 'Credential check failed.' };
   };
 
-  const setFilesRoots = useCallback((roots: string[]) => {
-    updateConfig({ FILES_ROOTS: serializePathList(roots) });
-  }, [updateConfig]);
-
   const toggleScanFirstMode = useCallback((enabled: boolean) => {
     if (enabled) {
       updateConfig({
@@ -524,20 +616,6 @@ function SettingsPage() {
     updateConfig({ SCHEDULER_PAUSED: false });
     toast.success('Scheduled scans re-enabled');
   }, [updateConfig]);
-
-  const addFilesRoot = useCallback((path: string) => {
-    const clean = parsePathListValue([path])[0] || '';
-    if (!clean) return;
-    const current = parsePathListValue(config.FILES_ROOTS);
-    if (current.includes(clean)) return;
-    setFilesRoots([...current, clean]);
-  }, [config.FILES_ROOTS, setFilesRoots]);
-
-  const removeFilesRoot = useCallback((path: string) => {
-    const current = parsePathListValue(config.FILES_ROOTS);
-    setFilesRoots(current.filter((p) => p !== path));
-  }, [config.FILES_ROOTS, setFilesRoots]);
-  const [pendingFilesRoot, setPendingFilesRoot] = useState('/music');
 
   const handleRebuildFilesIndex = useCallback(async () => {
     if (rebuildIndexLoading) return;
@@ -606,12 +684,6 @@ function SettingsPage() {
       setDangerBusyPreset(null);
     }
   }, [dangerBusyPreset, getApiErrorMessage, pendingDangerPreset, loadConfig]);
-
-  useEffect(() => {
-    if (!pendingFilesRoot.trim()) {
-      setPendingFilesRoot(filesRoots[0] ?? '/music');
-    }
-  }, [filesRoots, pendingFilesRoot]);
 
   useEffect(() => {
     if (!isRestarting) return;
@@ -712,14 +784,16 @@ function SettingsPage() {
         )}
 
         {/* Mobile: horizontal scroll nav */}
-        <nav className="md:hidden mb-4 -mx-6 px-6 overflow-x-auto pb-2 border-b border-border" aria-label="Settings sections">
-          <div className="flex gap-1 min-w-max">
-            {SETTINGS_SECTIONS.map(({ id, label }) => (
+        <nav className="md:hidden mb-4 -mx-6 px-6 overflow-x-auto pb-3 border-b border-border" aria-label="Settings sections">
+          <div className="flex gap-2 min-w-max">
+            {SETTINGS_SECTIONS.map(({ id, label, icon: Icon, navClass, navActiveClass }) => (
               <a
                 key={id}
                 href={`#${id}`}
-                className="shrink-0 py-2 px-3 rounded-md text-sm text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors whitespace-nowrap"
+                onClick={() => setActiveSettingsSection(id)}
+                className={`shrink-0 flex items-center gap-1.5 py-2 px-3 rounded-lg border text-sm transition-colors whitespace-nowrap ${navClass} ${activeSettingsSection === id ? navActiveClass : ''}`}
               >
+                <Icon className="w-3.5 h-3.5" />
                 {label}
               </a>
             ))}
@@ -728,16 +802,18 @@ function SettingsPage() {
 
         <div className="flex gap-8">
           {/* Desktop: sticky left sidebar with anchors */}
-          <nav className="hidden md:block shrink-0 w-44 top-24 self-start sticky" aria-label="Settings sections">
-            <p className="text-xs font-medium text-muted-foreground uppercase tracking-wider mb-2">Sections</p>
-            <ul className="space-y-0.5">
-              {SETTINGS_SECTIONS.map(({ id, label }) => (
+          <nav className="hidden md:block shrink-0 w-56 top-24 self-start sticky rounded-xl border border-border bg-card/50 p-3 shadow-sm" aria-label="Settings sections">
+            <p className="text-xs font-medium text-muted-foreground uppercase tracking-wider mb-3">Settings map</p>
+            <ul className="space-y-1.5">
+              {SETTINGS_SECTIONS.map(({ id, label, icon: Icon, navClass, navActiveClass }) => (
                 <li key={id}>
                   <a
                     href={`#${id}`}
-                    className="block py-1.5 px-2 rounded-md text-sm text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors"
+                    onClick={() => setActiveSettingsSection(id)}
+                    className={`flex items-center gap-2 py-2 px-2.5 rounded-lg border text-sm transition-colors ${navClass} ${activeSettingsSection === id ? navActiveClass : ''}`}
                   >
-                    {label}
+                    <Icon className="w-4 h-4" />
+                    <span>{label}</span>
                   </a>
                 </li>
               ))}
@@ -745,20 +821,27 @@ function SettingsPage() {
           </nav>
 
           <div className="min-w-0 flex-1 space-y-6">
-            <Card id="settings-files-export" className="scroll-mt-24">
+            <Card id="settings-files-export" className={`scroll-mt-24 ${getSettingsSection('settings-files-export').cardClass}`}>
               <CardHeader>
                 <CardTitle className="flex items-center gap-2">
-                  <FolderOutput className="w-5 h-5" />
+                  <span className={`inline-flex h-8 w-8 items-center justify-center rounded-md ${getSettingsSection('settings-files-export').iconClass}`}>
+                    <FolderOutput className="w-4 h-4" />
+                  </span>
                   Folders
                 </CardTitle>
                 <CardDescription>
-                  Configure scan sources, caches, and destination folders used by pipeline steps.
+                  Configure scan roots, incoming/library roles, cache folders, and export destinations in one place.
                 </CardDescription>
               </CardHeader>
               <CardContent className="space-y-4">
-                <div className="space-y-2">
+                <div className="space-y-2 rounded-lg border border-border p-3">
                   <div className="flex items-center justify-between gap-3">
-                    <Label>Music folders</Label>
+                    <div className="space-y-1">
+                      <Label>Library index</Label>
+                      <p className="text-xs text-muted-foreground">
+                        Rebuild indexed files from currently enabled source roots.
+                      </p>
+                    </div>
                     <AlertDialog>
                       <AlertDialogTrigger asChild>
                         <Button
@@ -776,12 +859,11 @@ function SettingsPage() {
                         <AlertDialogHeader>
                           <AlertDialogTitle>Rebuild library index from scratch?</AlertDialogTitle>
                           <AlertDialogDescription>
-                            This will clear the current files-library index and rebuild everything from the configured music folders.
-                            Existing indexed entries will be removed before re-indexing.
+                            This clears files-library rows and rebuilds from the enabled source roots below.
                           </AlertDialogDescription>
                         </AlertDialogHeader>
                         <div className="rounded-md border border-border bg-muted/30 p-3 text-xs text-muted-foreground space-y-1">
-                          <p className="font-medium text-foreground">Sources used for rebuild</p>
+                          <p className="font-medium text-foreground">Current roots</p>
                           {filesRoots.map((rootPath) => (
                             <p key={`rebuild-${rootPath}`} className="font-mono truncate" title={rootPath}>{rootPath}</p>
                           ))}
@@ -801,53 +883,6 @@ function SettingsPage() {
                         </AlertDialogFooter>
                       </AlertDialogContent>
                     </AlertDialog>
-                  </div>
-                  <p className="text-xs text-muted-foreground">
-                    Add one or more scan roots (container paths). For Library/Incoming roles and Primary destination, use <span className="text-foreground">Sources &amp; autonomy</span> below.
-                  </p>
-                  <div className="space-y-2">
-                    {filesRoots.length === 0 ? (
-                      <p className="text-xs text-muted-foreground border rounded-md px-3 py-2">
-                        No source folder configured.
-                      </p>
-                    ) : (
-                      <div className="space-y-2">
-                        {filesRoots.map((rootPath) => (
-                          <div key={rootPath} className="flex items-center justify-between gap-2 border rounded-md px-3 py-2">
-                            <span className="font-mono text-sm truncate" title={rootPath}>{rootPath}</span>
-                            <Button
-                              type="button"
-                              variant="ghost"
-                              size="icon"
-                              onClick={() => removeFilesRoot(rootPath)}
-                              aria-label={`Remove ${rootPath}`}
-                            >
-                              <X className="w-4 h-4" />
-                            </Button>
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                    <div className="flex items-center gap-2">
-                      <div className="flex-1">
-                        <FolderBrowserInput
-                          value={pendingFilesRoot}
-                          onChange={setPendingFilesRoot}
-                          placeholder="/music"
-                          selectLabel="Add music source folder"
-                        />
-                      </div>
-                      <Button
-                        type="button"
-                        variant="outline"
-                        className="gap-2 shrink-0"
-                        onClick={() => addFilesRoot(pendingFilesRoot)}
-                        disabled={!pendingFilesRoot.trim()}
-                      >
-                        <Plus className="w-4 h-4" />
-                        Add
-                      </Button>
-                    </div>
                   </div>
                 </div>
                 <div className="space-y-2">
@@ -998,28 +1033,62 @@ function SettingsPage() {
                     selectLabel="Select duplicates destination folder"
                   />
                 </div>
+                <Separator />
+                <div className="space-y-2">
+                  <Label>Library export folder</Label>
+                  <p className="text-xs text-muted-foreground">
+                    Destination used by the export step when enabled.
+                  </p>
+                  <FolderBrowserInput
+                    value={config.EXPORT_ROOT ?? '/music/library'}
+                    onChange={(path) => updateConfig({ EXPORT_ROOT: path || '/music/library' })}
+                    placeholder="/music/library"
+                    selectLabel="Select library export destination folder"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label>Export strategy</Label>
+                  <p className="text-xs text-muted-foreground">
+                    Choose how PMDA writes files to the export library folder.
+                  </p>
+                  <Select
+                    value={(config.EXPORT_LINK_STRATEGY as 'hardlink' | 'symlink' | 'copy' | 'move' | undefined) ?? 'hardlink'}
+                    onValueChange={(value: 'hardlink' | 'symlink' | 'copy' | 'move') => updateConfig({ EXPORT_LINK_STRATEGY: value })}
+                  >
+                    <SelectTrigger className="w-full md:w-[320px]">
+                      <SelectValue placeholder="Select strategy" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="hardlink">Hardlink (fast, no extra space)</SelectItem>
+                      <SelectItem value="symlink">Symlink (keeps original files)</SelectItem>
+                      <SelectItem value="copy">Copy (duplicates files)</SelectItem>
+                      <SelectItem value="move">Move (relocate files)</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+                <Separator />
+                <div className="space-y-3">
+                  <div className="space-y-1">
+                    <Label>Sources & autonomy</Label>
+                    <p className="text-xs text-muted-foreground">
+                      Mark each root as Library or Incoming and choose the primary Library destination.
+                    </p>
+                  </div>
+                  <SourcesAutonomySettings />
+                </div>
               </CardContent>
             </Card>
 
             <Separator />
 
-            <Card id="settings-sources-autonomy" className="scroll-mt-24">
+            <Card id="settings-scan-behavior" className={`scroll-mt-24 ${getSettingsSection('settings-scan-behavior').cardClass}`}>
               <CardHeader>
-                <CardTitle>Sources & autonomy</CardTitle>
-                <CardDescription>
-                  Define where PMDA reads music (library vs incoming) and where cleaned winners are placed.
-                </CardDescription>
-              </CardHeader>
-              <CardContent>
-                <SourcesAutonomySettings />
-              </CardContent>
-            </Card>
-
-            <Separator />
-
-            <Card id="settings-scan-behavior" className="scroll-mt-24">
-              <CardHeader>
-                <CardTitle>Scan behavior</CardTitle>
+                <CardTitle className="flex items-center gap-2">
+                  <span className={`inline-flex h-8 w-8 items-center justify-center rounded-md ${getSettingsSection('settings-scan-behavior').iconClass}`}>
+                    <SlidersHorizontal className="w-4 h-4" />
+                  </span>
+                  Scan behavior
+                </CardTitle>
                 <CardDescription>
                   Recommended mode is scan-first: PMDA runs pipeline inside the scan and avoids random background jobs.
                 </CardDescription>
@@ -1119,9 +1188,14 @@ function SettingsPage() {
 
             <Separator />
 
-            <Card id="settings-pipeline" className="scroll-mt-24">
+            <Card id="settings-pipeline" className={`scroll-mt-24 ${getSettingsSection('settings-pipeline').cardClass}`}>
               <CardHeader>
-                <CardTitle>Pipeline automation</CardTitle>
+                <CardTitle className="flex items-center gap-2">
+                  <span className={`inline-flex h-8 w-8 items-center justify-center rounded-md ${getSettingsSection('settings-pipeline').iconClass}`}>
+                    <Workflow className="w-4 h-4" />
+                  </span>
+                  Pipeline automation
+                </CardTitle>
                 <CardDescription>Enable/disable each pipeline stage and configure external player sync.</CardDescription>
               </CardHeader>
               <CardContent>
@@ -1131,10 +1205,12 @@ function SettingsPage() {
 
             <Separator />
 
-            <Card id="settings-ai" className="scroll-mt-24">
+            <Card id="settings-ai" className={`scroll-mt-24 ${getSettingsSection('settings-ai').cardClass}`}>
               <CardHeader>
                 <CardTitle className="flex items-center gap-2">
-                  <Sparkles className="w-5 h-5" />
+                  <span className={`inline-flex h-8 w-8 items-center justify-center rounded-md ${getSettingsSection('settings-ai').iconClass}`}>
+                    <Sparkles className="w-4 h-4" />
+                  </span>
                   AI
                 </CardTitle>
                 <CardDescription>
@@ -1237,7 +1313,14 @@ function SettingsPage() {
                       variant="outline"
                       size="sm"
                       className="gap-2"
-                      onClick={loadConfig}
+                      onClick={async () => {
+                        setOpenaiOAuthBusy(true);
+                        try {
+                          await refreshOpenAICodexStatus(true);
+                        } finally {
+                          setOpenaiOAuthBusy(false);
+                        }
+                      }}
                       disabled={openaiOAuthBusy}
                     >
                       <RefreshCw className="w-4 h-4" />
@@ -1531,10 +1614,12 @@ function SettingsPage() {
 
             <Separator />
 
-            <Card id="settings-providers" className="scroll-mt-24">
+            <Card id="settings-providers" className={`scroll-mt-24 ${getSettingsSection('settings-providers').cardClass}`}>
               <CardHeader>
                 <CardTitle className="flex items-center gap-2">
-                  <Database className="w-5 h-5" />
+                  <span className={`inline-flex h-8 w-8 items-center justify-center rounded-md ${getSettingsSection('settings-providers').iconClass}`}>
+                    <Database className="w-4 h-4" />
+                  </span>
                   Metadata providers
                 </CardTitle>
                 <CardDescription>
@@ -1727,10 +1812,12 @@ function SettingsPage() {
 
             <Separator />
 
-            <Card id="settings-concerts" className="scroll-mt-24">
+            <Card id="settings-concerts" className={`scroll-mt-24 ${getSettingsSection('settings-concerts').cardClass}`}>
               <CardHeader>
                 <CardTitle className="flex items-center gap-2">
-                  <MapPin className="w-5 h-5" />
+                  <span className={`inline-flex h-8 w-8 items-center justify-center rounded-md ${getSettingsSection('settings-concerts').iconClass}`}>
+                    <MapPin className="w-4 h-4" />
+                  </span>
                   Concerts
                 </CardTitle>
                 <CardDescription>
@@ -1834,23 +1921,12 @@ function SettingsPage() {
 
             <Separator />
 
-            {/* Notifications Settings */}
-            <Card id="settings-notifications" className="scroll-mt-24">
-              <CardHeader>
-                <CardTitle>In-app notifications</CardTitle>
-                <CardDescription>Scan and pipeline notifications shown directly inside PMDA.</CardDescription>
-              </CardHeader>
-              <CardContent>
-                <NotificationSettings config={config} updateConfig={updateConfig} />
-              </CardContent>
-            </Card>
-
-            <Separator />
-
-            <Card id="settings-danger-zone" className="scroll-mt-24 border-destructive/30">
+            <Card id="settings-danger-zone" className={`scroll-mt-24 ${getSettingsSection('settings-danger-zone').cardClass}`}>
               <CardHeader>
                 <CardTitle className="flex items-center gap-2 text-destructive">
-                  <AlertTriangle className="w-5 h-5" />
+                  <span className={`inline-flex h-8 w-8 items-center justify-center rounded-md ${getSettingsSection('settings-danger-zone').iconClass}`}>
+                    <AlertTriangle className="w-4 h-4" />
+                  </span>
                   Danger Zone
                 </CardTitle>
                 <CardDescription>

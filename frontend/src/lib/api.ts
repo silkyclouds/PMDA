@@ -2690,7 +2690,11 @@ export interface ScanPreflightResult {
 }
 
 export async function getScanPreflight(): Promise<ScanPreflightResult> {
-  return fetchApi<ScanPreflightResult>('/api/scan/preflight');
+  return fetchApi<ScanPreflightResult>('/api/scan/preflight', { timeoutMs: 45000 });
+}
+
+export async function getProvidersPreflight(): Promise<ScanPreflightResult> {
+  return fetchApi<ScanPreflightResult>('/api/providers/preflight', { timeoutMs: 45000 });
 }
 
 export async function playerCheck(payload: PlayerCheckPayload = {}): Promise<PlayerActionResult> {
@@ -3413,8 +3417,10 @@ export async function pollOpenAIDeviceOAuth(sessionId: string): Promise<OpenAIDe
   });
 }
 
-export async function getOpenAICodexOAuthStatus(): Promise<OpenAICodexOAuthStatusResponse> {
-  return fetchApi<OpenAICodexOAuthStatusResponse>('/api/ai/providers/openai-codex/oauth/status');
+export async function getOpenAICodexOAuthStatus(options?: { checkRuntime?: boolean }): Promise<OpenAICodexOAuthStatusResponse> {
+  const runtimeFlag = Boolean(options?.checkRuntime);
+  const query = runtimeFlag ? '?check_runtime=true' : '';
+  return fetchApi<OpenAICodexOAuthStatusResponse>(`/api/ai/providers/openai-codex/oauth/status${query}`);
 }
 
 export async function disconnectOpenAICodexOAuth(): Promise<{ ok: boolean; message?: string }> {

@@ -631,10 +631,13 @@ else:
 
 _AUTH_RATE_LIMIT_LOCK = threading.Lock()
 _AUTH_RATE_LIMIT_BUCKETS: dict[tuple[str, str], deque[int]] = {}
-AUTH_DB_BUSY_TIMEOUT_MS = max(250, int(os.getenv("PMDA_AUTH_DB_BUSY_TIMEOUT_MS", "1500") or "1500"))
-AUTH_SESSION_TOUCH_MIN_INTERVAL_SEC = max(5, int(os.getenv("PMDA_AUTH_SESSION_TOUCH_MIN_INTERVAL_SEC", "60") or "60"))
+AUTH_DB_BUSY_TIMEOUT_MS = max(500, int(os.getenv("PMDA_AUTH_DB_BUSY_TIMEOUT_MS", "10000") or "10000"))
+AUTH_SESSION_TOUCH_MIN_INTERVAL_SEC = max(5, int(os.getenv("PMDA_AUTH_SESSION_TOUCH_MIN_INTERVAL_SEC", "300") or "300"))
+AUTH_SESSION_TOUCH_DB_WRITES = _parse_bool(os.getenv("PMDA_AUTH_SESSION_TOUCH_DB_WRITES", "false"))
 _AUTH_SESSION_TOUCH_LOCK = threading.Lock()
 _AUTH_SESSION_TOUCH_CACHE: dict[str, int] = {}
+_AUTH_SESSION_CACHE_LOCK = threading.Lock()
+_AUTH_SESSION_USER_CACHE: dict[str, dict[str, Any]] = {}
 
 # Files-mode all-in-one data services (embedded in container entrypoint)
 PMDA_PG_HOST = (os.getenv("PMDA_PG_HOST", "127.0.0.1") or "127.0.0.1").strip()
@@ -663,6 +666,11 @@ PMDA_AUTO_CHANGED_ONLY_SCAN_MIN_PENDING = int(os.getenv("PMDA_AUTO_CHANGED_ONLY_
 PMDA_CACHE_TELEMETRY_TTL_SEC = float(os.getenv("PMDA_CACHE_TELEMETRY_TTL_SEC", "15") or "15")
 PMDA_CACHE_TELEMETRY_MAX_WALK_FILES = int(os.getenv("PMDA_CACHE_TELEMETRY_MAX_WALK_FILES", "400000") or "400000")
 PMDA_CACHE_TELEMETRY_MAX_REDIS_SCAN_KEYS = int(os.getenv("PMDA_CACHE_TELEMETRY_MAX_REDIS_SCAN_KEYS", "200000") or "200000")
+PMDA_REDIS_IDLE_CPU_WARN_PCT = float(os.getenv("PMDA_REDIS_IDLE_CPU_WARN_PCT", "35") or "35")
+PMDA_REDIS_IDLE_OPS_MAX = max(0, int(os.getenv("PMDA_REDIS_IDLE_OPS_MAX", "5") or "5"))
+PMDA_REDIS_IDLE_KEYS_MAX = max(0, int(os.getenv("PMDA_REDIS_IDLE_KEYS_MAX", "200") or "200"))
+PMDA_REDIS_IDLE_CONSECUTIVE = max(1, int(os.getenv("PMDA_REDIS_IDLE_CONSECUTIVE", "3") or "3"))
+PMDA_REDIS_IDLE_WARN_COOLDOWN_SEC = max(10.0, float(os.getenv("PMDA_REDIS_IDLE_WARN_COOLDOWN_SEC", "180") or "180"))
 PMDA_FILES_LOCAL_CACHE_MAX_KEYS = int(max(1000, _parse_int(os.getenv("PMDA_FILES_LOCAL_CACHE_MAX_KEYS", "200000"), 200000) or 200000))
 PMDA_BENCHMARK_REPORTS_DIR = (
     os.getenv("PMDA_BENCHMARK_REPORTS_DIR", "/music/pmda_scan_benchmark/reports")
@@ -831,6 +839,53 @@ def _auth_should_touch_session(token_hash: str, now_ts: int) -> bool:
             for k in stale[:5000]:
                 _AUTH_SESSION_TOUCH_CACHE.pop(k, None)
     return True
+
+
+def _auth_session_cache_get(token_hash: str, now_ts: int) -> Optional[dict]:
+    key = str(token_hash or "").strip()
+    if not key:
+        return None
+    now = int(now_ts or _auth_now_ts())
+    with _AUTH_SESSION_CACHE_LOCK:
+        entry = _AUTH_SESSION_USER_CACHE.get(key)
+        if not isinstance(entry, dict):
+            return None
+        expires_at = int(entry.get("expires_at") or 0)
+        if expires_at <= now:
+            _AUTH_SESSION_USER_CACHE.pop(key, None)
+            return None
+        user_obj = entry.get("user")
+        if isinstance(user_obj, dict):
+            return dict(user_obj)
+        return None
+
+
+def _auth_session_cache_set(token_hash: str, user_obj: dict, expires_at: int) -> None:
+    key = str(token_hash or "").strip()
+    if not key or not isinstance(user_obj, dict):
+        return
+    now = _auth_now_ts()
+    with _AUTH_SESSION_CACHE_LOCK:
+        _AUTH_SESSION_USER_CACHE[key] = {
+            "user": dict(user_obj),
+            "expires_at": int(expires_at or 0),
+            "updated_at": now,
+        }
+        if len(_AUTH_SESSION_USER_CACHE) > 5000:
+            stale = sorted(
+                _AUTH_SESSION_USER_CACHE.items(),
+                key=lambda item: int((item[1] or {}).get("updated_at") or 0),
+            )
+            for stale_key, _ in stale[:2000]:
+                _AUTH_SESSION_USER_CACHE.pop(stale_key, None)
+
+
+def _auth_session_cache_drop(token_hash: str) -> None:
+    key = str(token_hash or "").strip()
+    if not key:
+        return
+    with _AUTH_SESSION_CACHE_LOCK:
+        _AUTH_SESSION_USER_CACHE.pop(key, None)
 
 
 def _auth_password_hash(password: str, salt_hex: str) -> str:
@@ -1202,63 +1257,100 @@ def _auth_resolve_session(raw_token: str) -> Optional[dict]:
         return None
     now = _auth_now_ts()
     token_hash = _auth_token_hash(token)
-    con = _auth_db_connect()
-    try:
-        cur = con.cursor()
-        cur.execute(
-            """
-            SELECT
-                s.user_id,
-                s.expires_at,
-                u.id,
-                u.username,
-                u.is_admin,
-                u.can_download,
-                u.can_view_statistics,
-                u.is_active,
-                u.created_at,
-                u.updated_at,
-                u.last_login_at
-            FROM auth_sessions s
-            JOIN auth_users u ON u.id = s.user_id
-            WHERE s.token_hash = ?
-            LIMIT 1
-            """,
-            (token_hash,),
-        )
-        row = cur.fetchone()
-        if not row:
-            return None
-        expires_at = int(row["expires_at"] or 0)
-        if expires_at <= now:
-            cur.execute("DELETE FROM auth_sessions WHERE token_hash = ?", (token_hash,))
-            con.commit()
-            return None
-        if not bool(int(row["is_active"] or 0)):
-            return None
-        # Best effort touch: never fail auth resolution because SQLite is briefly locked.
-        if _auth_should_touch_session(token_hash, now):
-            try:
-                cur.execute("UPDATE auth_sessions SET last_used_at = ? WHERE token_hash = ?", (now, token_hash))
-                con.commit()
-            except sqlite3.OperationalError as exc:
-                msg = str(exc or "").lower()
-                if "locked" in msg or "busy" in msg:
+    lock_error = None
+    for attempt in range(2):
+        con = _auth_db_connect()
+        try:
+            cur = con.cursor()
+            cur.execute(
+                """
+                SELECT
+                    s.user_id,
+                    s.expires_at,
+                    u.id,
+                    u.username,
+                    u.is_admin,
+                    u.can_download,
+                    u.can_view_statistics,
+                    u.is_active,
+                    u.created_at,
+                    u.updated_at,
+                    u.last_login_at
+                FROM auth_sessions s
+                JOIN auth_users u ON u.id = s.user_id
+                WHERE s.token_hash = ?
+                LIMIT 1
+                """,
+                (token_hash,),
+            )
+            row = cur.fetchone()
+            if not row:
+                _auth_session_cache_drop(token_hash)
+                return None
+            expires_at = int(row["expires_at"] or 0)
+            if expires_at <= now:
+                try:
+                    cur.execute("DELETE FROM auth_sessions WHERE token_hash = ?", (token_hash,))
+                    con.commit()
+                except Exception:
                     try:
                         con.rollback()
                     except Exception:
                         pass
-                    logging.debug("Auth session touch skipped due to SQLite lock")
-                else:
-                    raise
-            except Exception:
+                _auth_session_cache_drop(token_hash)
+                return None
+            if not bool(int(row["is_active"] or 0)):
+                _auth_session_cache_drop(token_hash)
+                return None
+            user_obj = _auth_public_user(row)
+            _auth_session_cache_set(token_hash, user_obj, expires_at)
+            # Best effort touch: never fail auth resolution because SQLite is briefly locked.
+            if AUTH_SESSION_TOUCH_DB_WRITES and _auth_should_touch_session(token_hash, now):
+                try:
+                    cur.execute("UPDATE auth_sessions SET last_used_at = ? WHERE token_hash = ?", (now, token_hash))
+                    con.commit()
+                except sqlite3.OperationalError as exc:
+                    msg = str(exc or "").lower()
+                    if "locked" in msg or "busy" in msg:
+                        try:
+                            con.rollback()
+                        except Exception:
+                            pass
+                        logging.debug("Auth session touch skipped due to SQLite lock")
+                    else:
+                        raise
+                except Exception:
+                    try:
+                        con.rollback()
+                    except Exception:
+                        pass
+            return user_obj
+        except sqlite3.OperationalError as exc:
+            msg = str(exc or "").lower()
+            if "locked" in msg or "busy" in msg:
+                lock_error = exc
                 try:
                     con.rollback()
                 except Exception:
                     pass
-        return _auth_public_user(row)
-    finally:
-        con.close()
+                if attempt == 0:
+                    time.sleep(0.05)
+                    continue
+                cached = _auth_session_cache_get(token_hash, now)
+                if cached:
+                    logging.debug("Auth session served from cache after SQLite lock")
+                    return cached
+                logging.warning("Auth session lookup failed due to SQLite lock and no cache entry")
+                return None
+            raise
+        finally:
+            con.close()
+    if lock_error is not None:
+        cached = _auth_session_cache_get(token_hash, now)
+        if cached:
+            logging.debug("Auth session served from cache after lock retry exhaustion")
+            return cached
+    return None
 
 
 def _auth_delete_session(raw_token: str) -> None:
@@ -1266,6 +1358,7 @@ def _auth_delete_session(raw_token: str) -> None:
     if not token:
         return
     token_hash = _auth_token_hash(token)
+    _auth_session_cache_drop(token_hash)
     con = _auth_db_connect()
     try:
         cur = con.cursor()
@@ -3110,7 +3203,9 @@ def _resolve_provider_for_runtime(requested_provider: str, analysis_type: str, *
     selected = select_provider_id(
         context=context,
         preferred=str(preferred or ""),
-        codex_connected=_openai_codex_connected(uid, require_token=True),
+        # Selection should stay lightweight and resilient; runtime token validation
+        # happens when a request is actually sent to the provider.
+        codex_connected=_openai_codex_connected(uid, require_token=False),
         openai_api_enabled=_openai_api_key_mode_enabled(),
         openai_codex_enabled=_openai_codex_oauth_mode_enabled(),
     )
@@ -9300,6 +9395,10 @@ _FILES_REDIS_LAST_ERROR = ""
 _FILES_REDIS_LAST_OK_TS = 0.0
 _FILES_PG_LAST_ERROR = ""
 _FILES_PG_LAST_OK_TS = 0.0
+_REDIS_CPU_SAMPLE_LOCK = threading.Lock()
+_REDIS_CPU_LAST_SAMPLE: dict[str, tuple[float, int, int]] = {}
+_REDIS_IDLE_DRIFT_STREAK = 0
+_REDIS_IDLE_LAST_WARN_TS = 0.0
 
 _LOSSLESS_FORMATS = {"FLAC", "ALAC", "APE", "WV", "WAV", "AIFF", "DSF"}
 _ARTIST_IMAGE_NAMES = (
@@ -10016,6 +10115,61 @@ def _safe_int(value, default: int = 0) -> int:
         return default
 
 
+def _read_total_cpu_jiffies() -> int:
+    try:
+        with open("/proc/stat", "r", encoding="utf-8", errors="ignore") as fh:
+            first = fh.readline().strip()
+        if not first.startswith("cpu "):
+            return 0
+        parts = first.split()[1:]
+        return sum(int(p) for p in parts)
+    except Exception:
+        return 0
+
+
+def _read_process_cpu_jiffies(pid: int) -> int:
+    if int(pid or 0) <= 0:
+        return 0
+    try:
+        with open(f"/proc/{int(pid)}/stat", "r", encoding="utf-8", errors="ignore") as fh:
+            raw = fh.read().strip()
+        if not raw:
+            return 0
+        # /proc/<pid>/stat format: fields 14 and 15 are utime/stime.
+        fields = raw.split()
+        if len(fields) < 16:
+            return 0
+        utime = int(fields[13])
+        stime = int(fields[14])
+        return max(0, utime + stime)
+    except Exception:
+        return 0
+
+
+def _sample_process_cpu_pct(sample_key: str, pid: int) -> float | None:
+    key = str(sample_key or "").strip()
+    proc_jiffies = _read_process_cpu_jiffies(int(pid or 0))
+    total_jiffies = _read_total_cpu_jiffies()
+    if not key or proc_jiffies <= 0 or total_jiffies <= 0:
+        return None
+    now = time.time()
+    with _REDIS_CPU_SAMPLE_LOCK:
+        prev = _REDIS_CPU_LAST_SAMPLE.get(key)
+        _REDIS_CPU_LAST_SAMPLE[key] = (float(now), int(proc_jiffies), int(total_jiffies))
+    if not prev:
+        return None
+    _prev_ts, prev_proc, prev_total = prev
+    delta_proc = int(proc_jiffies) - int(prev_proc or 0)
+    delta_total = int(total_jiffies) - int(prev_total or 0)
+    if delta_proc < 0 or delta_total <= 0:
+        return None
+    cpu_count = max(1, int(os.cpu_count() or 1))
+    pct = (float(delta_proc) / float(delta_total)) * 100.0 * float(cpu_count)
+    if pct < 0.0:
+        return 0.0
+    return round(float(pct), 2)
+
+
 def _read_first_int(paths: list[str]) -> Optional[int]:
     for raw in paths:
         p = Path(raw)
@@ -10335,6 +10489,16 @@ def _read_redis_cache_metrics() -> dict:
         "keyspace_hits": 0,
         "keyspace_misses": 0,
         "keyspace_hit_rate_pct": None,
+        "ops_per_sec": 0,
+        "connected_clients": 0,
+        "redis_process_id": 0,
+        "redis_process_cpu_pct": None,
+        "idle_cpu_drift": {
+            "suspected": False,
+            "streak": 0,
+            "last_warn_ts": 0.0,
+            "reason": "",
+        },
     }
     try:
         with _FILES_LOCAL_CACHE_LOCK:
@@ -10374,6 +10538,7 @@ def _read_redis_cache_metrics() -> dict:
         info_stats = cli.info("stats") or {}
         hits = _safe_int(info_stats.get("keyspace_hits"), 0)
         misses = _safe_int(info_stats.get("keyspace_misses"), 0)
+        out["ops_per_sec"] = _safe_int(info_stats.get("instantaneous_ops_per_sec"), 0)
         out["keyspace_hits"] = hits
         out["keyspace_misses"] = misses
         out["evicted_keys"] = _safe_int(info_stats.get("evicted_keys"), 0)
@@ -10382,6 +10547,25 @@ def _read_redis_cache_metrics() -> dict:
             out["keyspace_hit_rate_pct"] = round((hits / total) * 100.0, 2)
     except Exception:
         pass
+    try:
+        info_clients = cli.info("clients") or {}
+        out["connected_clients"] = _safe_int(info_clients.get("connected_clients"), 0)
+    except Exception:
+        pass
+    redis_pid = 0
+    try:
+        info_server = cli.info("server") or {}
+        redis_pid = _safe_int(info_server.get("process_id"), 0)
+        out["redis_process_id"] = int(redis_pid)
+    except Exception:
+        redis_pid = 0
+    if redis_pid > 0:
+        cpu_pct = _sample_process_cpu_pct(
+            f"redis:{PMDA_REDIS_HOST}:{PMDA_REDIS_PORT}:{PMDA_REDIS_DB}",
+            int(redis_pid),
+        )
+        if cpu_pct is not None:
+            out["redis_process_cpu_pct"] = float(cpu_pct)
     try:
         max_scan = max(1000, int(PMDA_CACHE_TELEMETRY_MAX_REDIS_SCAN_KEYS or 200000))
         k = 0
@@ -10393,6 +10577,46 @@ def _read_redis_cache_metrics() -> dict:
                 break
         out["pmda_prefix_keys"] = int(k)
         out["pmda_prefix_scan_truncated"] = bool(truncated)
+    except Exception:
+        pass
+    try:
+        cpu_pct = float(out.get("redis_process_cpu_pct") or 0.0)
+        ops_per_sec = int(out.get("ops_per_sec") or 0)
+        db_keys = int(out.get("db_keys") or 0)
+        drift_reason = (
+            f"cpu={cpu_pct:.1f}% ops={ops_per_sec}/s db_keys={db_keys}"
+            if cpu_pct > 0
+            else ""
+        )
+        global _REDIS_IDLE_DRIFT_STREAK, _REDIS_IDLE_LAST_WARN_TS
+        if (
+            cpu_pct >= float(PMDA_REDIS_IDLE_CPU_WARN_PCT)
+            and ops_per_sec <= int(PMDA_REDIS_IDLE_OPS_MAX)
+            and db_keys <= int(PMDA_REDIS_IDLE_KEYS_MAX)
+        ):
+            _REDIS_IDLE_DRIFT_STREAK = int(_REDIS_IDLE_DRIFT_STREAK) + 1
+        else:
+            _REDIS_IDLE_DRIFT_STREAK = 0
+            drift_reason = ""
+        now_ts = time.time()
+        suspected = int(_REDIS_IDLE_DRIFT_STREAK) >= int(PMDA_REDIS_IDLE_CONSECUTIVE)
+        out["idle_cpu_drift"] = {
+            "suspected": bool(suspected),
+            "streak": int(_REDIS_IDLE_DRIFT_STREAK),
+            "last_warn_ts": float(_REDIS_IDLE_LAST_WARN_TS or 0.0),
+            "reason": str(drift_reason or ""),
+        }
+        if suspected and (now_ts - float(_REDIS_IDLE_LAST_WARN_TS or 0.0)) >= float(PMDA_REDIS_IDLE_WARN_COOLDOWN_SEC):
+            _REDIS_IDLE_LAST_WARN_TS = float(now_ts)
+            out["idle_cpu_drift"]["last_warn_ts"] = float(_REDIS_IDLE_LAST_WARN_TS)
+            logging.warning(
+                "[Redis] suspicious idle CPU drift detected (%s) host=%s:%s db=%s maxmemory=%sMB",
+                drift_reason or "n/a",
+                PMDA_REDIS_HOST,
+                PMDA_REDIS_PORT,
+                PMDA_REDIS_DB,
+                int((out.get("maxmemory_bytes") or 0) / (1024 * 1024)),
+            )
     except Exception:
         pass
     return out
@@ -33808,6 +34032,29 @@ def _run_acoustid_preflight() -> tuple[bool, str]:
         return False, f"pyacoustid not installed: {e}"
 
 
+def _run_provider_preflights_parallel() -> dict[str, tuple[bool, str]]:
+    checks: list[tuple[str, Any]] = [
+        ("discogs", _run_discogs_preflight),
+        ("lastfm", _run_lastfm_preflight),
+        ("fanart", _run_fanart_preflight),
+        ("serper", _run_serper_preflight),
+        ("acoustid", _run_acoustid_preflight),
+    ]
+    out: dict[str, tuple[bool, str]] = {}
+    with ThreadPoolExecutor(max_workers=len(checks), thread_name_prefix="pmda-preflight") as pool:
+        fut_map = {pool.submit(fn): key for key, fn in checks}
+        for fut in as_completed(fut_map):
+            key = fut_map[fut]
+            try:
+                ok, msg = fut.result()
+                out[key] = (bool(ok), str(msg or ""))
+            except Exception as exc:
+                out[key] = (False, f"{key} preflight failed: {exc}")
+    for key, _ in checks:
+        out.setdefault(key, (False, "No result"))
+    return out
+
+
 def _fetch_discogs_release(artist_name: str, album_title: str) -> Optional[dict]:
     """
     Search Discogs for a release by artist + album. Returns dict with title, year, cover_url, artist_name, or None.
@@ -35921,7 +36168,6 @@ def _web_search_serper(query: str, num: int = 10, *, allow_ai_fallback: bool = T
 @app.get("/api/scan/preflight")
 def scan_preflight():
     """Check MusicBrainz, AI, Discogs, Last.fm and Bandcamp. Returns clear ok/error for UI."""
-    _reload_ai_config_and_reinit()
     mb_ok, ai_ok = _run_preflight_checks()
     ai_runtime_ok, ai_runtime_provider, ai_runtime_auth, ai_runtime_reason = _resolve_ai_runtime_availability(
         analysis_type="assistant_chat",
@@ -35950,20 +36196,21 @@ def scan_preflight():
         ai_msg = ai_runtime_reason or ai_func_err or "No API key or provider configured"
     ai_provider = {"ok": ai_ok, "message": ai_msg, "provider": provider_name}
 
-    discogs_ok, discogs_msg = _run_discogs_preflight()
+    provider_checks = _run_provider_preflights_parallel()
+    discogs_ok, discogs_msg = provider_checks.get("discogs", (False, "No result"))
     discogs = {"ok": discogs_ok, "message": discogs_msg}
-    lastfm_ok, lastfm_msg = _run_lastfm_preflight()
+    lastfm_ok, lastfm_msg = provider_checks.get("lastfm", (False, "No result"))
     lastfm = {"ok": lastfm_ok, "message": lastfm_msg}
-    fanart_ok, fanart_msg = _run_fanart_preflight()
+    fanart_ok, fanart_msg = provider_checks.get("fanart", (False, "No result"))
     fanart = {"ok": fanart_ok, "message": fanart_msg}
     if USE_BANDCAMP:
         bandcamp = {"ok": True, "message": "Configured (fallback ultime, no connection test)"}
     else:
         bandcamp = {"ok": False, "message": "Disabled"}
 
-    serper_ok, serper_msg = _run_serper_preflight()
+    serper_ok, serper_msg = provider_checks.get("serper", (False, "No result"))
     serper = {"ok": serper_ok, "message": serper_msg}
-    acoustid_ok, acoustid_msg = _run_acoustid_preflight()
+    acoustid_ok, acoustid_msg = provider_checks.get("acoustid", (False, "No result"))
     acoustid = {"ok": acoustid_ok, "message": acoustid_msg}
     paths = _paths_rw_status()
     return jsonify(
@@ -35976,6 +36223,19 @@ def scan_preflight():
         serper=serper,
         acoustid=acoustid,
         paths=paths,
+    )
+
+
+@app.get("/api/providers/preflight")
+def providers_preflight():
+    checks = _run_provider_preflights_parallel()
+    return jsonify(
+        discogs={"ok": checks["discogs"][0], "message": checks["discogs"][1]},
+        lastfm={"ok": checks["lastfm"][0], "message": checks["lastfm"][1]},
+        fanart={"ok": checks["fanart"][0], "message": checks["fanart"][1]},
+        serper={"ok": checks["serper"][0], "message": checks["serper"][1]},
+        acoustid={"ok": checks["acoustid"][0], "message": checks["acoustid"][1]},
+        checked_at=int(time.time()),
     )
 
 
@@ -37011,10 +37271,9 @@ def _openai_codex_oauth_poll_impl() -> tuple[Response, int]:
             payload["retry_after"] = int(result.retry_after)
         if result.api_key_saved is not None:
             payload["api_key_saved"] = bool(result.api_key_saved)
+        # Keep poll responses HTTP-200 for pending/completed/error state transitions
+        # so the UI can always update state deterministically.
         http_status = 200
-        if payload["status"] == "error":
-            low = str(payload.get("message") or "").lower()
-            http_status = 401 if "unauthorized" in low or "api key exchange" in low else 500
         if payload["status"] == "completed":
             _openai_codex_health_cache_invalidate(_current_user_id_or_zero())
         return jsonify(payload), http_status
@@ -37036,12 +37295,14 @@ def api_openai_codex_oauth_device_poll():
 def api_openai_codex_oauth_status():
     try:
         uid = _current_user_id_or_zero()
+        runtime_check = _parse_bool(request.args.get("check_runtime", "false"))
         status_obj = _openai_auth_service().status(uid, provider_id="openai-codex")
-        token_ready = False
+        token_ready = bool(status_obj.connected)
         token_reason = ""
         if bool(status_obj.connected) and not _openai_codex_oauth_mode_enabled():
             token_reason = _provider_mode_disabled_reason("openai-codex") or "OpenAI Codex OAuth mode is disabled in Settings"
-        elif bool(status_obj.connected) and _openai_codex_oauth_mode_enabled():
+            token_ready = False
+        elif bool(status_obj.connected) and _openai_codex_oauth_mode_enabled() and bool(runtime_check):
             token_ready, token_reason = _openai_codex_token_health(uid, force_refresh=False)
         payload = {
             # "connected" means runtime-usable (not just profile row present).
@@ -37055,6 +37316,7 @@ def api_openai_codex_oauth_status():
             "has_refresh_token": bool(status_obj.has_refresh_token),
             "metadata": status_obj.metadata or {},
             "ready": bool(token_ready),
+            "runtime_checked": bool(runtime_check),
             "error": str(token_reason or "") if (bool(status_obj.connected) and not bool(token_ready)) else "",
         }
         return jsonify(payload)

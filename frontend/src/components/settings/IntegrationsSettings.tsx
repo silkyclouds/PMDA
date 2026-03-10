@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react';
-import { Link2, Loader2, CheckCircle2, XCircle, ExternalLink, SlidersHorizontal } from 'lucide-react';
+import { Link2, Loader2, CheckCircle2, XCircle, SlidersHorizontal } from 'lucide-react';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Switch } from '@/components/ui/switch';
@@ -7,7 +7,6 @@ import { Button } from '@/components/ui/button';
 import { PasswordInput } from '@/components/ui/password-input';
 import { FieldTooltip } from '@/components/ui/field-tooltip';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
-import { FolderBrowserInput } from '@/components/settings/FolderBrowserInput';
 import * as api from '@/lib/api';
 import type { PMDAConfig, PlayerTarget } from '@/lib/api';
 import { toast } from 'sonner';
@@ -29,8 +28,6 @@ export function IntegrationsSettings({ config, updateConfig }: IntegrationsSetti
   const [testingPlayer, setTestingPlayer] = useState(false);
   const [refreshingPlayer, setRefreshingPlayer] = useState(false);
   const [playerResult, setPlayerResult] = useState<{ success: boolean; message: string } | null>(null);
-  const [testingAutobrr, setTestingAutobrr] = useState(false);
-  const [autobrrTestResult, setAutobrrTestResult] = useState<{ success: boolean; message: string } | null>(null);
 
   const playerTarget: PlayerTarget = useMemo(() => {
     const value = String(config.PIPELINE_PLAYER_TARGET || 'none').trim().toLowerCase();
@@ -80,32 +77,6 @@ export function IntegrationsSettings({ config, updateConfig }: IntegrationsSetti
       toast.error(error instanceof Error ? error.message : 'Failed to trigger player refresh');
     } finally {
       setRefreshingPlayer(false);
-    }
-  };
-
-  const testAutobrr = async () => {
-    const url = config.AUTOBRR_URL?.trim();
-    const apiKey = config.AUTOBRR_API_KEY?.trim();
-    if (!url || !apiKey) {
-      setAutobrrTestResult({ success: false, message: 'Autobrr URL and API Key are required' });
-      return;
-    }
-    setTestingAutobrr(true);
-    setAutobrrTestResult(null);
-    try {
-      const result = await api.testAutobrr(url, apiKey);
-      setAutobrrTestResult(result);
-      if (result.success) {
-        toast.success('Autobrr connection successful');
-      } else {
-        toast.error(result.message || 'Autobrr connection failed');
-      }
-    } catch (error: unknown) {
-      const message = error instanceof Error ? error.message : 'Failed to test Autobrr connection';
-      setAutobrrTestResult({ success: false, message });
-      toast.error(message);
-    } finally {
-      setTestingAutobrr(false);
     }
   };
 
@@ -166,61 +137,18 @@ export function IntegrationsSettings({ config, updateConfig }: IntegrationsSetti
             />
           </div>
 
-          <div className="p-3 rounded-lg bg-muted/50 space-y-3">
-            <div className="flex items-start justify-between gap-3">
-              <div className="space-y-0.5 flex-1">
-                <Label>Export files library</Label>
-                <p className="text-xs text-muted-foreground">Build/update the export tree using hardlink/symlink/copy/move strategy.</p>
-              </div>
-              <Switch
-                checked={config.PIPELINE_ENABLE_EXPORT ?? false}
-                onCheckedChange={(checked) => updateConfig({ PIPELINE_ENABLE_EXPORT: checked })}
-                className="mt-1"
-              />
+          <div className="flex items-start justify-between p-3 rounded-lg bg-muted/50">
+            <div className="space-y-0.5 flex-1">
+              <Label>Export files library</Label>
+              <p className="text-xs text-muted-foreground">
+                Build/update the export tree. Folder + strategy are configured in <span className="text-foreground">Folders</span>.
+              </p>
             </div>
-
-            {config.PIPELINE_ENABLE_EXPORT === true && (
-              <div className="pt-3 border-t border-border/60 space-y-3">
-                <div className="space-y-2">
-                  <Label>Library folder</Label>
-                  <p className="text-xs text-muted-foreground">
-                    Destination folder for exported files (clean structure), e.g. <span className="font-mono">/music_matched</span>.
-                  </p>
-                  <FolderBrowserInput
-                    value={config.EXPORT_ROOT ?? '/music/library'}
-                    onChange={(path) => updateConfig({ EXPORT_ROOT: path })}
-                    placeholder="/music/library"
-                    selectLabel="Select library destination folder"
-                  />
-                </div>
-
-                <div className="space-y-2">
-                  <Label>Export strategy</Label>
-                  <p className="text-xs text-muted-foreground">
-                    Choose how PMDA writes files to the library folder.
-                  </p>
-                  <Select
-                    value={(config.EXPORT_LINK_STRATEGY as 'hardlink' | 'symlink' | 'copy' | 'move' | undefined) ?? 'hardlink'}
-                    onValueChange={(value: 'hardlink' | 'symlink' | 'copy' | 'move') => updateConfig({ EXPORT_LINK_STRATEGY: value })}
-                    disabled={config.PIPELINE_ENABLE_EXPORT !== true}
-                  >
-                    <SelectTrigger className="w-full md:w-[320px]">
-                      <SelectValue placeholder="Select strategy" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="hardlink">Hardlink (fast, no extra space)</SelectItem>
-                      <SelectItem value="symlink">Symlink (keeps original files)</SelectItem>
-                      <SelectItem value="copy">Copy (duplicates files)</SelectItem>
-                      <SelectItem value="move">Move (relocate files)</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </div>
-
-                <p className="text-xs text-muted-foreground">
-                  Export is built automatically by the pipeline when enabled. No manual action is required.
-                </p>
-              </div>
-            )}
+            <Switch
+              checked={config.PIPELINE_ENABLE_EXPORT ?? false}
+              onCheckedChange={(checked) => updateConfig({ PIPELINE_ENABLE_EXPORT: checked })}
+              className="mt-1"
+            />
           </div>
 
           <div className="flex items-start justify-between p-3 rounded-lg bg-muted/50">
@@ -397,73 +325,6 @@ export function IntegrationsSettings({ config, updateConfig }: IntegrationsSetti
         )}
       </div>
 
-      <div className="space-y-4 p-4 rounded-lg border border-border">
-        <div className="flex items-center justify-between">
-          <div>
-            <h4 className="font-medium text-sm">Autobrr</h4>
-            <p className="text-xs text-muted-foreground mt-1">
-              Optional monitoring integration for similar artists.
-            </p>
-          </div>
-          <Button variant="outline" size="sm" asChild className="gap-1.5 shrink-0">
-            <a href="https://autobrr.com" target="_blank" rel="noopener noreferrer">
-              <ExternalLink className="w-3 h-3" />
-              Docs
-            </a>
-          </Button>
-        </div>
-
-        <div className="space-y-3 pt-2 border-t border-border">
-          <div className="space-y-2">
-            <Label htmlFor="autobrr-url">Autobrr URL</Label>
-            <Input
-              id="autobrr-url"
-              placeholder="http://192.168.1.100:7474"
-              value={config.AUTOBRR_URL || ''}
-              onChange={(e) => updateConfig({ AUTOBRR_URL: e.target.value })}
-            />
-          </div>
-
-          <div className="space-y-2">
-            <Label htmlFor="autobrr-api-key">Autobrr API Key</Label>
-            <PasswordInput
-              id="autobrr-api-key"
-              placeholder="Enter Autobrr API key"
-              value={config.AUTOBRR_API_KEY || ''}
-              onChange={(e) => updateConfig({ AUTOBRR_API_KEY: e.target.value })}
-            />
-          </div>
-
-          {(config.AUTOBRR_URL?.trim() || config.AUTOBRR_API_KEY?.trim()) && (
-            <Button
-              variant="secondary"
-              onClick={testAutobrr}
-              disabled={testingAutobrr || !config.AUTOBRR_URL?.trim() || !config.AUTOBRR_API_KEY?.trim()}
-              className="gap-1.5 w-full"
-            >
-              {testingAutobrr ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
-              Test Autobrr connection
-            </Button>
-          )}
-
-          {autobrrTestResult && (
-            <div className={`p-3 rounded-lg flex items-start gap-2 ${
-              autobrrTestResult.success
-                ? 'bg-green-500/10 border border-green-500/20'
-                : 'bg-red-500/10 border border-red-500/20'
-            }`}>
-              {autobrrTestResult.success ? (
-                <CheckCircle2 className="w-4 h-4 text-green-500 mt-0.5 shrink-0" />
-              ) : (
-                <XCircle className="w-4 h-4 text-red-500 mt-0.5 shrink-0" />
-              )}
-              <p className={`text-xs ${autobrrTestResult.success ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}`}>
-                {autobrrTestResult.message}
-              </p>
-            </div>
-          )}
-        </div>
-      </div>
     </div>
   );
 }

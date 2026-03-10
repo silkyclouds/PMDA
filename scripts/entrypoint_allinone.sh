@@ -15,6 +15,11 @@ PMDA_REDIS_PORT="${PMDA_REDIS_PORT:-6379}"
 PMDA_REDIS_DB="${PMDA_REDIS_DB:-0}"
 PMDA_REDIS_PASSWORD="${PMDA_REDIS_PASSWORD:-}"
 PMDA_REDIS_MAXMEMORY_MB="${PMDA_REDIS_MAXMEMORY_MB:-}"
+PMDA_REDIS_HZ="${PMDA_REDIS_HZ:-10}"
+PMDA_REDIS_DYNAMIC_HZ="${PMDA_REDIS_DYNAMIC_HZ:-yes}"
+PMDA_REDIS_IO_THREADS="${PMDA_REDIS_IO_THREADS:-0}"
+PMDA_REDIS_IO_THREADS_READS="${PMDA_REDIS_IO_THREADS_READS:-false}"
+PMDA_REDIS_ACTIVE_DEFRAG="${PMDA_REDIS_ACTIVE_DEFRAG:-no}"
 PMDA_PID=""
 PMDA_CLEANED_UP=0
 
@@ -137,16 +142,21 @@ apply_pg_tuning() {
 }
 
 build_redis_args() {
-  local total_mem_mb cpu_count redis_maxmemory_mb io_threads
+  local total_mem_mb cpu_count redis_maxmemory_mb io_threads configured_threads redis_hz
   total_mem_mb="$(detect_memory_mb)"
   cpu_count="$(detect_cpu_count)"
   total_mem_mb="$(clamp_int "${total_mem_mb}" 1024 1048576)"
+  redis_hz="$(clamp_int "${PMDA_REDIS_HZ}" 1 100)"
   if [ -n "${PMDA_REDIS_MAXMEMORY_MB}" ]; then
     redis_maxmemory_mb="$(clamp_int "${PMDA_REDIS_MAXMEMORY_MB}" 128 65536)"
   else
     redis_maxmemory_mb="$(clamp_int $(( total_mem_mb * 15 / 100 )) 128 65536)"
   fi
   io_threads="$(clamp_int $(( cpu_count - 1 )) 1 8)"
+  configured_threads="$(to_int "${PMDA_REDIS_IO_THREADS}")"
+  if [ "${configured_threads}" -gt 0 ]; then
+    io_threads="$(clamp_int "${configured_threads}" 1 8)"
+  fi
 
   REDIS_ARGS=(
     --bind "${PMDA_REDIS_HOST}"
@@ -159,15 +169,17 @@ build_redis_args() {
     --lazyfree-lazy-eviction yes
     --lazyfree-lazy-expire yes
     --lazyfree-lazy-server-del yes
-    --hz 50
+    --hz "${redis_hz}"
+    --dynamic-hz "${PMDA_REDIS_DYNAMIC_HZ}"
+    --activedefrag "${PMDA_REDIS_ACTIVE_DEFRAG}"
   )
   if [ -n "${PMDA_REDIS_PASSWORD}" ]; then
     REDIS_ARGS+=(--requirepass "${PMDA_REDIS_PASSWORD}")
   fi
-  if [ "${cpu_count}" -gt 2 ]; then
-    REDIS_ARGS+=(--io-threads "${io_threads}" --io-threads-do-reads yes)
+  if [ "${io_threads}" -gt 1 ]; then
+    REDIS_ARGS+=(--io-threads "${io_threads}" --io-threads-do-reads "${PMDA_REDIS_IO_THREADS_READS}")
   fi
-  echo "[PMDA] Redis tuned maxmemory=${redis_maxmemory_mb}MB policy=allkeys-lru io_threads=${io_threads}"
+  echo "[PMDA] Redis tuned maxmemory=${redis_maxmemory_mb}MB policy=allkeys-lru hz=${redis_hz} dynamic_hz=${PMDA_REDIS_DYNAMIC_HZ} io_threads=${io_threads} io_reads=${PMDA_REDIS_IO_THREADS_READS}"
 }
 
 cleanup_services() {
