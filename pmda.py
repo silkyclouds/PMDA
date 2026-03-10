@@ -45,7 +45,7 @@ import time
 import atexit
 from datetime import datetime, timedelta, time as dt_time
 from collections import defaultdict, OrderedDict, deque
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout, as_completed
 from pathlib import Path
 from typing import NamedTuple, List, Dict, Optional, Tuple, Any
 from urllib.parse import quote, quote_plus, urlparse
@@ -671,6 +671,7 @@ PMDA_REDIS_IDLE_OPS_MAX = max(0, int(os.getenv("PMDA_REDIS_IDLE_OPS_MAX", "5") o
 PMDA_REDIS_IDLE_KEYS_MAX = max(0, int(os.getenv("PMDA_REDIS_IDLE_KEYS_MAX", "200") or "200"))
 PMDA_REDIS_IDLE_CONSECUTIVE = max(1, int(os.getenv("PMDA_REDIS_IDLE_CONSECUTIVE", "3") or "3"))
 PMDA_REDIS_IDLE_WARN_COOLDOWN_SEC = max(10.0, float(os.getenv("PMDA_REDIS_IDLE_WARN_COOLDOWN_SEC", "180") or "180"))
+PMDA_OPENAI_CODEX_STATUS_TIMEOUT_SEC = max(1.0, float(os.getenv("PMDA_OPENAI_CODEX_STATUS_TIMEOUT_SEC", "6") or "6"))
 PMDA_FILES_LOCAL_CACHE_MAX_KEYS = int(max(1000, _parse_int(os.getenv("PMDA_FILES_LOCAL_CACHE_MAX_KEYS", "200000"), 200000) or 200000))
 PMDA_BENCHMARK_REPORTS_DIR = (
     os.getenv("PMDA_BENCHMARK_REPORTS_DIR", "/music/pmda_scan_benchmark/reports")
@@ -2665,7 +2666,16 @@ def _reinit_ai_from_globals():
                 RESOLVED_STOP_OK = True
                 logging.warning("OpenAI model probe failed; AI disabled. %s", AI_FUNCTIONAL_ERROR_MSG)
         else:
-            if bool(getattr(mod, "OPENAI_ENABLE_CODEX_OAUTH_MODE", OPENAI_ENABLE_CODEX_OAUTH_MODE)):
+            codex_mode_enabled = bool(getattr(mod, "OPENAI_ENABLE_CODEX_OAUTH_MODE", OPENAI_ENABLE_CODEX_OAUTH_MODE))
+            if provider == "openai-codex" and codex_mode_enabled and _openai_codex_any_profile_present():
+                ai_provider_ready = True
+                RESOLVED_MODEL = (openai_model or "").strip() or "gpt-5-nano"
+                # Codex OAuth calls use the same responses path; keep a permissive style marker.
+                RESOLVED_PARAM_STYLE = "responses"
+                RESOLVED_STOP_OK = True
+                AI_FUNCTIONAL_ERROR_MSG = None
+                logging.info("OpenAI Codex OAuth profile detected: AI runtime enabled without API key.")
+            elif codex_mode_enabled:
                 logging.info("No OPENAI_API_KEY; API-key mode unavailable (OAuth mode may still be usable).")
             else:
                 logging.info("No OPENAI_API_KEY; AI-driven selection disabled.")
@@ -3078,10 +3088,33 @@ def _openai_codex_token_health(user_id: int | None = None, *, force_refresh: boo
                 reason,
             )
         return False, reason
+    # Fast path for UI status checks: if profile expiry is clearly valid, skip token
+    # decryption/refresh calls to keep Settings responsive under DB pressure.
     try:
-        token = _openai_auth_service().get_valid_access_token(uid, provider_id="openai-codex")
+        profile_status = _openai_auth_service().status(uid, provider_id="openai-codex")
+        if bool(profile_status.connected):
+            exp = int(profile_status.expires_in_sec or 0)
+            if exp > 120:
+                with _openai_codex_health_lock:
+                    _openai_codex_health_cache[uid] = (
+                        float(now_ts + _OPENAI_CODEX_HEALTH_TTL_OK_SEC),
+                        True,
+                        "",
+                    )
+                return True, ""
+    except Exception:
+        # Fall through to runtime token probe.
+        pass
+    try:
+        timeout_sec = max(1.0, float(PMDA_OPENAI_CODEX_STATUS_TIMEOUT_SEC))
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="codex-status-check") as pool:
+            fut = pool.submit(_openai_auth_service().get_valid_access_token, uid, "openai-codex")
+            token = fut.result(timeout=timeout_sec)
         ok = bool(str(token or "").strip())
         reason = "" if ok else "OpenAI Codex access token is empty"
+    except FutureTimeout:
+        ok = False
+        reason = f"OpenAI Codex status check timed out after {int(PMDA_OPENAI_CODEX_STATUS_TIMEOUT_SEC)}s"
     except Exception as exc:
         ok = False
         reason = str(exc or "").strip() or "OpenAI Codex OAuth token is unavailable"
