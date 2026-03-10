@@ -152,7 +152,7 @@ build_redis_args() {
   else
     redis_maxmemory_mb="$(clamp_int $(( total_mem_mb * 15 / 100 )) 128 65536)"
   fi
-  io_threads="$(clamp_int $(( cpu_count - 1 )) 1 8)"
+  io_threads=0
   configured_threads="$(to_int "${PMDA_REDIS_IO_THREADS}")"
   if [ "${configured_threads}" -gt 0 ]; then
     io_threads="$(clamp_int "${configured_threads}" 1 8)"

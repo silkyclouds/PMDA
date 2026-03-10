@@ -36314,8 +36314,26 @@ def start_scan():
 
     # Keep /scan/start non-blocking: AI config reload/probe runs in background_scan().
     # Scans are still allowed even when AI is not ready; PMDA falls back to deterministic heuristics.
+    # But expose a realistic readiness snapshot so UI does not show false negatives for OAuth-only mode.
+    ai_enabled_for_start = bool(ai_provider_ready)
+    if not ai_enabled_for_start:
+        try:
+            uid = _current_user_id_or_zero()
+            effective_scan_provider = _resolve_provider_for_runtime(
+                str(AI_PROVIDER or "openai"),
+                "provider_identity",
+                user_id=uid,
+            )
+            if (
+                effective_scan_provider == "openai-codex"
+                and _openai_codex_oauth_mode_enabled()
+                and (_openai_codex_profile_present(uid) or _openai_codex_any_profile_present())
+            ):
+                ai_enabled_for_start = True
+        except Exception:
+            pass
     ai_warning = None
-    if not ai_provider_ready:
+    if not ai_enabled_for_start:
         ai_warning = getattr(sys.modules[__name__], "AI_FUNCTIONAL_ERROR_MSG", None) or "AI is not ready; scan will run without AI."
     scan_should_stop.clear()
     scan_is_paused.clear()
@@ -36348,7 +36366,7 @@ def start_scan():
         "scan_type": scan_type,
         "default_scan_type": default_scan_type,
         "run_improve_after": run_improve_after,
-        "ai_enabled": bool(ai_provider_ready),
+        "ai_enabled": bool(ai_enabled_for_start),
         "ai_warning": ai_warning,
     })
 
