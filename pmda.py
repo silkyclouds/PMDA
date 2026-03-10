@@ -3085,6 +3085,17 @@ def _resolve_openai_client_for_runtime(provider_for_usage: str, user_id: int | N
     return None, "none"
 
 
+def _ai_guardrail_precheck_safe(**kwargs: Any) -> tuple[bool, str, dict[str, Any]]:
+    """
+    Guardrails are defined later in this module. During early startup probes, that
+    symbol may not be available yet; in that case we allow the probe call through.
+    """
+    guard_fn = globals().get("_ai_guardrail_precheck")
+    if callable(guard_fn):
+        return guard_fn(**kwargs)
+    return True, "", {}
+
+
 def call_ai_provider(
     provider: str,
     model: str,
@@ -3112,7 +3123,7 @@ def call_ai_provider(
     provider_lower = provider_for_usage.lower()
     auth_mode_for_usage = _provider_auth_mode(provider_for_usage)
     try:
-        guard_allowed, guard_reason, guard_meta = _ai_guardrail_precheck(
+        guard_allowed, guard_reason, guard_meta = _ai_guardrail_precheck_safe(
             provider=provider_for_usage,
             model=str(model or ""),
             endpoint_kind="text",
@@ -3376,7 +3387,7 @@ def call_ai_provider_vision(
     else:
         _kwargs["max_tokens"] = max_tokens
     try:
-        guard_allowed, guard_reason, guard_meta = _ai_guardrail_precheck(
+        guard_allowed, guard_reason, guard_meta = _ai_guardrail_precheck_safe(
             provider=provider_for_usage,
             model=str(model or ""),
             endpoint_kind="vision",
