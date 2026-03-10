@@ -631,6 +631,10 @@ else:
 
 _AUTH_RATE_LIMIT_LOCK = threading.Lock()
 _AUTH_RATE_LIMIT_BUCKETS: dict[tuple[str, str], deque[int]] = {}
+AUTH_DB_BUSY_TIMEOUT_MS = max(250, int(os.getenv("PMDA_AUTH_DB_BUSY_TIMEOUT_MS", "1500") or "1500"))
+AUTH_SESSION_TOUCH_MIN_INTERVAL_SEC = max(5, int(os.getenv("PMDA_AUTH_SESSION_TOUCH_MIN_INTERVAL_SEC", "60") or "60"))
+_AUTH_SESSION_TOUCH_LOCK = threading.Lock()
+_AUTH_SESSION_TOUCH_CACHE: dict[str, int] = {}
 
 # Files-mode all-in-one data services (embedded in container entrypoint)
 PMDA_PG_HOST = (os.getenv("PMDA_PG_HOST", "127.0.0.1") or "127.0.0.1").strip()
@@ -795,9 +799,38 @@ def _auth_now_ts() -> int:
 
 
 def _auth_db_connect() -> sqlite3.Connection:
-    con = sqlite3.connect(str(SETTINGS_DB_FILE), timeout=10)
+    timeout_sec = max(0.5, float(AUTH_DB_BUSY_TIMEOUT_MS) / 1000.0)
+    con = sqlite3.connect(str(SETTINGS_DB_FILE), timeout=timeout_sec)
     con.row_factory = sqlite3.Row
+    try:
+        con.execute(f"PRAGMA busy_timeout={int(AUTH_DB_BUSY_TIMEOUT_MS)};")
+    except Exception:
+        pass
     return con
+
+
+def _auth_should_touch_session(token_hash: str, now_ts: int) -> bool:
+    """
+    Reduce SQLite write contention by throttling auth_sessions.last_used_at updates.
+    Session activity is still tracked, but at most once per token per interval.
+    """
+    key = str(token_hash or "").strip()
+    if not key:
+        return False
+    now = int(now_ts or _auth_now_ts())
+    min_interval = max(5, int(AUTH_SESSION_TOUCH_MIN_INTERVAL_SEC or 60))
+    with _AUTH_SESSION_TOUCH_LOCK:
+        prev = int(_AUTH_SESSION_TOUCH_CACHE.get(key) or 0)
+        if prev > 0 and (now - prev) < min_interval:
+            return False
+        _AUTH_SESSION_TOUCH_CACHE[key] = now
+        # Keep the in-memory map bounded in long-running sessions.
+        if len(_AUTH_SESSION_TOUCH_CACHE) > 10000:
+            cutoff = now - (min_interval * 4)
+            stale = [k for k, ts in _AUTH_SESSION_TOUCH_CACHE.items() if int(ts or 0) < cutoff]
+            for k in stale[:5000]:
+                _AUTH_SESSION_TOUCH_CACHE.pop(k, None)
+    return True
 
 
 def _auth_password_hash(password: str, salt_hex: str) -> str:
@@ -1203,8 +1236,26 @@ def _auth_resolve_session(raw_token: str) -> Optional[dict]:
             return None
         if not bool(int(row["is_active"] or 0)):
             return None
-        cur.execute("UPDATE auth_sessions SET last_used_at = ? WHERE token_hash = ?", (now, token_hash))
-        con.commit()
+        # Best effort touch: never fail auth resolution because SQLite is briefly locked.
+        if _auth_should_touch_session(token_hash, now):
+            try:
+                cur.execute("UPDATE auth_sessions SET last_used_at = ? WHERE token_hash = ?", (now, token_hash))
+                con.commit()
+            except sqlite3.OperationalError as exc:
+                msg = str(exc or "").lower()
+                if "locked" in msg or "busy" in msg:
+                    try:
+                        con.rollback()
+                    except Exception:
+                        pass
+                    logging.debug("Auth session touch skipped due to SQLite lock")
+                else:
+                    raise
+            except Exception:
+                try:
+                    con.rollback()
+                except Exception:
+                    pass
         return _auth_public_user(row)
     finally:
         con.close()
@@ -1779,6 +1830,8 @@ merged = {
     "LOG_LEVEL":      _get("LOG_LEVEL",      default="INFO").upper(),
     "AI_PROVIDER": _get("AI_PROVIDER", default="openai", cast=str),
     "OPENAI_API_KEY": _get("OPENAI_API_KEY", default="",                                cast=str),
+    "OPENAI_ENABLE_API_KEY_MODE": _get("OPENAI_ENABLE_API_KEY_MODE", default=True, cast=_parse_bool),
+    "OPENAI_ENABLE_CODEX_OAUTH_MODE": _get("OPENAI_ENABLE_CODEX_OAUTH_MODE", default=True, cast=_parse_bool),
     "OPENAI_MODEL":   _get("OPENAI_MODEL",   default="gpt-4",                           cast=str),
     "AI_USAGE_LEVEL": _get("AI_USAGE_LEVEL", default="medium",                          cast=str),
     "ANTHROPIC_API_KEY": _get("ANTHROPIC_API_KEY", default="", cast=str),
@@ -2092,6 +2145,8 @@ ACOUSTID_API_KEY: str = str(merged.get("ACOUSTID_API_KEY", "") or "").strip()
 USE_ACOUSTID_WHEN_TAGGED: bool = bool(merged.get("USE_ACOUSTID_WHEN_TAGGED", False))
 USE_WEB_SEARCH_FOR_MB: bool = bool(merged.get("USE_WEB_SEARCH_FOR_MB", True))
 USE_AI_WEB_SEARCH_FALLBACK: bool = bool(merged.get("USE_AI_WEB_SEARCH_FALLBACK", True))
+OPENAI_ENABLE_API_KEY_MODE: bool = bool(merged.get("OPENAI_ENABLE_API_KEY_MODE", True))
+OPENAI_ENABLE_CODEX_OAUTH_MODE: bool = bool(merged.get("OPENAI_ENABLE_CODEX_OAUTH_MODE", True))
 SCHEDULER_ALLOW_NON_SCAN_JOBS: bool = bool(merged.get("SCHEDULER_ALLOW_NON_SCAN_JOBS", SCHEDULER_ALLOW_NON_SCAN_JOBS))
 AI_MAX_CALLS_PER_SCAN: int = int(max(0, merged.get("AI_MAX_CALLS_PER_SCAN", AI_MAX_CALLS_PER_SCAN) or AI_MAX_CALLS_PER_SCAN))
 AI_CALL_COOLDOWN_SEC: float = float(max(0.0, min(30.0, merged.get("AI_CALL_COOLDOWN_SEC", AI_CALL_COOLDOWN_SEC) or AI_CALL_COOLDOWN_SEC)))
@@ -2317,6 +2372,8 @@ SCAN_THREADS = merged["SCAN_THREADS"]
 LOG_LEVEL      = merged["LOG_LEVEL"]
 AI_PROVIDER    = merged["AI_PROVIDER"]
 OPENAI_API_KEY = merged["OPENAI_API_KEY"]
+OPENAI_ENABLE_API_KEY_MODE = bool(merged.get("OPENAI_ENABLE_API_KEY_MODE", True))
+OPENAI_ENABLE_CODEX_OAUTH_MODE = bool(merged.get("OPENAI_ENABLE_CODEX_OAUTH_MODE", True))
 OPENAI_MODEL   = merged["OPENAI_MODEL"]
 ANTHROPIC_API_KEY = merged["ANTHROPIC_API_KEY"]
 GOOGLE_API_KEY = merged["GOOGLE_API_KEY"]
@@ -2402,7 +2459,10 @@ if AI_PROVIDER.lower() in {"openai", "openai-api", "openai-codex"}:
         except Exception as e:
             logging.warning("OpenAI client init failed: %s", e)
     else:
-        logging.info("No OPENAI_API_KEY provided; AI-driven selection disabled.")
+        if bool(OPENAI_ENABLE_CODEX_OAUTH_MODE):
+            logging.info("No OPENAI_API_KEY provided; API-key mode unavailable (OAuth mode may still be usable).")
+        else:
+            logging.info("No OPENAI_API_KEY provided; AI-driven selection disabled.")
 elif AI_PROVIDER.lower() == "anthropic":
     if ANTHROPIC_API_KEY and anthropic:
         try:
@@ -2512,7 +2572,10 @@ def _reinit_ai_from_globals():
                 RESOLVED_STOP_OK = True
                 logging.warning("OpenAI model probe failed; AI disabled. %s", AI_FUNCTIONAL_ERROR_MSG)
         else:
-            logging.info("No OPENAI_API_KEY; AI-driven selection disabled.")
+            if bool(getattr(mod, "OPENAI_ENABLE_CODEX_OAUTH_MODE", OPENAI_ENABLE_CODEX_OAUTH_MODE)):
+                logging.info("No OPENAI_API_KEY; API-key mode unavailable (OAuth mode may still be usable).")
+            else:
+                logging.info("No OPENAI_API_KEY; AI-driven selection disabled.")
     elif provider == "anthropic":
         if anthropic_key and anthropic:
             try:
@@ -2777,7 +2840,12 @@ _PROVIDER_PREF_DEFAULTS = {
 }
 _auth_crypto_lock = threading.Lock()
 _auth_fernet_cached: Any | None = None
+_auth_seed_cached: str | None = None
 _openai_auth_service_cached: OpenAIAuthService | None = None
+_openai_codex_health_lock = threading.Lock()
+_openai_codex_health_cache: dict[int, tuple[float, bool, str]] = {}
+_OPENAI_CODEX_HEALTH_TTL_OK_SEC = 300
+_OPENAI_CODEX_HEALTH_TTL_ERR_SEC = 30
 
 
 def _current_user_id_or_zero() -> int:
@@ -2811,6 +2879,32 @@ def _provider_auth_mode(provider_id: str) -> str:
     return "unknown"
 
 
+def _openai_api_key_mode_enabled() -> bool:
+    return bool(getattr(sys.modules[__name__], "OPENAI_ENABLE_API_KEY_MODE", True))
+
+
+def _openai_codex_oauth_mode_enabled() -> bool:
+    return bool(getattr(sys.modules[__name__], "OPENAI_ENABLE_CODEX_OAUTH_MODE", True))
+
+
+def _provider_mode_enabled(provider_id: str) -> bool:
+    pid = _normalize_provider_id(provider_id, fallback="")
+    if pid == "openai-api":
+        return _openai_api_key_mode_enabled()
+    if pid == "openai-codex":
+        return _openai_codex_oauth_mode_enabled()
+    return True
+
+
+def _provider_mode_disabled_reason(provider_id: str) -> str:
+    pid = _normalize_provider_id(provider_id, fallback="")
+    if pid == "openai-api" and not _openai_api_key_mode_enabled():
+        return "OpenAI API-key mode is disabled in Settings"
+    if pid == "openai-codex" and not _openai_codex_oauth_mode_enabled():
+        return "OpenAI Codex OAuth mode is disabled in Settings"
+    return ""
+
+
 def _ai_context_from_analysis_type(analysis_type: str) -> str:
     text = str(analysis_type or "").strip().lower()
     if not text:
@@ -2822,7 +2916,15 @@ def _ai_context_from_analysis_type(analysis_type: str) -> str:
     return "batch"
 
 
-def _openai_codex_connected(user_id: int | None = None) -> bool:
+def _openai_codex_health_cache_invalidate(user_id: int | None = None) -> None:
+    with _openai_codex_health_lock:
+        if user_id is None:
+            _openai_codex_health_cache.clear()
+        else:
+            _openai_codex_health_cache.pop(int(user_id or 0), None)
+
+
+def _openai_codex_profile_present(user_id: int | None = None) -> bool:
     uid = int(user_id or 0)
     try:
         con = sqlite3.connect(str(SETTINGS_DB_FILE), timeout=5)
@@ -2844,6 +2946,63 @@ def _openai_codex_connected(user_id: int | None = None) -> bool:
         return bool(row)
     except Exception:
         return False
+
+
+def _openai_codex_any_profile_present() -> bool:
+    try:
+        con = sqlite3.connect(str(SETTINGS_DB_FILE), timeout=5)
+        cur = con.cursor()
+        cur.execute(
+            """
+            SELECT 1
+            FROM ai_auth_profiles
+            WHERE provider_id = 'openai-codex'
+              AND is_active = 1
+            LIMIT 1
+            """
+        )
+        row = cur.fetchone()
+        con.close()
+        return bool(row)
+    except Exception:
+        return False
+
+
+def _openai_codex_token_health(user_id: int | None = None, *, force_refresh: bool = False) -> tuple[bool, str]:
+    uid = int(user_id or 0)
+    now_ts = time.time()
+    if not force_refresh:
+        with _openai_codex_health_lock:
+            cached = _openai_codex_health_cache.get(uid)
+            if cached and float(cached[0]) > now_ts:
+                return bool(cached[1]), str(cached[2] or "")
+    if not _openai_codex_profile_present(uid):
+        reason = "No active OpenAI Codex OAuth profile"
+        with _openai_codex_health_lock:
+            _openai_codex_health_cache[uid] = (
+                float(now_ts + _OPENAI_CODEX_HEALTH_TTL_ERR_SEC),
+                False,
+                reason,
+            )
+        return False, reason
+    try:
+        token = _openai_auth_service().get_valid_access_token(uid, provider_id="openai-codex")
+        ok = bool(str(token or "").strip())
+        reason = "" if ok else "OpenAI Codex access token is empty"
+    except Exception as exc:
+        ok = False
+        reason = str(exc or "").strip() or "OpenAI Codex OAuth token is unavailable"
+    ttl = _OPENAI_CODEX_HEALTH_TTL_OK_SEC if ok else _OPENAI_CODEX_HEALTH_TTL_ERR_SEC
+    with _openai_codex_health_lock:
+        _openai_codex_health_cache[uid] = (float(now_ts + ttl), bool(ok), str(reason or ""))
+    return bool(ok), str(reason or "")
+
+
+def _openai_codex_connected(user_id: int | None = None, *, require_token: bool = False) -> bool:
+    if not require_token:
+        return _openai_codex_profile_present(user_id)
+    ok, _reason = _openai_codex_token_health(user_id, force_refresh=False)
+    return bool(ok)
 
 
 def _get_ai_provider_preferences(user_id: int | None = None) -> dict[str, str]:
@@ -2924,31 +3083,155 @@ def _save_ai_provider_preferences(
     return prefs
 
 
-def _resolve_provider_for_runtime(requested_provider: str, analysis_type: str) -> str:
+def _resolve_provider_for_runtime(requested_provider: str, analysis_type: str, *, user_id: int | None = None) -> str:
     req = str(requested_provider or "").strip().lower()
     if req and req not in _OPENAI_PROVIDER_IDS:
         return _normalize_provider_id(req, fallback=req)
-    user_id = _current_user_id_or_zero()
+    uid = _current_user_id_or_zero() if user_id is None else max(0, int(user_id or 0))
     context = _ai_context_from_analysis_type(analysis_type)
-    prefs = _get_ai_provider_preferences(user_id)
+    prefs = _get_ai_provider_preferences(uid)
     preferred = {
         "interactive": prefs.get("interactive_provider_id", "openai-codex"),
         "batch": prefs.get("batch_provider_id", "openai-api"),
         "web_search": prefs.get("web_search_provider_id", "openai-api"),
     }.get(context, prefs.get("batch_provider_id", "openai-api"))
+    preferred_norm = _normalize_provider_id(str(preferred or ""), fallback="")
+    # Respect explicit OpenAI preference when mode is enabled so runtime errors stay clear
+    # (e.g. Codex OAuth token invalid should not silently turn into API-key errors).
+    if preferred_norm in _OPENAI_PROVIDER_IDS and _provider_mode_enabled(preferred_norm):
+        if preferred_norm == "openai-codex":
+            # Keep codex selection if a profile exists, even when token refresh fails at runtime.
+            if _openai_codex_profile_present(uid):
+                return "openai-codex"
+            # No profile at all: allow selector fallback to avoid hard failure on fresh installs.
+        else:
+            return preferred_norm
+
     selected = select_provider_id(
         context=context,
         preferred=str(preferred or ""),
-        codex_connected=_openai_codex_connected(user_id),
+        codex_connected=_openai_codex_connected(uid, require_token=True),
+        openai_api_enabled=_openai_api_key_mode_enabled(),
+        openai_codex_enabled=_openai_codex_oauth_mode_enabled(),
     )
-    return _normalize_provider_id(selected, fallback="openai-api")
+    normalized = _normalize_provider_id(selected, fallback="openai-api")
+    if normalized == "openai-api" and not _openai_api_key_mode_enabled():
+        if _openai_codex_oauth_mode_enabled() and _openai_codex_connected(uid, require_token=True):
+            return "openai-codex"
+    if normalized == "openai-codex" and not _openai_codex_oauth_mode_enabled():
+        if _openai_api_key_mode_enabled():
+            return "openai-api"
+    return normalized
+
+
+def _resolve_ai_runtime_availability(
+    *,
+    analysis_type: str,
+    requested_provider: str = "openai",
+    user_id: int | None = None,
+) -> tuple[bool, str, str, str]:
+    uid = _current_user_id_or_zero() if user_id is None else max(0, int(user_id or 0))
+    provider_effective = _resolve_provider_for_runtime(
+        requested_provider=str(requested_provider or ""),
+        analysis_type=str(analysis_type or ""),
+        user_id=uid,
+    )
+    provider_lower = str(provider_effective or "").strip().lower()
+    auth_mode = _provider_auth_mode(provider_effective)
+    if not _provider_mode_enabled(provider_effective):
+        return (False, provider_effective, auth_mode, _provider_mode_disabled_reason(provider_effective) or "Provider mode disabled")
+    if provider_lower in {"openai", "openai-api", "openai-codex"}:
+        client_to_use, auth_mode_for_usage, openai_reason = _resolve_openai_client_for_runtime(provider_effective, uid)
+        if client_to_use:
+            return (True, provider_effective, auth_mode_for_usage, "")
+        if provider_lower == "openai-codex":
+            return (
+                False,
+                provider_effective,
+                auth_mode_for_usage,
+                openai_reason or "OpenAI Codex OAuth is not connected for this user",
+            )
+        return (
+            False,
+            provider_effective,
+            auth_mode_for_usage,
+            openai_reason or "OpenAI API key is missing or invalid",
+        )
+    if provider_lower == "anthropic":
+        return (bool(anthropic_client), provider_effective, auth_mode, "Anthropic API key is missing or invalid")
+    if provider_lower == "google":
+        return (bool(google_client_configured and google_client), provider_effective, auth_mode, "Google API key is missing or invalid")
+    if provider_lower == "ollama":
+        return (bool(ollama_url), provider_effective, auth_mode, "Ollama URL is not configured")
+    return (False, provider_effective, auth_mode, "Unsupported AI provider")
 
 
 def _auth_encryption_seed() -> bytes:
+    global _auth_seed_cached
     seed = str(os.getenv("PMDA_AUTH_ENCRYPTION_KEY") or "").strip()
-    if not seed:
-        seed = f"{socket.gethostname()}:{SETTINGS_DB_FILE}"
-    return hashlib.sha256(seed.encode("utf-8", errors="ignore")).digest()
+    if seed:
+        return hashlib.sha256(seed.encode("utf-8", errors="ignore")).digest()
+    with _auth_crypto_lock:
+        if _auth_seed_cached:
+            return hashlib.sha256(_auth_seed_cached.encode("utf-8", errors="ignore")).digest()
+        cfg_dir = Path(str(PMDA_CONFIG_DIR or "/config")).expanduser()
+        seed_file = cfg_dir / ".pmda_auth_seed"
+        try:
+            stored = seed_file.read_text(encoding="utf-8").strip()
+            if stored:
+                _auth_seed_cached = stored
+                return hashlib.sha256(stored.encode("utf-8", errors="ignore")).digest()
+        except Exception:
+            pass
+        generated = ""
+        try:
+            cfg_dir.mkdir(parents=True, exist_ok=True)
+            generated = secrets.token_urlsafe(48)
+            tmp = seed_file.with_suffix(".tmp")
+            tmp.write_text(generated, encoding="utf-8")
+            try:
+                os.chmod(tmp, 0o600)
+            except Exception:
+                pass
+            os.replace(tmp, seed_file)
+        except Exception:
+            # Legacy fallback (old behavior). This is unstable across container recreation,
+            # but still better than blocking runtime if /config is not writable.
+            generated = f"{socket.gethostname()}:{SETTINGS_DB_FILE}"
+        _auth_seed_cached = generated
+        return hashlib.sha256(generated.encode("utf-8", errors="ignore")).digest()
+
+
+def _auth_legacy_seeds_for_decrypt() -> list[bytes]:
+    seeds: list[bytes] = []
+
+    def _append(raw: str) -> None:
+        text = str(raw or "").strip()
+        if not text:
+            return
+        digest = hashlib.sha256(text.encode("utf-8", errors="ignore")).digest()
+        if digest not in seeds:
+            seeds.append(digest)
+
+    # Legacy deterministic seed (pre-stable-key implementation).
+    _append(f"{socket.gethostname()}:{SETTINGS_DB_FILE}")
+
+    # Optional manual recovery hook for old container-bound seeds.
+    # Format: comma-separated seed strings.
+    extra = str(os.getenv("PMDA_AUTH_LEGACY_SEEDS") or "").strip()
+    if extra:
+        for part in extra.split(","):
+            _append(part)
+    return seeds
+
+
+def _fernet_with_seed(seed_bytes: bytes) -> Any | None:
+    if Fernet is None:
+        return None
+    try:
+        return Fernet(base64.urlsafe_b64encode(seed_bytes))
+    except Exception:
+        return None
 
 
 def _auth_fernet_instance() -> Any | None:
@@ -3001,19 +3284,40 @@ def _auth_decrypt(value: str) -> str:
     if raw.startswith("enc:v1:"):
         token = raw.split("enc:v1:", 1)[1]
         inst = _auth_fernet_instance()
-        if inst is None:
-            return ""
-        try:
-            return inst.decrypt(token.encode("utf-8", errors="ignore")).decode("utf-8", errors="ignore")
-        except InvalidToken:
-            return ""
-        except Exception:
-            return ""
+        if inst is not None:
+            try:
+                return inst.decrypt(token.encode("utf-8", errors="ignore")).decode("utf-8", errors="ignore")
+            except InvalidToken:
+                pass
+            except Exception:
+                pass
+        for legacy_seed in _auth_legacy_seeds_for_decrypt():
+            legacy_inst = _fernet_with_seed(legacy_seed)
+            if legacy_inst is None:
+                continue
+            try:
+                return legacy_inst.decrypt(token.encode("utf-8", errors="ignore")).decode("utf-8", errors="ignore")
+            except Exception:
+                continue
+        return ""
     if raw.startswith("enc:xor:"):
         token = raw.split("enc:xor:", 1)[1]
         try:
             payload = base64.urlsafe_b64decode(token.encode("ascii", errors="ignore"))
-            return _xor_cipher(payload, _auth_encryption_seed()).decode("utf-8", errors="ignore")
+        except Exception:
+            payload = b""
+        if payload:
+            seeds = [_auth_encryption_seed(), *_auth_legacy_seeds_for_decrypt()]
+            for seed in seeds:
+                try:
+                    candidate = _xor_cipher(payload, seed).decode("utf-8", errors="ignore")
+                except Exception:
+                    candidate = ""
+                if candidate:
+                    return candidate
+        try:
+            # Final fallback: older plaintext values without prefix.
+            return base64.urlsafe_b64decode(token.encode("ascii", errors="ignore")).decode("utf-8", errors="ignore")
         except Exception:
             return ""
     return raw
@@ -3067,9 +3371,12 @@ def _openai_auth_service() -> OpenAIAuthService:
     return _openai_auth_service_cached
 
 
-def _resolve_openai_client_for_runtime(provider_for_usage: str, user_id: int | None) -> tuple[Any | None, str]:
+def _resolve_openai_client_for_runtime(provider_for_usage: str, user_id: int | None) -> tuple[Any | None, str, str]:
     pid = _normalize_provider_id(provider_for_usage, fallback="openai-api")
+    oauth_reason = ""
     if pid == "openai-codex":
+        if not _openai_codex_oauth_mode_enabled():
+            return None, "oauth", _provider_mode_disabled_reason("openai-codex") or "OpenAI Codex OAuth mode is disabled in Settings"
         try:
             access_token = _openai_auth_service().get_valid_access_token(user_id, provider_id="openai-codex")
             if access_token:
@@ -3077,12 +3384,23 @@ def _resolve_openai_client_for_runtime(provider_for_usage: str, user_id: int | N
                 kwargs: dict[str, Any] = {"api_key": access_token}
                 if base_url:
                     kwargs["base_url"] = base_url
-                return OpenAI(**kwargs), "oauth"
+                return OpenAI(**kwargs), "oauth", ""
+            oauth_reason = "OpenAI Codex OAuth returned an empty access token"
         except Exception as exc:
-            logging.debug("OpenAI Codex OAuth unavailable; falling back to API key: %s", exc)
+            oauth_reason = str(exc or "").strip() or "OpenAI Codex OAuth token is unavailable"
+            if _openai_api_key_mode_enabled():
+                logging.warning("OpenAI Codex OAuth unavailable; falling back to API key: %s", oauth_reason)
+            else:
+                logging.warning("OpenAI Codex OAuth unavailable (API-key mode disabled): %s", oauth_reason)
+        if not _openai_api_key_mode_enabled():
+            return None, "oauth", oauth_reason or "OpenAI Codex OAuth is not connected for this user"
+    if not _openai_api_key_mode_enabled():
+        return None, "api_key", _provider_mode_disabled_reason("openai-api") or "OpenAI API-key mode is disabled in Settings"
     if openai_client:
-        return openai_client, "api_key"
-    return None, "none"
+        return openai_client, "api_key", ""
+    if pid == "openai-codex" and oauth_reason:
+        return None, "none", oauth_reason
+    return None, "none", "OpenAI API key is missing or invalid"
 
 
 def _ai_guardrail_precheck_safe(**kwargs: Any) -> tuple[bool, str, dict[str, Any]]:
@@ -3133,12 +3451,12 @@ def call_ai_provider(
         if not guard_allowed:
             raise RuntimeError(f"AI guardrail blocked call: {guard_reason}")
         if provider_lower in {"openai", "openai-api", "openai-codex"}:
-            client_to_use, auth_mode_for_usage = _resolve_openai_client_for_runtime(
+            client_to_use, auth_mode_for_usage, openai_runtime_reason = _resolve_openai_client_for_runtime(
                 provider_for_usage,
                 _current_user_id_or_zero(),
             )
             if not client_to_use:
-                raise ValueError("OpenAI client not initialized")
+                raise ValueError(openai_runtime_reason or "OpenAI client not initialized")
             try:
                 if (model or "").strip().lower().startswith("gpt-5") and int(max_tokens or 0) < 128:
                     max_tokens = 128
@@ -3326,11 +3644,13 @@ def call_ai_provider_vision(
             max_tokens=max_tokens,
             analysis_type=analysis_type,
         )
-    client_to_use, auth_mode_for_usage = _resolve_openai_client_for_runtime(
+    client_to_use, auth_mode_for_usage, openai_runtime_reason = _resolve_openai_client_for_runtime(
         provider_for_usage,
         _current_user_id_or_zero(),
     )
     if not client_to_use:
+        if openai_runtime_reason:
+            logging.warning("OpenAI vision call downgraded to text provider due to runtime issue: %s", openai_runtime_reason)
         return call_ai_provider(
             "openai-api",
             model,
@@ -14567,12 +14887,12 @@ def call_ai_provider_longform(
         if not guard_allowed:
             raise RuntimeError(f"AI guardrail blocked call: {guard_reason}")
         if provider_lower in {"openai", "openai-api", "openai-codex"}:
-            client_to_use, auth_mode_for_usage = _resolve_openai_client_for_runtime(
+            client_to_use, auth_mode_for_usage, openai_runtime_reason = _resolve_openai_client_for_runtime(
                 provider_for_usage,
                 _current_user_id_or_zero(),
             )
             if not client_to_use:
-                raise ValueError("OpenAI client not initialized")
+                raise ValueError(openai_runtime_reason or "OpenAI client not initialized")
             try:
                 is_gpt5 = (model or "").strip().lower().startswith("gpt-5")
             except Exception:
@@ -35248,7 +35568,7 @@ def _ai_web_search_budget_allows() -> tuple[bool, str]:
                 """
                 SELECT COUNT(*) AS c
                 FROM ai_call_usage
-                WHERE provider = 'openai'
+                WHERE provider IN ('openai', 'openai-api', 'openai-codex')
                   AND endpoint_kind = 'web_search'
                   AND created_at >= ?
                 """,
@@ -35264,7 +35584,7 @@ def _ai_web_search_budget_allows() -> tuple[bool, str]:
                 """
                 SELECT COUNT(*) AS c
                 FROM ai_call_usage
-                WHERE provider = 'openai'
+                WHERE provider IN ('openai', 'openai-api', 'openai-codex')
                   AND endpoint_kind = 'web_search'
                   AND created_at >= ?
                 """,
@@ -35281,13 +35601,57 @@ def _ai_web_search_budget_allows() -> tuple[bool, str]:
     return (True, "")
 
 
-def _ai_web_search_available() -> bool:
+def _ai_web_search_available(*, user_id: int | None = None) -> bool:
     if not bool(getattr(sys.modules[__name__], "USE_AI_WEB_SEARCH_FALLBACK", True)):
         return False
-    if not bool(getattr(sys.modules[__name__], "ai_provider_ready", False)):
+    ok, provider_effective, _auth_mode, _reason = _resolve_ai_runtime_availability(
+        analysis_type="web_search",
+        requested_provider="openai",
+        user_id=user_id,
+    )
+    if not ok:
         return False
-    provider = str(getattr(sys.modules[__name__], "AI_PROVIDER", "openai") or "openai").strip().lower()
-    return bool(provider == "openai" and openai_client)
+    return str(provider_effective or "").strip().lower() in {"openai", "openai-api", "openai-codex"}
+
+
+def _is_openai_web_search_unsupported_error(message: str) -> bool:
+    text = str(message or "").strip().lower()
+    if not text:
+        return False
+    markers = (
+        "web search unavailable",
+        "web_search",
+        "web-search",
+        "does not support tools",
+        "unsupported parameter: 'tools'",
+        "tool is not supported",
+        "unsupported parameter: 'temperature'",
+        "parameter 'temperature' is not supported",
+    )
+    return any(m in text for m in markers)
+
+
+def _openai_web_search_model_candidates(primary_model: str) -> list[str]:
+    candidates: list[str] = []
+
+    def _add(model_name: str) -> None:
+        name = str(model_name or "").strip()
+        if not name:
+            return
+        if name not in candidates:
+            candidates.append(name)
+
+    # Optional explicit model just for web-search fallback.
+    try:
+        _add(str(_get_config_from_db("OPENAI_WEB_SEARCH_MODEL", "") or ""))
+    except Exception:
+        pass
+    _add(primary_model)
+    # Known models that generally expose web search tooling.
+    _add("gpt-4o-mini")
+    _add("gpt-4.1-mini")
+    _add("gpt-4o")
+    return candidates
 
 
 def _openai_web_search_fallback(query: str, num: int = 10, *, reason: str = "") -> list[dict]:
@@ -35295,15 +35659,36 @@ def _openai_web_search_fallback(query: str, num: int = 10, *, reason: str = "") 
     Fallback web search using OpenAI native web-search tool when Serper is unavailable.
     Returns list of {"title","link","snippet","source"}.
     """
-    if not _ai_web_search_available():
+    user_id = _current_user_id_or_zero()
+    if not _ai_web_search_available(user_id=user_id):
         return []
     q = str(query or "").strip()
     if not q:
         return []
-    model = (
+    provider_for_usage = _resolve_provider_for_runtime(
+        requested_provider="openai",
+        analysis_type="web_search",
+        user_id=user_id,
+    )
+    provider_lower = str(provider_for_usage or "").strip().lower()
+    if provider_lower not in {"openai", "openai-api", "openai-codex"}:
+        return []
+    client_to_use, auth_mode_for_usage, openai_runtime_reason = _resolve_openai_client_for_runtime(provider_for_usage, user_id)
+    if not client_to_use:
+        if openai_runtime_reason:
+            logging.warning(
+                "[WEB][AI] OpenAI web-search fallback unavailable (%s, provider=%s): %s",
+                usage_reason,
+                provider_for_usage,
+                openai_runtime_reason,
+            )
+        return []
+    base_model = (
         getattr(sys.modules[__name__], "RESOLVED_MODEL", None)
         or getattr(sys.modules[__name__], "OPENAI_MODEL", "gpt-4o-mini")
     )
+    model_candidates = _openai_web_search_model_candidates(str(base_model or ""))
+    model_used = str(model_candidates[0] if model_candidates else (base_model or "gpt-4o-mini"))
     prompt = (
         f"Search the web for: {q}\n"
         f"Return ONLY a JSON array (max {max(1, int(num or 10))} items).\n"
@@ -35314,6 +35699,7 @@ def _openai_web_search_fallback(query: str, num: int = 10, *, reason: str = "") 
     response_obj: Any = None
     status = "failed"
     error_msg = ""
+    auth_mode_for_usage = _provider_auth_mode(provider_for_usage)
     guard_allowed = True
     guard_reason = ""
     guard_meta: dict[str, Any] = {}
@@ -35335,35 +35721,53 @@ def _openai_web_search_fallback(query: str, num: int = 10, *, reason: str = "") 
         ),
     )
     try:
-        guard_allowed, guard_reason, guard_meta = _ai_guardrail_precheck(
-            provider="openai",
-            model=str(model or ""),
-            endpoint_kind="web_search",
-            analysis_type="web_search",
-            requested_tokens=int(max_output_tokens),
-        )
-        if not guard_allowed:
-            raise RuntimeError(f"AI guardrail blocked call: {guard_reason}")
-        req = {
-            "model": model,
-            "tools": [{"type": "web_search_preview"}],
-            "input": prompt,
-            "max_output_tokens": max_output_tokens,
-        }
-        resp = openai_client.responses.create(**req)
-        response_obj = resp
-        raw_text = _extract_text_from_openai_response(resp)
-        rows = _assistant_extract_json_array(raw_text)
-        normalized = _normalize_web_results(rows, source="openai_web_search", max_items=max(1, int(num or 10)))
-        status = "completed"
-        if normalized:
-            logging.info(
-                "[WEB][AI] OpenAI web-search fallback used (%s) query=%r results=%d",
-                usage_reason,
-                q,
-                len(normalized),
+        for idx, model_try in enumerate(model_candidates):
+            model_used = str(model_try or "").strip() or model_used
+            guard_allowed, guard_reason, guard_meta = _ai_guardrail_precheck(
+                provider=provider_for_usage,
+                model=model_used,
+                endpoint_kind="web_search",
+                analysis_type="web_search",
+                requested_tokens=int(max_output_tokens),
             )
-            return normalized[: max(1, int(num or 10))]
+            if not guard_allowed:
+                raise RuntimeError(f"AI guardrail blocked call: {guard_reason}")
+            req = {
+                "model": model_used,
+                "tools": [{"type": "web_search_preview"}],
+                "input": prompt,
+                "max_output_tokens": max_output_tokens,
+            }
+            try:
+                resp = client_to_use.responses.create(**req)
+            except Exception as call_err:
+                call_error = str(call_err or "").strip()
+                if idx < (len(model_candidates) - 1) and _is_openai_web_search_unsupported_error(call_error):
+                    logging.info(
+                        "[WEB][AI] web-search tool unsupported on model=%s (provider=%s auth=%s); retrying with next candidate",
+                        model_used,
+                        provider_for_usage,
+                        auth_mode_for_usage,
+                    )
+                    continue
+                raise
+
+            response_obj = resp
+            raw_text = _extract_text_from_openai_response(resp)
+            rows = _assistant_extract_json_array(raw_text)
+            normalized = _normalize_web_results(rows, source="openai_web_search", max_items=max(1, int(num or 10)))
+            status = "completed"
+            if normalized:
+                logging.info(
+                    "[WEB][AI] OpenAI web-search fallback used (%s, provider=%s, auth=%s, model=%s) query=%r results=%d",
+                    usage_reason,
+                    provider_for_usage,
+                    auth_mode_for_usage,
+                    model_used,
+                    q,
+                    len(normalized),
+                )
+                return normalized[: max(1, int(num or 10))]
     except Exception as e:
         error_msg = str(e)
         logging.warning(
@@ -35377,8 +35781,8 @@ def _openai_web_search_fallback(query: str, num: int = 10, *, reason: str = "") 
         if callable(recorder):
             web_search_tool_calls = 1 if response_obj is not None else 0
             recorder(
-                provider="openai",
-                model=model,
+                provider=provider_for_usage,
+                model=model_used,
                 endpoint_kind="web_search",
                 analysis_type="web_search",
                 started_at=started_at,
@@ -35393,6 +35797,7 @@ def _openai_web_search_fallback(query: str, num: int = 10, *, reason: str = "") 
                     "max_items": int(max_items),
                     "max_output_tokens": int(max_output_tokens),
                     "web_search_tool_calls": int(web_search_tool_calls),
+                    "auth_mode": auth_mode_for_usage,
                     "guardrail_blocked": bool(not guard_allowed),
                     "guardrail_reason": guard_reason if not guard_allowed else "",
                     **(guard_meta or {}),
@@ -35518,6 +35923,12 @@ def scan_preflight():
     """Check MusicBrainz, AI, Discogs, Last.fm and Bandcamp. Returns clear ok/error for UI."""
     _reload_ai_config_and_reinit()
     mb_ok, ai_ok = _run_preflight_checks()
+    ai_runtime_ok, ai_runtime_provider, ai_runtime_auth, ai_runtime_reason = _resolve_ai_runtime_availability(
+        analysis_type="assistant_chat",
+        requested_provider="openai",
+        user_id=_current_user_id_or_zero(),
+    )
+    ai_ok = bool(ai_ok or ai_runtime_ok)
     provider_name = getattr(sys.modules[__name__], "AI_PROVIDER", None) or "OpenAI"
     resolved_model = getattr(sys.modules[__name__], "RESOLVED_MODEL", None)
     ai_func_err = getattr(sys.modules[__name__], "AI_FUNCTIONAL_ERROR_MSG", None)
@@ -35529,9 +35940,14 @@ def scan_preflight():
         mb_msg = "MusicBrainz unreachable"
     musicbrainz = {"ok": mb_ok, "message": mb_msg}
     if ai_ok:
-        ai_msg = f"{provider_name} reachable" + (f", model {resolved_model} (params verified)" if resolved_model else "") if (OPENAI_API_KEY and openai_client) else f"{provider_name} configured"
+        if ai_runtime_ok:
+            ai_msg = f"{ai_runtime_provider} reachable ({ai_runtime_auth})"
+        elif (OPENAI_API_KEY and openai_client):
+            ai_msg = f"{provider_name} reachable" + (f", model {resolved_model} (params verified)" if resolved_model else "")
+        else:
+            ai_msg = f"{provider_name} configured"
     else:
-        ai_msg = ai_func_err or "No API key or provider configured"
+        ai_msg = ai_runtime_reason or ai_func_err or "No API key or provider configured"
     ai_provider = {"ok": ai_ok, "message": ai_msg, "provider": provider_name}
 
     discogs_ok, discogs_msg = _run_discogs_preflight()
@@ -36599,6 +37015,8 @@ def _openai_codex_oauth_poll_impl() -> tuple[Response, int]:
         if payload["status"] == "error":
             low = str(payload.get("message") or "").lower()
             http_status = 401 if "unauthorized" in low or "api key exchange" in low else 500
+        if payload["status"] == "completed":
+            _openai_codex_health_cache_invalidate(_current_user_id_or_zero())
         return jsonify(payload), http_status
     except Exception as exc:
         return jsonify({"status": "error", "message": str(exc) or "OAuth poll failed"}), 500
@@ -36617,9 +37035,18 @@ def api_openai_codex_oauth_device_poll():
 @app.get("/api/ai/providers/openai-codex/oauth/status")
 def api_openai_codex_oauth_status():
     try:
-        status_obj = _openai_auth_service().status(_current_user_id_or_zero(), provider_id="openai-codex")
+        uid = _current_user_id_or_zero()
+        status_obj = _openai_auth_service().status(uid, provider_id="openai-codex")
+        token_ready = False
+        token_reason = ""
+        if bool(status_obj.connected) and not _openai_codex_oauth_mode_enabled():
+            token_reason = _provider_mode_disabled_reason("openai-codex") or "OpenAI Codex OAuth mode is disabled in Settings"
+        elif bool(status_obj.connected) and _openai_codex_oauth_mode_enabled():
+            token_ready, token_reason = _openai_codex_token_health(uid, force_refresh=False)
         payload = {
-            "connected": bool(status_obj.connected),
+            # "connected" means runtime-usable (not just profile row present).
+            "connected": bool(status_obj.connected and token_ready),
+            "profile_connected": bool(status_obj.connected),
             "provider_id": str(status_obj.provider_id or "openai-codex"),
             "auth_mode": str(status_obj.auth_mode or "none"),
             "account_id": str(status_obj.account_id or ""),
@@ -36627,6 +37054,8 @@ def api_openai_codex_oauth_status():
             "expires_in_sec": int(status_obj.expires_in_sec) if status_obj.expires_in_sec is not None else None,
             "has_refresh_token": bool(status_obj.has_refresh_token),
             "metadata": status_obj.metadata or {},
+            "ready": bool(token_ready),
+            "error": str(token_reason or "") if (bool(status_obj.connected) and not bool(token_ready)) else "",
         }
         return jsonify(payload)
     except Exception as exc:
@@ -36637,6 +37066,7 @@ def api_openai_codex_oauth_status():
 def api_openai_codex_oauth_disconnect():
     try:
         _openai_auth_service().disconnect(_current_user_id_or_zero(), provider_id="openai-codex")
+        _openai_codex_health_cache_invalidate(_current_user_id_or_zero())
         return jsonify({"ok": True, "message": "OpenAI Codex OAuth disconnected"})
     except Exception as exc:
         return jsonify({"ok": False, "message": str(exc) or "Disconnect failed"}), 500
@@ -37455,6 +37885,29 @@ def _get_config_from_db(key: str, default_value=None):
     return default_value
 
 
+def _settings_db_read_all() -> dict[str, str]:
+    """Fetch the whole settings table once (fast path for /api/config)."""
+    out: dict[str, str] = {}
+    db_path = SETTINGS_DB_FILE
+    try:
+        if not db_path.exists():
+            return out
+        con = sqlite3.connect(str(db_path), timeout=2)
+        cur = con.cursor()
+        cur.execute("SELECT key, value FROM settings")
+        for row in cur.fetchall():
+            if not row:
+                continue
+            k = str(row[0] or "").strip()
+            if not k:
+                continue
+            out[k] = "" if row[1] is None else str(row[1])
+        con.close()
+    except Exception:
+        return out
+    return out
+
+
 MASKED_SECRET_KEYS: set[str] = {
     "OPENAI_API_KEY", "PLEX_TOKEN", "DISCORD_WEBHOOK",
     "OPENAI_OAUTH_REFRESH_TOKEN",
@@ -37704,11 +38157,13 @@ def api_config_get():
     Loads from SQLite (settings table) first, then falls back to runtime variables.
     SQLite is the single source of truth for all saved configuration.
     """
+    # Load settings table once to keep /api/config responsive under concurrent traffic.
+    settings_snapshot = _settings_db_read_all()
+
     # Load from SQLite first (source of truth), fallback to runtime variables
     def get_setting(key: str, runtime_value, default=""):
-        db_value = _get_config_from_db(key)
-        if db_value is not None:
-            return db_value
+        if key in settings_snapshot:
+            return settings_snapshot.get(key)
         return runtime_value if runtime_value is not None else default
 
     def get_setting_bool(key: str, runtime_value):
@@ -37721,10 +38176,10 @@ def api_config_get():
     skip_folders = getattr(sys.modules[__name__], "SKIP_FOLDERS", [])
     
     # Check if settings exist in DB (wizard was completed)
-    has_settings = _has_settings_in_db()
+    has_settings = bool(settings_snapshot)
     
     # Load SECTION_IDS from SQLite if available (stored as comma-separated "1,5" or legacy JSON "[1,5]")
-    section_ids_str = _get_config_from_db("SECTION_IDS")
+    section_ids_str = settings_snapshot.get("SECTION_IDS")
     if section_ids_str:
         raw = str(section_ids_str).strip()
         try:
@@ -37736,7 +38191,7 @@ def api_config_get():
             pass
     
     # Load PATH_MAP from SQLite if available
-    path_map_str = _get_config_from_db("PATH_MAP")
+    path_map_str = settings_snapshot.get("PATH_MAP")
     if path_map_str:
         try:
             path_map = json.loads(path_map_str) if isinstance(path_map_str, str) else path_map_str
@@ -37770,16 +38225,20 @@ def api_config_get():
     navidrome_key_eff = get_setting("NAVIDROME_API_KEY", NAVIDROME_API_KEY)
     user_id_eff = _current_user_id_or_zero()
     provider_prefs_eff = _get_ai_provider_preferences(user_id_eff)
-    codex_connected_eff = _openai_codex_connected(user_id_eff)
+    codex_connected_eff = _openai_codex_connected(user_id_eff, require_token=True)
     openai_effective_interactive = select_provider_id(
         context="interactive",
         preferred=str(provider_prefs_eff.get("interactive_provider_id") or "openai-codex"),
         codex_connected=codex_connected_eff,
+        openai_api_enabled=bool(get_setting_bool("OPENAI_ENABLE_API_KEY_MODE", OPENAI_ENABLE_API_KEY_MODE)),
+        openai_codex_enabled=bool(get_setting_bool("OPENAI_ENABLE_CODEX_OAUTH_MODE", OPENAI_ENABLE_CODEX_OAUTH_MODE)),
     )
     openai_effective_batch = select_provider_id(
         context="batch",
         preferred=str(provider_prefs_eff.get("batch_provider_id") or "openai-api"),
         codex_connected=codex_connected_eff,
+        openai_api_enabled=bool(get_setting_bool("OPENAI_ENABLE_API_KEY_MODE", OPENAI_ENABLE_API_KEY_MODE)),
+        openai_codex_enabled=bool(get_setting_bool("OPENAI_ENABLE_CODEX_OAUTH_MODE", OPENAI_ENABLE_CODEX_OAUTH_MODE)),
     )
 
     payload = {
@@ -37806,6 +38265,8 @@ def api_config_get():
         "AI_USAGE_LEVEL": _normalize_ai_usage_level(get_setting("AI_USAGE_LEVEL", AI_USAGE_LEVEL)),
         "OPENAI_API_KEY": str(openai_key_eff or ""),
         "OPENAI_API_KEY_SET": _is_set(openai_key_eff),
+        "OPENAI_ENABLE_API_KEY_MODE": get_setting_bool("OPENAI_ENABLE_API_KEY_MODE", OPENAI_ENABLE_API_KEY_MODE),
+        "OPENAI_ENABLE_CODEX_OAUTH_MODE": get_setting_bool("OPENAI_ENABLE_CODEX_OAUTH_MODE", OPENAI_ENABLE_CODEX_OAUTH_MODE),
         "OPENAI_OAUTH_REFRESH_TOKEN_SET": _is_set(openai_oauth_refresh_eff),
         "OPENAI_AUTH_MODE": (
             "oauth_api_key"
@@ -38010,7 +38471,7 @@ def api_ai_provider_preferences_get():
                 "batch_provider_id": _resolve_provider_for_runtime("openai", "scan_pipeline"),
                 "web_search_provider_id": _resolve_provider_for_runtime("openai", "web_search"),
             },
-            "codex_connected": bool(_openai_codex_connected(user_id)),
+            "codex_connected": bool(_openai_codex_connected(user_id, require_token=True)),
         }
     )
 
@@ -38080,6 +38541,7 @@ def _apply_settings_in_memory(updates: dict):
     global PLEX_CONFIGURED  # declared once so it can be set in any of the Plex blocks below
     mod = sys.modules[__name__]
     ai_keys = {"AI_PROVIDER", "OPENAI_API_KEY", "OPENAI_MODEL", "OPENAI_MODEL_FALLBACKS",
+               "OPENAI_ENABLE_API_KEY_MODE", "OPENAI_ENABLE_CODEX_OAUTH_MODE",
                "ANTHROPIC_API_KEY", "GOOGLE_API_KEY", "OLLAMA_URL"}
     need_ai_reinit = bool(ai_keys & set(updates.keys()))
 
@@ -38722,6 +39184,14 @@ def _apply_settings_in_memory(updates: dict):
         v = str(updates["OPENAI_API_KEY"] or "").strip()
         if not _is_masked_secret_placeholder(v):
             mod.OPENAI_API_KEY = v
+    if "OPENAI_ENABLE_API_KEY_MODE" in updates:
+        global OPENAI_ENABLE_API_KEY_MODE
+        OPENAI_ENABLE_API_KEY_MODE = bool(_parse_bool(updates["OPENAI_ENABLE_API_KEY_MODE"]))
+        mod.OPENAI_ENABLE_API_KEY_MODE = OPENAI_ENABLE_API_KEY_MODE
+    if "OPENAI_ENABLE_CODEX_OAUTH_MODE" in updates:
+        global OPENAI_ENABLE_CODEX_OAUTH_MODE
+        OPENAI_ENABLE_CODEX_OAUTH_MODE = bool(_parse_bool(updates["OPENAI_ENABLE_CODEX_OAUTH_MODE"]))
+        mod.OPENAI_ENABLE_CODEX_OAUTH_MODE = OPENAI_ENABLE_CODEX_OAUTH_MODE
     if "OPENAI_MODEL" in updates:
         mod.OPENAI_MODEL = str(updates["OPENAI_MODEL"] or "gpt-4")
     if "ANTHROPIC_API_KEY" in updates:
@@ -38752,7 +39222,8 @@ def api_config_put():
     allowed = {
         "PLEX_HOST", "PLEX_TOKEN", "PLEX_BASE_PATH", "PLEX_DB_PATH", "SECTION_IDS", "PATH_MAP",
         "DUPE_ROOT", "PMDA_CONFIG_DIR", "MUSIC_PARENT_PATH",
-        "SCAN_THREADS", "LOG_LEVEL", "LOG_FILE", "AI_PROVIDER", "AI_USAGE_LEVEL", "OPENAI_API_KEY", "OPENAI_MODEL",
+        "SCAN_THREADS", "LOG_LEVEL", "LOG_FILE", "AI_PROVIDER", "AI_USAGE_LEVEL", "OPENAI_API_KEY",
+        "OPENAI_ENABLE_API_KEY_MODE", "OPENAI_ENABLE_CODEX_OAUTH_MODE", "OPENAI_MODEL",
         "OPENAI_MODEL_FALLBACKS", "ANTHROPIC_API_KEY", "GOOGLE_API_KEY", "OLLAMA_URL",
         "DISCORD_WEBHOOK", "USE_MUSICBRAINZ", "MUSICBRAINZ_EMAIL", "MB_RETRY_NOT_FOUND",
         "MB_SEARCH_ALBUM_TIMEOUT_SEC", "MB_CANDIDATE_FETCH_LIMIT", "MB_TRACKLIST_FETCH_LIMIT", "MB_FAST_FALLBACK_MODE",
@@ -38832,6 +39303,7 @@ def api_config_put():
         "TASK_NOTIFY_PLAYER_SYNC",
         "USE_AI_WEB_SEARCH_FALLBACK",
         "SCHEDULER_ALLOW_NON_SCAN_JOBS",
+        "OPENAI_ENABLE_API_KEY_MODE", "OPENAI_ENABLE_CODEX_OAUTH_MODE",
     ):
         if _k in updates:
             updates[_k] = bool(_parse_bool(updates[_k]))
@@ -46656,8 +47128,21 @@ def api_library_artist_summary_ai(artist_id: int):
     """Generate/refresh an AI summary (100-200 words) for an artist and persist it in PostgreSQL."""
     if _get_library_mode() != "files":
         return jsonify({"error": "Artist summary endpoint is available in Files mode only"}), 400
-    if not bool(getattr(sys.modules[__name__], "ai_provider_ready", False)):
-        msg = getattr(sys.modules[__name__], "AI_FUNCTIONAL_ERROR_MSG", None) or "AI is not configured"
+    ai_ok, _provider_effective, _auth_mode, ai_reason = _resolve_ai_runtime_availability(
+        analysis_type="assistant_chat",
+        requested_provider="openai",
+        user_id=_current_user_id_or_zero(),
+    )
+    if not ai_ok:
+        msg = ai_reason or getattr(sys.modules[__name__], "AI_FUNCTIONAL_ERROR_MSG", None) or "AI is not configured"
+        logging.warning(
+            "[ArtistFacts] AI unavailable for artist_id=%s user_id=%s provider=%s auth=%s reason=%s",
+            int(artist_id or 0),
+            _current_user_id_or_zero(),
+            str(_provider_effective or ""),
+            str(_auth_mode or ""),
+            str(msg or ""),
+        )
         return jsonify({"error": msg}), 503
 
     body = request.get_json(silent=True) or {}
@@ -46892,7 +47377,7 @@ def api_library_artist_summary_ai(artist_id: int):
             "Task: Write the best possible artist description for a music library UI."
         )
 
-        provider = getattr(sys.modules[__name__], "AI_PROVIDER", "openai")
+        provider = "openai"
         model = getattr(sys.modules[__name__], "RESOLVED_MODEL", None) or getattr(sys.modules[__name__], "OPENAI_MODEL", "gpt-4o-mini")
         ai_text = call_ai_provider_longform(
             provider,
@@ -46900,7 +47385,7 @@ def api_library_artist_summary_ai(artist_id: int):
             system_msg,
             user_msg,
             max_tokens=520,
-            analysis_type="other",
+            analysis_type="assistant_chat",
         )
         ai_text = (ai_text or "").strip()
         if not ai_text:
@@ -47434,8 +47919,21 @@ def api_library_artist_facts_extract(artist_id: int):
     """Extract artist facts via AI (stored in PostgreSQL)."""
     if _get_library_mode() != "files":
         return jsonify({"error": "Artist facts endpoint is available in Files mode only"}), 400
-    if not bool(getattr(sys.modules[__name__], "ai_provider_ready", False)):
-        msg = getattr(sys.modules[__name__], "AI_FUNCTIONAL_ERROR_MSG", None) or "AI is not configured"
+    ai_ok, _provider_effective, _auth_mode, ai_reason = _resolve_ai_runtime_availability(
+        analysis_type="assistant_chat",
+        requested_provider="openai",
+        user_id=_current_user_id_or_zero(),
+    )
+    if not ai_ok:
+        msg = ai_reason or getattr(sys.modules[__name__], "AI_FUNCTIONAL_ERROR_MSG", None) or "AI is not configured"
+        logging.warning(
+            "[ArtistFacts] AI unavailable for facts/extract artist_id=%s user_id=%s provider=%s auth=%s reason=%s",
+            int(artist_id or 0),
+            _current_user_id_or_zero(),
+            str(_provider_effective or ""),
+            str(_auth_mode or ""),
+            str(msg or ""),
+        )
         return jsonify({"error": msg}), 503
     ok, err = _ensure_files_index_ready()
     if not ok:
@@ -47512,7 +48010,7 @@ def api_library_artist_facts_extract(artist_id: int):
             f"{ctx}\n"
         )
 
-        provider = getattr(sys.modules[__name__], "AI_PROVIDER", "openai")
+        provider = "openai"
         model = getattr(sys.modules[__name__], "RESOLVED_MODEL", None) or getattr(sys.modules[__name__], "OPENAI_MODEL", "gpt-4o-mini")
         raw = call_ai_provider_longform(
             provider,
@@ -47520,7 +48018,7 @@ def api_library_artist_facts_extract(artist_id: int):
             system_msg,
             user_msg,
             max_tokens=800,
-            analysis_type="other",
+            analysis_type="assistant_chat",
         )
         raw = (raw or "").strip()
         if not raw:
@@ -51154,9 +51652,14 @@ def _fetch_album_review_web_ai(
     search_source = _review_search_source_from_hits(hits)
     summary = ""
     source = search_source
-    if bool(getattr(sys.modules[__name__], "ai_provider_ready", False)):
+    ai_ok, _provider_effective, _auth_mode, _ai_reason = _resolve_ai_runtime_availability(
+        analysis_type="album_review_generate",
+        requested_provider="openai",
+        user_id=_current_user_id_or_zero(),
+    )
+    if ai_ok:
         try:
-            provider = getattr(sys.modules[__name__], "AI_PROVIDER", "openai")
+            provider = "openai"
             model = getattr(sys.modules[__name__], "RESOLVED_MODEL", None) or getattr(sys.modules[__name__], "OPENAI_MODEL", "gpt-4o-mini")
             system_msg = (
                 "You are PMDA metadata assistant. Extract a concise album review snippet from provided web snippets.\n"
@@ -51178,7 +51681,7 @@ def _fetch_album_review_web_ai(
                 system_msg,
                 user_msg,
                 max_tokens=320,
-                analysis_type="other",
+                analysis_type="album_review_generate",
             )
             summary = _strip_html_text(str(ai_out or "").strip())
             if summary:
@@ -51249,8 +51752,13 @@ def _fetch_album_review_web_ai_batch(
         return {}
 
     ai_summaries_by_norm: dict[str, str] = {}
-    if bool(getattr(sys.modules[__name__], "ai_provider_ready", False)):
-        provider = getattr(sys.modules[__name__], "AI_PROVIDER", "openai")
+    ai_ok, _provider_effective, _auth_mode, _ai_reason = _resolve_ai_runtime_availability(
+        analysis_type="album_review_batch",
+        requested_provider="openai",
+        user_id=_current_user_id_or_zero(),
+    )
+    if ai_ok:
+        provider = "openai"
         model = getattr(sys.modules[__name__], "RESOLVED_MODEL", None) or getattr(sys.modules[__name__], "OPENAI_MODEL", "gpt-4o-mini")
         chunk_size = 8
         for i in range(0, len(prepared), chunk_size):
@@ -51284,7 +51792,7 @@ def _fetch_album_review_web_ai_batch(
                     system_msg,
                     user_msg,
                     max_tokens=max(500, min(2200, 260 * len(chunk))),
-                    analysis_type="other",
+                    analysis_type="album_review_batch",
                 )
                 parsed = _assistant_extract_json_array(str(ai_out or ""))
                 for row in parsed:
@@ -54397,15 +54905,30 @@ def api_library_album_review_generate(album_id: int):
                 or str(profile.get("short_description") or "").strip()
             )
         if not has_profile_text:
+            ai_web_ok, _ai_web_provider, _ai_web_auth, ai_web_reason = _resolve_ai_runtime_availability(
+                analysis_type="web_search",
+                requested_provider="openai",
+                user_id=_current_user_id_or_zero(),
+            )
             ai_web_fallback_possible = bool(
                 bool(getattr(sys.modules[__name__], "USE_AI_WEB_SEARCH_FALLBACK", True))
-                and bool(getattr(sys.modules[__name__], "ai_provider_ready", False))
-                and str(getattr(sys.modules[__name__], "AI_PROVIDER", "openai") or "openai").strip().lower() == "openai"
-                and bool(openai_client)
+                and bool(ai_web_ok)
+                and str(_ai_web_provider or "").strip().lower() in {"openai", "openai-api", "openai-codex"}
             )
             serper_ok, serper_msg = _run_serper_preflight()
             if not serper_ok and not ai_web_fallback_possible:
-                return jsonify({"error": f"No relevant review found (web search unavailable: {serper_msg})"}), 404
+                detail_parts: list[str] = []
+                if str(ai_web_reason or "").strip():
+                    detail_parts.append(f"openai_web={str(ai_web_reason).strip()}")
+                if str(serper_msg or "").strip():
+                    detail_parts.append(f"serper={str(serper_msg).strip()}")
+                detail = " ; ".join(detail_parts) if detail_parts else "no web provider available"
+                logging.warning(
+                    "[Review] Album %s web search unavailable for review generation: %s",
+                    int(album_id or 0),
+                    detail,
+                )
+                return jsonify({"error": f"No relevant review found (web search unavailable: {detail})"}), 404
             return jsonify({"error": "No relevant review found"}), 404
 
         with conn.transaction():
