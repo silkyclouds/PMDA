@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { Loader2, RefreshCw, Save, UserPlus } from 'lucide-react';
+import { Loader2, RefreshCw, Save, Trash2, UserPlus } from 'lucide-react';
 import { toast } from 'sonner';
 
 import * as api from '@/lib/api';
@@ -15,6 +15,7 @@ interface UserDraft {
   username: string;
   is_admin: boolean;
   can_download: boolean;
+  can_view_statistics: boolean;
   is_active: boolean;
   password: string;
 }
@@ -24,6 +25,7 @@ function toDraft(user: api.AuthUser): UserDraft {
     username: user.username,
     is_admin: Boolean(user.is_admin),
     can_download: Boolean(user.can_download),
+    can_view_statistics: Boolean(user.can_view_statistics),
     is_active: Boolean(user.is_active),
     password: '',
   };
@@ -51,6 +53,7 @@ export default function AdminUsersPage() {
   const [drafts, setDrafts] = useState<Record<number, UserDraft>>({});
   const [loading, setLoading] = useState(true);
   const [savingId, setSavingId] = useState<number | null>(null);
+  const [deletingId, setDeletingId] = useState<number | null>(null);
   const [createBusy, setCreateBusy] = useState(false);
   const [newUser, setNewUser] = useState({
     username: '',
@@ -58,6 +61,7 @@ export default function AdminUsersPage() {
     passwordConfirm: '',
     is_admin: false,
     can_download: false,
+    can_view_statistics: false,
   });
 
   const loadUsers = useCallback(async () => {
@@ -93,6 +97,7 @@ export default function AdminUsersPage() {
           username: '',
           is_admin: false,
           can_download: false,
+          can_view_statistics: false,
           is_active: true,
           password: '',
         }),
@@ -111,6 +116,7 @@ export default function AdminUsersPage() {
           username: draft.username.trim(),
           is_admin: Boolean(draft.is_admin),
           can_download: Boolean(draft.can_download),
+          can_view_statistics: Boolean(draft.can_view_statistics),
           is_active: Boolean(draft.is_active),
         };
         if (draft.password.trim()) {
@@ -145,9 +151,17 @@ export default function AdminUsersPage() {
         password_confirm: newUser.passwordConfirm,
         is_admin: newUser.is_admin,
         can_download: newUser.can_download,
+        can_view_statistics: newUser.can_view_statistics,
       });
       toast.success('User created');
-      setNewUser({ username: '', password: '', passwordConfirm: '', is_admin: false, can_download: false });
+      setNewUser({
+        username: '',
+        password: '',
+        passwordConfirm: '',
+        is_admin: false,
+        can_download: false,
+        can_view_statistics: false,
+      });
       await loadUsers();
     } catch (error) {
       toast.error(getApiErrorMessage(error));
@@ -155,6 +169,24 @@ export default function AdminUsersPage() {
       setCreateBusy(false);
     }
   }, [loadUsers, newUser]);
+
+  const onDeleteUser = useCallback(
+    async (userId: number, username: string) => {
+      const answer = window.confirm(`Delete user "${username}"?\n\nThis action cannot be undone.`);
+      if (!answer) return;
+      setDeletingId(userId);
+      try {
+        await api.deleteAdminUser(userId);
+        toast.success(`User "${username}" deleted`);
+        await loadUsers();
+      } catch (error) {
+        toast.error(getApiErrorMessage(error));
+      } finally {
+        setDeletingId(null);
+      }
+    },
+    [loadUsers],
+  );
 
   const sortedUsers = useMemo(() => {
     return [...users].sort((a, b) => Number(b.is_admin) - Number(a.is_admin) || a.username.localeCompare(b.username));
@@ -179,7 +211,7 @@ export default function AdminUsersPage() {
         <CardHeader className="flex flex-row items-center justify-between gap-3">
           <div>
             <CardTitle>User Management</CardTitle>
-            <CardDescription>Manage PMDA users, roles and download permission.</CardDescription>
+            <CardDescription>Manage PMDA users, roles, download permission, and statistics visibility.</CardDescription>
           </div>
           <Button type="button" variant="outline" onClick={() => void loadUsers()} disabled={loading}>
             {loading ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-2 h-4 w-4" />}
@@ -195,13 +227,14 @@ export default function AdminUsersPage() {
             sortedUsers.map((u) => {
               const draft = drafts[u.id] ?? toDraft(u);
               const isSelf = Number(auth.user?.id) === Number(u.id);
+              const isDeleting = deletingId === u.id;
               return (
                 <div key={u.id} className="rounded-lg border p-4">
                   <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
                     <p className="text-sm font-medium">#{u.id} · {u.username}</p>
                     <p className="text-xs text-muted-foreground">Last login: {formatLastLogin(u.last_login_at)}</p>
                   </div>
-                  <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-5">
+                  <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-7">
                     <div className="space-y-1">
                       <Label htmlFor={`username-${u.id}`}>Username</Label>
                       <Input
@@ -241,21 +274,49 @@ export default function AdminUsersPage() {
                       </div>
                     </div>
                     <div className="space-y-1">
+                      <Label htmlFor={`statistics-${u.id}`}>Can view statistics</Label>
+                      <div className="flex h-10 items-center">
+                        <Switch
+                          id={`statistics-${u.id}`}
+                          checked={Boolean(draft.can_view_statistics)}
+                          onCheckedChange={(checked) => updateDraft(u.id, { can_view_statistics: Boolean(checked) })}
+                        />
+                      </div>
+                    </div>
+                    <div className="space-y-1">
                       <Label htmlFor={`active-${u.id}`}>Active</Label>
-                      <div className="flex h-10 items-center justify-between gap-2">
+                      <div className="flex h-10 items-center">
                         <Switch
                           id={`active-${u.id}`}
                           checked={Boolean(draft.is_active)}
                           onCheckedChange={(checked) => updateDraft(u.id, { is_active: Boolean(checked) })}
                         />
+                      </div>
+                    </div>
+                    <div className="space-y-1">
+                      <Label>Actions</Label>
+                      <div className="flex h-10 items-center gap-2">
                         <Button
                           type="button"
-                          size="sm"
+                          size="icon"
                           onClick={() => void saveUser(u.id)}
-                          disabled={savingId === u.id}
+                          disabled={savingId === u.id || isDeleting}
+                          title="Save user"
+                          aria-label={`Save user ${u.username}`}
                         >
-                          {savingId === u.id ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Save className="mr-2 h-4 w-4" />}
-                          Save
+                          {savingId === u.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+                        </Button>
+                        <Button
+                          type="button"
+                          size="icon"
+                          variant="outline"
+                          className="border-destructive/50 text-destructive hover:bg-destructive/10"
+                          onClick={() => void onDeleteUser(u.id, u.username)}
+                          disabled={isSelf || savingId === u.id || isDeleting}
+                          title={isSelf ? 'You cannot delete your own account' : 'Delete user'}
+                          aria-label={isSelf ? `Delete user ${u.username} disabled` : `Delete user ${u.username}`}
+                        >
+                          {isDeleting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
                         </Button>
                       </div>
                     </div>
@@ -318,8 +379,16 @@ export default function AdminUsersPage() {
               />
               <Label htmlFor="new-can-download">Can download albums</Label>
             </div>
+            <div className="flex items-center gap-2">
+              <Switch
+                id="new-can-view-statistics"
+                checked={Boolean(newUser.can_view_statistics)}
+                onCheckedChange={(checked) => setNewUser((prev) => ({ ...prev, can_view_statistics: Boolean(checked) }))}
+              />
+              <Label htmlFor="new-can-view-statistics">Can view statistics</Label>
+            </div>
           </div>
-          <Button type="button" onClick={() => void onCreateUser()} disabled={createBusy}>
+            <Button type="button" onClick={() => void onCreateUser()} disabled={createBusy}>
             {createBusy ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <UserPlus className="mr-2 h-4 w-4" />}
             Create user
           </Button>

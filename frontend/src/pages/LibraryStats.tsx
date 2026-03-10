@@ -1,7 +1,7 @@
 import { useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
-import { BarChart3, Database, Music2, RefreshCw } from 'lucide-react';
+import { Database } from 'lucide-react';
 
 import {
   Chart as ChartJS,
@@ -19,8 +19,8 @@ import { Bar, Chart, Doughnut } from 'react-chartjs-2';
 
 import * as api from '@/lib/api';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
+import { StatisticsPageNav } from '@/components/statistics/StatisticsPageNav';
 
 ChartJS.register(CategoryScale, LinearScale, BarElement, LineElement, PointElement, ArcElement, Tooltip, Legend);
 
@@ -38,7 +38,7 @@ function topWithOther<T extends { count: number }>(items: T[], topN: number): { 
 export default function LibraryStatsPage() {
   const navigate = useNavigate();
 
-  const { data, isLoading, error, refetch, isFetching } = useQuery({
+  const { data, isLoading, error } = useQuery({
     queryKey: ['library-stats-library'],
     queryFn: () => api.getLibraryStatsLibrary(),
     staleTime: 10_000,
@@ -245,20 +245,7 @@ export default function LibraryStatsPage() {
           </h1>
           <p className="text-xs text-muted-foreground">Distributions and growth from the indexed library (Files mode).</p>
         </div>
-        <div className="flex items-center gap-2">
-          <Button variant="outline" size="sm" onClick={() => navigate('/statistics')} className="gap-2">
-            <BarChart3 className="h-4 w-4" />
-            Scan stats
-          </Button>
-          <Button variant="outline" size="sm" onClick={() => navigate('/statistics/listening')} className="gap-2">
-            <Music2 className="h-4 w-4" />
-            Listening stats
-          </Button>
-          <Button variant="outline" size="sm" onClick={() => void refetch()} disabled={isFetching} className="gap-2">
-            <RefreshCw className={isFetching ? 'h-4 w-4 animate-spin' : 'h-4 w-4'} />
-            Refresh
-          </Button>
-        </div>
+        <StatisticsPageNav active="library" />
       </div>
 
       {error ? (

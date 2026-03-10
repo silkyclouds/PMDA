@@ -7,6 +7,10 @@ import type { DuplicateCard, ScanProgress, DedupeProgress } from '@/lib/api';
 type ApiErrorShape = {
   body?: {
     error?: string;
+    message?: string;
+    reason?: string;
+    active_scan_type?: string;
+    started_at?: number;
     requiresConfig?: boolean;
     aiFunctionalFailure?: boolean;
     requiresAiConfig?: boolean;
@@ -136,7 +140,7 @@ export function useScanControls() {
   };
 
   const startMutation = useMutation<
-    { status: string; scan_type?: string; run_improve_after?: boolean },
+    api.StartScanResponse,
     unknown,
     api.StartScanOptions | undefined
   >({
@@ -144,9 +148,16 @@ export function useScanControls() {
     onSuccess: invalidateQueries,
     onError: (error: unknown) => {
       const err = error && typeof error === 'object' ? (error as ApiErrorShape) : {};
-      const msg = err.body?.error;
+      const msg = err.body?.error || err.body?.message;
       if (err.response?.status === 409) {
-        toast.error(msg || 'A scan is already running.');
+        const reason = String(err.body?.reason || '').trim().toLowerCase();
+        if (reason === 'bootstrap_required') {
+          toast.error(msg || 'Initial full scan required before changed-only scans.');
+          return;
+        }
+        const activeType = String(err.body?.active_scan_type || '').trim();
+        const suffix = activeType ? ` (${activeType})` : '';
+        toast.error(msg || `A scan is already running${suffix}.`);
         return;
       }
       if (err.body?.requiresConfig) {

@@ -1,7 +1,6 @@
-import { useEffect, useMemo, useState, type SyntheticEvent } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Music } from 'lucide-react';
-
-type ArtworkSourcePhase = 'album' | 'artist' | 'none';
+import { getAuthToken } from '@/lib/api';
 
 interface AlbumArtworkProps {
   albumThumb?: string | null;
@@ -50,41 +49,74 @@ export function AlbumArtwork({
     return `/api/library/files/artist/${id}/image?size=${px}`;
   }, [artistId, size]);
 
-  const [phase, setPhase] = useState<ArtworkSourcePhase>('none');
   const [src, setSrc] = useState<string | null>(null);
+  const objectUrlRef = useRef<string | null>(null);
 
   useEffect(() => {
-    if (albumUrl) {
-      setPhase('album');
-      setSrc(albumUrl);
-      return;
+    return () => {
+      const prev = objectUrlRef.current;
+      objectUrlRef.current = null;
+      if (prev) URL.revokeObjectURL(prev);
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const applyObjectUrl = (next: string | null) => {
+      if (cancelled) {
+        if (next) URL.revokeObjectURL(next);
+        return;
+      }
+      const prev = objectUrlRef.current;
+      objectUrlRef.current = next;
+      if (prev && prev !== next) URL.revokeObjectURL(prev);
+      setSrc(next);
+    };
+
+    const candidates = [albumUrl, artistUrl].filter((value): value is string => Boolean(value));
+    if (!candidates.length) {
+      applyObjectUrl(null);
+      return () => {
+        cancelled = true;
+      };
     }
-    if (artistUrl) {
-      setPhase('artist');
-      setSrc(artistUrl);
-      return;
-    }
-    setPhase('none');
-    setSrc(null);
+
+    const load = async () => {
+      for (let i = 0; i < candidates.length; i += 1) {
+        const url = candidates[i];
+        try {
+          const token = getAuthToken();
+          const headers = token ? { Authorization: `Bearer ${token}` } : undefined;
+          const res = await fetch(url, { cache: 'no-cache', headers });
+          if (!res.ok) continue;
+          const blob = await res.blob();
+          if (!blob || blob.size <= 0) continue;
+
+          // Backend returns a tiny transparent PNG when no cover is available.
+          // If album fallback is tiny and artist art exists, continue to next candidate.
+          const hasArtistFallback = Boolean(artistUrl) && candidates.length > 1;
+          const isAlbumCandidate = Boolean(albumUrl) && url === albumUrl;
+          const isTransparentPlaceholder =
+            isAlbumCandidate && hasArtistFallback && blob.type === 'image/png' && blob.size <= 512;
+          if (isTransparentPlaceholder) continue;
+
+          const blobUrl = URL.createObjectURL(blob);
+          applyObjectUrl(blobUrl);
+          return;
+        } catch {
+          // Ignore and try next candidate.
+        }
+      }
+      applyObjectUrl(null);
+    };
+
+    void load();
+
+    return () => {
+      cancelled = true;
+    };
   }, [albumUrl, artistUrl]);
-
-  const onError = () => {
-    if (phase === 'album' && artistUrl) {
-      setPhase('artist');
-      setSrc(artistUrl);
-      return;
-    }
-    setPhase('none');
-    setSrc(null);
-  };
-
-  const onLoad = (e: SyntheticEvent<HTMLImageElement>) => {
-    const img = e.currentTarget;
-    if (phase === 'album' && artistUrl && img.naturalWidth <= 2 && img.naturalHeight <= 2) {
-      setPhase('artist');
-      setSrc(artistUrl);
-    }
-  };
 
   if (src) {
     return (
@@ -95,8 +127,12 @@ export function AlbumArtwork({
         fetchPriority={priority ? 'high' : 'auto'}
         decoding="async"
         className={imageClassName}
-        onLoad={onLoad}
-        onError={onError}
+        onError={() => {
+          const prev = objectUrlRef.current;
+          objectUrlRef.current = null;
+          if (prev) URL.revokeObjectURL(prev);
+          setSrc(null);
+        }}
       />
     );
   }

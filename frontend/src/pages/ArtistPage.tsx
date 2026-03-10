@@ -132,7 +132,6 @@ export default function ArtistPage() {
   const artistId = Number(params.artistId);
   const { toast } = useToast();
   const autoAiRequestedRef = useRef(false);
-  const autoFactsRequestedRef = useRef(false);
   const similarRefreshAttemptsRef = useRef(0);
 
   const [loading, setLoading] = useState(true);
@@ -150,6 +149,8 @@ export default function ArtistPage() {
   const [concertsMeta, setConcertsMeta] = useState<{ provider: string; updated_at: number; source_url?: string | null } | null>(null);
   const [factsLoading, setFactsLoading] = useState(false);
   const [facts, setFacts] = useState<api.ArtistFactsResponse | null>(null);
+  const [factsLoadedOnce, setFactsLoadedOnce] = useState(false);
+  const [connectionDetailsOpen, setConnectionDetailsOpen] = useState(false);
   const [artistLiked, setArtistLiked] = useState(false);
   const [descExpanded, setDescExpanded] = useState(false);
   const [refreshAllBusy, setRefreshAllBusy] = useState(false);
@@ -161,6 +162,13 @@ export default function ArtistPage() {
   const appendIncludeUnmatched = useCallback((url: string) => {
     return `${url}${url.includes('?') ? '&' : '?'}include_unmatched=${includeUnmatchedParam}`;
   }, [includeUnmatchedParam]);
+  const apiErrorText = useCallback((value: unknown): string => {
+    const bodyMsg = (value as { body?: { message?: unknown } } | null)?.body?.message;
+    if (typeof bodyMsg === 'string' && bodyMsg.trim()) return bodyMsg.trim();
+    if (value instanceof Error && value.message.trim()) return value.message.trim();
+    const txt = String(value ?? '').trim();
+    return txt || 'unknown error';
+  }, []);
 
   const fetchArtist = useCallback(async () => {
     if (!Number.isFinite(artistId) || artistId <= 0) {
@@ -258,31 +266,25 @@ export default function ArtistPage() {
       setFacts(null);
     } finally {
       setFactsLoading(false);
+      setFactsLoadedOnce(true);
     }
   }, [artistId]);
 
-  const extractFacts = useCallback(async () => {
-    if (!Number.isFinite(artistId) || artistId <= 0) return;
-    setFactsLoading(true);
-    try {
-      const res = await api.extractArtistFacts(artistId);
-      setFacts(res);
-      toast({ title: 'Connections updated', description: 'Updated artist connections.' });
-    } catch (e) {
-      toast({
-        title: 'Connections refresh failed',
-        description: e instanceof Error ? e.message : 'Failed to refresh connections',
-        variant: 'destructive',
-      });
-    } finally {
-      setFactsLoading(false);
-    }
-  }, [artistId, toast]);
-
   useEffect(() => {
     void loadConcerts(false);
+  }, [loadConcerts]);
+
+  useEffect(() => {
+    setFacts(null);
+    setFactsLoadedOnce(false);
+    setConnectionDetailsOpen(false);
+  }, [artistId]);
+
+  useEffect(() => {
+    if (!connectionDetailsOpen) return;
+    if (factsLoadedOnce || factsLoading) return;
     void loadFacts();
-  }, [loadConcerts, loadFacts]);
+  }, [connectionDetailsOpen, factsLoadedOnce, factsLoading, loadFacts]);
 
   useEffect(() => {
     let cancelled = false;
@@ -310,19 +312,6 @@ export default function ArtistPage() {
       cancelled = true;
     };
   }, []);
-
-  useEffect(() => {
-    // Auto-extract connections once when we have a description but no extracted facts yet.
-    if (factsLoading) return;
-    if (autoFactsRequestedRef.current) return;
-    const obj = facts?.facts;
-    const totalKnown = obj && typeof obj === 'object' ? Object.values(obj as Record<string, unknown>).filter((v) => Array.isArray(v) && v.length > 0).length : 0;
-    if (totalKnown > 0) return;
-    const anyDesc = ((summary?.original?.text || '') + (summary?.ai?.text || '')).trim();
-    if (!anyDesc) return;
-    autoFactsRequestedRef.current = true;
-    void extractFacts();
-  }, [facts, factsLoading, summary, extractFacts]);
 
   useEffect(() => {
     let cancelled = false;
@@ -414,7 +403,6 @@ export default function ArtistPage() {
     setRefreshAllBusy(true);
     setDescExpanded(false);
     autoAiRequestedRef.current = false;
-    autoFactsRequestedRef.current = false;
     try {
       await Promise.allSettled([
         fetchArtist(),
@@ -430,9 +418,10 @@ export default function ArtistPage() {
         await ensureDescription();
       }
 
-      // Always attempt to refresh connections; backend will no-op if AI isn't configured.
-      await extractFacts();
-      await loadFacts();
+      // Keep page refresh cheap: only refresh facts when connection details are open.
+      if (connectionDetailsOpen) {
+        await loadFacts();
+      }
 
       toast({ title: 'Refreshed', description: 'Artist analysis updated.' });
     } catch (e) {
@@ -440,7 +429,7 @@ export default function ArtistPage() {
     } finally {
       setRefreshAllBusy(false);
     }
-  }, [artistId, refreshAllBusy, fetchArtist, fetchProfile, loadConcerts, ensureDescription, extractFacts, loadFacts, toast]);
+  }, [artistId, refreshAllBusy, fetchArtist, fetchProfile, loadConcerts, ensureDescription, connectionDetailsOpen, loadFacts, toast]);
 
   const runArtistAiResearch = useCallback(async () => {
     if (!Number.isFinite(artistId) || artistId <= 0) return;
@@ -448,17 +437,30 @@ export default function ArtistPage() {
     setAiProcessBusy(true);
     try {
       let started = false;
+      let profileRefreshFailed = false;
+      let summaryFailed = false;
+      let factsFailed = false;
       try {
         const res = await api.enrichArtistWithAI(artistId);
         started = Boolean(res.started);
       } catch {
         started = false;
+        profileRefreshFailed = true;
       }
 
-      await Promise.allSettled([
-        api.generateArtistAiSummary(artistId, 'en'),
-        api.extractArtistFacts(artistId),
-      ]);
+      const shouldRefreshConnections = Boolean(connectionDetailsOpen);
+      const stepTasks: Promise<unknown>[] = [api.generateArtistAiSummary(artistId, 'en')];
+      if (shouldRefreshConnections) {
+        // Keep artist page opening cheap: only refresh AI connections on-demand.
+        stepTasks.push(api.extractArtistFacts(artistId));
+      }
+      const stepResults = await Promise.allSettled(stepTasks);
+      summaryFailed = stepResults[0]?.status === 'rejected';
+      factsFailed = shouldRefreshConnections && stepResults[1]?.status === 'rejected';
+      const summaryErr = stepResults[0]?.status === 'rejected' ? apiErrorText(stepResults[0].reason) : '';
+      const factsErr = (shouldRefreshConnections && stepResults[1]?.status === 'rejected')
+        ? apiErrorText(stepResults[1].reason)
+        : '';
 
       const targets = (details?.albums || [])
         .map((a) => Number(a.album_id || 0))
@@ -481,16 +483,25 @@ export default function ArtistPage() {
         await Promise.all(workers);
       }
 
-      await Promise.allSettled([
+      const postTasks: Promise<unknown>[] = [
         fetchArtist(),
         fetchProfile(false),
         loadSummary(),
-        loadFacts(),
-      ]);
+      ];
+      if (connectionDetailsOpen) {
+        postTasks.push(loadFacts());
+      }
+      await Promise.allSettled(postTasks);
 
+      const hasFailure = profileRefreshFailed || summaryFailed || factsFailed || failed > 0;
+      const detailParts = [
+        summaryErr ? `summary: ${summaryErr}` : '',
+        factsErr ? `connections: ${factsErr}` : '',
+      ].filter((x) => x.length > 0);
       toast({
-        title: 'AI research completed',
-        description: `Profiles ${started ? 'queued' : 'not queued'} · album reviews ${generated}${failed > 0 ? ` (${failed} failed)` : ''}.`,
+        title: hasFailure ? 'AI research partially completed' : 'AI research completed',
+        description: `Profiles ${started ? 'queued' : 'not queued'} · album reviews ${generated}${failed > 0 ? ` (${failed} failed)` : ''}${summaryFailed ? ' · summary failed' : ''}${factsFailed ? ' · connections failed' : ''}${!shouldRefreshConnections ? ' · connections skipped (on-demand)' : ''}${detailParts.length ? ` · ${detailParts.join(' | ')}` : ''}.`,
+        variant: hasFailure ? 'destructive' : 'default',
       });
     } catch (e) {
       toast({
@@ -501,7 +512,7 @@ export default function ArtistPage() {
     } finally {
       setAiProcessBusy(false);
     }
-  }, [aiProcessBusy, artistId, details?.albums, fetchArtist, fetchProfile, loadFacts, loadSummary, toast]);
+  }, [aiProcessBusy, apiErrorText, artistId, connectionDetailsOpen, details?.albums, fetchArtist, fetchProfile, loadFacts, loadSummary, toast]);
 
   useEffect(() => {
     // Auto-generate a description only when nothing exists yet.
@@ -746,6 +757,7 @@ export default function ArtistPage() {
     + factsCollabs.length
     + factsLabels.length
     + factsCities.length;
+  const connectionCountDisplay = factsLoadedOnce ? String(connectionCount) : "—";
   const profileGenres = (profile?.tags || []).map((x) => String(x || '').trim()).filter(Boolean);
   const normalizedGenres = Array.from(new Set([...factsGenres, ...profileGenres])).slice(0, 10);
   const isDeceased =
@@ -785,11 +797,11 @@ export default function ArtistPage() {
         </div>
 
         <Card className="overflow-hidden border-border/70">
-          <div className="relative">
-            <div className="absolute inset-0 z-10 bg-background/40 backdrop-blur-2xl" />
-            <div className="absolute inset-0 z-10 bg-gradient-to-r from-background/96 via-background/78 to-background/62" />
+          <div className="relative overflow-hidden">
+            <div className="absolute inset-0 z-10 bg-background/18 backdrop-blur-md" />
+            <div className="absolute inset-0 z-10 bg-gradient-to-r from-background/76 via-background/58 to-background/42" />
             {heroImage ? (
-              <img src={heroImage} alt={details.artist_name} className="w-full h-64 md:h-96 object-cover blur-[2.5px] scale-[1.04]" />
+              <img src={heroImage} alt={details.artist_name} className="w-full h-64 md:h-96 object-cover blur-[1.4px] scale-[1.06]" />
             ) : (
               <div className="h-64 md:h-96 bg-gradient-to-br from-zinc-900 via-zinc-800 to-zinc-900" />
             )}
@@ -932,7 +944,7 @@ export default function ArtistPage() {
               </Button>
               <Badge variant="outline" className={`h-8 px-2.5 text-[11px] gap-1.5 ${badgeKindClass('count')}`}>
                 <Users className="h-3.5 w-3.5" />
-                Connections: {connectionCount}
+                Connections: {connectionCountDisplay}
               </Badge>
               {isDeceased ? (
                 <Badge
@@ -1007,7 +1019,7 @@ export default function ArtistPage() {
               ) : null}
             </div>
 
-            <Collapsible defaultOpen={false}>
+            <Collapsible open={connectionDetailsOpen} onOpenChange={setConnectionDetailsOpen}>
               <CollapsibleTrigger asChild>
                 <Button type="button" variant="ghost" size="sm" className="gap-1.5 px-0">
                   <ChevronDown className="h-4 w-4" />
@@ -1015,7 +1027,11 @@ export default function ArtistPage() {
                 </Button>
               </CollapsibleTrigger>
               <CollapsibleContent className="pt-2">
-                {connectionCount === 0 ? (
+                {!factsLoadedOnce && !factsLoading ? (
+                  <p className="text-sm text-muted-foreground">
+                    Connections are loaded on demand from cached scan data. Open once to fetch.
+                  </p>
+                ) : connectionCount === 0 ? (
                   <p className="text-sm text-muted-foreground">
                     No connections found yet. Use Refresh to analyze labels, collaborations, and related acts.
                   </p>

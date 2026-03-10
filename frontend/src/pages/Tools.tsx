@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { AlertTriangle, ChevronLeft, ChevronRight, Loader2, RefreshCw, Tags, Trash2, Undo2 } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
@@ -28,6 +28,7 @@ export default function Tools() {
   const navigate = useNavigate();
   const [restoring, setRestoring] = useState<'dedupe' | 'incomplete' | null>(null);
   const [selectedScanId, setSelectedScanId] = useState<number | null>(null);
+  const [movesFilter, setMovesFilter] = useState<'all' | 'active' | 'restored'>('all');
 
   const { data: history, isLoading: loadingHistory, refetch: refetchHistory } = useQuery({
     queryKey: ['scan-history-tools'],
@@ -67,6 +68,7 @@ export default function Tools() {
   }, [completedRuns, selectedIndex]);
 
   const selectedSummary = selectedRun?.summary_json ?? null;
+  const selectedRunQuery = selectedRun?.scan_id ? `?scan_id=${selectedRun.scan_id}` : '';
   const selectedAlbumsDone = Number(selectedRun?.albums_scanned ?? 0);
   const selectedAlbumsTotal = Number(
     selectedSummary?.strict_total_albums
@@ -88,28 +90,49 @@ export default function Tools() {
     queryKey: ['scan-moves-tools', selectedRun?.scan_id],
     queryFn: async () => {
       if (!selectedRun?.scan_id) return [];
-      return api.getScanMoves(selectedRun.scan_id);
+      return api.getScanMoves(selectedRun.scan_id, { status: 'all' });
+    },
+    enabled: Boolean(selectedRun?.scan_id),
+    refetchInterval: 5000,
+  });
+  const { data: movesSummary } = useQuery({
+    queryKey: ['scan-moves-tools-summary', selectedRun?.scan_id],
+    queryFn: async () => {
+      if (!selectedRun?.scan_id) return null;
+      return api.getScanMovesSummary(selectedRun.scan_id);
     },
     enabled: Boolean(selectedRun?.scan_id),
     refetchInterval: 5000,
   });
 
-  const dedupeMoves = useMemo(
-    () => (moves || []).filter((m) => (m.move_reason || 'dedupe') === 'dedupe' && !m.restored),
+  const dedupeMovesAll = useMemo(
+    () => (moves || []).filter((m) => (m.move_reason || 'dedupe') === 'dedupe'),
     [moves],
   );
-  const incompleteMoves = useMemo(
-    () => (moves || []).filter((m) => (m.move_reason || '') === 'incomplete' && !m.restored),
+  const incompleteMovesAll = useMemo(
+    () => (moves || []).filter((m) => (m.move_reason || '') === 'incomplete'),
     [moves],
   );
+  const filterMoves = useCallback(
+    (items: api.ScanMove[]) => {
+      if (movesFilter === 'active') return items.filter((m) => !m.restored);
+      if (movesFilter === 'restored') return items.filter((m) => Boolean(m.restored));
+      return items;
+    },
+    [movesFilter],
+  );
+  const dedupeMoves = useMemo(() => filterMoves(dedupeMovesAll), [dedupeMovesAll, filterMoves]);
+  const incompleteMoves = useMemo(() => filterMoves(incompleteMovesAll), [incompleteMovesAll, filterMoves]);
+  const dedupePendingCount = useMemo(() => dedupeMovesAll.filter((m) => !m.restored).length, [dedupeMovesAll]);
+  const incompletePendingCount = useMemo(() => incompleteMovesAll.filter((m) => !m.restored).length, [incompleteMovesAll]);
   const hasIncompleteReview = useMemo(() => {
     const broken = Number(
       selectedRun?.broken_albums_count
       ?? selectedSummary?.broken_albums_count
       ?? 0,
     );
-    return broken > 0 || incompleteMoves.length > 0;
-  }, [incompleteMoves.length, selectedRun?.broken_albums_count, selectedSummary?.broken_albums_count]);
+    return broken > 0 || incompleteMovesAll.length > 0;
+  }, [incompleteMovesAll.length, selectedRun?.broken_albums_count, selectedSummary?.broken_albums_count]);
   const hasDuplicateReview = useMemo(() => {
     const dupes = Number(
       selectedRun?.duplicates_found
@@ -119,9 +142,9 @@ export default function Tools() {
       ?? selectedSummary?.total_duplicates_count
       ?? 0,
     );
-    return dupes > 0 || dedupeMoves.length > 0;
+    return dupes > 0 || dedupeMovesAll.length > 0;
   }, [
-    dedupeMoves.length,
+    dedupeMovesAll.length,
     selectedRun?.duplicate_groups_count,
     selectedRun?.duplicates_found,
     selectedRun?.total_duplicates_count,
@@ -176,7 +199,7 @@ export default function Tools() {
             <Button
               size="sm"
               className="gap-1.5 bg-amber-500/90 hover:bg-amber-500 text-black border border-amber-300/30"
-              onClick={() => navigate('/broken-albums')}
+              onClick={() => navigate(`/broken-albums${selectedRunQuery}`)}
               disabled={!hasIncompleteReview}
             >
               Review incompletes
@@ -184,7 +207,7 @@ export default function Tools() {
             <Button
               size="sm"
               className="gap-1.5 bg-amber-500/90 hover:bg-amber-500 text-black border border-amber-300/30"
-              onClick={() => navigate('/tools/duplicates')}
+              onClick={() => navigate(`/tools/duplicates${selectedRunQuery}`)}
               disabled={!hasDuplicateReview}
             >
               Fine-check duplicates
@@ -251,8 +274,26 @@ export default function Tools() {
                 </Badge>
                 <Badge variant="outline">{selectedRun.artists_processed}/{selectedRun.artists_total} artists processed</Badge>
                 <Badge variant="outline">{selectedRun.duplicates_found} duplicate group(s)</Badge>
-                <Badge variant="outline">{selectedRun.albums_moved} moved</Badge>
+                    <Badge variant="outline">{selectedRun.albums_moved} moved</Badge>
+                    <Badge variant="outline">
+                      history {movesSummary?.total_moved ?? 0} · pending {movesSummary?.pending ?? 0} · restored {movesSummary?.restored ?? 0}
+                    </Badge>
                 <Badge variant="outline">runtime {fmtDurationSeconds(selectedDurationSeconds)}</Badge>
+              </CardContent>
+            </Card>
+
+            <Card>
+              <CardContent className="py-3 flex flex-wrap items-center gap-2">
+                <span className="text-xs text-muted-foreground">Move history filter:</span>
+                <Button size="sm" variant={movesFilter === 'all' ? 'default' : 'outline'} onClick={() => setMovesFilter('all')}>
+                  All
+                </Button>
+                <Button size="sm" variant={movesFilter === 'active' ? 'default' : 'outline'} onClick={() => setMovesFilter('active')}>
+                  Pending rollback
+                </Button>
+                <Button size="sm" variant={movesFilter === 'restored' ? 'default' : 'outline'} onClick={() => setMovesFilter('restored')}>
+                  Restored
+                </Button>
               </CardContent>
             </Card>
 
@@ -290,7 +331,7 @@ export default function Tools() {
                     <Button
                       size="sm"
                       className="gap-1.5 bg-amber-500/90 hover:bg-amber-500 text-black border border-amber-300/30"
-                      onClick={() => navigate('/broken-albums')}
+                      onClick={() => navigate(`/broken-albums${selectedRunQuery}`)}
                       disabled={!hasIncompleteReview}
                     >
                       Review incompletes
@@ -300,12 +341,13 @@ export default function Tools() {
                       size="sm"
                       className="gap-1.5"
                       onClick={() => restoreByReason('incomplete')}
-                      disabled={restoring !== null || incompleteMoves.length === 0}
+                      disabled={restoring !== null || incompletePendingCount === 0}
                     >
                       {restoring === 'incomplete' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Undo2 className="w-4 h-4" />}
                       Restore incomplete
                     </Button>
-                    <Badge variant="outline">{incompleteMoves.length} queued move(s)</Badge>
+                    <Badge variant="outline">{incompletePendingCount} queued move(s)</Badge>
+                    <Badge variant="outline">{incompleteMovesAll.length} total move(s)</Badge>
                   </div>
                 </CardContent>
               </Card>
@@ -324,7 +366,7 @@ export default function Tools() {
                   <Button
                     size="sm"
                     className="gap-1.5 bg-amber-500/90 hover:bg-amber-500 text-black border border-amber-300/30"
-                    onClick={() => navigate('/tools/duplicates')}
+                    onClick={() => navigate(`/tools/duplicates${selectedRunQuery}`)}
                     disabled={!hasDuplicateReview}
                   >
                     Fine-check duplicates
@@ -334,12 +376,13 @@ export default function Tools() {
                     size="sm"
                     className="gap-1.5"
                     onClick={() => restoreByReason('dedupe')}
-                    disabled={restoring !== null || dedupeMoves.length === 0}
+                    disabled={restoring !== null || dedupePendingCount === 0}
                   >
                     {restoring === 'dedupe' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Undo2 className="w-4 h-4" />}
                     Restore dedupe moves
                   </Button>
-                  <Badge variant="outline">{dedupeMoves.length} queued move(s)</Badge>
+                  <Badge variant="outline">{dedupePendingCount} queued move(s)</Badge>
+                  <Badge variant="outline">{dedupeMovesAll.length} total move(s)</Badge>
                 </div>
 
                 {loadingMoves ? (
@@ -348,7 +391,9 @@ export default function Tools() {
                     Loading moves…
                   </div>
                 ) : dedupeMoves.length === 0 ? (
-                  <p className="text-sm text-muted-foreground">No dedupe moves in latest run.</p>
+                  <p className="text-sm text-muted-foreground">
+                    No dedupe moves for this filter in selected run.
+                  </p>
                 ) : (
                   <div className="max-h-72 overflow-auto rounded-md border">
                     <table className="w-full text-sm">

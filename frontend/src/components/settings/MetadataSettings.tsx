@@ -303,7 +303,7 @@ export function MetadataSettings({ config, updateConfig, errors }: MetadataSetti
                     <div className="space-y-0.5">
                       <Label htmlFor="use-web-search-mb" className="text-sm font-medium">Use web search for MusicBrainz</Label>
                       <p className="text-xs text-muted-foreground">
-                        When no MB candidate or AI says NONE, search the web (Serper) and ask AI to suggest an MBID from results.
+                        When no MB candidate or AI says NONE, search the web (AI-first, Serper backup) and ask AI to suggest an MBID from results.
                       </p>
                     </div>
                     <Switch
@@ -324,8 +324,65 @@ export function MetadataSettings({ config, updateConfig, errors }: MetadataSetti
                       <p className="text-xs text-muted-foreground">
                         Get a key at serper.dev (2500 free searches/month).
                       </p>
+                      <div className="flex items-center justify-between rounded-lg border border-border p-3">
+                        <div className="space-y-0.5">
+                          <Label htmlFor="use-ai-web-search-fallback" className="text-sm font-medium">Prioritize AI web search</Label>
+                          <p className="text-xs text-muted-foreground">
+                            When enabled, PMDA tries OpenAI web search first and uses Serper as fallback if needed.
+                          </p>
+                        </div>
+                        <Switch
+                          id="use-ai-web-search-fallback"
+                          checked={config.USE_AI_WEB_SEARCH_FALLBACK ?? true}
+                          onCheckedChange={(checked) => updateConfig({ USE_AI_WEB_SEARCH_FALLBACK: checked })}
+                        />
+                      </div>
                     </div>
                   )}
+                  <div className="space-y-3 rounded-lg border border-border p-3">
+                    <div className="space-y-0.5">
+                      <Label className="text-sm font-medium">AI cost guardrails (hard limits)</Label>
+                      <p className="text-xs text-muted-foreground">
+                        These limits are enforced during scan calls (including AI web-search fallback) to prevent runaway cost.
+                      </p>
+                    </div>
+                    <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                      <div className="space-y-1.5">
+                        <Label htmlFor="ai-max-calls-per-scan" className="text-xs text-muted-foreground">Max AI calls per scan</Label>
+                        <Input
+                          id="ai-max-calls-per-scan"
+                          type="number"
+                          min={0}
+                          max={100000}
+                          step={1}
+                          value={config.AI_MAX_CALLS_PER_SCAN ?? 60}
+                          onChange={(e) => {
+                            const raw = Number(e.target.value);
+                            const next = Number.isFinite(raw) ? Math.max(0, Math.min(100000, Math.trunc(raw))) : 60;
+                            updateConfig({ AI_MAX_CALLS_PER_SCAN: next });
+                          }}
+                        />
+                        <p className="text-[11px] text-muted-foreground">0 disables scan-time AI calls entirely.</p>
+                      </div>
+                      <div className="space-y-1.5">
+                        <Label htmlFor="ai-call-cooldown-sec" className="text-xs text-muted-foreground">Cooldown between AI calls (seconds)</Label>
+                        <Input
+                          id="ai-call-cooldown-sec"
+                          type="number"
+                          min={0}
+                          max={30}
+                          step={0.1}
+                          value={config.AI_CALL_COOLDOWN_SEC ?? 1}
+                          onChange={(e) => {
+                            const raw = Number(e.target.value);
+                            const next = Number.isFinite(raw) ? Math.max(0, Math.min(30, raw)) : 1;
+                            updateConfig({ AI_CALL_COOLDOWN_SEC: next });
+                          }}
+                        />
+                        <p className="text-[11px] text-muted-foreground">Applies globally to scan AI calls.</p>
+                      </div>
+                    </div>
+                  </div>
                   <div className="flex items-center justify-between rounded-lg border border-border p-3">
                     <div className="space-y-0.5">
                       <Label htmlFor="skip-mb-live" className="text-sm font-medium">Skip MusicBrainz for live albums</Label>

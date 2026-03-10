@@ -9,6 +9,7 @@ import { Checkbox } from '@/components/ui/checkbox';
 import { AspectRatio } from '@/components/ui/aspect-ratio';
 import { Carousel, CarouselContent, CarouselItem, CarouselNext, CarouselPrevious } from '@/components/ui/carousel';
 import { AlbumArtwork } from '@/components/library/AlbumArtwork';
+import { LibraryEmptyState } from '@/components/library/LibraryEmptyState';
 import { usePlayback } from '@/contexts/PlaybackContext';
 import { useToast } from '@/hooks/use-toast';
 import * as api from '@/lib/api';
@@ -52,7 +53,7 @@ function normalizeHomeSectionOrder(raw: unknown): HomeSectionKey[] {
 export default function LibraryHome() {
   const navigate = useNavigate();
   const location = useLocation();
-  const { includeUnmatched } = useOutletContext<LibraryOutletContext>();
+  const { includeUnmatched, libraryIsEmpty } = useOutletContext<LibraryOutletContext>();
   const { toast } = useToast();
   const { startPlayback, setCurrentTrack, recommendationSessionId, session } = usePlayback();
 
@@ -180,16 +181,29 @@ export default function LibraryHome() {
   }, [includeUnmatched]);
 
   useEffect(() => {
+    if (libraryIsEmpty) {
+      setDiscover(null);
+      setTopArtists([]);
+      setRecentArtists([]);
+      setRecentlyPlayedAlbums([]);
+      setRecentAlbums([]);
+      return;
+    }
     void loadDiscover();
     void loadTopArtists();
     void loadRecentArtists();
     void loadRecentlyPlayed();
     void loadRecent();
-  }, [includeUnmatched, loadDiscover, loadTopArtists, loadRecentArtists, loadRecentlyPlayed, loadRecent]);
+  }, [includeUnmatched, loadDiscover, loadTopArtists, loadRecentArtists, loadRecentlyPlayed, loadRecent, libraryIsEmpty]);
 
   useEffect(() => {
+    if (libraryIsEmpty) {
+      setRecommendations([]);
+      setRecoError(null);
+      return;
+    }
     void loadRecommendations();
-  }, [loadRecommendations]);
+  }, [loadRecommendations, libraryIsEmpty]);
 
   const handlePlayAlbum = async (albumId: number, fallbackTitle: string, fallbackThumb?: string | null) => {
     try {
@@ -309,6 +323,14 @@ export default function LibraryHome() {
     if (idx < 0) return { order: 999, display: 'none' };
     return { order: idx };
   }, [visibleSectionOrder]);
+
+  if (libraryIsEmpty) {
+    return (
+      <div className="container pb-6">
+        <LibraryEmptyState />
+      </div>
+    );
+  }
 
   return (
     <div className="container pb-6 flex flex-col gap-5 md:gap-6">

@@ -7,6 +7,7 @@ import {
 import { Button } from '@/components/ui/button';
 import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetTrigger } from '@/components/ui/sheet';
 import { Badge } from '@/components/ui/badge';
+import { Logo } from '@/components/Logo';
 import { cn } from '@/lib/utils';
 
 interface NavItem {
@@ -59,13 +60,7 @@ export function MobileNav({ duplicateCount, onSettingsClick }: MobileNavProps) {
       <SheetContent side="left" className="w-72 p-0">
         <SheetHeader className="p-4 border-b border-border">
           <SheetTitle className="flex items-center gap-2 text-left">
-            <img
-              src="/pmda-logo-mute-v1-transparent-cropped.png"
-              alt="PMDA"
-              className="h-7 w-auto object-contain"
-              loading="eager"
-              decoding="async"
-            />
+            <Logo variant="wordmark" size="sm" className="pointer-events-none select-none" />
           </SheetTitle>
         </SheetHeader>
         

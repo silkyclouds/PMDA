@@ -562,7 +562,7 @@ export function ScanProgress({
             {bootstrap_required
               ? "Initial full scan required before changed-only runs."
               : autonomous_mode && has_completed_full_scan
-                ? "Autonomous mode active. Default scan switched to changed only."
+                ? "Bootstrap complete. Default scan switched to changed only."
                 : "Choose scan mode manually."}
             <span className="ml-1 text-muted-foreground">
               (default: {String(default_scan_type || 'full').replace('_', ' ')})
@@ -1087,7 +1087,7 @@ export function ScanProgress({
               {bootstrap_required
                 ? "Initial full scan required. Changed-only is blocked until first full completes."
                 : autonomous_mode && has_completed_full_scan
-                  ? "Autonomous mode active. Default scan switched to changed only (you can still force full)."
+                  ? "Bootstrap complete. Default scan switched to changed only (you can still force full)."
                   : "Default scan mode is still manual."}
               <span className="ml-1 text-muted-foreground">
                 Current backend default: {String(default_scan_type || 'full').replace('_', ' ')}.

@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
-import { BarChart3, Clock, Headphones, Music2 } from 'lucide-react';
+import { Clock, Headphones } from 'lucide-react';
 import {
   Chart as ChartJS,
   CategoryScale,
@@ -17,9 +17,9 @@ import { Bar, Doughnut, Line } from 'react-chartjs-2';
 
 import * as api from '@/lib/api';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { StatisticsPageNav } from '@/components/statistics/StatisticsPageNav';
 
 ChartJS.register(CategoryScale, LinearScale, BarElement, LineElement, PointElement, ArcElement, Tooltip, Legend);
 
@@ -35,7 +35,7 @@ export default function ListeningStatsPage() {
   const navigate = useNavigate();
   const [days, setDays] = useState(30);
 
-  const { data, isLoading, error, refetch, isFetching } = useQuery({
+  const { data, isLoading, error } = useQuery({
     queryKey: ['playback-stats', days],
     queryFn: () => api.getPlaybackStats(days),
     staleTime: 10_000,
@@ -133,19 +133,7 @@ export default function ListeningStatsPage() {
           </h1>
           <p className="text-xs text-muted-foreground">Personal listening habits (single user).</p>
         </div>
-        <div className="flex items-center gap-2">
-          <Button variant="outline" size="sm" onClick={() => navigate('/statistics')} className="gap-2">
-            <BarChart3 className="h-4 w-4" />
-            Scan stats
-          </Button>
-          <Button variant="outline" size="sm" onClick={() => navigate('/statistics/library')} className="gap-2">
-            <Music2 className="h-4 w-4" />
-            Library stats
-          </Button>
-          <Button variant="outline" size="sm" onClick={() => void refetch()} disabled={isFetching}>
-            Refresh
-          </Button>
-        </div>
+        <StatisticsPageNav active="listening" />
       </div>
 
       <Tabs value={String(days)} onValueChange={(v) => setDays(Number(v) || 30)}>
@@ -297,4 +285,3 @@ export default function ListeningStatsPage() {
     </div>
   );
 }
-

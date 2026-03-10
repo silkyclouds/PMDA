@@ -67,6 +67,22 @@ export function normalizeConfigForUI(raw: Partial<PMDAConfig>): Partial<PMDAConf
   if (out.PIPELINE_ENABLE_INCOMPLETE_MOVE !== undefined) out.PIPELINE_ENABLE_INCOMPLETE_MOVE = toBool(out.PIPELINE_ENABLE_INCOMPLETE_MOVE);
   if (out.PIPELINE_ENABLE_EXPORT !== undefined) out.PIPELINE_ENABLE_EXPORT = toBool(out.PIPELINE_ENABLE_EXPORT);
   if (out.PIPELINE_ENABLE_PLAYER_SYNC !== undefined) out.PIPELINE_ENABLE_PLAYER_SYNC = toBool(out.PIPELINE_ENABLE_PLAYER_SYNC);
+  if (out.PIPELINE_POST_SCAN_ASYNC !== undefined) out.PIPELINE_POST_SCAN_ASYNC = toBool(out.PIPELINE_POST_SCAN_ASYNC);
+  if (out.TASK_NOTIFICATIONS_ENABLED !== undefined) out.TASK_NOTIFICATIONS_ENABLED = toBool(out.TASK_NOTIFICATIONS_ENABLED);
+  if (out.TASK_NOTIFICATIONS_SUCCESS !== undefined) out.TASK_NOTIFICATIONS_SUCCESS = toBool(out.TASK_NOTIFICATIONS_SUCCESS);
+  if (out.TASK_NOTIFICATIONS_FAILURE !== undefined) out.TASK_NOTIFICATIONS_FAILURE = toBool(out.TASK_NOTIFICATIONS_FAILURE);
+  if (out.TASK_NOTIFICATIONS_SILENT_INTERACTIVE_SCAN !== undefined) out.TASK_NOTIFICATIONS_SILENT_INTERACTIVE_SCAN = toBool(out.TASK_NOTIFICATIONS_SILENT_INTERACTIVE_SCAN);
+  if (out.TASK_NOTIFY_SCAN_CHANGED !== undefined) out.TASK_NOTIFY_SCAN_CHANGED = toBool(out.TASK_NOTIFY_SCAN_CHANGED);
+  if (out.TASK_NOTIFY_SCAN_FULL !== undefined) out.TASK_NOTIFY_SCAN_FULL = toBool(out.TASK_NOTIFY_SCAN_FULL);
+  if (out.TASK_NOTIFY_ENRICH_BATCH !== undefined) out.TASK_NOTIFY_ENRICH_BATCH = toBool(out.TASK_NOTIFY_ENRICH_BATCH);
+  if (out.TASK_NOTIFY_DEDUPE !== undefined) out.TASK_NOTIFY_DEDUPE = toBool(out.TASK_NOTIFY_DEDUPE);
+  if (out.TASK_NOTIFY_INCOMPLETE_MOVE !== undefined) out.TASK_NOTIFY_INCOMPLETE_MOVE = toBool(out.TASK_NOTIFY_INCOMPLETE_MOVE);
+  if (out.TASK_NOTIFY_EXPORT !== undefined) out.TASK_NOTIFY_EXPORT = toBool(out.TASK_NOTIFY_EXPORT);
+  if (out.TASK_NOTIFY_PLAYER_SYNC !== undefined) out.TASK_NOTIFY_PLAYER_SYNC = toBool(out.TASK_NOTIFY_PLAYER_SYNC);
+  if (out.SCHEDULER_PAUSED !== undefined) out.SCHEDULER_PAUSED = toBool(out.SCHEDULER_PAUSED);
+  if (out.TASK_NOTIFICATIONS_COOLDOWN_SEC !== undefined) {
+    out.TASK_NOTIFICATIONS_COOLDOWN_SEC = Math.max(0, Math.min(3600, Number(out.TASK_NOTIFICATIONS_COOLDOWN_SEC) || 0));
+  }
   if (out.LIBRARY_INCLUDE_UNMATCHED !== undefined) out.LIBRARY_INCLUDE_UNMATCHED = toBool(out.LIBRARY_INCLUDE_UNMATCHED);
   if (out.NORMALIZE_PARENTHETICAL_FOR_DEDUPE !== undefined) out.NORMALIZE_PARENTHETICAL_FOR_DEDUPE = toBool(out.NORMALIZE_PARENTHETICAL_FOR_DEDUPE);
   if (out.BACKUP_BEFORE_FIX !== undefined) out.BACKUP_BEFORE_FIX = toBool(out.BACKUP_BEFORE_FIX);
@@ -111,6 +127,16 @@ export function normalizeConfigForUI(raw: Partial<PMDAConfig>): Partial<PMDAConf
     const roots = parsePathList(out.FILES_ROOTS as unknown);
     out.FILES_ROOTS = roots.join(', ');
   }
+  if (out.WINNER_SOURCE_ROOT_ID != null) {
+    const sid = Number(out.WINNER_SOURCE_ROOT_ID);
+    out.WINNER_SOURCE_ROOT_ID = Number.isFinite(sid) && sid > 0 ? String(Math.trunc(sid)) : '';
+  }
+  if (out.LIBRARY_WINNER_PLACEMENT_STRATEGY != null) {
+    const strategy = String(out.LIBRARY_WINNER_PLACEMENT_STRATEGY).trim().toLowerCase();
+    out.LIBRARY_WINNER_PLACEMENT_STRATEGY = (
+      ['move', 'hardlink', 'symlink', 'copy'].includes(strategy) ? strategy : 'move'
+    ) as PMDAConfig['LIBRARY_WINNER_PLACEMENT_STRATEGY'];
+  }
   if (out.PIPELINE_PLAYER_TARGET != null) {
     const target = String(out.PIPELINE_PLAYER_TARGET).trim().toLowerCase();
     out.PIPELINE_PLAYER_TARGET = (['none', 'plex', 'jellyfin', 'navidrome'].includes(target) ? target : 'none') as PMDAConfig['PIPELINE_PLAYER_TARGET'];
@@ -118,6 +144,24 @@ export function normalizeConfigForUI(raw: Partial<PMDAConfig>): Partial<PMDAConf
   if (out.AI_USAGE_LEVEL != null) {
     const level = String(out.AI_USAGE_LEVEL).trim().toLowerCase();
     out.AI_USAGE_LEVEL = (['limited', 'medium', 'aggressive'].includes(level) ? level : 'medium') as PMDAConfig['AI_USAGE_LEVEL'];
+  }
+  if (out.USE_AI_FOR_SOFT_MATCH_PROFILES !== undefined) {
+    out.USE_AI_FOR_SOFT_MATCH_PROFILES = toBool(out.USE_AI_FOR_SOFT_MATCH_PROFILES);
+  }
+  if (out.USE_AI_WEB_SEARCH_FALLBACK !== undefined) {
+    out.USE_AI_WEB_SEARCH_FALLBACK = toBool(out.USE_AI_WEB_SEARCH_FALLBACK);
+  }
+  if (out.OPENAI_ENABLE_API_KEY_MODE !== undefined) {
+    out.OPENAI_ENABLE_API_KEY_MODE = toBool(out.OPENAI_ENABLE_API_KEY_MODE);
+  }
+  if (out.OPENAI_ENABLE_CODEX_OAUTH_MODE !== undefined) {
+    out.OPENAI_ENABLE_CODEX_OAUTH_MODE = toBool(out.OPENAI_ENABLE_CODEX_OAUTH_MODE);
+  }
+  if (out.AI_MAX_CALLS_PER_SCAN !== undefined) {
+    out.AI_MAX_CALLS_PER_SCAN = Math.max(0, Math.min(100000, Number(out.AI_MAX_CALLS_PER_SCAN) || 0));
+  }
+  if (out.AI_CALL_COOLDOWN_SEC !== undefined) {
+    out.AI_CALL_COOLDOWN_SEC = Math.max(0, Math.min(30, Number(out.AI_CALL_COOLDOWN_SEC) || 0));
   }
   return out;
 }

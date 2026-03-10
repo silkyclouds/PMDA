@@ -2,7 +2,7 @@ import { FormEvent, useState } from 'react';
 import { Loader2, ShieldPlus } from 'lucide-react';
 
 import { useAuth } from '@/contexts/AuthContext';
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import { Card, CardContent, CardDescription, CardHeader } from '@/components/ui/card';
 import { Label } from '@/components/ui/label';
 import { Input } from '@/components/ui/input';
 import { PasswordInput } from '@/components/ui/password-input';
@@ -41,8 +41,18 @@ export default function BootstrapAdminPage() {
     <div className="min-h-screen bg-gradient-to-br from-amber-50 via-orange-50 to-stone-100 p-6 md:p-10">
       <div className="mx-auto flex min-h-[80vh] w-full max-w-lg items-center">
         <Card className="w-full shadow-sm">
-          <CardHeader>
-            <CardTitle className="text-xl">Initialize PMDA Security</CardTitle>
+          <CardHeader className="space-y-4">
+            <div className="flex justify-center">
+              <img
+                src="/pmda-logo-mute-v1-transparent-cropped.png"
+                alt="PMDA"
+                width={1024}
+                height={514}
+                className="h-auto w-56 max-w-[85%] object-contain"
+                loading="eager"
+                decoding="async"
+              />
+            </div>
             <CardDescription>
               First run detected. Create the initial administrator account.
             </CardDescription>

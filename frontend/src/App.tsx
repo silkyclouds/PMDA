@@ -36,6 +36,7 @@ import { AudioPlayer } from "./components/library/AudioPlayer";
 import { ScanFinishedInvalidator } from "./components/ScanFinishedInvalidator";
 import { AssistantDock } from "./components/assistant/AssistantDock";
 import { AppLayout } from "./components/layout/AppLayout";
+import { useTaskEvents } from "./hooks/useTaskEvents";
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -71,6 +72,7 @@ function AuthLoadingScreen() {
 function AppRoutesWithPlayer() {
   const { session, setCurrentTrack, closePlayer, recommendationSessionId } = usePlayback();
   const auth = useAuth();
+  useTaskEvents({ enabled: Boolean(auth.user?.is_admin), pollIntervalMs: 3000 });
 
   if (auth.isLoading) {
     return <AuthLoadingScreen />;
@@ -95,6 +97,8 @@ function AppRoutesWithPlayer() {
   }
 
   const adminOnly = (element: JSX.Element) => (auth.isAdmin ? element : <Navigate to="/library" replace />);
+  const statsAllowed = auth.isAdmin || auth.canViewStatistics;
+  const statsOnly = (element: JSX.Element) => (statsAllowed ? element : <Navigate to="/library" replace />);
 
   return (
     <>
@@ -105,9 +109,9 @@ function AppRoutesWithPlayer() {
           <Route path="/scan" element={adminOnly(<Scan />)} />
           <Route path="/unduper" element={<Navigate to={auth.isAdmin ? "/tools/duplicates" : "/library"} replace />} />
           <Route path="/history" element={<Navigate to={auth.isAdmin ? "/tools" : "/library"} replace />} />
-          <Route path="/statistics" element={adminOnly(<Statistics />)} />
-          <Route path="/statistics/listening" element={adminOnly(<ListeningStatsPage />)} />
-          <Route path="/statistics/library" element={adminOnly(<LibraryStatsPage />)} />
+          <Route path="/statistics" element={statsOnly(<Statistics />)} />
+          <Route path="/statistics/listening" element={statsOnly(<ListeningStatsPage />)} />
+          <Route path="/statistics/library" element={statsOnly(<LibraryStatsPage />)} />
           <Route path="/tools" element={adminOnly(<Tools />)} />
           <Route path="/tools/duplicates" element={adminOnly(<Unduper />)} />
           <Route path="/library" element={<LibraryLayout />}>

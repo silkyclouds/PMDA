@@ -1,5 +1,6 @@
 Flask>=2.0
 requests>=2.0
+cryptography>=42.0.0
 # PMDA uses the `OpenAI` client class and the `client.chat.completions.create(...)` API shape,
 # which require the 1.x OpenAI Python SDK.
 openai>=1.0.0,<2
@@ -11,6 +12,8 @@ Pillow>=9.0.0
 discogs-client>=2.3.0
 pylast>=5.1.0
 pyacoustid>=1.2.0
-psycopg[binary]>=3.2.0
+# psycopg-binary wheels are not published for arm/v7; use pure psycopg there.
+psycopg[binary]>=3.2.0; platform_machine != "armv7l"
+psycopg>=3.2.0; platform_machine == "armv7l"
 redis>=5.0.0
 watchdog>=4.0.0

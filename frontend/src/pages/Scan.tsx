@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { ScanProgress } from '@/components/ScanProgress';
+import { ScanProgress, type ScanType } from '@/components/ScanProgress';
 import { useScanControls, useDuplicates } from '@/hooks/usePMDA';
 import { useScanProgressShared } from '@/hooks/useScanProgressShared';
 import type { ScanProgress as ScanProgressType } from '@/lib/api';
@@ -13,6 +13,8 @@ export default function Scan() {
   const scanControls = useScanControls();
   const queryClient = useQueryClient();
   const wasScanningRef = useRef(false);
+  const [scanType, setScanType] = useState<ScanType>('full');
+  const [scanTypeTouched, setScanTypeTouched] = useState(false);
   
   // Persistent summary - survives query invalidation, only clears on explicit "Clear results"
   const [persistedSummary, setPersistedSummary] = useState<LastScanSummary | null>(null);
@@ -53,6 +55,23 @@ export default function Scan() {
   } : { scanning: false, progress: 0, total: 0, status: 'idle' as const };
 
   useEffect(() => {
+    const backendDefaultRaw = String(scanProgress?.default_scan_type || '').trim().toLowerCase();
+    const backendDefault: ScanType = (
+      backendDefaultRaw === 'changed_only' || backendDefaultRaw === 'incomplete_only' || backendDefaultRaw === 'full'
+        ? (backendDefaultRaw as ScanType)
+        : 'full'
+    );
+    if (!scanTypeTouched) {
+      setScanType(backendDefault);
+    }
+  }, [scanProgress?.default_scan_type, scanTypeTouched]);
+
+  const handleScanTypeChange = useCallback((next: ScanType) => {
+    setScanTypeTouched(true);
+    setScanType(next);
+  }, []);
+
+  useEffect(() => {
     const scanning = scanProgress?.scanning ?? false;
     if (wasScanningRef.current && !scanning) {
       queryClient.invalidateQueries({ queryKey: ['duplicates'] });
@@ -80,6 +99,8 @@ export default function Scan() {
         isResuming={scanControls.isResuming}
         isStopping={scanControls.isStopping}
         isClearing={scanControls.isClearing}
+        scanType={scanType}
+        onScanTypeChange={handleScanTypeChange}
         compact
       />
     </main>

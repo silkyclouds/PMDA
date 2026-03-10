@@ -4,6 +4,7 @@ import { Building2, Loader2 } from 'lucide-react';
 
 import { Badge } from '@/components/ui/badge';
 import { Card } from '@/components/ui/card';
+import { LibraryEmptyState } from '@/components/library/LibraryEmptyState';
 import { useLibraryQuery } from '@/hooks/useLibraryQuery';
 import * as api from '@/lib/api';
 import { cn } from '@/lib/utils';
@@ -12,7 +13,7 @@ import type { LibraryOutletContext } from '@/pages/LibraryLayout';
 export default function LibraryLabels() {
   const navigate = useNavigate();
   const location = useLocation();
-  const { includeUnmatched } = useOutletContext<LibraryOutletContext>();
+  const { includeUnmatched, libraryIsEmpty } = useOutletContext<LibraryOutletContext>();
   const { search, genre, year } = useLibraryQuery();
 
   const [loading, setLoading] = useState(false);
@@ -61,9 +62,16 @@ export default function LibraryLabels() {
   }, [genre, includeUnmatched, limit, search, year]);
 
   useEffect(() => {
+    if (libraryIsEmpty) {
+      setLabels([]);
+      setTotal(0);
+      setOffset(0);
+      setLoading(false);
+      return;
+    }
     setOffset(0);
     void fetchLabels({ reset: true, pageOffset: 0 });
-  }, [search, genre, year, includeUnmatched, fetchLabels]);
+  }, [search, genre, year, includeUnmatched, fetchLabels, libraryIsEmpty]);
 
   const canLoadMore = labels.length < total && !loading;
   const loadMore = useCallback(async () => {
@@ -95,6 +103,14 @@ export default function LibraryLabels() {
     obs.observe(node);
     return () => obs.disconnect();
   }, [labels.length, loadMore, total]);
+
+  if (libraryIsEmpty) {
+    return (
+      <div className="container pb-6">
+        <LibraryEmptyState />
+      </div>
+    );
+  }
 
   return (
     <div className="container pb-6 space-y-4">

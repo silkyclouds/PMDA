@@ -227,19 +227,19 @@
   /* Format badge */
   .format-badge {
     @apply inline-flex items-center px-2 py-0.5 text-xs font-medium rounded-md;
-    @apply bg-accent text-accent-foreground;
+    @apply bg-muted text-foreground border border-border;
   }
 
   .format-badge-flac {
-    @apply bg-primary/10 text-primary;
+    @apply border-emerald-300 bg-emerald-100 text-emerald-900 dark:border-emerald-700 dark:bg-emerald-900 dark:text-emerald-100;
   }
 
   .format-badge-mp3 {
-    @apply bg-warning/10 text-warning;
+    @apply border-orange-300 bg-orange-100 text-orange-900 dark:border-orange-700 dark:bg-orange-900 dark:text-orange-100;
   }
 
   .format-badge-m4a {
-    @apply bg-success/10 text-success;
+    @apply border-sky-300 bg-sky-100 text-sky-900 dark:border-sky-700 dark:bg-sky-900 dark:text-sky-100;
   }
 
   /* Modal overlay with strong glass effect */

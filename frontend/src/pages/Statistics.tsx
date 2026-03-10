@@ -16,7 +16,6 @@ import {
   RefreshCw,
 } from 'lucide-react';
 import { useQuery } from '@tanstack/react-query';
-import { useNavigate } from 'react-router-dom';
 import { format } from 'date-fns';
 import {
   Chart as ChartJS,
@@ -42,6 +41,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/com
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { ProviderBadge } from '@/components/providers/ProviderBadge';
+import { StatisticsPageNav } from '@/components/statistics/StatisticsPageNav';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import * as api from '@/lib/api';
 import { toast } from 'sonner';
@@ -442,7 +442,6 @@ function StatCard({
 }
 
 export default function Statistics() {
-  const navigate = useNavigate();
   const [period, setPeriod] = useState<PeriodKey>('last');
   const [activeTab, setActiveTab] = useState<StatsTab>('overview');
   const [aiCostScope, setAiCostScope] = useState<'scan' | 'lifecycle'>('lifecycle');
@@ -469,7 +468,6 @@ export default function Statistics() {
   const {
     data: cacheControl,
     refetch: refetchCacheControl,
-    isFetching: cacheControlRefreshing,
   } = useQuery<CacheControlMetrics>({
     queryKey: ['stats-cache-control'],
     queryFn: () => api.getCacheControlMetrics(false),
@@ -479,7 +477,6 @@ export default function Statistics() {
   const {
     data: watcherRuntimeStatus,
     refetch: refetchWatcherRuntimeStatus,
-    isFetching: watcherRuntimeRefreshing,
   } = useQuery({
     queryKey: ['files-watcher-status'],
     queryFn: api.getFilesWatcherStatus,
@@ -488,8 +485,6 @@ export default function Statistics() {
   });
   const {
     data: libraryStats,
-    refetch: refetchLibraryStats,
-    isFetching: libraryStatsRefreshing,
   } = useQuery({
     queryKey: ['library-stats-library'],
     queryFn: api.getLibraryStatsLibrary,
@@ -566,8 +561,6 @@ export default function Statistics() {
   }, [completedScans]);
   const {
     data: scanMovesAudit,
-    refetch: refetchScanMovesAudit,
-    isFetching: scanMovesAuditRefreshing,
   } = useQuery({
     queryKey: ['scan-moves-audit', latestCompletedScanId],
     queryFn: () => api.getScanMovesAudit(latestCompletedScanId ?? undefined),
@@ -577,8 +570,6 @@ export default function Statistics() {
   });
   const {
     data: benchmarkReportsResponse,
-    refetch: refetchBenchmarkReports,
-    isFetching: benchmarkReportsRefreshing,
   } = useQuery({
     queryKey: ['benchmark-reports'],
     queryFn: () => api.getBenchmarkReports(80),
@@ -1239,51 +1230,23 @@ export default function Statistics() {
             <h1 className="text-display text-foreground">Statistics</h1>
             <p className="text-small text-muted-foreground mt-1">Single source of truth from completed scans</p>
           </div>
-          <div className="flex flex-wrap items-center justify-end gap-2">
-            <Button variant="outline" size="sm" onClick={() => navigate('/statistics/listening')} className="gap-2">
-              <Clock className="h-4 w-4" />
-              Listening
-            </Button>
-            <Button variant="outline" size="sm" onClick={() => navigate('/statistics/library')} className="gap-2">
-              <Database className="h-4 w-4" />
-              Library
-            </Button>
-            <div className="flex rounded-lg border border-border p-0.5 bg-muted/30">
-              {PERIODS.map((p) => (
-                <Button
-                  key={p.key}
-                  variant={period === p.key ? 'secondary' : 'ghost'}
-                  size="sm"
-                  className="px-3"
-                  onClick={() => setPeriod(p.key)}
-                >
-                  {p.label}
-                </Button>
-              ))}
-            </div>
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              className="gap-2"
-              onClick={() => {
-                void Promise.all([
-                  refetchLibraryStats(),
-                  refetchScanMovesAudit(),
-                  refetchCacheControl(),
-                  refetchBenchmarkReports(),
-                ]);
-              }}
-              disabled={libraryStatsRefreshing || scanMovesAuditRefreshing || cacheControlRefreshing || benchmarkReportsRefreshing}
-            >
-              {(libraryStatsRefreshing || scanMovesAuditRefreshing || cacheControlRefreshing || benchmarkReportsRefreshing) ? (
-                <Loader2 className="h-4 w-4 animate-spin" />
-              ) : (
-                <RefreshCw className="h-4 w-4" />
-              )}
-              Refresh data
-            </Button>
+          <StatisticsPageNav active="scan" />
+        </div>
+
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="space-y-1">
+            <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Period picker</p>
+            <p className="text-xs text-muted-foreground">Same quick-range control as Listening stats.</p>
           </div>
+          <Tabs value={period} onValueChange={(value) => setPeriod(value as PeriodKey)}>
+            <TabsList>
+              {PERIODS.map((p) => (
+                <TabsTrigger key={p.key} value={p.key}>
+                  {p.label}
+                </TabsTrigger>
+              ))}
+            </TabsList>
+          </Tabs>
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
@@ -1452,32 +1415,65 @@ export default function Statistics() {
           </Card>
         ) : (
           <Tabs value={activeTab} onValueChange={(v) => setActiveTab(v as StatsTab)}>
-            <TabsList className="grid grid-cols-2 md:grid-cols-6 w-full md:w-auto rounded-xl bg-muted/60 border border-border p-1 shadow-sm">
-              <TabsTrigger value="overview" className="gap-2 rounded-lg">
-                <BarChart3 className="w-4 h-4" />
-                Overview
-              </TabsTrigger>
-              <TabsTrigger value="metadata" className="gap-2 rounded-lg">
-                <Database className="w-4 h-4" />
-                Metadata
-              </TabsTrigger>
-              <TabsTrigger value="ai" className="gap-2 rounded-lg">
-                <Sparkles className="w-4 h-4" />
-                AI
-              </TabsTrigger>
-              <TabsTrigger value="quality" className="gap-2 rounded-lg">
-                <Sparkles className="w-4 h-4" />
-                Quality
-              </TabsTrigger>
-              <TabsTrigger value="operations" className="gap-2 rounded-lg">
-                <Gauge className="w-4 h-4" />
-                Operations
-              </TabsTrigger>
-              <TabsTrigger value="benchmark" className="gap-2 rounded-lg">
-                <Gauge className="w-4 h-4" />
-                Benchmark
-              </TabsTrigger>
-            </TabsList>
+            <div className="space-y-2">
+              <p className="text-sm font-medium">Scan sections</p>
+              <TabsList className="grid h-auto w-full grid-cols-1 gap-2 rounded-xl border border-border bg-muted/30 p-2 shadow-sm sm:grid-cols-2 xl:grid-cols-3">
+                <TabsTrigger
+                  value="overview"
+                  className="h-11 justify-start rounded-lg border border-border/60 bg-card/70 px-3 text-left text-sm font-semibold text-foreground transition-colors hover:bg-accent/70 data-[state=active]:border-cyan-400/60 data-[state=active]:bg-cyan-500/20 data-[state=active]:text-cyan-100 data-[state=active]:shadow-[0_0_0_1px_rgba(34,211,238,0.22)]"
+                >
+                  <span className="flex items-center gap-2">
+                    <BarChart3 className="w-4 h-4" />
+                    Overview
+                  </span>
+                </TabsTrigger>
+                <TabsTrigger
+                  value="metadata"
+                  className="h-11 justify-start rounded-lg border border-border/60 bg-card/70 px-3 text-left text-sm font-semibold text-foreground transition-colors hover:bg-accent/70 data-[state=active]:border-indigo-400/60 data-[state=active]:bg-indigo-500/20 data-[state=active]:text-indigo-100 data-[state=active]:shadow-[0_0_0_1px_rgba(129,140,248,0.22)]"
+                >
+                  <span className="flex items-center gap-2">
+                    <Database className="w-4 h-4" />
+                    Metadata
+                  </span>
+                </TabsTrigger>
+                <TabsTrigger
+                  value="ai"
+                  className="h-11 justify-start rounded-lg border border-border/60 bg-card/70 px-3 text-left text-sm font-semibold text-foreground transition-colors hover:bg-accent/70 data-[state=active]:border-violet-400/60 data-[state=active]:bg-violet-500/20 data-[state=active]:text-violet-100 data-[state=active]:shadow-[0_0_0_1px_rgba(167,139,250,0.22)]"
+                >
+                  <span className="flex items-center gap-2">
+                    <Sparkles className="w-4 h-4" />
+                    AI Cost
+                  </span>
+                </TabsTrigger>
+                <TabsTrigger
+                  value="quality"
+                  className="h-11 justify-start rounded-lg border border-border/60 bg-card/70 px-3 text-left text-sm font-semibold text-foreground transition-colors hover:bg-accent/70 data-[state=active]:border-emerald-400/60 data-[state=active]:bg-emerald-500/20 data-[state=active]:text-emerald-100 data-[state=active]:shadow-[0_0_0_1px_rgba(52,211,153,0.22)]"
+                >
+                  <span className="flex items-center gap-2">
+                    <Sparkles className="w-4 h-4" />
+                    Quality
+                  </span>
+                </TabsTrigger>
+                <TabsTrigger
+                  value="operations"
+                  className="h-11 justify-start rounded-lg border border-border/60 bg-card/70 px-3 text-left text-sm font-semibold text-foreground transition-colors hover:bg-accent/70 data-[state=active]:border-amber-400/60 data-[state=active]:bg-amber-500/20 data-[state=active]:text-amber-100 data-[state=active]:shadow-[0_0_0_1px_rgba(251,191,36,0.22)]"
+                >
+                  <span className="flex items-center gap-2">
+                    <Gauge className="w-4 h-4" />
+                    Operations
+                  </span>
+                </TabsTrigger>
+                <TabsTrigger
+                  value="benchmark"
+                  className="h-11 justify-start rounded-lg border border-border/60 bg-card/70 px-3 text-left text-sm font-semibold text-foreground transition-colors hover:bg-accent/70 data-[state=active]:border-pink-400/60 data-[state=active]:bg-pink-500/20 data-[state=active]:text-pink-100 data-[state=active]:shadow-[0_0_0_1px_rgba(244,114,182,0.22)]"
+                >
+                  <span className="flex items-center gap-2">
+                    <Gauge className="w-4 h-4" />
+                    Benchmark
+                  </span>
+                </TabsTrigger>
+              </TabsList>
+            </div>
 
             <TabsContent value="overview" className="space-y-4">
               <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4">
@@ -2203,21 +2199,6 @@ export default function Statistics() {
                       </CardDescription>
                     </div>
                     <div className="flex items-center gap-2">
-                      <Button
-                        type="button"
-                        size="sm"
-                        variant="outline"
-                        className="gap-1.5"
-                        onClick={() => {
-                          void Promise.all([refetchCacheControl(), refetchWatcherRuntimeStatus()]);
-                        }}
-                        disabled={cacheControlRefreshing || watcherRuntimeRefreshing}
-                      >
-                        {(cacheControlRefreshing || watcherRuntimeRefreshing)
-                          ? <Loader2 className="w-4 h-4 animate-spin" />
-                          : <RefreshCw className="w-4 h-4" />}
-                        Refresh
-                      </Button>
                       <Button
                         type="button"
                         size="sm"

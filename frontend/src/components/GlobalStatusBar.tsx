@@ -21,6 +21,10 @@ export function GlobalStatusBar() {
     preScanStageLabel,
     preScanStatusLabel,
     preScanCountersLabel,
+    runScopePreparing,
+    runScopeStage,
+    runScopeStatusLabel,
+    runScopeCountersLabel,
     currentArtist,
     lastScanSummary,
     dedupePercent,
@@ -110,7 +114,9 @@ export function GlobalStatusBar() {
                 <div className="flex items-center gap-2">
                   <RefreshCw className="w-4 h-4 text-primary animate-spin" />
                   <span className="text-sm font-medium text-foreground">
-                    {preScanActive || phase === 'pre_scan'
+                    {runScopePreparing
+                      ? `Scanning · preparing_run_scope${runScopeStage ? ` · ${runScopeStage}` : ''}`
+                      : preScanActive || phase === 'pre_scan'
                       ? `Scanning · pre-scan${preScanActive && preScanStageLabel && preScanStageLabel !== 'pre-scan' ? ` · ${preScanStageLabel}` : ''}`
                       : 'Scanning'}
                   </span>
@@ -119,9 +125,13 @@ export function GlobalStatusBar() {
                   <Progress value={progressPercent} className="w-28 h-1.5" />
                   <span className="text-xs text-muted-foreground tabular-nums font-medium">{Math.round(progressPercent)}%</span>
                 </div>
-                {(preScanActive ? preScanStatusLabel : currentArtist) && (
+                {((runScopePreparing ? runScopeStatusLabel : (preScanActive ? preScanStatusLabel : currentArtist))) && (
                   <span className="hidden lg:block text-xs text-muted-foreground truncate max-w-48">
-                    {preScanActive ? `${preScanStatusLabel} · ${preScanCountersLabel}` : currentArtist}
+                    {runScopePreparing
+                      ? `${runScopeStatusLabel} · ${runScopeCountersLabel}`
+                      : preScanActive
+                        ? `${preScanStatusLabel} · ${preScanCountersLabel}`
+                        : currentArtist}
                   </span>
                 )}
               </>

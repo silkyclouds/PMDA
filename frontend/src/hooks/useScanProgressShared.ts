@@ -54,7 +54,11 @@ export function useScanProgressShared(options: UseScanProgressSharedOptions = {}
   const preScanEntriesScanned = Math.max(0, progress?.scan_discovery_entries_scanned || 0);
   const preScanFilesFound = Math.max(0, progress?.scan_discovery_files_found || 0);
   const preScanStage = String(progress?.scan_discovery_stage || '');
-  const preScanActive = isScanning && (
+  const runScopePreparing = isScanning && (
+    phase === 'preparing_run_scope' ||
+    Boolean(progress?.scan_run_scope_preparing)
+  );
+  const preScanActive = isScanning && !runScopePreparing && (
     phase === 'pre_scan' ||
     Boolean(progress?.scan_discovery_running) ||
     preScanStage === 'filesystem' ||
@@ -94,6 +98,16 @@ export function useScanProgressShared(options: UseScanProgressSharedOptions = {}
       ? `roots ${Math.max(0, Math.min(preScanRootsDone, preScanRootsTotal)).toLocaleString()}/${preScanRootsTotal.toLocaleString()}`
       : `${preScanEntriesScanned.toLocaleString()} entries`;
   const preScanCountersLabel = `visited ${preScanEntriesScanned.toLocaleString()} · audio ${preScanFilesFound.toLocaleString()}`;
+  const runScopeStage = String(progress?.scan_run_scope_stage || '');
+  const runScopeDone = Math.max(0, progress?.scan_run_scope_done || 0);
+  const runScopeTotal = Math.max(0, progress?.scan_run_scope_total || 0);
+  const runScopePercent = Math.max(0, Math.min(100, progress?.scan_run_scope_percent || 0));
+  const runScopeIncludedArtists = Math.max(0, progress?.scan_run_scope_artists_included || 0);
+  const runScopeIncludedAlbums = Math.max(0, progress?.scan_run_scope_albums_included || 0);
+  const runScopeStatusLabel = runScopeTotal > 0
+    ? `${runScopeDone.toLocaleString()}/${runScopeTotal.toLocaleString()}`
+    : `${runScopeDone.toLocaleString()}/?`;
+  const runScopeCountersLabel = `in scope ${runScopeIncludedArtists.toLocaleString()} artists · ${runScopeIncludedAlbums.toLocaleString()} albums`;
 
   // Bar progress: include post-processing when present so 100% means truly finished.
   const artistsProcessed = progress?.artists_processed ?? 0;
@@ -109,13 +123,15 @@ export function useScanProgressShared(options: UseScanProgressSharedOptions = {}
   const compositeTotal = Math.max(0, artistsTotal) + Math.max(0, postTotal);
   const rawPercent = preScanActive
     ? preScanPercent
+    : runScopePreparing
+    ? runScopePercent
     : hasPostWork
     ? (compositeTotal > 0 ? Math.min(100, (compositeDone / compositeTotal) * 100) : 0)
     : (isScanning && artistsTotal > 0
       ? Math.min(100, (artistsProcessed / artistsTotal) * 100)
       : (stepTotal > 0 ? Math.min(100, (stepProgress / stepTotal) * 100) : 0));
   const progressPercent = isScanning
-    ? (preScanActive ? Math.min(100, rawPercent) : Math.min(99, rawPercent))
+    ? ((preScanActive || runScopePreparing) ? Math.min(100, rawPercent) : Math.min(99, rawPercent))
     : rawPercent;
   const status = progress?.status ?? 'idle';
   
@@ -203,7 +219,11 @@ export function useScanProgressShared(options: UseScanProgressSharedOptions = {}
     preScanStageLabel,
     preScanStatusLabel,
     preScanCountersLabel,
-    
+    runScopePreparing,
+    runScopeStage,
+    runScopeStatusLabel,
+    runScopeCountersLabel,
+
     // Dedupe progress values
     dedupeProgressValue,
     dedupeTotal,

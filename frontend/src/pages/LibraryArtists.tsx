@@ -4,6 +4,7 @@ import { Loader2, UserRound } from 'lucide-react';
 
 import { Badge } from '@/components/ui/badge';
 import { Card } from '@/components/ui/card';
+import { LibraryEmptyState } from '@/components/library/LibraryEmptyState';
 import { useLibraryQuery } from '@/hooks/useLibraryQuery';
 import * as api from '@/lib/api';
 import type { LibraryOutletContext } from '@/pages/LibraryLayout';
@@ -11,7 +12,7 @@ import type { LibraryOutletContext } from '@/pages/LibraryLayout';
 export default function LibraryArtists() {
   const navigate = useNavigate();
   const location = useLocation();
-  const { includeUnmatched } = useOutletContext<LibraryOutletContext>();
+  const { includeUnmatched, libraryIsEmpty } = useOutletContext<LibraryOutletContext>();
   const { search, genre, label, year } = useLibraryQuery();
 
   const [loading, setLoading] = useState(false);
@@ -61,9 +62,16 @@ export default function LibraryArtists() {
   }, [genre, includeUnmatched, label, limit, search, year]);
 
   useEffect(() => {
+    if (libraryIsEmpty) {
+      setArtists([]);
+      setTotal(0);
+      setOffset(0);
+      setLoading(false);
+      return;
+    }
     setOffset(0);
     void fetchArtists({ reset: true, pageOffset: 0 });
-  }, [search, genre, label, year, includeUnmatched, fetchArtists]);
+  }, [search, genre, label, year, includeUnmatched, fetchArtists, libraryIsEmpty]);
 
   const canLoadMore = artists.length < total && !loading;
   const loadMore = useCallback(async () => {
@@ -95,6 +103,14 @@ export default function LibraryArtists() {
     obs.observe(node);
     return () => obs.disconnect();
   }, [artists.length, loadMore, total]);
+
+  if (libraryIsEmpty) {
+    return (
+      <div className="container pb-6">
+        <LibraryEmptyState />
+      </div>
+    );
+  }
 
   return (
     <div className="container pb-6 space-y-4">

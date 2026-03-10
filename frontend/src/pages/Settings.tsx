@@ -1069,9 +1069,9 @@ function SettingsPage() {
                 <Separator />
                 <div className="space-y-3">
                   <div className="space-y-1">
-                    <Label>Sources & autonomy</Label>
+                    <Label>Source folders (Library / Incoming)</Label>
                     <p className="text-xs text-muted-foreground">
-                      Mark each root as Library or Incoming and choose the primary Library destination.
+                      Add all scan roots here, set each one as Library or Incoming, and pick the primary Library destination.
                     </p>
                   </div>
                   <SourcesAutonomySettings />

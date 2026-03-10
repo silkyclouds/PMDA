@@ -10,11 +10,13 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { Slider } from '@/components/ui/slider';
 import { FormatBadge } from '@/components/FormatBadge';
 import { AlbumArtwork } from '@/components/library/AlbumArtwork';
+import { LibraryEmptyState } from '@/components/library/LibraryEmptyState';
 import { usePlayback } from '@/contexts/PlaybackContext';
 import { useToast } from '@/hooks/use-toast';
 import { useLibraryQuery } from '@/hooks/useLibraryQuery';
 import { useIsMobile } from '@/hooks/use-mobile';
 import { dedupeAlbumsForDisplay, mergeAlbumsForDisplay } from '@/lib/albumDisplayDedupe';
+import { badgeKindClass } from '@/lib/badgeStyles';
 import { cn } from '@/lib/utils';
 import * as api from '@/lib/api';
 import type { TrackInfo } from '@/components/library/AudioPlayer';
@@ -45,7 +47,7 @@ export default function LibraryAlbums() {
   const isMobile = useIsMobile();
   const navigate = useNavigate();
   const location = useLocation();
-  const { includeUnmatched } = useOutletContext<LibraryOutletContext>();
+  const { includeUnmatched, libraryIsEmpty } = useOutletContext<LibraryOutletContext>();
   const { toast } = useToast();
   const { startPlayback, setCurrentTrack } = usePlayback();
   const { search, genre, label, year } = useLibraryQuery();
@@ -166,9 +168,16 @@ export default function LibraryAlbums() {
   }, [sort]);
 
   useEffect(() => {
+    if (libraryIsEmpty) {
+      setAlbums([]);
+      setOffset(0);
+      setTotalAlbums(0);
+      setAlbumLoading(false);
+      return;
+    }
     setOffset(0);
     void fetchAlbums({ reset: true, pageOffset: 0 });
-  }, [search, genre, label, year, sort, includeUnmatched, fetchAlbums]);
+  }, [search, genre, label, year, sort, includeUnmatched, fetchAlbums, libraryIsEmpty]);
 
   const handlePlayAlbum = async (albumId: number, fallbackTitle: string, fallbackThumb?: string | null) => {
     try {
@@ -222,6 +231,14 @@ export default function LibraryAlbums() {
     obs.observe(node);
     return () => obs.disconnect();
   }, [albums.length, loadMore, totalAlbums]);
+
+  if (libraryIsEmpty) {
+    return (
+      <div className="container pb-6">
+        <LibraryEmptyState />
+      </div>
+    );
+  }
 
   return (
     <div className="container pb-6 space-y-4">
@@ -342,13 +359,16 @@ export default function LibraryAlbums() {
 
                 <div className="flex flex-wrap items-center gap-1.5">
                   {a.format ? <FormatBadge format={a.format} size="sm" /> : null}
-                  <Badge variant={a.is_lossless ? 'secondary' : 'outline'} className="text-[10px]">
+                  <Badge
+                    variant="outline"
+                    className={cn("text-[10px]", a.is_lossless ? badgeKindClass('lossless') : badgeKindClass('lossy'))}
+                  >
                     {a.is_lossless ? 'Lossless' : 'Lossy'}
                   </Badge>
-                  <Badge variant="outline" className="text-[10px]">
+                  <Badge variant="outline" className={cn("text-[10px]", badgeKindClass('year'))}>
                     {a.year ?? '—'}
                   </Badge>
-                  <Badge variant="outline" className="text-[10px]">
+                  <Badge variant="outline" className={cn("text-[10px]", badgeKindClass('count'))}>
                     {a.track_count}t
                   </Badge>
                 </div>
@@ -364,22 +384,22 @@ export default function LibraryAlbums() {
                           {shown.map((g) => (
                             <Badge
                               key={`alb-g-${a.album_id}-${g}`}
-                              variant="secondary"
-                              className="text-[10px] cursor-pointer"
+                              variant="outline"
+                              className={cn("text-[10px] cursor-pointer", badgeKindClass('genre'))}
                               title="Browse genre"
                               onClick={() => navigate(`/library/genre/${encodeURIComponent(g)}${location.search || ''}`)}
                             >
                               {g}
                             </Badge>
                           ))}
-                          {more > 0 ? <Badge variant="secondary" className="text-[10px]">+{more}</Badge> : null}
+                          {more > 0 ? <Badge variant="outline" className={cn("text-[10px]", badgeKindClass('genre'))}>+{more}</Badge> : null}
                         </>
                       );
                     })()}
                     {a.label ? (
                       <Badge
                         variant="outline"
-                        className="text-[10px] cursor-pointer"
+                        className={cn("text-[10px] cursor-pointer", badgeKindClass('label'))}
                         title="Open label"
                         onClick={() => navigate(`/library/label/${encodeURIComponent(a.label || '')}${location.search || ''}`)}
                       >

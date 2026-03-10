@@ -1,5 +1,7 @@
 # ─── Stage 1: build frontend (React/Vite) ─────────────────────────────────────
-FROM node:20-alpine AS frontend-build
+# Build frontend on the builder host architecture only; output is static assets
+# and can be reused for all target runtime architectures.
+FROM --platform=$BUILDPLATFORM node:20-alpine AS frontend-build
 WORKDIR /fe
 COPY frontend/package.json frontend/package-lock.json* ./
 RUN npm install
@@ -8,6 +10,8 @@ RUN npm run build
 
 # ─── Stage 2: PMDA backend + integrated frontend ─────────────────────────────
 FROM python:3.11-slim
+ARG TARGETARCH
+ARG TARGETVARIANT
 
 ENV PMDA_CONFIG_DIR=/config
 ENV PMDA_PG_VERSION=15
@@ -31,6 +35,25 @@ RUN apt-get update && \
       postgresql-contrib \
       redis-server \
     && rm -rf /var/lib/apt/lists/*
+
+# arm/v7 lacks wheels for some Python deps (e.g. Pillow/cffi), so compile toolchain is needed.
+RUN if [ "$TARGETARCH" = "arm" ] && [ "$TARGETVARIANT" = "v7" ]; then \
+      apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        pkg-config \
+        python3-dev \
+        libffi-dev \
+        libjpeg-dev \
+        zlib1g-dev \
+        libopenjp2-7-dev \
+        libtiff-dev \
+        libfreetype6-dev \
+        liblcms2-dev \
+        libwebp-dev \
+        libharfbuzz-dev \
+        libfribidi-dev \
+      && rm -rf /var/lib/apt/lists/*; \
+    fi
 
 WORKDIR /app
 COPY . /app

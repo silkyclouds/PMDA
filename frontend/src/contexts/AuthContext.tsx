@@ -8,7 +8,8 @@ interface AuthContextValue {
   user: api.AuthUser | null;
   isAdmin: boolean;
   canDownload: boolean;
-  login: (username: string, password: string) => Promise<void>;
+  canViewStatistics: boolean;
+  login: (username: string, password: string, rememberMe?: boolean) => Promise<void>;
   bootstrapAdmin: (username: string, password: string, passwordConfirm: string) => Promise<void>;
   logout: () => Promise<void>;
   refreshSession: () => Promise<void>;
@@ -73,9 +74,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     void initialize();
   }, [initialize]);
 
-  const login = useCallback(async (username: string, password: string) => {
-    const payload = await api.login({ username, password });
-    api.setAuthToken(payload.token);
+  const login = useCallback(async (username: string, password: string, rememberMe = true) => {
+    const payload = await api.login({ username, password, remember_me: Boolean(rememberMe) });
+    api.setAuthToken(payload.token, Boolean(rememberMe));
     setBootstrapRequired(false);
     setUser(payload.user ?? null);
   }, []);
@@ -105,6 +106,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       user,
       isAdmin: Boolean(user?.is_admin),
       canDownload: Boolean(user?.can_download),
+      canViewStatistics: Boolean(user?.is_admin || user?.can_view_statistics),
       login,
       bootstrapAdmin,
       logout,

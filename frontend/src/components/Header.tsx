@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
+import { useLocation } from 'react-router-dom';
 import { RefreshCw } from 'lucide-react';
 import { WelcomeModal } from '@/components/WelcomeModal';
 import { ThemeToggle } from '@/components/ThemeToggle';
@@ -62,6 +63,7 @@ function RebootCountdown({ onComplete, onProgress }: { onComplete: () => void; o
 
 export function Header() {
   const { isAdmin } = useAuth();
+  const location = useLocation();
   const [showSettings, setShowSettings] = useState(false);
   const [isRebooting, setIsRebooting] = useState(false);
   const [rebootCountdown, setRebootCountdown] = useState(30);
@@ -87,6 +89,8 @@ export function Header() {
     }).catch(() => {});
   }, [isAdmin]);
 
+  const showGlobalSearch = location.pathname.startsWith('/library');
+
   return (
     <>
       <header className="sticky top-0 z-50 safe-top border-b border-border/70 bg-card/85 backdrop-blur-xl supports-[backdrop-filter]:bg-card/70">
@@ -98,7 +102,9 @@ export function Header() {
                   <ThemeToggle />
               </div>
             </div>
-            <GlobalSearch className="max-w-none animate-in fade-in-0 slide-in-from-bottom-1 duration-300" />
+            {showGlobalSearch ? (
+              <GlobalSearch className="max-w-none animate-in fade-in-0 slide-in-from-bottom-1 duration-300" />
+            ) : null}
           </div>
         </div>
       </header>

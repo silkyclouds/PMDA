@@ -4,7 +4,7 @@ import { Loader2, RotateCcw, Trash2, CheckSquare, Square, Package, AlertTriangle
 import { Button } from '@/components/ui/button';
 import { toast } from 'sonner';
 import * as api from '@/lib/api';
-import type { ScanHistoryEntry, ScanMove } from '@/lib/api';
+import type { ScanHistoryEntry, ScanMove, ScanAICostSummary } from '@/lib/api';
 
 interface ScanDetailsProps {
   scanId: number;
@@ -18,6 +18,8 @@ export function ScanDetails({ scanId, onRestore }: ScanDetailsProps) {
   const [isLoading, setIsLoading] = useState(true);
   const [isRestoring, setIsRestoring] = useState(false);
   const [isDeduping, setIsDeduping] = useState(false);
+  const [aiScope, setAiScope] = useState<'scan' | 'lifecycle'>('lifecycle');
+  const [aiCosts, setAiCosts] = useState<ScanAICostSummary | null>(null);
 
   const getErrorMessage = (error: unknown, fallback: string) => {
     if (error && typeof error === 'object') {
@@ -34,17 +36,24 @@ export function ScanDetails({ scanId, onRestore }: ScanDetailsProps) {
 
   useEffect(() => {
     loadDetails();
-  }, [scanId]);
+  }, [scanId, aiScope]);
 
   const loadDetails = async () => {
     setIsLoading(true);
     try {
-      const [scanData, movesData] = await Promise.all([
+      const [scanData, movesData, aiCostData] = await Promise.all([
         api.getScanDetails(scanId),
         api.getScanMoves(scanId),
+        api
+          .getScanAICostSummary(scanId, {
+            includeLifecycle: aiScope === 'lifecycle',
+            groupBy: 'analysis_type',
+          })
+          .catch(() => null),
       ]);
       setScan(scanData);
       setMoves(movesData.filter(m => !m.restored));
+      setAiCosts(aiCostData);
       setSelectedMoves(new Set());
     } catch (error) {
       console.error('Failed to load scan details:', error);
@@ -318,6 +327,72 @@ export function ScanDetails({ scanId, onRestore }: ScanDetailsProps) {
                 </div>
               )}
             </div>
+          </div>
+        )}
+
+        {!isDedupe && scan.entry_type !== 'incomplete' && (
+          <div>
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="text-sm font-semibold">AI Cost & Usage</h3>
+              <div className="flex items-center gap-2">
+                <Button
+                  size="sm"
+                  variant={aiScope === 'lifecycle' ? 'default' : 'outline'}
+                  className="h-7 text-xs"
+                  onClick={() => setAiScope('lifecycle')}
+                >
+                  Lifecycle
+                </Button>
+                <Button
+                  size="sm"
+                  variant={aiScope === 'scan' ? 'default' : 'outline'}
+                  className="h-7 text-xs"
+                  onClick={() => setAiScope('scan')}
+                >
+                  Scan only
+                </Button>
+              </div>
+            </div>
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">
+              <div className="rounded-lg border border-border bg-muted/40 p-3">
+                <div className="text-muted-foreground text-xs">Total USD</div>
+                <div className="font-semibold text-base">${(aiCosts?.totals?.cost_usd ?? 0).toFixed(4)}</div>
+              </div>
+              <div className="rounded-lg border border-border bg-muted/40 p-3">
+                <div className="text-muted-foreground text-xs">Total tokens</div>
+                <div className="font-semibold text-base">{(aiCosts?.totals?.total_tokens ?? 0).toLocaleString()}</div>
+              </div>
+              <div className="rounded-lg border border-border bg-muted/40 p-3">
+                <div className="text-muted-foreground text-xs">Unpriced calls</div>
+                <div className="font-semibold text-base">{(aiCosts?.totals?.unpriced_calls ?? 0).toLocaleString()}</div>
+              </div>
+              <div className="rounded-lg border border-border bg-muted/40 p-3">
+                <div className="text-muted-foreground text-xs">Lifecycle status</div>
+                <div className="font-semibold text-base">
+                  {(aiCosts?.lifecycle_complete ?? false) ? 'Complete' : 'In progress'}
+                </div>
+              </div>
+            </div>
+            {Array.isArray(aiCosts?.breakdown) && aiCosts!.breakdown.length > 0 && (
+              <div className="mt-3 border rounded-lg overflow-hidden">
+                <div className="grid grid-cols-12 gap-2 px-3 py-2 text-[11px] uppercase tracking-wide text-muted-foreground bg-muted/30">
+                  <div className="col-span-5">Analysis type</div>
+                  <div className="col-span-2 text-right">Calls</div>
+                  <div className="col-span-3 text-right">Tokens</div>
+                  <div className="col-span-2 text-right">USD</div>
+                </div>
+                <div className="divide-y">
+                  {aiCosts!.breakdown.map((row, idx) => (
+                    <div key={`${row.analysis_type || 'unknown'}-${idx}`} className="grid grid-cols-12 gap-2 px-3 py-2 text-xs">
+                      <div className="col-span-5 truncate">{row.analysis_type || 'unknown'}</div>
+                      <div className="col-span-2 text-right tabular-nums">{(row.calls ?? 0).toLocaleString()}</div>
+                      <div className="col-span-3 text-right tabular-nums">{(row.total_tokens ?? 0).toLocaleString()}</div>
+                      <div className="col-span-2 text-right tabular-nums">${(row.cost_usd ?? 0).toFixed(4)}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
         )}
 

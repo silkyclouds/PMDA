@@ -4,6 +4,7 @@ import { Loader2, Tag } from 'lucide-react';
 
 import { Badge } from '@/components/ui/badge';
 import { Card } from '@/components/ui/card';
+import { LibraryEmptyState } from '@/components/library/LibraryEmptyState';
 import { useLibraryQuery } from '@/hooks/useLibraryQuery';
 import * as api from '@/lib/api';
 import { cn } from '@/lib/utils';
@@ -12,7 +13,7 @@ import type { LibraryOutletContext } from '@/pages/LibraryLayout';
 export default function LibraryGenres() {
   const navigate = useNavigate();
   const location = useLocation();
-  const { includeUnmatched } = useOutletContext<LibraryOutletContext>();
+  const { includeUnmatched, libraryIsEmpty } = useOutletContext<LibraryOutletContext>();
   const { search, label, year } = useLibraryQuery();
 
   const [loading, setLoading] = useState(false);
@@ -61,9 +62,16 @@ export default function LibraryGenres() {
   }, [includeUnmatched, label, limit, search, year]);
 
   useEffect(() => {
+    if (libraryIsEmpty) {
+      setGenres([]);
+      setTotal(0);
+      setOffset(0);
+      setLoading(false);
+      return;
+    }
     setOffset(0);
     void fetchGenres({ reset: true, pageOffset: 0 });
-  }, [search, label, year, includeUnmatched, fetchGenres]);
+  }, [search, label, year, includeUnmatched, fetchGenres, libraryIsEmpty]);
 
   const canLoadMore = genres.length < total && !loading;
   const loadMore = useCallback(async () => {
@@ -95,6 +103,14 @@ export default function LibraryGenres() {
     obs.observe(node);
     return () => obs.disconnect();
   }, [genres.length, loadMore, total]);
+
+  if (libraryIsEmpty) {
+    return (
+      <div className="container pb-6">
+        <LibraryEmptyState />
+      </div>
+    );
+  }
 
   return (
     <div className="container pb-6 space-y-4">
