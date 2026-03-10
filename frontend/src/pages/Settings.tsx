@@ -45,12 +45,12 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/component
 const SETTINGS_SECTIONS: { id: string; label: string }[] = [
   { id: 'settings-files-export', label: 'Folders' },
   { id: 'settings-sources-autonomy', label: 'Sources & autonomy' },
+  { id: 'settings-scan-behavior', label: 'Scan behavior' },
   { id: 'settings-pipeline', label: 'Pipeline' },
-  { id: 'settings-scheduler', label: 'Scheduler' },
   { id: 'settings-ai', label: 'AI' },
   { id: 'settings-providers', label: 'Metadata providers' },
   { id: 'settings-concerts', label: 'Concerts' },
-  { id: 'settings-notifications', label: 'Notifications' },
+  { id: 'settings-notifications', label: 'In-app notifications' },
   { id: 'settings-danger-zone', label: 'Danger zone' },
 ];
 
@@ -193,6 +193,7 @@ function SettingsPage() {
   const [providerPreferencesBusy, setProviderPreferencesBusy] = useState(false);
   const [rebuildIndexLoading, setRebuildIndexLoading] = useState(false);
   const [advancedFoldersOpen, setAdvancedFoldersOpen] = useState(false);
+  const [schedulerAdvancedOpen, setSchedulerAdvancedOpen] = useState(false);
   const [providersChecking, setProvidersChecking] = useState(false);
   const [providersPreflight, setProvidersPreflight] = useState<api.ScanPreflightResult | null>(null);
   const [providersPreflightAt, setProvidersPreflightAt] = useState<number | null>(null);
@@ -203,6 +204,10 @@ function SettingsPage() {
   const [rebootCountdown, setRebootCountdown] = useState(35);
   const [rebootProgress, setRebootProgress] = useState(0);
   const openaiModelsKeyRef = useRef<string>('');
+  const openaiApiModeEnabled = config.OPENAI_ENABLE_API_KEY_MODE !== false;
+  const openaiCodexModeEnabled = config.OPENAI_ENABLE_CODEX_OAUTH_MODE !== false;
+  const codexProfileConnected = Boolean(openaiCodexStatus?.profile_connected || openaiCodexStatus?.connected);
+  const codexReady = Boolean(openaiCodexStatus?.connected);
 
   const getApiErrorMessage = (e: unknown): string | null => {
     const bodyMsg = (e as { body?: { message?: unknown } } | null)?.body?.message;
@@ -259,6 +264,13 @@ function SettingsPage() {
 
   // Fetch the curated list of compatible OpenAI models for the dropdown (avoids manual typing).
   useEffect(() => {
+    if (!openaiApiModeEnabled) {
+      openaiModelsKeyRef.current = '';
+      setOpenaiModels([]);
+      setOpenaiModelsError(null);
+      setOpenaiModelsLoading(false);
+      return;
+    }
     const key = (config.OPENAI_API_KEY || '').trim();
     // Avoid calling the endpoint on every keystroke while user is typing.
     if (!key || !key.startsWith('sk-') || key.length < 20) {
@@ -284,7 +296,7 @@ function SettingsPage() {
         setOpenaiModelsLoading(false);
       }
     })();
-  }, [config.OPENAI_API_KEY]);
+  }, [config.OPENAI_API_KEY, openaiApiModeEnabled]);
 
   const loadConfig = async () => {
     setIsLoading(true);
@@ -454,6 +466,10 @@ function SettingsPage() {
   })();
   const selectedAiLevelIndex = Math.max(0, AI_USAGE_LEVELS.findIndex((lvl) => lvl.value === selectedAiLevel));
   const selectedAiLevelMeta = AI_USAGE_LEVELS[selectedAiLevelIndex] || AI_USAGE_LEVELS[1];
+  const schedulerPaused = config.SCHEDULER_PAUSED !== false;
+  const allowNonScanJobs = Boolean(config.SCHEDULER_ALLOW_NON_SCAN_JOBS ?? false);
+  const postScanAsync = Boolean(config.PIPELINE_POST_SCAN_ASYNC ?? false);
+  const scanFirstModeEnabled = schedulerPaused && !allowNonScanJobs && !postScanAsync;
 
   type ProviderState = {
     variant: 'default' | 'secondary' | 'destructive' | 'outline';
@@ -483,6 +499,20 @@ function SettingsPage() {
 
   const setFilesRoots = useCallback((roots: string[]) => {
     updateConfig({ FILES_ROOTS: serializePathList(roots) });
+  }, [updateConfig]);
+
+  const toggleScanFirstMode = useCallback((enabled: boolean) => {
+    if (enabled) {
+      updateConfig({
+        SCHEDULER_PAUSED: true,
+        SCHEDULER_ALLOW_NON_SCAN_JOBS: false,
+        PIPELINE_POST_SCAN_ASYNC: false,
+      });
+      toast.success('Scan-first mode enabled');
+      return;
+    }
+    updateConfig({ SCHEDULER_PAUSED: false });
+    toast.success('Scheduled scans re-enabled');
   }, [updateConfig]);
 
   const addFilesRoot = useCallback((path: string) => {
@@ -977,6 +1007,106 @@ function SettingsPage() {
 
             <Separator />
 
+            <Card id="settings-scan-behavior" className="scroll-mt-24">
+              <CardHeader>
+                <CardTitle>Scan behavior</CardTitle>
+                <CardDescription>
+                  Recommended mode is scan-first: PMDA runs pipeline inside the scan and avoids random background jobs.
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                <div className="rounded-lg border border-border p-4 space-y-3">
+                  <div className="flex items-start justify-between gap-3 rounded-md bg-muted/40 p-3">
+                    <div className="space-y-1">
+                      <Label>Scan-first mode (recommended)</Label>
+                      <p className="text-xs text-muted-foreground">
+                        Disable scheduler jobs and run pipeline during manual scans only.
+                      </p>
+                    </div>
+                    <Switch
+                      checked={scanFirstModeEnabled}
+                      onCheckedChange={(checked) => toggleScanFirstMode(Boolean(checked))}
+                    />
+                  </div>
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                    <div className="rounded-md border border-border/60 px-3 py-2">
+                      <p className="text-xs text-muted-foreground">Scheduled scans</p>
+                      <p className="text-sm font-medium">{schedulerPaused ? 'Paused' : 'Enabled'}</p>
+                    </div>
+                    <div className="rounded-md border border-border/60 px-3 py-2">
+                      <p className="text-xs text-muted-foreground">Non-scan background jobs</p>
+                      <p className="text-sm font-medium">{allowNonScanJobs ? 'Allowed' : 'Disabled'}</p>
+                    </div>
+                    <div className="rounded-md border border-border/60 px-3 py-2">
+                      <p className="text-xs text-muted-foreground">Post-scan chain</p>
+                      <p className="text-sm font-medium">{postScanAsync ? 'Async queue' : 'Inline in scan'}</p>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="rounded-lg border border-border p-4 space-y-3">
+                  <div className="flex items-center justify-between gap-3 rounded-md border border-border/60 px-3 py-2">
+                    <div className="space-y-1">
+                      <Label>Allow scheduled scans</Label>
+                      <p className="text-xs text-muted-foreground">
+                        If disabled, PMDA will only scan when you launch a scan manually.
+                      </p>
+                    </div>
+                    <Switch
+                      checked={!schedulerPaused}
+                      onCheckedChange={(checked) => updateConfig({ SCHEDULER_PAUSED: !Boolean(checked) })}
+                    />
+                  </div>
+                  <div className="flex items-center justify-between gap-3 rounded-md border border-border/60 px-3 py-2">
+                    <div className="space-y-1">
+                      <Label>Allow non-scan background jobs</Label>
+                      <p className="text-xs text-muted-foreground">
+                        Allows scheduler to run enrichment/dedupe/export outside scan runs.
+                      </p>
+                    </div>
+                    <Switch
+                      checked={allowNonScanJobs}
+                      onCheckedChange={(checked) => updateConfig({ SCHEDULER_ALLOW_NON_SCAN_JOBS: Boolean(checked) })}
+                    />
+                  </div>
+                  <div className="flex items-center justify-between gap-3 rounded-md border border-border/60 px-3 py-2">
+                    <div className="space-y-1">
+                      <Label>Post-scan chain in async queue</Label>
+                      <p className="text-xs text-muted-foreground">
+                        Disabled = run all pipeline steps in the same scan run for predictable behavior.
+                      </p>
+                    </div>
+                    <Switch
+                      checked={postScanAsync}
+                      onCheckedChange={(checked) => updateConfig({ PIPELINE_POST_SCAN_ASYNC: Boolean(checked) })}
+                    />
+                  </div>
+                </div>
+
+                <Collapsible open={schedulerAdvancedOpen} onOpenChange={setSchedulerAdvancedOpen}>
+                  <div className="rounded-lg border border-border bg-muted/20">
+                    <CollapsibleTrigger asChild>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        className="w-full justify-between rounded-none px-3 py-2 text-left"
+                      >
+                        <span className="text-sm font-medium">Advanced scheduler rules</span>
+                        <ChevronDown className={`w-4 h-4 transition-transform ${schedulerAdvancedOpen ? 'rotate-180' : ''}`} />
+                      </Button>
+                    </CollapsibleTrigger>
+                    <CollapsibleContent>
+                      <div className="border-t border-border/60 p-3">
+                        <SchedulerSettings config={config} updateConfig={updateConfig} />
+                      </div>
+                    </CollapsibleContent>
+                  </div>
+                </Collapsible>
+              </CardContent>
+            </Card>
+
+            <Separator />
+
             <Card id="settings-pipeline" className="scroll-mt-24">
               <CardHeader>
                 <CardTitle>Pipeline automation</CardTitle>
@@ -984,20 +1114,6 @@ function SettingsPage() {
               </CardHeader>
               <CardContent>
                 <IntegrationsSettings config={config} updateConfig={updateConfig} errors={errors} />
-              </CardContent>
-            </Card>
-
-            <Separator />
-
-            <Card id="settings-scheduler" className="scroll-mt-24">
-              <CardHeader>
-                <CardTitle>Scheduler</CardTitle>
-                <CardDescription>
-                  Choose when scans run and which post-scan jobs should run automatically.
-                </CardDescription>
-              </CardHeader>
-              <CardContent>
-                <SchedulerSettings config={config} updateConfig={updateConfig} />
               </CardContent>
             </Card>
 
@@ -1014,6 +1130,37 @@ function SettingsPage() {
                 </CardDescription>
               </CardHeader>
               <CardContent className="space-y-4">
+                <div className="rounded-lg border border-border p-4 space-y-4">
+                  <div className="space-y-1">
+                    <Label>OpenAI modes</Label>
+                    <p className="text-xs text-muted-foreground">
+                      Activate only the OpenAI auth modes you want PMDA to use at runtime.
+                    </p>
+                  </div>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div className="flex items-center justify-between gap-3 rounded-md border border-border/60 px-3 py-2">
+                      <div className="space-y-0.5">
+                        <p className="text-sm font-medium">API key mode</p>
+                        <p className="text-xs text-muted-foreground">Used by `openai-api` provider.</p>
+                      </div>
+                      <Switch
+                        checked={openaiApiModeEnabled}
+                        onCheckedChange={(checked) => updateConfig({ OPENAI_ENABLE_API_KEY_MODE: checked })}
+                      />
+                    </div>
+                    <div className="flex items-center justify-between gap-3 rounded-md border border-border/60 px-3 py-2">
+                      <div className="space-y-0.5">
+                        <p className="text-sm font-medium">ChatGPT OAuth mode</p>
+                        <p className="text-xs text-muted-foreground">Used by `openai-codex` provider.</p>
+                      </div>
+                      <Switch
+                        checked={openaiCodexModeEnabled}
+                        onCheckedChange={(checked) => updateConfig({ OPENAI_ENABLE_CODEX_OAUTH_MODE: checked })}
+                      />
+                    </div>
+                  </div>
+                </div>
+
                 <div className="rounded-lg border border-border p-4 space-y-3">
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <div className="space-y-1">
@@ -1023,8 +1170,8 @@ function SettingsPage() {
                       </p>
                     </div>
                     <div className="flex items-center gap-2">
-                      <Badge variant={openaiCodexStatus?.connected ? 'default' : 'outline'}>
-                        {openaiCodexStatus?.connected ? 'Connected' : 'Not connected'}
+                      <Badge variant={codexReady ? 'default' : (codexProfileConnected ? 'secondary' : 'outline')}>
+                        {codexReady ? 'Connected' : (codexProfileConnected ? 'Reconnect required' : 'Not connected')}
                       </Badge>
                       {openaiCodexStatus?.auth_mode ? (
                         <Badge variant="outline">{openaiCodexStatus.auth_mode}</Badge>
@@ -1036,7 +1183,7 @@ function SettingsPage() {
                       <span className="font-medium">Note:</span> {openaiOAuth.warning}
                     </p>
                   )}
-                  {openaiCodexStatus?.connected ? (
+                  {codexProfileConnected ? (
                     <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
                       {openaiCodexStatus.account_id ? <Badge variant="outline">Account: {openaiCodexStatus.account_id}</Badge> : null}
                       {typeof openaiCodexStatus.expires_in_sec === 'number' ? (
@@ -1045,6 +1192,11 @@ function SettingsPage() {
                       {openaiCodexStatus.has_refresh_token ? <Badge variant="outline">Refresh token available</Badge> : null}
                     </div>
                   ) : null}
+                  {openaiCodexStatus?.error ? (
+                    <p className="text-xs text-destructive">
+                      OAuth runtime issue: {openaiCodexStatus.error}
+                    </p>
+                  ) : null}
                   <div className="flex flex-wrap items-center gap-2">
                     <Button
                       type="button"
@@ -1052,7 +1204,7 @@ function SettingsPage() {
                       size="sm"
                       className="gap-2"
                       onClick={startOpenAIOAuth}
-                      disabled={openaiOAuthBusy}
+                      disabled={openaiOAuthBusy || !openaiCodexModeEnabled}
                     >
                       {openaiOAuthBusy ? <Loader2 className="w-4 h-4 animate-spin" /> : <ExternalLink className="w-4 h-4" />}
                       Connect
@@ -1063,7 +1215,7 @@ function SettingsPage() {
                       size="sm"
                       className="gap-2"
                       onClick={disconnectOpenAIOAuth}
-                      disabled={openaiOAuthBusy || !openaiCodexStatus?.connected}
+                      disabled={openaiOAuthBusy || !openaiCodexModeEnabled || !codexProfileConnected}
                     >
                       {openaiOAuthBusy ? <Loader2 className="w-4 h-4 animate-spin" /> : <X className="w-4 h-4" />}
                       Disconnect
@@ -1080,6 +1232,9 @@ function SettingsPage() {
                       Refresh status
                     </Button>
                   </div>
+                  {!openaiCodexModeEnabled ? (
+                    <p className="text-xs text-amber-600">ChatGPT OAuth mode is disabled. Interactive OAuth routing is inactive.</p>
+                  ) : null}
                   {openaiOAuth && (
                     <div className="space-y-2 pt-2 border-t border-border/60">
                       <div className="flex flex-col sm:flex-row sm:items-center gap-2">
@@ -1142,6 +1297,7 @@ function SettingsPage() {
                       value={config.OPENAI_API_KEY || ''}
                       onChange={(e) => updateConfig({ OPENAI_API_KEY: e.target.value, AI_PROVIDER: 'openai-api' })}
                       placeholder="sk-..."
+                      disabled={!openaiApiModeEnabled}
                     />
                   </div>
                   <div className="space-y-2">
@@ -1161,6 +1317,7 @@ function SettingsPage() {
                           <Select
                             value={current}
                             onValueChange={(value) => updateConfig({ OPENAI_MODEL: value, AI_PROVIDER: 'openai-api' })}
+                            disabled={!openaiApiModeEnabled}
                           >
                             <SelectTrigger>
                               <SelectValue placeholder="Select a model" />
@@ -1180,12 +1337,16 @@ function SettingsPage() {
                         placeholder="gpt-5-nano"
                         value={config.OPENAI_MODEL || ''}
                         onChange={(e) => updateConfig({ OPENAI_MODEL: e.target.value, AI_PROVIDER: 'openai-api' })}
+                        disabled={!openaiApiModeEnabled}
                       />
                     )}
                     {openaiModelsError && (
                       <p className="text-xs text-destructive">{openaiModelsError}</p>
                     )}
                   </div>
+                  {!openaiApiModeEnabled ? (
+                    <p className="text-xs text-amber-600">API key mode is disabled. Batch/web-search routing to `openai-api` is inactive.</p>
+                  ) : null}
                 </div>
 
                 <div className="rounded-lg border border-border p-4 space-y-3">
@@ -1213,7 +1374,11 @@ function SettingsPage() {
                             <SelectItem
                               key={`interactive-${opt.value}`}
                               value={opt.value}
-                              disabled={Boolean(opt.codexOnly && !openaiCodexStatus?.connected)}
+                              disabled={Boolean(
+                                (opt.value === 'openai-api' && !openaiApiModeEnabled)
+                                || (opt.value === 'openai-codex' && (!openaiCodexModeEnabled || !openaiCodexStatus?.connected))
+                                || (opt.codexOnly && !openaiCodexStatus?.connected)
+                              )}
                             >
                               <span className="inline-flex items-center gap-2">
                                 <ProviderIcon provider={opt.provider} />
@@ -1248,7 +1413,11 @@ function SettingsPage() {
                             <SelectItem
                               key={`batch-${opt.value}`}
                               value={opt.value}
-                              disabled={Boolean(opt.codexOnly && !openaiCodexStatus?.connected)}
+                              disabled={Boolean(
+                                (opt.value === 'openai-api' && !openaiApiModeEnabled)
+                                || (opt.value === 'openai-codex' && (!openaiCodexModeEnabled || !openaiCodexStatus?.connected))
+                                || (opt.codexOnly && !openaiCodexStatus?.connected)
+                              )}
                             >
                               <span className="inline-flex items-center gap-2">
                                 <ProviderIcon provider={opt.provider} />
@@ -1283,7 +1452,11 @@ function SettingsPage() {
                             <SelectItem
                               key={`web-${opt.value}`}
                               value={opt.value}
-                              disabled={Boolean(opt.codexOnly && !openaiCodexStatus?.connected)}
+                              disabled={Boolean(
+                                (opt.value === 'openai-api' && !openaiApiModeEnabled)
+                                || (opt.value === 'openai-codex' && (!openaiCodexModeEnabled || !openaiCodexStatus?.connected))
+                                || (opt.codexOnly && !openaiCodexStatus?.connected)
+                              )}
                             >
                               <span className="inline-flex items-center gap-2">
                                 <ProviderIcon provider={opt.provider} />
@@ -1652,11 +1825,11 @@ function SettingsPage() {
             {/* Notifications Settings */}
             <Card id="settings-notifications" className="scroll-mt-24">
               <CardHeader>
-                <CardTitle>Notifications</CardTitle>
-                <CardDescription>Configure notification settings</CardDescription>
+                <CardTitle>In-app notifications</CardTitle>
+                <CardDescription>Scan and pipeline notifications shown directly inside PMDA.</CardDescription>
               </CardHeader>
               <CardContent>
-                <NotificationSettings config={config} updateConfig={updateConfig} errors={errors} />
+                <NotificationSettings config={config} updateConfig={updateConfig} />
               </CardContent>
             </Card>
 

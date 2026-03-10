@@ -3,23 +3,31 @@
 const _raw = import.meta.env.VITE_PMDA_API_URL ?? '';
 const API_BASE_URL = typeof _raw === 'string' && (_raw.startsWith('http://') || _raw.startsWith('https://')) ? _raw : '';
 const AUTH_TOKEN_STORAGE_KEY = 'pmda_auth_token';
+const AUTH_TOKEN_SESSION_STORAGE_KEY = 'pmda_auth_token_session';
 
 export function getAuthToken(): string {
   try {
+    const sessionToken = (window.sessionStorage.getItem(AUTH_TOKEN_SESSION_STORAGE_KEY) || '').trim();
+    if (sessionToken) return sessionToken;
     return (window.localStorage.getItem(AUTH_TOKEN_STORAGE_KEY) || '').trim();
   } catch {
     return '';
   }
 }
 
-export function setAuthToken(token: string): void {
+export function setAuthToken(token: string, remember = true): void {
   try {
     const clean = String(token || '').trim();
+    window.localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
+    window.sessionStorage.removeItem(AUTH_TOKEN_SESSION_STORAGE_KEY);
     if (!clean) {
-      window.localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
       return;
     }
-    window.localStorage.setItem(AUTH_TOKEN_STORAGE_KEY, clean);
+    if (remember) {
+      window.localStorage.setItem(AUTH_TOKEN_STORAGE_KEY, clean);
+    } else {
+      window.sessionStorage.setItem(AUTH_TOKEN_SESSION_STORAGE_KEY, clean);
+    }
   } catch {
     // ignore
   }
@@ -28,6 +36,7 @@ export function setAuthToken(token: string): void {
 export function clearAuthToken(): void {
   try {
     window.localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
+    window.sessionStorage.removeItem(AUTH_TOKEN_SESSION_STORAGE_KEY);
   } catch {
     // ignore
   }
@@ -113,6 +122,7 @@ export interface DuplicateCard {
 
 export interface ScanProgress {
   scanning: boolean;
+  scan_starting?: boolean;
   progress: number;
   total: number;
   /** Progress including in-progress artist albums (so bar moves during scan) */
@@ -120,8 +130,8 @@ export interface ScanProgress {
   status: 'running' | 'paused' | 'stopped' | 'idle';
   scan_type?: 'full' | 'changed_only' | 'incomplete_only';
   scan_resume_run_id?: string | null;
-  /** Current scan phase: pre_scan | format_analysis | identification_tags | ia_analysis | finalizing | moving_dupes | post_processing */
-  phase?: 'pre_scan' | 'format_analysis' | 'identification_tags' | 'ia_analysis' | 'finalizing' | 'moving_dupes' | 'post_processing' | null;
+  /** Current scan phase: pre_scan | preparing_run_scope | format_analysis | identification_tags | ia_analysis | finalizing | moving_dupes | post_processing */
+  phase?: 'pre_scan' | 'preparing_run_scope' | 'format_analysis' | 'identification_tags' | 'ia_analysis' | 'finalizing' | 'moving_dupes' | 'post_processing' | null;
   /** Micro-step for live indicators: analyzing_format | fetching_mb_id | searching_mb | comparing_versions | detecting_best | done */
   current_step?: string | null;
   /** Total albums in this scan (for N/M display in findings) */
@@ -141,6 +151,20 @@ export interface ScanProgress {
   resume_skipped_artists?: number;
   /** Albums skipped by resume (already done/unchanged). */
   resume_skipped_albums?: number;
+  /** True while resume filtering is preparing the effective run scope. */
+  scan_run_scope_preparing?: boolean;
+  /** Current sub-stage of run-scope preparation. */
+  scan_run_scope_stage?: 'idle' | 'signatures' | 'resume_compare' | 'resume_seed' | 'done' | string | null;
+  /** Progress counter for run-scope preparation stage. */
+  scan_run_scope_done?: number;
+  /** Total artists for run-scope preparation stage. */
+  scan_run_scope_total?: number;
+  /** Percent completion for run-scope preparation stage. */
+  scan_run_scope_percent?: number;
+  /** Artists included in effective run scope after resume filtering. */
+  scan_run_scope_artists_included?: number;
+  /** Albums included in effective run scope after resume filtering. */
+  scan_run_scope_albums_included?: number;
   ai_used_count?: number;
   mb_used_count?: number;
   ai_enabled?: boolean;
@@ -236,6 +260,11 @@ export interface ScanProgress {
   scan_discogs_matched?: number;
   scan_lastfm_matched?: number;
   scan_bandcamp_matched?: number;
+  /** AI guardrail counters for the currently running scan. */
+  scan_ai_guard_calls_used?: number;
+  scan_ai_guard_calls_blocked?: number;
+  scan_ai_guard_last_reason?: string;
+  scan_ai_guard_last_block_at?: number | null;
   scan_start_time?: number | null;
   /** Pipeline toggles effectively applied for this running scan. */
   scan_pipeline_flags?: {
@@ -246,6 +275,8 @@ export interface ScanProgress {
     player_sync?: boolean;
     sync_target?: string;
   };
+  /** When true, post-scan pipeline work is queued in background jobs. */
+  scan_pipeline_async?: boolean;
   /** Sync target resolved for this scan. */
   scan_pipeline_sync_target?: string | null;
   /** Number of incomplete albums auto-moved in this scan. */
@@ -266,6 +297,15 @@ export interface ScanProgress {
   scan_player_sync_target?: string | null;
   scan_player_sync_ok?: boolean | null;
   scan_player_sync_message?: string | null;
+  /** Bootstrap/autonomy state for scan defaults. */
+  bootstrap_required?: boolean;
+  autonomous_mode?: boolean;
+  has_completed_full_scan?: boolean;
+  default_scan_type?: 'full' | 'changed_only' | 'incomplete_only' | string;
+  /** Live timing metrics. */
+  elapsed_seconds?: number | null;
+  phase_rate?: number | null;
+  phase_progress?: number | null;
 }
 
 export interface CacheControlMetrics {
@@ -378,6 +418,12 @@ export interface CacheControlMetrics {
     enabled?: boolean;
     available?: boolean;
     reason?: string;
+    restart_in_progress?: boolean;
+    consecutive_failures?: number;
+    last_restart_duration_ms?: number | null;
+    last_error?: string;
+    last_restart_started_at?: number | null;
+    last_restart_ended_at?: number | null;
     roots: string[];
     dirty_count: number;
     last_event_at?: number | null;
@@ -560,6 +606,10 @@ export interface PMDAConfig {
   LIBRARY_INCLUDE_UNMATCHED?: boolean;
   /** File-library roots (comma-separated string in UI). */
   FILES_ROOTS?: string;
+  /** Canonical winner source root id for dedupe winner placement. */
+  WINNER_SOURCE_ROOT_ID?: string;
+  /** Winner placement strategy for canonical root normalization. */
+  LIBRARY_WINNER_PLACEMENT_STRATEGY?: 'move' | 'hardlink' | 'symlink' | 'copy';
   /** Root folder for the clean export library. */
   EXPORT_ROOT?: string;
   /** Naming template used when exporting via hardlinks/symlinks/copies. */
@@ -584,10 +634,21 @@ export interface PMDAConfig {
   AUTO_EXPORT_LIBRARY?: boolean;
   
   // AI Provider
-  AI_PROVIDER: 'openai' | 'anthropic' | 'google' | 'ollama';
+  AI_PROVIDER: 'openai' | 'openai-api' | 'openai-codex' | 'anthropic' | 'google' | 'ollama';
   /** Global AI usage profile across matching/dedupe/vision flow. */
   AI_USAGE_LEVEL?: 'limited' | 'medium' | 'aggressive';
   OPENAI_API_KEY: string;
+  OPENAI_API_KEY_SET?: boolean;
+  OPENAI_ENABLE_API_KEY_MODE?: boolean;
+  OPENAI_ENABLE_CODEX_OAUTH_MODE?: boolean;
+  OPENAI_OAUTH_REFRESH_TOKEN_SET?: boolean;
+  OPENAI_AUTH_MODE?: 'none' | 'api_key' | 'oauth_api_key' | 'oauth_connected_no_api_key' | string;
+  OPENAI_CODEX_OAUTH_CONNECTED?: boolean;
+  OPENAI_PROVIDER_PREF_INTERACTIVE?: string;
+  OPENAI_PROVIDER_PREF_BATCH?: string;
+  OPENAI_PROVIDER_PREF_WEB_SEARCH?: string;
+  OPENAI_PROVIDER_EFFECTIVE_INTERACTIVE?: string;
+  OPENAI_PROVIDER_EFFECTIVE_BATCH?: string;
   OPENAI_MODEL: string;
   OPENAI_MODEL_FALLBACKS: string;
   ANTHROPIC_API_KEY: string;
@@ -611,6 +672,8 @@ export interface PMDAConfig {
   USE_AI_FOR_MB_VERIFY?: boolean;
   /** Use AI arbitration for ambiguous duplicate groups. */
   USE_AI_FOR_DEDUPE?: boolean;
+  /** When enabled, PMDA can auto-generate album reviews/descriptions for SOFT_MATCH albums. */
+  USE_AI_FOR_SOFT_MATCH_PROFILES?: boolean;
   /** After AI text match, compare local cover to Cover Art Archive (vision). Reject match if "No". */
   USE_AI_VISION_FOR_COVER?: boolean;
   /** Minimum AI confidence (0–100). Below this, reject match and try other sources. 0 = accept all. */
@@ -637,6 +700,12 @@ export interface PMDAConfig {
   USE_ACOUSTID_WHEN_TAGGED?: boolean;
   /** When no MB candidate or AI says NONE, use web search (Serper) + AI to suggest MBID. */
   USE_WEB_SEARCH_FOR_MB?: boolean;
+  /** When Serper is unavailable (missing key/no credits), fallback to OpenAI native web search tool. */
+  USE_AI_WEB_SEARCH_FALLBACK?: boolean;
+  /** Hard cap for total AI calls per scan (0 = disable AI calls during scan). */
+  AI_MAX_CALLS_PER_SCAN?: number;
+  /** Minimum delay between AI calls in scan flows. */
+  AI_CALL_COOLDOWN_SEC?: number;
   /** Serper.dev API key for web search. */
   SERPER_API_KEY?: string;
   // Metadata Providers
@@ -678,6 +747,22 @@ export interface PMDAConfig {
   PIPELINE_ENABLE_EXPORT?: boolean;
   PIPELINE_ENABLE_PLAYER_SYNC?: boolean;
   PIPELINE_PLAYER_TARGET?: 'none' | 'plex' | 'jellyfin' | 'navidrome';
+  PIPELINE_POST_SCAN_ASYNC?: boolean;
+  TASK_NOTIFICATIONS_ENABLED?: boolean;
+  TASK_NOTIFICATIONS_SUCCESS?: boolean;
+  TASK_NOTIFICATIONS_FAILURE?: boolean;
+  TASK_NOTIFICATIONS_SILENT_INTERACTIVE_SCAN?: boolean;
+  TASK_NOTIFICATIONS_COOLDOWN_SEC?: number;
+  TASK_NOTIFY_SCAN_CHANGED?: boolean;
+  TASK_NOTIFY_SCAN_FULL?: boolean;
+  TASK_NOTIFY_ENRICH_BATCH?: boolean;
+  TASK_NOTIFY_DEDUPE?: boolean;
+  TASK_NOTIFY_INCOMPLETE_MOVE?: boolean;
+  TASK_NOTIFY_EXPORT?: boolean;
+  TASK_NOTIFY_PLAYER_SYNC?: boolean;
+  SCHEDULER_PAUSED?: boolean;
+  /** Allow scheduler to run non-scan jobs (enrich/dedupe/export/player-sync) outside scan post-chain. */
+  SCHEDULER_ALLOW_NON_SCAN_JOBS?: boolean;
   // Integrations
   LIDARR_URL: string;
   LIDARR_API_KEY: string;
@@ -718,6 +803,111 @@ export interface PlayerCheckPayload {
   NAVIDROME_API_KEY?: string;
 }
 
+export type TaskJobType =
+  | 'scan_changed'
+  | 'scan_full'
+  | 'enrich_batch'
+  | 'dedupe'
+  | 'incomplete_move'
+  | 'export'
+  | 'player_sync';
+
+export type TaskScope = 'new' | 'full' | 'both';
+export type TaskEventStatus = 'started' | 'completed' | 'failed' | 'skipped';
+
+export interface TaskEvent {
+  event_id: number;
+  run_id?: string | null;
+  job_type: TaskJobType;
+  scope: TaskScope;
+  status: TaskEventStatus;
+  message: string;
+  metrics?: Record<string, unknown>;
+  summary?: Record<string, unknown>;
+  error?: string;
+  source?: string;
+  started_at: number;
+  ended_at?: number | null;
+  duration_ms?: number | null;
+}
+
+export interface TaskEventsResponse {
+  events: TaskEvent[];
+  last_id: number;
+  server_time: number;
+}
+
+export type SchedulerTriggerType = 'interval' | 'weekly';
+
+export interface SchedulerRule {
+  rule_id?: number;
+  job_type: TaskJobType;
+  enabled: boolean;
+  trigger_type: SchedulerTriggerType;
+  interval_min?: number | null;
+  days_of_week?: string;
+  time_local?: string;
+  scope: TaskScope;
+  post_scan_chain: boolean;
+  priority: number;
+  max_concurrency: number;
+  next_run_ts?: number | null;
+  last_run_ts?: number | null;
+  created_at?: number;
+  updated_at?: number;
+}
+
+export interface SchedulerRulesResponse {
+  rules: SchedulerRule[];
+  paused: boolean;
+}
+
+export interface SchedulerRunJobPayload {
+  job_type: TaskJobType;
+  scope?: TaskScope;
+  source?: string;
+}
+
+export interface SchedulerRunJobResponse {
+  status: 'started' | 'blocked';
+  message?: string;
+  run_id?: string | null;
+}
+
+export interface SchedulerRunningJob {
+  run_id: string;
+  rule_id?: number | null;
+  job_type: TaskJobType;
+  scope: TaskScope;
+  source: string;
+  origin_scan_id?: number | null;
+  started_at: number;
+}
+
+export interface SchedulerJobStatusEntry {
+  job_run_id: string;
+  rule_id?: number | null;
+  job_type: TaskJobType;
+  scope: TaskScope;
+  source: string;
+  origin_scan_id?: number | null;
+  status: 'queued' | 'running' | 'completed' | 'failed' | 'skipped';
+  message: string;
+  metrics?: Record<string, unknown>;
+  error?: string;
+  created_at: number;
+  started_at?: number | null;
+  ended_at?: number | null;
+  duration_ms?: number | null;
+}
+
+export interface SchedulerJobsStatusResponse {
+  paused: boolean;
+  thread_alive: boolean;
+  running: SchedulerRunningJob[];
+  jobs: SchedulerJobStatusEntry[];
+}
+
 export interface ScanHistoryEntry {
   scan_id: number;
   start_time: number;
@@ -747,6 +937,10 @@ export interface ScanHistoryEntry {
   albums_without_complete_tags?: number;
   albums_without_mb_id?: number;
   albums_without_artist_mb_id?: number;
+  ai_tokens_total?: number;
+  ai_cost_usd_total?: number;
+  ai_unpriced_calls?: number;
+  ai_lifecycle_complete?: boolean;
   /** Parsed summary from scan (formats, cache, AI/MB stats, etc.) when available */
   summary_json?: ScanHistorySummaryJson | null;
   /** Human-readable list of steps executed during the scan (from summary_json.steps_executed) */
@@ -768,6 +962,10 @@ export interface ScanHistorySummaryJson {
   ai_calls_mb_verify?: number;
   ai_calls_web_mbid?: number;
   ai_calls_vision?: number;
+  ai_tokens_total?: number;
+  ai_cost_usd_total?: number;
+  ai_unpriced_calls?: number;
+  ai_lifecycle_complete?: boolean;
   // Duplicate decision telemetry
   duplicate_groups_total?: number;
   duplicate_groups_saved?: number;
@@ -825,6 +1023,78 @@ export interface ScanHistorySummaryJson {
   pmda_albums_with_artist_image?: number;
 }
 
+export type AICostGroupBy = 'analysis_type' | 'job_type' | 'model' | 'provider' | 'album' | 'auth_mode';
+
+export interface AICostEntry {
+  analysis_type?: string;
+  job_type?: string;
+  model?: string;
+  provider?: string;
+  auth_mode?: string;
+  album_id?: number | null;
+  album_artist?: string;
+  album_title?: string;
+  scope?: string;
+  calls: number;
+  input_tokens: number;
+  cached_input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  cost_usd: number;
+  cost_microusd?: number;
+  unpriced_calls?: number;
+}
+
+export interface ScanAICostTotals {
+  calls: number;
+  input_tokens: number;
+  cached_input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  cost_usd: number;
+  cost_microusd?: number;
+  unpriced_calls: number;
+}
+
+export interface ScanAICostSummary {
+  scan_id: number;
+  currency: 'USD' | string;
+  include_lifecycle: boolean;
+  group_by: AICostGroupBy;
+  limit?: number;
+  totals: ScanAICostTotals;
+  breakdown: AICostEntry[];
+  lifecycle_complete: boolean;
+  last_updated_at?: number | null;
+}
+
+export interface BenchmarkCheckResult {
+  name: string;
+  pass: boolean;
+  weight: number;
+  detail?: string;
+}
+
+export interface BenchmarkReportSummary {
+  file: string;
+  generated_at: number;
+  scan_id: number;
+  score: number;
+  earned_weight: number;
+  total_weight: number;
+  check_count: number;
+  pass_count: number;
+  fail_count: number;
+  failed_checks: string[];
+  checks: BenchmarkCheckResult[];
+}
+
+export interface BenchmarkReportsResponse {
+  available: boolean;
+  path: string;
+  reports: BenchmarkReportSummary[];
+}
+
 export interface ScanHistoryEntryOld {
   scan_id: number;
   start_time: number;
@@ -870,6 +1140,28 @@ export interface ScanMove {
   fmt_text?: string;
   /** Move reason: dedupe | incomplete */
   move_reason?: 'dedupe' | 'incomplete' | string;
+  /** Dedupe winner metadata (when move_reason=dedupe). */
+  winner_album_id?: number | null;
+  winner_title?: string;
+  winner_path?: string;
+  /** Pipeline decision metadata captured at move time. */
+  decision_source?: string;
+  decision_provider?: string;
+  decision_reason?: string;
+  decision_confidence?: number | null;
+  /** Full move review payload (winner/loser analysis or incomplete diagnostics). */
+  details?: Record<string, unknown>;
+}
+
+export interface ScanMovesSummary {
+  scan_id: number;
+  total_moved: number;
+  pending: number;
+  restored: number;
+  size_mb: number;
+  first_moved_at?: number | null;
+  last_moved_at?: number | null;
+  by_reason: Record<string, { total_moved: number; pending: number; restored: number; size_mb: number }>;
 }
 
 type ApiError = Error & { response?: Response; body?: unknown };
@@ -1850,6 +2142,7 @@ export interface AlbumDetailResponse {
   cover_url?: string | null;
   bandcamp_album_url?: string | null;
   metadata_source?: string | null;
+  metadata_source_url?: string | null;
   artist_id: number;
   artist_name: string;
   review?: AlbumDetailReview;
@@ -1859,6 +2152,338 @@ export interface AlbumDetailResponse {
 export async function getAlbumDetail(albumId: number): Promise<AlbumDetailResponse> {
   return fetchApi<AlbumDetailResponse>(`/api/library/album/${encodeURIComponent(String(albumId))}`, {
     timeoutMs: 30000,
+  });
+}
+
+export interface AlbumTrackDetailItem extends AlbumDetailTrack {
+  tags?: Record<string, string>;
+  tags_error?: string | null;
+}
+
+export interface AlbumTrackDetailsResponse {
+  album_id: number;
+  artist_name: string;
+  album_title: string;
+  tracks: AlbumTrackDetailItem[];
+}
+
+export async function getAlbumTrackDetails(albumId: number, includeTags = true): Promise<AlbumTrackDetailsResponse> {
+  const q = new URLSearchParams();
+  q.set('include_tags', includeTags ? '1' : '0');
+  return fetchApi<AlbumTrackDetailsResponse>(
+    `/api/library/album/${encodeURIComponent(String(albumId))}/tracks/detail?${q.toString()}`,
+    { timeoutMs: 60000 }
+  );
+}
+
+export interface MatchProviderAttempt {
+  provider: string;
+  label: string;
+  attempted: boolean;
+  selected: boolean;
+  id?: string | null;
+  url?: string | null;
+  notes?: string[];
+}
+
+export interface MatchAuditRecord {
+  id: number;
+  run_kind: string;
+  status: string;
+  match_type?: 'MATCH' | 'SOFT_MATCH' | 'NO_MATCH' | null;
+  confidence?: number | null;
+  ai_used: boolean;
+  ai_confidence?: number | null;
+  provider_used?: string | null;
+  summary?: string | null;
+  created_at: number;
+  details?: Record<string, unknown>;
+  album_id?: number;
+}
+
+export interface ProviderCrosscheckItem {
+  provider: string;
+  label: string;
+  attempted: boolean;
+  selected: boolean;
+  provider_id?: string | null;
+  source_url?: string | null;
+  title?: string | null;
+  artist?: string | null;
+  year?: number | null;
+  cover_url?: string | null;
+  track_count: number;
+  local_track_count: number;
+  title_score: number;
+  artist_score: number;
+  track_score: number;
+  confidence: number;
+  strict_match_verified: boolean;
+  strict_reject_reason?: string | null;
+  soft_match_ok: boolean;
+  soft_match_reason?: string | null;
+  has_review: boolean;
+  ai_used: boolean;
+  ai_confidence?: number | null;
+  versions_count?: number | null;
+  versions?: Array<{
+    id: string;
+    title?: string | null;
+    date?: string | null;
+    country?: string | null;
+    status?: string | null;
+    url?: string | null;
+  }>;
+}
+
+export interface AlbumAlternativeCover {
+  provider: string;
+  label: string;
+  cover_url: string;
+  source_url?: string | null;
+  selected: boolean;
+}
+
+export interface AlbumMatchDetailResponse {
+  album_id: number;
+  album_title: string;
+  artist_id: number;
+  artist_name: string;
+  year?: number | null;
+  track_count: number;
+  match_type: 'MATCH' | 'SOFT_MATCH' | 'NO_MATCH';
+  confidence?: number | null;
+  decision: {
+    strict_match_verified: boolean;
+    strict_match_provider?: string | null;
+    strict_reject_reason?: string | null;
+    strict_tracklist_score: number;
+    selected_provider?: string | null;
+    metadata_source?: string | null;
+  };
+  pmda: {
+    id?: string | null;
+    matched: boolean;
+    cover: boolean;
+    artist_image: boolean;
+    complete: boolean;
+    match_provider?: string | null;
+    cover_provider?: string | null;
+    artist_provider?: string | null;
+  };
+  ai?: {
+    used: boolean;
+    confidence?: number | null;
+    source?: string | null;
+  };
+  identity: {
+    musicbrainz_release_group_id?: string | null;
+    discogs_release_id?: string | null;
+    lastfm_album_mbid?: string | null;
+    bandcamp_album_url?: string | null;
+  };
+  cover: {
+    has_cover: boolean;
+    provider?: string | null;
+    origin: string;
+    path?: string | null;
+    url?: string | null;
+  };
+  artist_image: {
+    has_image: boolean;
+    provider?: string | null;
+    mode: string;
+    source_url?: string | null;
+    url?: string | null;
+  };
+  description: {
+    album_profile_source?: string | null;
+    album_profile_updated_at?: number | null;
+    artist_profile_source?: string | null;
+    artist_profile_updated_at?: number | null;
+    soft_match_ai_auto_enabled?: boolean;
+  };
+  providers_order: string[];
+  provider_attempts: MatchProviderAttempt[];
+  provider_crosscheck?: ProviderCrosscheckItem[];
+  links: Array<{
+    provider: string;
+    label: string;
+    url: string;
+    release_title?: string | null;
+    release_artist?: string | null;
+    release_year?: number | null;
+    provider_ref?: string | null;
+  }>;
+  alternative_covers?: AlbumAlternativeCover[];
+  versions?: {
+    has_alternatives: boolean;
+    provider?: string | null;
+    count: number;
+    source_url?: string | null;
+    items: Array<{
+      id: string;
+      title?: string | null;
+      date?: string | null;
+      country?: string | null;
+      status?: string | null;
+      url?: string | null;
+    }>;
+  };
+  latest_manual_run?: MatchAuditRecord | null;
+  history: MatchAuditRecord[];
+  updated_at?: number | null;
+}
+
+export interface ArtistMatchDetailAlbum {
+  album_id: number;
+  album_title: string;
+  year?: number | null;
+  match_type: 'MATCH' | 'SOFT_MATCH' | 'NO_MATCH';
+  confidence?: number | null;
+  selected_provider?: string | null;
+  strict_match_verified: boolean;
+  strict_match_provider?: string | null;
+  strict_reject_reason?: string | null;
+  strict_tracklist_score: number;
+  metadata_source?: string | null;
+  identity: {
+    musicbrainz_release_group_id?: string | null;
+    discogs_release_id?: string | null;
+    lastfm_album_mbid?: string | null;
+    bandcamp_album_url?: string | null;
+  };
+  cover: {
+    has_cover: boolean;
+    origin: string;
+    url?: string | null;
+  };
+  links: Array<{
+    provider: string;
+    label: string;
+    url: string;
+    release_title?: string | null;
+    release_artist?: string | null;
+    release_year?: number | null;
+    provider_ref?: string | null;
+  }>;
+  updated_at?: number;
+}
+
+export interface ArtistMatchDetailResponse {
+  artist_id: number;
+  artist_name: string;
+  album_count: number;
+  artist_profile_source?: string | null;
+  artist_profile_updated_at?: number | null;
+  artist_image: {
+    has_image: boolean;
+    mode: string;
+    provider?: string | null;
+    source_url?: string | null;
+    url?: string | null;
+  };
+  summary: {
+    matched: number;
+    soft_matched: number;
+    not_matched: number;
+    total: number;
+  };
+  albums: ArtistMatchDetailAlbum[];
+  history: MatchAuditRecord[];
+  updated_at?: number;
+}
+
+export interface RematchAlbumResponse {
+  summary?: string;
+  steps?: string[];
+  tags_updated?: boolean;
+  cover_saved?: boolean;
+  provider_used?: string | null;
+  files_updated?: number;
+  mutation_blocked?: boolean;
+  mutation_blocked_reason?: string;
+  strict_match_verified?: boolean;
+  strict_match_provider?: string;
+  strict_reject_reason?: string;
+  strict_tracklist_score?: number;
+  audit_recorded?: boolean;
+}
+
+export interface GenerateAlbumReviewResponse {
+  ok: boolean;
+  album_id: number;
+  artist_id?: number;
+  source?: string;
+  used_ai?: boolean;
+  updated_at?: number;
+}
+
+export interface EnrichArtistAiResponse {
+  started: boolean;
+  artist_id: number;
+  artist_name?: string;
+  albums_total?: number;
+  profiles_targeted?: number;
+  mode?: string;
+}
+
+export async function getAlbumMatchDetail(albumId: number): Promise<AlbumMatchDetailResponse> {
+  return fetchApi<AlbumMatchDetailResponse>(`/api/library/album/${encodeURIComponent(String(albumId))}/match-detail`);
+}
+
+export async function getArtistMatchDetail(artistId: number): Promise<ArtistMatchDetailResponse> {
+  return fetchApi<ArtistMatchDetailResponse>(`/api/library/artist/${encodeURIComponent(String(artistId))}/match-detail`);
+}
+
+export async function rematchAlbum(albumId: number): Promise<RematchAlbumResponse> {
+  return fetchApi<RematchAlbumResponse>(`/api/library/album/${encodeURIComponent(String(albumId))}/rematch`, {
+    method: 'POST',
+    body: JSON.stringify({}),
+  });
+}
+
+export async function generateAlbumReview(albumId: number): Promise<GenerateAlbumReviewResponse> {
+  return fetchApi<GenerateAlbumReviewResponse>(`/api/library/album/${encodeURIComponent(String(albumId))}/review/generate`, {
+    method: 'POST',
+    body: JSON.stringify({}),
+  });
+}
+
+export async function enrichArtistWithAI(artistId: number): Promise<EnrichArtistAiResponse> {
+  return fetchApi<EnrichArtistAiResponse>(`/api/library/artist/${encodeURIComponent(String(artistId))}/ai/enrich`, {
+    method: 'POST',
+    body: JSON.stringify({}),
+  });
+}
+
+export async function rematchArtist(artistId: number): Promise<{ started: boolean; total: number }> {
+  return fetchApi<{ started: boolean; total: number }>(`/api/library/artist/${encodeURIComponent(String(artistId))}/rematch`, {
+    method: 'POST',
+    body: JSON.stringify({}),
+  });
+}
+
+export interface SelectAlbumCoverResponse {
+  ok: boolean;
+  album_id: number;
+  provider: string;
+  cover_url: string;
+  cover_path: string;
+  source_url?: string | null;
+}
+
+export async function selectAlbumCover(
+  albumId: number,
+  payload: { cover_url: string; provider?: string | null; source_url?: string | null }
+): Promise<SelectAlbumCoverResponse> {
+  return fetchApi<SelectAlbumCoverResponse>(`/api/library/album/${encodeURIComponent(String(albumId))}/cover/select`, {
+    method: 'POST',
+    body: JSON.stringify({
+      cover_url: payload.cover_url,
+      provider: payload.provider || null,
+      source_url: payload.source_url || null,
+    }),
   });
 }
 
@@ -2042,6 +2667,11 @@ export async function getCacheControlMetrics(force: boolean = false): Promise<Ca
   return fetchApi<CacheControlMetrics>(`/api/statistics/cache-control${force ? '?force=true' : ''}`);
 }
 
+export async function getBenchmarkReports(limit: number = 40): Promise<BenchmarkReportsResponse> {
+  const safeLimit = Number.isFinite(limit) ? Math.max(1, Math.min(200, Math.trunc(limit))) : 40;
+  return fetchApi<BenchmarkReportsResponse>(`/api/statistics/benchmark-reports?limit=${safeLimit}`);
+}
+
 export async function getScanLogsTail(lines: number = 180): Promise<LogTailResponse> {
   const n = Number.isFinite(lines) ? Math.max(20, Math.min(1200, Math.trunc(lines))) : 180;
   return fetchApi<LogTailResponse>(`/api/logs/tail?lines=${n}`);
@@ -2052,6 +2682,7 @@ export interface ScanPreflightResult {
   ai: { ok: boolean; message: string; provider: string };
   discogs?: { ok: boolean; message: string };
   lastfm?: { ok: boolean; message: string };
+  fanart?: { ok: boolean; message: string };
   bandcamp?: { ok: boolean; message: string };
   serper?: { ok: boolean; message: string };
   acoustid?: { ok: boolean; message: string };
@@ -2081,12 +2712,132 @@ export interface StartScanOptions {
   run_improve_after?: boolean;
 }
 
-export async function startScan(options?: StartScanOptions): Promise<{ status: string; scan_type?: string; run_improve_after?: boolean }> {
+export interface StartScanResponse {
+  status: 'started' | 'ok' | string;
+  scan_type?: string;
+  default_scan_type?: string;
+  reason?: string;
+  message?: string;
+  active_scan_type?: string;
+  started_at?: number | null;
+  run_improve_after?: boolean;
+  ai_enabled?: boolean;
+  ai_warning?: string | null;
+}
+
+export interface FilesWatcherStatus {
+  running: boolean;
+  enabled: boolean;
+  available: boolean;
+  degraded_mode?: boolean;
+  reason: string;
+  dirty_count: number;
+  dirty_count_by_root?: Record<string, number>;
+  last_event_at?: number | null;
+  last_event_path?: string | null;
+  restart_in_progress: boolean;
+  consecutive_failures: number;
+  last_restart_duration_ms?: number | null;
+  last_error?: string;
+  last_restart_started_at?: number | null;
+  last_restart_ended_at?: number | null;
+  roots?: string[];
+}
+
+export interface FilesWatcherRestartResponse {
+  status: 'accepted' | string;
+  requested_at: number;
+}
+
+export async function startScan(options?: StartScanOptions): Promise<StartScanResponse> {
   return fetchApi('/scan/start', {
     method: 'POST',
     body: options ? JSON.stringify(options) : undefined,
     headers: options ? { 'Content-Type': 'application/json' } : undefined,
   });
+}
+
+export async function getFilesWatcherStatus(): Promise<FilesWatcherStatus> {
+  return fetchApi<FilesWatcherStatus>('/api/files/watcher/status');
+}
+
+export async function restartFilesWatcher(): Promise<FilesWatcherRestartResponse> {
+  return fetchApi<FilesWatcherRestartResponse>('/api/files/watcher/restart', { method: 'POST' });
+}
+
+export interface ScanDefaultsResponse {
+  default_scan_type: 'full' | 'changed_only' | 'incomplete_only' | string;
+  bootstrap_required: boolean;
+  autonomous_mode: boolean;
+  has_completed_full_scan: boolean;
+  first_full_scan_id?: number | null;
+  first_full_completed_at?: number | null;
+}
+
+export interface BootstrapStatus {
+  bootstrap_required: boolean;
+  autonomous_mode: boolean;
+  first_full_scan_id?: number | null;
+  first_full_completed_at?: number | null;
+  default_scan_type?: 'full' | 'changed_only' | 'incomplete_only' | string;
+}
+
+export interface FileSourceRoot {
+  source_id?: number;
+  path: string;
+  role: 'library' | 'incoming';
+  enabled: boolean;
+  priority: number;
+  is_winner_root?: boolean;
+  created_at?: number;
+  updated_at?: number;
+}
+
+export interface FileSourcesResponse {
+  roots: FileSourceRoot[];
+  winner_source_root_id?: number | null;
+  winner_placement_strategy?: 'move' | 'hardlink' | 'symlink' | 'copy';
+  status?: string;
+}
+
+export interface IncomingDeltaStatus {
+  pending_folders: number;
+  oldest_event_at?: number | null;
+  last_processed_at?: number | null;
+  errors?: string[];
+  pending_by_source?: Record<string, number>;
+  incoming_source_ids?: number[];
+}
+
+export async function getScanDefaults(): Promise<ScanDefaultsResponse> {
+  return fetchApi<ScanDefaultsResponse>('/api/scan/defaults');
+}
+
+export async function getPipelineBootstrapStatus(): Promise<BootstrapStatus> {
+  return fetchApi<BootstrapStatus>('/api/pipeline/bootstrap/status');
+}
+
+export async function getFileSources(): Promise<FileSourcesResponse> {
+  return fetchApi<FileSourcesResponse>('/api/files/sources');
+}
+
+export async function updateFileSources(payload: {
+  roots: FileSourceRoot[];
+  winner_source_root_id?: number | null;
+  winner_placement_strategy?: 'move' | 'hardlink' | 'symlink' | 'copy';
+}): Promise<FileSourcesResponse> {
+  return fetchApi<FileSourcesResponse>('/api/files/sources', {
+    method: 'PUT',
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function getIncomingStatus(): Promise<IncomingDeltaStatus> {
+  return fetchApi<IncomingDeltaStatus>('/api/incoming/status');
+}
+
+export async function triggerIncomingRescan(): Promise<{ status: string; reason?: string; message?: string }> {
+  return fetchApi<{ status: string; reason?: string; message?: string }>('/api/incoming/rescan', { method: 'POST' });
 }
 
 export interface IncompleteScanProgress {
@@ -2168,6 +2919,31 @@ export async function clearScan(options: ClearScanOptions = {}): Promise<ClearSc
   return fetchApi<ClearScanResult>('/api/scan/clear', {
     method: 'POST',
     body: JSON.stringify(options),
+  });
+}
+
+export type MaintenanceResetAction = 'media_cache' | 'state_db' | 'cache_db' | 'settings_db' | 'files_index';
+
+export interface MaintenanceResetRequest {
+  actions: MaintenanceResetAction[];
+  restart?: boolean;
+  confirm_settings_db?: boolean;
+}
+
+export interface MaintenanceResetResponse {
+  status: 'ok' | 'partial' | 'error' | 'blocked';
+  message: string;
+  actions: MaintenanceResetAction[];
+  results: Record<string, unknown>;
+  warnings?: string[];
+  errors?: string[];
+  restart_initiated?: boolean;
+}
+
+export async function runMaintenanceReset(payload: MaintenanceResetRequest): Promise<MaintenanceResetResponse> {
+  return fetchApi<MaintenanceResetResponse>('/api/admin/maintenance/reset', {
+    method: 'POST',
+    body: JSON.stringify(payload),
   });
 }
 
@@ -2322,6 +3098,7 @@ export interface AuthUser {
   username: string;
   is_admin: boolean;
   can_download: boolean;
+  can_view_statistics: boolean;
   is_active: boolean;
   created_at: number;
   updated_at: number;
@@ -2341,12 +3118,14 @@ export interface AuthBootstrapRequest {
 export interface AuthLoginRequest {
   username: string;
   password: string;
+  remember_me?: boolean;
 }
 
 export interface AuthLoginResponse {
   ok: boolean;
   token: string;
   expires_at: number;
+  remember_me?: boolean;
   user: AuthUser;
 }
 
@@ -2365,6 +3144,7 @@ export interface AdminUserCreateRequest {
   password_confirm: string;
   is_admin?: boolean;
   can_download?: boolean;
+  can_view_statistics?: boolean;
   is_active?: boolean;
 }
 
@@ -2373,12 +3153,19 @@ export interface AdminUserUpdateRequest {
   password?: string;
   is_admin?: boolean;
   can_download?: boolean;
+  can_view_statistics?: boolean;
   is_active?: boolean;
 }
 
 export interface AdminUserMutationResponse {
   ok: boolean;
   user: AuthUser;
+}
+
+export interface AdminUserDeleteResponse {
+  ok: boolean;
+  deleted_user_id: number;
+  username?: string;
 }
 
 export async function getAuthBootstrapStatus(): Promise<AuthBootstrapStatusResponse> {
@@ -2425,6 +3212,12 @@ export async function updateAdminUser(userId: number, payload: AdminUserUpdateRe
   });
 }
 
+export async function deleteAdminUser(userId: number): Promise<AdminUserDeleteResponse> {
+  return fetchApi<AdminUserDeleteResponse>(`/api/admin/users/${encodeURIComponent(String(userId))}`, {
+    method: 'DELETE',
+  });
+}
+
 export async function getConfig(): Promise<ConfigResponse> {
   try {
     return await fetchApi<ConfigResponse>('/api/config');
@@ -2438,6 +3231,42 @@ export async function saveConfig(config: Partial<PMDAConfig>): Promise<{ status:
     method: 'PUT',
     body: JSON.stringify(config),
   });
+}
+
+export async function getTaskEvents(afterId = 0, limit = 100): Promise<TaskEventsResponse> {
+  const safeAfter = Math.max(0, Number(afterId) || 0);
+  const safeLimit = Math.max(1, Math.min(500, Number(limit) || 100));
+  return fetchApi<TaskEventsResponse>(`/api/events/tasks?after_id=${safeAfter}&limit=${safeLimit}`);
+}
+
+export async function getSchedulerRules(): Promise<SchedulerRulesResponse> {
+  return fetchApi<SchedulerRulesResponse>('/api/scheduler/rules');
+}
+
+export async function saveSchedulerRules(rules: SchedulerRule[]): Promise<SchedulerRulesResponse & { status: string }> {
+  return fetchApi<SchedulerRulesResponse & { status: string }>('/api/scheduler/rules', {
+    method: 'PUT',
+    body: JSON.stringify({ rules }),
+  });
+}
+
+export async function runSchedulerJob(payload: SchedulerRunJobPayload): Promise<SchedulerRunJobResponse> {
+  return fetchApi<SchedulerRunJobResponse>('/api/scheduler/jobs/run', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function pauseSchedulerJobs(): Promise<{ status: string; paused: boolean }> {
+  return fetchApi<{ status: string; paused: boolean }>('/api/scheduler/jobs/pause', { method: 'POST' });
+}
+
+export async function resumeSchedulerJobs(): Promise<{ status: string; paused: boolean }> {
+  return fetchApi<{ status: string; paused: boolean }>('/api/scheduler/jobs/resume', { method: 'POST' });
+}
+
+export async function getSchedulerJobsStatus(): Promise<SchedulerJobsStatusResponse> {
+  return fetchApi<SchedulerJobsStatusResponse>('/api/scheduler/jobs/status');
 }
 
 /** Files backend: start rebuild of export library (hardlinks/symlinks/copies/moves). */
@@ -2545,16 +3374,65 @@ export interface OpenAIDeviceOAuthPollResponse {
   api_key_saved?: boolean;
 }
 
+export interface OpenAICodexOAuthStatusResponse {
+  connected: boolean;
+  profile_connected?: boolean;
+  ready?: boolean;
+  provider_id?: string;
+  auth_mode?: string;
+  account_id?: string;
+  expires_at?: number | null;
+  expires_in_sec?: number | null;
+  has_refresh_token?: boolean;
+  metadata?: Record<string, unknown>;
+  error?: string;
+}
+
+export interface AIProviderPreferencesResponse {
+  interactive_provider_id: string;
+  batch_provider_id: string;
+  web_search_provider_id: string;
+  codex_connected?: boolean;
+  effective?: {
+    interactive_provider_id?: string;
+    batch_provider_id?: string;
+    web_search_provider_id?: string;
+  };
+}
+
 export async function startOpenAIDeviceOAuth(): Promise<OpenAIDeviceOAuthStartResponse> {
-  return fetchApi<OpenAIDeviceOAuthStartResponse>('/api/openai/oauth/device/start', {
+  return fetchApi<OpenAIDeviceOAuthStartResponse>('/api/ai/providers/openai-codex/oauth/device/start', {
     method: 'POST',
   });
 }
 
 export async function pollOpenAIDeviceOAuth(sessionId: string): Promise<OpenAIDeviceOAuthPollResponse> {
-  return fetchApi<OpenAIDeviceOAuthPollResponse>('/api/openai/oauth/device/poll', {
+  return fetchApi<OpenAIDeviceOAuthPollResponse>('/api/ai/providers/openai-codex/oauth/device/poll', {
     method: 'POST',
     body: JSON.stringify({ session_id: sessionId }),
+  });
+}
+
+export async function getOpenAICodexOAuthStatus(): Promise<OpenAICodexOAuthStatusResponse> {
+  return fetchApi<OpenAICodexOAuthStatusResponse>('/api/ai/providers/openai-codex/oauth/status');
+}
+
+export async function disconnectOpenAICodexOAuth(): Promise<{ ok: boolean; message?: string }> {
+  return fetchApi<{ ok: boolean; message?: string }>('/api/ai/providers/openai-codex/oauth/disconnect', {
+    method: 'POST',
+  });
+}
+
+export async function getAIProviderPreferences(): Promise<AIProviderPreferencesResponse> {
+  return fetchApi<AIProviderPreferencesResponse>('/api/ai/providers/preferences');
+}
+
+export async function saveAIProviderPreferences(
+  payload: Pick<AIProviderPreferencesResponse, 'interactive_provider_id' | 'batch_provider_id' | 'web_search_provider_id'>
+): Promise<AIProviderPreferencesResponse & { status?: string }> {
+  return fetchApi<AIProviderPreferencesResponse & { status?: string }>('/api/ai/providers/preferences', {
+    method: 'PUT',
+    body: JSON.stringify(payload),
   });
 }
 
@@ -2570,7 +3448,7 @@ export async function getOpenAIModels(apiKey: string): Promise<string[]> {
 }
 
 export async function getAIModels(
-  provider: 'openai' | 'anthropic' | 'google' | 'ollama',
+  provider: 'openai' | 'openai-api' | 'openai-codex' | 'anthropic' | 'google' | 'ollama',
   credentials: { apiKey?: string; url?: string }
 ): Promise<string[]> {
   try {
@@ -2584,7 +3462,7 @@ export async function getAIModels(
       if (!credentials.apiKey?.trim()) {
         throw new Error('API key is required');
       }
-      if (provider === 'openai') {
+      if (provider === 'openai' || provider === 'openai-api' || provider === 'openai-codex') {
         body.OPENAI_API_KEY = credentials.apiKey.trim();
       } else if (provider === 'anthropic') {
         body.ANTHROPIC_API_KEY = credentials.apiKey.trim();
@@ -2643,8 +3521,32 @@ export async function getScanDetails(scanId: number): Promise<ScanHistoryEntry> 
   return fetchApi<ScanHistoryEntry>(`/api/scan-history/${scanId}`);
 }
 
-export async function getScanMoves(scanId: number): Promise<ScanMove[]> {
-  return fetchApi<ScanMove[]>(`/api/scan-history/${scanId}/moves`);
+export async function getScanAICostSummary(
+  scanId: number,
+  options?: { includeLifecycle?: boolean; groupBy?: AICostGroupBy; limit?: number },
+): Promise<ScanAICostSummary> {
+  const params = new URLSearchParams();
+  params.set('include_lifecycle', options?.includeLifecycle === false ? 'false' : 'true');
+  params.set('group_by', options?.groupBy || 'analysis_type');
+  if (typeof options?.limit === 'number' && Number.isFinite(options.limit) && options.limit > 0) {
+    params.set('limit', String(Math.trunc(options.limit)));
+  }
+  return fetchApi<ScanAICostSummary>(`/api/scans/${scanId}/ai-costs?${params.toString()}`);
+}
+
+export async function getScanMoves(
+  scanId: number,
+  options?: { reason?: 'dedupe' | 'incomplete'; status?: 'all' | 'active' | 'restored' }
+): Promise<ScanMove[]> {
+  const params = new URLSearchParams();
+  if (options?.reason) params.set('reason', options.reason);
+  if (options?.status) params.set('status', options.status);
+  const qs = params.toString();
+  return fetchApi<ScanMove[]>(`/api/scan-history/${scanId}/moves${qs ? `?${qs}` : ''}`);
+}
+
+export async function getScanMovesSummary(scanId: number): Promise<ScanMovesSummary> {
+  return fetchApi<ScanMovesSummary>(`/api/scan-history/${scanId}/moves/summary`);
 }
 
 export interface RestoreMovesResult {
