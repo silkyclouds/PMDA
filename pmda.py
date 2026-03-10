@@ -38225,7 +38225,9 @@ def api_config_get():
     navidrome_key_eff = get_setting("NAVIDROME_API_KEY", NAVIDROME_API_KEY)
     user_id_eff = _current_user_id_or_zero()
     provider_prefs_eff = _get_ai_provider_preferences(user_id_eff)
-    codex_connected_eff = _openai_codex_connected(user_id_eff, require_token=True)
+    # Keep /api/config fast: do not trigger token refresh/validation here.
+    # Detailed runtime readiness is exposed via /api/ai/providers/openai-codex/oauth/status.
+    codex_connected_eff = _openai_codex_connected(user_id_eff, require_token=False)
     openai_effective_interactive = select_provider_id(
         context="interactive",
         preferred=str(provider_prefs_eff.get("interactive_provider_id") or "openai-codex"),
@@ -38471,7 +38473,8 @@ def api_ai_provider_preferences_get():
                 "batch_provider_id": _resolve_provider_for_runtime("openai", "scan_pipeline"),
                 "web_search_provider_id": _resolve_provider_for_runtime("openai", "web_search"),
             },
-            "codex_connected": bool(_openai_codex_connected(user_id, require_token=True)),
+            # Presence-level signal only (fast, no token refresh).
+            "codex_connected": bool(_openai_codex_connected(user_id, require_token=False)),
         }
     )
 
