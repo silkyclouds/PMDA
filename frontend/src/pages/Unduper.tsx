@@ -1,14 +1,17 @@
 import { useState, useMemo, useCallback, useEffect, useRef } from 'react';
-import { Trash2, Loader2, GitMerge } from 'lucide-react';
+import { Trash2, Loader2, GitMerge, Undo2 } from 'lucide-react';
 import { toast } from 'sonner';
 import { useQueryClient } from '@tanstack/react-query';
+import { useSearchParams } from 'react-router-dom';
 import { SearchInput } from '@/components/SearchInput';
 import { ListModeToggle, type ListMode } from '@/components/ListModeToggle';
 import { DuplicateTable } from '@/components/DuplicateTable';
 import { DetailModal } from '@/components/DetailModal';
 import { Pagination } from '@/components/Pagination';
 import { EmptyState } from '@/components/EmptyState';
+import { ProviderBadge } from '@/components/providers/ProviderBadge';
 import { Button } from '@/components/ui/button';
+import { Badge } from '@/components/ui/badge';
 import {
   useDuplicates,
   useScanControls,
@@ -16,9 +19,9 @@ import {
   useSelection,
 } from '@/hooks/usePMDA';
 import { useScanProgressShared } from '@/hooks/useScanProgressShared';
-import { getLibraryStats } from '@/lib/api';
+import { getLibraryStats, getScanMoves, restoreMoves } from '@/lib/api';
 import { useQuery } from '@tanstack/react-query';
-import type { DuplicateCard as DuplicateCardType, DedupeCurrentGroup } from '@/lib/api';
+import type { DuplicateCard as DuplicateCardType, DedupeCurrentGroup, ScanMove } from '@/lib/api';
 import { formatETA } from '@/lib/utils';
 
 const ITEMS_PER_PAGE = 50;
@@ -63,6 +66,13 @@ function DedupeCurrentGroupCard({ group }: { group: DedupeCurrentGroup }) {
 }
 
 export default function Unduper() {
+  const [searchParams] = useSearchParams();
+  const reviewScanId = useMemo(() => {
+    const raw = searchParams.get('scan_id');
+    const parsed = Number(raw);
+    return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : null;
+  }, [searchParams]);
+
   // View state
   const [listMode, setListMode] = useState<ListMode>(() => {
     return (localStorage.getItem('pmda-list-mode') as ListMode) || 'compact';
@@ -71,6 +81,9 @@ export default function Unduper() {
   const [currentPage, setCurrentPage] = useState(1);
   const [selectedDuplicate, setSelectedDuplicate] = useState<DuplicateCardType | null>(null);
   const [dedupingId, setDedupingId] = useState<string | null>(null);
+  const [restoringMoveIds, setRestoringMoveIds] = useState<Set<number>>(new Set());
+  const [restoringAllMoves, setRestoringAllMoves] = useState(false);
+  const [reviewMovesFilter, setReviewMovesFilter] = useState<'all' | 'active' | 'restored'>('all');
 
   // Data hooks (refetch duplicates every 2s during scan so list grows as artists finish, 1s during dedupe)
   const { progress: scanProgress, dedupeProgress } = useScanProgressShared({ pollInterval: 2500 });
@@ -84,6 +97,13 @@ export default function Unduper() {
     queryFn: () => getLibraryStats(),
     staleTime: 60000,
     retry: 2,
+  });
+  const { data: reviewScanMoves = [], isLoading: loadingReviewScanMoves, refetch: refetchReviewScanMoves } = useQuery({
+    queryKey: ['scan-moves-review-dedupe', reviewScanId],
+    queryFn: () => getScanMoves(reviewScanId as number, { reason: 'dedupe', status: 'all' }),
+    enabled: Boolean(reviewScanId),
+    staleTime: 5000,
+    refetchInterval: 5000,
   });
   const queryClient = useQueryClient();
   const scanControls = useScanControls();
@@ -139,6 +159,23 @@ export default function Unduper() {
   };
 
   const showLibraryStatsHint = !loadingDuplicates && filteredDuplicates.length === 0 && libraryStatsError != null;
+  const dedupeMovesForReviewAll = useMemo(
+    () =>
+      (reviewScanMoves || []).filter(
+        (m: ScanMove) => (m.move_reason || 'dedupe').toLowerCase() === 'dedupe',
+      ),
+    [reviewScanMoves],
+  );
+  const dedupeMovesForReview = useMemo(() => {
+    if (reviewMovesFilter === 'active') return dedupeMovesForReviewAll.filter((m) => !m.restored);
+    if (reviewMovesFilter === 'restored') return dedupeMovesForReviewAll.filter((m) => Boolean(m.restored));
+    return dedupeMovesForReviewAll;
+  }, [dedupeMovesForReviewAll, reviewMovesFilter]);
+  const dedupeMovesPending = useMemo(
+    () => dedupeMovesForReviewAll.filter((m) => !m.restored),
+    [dedupeMovesForReviewAll],
+  );
+  const hasReviewHistory = Boolean(reviewScanId && dedupeMovesForReviewAll.length > 0);
 
   // Dedupe handlers
   const handleDedupeSingle = useCallback(
@@ -206,6 +243,42 @@ export default function Unduper() {
     await handleDedupeSingle(selectedDuplicate);
   };
 
+  const handleRestoreReviewMoves = useCallback(
+    async (moveIds: number[]) => {
+      if (!reviewScanId || moveIds.length === 0) return;
+      const validIds = moveIds.filter((id) => Number.isFinite(id) && id > 0);
+      if (validIds.length === 0) return;
+      if (validIds.length > 1) {
+        setRestoringAllMoves(true);
+      } else {
+        setRestoringMoveIds((prev) => new Set(prev).add(validIds[0]));
+      }
+      try {
+        const res = await restoreMoves(reviewScanId, validIds, false);
+        toast.success(`${res.restored} move(s) restored`);
+        await Promise.all([
+          refetchReviewScanMoves(),
+          queryClient.invalidateQueries({ queryKey: ['duplicates'] }),
+          queryClient.invalidateQueries({ queryKey: ['scan-history'] }),
+          queryClient.invalidateQueries({ queryKey: ['scan-history-tools'] }),
+        ]);
+      } catch (error) {
+        toast.error(error instanceof Error ? error.message : 'Failed to restore moved albums');
+      } finally {
+        if (validIds.length > 1) {
+          setRestoringAllMoves(false);
+        } else {
+          setRestoringMoveIds((prev) => {
+            const next = new Set(prev);
+            for (const id of validIds) next.delete(id);
+            return next;
+          });
+        }
+      }
+    },
+    [queryClient, refetchReviewScanMoves, reviewScanId],
+  );
+
   return (
     <div className="container pb-6 space-y-6">
         {/* Dedupe in progress: banner + current group detail + percent & ETA */}
@@ -248,6 +321,117 @@ export default function Unduper() {
             )}
           </div>
         )}
+
+        {reviewScanId ? (
+          <div className="rounded-lg border border-border bg-muted/20 p-4 space-y-3">
+            <div className="flex flex-wrap items-center gap-2">
+              <p className="text-sm font-medium text-foreground">
+                Dedupe moves review for run #{reviewScanId}
+              </p>
+              <Badge variant="outline">{dedupeMovesForReviewAll.length} moved loser album(s)</Badge>
+              <Badge variant="outline">{dedupeMovesPending.length} pending rollback</Badge>
+              <Button size="sm" variant={reviewMovesFilter === 'all' ? 'default' : 'outline'} onClick={() => setReviewMovesFilter('all')}>
+                All
+              </Button>
+              <Button size="sm" variant={reviewMovesFilter === 'active' ? 'default' : 'outline'} onClick={() => setReviewMovesFilter('active')}>
+                Pending
+              </Button>
+              <Button size="sm" variant={reviewMovesFilter === 'restored' ? 'default' : 'outline'} onClick={() => setReviewMovesFilter('restored')}>
+                Restored
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                className="gap-1.5"
+                onClick={() => void handleRestoreReviewMoves(dedupeMovesPending.map((m) => m.move_id))}
+                disabled={dedupeMovesPending.length === 0 || restoringAllMoves || restoringMoveIds.size > 0}
+              >
+                {restoringAllMoves ? <Loader2 className="w-4 h-4 animate-spin" /> : <Undo2 className="w-4 h-4" />}
+                Restore all moved
+              </Button>
+            </div>
+
+            {loadingReviewScanMoves ? (
+              <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                <Loader2 className="w-4 h-4 animate-spin" />
+                Loading move history…
+              </div>
+            ) : dedupeMovesForReview.length === 0 ? (
+              <p className="text-sm text-muted-foreground">
+                {reviewMovesFilter === 'active'
+                  ? 'No active dedupe moves for this run.'
+                  : reviewMovesFilter === 'restored'
+                    ? 'No restored dedupe moves for this run.'
+                    : 'No dedupe moves for this filter in this run.'}
+              </p>
+            ) : (
+              <div className="max-h-72 overflow-auto rounded-md border">
+                <table className="w-full text-sm">
+                  <thead className="bg-muted/50 sticky top-0">
+                    <tr>
+                      <th className="text-left px-3 py-2 font-medium">Moved album</th>
+                      <th className="text-left px-3 py-2 font-medium">Winner</th>
+                      <th className="text-left px-3 py-2 font-medium">Why moved</th>
+                      <th className="text-left px-3 py-2 font-medium">Action</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {dedupeMovesForReview.map((move) => (
+                      <tr key={move.move_id} className="border-t border-border align-top">
+                        <td className="px-3 py-2">
+                          <p className="font-medium">{move.artist}</p>
+                          <p>{move.album_title || `Album #${move.album_id}`}</p>
+                          <p className="text-xs text-muted-foreground break-all" title={move.moved_to_path}>
+                            {move.moved_to_path}
+                          </p>
+                        </td>
+                        <td className="px-3 py-2">
+                          <p>{move.winner_title || 'n/a'}</p>
+                          {move.winner_path ? (
+                            <p className="text-xs text-muted-foreground break-all" title={move.winner_path}>
+                              {move.winner_path}
+                            </p>
+                          ) : null}
+                        </td>
+                        <td className="px-3 py-2">
+                          <div className="flex flex-wrap items-center gap-1">
+                            <Badge variant={move.restored ? 'secondary' : 'default'}>
+                              {move.restored ? 'Restored' : 'Pending'}
+                            </Badge>
+                            {move.decision_provider ? <ProviderBadge provider={move.decision_provider} prefix="Provider" /> : null}
+                            {move.decision_source ? <ProviderBadge provider={move.decision_source} prefix="Source" /> : null}
+                            {move.decision_confidence != null ? (
+                              <Badge variant="outline">score {Number(move.decision_confidence).toFixed(2)}</Badge>
+                            ) : null}
+                          </div>
+                          {move.decision_reason ? (
+                            <p className="text-xs text-muted-foreground mt-1">{move.decision_reason}</p>
+                          ) : null}
+                        </td>
+                        <td className="px-3 py-2">
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            className="gap-1.5"
+                            onClick={() => void handleRestoreReviewMoves([move.move_id])}
+                            disabled={restoringAllMoves || restoringMoveIds.size > 0 || Boolean(move.restored)}
+                          >
+                            {restoringMoveIds.has(move.move_id) ? (
+                              <Loader2 className="w-4 h-4 animate-spin" />
+                            ) : (
+                              <Undo2 className="w-4 h-4" />
+                            )}
+                            Rollback
+                          </Button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        ) : null}
         {showLibraryStatsHint && (
           <p className="text-sm text-muted-foreground">
             Library stats unavailable. Run a scan or check your source folders.
@@ -334,7 +518,7 @@ export default function Unduper() {
         )}
 
         {/* Empty state */}
-        {!loadingDuplicates && filteredDuplicates.length === 0 && (
+        {!loadingDuplicates && filteredDuplicates.length === 0 && !hasReviewHistory && (
           <EmptyState
             onStartScan={scanControls.start}
             isScanning={scanProgress?.scanning ?? false}

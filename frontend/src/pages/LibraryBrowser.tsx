@@ -10,6 +10,8 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { SimilarArtists } from '@/components/library/SimilarArtists';
 import { AlbumEditor } from '@/components/library/AlbumEditor';
 import { ImproveAlbumDialog } from '@/components/library/ImproveAlbumDialog';
+import { ProviderBadge } from '@/components/providers/ProviderBadge';
+import { ProviderLink } from '@/components/providers/ProviderLink';
 import { type TrackInfo } from '@/components/library/AudioPlayer';
 import { usePlayback } from '@/contexts/PlaybackContext';
 import { FormatBadge } from '@/components/FormatBadge';
@@ -133,14 +135,6 @@ function IssueBadges({ album, className }: { album: AlbumInfo; className?: strin
           ? 'Bandcamp'
           : metadataSourceRaw || null;
   const hasProviderFromMetadata = Boolean(metadataFallbackLabel && metadataSource !== 'musicbrainz');
-  const metadataProviderBadgeClass =
-    metadataSource === 'discogs'
-      ? 'text-xs bg-emerald-500/20 text-emerald-700 dark:bg-emerald-500/30 dark:text-emerald-300 border-emerald-500/30'
-      : metadataSource === 'lastfm'
-        ? 'text-xs bg-blue-500/20 text-blue-700 dark:bg-blue-500/30 dark:text-blue-300 border-blue-500/30'
-        : metadataSource === 'bandcamp'
-          ? 'text-xs bg-fuchsia-500/20 text-fuchsia-700 dark:bg-fuchsia-500/30 dark:text-fuchsia-300 border-fuchsia-500/30'
-          : 'text-xs bg-zinc-500/20 text-zinc-700 dark:bg-zinc-500/30 dark:text-zinc-300 border-zinc-500/30';
   const hasFallbackSource = Boolean(
     (album.discogs_release_id && album.discogs_release_id.trim()) ||
       (album.lastfm_album_mbid && album.lastfm_album_mbid.trim()) ||
@@ -155,57 +149,29 @@ function IssueBadges({ album, className }: { album: AlbumInfo; className?: strin
         </Badge>
       )}
       {hasMbId ? (
-        <a
+        <ProviderLink
+          provider="musicbrainz"
           href={`https://musicbrainz.org/release-group/${album.musicbrainz_release_group_id}`}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="inline-flex"
+          labelOverride="MBID"
           onClick={(e) => e.stopPropagation()}
-        >
-          <Badge className="text-xs bg-emerald-500/20 text-emerald-700 dark:bg-emerald-500/30 dark:text-emerald-300 border-emerald-500/30 hover:underline cursor-pointer">
-            MBID
-          </Badge>
-        </a>
+        />
       ) : hasFallbackSource ? (
         <>
           {album.discogs_release_id ? (
-            <a
+            <ProviderLink
+              provider="discogs"
               href={`https://www.discogs.com/release/${encodeURIComponent(album.discogs_release_id)}`}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="inline-flex"
               onClick={(e) => e.stopPropagation()}
-            >
-              <Badge className="text-xs bg-emerald-500/20 text-emerald-700 dark:bg-emerald-500/30 dark:text-emerald-300 border-emerald-500/30 hover:underline cursor-pointer">
-                Discogs
-              </Badge>
-            </a>
+            />
           ) : null}
           {album.lastfm_album_mbid ? (
-            <Badge
-              className="text-xs bg-blue-500/20 text-blue-700 dark:bg-blue-500/30 dark:text-blue-300 border-blue-500/30"
-              title={`Last.fm MBID: ${album.lastfm_album_mbid}`}
-            >
-              Last.fm
-            </Badge>
+            <ProviderBadge provider="lastfm" className="text-xs" />
           ) : null}
           {album.bandcamp_album_url ? (
-            <a
-              href={album.bandcamp_album_url}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="inline-flex"
-              onClick={(e) => e.stopPropagation()}
-            >
-              <Badge className="text-xs bg-fuchsia-500/20 text-fuchsia-700 dark:bg-fuchsia-500/30 dark:text-fuchsia-300 border-fuchsia-500/30 hover:underline cursor-pointer">
-                Bandcamp
-              </Badge>
-            </a>
+            <ProviderLink provider="bandcamp" href={album.bandcamp_album_url} onClick={(e) => e.stopPropagation()} />
           ) : null}
           {!album.discogs_release_id && !album.lastfm_album_mbid && !album.bandcamp_album_url && hasProviderFromMetadata && metadataFallbackLabel ? (
-            <Badge className={metadataProviderBadgeClass}>
-              {metadataFallbackLabel}
-            </Badge>
+            <ProviderBadge provider={metadataSourceRaw} labelOverride={metadataFallbackLabel} className="text-xs" />
           ) : null}
         </>
       ) : album.mb_identified === false && (
@@ -1441,12 +1407,12 @@ export default function LibraryBrowser() {
                   const status = improveAllProgress?.provider_status?.[name] ?? 'pending';
                   const isCurrent = improveAllProgress?.current_provider === name;
                   return (
-                    <span key={name} className="flex items-center gap-1.5 text-xs capitalize">
+                    <span key={name} className="flex items-center gap-1.5 text-xs">
                       {status === 'ok' && <Check className="h-4 w-4 text-green-600" aria-hidden />}
                       {status === 'fail' && <X className="h-4 w-4 text-destructive" aria-hidden />}
                       {status === 'pending' && !isCurrent && <Circle className="h-3.5 w-3.5 text-muted-foreground" aria-hidden />}
                       {isCurrent && <Loader2 className="h-4 w-4 animate-spin text-primary" aria-hidden />}
-                      <span className={cn(isCurrent && 'font-medium')}>{name}</span>
+                      <ProviderBadge provider={name} className={cn('text-[10px]', isCurrent && 'font-medium')} />
                     </span>
                   );
                 })}
@@ -1521,7 +1487,7 @@ export default function LibraryBrowser() {
                   <tbody>
                     {Object.entries(improveAllResult.by_provider || {}).map(([provider, stats]) => (
                       <tr key={provider} className="border-b last:border-0">
-                        <td className="py-1.5 px-3 capitalize">{provider}</td>
+                        <td className="py-1.5 px-3"><ProviderBadge provider={provider} className="text-[10px]" /></td>
                         <td className="py-1.5 px-3 text-right">{stats.identified}</td>
                         <td className="py-1.5 px-3 text-right">{stats.covers}</td>
                         <td className="py-1.5 px-3 text-right">{stats.tags}</td>

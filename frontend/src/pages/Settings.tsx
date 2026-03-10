@@ -1,18 +1,24 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Save, Loader2, Check, FolderOutput, RefreshCw, Plus, X, Database, Sparkles, ExternalLink, Copy, MapPin, ChevronDown } from 'lucide-react';
+import { Save, Loader2, Check, FolderOutput, RefreshCw, Plus, X, Database, Sparkles, ExternalLink, Copy, MapPin, ChevronDown, AlertTriangle, Trash2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { toast } from 'sonner';
 import { NotificationSettings } from '@/components/settings/NotificationSettings';
 import { IntegrationsSettings } from '@/components/settings/IntegrationsSettings';
+import { SchedulerSettings } from '@/components/settings/SchedulerSettings';
+import { SourcesAutonomySettings } from '@/components/settings/SourcesAutonomySettings';
+import { ProviderBadge } from '@/components/providers/ProviderBadge';
+import { ProviderIcon } from '@/components/providers/ProviderIcon';
 import * as api from '@/lib/api';
 import type { PMDAConfig } from '@/lib/api';
 import { normalizeConfigForUI } from '@/lib/configUtils';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import { Badge } from '@/components/ui/badge';
 import { Separator } from '@/components/ui/separator';
 import { Label } from '@/components/ui/label';
 import { Input } from '@/components/ui/input';
 import { PasswordInput } from '@/components/ui/password-input';
 import { Slider } from '@/components/ui/slider';
+import { Progress } from '@/components/ui/progress';
 import { FolderBrowserInput } from '@/components/settings/FolderBrowserInput';
 import { Switch } from '@/components/ui/switch';
 import {
@@ -33,16 +39,31 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
 
 const SETTINGS_SECTIONS: { id: string; label: string }[] = [
   { id: 'settings-files-export', label: 'Folders' },
+  { id: 'settings-sources-autonomy', label: 'Sources & autonomy' },
   { id: 'settings-pipeline', label: 'Pipeline' },
+  { id: 'settings-scheduler', label: 'Scheduler' },
   { id: 'settings-ai', label: 'AI' },
   { id: 'settings-providers', label: 'Metadata providers' },
   { id: 'settings-concerts', label: 'Concerts' },
   { id: 'settings-notifications', label: 'Notifications' },
+  { id: 'settings-danger-zone', label: 'Danger zone' },
 ];
+
+type MaintenanceResetAction = api.MaintenanceResetAction;
+type DangerPreset = 'reset_all_keep_settings';
+
+type DangerPresetMeta = {
+  id: DangerPreset;
+  title: string;
+  description: string;
+  buttonLabel: string;
+  resetActions: MaintenanceResetAction[];
+};
 
 const AI_USAGE_LEVELS: Array<{
   value: NonNullable<PMDAConfig['AI_USAGE_LEVEL']>;
@@ -63,6 +84,27 @@ const AI_USAGE_LEVELS: Array<{
     value: 'aggressive',
     label: 'Aggressive',
     description: 'Maximum AI usage: verification + matching + vision + web MBID + duplicate arbitration.',
+  },
+];
+
+type AIProviderId = 'openai-api' | 'openai-codex' | 'anthropic' | 'google' | 'ollama';
+
+const AI_PROVIDER_OPTIONS: Array<{ value: AIProviderId; label: string; provider: string; codexOnly?: boolean }> = [
+  { value: 'openai-api', label: 'OpenAI API (key)', provider: 'openai-api' },
+  { value: 'openai-codex', label: 'OpenAI Codex (ChatGPT OAuth)', provider: 'openai-codex', codexOnly: true },
+  { value: 'anthropic', label: 'Anthropic', provider: 'anthropic' },
+  { value: 'google', label: 'Google', provider: 'google' },
+  { value: 'ollama', label: 'Ollama (local)', provider: 'ollama' },
+];
+
+const DANGER_PRESETS: DangerPresetMeta[] = [
+  {
+    id: 'reset_all_keep_settings',
+    title: 'Reset PMDA (keep settings)',
+    description:
+      'Clears NVMe media cache, resets cache.db, resets state.db, and clears PostgreSQL files index. Settings, users, and provider keys are preserved.',
+    buttonLabel: 'Reset PMDA now',
+    resetActions: ['media_cache', 'cache_db', 'state_db', 'files_index'],
   },
 ];
 
@@ -146,8 +188,20 @@ function SettingsPage() {
   const [openaiModelsLoading, setOpenaiModelsLoading] = useState(false);
   const [openaiModels, setOpenaiModels] = useState<string[]>([]);
   const [openaiModelsError, setOpenaiModelsError] = useState<string | null>(null);
+  const [openaiCodexStatus, setOpenaiCodexStatus] = useState<api.OpenAICodexOAuthStatusResponse | null>(null);
+  const [providerPreferences, setProviderPreferences] = useState<api.AIProviderPreferencesResponse | null>(null);
+  const [providerPreferencesBusy, setProviderPreferencesBusy] = useState(false);
   const [rebuildIndexLoading, setRebuildIndexLoading] = useState(false);
   const [advancedFoldersOpen, setAdvancedFoldersOpen] = useState(false);
+  const [providersChecking, setProvidersChecking] = useState(false);
+  const [providersPreflight, setProvidersPreflight] = useState<api.ScanPreflightResult | null>(null);
+  const [providersPreflightAt, setProvidersPreflightAt] = useState<number | null>(null);
+  const [dangerDialogOpen, setDangerDialogOpen] = useState(false);
+  const [pendingDangerPreset, setPendingDangerPreset] = useState<DangerPreset | null>(null);
+  const [dangerBusyPreset, setDangerBusyPreset] = useState<DangerPreset | null>(null);
+  const [isRestarting, setIsRestarting] = useState(false);
+  const [rebootCountdown, setRebootCountdown] = useState(35);
+  const [rebootProgress, setRebootProgress] = useState(0);
   const openaiModelsKeyRef = useRef<string>('');
 
   const getApiErrorMessage = (e: unknown): string | null => {
@@ -185,6 +239,20 @@ function SettingsPage() {
     }
   };
 
+  const refreshProviderStatus = useCallback(async () => {
+    setProvidersChecking(true);
+    try {
+      const status = await api.getScanPreflight();
+      setProvidersPreflight(status);
+      setProvidersPreflightAt(Date.now());
+      toast.success('Provider checks completed');
+    } catch (e) {
+      toast.error(getApiErrorMessage(e) || (e instanceof Error ? e.message : 'Provider checks failed'));
+    } finally {
+      setProvidersChecking(false);
+    }
+  }, [getApiErrorMessage]);
+
   useEffect(() => {
     loadConfig();
   }, []);
@@ -221,8 +289,14 @@ function SettingsPage() {
   const loadConfig = async () => {
     setIsLoading(true);
     try {
-      const data = await api.getConfig();
+      const [data, codexStatus, prefs] = await Promise.all([
+        api.getConfig(),
+        api.getOpenAICodexOAuthStatus().catch(() => null),
+        api.getAIProviderPreferences().catch(() => null),
+      ]);
       setConfig(normalizeConfigForUI(data));
+      if (codexStatus) setOpenaiCodexStatus(codexStatus);
+      if (prefs) setProviderPreferences(prefs);
     } catch (error) {
       console.error('Failed to load config:', error);
       toast.error('Failed to load configuration');
@@ -255,6 +329,23 @@ function SettingsPage() {
     }
   }, []);
 
+  const disconnectOpenAIOAuth = useCallback(async () => {
+    setOpenaiOAuthBusy(true);
+    try {
+      const result = await api.disconnectOpenAICodexOAuth();
+      if (!result.ok) {
+        throw new Error(result.message || 'Failed to disconnect OpenAI Codex OAuth');
+      }
+      setOpenaiOAuth(null);
+      toast.success(result.message || 'OpenAI Codex OAuth disconnected');
+      await loadConfig();
+    } catch (e) {
+      toast.error(getApiErrorMessage(e) || (e instanceof Error ? e.message : 'Failed to disconnect OpenAI OAuth'));
+    } finally {
+      setOpenaiOAuthBusy(false);
+    }
+  }, [loadConfig]);
+
   const pollOpenAIOAuth = useCallback(async () => {
     if (!openaiOAuth?.sessionId || openaiOAuthBusy) return;
     setOpenaiOAuthBusy(true);
@@ -283,6 +374,35 @@ function SettingsPage() {
       setOpenaiOAuthBusy(false);
     }
   }, [loadConfig, openaiOAuth?.sessionId, openaiOAuthBusy]);
+
+  const saveProviderPreferences = useCallback(
+    async (patch: Partial<Pick<api.AIProviderPreferencesResponse, 'interactive_provider_id' | 'batch_provider_id' | 'web_search_provider_id'>>) => {
+      const current = providerPreferences || {
+        interactive_provider_id: 'openai-codex',
+        batch_provider_id: 'openai-api',
+        web_search_provider_id: 'openai-api',
+      };
+      const payload = {
+        interactive_provider_id: String(patch.interactive_provider_id || current.interactive_provider_id || 'openai-codex'),
+        batch_provider_id: String(patch.batch_provider_id || current.batch_provider_id || 'openai-api'),
+        web_search_provider_id: String(patch.web_search_provider_id || current.web_search_provider_id || 'openai-api'),
+      };
+      setProviderPreferencesBusy(true);
+      setProviderPreferences((prev) => ({ ...(prev || current), ...payload }));
+      try {
+        const saved = await api.saveAIProviderPreferences(payload);
+        setProviderPreferences(saved);
+        toast.success('AI provider preferences saved');
+        await loadConfig();
+      } catch (e) {
+        toast.error(getApiErrorMessage(e) || (e instanceof Error ? e.message : 'Failed to save provider preferences'));
+        await loadConfig();
+      } finally {
+        setProviderPreferencesBusy(false);
+      }
+    },
+    [getApiErrorMessage, loadConfig, providerPreferences],
+  );
 
   useEffect(() => {
     if (!openaiOAuth || openaiOAuth.status !== 'pending') return;
@@ -335,6 +455,32 @@ function SettingsPage() {
   const selectedAiLevelIndex = Math.max(0, AI_USAGE_LEVELS.findIndex((lvl) => lvl.value === selectedAiLevel));
   const selectedAiLevelMeta = AI_USAGE_LEVELS[selectedAiLevelIndex] || AI_USAGE_LEVELS[1];
 
+  type ProviderState = {
+    variant: 'default' | 'secondary' | 'destructive' | 'outline';
+    label: string;
+    message: string;
+  };
+
+  const providerState = (
+    key: 'discogs' | 'lastfm' | 'fanart' | 'serper' | 'acoustid',
+    configured: boolean,
+  ): ProviderState => {
+    if (!configured) {
+      return { variant: 'outline', label: 'Not configured', message: 'No credentials set.' };
+    }
+    if (!providersPreflight) {
+      return { variant: 'secondary', label: 'Configured', message: 'Click “Check keys” to verify credentials.' };
+    }
+    const result = providersPreflight[key];
+    if (!result) {
+      return { variant: 'secondary', label: 'Configured', message: 'No check result available yet.' };
+    }
+    if (result.ok) {
+      return { variant: 'default', label: 'Valid', message: result.message || 'Credentials look good.' };
+    }
+    return { variant: 'destructive', label: 'Issue', message: result.message || 'Credential check failed.' };
+  };
+
   const setFilesRoots = useCallback((roots: string[]) => {
     updateConfig({ FILES_ROOTS: serializePathList(roots) });
   }, [updateConfig]);
@@ -376,11 +522,75 @@ function SettingsPage() {
     }
   }, [filesRoots.length, getApiErrorMessage, rebuildIndexLoading]);
 
+  const activeDangerMeta = DANGER_PRESETS.find((item) => item.id === pendingDangerPreset) || null;
+
+  const openDangerConfirm = useCallback((action: DangerPreset) => {
+    if (dangerBusyPreset) return;
+    setPendingDangerPreset(action);
+    setDangerDialogOpen(true);
+  }, [dangerBusyPreset]);
+
+  const runDangerAction = useCallback(async () => {
+    if (!pendingDangerPreset || dangerBusyPreset) return;
+    const preset = DANGER_PRESETS.find((item) => item.id === pendingDangerPreset) || null;
+    if (!preset) return;
+    setDangerBusyPreset(preset.id);
+    try {
+      const result = await api.runMaintenanceReset({
+        actions: preset.resetActions,
+        restart: true,
+      });
+      if (result.status === 'blocked') {
+        toast.error(result.message || 'Stop the running scan before using Danger Zone actions.');
+        return;
+      }
+      if (result.status === 'partial' || (result.errors && result.errors.length > 0)) {
+        toast.error(result.message || 'Maintenance action completed with errors.');
+      } else {
+        toast.success(result.message || 'Maintenance action completed.');
+      }
+      if (result.restart_initiated) {
+        setDangerDialogOpen(false);
+        setPendingDangerPreset(null);
+        setRebootCountdown(35);
+        setRebootProgress(0);
+        setIsRestarting(true);
+        return;
+      }
+      setDangerDialogOpen(false);
+      setPendingDangerPreset(null);
+      await loadConfig();
+    } catch (e) {
+      toast.error(getApiErrorMessage(e) || (e instanceof Error ? e.message : 'Maintenance action failed'));
+    } finally {
+      setDangerBusyPreset(null);
+    }
+  }, [dangerBusyPreset, getApiErrorMessage, pendingDangerPreset, loadConfig]);
+
   useEffect(() => {
     if (!pendingFilesRoot.trim()) {
       setPendingFilesRoot(filesRoots[0] ?? '/music');
     }
   }, [filesRoots, pendingFilesRoot]);
+
+  useEffect(() => {
+    if (!isRestarting) return;
+    const totalMs = 35_000;
+    const startedAt = Date.now();
+    const timer = setInterval(() => {
+      const elapsed = Date.now() - startedAt;
+      const remaining = Math.max(0, totalMs - elapsed);
+      const seconds = Math.ceil(remaining / 1000);
+      const progress = Math.min(100, (elapsed / totalMs) * 100);
+      setRebootCountdown(seconds);
+      setRebootProgress(progress);
+      if (remaining <= 0) {
+        clearInterval(timer);
+        window.location.reload();
+      }
+    }, 100);
+    return () => clearInterval(timer);
+  }, [isRestarting]);
 
   useEffect(() => {
     return () => {
@@ -553,7 +763,7 @@ function SettingsPage() {
                     </AlertDialog>
                   </div>
                   <p className="text-xs text-muted-foreground">
-                    Add one or more source folders to scan (container paths).
+                    Add one or more scan roots (container paths). For Library/Incoming roles and Primary destination, use <span className="text-foreground">Sources &amp; autonomy</span> below.
                   </p>
                   <div className="space-y-2">
                     {filesRoots.length === 0 ? (
@@ -753,6 +963,20 @@ function SettingsPage() {
 
             <Separator />
 
+            <Card id="settings-sources-autonomy" className="scroll-mt-24">
+              <CardHeader>
+                <CardTitle>Sources & autonomy</CardTitle>
+                <CardDescription>
+                  Define where PMDA reads music (library vs incoming) and where cleaned winners are placed.
+                </CardDescription>
+              </CardHeader>
+              <CardContent>
+                <SourcesAutonomySettings />
+              </CardContent>
+            </Card>
+
+            <Separator />
+
             <Card id="settings-pipeline" className="scroll-mt-24">
               <CardHeader>
                 <CardTitle>Pipeline automation</CardTitle>
@@ -765,164 +989,360 @@ function SettingsPage() {
 
             <Separator />
 
-	            <Card id="settings-ai" className="scroll-mt-24">
-	            <CardHeader>
-	                <CardTitle className="flex items-center gap-2">
-	                  <Sparkles className="w-5 h-5" />
-	                  AI
-	                </CardTitle>
-	                <CardDescription>
-                    Connect OpenAI via OAuth (quick setup) or paste an API key. Note: ChatGPT subscription is separate from API billing.
-                  </CardDescription>
-	              </CardHeader>
-	              <CardContent className="space-y-4">
-	                <div className="rounded-lg border border-border p-4 space-y-3">
-	                  <div className="flex flex-wrap items-start justify-between gap-3">
-	                    <div className="space-y-1">
-	                      <Label>Sign in with OpenAI (OAuth)</Label>
-	                      <p className="text-xs text-muted-foreground">
-	                        Quick setup without copy/pasting an API key.
-	                      </p>
-	                      {openaiOAuth?.warning && (
-	                        <p className="text-xs text-muted-foreground">
-	                          <span className="font-medium">Note:</span> {openaiOAuth.warning}
-	                        </p>
-	                      )}
-	                    </div>
-	                    <Button
-	                      type="button"
-	                      variant="outline"
-	                      size="sm"
-	                      className="gap-2 shrink-0"
-	                      onClick={startOpenAIOAuth}
-	                      disabled={openaiOAuthBusy}
-	                    >
-	                      {openaiOAuthBusy ? <Loader2 className="w-4 h-4 animate-spin" /> : <ExternalLink className="w-4 h-4" />}
-	                      Connect
-	                    </Button>
-	                  </div>
-	                  {openaiOAuth && (
-	                    <div className="space-y-2">
-	                      <div className="flex flex-col sm:flex-row sm:items-center gap-2">
-	                        <Input readOnly value={openaiOAuth.userCode} className="font-mono" />
-	                        <div className="flex items-center gap-2">
-	                          <Button
-	                            type="button"
-	                            variant="secondary"
-	                            size="sm"
-	                            className="gap-1.5"
-	                            onClick={async () => {
-	                              const ok = await copyTextToClipboard(openaiOAuth.userCode);
-	                              if (ok) toast.success('Code copied');
-	                              else toast.error('Copy failed');
-	                            }}
-	                          >
-	                            <Copy className="w-4 h-4" />
-	                            Copy
-	                          </Button>
-	                          <Button type="button" variant="secondary" size="sm" className="gap-1.5" asChild>
-	                            <a href={openaiOAuth.verificationUrl} target="_blank" rel="noreferrer">
-	                              <ExternalLink className="w-4 h-4" />
-	                              Open OpenAI
-	                            </a>
-	                          </Button>
-	                        </div>
-	                      </div>
-	                      <p className="text-xs text-muted-foreground">
-	                        1) Open the OpenAI page, 2) enter the code, 3) come back here. PMDA will connect automatically.
-	                      </p>
-	                      <div className="flex flex-wrap items-center gap-2">
-	                        <Button
-	                          type="button"
-	                          variant="outline"
-	                          size="sm"
-	                          className="gap-2"
-	                          onClick={pollOpenAIOAuth}
-	                          disabled={openaiOAuthBusy || openaiOAuth.status !== 'pending'}
-	                        >
-	                          {openaiOAuthBusy ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
-	                          Check status
-	                        </Button>
-	                        <span className="text-xs text-muted-foreground">
-	                          {openaiOAuth.message
-	                            || (openaiOAuth.status === 'pending' ? 'Waiting for authorization…'
-	                              : openaiOAuth.status === 'completed' ? 'Connected' : 'Error')}
-	                        </span>
-	                      </div>
-	                    </div>
-	                  )}
-	                </div>
-	                <div className="space-y-2">
-	                  <Label>OpenAI API key</Label>
-	                  <p className="text-xs text-muted-foreground">Required for AI match verification and cover checks.</p>
-	                  <PasswordInput
-                    value={config.OPENAI_API_KEY || ''}
-                    onChange={(e) => updateConfig({ OPENAI_API_KEY: e.target.value, AI_PROVIDER: 'openai' })}
-                    placeholder="sk-..."
-                  />
-                </div>
-	                <div className="space-y-2">
-	                  <Label>Model (optional)</Label>
-	                  {openaiModelsLoading ? (
-	                    <div className="flex items-center gap-2 text-sm text-muted-foreground py-2">
-	                      <Loader2 className="w-4 h-4 animate-spin" />
-	                      Loading available models...
-	                    </div>
-	                  ) : openaiModels.length > 0 ? (
-	                    (() => {
-	                      const current = (config.OPENAI_MODEL || '').trim();
-	                      const items = current && !openaiModels.includes(current)
-	                        ? [current, ...openaiModels]
-	                        : openaiModels;
-	                      return (
-	                        <Select
-	                          value={current}
-	                          onValueChange={(value) => updateConfig({ OPENAI_MODEL: value, AI_PROVIDER: 'openai' })}
-	                        >
-	                          <SelectTrigger>
-	                            <SelectValue placeholder="Select a model" />
-	                          </SelectTrigger>
-	                          <SelectContent>
-	                            {items.map((m) => (
-	                              <SelectItem key={m} value={m}>
-	                                {m}{m === current && !openaiModels.includes(current) ? ' (custom)' : ''}
-	                              </SelectItem>
-	                            ))}
-	                          </SelectContent>
-	                        </Select>
-	                      );
-	                    })()
-	                  ) : (
-	                    <Input
-	                      placeholder="gpt-5-nano"
-	                      value={config.OPENAI_MODEL || ''}
-	                      onChange={(e) => updateConfig({ OPENAI_MODEL: e.target.value, AI_PROVIDER: 'openai' })}
-	                    />
-	                  )}
-	                  {openaiModelsError && (
-	                    <p className="text-xs text-destructive">{openaiModelsError}</p>
-	                  )}
-                    <div className="mt-4 space-y-3 rounded-lg border border-border/60 bg-muted/30 p-3">
-                      <div className="flex items-center justify-between gap-2">
-                        <Label>AI usage level</Label>
-                        <span className="text-xs font-medium text-muted-foreground">{selectedAiLevelMeta.label}</span>
-                      </div>
-                      <Slider
-                        min={0}
-                        max={2}
-                        step={1}
-                        value={[selectedAiLevelIndex]}
-                        onValueChange={(values) => {
-                          const idx = Math.max(0, Math.min(2, Number(values?.[0] ?? 1)));
-                          const level = AI_USAGE_LEVELS[idx]?.value ?? 'medium';
-                          updateConfig({ AI_USAGE_LEVEL: level });
-                        }}
-                      />
-                      <p className="text-xs text-muted-foreground">{selectedAiLevelMeta.description}</p>
+            <Card id="settings-scheduler" className="scroll-mt-24">
+              <CardHeader>
+                <CardTitle>Scheduler</CardTitle>
+                <CardDescription>
+                  Choose when scans run and which post-scan jobs should run automatically.
+                </CardDescription>
+              </CardHeader>
+              <CardContent>
+                <SchedulerSettings config={config} updateConfig={updateConfig} />
+              </CardContent>
+            </Card>
+
+            <Separator />
+
+            <Card id="settings-ai" className="scroll-mt-24">
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2">
+                  <Sparkles className="w-5 h-5" />
+                  AI
+                </CardTitle>
+                <CardDescription>
+                  Configure OpenAI API key for batch workloads and OpenAI Codex OAuth for interactive workflows.
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                <div className="rounded-lg border border-border p-4 space-y-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="space-y-1">
+                      <Label>OpenAI Codex (Sign in with ChatGPT)</Label>
+                      <p className="text-xs text-muted-foreground">
+                        Recommended for interactive flows. PMDA stores OAuth tokens securely in settings DB.
+                      </p>
                     </div>
-	                </div>
-	              </CardContent>
-	            </Card>
+                    <div className="flex items-center gap-2">
+                      <Badge variant={openaiCodexStatus?.connected ? 'default' : 'outline'}>
+                        {openaiCodexStatus?.connected ? 'Connected' : 'Not connected'}
+                      </Badge>
+                      {openaiCodexStatus?.auth_mode ? (
+                        <Badge variant="outline">{openaiCodexStatus.auth_mode}</Badge>
+                      ) : null}
+                    </div>
+                  </div>
+                  {openaiOAuth?.warning && (
+                    <p className="text-xs text-muted-foreground">
+                      <span className="font-medium">Note:</span> {openaiOAuth.warning}
+                    </p>
+                  )}
+                  {openaiCodexStatus?.connected ? (
+                    <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                      {openaiCodexStatus.account_id ? <Badge variant="outline">Account: {openaiCodexStatus.account_id}</Badge> : null}
+                      {typeof openaiCodexStatus.expires_in_sec === 'number' ? (
+                        <Badge variant="outline">Expires in {Math.max(0, Math.floor(openaiCodexStatus.expires_in_sec / 60))} min</Badge>
+                      ) : null}
+                      {openaiCodexStatus.has_refresh_token ? <Badge variant="outline">Refresh token available</Badge> : null}
+                    </div>
+                  ) : null}
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      className="gap-2"
+                      onClick={startOpenAIOAuth}
+                      disabled={openaiOAuthBusy}
+                    >
+                      {openaiOAuthBusy ? <Loader2 className="w-4 h-4 animate-spin" /> : <ExternalLink className="w-4 h-4" />}
+                      Connect
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      className="gap-2"
+                      onClick={disconnectOpenAIOAuth}
+                      disabled={openaiOAuthBusy || !openaiCodexStatus?.connected}
+                    >
+                      {openaiOAuthBusy ? <Loader2 className="w-4 h-4 animate-spin" /> : <X className="w-4 h-4" />}
+                      Disconnect
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      className="gap-2"
+                      onClick={loadConfig}
+                      disabled={openaiOAuthBusy}
+                    >
+                      <RefreshCw className="w-4 h-4" />
+                      Refresh status
+                    </Button>
+                  </div>
+                  {openaiOAuth && (
+                    <div className="space-y-2 pt-2 border-t border-border/60">
+                      <div className="flex flex-col sm:flex-row sm:items-center gap-2">
+                        <Input readOnly value={openaiOAuth.userCode} className="font-mono" />
+                        <div className="flex items-center gap-2">
+                          <Button
+                            type="button"
+                            variant="secondary"
+                            size="sm"
+                            className="gap-1.5"
+                            onClick={async () => {
+                              const ok = await copyTextToClipboard(openaiOAuth.userCode);
+                              if (ok) toast.success('Code copied');
+                              else toast.error('Copy failed');
+                            }}
+                          >
+                            <Copy className="w-4 h-4" />
+                            Copy
+                          </Button>
+                          <Button type="button" variant="secondary" size="sm" className="gap-1.5" asChild>
+                            <a href={openaiOAuth.verificationUrl} target="_blank" rel="noreferrer">
+                              <ExternalLink className="w-4 h-4" />
+                              Open OpenAI
+                            </a>
+                          </Button>
+                        </div>
+                      </div>
+                      <p className="text-xs text-muted-foreground">
+                        1) Open the OpenAI page, 2) enter the code, 3) come back here. PMDA will connect automatically.
+                      </p>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          className="gap-2"
+                          onClick={pollOpenAIOAuth}
+                          disabled={openaiOAuthBusy || openaiOAuth.status !== 'pending'}
+                        >
+                          {openaiOAuthBusy ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
+                          Check status
+                        </Button>
+                        <span className="text-xs text-muted-foreground">
+                          {openaiOAuth.message
+                            || (openaiOAuth.status === 'pending' ? 'Waiting for authorization…'
+                              : openaiOAuth.status === 'completed' ? 'Connected' : 'Error')}
+                        </span>
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                <div className="rounded-lg border border-border p-4 space-y-3">
+                  <div className="space-y-2">
+                    <Label>OpenAI API key (batch/automation)</Label>
+                    <p className="text-xs text-muted-foreground">
+                      Used by `openai-api` provider for batch scan jobs, metadata enrichment and automations.
+                    </p>
+                    <PasswordInput
+                      value={config.OPENAI_API_KEY || ''}
+                      onChange={(e) => updateConfig({ OPENAI_API_KEY: e.target.value, AI_PROVIDER: 'openai-api' })}
+                      placeholder="sk-..."
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <Label>Model (optional)</Label>
+                    {openaiModelsLoading ? (
+                      <div className="flex items-center gap-2 text-sm text-muted-foreground py-2">
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                        Loading available models...
+                      </div>
+                    ) : openaiModels.length > 0 ? (
+                      (() => {
+                        const current = (config.OPENAI_MODEL || '').trim();
+                        const items = current && !openaiModels.includes(current)
+                          ? [current, ...openaiModels]
+                          : openaiModels;
+                        return (
+                          <Select
+                            value={current}
+                            onValueChange={(value) => updateConfig({ OPENAI_MODEL: value, AI_PROVIDER: 'openai-api' })}
+                          >
+                            <SelectTrigger>
+                              <SelectValue placeholder="Select a model" />
+                            </SelectTrigger>
+                            <SelectContent>
+                              {items.map((m) => (
+                                <SelectItem key={m} value={m}>
+                                  {m}{m === current && !openaiModels.includes(current) ? ' (custom)' : ''}
+                                </SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+                        );
+                      })()
+                    ) : (
+                      <Input
+                        placeholder="gpt-5-nano"
+                        value={config.OPENAI_MODEL || ''}
+                        onChange={(e) => updateConfig({ OPENAI_MODEL: e.target.value, AI_PROVIDER: 'openai-api' })}
+                      />
+                    )}
+                    {openaiModelsError && (
+                      <p className="text-xs text-destructive">{openaiModelsError}</p>
+                    )}
+                  </div>
+                </div>
+
+                <div className="rounded-lg border border-border p-4 space-y-3">
+                  <div className="space-y-1">
+                    <Label>Provider routing by context</Label>
+                    <p className="text-xs text-muted-foreground">
+                      Select which provider PMDA uses by runtime context. Interactive will fallback automatically if Codex OAuth is unavailable.
+                    </p>
+                  </div>
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                    <div className="space-y-2">
+                      <Label className="text-xs">Interactive</Label>
+                      <Select
+                        value={providerPreferences?.interactive_provider_id || config.OPENAI_PROVIDER_PREF_INTERACTIVE || 'openai-codex'}
+                        onValueChange={(value: AIProviderId) => {
+                          void saveProviderPreferences({ interactive_provider_id: value });
+                        }}
+                        disabled={providerPreferencesBusy}
+                      >
+                        <SelectTrigger>
+                          <SelectValue placeholder="Select provider" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {AI_PROVIDER_OPTIONS.map((opt) => (
+                            <SelectItem
+                              key={`interactive-${opt.value}`}
+                              value={opt.value}
+                              disabled={Boolean(opt.codexOnly && !openaiCodexStatus?.connected)}
+                            >
+                              <span className="inline-flex items-center gap-2">
+                                <ProviderIcon provider={opt.provider} />
+                                {opt.label}
+                              </span>
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                      <div className="text-[11px] text-muted-foreground flex items-center gap-2">
+                        <span>Effective:</span>
+                        <ProviderBadge
+                          provider={config.OPENAI_PROVIDER_EFFECTIVE_INTERACTIVE || providerPreferences?.effective?.interactive_provider_id || 'openai-api'}
+                          className="h-5 px-2 py-0 text-[10px]"
+                        />
+                      </div>
+                    </div>
+                    <div className="space-y-2">
+                      <Label className="text-xs">Batch</Label>
+                      <Select
+                        value={providerPreferences?.batch_provider_id || config.OPENAI_PROVIDER_PREF_BATCH || 'openai-api'}
+                        onValueChange={(value: AIProviderId) => {
+                          void saveProviderPreferences({ batch_provider_id: value });
+                        }}
+                        disabled={providerPreferencesBusy}
+                      >
+                        <SelectTrigger>
+                          <SelectValue placeholder="Select provider" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {AI_PROVIDER_OPTIONS.map((opt) => (
+                            <SelectItem
+                              key={`batch-${opt.value}`}
+                              value={opt.value}
+                              disabled={Boolean(opt.codexOnly && !openaiCodexStatus?.connected)}
+                            >
+                              <span className="inline-flex items-center gap-2">
+                                <ProviderIcon provider={opt.provider} />
+                                {opt.label}
+                              </span>
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                      <div className="text-[11px] text-muted-foreground flex items-center gap-2">
+                        <span>Effective:</span>
+                        <ProviderBadge
+                          provider={config.OPENAI_PROVIDER_EFFECTIVE_BATCH || providerPreferences?.effective?.batch_provider_id || 'openai-api'}
+                          className="h-5 px-2 py-0 text-[10px]"
+                        />
+                      </div>
+                    </div>
+                    <div className="space-y-2">
+                      <Label className="text-xs">Web search</Label>
+                      <Select
+                        value={providerPreferences?.web_search_provider_id || config.OPENAI_PROVIDER_PREF_WEB_SEARCH || 'openai-api'}
+                        onValueChange={(value: AIProviderId) => {
+                          void saveProviderPreferences({ web_search_provider_id: value });
+                        }}
+                        disabled={providerPreferencesBusy}
+                      >
+                        <SelectTrigger>
+                          <SelectValue placeholder="Select provider" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {AI_PROVIDER_OPTIONS.map((opt) => (
+                            <SelectItem
+                              key={`web-${opt.value}`}
+                              value={opt.value}
+                              disabled={Boolean(opt.codexOnly && !openaiCodexStatus?.connected)}
+                            >
+                              <span className="inline-flex items-center gap-2">
+                                <ProviderIcon provider={opt.provider} />
+                                {opt.label}
+                              </span>
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                      <div className="text-[11px] text-muted-foreground flex items-center gap-2">
+                        <span>Effective:</span>
+                        <ProviderBadge
+                          provider={providerPreferences?.effective?.web_search_provider_id || providerPreferences?.web_search_provider_id || 'openai-api'}
+                          className="h-5 px-2 py-0 text-[10px]"
+                        />
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="space-y-2">
+                  <div className="mt-1 space-y-3 rounded-lg border border-border/60 bg-muted/30 p-3">
+                    <div className="flex items-center justify-between gap-2">
+                      <Label>AI usage level</Label>
+                      <span className="text-xs font-medium text-muted-foreground">{selectedAiLevelMeta.label}</span>
+                    </div>
+                    <Slider
+                      min={0}
+                      max={2}
+                      step={1}
+                      value={[selectedAiLevelIndex]}
+                      onValueChange={(values) => {
+                        const idx = Math.max(0, Math.min(2, Number(values?.[0] ?? 1)));
+                        const level = AI_USAGE_LEVELS[idx]?.value ?? 'medium';
+                        updateConfig({ AI_USAGE_LEVEL: level });
+                      }}
+                    />
+                    <p className="text-xs text-muted-foreground">{selectedAiLevelMeta.description}</p>
+                  </div>
+                  <div className="rounded-lg border border-border/60 p-3 space-y-2">
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="space-y-1">
+                        <Label>Auto-generate soft-match album reviews</Label>
+                        <p className="text-xs text-muted-foreground">
+                          When enabled, PMDA can generate album descriptions for SOFT_MATCH albums (web + AI relevance checks).
+                        </p>
+                      </div>
+                      <Switch
+                        checked={Boolean(config.USE_AI_FOR_SOFT_MATCH_PROFILES)}
+                        onCheckedChange={(checked) => updateConfig({ USE_AI_FOR_SOFT_MATCH_PROFILES: Boolean(checked) })}
+                      />
+                    </div>
+                    <p className="text-[11px] text-muted-foreground">
+                      Manual generation from album match detail remains available even when this is disabled.
+                    </p>
+                  </div>
+                </div>
+              </CardContent>
+            </Card>
 
             <Separator />
 
@@ -932,113 +1352,191 @@ function SettingsPage() {
                   <Database className="w-5 h-5" />
                   Metadata providers
                 </CardTitle>
-                <CardDescription>Optional API keys to improve matches (all providers are always on).</CardDescription>
+                <CardDescription>
+                  Optional credentials that improve matching/enrichment quality.
+                </CardDescription>
               </CardHeader>
               <CardContent className="space-y-4">
-                <div className="space-y-2">
-                  <div className="flex items-center justify-between gap-3">
-                    <Label htmlFor="discogs-token">Discogs token (optional)</Label>
-                    <a
-                      href="https://www.discogs.com/settings/developers"
-                      target="_blank"
-                      rel="noreferrer"
-                      className="text-xs text-primary inline-flex items-center gap-1 hover:underline"
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <p className="text-xs text-muted-foreground">
+                    Separation by provider, with live credential checks.
+                  </p>
+                  <div className="flex items-center gap-2">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      className="gap-2"
+                      onClick={refreshProviderStatus}
+                      disabled={providersChecking}
                     >
-                      Create token <ExternalLink className="w-3 h-3" />
-                    </a>
+                      {providersChecking ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
+                      Check keys
+                    </Button>
+                    <span className="text-xs text-muted-foreground">
+                      Last check: {providersPreflightAt ? new Date(providersPreflightAt).toLocaleTimeString() : 'not run yet'}
+                    </span>
                   </div>
-                  <PasswordInput
-                    id="discogs-token"
-                    placeholder="Discogs user token"
-                    value={config.DISCOGS_USER_TOKEN || ''}
-                    onChange={(e) => updateConfig({ DISCOGS_USER_TOKEN: e.target.value })}
-                  />
                 </div>
-                <div className="space-y-2">
-                  <div className="flex items-center justify-between gap-3">
-                    <Label htmlFor="lastfm-key">Last.fm API key (optional)</Label>
-                    <a
-                      href="https://www.last.fm/api/account/create"
-                      target="_blank"
-                      rel="noreferrer"
-                      className="text-xs text-primary inline-flex items-center gap-1 hover:underline"
-                    >
-                      Create API key <ExternalLink className="w-3 h-3" />
-                    </a>
-                  </div>
-                  <PasswordInput
-                    id="lastfm-key"
-                    placeholder="Last.fm API key"
-                    value={config.LASTFM_API_KEY || ''}
-                    onChange={(e) => updateConfig({ LASTFM_API_KEY: e.target.value })}
-                  />
-                </div>
-                <div className="space-y-2">
-                  <Label htmlFor="lastfm-secret">Last.fm API secret (optional)</Label>
-                  <PasswordInput
-                    id="lastfm-secret"
-                    placeholder="Last.fm API secret"
-                    value={config.LASTFM_API_SECRET || ''}
-                    onChange={(e) => updateConfig({ LASTFM_API_SECRET: e.target.value })}
-                  />
-                </div>
-                <div className="space-y-2">
-                  <div className="flex items-center justify-between gap-3">
-                    <Label htmlFor="fanart-key">Fanart.tv API key (optional)</Label>
-                    <a
-                      href="https://fanart.tv/get-an-api-key/"
-                      target="_blank"
-                      rel="noreferrer"
-                      className="text-xs text-primary inline-flex items-center gap-1 hover:underline"
-                    >
-                      Create API key <ExternalLink className="w-3 h-3" />
-                    </a>
-                  </div>
-                  <PasswordInput
-                    id="fanart-key"
-                    placeholder="Fanart.tv API key"
-                    value={String(config.FANART_API_KEY ?? '')}
-                    onChange={(e) => updateConfig({ FANART_API_KEY: e.target.value })}
-                  />
-                </div>
-                <div className="space-y-2">
-                  <div className="flex items-center justify-between gap-3">
-                    <Label htmlFor="serper-key">Serper API key (optional)</Label>
-                    <a
-                      href="https://serper.dev/"
-                      target="_blank"
-                      rel="noreferrer"
-                      className="text-xs text-primary inline-flex items-center gap-1 hover:underline"
-                    >
-                      Create API key <ExternalLink className="w-3 h-3" />
-                    </a>
-                  </div>
-                  <PasswordInput
-                    id="serper-key"
-                    placeholder="Serper.dev API key"
-                    value={String(config.SERPER_API_KEY ?? '')}
-                    onChange={(e) => updateConfig({ SERPER_API_KEY: e.target.value })}
-                  />
-                </div>
-                <div className="space-y-2">
-                  <div className="flex items-center justify-between gap-3">
-                    <Label htmlFor="acoustid-key">AcoustID API key (optional)</Label>
-                    <a
-                      href="https://acoustid.org/new-application"
-                      target="_blank"
-                      rel="noreferrer"
-                      className="text-xs text-primary inline-flex items-center gap-1 hover:underline"
-                    >
-                      Create API key <ExternalLink className="w-3 h-3" />
-                    </a>
-                  </div>
-                  <PasswordInput
-                    id="acoustid-key"
-                    placeholder="AcoustID API key"
-                    value={String(config.ACOUSTID_API_KEY ?? '')}
-                    onChange={(e) => updateConfig({ ACOUSTID_API_KEY: e.target.value })}
-                  />
-                </div>
+
+                <Tabs defaultValue="discogs" className="w-full">
+                  <TabsList className="grid h-auto w-full grid-cols-5">
+                    <TabsTrigger value="discogs"><span className="inline-flex items-center gap-1.5"><ProviderIcon provider="discogs" />Discogs</span></TabsTrigger>
+                    <TabsTrigger value="lastfm"><span className="inline-flex items-center gap-1.5"><ProviderIcon provider="lastfm" />Last.fm</span></TabsTrigger>
+                    <TabsTrigger value="fanart"><span className="inline-flex items-center gap-1.5"><ProviderIcon provider="fanart" />Fanart</span></TabsTrigger>
+                    <TabsTrigger value="serper"><span className="inline-flex items-center gap-1.5"><ProviderIcon provider="serper" />Serper</span></TabsTrigger>
+                    <TabsTrigger value="acoustid"><span className="inline-flex items-center gap-1.5"><ProviderIcon provider="acoustid" />AcoustID</span></TabsTrigger>
+                  </TabsList>
+
+                  <TabsContent value="discogs" className="mt-3">
+                    {(() => {
+                      const state = providerState('discogs', Boolean(String(config.DISCOGS_USER_TOKEN || '').trim()));
+                      return (
+                        <div className="space-y-3 rounded-lg border border-border p-3">
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <div className="space-y-1">
+                              <Label htmlFor="discogs-token">Discogs user token</Label>
+                              <p className="text-xs text-muted-foreground">{state.message}</p>
+                            </div>
+                            <div className="flex items-center gap-2">
+                              <Badge variant={state.variant}>{state.label}</Badge>
+                              <a href="https://www.discogs.com/settings/developers" target="_blank" rel="noreferrer" className="text-xs text-primary inline-flex items-center gap-1 hover:underline">
+                                Create token <ExternalLink className="w-3 h-3" />
+                              </a>
+                            </div>
+                          </div>
+                          <PasswordInput
+                            id="discogs-token"
+                            placeholder="Discogs user token"
+                            value={config.DISCOGS_USER_TOKEN || ''}
+                            onChange={(e) => updateConfig({ DISCOGS_USER_TOKEN: e.target.value })}
+                          />
+                        </div>
+                      );
+                    })()}
+                  </TabsContent>
+
+                  <TabsContent value="lastfm" className="mt-3">
+                    {(() => {
+                      const configured = Boolean(String(config.LASTFM_API_KEY || '').trim() && String(config.LASTFM_API_SECRET || '').trim());
+                      const state = providerState('lastfm', configured);
+                      return (
+                        <div className="space-y-3 rounded-lg border border-border p-3">
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <div className="space-y-1">
+                              <Label htmlFor="lastfm-key">Last.fm credentials</Label>
+                              <p className="text-xs text-muted-foreground">{state.message}</p>
+                            </div>
+                            <div className="flex items-center gap-2">
+                              <Badge variant={state.variant}>{state.label}</Badge>
+                              <a href="https://www.last.fm/api/account/create" target="_blank" rel="noreferrer" className="text-xs text-primary inline-flex items-center gap-1 hover:underline">
+                                Create keys <ExternalLink className="w-3 h-3" />
+                              </a>
+                            </div>
+                          </div>
+                          <div className="grid grid-cols-1 gap-2 md:grid-cols-2">
+                            <PasswordInput
+                              id="lastfm-key"
+                              placeholder="Last.fm API key"
+                              value={config.LASTFM_API_KEY || ''}
+                              onChange={(e) => updateConfig({ LASTFM_API_KEY: e.target.value })}
+                            />
+                            <PasswordInput
+                              id="lastfm-secret"
+                              placeholder="Last.fm API secret"
+                              value={config.LASTFM_API_SECRET || ''}
+                              onChange={(e) => updateConfig({ LASTFM_API_SECRET: e.target.value })}
+                            />
+                          </div>
+                        </div>
+                      );
+                    })()}
+                  </TabsContent>
+
+                  <TabsContent value="fanart" className="mt-3">
+                    {(() => {
+                      const state = providerState('fanart', Boolean(String(config.FANART_API_KEY || '').trim()));
+                      return (
+                        <div className="space-y-3 rounded-lg border border-border p-3">
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <div className="space-y-1">
+                              <Label htmlFor="fanart-key">Fanart.tv API key</Label>
+                              <p className="text-xs text-muted-foreground">{state.message}</p>
+                            </div>
+                            <div className="flex items-center gap-2">
+                              <Badge variant={state.variant}>{state.label}</Badge>
+                              <a href="https://fanart.tv/get-an-api-key/" target="_blank" rel="noreferrer" className="text-xs text-primary inline-flex items-center gap-1 hover:underline">
+                                Create key <ExternalLink className="w-3 h-3" />
+                              </a>
+                            </div>
+                          </div>
+                          <PasswordInput
+                            id="fanart-key"
+                            placeholder="Fanart.tv API key"
+                            value={String(config.FANART_API_KEY ?? '')}
+                            onChange={(e) => updateConfig({ FANART_API_KEY: e.target.value })}
+                          />
+                        </div>
+                      );
+                    })()}
+                  </TabsContent>
+
+                  <TabsContent value="serper" className="mt-3">
+                    {(() => {
+                      const state = providerState('serper', Boolean(String(config.SERPER_API_KEY || '').trim()));
+                      return (
+                        <div className="space-y-3 rounded-lg border border-border p-3">
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <div className="space-y-1">
+                              <Label htmlFor="serper-key">Serper API key</Label>
+                              <p className="text-xs text-muted-foreground">{state.message}</p>
+                            </div>
+                            <div className="flex items-center gap-2">
+                              <Badge variant={state.variant}>{state.label}</Badge>
+                              <a href="https://serper.dev/" target="_blank" rel="noreferrer" className="text-xs text-primary inline-flex items-center gap-1 hover:underline">
+                                Create key <ExternalLink className="w-3 h-3" />
+                              </a>
+                            </div>
+                          </div>
+                          <PasswordInput
+                            id="serper-key"
+                            placeholder="Serper.dev API key"
+                            value={String(config.SERPER_API_KEY ?? '')}
+                            onChange={(e) => updateConfig({ SERPER_API_KEY: e.target.value })}
+                          />
+                        </div>
+                      );
+                    })()}
+                  </TabsContent>
+
+                  <TabsContent value="acoustid" className="mt-3">
+                    {(() => {
+                      const state = providerState('acoustid', Boolean(String(config.ACOUSTID_API_KEY || '').trim()));
+                      return (
+                        <div className="space-y-3 rounded-lg border border-border p-3">
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <div className="space-y-1">
+                              <Label htmlFor="acoustid-key">AcoustID API key</Label>
+                              <p className="text-xs text-muted-foreground">{state.message}</p>
+                            </div>
+                            <div className="flex items-center gap-2">
+                              <Badge variant={state.variant}>{state.label}</Badge>
+                              <a href="https://acoustid.org/new-application" target="_blank" rel="noreferrer" className="text-xs text-primary inline-flex items-center gap-1 hover:underline">
+                                Create key <ExternalLink className="w-3 h-3" />
+                              </a>
+                            </div>
+                          </div>
+                          <PasswordInput
+                            id="acoustid-key"
+                            placeholder="AcoustID API key"
+                            value={String(config.ACOUSTID_API_KEY ?? '')}
+                            onChange={(e) => updateConfig({ ACOUSTID_API_KEY: e.target.value })}
+                          />
+                        </div>
+                      );
+                    })()}
+                  </TabsContent>
+                </Tabs>
               </CardContent>
             </Card>
 
@@ -1162,6 +1660,43 @@ function SettingsPage() {
               </CardContent>
             </Card>
 
+            <Separator />
+
+            <Card id="settings-danger-zone" className="scroll-mt-24 border-destructive/30">
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2 text-destructive">
+                  <AlertTriangle className="w-5 h-5" />
+                  Danger Zone
+                </CardTitle>
+                <CardDescription>
+                  Full maintenance reset. This clears library/cache/state data and restarts PMDA automatically, while keeping settings and credentials.
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-3">
+                {DANGER_PRESETS.map((action) => (
+                  <div
+                    key={action.id}
+                    className="flex flex-col gap-3 rounded-md border border-destructive/20 bg-destructive/5 p-3 md:flex-row md:items-center md:justify-between"
+                  >
+                    <div className="space-y-1">
+                      <p className="text-sm font-medium">{action.title}</p>
+                      <p className="text-xs text-muted-foreground">{action.description}</p>
+                    </div>
+                    <Button
+                      type="button"
+                      variant="destructive"
+                      className="gap-2 shrink-0"
+                      onClick={() => openDangerConfirm(action.id)}
+                      disabled={Boolean(dangerBusyPreset) || isRestarting}
+                    >
+                      {dangerBusyPreset === action.id ? <Loader2 className="w-4 h-4 animate-spin" /> : <Trash2 className="w-4 h-4" />}
+                      {action.buttonLabel}
+                    </Button>
+                  </div>
+                ))}
+              </CardContent>
+            </Card>
+
             <div className="flex justify-end pt-4">
               <Button onClick={saveConfig} disabled={isSaving} variant="outline" className="gap-2">
                 {isSaving ? (
@@ -1179,6 +1714,70 @@ function SettingsPage() {
             </div>
           </div>
         </div>
+
+        <AlertDialog
+          open={dangerDialogOpen}
+          onOpenChange={(open) => {
+            if (dangerBusyPreset) return;
+            setDangerDialogOpen(open);
+            if (!open) setPendingDangerPreset(null);
+          }}
+        >
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>
+                {activeDangerMeta ? `${activeDangerMeta.title}?` : 'Confirm maintenance action'}
+              </AlertDialogTitle>
+              <AlertDialogDescription>
+                This will remove generated artwork cache, reset <span className="font-mono">cache.db</span>,
+                reset <span className="font-mono">state.db</span>, and clear indexed library rows in PostgreSQL.
+                Settings, users, and API keys are kept. This action is destructive and cannot be undone.
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel disabled={Boolean(dangerBusyPreset)}>Cancel</AlertDialogCancel>
+              <AlertDialogAction
+                onClick={(e) => {
+                  e.preventDefault();
+                  runDangerAction();
+                }}
+                disabled={Boolean(dangerBusyPreset)}
+              >
+                {dangerBusyPreset ? (
+                  <span className="inline-flex items-center gap-2">
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    Processing...
+                  </span>
+                ) : (
+                  'Confirm and restart PMDA'
+                )}
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
+
+        {isRestarting && (
+          <>
+            <div className="fixed inset-0 z-[10000] bg-black/80 backdrop-blur-md" />
+            <div className="fixed left-1/2 top-1/2 z-[10001] w-full max-w-md -translate-x-1/2 -translate-y-1/2 rounded-2xl border border-border bg-card p-6 shadow-2xl">
+              <div className="flex flex-col items-center gap-4 text-center">
+                <div className="rounded-full bg-primary/10 p-4">
+                  <RefreshCw className="h-8 w-8 animate-spin text-primary" />
+                </div>
+                <div className="space-y-2">
+                  <h3 className="text-lg font-semibold">PMDA is restarting</h3>
+                  <p className="text-sm text-muted-foreground">
+                    Please hold on. Auto-refresh in <span className="font-mono font-semibold text-primary">{rebootCountdown}</span> {rebootCountdown === 1 ? 'second' : 'seconds'}.
+                  </p>
+                </div>
+                <div className="w-full space-y-2">
+                  <Progress value={rebootProgress} className="h-2" />
+                  <p className="text-xs text-muted-foreground">Waiting for PMDA container to come back…</p>
+                </div>
+              </div>
+            </div>
+          </>
+        )}
     </div>
   );
 }

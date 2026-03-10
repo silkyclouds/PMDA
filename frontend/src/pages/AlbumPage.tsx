@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
-import { ArrowLeft, Calendar, Download, ExternalLink, ListPlus, Loader2, Music, Play, Plus } from 'lucide-react';
+import { ArrowLeft, Calendar, ChevronDown, ChevronUp, Download, Info, ListPlus, Loader2, Music, Pencil, Play, Plus, Sparkles } from 'lucide-react';
 
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -9,7 +9,12 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/component
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { FormatBadge } from '@/components/FormatBadge';
+import { MatchDetailDialog } from '@/components/library/MatchDetailDialog';
+import { ProviderBadge } from '@/components/providers/ProviderBadge';
+import { ProviderLink } from '@/components/providers/ProviderLink';
 import * as api from '@/lib/api';
+import { badgeKindClass } from '@/lib/badgeStyles';
+import { cn } from '@/lib/utils';
 import { useToast } from '@/hooks/use-toast';
 import { usePlayback } from '@/contexts/PlaybackContext';
 import { useAuth } from '@/contexts/AuthContext';
@@ -22,6 +27,20 @@ function formatDuration(seconds: number): string {
   const sec = s % 60;
   if (h > 0) return `${h}:${m.toString().padStart(2, '0')}:${sec.toString().padStart(2, '0')}`;
   return `${m}:${sec.toString().padStart(2, '0')}`;
+}
+
+function formatBytes(bytes: number): string {
+  const value = Number(bytes || 0);
+  if (!Number.isFinite(value) || value <= 0) return '—';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let size = value;
+  let idx = 0;
+  while (size >= 1024 && idx < units.length - 1) {
+    size /= 1024;
+    idx += 1;
+  }
+  const fixed = size >= 10 || idx === 0 ? 0 : 1;
+  return `${size.toFixed(fixed)} ${units[idx]}`;
 }
 
 function wordCount(text: string): number {
@@ -78,6 +97,25 @@ function splitInlineTrackArtistTitle(
   return { artist: left, title: right };
 }
 
+function parseGenreBadges(value: string): string[] {
+  const raw = String(value || '').trim();
+  if (!raw) return [];
+  const chunks = raw
+    .split(/[;,/|]+/g)
+    .map((item) => item.trim())
+    .filter(Boolean);
+  const uniq = new Set<string>();
+  const out: string[] = [];
+  for (const chunk of chunks) {
+    const norm = chunk.toLowerCase();
+    if (uniq.has(norm)) continue;
+    uniq.add(norm);
+    out.push(chunk);
+    if (out.length >= 10) break;
+  }
+  return out;
+}
+
 export default function AlbumPage() {
   const navigate = useNavigate();
   const params = useParams<{ albumId: string }>();
@@ -94,6 +132,12 @@ export default function AlbumPage() {
   const [playlists, setPlaylists] = useState<api.PlaylistSummary[]>([]);
   const [addingTrackId, setAddingTrackId] = useState<number | null>(null);
   const [downloadingAlbum, setDownloadingAlbum] = useState(false);
+  const [aiReviewBusy, setAiReviewBusy] = useState(false);
+  const [matchDialogOpen, setMatchDialogOpen] = useState(false);
+  const [trackDetailsLoading, setTrackDetailsLoading] = useState(false);
+  const [trackDetailsError, setTrackDetailsError] = useState<string | null>(null);
+  const [expandedTrackId, setExpandedTrackId] = useState<number | null>(null);
+  const [trackDetailsById, setTrackDetailsById] = useState<Record<number, api.AlbumTrackDetailItem>>({});
   const durationRefreshAttemptsRef = useRef(0);
 
   const load = useCallback(async () => {
@@ -121,6 +165,28 @@ export default function AlbumPage() {
 
   useEffect(() => {
     durationRefreshAttemptsRef.current = 0;
+    setExpandedTrackId(null);
+    setTrackDetailsError(null);
+    setTrackDetailsById({});
+  }, [albumId]);
+
+  const loadTrackDetails = useCallback(async () => {
+    if (!Number.isFinite(albumId) || albumId <= 0) return;
+    setTrackDetailsLoading(true);
+    setTrackDetailsError(null);
+    try {
+      const res = await api.getAlbumTrackDetails(albumId, true);
+      const map: Record<number, api.AlbumTrackDetailItem> = {};
+      for (const item of res.tracks || []) {
+        const tid = Number(item?.track_id || 0);
+        if (tid > 0) map[tid] = item;
+      }
+      setTrackDetailsById(map);
+    } catch (e) {
+      setTrackDetailsError(e instanceof Error ? e.message : 'Failed to load track details');
+    } finally {
+      setTrackDetailsLoading(false);
+    }
   }, [albumId]);
 
   useEffect(() => {
@@ -128,7 +194,7 @@ export default function AlbumPage() {
     if (!data || loading) return;
     const hasMissingDurations = (data.tracks || []).some((t) => Number(t.duration_sec || 0) <= 0);
     if (!hasMissingDurations) return;
-    if (durationRefreshAttemptsRef.current > 0) return;
+    if (durationRefreshAttemptsRef.current >= 3) return;
 
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
@@ -143,7 +209,8 @@ export default function AlbumPage() {
       }
     };
 
-    timer = setTimeout(run, 1100);
+    const attemptNo = Math.max(0, durationRefreshAttemptsRef.current);
+    timer = setTimeout(run, 900 + attemptNo * 1300);
     return () => {
       cancelled = true;
       if (timer) clearTimeout(timer);
@@ -269,6 +336,36 @@ export default function AlbumPage() {
     [playlists, toast]
   );
 
+  const handleGenerateAiReview = useCallback(async () => {
+    if (!data || aiReviewBusy) return;
+    setAiReviewBusy(true);
+    try {
+      const res = await api.generateAlbumReview(data.album_id);
+      await load();
+      toast({
+        title: 'Album review generated',
+        description: res.source ? `Source: ${res.source}` : 'Review updated.',
+      });
+    } catch (e) {
+      const apiMsg =
+        (e && typeof e === 'object' && 'body' in e && typeof (e as { body?: unknown }).body === 'object'
+          ? String(
+              ((e as { body?: Record<string, unknown> }).body?.error
+                || (e as { body?: Record<string, unknown> }).body?.detail
+                || (e as { body?: Record<string, unknown> }).body?.message
+                || '')
+            ).trim()
+          : '') || '';
+      toast({
+        title: 'AI review failed',
+        description: apiMsg || (e instanceof Error ? e.message : 'Unable to generate album review'),
+        variant: 'destructive',
+      });
+    } finally {
+      setAiReviewBusy(false);
+    }
+  }, [aiReviewBusy, data, load, toast]);
+
   if (loading) {
     return (
       <div className="container py-8">
@@ -297,6 +394,7 @@ export default function AlbumPage() {
   const reviewText = (data.review?.description || data.review?.short_description || '').trim();
   const reviewSource = (data.review?.source || '').trim();
   const showReviewToggle = wordCount(reviewText) >= 80 || reviewText.length >= 420;
+  const genreBadges = parseGenreBadges(data.genre || '');
 
   return (
     <div className="container py-4 md:py-6 space-y-5 md:space-y-6">
@@ -329,6 +427,26 @@ export default function AlbumPage() {
               Download
             </Button>
           ) : null}
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-8 gap-2"
+            onClick={() => setMatchDialogOpen(true)}
+          >
+            <Info className="w-4 h-4" />
+            Match detail
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-8 gap-2"
+            onClick={() => void handleGenerateAiReview()}
+            disabled={aiReviewBusy}
+            title="Generate album review via AI with safety checks"
+          >
+            {aiReviewBusy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
+            AI review
+          </Button>
           <Button size="sm" className="h-8 gap-2" onClick={handlePlay} disabled={playbackTracks.length === 0}>
             <Play className="w-4 h-4" />
             Play
@@ -337,24 +455,36 @@ export default function AlbumPage() {
       </div>
 
       <Card className="overflow-hidden border-border/70">
-        <div className="relative">
-          <div className="absolute inset-0 z-10 bg-background/40 backdrop-blur-2xl" />
-          <div className="absolute inset-0 z-10 bg-gradient-to-r from-background/96 via-background/78 to-background/62" />
+        <div className="relative overflow-hidden">
+          <div className="absolute inset-0 z-10 bg-background/18 backdrop-blur-md" />
+          <div className="absolute inset-0 z-10 bg-gradient-to-r from-background/76 via-background/58 to-background/42" />
           {data.cover_url ? (
-            <img src={data.cover_url} alt={data.title} className="w-full h-64 md:h-72 object-cover blur-[2.2px] scale-[1.08]" />
+            <img src={data.cover_url} alt={data.title} className="w-full h-64 md:h-72 object-cover blur-[1.4px] scale-[1.06]" />
           ) : (
             <div className="h-64 md:h-72 bg-gradient-to-br from-muted via-muted/70 to-accent/20" />
           )}
           <div className="absolute inset-0 z-20 p-6 md:p-8 flex items-end">
-            <div className="grid grid-cols-1 md:grid-cols-[8.5rem,1fr] gap-5 w-full items-end">
-              <div className="w-28 h-28 md:w-36 md:h-36 rounded-3xl overflow-hidden border border-border/60 bg-muted shrink-0 shadow-sm">
-                {data.cover_url ? (
-                  <img src={data.cover_url} alt={data.title} className="w-full h-full object-cover animate-in fade-in-0 duration-300" />
-                ) : (
-                  <div className="w-full h-full flex items-center justify-center">
-                    <Music className="w-8 h-8 text-muted-foreground" />
-                  </div>
-                )}
+            <div className="grid grid-cols-1 md:grid-cols-[12rem,1fr] gap-5 w-full items-end">
+              <div className="w-36 h-36 md:w-48 md:h-48 rounded-3xl overflow-hidden border border-border bg-muted shrink-0 shadow-md">
+                <div className="relative w-full h-full group">
+                  {data.cover_url ? (
+                    <img src={data.cover_url} alt={data.title} className="w-full h-full object-cover animate-in fade-in-0 duration-300" />
+                  ) : (
+                    <div className="w-full h-full flex items-center justify-center">
+                      <Music className="w-8 h-8 text-muted-foreground" />
+                    </div>
+                  )}
+                  <Button
+                    type="button"
+                    size="icon"
+                    variant="secondary"
+                    className="absolute right-1.5 bottom-1.5 h-7 w-7 opacity-0 group-hover:opacity-100 transition-opacity"
+                    title="Edit cover source"
+                    onClick={() => setMatchDialogOpen(true)}
+                  >
+                    <Pencil className="w-3.5 h-3.5" />
+                  </Button>
+                </div>
               </div>
               <div className="min-w-0">
                 <h1 className="text-2xl md:text-4xl font-bold tracking-tight truncate">{data.title}</h1>
@@ -369,41 +499,54 @@ export default function AlbumPage() {
 
                 <div className="flex flex-wrap items-center gap-2 mt-4">
                   {data.year ? (
-                    <Badge variant="outline" className="gap-1.5 text-[10px]">
+                    <Badge variant="outline" className={cn("gap-1.5 text-[10px]", badgeKindClass('year'))}>
                       <Calendar className="w-3 h-3" />
                       {data.year}
                     </Badge>
                   ) : null}
-                  <Badge variant="outline" className="text-[10px]">
+                  <Badge variant="outline" className={cn("text-[10px]", badgeKindClass('count'))}>
                     {data.track_count} tracks
                   </Badge>
-                  <Badge variant="outline" className="text-[10px]">
+                  <Badge variant="outline" className={cn("text-[10px]", badgeKindClass('duration'))}>
                     {formatDuration(data.total_duration_sec || 0)}
                   </Badge>
                   {data.format ? <FormatBadge format={data.format} size="sm" /> : null}
-                  <Badge variant={data.is_lossless ? 'secondary' : 'outline'} className="text-[10px]">
+                  <Badge
+                    variant="outline"
+                    className={cn("text-[10px]", data.is_lossless ? badgeKindClass('lossless') : badgeKindClass('lossy'))}
+                  >
                     {data.is_lossless ? 'Lossless' : 'Lossy'}
                   </Badge>
                   {data.metadata_source ? (
-                    <Badge variant="outline" className="text-[10px]">
-                      Source: {data.metadata_source}
-                    </Badge>
+                    data.metadata_source_url ? (
+                      <ProviderLink
+                        provider={data.metadata_source}
+                        href={data.metadata_source_url}
+                        prefix="Source"
+                        className="inline-flex"
+                      />
+                    ) : (
+                      <ProviderBadge provider={data.metadata_source} prefix="Source" className="text-[10px]" />
+                    )
                   ) : null}
                   {data.bandcamp_album_url ? (
-                    <a
-                      href={data.bandcamp_album_url}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="inline-flex"
-                      title="Open on Bandcamp"
-                    >
-                      <Badge variant="outline" className="gap-1.5 text-[10px] hover:bg-muted transition-colors">
-                        <ExternalLink className="w-3 h-3" />
-                        Bandcamp
-                      </Badge>
-                    </a>
+                    <ProviderLink provider="bandcamp" href={data.bandcamp_album_url} className="inline-flex" />
                   ) : null}
                 </div>
+                {genreBadges.length > 0 ? (
+                  <div className="mt-3 flex flex-wrap gap-1.5">
+                    {genreBadges.map((genre) => (
+                      <Badge
+                        key={`album-genre-${genre}`}
+                        variant="outline"
+                        className={cn("text-[10px] cursor-pointer", badgeKindClass('genre'))}
+                        onClick={() => navigate(`/library/genre/${encodeURIComponent(genre)}`)}
+                      >
+                        {genre}
+                      </Badge>
+                    ))}
+                  </div>
+                ) : null}
               </div>
             </div>
           </div>
@@ -421,9 +564,7 @@ export default function AlbumPage() {
                 </CollapsibleContent>
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   {reviewSource ? (
-                    <Badge variant="outline" className="text-[10px]">
-                      Source: {reviewSource}
-                    </Badge>
+                    <ProviderBadge provider={reviewSource} prefix="Source" className="text-[10px]" />
                   ) : (
                     <span />
                   )}
@@ -452,7 +593,13 @@ export default function AlbumPage() {
                 {trackRows.length > 0 ? `${trackRows.length} track${trackRows.length !== 1 ? 's' : ''}` : ' '}
               </p>
             </div>
+            <div className="flex items-center gap-2">
+              {trackDetailsLoading ? <Loader2 className="w-4 h-4 animate-spin text-muted-foreground" /> : null}
+            </div>
           </div>
+          {trackDetailsError ? (
+            <p className="text-xs text-destructive">{trackDetailsError}</p>
+          ) : null}
 
           {trackRows.length === 0 ? (
             <p className="text-sm text-muted-foreground">No tracks found for this album.</p>
@@ -463,10 +610,11 @@ export default function AlbumPage() {
                   <TableRow className="hover:bg-transparent">
                     <TableHead className="h-10 w-[80px] text-[10px] uppercase tracking-wide">#</TableHead>
                     <TableHead className="h-10 text-[10px] uppercase tracking-wide">Artist</TableHead>
+                    <TableHead className="h-10 w-[70px] text-right text-[10px] uppercase tracking-wide">Play</TableHead>
                     <TableHead className="h-10 min-w-[320px] text-[10px] uppercase tracking-wide">Track name</TableHead>
                     <TableHead className="h-10 w-[90px] text-right text-[10px] uppercase tracking-wide">Duration</TableHead>
-                    <TableHead className="h-10 w-[70px] text-right text-[10px] uppercase tracking-wide">Play</TableHead>
                     <TableHead className="h-10 w-[78px] text-right text-[10px] uppercase tracking-wide">Queue</TableHead>
+                    <TableHead className="h-10 w-[90px] text-right text-[10px] uppercase tracking-wide">Detail</TableHead>
                     {isAdmin ? (
                       <TableHead className="h-10 w-[92px] text-right text-[10px] uppercase tracking-wide">Playlist</TableHead>
                     ) : null}
@@ -475,110 +623,172 @@ export default function AlbumPage() {
                 <TableBody>
                   {trackRows.map((t, idx) => {
                     const canStream = playbackByTrackId.has(t.track_id);
+                    const detail = trackDetailsById[t.track_id];
+                    const detailOpen = expandedTrackId === t.track_id;
+                    const detailTagEntries = Object.entries(detail?.tags || {}).sort((a, b) => a[0].localeCompare(b[0]));
+                    const detailsColspan = isAdmin ? 8 : 7;
                     return (
-                      <TableRow key={`alb-tr-${t.track_id || idx}`}>
-                        <TableCell className="py-3 text-xs tabular-nums text-muted-foreground">{t.display_num}</TableCell>
-                        <TableCell className="py-3">
-                          <div className="max-w-[220px] truncate text-sm text-muted-foreground">{t.display_artist}</div>
-                        </TableCell>
-                        <TableCell className="py-3">
-                          <div className="text-sm font-medium truncate">{t.display_title || 'Untitled'}</div>
-                          <div className="flex items-center gap-1.5 flex-wrap mt-1">
-                            {t.featured ? (
-                              <Badge variant="secondary" className="text-[10px]">
-                                feat. {t.featured}
-                              </Badge>
-                            ) : null}
-                            {t.format ? (
-                              <Badge variant="outline" className="text-[10px]">
-                                {t.format.toUpperCase()}
-                              </Badge>
-                            ) : null}
-                            {t.sample_rate ? (
-                              <Badge variant="outline" className="text-[10px]">
-                                {Math.round((t.sample_rate || 0) / 100) / 10}kHz
-                              </Badge>
-                            ) : null}
-                            {t.bit_depth ? (
-                              <Badge variant="outline" className="text-[10px]">
-                                {t.bit_depth}bit
-                              </Badge>
-                            ) : null}
-                          </div>
-                        </TableCell>
-                        <TableCell className="py-3 text-right text-xs tabular-nums text-muted-foreground">
-                          {formatDuration(t.duration_sec || 0)}
-                        </TableCell>
-                        <TableCell className="py-3 text-right">
-                          <Button
-                            type="button"
-                            size="icon"
-                            variant="ghost"
-                            className="h-8 w-8 rounded-full"
-                            onClick={() => handlePlayTrack(t.track_id)}
-                            title="Play track"
-                            disabled={!canStream}
-                          >
-                            <Play className="h-4 w-4" />
-                          </Button>
-                        </TableCell>
-                        <TableCell className="py-3 text-right">
-                          <Button
-                            type="button"
-                            size="icon"
-                            variant="ghost"
-                            className="h-8 w-8 rounded-full"
-                            onClick={() => handleQueueTrack(t.track_id)}
-                            title="Queue track"
-                            disabled={!canStream}
-                          >
-                            <ListPlus className="h-4 w-4" />
-                          </Button>
-                        </TableCell>
-                        {isAdmin ? (
-                          <TableCell className="py-3 text-right">
-                            <DropdownMenu>
-                              <DropdownMenuTrigger asChild>
-                                <Button
-                                  type="button"
-                                  size="icon"
-                                  variant="ghost"
-                                  className="h-8 w-8 rounded-full"
-                                  title="Add to playlist"
-                                  disabled={!canStream || addingTrackId === t.track_id}
-                                >
-                                  {addingTrackId === t.track_id ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
-                                </Button>
-                              </DropdownMenuTrigger>
-                              <DropdownMenuContent align="end" className="w-64">
-                                <DropdownMenuLabel>Add to playlist</DropdownMenuLabel>
-                                <DropdownMenuSeparator />
-                                {playlistsLoading ? (
-                                  <DropdownMenuItem disabled>Loading playlists…</DropdownMenuItem>
-                                ) : playlists.length === 0 ? (
-                                  <DropdownMenuItem onSelect={() => navigate('/library/playlists')}>
-                                    Create a playlist
-                                  </DropdownMenuItem>
-                                ) : (
-                                  playlists.slice(0, 20).map((pl) => (
-                                    <DropdownMenuItem
-                                      key={`pl-add-${pl.playlist_id}`}
-                                      onSelect={() => void handleAddTrackToPlaylist(t.track_id, pl.playlist_id)}
-                                    >
-                                      <span className="truncate">{pl.name}</span>
-                                      <span className="ml-auto text-xs text-muted-foreground">{pl.item_count}</span>
-                                    </DropdownMenuItem>
-                                  ))
-                                )}
-                                <DropdownMenuSeparator />
-                                <DropdownMenuItem onSelect={() => navigate('/library/playlists')}>
-                                  Manage playlists
-                                </DropdownMenuItem>
-                              </DropdownMenuContent>
-                            </DropdownMenu>
+                      <Fragment key={`alb-tr-${t.track_id || idx}`}>
+                        <TableRow>
+                          <TableCell className="py-3 text-xs tabular-nums text-muted-foreground">{t.display_num}</TableCell>
+                          <TableCell className="py-3">
+                            <div className="max-w-[220px] truncate text-sm text-muted-foreground">{t.display_artist}</div>
                           </TableCell>
+                          <TableCell className="py-3 text-right">
+                            <Button
+                              type="button"
+                              size="icon"
+                              variant="ghost"
+                              className="h-8 w-8 rounded-full"
+                              onClick={() => handlePlayTrack(t.track_id)}
+                              title="Play track"
+                              disabled={!canStream}
+                            >
+                              <Play className="h-4 w-4" />
+                            </Button>
+                          </TableCell>
+                          <TableCell className="py-3">
+                            <div className="text-sm font-medium truncate">{t.display_title || 'Untitled'}</div>
+                            <div className="flex items-center gap-1.5 flex-wrap mt-1">
+                              {t.featured ? (
+                                <Badge variant="outline" className={cn("text-[10px]", badgeKindClass('genre'))}>
+                                  feat. {t.featured}
+                                </Badge>
+                              ) : null}
+                              {t.format ? (
+                                <Badge variant="outline" className={cn("text-[10px]", badgeKindClass('track_meta'))}>
+                                  {t.format.toUpperCase()}
+                                </Badge>
+                              ) : null}
+                              {t.sample_rate ? (
+                                <Badge variant="outline" className={cn("text-[10px]", badgeKindClass('track_meta'))}>
+                                  {Math.round((t.sample_rate || 0) / 100) / 10}kHz
+                                </Badge>
+                              ) : null}
+                              {t.bit_depth ? (
+                                <Badge variant="outline" className={cn("text-[10px]", badgeKindClass('track_meta'))}>
+                                  {t.bit_depth}bit
+                                </Badge>
+                              ) : null}
+                            </div>
+                          </TableCell>
+                          <TableCell className="py-3 text-right text-xs tabular-nums text-muted-foreground">
+                            {Number(t.duration_sec || 0) > 0 ? formatDuration(t.duration_sec || 0) : '—'}
+                          </TableCell>
+                          <TableCell className="py-3 text-right">
+                            <Button
+                              type="button"
+                              size="icon"
+                              variant="ghost"
+                              className="h-8 w-8 rounded-full"
+                              onClick={() => handleQueueTrack(t.track_id)}
+                              title="Queue track"
+                              disabled={!canStream}
+                            >
+                              <ListPlus className="h-4 w-4" />
+                            </Button>
+                          </TableCell>
+                          <TableCell className="py-3 text-right">
+                            <Button
+                              type="button"
+                              size="sm"
+                              variant="ghost"
+                              className="h-8 px-2.5"
+                              onClick={() => {
+                                if (!trackDetailsLoading && Object.keys(trackDetailsById).length === 0) {
+                                  void loadTrackDetails();
+                                }
+                                setExpandedTrackId((prev) => (prev === t.track_id ? null : t.track_id));
+                              }}
+                            >
+                              {detailOpen ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+                            </Button>
+                          </TableCell>
+                          {isAdmin ? (
+                            <TableCell className="py-3 text-right">
+                              <DropdownMenu>
+                                <DropdownMenuTrigger asChild>
+                                  <Button
+                                    type="button"
+                                    size="icon"
+                                    variant="ghost"
+                                    className="h-8 w-8 rounded-full"
+                                    title="Add to playlist"
+                                    disabled={!canStream || addingTrackId === t.track_id}
+                                  >
+                                    {addingTrackId === t.track_id ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
+                                  </Button>
+                                </DropdownMenuTrigger>
+                                <DropdownMenuContent align="end" className="w-64">
+                                  <DropdownMenuLabel>Add to playlist</DropdownMenuLabel>
+                                  <DropdownMenuSeparator />
+                                  {playlistsLoading ? (
+                                    <DropdownMenuItem disabled>Loading playlists…</DropdownMenuItem>
+                                  ) : playlists.length === 0 ? (
+                                    <DropdownMenuItem onSelect={() => navigate('/library/playlists')}>
+                                      Create a playlist
+                                    </DropdownMenuItem>
+                                  ) : (
+                                    playlists.slice(0, 20).map((pl) => (
+                                      <DropdownMenuItem
+                                        key={`pl-add-${pl.playlist_id}`}
+                                        onSelect={() => void handleAddTrackToPlaylist(t.track_id, pl.playlist_id)}
+                                      >
+                                        <span className="truncate">{pl.name}</span>
+                                        <span className="ml-auto text-xs text-muted-foreground">{pl.item_count}</span>
+                                      </DropdownMenuItem>
+                                    ))
+                                  )}
+                                  <DropdownMenuSeparator />
+                                  <DropdownMenuItem onSelect={() => navigate('/library/playlists')}>
+                                    Manage playlists
+                                  </DropdownMenuItem>
+                                </DropdownMenuContent>
+                              </DropdownMenu>
+                            </TableCell>
+                          ) : null}
+                        </TableRow>
+                        {detailOpen ? (
+                          <TableRow className="bg-muted/20">
+                            <TableCell colSpan={detailsColspan} className="py-3 px-4">
+                              <div className="space-y-3">
+                                <div className="text-xs">
+                                  <span className="text-muted-foreground">Path:</span>{' '}
+                                  <code className="rounded bg-muted px-1.5 py-0.5 text-[11px]">{detail?.file_path || t.file_path || '—'}</code>
+                                </div>
+                                <div className="flex flex-wrap gap-1.5 text-[11px]">
+                                  <Badge variant="outline" className={badgeKindClass('track_meta')}>Format: {(detail?.format || t.format || '—').toUpperCase()}</Badge>
+                                  <Badge variant="outline" className={badgeKindClass('track_meta')}>Bitrate: {detail?.bitrate || t.bitrate || 0} kb/s</Badge>
+                                  <Badge variant="outline" className={badgeKindClass('track_meta')}>
+                                    Sample rate: {Math.round(((detail?.sample_rate || t.sample_rate || 0) / 100) || 0) / 10} kHz
+                                  </Badge>
+                                  <Badge variant="outline" className={badgeKindClass('track_meta')}>Bit depth: {detail?.bit_depth || t.bit_depth || 0} bit</Badge>
+                                  <Badge variant="outline" className={badgeKindClass('track_meta')}>Size: {formatBytes(detail?.file_size_bytes || t.file_size_bytes || 0)}</Badge>
+                                </div>
+                                {detail?.tags_error ? (
+                                  <p className="text-xs text-destructive">Tag inspector: {detail.tags_error}</p>
+                                ) : null}
+                                <div className="space-y-2">
+                                  <div className="text-xs font-medium">All file tags ({detailTagEntries.length})</div>
+                                  {detailTagEntries.length === 0 ? (
+                                    <p className="text-xs text-muted-foreground">
+                                      {trackDetailsLoading ? 'Loading tags…' : 'No tag data available for this track.'}
+                                    </p>
+                                  ) : (
+                                    <div className="grid grid-cols-1 md:grid-cols-2 gap-x-4 gap-y-1.5">
+                                      {detailTagEntries.map(([k, v]) => (
+                                        <div key={`tag-${t.track_id}-${k}`} className="text-[11px] leading-relaxed">
+                                          <span className="font-medium">{k}</span>: <span className="text-muted-foreground break-all">{v}</span>
+                                        </div>
+                                      ))}
+                                    </div>
+                                  )}
+                                </div>
+                              </div>
+                            </TableCell>
+                          </TableRow>
                         ) : null}
-                      </TableRow>
+                      </Fragment>
                     );
                   })}
                 </TableBody>
@@ -587,6 +797,15 @@ export default function AlbumPage() {
           )}
         </CardContent>
       </Card>
+
+      <MatchDetailDialog
+        open={matchDialogOpen}
+        onOpenChange={setMatchDialogOpen}
+        entity={{ kind: 'album', albumId: data.album_id }}
+        onDataChanged={() => {
+          void load();
+        }}
+      />
     </div>
   );
 }

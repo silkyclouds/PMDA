@@ -4,6 +4,7 @@ import { Bot, Loader2, MessageCircle, Send, Sparkles } from 'lucide-react';
 
 import { cn } from '@/lib/utils';
 import * as api from '@/lib/api';
+import { ProviderBadge } from '@/components/providers/ProviderBadge';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -284,9 +285,14 @@ export function AssistantDock({ bottomOffsetPx = 16 }: { bottomOffsetPx?: number
                       {assistantOnline ? 'Online' : 'Offline'}
                     </Badge>
                     {status?.ai_provider ? (
-                      <Badge variant="outline" className="max-w-full truncate">
-                        {status.ai_provider} {status.ai_model ? `· ${status.ai_model}` : ''}
-                      </Badge>
+                      <div className="inline-flex items-center gap-1.5 max-w-full">
+                        <ProviderBadge provider={status.ai_provider} className="max-w-full truncate" />
+                        {status.ai_model ? (
+                          <Badge variant="outline" className="max-w-full truncate">
+                            {status.ai_model}
+                          </Badge>
+                        ) : null}
+                      </div>
                     ) : null}
                     {contextArtistId > 0 ? (
                       <Badge variant="outline" className="max-w-full truncate">

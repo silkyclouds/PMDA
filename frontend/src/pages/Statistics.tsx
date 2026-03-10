@@ -31,12 +31,20 @@ import {
   Legend,
 } from 'chart.js';
 import { Bar, Line, Doughnut, Pie } from 'react-chartjs-2';
-import type { CacheControlMetrics, ScanHistoryEntry, ScanProgress } from '@/lib/api';
+import type {
+  BenchmarkReportSummary,
+  CacheControlMetrics,
+  ScanAICostSummary,
+  ScanHistoryEntry,
+  ScanProgress,
+} from '@/lib/api';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
+import { ProviderBadge } from '@/components/providers/ProviderBadge';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import * as api from '@/lib/api';
+import { toast } from 'sonner';
 
 ChartJS.register(
   CategoryScale,
@@ -57,9 +65,11 @@ const PERIODS = [
   { key: 'last', label: 'Last scan', hours: 0 },
   { key: 'forever', label: 'Forever', hours: 0 },
 ] as const;
+const AI_COST_ALBUM_LIMIT = 200;
+const AI_COST_SCAN_ROWS_LIMIT = 30;
 
 type PeriodKey = (typeof PERIODS)[number]['key'];
-type StatsTab = 'overview' | 'metadata' | 'quality' | 'operations' | 'ai';
+type StatsTab = 'overview' | 'metadata' | 'quality' | 'operations' | 'ai' | 'benchmark';
 
 interface ScanSnapshot {
   scanId: number;
@@ -94,6 +104,9 @@ interface ScanSnapshot {
   aiCallsWebMbid: number;
   aiCallsVision: number;
   aiErrorsTotal: number;
+  aiTokensTotal: number;
+  aiCostUsdTotal: number;
+  aiUnpricedCalls: number;
 }
 
 interface AggregateStats {
@@ -127,6 +140,9 @@ interface AggregateStats {
   aiCallsWebMbid: number;
   aiCallsVision: number;
   aiErrorsTotal: number;
+  aiTokensTotal: number;
+  aiCostUsdTotal: number;
+  aiUnpricedCalls: number;
 }
 
 function n(value: number | null | undefined): number {
@@ -148,6 +164,13 @@ function formatBytes(bytes: number): string {
     idx += 1;
   }
   return `${val.toFixed(val >= 100 || idx === 0 ? 0 : 1)} ${units[idx]}`;
+}
+
+function formatUsd(value: number): string {
+  const v = Number.isFinite(value) ? Math.max(0, value) : 0;
+  if (v >= 100) return `$${v.toFixed(2)}`;
+  if (v >= 1) return `$${v.toFixed(3)}`;
+  return `$${v.toFixed(4)}`;
 }
 
 function formatPercent(value: number, total: number): string {
@@ -224,6 +247,9 @@ function normalizeScan(entry: ScanHistoryEntry): ScanSnapshot {
     aiCallsWebMbid: n(summary?.ai_calls_web_mbid),
     aiCallsVision: n(summary?.ai_calls_vision),
     aiErrorsTotal: Array.isArray(summary?.ai_errors) ? summary!.ai_errors!.length : 0,
+    aiTokensTotal: n(summary?.ai_tokens_total ?? entry.ai_tokens_total),
+    aiCostUsdTotal: n(summary?.ai_cost_usd_total ?? entry.ai_cost_usd_total),
+    aiUnpricedCalls: n(summary?.ai_unpriced_calls ?? entry.ai_unpriced_calls),
   };
 }
 
@@ -279,6 +305,9 @@ function normalizeLiveScan(progress: ScanProgress, fallbackStartTime: number): S
     aiCallsWebMbid: 0,
     aiCallsVision: 0,
     aiErrorsTotal: 0,
+    aiTokensTotal: 0,
+    aiCostUsdTotal: 0,
+    aiUnpricedCalls: 0,
   };
 }
 
@@ -315,6 +344,9 @@ function aggregate(scans: ScanSnapshot[]): AggregateStats {
       acc.aiCallsWebMbid += scan.aiCallsWebMbid;
       acc.aiCallsVision += scan.aiCallsVision;
       acc.aiErrorsTotal += scan.aiErrorsTotal;
+      acc.aiTokensTotal += scan.aiTokensTotal;
+      acc.aiCostUsdTotal += scan.aiCostUsdTotal;
+      acc.aiUnpricedCalls += scan.aiUnpricedCalls;
       return acc;
     },
     {
@@ -348,6 +380,9 @@ function aggregate(scans: ScanSnapshot[]): AggregateStats {
       aiCallsWebMbid: 0,
       aiCallsVision: 0,
       aiErrorsTotal: 0,
+      aiTokensTotal: 0,
+      aiCostUsdTotal: 0,
+      aiUnpricedCalls: 0,
     },
   );
 }
@@ -410,6 +445,8 @@ export default function Statistics() {
   const navigate = useNavigate();
   const [period, setPeriod] = useState<PeriodKey>('last');
   const [activeTab, setActiveTab] = useState<StatsTab>('overview');
+  const [aiCostScope, setAiCostScope] = useState<'scan' | 'lifecycle'>('lifecycle');
+  const [watcherRestarting, setWatcherRestarting] = useState(false);
   const liveScanStartRef = useRef<number>(Math.floor(Date.now() / 1000));
 
   const { data: history = [], isLoading } = useQuery({
@@ -423,6 +460,12 @@ export default function Statistics() {
     refetchInterval: 2000,
     refetchIntervalInBackground: true,
   });
+  const { data: configData } = useQuery({
+    queryKey: ['config-ai-billing'],
+    queryFn: api.getConfig,
+    staleTime: 60_000,
+    refetchInterval: false,
+  });
   const {
     data: cacheControl,
     refetch: refetchCacheControl,
@@ -430,6 +473,16 @@ export default function Statistics() {
   } = useQuery<CacheControlMetrics>({
     queryKey: ['stats-cache-control'],
     queryFn: () => api.getCacheControlMetrics(false),
+    refetchInterval: (scanProgress?.scanning || scanProgress?.post_processing) ? 5000 : 15000,
+    refetchIntervalInBackground: true,
+  });
+  const {
+    data: watcherRuntimeStatus,
+    refetch: refetchWatcherRuntimeStatus,
+    isFetching: watcherRuntimeRefreshing,
+  } = useQuery({
+    queryKey: ['files-watcher-status'],
+    queryFn: api.getFilesWatcherStatus,
     refetchInterval: (scanProgress?.scanning || scanProgress?.post_processing) ? 5000 : 15000,
     refetchIntervalInBackground: true,
   });
@@ -450,6 +503,10 @@ export default function Statistics() {
   const liveDetectedAlbumsTotal = n(scanProgress?.detected_albums_total);
   const liveSkippedArtists = n(scanProgress?.resume_skipped_artists);
   const liveSkippedAlbums = n(scanProgress?.resume_skipped_albums);
+  const isRunScopePreparing = Boolean(
+    isLiveRunActive &&
+    (scanProgress?.phase === 'preparing_run_scope' || scanProgress?.scan_run_scope_preparing),
+  );
   const isPreScanPhase = Boolean(isLiveRunActive && scanProgress?.phase === 'pre_scan');
   const preScanStage = String(scanProgress?.scan_discovery_stage || '');
   const preScanRootsDone = n(scanProgress?.scan_discovery_roots_done);
@@ -471,7 +528,15 @@ export default function Statistics() {
   const preScanProgressDone = preScanProgressTotal > 0
     ? Math.min(preScanProgressDoneRaw, preScanProgressTotal)
     : preScanProgressDoneRaw;
-  const runScopePending = isPreScanPhase && liveDetectedArtistsTotal === 0 && liveDetectedAlbumsTotal === 0;
+  const runScopePrepStage = String(scanProgress?.scan_run_scope_stage || '');
+  const runScopePrepDoneRaw = n(scanProgress?.scan_run_scope_done);
+  const runScopePrepTotal = n(scanProgress?.scan_run_scope_total);
+  const runScopePrepDone = runScopePrepTotal > 0
+    ? Math.min(runScopePrepDoneRaw, runScopePrepTotal)
+    : runScopePrepDoneRaw;
+  const runScopeIncludedArtists = n(scanProgress?.scan_run_scope_artists_included);
+  const runScopeIncludedAlbums = n(scanProgress?.scan_run_scope_albums_included);
+  const runScopePending = (isPreScanPhase || isRunScopePreparing) && liveDetectedArtistsTotal === 0 && liveDetectedAlbumsTotal === 0;
   const liveTracksDetected = n(scanProgress?.scan_tracks_detected_total);
   const liveTracksLibraryKept = n(scanProgress?.scan_tracks_library_kept);
   const liveTracksMovedDupes = n(scanProgress?.scan_tracks_moved_dupes);
@@ -510,6 +575,30 @@ export default function Statistics() {
     refetchInterval: 60000,
     refetchIntervalInBackground: true,
   });
+  const {
+    data: benchmarkReportsResponse,
+    refetch: refetchBenchmarkReports,
+    isFetching: benchmarkReportsRefreshing,
+  } = useQuery({
+    queryKey: ['benchmark-reports'],
+    queryFn: () => api.getBenchmarkReports(80),
+    refetchInterval: (scanProgress?.scanning || scanProgress?.post_processing) ? 5000 : 30000,
+    refetchIntervalInBackground: true,
+  });
+  const benchmarkReports = useMemo<BenchmarkReportSummary[]>(
+    () => benchmarkReportsResponse?.reports ?? [],
+    [benchmarkReportsResponse?.reports],
+  );
+  const latestBenchmark = benchmarkReports[0] ?? null;
+  const benchmarkAverageScore = useMemo(() => {
+    if (benchmarkReports.length <= 0) return 0;
+    const total = benchmarkReports.reduce((acc, row) => acc + Number(row.score || 0), 0);
+    return total / benchmarkReports.length;
+  }, [benchmarkReports]);
+  const benchmarkBestScore = useMemo(
+    () => benchmarkReports.reduce((acc, row) => Math.max(acc, Number(row.score || 0)), 0),
+    [benchmarkReports],
+  );
 
   const liveScan = useMemo(() => {
     if (!scanProgress || !isLiveRunActive) return null;
@@ -549,6 +638,58 @@ export default function Statistics() {
       .filter((entry) => entry.entry_type === 'scan' && entry.status === 'completed' && Boolean(entry.end_time))
       .sort((a, b) => n(b.start_time) - n(a.start_time))[0] ?? null;
   }, [history]);
+  const aiCostScanId = useMemo(() => {
+    if (latestSelected && Number.isFinite(latestSelected.scanId) && latestSelected.scanId > 0) {
+      return latestSelected.scanId;
+    }
+    const fallback = latestCompletedEntry?.scan_id ?? 0;
+    return fallback > 0 ? fallback : null;
+  }, [latestCompletedEntry?.scan_id, latestSelected]);
+  const { data: latestAiCostSummary } = useQuery<ScanAICostSummary>({
+    queryKey: ['scan-ai-cost-summary', aiCostScanId, aiCostScope],
+    queryFn: () =>
+      api.getScanAICostSummary(aiCostScanId as number, {
+        includeLifecycle: aiCostScope === 'lifecycle',
+        groupBy: 'analysis_type',
+      }),
+    enabled: (aiCostScanId ?? 0) > 0,
+    refetchInterval: (scanProgress?.scanning || scanProgress?.post_processing) ? 5000 : 30000,
+    refetchIntervalInBackground: true,
+  });
+  const { data: latestAiCostByAlbum } = useQuery<ScanAICostSummary>({
+    queryKey: ['scan-ai-cost-album', aiCostScanId, aiCostScope, AI_COST_ALBUM_LIMIT],
+    queryFn: () =>
+      api.getScanAICostSummary(aiCostScanId as number, {
+        includeLifecycle: aiCostScope === 'lifecycle',
+        groupBy: 'album',
+        limit: AI_COST_ALBUM_LIMIT,
+      }),
+    enabled: (aiCostScanId ?? 0) > 0,
+    refetchInterval: (scanProgress?.scanning || scanProgress?.post_processing) ? 5000 : 30000,
+    refetchIntervalInBackground: true,
+  });
+  const { data: latestAiCostByProvider } = useQuery<ScanAICostSummary>({
+    queryKey: ['scan-ai-cost-provider', aiCostScanId, aiCostScope],
+    queryFn: () =>
+      api.getScanAICostSummary(aiCostScanId as number, {
+        includeLifecycle: aiCostScope === 'lifecycle',
+        groupBy: 'provider',
+      }),
+    enabled: (aiCostScanId ?? 0) > 0,
+    refetchInterval: (scanProgress?.scanning || scanProgress?.post_processing) ? 5000 : 30000,
+    refetchIntervalInBackground: true,
+  });
+  const { data: latestAiCostByAuthMode } = useQuery<ScanAICostSummary>({
+    queryKey: ['scan-ai-cost-auth-mode', aiCostScanId, aiCostScope],
+    queryFn: () =>
+      api.getScanAICostSummary(aiCostScanId as number, {
+        includeLifecycle: aiCostScope === 'lifecycle',
+        groupBy: 'auth_mode',
+      }),
+    enabled: (aiCostScanId ?? 0) > 0,
+    refetchInterval: (scanProgress?.scanning || scanProgress?.post_processing) ? 5000 : 30000,
+    refetchIntervalInBackground: true,
+  });
   const latestSummaryTracksDetected = n(latestCompletedEntry?.summary_json?.scan_tracks_detected_total);
   const latestSummaryTracksLibraryKept = n(latestCompletedEntry?.summary_json?.scan_tracks_library_kept);
   const latestSummaryTracksMovedDupes = n(latestCompletedEntry?.summary_json?.scan_tracks_moved_dupes);
@@ -597,6 +738,33 @@ export default function Statistics() {
     period,
     selectedScans.length,
   ]);
+  const latestAiTotals = latestAiCostSummary?.totals;
+  const latestAiBreakdown = latestAiCostSummary?.breakdown ?? [];
+  const latestAiAlbumBreakdown = latestAiCostByAlbum?.breakdown ?? [];
+  const latestAiProviderBreakdown = latestAiCostByProvider?.breakdown ?? [];
+  const latestAiAuthModeBreakdown = latestAiCostByAuthMode?.breakdown ?? [];
+  const recentAiScanRows = completedScans.slice(0, AI_COST_SCAN_ROWS_LIMIT);
+  const liveGuardCallsUsed = n(scanProgress?.scan_ai_guard_calls_used);
+  const liveGuardCallsBlocked = n(scanProgress?.scan_ai_guard_calls_blocked);
+  const liveGuardLastReason = String(scanProgress?.scan_ai_guard_last_reason || '').trim();
+  const aiBillingModeLabel = useMemo(() => {
+    const provider = String(configData?.AI_PROVIDER || '').trim().toLowerCase();
+    if (!provider) return 'Unknown billing mode';
+    if (!['openai', 'openai-api', 'openai-codex'].includes(provider)) return `Provider billing: ${provider}`;
+    const authMode = String(configData?.OPENAI_AUTH_MODE || '').trim().toLowerCase();
+    const codexConnected = Boolean(configData?.OPENAI_CODEX_OAUTH_CONNECTED);
+    if (provider === 'openai-codex') {
+      if (codexConnected) return 'OpenAI Codex OAuth connected (billing may be account-plan dependent)';
+      return 'OpenAI Codex selected but OAuth is not connected';
+    }
+    if (provider === 'openai-api') {
+      return 'OpenAI API metered (API key mode)';
+    }
+    if (authMode === 'oauth_api_key') return 'OpenAI API metered (OAuth login connected)';
+    if (authMode === 'oauth_connected_no_api_key') return 'OAuth connected, but no API key available';
+    if (authMode === 'api_key') return 'OpenAI API metered';
+    return 'OpenAI not configured';
+  }, [configData?.AI_PROVIDER, configData?.OPENAI_AUTH_MODE, configData?.OPENAI_CODEX_OAUTH_CONNECTED]);
 
   const throughputAlbumsPerMin =
     current.durationSeconds > 0 ? (current.albumsScanned / current.durationSeconds) * 60 : 0;
@@ -825,6 +993,29 @@ export default function Statistics() {
     };
   }, [scansChrono]);
 
+  const benchmarkTrendData = useMemo(() => {
+    const rows = [...benchmarkReports]
+      .filter((row) => Number.isFinite(Number(row.generated_at)))
+      .sort((a, b) => Number(a.generated_at || 0) - Number(b.generated_at || 0));
+    const pointRadius = rows.length <= 1 ? 4 : 2;
+    return {
+      labels: rows.map((row) => format(new Date(Number(row.generated_at || 0) * 1000), 'MM-dd HH:mm')),
+      datasets: [
+        {
+          label: 'Benchmark score',
+          data: rows.map((row) => Number(row.score || 0)),
+          borderColor: '#22c55e',
+          backgroundColor: 'rgba(34,197,94,0.2)',
+          tension: 0.25,
+          fill: true,
+          borderWidth: 2,
+          pointRadius,
+          pointHoverRadius: Math.max(4, pointRadius + 1),
+        },
+      ],
+    };
+  }, [benchmarkReports]);
+
   const cacheMixData = useMemo(() => {
     return {
       labels: ['Audio cache', 'MusicBrainz cache'],
@@ -890,21 +1081,38 @@ export default function Statistics() {
 
   const watcherStatus = useMemo(() => {
     if (!hasTelemetry) return { label: 'unknown', variant: 'outline' as const, reason: '' };
-    const running = cacheControl?.files_watcher?.running === true;
-    const enabled = cacheControl?.files_watcher?.enabled !== false;
-    const available = cacheControl?.files_watcher?.available !== false;
-    const reason = String(cacheControl?.files_watcher?.reason || '').trim();
+    const running = watcherRuntimeStatus?.running ?? (cacheControl?.files_watcher?.running === true);
+    const enabled = watcherRuntimeStatus?.enabled ?? (cacheControl?.files_watcher?.enabled !== false);
+    const available = watcherRuntimeStatus?.available ?? (cacheControl?.files_watcher?.available !== false);
+    const reason = String(watcherRuntimeStatus?.reason || cacheControl?.files_watcher?.reason || '').trim();
     if (running) return { label: 'running', variant: 'secondary' as const, reason };
     if (!enabled) return { label: 'disabled', variant: 'outline' as const, reason: reason || 'disabled_by_setting' };
     if (!available) return { label: 'unavailable', variant: 'outline' as const, reason: reason || 'watchdog_unavailable' };
     return { label: 'stopped', variant: 'outline' as const, reason };
   }, [
+    watcherRuntimeStatus?.available,
+    watcherRuntimeStatus?.enabled,
+    watcherRuntimeStatus?.reason,
+    watcherRuntimeStatus?.running,
     cacheControl?.files_watcher?.available,
     cacheControl?.files_watcher?.enabled,
     cacheControl?.files_watcher?.reason,
     cacheControl?.files_watcher?.running,
     hasTelemetry,
   ]);
+
+  const restartWatcher = async () => {
+    setWatcherRestarting(true);
+    try {
+      await api.restartFilesWatcher();
+      toast.success('Watcher restart requested');
+      void Promise.all([refetchWatcherRuntimeStatus(), refetchCacheControl()]);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'Failed to restart watcher');
+    } finally {
+      setWatcherRestarting(false);
+    }
+  };
 
   const cacheStorageData = useMemo(() => {
     return {
@@ -1059,11 +1267,16 @@ export default function Statistics() {
               size="sm"
               className="gap-2"
               onClick={() => {
-                void Promise.all([refetchLibraryStats(), refetchScanMovesAudit(), refetchCacheControl()]);
+                void Promise.all([
+                  refetchLibraryStats(),
+                  refetchScanMovesAudit(),
+                  refetchCacheControl(),
+                  refetchBenchmarkReports(),
+                ]);
               }}
-              disabled={libraryStatsRefreshing || scanMovesAuditRefreshing || cacheControlRefreshing}
+              disabled={libraryStatsRefreshing || scanMovesAuditRefreshing || cacheControlRefreshing || benchmarkReportsRefreshing}
             >
-              {(libraryStatsRefreshing || scanMovesAuditRefreshing || cacheControlRefreshing) ? (
+              {(libraryStatsRefreshing || scanMovesAuditRefreshing || cacheControlRefreshing || benchmarkReportsRefreshing) ? (
                 <Loader2 className="h-4 w-4 animate-spin" />
               ) : (
                 <RefreshCw className="h-4 w-4" />
@@ -1091,19 +1304,25 @@ export default function Statistics() {
               </CardDescription>
             </CardHeader>
             <CardContent className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3 text-sm">
-              {isPreScanPhase ? (
+              {(isPreScanPhase || isRunScopePreparing) ? (
                 <>
                   <div className="rounded-lg border border-border bg-background/70 p-3">
-                    <p className="text-muted-foreground">Pre-scan progress</p>
+                    <p className="text-muted-foreground">{isRunScopePreparing ? 'Preparing run scope' : 'Pre-scan progress'}</p>
                     <p className="text-xl font-semibold tabular-nums">
-                      {preScanProgressTotal > 0
-                        ? `${preScanProgressDone.toLocaleString()} / ${preScanProgressTotal.toLocaleString()}`
-                        : preScanRootsTotal > 0
-                          ? `${preScanRootsDone.toLocaleString()} / ${preScanRootsTotal.toLocaleString()}`
-                          : `${preScanProgressDone.toLocaleString()} / ?`}
+                      {isRunScopePreparing
+                        ? runScopePrepTotal > 0
+                          ? `${runScopePrepDone.toLocaleString()} / ${runScopePrepTotal.toLocaleString()}`
+                          : `${runScopePrepDone.toLocaleString()} / ?`
+                        : preScanProgressTotal > 0
+                          ? `${preScanProgressDone.toLocaleString()} / ${preScanProgressTotal.toLocaleString()}`
+                          : preScanRootsTotal > 0
+                            ? `${preScanRootsDone.toLocaleString()} / ${preScanRootsTotal.toLocaleString()}`
+                            : `${preScanProgressDone.toLocaleString()} / ?`}
                     </p>
                     <p className="text-xs text-muted-foreground tabular-nums">
-                      {preScanProgressTotal > 0 ? 'albums' : 'roots'}
+                      {isRunScopePreparing
+                        ? (runScopePrepStage || 'resume')
+                        : (preScanProgressTotal > 0 ? 'albums' : 'roots')}
                     </p>
                   </div>
                   <div className="rounded-lg border border-border bg-background/70 p-3">
@@ -1127,10 +1346,10 @@ export default function Statistics() {
                   <div className="rounded-lg border border-border bg-background/70 p-3">
                     <p className="text-muted-foreground">Run scope</p>
                     <p className="text-xl font-semibold tabular-nums">
-                      {n(scanProgress.detected_artists_total).toLocaleString()} artists
+                      {(isRunScopePreparing ? runScopeIncludedArtists : n(scanProgress.detected_artists_total)).toLocaleString()} artists
                     </p>
                     <p className="text-xs text-muted-foreground tabular-nums">
-                      {n(scanProgress.detected_albums_total).toLocaleString()} albums
+                      {(isRunScopePreparing ? runScopeIncludedAlbums : n(scanProgress.detected_albums_total)).toLocaleString()} albums
                     </p>
                     {runScopePending && (
                       <p className="text-[11px] text-muted-foreground">pending until plan ready</p>
@@ -1233,7 +1452,7 @@ export default function Statistics() {
           </Card>
         ) : (
           <Tabs value={activeTab} onValueChange={(v) => setActiveTab(v as StatsTab)}>
-            <TabsList className="grid grid-cols-2 md:grid-cols-5 w-full md:w-auto rounded-xl bg-muted/60 border border-border p-1 shadow-sm">
+            <TabsList className="grid grid-cols-2 md:grid-cols-6 w-full md:w-auto rounded-xl bg-muted/60 border border-border p-1 shadow-sm">
               <TabsTrigger value="overview" className="gap-2 rounded-lg">
                 <BarChart3 className="w-4 h-4" />
                 Overview
@@ -1253,6 +1472,10 @@ export default function Statistics() {
               <TabsTrigger value="operations" className="gap-2 rounded-lg">
                 <Gauge className="w-4 h-4" />
                 Operations
+              </TabsTrigger>
+              <TabsTrigger value="benchmark" className="gap-2 rounded-lg">
+                <Gauge className="w-4 h-4" />
+                Benchmark
               </TabsTrigger>
             </TabsList>
 
@@ -1451,6 +1674,32 @@ export default function Statistics() {
             </TabsContent>
 
             <TabsContent value="ai" className="space-y-4">
+              <div className="flex items-center justify-between gap-3 rounded-lg border border-border bg-card p-3">
+                <div>
+                  <p className="text-sm font-medium">Cost scope</p>
+                  <p className="text-xs text-muted-foreground">
+                    {aiCostScanId ? `Scan #${aiCostScanId}` : 'No completed scan selected'}
+                  </p>
+                  <p className="text-xs text-muted-foreground mt-1">{aiBillingModeLabel}</p>
+                </div>
+                <div className="flex items-center gap-2">
+                  <Button
+                    size="sm"
+                    variant={aiCostScope === 'lifecycle' ? 'default' : 'outline'}
+                    onClick={() => setAiCostScope('lifecycle')}
+                  >
+                    Lifecycle
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant={aiCostScope === 'scan' ? 'default' : 'outline'}
+                    onClick={() => setAiCostScope('scan')}
+                  >
+                    Scan only
+                  </Button>
+                </div>
+              </div>
+
               <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
                 <StatCard
                   title="Total AI Calls"
@@ -1487,6 +1736,39 @@ export default function Statistics() {
                 />
               </div>
 
+              <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-5 gap-4">
+                <StatCard
+                  title="Total USD"
+                  icon={<Gauge className="w-4 h-4 text-primary" />}
+                  value={formatUsd(latestAiTotals?.cost_usd ?? current.aiCostUsdTotal)}
+                  description={`Scope: ${aiCostScope}`}
+                />
+                <StatCard
+                  title="Total Tokens"
+                  icon={<Server className="w-4 h-4 text-secondary" />}
+                  value={(latestAiTotals?.total_tokens ?? current.aiTokensTotal).toLocaleString()}
+                  description="Input + output + cache"
+                />
+                <StatCard
+                  title="Unpriced Calls"
+                  icon={<AlertCircle className="w-4 h-4 text-warning" />}
+                  value={(latestAiTotals?.unpriced_calls ?? current.aiUnpricedCalls).toLocaleString()}
+                  description="Provider usage or pricing missing"
+                />
+                <StatCard
+                  title="Guardrail Blocks"
+                  icon={<AlertCircle className="w-4 h-4 text-red-500" />}
+                  value={liveGuardCallsBlocked.toLocaleString()}
+                  description={liveGuardLastReason || `Allowed this run: ${liveGuardCallsUsed.toLocaleString()}`}
+                />
+                <StatCard
+                  title="Lifecycle"
+                  icon={<Clock className="w-4 h-4 text-info" />}
+                  value={(latestAiCostSummary?.lifecycle_complete ?? false) ? 'Complete' : 'In progress'}
+                  description={latestAiCostSummary?.last_updated_at ? `Updated ${format(new Date(latestAiCostSummary.last_updated_at * 1000), 'HH:mm:ss')}` : 'No rollup yet'}
+                />
+              </div>
+
               <Card>
                 <CardHeader>
                   <CardTitle className="text-sm">AI calls breakdown</CardTitle>
@@ -1513,12 +1795,164 @@ export default function Statistics() {
 
               <Card>
                 <CardHeader>
-                  <CardTitle className="text-sm">Cost telemetry status</CardTitle>
+                  <CardTitle className="text-sm">AI cost breakdown</CardTitle>
+                  <CardDescription>Persisted USD + tokens by analysis type (includes web-search tool fees when priced).</CardDescription>
                 </CardHeader>
                 <CardContent>
-                  <p className="text-sm text-muted-foreground">
-                    PMDA tracks AI call volumes per scan (shown above). Token-level and exact USD cost tracking are not persisted yet in this build.
-                  </p>
+                  {latestAiBreakdown.length <= 0 ? (
+                    <p className="text-sm text-muted-foreground">No persisted AI cost rows for this scope yet.</p>
+                  ) : (
+                    <div className="border rounded-lg overflow-hidden">
+                      <div className="grid grid-cols-12 gap-2 px-3 py-2 text-[11px] uppercase tracking-wide text-muted-foreground bg-muted/30">
+                        <div className="col-span-5">Analysis type</div>
+                        <div className="col-span-2 text-right">Calls</div>
+                        <div className="col-span-3 text-right">Tokens</div>
+                        <div className="col-span-2 text-right">USD</div>
+                      </div>
+                      <div className="divide-y">
+                        {latestAiBreakdown.map((row, idx) => (
+                          <div key={`${row.analysis_type || 'unknown'}-${idx}`} className="grid grid-cols-12 gap-2 px-3 py-2 text-xs">
+                            <div className="col-span-5 truncate">{row.analysis_type || 'unknown'}</div>
+                            <div className="col-span-2 text-right tabular-nums">{(row.calls ?? 0).toLocaleString()}</div>
+                            <div className="col-span-3 text-right tabular-nums">{(row.total_tokens ?? 0).toLocaleString()}</div>
+                            <div className="col-span-2 text-right tabular-nums">{formatUsd(row.cost_usd ?? 0)}</div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </CardContent>
+              </Card>
+
+              <Card>
+                <CardHeader>
+                  <CardTitle className="text-sm">AI cost by provider</CardTitle>
+                  <CardDescription>Calls/tokens/USD grouped by effective provider for this scan scope.</CardDescription>
+                </CardHeader>
+                <CardContent>
+                  {latestAiProviderBreakdown.length <= 0 ? (
+                    <p className="text-sm text-muted-foreground">No provider-level AI usage rows for this scope yet.</p>
+                  ) : (
+                    <div className="border rounded-lg overflow-hidden">
+                      <div className="grid grid-cols-12 gap-2 px-3 py-2 text-[11px] uppercase tracking-wide text-muted-foreground bg-muted/30">
+                        <div className="col-span-4">Provider</div>
+                        <div className="col-span-2 text-right">Calls</div>
+                        <div className="col-span-3 text-right">Tokens</div>
+                        <div className="col-span-3 text-right">USD</div>
+                      </div>
+                      <div className="divide-y">
+                        {latestAiProviderBreakdown.map((row, idx) => (
+                          <div key={`ai-provider-${row.provider || 'unknown'}-${idx}`} className="grid grid-cols-12 gap-2 px-3 py-2 text-xs">
+                            <div className="col-span-4 truncate"><ProviderBadge provider={row.provider || 'unknown'} className="h-5 px-2 py-0 text-[10px]" /></div>
+                            <div className="col-span-2 text-right tabular-nums">{(row.calls ?? 0).toLocaleString()}</div>
+                            <div className="col-span-3 text-right tabular-nums">{(row.total_tokens ?? 0).toLocaleString()}</div>
+                            <div className="col-span-3 text-right tabular-nums">{formatUsd(row.cost_usd ?? 0)}</div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </CardContent>
+              </Card>
+
+              <Card>
+                <CardHeader>
+                  <CardTitle className="text-sm">AI cost by auth mode</CardTitle>
+                  <CardDescription>Shows whether usage came from `api_key`, `oauth` or other auth modes.</CardDescription>
+                </CardHeader>
+                <CardContent>
+                  {latestAiAuthModeBreakdown.length <= 0 ? (
+                    <p className="text-sm text-muted-foreground">No auth-mode AI usage rows for this scope yet.</p>
+                  ) : (
+                    <div className="border rounded-lg overflow-hidden">
+                      <div className="grid grid-cols-12 gap-2 px-3 py-2 text-[11px] uppercase tracking-wide text-muted-foreground bg-muted/30">
+                        <div className="col-span-4">Auth mode</div>
+                        <div className="col-span-2 text-right">Calls</div>
+                        <div className="col-span-3 text-right">Tokens</div>
+                        <div className="col-span-3 text-right">USD</div>
+                      </div>
+                      <div className="divide-y">
+                        {latestAiAuthModeBreakdown.map((row, idx) => (
+                          <div key={`ai-auth-${row.auth_mode || 'unknown'}-${idx}`} className="grid grid-cols-12 gap-2 px-3 py-2 text-xs">
+                            <div className="col-span-4 truncate">{row.auth_mode || 'unknown'}</div>
+                            <div className="col-span-2 text-right tabular-nums">{(row.calls ?? 0).toLocaleString()}</div>
+                            <div className="col-span-3 text-right tabular-nums">{(row.total_tokens ?? 0).toLocaleString()}</div>
+                            <div className="col-span-3 text-right tabular-nums">{formatUsd(row.cost_usd ?? 0)}</div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </CardContent>
+              </Card>
+
+              <Card>
+                <CardHeader>
+                  <CardTitle className="text-sm">AI cost per scan</CardTitle>
+                  <CardDescription>Recent completed scans with calls/tokens/USD.</CardDescription>
+                </CardHeader>
+                <CardContent>
+                  {recentAiScanRows.length <= 0 ? (
+                    <p className="text-sm text-muted-foreground">No completed scan yet.</p>
+                  ) : (
+                    <div className="border rounded-lg overflow-hidden">
+                      <div className="grid grid-cols-12 gap-2 px-3 py-2 text-[11px] uppercase tracking-wide text-muted-foreground bg-muted/30">
+                        <div className="col-span-2">Scan</div>
+                        <div className="col-span-3">Started</div>
+                        <div className="col-span-2 text-right">Calls</div>
+                        <div className="col-span-2 text-right">Tokens</div>
+                        <div className="col-span-1 text-right">Albums</div>
+                        <div className="col-span-2 text-right">USD</div>
+                      </div>
+                      <div className="divide-y">
+                        {recentAiScanRows.map((row) => (
+                          <div key={`ai-scan-${row.scanId}`} className="grid grid-cols-12 gap-2 px-3 py-2 text-xs">
+                            <div className="col-span-2 tabular-nums">#{row.scanId}</div>
+                            <div className="col-span-3 truncate">{format(new Date(row.startTime * 1000), 'MM-dd HH:mm')}</div>
+                            <div className="col-span-2 text-right tabular-nums">{row.aiCallsTotal.toLocaleString()}</div>
+                            <div className="col-span-2 text-right tabular-nums">{row.aiTokensTotal.toLocaleString()}</div>
+                            <div className="col-span-1 text-right tabular-nums">{row.albumsScanned.toLocaleString()}</div>
+                            <div className="col-span-2 text-right tabular-nums">{formatUsd(row.aiCostUsdTotal)}</div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </CardContent>
+              </Card>
+
+              <Card>
+                <CardHeader>
+                  <CardTitle className="text-sm">AI cost per album</CardTitle>
+                  <CardDescription>
+                    Scope: {aiCostScope} · top {latestAiCostByAlbum?.limit || AI_COST_ALBUM_LIMIT} albums for scan #{aiCostScanId ?? '-'}.
+                  </CardDescription>
+                </CardHeader>
+                <CardContent>
+                  {latestAiAlbumBreakdown.length <= 0 ? (
+                    <p className="text-sm text-muted-foreground">No album-level AI usage rows for this scope yet.</p>
+                  ) : (
+                    <div className="border rounded-lg overflow-hidden">
+                      <div className="grid grid-cols-12 gap-2 px-3 py-2 text-[11px] uppercase tracking-wide text-muted-foreground bg-muted/30">
+                        <div className="col-span-4">Artist</div>
+                        <div className="col-span-3">Album</div>
+                        <div className="col-span-1 text-right">Calls</div>
+                        <div className="col-span-2 text-right">Tokens</div>
+                        <div className="col-span-2 text-right">USD</div>
+                      </div>
+                      <div className="divide-y">
+                        {latestAiAlbumBreakdown.map((row, idx) => (
+                          <div key={`ai-album-${row.album_id ?? 'none'}-${idx}`} className="grid grid-cols-12 gap-2 px-3 py-2 text-xs">
+                            <div className="col-span-4 truncate">{row.album_artist || 'Unknown artist'}</div>
+                            <div className="col-span-3 truncate">{row.album_title || (row.album_id ? `Album #${row.album_id}` : 'Unknown album')}</div>
+                            <div className="col-span-1 text-right tabular-nums">{(row.calls ?? 0).toLocaleString()}</div>
+                            <div className="col-span-2 text-right tabular-nums">{(row.total_tokens ?? 0).toLocaleString()}</div>
+                            <div className="col-span-2 text-right tabular-nums">{formatUsd(row.cost_usd ?? 0)}</div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
                 </CardContent>
               </Card>
             </TabsContent>
@@ -1614,6 +2048,110 @@ export default function Statistics() {
               </Card>
             </TabsContent>
 
+            <TabsContent value="benchmark" className="space-y-4">
+              <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
+                <StatCard
+                  title="Benchmark Runs"
+                  icon={<Layers className="w-4 h-4 text-primary" />}
+                  value={benchmarkReports.length.toLocaleString()}
+                  description="Saved benchmark reports"
+                />
+                <StatCard
+                  title="Latest Score"
+                  icon={<Gauge className="w-4 h-4 text-success" />}
+                  value={latestBenchmark ? `${Number(latestBenchmark.score || 0).toFixed(2)}%` : 'N/A'}
+                  description={latestBenchmark ? `scan #${latestBenchmark.scan_id}` : 'No report yet'}
+                />
+                <StatCard
+                  title="Average Score"
+                  icon={<BarChart3 className="w-4 h-4 text-info" />}
+                  value={benchmarkReports.length > 0 ? `${benchmarkAverageScore.toFixed(2)}%` : 'N/A'}
+                />
+                <StatCard
+                  title="Best Score"
+                  icon={<Sparkles className="w-4 h-4 text-emerald-500" />}
+                  value={benchmarkReports.length > 0 ? `${benchmarkBestScore.toFixed(2)}%` : 'N/A'}
+                />
+              </div>
+
+              <Card>
+                <CardHeader>
+                  <CardTitle className="text-sm">Benchmark Trend</CardTitle>
+                  <CardDescription>Score evolution across saved benchmark runs.</CardDescription>
+                </CardHeader>
+                <CardContent>
+                  {benchmarkReports.length <= 1 ? (
+                    <p className="text-sm text-muted-foreground">Run at least 2 benchmark cycles to display a trend.</p>
+                  ) : (
+                    <div className="h-[260px]">
+                      <Line
+                        data={benchmarkTrendData}
+                        options={{
+                          ...chartOptions,
+                          scales: {
+                            y: {
+                              beginAtZero: true,
+                              max: 100,
+                              ticks: { callback: (value) => `${value}%` },
+                            },
+                          },
+                        }}
+                      />
+                    </div>
+                  )}
+                </CardContent>
+              </Card>
+
+              <Card>
+                <CardHeader>
+                  <CardTitle className="text-sm">Benchmark Runs</CardTitle>
+                  <CardDescription>
+                    {benchmarkReportsResponse?.available
+                      ? `Source: ${benchmarkReportsResponse.path}`
+                      : 'Benchmark reports directory is not available.'}
+                  </CardDescription>
+                </CardHeader>
+                <CardContent>
+                  {benchmarkReports.length <= 0 ? (
+                    <p className="text-sm text-muted-foreground">No benchmark report found yet.</p>
+                  ) : (
+                    <div className="max-h-[320px] overflow-auto rounded-md border">
+                      <table className="w-full text-sm">
+                        <thead className="bg-muted/50 sticky top-0">
+                          <tr>
+                            <th className="text-left px-3 py-2 font-medium">Generated</th>
+                            <th className="text-right px-3 py-2 font-medium">Scan</th>
+                            <th className="text-right px-3 py-2 font-medium">Score</th>
+                            <th className="text-right px-3 py-2 font-medium">Checks</th>
+                            <th className="text-left px-3 py-2 font-medium">Failed checks</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {benchmarkReports.map((row) => (
+                            <tr key={`bench-${row.file}`} className="border-t border-border">
+                              <td className="px-3 py-2 tabular-nums">
+                                {Number(row.generated_at || 0) > 0
+                                  ? format(new Date(Number(row.generated_at || 0) * 1000), 'yyyy-MM-dd HH:mm:ss')
+                                  : 'unknown'}
+                              </td>
+                              <td className="px-3 py-2 text-right tabular-nums">{Number(row.scan_id || 0).toLocaleString()}</td>
+                              <td className="px-3 py-2 text-right tabular-nums font-semibold">{Number(row.score || 0).toFixed(2)}%</td>
+                              <td className="px-3 py-2 text-right tabular-nums">{Number(row.pass_count || 0)}/{Number(row.check_count || 0)}</td>
+                              <td className="px-3 py-2">
+                                {Array.isArray(row.failed_checks) && row.failed_checks.length > 0
+                                  ? row.failed_checks.join(', ')
+                                  : 'none'}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </CardContent>
+              </Card>
+            </TabsContent>
+
             <TabsContent value="operations" className="space-y-4">
               <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4">
                 <StatCard
@@ -1664,19 +2202,36 @@ export default function Statistics() {
                         Redis/PostgreSQL/SQLite/media cache telemetry with live runtime memory.
                       </CardDescription>
                     </div>
-                    <Button
-                      type="button"
-                      size="sm"
-                      variant="outline"
-                      className="gap-1.5"
-                      onClick={() => {
-                        void refetchCacheControl();
-                      }}
-                      disabled={cacheControlRefreshing}
-                    >
-                      {cacheControlRefreshing ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
-                      Refresh
-                    </Button>
+                    <div className="flex items-center gap-2">
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        className="gap-1.5"
+                        onClick={() => {
+                          void Promise.all([refetchCacheControl(), refetchWatcherRuntimeStatus()]);
+                        }}
+                        disabled={cacheControlRefreshing || watcherRuntimeRefreshing}
+                      >
+                        {(cacheControlRefreshing || watcherRuntimeRefreshing)
+                          ? <Loader2 className="w-4 h-4 animate-spin" />
+                          : <RefreshCw className="w-4 h-4" />}
+                        Refresh
+                      </Button>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        className="gap-1.5"
+                        onClick={() => {
+                          void restartWatcher();
+                        }}
+                        disabled={watcherRestarting}
+                      >
+                        {watcherRestarting ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
+                        Restart watcher
+                      </Button>
+                    </div>
                   </div>
                 </CardHeader>
                 <CardContent className="space-y-2">

@@ -11,6 +11,7 @@ import { Slider } from '@/components/ui/slider';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Carousel, CarouselContent, CarouselItem, CarouselNext, CarouselPrevious } from '@/components/ui/carousel';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
+import { ProviderBadge } from '@/components/providers/ProviderBadge';
 import { cn } from '@/lib/utils';
 import { usePlayback } from '@/contexts/PlaybackContext';
 import { useToast } from '@/hooks/use-toast';
@@ -1368,7 +1369,7 @@ export default function Library() {
                                       {a.label}
                                     </Badge>
                                   ) : null}
-                                  {a.profile_source ? <Badge variant="outline" className="text-[10px]">Source: {a.profile_source}</Badge> : null}
+                                  {a.profile_source ? <ProviderBadge provider={a.profile_source} prefix="Source" className="text-[10px]" /> : null}
                                 </div>
                               </div>
                               <p className="text-sm text-muted-foreground leading-relaxed line-clamp-3">

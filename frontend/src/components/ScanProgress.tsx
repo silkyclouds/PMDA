@@ -1,10 +1,11 @@
 import { useState, useRef, useEffect, useMemo } from 'react';
 import { Link } from 'react-router-dom';
-import { Play, Pause, Square, RefreshCw, Loader2, ChevronDown, ChevronUp, Sparkles, Database, Music, Cpu, Zap, AlertTriangle, Image, Tag, Package, Trash2, Clock, FolderInput, Terminal, Download } from 'lucide-react';
+import { Play, Pause, Square, RefreshCw, Loader2, ChevronDown, ChevronUp, Sparkles, Database, Music, Cpu, Zap, AlertTriangle, Image, Tag, Package, Trash2, Clock, FolderInput, Terminal, Download, BarChart3 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle, AlertDialogTrigger } from '@/components/ui/alert-dialog';
+import { ProviderBadge } from '@/components/providers/ProviderBadge';
 import { cn } from '@/lib/utils';
 import type { ScanProgress as ScanProgressType } from '@/lib/api';
 import {
@@ -18,12 +19,15 @@ import {
 } from '@/lib/api';
 import { toast } from 'sonner';
 
-function formatETA(seconds: number | undefined): string {
-  if (!seconds || seconds <= 0) return '…';
-  const hours = Math.floor(seconds / 3600);
-  const minutes = Math.floor((seconds % 3600) / 60);
-  const secs = Math.round(seconds % 60);
+function formatDuration(seconds: number | null | undefined): string {
+  if (seconds == null || !Number.isFinite(seconds) || seconds < 0) return '—';
+  const total = Math.floor(seconds);
+  const days = Math.floor(total / 86400);
+  const hours = Math.floor((total % 86400) / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const secs = total % 60;
   const parts: string[] = [];
+  if (days > 0) parts.push(`${days}d`);
   if (hours > 0) parts.push(`${hours}h`);
   if (minutes > 0) parts.push(`${minutes}m`);
   if (secs > 0 || parts.length === 0) parts.push(`${secs}s`);
@@ -118,6 +122,13 @@ export function ScanProgress({
     detected_albums_total = 0,
     resume_skipped_artists = 0,
     resume_skipped_albums = 0,
+    scan_run_scope_preparing = false,
+    scan_run_scope_stage = 'idle',
+    scan_run_scope_done = 0,
+    scan_run_scope_total = 0,
+    scan_run_scope_percent = 0,
+    scan_run_scope_artists_included = 0,
+    scan_run_scope_albums_included = 0,
     ai_used_count = 0,
     mb_used_count = 0,
     ai_enabled = false,
@@ -172,6 +183,7 @@ export function ScanProgress({
     scan_discovery_folders_total = 0,
     scan_discovery_albums_done = 0,
     scan_discovery_albums_total = 0,
+    scan_discovery_started_at = null,
     scan_preplan_done = 0,
     scan_preplan_total = 0,
     scan_pipeline_flags = {},
@@ -181,10 +193,79 @@ export function ScanProgress({
     scan_player_sync_target = null,
     scan_player_sync_ok = null,
     scan_player_sync_message = null,
+    scan_start_time = null,
+    bootstrap_required = false,
+    autonomous_mode = false,
+    has_completed_full_scan = false,
+    default_scan_type = 'full',
+    elapsed_seconds = null,
+    phase_rate = null,
+    phase_progress = null,
   } = safeProgress;
+
+  const effectiveScanStart = useMemo(() => {
+    if (scan_start_time != null && Number.isFinite(scan_start_time) && scan_start_time > 0) {
+      return Number(scan_start_time);
+    }
+    if (scan_discovery_started_at != null && Number.isFinite(scan_discovery_started_at) && scan_discovery_started_at > 0) {
+      return Number(scan_discovery_started_at);
+    }
+    return null;
+  }, [scan_start_time, scan_discovery_started_at]);
+
+  const elapsedSeconds = useMemo(() => {
+    if (!scanning) return null;
+    if (elapsed_seconds != null && Number.isFinite(elapsed_seconds) && Number(elapsed_seconds) >= 0) {
+      return Math.max(0, Math.floor(Number(elapsed_seconds)));
+    }
+    if (effectiveScanStart == null) return null;
+    return Math.max(0, Math.floor(Date.now() / 1000 - effectiveScanStart));
+  }, [scanning, elapsed_seconds, effectiveScanStart, current, scan_discovery_entries_scanned, scan_discovery_files_found, artists_processed, post_processing_done]);
+
+  const etaSecondsValue = useMemo(() => {
+    if (eta_seconds == null || !Number.isFinite(eta_seconds) || eta_seconds <= 0) return null;
+    return Math.max(0, Math.round(Number(eta_seconds)));
+  }, [eta_seconds]);
+
+  const estimatedTotalSeconds = useMemo(() => {
+    if (elapsedSeconds == null || etaSecondsValue == null) return null;
+    return elapsedSeconds + etaSecondsValue;
+  }, [elapsedSeconds, etaSecondsValue]);
+
+  const phaseRateValue = useMemo(() => {
+    if (!scanning) return null;
+    if (phase_rate == null || !Number.isFinite(phase_rate) || Number(phase_rate) <= 0) return null;
+    return Number(phase_rate);
+  }, [scanning, phase_rate]);
+
+  const phaseProgressValue = useMemo(() => {
+    if (phase_progress == null || !Number.isFinite(phase_progress)) return null;
+    const n = Number(phase_progress);
+    return Math.max(0, Math.min(100, n));
+  }, [phase_progress]);
+
+  const changedOnlyBlocked = Boolean(bootstrap_required);
 
   // Stage badge: use backend phase (format_analysis | identification_tags | ia_analysis | finalizing | moving_dupes | post_processing)
   const effectiveStage = phase ?? (post_processing ? 'post_processing' : (finalizing ? 'finalizing' : (deduping ? 'moving_dupes' : 'format_analysis')));
+  const runScopePreparing = scanning && (phase === 'preparing_run_scope' || scan_run_scope_preparing);
+  const runScopeStage = String(scan_run_scope_stage || 'idle');
+  const runScopeStageLabel = runScopeStage === 'signatures'
+    ? 'signatures'
+    : runScopeStage === 'resume_compare'
+      ? 'resume compare'
+      : runScopeStage === 'resume_seed'
+        ? 'resume seed'
+        : runScopeStage === 'done'
+          ? 'done'
+          : 'preparing run scope';
+  const runScopeProgressTotal = Math.max(0, scan_run_scope_total || detected_artists_total || artists_total || 0);
+  const runScopeProgressDone = runScopeProgressTotal > 0
+    ? Math.max(0, Math.min(scan_run_scope_done || 0, runScopeProgressTotal))
+    : Math.max(0, scan_run_scope_done || 0);
+  const runScopePercent = runScopeProgressTotal > 0
+    ? Math.min(100, (runScopeProgressDone / runScopeProgressTotal) * 100)
+    : Math.max(0, Math.min(100, Number(scan_run_scope_percent || 0)));
   const preScanAlbumsTotal = Math.max(0, scan_preplan_total || scan_discovery_albums_total || scan_discovery_folders_total);
   const preScanAlbumsDone = Math.max(0, scan_preplan_done || scan_discovery_albums_done || scan_discovery_folders_done);
   const preScanRootsTotal = Math.max(0, scan_discovery_roots_total);
@@ -199,6 +280,7 @@ export function ScanProgress({
         : 'pre-scan';
   const preScanActive =
     scanning &&
+    !runScopePreparing &&
     artists_total === 0 &&
     (
       phase === 'pre_scan' ||
@@ -236,28 +318,39 @@ export function ScanProgress({
   const postUnitsTotal = Math.max(0, post_processing_total);
   const compositeDone = scanUnitsDone + postUnitsDone;
   const compositeTotal = scanUnitsTotal + postUnitsTotal;
-  const displayProgress = preScanActive && preScanProgressTotal > 0
+  const displayProgress = runScopePreparing && runScopeProgressTotal > 0
+    ? runScopeProgressDone
+    : preScanActive && preScanProgressTotal > 0
     ? preScanProgressDone
     : hasPostWork
     ? compositeDone
     : (scanning && artists_total > 0 ? artists_processed : current);
-  const displayTotal = preScanActive && preScanProgressTotal > 0
+  const displayTotal = runScopePreparing && runScopeProgressTotal > 0
+    ? runScopeProgressTotal
+    : preScanActive && preScanProgressTotal > 0
     ? preScanProgressTotal
     : hasPostWork
     ? compositeTotal
     : (scanning && artists_total > 0 ? artists_total : total);
-  const percentageExact = preScanActive
+  const percentageExact = runScopePreparing
+    ? runScopePercent
+    : preScanActive
     ? preScanPercent
     : (displayTotal > 0 ? Math.min(100, (displayProgress / displayTotal) * 100) : 0);
-  // Keep 99% clamp only for non pre-scan running phases.
+  // Keep 99% clamp only for regular running phases.
   const percentage = scanning
-    ? (preScanActive ? Math.min(100, Math.floor(percentageExact)) : Math.min(99, Math.floor(percentageExact)))
+    ? ((preScanActive || runScopePreparing) ? Math.min(100, Math.floor(percentageExact)) : Math.min(99, Math.floor(percentageExact)))
     : Math.round(percentageExact);
 
   // Toast once when scan finishes with AI errors
   useEffect(() => {
     if (scanning) hasToastedAiErrors.current = false;
   }, [scanning]);
+  useEffect(() => {
+    if (changedOnlyBlocked && scanType === 'changed_only') {
+      setScanType('full');
+    }
+  }, [changedOnlyBlocked, scanType, setScanType]);
   useEffect(() => {
     if (!scanning && last_scan_summary?.ai_errors?.length && !hasToastedAiErrors.current) {
       const n = last_scan_summary.ai_errors.length;
@@ -275,10 +368,10 @@ export function ScanProgress({
       setWaitingForProgress(false);
       return;
     }
-    if (artists_total > 0 || total > 0 || preScanActive) {
+    if (artists_total > 0 || total > 0 || preScanActive || runScopePreparing) {
       setWaitingForProgress(false);
     }
-  }, [waitingForProgress, scanning, artists_total, total, preScanActive]);
+  }, [waitingForProgress, scanning, artists_total, total, preScanActive, runScopePreparing]);
 
   // Poll improve-all progress when not scanning
   useEffect(() => {
@@ -375,10 +468,14 @@ export function ScanProgress({
 
   if (isCompact) {
     const statusLabel = scanning
-      ? (preScanActive ? `Scanning · pre-scan · ${preScanStageLabel}` : (phase ? `Scanning · ${phase}` : 'Scanning'))
+      ? (runScopePreparing
+        ? `Scanning · preparing_run_scope · ${runScopeStageLabel}`
+        : (preScanActive ? `Scanning · pre-scan · ${preScanStageLabel}` : (phase ? `Scanning · ${phase}` : 'Scanning')))
       : 'Idle';
     const progressLabel = scanning
-      ? (preScanActive && preScanProgressTotal > 0
+      ? (runScopePreparing && runScopeProgressTotal > 0
+        ? `Preparing run scope · ${runScopeStageLabel} · ${displayProgress}/${displayTotal}`
+        : preScanActive && preScanProgressTotal > 0
         ? `Pre-scan ${preScanStageLabel} · ${displayProgress}/${displayTotal}`
         : `${displayProgress}/${displayTotal} artist(s)`)
       : 'Ready to scan';
@@ -394,6 +491,14 @@ export function ScanProgress({
               )}
             </div>
             <div className="flex flex-wrap gap-2">
+              <Link
+                to="/statistics"
+                className="inline-flex h-10 items-center gap-1.5 rounded-md border border-border px-3 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                title="Open live scan statistics"
+              >
+                <BarChart3 className="h-3.5 w-3.5" />
+                Live stats
+              </Link>
               {!scanning && status !== 'running' && (
                 <Button onClick={() => onStart({ scan_type: scanType })} disabled={isStarting} className="gap-2">
                   {isStarting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
@@ -428,6 +533,40 @@ export function ScanProgress({
               <span>{progressLabel}</span>
               <span className="tabular-nums">{percentage}%</span>
             </div>
+            {scanning && (
+              <div className="flex flex-wrap items-center gap-3 text-[11px] text-muted-foreground">
+                <span className="tabular-nums">Elapsed {formatDuration(elapsedSeconds)}</span>
+                <span className="tabular-nums">
+                  ETA {etaSecondsValue != null ? formatDuration(etaSecondsValue) : 'calculating…'}
+                </span>
+                <span className="tabular-nums">
+                  Est. total {estimatedTotalSeconds != null ? formatDuration(estimatedTotalSeconds) : '—'}
+                </span>
+                <span className="tabular-nums">
+                  Rate {phaseRateValue != null ? `${phaseRateValue.toFixed(2)} step/s` : '—'}
+                </span>
+                <span className="tabular-nums">
+                  Phase {phaseProgressValue != null ? `${phaseProgressValue.toFixed(1)}%` : '—'}
+                </span>
+              </div>
+            )}
+          </div>
+          <div className={cn(
+            "rounded-md border px-3 py-2 text-xs",
+            bootstrap_required
+              ? "border-amber-500/40 bg-amber-500/10 text-amber-800 dark:text-amber-300"
+              : autonomous_mode && has_completed_full_scan
+                ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-800 dark:text-emerald-300"
+                : "border-border bg-muted/40 text-muted-foreground"
+          )}>
+            {bootstrap_required
+              ? "Initial full scan required before changed-only runs."
+              : autonomous_mode && has_completed_full_scan
+                ? "Autonomous mode active. Default scan switched to changed only."
+                : "Choose scan mode manually."}
+            <span className="ml-1 text-muted-foreground">
+              (default: {String(default_scan_type || 'full').replace('_', ' ')})
+            </span>
           </div>
 	          <div className="flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
 	            <span className="text-foreground font-medium">Mode:</span>
@@ -443,18 +582,16 @@ export function ScanProgress({
                 variant={scanType === 'changed_only' ? 'default' : 'outline'}
                 size="sm"
                 onClick={() => setScanType('changed_only')}
+                disabled={changedOnlyBlocked}
               >
 	                Changed only
 	              </Button>
 	            </div>
 	          </div>
-	          <p className="text-[11px] text-muted-foreground leading-4">
-	            <span className="font-medium text-foreground">Full</span>: scans everything under your sources (best for a first run).{' '}
-	            <span className="font-medium text-foreground">Changed only</span>: scans only new/modified album folders (recommended).
-	          </p>
-	          <div className="text-xs text-muted-foreground">
-	            Detailed stats live in <Link to="/statistics" className="underline underline-offset-2">Statistics</Link>.
-	          </div>
+          <p className="text-[11px] text-muted-foreground leading-4">
+            <span className="font-medium text-foreground">Full</span>: scans everything under your sources (best for a first run).{' '}
+            <span className="font-medium text-foreground">Changed only</span>: scans only new/modified album folders (recommended).
+          </p>
         </div>
       </div>
     );
@@ -939,6 +1076,23 @@ export function ScanProgress({
           )}
 
           <div className="flex flex-col gap-3 pt-4 border-t border-border">
+            <div className={cn(
+              "rounded-md border px-3 py-2 text-xs",
+              bootstrap_required
+                ? "border-amber-500/40 bg-amber-500/10 text-amber-800 dark:text-amber-300"
+                : autonomous_mode && has_completed_full_scan
+                  ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-800 dark:text-emerald-300"
+                  : "border-border bg-muted/40 text-muted-foreground"
+            )}>
+              {bootstrap_required
+                ? "Initial full scan required. Changed-only is blocked until first full completes."
+                : autonomous_mode && has_completed_full_scan
+                  ? "Autonomous mode active. Default scan switched to changed only (you can still force full)."
+                  : "Default scan mode is still manual."}
+              <span className="ml-1 text-muted-foreground">
+                Current backend default: {String(default_scan_type || 'full').replace('_', ' ')}.
+              </span>
+            </div>
             <div className="flex flex-wrap items-center gap-4">
 	              <div className="flex items-center gap-2">
 	                <span className="text-sm font-medium text-foreground">Scan type</span>
@@ -949,7 +1103,7 @@ export function ScanProgress({
 	                  disabled={scanning}
 	                >
 	                  <option value="full">Full scan (duplicates + incomplete)</option>
-	                  <option value="changed_only">Changed only (new/modified albums)</option>
+	                  <option value="changed_only" disabled={changedOnlyBlocked}>Changed only (new/modified albums)</option>
 	                  <option value="incomplete_only">Incomplete albums only</option>
 	                </select>
 	              </div>
@@ -961,8 +1115,10 @@ export function ScanProgress({
                 {scanType === 'incomplete_only'
                   ? 'Scan only for incomplete albums (missing tracks). Results appear in Incomplete albums.'
                   : scanType === 'changed_only'
-                    ? 'Scan only new/modified albums. Unchanged and already-complete albums are skipped.'
-                  : 'One scan analyzes duplicates, metadata, and tags. Results appear in Tools, Library, and Statistics.'}
+                    ? (bootstrap_required
+                        ? 'Changed-only requires one successful initial full scan first.'
+                        : 'Scan only new/modified albums. Unchanged and already-complete albums are skipped.')
+                    : 'One scan analyzes duplicates, metadata, and tags. Results appear in Tools, Library, and Statistics.'}
               </p>
             </div>
             <div className="flex items-center gap-2 shrink-0">
@@ -1015,7 +1171,8 @@ export function ScanProgress({
                   </div>
                   <div className={cn("flex items-center gap-2", preflightResult.ai.ok ? "text-green-600 dark:text-green-400" : "text-destructive")}>
                     <Sparkles className="w-4 h-4 shrink-0" />
-                    {preflightResult.ai.ok ? `${preflightResult.ai.provider}: OK` : `${preflightResult.ai.provider}: ${preflightResult.ai.message || "Error"}`}
+                    <ProviderBadge provider={preflightResult.ai.provider} className="h-5 px-2 py-0 text-[10px]" />
+                    <span>{preflightResult.ai.ok ? 'OK' : (preflightResult.ai.message || 'Error')}</span>
                   </div>
                   {preflightResult.discogs != null && (
                     <div className={cn("flex items-center gap-2", preflightResult.discogs.ok ? "text-green-600 dark:text-green-400" : "text-muted-foreground")}>
@@ -1164,7 +1321,11 @@ export function ScanProgress({
                 <div className="flex items-baseline gap-2 min-w-0">
                   <span className="text-2xl font-bold tabular-nums text-foreground">{percentage}%</span>
                   <span className="text-sm text-muted-foreground shrink-0">
-                    {preScanActive
+                    {runScopePreparing
+                      ? runScopeProgressTotal > 0
+                        ? `Preparing run scope · ${runScopeStageLabel} · ${runScopeProgressDone.toLocaleString()} / ${runScopeProgressTotal.toLocaleString()} artists`
+                        : `Preparing run scope · ${runScopeStageLabel}`
+                      : preScanActive
                       ? preScanAlbumsTotal > 0 && preScanStage === 'album_candidates'
                         ? `Pre-scan · ${preScanStageLabel} · albums ${displayProgress.toLocaleString()} / ${displayTotal.toLocaleString()}`
                         : preScanRootsTotal > 0
@@ -1179,15 +1340,26 @@ export function ScanProgress({
                         : '—'}
                   </span>
                 </div>
-                {eta_seconds != null && eta_seconds > 0 && (
-                  <div className="flex items-center gap-1.5 text-sm font-medium text-primary shrink-0">
-                    <Clock className="w-4 h-4" />
-                    ~{formatETA(eta_seconds)} left
-                  </div>
-                )}
-                {scanning && !preScanActive && (eta_seconds == null || eta_seconds <= 0) && (artists_total > 0 || total > 0) && (
-                  <span className="text-xs text-muted-foreground shrink-0">ETA calculating…</span>
-                )}
+                <div className="flex flex-wrap items-center justify-end gap-x-3 gap-y-1 text-xs shrink-0">
+                  <Link
+                    to="/statistics"
+                    className="inline-flex items-center gap-1 text-primary hover:underline underline-offset-2"
+                    title="Open live scan statistics"
+                  >
+                    <BarChart3 className="w-3.5 h-3.5" />
+                    Live stats
+                  </Link>
+                  <span className="inline-flex items-center gap-1 text-muted-foreground tabular-nums">
+                    <Clock className="w-3.5 h-3.5" />
+                    Elapsed {formatDuration(elapsedSeconds)}
+                  </span>
+                  <span className={cn("tabular-nums", etaSecondsValue != null ? "text-primary font-medium" : "text-muted-foreground")}>
+                    ETA {etaSecondsValue != null ? formatDuration(etaSecondsValue) : 'calculating…'}
+                  </span>
+                  <span className="text-muted-foreground tabular-nums">
+                    Est. total {estimatedTotalSeconds != null ? formatDuration(estimatedTotalSeconds) : '—'}
+                  </span>
+                </div>
               </div>
               <div className="progress-track h-3">
                 <div
@@ -1195,15 +1367,31 @@ export function ScanProgress({
                   style={{ width: `${percentageExact}%` }}
                 />
               </div>
-              {preScanActive && (
+              {(preScanActive || runScopePreparing) && (
                 <p className="text-[11px] text-muted-foreground">
-                  Pre-scan phase: depending on library size and album count this can be long. Patience, see logs for details.
+                  {runScopePreparing
+                    ? 'Preparing run scope: signatures + resume comparison are running. Live counters below.'
+                    : 'Pre-scan phase: depending on library size and album count this can be long. Patience, see logs for details.'}
                 </p>
               )}
             </div>
 
             {scanning && (
-              preScanActive ? (
+              runScopePreparing ? (
+                <div className="rounded-lg border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+                  <span className="font-medium text-foreground/80">Preparing run scope</span>
+                  <span className="mx-1">•</span>
+                  stage {runScopeStage || 'signatures'}
+                  <span className="mx-1">•</span>
+                  {runScopeProgressTotal > 0
+                    ? `${runScopeProgressDone.toLocaleString()}/${runScopeProgressTotal.toLocaleString()} artists`
+                    : `${runScopeProgressDone.toLocaleString()} artists`}
+                  <span className="mx-1">•</span>
+                  in scope {scan_run_scope_artists_included.toLocaleString()} artists
+                  <span className="mx-1">•</span>
+                  {scan_run_scope_albums_included.toLocaleString()} albums
+                </div>
+              ) : preScanActive ? (
                 <div className="rounded-lg border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
                   <span className="font-medium text-foreground/80">Pre-scan phase</span>
                   <span className="mx-1">•</span>
@@ -1295,7 +1483,7 @@ export function ScanProgress({
             )}
 
             {/* ─── Phase stepper (compact): highlight stage from backend phase ─── */}
-            {!preScanActive && (phase || auto_move_enabled || showPostProcessingStep) && (
+            {!preScanActive && !runScopePreparing && (phase || auto_move_enabled || showPostProcessingStep) && (
               <div className="flex flex-wrap items-center gap-2 text-xs">
                 <span className={cn(
                   "flex items-center gap-1.5 px-2.5 py-1 rounded-full font-medium",
@@ -1614,9 +1802,10 @@ export function ScanProgress({
                       AI (LLM)
                     </span>
                     {ai_enabled ? (
-                      <span className="text-green-600 dark:text-green-400 font-medium">
+                      <span className="text-green-600 dark:text-green-400 font-medium inline-flex items-center gap-1.5">
                         On {ai_used_count > 0 && ` · ${ai_used_count} groups`}
-                        {(ai_provider || ai_model) && ` · ${[ai_provider, ai_model].filter(Boolean).join(' · ')}`}
+                        {ai_provider ? <ProviderBadge provider={ai_provider} className="h-5 px-2 py-0 text-[10px]" /> : null}
+                        {ai_model ? <span>· {ai_model}</span> : null}
                       </span>
                     ) : (
                       <span className="text-muted-foreground">Off (Signature)</span>

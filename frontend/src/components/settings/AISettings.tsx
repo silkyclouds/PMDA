@@ -7,6 +7,7 @@ import { Textarea } from '@/components/ui/textarea';
 import { Button } from '@/components/ui/button';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
 import { FieldTooltip } from '@/components/ui/field-tooltip';
+import { ProviderIcon } from '@/components/providers/ProviderIcon';
 import {
   Select,
   SelectContent,
@@ -154,10 +155,30 @@ export function AISettings({ config, updateConfig, errors }: AISettingsProps) {
                 <SelectValue placeholder="Select provider" />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="openai">OpenAI</SelectItem>
-                <SelectItem value="anthropic">Anthropic (Claude)</SelectItem>
-                <SelectItem value="google">Google (Gemini)</SelectItem>
-                <SelectItem value="ollama">Ollama (Local)</SelectItem>
+                <SelectItem value="openai">
+                  <span className="inline-flex items-center gap-2">
+                    <ProviderIcon provider="openai-api" />
+                    OpenAI
+                  </span>
+                </SelectItem>
+                <SelectItem value="anthropic">
+                  <span className="inline-flex items-center gap-2">
+                    <ProviderIcon provider="anthropic" />
+                    Anthropic (Claude)
+                  </span>
+                </SelectItem>
+                <SelectItem value="google">
+                  <span className="inline-flex items-center gap-2">
+                    <ProviderIcon provider="google" />
+                    Google (Gemini)
+                  </span>
+                </SelectItem>
+                <SelectItem value="ollama">
+                  <span className="inline-flex items-center gap-2">
+                    <ProviderIcon provider="ollama" />
+                    Ollama (Local)
+                  </span>
+                </SelectItem>
               </SelectContent>
             </Select>
           </div>

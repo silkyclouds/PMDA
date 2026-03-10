@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useLocation, useNavigate, useParams } from 'react-router-dom';
-import { ArrowLeft, Calendar, ChevronDown, ChevronUp, Disc3, ExternalLink, Heart, Loader2, Music, Play, RefreshCw, Sparkles, Users } from 'lucide-react';
+import { ArrowLeft, Calendar, ChevronDown, ChevronUp, Disc3, ExternalLink, Heart, Info, Loader2, Music, Play, RefreshCw, Sparkles, Users } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Card, CardContent } from '@/components/ui/card';
@@ -9,7 +9,10 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/component
 import { Carousel, CarouselContent, CarouselItem, CarouselNext, CarouselPrevious } from '@/components/ui/carousel';
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { AlbumArtwork } from '@/components/library/AlbumArtwork';
+import { MatchDetailDialog } from '@/components/library/MatchDetailDialog';
+import { ProviderBadge } from '@/components/providers/ProviderBadge';
 import { cn } from '@/lib/utils';
+import { badgeKindClass } from '@/lib/badgeStyles';
 import { FormatBadge } from '@/components/FormatBadge';
 import * as api from '@/lib/api';
 import { useToast } from '@/hooks/use-toast';
@@ -150,8 +153,10 @@ export default function ArtistPage() {
   const [artistLiked, setArtistLiked] = useState(false);
   const [descExpanded, setDescExpanded] = useState(false);
   const [refreshAllBusy, setRefreshAllBusy] = useState(false);
+  const [aiProcessBusy, setAiProcessBusy] = useState(false);
   const [concertFilter, setConcertFilter] = useState<{ enabled: boolean; lat: number | null; lon: number | null; radiusKm: number } | null>(null);
   const [showConcertsModal, setShowConcertsModal] = useState(false);
+  const [matchDialogOpen, setMatchDialogOpen] = useState(false);
   const includeUnmatchedParam = '1';
   const appendIncludeUnmatched = useCallback((url: string) => {
     return `${url}${url.includes('?') ? '&' : '?'}include_unmatched=${includeUnmatchedParam}`;
@@ -437,6 +442,67 @@ export default function ArtistPage() {
     }
   }, [artistId, refreshAllBusy, fetchArtist, fetchProfile, loadConcerts, ensureDescription, extractFacts, loadFacts, toast]);
 
+  const runArtistAiResearch = useCallback(async () => {
+    if (!Number.isFinite(artistId) || artistId <= 0) return;
+    if (aiProcessBusy) return;
+    setAiProcessBusy(true);
+    try {
+      let started = false;
+      try {
+        const res = await api.enrichArtistWithAI(artistId);
+        started = Boolean(res.started);
+      } catch {
+        started = false;
+      }
+
+      await Promise.allSettled([
+        api.generateArtistAiSummary(artistId, 'en'),
+        api.extractArtistFacts(artistId),
+      ]);
+
+      const targets = (details?.albums || [])
+        .map((a) => Number(a.album_id || 0))
+        .filter((id) => Number.isFinite(id) && id > 0);
+      let generated = 0;
+      let failed = 0;
+      if (targets.length > 0) {
+        let idx = 0;
+        const workers = Array.from({ length: Math.min(3, targets.length) }, () => (async () => {
+          while (idx < targets.length) {
+            const current = targets[idx++];
+            try {
+              await api.generateAlbumReview(current);
+              generated += 1;
+            } catch {
+              failed += 1;
+            }
+          }
+        })());
+        await Promise.all(workers);
+      }
+
+      await Promise.allSettled([
+        fetchArtist(),
+        fetchProfile(false),
+        loadSummary(),
+        loadFacts(),
+      ]);
+
+      toast({
+        title: 'AI research completed',
+        description: `Profiles ${started ? 'queued' : 'not queued'} · album reviews ${generated}${failed > 0 ? ` (${failed} failed)` : ''}.`,
+      });
+    } catch (e) {
+      toast({
+        title: 'AI research failed',
+        description: e instanceof Error ? e.message : 'Failed to run AI artist processing',
+        variant: 'destructive',
+      });
+    } finally {
+      setAiProcessBusy(false);
+    }
+  }, [aiProcessBusy, artistId, details?.albums, fetchArtist, fetchProfile, loadFacts, loadSummary, toast]);
+
   useEffect(() => {
     // Auto-generate a description only when nothing exists yet.
     if (summaryLoading) return;
@@ -706,13 +772,13 @@ export default function ArtistPage() {
             Back to Library
           </Button>
           {profileEnriching && (
-            <Badge variant="outline" className="gap-1.5">
+            <Badge variant="outline" className={`gap-1.5 ${badgeKindClass('source')}`}>
               <Loader2 className="w-3 h-3 animate-spin" />
               Enriching profile
             </Badge>
           )}
           {!profileEnriching && profileEnrichState === 'timeout' ? (
-            <Badge variant="outline" className="gap-1.5" title="Background enrichment timed out for this attempt.">
+            <Badge variant="outline" className={`gap-1.5 ${badgeKindClass('status_soft')}`} title="Background enrichment timed out for this attempt.">
               Enrichment timed out
             </Badge>
           ) : null}
@@ -746,7 +812,7 @@ export default function ArtistPage() {
                   {tags.length > 0 && (
                     <div className="flex flex-wrap gap-1.5 mt-3">
                       {tags.map((tag) => (
-                        <Badge key={tag} variant="secondary" className="text-[11px]">
+                        <Badge key={tag} variant="outline" className={`text-[11px] ${badgeKindClass('genre')}`}>
                           {tag}
                         </Badge>
                       ))}
@@ -765,11 +831,9 @@ export default function ArtistPage() {
                       {artistLiked ? 'Liked' : 'Like'}
                     </Button>
                     {displaySource ? (
-                      <Badge variant="outline" className="text-[10px]">
-                        Source: {displaySource}
-                      </Badge>
+                      <ProviderBadge provider={displaySource} prefix="Source" className="text-[10px]" />
                     ) : null}
-                    <Badge variant="outline" className="text-[10px]">
+                    <Badge variant="outline" className={`text-[10px] ${badgeKindClass('muted')}`}>
                       Updated: {formatUpdated(displayUpdated)}
                     </Badge>
                     <Button
@@ -783,6 +847,28 @@ export default function ArtistPage() {
                     >
                       {refreshAllBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
                       Refresh
+                    </Button>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      className="h-8 gap-2"
+                      onClick={() => void runArtistAiResearch()}
+                      disabled={aiProcessBusy}
+                      title="Run AI research and consistency checks for this artist and albums"
+                    >
+                      {aiProcessBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />}
+                      AI research
+                    </Button>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      className="h-8 gap-2"
+                      onClick={() => setMatchDialogOpen(true)}
+                    >
+                      <Info className="h-3.5 w-3.5" />
+                      Match detail
                     </Button>
                   </div>
                 </div>
@@ -844,21 +930,21 @@ export default function ArtistPage() {
                   {concertList.events.length}
                 </Badge>
               </Button>
-              <Badge variant="outline" className="h-8 px-2.5 text-[11px] gap-1.5">
+              <Badge variant="outline" className={`h-8 px-2.5 text-[11px] gap-1.5 ${badgeKindClass('count')}`}>
                 <Users className="h-3.5 w-3.5" />
                 Connections: {connectionCount}
               </Badge>
               {isDeceased ? (
                 <Badge
                   variant="secondary"
-                  className="h-8 px-2.5 text-[11px]"
+                  className={`h-8 px-2.5 text-[11px] ${badgeKindClass('status_soft')}`}
                   title="At best you'll see a cover band."
                 >
                   No more concerts
                 </Badge>
               ) : null}
               {factsLoading ? (
-                <Badge variant="outline" className="h-8 px-2.5 text-[11px] gap-1.5">
+                <Badge variant="outline" className={`h-8 px-2.5 text-[11px] gap-1.5 ${badgeKindClass('source')}`}>
                   <Loader2 className="h-3 w-3 animate-spin" />
                   Updating facts
                 </Badge>
@@ -873,8 +959,8 @@ export default function ArtistPage() {
                       key={`genre-${g}`}
                       type="button"
                       size="sm"
-                      variant="secondary"
-                      className="h-6 px-2 text-[11px]"
+                      variant="outline"
+                      className={`h-6 px-2 text-[11px] ${badgeKindClass('genre')}`}
                       title="Open genre"
                       onClick={() => navigate(`/library/genre/${encodeURIComponent(g)}${location.search || ''}`)}
                     >
@@ -980,7 +1066,7 @@ export default function ArtistPage() {
                         <div className="text-xs font-medium text-muted-foreground">Cities</div>
                         <div className="flex flex-wrap gap-1.5">
                           {factsCities.map((x) => (
-                            <Badge key={`city-${x}`} variant="secondary" className="text-[11px]">
+                            <Badge key={`city-${x}`} variant="outline" className={`text-[11px] ${badgeKindClass('source')}`}>
                               {x}
                             </Badge>
                           ))}
@@ -1000,13 +1086,11 @@ export default function ArtistPage() {
               <DialogTitle className="flex items-center gap-2">
                 <Calendar className="w-4 h-4 text-primary" />
                 Upcoming Concerts
-                <Badge variant="outline" className="text-[10px]">
+                <Badge variant="outline" className={`text-[10px] ${badgeKindClass('count')}`}>
                   {concertList.events.length}
                 </Badge>
                 {concertsMeta?.provider ? (
-                  <Badge variant="outline" className="text-[10px]">
-                    {concertsMeta.provider}
-                  </Badge>
+                  <ProviderBadge provider={concertsMeta.provider} className="text-[10px]" />
                 ) : null}
               </DialogTitle>
               <DialogDescription>
@@ -1129,7 +1213,10 @@ export default function ArtistPage() {
                           </div>
                           <div className="flex items-center gap-1.5 flex-wrap">
                             {album.format && <FormatBadge format={album.format} size="sm" />}
-                            <Badge variant={album.is_lossless ? 'secondary' : 'outline'} className="text-[10px]">
+                            <Badge
+                              variant="outline"
+                              className={`text-[10px] ${album.is_lossless ? badgeKindClass('lossless') : badgeKindClass('lossy')}`}
+                            >
                               {album.is_lossless ? 'Lossless' : 'Lossy'}
                             </Badge>
                           </div>
@@ -1222,6 +1309,15 @@ export default function ArtistPage() {
             </div>
           )}
         </section>
+
+        <MatchDetailDialog
+          open={matchDialogOpen}
+          onOpenChange={setMatchDialogOpen}
+          entity={{ kind: 'artist', artistId: details.artist_id }}
+          onDataChanged={() => {
+            void fetchArtist();
+          }}
+        />
     </div>
   );
 }
