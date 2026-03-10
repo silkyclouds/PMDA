@@ -298,17 +298,27 @@ function SettingsPage() {
     })();
   }, [config.OPENAI_API_KEY, openaiApiModeEnabled]);
 
-  const loadConfig = async () => {
-    setIsLoading(true);
+  const loadOptionalProviderState = useCallback(async () => {
     try {
-      const [data, codexStatus, prefs] = await Promise.all([
-        api.getConfig(),
+      const [codexStatus, prefs] = await Promise.all([
         api.getOpenAICodexOAuthStatus().catch(() => null),
         api.getAIProviderPreferences().catch(() => null),
       ]);
-      setConfig(normalizeConfigForUI(data));
       if (codexStatus) setOpenaiCodexStatus(codexStatus);
       if (prefs) setProviderPreferences(prefs);
+    } catch {
+      // Keep Settings responsive even if optional provider checks fail.
+    }
+  }, []);
+
+  const loadConfig = async () => {
+    setIsLoading(true);
+    try {
+      const data = await api.getConfig();
+      setConfig(normalizeConfigForUI(data));
+      setIsLoading(false);
+      void loadOptionalProviderState();
+      return;
     } catch (error) {
       console.error('Failed to load config:', error);
       toast.error('Failed to load configuration');
@@ -1097,7 +1107,9 @@ function SettingsPage() {
                     </CollapsibleTrigger>
                     <CollapsibleContent>
                       <div className="border-t border-border/60 p-3">
-                        <SchedulerSettings config={config} updateConfig={updateConfig} />
+                        {schedulerAdvancedOpen ? (
+                          <SchedulerSettings config={config} updateConfig={updateConfig} />
+                        ) : null}
                       </div>
                     </CollapsibleContent>
                   </div>
