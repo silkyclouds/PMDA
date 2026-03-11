@@ -45,7 +45,7 @@ import time
 import atexit
 from datetime import datetime, timedelta, time as dt_time
 from collections import defaultdict, OrderedDict, deque
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout, as_completed
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout, as_completed, wait
 from pathlib import Path
 from typing import NamedTuple, List, Dict, Optional, Tuple, Any
 from urllib.parse import quote, quote_plus, urlparse
@@ -747,6 +747,18 @@ AI_WEB_SEARCH_CACHE_MAX_ENTRIES = max(
 AI_OPENAI_REQUEST_TIMEOUT_SEC = max(
     10.0,
     min(180.0, float(os.getenv("PMDA_AI_OPENAI_REQUEST_TIMEOUT_SEC", "45") or "45")),
+)
+MB_AI_VERIFY_TIMEOUT_SEC = max(
+    5.0,
+    min(120.0, float(os.getenv("PMDA_MB_AI_VERIFY_TIMEOUT_SEC", "35") or "35")),
+)
+MB_AI_TIEBREAK_TIMEOUT_SEC = max(
+    5.0,
+    min(120.0, float(os.getenv("PMDA_MB_AI_TIEBREAK_TIMEOUT_SEC", "30") or "30")),
+)
+PROVIDER_FALLBACK_PARALLEL_TIMEOUT_SEC = max(
+    2.0,
+    min(45.0, float(os.getenv("PMDA_PROVIDER_FALLBACK_TIMEOUT_SEC", "12") or "12")),
 )
 
 
@@ -3951,6 +3963,57 @@ def parse_ai_confidence(reply: str) -> tuple[str, Optional[int]]:
     return (text, None)
 
 
+def _call_ai_provider_bounded(
+    *,
+    provider: str,
+    model: str,
+    system_msg: str,
+    user_msg: str,
+    max_tokens: int,
+    analysis_type: str,
+    timeout_sec: float,
+    log_prefix: str,
+) -> str:
+    """
+    Run call_ai_provider with a hard timeout so album scan threads never hang indefinitely.
+    """
+    timeout_val = max(5.0, float(timeout_sec or 0.0))
+    started = time.perf_counter()
+    pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pmda-ai-bounded")
+    fut = pool.submit(
+        call_ai_provider,
+        provider,
+        model,
+        system_msg,
+        user_msg,
+        int(max_tokens or 0),
+        analysis_type=analysis_type,
+    )
+    try:
+        reply = fut.result(timeout=timeout_val)
+        elapsed = time.perf_counter() - started
+        logging.info("%s AI call completed in %.2fs", log_prefix, elapsed)
+        return str(reply or "")
+    except FutureTimeout:
+        elapsed = time.perf_counter() - started
+        logging.warning(
+            "%s AI call timed out after %.1fs (elapsed %.2fs); continuing without AI result",
+            log_prefix,
+            timeout_val,
+            elapsed,
+        )
+        raise TimeoutError(f"{log_prefix} timeout")
+    finally:
+        try:
+            fut.cancel()
+        except Exception:
+            pass
+        try:
+            pool.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+
+
 def ai_verify_mb_match(
     artist: str,
     title_raw: Optional[str],
@@ -4013,13 +4076,28 @@ def ai_verify_mb_match(
     try:
         model = getattr(sys.modules[__name__], "RESOLVED_MODEL", None) or getattr(sys.modules[__name__], "OPENAI_MODEL", "gpt-4")
         provider = getattr(sys.modules[__name__], "AI_PROVIDER", "openai")
-        reply = call_ai_provider(
-            provider,
-            model,
-            system_msg,
-            user_msg,
+        verify_timeout = float(
+            getattr(
+                sys.modules[__name__],
+                "MB_AI_VERIFY_TIMEOUT_SEC",
+                MB_AI_VERIFY_TIMEOUT_SEC,
+            )
+            or MB_AI_VERIFY_TIMEOUT_SEC
+        )
+        logging.info(
+            "[MusicBrainz Verify] AI disambiguation start (candidates=%d, timeout=%.1fs)",
+            len(candidates),
+            verify_timeout,
+        )
+        reply = _call_ai_provider_bounded(
+            provider=provider,
+            model=model,
+            system_msg=system_msg,
+            user_msg=user_msg,
             max_tokens=30,
             analysis_type="mb_match_verify",
+            timeout_sec=verify_timeout,
+            log_prefix="[MusicBrainz Verify]",
         )
         reply_clean, ai_confidence = parse_ai_confidence((reply or "").strip())
         reply_clean = reply_clean.upper()
@@ -21364,20 +21442,49 @@ def _fetch_album_provider_fallbacks_parallel(artist: str, album_title: str) -> d
                     logging.debug("[Providers] lastfm fetch failed for %r - %r: %s", artist_name, title, e)
     else:
         tasks = {}
-        with ThreadPoolExecutor(max_workers=3, thread_name_prefix="pmda-provider-fallback") as pool:
+        timeout_total = float(
+            getattr(
+                sys.modules[__name__],
+                "PROVIDER_FALLBACK_PARALLEL_TIMEOUT_SEC",
+                PROVIDER_FALLBACK_PARALLEL_TIMEOUT_SEC,
+            )
+            or PROVIDER_FALLBACK_PARALLEL_TIMEOUT_SEC
+        )
+        pool = ThreadPoolExecutor(max_workers=3, thread_name_prefix="pmda-provider-fallback")
+        try:
             if USE_DISCOGS:
                 tasks[pool.submit(fetch_provider_album_lookup_cached, "discogs", artist_name, title, _fetch_discogs_release)] = "discogs"
             if USE_BANDCAMP:
                 tasks[pool.submit(fetch_provider_album_lookup_cached, "bandcamp", artist_name, title, _fetch_bandcamp_album_info)] = "bandcamp"
             if USE_LASTFM:
                 tasks[pool.submit(fetch_provider_album_lookup_cached, "lastfm", artist_name, title, _fetch_lastfm_album_info)] = "lastfm"
-
-            for fut in as_completed(tasks):
-                key = tasks[fut]
-                try:
-                    out[key] = fut.result()
-                except Exception as e:
-                    logging.debug("[Providers] %s fetch failed for %r - %r: %s", key, artist_name, title, e)
+            if tasks:
+                done, not_done = wait(set(tasks.keys()), timeout=max(1.0, timeout_total))
+                for fut in done:
+                    key = tasks[fut]
+                    try:
+                        out[key] = fut.result()
+                    except Exception as e:
+                        logging.debug("[Providers] %s fetch failed for %r - %r: %s", key, artist_name, title, e)
+                if not_done:
+                    timed_out_keys = [tasks[fut] for fut in not_done if fut in tasks]
+                    logging.warning(
+                        "[Providers] fallback lookup timeout after %.1fs for %r - %r (timed out: %s)",
+                        timeout_total,
+                        artist_name,
+                        title,
+                        ", ".join(sorted(set(timed_out_keys))) or "unknown",
+                    )
+                    for fut in not_done:
+                        try:
+                            fut.cancel()
+                        except Exception:
+                            pass
+        finally:
+            try:
+                pool.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
 
     discogs_info = out.get("discogs")
     if discogs_info:
@@ -23364,13 +23471,28 @@ def search_mb_release_group_by_metadata(
                 try:
                     provider = getattr(sys.modules[__name__], "AI_PROVIDER", "openai")
                     model = getattr(sys.modules[__name__], "RESOLVED_MODEL", None) or getattr(sys.modules[__name__], "OPENAI_MODEL", "gpt-4o-mini")
-                    reply = call_ai_provider(
-                        provider,
-                        model,
-                        "Reply with a single letter (A/B/...) or NONE. Optionally end with (confidence: N).",
-                        prompt,
+                    tiebreak_timeout = float(
+                        getattr(
+                            sys.modules[__name__],
+                            "MB_AI_TIEBREAK_TIMEOUT_SEC",
+                            MB_AI_TIEBREAK_TIMEOUT_SEC,
+                        )
+                        or MB_AI_TIEBREAK_TIMEOUT_SEC
+                    )
+                    logging.info(
+                        "[MusicBrainz Search] AI tie-break start (candidates=%d, timeout=%.1fs)",
+                        len(matching),
+                        tiebreak_timeout,
+                    )
+                    reply = _call_ai_provider_bounded(
+                        provider=provider,
+                        model=model,
+                        system_msg="Reply with a single letter (A/B/...) or NONE. Optionally end with (confidence: N).",
+                        user_msg=prompt,
                         max_tokens=30,
                         analysis_type="mb_candidate_tiebreak",
+                        timeout_sec=tiebreak_timeout,
+                        log_prefix="[MusicBrainz Search]",
                     )
                     reply_clean, ai_confidence = parse_ai_confidence((reply or "").strip())
                     if ai_confidence is not None:
