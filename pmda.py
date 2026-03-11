@@ -32980,6 +32980,7 @@ def background_scan():
         with lock:
             state["scan_finalizing"] = False
             run_improve_after = state.pop("run_improve_after", False)
+        profile_enrich_inline_done = False
         # Magic / run-improve-after: run improve-all only for a completed scan.
         should_request_improve = bool((not pipeline_async_enabled) and (run_improve_after or pipeline_flags.get("match_fix")))
         if should_request_improve and scan_status != "completed":
@@ -33134,6 +33135,7 @@ def background_scan():
                                 int(enrich_metrics.get("artists_failed") or 0),
                                 int(enrich_metrics.get("albums_targeted") or 0),
                             )
+                            profile_enrich_inline_done = True
                         except Exception:
                             logging.exception("Scan inline profile enrichment failed")
             else:
@@ -33141,6 +33143,30 @@ def background_scan():
                     logging.info("Magic mode: dedupe done; no albums to improve from current scan.")
                 else:
                     logging.info("Run improve after scan: no albums to improve from current scan.")
+        # Files mode, scheduler-off: always execute profile enrichment inside scan, even when
+        # post-processing was streamed by artist (no global improve-all block).
+        if (
+            scan_status == "completed"
+            and _get_library_mode() == "files"
+            and not bool(getattr(sys.modules[__name__], "SCHEDULER_ALLOW_NON_SCAN_JOBS", SCHEDULER_ALLOW_NON_SCAN_JOBS))
+            and bool((run_improve_after_requested or pipeline_flags_requested.get("match_fix")))
+            and not bool(profile_enrich_inline_done)
+        ):
+            try:
+                targets = _scan_collect_profile_enrich_targets(_int_or_none(scan_id))
+                enrich_metrics = _run_scan_profile_enrichment_inline(
+                    targets,
+                    reason=f"scan_{int(scan_id or 0)}_fallback",
+                )
+                logging.info(
+                    "Pipeline step profile-enrich-inline (fallback): artists=%d done=%d failed=%d albums=%d",
+                    int(enrich_metrics.get("artists_total") or 0),
+                    int(enrich_metrics.get("artists_done") or 0),
+                    int(enrich_metrics.get("artists_failed") or 0),
+                    int(enrich_metrics.get("albums_targeted") or 0),
+                )
+            except Exception:
+                logging.exception("Scan inline profile enrichment fallback failed")
         if scan_stream_post_by_artist and scan_status == "completed":
             try:
                 if _get_library_mode() == "files" and getattr(sys.modules[__name__], "AUTO_EXPORT_LIBRARY", False):
@@ -56881,6 +56907,47 @@ def _run_scan_profile_enrichment_inline(best_albums_list: list[dict], *, reason:
         "artists_failed": int(artists_failed),
         "albums_targeted": int(albums_targeted),
     }
+
+
+def _scan_collect_profile_enrich_targets(scan_id: int | None) -> list[dict]:
+    """
+    Build minimal album targets from scan_editions for inline profile enrichment.
+    """
+    sid = _parse_int_loose(scan_id, 0)
+    if sid <= 0:
+        return []
+    rows: list[dict] = []
+    try:
+        con = sqlite3.connect(str(STATE_DB_FILE))
+        cur = con.cursor()
+        cur.execute(
+            """
+            SELECT artist, album_id, title_raw, folder
+            FROM scan_editions
+            WHERE scan_id = ?
+            ORDER BY artist, album_id
+            """,
+            (sid,),
+        )
+        for artist, album_id, title_raw, folder in cur.fetchall():
+            artist_name = str(artist or "").strip()
+            album_title = str(title_raw or "").strip()
+            if not artist_name or not album_title:
+                continue
+            rows.append(
+                {
+                    "artist": artist_name,
+                    "album_id": int(_parse_int_loose(album_id, 0) or 0),
+                    "album_title": album_title,
+                    "title_raw": album_title,
+                    "folder": str(folder or "").strip(),
+                }
+            )
+        con.close()
+    except Exception:
+        logging.debug("Failed to collect scan profile enrichment targets for scan_id=%s", sid, exc_info=True)
+        return []
+    return rows
 
 
 def _run_improve_all_albums(artist_id: int, album_ids: list, album_titles: dict):
