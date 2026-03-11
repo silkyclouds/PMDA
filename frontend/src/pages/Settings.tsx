@@ -177,7 +177,7 @@ const DANGER_PRESETS: DangerPresetMeta[] = [
     id: 'reset_all_keep_settings',
     title: 'Reset PMDA (keep settings)',
     description:
-      'Clears NVMe media cache, resets cache.db, resets state.db, and clears PostgreSQL files index. Settings, users, and provider keys are preserved.',
+      'Clears NVMe media cache, resets cache.db, resets state.db, clears PostgreSQL files index, and empties the visible library until the next full scan. Settings, users, and provider keys are preserved.',
     buttonLabel: 'Reset PMDA now',
     resetActions: ['media_cache', 'cache_db', 'state_db', 'files_index'],
   },
@@ -1992,7 +1992,8 @@ function SettingsPage() {
               <AlertDialogDescription>
                 This will remove generated artwork cache, reset <span className="font-mono">cache.db</span>,
                 reset <span className="font-mono">state.db</span>, and clear indexed library rows in PostgreSQL.
-                Settings, users, and API keys are kept. This action is destructive and cannot be undone.
+                The library view will stay empty until you run the next full scan. Settings, users, and API keys are kept.
+                This action is destructive and cannot be undone.
               </AlertDialogDescription>
             </AlertDialogHeader>
             <AlertDialogFooter>

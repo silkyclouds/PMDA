@@ -13647,6 +13647,28 @@ def _ensure_files_index_ready() -> tuple[bool, Optional[str]]:
         # During a running Files scan, the live index may be intentionally empty
         # before first artist publication. Do not force a full bootstrap rebuild.
         return True, None
+    bootstrap_required = bool(_pipeline_bootstrap_status().get("bootstrap_required"))
+    if bootstrap_required and (albums == 0 or tracks == 0):
+        # Explicitly keep the Files index empty until the first completed full scan.
+        # This is required for maintenance reset semantics: "reset PMDA (keep settings)"
+        # must not repopulate the library automatically at startup.
+        _files_index_set_state(
+            running=False,
+            started_at=None,
+            finished_at=time.time(),
+            phase="idle",
+            current_folder=None,
+            folders_processed=0,
+            total_folders=0,
+            artists=0,
+            albums=0,
+            tracks=0,
+            error=None,
+        )
+        logging.info(
+            "Files library index bootstrap skipped: initial full scan required (bootstrap_required=1)."
+        )
+        return True, None
     if albums > 0 and tracks > 0:
         # One-time migration for legacy rows: align match flags with strict verification.
         # This keeps counters coherent even before a fresh full scan.
