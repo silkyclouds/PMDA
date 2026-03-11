@@ -748,6 +748,23 @@ AI_OPENAI_REQUEST_TIMEOUT_SEC = max(
     10.0,
     min(180.0, float(os.getenv("PMDA_AI_OPENAI_REQUEST_TIMEOUT_SEC", "45") or "45")),
 )
+
+
+def _openai_request_timeout_seconds() -> float:
+    """Return the effective OpenAI request timeout with runtime override support."""
+    try:
+        val = float(
+            getattr(
+                sys.modules[__name__],
+                "AI_OPENAI_REQUEST_TIMEOUT_SEC",
+                AI_OPENAI_REQUEST_TIMEOUT_SEC,
+            )
+            or AI_OPENAI_REQUEST_TIMEOUT_SEC
+        )
+    except Exception:
+        val = float(AI_OPENAI_REQUEST_TIMEOUT_SEC)
+    return max(10.0, min(180.0, val))
+
 AI_MAX_CALLS_PER_SCAN = max(
     0,
     int(os.getenv("PMDA_AI_MAX_CALLS_PER_SCAN", "60") or "60"),
@@ -2551,7 +2568,7 @@ if AI_PROVIDER.lower() in {"openai", "openai-api", "openai-codex"}:
     if OPENAI_API_KEY:
         os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
         try:
-            openai_client = OpenAI()
+            openai_client = OpenAI(timeout=_openai_request_timeout_seconds())
             ai_provider_ready = True
             logging.info("OpenAI client initialized")
         except Exception as e:
@@ -2631,7 +2648,7 @@ def _reinit_ai_from_globals():
         if openai_key:
             os.environ["OPENAI_API_KEY"] = openai_key
             try:
-                openai_client = OpenAI()
+                openai_client = OpenAI(timeout=_openai_request_timeout_seconds())
                 ai_provider_ready = True
                 logging.info("OpenAI client re-initialized (settings applied)")
             except Exception as e:
@@ -3516,6 +3533,7 @@ def _resolve_openai_client_for_runtime(provider_for_usage: str, user_id: int | N
                 kwargs: dict[str, Any] = {"api_key": access_token}
                 if base_url:
                     kwargs["base_url"] = base_url
+                kwargs["timeout"] = _openai_request_timeout_seconds()
                 return OpenAI(**kwargs), "oauth", ""
             oauth_reason = "OpenAI Codex OAuth returned an empty access token"
         except Exception as exc:
@@ -3606,7 +3624,7 @@ def call_ai_provider(
                     {"role": ("developer" if is_gpt5 else "system"), "content": system_msg},
                     {"role": "user", "content": user_msg},
                 ],
-                "timeout": float(getattr(sys.modules[__name__], "AI_OPENAI_REQUEST_TIMEOUT_SEC", AI_OPENAI_REQUEST_TIMEOUT_SEC) or AI_OPENAI_REQUEST_TIMEOUT_SEC),
+                "timeout": _openai_request_timeout_seconds(),
             }
             if is_gpt5:
                 _kwargs["reasoning_effort"] = "minimal"
@@ -15193,6 +15211,7 @@ def call_ai_provider_longform(
                     {"role": ("developer" if is_gpt5 else "system"), "content": system_msg},
                     {"role": "user", "content": user_msg},
                 ],
+                "timeout": _openai_request_timeout_seconds(),
             }
             if is_gpt5:
                 _kwargs["reasoning_effort"] = "minimal"
@@ -16893,6 +16912,7 @@ def _assistant_sql_agent_generate_query(
             ],
             "temperature": 0,
             "response_format": {"type": "json_object"},
+            "timeout": _openai_request_timeout_seconds(),
         }
         if param_style == "mct":
             _kwargs["max_completion_tokens"] = 420
@@ -36044,7 +36064,7 @@ def _openai_web_search_fallback(query: str, num: int = 10, *, reason: str = "") 
                 "tools": [{"type": "web_search_preview"}],
                 "input": prompt,
                 "max_output_tokens": max_output_tokens,
-                "timeout": float(getattr(sys.modules[__name__], "AI_OPENAI_REQUEST_TIMEOUT_SEC", AI_OPENAI_REQUEST_TIMEOUT_SEC) or AI_OPENAI_REQUEST_TIMEOUT_SEC),
+                "timeout": _openai_request_timeout_seconds(),
             }
             try:
                 resp = client_to_use.responses.create(**req)
@@ -37256,7 +37276,7 @@ def api_openai_check():
         return jsonify({"success": False, "message": "Invalid API key format. OpenAI keys start with 'sk-'"}), 400
     
     try:
-        client = OpenAI(api_key=key)
+        client = OpenAI(api_key=key, timeout=_openai_request_timeout_seconds())
         # Try with max_completion_tokens first (newer API)
         try:
             response = client.chat.completions.create(
@@ -37535,7 +37555,7 @@ def api_openai_models():
         return jsonify({"error": "Invalid API key format. OpenAI keys start with 'sk-'"}), 400
 
     try:
-        client = OpenAI(api_key=key)
+        client = OpenAI(api_key=key, timeout=_openai_request_timeout_seconds())
         # Return only curated compatible models (no API list fetch – we never show incompatible models)
         available_models = list(OPENAI_COMPATIBLE_MODELS)
         logging.info("Returning %d compatible OpenAI models for Settings", len(available_models))
