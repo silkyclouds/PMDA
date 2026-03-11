@@ -764,6 +764,10 @@ AI_SCAN_HARD_TIMEOUT_SEC = max(
     8.0,
     min(120.0, float(os.getenv("PMDA_AI_SCAN_HARD_TIMEOUT_SEC", "30") or "30")),
 )
+AI_REVIEW_FETCH_TIMEOUT_SEC = max(
+    4.0,
+    min(60.0, float(os.getenv("PMDA_AI_REVIEW_FETCH_TIMEOUT_SEC", "12") or "12")),
+)
 
 
 def _openai_request_timeout_seconds() -> float:
@@ -3588,6 +3592,7 @@ def call_ai_provider(
     max_tokens: int = 256,
     *,
     analysis_type: str,
+    request_timeout_sec: float | None = None,
 ) -> str:
     """
     Call the configured provider (text endpoint) and persist token/cost usage.
@@ -3623,6 +3628,10 @@ def call_ai_provider(
             )
             if not client_to_use:
                 raise ValueError(openai_runtime_reason or "OpenAI client not initialized")
+            request_timeout = max(
+                5.0,
+                float(request_timeout_sec if request_timeout_sec is not None else _openai_request_timeout_seconds()),
+            )
             try:
                 if (model or "").strip().lower().startswith("gpt-5") and int(max_tokens or 0) < 128:
                     max_tokens = 128
@@ -3632,6 +3641,30 @@ def call_ai_provider(
                 is_gpt5 = (model or "").strip().lower().startswith("gpt-5")
             except Exception:
                 is_gpt5 = False
+            use_responses_api = bool(auth_mode_for_usage == "oauth" or provider_lower == "openai-codex")
+            if use_responses_api:
+                try:
+                    resp = client_to_use.responses.create(
+                        model=model,
+                        input=[
+                            {"role": ("developer" if is_gpt5 else "system"), "content": system_msg},
+                            {"role": "user", "content": user_msg},
+                        ],
+                        max_output_tokens=max_tokens,
+                        timeout=request_timeout,
+                    )
+                    response_obj = resp
+                    out = _extract_text_from_openai_response(resp)
+                    if out:
+                        status = "completed"
+                        return out
+                    raise RuntimeError("OpenAI responses call returned empty output")
+                except Exception as e:
+                    # OAuth mode should not downgrade to chat.completions (often unsupported).
+                    if auth_mode_for_usage == "oauth":
+                        raise
+                    logging.debug("OpenAI responses fallback to chat.completions: %s", e)
+
             param_style = getattr(sys.modules[__name__], "RESOLVED_PARAM_STYLE", "mct")
             stop_ok = getattr(sys.modules[__name__], "RESOLVED_STOP_OK", True)
             _kwargs = {
@@ -3640,7 +3673,7 @@ def call_ai_provider(
                     {"role": ("developer" if is_gpt5 else "system"), "content": system_msg},
                     {"role": "user", "content": user_msg},
                 ],
-                "timeout": _openai_request_timeout_seconds(),
+                "timeout": request_timeout,
             }
             if is_gpt5:
                 _kwargs["reasoning_effort"] = "minimal"
@@ -3992,6 +4025,7 @@ def _call_ai_provider_bounded(
         user_msg,
         int(max_tokens or 0),
         analysis_type=analysis_type,
+        request_timeout_sec=max(5.0, timeout_val - 2.0),
     )
     try:
         reply = fut.result(timeout=timeout_val)
@@ -4002,6 +4036,45 @@ def _call_ai_provider_bounded(
         elapsed = time.perf_counter() - started
         logging.warning(
             "%s AI call timed out after %.1fs (elapsed %.2fs); continuing without AI result",
+            log_prefix,
+            timeout_val,
+            elapsed,
+        )
+        raise TimeoutError(f"{log_prefix} timeout")
+    finally:
+        try:
+            fut.cancel()
+        except Exception:
+            pass
+        try:
+            pool.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+
+
+def _run_callable_bounded(
+    func,
+    *args: Any,
+    timeout_sec: float,
+    log_prefix: str,
+    **kwargs: Any,
+) -> Any:
+    """
+    Run any callable with a hard timeout, used by slow manual endpoints.
+    """
+    timeout_val = max(1.0, float(timeout_sec or 0.0))
+    started = time.perf_counter()
+    pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pmda-call-bounded")
+    fut = pool.submit(func, *args, **kwargs)
+    try:
+        out = fut.result(timeout=timeout_val)
+        elapsed = time.perf_counter() - started
+        logging.info("%s call completed in %.2fs", log_prefix, elapsed)
+        return out
+    except FutureTimeout:
+        elapsed = time.perf_counter() - started
+        logging.warning(
+            "%s call timed out after %.1fs (elapsed %.2fs)",
             log_prefix,
             timeout_val,
             elapsed,
@@ -15244,6 +15317,7 @@ def call_ai_provider_longform(
     max_tokens: int = 800,
     *,
     analysis_type: str,
+    request_timeout_sec: float | None = None,
 ) -> str:
     """AI call that allows multi-line answers and persists token/cost telemetry."""
     started_at = time.time()
@@ -15277,6 +15351,10 @@ def call_ai_provider_longform(
             )
             if not client_to_use:
                 raise ValueError(openai_runtime_reason or "OpenAI client not initialized")
+            request_timeout = max(
+                5.0,
+                float(request_timeout_sec if request_timeout_sec is not None else _openai_request_timeout_seconds()),
+            )
             try:
                 is_gpt5 = (model or "").strip().lower().startswith("gpt-5")
             except Exception:
@@ -15286,6 +15364,29 @@ def call_ai_provider_longform(
                     max_tokens = 256
             except Exception:
                 pass
+            use_responses_api = bool(auth_mode_for_usage == "oauth" or provider_lower == "openai-codex")
+            if use_responses_api:
+                try:
+                    resp = client_to_use.responses.create(
+                        model=model,
+                        input=[
+                            {"role": ("developer" if is_gpt5 else "system"), "content": system_msg},
+                            {"role": "user", "content": user_msg},
+                        ],
+                        max_output_tokens=max_tokens,
+                        timeout=request_timeout,
+                    )
+                    response_obj = resp
+                    out = _extract_text_from_openai_response(resp)
+                    if out:
+                        status = "completed"
+                        return out
+                    raise RuntimeError("OpenAI responses call returned empty output")
+                except Exception as e:
+                    if auth_mode_for_usage == "oauth":
+                        raise
+                    logging.debug("OpenAI responses longform fallback to chat.completions: %s", e)
+
             param_style = getattr(sys.modules[__name__], "RESOLVED_PARAM_STYLE", "mct")
             _kwargs = {
                 "model": model,
@@ -15293,7 +15394,7 @@ def call_ai_provider_longform(
                     {"role": ("developer" if is_gpt5 else "system"), "content": system_msg},
                     {"role": "user", "content": user_msg},
                 ],
-                "timeout": _openai_request_timeout_seconds(),
+                "timeout": request_timeout,
             }
             if is_gpt5:
                 _kwargs["reasoning_effort"] = "minimal"
@@ -28639,6 +28740,18 @@ def _publish_files_library_artist_from_items(
         has_cover = bool(cover_path and cover_path.is_file()) or album_folder_has_cover(folder)
         artist_folder = _files_guess_artist_folder(folder, artist_resolved)
         artist_image_path = _first_artist_image_path(artist_folder) if artist_folder else None
+        if not artist_image_path and artist_norm:
+            # Fallback to cached external artist image (fanart/lastfm/wikipedia...) when
+            # no on-disk artist image exists in the music folder.
+            try:
+                ext_row = _files_get_external_artist_images(conn, [artist_norm]).get(artist_norm) or {}
+                ext_path_raw = str(ext_row.get("image_path") or "").strip()
+                if ext_path_raw:
+                    ext_path = path_for_fs_access(Path(ext_path_raw))
+                    if ext_path.exists() and ext_path.is_file():
+                        artist_image_path = ext_path
+            except Exception:
+                artist_image_path = artist_image_path
         has_artist_image = bool(artist_image_path and artist_image_path.is_file())
         indices = [int(t.get("track_num") or 0) for t in track_entries if int(t.get("track_num") or 0) > 0]
         actual_track_count = len(track_entries)
@@ -33008,6 +33121,21 @@ def background_scan():
                 _run_improve_all_albums_global(best_albums)
                 if _get_library_mode() == "files":
                     _refresh_files_album_scan_cache_from_editions(best_albums, scan_id=scan_id)
+                    if not bool(getattr(sys.modules[__name__], "SCHEDULER_ALLOW_NON_SCAN_JOBS", SCHEDULER_ALLOW_NON_SCAN_JOBS)):
+                        try:
+                            enrich_metrics = _run_scan_profile_enrichment_inline(
+                                best_albums,
+                                reason=f"scan_{int(scan_id or 0)}",
+                            )
+                            logging.info(
+                                "Pipeline step profile-enrich-inline: artists=%d done=%d failed=%d albums=%d",
+                                int(enrich_metrics.get("artists_total") or 0),
+                                int(enrich_metrics.get("artists_done") or 0),
+                                int(enrich_metrics.get("artists_failed") or 0),
+                                int(enrich_metrics.get("albums_targeted") or 0),
+                            )
+                        except Exception:
+                            logging.exception("Scan inline profile enrichment failed")
             else:
                 if MAGIC_MODE:
                     logging.info("Magic mode: dedupe done; no albums to improve from current scan.")
@@ -55373,11 +55501,28 @@ def api_library_album_review_generate(album_id: int):
                     album_title,
                 )
 
-        profile = _fetch_album_review_web_ai(
-            review_artist,
-            review_album,
-            allow_short_title_fallback=bool(strict_verified or has_identity_hint),
-        ) or {}
+        review_timeout = max(
+            4.0,
+            float(
+                getattr(
+                    sys.modules[__name__],
+                    "AI_REVIEW_FETCH_TIMEOUT_SEC",
+                    AI_REVIEW_FETCH_TIMEOUT_SEC,
+                )
+                or AI_REVIEW_FETCH_TIMEOUT_SEC
+            ),
+        )
+        try:
+            profile = _run_callable_bounded(
+                _fetch_album_review_web_ai,
+                review_artist,
+                review_album,
+                allow_short_title_fallback=bool(strict_verified or has_identity_hint),
+                timeout_sec=review_timeout,
+                log_prefix=f"[Review] album={int(album_id or 0)} web+ai",
+            ) or {}
+        except TimeoutError:
+            return jsonify({"error": f"Review lookup timed out after {int(review_timeout)}s"}), 504
         if not isinstance(profile, dict):
             profile = {}
         has_profile_text = bool(
@@ -55385,27 +55530,39 @@ def api_library_album_review_generate(album_id: int):
             or str(profile.get("short_description") or "").strip()
         )
         if not has_profile_text:
-            profile = _fetch_best_album_profile(
-                review_artist,
-                review_album,
-                allow_web_ai=False,
-                allow_short_title_fallback=bool(strict_verified or has_identity_hint),
-            ) or {}
+            try:
+                profile = _run_callable_bounded(
+                    _fetch_best_album_profile,
+                    review_artist,
+                    review_album,
+                    allow_web_ai=False,
+                    allow_short_title_fallback=bool(strict_verified or has_identity_hint),
+                    timeout_sec=review_timeout,
+                    log_prefix=f"[Review] album={int(album_id or 0)} provider-fallback",
+                ) or {}
+            except TimeoutError:
+                return jsonify({"error": f"Review provider fallback timed out after {int(review_timeout)}s"}), 504
             has_profile_text = bool(
                 str(profile.get("description") or "").strip()
                 or str(profile.get("short_description") or "").strip()
             )
         if not has_profile_text:
-            profile = _fetch_album_profile_from_provider_fallback(
-                review_artist,
-                review_album,
-                metadata_source=str(metadata_source or "").strip(),
-                mbid=str(mbid or "").strip(),
-                discogs_release_id=str(discogs_release_id or "").strip(),
-                lastfm_album_mbid=str(lastfm_album_mbid or "").strip(),
-                bandcamp_album_url=str(bandcamp_album_url or "").strip(),
-                allow_short_title_fallback=bool(strict_verified or has_identity_hint),
-            ) or {}
+            try:
+                profile = _run_callable_bounded(
+                    _fetch_album_profile_from_provider_fallback,
+                    review_artist,
+                    review_album,
+                    metadata_source=str(metadata_source or "").strip(),
+                    mbid=str(mbid or "").strip(),
+                    discogs_release_id=str(discogs_release_id or "").strip(),
+                    lastfm_album_mbid=str(lastfm_album_mbid or "").strip(),
+                    bandcamp_album_url=str(bandcamp_album_url or "").strip(),
+                    allow_short_title_fallback=bool(strict_verified or has_identity_hint),
+                    timeout_sec=review_timeout,
+                    log_prefix=f"[Review] album={int(album_id or 0)} hard-fallback",
+                ) or {}
+            except TimeoutError:
+                return jsonify({"error": f"Review hard fallback timed out after {int(review_timeout)}s"}), 504
             has_profile_text = bool(
                 str(profile.get("description") or "").strip()
                 or str(profile.get("short_description") or "").strip()
@@ -56616,6 +56773,114 @@ def _run_improve_all_albums_global(best_albums_list: List[dict]):
             if state.get("improve_all"):
                 state["improve_all"]["running"] = False
                 state["improve_all"]["error"] = str(e)
+
+
+def _run_scan_profile_enrichment_inline(best_albums_list: list[dict], *, reason: str = "scan_inline") -> dict[str, int]:
+    """
+    Scan-only profile enrichment (artist bios + album reviews) executed inside the scan
+    when background scheduler jobs are disabled. This keeps the pipeline deterministic:
+    one scan run does all metadata processing.
+    """
+    if _get_library_mode() != "files":
+        return {"artists_total": 0, "artists_done": 0, "artists_failed": 0, "albums_targeted": 0}
+    grouped: dict[str, dict[str, Any]] = {}
+    for row in (best_albums_list or []):
+        if not isinstance(row, dict):
+            continue
+        artist_name = str(row.get("artist") or "").strip()
+        album_title = str(row.get("album_title") or row.get("title_raw") or "").strip()
+        if not artist_name or not album_title:
+            continue
+        artist_norm = _norm_artist_key(artist_name)
+        if not artist_norm:
+            continue
+        title_norm = norm_album_for_dedup(album_title, normalize_parenthetical=True)
+        if not title_norm:
+            title_norm = norm_album(album_title)
+        bucket = grouped.setdefault(
+            artist_norm,
+            {
+                "artist_name": artist_name,
+                "albums": [],
+                "_seen_norms": set(),
+            },
+        )
+        seen_norms: set[str] = bucket.get("_seen_norms") or set()
+        if title_norm in seen_norms:
+            continue
+        seen_norms.add(title_norm)
+        bucket["_seen_norms"] = seen_norms
+        bucket["albums"].append((album_title, title_norm))
+
+    artists_total = len(grouped)
+    artists_done = 0
+    artists_failed = 0
+    albums_targeted = sum(len(v.get("albums") or []) for v in grouped.values())
+    if artists_total <= 0:
+        return {
+            "artists_total": 0,
+            "artists_done": 0,
+            "artists_failed": 0,
+            "albums_targeted": 0,
+        }
+
+    logging.info(
+        "Pipeline step profile-enrich-inline: start (artists=%d, albums=%d, reason=%s)",
+        artists_total,
+        albums_targeted,
+        reason,
+    )
+    with lock:
+        state["scan_profile_enrich_total"] = int(artists_total)
+        state["scan_profile_enrich_done"] = 0
+        state["scan_profile_enrich_current_artist"] = None
+        state["scan_profile_enrich_running"] = True
+        state["scan_profile_enrich_started_at"] = time.time()
+
+    try:
+        for artist_norm, payload in grouped.items():
+            artist_name = str(payload.get("artist_name") or "").strip()
+            albums = list(payload.get("albums") or [])
+            with lock:
+                state["scan_profile_enrich_current_artist"] = artist_name
+            if not artist_name or not albums:
+                continue
+            job_key = f"{reason}:{artist_norm}:{int(time.time() * 1000)}"
+            try:
+                _run_files_profile_enrichment_job(
+                    job_key=job_key,
+                    artist_name=artist_name,
+                    artist_norm=artist_norm,
+                    albums=albums,
+                    skip_album_profiles=False,
+                    allow_soft_profiles=True,
+                )
+                artists_done += 1
+            except Exception:
+                artists_failed += 1
+                logging.debug("Inline profile enrichment failed for %s", artist_name, exc_info=True)
+            finally:
+                with lock:
+                    state["scan_profile_enrich_done"] = int(artists_done + artists_failed)
+                    state["scan_profile_enrich_updated_at"] = time.time()
+    finally:
+        with lock:
+            state["scan_profile_enrich_running"] = False
+            state["scan_profile_enrich_current_artist"] = None
+            state["scan_profile_enrich_finished_at"] = time.time()
+
+    logging.info(
+        "Pipeline step profile-enrich-inline: done (artists_done=%d, artists_failed=%d, albums=%d)",
+        artists_done,
+        artists_failed,
+        albums_targeted,
+    )
+    return {
+        "artists_total": int(artists_total),
+        "artists_done": int(artists_done),
+        "artists_failed": int(artists_failed),
+        "albums_targeted": int(albums_targeted),
+    }
 
 
 def _run_improve_all_albums(artist_id: int, album_ids: list, album_titles: dict):
