@@ -744,6 +744,10 @@ AI_WEB_SEARCH_CACHE_MAX_ENTRIES = max(
     100,
     int(os.getenv("PMDA_AI_WEB_SEARCH_CACHE_MAX_ENTRIES", "2000") or "2000"),
 )
+AI_OPENAI_REQUEST_TIMEOUT_SEC = max(
+    10.0,
+    min(180.0, float(os.getenv("PMDA_AI_OPENAI_REQUEST_TIMEOUT_SEC", "45") or "45")),
+)
 AI_MAX_CALLS_PER_SCAN = max(
     0,
     int(os.getenv("PMDA_AI_MAX_CALLS_PER_SCAN", "60") or "60"),
@@ -3602,6 +3606,7 @@ def call_ai_provider(
                     {"role": ("developer" if is_gpt5 else "system"), "content": system_msg},
                     {"role": "user", "content": user_msg},
                 ],
+                "timeout": float(getattr(sys.modules[__name__], "AI_OPENAI_REQUEST_TIMEOUT_SEC", AI_OPENAI_REQUEST_TIMEOUT_SEC) or AI_OPENAI_REQUEST_TIMEOUT_SEC),
             }
             if is_gpt5:
                 _kwargs["reasoning_effort"] = "minimal"
@@ -36039,6 +36044,7 @@ def _openai_web_search_fallback(query: str, num: int = 10, *, reason: str = "") 
                 "tools": [{"type": "web_search_preview"}],
                 "input": prompt,
                 "max_output_tokens": max_output_tokens,
+                "timeout": float(getattr(sys.modules[__name__], "AI_OPENAI_REQUEST_TIMEOUT_SEC", AI_OPENAI_REQUEST_TIMEOUT_SEC) or AI_OPENAI_REQUEST_TIMEOUT_SEC),
             }
             try:
                 resp = client_to_use.responses.create(**req)
