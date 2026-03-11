@@ -760,6 +760,10 @@ PROVIDER_FALLBACK_PARALLEL_TIMEOUT_SEC = max(
     2.0,
     min(45.0, float(os.getenv("PMDA_PROVIDER_FALLBACK_TIMEOUT_SEC", "12") or "12")),
 )
+AI_SCAN_HARD_TIMEOUT_SEC = max(
+    8.0,
+    min(120.0, float(os.getenv("PMDA_AI_SCAN_HARD_TIMEOUT_SEC", "30") or "30")),
+)
 
 
 def _openai_request_timeout_seconds() -> float:
@@ -21240,13 +21244,15 @@ def _identify_album_by_acoustic_id(
                     )
                     + "\n\nWhich release group matches this album? Reply with one letter or the MBID or NONE. Optionally end with (confidence: N) where N is 0-100."
                 )
-                reply = call_ai_provider(
-                    getattr(sys.modules[__name__], "AI_PROVIDER", "openai"),
-                    getattr(sys.modules[__name__], "RESOLVED_MODEL", "gpt-4o-mini"),
-                    "Reply with a single letter (A,B,...) or an MBID (UUID) or NONE. Optionally end with (confidence: N).",
-                    prompt,
+                reply = _call_ai_provider_bounded(
+                    provider=getattr(sys.modules[__name__], "AI_PROVIDER", "openai"),
+                    model=getattr(sys.modules[__name__], "RESOLVED_MODEL", "gpt-4o-mini"),
+                    system_msg="Reply with a single letter (A,B,...) or an MBID (UUID) or NONE. Optionally end with (confidence: N).",
+                    user_msg=prompt,
                     max_tokens=40,
                     analysis_type="acoustid_candidate_disambiguation",
+                    timeout_sec=AI_SCAN_HARD_TIMEOUT_SEC,
+                    log_prefix="[AcousticID]",
                 )
                 reply_clean, ai_confidence = parse_ai_confidence((reply or "").strip())
                 if ai_confidence is not None:
@@ -22069,13 +22075,15 @@ def _ai_choose_provider_identity_candidate(
     try:
         provider = getattr(sys.modules[__name__], "AI_PROVIDER", "openai")
         model = getattr(sys.modules[__name__], "RESOLVED_MODEL", None) or getattr(sys.modules[__name__], "OPENAI_MODEL", "gpt-4o-mini")
-        reply = call_ai_provider(
-            provider,
-            model,
-            system_msg,
-            prompt,
+        reply = _call_ai_provider_bounded(
+            provider=provider,
+            model=model,
+            system_msg=system_msg,
+            user_msg=prompt,
             max_tokens=30,
             analysis_type="provider_identity_verify",
+            timeout_sec=AI_SCAN_HARD_TIMEOUT_SEC,
+            log_prefix="[Providers Arbitration]",
         )
         reply_clean, ai_confidence = parse_ai_confidence((reply or "").strip())
         cleaned = (reply_clean or "").strip().upper()
@@ -22700,13 +22708,15 @@ def _infer_identity_from_local_context_ai(
     prompt += "\nDo not invent random artists/albums. Prefer exact identity visible in filenames."
 
     try:
-        out = call_ai_provider(
-            provider,
-            model,
-            "Return strict JSON object only. No markdown.",
-            prompt,
+        out = _call_ai_provider_bounded(
+            provider=provider,
+            model=model,
+            system_msg="Return strict JSON object only. No markdown.",
+            user_msg=prompt,
             max_tokens=220,
             analysis_type="identity_inference_no_tags",
+            timeout_sec=AI_SCAN_HARD_TIMEOUT_SEC,
+            log_prefix="[AI Identity]",
         )
         obj = _assistant_extract_json_obj(out or "")
         artist_guess = str(obj.get("artist") or "").strip()
@@ -23026,13 +23036,15 @@ def search_mb_release_group_by_metadata(
                 try:
                     provider = getattr(sys.modules[__name__], "AI_PROVIDER", "openai")
                     model = getattr(sys.modules[__name__], "RESOLVED_MODEL", None) or getattr(sys.modules[__name__], "OPENAI_MODEL", "gpt-4o-mini")
-                    reply = call_ai_provider(
-                        provider,
-                        model,
-                        "You reply with a single MBID (UUID) or the word NONE. Optionally end with (confidence: N).",
-                        prompt,
+                    reply = _call_ai_provider_bounded(
+                        provider=provider,
+                        model=model,
+                        system_msg="You reply with a single MBID (UUID) or the word NONE. Optionally end with (confidence: N).",
+                        user_msg=prompt,
                         max_tokens=70,
                         analysis_type="web_mbid_inference",
+                        timeout_sec=AI_SCAN_HARD_TIMEOUT_SEC,
+                        log_prefix="[MusicBrainz Web+AI]",
                     )
                     reply_clean, ai_confidence = parse_ai_confidence((reply or "").strip())
                     if ai_confidence is not None:
@@ -23292,13 +23304,15 @@ def search_mb_release_group_by_metadata(
                         try:
                             provider = getattr(sys.modules[__name__], "AI_PROVIDER", "openai")
                             model = getattr(sys.modules[__name__], "RESOLVED_MODEL", None) or getattr(sys.modules[__name__], "OPENAI_MODEL", "gpt-4o-mini")
-                            reply = call_ai_provider(
-                                provider,
-                                model,
-                                "You reply with a single letter, or an MBID (UUID), or NONE. Optionally end with (confidence: N).",
-                                prompt,
+                            reply = _call_ai_provider_bounded(
+                                provider=provider,
+                                model=model,
+                                system_msg="You reply with a single letter, or an MBID (UUID), or NONE. Optionally end with (confidence: N).",
+                                user_msg=prompt,
                                 max_tokens=70,
                                 analysis_type="mb_retry_disambiguation",
+                                timeout_sec=AI_SCAN_HARD_TIMEOUT_SEC,
+                                log_prefix="[MusicBrainz Retry]",
                             )
                             reply_clean, ai_confidence = parse_ai_confidence((reply or "").strip())
                             if ai_confidence is not None:
@@ -23701,13 +23715,15 @@ def ai_suggest_artist_roles(
             "Respond strictly as JSON with keys 'main_album_artist' (string) and 'featuring_by_track' (object mapping track index to list of strings)."
         )
 
-        reply = call_ai_provider(
-            AI_PROVIDER,
-            RESOLVED_MODEL or OPENAI_MODEL,
-            system_prompt,
-            user_prompt,
+        reply = _call_ai_provider_bounded(
+            provider=AI_PROVIDER,
+            model=RESOLVED_MODEL or OPENAI_MODEL,
+            system_msg=system_prompt,
+            user_msg=user_prompt,
             max_tokens=400,
             analysis_type="other",
+            timeout_sec=AI_SCAN_HARD_TIMEOUT_SEC,
+            log_prefix="[AI Artist Roles]",
         )
         if not reply:
             return None
@@ -23866,13 +23882,15 @@ def choose_best(editions: List[dict], defer_ai: bool = False) -> dict | None:
 
         ai_confidence = None
         try:
-            txt = call_ai_provider(
-                AI_PROVIDER,
-                model_to_use,
-                system_msg,
-                user_msg,
+            txt = _call_ai_provider_bounded(
+                provider=AI_PROVIDER,
+                model=model_to_use,
+                system_msg=system_msg,
+                user_msg=user_msg,
                 max_tokens=256,
                 analysis_type="dedupe_choose_best",
+                timeout_sec=AI_SCAN_HARD_TIMEOUT_SEC,
+                log_prefix="[Dedupe AI]",
             )
             lines = [l.strip() for l in (txt or '').replace('```', '').splitlines() if l.strip()]
             txt = lines[0] if lines else (txt or '')
@@ -24941,13 +24959,15 @@ def scan_duplicates(
                                     try:
                                         provider = getattr(sys.modules[__name__], "AI_PROVIDER", "openai")
                                         model = getattr(sys.modules[__name__], "RESOLVED_MODEL", None) or getattr(sys.modules[__name__], "OPENAI_MODEL", "gpt-4o-mini")
-                                        reply = call_ai_provider(
-                                            provider,
-                                            model,
-                                            system_msg,
-                                            prompt,
+                                        reply = _call_ai_provider_bounded(
+                                            provider=provider,
+                                            model=model,
+                                            system_msg=system_msg,
+                                            user_msg=prompt,
                                             max_tokens=40,
                                             analysis_type="mb_artist_index_choice",
+                                            timeout_sec=AI_SCAN_HARD_TIMEOUT_SEC,
+                                            log_prefix="[MusicBrainz Index AI]",
                                         )
                                         reply_clean, ai_confidence = parse_ai_confidence((reply or "").strip())
                                         if ai_confidence is not None:
@@ -31758,7 +31778,7 @@ def background_scan():
                                 res = _rebuild_files_library_index_for_artist(
                                     artist_name_for_batch,
                                     reason=rebuild_reason,
-                                    wait_if_running=True,
+                                    wait_if_running=False,
                                 )
                                 if not res.get("ok"):
                                     logging.debug(
@@ -31945,7 +31965,7 @@ def background_scan():
                             res = _rebuild_files_library_index_for_artist(
                                 artist_name,
                                 reason=rebuild_reason,
-                                wait_if_running=True,
+                                wait_if_running=False,
                             )
                             if not res.get("ok"):
                                 logging.debug(
