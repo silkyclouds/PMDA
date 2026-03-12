@@ -2706,7 +2706,14 @@ def _reinit_ai_from_globals():
                 RESOLVED_PARAM_STYLE = "responses"
                 RESOLVED_STOP_OK = True
                 AI_FUNCTIONAL_ERROR_MSG = codex_reason or "OpenAI Codex OAuth profile exists but runtime is not ready"
-                logging.warning("OpenAI Codex OAuth runtime unavailable: %s", AI_FUNCTIONAL_ERROR_MSG)
+                log_reason = str(AI_FUNCTIONAL_ERROR_MSG or "").strip().lower()
+                if "still initializing" in log_reason or "not ready" in log_reason:
+                    logging.info(
+                        "OpenAI Codex OAuth runtime deferred until first on-demand token check: %s",
+                        AI_FUNCTIONAL_ERROR_MSG,
+                    )
+                else:
+                    logging.warning("OpenAI Codex OAuth runtime unavailable: %s", AI_FUNCTIONAL_ERROR_MSG)
             elif openai_client:
                 ai_provider_ready = True
                 RESOLVED_MODEL = (openai_model or "").strip() or "gpt-4o-mini"
@@ -10558,7 +10565,7 @@ def _files_pg_init_schema() -> bool:
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_files_tracks_title_trgm ON files_tracks USING gin (title gin_trgm_ops)")
             except Exception:
                 pass
-            # Migrate legacy external-artist-image keys to the same loose normalization used by files_artists.name_norm.
+            # Migrate legacy external-artist-image keys to the same strict normalization used by files_artists.name_norm.
             # This keeps joins fast and prevents repeated re-downloads when the library contains punctuation/&/unicode.
             try:
                 _files_migrate_external_artist_images_norm_keys(cur)
@@ -10715,7 +10722,7 @@ def _files_migrate_external_artist_images_norm_keys(cur) -> None:
     except Exception:
         pass
     if migrated:
-        logging.info("Migrated %d external artist image cache keys to loose normalization", migrated)
+        logging.info("Migrated %d external artist image cache keys to strict normalization", migrated)
 
 
 def _files_redis_client():
