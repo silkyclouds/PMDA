@@ -8168,9 +8168,28 @@ def _ai_breakdown_for_scan(cur: sqlite3.Cursor, scan_id: int, column: str) -> di
 
 
 def _ai_lifecycle_complete_for_scan(cur: sqlite3.Cursor, scan_id: int) -> int:
+    try:
+        sid = int(scan_id or 0)
+    except Exception:
+        sid = 0
+    if sid > 0:
+        try:
+            with lock:
+                current_scan_id = int(state.get("scan_id") or 0)
+                if current_scan_id == sid:
+                    if bool(state.get("scanning")):
+                        return 0
+                    if bool(state.get("scan_finalizing")):
+                        return 0
+                    if bool(state.get("scan_post_processing")):
+                        return 0
+                    if bool(state.get("scan_profile_enrich_running")):
+                        return 0
+        except Exception:
+            pass
     cur.execute(
         "SELECT status, end_time FROM scan_history WHERE scan_id = ? LIMIT 1",
-        (int(scan_id),),
+        (sid,),
     )
     row = cur.fetchone()
     if not row:
@@ -28159,6 +28178,7 @@ def _refresh_scan_history_from_published(scan_id: int | None) -> None:
         cur.execute(
             """
             SELECT
+                COALESCE(start_time, 0),
                 COALESCE(ai_tokens_total, 0),
                 COALESCE(ai_cost_usd_total, 0),
                 COALESCE(ai_unpriced_calls, 0),
@@ -28168,15 +28188,22 @@ def _refresh_scan_history_from_published(scan_id: int | None) -> None:
             """,
             (sid,),
         )
-        ai_row = cur.fetchone() or (0, 0.0, 0, 0)
+        ai_row = cur.fetchone() or (0, 0, 0.0, 0, 0)
+        start_time = float(ai_row[0] or 0.0)
+        lifecycle_complete = bool(ai_row[4])
+        end_time = None
+        duration_seconds = None
+        if lifecycle_complete and start_time > 0:
+            end_time = time.time()
+            duration_seconds = int(max(0.0, end_time - start_time))
         summary["albums_without_album_image"] = int(without_cover)
         summary["albums_without_artist_image"] = int(without_artist_image)
         summary["albums_without_complete_tags"] = int(without_complete_tags)
         summary["albums_without_mb_id"] = int(without_mb_id)
-        summary["ai_tokens_total"] = int(ai_row[0] or 0)
-        summary["ai_cost_usd_total"] = float(ai_row[1] or 0.0)
-        summary["ai_unpriced_calls"] = int(ai_row[2] or 0)
-        summary["ai_lifecycle_complete"] = bool(ai_row[3])
+        summary["ai_tokens_total"] = int(ai_row[1] or 0)
+        summary["ai_cost_usd_total"] = float(ai_row[2] or 0.0)
+        summary["ai_unpriced_calls"] = int(ai_row[3] or 0)
+        summary["ai_lifecycle_complete"] = lifecycle_complete
         summary["ai_calls_total"] = int(_parse_int_loose(summary.get("ai_calls_total"), 0) or 0)
         try:
             summary["ai_calls_total"] = int(
@@ -28197,6 +28224,8 @@ def _refresh_scan_history_from_published(scan_id: int | None) -> None:
                 albums_without_album_image = ?,
                 albums_without_complete_tags = ?,
                 albums_without_mb_id = ?,
+                end_time = COALESCE(?, end_time),
+                duration_seconds = COALESCE(?, duration_seconds),
                 summary_json = ?
             WHERE scan_id = ?
             """,
@@ -28205,6 +28234,8 @@ def _refresh_scan_history_from_published(scan_id: int | None) -> None:
                 int(without_cover),
                 int(without_complete_tags),
                 int(without_mb_id),
+                end_time,
+                duration_seconds,
                 json.dumps(summary),
                 sid,
             ),
@@ -42716,6 +42747,12 @@ def api_progress():
         scan_ai_guard_calls_blocked = int(state.get("scan_ai_guard_calls_blocked") or 0)
         scan_ai_guard_last_reason = str(state.get("scan_ai_guard_last_reason") or "")
         scan_ai_guard_last_block_at = state.get("scan_ai_guard_last_block_at")
+        scan_profile_enrich_running = bool(state.get("scan_profile_enrich_running"))
+        scan_profile_enrich_total = int(state.get("scan_profile_enrich_total") or 0)
+        scan_profile_enrich_done = int(state.get("scan_profile_enrich_done") or 0)
+        scan_profile_enrich_current_artist = state.get("scan_profile_enrich_current_artist")
+        scan_profile_enrich_started_at = state.get("scan_profile_enrich_started_at")
+        scan_profile_enrich_updated_at = state.get("scan_profile_enrich_updated_at")
         mb_enabled = state.get("scan_mb_enabled", False)
         audio_cache_hits = state.get("scan_audio_cache_hits", 0)
         audio_cache_misses = state.get("scan_audio_cache_misses", 0)
@@ -42851,6 +42888,21 @@ def api_progress():
             )
         )
         # Phase: derive from current_step and flags for UI (format_analysis | identification_tags | ia_analysis | finalizing | moving_dupes)
+        scan_profile_enrich_percent = 0.0
+        scan_profile_enrich_eta_seconds = None
+        if scan_profile_enrich_total > 0:
+            scan_profile_enrich_done = max(0, min(scan_profile_enrich_done, scan_profile_enrich_total))
+            scan_profile_enrich_percent = round((scan_profile_enrich_done / scan_profile_enrich_total) * 100.0, 2)
+        if scan_profile_enrich_running and scan_profile_enrich_started_at and scan_profile_enrich_done > 0 and scan_profile_enrich_total > 0:
+            try:
+                enrich_elapsed = max(0.0, float(time.time() - float(scan_profile_enrich_started_at)))
+            except Exception:
+                enrich_elapsed = 0.0
+            if enrich_elapsed > 0:
+                enrich_rate = scan_profile_enrich_done / enrich_elapsed
+                enrich_remaining = max(0, scan_profile_enrich_total - scan_profile_enrich_done)
+                if enrich_rate > 0 and enrich_remaining > 0:
+                    scan_profile_enrich_eta_seconds = int(enrich_remaining / enrich_rate)
         if not scanning:
             phase = None
         elif run_scope_preparing:
@@ -42861,6 +42913,8 @@ def api_progress():
             phase = "moving_dupes"
         elif finalizing:
             phase = "finalizing"
+        elif scan_profile_enrich_running:
+            phase = "profile_enrichment"
         elif scan_post_processing and current_step in (None, "", "done") and "_ai_batch" not in active_artists_dict:
             phase = "post_processing"
         elif current_step in ("comparing_versions", "detecting_best") or "_ai_batch" in active_artists_dict:
@@ -42871,6 +42925,11 @@ def api_progress():
             phase = "format_analysis"
         else:
             phase = "format_analysis"
+        if scan_profile_enrich_running and scan_profile_enrich_total > 0:
+            phase_progress = scan_profile_enrich_percent
+            if scan_profile_enrich_eta_seconds is not None:
+                eta_seconds = scan_profile_enrich_eta_seconds
+            current_step = "enriching_profiles"
     
     # AI provider/model for display (read outside lock)
     ai_provider_display = AI_PROVIDER or ""
@@ -42975,6 +43034,14 @@ def api_progress():
         "scan_ai_guard_calls_blocked": scan_ai_guard_calls_blocked,
         "scan_ai_guard_last_reason": scan_ai_guard_last_reason,
         "scan_ai_guard_last_block_at": scan_ai_guard_last_block_at,
+        "scan_profile_enrich_running": scan_profile_enrich_running,
+        "scan_profile_enrich_total": scan_profile_enrich_total,
+        "scan_profile_enrich_done": scan_profile_enrich_done,
+        "scan_profile_enrich_percent": scan_profile_enrich_percent,
+        "scan_profile_enrich_eta_seconds": scan_profile_enrich_eta_seconds,
+        "scan_profile_enrich_current_artist": scan_profile_enrich_current_artist,
+        "scan_profile_enrich_started_at": scan_profile_enrich_started_at,
+        "scan_profile_enrich_updated_at": scan_profile_enrich_updated_at,
         "mb_enabled": mb_enabled,
         # Cache statistics
         "audio_cache_hits": audio_cache_hits,
