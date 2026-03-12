@@ -22839,6 +22839,16 @@ def _provider_candidate_soft_identity_ok(
     if has_provider_tracklist and has_local_tracklist:
         if track_count_ratio < 0.55:
             return (False, "track_count_mismatch")
+        local_track_count = int(candidate.get("local_track_count") or 0)
+        provider_track_count = int(candidate.get("provider_track_count") or 0)
+        # When both sides expose a meaningful tracklist, reject obviously wrong
+        # editions even if the counts are similar. Similar counts alone are not
+        # enough when titles do not line up.
+        if (
+            min(local_track_count, provider_track_count) >= 5
+            and track_score < 0.55
+        ):
+            return (False, "track_title_mismatch")
         if track_score < 0.40 and track_count_ratio < 0.80:
             return (False, "track_title_mismatch")
     else:
@@ -30117,32 +30127,32 @@ def _publish_files_library_artist_from_items(
                 conn=pg_conn,
             )
             has_artist_image = bool(artist_image_path and artist_image_path.is_file())
-        indices = [int(t.get("track_num") or 0) for t in track_entries if int(t.get("track_num") or 0) > 0]
-        actual_track_count = len(track_entries)
-        is_broken = bool(item.get("is_broken"))
-        expected_track_count = _parse_int_loose(item.get("expected_track_count"), 0) or None
-        missing_indices = list(item.get("missing_indices") or [])
-        if is_broken and expected_track_count and not missing_indices:
-            missing_indices = _edition_missing_indices_exact(item, int(expected_track_count or 0), actual_track_count)
-        if (not is_broken) and indices:
-            max_idx = max(indices)
-            coverage = (actual_track_count / max_idx) if max_idx else 1.0
-            # Skip broken detection when track numbering is obviously corrupt.
-            if max_idx > max(120, actual_track_count * 3) and coverage < 0.5:
-                is_broken = False
-                expected_track_count = None
-                missing_indices = []
-            else:
-                is_broken, _actual_count_from_indices, gaps = _detect_gaps_in_indices(indices)
-                if is_broken:
-                    expected_track_count = max_idx
-                    for start_i, end_i in gaps:
-                        if (end_i - start_i) > 2000:
-                            continue
-                        missing_indices.extend(list(range(start_i + 1, end_i)))
-                        if len(missing_indices) > 5000:
-                            missing_indices = missing_indices[:5000]
-                            break
+            indices = [int(t.get("track_num") or 0) for t in track_entries if int(t.get("track_num") or 0) > 0]
+            actual_track_count = len(track_entries)
+            is_broken = bool(item.get("is_broken"))
+            expected_track_count = _parse_int_loose(item.get("expected_track_count"), 0) or None
+            missing_indices = list(item.get("missing_indices") or [])
+            if is_broken and expected_track_count and not missing_indices:
+                missing_indices = _edition_missing_indices_exact(item, int(expected_track_count or 0), actual_track_count)
+            if (not is_broken) and indices:
+                max_idx = max(indices)
+                coverage = (actual_track_count / max_idx) if max_idx else 1.0
+                # Skip broken detection when track numbering is obviously corrupt.
+                if max_idx > max(120, actual_track_count * 3) and coverage < 0.5:
+                    is_broken = False
+                    expected_track_count = None
+                    missing_indices = []
+                else:
+                    is_broken, _actual_count_from_indices, gaps = _detect_gaps_in_indices(indices)
+                    if is_broken:
+                        expected_track_count = max_idx
+                        for start_i, end_i in gaps:
+                            if (end_i - start_i) > 2000:
+                                continue
+                            missing_indices.extend(list(range(start_i + 1, end_i)))
+                            if len(missing_indices) > 5000:
+                                missing_indices = missing_indices[:5000]
+                                break
             album_id = _parse_int_loose(item.get("album_id"), 0)
             result = results_by_album_id.get(album_id, {})
             mbid = (
