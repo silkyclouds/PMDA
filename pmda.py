@@ -1302,6 +1302,10 @@ def _auth_resolve_session(raw_token: str) -> Optional[dict]:
         return None
     now = _auth_now_ts()
     token_hash = _auth_token_hash(token)
+    should_touch = bool(AUTH_SESSION_TOUCH_DB_WRITES and _auth_should_touch_session(token_hash, now))
+    cached = _auth_session_cache_get(token_hash, now)
+    if cached and not should_touch:
+        return cached
     lock_error = None
     for attempt in range(2):
         con = _auth_db_connect()
@@ -1350,7 +1354,7 @@ def _auth_resolve_session(raw_token: str) -> Optional[dict]:
             user_obj = _auth_public_user(row)
             _auth_session_cache_set(token_hash, user_obj, expires_at)
             # Best effort touch: never fail auth resolution because SQLite is briefly locked.
-            if AUTH_SESSION_TOUCH_DB_WRITES and _auth_should_touch_session(token_hash, now):
+            if should_touch:
                 try:
                     cur.execute("UPDATE auth_sessions SET last_used_at = ? WHERE token_hash = ?", (now, token_hash))
                     con.commit()
@@ -10571,15 +10575,13 @@ def _files_pg_init_schema() -> bool:
 
 def _files_migrate_external_artist_images_norm_keys(cur) -> None:
     """
-    Some builds cached external artist images using a stricter normalization than the Files library index.
-    Files library uses a loose normalization for files_artists.name_norm (lower + collapse spaces, keep punctuation).
-    This migrates files_external_artist_images.name_norm to the loose normalization so joins work and
-    backfill can reuse cached images instead of re-downloading everything.
+    Keep files_external_artist_images.name_norm aligned with the current artist normalization used by
+    files_artists.name_norm so joins work and cached images survive normalization upgrades.
     """
     try:
         cur.execute("SELECT COALESCE(value, '') FROM files_index_meta WHERE key = 'external_artist_images_norm' LIMIT 1")
         row = cur.fetchone()
-        if row and str(row[0] or "").strip() == "loose_v1":
+        if row and str(row[0] or "").strip() == "strict_v2":
             return
     except Exception:
         # If meta read fails, still attempt best-effort migration.
@@ -10600,7 +10602,7 @@ def _files_migrate_external_artist_images_norm_keys(cur) -> None:
             cur.execute(
                 """
                 INSERT INTO files_index_meta(key, value, updated_at)
-                VALUES ('external_artist_images_norm', 'loose_v1', NOW())
+                VALUES ('external_artist_images_norm', 'strict_v2', NOW())
                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
                 """
             )
@@ -10706,7 +10708,7 @@ def _files_migrate_external_artist_images_norm_keys(cur) -> None:
         cur.execute(
             """
             INSERT INTO files_index_meta(key, value, updated_at)
-            VALUES ('external_artist_images_norm', 'loose_v1', NOW())
+            VALUES ('external_artist_images_norm', 'strict_v2', NOW())
             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
             """
         )
@@ -13807,9 +13809,14 @@ def _rebuild_files_library_index(reason: str = "manual", wait_if_running: bool =
                         "image_path": str(artist_image_path) if artist_image_path else None,
                         "has_image": artist_has_image,
                     }
-                elif artist_has_image and not artists_map[artist_norm].get("has_image"):
-                    artists_map[artist_norm]["image_path"] = str(artist_image_path)
-                    artists_map[artist_norm]["has_image"] = True
+                else:
+                    artists_map[artist_norm]["name"] = _choose_preferred_identity_display(
+                        str(artists_map[artist_norm].get("name") or ""),
+                        artist_name,
+                    )
+                    if artist_has_image and not artists_map[artist_norm].get("has_image"):
+                        artists_map[artist_norm]["image_path"] = str(artist_image_path)
+                        artists_map[artist_norm]["has_image"] = True
 
                 indices = [t["track_num"] for t in track_entries if t["track_num"] > 0]
                 actual_track_count = len(track_entries)
@@ -21422,10 +21429,10 @@ def _incomplete_album_disk_crosscheck(
     if disk_extra:
         classifications.append("DISK_HAS_MORE")
     if (tag_album or tag_artist) and album_title_str:
-        album_norm = (album_title_str or "").strip().lower()
-        artist_norm = (artist or "").strip().lower()
-        tag_album_norm = (tag_album or "").strip().lower()
-        tag_artist_norm = (tag_artist or "").strip().lower()
+        album_norm = _normalize_identity_text_strict(album_title_str or "")
+        artist_norm = _norm_artist_key(artist or "")
+        tag_album_norm = _normalize_identity_text_strict(tag_album or "")
+        tag_artist_norm = _norm_artist_key(tag_artist or "")
         if tag_album_norm and tag_album_norm != album_norm:
             classifications.append("DISK_HAS_TAG_SPLIT")
         elif tag_artist_norm and tag_artist_norm != artist_norm:
@@ -23447,10 +23454,13 @@ def _prefer_identity_hint_value(
         return hinted_txt
     if field_name in missing_required:
         return hinted_txt
+    current_norm = _normalize_identity_text_strict(current_txt)
+    hinted_norm = _normalize_identity_text_strict(hinted_txt)
+    if current_norm and hinted_norm and current_norm == hinted_norm:
+        return _choose_preferred_identity_display(current_txt, hinted_txt)
     if field_name == "album":
         folder_txt = _sanitize_album_title_display(str(folder_name or "").replace("_", " ").strip())
         if folder_txt:
-            current_norm = _normalize_identity_text_strict(current_txt)
             folder_norm = _normalize_identity_text_strict(folder_txt)
             if current_norm and folder_norm and current_norm == folder_norm:
                 return hinted_txt
@@ -25782,7 +25792,7 @@ def scan_duplicates(
                 # Fallback: search by metadata if no ID tag yielded results
                 album_norm = e['album_norm']
                 tracks = {t.title for t in e['tracks']}
-                artist_norm_key = artist.lower().strip()
+                artist_norm_key = _norm_artist_key(artist)
                 if not rg_info:
                     # Check cache for "artist+album -> MBID".
                     cached_mbid = cached_rg_info = None
@@ -27762,6 +27772,134 @@ def update_scan_history_incremental(
         con.close()
     except Exception as e:
         logging.debug("update_scan_history_incremental failed: %s", e)
+
+
+def _refresh_scan_history_from_published(scan_id: int | None) -> None:
+    sid = _parse_int_loose(scan_id, 0)
+    if sid <= 0:
+        return
+    try:
+        con = _state_connect(timeout=20)
+        cur = con.cursor()
+        cur.execute(
+            """
+            SELECT
+                artist_norm,
+                COALESCE(has_cover, 0),
+                COALESCE(cover_path, ''),
+                COALESCE(has_artist_image, 0),
+                COALESCE(artist_image_path, ''),
+                COALESCE(missing_required_tags_json, '[]'),
+                COALESCE(strict_match_verified, 0),
+                COALESCE(musicbrainz_release_group_id, '')
+            FROM files_library_published_albums
+            WHERE scan_id = ?
+            """,
+            (sid,),
+        )
+        rows = cur.fetchall()
+        if not rows:
+            con.close()
+            return
+        norms = sorted({
+            str(row[0] or "").strip()
+            for row in rows
+            if str(row[0] or "").strip()
+        })
+        ext_with_image: set[str] = set()
+        if norms:
+            placeholders = ",".join("?" for _ in norms)
+            cur.execute(
+                f"""
+                SELECT name_norm
+                FROM files_external_artist_images
+                WHERE name_norm IN ({placeholders})
+                  AND COALESCE(image_path, '') <> ''
+                """,
+                norms,
+            )
+            ext_with_image = {str(r[0] or "").strip() for r in cur.fetchall() if str(r[0] or "").strip()}
+
+        without_cover = 0
+        without_artist_image = 0
+        without_complete_tags = 0
+        without_mb_id = 0
+        for row in rows:
+            artist_norm = str(row[0] or "").strip()
+            has_cover = bool(row[1]) or bool(str(row[2] or "").strip())
+            has_artist_image = bool(row[3]) or bool(str(row[4] or "").strip()) or (artist_norm in ext_with_image)
+            try:
+                missing_required = json.loads(row[5] or "[]")
+                missing_required = missing_required if isinstance(missing_required, list) else []
+            except Exception:
+                missing_required = []
+            has_mb_id = bool(row[6]) or bool(str(row[7] or "").strip())
+            if not has_cover:
+                without_cover += 1
+            if not has_artist_image:
+                without_artist_image += 1
+            if missing_required:
+                without_complete_tags += 1
+            if not has_mb_id:
+                without_mb_id += 1
+
+        cur.execute("SELECT summary_json FROM scan_history WHERE scan_id = ?", (sid,))
+        row = cur.fetchone()
+        summary: dict[str, Any] = {}
+        if row and row[0]:
+            try:
+                parsed = json.loads(row[0])
+                if isinstance(parsed, dict):
+                    summary = parsed
+            except Exception:
+                summary = {}
+
+        _ai_refresh_rollup_for_scan(cur, sid)
+        cur.execute(
+            """
+            SELECT
+                COALESCE(ai_tokens_total, 0),
+                COALESCE(ai_cost_usd_total, 0),
+                COALESCE(ai_unpriced_calls, 0),
+                COALESCE(ai_lifecycle_complete, 0)
+            FROM scan_history
+            WHERE scan_id = ?
+            """,
+            (sid,),
+        )
+        ai_row = cur.fetchone() or (0, 0.0, 0, 0)
+        summary["albums_without_album_image"] = int(without_cover)
+        summary["albums_without_artist_image"] = int(without_artist_image)
+        summary["albums_without_complete_tags"] = int(without_complete_tags)
+        summary["albums_without_mb_id"] = int(without_mb_id)
+        summary["ai_tokens_total"] = int(ai_row[0] or 0)
+        summary["ai_cost_usd_total"] = float(ai_row[1] or 0.0)
+        summary["ai_unpriced_calls"] = int(ai_row[2] or 0)
+        summary["ai_lifecycle_complete"] = bool(ai_row[3])
+        summary["summary_refreshed_at"] = time.time()
+        cur.execute(
+            """
+            UPDATE scan_history
+            SET albums_without_artist_image = ?,
+                albums_without_album_image = ?,
+                albums_without_complete_tags = ?,
+                albums_without_mb_id = ?,
+                summary_json = ?
+            WHERE scan_id = ?
+            """,
+            (
+                int(without_artist_image),
+                int(without_cover),
+                int(without_complete_tags),
+                int(without_mb_id),
+                json.dumps(summary),
+                sid,
+            ),
+        )
+        con.commit()
+        con.close()
+    except Exception:
+        logging.debug("Failed to refresh scan_history from published rows for scan_id=%s", scan_id, exc_info=True)
 
 
 def save_scan_to_db(scan_results: Dict[str, List[dict]]):
@@ -29864,9 +30002,14 @@ def _rows_to_files_library_payload(rows: list[tuple]) -> tuple[dict[str, dict], 
                 "image_path": image_path or None,
                 "has_image": has_image,
             }
-        elif has_image and not artists_map[artist_norm].get("has_image"):
-            artists_map[artist_norm]["image_path"] = image_path
-            artists_map[artist_norm]["has_image"] = True
+        else:
+            artists_map[artist_norm]["name"] = _choose_preferred_identity_display(
+                str(artists_map[artist_norm].get("name") or ""),
+                artist_name,
+            )
+            if has_image and not artists_map[artist_norm].get("has_image"):
+                artists_map[artist_norm]["image_path"] = image_path
+                artists_map[artist_norm]["has_image"] = True
         try:
             tags_json = json.loads(row[9] or "[]") if row[9] else []
             if not isinstance(tags_json, list):
@@ -30049,7 +30192,7 @@ def _compute_artist_signature(
 ) -> str:
     """Compute artist signature so resume can detect new/changed albums."""
     h = hashlib.sha256()
-    h.update(((artist_name or "").strip().lower()).encode("utf-8", errors="ignore"))
+    h.update((_norm_artist_key(artist_name) or "").encode("utf-8", errors="ignore"))
     h.update(b"\x1f")
     h.update(str(len(album_ids)).encode("ascii", errors="ignore"))
     h.update(b"\x1f")
@@ -31484,7 +31627,7 @@ def _build_scan_plan(scan_type: str = "full") -> tuple[list[tuple[int, str, list
 
     artists_by_name: dict[str, list[tuple[int, str]]] = defaultdict(list)
     for artist_id, artist_name in artists_raw:
-        name_norm = (artist_name or "").strip().lower()
+        name_norm = _norm_artist_key(artist_name)
         artists_by_name[name_norm].append((artist_id, artist_name))
 
     artists_merged: list[tuple[int, str, list[int]]] = []
@@ -34159,6 +34302,7 @@ def background_scan():
                                 int(enrich_metrics.get("albums_targeted") or 0),
                             )
                             profile_enrich_inline_done = True
+                            _refresh_scan_history_from_published(scan_id)
                         except Exception:
                             logging.exception("Scan inline profile enrichment failed")
             else:
@@ -34188,6 +34332,7 @@ def background_scan():
                     int(enrich_metrics.get("artists_failed") or 0),
                     int(enrich_metrics.get("albums_targeted") or 0),
                 )
+                _refresh_scan_history_from_published(scan_id)
             except Exception:
                 logging.exception("Scan inline profile enrichment fallback failed")
         if scan_stream_post_by_artist and scan_status == "completed":
@@ -35736,8 +35881,35 @@ def _truncate_text(value: str, max_chars: int = 420) -> str:
 
 
 def _norm_artist_key(name: str) -> str:
-    """Stable key for artist-name lookups (DB keys, external image cache keys)."""
-    return " ".join((name or "").split()).lower().strip()
+    """Stable accent-insensitive key for artist-name lookups and cache joins."""
+    return _normalize_identity_text_strict(name or "")
+
+
+def _identity_display_quality_score(value: str) -> tuple[int, int, int, int, int]:
+    txt = " ".join(str(value or "").split()).strip()
+    if not txt:
+        return (-1, -1, -1, -1, -1)
+    non_generic = 0 if _identity_text_is_generic(txt) else 1
+    has_non_ascii = 1 if any(ord(ch) > 127 for ch in txt) else 0
+    has_punctuation = 1 if any(ch in txt for ch in "…'’&-:;,./()[]{}") else 0
+    has_mixed_case = 1 if any(ch.islower() for ch in txt) and any(ch.isupper() for ch in txt) else 0
+    return (non_generic, has_non_ascii, has_punctuation, has_mixed_case, len(txt))
+
+
+def _choose_preferred_identity_display(current_value: str, candidate_value: str) -> str:
+    current_txt = " ".join(str(current_value or "").split()).strip()
+    candidate_txt = " ".join(str(candidate_value or "").split()).strip()
+    if not candidate_txt:
+        return current_txt
+    if not current_txt:
+        return candidate_txt
+    current_norm = _normalize_identity_text_strict(current_txt)
+    candidate_norm = _normalize_identity_text_strict(candidate_txt)
+    if current_norm and candidate_norm and current_norm != candidate_norm:
+        return current_txt
+    if _identity_display_quality_score(candidate_txt) > _identity_display_quality_score(current_txt):
+        return candidate_txt
+    return current_txt
 
 
 def _word_count(text: str) -> int:
@@ -43081,7 +43253,7 @@ def _run_incomplete_albums_scan():
             ).fetchall()
             artists_by_name = defaultdict(list)
             for artist_id, artist_name in artists_raw:
-                name_norm = (artist_name or "").strip().lower()
+                name_norm = _norm_artist_key(artist_name)
                 artists_by_name[name_norm].append((artist_id, artist_name))
             for name_norm, id_name_list in artists_by_name.items():
                 artist_ids = [aid for aid, _ in id_name_list]
@@ -44881,7 +45053,7 @@ def api_library_artists():
         # Get broken albums count
         cur.execute("SELECT COUNT(*) FROM broken_albums WHERE artist = ?", (artist_name,))
         broken_count = cur.fetchone()[0] or 0
-        name_norm = (artist_name or "").strip().lower()
+        name_norm = _norm_artist_key(artist_name)
         if name_norm not in aggregated:
             aggregated[name_norm] = {
                 "artist_id": artist_id,
@@ -48393,7 +48565,7 @@ def api_library_artist_detail(artist_id):
         return jsonify({"error": "Artist not found"}), 404
     
     artist_name = artist_row[1]
-    name_norm = (artist_name or "").strip().lower()
+    name_norm = _norm_artist_key(artist_name)
     # Collect all artist IDs with same normalized name in selected sections
     artist_ids_same_name = [artist_id]
     try:
@@ -48401,15 +48573,18 @@ def api_library_artist_detail(artist_id):
         if placeholders_sections:
             rows_same = db_conn.execute(
                 f"""
-                SELECT id FROM metadata_items 
+                SELECT id, title FROM metadata_items 
                 WHERE metadata_type = 8 
                   AND title IS NOT NULL 
-                  AND LOWER(TRIM(title)) = ? 
                   AND library_section_id IN ({placeholders_sections})
                 """,
-                [name_norm] + list(SECTION_IDS)
+                list(SECTION_IDS)
             ).fetchall()
-            artist_ids_same_name = list({r[0] for r in rows_same} | {artist_id})
+            artist_ids_same_name = list({
+                int(r[0])
+                for r in rows_same
+                if _norm_artist_key(r[1] or "") == name_norm
+            } | {artist_id})
     except Exception:
         artist_ids_same_name = [artist_id]
     
@@ -58022,6 +58197,10 @@ def _run_scan_profile_enrichment_inline(best_albums_list: list[dict], *, reason:
                 "albums": [],
                 "_seen_norms": set(),
             },
+        )
+        bucket["artist_name"] = _choose_preferred_identity_display(
+            str(bucket.get("artist_name") or ""),
+            artist_name,
         )
         seen_norms: set[str] = bucket.get("_seen_norms") or set()
         if title_norm in seen_norms:
