@@ -339,49 +339,10 @@ export function MetadataSettings({ config, updateConfig, errors }: MetadataSetti
                       </div>
                     </div>
                   )}
-                  <div className="space-y-3 rounded-lg border border-border p-3">
-                    <div className="space-y-0.5">
-                      <Label className="text-sm font-medium">AI cost guardrails (hard limits)</Label>
-                      <p className="text-xs text-muted-foreground">
-                        These limits are enforced during scan calls (including AI web-search fallback) to prevent runaway cost.
-                      </p>
-                    </div>
-                    <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                      <div className="space-y-1.5">
-                        <Label htmlFor="ai-max-calls-per-scan" className="text-xs text-muted-foreground">Max AI calls per scan</Label>
-                        <Input
-                          id="ai-max-calls-per-scan"
-                          type="number"
-                          min={0}
-                          max={100000}
-                          step={1}
-                          value={config.AI_MAX_CALLS_PER_SCAN ?? 60}
-                          onChange={(e) => {
-                            const raw = Number(e.target.value);
-                            const next = Number.isFinite(raw) ? Math.max(0, Math.min(100000, Math.trunc(raw))) : 60;
-                            updateConfig({ AI_MAX_CALLS_PER_SCAN: next });
-                          }}
-                        />
-                        <p className="text-[11px] text-muted-foreground">0 disables scan-time AI calls entirely.</p>
-                      </div>
-                      <div className="space-y-1.5">
-                        <Label htmlFor="ai-call-cooldown-sec" className="text-xs text-muted-foreground">Cooldown between AI calls (seconds)</Label>
-                        <Input
-                          id="ai-call-cooldown-sec"
-                          type="number"
-                          min={0}
-                          max={30}
-                          step={0.1}
-                          value={config.AI_CALL_COOLDOWN_SEC ?? 1}
-                          onChange={(e) => {
-                            const raw = Number(e.target.value);
-                            const next = Number.isFinite(raw) ? Math.max(0, Math.min(30, raw)) : 1;
-                            updateConfig({ AI_CALL_COOLDOWN_SEC: next });
-                          }}
-                        />
-                        <p className="text-[11px] text-muted-foreground">Applies globally to scan AI calls.</p>
-                      </div>
-                    </div>
+                  <div className="rounded-lg border border-border/70 bg-muted/20 p-3">
+                    <p className="text-xs text-muted-foreground">
+                      PMDA batches AI work automatically during scans. Hard caps and cooldown controls are disabled.
+                    </p>
                   </div>
                   <div className="flex items-center justify-between rounded-lg border border-border p-3">
                     <div className="space-y-0.5">
