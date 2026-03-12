@@ -58707,7 +58707,12 @@ def _run_scan_profile_enrichment_inline(best_albums_list: list[dict], *, reason:
 
 def _scan_collect_profile_enrich_targets(scan_id: int | None) -> list[dict]:
     """
-    Build minimal album targets from scan_editions for inline profile enrichment.
+    Build album targets from scan_editions for inline profile enrichment and
+    final Files publication rebuild.
+
+    These targets must carry the identity/match fields discovered during the
+    scan, otherwise the post-scan publication rebuild drops metadata_source,
+    strict match flags, provider ids, and MBIDs from the live Files index.
     """
     sid = _parse_int_loose(scan_id, 0)
     if sid <= 0:
@@ -58718,18 +58723,55 @@ def _scan_collect_profile_enrich_targets(scan_id: int | None) -> list[dict]:
         cur = con.cursor()
         cur.execute(
             """
-            SELECT artist, album_id, title_raw, folder
+            SELECT artist, album_id, title_raw, folder,
+                   meta_json,
+                   musicbrainz_id,
+                   discogs_release_id,
+                   lastfm_album_mbid,
+                   bandcamp_album_url,
+                   metadata_source,
+                   strict_match_verified,
+                   strict_match_provider,
+                   strict_reject_reason,
+                   strict_tracklist_score,
+                   is_broken,
+                   expected_track_count,
+                   actual_track_count,
+                   missing_indices
             FROM scan_editions
             WHERE scan_id = ?
             ORDER BY artist, album_id
             """,
             (sid,),
         )
-        for artist, album_id, title_raw, folder in cur.fetchall():
+        for (
+            artist,
+            album_id,
+            title_raw,
+            folder,
+            meta_json,
+            musicbrainz_id,
+            discogs_release_id,
+            lastfm_album_mbid,
+            bandcamp_album_url,
+            metadata_source,
+            strict_match_verified,
+            strict_match_provider,
+            strict_reject_reason,
+            strict_tracklist_score,
+            is_broken,
+            expected_track_count,
+            actual_track_count,
+            missing_indices,
+        ) in cur.fetchall():
             artist_name = str(artist or "").strip()
             album_title = str(title_raw or "").strip()
             if not artist_name or not album_title:
                 continue
+            try:
+                meta = json.loads(str(meta_json or "").strip()) if meta_json else {}
+            except Exception:
+                meta = {}
             rows.append(
                 {
                     "artist": artist_name,
@@ -58737,6 +58779,24 @@ def _scan_collect_profile_enrich_targets(scan_id: int | None) -> list[dict]:
                     "album_title": album_title,
                     "title_raw": album_title,
                     "folder": str(folder or "").strip(),
+                    "meta": meta if isinstance(meta, dict) else {},
+                    "musicbrainz_id": str(musicbrainz_id or "").strip(),
+                    "discogs_release_id": str(discogs_release_id or "").strip(),
+                    "lastfm_album_mbid": str(lastfm_album_mbid or "").strip(),
+                    "bandcamp_album_url": str(bandcamp_album_url or "").strip(),
+                    "metadata_source": _normalize_identity_provider(str(metadata_source or "")),
+                    "strict_match_verified": bool(strict_match_verified),
+                    "strict_match_provider": _normalize_identity_provider(str(strict_match_provider or "")),
+                    "strict_reject_reason": str(strict_reject_reason or "").strip(),
+                    "strict_tracklist_score": float(strict_tracklist_score or 0.0),
+                    "is_broken": bool(is_broken),
+                    "expected_track_count": int(_parse_int_loose(expected_track_count, 0) or 0) or None,
+                    "actual_track_count": int(_parse_int_loose(actual_track_count, 0) or 0) or None,
+                    "missing_indices": (
+                        json.loads(str(missing_indices or "").strip())
+                        if isinstance(missing_indices, str) and str(missing_indices or "").strip()
+                        else (missing_indices or [])
+                    ),
                 }
             )
         con.close()
