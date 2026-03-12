@@ -2160,7 +2160,7 @@ merged = {
     "REPROCESS_INCOMPLETE_ALBUMS": _get("REPROCESS_INCOMPLETE_ALBUMS", default="true", cast=_parse_bool),
     # Library backend & file-library settings
     "LIBRARY_MODE": _get("LIBRARY_MODE", default="files", cast=str),
-    "LIBRARY_INCLUDE_UNMATCHED": _get("LIBRARY_INCLUDE_UNMATCHED", default=False, cast=_parse_bool),
+    "LIBRARY_INCLUDE_UNMATCHED": _get("LIBRARY_INCLUDE_UNMATCHED", default=True, cast=_parse_bool),
     "FILES_ROOTS": _get("FILES_ROOTS", default="", cast=_parse_files_roots),
     "LIBRARY_WINNER_PLACEMENT_STRATEGY": _get("LIBRARY_WINNER_PLACEMENT_STRATEGY", default="move", cast=str),
     "WINNER_SOURCE_ROOT_ID": _get("WINNER_SOURCE_ROOT_ID", default="", cast=str),
@@ -2179,7 +2179,7 @@ merged = {
 
 SKIP_FOLDERS: list[str] = merged["SKIP_FOLDERS"]
 LIBRARY_MODE: str = str(merged.get("LIBRARY_MODE", "files") or "files").strip().lower()
-LIBRARY_INCLUDE_UNMATCHED: bool = bool(merged.get("LIBRARY_INCLUDE_UNMATCHED", False))
+LIBRARY_INCLUDE_UNMATCHED: bool = bool(merged.get("LIBRARY_INCLUDE_UNMATCHED", True))
 FILES_ROOTS: list[str] = merged.get("FILES_ROOTS", []) or []
 LIBRARY_WINNER_PLACEMENT_STRATEGY: str = str(merged.get("LIBRARY_WINNER_PLACEMENT_STRATEGY", "move") or "move").strip().lower()
 if LIBRARY_WINNER_PLACEMENT_STRATEGY not in {"move", "hardlink", "symlink", "copy"}:
@@ -28130,7 +28130,8 @@ def _refresh_scan_history_from_published(scan_id: int | None) -> None:
                 COALESCE(artist_image_path, ''),
                 COALESCE(missing_required_tags_json, '[]'),
                 COALESCE(strict_match_verified, 0),
-                COALESCE(musicbrainz_release_group_id, '')
+                COALESCE(musicbrainz_release_group_id, ''),
+                COALESCE(primary_tags_json, '{}')
             FROM files_library_published_albums
             WHERE scan_id = ?
             """,
@@ -28145,7 +28146,13 @@ def _refresh_scan_history_from_published(scan_id: int | None) -> None:
         without_artist_image = 0
         without_complete_tags = 0
         without_mb_id = 0
+        pmda_albums_processed = 0
+        pmda_albums_complete = 0
+        pmda_albums_with_cover = 0
+        pmda_albums_with_artist_image = 0
+        published_artists: set[str] = set()
         for row in rows:
+            artist_norm = str(row[0] or "").strip()
             has_cover = bool(row[1]) or bool(str(row[2] or "").strip())
             has_artist_image = bool(row[3]) or bool(str(row[4] or "").strip())
             try:
@@ -28154,6 +28161,17 @@ def _refresh_scan_history_from_published(scan_id: int | None) -> None:
             except Exception:
                 missing_required = []
             has_mb_id = bool(row[6]) or bool(str(row[7] or "").strip())
+            try:
+                primary_tags = json.loads(row[8] or "{}")
+                primary_tags = primary_tags if isinstance(primary_tags, dict) else {}
+            except Exception:
+                primary_tags = {}
+            pmda_matched = _pmda_bool_from_str(primary_tags.get(PMDA_MATCHED_TAG, ""))
+            pmda_cover = _pmda_bool_from_str(primary_tags.get(PMDA_COVER_TAG, "")) or has_cover
+            pmda_artist_image = _pmda_bool_from_str(primary_tags.get(PMDA_ARTIST_IMAGE_TAG, "")) or has_artist_image
+            pmda_complete = _pmda_bool_from_str(primary_tags.get(PMDA_COMPLETE_TAG, ""))
+            if artist_norm:
+                published_artists.add(artist_norm)
             if not has_cover:
                 without_cover += 1
             if not has_artist_image:
@@ -28162,6 +28180,14 @@ def _refresh_scan_history_from_published(scan_id: int | None) -> None:
                 without_complete_tags += 1
             if not has_mb_id:
                 without_mb_id += 1
+            if pmda_matched or pmda_cover or pmda_artist_image:
+                pmda_albums_processed += 1
+            if pmda_cover:
+                pmda_albums_with_cover += 1
+            if pmda_artist_image:
+                pmda_albums_with_artist_image += 1
+            if pmda_complete or (pmda_matched and pmda_cover and pmda_artist_image and not missing_required):
+                pmda_albums_complete += 1
 
         cur.execute("SELECT summary_json FROM scan_history WHERE scan_id = ?", (sid,))
         row = cur.fetchone()
@@ -28200,6 +28226,12 @@ def _refresh_scan_history_from_published(scan_id: int | None) -> None:
         summary["albums_without_artist_image"] = int(without_artist_image)
         summary["albums_without_complete_tags"] = int(without_complete_tags)
         summary["albums_without_mb_id"] = int(without_mb_id)
+        summary["published_albums"] = int(len(rows))
+        summary["published_artists"] = int(len(published_artists))
+        summary["pmda_albums_processed"] = int(pmda_albums_processed)
+        summary["pmda_albums_complete"] = int(pmda_albums_complete)
+        summary["pmda_albums_with_cover"] = int(pmda_albums_with_cover)
+        summary["pmda_albums_with_artist_image"] = int(pmda_albums_with_artist_image)
         summary["ai_tokens_total"] = int(ai_row[1] or 0)
         summary["ai_cost_usd_total"] = float(ai_row[2] or 0.0)
         summary["ai_unpriced_calls"] = int(ai_row[3] or 0)
@@ -28224,6 +28256,10 @@ def _refresh_scan_history_from_published(scan_id: int | None) -> None:
                 albums_without_album_image = ?,
                 albums_without_complete_tags = ?,
                 albums_without_mb_id = ?,
+                artists_processed = CASE
+                    WHEN COALESCE(artists_processed, 0) < ? THEN ?
+                    ELSE artists_processed
+                END,
                 end_time = COALESCE(?, end_time),
                 duration_seconds = COALESCE(?, duration_seconds),
                 summary_json = ?
@@ -28234,6 +28270,8 @@ def _refresh_scan_history_from_published(scan_id: int | None) -> None:
                 int(without_cover),
                 int(without_complete_tags),
                 int(without_mb_id),
+                int(len(published_artists)),
+                int(len(published_artists)),
                 end_time,
                 duration_seconds,
                 json.dumps(summary),
@@ -34852,6 +34890,19 @@ def background_scan():
             state["scan_auto_trigger"] = None
             state["scan_scheduler_run_id"] = None
             state["scanning"] = False
+        if scan_status == "completed" and _get_library_mode() == "files":
+            try:
+                _refresh_scan_history_from_published(scan_id)
+                logging.info(
+                    "Final published scan refresh complete for scan_id=%s after scan state settled",
+                    scan_id,
+                )
+            except Exception:
+                logging.debug(
+                    "Final settled-state scan refresh failed for scan_id=%s",
+                    scan_id,
+                    exc_info=True,
+                )
         if pipeline_async_enabled and scan_status == "completed":
             try:
                 include_enrich = bool(run_improve_after_requested or pipeline_flags_requested.get("match_fix"))
@@ -40569,7 +40620,7 @@ def _library_include_unmatched_effective() -> bool:
     """
     raw = request.args.get("include_unmatched")
     if raw is None or str(raw).strip() == "":
-        return bool(getattr(sys.modules[__name__], "LIBRARY_INCLUDE_UNMATCHED", False))
+        return bool(getattr(sys.modules[__name__], "LIBRARY_INCLUDE_UNMATCHED", True))
     return bool(_parse_bool(raw))
 
 
@@ -40880,7 +40931,7 @@ def api_config_get():
         public_payload = {
             "configured": configured,
             "LIBRARY_MODE": payload.get("LIBRARY_MODE", "files"),
-            "LIBRARY_INCLUDE_UNMATCHED": bool(payload.get("LIBRARY_INCLUDE_UNMATCHED", False)),
+            "LIBRARY_INCLUDE_UNMATCHED": bool(payload.get("LIBRARY_INCLUDE_UNMATCHED", True)),
             "CONCERTS_FILTER_ENABLED": bool(payload.get("CONCERTS_FILTER_ENABLED", False)),
             "CONCERTS_HOME_LAT": str(payload.get("CONCERTS_HOME_LAT", "") or "").strip(),
             "CONCERTS_HOME_LON": str(payload.get("CONCERTS_HOME_LON", "") or "").strip(),
