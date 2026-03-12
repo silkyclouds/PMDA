@@ -26,9 +26,13 @@ ENV PMDA_REDIS_PORT=6379
 ENV PMDA_REDIS_DB=0
 
 # libchromaprint-tools provides fpcalc for pyacoustid (AcousticID fingerprinting)
-RUN apt-get update && \
+RUN mkdir -p /etc/postgresql-common && \
+    printf 'create_main_cluster = false\n' > /etc/postgresql-common/createcluster.conf && \
+    apt-get update && \
     apt-get install -y --no-install-recommends \
       ffmpeg \
+      nodejs \
+      npm \
       sqlite3 \
       libchromaprint-tools \
       postgresql \
@@ -61,6 +65,7 @@ COPY . /app
 COPY --from=frontend-build /fe/dist /app/frontend/dist
 
 RUN pip install --no-cache-dir -r requirements.txt
+RUN npm install -g @openai/codex
 RUN chmod +x /app/scripts/entrypoint_allinone.sh
 
 EXPOSE 5005

@@ -56,6 +56,8 @@ class OpenAIAuthService:
         decrypt: callable,
         apply_api_key: callable,
         set_legacy_refresh: callable,
+        get_legacy_refresh: callable,
+        clear_derived_api_key: callable,
         get_user_id: callable,
     ) -> None:
         self.settings_db_path = Path(settings_db_path)
@@ -65,6 +67,8 @@ class OpenAIAuthService:
         self.decrypt = decrypt
         self.apply_api_key = apply_api_key
         self.set_legacy_refresh = set_legacy_refresh
+        self.get_legacy_refresh = get_legacy_refresh
+        self.clear_derived_api_key = clear_derived_api_key
         self.get_user_id = get_user_id
         self._lock = Lock()
         self._sessions: dict[str, dict[str, Any]] = {}
@@ -82,7 +86,10 @@ class OpenAIAuthService:
         con = sqlite3.connect(str(self.settings_db_path), timeout=15)
         con.row_factory = sqlite3.Row
         try:
+            con.execute("PRAGMA journal_mode=WAL;")
             con.execute("PRAGMA busy_timeout=30000;")
+            con.execute("PRAGMA synchronous=NORMAL;")
+            con.execute("PRAGMA temp_store=MEMORY;")
         except Exception:
             pass
         return con
@@ -200,6 +207,30 @@ class OpenAIAuthService:
                 out["meta"] = {}
             return out
 
+    def _latest_active_profile(self, provider_id: str) -> dict[str, Any] | None:
+        with self._conn() as con:
+            cur = con.cursor()
+            cur.execute(
+                """
+                SELECT id, user_id, provider_id, mode, account_id, access_token_enc, refresh_token_enc,
+                       expires_at, meta_json, is_active, created_at, updated_at
+                FROM ai_auth_profiles
+                WHERE provider_id = ? AND is_active = 1
+                ORDER BY updated_at DESC, id DESC
+                LIMIT 1
+                """,
+                (str(provider_id),),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            out = dict(row)
+            try:
+                out["meta"] = json.loads(str(out.get("meta_json") or "{}"))
+            except Exception:
+                out["meta"] = {}
+            return out
+
     def _refresh_access_token(self, refresh_token: str) -> dict[str, Any]:
         token_url = f"{self.issuer}/oauth/token"
         resp = requests.post(
@@ -215,6 +246,16 @@ class OpenAIAuthService:
         if not resp.ok:
             raise RuntimeError(self._http_error_message("OpenAI OAuth refresh failed", resp))
         return resp.json() if resp.content else {}
+
+    def _meta_with_tokens(self, meta: dict[str, Any] | None, *, id_token: str = "") -> dict[str, Any]:
+        payload = dict(meta or {})
+        tok = str(id_token or "").strip()
+        if tok:
+            try:
+                payload["id_token_enc"] = str(self.encrypt(tok) or "")
+            except Exception:
+                logging.debug("Failed to encrypt OpenAI OAuth id_token", exc_info=True)
+        return payload
 
     def start_device_flow(self, user_id: int | None = None) -> DeviceStartResult:
         _ = self._effective_user_id(user_id)
@@ -423,7 +464,10 @@ class OpenAIAuthService:
                     access_token=access_token,
                     refresh_token=refresh_token,
                     expires_at=expires_at,
-                    meta={"issuer": self.issuer, "client_id": self.client_id},
+                    meta=self._meta_with_tokens(
+                        {"issuer": self.issuer, "client_id": self.client_id},
+                        id_token=id_token,
+                    ),
                 )
             except Exception as exc:
                 msg = str(exc) or "OAuth profile save failed"
@@ -439,17 +483,6 @@ class OpenAIAuthService:
                 # Legacy indicator for compatibility with old UI modes.
                 self.set_legacy_refresh(refresh_token)
 
-            api_key_saved = False
-            if id_token:
-                try:
-                    api_key = self._exchange_id_token_for_api_key(id_token)
-                    if api_key:
-                        self.apply_api_key(api_key)
-                        api_key_saved = True
-                except Exception as exc:
-                    logging.info("[OpenAI OAuth] id_token -> API key exchange skipped: %s", exc)
-                    api_key_saved = False
-
             with self._lock:
                 sess_done = self._sessions.get(sid)
                 if isinstance(sess_done, dict):
@@ -461,7 +494,7 @@ class OpenAIAuthService:
             return DevicePollResult(
                 status="completed",
                 message="Connected",
-                api_key_saved=api_key_saved,
+                api_key_saved=False,
             )
         finally:
             with self._lock:
@@ -470,27 +503,92 @@ class OpenAIAuthService:
                     sess_final["polling"] = False
 
     def get_valid_access_token(self, user_id: int | None, provider_id: str = "openai-codex") -> str:
+        return self.get_valid_access_token_for_runtime(user_id, provider_id=provider_id, ensure_runtime_key=False)
+
+    def get_valid_access_token_for_runtime(
+        self,
+        user_id: int | None,
+        *,
+        provider_id: str = "openai-codex",
+        ensure_runtime_key: bool = False,
+    ) -> str:
+        tokens = self.get_runtime_tokens(
+            user_id,
+            provider_id=provider_id,
+            require_id_token=False,
+            ensure_runtime_key=ensure_runtime_key,
+        )
+        return str(tokens.get("access_token") or "").strip()
+
+    def get_runtime_tokens(
+        self,
+        user_id: int | None,
+        *,
+        provider_id: str = "openai-codex",
+        require_id_token: bool = False,
+        ensure_runtime_key: bool = False,
+    ) -> dict[str, Any]:
         uid = self._effective_user_id(user_id)
         profile = self._active_profile(uid, provider_id)
         if not profile:
             if uid != 0:
                 profile = self._active_profile(0, provider_id)
+            else:
+                profile = self._latest_active_profile(provider_id)
         if not profile:
             raise RuntimeError("No active OpenAI Codex OAuth profile")
 
         access_token = str(self.decrypt(str(profile.get("access_token_enc") or "")) or "").strip()
         refresh_token = str(self.decrypt(str(profile.get("refresh_token_enc") or "")) or "").strip()
+        profile_had_encrypted_refresh = bool(str(profile.get("refresh_token_enc") or "").strip())
+        meta = profile.get("meta") if isinstance(profile.get("meta"), dict) else {}
+        id_token = ""
+        try:
+            id_token = str(self.decrypt(str(meta.get("id_token_enc") or "")) or "").strip()
+        except Exception:
+            id_token = ""
+        if not id_token:
+            id_token = str(meta.get("id_token") or "").strip()
+        if not refresh_token:
+            try:
+                refresh_token = str(self.get_legacy_refresh() or "").strip()
+            except Exception:
+                refresh_token = ""
         expires_at = int(profile.get("expires_at") or 0)
         now = int(time.time())
-        if access_token and expires_at > now + 120:
-            return access_token
+        force_refresh = bool((ensure_runtime_key or (require_id_token and not id_token)) and refresh_token)
+        if access_token and expires_at > now + 120 and not force_refresh:
+            return {
+                "access_token": access_token,
+                "refresh_token": refresh_token,
+                "id_token": id_token,
+                "account_id": str(profile.get("account_id") or ""),
+                "expires_at": expires_at,
+                "provider_id": str(profile.get("provider_id") or provider_id),
+                "user_id": int(profile.get("user_id") or uid),
+                "meta": meta,
+            }
 
         if not refresh_token:
+            if access_token and expires_at > now + 30:
+                return {
+                    "access_token": access_token,
+                    "refresh_token": refresh_token,
+                    "id_token": id_token,
+                    "account_id": str(profile.get("account_id") or ""),
+                    "expires_at": expires_at,
+                    "provider_id": str(profile.get("provider_id") or provider_id),
+                    "user_id": int(profile.get("user_id") or uid),
+                    "meta": meta,
+                }
+            if profile_had_encrypted_refresh:
+                raise RuntimeError("OpenAI Codex OAuth profile is present but its refresh token cannot be decrypted; reconnect Codex OAuth")
             raise RuntimeError("OpenAI Codex access token expired and no refresh token is available")
 
         refreshed = self._refresh_access_token(refresh_token)
         new_access = str(refreshed.get("access_token") or "").strip()
         new_refresh = str(refreshed.get("refresh_token") or refresh_token).strip()
+        new_id_token = str(refreshed.get("id_token") or id_token).strip()
         if not new_access:
             raise RuntimeError("OpenAI OAuth refresh returned empty access token")
         expires_in = 0
@@ -507,9 +605,30 @@ class OpenAIAuthService:
             access_token=new_access,
             refresh_token=new_refresh,
             expires_at=new_expires_at,
-            meta=profile.get("meta") if isinstance(profile.get("meta"), dict) else {},
+            meta=self._meta_with_tokens(meta, id_token=new_id_token),
         )
-        return new_access
+        if new_refresh:
+            try:
+                self.set_legacy_refresh(new_refresh)
+            except Exception:
+                logging.debug("Failed to persist refreshed OPENAI_OAUTH_REFRESH_TOKEN", exc_info=True)
+        if new_id_token and ensure_runtime_key:
+            try:
+                api_key = self._exchange_id_token_for_api_key(new_id_token)
+                if api_key:
+                    self.apply_api_key(api_key)
+            except Exception as exc:
+                logging.info("[OpenAI OAuth] refresh id_token -> API key exchange skipped: %s", exc)
+        return {
+            "access_token": new_access,
+            "refresh_token": new_refresh,
+            "id_token": new_id_token,
+            "account_id": str(profile.get("account_id") or ""),
+            "expires_at": new_expires_at,
+            "provider_id": str(profile.get("provider_id") or provider_id),
+            "user_id": int(profile.get("user_id") or uid),
+            "meta": self._meta_with_tokens(meta, id_token=new_id_token),
+        }
 
     def disconnect(self, user_id: int | None, provider_id: str = "openai-codex") -> None:
         uid = self._effective_user_id(user_id)
@@ -527,15 +646,27 @@ class OpenAIAuthService:
             # Keep API-key mode untouched, but clear legacy OAuth refresh marker.
             cur.execute("DELETE FROM settings WHERE key = 'OPENAI_OAUTH_REFRESH_TOKEN'")
             con.commit()
+        try:
+            self.clear_derived_api_key()
+        except Exception:
+            logging.debug("Failed to clear derived OpenAI Codex runtime key", exc_info=True)
 
     def status(self, user_id: int | None, provider_id: str = "openai-codex") -> OAuthStatusResult:
         uid = self._effective_user_id(user_id)
         profile = self._active_profile(uid, provider_id) or (self._active_profile(0, provider_id) if uid != 0 else None)
+        if not profile and uid == 0:
+            profile = self._latest_active_profile(provider_id)
         if not profile:
             return OAuthStatusResult(connected=False, provider_id=provider_id, auth_mode="none")
         expires_at = int(profile.get("expires_at") or 0) or None
         now = int(time.time())
         expires_in = max(0, expires_at - now) if expires_at else None
+        metadata = profile.get("meta") if isinstance(profile.get("meta"), dict) else {}
+        metadata_public = {
+            str(k): v
+            for k, v in dict(metadata or {}).items()
+            if str(k) not in {"id_token", "id_token_enc", "access_token", "refresh_token"}
+        }
         return OAuthStatusResult(
             connected=True,
             provider_id=provider_id,
@@ -544,7 +675,7 @@ class OpenAIAuthService:
             expires_at=expires_at,
             expires_in_sec=expires_in,
             has_refresh_token=bool(str(profile.get("refresh_token_enc") or "").strip()),
-            metadata=profile.get("meta") if isinstance(profile.get("meta"), dict) else {},
+            metadata=metadata_public,
         )
 
 

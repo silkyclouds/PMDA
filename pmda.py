@@ -671,7 +671,7 @@ PMDA_REDIS_IDLE_OPS_MAX = max(0, int(os.getenv("PMDA_REDIS_IDLE_OPS_MAX", "5") o
 PMDA_REDIS_IDLE_KEYS_MAX = max(0, int(os.getenv("PMDA_REDIS_IDLE_KEYS_MAX", "200") or "200"))
 PMDA_REDIS_IDLE_CONSECUTIVE = max(1, int(os.getenv("PMDA_REDIS_IDLE_CONSECUTIVE", "3") or "3"))
 PMDA_REDIS_IDLE_WARN_COOLDOWN_SEC = max(10.0, float(os.getenv("PMDA_REDIS_IDLE_WARN_COOLDOWN_SEC", "180") or "180"))
-PMDA_OPENAI_CODEX_STATUS_TIMEOUT_SEC = max(1.0, float(os.getenv("PMDA_OPENAI_CODEX_STATUS_TIMEOUT_SEC", "6") or "6"))
+PMDA_OPENAI_CODEX_STATUS_TIMEOUT_SEC = max(5.0, float(os.getenv("PMDA_OPENAI_CODEX_STATUS_TIMEOUT_SEC", "30") or "30"))
 PMDA_FILES_LOCAL_CACHE_MAX_KEYS = int(max(1000, _parse_int(os.getenv("PMDA_FILES_LOCAL_CACHE_MAX_KEYS", "200000"), 200000) or 200000))
 PMDA_BENCHMARK_REPORTS_DIR = (
     os.getenv("PMDA_BENCHMARK_REPORTS_DIR", "/music/pmda_scan_benchmark/reports")
@@ -722,15 +722,15 @@ AI_PRICING_VERSION = "v1"
 AI_ALLOW_ANALYSIS_OTHER = _parse_bool(os.getenv("PMDA_AI_ALLOW_ANALYSIS_OTHER", "false"))
 AI_WEB_SEARCH_MAX_CALLS_PER_HOUR = max(
     0,
-    int(os.getenv("PMDA_AI_WEB_SEARCH_MAX_CALLS_PER_HOUR", "12") or "12"),
+    int(os.getenv("PMDA_AI_WEB_SEARCH_MAX_CALLS_PER_HOUR", "0") or "0"),
 )
 AI_WEB_SEARCH_MAX_CALLS_PER_DAY = max(
     0,
-    int(os.getenv("PMDA_AI_WEB_SEARCH_MAX_CALLS_PER_DAY", "60") or "60"),
+    int(os.getenv("PMDA_AI_WEB_SEARCH_MAX_CALLS_PER_DAY", "0") or "0"),
 )
 AI_WEB_SEARCH_MAX_OUTPUT_TOKENS = max(
     120,
-    min(1200, int(os.getenv("PMDA_AI_WEB_SEARCH_MAX_OUTPUT_TOKENS", "300") or "300")),
+    min(4000, int(os.getenv("PMDA_AI_WEB_SEARCH_MAX_OUTPUT_TOKENS", "900") or "900")),
 )
 AI_WEB_SEARCH_CACHE_TTL_SEC = max(
     60,
@@ -746,27 +746,27 @@ AI_WEB_SEARCH_CACHE_MAX_ENTRIES = max(
 )
 AI_OPENAI_REQUEST_TIMEOUT_SEC = max(
     10.0,
-    min(180.0, float(os.getenv("PMDA_AI_OPENAI_REQUEST_TIMEOUT_SEC", "45") or "45")),
+    min(600.0, float(os.getenv("PMDA_AI_OPENAI_REQUEST_TIMEOUT_SEC", "120") or "120")),
 )
 MB_AI_VERIFY_TIMEOUT_SEC = max(
     5.0,
-    min(120.0, float(os.getenv("PMDA_MB_AI_VERIFY_TIMEOUT_SEC", "35") or "35")),
+    min(300.0, float(os.getenv("PMDA_MB_AI_VERIFY_TIMEOUT_SEC", "90") or "90")),
 )
 MB_AI_TIEBREAK_TIMEOUT_SEC = max(
     5.0,
-    min(120.0, float(os.getenv("PMDA_MB_AI_TIEBREAK_TIMEOUT_SEC", "30") or "30")),
+    min(300.0, float(os.getenv("PMDA_MB_AI_TIEBREAK_TIMEOUT_SEC", "90") or "90")),
 )
 PROVIDER_FALLBACK_PARALLEL_TIMEOUT_SEC = max(
     2.0,
-    min(45.0, float(os.getenv("PMDA_PROVIDER_FALLBACK_TIMEOUT_SEC", "12") or "12")),
+    min(120.0, float(os.getenv("PMDA_PROVIDER_FALLBACK_TIMEOUT_SEC", "45") or "45")),
 )
 AI_SCAN_HARD_TIMEOUT_SEC = max(
     8.0,
-    min(120.0, float(os.getenv("PMDA_AI_SCAN_HARD_TIMEOUT_SEC", "30") or "30")),
+    min(600.0, float(os.getenv("PMDA_AI_SCAN_HARD_TIMEOUT_SEC", "120") or "120")),
 )
 AI_REVIEW_FETCH_TIMEOUT_SEC = max(
     4.0,
-    min(60.0, float(os.getenv("PMDA_AI_REVIEW_FETCH_TIMEOUT_SEC", "12") or "12")),
+    min(300.0, float(os.getenv("PMDA_AI_REVIEW_FETCH_TIMEOUT_SEC", "90") or "90")),
 )
 
 
@@ -787,19 +787,19 @@ def _openai_request_timeout_seconds() -> float:
 
 AI_MAX_CALLS_PER_SCAN = max(
     0,
-    int(os.getenv("PMDA_AI_MAX_CALLS_PER_SCAN", "60") or "60"),
+    int(os.getenv("PMDA_AI_MAX_CALLS_PER_SCAN", "0") or "0"),
 )
 AI_CALL_COOLDOWN_SEC = max(
     0.0,
-    min(30.0, float(os.getenv("PMDA_AI_CALL_COOLDOWN_SEC", "1.0") or "1.0")),
+    min(30.0, float(os.getenv("PMDA_AI_CALL_COOLDOWN_SEC", "0") or "0")),
 )
 AI_GLOBAL_MAX_CALLS_PER_MINUTE = max(
     0,
-    int(os.getenv("PMDA_AI_GLOBAL_MAX_CALLS_PER_MINUTE", "20") or "20"),
+    int(os.getenv("PMDA_AI_GLOBAL_MAX_CALLS_PER_MINUTE", "0") or "0"),
 )
 AI_GLOBAL_MAX_CALLS_PER_DAY = max(
     0,
-    int(os.getenv("PMDA_AI_GLOBAL_MAX_CALLS_PER_DAY", "400") or "400"),
+    int(os.getenv("PMDA_AI_GLOBAL_MAX_CALLS_PER_DAY", "0") or "0"),
 )
 
 # Pricing is expressed in micro-USD (1 USD = 1_000_000 micro-USD).
@@ -853,7 +853,10 @@ def _auth_db_connect() -> sqlite3.Connection:
     con = sqlite3.connect(str(SETTINGS_DB_FILE), timeout=timeout_sec)
     con.row_factory = sqlite3.Row
     try:
+        con.execute("PRAGMA journal_mode=WAL;")
         con.execute(f"PRAGMA busy_timeout={int(AUTH_DB_BUSY_TIMEOUT_MS)};")
+        con.execute("PRAGMA synchronous=NORMAL;")
+        con.execute("PRAGMA temp_store=MEMORY;")
     except Exception:
         pass
     return con
@@ -1980,25 +1983,26 @@ merged = {
     # Time budget (seconds) per album for MusicBrainz search flow before we fall back faster to other providers.
     "MB_SEARCH_ALBUM_TIMEOUT_SEC": _get(
         "MB_SEARCH_ALBUM_TIMEOUT_SEC",
-        # Default reduced to keep scans fast on large libraries; strict provider fallbacks cover the hard cases.
-        default=12,
-        cast=lambda x: max(10, min(300, int(x) if x is not None and str(x).strip().isdigit() else 12)),
+        # 0 = unlimited per-album MusicBrainz search budget. PMDA should prefer correctness over premature fallback.
+        default=0,
+        cast=lambda x: max(0, min(3600, int(x) if x is not None and str(x).strip().isdigit() else 0)),
     ),
     # Maximum number of MB candidates for which we fetch full details per album.
     "MB_CANDIDATE_FETCH_LIMIT": _get(
         "MB_CANDIDATE_FETCH_LIMIT",
-        default=4,
-        cast=lambda x: max(1, min(20, int(x) if x is not None and str(x).strip().isdigit() else 4)),
+        # 0 = unlimited candidate detail fetch.
+        default=0,
+        cast=lambda x: max(0, min(100, int(x) if x is not None and str(x).strip().isdigit() else 0)),
     ),
     # Fetch recording-level track titles only for first N candidates (expensive endpoint).
     "MB_TRACKLIST_FETCH_LIMIT": _get(
         "MB_TRACKLIST_FETCH_LIMIT",
-        # Default reduced: this endpoint is expensive and can dominate scan time when many albums are ambiguous.
-        default=1,
-        cast=lambda x: max(0, min(20, int(x) if x is not None and str(x).strip().isdigit() else 1)),
+        # 0 = fetch tracklists for all detailed candidates.
+        default=0,
+        cast=lambda x: max(0, min(100, int(x) if x is not None and str(x).strip().isdigit() else 0)),
     ),
-    # If true, once MB budget is exceeded or MB has no candidates, we prioritize provider fallback and skip web+AI MBID hunt.
-    "MB_FAST_FALLBACK_MODE": _get("MB_FAST_FALLBACK_MODE", default=True, cast=_parse_bool),
+    # Disabled by default: correctness first, we do not skip web+AI MBID hunt merely for speed.
+    "MB_FAST_FALLBACK_MODE": _get("MB_FAST_FALLBACK_MODE", default=False, cast=_parse_bool),
     # Provider identity arbitration (Discogs/Last.fm/Bandcamp when MB is unavailable).
     "PROVIDER_IDENTITY_STRICT": _get("PROVIDER_IDENTITY_STRICT", default=True, cast=_parse_bool),
     "PROVIDER_IDENTITY_USE_AI": _get("PROVIDER_IDENTITY_USE_AI", default=True, cast=_parse_bool),
@@ -2085,7 +2089,7 @@ merged = {
     "USE_AI_FOR_MB_VERIFY": _get("USE_AI_FOR_MB_VERIFY", default=True, cast=_parse_bool),
     "USE_AI_FOR_DEDUPE": _get("USE_AI_FOR_DEDUPE", default=True, cast=_parse_bool),
     # When enabled, album descriptions/reviews can also be auto-generated for SOFT_MATCH albums.
-    "USE_AI_FOR_SOFT_MATCH_PROFILES": _get("USE_AI_FOR_SOFT_MATCH_PROFILES", default=False, cast=_parse_bool),
+    "USE_AI_FOR_SOFT_MATCH_PROFILES": _get("USE_AI_FOR_SOFT_MATCH_PROFILES", default=True, cast=_parse_bool),
     "USE_AI_VISION_FOR_COVER": _get("USE_AI_VISION_FOR_COVER", default=True, cast=_parse_bool),
     "AI_CONFIDENCE_MIN": _get("AI_CONFIDENCE_MIN", default=50, cast=lambda x: int(x) if x is not None and str(x).strip().isdigit() else 50),
     "OPENAI_VISION_MODEL": _get("OPENAI_VISION_MODEL", default="", cast=str),
@@ -2192,10 +2196,10 @@ USE_MUSICBRAINZ: bool = bool(merged["USE_MUSICBRAINZ"])
 MUSICBRAINZ_EMAIL: str = merged.get("MUSICBRAINZ_EMAIL", "pmda@example.com")
 MB_QUEUE_ENABLED: bool = bool(merged.get("MB_QUEUE_ENABLED", True))
 MB_RETRY_NOT_FOUND: bool = bool(merged.get("MB_RETRY_NOT_FOUND", False))
-MB_SEARCH_ALBUM_TIMEOUT_SEC: int = int(merged.get("MB_SEARCH_ALBUM_TIMEOUT_SEC", 20))
-MB_CANDIDATE_FETCH_LIMIT: int = int(merged.get("MB_CANDIDATE_FETCH_LIMIT", 4))
-MB_TRACKLIST_FETCH_LIMIT: int = int(merged.get("MB_TRACKLIST_FETCH_LIMIT", 2))
-MB_FAST_FALLBACK_MODE: bool = bool(merged.get("MB_FAST_FALLBACK_MODE", True))
+MB_SEARCH_ALBUM_TIMEOUT_SEC: int = int(merged.get("MB_SEARCH_ALBUM_TIMEOUT_SEC", 0))
+MB_CANDIDATE_FETCH_LIMIT: int = int(merged.get("MB_CANDIDATE_FETCH_LIMIT", 0))
+MB_TRACKLIST_FETCH_LIMIT: int = int(merged.get("MB_TRACKLIST_FETCH_LIMIT", 0))
+MB_FAST_FALLBACK_MODE: bool = bool(merged.get("MB_FAST_FALLBACK_MODE", False))
 PROVIDER_IDENTITY_STRICT: bool = bool(merged.get("PROVIDER_IDENTITY_STRICT", True))
 PROVIDER_IDENTITY_USE_AI: bool = bool(merged.get("PROVIDER_IDENTITY_USE_AI", True))
 PROVIDER_IDENTITY_MIN_SCORE: float = float(merged.get("PROVIDER_IDENTITY_MIN_SCORE", 0.72))
@@ -2585,7 +2589,7 @@ ollama_url = None
 ai_provider_ready = False
 
 if AI_PROVIDER.lower() in {"openai", "openai-api", "openai-codex"}:
-    if OPENAI_API_KEY:
+    if bool(OPENAI_ENABLE_API_KEY_MODE) and OPENAI_API_KEY:
         os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
         try:
             openai_client = OpenAI(timeout=_openai_request_timeout_seconds())
@@ -2595,9 +2599,17 @@ if AI_PROVIDER.lower() in {"openai", "openai-api", "openai-codex"}:
             logging.warning("OpenAI client init failed: %s", e)
     else:
         if bool(OPENAI_ENABLE_CODEX_OAUTH_MODE):
-            logging.info("No OPENAI_API_KEY provided; API-key mode unavailable (OAuth mode may still be usable).")
+            logging.info(
+                "OpenAI API key is configured, but API-key mode is disabled; OAuth mode may still be usable."
+                if OPENAI_API_KEY
+                else "No OPENAI_API_KEY provided; API-key mode unavailable (OAuth mode may still be usable)."
+            )
         else:
-            logging.info("No OPENAI_API_KEY provided; AI-driven selection disabled.")
+            logging.info(
+                "OpenAI API key is configured, but API-key mode is disabled and OAuth mode is off; AI-driven selection disabled."
+                if OPENAI_API_KEY
+                else "No OPENAI_API_KEY provided; AI-driven selection disabled."
+            )
 elif AI_PROVIDER.lower() == "anthropic":
     if ANTHROPIC_API_KEY and anthropic:
         try:
@@ -2665,7 +2677,9 @@ def _reinit_ai_from_globals():
     ai_provider_ready = False
 
     if provider in {"openai", "openai-api", "openai-codex"}:
-        if openai_key:
+        api_key_mode_enabled = bool(getattr(mod, "OPENAI_ENABLE_API_KEY_MODE", OPENAI_ENABLE_API_KEY_MODE))
+        codex_mode_enabled = bool(getattr(mod, "OPENAI_ENABLE_CODEX_OAUTH_MODE", OPENAI_ENABLE_CODEX_OAUTH_MODE))
+        if api_key_mode_enabled and openai_key:
             os.environ["OPENAI_API_KEY"] = openai_key
             try:
                 openai_client = OpenAI(timeout=_openai_request_timeout_seconds())
@@ -2673,7 +2687,34 @@ def _reinit_ai_from_globals():
                 logging.info("OpenAI client re-initialized (settings applied)")
             except Exception as e:
                 logging.warning("OpenAI client re-init failed: %s", e)
-        if openai_client:
+        if provider == "openai-codex":
+            codex_ok, codex_reason = _openai_codex_token_health(_current_user_id_or_zero(), force_refresh=False)
+            if codex_mode_enabled and codex_ok:
+                ai_provider_ready = True
+                RESOLVED_MODEL = (openai_model or "").strip() or "codex"
+                RESOLVED_PARAM_STYLE = "responses"
+                RESOLVED_STOP_OK = True
+                AI_FUNCTIONAL_ERROR_MSG = None
+                logging.info("OpenAI Codex OAuth runtime ready via Codex CLI")
+            elif codex_mode_enabled and _openai_codex_any_profile_present():
+                ai_provider_ready = False
+                RESOLVED_MODEL = (openai_model or "").strip() or "codex"
+                RESOLVED_PARAM_STYLE = "responses"
+                RESOLVED_STOP_OK = True
+                AI_FUNCTIONAL_ERROR_MSG = codex_reason or "OpenAI Codex OAuth profile exists but runtime is not ready"
+                logging.warning("OpenAI Codex OAuth runtime unavailable: %s", AI_FUNCTIONAL_ERROR_MSG)
+            elif openai_client:
+                ai_provider_ready = True
+                RESOLVED_MODEL = (openai_model or "").strip() or "gpt-4o-mini"
+                RESOLVED_PARAM_STYLE = "mct"
+                RESOLVED_STOP_OK = True
+                AI_FUNCTIONAL_ERROR_MSG = None
+                logging.info("OpenAI API client available for non-Codex fallback contexts")
+            elif codex_mode_enabled:
+                logging.info("No OpenAI Codex OAuth profile found; OAuth mode configured but not connected.")
+            else:
+                logging.info("OpenAI Codex OAuth mode disabled; runtime unavailable.")
+        elif openai_client:
             # One model only: probe the configured model to learn token param style and
             # ensure we get parseable output for PMDA. We do not auto-fallback to other models.
             cand = (openai_model or "").strip() or "gpt-4o-mini"
@@ -2706,20 +2747,10 @@ def _reinit_ai_from_globals():
                 RESOLVED_PARAM_STYLE = "mct"
                 RESOLVED_STOP_OK = True
                 logging.warning("OpenAI model probe failed; AI disabled. %s", AI_FUNCTIONAL_ERROR_MSG)
+        elif codex_mode_enabled:
+            logging.info("No OPENAI_API_KEY; API-key mode unavailable (OAuth mode may still be usable).")
         else:
-            codex_mode_enabled = bool(getattr(mod, "OPENAI_ENABLE_CODEX_OAUTH_MODE", OPENAI_ENABLE_CODEX_OAUTH_MODE))
-            if provider == "openai-codex" and codex_mode_enabled and _openai_codex_any_profile_present():
-                ai_provider_ready = True
-                RESOLVED_MODEL = (openai_model or "").strip() or "gpt-5-nano"
-                # Codex OAuth calls use the same responses path; keep a permissive style marker.
-                RESOLVED_PARAM_STYLE = "responses"
-                RESOLVED_STOP_OK = True
-                AI_FUNCTIONAL_ERROR_MSG = None
-                logging.info("OpenAI Codex OAuth profile detected: AI runtime enabled without API key.")
-            elif codex_mode_enabled:
-                logging.info("No OPENAI_API_KEY; API-key mode unavailable (OAuth mode may still be usable).")
-            else:
-                logging.info("No OPENAI_API_KEY; AI-driven selection disabled.")
+            logging.info("No OPENAI_API_KEY; AI-driven selection disabled.")
     elif provider == "anthropic":
         if anthropic_key and anthropic:
             try:
@@ -2766,8 +2797,16 @@ def _reload_ai_config_and_reinit():
     (single source of truth for configuration), not STATE_DB_FILE (scan data DB).
     """
     mod = sys.modules[__name__]
-    ai_config_keys = ("AI_PROVIDER", "OPENAI_API_KEY", "OPENAI_MODEL",
-                      "ANTHROPIC_API_KEY", "GOOGLE_API_KEY", "OLLAMA_URL")
+    ai_config_keys = (
+        "AI_PROVIDER",
+        "OPENAI_API_KEY",
+        "OPENAI_MODEL",
+        "OPENAI_ENABLE_API_KEY_MODE",
+        "OPENAI_ENABLE_CODEX_OAUTH_MODE",
+        "ANTHROPIC_API_KEY",
+        "GOOGLE_API_KEY",
+        "OLLAMA_URL",
+    )
     try:
         db_path = SETTINGS_DB_FILE
         if db_path.exists():
@@ -2784,6 +2823,29 @@ def _reload_ai_config_and_reinit():
         _reinit_ai_from_globals()
     except Exception as e:
         logging.warning("_reload_ai_config_and_reinit failed: %s", e)
+
+
+def _wait_for_codex_runtime_ready_for_scan(user_id: int | None = None, *, timeout_sec: float = 45.0) -> tuple[bool, str]:
+    """
+    When PMDA is configured to use Codex OAuth for scan-time AI, do not start the
+    heavy pipeline until the OAuth runtime is actually usable.
+    """
+    uid = int(user_id or 0)
+    if not _openai_codex_oauth_mode_enabled():
+        return False, _provider_mode_disabled_reason("openai-codex") or "OpenAI Codex OAuth mode is disabled"
+    if not (_openai_codex_profile_present(uid) or _openai_codex_any_profile_present()):
+        return False, "No active OpenAI Codex OAuth profile"
+    deadline = time.time() + max(5.0, float(timeout_sec or 0.0))
+    last_reason = ""
+    attempt = 0
+    while time.time() < deadline:
+        attempt += 1
+        ok, reason = _openai_codex_token_health(uid, force_refresh=(attempt == 1))
+        if ok:
+            return True, ""
+        last_reason = str(reason or "").strip()
+        time.sleep(1.0)
+    return False, (last_reason or f"OpenAI Codex runtime not ready after {int(max(5.0, float(timeout_sec or 0.0)))}s")
 
 
 # --- Resolve a working OpenAI model (with price-aware fallbacks) -------------
@@ -2979,10 +3041,10 @@ def _openai_chat_text(resp: Any) -> str:
 _OPENAI_PROVIDER_IDS = {"openai", "openai-api", "openai-codex"}
 _PROVIDER_PREF_DEFAULTS = {
     "interactive_provider_id": "openai-codex",
-    "batch_provider_id": "openai-api",
-    "web_search_provider_id": "openai-api",
+    "batch_provider_id": "openai-codex",
+    "web_search_provider_id": "openai-codex",
 }
-_auth_crypto_lock = threading.Lock()
+_auth_crypto_lock = threading.RLock()
 _auth_fernet_cached: Any | None = None
 _auth_seed_cached: str | None = None
 _openai_auth_service_cached: OpenAIAuthService | None = None
@@ -2990,6 +3052,8 @@ _openai_codex_health_lock = threading.Lock()
 _openai_codex_health_cache: dict[int, tuple[float, bool, str]] = {}
 _OPENAI_CODEX_HEALTH_TTL_OK_SEC = 300
 _OPENAI_CODEX_HEALTH_TTL_ERR_SEC = 30
+_codex_cli_path_lock = threading.Lock()
+_codex_cli_path_cached: str | None = None
 
 
 def _current_user_id_or_zero() -> int:
@@ -3049,6 +3113,43 @@ def _provider_mode_disabled_reason(provider_id: str) -> str:
     return ""
 
 
+def _openai_api_runtime_available() -> bool:
+    if not _openai_api_key_mode_enabled():
+        return False
+    if openai_client:
+        return True
+    return bool(str(globals().get("OPENAI_API_KEY", "") or "").strip())
+
+
+def _openai_codex_runtime_available(user_id: int | None = None, *, require_token: bool = True) -> bool:
+    if not _openai_codex_oauth_mode_enabled():
+        return False
+    return bool(_openai_codex_connected(user_id, require_token=require_token))
+
+
+def _openai_error_allows_codex_fallback(exc: Any) -> bool:
+    text = str(exc or "").strip().lower()
+    if not text:
+        return False
+    markers = (
+        "429",
+        "401",
+        "403",
+        "quota",
+        "insufficient_quota",
+        "rate limit",
+        "rate_limit",
+        "billing",
+        "invalid_api_key",
+        "api key",
+        "authentication",
+        "unauthorized",
+        "service unavailable",
+        "503",
+    )
+    return any(marker in text for marker in markers)
+
+
 def _ai_context_from_analysis_type(analysis_type: str) -> str:
     text = str(analysis_type or "").strip().lower()
     if not text:
@@ -3068,23 +3169,64 @@ def _openai_codex_health_cache_invalidate(user_id: int | None = None) -> None:
             _openai_codex_health_cache.pop(int(user_id or 0), None)
 
 
+def _codex_cli_path(refresh: bool = False) -> str:
+    global _codex_cli_path_cached
+    with _codex_cli_path_lock:
+        if _codex_cli_path_cached is not None and not refresh:
+            return _codex_cli_path_cached
+        candidates: list[str] = []
+        try:
+            configured = str(_get_config_from_db("OPENAI_CODEX_CLI_BIN", "") or "").strip()
+        except Exception:
+            configured = ""
+        if configured:
+            candidates.append(configured)
+        for item in ("codex", "/usr/local/bin/codex", "/usr/bin/codex"):
+            if item not in candidates:
+                candidates.append(item)
+        resolved = ""
+        for item in candidates:
+            probe = shutil.which(item) if os.path.sep not in item else item
+            if probe and Path(probe).exists():
+                resolved = str(probe)
+                break
+        _codex_cli_path_cached = resolved
+        return resolved
+
+
+def _codex_cli_available(refresh: bool = False) -> bool:
+    return bool(_codex_cli_path(refresh=refresh))
+
+
 def _openai_codex_profile_present(user_id: int | None = None) -> bool:
     uid = int(user_id or 0)
     try:
         con = sqlite3.connect(str(SETTINGS_DB_FILE), timeout=5)
         cur = con.cursor()
-        cur.execute(
-            """
-            SELECT 1
-            FROM ai_auth_profiles
-            WHERE provider_id = 'openai-codex'
-              AND is_active = 1
-              AND user_id IN (?, 0)
-            ORDER BY CASE WHEN user_id = ? THEN 0 ELSE 1 END, updated_at DESC
-            LIMIT 1
-            """,
-            (uid, uid),
-        )
+        if uid > 0:
+            cur.execute(
+                """
+                SELECT 1
+                FROM ai_auth_profiles
+                WHERE provider_id = 'openai-codex'
+                  AND is_active = 1
+                  AND user_id IN (?, 0)
+                ORDER BY CASE WHEN user_id = ? THEN 0 ELSE 1 END, updated_at DESC
+                LIMIT 1
+                """,
+                (uid, uid),
+            )
+        else:
+            cur.execute(
+                """
+                SELECT 1
+                FROM ai_auth_profiles
+                WHERE provider_id = 'openai-codex'
+                  AND is_active = 1
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """
+            )
         row = cur.fetchone()
         con.close()
         return bool(row)
@@ -3129,31 +3271,41 @@ def _openai_codex_token_health(user_id: int | None = None, *, force_refresh: boo
                 reason,
             )
         return False, reason
-    # Fast path for UI status checks: if profile expiry is clearly valid, skip token
-    # decryption/refresh calls to keep Settings responsive under DB pressure.
+    if not _codex_cli_available():
+        reason = "Codex CLI is not installed in the PMDA runtime"
+        with _openai_codex_health_lock:
+            _openai_codex_health_cache[uid] = (
+                float(now_ts + _OPENAI_CODEX_HEALTH_TTL_ERR_SEC),
+                False,
+                reason,
+            )
+        return False, reason
     try:
-        profile_status = _openai_auth_service().status(uid, provider_id="openai-codex")
-        if bool(profile_status.connected):
-            exp = int(profile_status.expires_in_sec or 0)
-            if exp > 120:
-                with _openai_codex_health_lock:
-                    _openai_codex_health_cache[uid] = (
-                        float(now_ts + _OPENAI_CODEX_HEALTH_TTL_OK_SEC),
-                        True,
-                        "",
-                    )
-                return True, ""
-    except Exception:
-        # Fall through to runtime token probe.
-        pass
-    try:
-        timeout_sec = max(1.0, float(PMDA_OPENAI_CODEX_STATUS_TIMEOUT_SEC))
-        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="codex-status-check") as pool:
-            fut = pool.submit(_openai_auth_service().get_valid_access_token, uid, "openai-codex")
-            token = fut.result(timeout=timeout_sec)
-        ok = bool(str(token or "").strip())
-        reason = "" if ok else "OpenAI Codex access token is empty"
+        runtime_tokens_fn = globals().get("_openai_codex_runtime_tokens")
+        if not callable(runtime_tokens_fn):
+            raise RuntimeError("OpenAI Codex runtime is still initializing")
+        bounded_runner = globals().get("_run_callable_bounded")
+        if callable(bounded_runner):
+            tokens = bounded_runner(
+                runtime_tokens_fn,
+                uid,
+                force_refresh=bool(force_refresh),
+                require_id_token=True,
+                timeout_sec=max(1.0, float(PMDA_OPENAI_CODEX_STATUS_TIMEOUT_SEC)),
+                log_prefix="[OpenAI Codex status]",
+            )
+        else:
+            tokens = runtime_tokens_fn(
+                uid,
+                force_refresh=bool(force_refresh),
+                require_id_token=True,
+            )
+        ok = bool(str((tokens or {}).get("access_token") or "").strip())
+        reason = "" if ok else "OpenAI Codex OAuth access token is unavailable; reconnect Codex OAuth"
     except FutureTimeout:
+        ok = False
+        reason = f"OpenAI Codex status check timed out after {int(PMDA_OPENAI_CODEX_STATUS_TIMEOUT_SEC)}s"
+    except TimeoutError:
         ok = False
         reason = f"OpenAI Codex status check timed out after {int(PMDA_OPENAI_CODEX_STATUS_TIMEOUT_SEC)}s"
     except Exception as exc:
@@ -3170,6 +3322,13 @@ def _openai_codex_connected(user_id: int | None = None, *, require_token: bool =
         return _openai_codex_profile_present(user_id)
     ok, _reason = _openai_codex_token_health(user_id, force_refresh=False)
     return bool(ok)
+
+
+if AI_PROVIDER.lower() == "openai-codex" and bool(OPENAI_ENABLE_CODEX_OAUTH_MODE) and not openai_client:
+    try:
+        _reinit_ai_from_globals()
+    except Exception:
+        logging.debug("Deferred OpenAI Codex OAuth re-init failed during startup", exc_info=True)
 
 
 def _get_ai_provider_preferences(user_id: int | None = None) -> dict[str, str]:
@@ -3220,8 +3379,8 @@ def _save_ai_provider_preferences(
     now = int(time.time())
     prefs = {
         "interactive_provider_id": _normalize_provider_id(interactive_provider_id, fallback="openai-codex"),
-        "batch_provider_id": _normalize_provider_id(batch_provider_id, fallback="openai-api"),
-        "web_search_provider_id": _normalize_provider_id(web_search_provider_id, fallback="openai-api"),
+        "batch_provider_id": _normalize_provider_id(batch_provider_id, fallback="openai-codex"),
+        "web_search_provider_id": _normalize_provider_id(web_search_provider_id, fallback="openai-codex"),
     }
     init_settings_db()
     con = sqlite3.connect(str(SETTINGS_DB_FILE), timeout=10)
@@ -3257,38 +3416,46 @@ def _resolve_provider_for_runtime(requested_provider: str, analysis_type: str, *
     uid = _current_user_id_or_zero() if user_id is None else max(0, int(user_id or 0))
     context = _ai_context_from_analysis_type(analysis_type)
     prefs = _get_ai_provider_preferences(uid)
+    api_ready = _openai_api_runtime_available()
+    codex_ready = _openai_codex_runtime_available(uid, require_token=True)
+    codex_profile_present = _openai_codex_connected(uid, require_token=False)
     preferred = {
         "interactive": prefs.get("interactive_provider_id", "openai-codex"),
-        "batch": prefs.get("batch_provider_id", "openai-api"),
-        "web_search": prefs.get("web_search_provider_id", "openai-api"),
-    }.get(context, prefs.get("batch_provider_id", "openai-api"))
+        "batch": prefs.get("batch_provider_id", "openai-codex"),
+        "web_search": prefs.get("web_search_provider_id", "openai-codex"),
+    }.get(context, prefs.get("batch_provider_id", "openai-codex"))
     preferred_norm = _normalize_provider_id(str(preferred or ""), fallback="")
-    # Respect explicit OpenAI preference when mode is enabled so runtime errors stay clear
-    # (e.g. Codex OAuth token invalid should not silently turn into API-key errors).
+    # Prefer the explicit provider when it is genuinely usable. For Codex OAuth,
+    # a stored profile alone is not enough: if runtime token derivation fails and
+    # API-key mode is available, fall back so PMDA keeps functioning.
     if preferred_norm in _OPENAI_PROVIDER_IDS and _provider_mode_enabled(preferred_norm):
         if preferred_norm == "openai-codex":
-            # Keep codex selection if a profile exists, even when token refresh fails at runtime.
-            if _openai_codex_profile_present(uid):
+            if codex_ready:
                 return "openai-codex"
-            # No profile at all: allow selector fallback to avoid hard failure on fresh installs.
-        else:
+            if api_ready:
+                return "openai-api"
+            if codex_profile_present:
+                return "openai-codex"
+        elif api_ready:
             return preferred_norm
+        elif codex_ready:
+            return "openai-codex"
 
     selected = select_provider_id(
         context=context,
         preferred=str(preferred or ""),
         # Selection should stay lightweight and resilient; runtime token validation
         # happens when a request is actually sent to the provider.
-        codex_connected=_openai_codex_connected(uid, require_token=False),
-        openai_api_enabled=_openai_api_key_mode_enabled(),
+        codex_connected=bool(codex_ready or codex_profile_present),
+        openai_api_enabled=bool(api_ready),
         openai_codex_enabled=_openai_codex_oauth_mode_enabled(),
     )
     normalized = _normalize_provider_id(selected, fallback="openai-api")
-    if normalized == "openai-api" and not _openai_api_key_mode_enabled():
-        if _openai_codex_oauth_mode_enabled() and _openai_codex_connected(uid, require_token=True):
+    if normalized == "openai-api" and not api_ready:
+        if codex_ready or codex_profile_present:
             return "openai-codex"
     if normalized == "openai-codex" and not _openai_codex_oauth_mode_enabled():
-        if _openai_api_key_mode_enabled():
+        if api_ready:
             return "openai-api"
     return normalized
 
@@ -3309,17 +3476,18 @@ def _resolve_ai_runtime_availability(
     auth_mode = _provider_auth_mode(provider_effective)
     if not _provider_mode_enabled(provider_effective):
         return (False, provider_effective, auth_mode, _provider_mode_disabled_reason(provider_effective) or "Provider mode disabled")
+    if provider_lower == "openai-codex":
+        ok, reason = _openai_codex_token_health(uid, force_refresh=False)
+        return (
+            bool(ok),
+            provider_effective,
+            auth_mode,
+            str(reason or "") if not ok else "",
+        )
     if provider_lower in {"openai", "openai-api", "openai-codex"}:
         client_to_use, auth_mode_for_usage, openai_reason = _resolve_openai_client_for_runtime(provider_effective, uid)
         if client_to_use:
             return (True, provider_effective, auth_mode_for_usage, "")
-        if provider_lower == "openai-codex":
-            return (
-                False,
-                provider_effective,
-                auth_mode_for_usage,
-                openai_reason or "OpenAI Codex OAuth is not connected for this user",
-            )
         return (
             False,
             provider_effective,
@@ -3343,7 +3511,7 @@ def _auth_encryption_seed() -> bytes:
     with _auth_crypto_lock:
         if _auth_seed_cached:
             return hashlib.sha256(_auth_seed_cached.encode("utf-8", errors="ignore")).digest()
-        cfg_dir = Path(str(PMDA_CONFIG_DIR or "/config")).expanduser()
+        cfg_dir = Path(str(CONFIG_DIR or "/config")).expanduser()
         seed_file = cfg_dir / ".pmda_auth_seed"
         try:
             stored = seed_file.read_text(encoding="utf-8").strip()
@@ -3510,6 +3678,13 @@ def _set_legacy_openai_oauth_refresh(refresh_token: str) -> None:
         logging.debug("Failed to persist OPENAI_OAUTH_REFRESH_TOKEN", exc_info=True)
 
 
+def _get_legacy_openai_oauth_refresh() -> str:
+    try:
+        return str(_get_config_from_db("OPENAI_OAUTH_REFRESH_TOKEN", "") or "").strip()
+    except Exception:
+        return ""
+
+
 def _apply_openai_api_key_from_oauth(api_key: str) -> None:
     key = str(api_key or "").strip()
     if not key:
@@ -3517,11 +3692,45 @@ def _apply_openai_api_key_from_oauth(api_key: str) -> None:
     init_settings_db()
     con = sqlite3.connect(str(SETTINGS_DB_FILE), timeout=10)
     cur = con.cursor()
-    cur.execute("INSERT OR REPLACE INTO settings(key, value) VALUES(?, ?)", ("AI_PROVIDER", "openai"))
-    cur.execute("INSERT OR REPLACE INTO settings(key, value) VALUES(?, ?)", ("OPENAI_API_KEY", key))
+    cur.execute(
+        "INSERT OR REPLACE INTO settings(key, value) VALUES(?, ?)",
+        ("OPENAI_CODEX_EXCHANGED_API_KEY", key),
+    )
     con.commit()
     con.close()
-    _apply_settings_in_memory({"AI_PROVIDER": "openai", "OPENAI_API_KEY": key})
+    setattr(sys.modules[__name__], "OPENAI_CODEX_EXCHANGED_API_KEY", key)
+
+
+def _clear_openai_codex_exchanged_api_key() -> None:
+    try:
+        init_settings_db()
+        con = sqlite3.connect(str(SETTINGS_DB_FILE), timeout=10)
+        cur = con.cursor()
+        cur.execute("DELETE FROM settings WHERE key = ?", ("OPENAI_CODEX_EXCHANGED_API_KEY",))
+        con.commit()
+        con.close()
+    except Exception:
+        logging.debug("Failed to clear OPENAI_CODEX_EXCHANGED_API_KEY", exc_info=True)
+    try:
+        setattr(sys.modules[__name__], "OPENAI_CODEX_EXCHANGED_API_KEY", "")
+    except Exception:
+        pass
+
+
+def _get_openai_codex_exchanged_api_key() -> str:
+    key = str(getattr(sys.modules[__name__], "OPENAI_CODEX_EXCHANGED_API_KEY", "") or "").strip()
+    if key:
+        return key
+    try:
+        key = str(_get_config_from_db("OPENAI_CODEX_EXCHANGED_API_KEY", "") or "").strip()
+    except Exception:
+        key = ""
+    if key:
+        try:
+            setattr(sys.modules[__name__], "OPENAI_CODEX_EXCHANGED_API_KEY", key)
+        except Exception:
+            pass
+    return key
 
 
 def _openai_auth_service() -> OpenAIAuthService:
@@ -3535,9 +3744,253 @@ def _openai_auth_service() -> OpenAIAuthService:
             decrypt=_auth_decrypt,
             apply_api_key=_apply_openai_api_key_from_oauth,
             set_legacy_refresh=_set_legacy_openai_oauth_refresh,
+            get_legacy_refresh=_get_legacy_openai_oauth_refresh,
+            clear_derived_api_key=_clear_openai_codex_exchanged_api_key,
             get_user_id=_current_user_id_or_zero,
         )
     return _openai_auth_service_cached
+
+
+def _codex_home_root() -> Path:
+    base = Path(str(CONFIG_DIR or "/config")).expanduser()
+    return base / "codex_runtime"
+
+
+def _codex_home_for_user(user_id: int | None) -> Path:
+    uid = max(0, int(user_id or 0))
+    return _codex_home_root() / f"user-{uid}"
+
+
+def _openai_codex_runtime_tokens(
+    user_id: int | None,
+    *,
+    force_refresh: bool = False,
+    require_id_token: bool = True,
+) -> dict[str, Any]:
+    svc = _openai_auth_service()
+    return svc.get_runtime_tokens(
+        user_id,
+        provider_id="openai-codex",
+        require_id_token=bool(require_id_token),
+        ensure_runtime_key=bool(force_refresh),
+    )
+
+
+def _write_codex_auth_json(user_id: int | None, *, force_refresh: bool = False) -> Path:
+    tokens = _openai_codex_runtime_tokens(user_id, force_refresh=force_refresh, require_id_token=True)
+    access_token = str(tokens.get("access_token") or "").strip()
+    refresh_token = str(tokens.get("refresh_token") or "").strip()
+    id_token = str(tokens.get("id_token") or "").strip()
+    account_id = str(tokens.get("account_id") or "").strip()
+    if not access_token:
+        raise RuntimeError("OpenAI Codex OAuth access token is unavailable")
+    home = _codex_home_for_user(user_id)
+    home.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "OPENAI_API_KEY": None,
+        "auth_mode": "chatgpt",
+        "last_refresh": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "tokens": {
+            "id_token": id_token,
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "account_id": account_id,
+        },
+    }
+    auth_path = home / "auth.json"
+    tmp_path = auth_path.with_suffix(".tmp")
+    tmp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    try:
+        os.chmod(tmp_path, 0o600)
+    except Exception:
+        pass
+    os.replace(tmp_path, auth_path)
+    return auth_path
+
+
+def _openai_usage_dict_from_codex(raw_usage: dict[str, Any] | None) -> dict[str, Any]:
+    usage = dict(raw_usage or {})
+    input_tokens = int(usage.get("input_tokens") or 0)
+    cached_input_tokens = int(usage.get("cached_input_tokens") or 0)
+    output_tokens = int(usage.get("output_tokens") or 0)
+    total_tokens = int(usage.get("total_tokens") or 0)
+    if total_tokens <= 0:
+        total_tokens = max(0, input_tokens + output_tokens)
+    return {
+        "input_tokens": input_tokens,
+        "prompt_tokens": input_tokens,
+        "completion_tokens": output_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+        "prompt_tokens_details": {"cached_tokens": cached_input_tokens},
+    }
+
+
+def _codex_extract_final_text(stdout_text: str) -> tuple[str, dict[str, Any], str | None]:
+    final_text = ""
+    usage: dict[str, Any] = {}
+    request_id = None
+    for raw_line in str(stdout_text or "").splitlines():
+        line = str(raw_line or "").strip()
+        if not line:
+            continue
+        try:
+            evt = json.loads(line)
+        except Exception:
+            continue
+        evt_type = str(evt.get("type") or "").strip()
+        if evt_type == "thread.started":
+            request_id = str(evt.get("thread_id") or request_id or "").strip() or request_id
+            continue
+        if evt_type == "item.completed":
+            item = evt.get("item") if isinstance(evt.get("item"), dict) else {}
+            if str(item.get("type") or "").strip() == "agent_message":
+                text = str(item.get("text") or "").strip()
+                if text:
+                    final_text = text
+            continue
+        if evt_type == "turn.completed":
+            usage = evt.get("usage") if isinstance(evt.get("usage"), dict) else usage
+    return final_text, usage, request_id
+
+
+def _build_codex_prompt(system_msg: str, user_msg: str) -> str:
+    return (
+        "You are PMDA's internal AI worker. Follow the instructions exactly.\n\n"
+        "System instructions:\n"
+        f"{str(system_msg or '').strip()}\n\n"
+        "Task:\n"
+        f"{str(user_msg or '').strip()}\n"
+    ).strip()
+
+
+def _materialize_codex_images(
+    temp_dir: Path,
+    image_urls: Optional[List[str]] = None,
+    image_base64: Optional[List[dict]] = None,
+) -> list[Path]:
+    out: list[Path] = []
+    seen: set[str] = set()
+    index = 0
+    for raw_url in list(image_urls or [])[:10]:
+        url = str(raw_url or "").strip()
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        index += 1
+        ext = ".img"
+        try:
+            parsed = urlparse(url)
+            suffix = Path(parsed.path or "").suffix.lower()
+            if suffix:
+                ext = suffix
+        except Exception:
+            pass
+        target = temp_dir / f"img_{index}{ext}"
+        resp = requests.get(url, timeout=20)
+        resp.raise_for_status()
+        target.write_bytes(resp.content)
+        out.append(target)
+    for item in list(image_base64 or [])[:10]:
+        if not isinstance(item, dict):
+            continue
+        blob = str(((item.get("image_url") or {}) if isinstance(item.get("image_url"), dict) else {}).get("url") or "").strip()
+        if not blob or not blob.startswith("data:"):
+            continue
+        header, _, encoded = blob.partition(",")
+        if not encoded:
+            continue
+        mime = header.partition(";")[0].replace("data:", "").strip().lower()
+        ext = ".png"
+        if "jpeg" in mime or "jpg" in mime:
+            ext = ".jpg"
+        elif "webp" in mime:
+            ext = ".webp"
+        elif "gif" in mime:
+            ext = ".gif"
+        index += 1
+        target = temp_dir / f"img_{index}{ext}"
+        target.write_bytes(base64.b64decode(encoded))
+        out.append(target)
+    return out
+
+
+def _run_openai_codex_exec(
+    *,
+    system_msg: str,
+    user_msg: str,
+    analysis_type: str,
+    request_timeout_sec: float | None = None,
+    web_search: bool = False,
+    image_urls: Optional[List[str]] = None,
+    image_base64: Optional[List[dict]] = None,
+) -> tuple[str, dict[str, Any]]:
+    codex_bin = _codex_cli_path()
+    if not codex_bin:
+        raise RuntimeError("Codex CLI is not installed in the PMDA runtime")
+    uid = _current_user_id_or_zero()
+    _write_codex_auth_json(uid, force_refresh=False)
+    codex_home = _codex_home_for_user(uid)
+    env = os.environ.copy()
+    env["CODEX_HOME"] = str(codex_home)
+    prompt = _build_codex_prompt(system_msg, user_msg)
+    request_timeout = max(
+        10.0,
+        float(request_timeout_sec if request_timeout_sec is not None else _openai_request_timeout_seconds()),
+    )
+    web_search_mode = '"live"' if web_search else '"disabled"'
+    cmd = [
+        codex_bin,
+        "exec",
+        "-C",
+        "/tmp",
+        "--skip-git-repo-check",
+        "--sandbox",
+        "read-only",
+        "--ephemeral",
+        "--json",
+        "-c",
+        "features.shell_tool=false",
+        "-c",
+        "features.apps=false",
+        "-c",
+        "history.persistence=\"none\"",
+        "-c",
+        "hide_agent_reasoning=true",
+        "-c",
+        f"web_search={web_search_mode}",
+        "-",
+    ]
+    with tempfile.TemporaryDirectory(prefix="pmda_codex_") as tmp_dir_str:
+        tmp_dir = Path(tmp_dir_str)
+        for img_path in _materialize_codex_images(tmp_dir, image_urls=image_urls, image_base64=image_base64):
+            cmd.extend(["--image", str(img_path)])
+        try:
+            proc = subprocess.run(
+                cmd,
+                input=prompt,
+                text=True,
+                capture_output=True,
+                env=env,
+                timeout=request_timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise TimeoutError(f"Codex CLI timed out after {int(request_timeout)}s ({analysis_type})") from exc
+    stdout_text = str(proc.stdout or "")
+    stderr_text = str(proc.stderr or "").strip()
+    final_text, usage, request_id = _codex_extract_final_text(stdout_text)
+    if proc.returncode != 0:
+        detail = stderr_text or stdout_text.strip().splitlines()[-1] if stdout_text.strip() else ""
+        raise RuntimeError(f"Codex CLI failed (exit {proc.returncode}){': ' + detail if detail else ''}")
+    if not final_text:
+        raise RuntimeError("Codex CLI returned empty output")
+    response_obj = {
+        "id": request_id or f"codex-exec-{uuid.uuid4().hex}",
+        "usage": _openai_usage_dict_from_codex(usage),
+        "provider": "openai-codex",
+    }
+    return final_text, response_obj
 
 
 def _resolve_openai_client_for_runtime(provider_for_usage: str, user_id: int | None) -> tuple[Any | None, str, str]:
@@ -3546,16 +3999,36 @@ def _resolve_openai_client_for_runtime(provider_for_usage: str, user_id: int | N
     if pid == "openai-codex":
         if not _openai_codex_oauth_mode_enabled():
             return None, "oauth", _provider_mode_disabled_reason("openai-codex") or "OpenAI Codex OAuth mode is disabled in Settings"
+        derived_api_key = _get_openai_codex_exchanged_api_key()
+        if derived_api_key:
+            base_url = str(_get_config_from_db("OPENAI_CODEX_BASE_URL", "") or "").strip()
+            kwargs: dict[str, Any] = {
+                "api_key": derived_api_key,
+                "timeout": _openai_request_timeout_seconds(),
+            }
+            if base_url:
+                kwargs["base_url"] = base_url
+            return OpenAI(**kwargs), "oauth", ""
         try:
-            access_token = _openai_auth_service().get_valid_access_token(user_id, provider_id="openai-codex")
-            if access_token:
+            _run_callable_bounded(
+                _openai_auth_service().get_valid_access_token_for_runtime,
+                user_id,
+                provider_id="openai-codex",
+                ensure_runtime_key=True,
+                timeout_sec=max(1.0, float(PMDA_OPENAI_CODEX_STATUS_TIMEOUT_SEC)),
+                log_prefix="[OpenAI Codex runtime]",
+            )
+            derived_api_key = _get_openai_codex_exchanged_api_key()
+            if derived_api_key:
                 base_url = str(_get_config_from_db("OPENAI_CODEX_BASE_URL", "") or "").strip()
-                kwargs: dict[str, Any] = {"api_key": access_token}
+                kwargs = {
+                    "api_key": derived_api_key,
+                    "timeout": _openai_request_timeout_seconds(),
+                }
                 if base_url:
                     kwargs["base_url"] = base_url
-                kwargs["timeout"] = _openai_request_timeout_seconds()
                 return OpenAI(**kwargs), "oauth", ""
-            oauth_reason = "OpenAI Codex OAuth returned an empty access token"
+            oauth_reason = "OpenAI Codex OAuth is connected but no runtime key was derived; reconnect Codex OAuth"
         except Exception as exc:
             oauth_reason = str(exc or "").strip() or "OpenAI Codex OAuth token is unavailable"
             if _openai_api_key_mode_enabled():
@@ -3563,7 +4036,7 @@ def _resolve_openai_client_for_runtime(provider_for_usage: str, user_id: int | N
             else:
                 logging.warning("OpenAI Codex OAuth unavailable (API-key mode disabled): %s", oauth_reason)
         if not _openai_api_key_mode_enabled():
-            return None, "oauth", oauth_reason or "OpenAI Codex OAuth is not connected for this user"
+            return None, "oauth", oauth_reason or "OpenAI Codex OAuth is connected but no usable runtime key is available; reconnect Codex OAuth"
     if not _openai_api_key_mode_enabled():
         return None, "api_key", _provider_mode_disabled_reason("openai-api") or "OpenAI API-key mode is disabled in Settings"
     if openai_client:
@@ -3621,116 +4094,149 @@ def call_ai_provider(
         )
         if not guard_allowed:
             raise RuntimeError(f"AI guardrail blocked call: {guard_reason}")
+        if provider_lower == "openai-codex":
+            out, response_obj = _run_openai_codex_exec(
+                system_msg=system_msg,
+                user_msg=user_msg,
+                analysis_type=str(analysis_type or ""),
+                request_timeout_sec=request_timeout_sec,
+                web_search=False,
+            )
+            auth_mode_for_usage = "oauth"
+            status = "completed"
+            return out
         if provider_lower in {"openai", "openai-api", "openai-codex"}:
-            client_to_use, auth_mode_for_usage, openai_runtime_reason = _resolve_openai_client_for_runtime(
-                provider_for_usage,
-                _current_user_id_or_zero(),
-            )
-            if not client_to_use:
-                raise ValueError(openai_runtime_reason or "OpenAI client not initialized")
-            request_timeout = max(
-                5.0,
-                float(request_timeout_sec if request_timeout_sec is not None else _openai_request_timeout_seconds()),
-            )
             try:
-                if (model or "").strip().lower().startswith("gpt-5") and int(max_tokens or 0) < 128:
-                    max_tokens = 128
-            except Exception:
-                pass
-            try:
-                is_gpt5 = (model or "").strip().lower().startswith("gpt-5")
-            except Exception:
-                is_gpt5 = False
-            use_responses_api = bool(auth_mode_for_usage == "oauth" or provider_lower == "openai-codex")
-            if use_responses_api:
+                client_to_use, auth_mode_for_usage, openai_runtime_reason = _resolve_openai_client_for_runtime(
+                    provider_for_usage,
+                    _current_user_id_or_zero(),
+                )
+                if not client_to_use:
+                    raise ValueError(openai_runtime_reason or "OpenAI client not initialized")
+                request_timeout = max(
+                    5.0,
+                    float(request_timeout_sec if request_timeout_sec is not None else _openai_request_timeout_seconds()),
+                )
                 try:
-                    resp = client_to_use.responses.create(
-                        model=model,
-                        input=[
-                            {"role": ("developer" if is_gpt5 else "system"), "content": system_msg},
-                            {"role": "user", "content": user_msg},
-                        ],
-                        max_output_tokens=max_tokens,
-                        timeout=request_timeout,
-                    )
-                    response_obj = resp
-                    out = _extract_text_from_openai_response(resp)
-                    if out:
-                        status = "completed"
-                        return out
-                    raise RuntimeError("OpenAI responses call returned empty output")
-                except Exception as e:
-                    # OAuth mode should not downgrade to chat.completions (often unsupported).
-                    if auth_mode_for_usage == "oauth":
-                        raise
-                    logging.debug("OpenAI responses fallback to chat.completions: %s", e)
-
-            param_style = getattr(sys.modules[__name__], "RESOLVED_PARAM_STYLE", "mct")
-            stop_ok = getattr(sys.modules[__name__], "RESOLVED_STOP_OK", True)
-            _kwargs = {
-                "model": model,
-                "messages": [
-                    {"role": ("developer" if is_gpt5 else "system"), "content": system_msg},
-                    {"role": "user", "content": user_msg},
-                ],
-                "timeout": request_timeout,
-            }
-            if is_gpt5:
-                _kwargs["reasoning_effort"] = "minimal"
-            try:
-                if stop_ok and not is_gpt5:
-                    _kwargs["stop"] = ["\n"]
-                if param_style == "mct":
-                    _kwargs["max_completion_tokens"] = max_tokens
-                else:
-                    _kwargs["max_tokens"] = max_tokens
-                resp = client_to_use.chat.completions.create(**_kwargs)
-                out = _openai_chat_text(resp)
-                response_obj = resp
-                if not out and is_gpt5 and int(max_tokens or 0) < 256:
-                    _kwargs_retry = dict(_kwargs)
-                    _kwargs_retry.pop("stop", None)
-                    _kwargs_retry.pop("max_tokens", None)
-                    _kwargs_retry["max_completion_tokens"] = 256
-                    resp2 = client_to_use.chat.completions.create(**_kwargs_retry)
-                    out = _openai_chat_text(resp2)
-                    response_obj = resp2
-                status = "completed"
-                return out
-            except Exception as e:
-                err_msg = str(e).lower()
-                if "reasoning_effort" in err_msg and ("unsupported_parameter" in err_msg or "400" in err_msg):
-                    _kwargs.pop("reasoning_effort", None)
-                    resp = client_to_use.chat.completions.create(**_kwargs)
-                    response_obj = resp
-                    status = "completed"
-                    return _openai_chat_text(resp)
-                if "unsupported_parameter" not in err_msg and "400" not in err_msg:
-                    raise
-                if "max_tokens" in err_msg and "max_completion_tokens" in err_msg:
-                    _kwargs.pop("max_tokens", None)
-                    _kwargs["max_completion_tokens"] = max_tokens
-                    resp = client_to_use.chat.completions.create(**_kwargs)
-                    response_obj = resp
-                    status = "completed"
-                    return _openai_chat_text(resp)
-                if "max_completion_tokens" in err_msg and ("max_tokens" in err_msg or "use" in err_msg):
-                    _kwargs.pop("max_completion_tokens", None)
-                    _kwargs["max_tokens"] = max_tokens
-                    resp = client_to_use.chat.completions.create(**_kwargs)
-                    response_obj = resp
-                    status = "completed"
-                    return _openai_chat_text(resp)
-                if "stop" in err_msg or "unsupported" in err_msg:
-                    _kwargs.pop("stop", None)
+                    if (model or "").strip().lower().startswith("gpt-5") and int(max_tokens or 0) < 128:
+                        max_tokens = 128
+                except Exception:
+                    pass
+                try:
+                    is_gpt5 = (model or "").strip().lower().startswith("gpt-5")
+                except Exception:
+                    is_gpt5 = False
+                use_responses_api = bool(auth_mode_for_usage == "oauth" or provider_lower == "openai-codex")
+                if use_responses_api:
                     try:
-                        sys.modules[__name__].RESOLVED_STOP_OK = False
-                    except Exception:
-                        pass
+                        resp = client_to_use.responses.create(
+                            model=model,
+                            input=[
+                                {"role": ("developer" if is_gpt5 else "system"), "content": system_msg},
+                                {"role": "user", "content": user_msg},
+                            ],
+                            max_output_tokens=max_tokens,
+                            timeout=request_timeout,
+                        )
+                        response_obj = resp
+                        out = _extract_text_from_openai_response(resp)
+                        if out:
+                            status = "completed"
+                            return out
+                        raise RuntimeError("OpenAI responses call returned empty output")
+                    except Exception as e:
+                        if auth_mode_for_usage == "oauth":
+                            raise
+                        logging.debug("OpenAI responses fallback to chat.completions: %s", e)
+
+                param_style = getattr(sys.modules[__name__], "RESOLVED_PARAM_STYLE", "mct")
+                stop_ok = getattr(sys.modules[__name__], "RESOLVED_STOP_OK", True)
+                _kwargs = {
+                    "model": model,
+                    "messages": [
+                        {"role": ("developer" if is_gpt5 else "system"), "content": system_msg},
+                        {"role": "user", "content": user_msg},
+                    ],
+                    "timeout": request_timeout,
+                }
+                if is_gpt5:
+                    _kwargs["reasoning_effort"] = "minimal"
+                try:
+                    if stop_ok and not is_gpt5:
+                        _kwargs["stop"] = ["\n"]
+                    if param_style == "mct":
+                        _kwargs["max_completion_tokens"] = max_tokens
+                    else:
+                        _kwargs["max_tokens"] = max_tokens
                     resp = client_to_use.chat.completions.create(**_kwargs)
+                    out = _openai_chat_text(resp)
                     response_obj = resp
+                    if not out and is_gpt5 and int(max_tokens or 0) < 256:
+                        _kwargs_retry = dict(_kwargs)
+                        _kwargs_retry.pop("stop", None)
+                        _kwargs_retry.pop("max_tokens", None)
+                        _kwargs_retry["max_completion_tokens"] = 256
+                        resp2 = client_to_use.chat.completions.create(**_kwargs_retry)
+                        out = _openai_chat_text(resp2)
+                        response_obj = resp2
                     status = "completed"
-                    return _openai_chat_text(resp)
+                    return out
+                except Exception as e:
+                    err_msg = str(e).lower()
+                    if "reasoning_effort" in err_msg and ("unsupported_parameter" in err_msg or "400" in err_msg):
+                        _kwargs.pop("reasoning_effort", None)
+                        resp = client_to_use.chat.completions.create(**_kwargs)
+                        response_obj = resp
+                        status = "completed"
+                        return _openai_chat_text(resp)
+                    if "unsupported_parameter" not in err_msg and "400" not in err_msg:
+                        raise
+                    if "max_tokens" in err_msg and "max_completion_tokens" in err_msg:
+                        _kwargs.pop("max_tokens", None)
+                        _kwargs["max_completion_tokens"] = max_tokens
+                        resp = client_to_use.chat.completions.create(**_kwargs)
+                        response_obj = resp
+                        status = "completed"
+                        return _openai_chat_text(resp)
+                    if "max_completion_tokens" in err_msg and ("max_tokens" in err_msg or "use" in err_msg):
+                        _kwargs.pop("max_completion_tokens", None)
+                        _kwargs["max_tokens"] = max_tokens
+                        resp = client_to_use.chat.completions.create(**_kwargs)
+                        response_obj = resp
+                        status = "completed"
+                        return _openai_chat_text(resp)
+                    if "stop" in err_msg or "unsupported" in err_msg:
+                        _kwargs.pop("stop", None)
+                        try:
+                            sys.modules[__name__].RESOLVED_STOP_OK = False
+                        except Exception:
+                            pass
+                        resp = client_to_use.chat.completions.create(**_kwargs)
+                        response_obj = resp
+                        status = "completed"
+                        return _openai_chat_text(resp)
+                    raise
+            except Exception as e:
+                if provider_lower in {"openai", "openai-api"} and _openai_error_allows_codex_fallback(e):
+                    uid = _current_user_id_or_zero()
+                    if _openai_codex_runtime_available(uid, require_token=True):
+                        logging.warning(
+                            "[AI] OpenAI API failed for %s; retrying with Codex OAuth: %s",
+                            str(analysis_type or ""),
+                            e,
+                        )
+                        out, response_obj = _run_openai_codex_exec(
+                            system_msg=system_msg,
+                            user_msg=user_msg,
+                            analysis_type=str(analysis_type or ""),
+                            request_timeout_sec=request_timeout_sec,
+                            web_search=False,
+                        )
+                        provider_for_usage = "openai-codex"
+                        auth_mode_for_usage = "oauth"
+                        status = "completed"
+                        error_msg = ""
+                        return out
                 raise
 
         if provider_lower == "anthropic":
@@ -3835,6 +4341,61 @@ def call_ai_provider_vision(
     )
     provider_for_usage = str(provider_effective or provider or "").strip()
     provider_lower = provider_for_usage.lower()
+    if provider_lower == "openai-codex":
+        started_at = time.time()
+        response_obj: Any = None
+        status = "failed"
+        error_msg = ""
+        image_inputs = 0
+        guard_allowed = True
+        guard_reason = ""
+        guard_meta: dict[str, Any] = {}
+        try:
+            guard_allowed, guard_reason, guard_meta = _ai_guardrail_precheck_safe(
+                provider=provider_for_usage,
+                model=str(model or ""),
+                endpoint_kind="vision",
+                analysis_type=str(analysis_type or ""),
+                requested_tokens=int(max_tokens or 0),
+            )
+            if not guard_allowed:
+                raise RuntimeError(f"AI guardrail blocked call: {guard_reason}")
+            image_inputs = min(10, len(list(image_urls or [])) + len(list(image_base64 or [])))
+            out, response_obj = _run_openai_codex_exec(
+                system_msg=system_msg,
+                user_msg=user_msg,
+                analysis_type=str(analysis_type or ""),
+                request_timeout_sec=None,
+                web_search=False,
+                image_urls=image_urls,
+                image_base64=image_base64,
+            )
+            status = "completed"
+            return out
+        except Exception as e:
+            error_msg = str(e)
+            raise
+        finally:
+            recorder = globals().get("record_ai_usage")
+            if callable(recorder):
+                recorder(
+                    provider=provider_for_usage,
+                    model=model,
+                    endpoint_kind="vision",
+                    analysis_type=analysis_type,
+                    started_at=started_at,
+                    status=status,
+                    response_obj=response_obj,
+                    image_inputs=image_inputs,
+                    error=error_msg,
+                    metadata={
+                        "max_tokens": int(max_tokens or 0),
+                        "auth_mode": "oauth",
+                        "guardrail_blocked": bool(not guard_allowed),
+                        "guardrail_reason": guard_reason if not guard_allowed else "",
+                        **(guard_meta or {}),
+                    },
+                )
     if provider_lower not in {"openai", "openai-api", "openai-codex"}:
         return call_ai_provider(
             provider_for_usage,
@@ -3933,6 +4494,28 @@ def call_ai_provider_vision(
     except Exception as e:
         logging.debug("[AI Vision] OpenAI vision call failed: %s", e)
         error_msg = str(e)
+        if provider_lower in {"openai", "openai-api"} and _openai_error_allows_codex_fallback(e):
+            uid = _current_user_id_or_zero()
+            if _openai_codex_runtime_available(uid, require_token=True):
+                logging.warning(
+                    "[AI Vision] OpenAI API failed for %s; retrying with Codex OAuth: %s",
+                    str(analysis_type or ""),
+                    e,
+                )
+                out, response_obj = _run_openai_codex_exec(
+                    system_msg=system_msg,
+                    user_msg=user_msg,
+                    analysis_type=str(analysis_type or ""),
+                    request_timeout_sec=None,
+                    web_search=False,
+                    image_urls=image_urls,
+                    image_base64=image_base64,
+                )
+                provider_for_usage = "openai-codex"
+                auth_mode_for_usage = "oauth"
+                status = "completed"
+                error_msg = ""
+                return out
         # Retry without reasoning_effort for models that don't support it.
         try:
             msg = str(e).lower()
@@ -5975,8 +6558,9 @@ def _insert_scan_move_row(
 
 def init_settings_db():
     """Initialize the dedicated settings.db used for all persistent configuration."""
-    con = sqlite3.connect(str(SETTINGS_DB_FILE))
+    con = sqlite3.connect(str(SETTINGS_DB_FILE), timeout=10)
     con.execute("PRAGMA journal_mode=WAL;")
+    con.execute("PRAGMA busy_timeout=5000;")
     con.commit()
     cur = con.cursor()
     cur.execute("""
@@ -6084,8 +6668,8 @@ def init_settings_db():
     ai_pref_cols = {r[1] for r in cur.fetchall()}
     for col_name, col_type in [
         ("interactive_provider_id", "TEXT NOT NULL DEFAULT 'openai-codex'"),
-        ("batch_provider_id", "TEXT NOT NULL DEFAULT 'openai-api'"),
-        ("web_search_provider_id", "TEXT NOT NULL DEFAULT 'openai-api'"),
+        ("batch_provider_id", "TEXT NOT NULL DEFAULT 'openai-codex'"),
+        ("web_search_provider_id", "TEXT NOT NULL DEFAULT 'openai-codex'"),
         ("updated_at", "INTEGER NOT NULL DEFAULT 0"),
     ]:
         if col_name not in ai_pref_cols:
@@ -7075,7 +7659,7 @@ def _ai_usage_extract_tokens(provider: str, response_obj: Any) -> tuple[dict[str
     except Exception:
         request_id = None
     try:
-        if provider_lower == "openai":
+        if provider_lower in {"openai", "openai-api", "openai-codex"}:
             usage = getattr(response_obj, "usage", None)
             if usage is None and isinstance(response_obj, dict):
                 usage = response_obj.get("usage")
@@ -7311,60 +7895,15 @@ def _ai_guard_update_scan_state_live(
 
 
 def _ai_guardrail_global_non_scan_allows() -> tuple[bool, str, dict[str, Any]]:
-    per_min = int(max(0, getattr(sys.modules[__name__], "AI_GLOBAL_MAX_CALLS_PER_MINUTE", AI_GLOBAL_MAX_CALLS_PER_MINUTE) or 0))
-    per_day = int(max(0, getattr(sys.modules[__name__], "AI_GLOBAL_MAX_CALLS_PER_DAY", AI_GLOBAL_MAX_CALLS_PER_DAY) or 0))
-    meta = {
-        "global_max_calls_per_minute": per_min,
-        "global_max_calls_per_day": per_day,
-    }
-    if per_min <= 0 and per_day <= 0:
-        return (True, "", meta)
-    now_ts = time.time()
-    con = None
-    try:
-        con = _state_connect(timeout=5)
-        cur = con.cursor()
-        if per_min > 0:
-            cur.execute(
-                """
-                SELECT COUNT(*) AS c
-                FROM ai_call_usage
-                WHERE created_at >= ?
-                  AND COALESCE(scan_id, 0) = 0
-                  AND COALESCE(origin_scan_id, 0) = 0
-                """,
-                (float(now_ts - 60.0),),
-            )
-            row_min = cur.fetchone()
-            count_min = int((row_min["c"] if row_min else 0) or 0)
-            meta["global_calls_last_minute"] = count_min
-            if count_min >= per_min:
-                return (False, f"global_non_scan_minute_cap ({count_min}/{per_min})", meta)
-        if per_day > 0:
-            cur.execute(
-                """
-                SELECT COUNT(*) AS c
-                FROM ai_call_usage
-                WHERE created_at >= ?
-                  AND COALESCE(scan_id, 0) = 0
-                  AND COALESCE(origin_scan_id, 0) = 0
-                """,
-                (float(now_ts - 86400.0),),
-            )
-            row_day = cur.fetchone()
-            count_day = int((row_day["c"] if row_day else 0) or 0)
-            meta["global_calls_last_day"] = count_day
-            if count_day >= per_day:
-                return (False, f"global_non_scan_day_cap ({count_day}/{per_day})", meta)
-    except Exception as e:
-        logging.debug("Global non-scan AI guard check failed (allowing call): %s", e)
-    finally:
-        try:
-            if con is not None:
-                con.close()
-        except Exception:
-            pass
-    return (True, "", meta)
+    return (
+        True,
+        "",
+        {
+            "global_max_calls_per_minute": 0,
+            "global_max_calls_per_day": 0,
+            "guardrail_policy": "disabled",
+        },
+    )
 
 
 def _ai_guardrail_precheck(
@@ -7382,78 +7921,34 @@ def _ai_guardrail_precheck(
         "analysis_type": _normalize_ai_analysis_type(analysis_type),
         "endpoint_kind": _ai_usage_endpoint_kind(endpoint_kind),
         "requested_tokens": int(max(0, int(requested_tokens or 0))),
+        "guardrail_policy": "disabled",
     }
-    if scan_budget_id <= 0:
-        allow_global, global_reason, global_meta = _ai_guardrail_global_non_scan_allows()
-        guard_meta.update(global_meta or {})
-        if not allow_global:
-            return (False, global_reason, guard_meta)
-        return (True, "", guard_meta)
-
-    max_calls = int(max(0, getattr(sys.modules[__name__], "AI_MAX_CALLS_PER_SCAN", AI_MAX_CALLS_PER_SCAN) or 0))
-    cooldown_sec = float(max(0.0, getattr(sys.modules[__name__], "AI_CALL_COOLDOWN_SEC", AI_CALL_COOLDOWN_SEC) or 0.0))
-    guard_meta["max_calls_per_scan"] = max_calls
-    guard_meta["cooldown_sec"] = cooldown_sec
-
-    now_ts = time.time()
-    with _ai_guard_runtime_lock:
-        rec = _ai_guard_runtime.get(int(scan_budget_id))
-        if not isinstance(rec, dict):
-            db_used, db_last_ts = _ai_guard_load_scan_snapshot(int(scan_budget_id))
-            rec = {
-                "used": int(db_used or 0),
-                "blocked": 0,
-                "last_ts": float(db_last_ts or 0.0),
-                "last_reason": "",
-                "last_block_at": 0.0,
-            }
-            _ai_guard_runtime[int(scan_budget_id)] = rec
-        used = int(rec.get("used") or 0)
-        blocked = int(rec.get("blocked") or 0)
-        last_ts = float(rec.get("last_ts") or 0.0)
-
-        if max_calls > 0 and used >= max_calls:
-            reason = f"cap_reached ({used}/{max_calls})"
-            blocked += 1
-            rec["blocked"] = blocked
-            rec["last_reason"] = reason
-            rec["last_block_at"] = now_ts
+    guard_meta.update(_ai_guardrail_global_non_scan_allows()[2] or {})
+    if scan_budget_id > 0:
+        now_ts = time.time()
+        with _ai_guard_runtime_lock:
+            rec = _ai_guard_runtime.get(int(scan_budget_id))
+            if not isinstance(rec, dict):
+                db_used, db_last_ts = _ai_guard_load_scan_snapshot(int(scan_budget_id))
+                rec = {
+                    "used": int(db_used or 0),
+                    "blocked": 0,
+                    "last_ts": float(db_last_ts or 0.0),
+                    "last_reason": "",
+                    "last_block_at": 0.0,
+                }
+                _ai_guard_runtime[int(scan_budget_id)] = rec
+            used = int(rec.get("used") or 0) + 1
+            blocked = int(rec.get("blocked") or 0)
+            rec["used"] = used
+            rec["last_ts"] = now_ts
+            rec["last_reason"] = ""
+            rec["last_block_at"] = 0.0
             _ai_guard_update_scan_state_live(
                 scan_budget_id=int(scan_budget_id),
                 used=used,
                 blocked=blocked,
-                reason=reason,
-                blocked_at=now_ts,
             )
-            return (False, reason, guard_meta)
-
-        if cooldown_sec > 0.0 and last_ts > 0.0:
-            delta = now_ts - last_ts
-            if delta < cooldown_sec:
-                wait_sec = max(0.0, cooldown_sec - delta)
-                reason = f"cooldown_active ({wait_sec:.2f}s)"
-                blocked += 1
-                rec["blocked"] = blocked
-                rec["last_reason"] = reason
-                rec["last_block_at"] = now_ts
-                _ai_guard_update_scan_state_live(
-                    scan_budget_id=int(scan_budget_id),
-                    used=used,
-                    blocked=blocked,
-                    reason=reason,
-                    blocked_at=now_ts,
-                )
-                return (False, reason, guard_meta)
-
-        used += 1
-        rec["used"] = used
-        rec["last_ts"] = now_ts
-        _ai_guard_update_scan_state_live(
-            scan_budget_id=int(scan_budget_id),
-            used=used,
-            blocked=blocked,
-        )
-
     return (True, "", guard_meta)
 
 
@@ -12820,7 +13315,7 @@ def _rebuild_files_library_index_for_artist(
             conn = _files_pg_connect()
             if conn is not None:
                 try:
-                    artist_norm = " ".join(artist_name.split()).lower()
+                    artist_norm = _norm_artist_key(artist_name)
                     artist_norm_alt = norm_album(artist_name or "")
                     with conn.transaction():
                         with conn.cursor() as cur:
@@ -13295,7 +13790,7 @@ def _rebuild_files_library_index(reason: str = "manual", wait_if_running: bool =
                     fallback=folder.name.replace("_", " ").strip() or "Unknown Album",
                 )
                 label = _pick_album_label_from_tag_dicts(tag_dicts)
-                artist_norm = " ".join((artist_name or "").split()).lower() or "unknown artist"
+                artist_norm = _norm_artist_key(artist_name) or "unknown artist"
                 title_norm = norm_album_for_dedup(album_title, normalize_parenthetical=True)
                 date_text = (first_tags.get("date") or first_tags.get("year") or "").strip()
                 year = _parse_int_loose((date_text[:4] if date_text else first_tags.get("year")), 0) or None
@@ -13962,6 +14457,31 @@ def _is_profile_stale(updated_at) -> bool:
     return (time.time() - ts) > _FILES_PROFILE_MAX_AGE_SEC
 
 
+def _profile_title_norm_variants(*values: str) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+
+    def _add(raw: str) -> None:
+        text = str(raw or "").strip()
+        if not text or text in seen:
+            return
+        seen.add(text)
+        out.append(text)
+
+    for raw in values:
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        _add(text)
+        _add(norm_album(text))
+        _add(norm_album_for_dedup(text, normalize_parenthetical=True))
+        if "…" in text:
+            _add(text.replace("…", "..."))
+        if "..." in text:
+            _add(text.replace("...", "…"))
+    return out
+
+
 def _files_get_artist_profile_cached(artist_name: str, artist_norm: str) -> dict:
     if not artist_norm:
         return {}
@@ -14014,7 +14534,13 @@ def _files_get_artist_profile_cached(artist_name: str, artist_norm: str) -> dict
 def _files_get_album_profiles_cached(artist_norm: str, title_norms: list[str]) -> dict[str, dict]:
     if not artist_norm or not title_norms:
         return {}
-    cache_key = f"library:album_profiles:{artist_norm}:{hashlib.sha1('|'.join(sorted(set(title_norms))).encode('utf-8', errors='ignore')).hexdigest()}"
+    expanded_title_norms: list[str] = []
+    for raw_norm in (title_norms or []):
+        expanded_title_norms.extend(_profile_title_norm_variants(raw_norm))
+    title_norms_clean = list(dict.fromkeys([t for t in expanded_title_norms if t]))
+    if not title_norms_clean:
+        return {}
+    cache_key = f"library:album_profiles:{artist_norm}:{hashlib.sha1('|'.join(sorted(set(title_norms_clean))).encode('utf-8', errors='ignore')).hexdigest()}"
     cached = _files_cache_get_json(cache_key)
     if isinstance(cached, dict):
         return cached
@@ -14022,9 +14548,6 @@ def _files_get_album_profiles_cached(artist_norm: str, title_norms: list[str]) -
     if conn is None:
         return {}
     try:
-        title_norms_clean = [t for t in title_norms if t]
-        if not title_norms_clean:
-            return {}
         placeholders = ",".join(["%s"] * len(title_norms_clean))
         with conn.cursor() as cur:
             cur.execute(
@@ -14050,6 +14573,9 @@ def _files_get_album_profiles_cached(artist_norm: str, title_norms: list[str]) -
                 "updated_at": int(_dt_to_epoch(row[5])) if row[5] else 0,
                 "stale": _is_profile_stale(row[5]),
             }
+            for alt_key in _profile_title_norm_variants(str(row[0] or "")):
+                if alt_key not in out:
+                    out[alt_key] = out[str(row[0] or "")]
         _files_cache_set_json(cache_key, out, ttl=1800)
         return out
     except Exception:
@@ -14692,7 +15218,7 @@ def _run_files_profile_enrichment_job(
                     du = _first_non_empty_artist_image(_fetch_artist_image_discogs)
                     if du:
                         candidates.append(("discogs", du))
-                    wu = _first_non_empty_artist_image(lambda n: _fetch_artist_image_web(n, allow_ai_fallback=False))
+                    wu = _first_non_empty_artist_image(lambda n: _fetch_artist_image_web(n, allow_ai_fallback=True))
                     if wu:
                         candidates.append(("web", wu))
 
@@ -14822,7 +15348,10 @@ def _run_files_profile_enrichment_job(
                         if du:
                             candidates_sim.append(("discogs", du))
                         try:
-                            wu = (_fetch_artist_image_web(sname) or "").strip()
+                            # Similar-artist warming must never starve the core scan pipeline.
+                            # Keep this strictly provider-driven; interactive/manual flows can still
+                            # use AI-backed research on demand.
+                            wu = (_fetch_artist_image_web(sname, allow_ai_fallback=False) or "").strip()
                         except Exception:
                             wu = ""
                         if wu:
@@ -15196,7 +15725,7 @@ def _enqueue_files_similar_images_warm(artist_norm: str, names: list[str]) -> bo
     return True
 
 
-_FILES_PROFILE_BACKFILL_ON_REBUILD = True
+_FILES_PROFILE_BACKFILL_ON_REBUILD = False
 _files_profile_backfill_lock = threading.Lock()
 _files_profile_backfill_state: dict = {
     "running": False,
@@ -15344,100 +15873,134 @@ def call_ai_provider_longform(
         )
         if not guard_allowed:
             raise RuntimeError(f"AI guardrail blocked call: {guard_reason}")
+        if provider_lower == "openai-codex":
+            out, response_obj = _run_openai_codex_exec(
+                system_msg=system_msg,
+                user_msg=user_msg,
+                analysis_type=str(analysis_type or ""),
+                request_timeout_sec=request_timeout_sec,
+                web_search=False,
+            )
+            auth_mode_for_usage = "oauth"
+            status = "completed"
+            return out
         if provider_lower in {"openai", "openai-api", "openai-codex"}:
-            client_to_use, auth_mode_for_usage, openai_runtime_reason = _resolve_openai_client_for_runtime(
-                provider_for_usage,
-                _current_user_id_or_zero(),
-            )
-            if not client_to_use:
-                raise ValueError(openai_runtime_reason or "OpenAI client not initialized")
-            request_timeout = max(
-                5.0,
-                float(request_timeout_sec if request_timeout_sec is not None else _openai_request_timeout_seconds()),
-            )
             try:
-                is_gpt5 = (model or "").strip().lower().startswith("gpt-5")
-            except Exception:
-                is_gpt5 = False
-            try:
-                if is_gpt5 and int(max_tokens or 0) < 256:
-                    max_tokens = 256
-            except Exception:
-                pass
-            use_responses_api = bool(auth_mode_for_usage == "oauth" or provider_lower == "openai-codex")
-            if use_responses_api:
+                client_to_use, auth_mode_for_usage, openai_runtime_reason = _resolve_openai_client_for_runtime(
+                    provider_for_usage,
+                    _current_user_id_or_zero(),
+                )
+                if not client_to_use:
+                    raise ValueError(openai_runtime_reason or "OpenAI client not initialized")
+                request_timeout = max(
+                    5.0,
+                    float(request_timeout_sec if request_timeout_sec is not None else _openai_request_timeout_seconds()),
+                )
                 try:
-                    resp = client_to_use.responses.create(
-                        model=model,
-                        input=[
-                            {"role": ("developer" if is_gpt5 else "system"), "content": system_msg},
-                            {"role": "user", "content": user_msg},
-                        ],
-                        max_output_tokens=max_tokens,
-                        timeout=request_timeout,
-                    )
-                    response_obj = resp
-                    out = _extract_text_from_openai_response(resp)
-                    if out:
-                        status = "completed"
-                        return out
-                    raise RuntimeError("OpenAI responses call returned empty output")
-                except Exception as e:
-                    if auth_mode_for_usage == "oauth":
-                        raise
-                    logging.debug("OpenAI responses longform fallback to chat.completions: %s", e)
+                    is_gpt5 = (model or "").strip().lower().startswith("gpt-5")
+                except Exception:
+                    is_gpt5 = False
+                try:
+                    if is_gpt5 and int(max_tokens or 0) < 256:
+                        max_tokens = 256
+                except Exception:
+                    pass
+                use_responses_api = bool(auth_mode_for_usage == "oauth" or provider_lower == "openai-codex")
+                if use_responses_api:
+                    try:
+                        resp = client_to_use.responses.create(
+                            model=model,
+                            input=[
+                                {"role": ("developer" if is_gpt5 else "system"), "content": system_msg},
+                                {"role": "user", "content": user_msg},
+                            ],
+                            max_output_tokens=max_tokens,
+                            timeout=request_timeout,
+                        )
+                        response_obj = resp
+                        out = _extract_text_from_openai_response(resp)
+                        if out:
+                            status = "completed"
+                            return out
+                        raise RuntimeError("OpenAI responses call returned empty output")
+                    except Exception as e:
+                        if auth_mode_for_usage == "oauth":
+                            raise
+                        logging.debug("OpenAI responses longform fallback to chat.completions: %s", e)
 
-            param_style = getattr(sys.modules[__name__], "RESOLVED_PARAM_STYLE", "mct")
-            _kwargs = {
-                "model": model,
-                "messages": [
-                    {"role": ("developer" if is_gpt5 else "system"), "content": system_msg},
-                    {"role": "user", "content": user_msg},
-                ],
-                "timeout": request_timeout,
-            }
-            if is_gpt5:
-                _kwargs["reasoning_effort"] = "minimal"
-            if param_style == "mct":
-                _kwargs["max_completion_tokens"] = max_tokens
-            else:
-                _kwargs["max_tokens"] = max_tokens
-            try:
-                resp = client_to_use.chat.completions.create(**_kwargs)
-                out = _openai_chat_text(resp)
-                response_obj = resp
-                if not out and is_gpt5:
-                    _kwargs_retry = dict(_kwargs)
-                    _kwargs_retry.pop("max_tokens", None)
-                    _kwargs_retry["max_completion_tokens"] = max(512, int(max_tokens or 0) * 2)
-                    resp2 = client_to_use.chat.completions.create(**_kwargs_retry)
-                    out = _openai_chat_text(resp2)
-                    response_obj = resp2
-                status = "completed"
-                return out
-            except Exception as e:
-                err_msg = str(e).lower()
-                if "reasoning_effort" in err_msg and ("unsupported_parameter" in err_msg or "400" in err_msg):
-                    _kwargs.pop("reasoning_effort", None)
+                param_style = getattr(sys.modules[__name__], "RESOLVED_PARAM_STYLE", "mct")
+                _kwargs = {
+                    "model": model,
+                    "messages": [
+                        {"role": ("developer" if is_gpt5 else "system"), "content": system_msg},
+                        {"role": "user", "content": user_msg},
+                    ],
+                    "timeout": request_timeout,
+                }
+                if is_gpt5:
+                    _kwargs["reasoning_effort"] = "minimal"
+                if param_style == "mct":
+                    _kwargs["max_completion_tokens"] = max_tokens
+                else:
+                    _kwargs["max_tokens"] = max_tokens
+                try:
                     resp = client_to_use.chat.completions.create(**_kwargs)
+                    out = _openai_chat_text(resp)
                     response_obj = resp
+                    if not out and is_gpt5:
+                        _kwargs_retry = dict(_kwargs)
+                        _kwargs_retry.pop("max_tokens", None)
+                        _kwargs_retry["max_completion_tokens"] = max(512, int(max_tokens or 0) * 2)
+                        resp2 = client_to_use.chat.completions.create(**_kwargs_retry)
+                        out = _openai_chat_text(resp2)
+                        response_obj = resp2
                     status = "completed"
-                    return _openai_chat_text(resp)
-                if "unsupported_parameter" in err_msg or "400" in err_msg:
-                    if "max_completion_tokens" in err_msg and ("max_tokens" in err_msg or "use" in err_msg):
-                        _kwargs.pop("max_completion_tokens", None)
-                        _kwargs["max_tokens"] = max_tokens
+                    return out
+                except Exception as e:
+                    err_msg = str(e).lower()
+                    if "reasoning_effort" in err_msg and ("unsupported_parameter" in err_msg or "400" in err_msg):
+                        _kwargs.pop("reasoning_effort", None)
                         resp = client_to_use.chat.completions.create(**_kwargs)
                         response_obj = resp
                         status = "completed"
                         return _openai_chat_text(resp)
-                    if "max_tokens" in err_msg and "max_completion_tokens" in err_msg:
-                        _kwargs.pop("max_tokens", None)
-                        _kwargs["max_completion_tokens"] = max_tokens
-                        resp = client_to_use.chat.completions.create(**_kwargs)
-                        response_obj = resp
+                    if "unsupported_parameter" in err_msg or "400" in err_msg:
+                        if "max_completion_tokens" in err_msg and ("max_tokens" in err_msg or "use" in err_msg):
+                            _kwargs.pop("max_completion_tokens", None)
+                            _kwargs["max_tokens"] = max_tokens
+                            resp = client_to_use.chat.completions.create(**_kwargs)
+                            response_obj = resp
+                            status = "completed"
+                            return _openai_chat_text(resp)
+                        if "max_tokens" in err_msg and "max_completion_tokens" in err_msg:
+                            _kwargs.pop("max_tokens", None)
+                            _kwargs["max_completion_tokens"] = max_tokens
+                            resp = client_to_use.chat.completions.create(**_kwargs)
+                            response_obj = resp
+                            status = "completed"
+                            return _openai_chat_text(resp)
+                    raise
+            except Exception as e:
+                if provider_lower in {"openai", "openai-api"} and _openai_error_allows_codex_fallback(e):
+                    uid = _current_user_id_or_zero()
+                    if _openai_codex_runtime_available(uid, require_token=True):
+                        logging.warning(
+                            "[AI] OpenAI API longform failed for %s; retrying with Codex OAuth: %s",
+                            str(analysis_type or ""),
+                            e,
+                        )
+                        out, response_obj = _run_openai_codex_exec(
+                            system_msg=system_msg,
+                            user_msg=user_msg,
+                            analysis_type=str(analysis_type or ""),
+                            request_timeout_sec=request_timeout_sec,
+                            web_search=False,
+                        )
+                        provider_for_usage = "openai-codex"
+                        auth_mode_for_usage = "oauth"
                         status = "completed"
-                        return _openai_chat_text(resp)
+                        error_msg = ""
+                        return out
                 raise
 
         if provider_lower == "anthropic":
@@ -15808,7 +16371,7 @@ def _assistant_ingest_artist_rag(conn, artist_id: int) -> dict:
         if not row:
             return {}
         artist_name = (row[1] or "").strip()
-        artist_norm = (row[2] or "").strip() or " ".join((artist_name or "").split()).lower()
+        artist_norm = (row[2] or "").strip() or _norm_artist_key(artist_name)
 
         cur.execute(
             """
@@ -20748,6 +21311,54 @@ def _detect_gaps_in_indices(indices: list) -> tuple[bool, int, list]:
     return True, actual_count, gaps
 
 
+def _edition_exact_expected_track_count(edition: dict | None, mb_hint: dict | None = None) -> int:
+    e = edition if isinstance(edition, dict) else {}
+    for source in (mb_hint, e.get("rg_info"), e.get("_strict_provider_payload"), e.get("_lookup_identity_hint")):
+        if not isinstance(source, dict):
+            continue
+        try:
+            count = int(source.get("track_count") or 0)
+        except Exception:
+            count = 0
+        if count > 0:
+            return count
+        for key in ("track_titles", "tracklist", "tracks"):
+            value = source.get(key)
+            if isinstance(value, list) and value:
+                return len(value)
+    try:
+        count = int(e.get("_expected_track_count") or 0)
+    except Exception:
+        count = 0
+    return max(0, count)
+
+
+def _edition_missing_indices_exact(edition: dict | None, expected_count: int, actual_count: int) -> list[int]:
+    expected = max(0, int(expected_count or 0))
+    actual = max(0, int(actual_count or 0))
+    if expected <= 0:
+        return []
+    e = edition if isinstance(edition, dict) else {}
+    seen: set[int] = set()
+    for track in (e.get("tracks") or []):
+        try:
+            if isinstance(track, dict):
+                idx = int(track.get("idx") or track.get("index") or track.get("track_num") or track.get("track") or 0)
+            else:
+                idx = int(getattr(track, "idx", 0) or 0)
+        except Exception:
+            idx = 0
+        if idx > 0:
+            seen.add(idx)
+    if seen and expected <= 500:
+        missing = [i for i in range(1, expected + 1) if i not in seen]
+        if missing:
+            return missing[:500]
+    if expected > actual:
+        return list(range(actual + 1, min(expected, actual + 500) + 1))
+    return []
+
+
 def _incomplete_album_disk_crosscheck(
     db_conn,
     artist: str,
@@ -21390,11 +22001,99 @@ def _search_mb_rg_candidates(artist: str, release_query: str, strict: bool) -> L
     result = musicbrainzngs.search_release_groups(
         artist=artist,
         release=release_query,
-        limit=15,
+        limit=50,
         strict=strict
     )
     logging.debug("[MusicBrainz Search] artist=%r release=%r strict=%s -> %d results", artist, release_query, strict, len(result.get('release-group-list', [])))
     return result.get('release-group-list', [])
+
+
+def _prefilter_mb_release_group_candidates(
+    artist_name: str,
+    album_title: str,
+    candidates: List[dict],
+) -> List[dict]:
+    """
+    Reduce obviously irrelevant MusicBrainz release-group candidates before fetching details.
+    This is not a hard cap: we keep every candidate that still looks title-relevant, and we
+    only skip candidates that are clearly unrelated to the requested album title.
+    """
+    if not candidates:
+        return []
+    local_title_raw = str(album_title or "").strip()
+    local_title_strict = _normalize_identity_album_strict(local_title_raw)
+    local_title_loose = norm_album(local_title_raw or "")
+    local_artist_raw = str(artist_name or "").strip()
+
+    exact: list[dict] = []
+    contains: list[dict] = []
+    fuzzy: list[dict] = []
+    fallback: list[dict] = []
+
+    for rg in candidates:
+        if not isinstance(rg, dict):
+            continue
+        cand = dict(rg)
+        cand_title = str(cand.get("title") or "").strip()
+        cand_title_strict = _normalize_identity_album_strict(cand_title)
+        cand_title_loose = norm_album(cand_title or "")
+        title_score = float(_provider_identity_text_score(local_title_raw, cand_title))
+        artist_names = _extract_mb_artist_names(cand)
+        artist_score = 0.0
+        for nm in artist_names:
+            artist_score = max(artist_score, float(_provider_identity_text_score(local_artist_raw, nm)))
+        cand["_pmda_prefilter_title_score"] = title_score
+        cand["_pmda_prefilter_artist_score"] = artist_score
+        cand["_pmda_prefilter_exact"] = False
+        cand["_pmda_prefilter_bucket"] = "fallback"
+
+        exact_match = bool(local_title_strict and cand_title_strict and cand_title_strict == local_title_strict)
+        contains_match = bool(
+            not exact_match
+            and local_title_loose
+            and cand_title_loose
+            and (local_title_loose in cand_title_loose or cand_title_loose in local_title_loose)
+        )
+        fuzzy_match = bool(
+            not exact_match
+            and not contains_match
+            and (
+                title_score >= 0.78
+                or (title_score >= 0.68 and artist_score >= 0.80)
+            )
+        )
+
+        if exact_match:
+            cand["_pmda_prefilter_exact"] = True
+            cand["_pmda_prefilter_bucket"] = "exact"
+            exact.append(cand)
+        elif contains_match:
+            cand["_pmda_prefilter_bucket"] = "contains"
+            contains.append(cand)
+        elif fuzzy_match:
+            cand["_pmda_prefilter_bucket"] = "fuzzy"
+            fuzzy.append(cand)
+        else:
+            fallback.append(cand)
+
+    sort_key = lambda item: (
+        1 if bool(item.get("_pmda_prefilter_exact")) else 0,
+        float(item.get("_pmda_prefilter_title_score") or 0.0),
+        float(item.get("_pmda_prefilter_artist_score") or 0.0),
+    )
+    exact.sort(key=sort_key, reverse=True)
+    contains.sort(key=sort_key, reverse=True)
+    fuzzy.sort(key=sort_key, reverse=True)
+    fallback.sort(key=sort_key, reverse=True)
+
+    if exact:
+        # Keep exact-title candidates and a tiny amount of related variants for legitimate editions.
+        return exact + contains[:2]
+    if contains:
+        return contains + fuzzy[:2]
+    if fuzzy:
+        return fuzzy
+    return []
 
 
 def fetch_all_mb_release_groups_for_artist(artist_name: str) -> List[dict]:
@@ -21626,12 +22325,13 @@ def _fetch_album_provider_fallbacks_parallel(artist: str, album_title: str) -> d
 def _normalize_identity_text_strict(value: str | None) -> str:
     """
     Normalize identity text for strict equality checks.
-    Keeps unicode letters but removes punctuation/extra spaces and decodes HTML entities.
+    Accent-insensitive, punctuation-insensitive normalization for deterministic equality checks.
     """
     raw = html.unescape(str(value or ""))
     if not raw:
         return ""
-    text = unicodedata.normalize("NFKC", raw).casefold().strip()
+    text = unicodedata.normalize("NFKD", unicodedata.normalize("NFKC", raw))
+    text = "".join(ch for ch in text if not unicodedata.combining(ch)).casefold().strip()
     if not text:
         return ""
     text = text.replace("&", " and ").replace("_", " ")
@@ -22715,6 +23415,124 @@ def _identity_text_is_generic(value: str) -> bool:
     return raw in generic_tokens
 
 
+def _edition_missing_required_tags_set(edition: dict | None) -> set[str]:
+    raw = []
+    if isinstance(edition, dict):
+        raw = edition.get("missing_required_tags") or []
+    if isinstance(raw, tuple):
+        raw = list(raw)
+    if not isinstance(raw, list):
+        raw = []
+    out: set[str] = set()
+    for item in raw:
+        txt = str(item or "").strip().lower()
+        if txt:
+            out.add(txt)
+    return out
+
+
+def _prefer_identity_hint_value(
+    *,
+    current_value: str,
+    hinted_value: str,
+    field_name: str,
+    missing_required: set[str],
+    folder_name: str = "",
+) -> str:
+    current_txt = str(current_value or "").strip()
+    hinted_txt = str(hinted_value or "").strip()
+    if not hinted_txt or _identity_text_is_generic(hinted_txt):
+        return current_txt
+    if _identity_text_is_generic(current_txt):
+        return hinted_txt
+    if field_name in missing_required:
+        return hinted_txt
+    if field_name == "album":
+        folder_txt = _sanitize_album_title_display(str(folder_name or "").replace("_", " ").strip())
+        if folder_txt:
+            current_norm = _normalize_identity_text_strict(current_txt)
+            folder_norm = _normalize_identity_text_strict(folder_txt)
+            if current_norm and folder_norm and current_norm == folder_norm:
+                return hinted_txt
+    return current_txt
+
+
+def _resolve_edition_display_identity(
+    edition: dict | None,
+    *,
+    default_artist: str = "",
+    default_title: str = "",
+    folder_name: str = "",
+) -> tuple[str, str]:
+    e = edition if isinstance(edition, dict) else {}
+    hint = e.get("_lookup_identity_hint") if isinstance(e.get("_lookup_identity_hint"), dict) else {}
+    missing_required = _edition_missing_required_tags_set(e)
+    current_artist = str(
+        e.get("artist")
+        or e.get("artist_name")
+        or default_artist
+        or ""
+    ).strip()
+    current_title = str(
+        e.get("title_raw")
+        or e.get("album_title")
+        or default_title
+        or ""
+    ).strip()
+    hinted_artist = str(
+        e.get("_lookup_artist_name")
+        or hint.get("artist")
+        or ""
+    ).strip()
+    hinted_album = str(
+        e.get("_lookup_album_title")
+        or hint.get("album")
+        or ""
+    ).strip()
+    artist_resolved = _prefer_identity_hint_value(
+        current_value=current_artist,
+        hinted_value=hinted_artist,
+        field_name="artist",
+        missing_required=missing_required,
+        folder_name=folder_name,
+    )
+    album_resolved = _prefer_identity_hint_value(
+        current_value=current_title,
+        hinted_value=hinted_album,
+        field_name="album",
+        missing_required=missing_required,
+        folder_name=folder_name,
+    )
+    artist_final = artist_resolved or current_artist or default_artist or "Unknown Artist"
+    album_final = album_resolved or current_title or default_title or "Unknown Album"
+    return (artist_final.strip(), _sanitize_album_title_display(album_final))
+
+
+def _apply_resolved_identity_to_edition(
+    edition: dict | None,
+    *,
+    default_artist: str = "",
+    default_title: str = "",
+    folder_name: str = "",
+) -> tuple[str, str]:
+    if not isinstance(edition, dict):
+        return (
+            str(default_artist or "").strip() or "Unknown Artist",
+            _sanitize_album_title_display(str(default_title or "").strip() or "Unknown Album"),
+        )
+    artist_final, album_final = _resolve_edition_display_identity(
+        edition,
+        default_artist=default_artist,
+        default_title=default_title,
+        folder_name=folder_name,
+    )
+    edition["artist"] = artist_final
+    edition["artist_name"] = artist_final
+    edition["title_raw"] = album_final
+    edition["album_title"] = album_final
+    return (artist_final, album_final)
+
+
 def _album_hint_from_track_titles(track_titles: list[str]) -> str:
     """
     Extract a likely album-title prefix from filename-like track titles:
@@ -22872,16 +23690,18 @@ def search_mb_release_group_by_metadata(
     if album_folder is not None and not isinstance(album_folder, Path):
         album_folder = Path(album_folder) if album_folder else None
     mb_search_started = time.perf_counter()
-    mb_budget_sec = max(10, int(getattr(sys.modules[__name__], "MB_SEARCH_ALBUM_TIMEOUT_SEC", 20) or 20))
-    candidate_fetch_limit = max(1, int(getattr(sys.modules[__name__], "MB_CANDIDATE_FETCH_LIMIT", 4) or 4))
-    tracklist_fetch_limit = max(0, int(getattr(sys.modules[__name__], "MB_TRACKLIST_FETCH_LIMIT", 2) or 2))
-    fast_fallback_mode = bool(getattr(sys.modules[__name__], "MB_FAST_FALLBACK_MODE", True))
+    mb_budget_sec = max(0, int(getattr(sys.modules[__name__], "MB_SEARCH_ALBUM_TIMEOUT_SEC", 0) or 0))
+    candidate_fetch_limit = max(0, int(getattr(sys.modules[__name__], "MB_CANDIDATE_FETCH_LIMIT", 0) or 0))
+    tracklist_fetch_limit = max(0, int(getattr(sys.modules[__name__], "MB_TRACKLIST_FETCH_LIMIT", 0) or 0))
+    fast_fallback_mode = bool(getattr(sys.modules[__name__], "MB_FAST_FALLBACK_MODE", False))
     provider_fallback_cache: dict | None = None
     use_ai_for_mb_match = bool(getattr(sys.modules[__name__], "USE_AI_FOR_MB_MATCH", False))
     use_ai_for_mb_verify = bool(getattr(sys.modules[__name__], "USE_AI_FOR_MB_VERIFY", False))
     use_ai_for_mb = bool(use_ai_for_mb_match or use_ai_for_mb_verify)
 
     def _mb_budget_exceeded() -> bool:
+        if mb_budget_sec <= 0:
+            return False
         return (time.perf_counter() - mb_search_started) >= mb_budget_sec
 
     def _provider_fallbacks() -> dict:
@@ -22960,6 +23780,32 @@ def search_mb_release_group_by_metadata(
             if raw_clean:
                 _run_search_and_browse(raw_clean)
 
+        raw_candidate_count = len(candidates)
+        if candidates:
+            prefiltered_candidates = _prefilter_mb_release_group_candidates(
+                artist_name=artist,
+                album_title=title_raw or album_norm or "",
+                candidates=candidates,
+            )
+            if prefiltered_candidates:
+                if len(prefiltered_candidates) != raw_candidate_count:
+                    logging.info(
+                        "[MusicBrainz] %s – %r: prefiltered %d/%d candidate(s) before detailed fetch",
+                        artist,
+                        title_raw or album_norm or "?",
+                        len(prefiltered_candidates),
+                        raw_candidate_count,
+                    )
+                candidates = prefiltered_candidates
+            else:
+                logging.info(
+                    "[MusicBrainz] %s – %r: no title-relevant candidate remained after prefilter (%d raw candidate(s)); switching to provider fallback flow",
+                    artist,
+                    title_raw or album_norm or "?",
+                    raw_candidate_count,
+                )
+                candidates = []
+
         if candidates:
             letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
             lines = [
@@ -22975,7 +23821,7 @@ def search_mb_release_group_by_metadata(
         # Intentionally avoid an "AI-first" pick here. We fetch a limited number of candidates and
         # only use AI later if disambiguation is genuinely ambiguous.
 
-        if len(candidates) > candidate_fetch_limit:
+        if candidate_fetch_limit > 0 and len(candidates) > candidate_fetch_limit:
             logging.info(
                 "[MusicBrainz] %s – %r: %d candidate(s); limiting detailed fetch to top %d for speed",
                 artist,
@@ -22984,7 +23830,8 @@ def search_mb_release_group_by_metadata(
                 candidate_fetch_limit,
             )
 
-        for idx, rg in enumerate(candidates[:candidate_fetch_limit]):
+        candidates_to_fetch = candidates[:candidate_fetch_limit] if candidate_fetch_limit > 0 else candidates
+        for idx, rg in enumerate(candidates_to_fetch):
             if _mb_budget_exceeded():
                 logging.info(
                     "[MusicBrainz] %s – %r: MB budget reached after %.1fs (budget=%ds); stopping detailed candidate fetch and using fallback flow",
@@ -23039,7 +23886,7 @@ def search_mb_release_group_by_metadata(
                 }
                 # Optionally fetch recording-level track titles for deterministic tracklist crosschecks
                 # (no LLM cost, but this endpoint is heavier; controlled by MB_TRACKLIST_FETCH_LIMIT).
-                if info.get('release-list') and idx < tracklist_fetch_limit and tracks:
+                if info.get('release-list') and tracks and (tracklist_fetch_limit <= 0 or idx < tracklist_fetch_limit):
                     first_release_id = info['release-list'][0].get('id')
                     if first_release_id:
                         try:
@@ -25018,6 +25865,12 @@ def scan_duplicates(
                                 e["_lookup_artist_name"] = hinted_artist
                                 e["_lookup_album_title"] = hinted_album
                                 e["_lookup_identity_hint"] = ai_identity_hint
+                                _apply_resolved_identity_to_edition(
+                                    e,
+                                    default_artist=artist,
+                                    default_title=title_raw_mb or album_norm,
+                                    folder_name=(Path(album_folder_arg).name if album_folder_arg else ""),
+                                )
                                 log_mb(
                                     "Album %s – \"%s\": AI local-context identity hint => artist=%r album=%r (confidence=%d)",
                                     artist,
@@ -25630,6 +26483,21 @@ def scan_duplicates(
                 e["tracks"],
                 mb_hint,
             )
+            strict_reject_reason = str(e.get("strict_reject_reason") or "").strip().lower()
+            if (not is_broken) and strict_reject_reason == "track_count_mismatch":
+                expected_exact = _edition_exact_expected_track_count(e, mb_hint=mb_hint)
+                if expected_exact > int(actual_count or 0):
+                    is_broken = True
+                    expected_count = expected_exact
+                    missing_indices = _edition_missing_indices_exact(e, expected_exact, int(actual_count or 0))
+                    logging.info(
+                        "[Artist %s] Album %s forced incomplete from strict track-count mismatch: actual=%s expected=%s missing=%s",
+                        artist,
+                        e.get("album_id"),
+                        actual_count,
+                        expected_exact,
+                        missing_indices[:24],
+                    )
             e['is_broken'] = is_broken
             if is_broken:
                 e['expected_track_count'] = expected_count
@@ -26502,6 +27370,18 @@ def save_scan_editions_to_db(scan_id: int, all_editions_by_artist: Dict[str, Lis
         for e in editions_list:
             folder = e.get("folder")
             meta = e.get("meta", {})
+            folder_name = ""
+            if folder:
+                try:
+                    folder_name = (Path(folder).name or "").strip()
+                except Exception:
+                    folder_name = ""
+            artist_resolved, title_resolved = _apply_resolved_identity_to_edition(
+                e,
+                default_artist=str(artist or ""),
+                default_title=str(e.get("title_raw") or e.get("album_title") or ""),
+                folder_name=folder_name,
+            )
             # has_cover: same logic as stats loop
             has_cover = 0
             if folder:
@@ -26596,9 +27476,9 @@ def save_scan_editions_to_db(scan_id: int, all_editions_by_artist: Dict[str, Lis
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 scan_id,
-                artist,
+                artist_resolved,
                 e.get("album_id"),
-                e.get("title_raw", ""),
+                title_resolved,
                 folder_str,
                 fmt_text,
                 e.get("br") or 0,
@@ -26719,6 +27599,18 @@ def save_scan_editions_artist_to_db(scan_id: int, artist_name: str, editions_lis
     for e in editions_list:
         folder = e.get("folder")
         meta = dict(e.get("meta", {}))
+        folder_name = ""
+        if folder:
+            try:
+                folder_name = (Path(folder).name or "").strip()
+            except Exception:
+                folder_name = ""
+        artist_resolved, title_resolved = _apply_resolved_identity_to_edition(
+            e,
+            default_artist=str(artist_name or ""),
+            default_title=str(e.get("title_raw") or e.get("album_title") or ""),
+            folder_name=folder_name,
+        )
         if e.get("primary_metadata_source"):
             meta["primary_metadata_source"] = e["primary_metadata_source"]
         if e.get("mb_submission_payload"):
@@ -26783,9 +27675,9 @@ def save_scan_editions_artist_to_db(scan_id: int, artist_name: str, editions_lis
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             scan_id,
-            artist_name,
+            artist_resolved,
             e.get("album_id"),
-            e.get("title_raw", ""),
+            title_resolved,
             folder_str,
             fmt_text,
             e.get("br") or 0,
@@ -28354,6 +29246,12 @@ def _refresh_files_album_scan_cache_from_editions(editions: list[dict], scan_id:
         has_artist_image = _artist_folder_has_image(folder.parent if folder.parent else folder)
         identity_fields = _extract_files_identity_fields(tags=tags, edition=e, cached={})
         mbid = identity_fields["musicbrainz_id"]
+        artist_resolved, title_resolved = _resolve_edition_display_identity(
+            e,
+            default_artist=str(e.get("artist") or e.get("artist_name") or folder.parent.name.replace("_", " ") or ""),
+            default_title=str(e.get("title_raw") or e.get("album_title") or folder.name or ""),
+            folder_name=folder.name,
+        )
         source_id = _parse_int_loose(e.get("source_id"), 0) or 0
         if source_id <= 0:
             source_id = int(_source_id_for_path(folder) or 0)
@@ -28362,8 +29260,8 @@ def _refresh_files_album_scan_cache_from_editions(editions: list[dict], scan_id:
                 "folder_path": folder_key,
                 "source_id": source_id if source_id > 0 else None,
                 "fingerprint": fingerprint,
-                "artist_name": e.get("artist") or e.get("artist_name") or "",
-                "album_title": e.get("title_raw") or e.get("album_title") or folder.name,
+                "artist_name": artist_resolved,
+                "album_title": title_resolved or folder.name,
                 "has_cover": has_cover,
                 "has_artist_image": has_artist_image,
                 "has_complete_tags": len(missing_required) == 0,
@@ -28459,6 +29357,11 @@ def _files_build_track_entries_from_item(item: dict, folder: Path) -> list[dict]
             dur_sec = int(dur_num / 1000.0) if dur_num > 5000 else int(dur_num)
         except Exception:
             dur_sec = int(max(0.0, _parse_duration_seconds_loose(raw_dur, 0.0)))
+        if dur_sec <= 0:
+            try:
+                dur_sec = int(max(0, _run_ffprobe_duration_sec(str(p)) or 0))
+            except Exception:
+                dur_sec = 0
         fmt = (p.suffix.lower().lstrip(".") or "UNKNOWN").upper()
         try:
             file_size = int(p.stat().st_size)
@@ -28712,18 +29615,25 @@ def _publish_files_library_artist_from_items(
             live_tags = extract_tags(first_audio) or {}
             if live_tags:
                 tags.update(live_tags)
+        resolved_artist_from_item, resolved_title_from_item = _resolve_edition_display_identity(
+            item,
+            default_artist=str(artist_name or ""),
+            default_title=str(item.get("album_title") or item.get("title_raw") or folder.name or ""),
+            folder_name=folder.name,
+        )
         title_fallback = (
-            (item.get("album_title") or "").strip()
+            resolved_title_from_item
+            or (item.get("album_title") or "").strip()
             or (item.get("title_raw") or "").strip()
             or folder.name.replace("_", " ").strip()
             or "Unknown Album"
         )
-        artist_fallback = (item.get("artist") or "").strip() or (artist_name or "").strip() or "Unknown Artist"
+        artist_fallback = resolved_artist_from_item or (item.get("artist") or "").strip() or (artist_name or "").strip() or "Unknown Artist"
         artist_resolved = _pick_album_artist_from_tag_dicts([tags], default=artist_fallback)
         album_resolved = _pick_album_title_from_tag_dicts([tags], fallback=title_fallback)
         album_resolved = _sanitize_album_title_display(album_resolved)
         label_resolved = _pick_album_label_from_tag_dicts([tags])
-        artist_norm = " ".join((artist_resolved or "").split()).lower() or "unknown artist"
+        artist_norm = _norm_artist_key(artist_resolved) or "unknown artist"
         title_norm = norm_album_for_dedup(album_resolved, normalize_parenthetical=True) or "unknown album"
         date_text = (tags.get("date") or tags.get("year") or "").strip()
         year = _parse_int_loose((date_text[:4] if date_text else tags.get("year")), 0) or None
@@ -28755,10 +29665,12 @@ def _publish_files_library_artist_from_items(
         has_artist_image = bool(artist_image_path and artist_image_path.is_file())
         indices = [int(t.get("track_num") or 0) for t in track_entries if int(t.get("track_num") or 0) > 0]
         actual_track_count = len(track_entries)
-        is_broken = False
-        expected_track_count = None
-        missing_indices: list[int] = []
-        if indices:
+        is_broken = bool(item.get("is_broken"))
+        expected_track_count = _parse_int_loose(item.get("expected_track_count"), 0) or None
+        missing_indices = list(item.get("missing_indices") or [])
+        if is_broken and expected_track_count and not missing_indices:
+            missing_indices = _edition_missing_indices_exact(item, int(expected_track_count or 0), actual_track_count)
+        if (not is_broken) and indices:
             max_idx = max(indices)
             coverage = (actual_track_count / max_idx) if max_idx else 1.0
             # Skip broken detection when track numbering is obviously corrupt.
@@ -28908,7 +29820,7 @@ def _rows_to_files_library_payload(rows: list[tuple]) -> tuple[dict[str, dict], 
         except Exception:
             continue
         artist_name = (row[1] or "").strip() or "Unknown Artist"
-        artist_norm = (row[2] or "").strip() or " ".join(artist_name.split()).lower() or "unknown artist"
+        artist_norm = (row[2] or "").strip() or _norm_artist_key(artist_name) or "unknown artist"
         album_title = _sanitize_album_title_display((row[3] or "").strip()) or "Unknown Album"
         # Recompute local artist image from the actual folder structure to avoid
         # falsely assigning a single FILES_ROOT/artist.jpg to every artist in flat libraries.
@@ -29058,7 +29970,7 @@ def _load_files_library_published_payload_for_artist(artist_hint: str) -> tuple[
     artist_name = str(artist_hint or "").strip()
     if not artist_name:
         return {}, [], 0
-    artist_norm = " ".join(artist_name.split()).lower()
+    artist_norm = _norm_artist_key(artist_name)
     artist_norm_alt = norm_album(artist_name or "") or artist_norm
     artist_like = "%" + " ".join(artist_name.lower().split()).replace("%", "").replace("_", "") + "%"
     try:
@@ -29501,7 +30413,11 @@ def _set_resume_run_status(run_id: str | None, status: str, scan_id: int | None 
         logging.debug("Failed to finalize resume run %s", run_id, exc_info=True)
 
 
-def _build_files_editions(scan_type: str = "full") -> tuple[list[tuple[int, str, list[int]]], int, dict]:
+def _build_files_editions(
+    scan_type: str = "full",
+    *,
+    respect_scan_controls: bool = True,
+) -> tuple[list[tuple[int, str, list[int]]], int, dict]:
     """
     Scan FILES_ROOTS, group audio files by parent folder (album candidate), infer
     artist/album/tracklist from tags, and return (artists_merged, total_albums, files_editions_by_album_id).
@@ -29523,6 +30439,19 @@ def _build_files_editions(scan_type: str = "full") -> tuple[list[tuple[int, str,
 
     active_root_paths = _effective_files_roots(enabled_only=True)
     roots = [Path(r) for r in (active_root_paths or FILES_ROOTS or []) if r]
+    stop_event = scan_should_stop if respect_scan_controls else None
+    pause_event = scan_is_paused if respect_scan_controls else None
+
+    def _files_scan_stop_requested() -> bool:
+        return bool(stop_event is not None and stop_event.is_set())
+
+    def _files_scan_wait_if_paused() -> bool:
+        if pause_event is None:
+            return True
+        while pause_event.is_set() and not _files_scan_stop_requested():
+            time.sleep(0.2)
+        return not _files_scan_stop_requested()
+
     if not roots:
         with lock:
             state["scan_discovery_running"] = False
@@ -29657,6 +30586,15 @@ def _build_files_editions(scan_type: str = "full") -> tuple[list[tuple[int, str,
 
     def _title_from_filename(path: Path, fallback_index: int) -> str:
         stem = path.stem.strip()
+        cleaned = re.sub(
+            r"^\s*[^-]+?\s*-\s*[^-]+?\s*-\s*\d{1,3}\s*-\s*",
+            "",
+            stem,
+            flags=re.IGNORECASE,
+        )
+        if cleaned != stem:
+            cleaned = cleaned.strip(" -_.")
+            return cleaned or stem or f"Track {fallback_index}"
         cleaned = re.sub(r"^\s*(?:cd|disc)\s*\d{1,2}\s*[-_. ]\s*\d{1,3}\s*[-_. ]*", "", stem, flags=re.IGNORECASE)
         cleaned = re.sub(r"^\s*\d{1,2}\s*[-_.]\s*\d{1,3}\s*[-_. ]*", "", cleaned)
         # Vinyl-side style: "A1 - Track", "B02_Track". Require digits so we don't strip leading letters
@@ -29769,10 +30707,10 @@ def _build_files_editions(scan_type: str = "full") -> tuple[list[tuple[int, str,
     if scan_type == "changed_only" and changed_pending_folder_keys:
         folders_total_pending = len(changed_pending_folder_keys)
         for idx, folder_key in enumerate(changed_pending_folder_keys, start=1):
-            if scan_should_stop.is_set():
+            if _files_scan_stop_requested():
                 log_scan("FILES discovery cancelled during watcher queue scan.")
                 return _cancel_discovery()
-            if not _scan_wait_if_paused():
+            if not _files_scan_wait_if_paused():
                 log_scan("FILES discovery cancelled while paused during watcher queue scan.")
                 return _cancel_discovery()
             folder_path = path_for_fs_access(Path(folder_key))
@@ -29825,10 +30763,10 @@ def _build_files_editions(scan_type: str = "full") -> tuple[list[tuple[int, str,
             progress_cb=_on_discovery_progress,
             progress_every=250,
             heartbeat_seconds=5.0,
-            stop_event=scan_should_stop,
-            pause_event=scan_is_paused,
+            stop_event=stop_event,
+            pause_event=pause_event,
         )
-        if scan_should_stop.is_set():
+        if _files_scan_stop_requested():
             log_scan("FILES discovery cancelled during filesystem walk.")
             return _cancel_discovery()
         for p in audio_files:
@@ -29878,7 +30816,7 @@ def _build_files_editions(scan_type: str = "full") -> tuple[list[tuple[int, str,
                 "FILES changed-only: %d dirty folder(s) no longer exist on disk.",
                 len(changed_pending_deleted_folder_keys),
             )
-    if scan_should_stop.is_set():
+    if _files_scan_stop_requested():
         log_scan("FILES discovery cancelled before album candidate planning.")
         return _cancel_discovery()
     _emit_files_discovery_heartbeat(
@@ -29901,10 +30839,10 @@ def _build_files_editions(scan_type: str = "full") -> tuple[list[tuple[int, str,
     folders_total = len(by_folder)
     folders_done = 0
     for folder, paths in sorted(by_folder.items(), key=lambda x: str(x[0])):
-        if scan_should_stop.is_set():
+        if _files_scan_stop_requested():
             log_scan("FILES discovery cancelled while building album candidates (%d/%d folders).", folders_done, folders_total)
             return _cancel_discovery()
-        if not _scan_wait_if_paused():
+        if not _files_scan_wait_if_paused():
             log_scan("FILES discovery cancelled while paused during album candidate build (%d/%d folders).", folders_done, folders_total)
             return _cancel_discovery()
         folders_done += 1
@@ -29985,7 +30923,9 @@ def _build_files_editions(scan_type: str = "full") -> tuple[list[tuple[int, str,
             next_album_id += 1
             files_editions_by_album_id[album_id] = {
                 "folder": folder,
+                "artist": artist_name,
                 "artist_name": artist_name,
+                "title_raw": album_title_tag,
                 "album_title": album_title_tag,
                 "album_norm": album_norm,
                 "tracks": tracks,
@@ -30050,6 +30990,22 @@ def _build_files_editions(scan_type: str = "full") -> tuple[list[tuple[int, str,
                 parent_name = ""
             if parent_name:
                 artist_name = parent_name
+        if (
+            not bool(_normalize_meta_text(first_tags.get("album")))
+            or (artist_name or "").strip().lower() in {"unknown", "unknown artist", "various", "various artists", "run source"}
+            or album_title_tag == _sanitize_album_title_display(folder.name.replace("_", " "))
+        ):
+            try:
+                inferred_artist_name, inferred_album_title = _infer_artist_album_from_folder(folder, ordered_paths)
+            except Exception:
+                inferred_artist_name, inferred_album_title = ("", "")
+            if inferred_artist_name and (artist_name or "").strip().lower() in {"unknown", "unknown artist", "various", "various artists", "run source"}:
+                artist_name = inferred_artist_name
+            if inferred_album_title and (
+                not bool(_normalize_meta_text(first_tags.get("album")))
+                or album_title_tag == _sanitize_album_title_display(folder.name.replace("_", " "))
+            ):
+                album_title_tag = _sanitize_album_title_display(inferred_album_title)
 
         tracks: list[Track] = []
         first_disc, first_trk = _parse_disc_track_loose(first_tags, fallback_disc=1, fallback_track=1)
@@ -30078,6 +31034,36 @@ def _build_files_editions(scan_type: str = "full") -> tuple[list[tuple[int, str,
         if not tracks:
             continue
 
+        missing_required_now = _check_required_tags(first_tags, REQUIRED_TAGS, edition={"tracks": tracks})
+        ai_identity_hint = _infer_identity_from_local_context_ai(
+            local_artist=artist_name,
+            local_album=album_title_tag,
+            folder_path=folder,
+            track_titles=[str(getattr(t, "title", "") or "") for t in tracks],
+            missing_required_tags=list(missing_required_now or []),
+        )
+        discovery_identity_ctx = {
+            "artist": artist_name,
+            "artist_name": artist_name,
+            "title_raw": album_title_tag,
+            "album_title": album_title_tag,
+            "missing_required_tags": list(missing_required_now or []),
+        }
+        if isinstance(ai_identity_hint, dict) and ai_identity_hint:
+            hinted_artist = str(ai_identity_hint.get("artist") or "").strip()
+            hinted_album = str(ai_identity_hint.get("album") or "").strip()
+            hint_conf = int(ai_identity_hint.get("confidence") or 0)
+            if hinted_artist and hinted_album and hint_conf >= 65:
+                discovery_identity_ctx["_lookup_artist_name"] = hinted_artist
+                discovery_identity_ctx["_lookup_album_title"] = hinted_album
+                discovery_identity_ctx["_lookup_identity_hint"] = ai_identity_hint
+                artist_name, album_title_tag = _apply_resolved_identity_to_edition(
+                    discovery_identity_ctx,
+                    default_artist=artist_name,
+                    default_title=album_title_tag,
+                    folder_name=folder.name,
+                )
+
         # Dominant format and confidence
         exts = [p.suffix.lower().lstrip(".") for p in ordered_paths]
         format_ext = max(set(exts), key=exts.count).upper() if exts else "UNKNOWN"
@@ -30090,7 +31076,6 @@ def _build_files_editions(scan_type: str = "full") -> tuple[list[tuple[int, str,
         album_norm = norm_album_for_dedup(album_title_tag, normalize_parenthetical)
         fingerprint = _compute_album_fingerprint(ordered_paths)
         folder_key = _album_folder_cache_key(folder_resolved)
-        missing_required_now = _check_required_tags(first_tags, REQUIRED_TAGS, edition={"tracks": tracks})
         has_cover_now = album_folder_has_cover(folder_resolved)
         has_artist_image_now = _artist_folder_has_image(folder_resolved.parent if folder_resolved.parent else folder_resolved)
         cached = cache_map.get(folder_key) or {}
@@ -30126,7 +31111,9 @@ def _build_files_editions(scan_type: str = "full") -> tuple[list[tuple[int, str,
 
         files_editions_by_album_id[album_id] = {
             "folder": folder,
+            "artist": artist_name,
             "artist_name": artist_name,
+            "title_raw": album_title_tag,
             "album_title": album_title_tag,
             "album_norm": album_norm,
             "tracks": tracks,
@@ -30154,6 +31141,9 @@ def _build_files_editions(scan_type: str = "full") -> tuple[list[tuple[int, str,
             "bandcamp_album_url": identity_now["bandcamp_album_url"],
             "metadata_source": identity_now["metadata_source"],
             "skip_heavy_processing": fast_skip_heavy,
+            "_lookup_artist_name": discovery_identity_ctx.get("_lookup_artist_name") or "",
+            "_lookup_album_title": discovery_identity_ctx.get("_lookup_album_title") or "",
+            "_lookup_identity_hint": discovery_identity_ctx.get("_lookup_identity_hint") or {},
         }
         artist_to_album_ids[artist_name].append(album_id)
         _set_discovery_state(
@@ -30338,7 +31328,7 @@ def _run_export_library() -> None:
     with lock:
         state["export_progress"] = {"running": True, "tracks_done": 0, "total_tracks": 0, "albums_done": 0, "total_albums": 0, "error": None}
     try:
-        _, _, editions_by_id = _build_files_editions(scan_type="full")
+        _, _, editions_by_id = _build_files_editions(scan_type="full", respect_scan_controls=False)
         export_editions: dict[int, dict] = {}
         skipped_broken = 0
         skipped_quarantine = 0
@@ -31040,6 +32030,7 @@ def background_scan():
     the whole scan, and `state["scanning"]` is **always** cleared even when
     an unexpected error occurs, so the front‑end never hangs in "running".
     """
+    global ai_provider_ready, AI_FUNCTIONAL_ERROR_MSG
     # Reload library backend settings (mode + files roots) and Plex selectors/path map
     # so scan always uses the latest saved sources from Settings.
     try:
@@ -31330,6 +32321,25 @@ def background_scan():
         # Reload AI config from DB and run functional check (probe/ladder for OpenAI)
         _reload_ai_config_and_reinit()
         logging.debug("Scan: AI reload/reinit done. ai_provider_ready=%s", ai_provider_ready)
+
+        try:
+            uid = _current_user_id_or_zero()
+            effective_scan_provider = _resolve_provider_for_runtime(
+                str(AI_PROVIDER or "openai"),
+                "provider_identity",
+                user_id=uid,
+            )
+            if effective_scan_provider == "openai-codex" and not ai_provider_ready:
+                codex_ready, codex_reason = _wait_for_codex_runtime_ready_for_scan(uid, timeout_sec=45.0)
+                if codex_ready:
+                    ai_provider_ready = True
+                    AI_FUNCTIONAL_ERROR_MSG = None
+                    logging.info("background_scan(): OpenAI Codex OAuth runtime became ready before scan processing started")
+                else:
+                    AI_FUNCTIONAL_ERROR_MSG = codex_reason or "OpenAI Codex OAuth runtime is unavailable"
+                    logging.warning("background_scan(): OpenAI Codex OAuth runtime still unavailable after wait: %s", AI_FUNCTIONAL_ERROR_MSG)
+        except Exception as e:
+            logging.warning("background_scan(): Codex runtime readiness wait failed: %s", e)
 
         if not ai_provider_ready:
             # Scans must still run without AI: the pipeline can rely on deterministic/provider signals.
@@ -31712,6 +32722,12 @@ def background_scan():
                                     e["strict_tracklist_score"] = float(result.get("strict_tracklist_score") or 0.0)
                                 except Exception:
                                     e["strict_tracklist_score"] = 0.0
+                            _apply_resolved_identity_to_edition(
+                                e,
+                                default_artist=str(artist_name or ""),
+                                default_title=str(item.get("album_title") or item.get("title_raw") or ""),
+                                folder_name=folder_path.name,
+                            )
                             e["missing_required_tags"] = list(missing_required_new or [])
                             e["has_cover"] = bool(has_cover_new)
                             e["has_artist_image"] = bool(has_artist_image_new)
@@ -31761,6 +32777,13 @@ def background_scan():
                             except Exception:
                                 logging.debug("Post-process counter delta update failed", exc_info=True)
                             break
+                    _apply_resolved_identity_to_edition(
+                        item,
+                        default_artist=str(artist_name or ""),
+                        default_title=str(item.get("album_title") or item.get("title_raw") or ""),
+                        folder_name=folder_path.name,
+                    )
+                    item["meta"] = tags
                 with lock:
                     state["scan_post_processing"] = True
                     state["scan_post_total"] = total_albums
@@ -36158,69 +37181,6 @@ def _ai_web_search_mark_run_query_seen(query: str, num: int) -> bool:
 
 
 def _ai_web_search_budget_allows() -> tuple[bool, str]:
-    per_hour = max(
-        0,
-        int(
-            getattr(
-                sys.modules[__name__],
-                "AI_WEB_SEARCH_MAX_CALLS_PER_HOUR",
-                AI_WEB_SEARCH_MAX_CALLS_PER_HOUR,
-            )
-            or 0
-        ),
-    )
-    per_day = max(
-        0,
-        int(
-            getattr(
-                sys.modules[__name__],
-                "AI_WEB_SEARCH_MAX_CALLS_PER_DAY",
-                AI_WEB_SEARCH_MAX_CALLS_PER_DAY,
-            )
-            or 0
-        ),
-    )
-    if per_hour <= 0 and per_day <= 0:
-        return (True, "")
-    try:
-        now_ts = time.time()
-        con = _state_connect(timeout=5)
-        cur = con.cursor()
-        if per_hour > 0:
-            cur.execute(
-                """
-                SELECT COUNT(*) AS c
-                FROM ai_call_usage
-                WHERE provider IN ('openai', 'openai-api', 'openai-codex')
-                  AND endpoint_kind = 'web_search'
-                  AND created_at >= ?
-                """,
-                (float(now_ts - 3600.0),),
-            )
-            row_h = cur.fetchone() or {}
-            count_hour = int(row_h["c"] or 0)
-            if count_hour >= per_hour:
-                con.close()
-                return (False, f"hourly limit reached ({count_hour}/{per_hour})")
-        if per_day > 0:
-            cur.execute(
-                """
-                SELECT COUNT(*) AS c
-                FROM ai_call_usage
-                WHERE provider IN ('openai', 'openai-api', 'openai-codex')
-                  AND endpoint_kind = 'web_search'
-                  AND created_at >= ?
-                """,
-                (float(now_ts - 86400.0),),
-            )
-            row_d = cur.fetchone() or {}
-            count_day = int(row_d["c"] or 0)
-            if count_day >= per_day:
-                con.close()
-                return (False, f"daily limit reached ({count_day}/{per_day})")
-        con.close()
-    except Exception as e:
-        logging.debug("[WEB][AI] budget check failed (request allowed): %s", e)
     return (True, "")
 
 
@@ -36295,6 +37255,85 @@ def _openai_web_search_fallback(query: str, num: int = 10, *, reason: str = "") 
     )
     provider_lower = str(provider_for_usage or "").strip().lower()
     if provider_lower not in {"openai", "openai-api", "openai-codex"}:
+        return []
+    if provider_lower == "openai-codex":
+        started_at = time.time()
+        response_obj: Any = None
+        status = "failed"
+        error_msg = ""
+        auth_mode_for_usage = "oauth"
+        guard_allowed = True
+        guard_reason = ""
+        guard_meta: dict[str, Any] = {}
+        max_items = max(1, int(num or 10))
+        prompt = (
+            f"Search the web for: {q}\n"
+            f"Return ONLY a JSON array (max {max_items} items).\n"
+            "Each item must have: title, link, snippet.\n"
+            "Use direct source URLs and concise snippets."
+        )
+        try:
+            guard_allowed, guard_reason, guard_meta = _ai_guardrail_precheck(
+                provider=provider_for_usage,
+                model="codex",
+                endpoint_kind="web_search",
+                analysis_type="web_search",
+                requested_tokens=int(max(120, 80 + (max_items * 60))),
+            )
+            if not guard_allowed:
+                raise RuntimeError(f"AI guardrail blocked call: {guard_reason}")
+            raw_text, response_obj = _run_openai_codex_exec(
+                system_msg="Use live web search and return only the requested JSON.",
+                user_msg=prompt,
+                analysis_type="web_search",
+                request_timeout_sec=_openai_request_timeout_seconds(),
+                web_search=True,
+            )
+            rows = _assistant_extract_json_array(raw_text)
+            normalized = _normalize_web_results(rows, source="openai_web_search", max_items=max_items)
+            status = "completed"
+            if normalized:
+                logging.info(
+                    "[WEB][AI] Codex web-search fallback used (%s, provider=%s, auth=%s) query=%r results=%d",
+                    str(reason or "codex_web_search"),
+                    provider_for_usage,
+                    auth_mode_for_usage,
+                    q,
+                    len(normalized),
+                )
+                return normalized[:max_items]
+        except Exception as e:
+            error_msg = str(e)
+            logging.warning(
+                "[WEB][AI] Codex web-search fallback failed (%s) query=%r: %s",
+                str(reason or "codex_web_search"),
+                q,
+                e,
+            )
+        finally:
+            recorder = globals().get("record_ai_usage")
+            if callable(recorder):
+                recorder(
+                    provider=provider_for_usage,
+                    model="codex",
+                    endpoint_kind="web_search",
+                    analysis_type="web_search",
+                    started_at=started_at,
+                    status=status,
+                    response_obj=response_obj,
+                    image_inputs=1 if response_obj is not None else 0,
+                    error=error_msg,
+                    metadata={
+                        "query_hash": hashlib.sha1(q.encode("utf-8", errors="ignore")).hexdigest(),
+                        "query_len": len(q),
+                        "reason": str(reason or "codex_web_search"),
+                        "max_items": int(max_items),
+                        "auth_mode": auth_mode_for_usage,
+                        "guardrail_blocked": bool(not guard_allowed),
+                        "guardrail_reason": guard_reason if not guard_allowed else "",
+                        **(guard_meta or {}),
+                    },
+                )
         return []
     client_to_use, auth_mode_for_usage, openai_runtime_reason = _resolve_openai_client_for_runtime(provider_for_usage, user_id)
     if not client_to_use:
@@ -36394,6 +37433,39 @@ def _openai_web_search_fallback(query: str, num: int = 10, *, reason: str = "") 
                 return normalized[: max(1, int(num or 10))]
     except Exception as e:
         error_msg = str(e)
+        if provider_lower in {"openai", "openai-api"} and _openai_error_allows_codex_fallback(e):
+            try:
+                uid = _current_user_id_or_zero()
+                if _openai_codex_runtime_available(uid, require_token=True):
+                    logging.warning(
+                        "[WEB][AI] OpenAI API web-search failed; retrying with Codex OAuth (%s) query=%r: %s",
+                        usage_reason,
+                        q,
+                        e,
+                    )
+                    raw_text, response_obj = _run_openai_codex_exec(
+                        system_msg="Use live web search and return only the requested JSON.",
+                        user_msg=prompt,
+                        analysis_type="web_search",
+                        request_timeout_sec=_openai_request_timeout_seconds(),
+                        web_search=True,
+                    )
+                    rows = _assistant_extract_json_array(raw_text)
+                    normalized = _normalize_web_results(rows, source="openai_web_search", max_items=max_items)
+                    provider_for_usage = "openai-codex"
+                    auth_mode_for_usage = "oauth"
+                    if normalized:
+                        error_msg = ""
+                        status = "completed"
+                        logging.info(
+                            "[WEB][AI] Codex web-search fallback used after API failure (%s) query=%r results=%d",
+                            usage_reason,
+                            q,
+                            len(normalized),
+                        )
+                        return normalized[:max_items]
+            except Exception as codex_exc:
+                error_msg = f"{error_msg} | codex fallback: {codex_exc}"
         logging.warning(
             "[WEB][AI] OpenAI web-search fallback failed (%s) query=%r: %s",
             usage_reason,
@@ -36432,10 +37504,9 @@ def _openai_web_search_fallback(query: str, num: int = 10, *, reason: str = "") 
 
 def _web_search_serper(query: str, num: int = 10, *, allow_ai_fallback: bool = True) -> List[dict]:
     """
-    Run web search with IA priority:
-    1) OpenAI native web-search tool (when enabled/available)
-    2) Serper as fallback/backup
-    3) OpenAI retry fallback when Serper fails and IA wasn't tried first
+    Run web search with Serper priority:
+    1) Serper when configured
+    2) AI web-search fallback when Serper is missing/unavailable
     Returns list of {"title", "link", "snippet"}.
     """
     q = str(query or "").strip()
@@ -36456,14 +37527,6 @@ def _web_search_serper(query: str, num: int = 10, *, allow_ai_fallback: bool = T
         return []
 
     ai_tried_primary = False
-    if allow_ai_fallback and _ai_web_search_available():
-        ai_tried_primary = True
-        ai_rows = _openai_web_search_fallback(q, num=limit, reason="ai_primary")
-        if ai_rows:
-            _ai_web_search_cache_set(q, limit, ai_rows[:limit], status="hit")
-            _ai_query_cache_set(scope, q, limit, ai_rows[:limit], status="hit", source="openai_web_search")
-            return ai_rows[:limit]
-
     key = getattr(sys.modules[__name__], "SERPER_API_KEY", "") or ""
     if not key.strip():
         if not ai_tried_primary:
@@ -37122,11 +38185,61 @@ def _maintenance_clear_media_cache() -> dict[str, Any]:
     return summary
 
 
+def _maintenance_clear_export_root() -> dict[str, Any]:
+    root = Path(str(EXPORT_ROOT or "").strip())
+    summary: dict[str, Any] = {
+        "root": str(root),
+        "configured": bool(str(root)),
+        "files_removed": 0,
+        "dirs_removed": 0,
+        "bytes_removed": 0,
+        "ok": True,
+        "error": "",
+    }
+    if not str(root):
+        return summary
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        for child in list(root.iterdir()):
+            try:
+                if child.is_file() or child.is_symlink():
+                    try:
+                        summary["bytes_removed"] += int(child.stat().st_size or 0)
+                    except Exception:
+                        pass
+                    child.unlink()
+                    summary["files_removed"] += 1
+                    continue
+                if child.is_dir():
+                    for fp in child.rglob("*"):
+                        if fp.is_file():
+                            summary["files_removed"] += 1
+                            try:
+                                summary["bytes_removed"] += int(fp.stat().st_size or 0)
+                            except Exception:
+                                pass
+                        elif fp.is_dir():
+                            summary["dirs_removed"] += 1
+                    shutil.rmtree(child)
+                    summary["dirs_removed"] += 1
+            except Exception as child_exc:
+                summary["ok"] = False
+                summary["error"] = str(child_exc)
+                break
+        return summary
+    except Exception as e:
+        summary["ok"] = False
+        summary["error"] = str(e)
+        return summary
+
+
 def _maintenance_clear_files_index() -> dict[str, Any]:
     out: dict[str, Any] = {
         "published_rows_deleted": 0,
         "pg_truncated": False,
         "ram_entries_cleared": 0,
+        "export_root_cleared": False,
+        "export_root_summary": {},
         "ok": True,
         "error": "",
     }
@@ -37190,6 +38303,13 @@ def _maintenance_clear_files_index() -> dict[str, Any]:
         )
         out["pg_truncated"] = True
         out["ram_entries_cleared"] = _maintenance_clear_artwork_ram_cache()
+        export_summary = _maintenance_clear_export_root()
+        out["export_root_summary"] = export_summary
+        out["export_root_cleared"] = bool(export_summary.get("ok", False))
+        if not bool(export_summary.get("ok", False)):
+            out["ok"] = False
+            out["error"] = str(export_summary.get("error") or "Export root reset failed")
+        _pipeline_bootstrap_reset()
         return out
     except Exception as e:
         out["ok"] = False
@@ -37842,6 +38962,9 @@ def api_openai_models():
     Uses a curated list so we never show models that fail PMDA's parseable-output requirements."""
     from flask import g
     data = getattr(g, 'ai_models_request_data', None) or request.get_json(silent=True) or {}
+    provider = (data.get("AI_PROVIDER") or "").strip().lower() or AI_PROVIDER.lower()
+    if provider == "openai-codex":
+        return jsonify(["codex"])
     key = (data.get("OPENAI_API_KEY") or "").strip() or OPENAI_API_KEY
 
     if not key:
@@ -38650,8 +39773,8 @@ def _reload_musicbrainz_settings_from_db():
     timeout_sec, timeout_changed = _reload_int(
         "MB_SEARCH_ALBUM_TIMEOUT_SEC",
         int(MB_SEARCH_ALBUM_TIMEOUT_SEC),
-        min_v=10,
-        max_v=300,
+        min_v=0,
+        max_v=3600,
     )
     if timeout_changed:
         MB_SEARCH_ALBUM_TIMEOUT_SEC = int(timeout_sec)
@@ -38661,8 +39784,8 @@ def _reload_musicbrainz_settings_from_db():
     cand_limit, cand_changed = _reload_int(
         "MB_CANDIDATE_FETCH_LIMIT",
         int(MB_CANDIDATE_FETCH_LIMIT),
-        min_v=1,
-        max_v=20,
+        min_v=0,
+        max_v=100,
     )
     if cand_changed:
         MB_CANDIDATE_FETCH_LIMIT = int(cand_limit)
@@ -38673,7 +39796,7 @@ def _reload_musicbrainz_settings_from_db():
         "MB_TRACKLIST_FETCH_LIMIT",
         int(MB_TRACKLIST_FETCH_LIMIT),
         min_v=0,
-        max_v=20,
+        max_v=100,
     )
     if track_changed:
         MB_TRACKLIST_FETCH_LIMIT = int(track_limit)
@@ -38894,7 +40017,7 @@ def api_config_get():
     )
     openai_effective_batch = select_provider_id(
         context="batch",
-        preferred=str(provider_prefs_eff.get("batch_provider_id") or "openai-api"),
+        preferred=str(provider_prefs_eff.get("batch_provider_id") or "openai-codex"),
         codex_connected=codex_connected_eff,
         openai_api_enabled=bool(get_setting_bool("OPENAI_ENABLE_API_KEY_MODE", OPENAI_ENABLE_API_KEY_MODE)),
         openai_codex_enabled=bool(get_setting_bool("OPENAI_ENABLE_CODEX_OAUTH_MODE", OPENAI_ENABLE_CODEX_OAUTH_MODE)),
@@ -38934,8 +40057,8 @@ def api_config_get():
         ),
         "OPENAI_CODEX_OAUTH_CONNECTED": bool(codex_connected_eff),
         "OPENAI_PROVIDER_PREF_INTERACTIVE": str(provider_prefs_eff.get("interactive_provider_id") or "openai-codex"),
-        "OPENAI_PROVIDER_PREF_BATCH": str(provider_prefs_eff.get("batch_provider_id") or "openai-api"),
-        "OPENAI_PROVIDER_PREF_WEB_SEARCH": str(provider_prefs_eff.get("web_search_provider_id") or "openai-api"),
+        "OPENAI_PROVIDER_PREF_BATCH": str(provider_prefs_eff.get("batch_provider_id") or "openai-codex"),
+        "OPENAI_PROVIDER_PREF_WEB_SEARCH": str(provider_prefs_eff.get("web_search_provider_id") or "openai-codex"),
         "OPENAI_PROVIDER_EFFECTIVE_INTERACTIVE": _normalize_provider_id(openai_effective_interactive, fallback="openai-api"),
         "OPENAI_PROVIDER_EFFECTIVE_BATCH": _normalize_provider_id(openai_effective_batch, fallback="openai-api"),
         "OPENAI_MODEL": get_setting("OPENAI_MODEL", OPENAI_MODEL),
@@ -38949,24 +40072,24 @@ def api_config_get():
         "MUSICBRAINZ_EMAIL": get_setting("MUSICBRAINZ_EMAIL", MUSICBRAINZ_EMAIL),
         "MB_RETRY_NOT_FOUND": get_setting_bool("MB_RETRY_NOT_FOUND", MB_RETRY_NOT_FOUND),
         "MB_SEARCH_ALBUM_TIMEOUT_SEC": max(
-            10,
+            0,
             min(
-                300,
-                int(get_setting("MB_SEARCH_ALBUM_TIMEOUT_SEC", MB_SEARCH_ALBUM_TIMEOUT_SEC) or 12),
+                3600,
+                int(get_setting("MB_SEARCH_ALBUM_TIMEOUT_SEC", MB_SEARCH_ALBUM_TIMEOUT_SEC) or 0),
             ),
         ),
         "MB_CANDIDATE_FETCH_LIMIT": max(
-            1,
+            0,
             min(
-                20,
-                int(get_setting("MB_CANDIDATE_FETCH_LIMIT", MB_CANDIDATE_FETCH_LIMIT) or 4),
+                100,
+                int(get_setting("MB_CANDIDATE_FETCH_LIMIT", MB_CANDIDATE_FETCH_LIMIT) or 0),
             ),
         ),
         "MB_TRACKLIST_FETCH_LIMIT": max(
             0,
             min(
-                20,
-                int(get_setting("MB_TRACKLIST_FETCH_LIMIT", MB_TRACKLIST_FETCH_LIMIT) or 1),
+                100,
+                int(get_setting("MB_TRACKLIST_FETCH_LIMIT", MB_TRACKLIST_FETCH_LIMIT) or 0),
             ),
         ),
         "MB_FAST_FALLBACK_MODE": get_setting_bool("MB_FAST_FALLBACK_MODE", MB_FAST_FALLBACK_MODE),
@@ -39123,8 +40246,8 @@ def api_ai_provider_preferences_get():
     return jsonify(
         {
             "interactive_provider_id": prefs.get("interactive_provider_id", "openai-codex"),
-            "batch_provider_id": prefs.get("batch_provider_id", "openai-api"),
-            "web_search_provider_id": prefs.get("web_search_provider_id", "openai-api"),
+            "batch_provider_id": prefs.get("batch_provider_id", "openai-codex"),
+            "web_search_provider_id": prefs.get("web_search_provider_id", "openai-codex"),
             "effective": {
                 "interactive_provider_id": _resolve_provider_for_runtime("openai", "assistant_chat"),
                 "batch_provider_id": _resolve_provider_for_runtime("openai", "scan_pipeline"),
@@ -39142,15 +40265,15 @@ def api_ai_provider_preferences_put():
     prefs = _save_ai_provider_preferences(
         user_id=_current_user_id_or_zero(),
         interactive_provider_id=str(data.get("interactive_provider_id") or "openai-codex"),
-        batch_provider_id=str(data.get("batch_provider_id") or "openai-api"),
-        web_search_provider_id=str(data.get("web_search_provider_id") or "openai-api"),
+        batch_provider_id=str(data.get("batch_provider_id") or "openai-codex"),
+        web_search_provider_id=str(data.get("web_search_provider_id") or "openai-codex"),
     )
     return jsonify(
         {
             "status": "ok",
             "interactive_provider_id": prefs.get("interactive_provider_id", "openai-codex"),
-            "batch_provider_id": prefs.get("batch_provider_id", "openai-api"),
-            "web_search_provider_id": prefs.get("web_search_provider_id", "openai-api"),
+            "batch_provider_id": prefs.get("batch_provider_id", "openai-codex"),
+            "web_search_provider_id": prefs.get("web_search_provider_id", "openai-codex"),
         }
     )
 
@@ -39260,19 +40383,19 @@ def _apply_settings_in_memory(updates: dict):
     if "MB_SEARCH_ALBUM_TIMEOUT_SEC" in updates:
         global MB_SEARCH_ALBUM_TIMEOUT_SEC
         try:
-            MB_SEARCH_ALBUM_TIMEOUT_SEC = max(10, min(300, int(updates["MB_SEARCH_ALBUM_TIMEOUT_SEC"])))
+            MB_SEARCH_ALBUM_TIMEOUT_SEC = max(0, min(3600, int(updates["MB_SEARCH_ALBUM_TIMEOUT_SEC"])))
         except (TypeError, ValueError):
             pass
     if "MB_CANDIDATE_FETCH_LIMIT" in updates:
         global MB_CANDIDATE_FETCH_LIMIT
         try:
-            MB_CANDIDATE_FETCH_LIMIT = max(1, min(20, int(updates["MB_CANDIDATE_FETCH_LIMIT"])))
+            MB_CANDIDATE_FETCH_LIMIT = max(0, min(100, int(updates["MB_CANDIDATE_FETCH_LIMIT"])))
         except (TypeError, ValueError):
             pass
     if "MB_TRACKLIST_FETCH_LIMIT" in updates:
         global MB_TRACKLIST_FETCH_LIMIT
         try:
-            MB_TRACKLIST_FETCH_LIMIT = max(0, min(20, int(updates["MB_TRACKLIST_FETCH_LIMIT"])))
+            MB_TRACKLIST_FETCH_LIMIT = max(0, min(100, int(updates["MB_TRACKLIST_FETCH_LIMIT"])))
         except (TypeError, ValueError):
             pass
     if "MB_FAST_FALLBACK_MODE" in updates:
@@ -40016,19 +41139,19 @@ def api_config_put():
             updates["BROKEN_ALBUM_PERCENTAGE_THRESHOLD"] = 0.20
     if "MB_SEARCH_ALBUM_TIMEOUT_SEC" in updates:
         try:
-            updates["MB_SEARCH_ALBUM_TIMEOUT_SEC"] = max(10, min(300, int(updates["MB_SEARCH_ALBUM_TIMEOUT_SEC"])))
+            updates["MB_SEARCH_ALBUM_TIMEOUT_SEC"] = max(0, min(3600, int(updates["MB_SEARCH_ALBUM_TIMEOUT_SEC"])))
         except (ValueError, TypeError):
-            updates["MB_SEARCH_ALBUM_TIMEOUT_SEC"] = 20
+            updates["MB_SEARCH_ALBUM_TIMEOUT_SEC"] = 0
     if "MB_CANDIDATE_FETCH_LIMIT" in updates:
         try:
-            updates["MB_CANDIDATE_FETCH_LIMIT"] = max(1, min(20, int(updates["MB_CANDIDATE_FETCH_LIMIT"])))
+            updates["MB_CANDIDATE_FETCH_LIMIT"] = max(0, min(100, int(updates["MB_CANDIDATE_FETCH_LIMIT"])))
         except (ValueError, TypeError):
-            updates["MB_CANDIDATE_FETCH_LIMIT"] = 4
+            updates["MB_CANDIDATE_FETCH_LIMIT"] = 0
     if "MB_TRACKLIST_FETCH_LIMIT" in updates:
         try:
-            updates["MB_TRACKLIST_FETCH_LIMIT"] = max(0, min(20, int(updates["MB_TRACKLIST_FETCH_LIMIT"])))
+            updates["MB_TRACKLIST_FETCH_LIMIT"] = max(0, min(100, int(updates["MB_TRACKLIST_FETCH_LIMIT"])))
         except (ValueError, TypeError):
-            updates["MB_TRACKLIST_FETCH_LIMIT"] = 2
+            updates["MB_TRACKLIST_FETCH_LIMIT"] = 0
     if "ARTWORK_RAM_CACHE_MB" in updates:
         try:
             updates["ARTWORK_RAM_CACHE_MB"] = max(0, min(65536, int(updates["ARTWORK_RAM_CACHE_MB"])))
@@ -42344,8 +43467,9 @@ def api_library_stats():
         indexed_artists, indexed_albums, indexed_tracks = _files_index_read_counts()
         index_state = _files_index_get_state() or {}
         index_running = bool(index_state.get("running"))
+        bootstrap_required = bool(_pipeline_bootstrap_status().get("bootstrap_required"))
         if indexed_albums <= 0 or indexed_tracks <= 0:
-            if not index_running:
+            if not index_running and not bootstrap_required:
                 _trigger_files_index_rebuild_async_throttled(
                     reason="api_library_stats_bootstrap",
                     cooldown_sec=45.0,
@@ -42444,8 +43568,9 @@ def api_library_stats_library():
     indexed_artists, indexed_albums, indexed_tracks = _files_index_read_counts()
     index_state = _files_index_get_state() or {}
     index_running = bool(index_state.get("running"))
+    bootstrap_required = bool(_pipeline_bootstrap_status().get("bootstrap_required"))
     if indexed_albums <= 0 or indexed_tracks <= 0:
-        if not index_running:
+        if not index_running and not bootstrap_required:
             _trigger_files_index_rebuild_async_throttled(
                 reason="api_library_stats_library_bootstrap",
                 cooldown_sec=45.0,
@@ -47062,17 +48187,17 @@ def api_library_artist_detail(artist_id):
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT id, name, has_image, image_path, updated_at FROM files_artists WHERE id = %s",
+                    "SELECT id, name, name_norm, has_image, image_path, updated_at FROM files_artists WHERE id = %s",
                     (artist_id,),
                 )
                 artist_row = cur.fetchone()
                 if not artist_row:
                     return jsonify({"error": "Artist not found"}), 404
                 artist_name = artist_row[1] or ""
-                artist_norm = " ".join((artist_name or "").split()).lower()
-                has_artist_image = bool(artist_row[2])
-                artist_image_path = (artist_row[3] or "").strip()
-                artist_updated_epoch = int(_dt_to_epoch(artist_row[4])) if len(artist_row) > 4 else 0
+                artist_norm = str(artist_row[2] or "").strip() or _norm_artist_key(artist_name)
+                has_artist_image = bool(artist_row[3])
+                artist_image_path = (artist_row[4] or "").strip()
+                artist_updated_epoch = int(_dt_to_epoch(artist_row[5])) if len(artist_row) > 5 else 0
                 cur.execute(
                     """
                     SELECT
@@ -47574,7 +48699,7 @@ def api_library_artist_profile(artist_id: int):
             if not row:
                 return jsonify({"error": "Artist not found"}), 404
             artist_name = row[1] or ""
-            artist_norm = row[2] or " ".join((artist_name or "").split()).lower()
+            artist_norm = str(row[2] or "").strip() or _norm_artist_key(artist_name)
             cur.execute(
                 """
                 SELECT title, title_norm
@@ -47707,7 +48832,7 @@ def api_library_artist_summary(artist_id: int):
             if not row:
                 return jsonify({"error": "Artist not found"}), 404
             artist_name = (row[1] or "").strip()
-            artist_norm = (row[2] or "").strip() or " ".join((artist_name or "").split()).lower()
+            artist_norm = (row[2] or "").strip() or _norm_artist_key(artist_name)
 
             cur.execute(
                 """
@@ -49143,7 +50268,8 @@ def api_library_album_detail(album_id: int):
                     COALESCE(alb.bandcamp_album_url, '') AS bandcamp_album_url,
                     COALESCE(alb.metadata_source, '') AS metadata_source,
                     art.id AS artist_id,
-                    COALESCE(art.name, '') AS artist_name
+                    COALESCE(art.name, '') AS artist_name,
+                    COALESCE(art.name_norm, '') AS artist_norm
                 FROM files_albums alb
                 JOIN files_artists art ON art.id = alb.artist_id
                 WHERE alb.id = %s
@@ -49176,10 +50302,11 @@ def api_library_album_detail(album_id: int):
                 metadata_source,
                 artist_id,
                 artist_name,
+                artist_name_norm,
             ) = row
 
             # Album profile (review/description) is keyed by (artist_norm, title_norm).
-            artist_norm = " ".join((artist_name or "").split()).lower()
+            artist_norm = str(artist_name_norm or "").strip() or _norm_artist_key(artist_name)
             title_norm = str(title_norm or "").strip()
             has_identity_hint = bool(
                 bool(strict_match_verified)
@@ -49196,13 +50323,18 @@ def api_library_album_detail(album_id: int):
             prof = {}
             if allow_profile_for_album and artist_norm and title_norm:
                 try:
+                    norm_variants = _profile_title_norm_variants(title_norm, album_title)
+                    placeholders = ",".join(["%s"] * len(norm_variants))
                     cur.execute(
-                        """
-                        SELECT description, short_description, source, updated_at
+                        f"""
+                        SELECT description, short_description, source, updated_at, title_norm
                         FROM files_album_profiles
-                        WHERE artist_norm = %s AND title_norm = %s
+                        WHERE artist_norm = %s
+                          AND title_norm IN ({placeholders})
+                        ORDER BY CASE WHEN title_norm = %s THEN 0 ELSE 1 END, updated_at DESC
+                        LIMIT 1
                         """,
-                        (artist_norm, title_norm),
+                        [artist_norm, *norm_variants, title_norm],
                     )
                     prow = cur.fetchone()
                     if prow:
@@ -49211,6 +50343,7 @@ def api_library_album_detail(album_id: int):
                             "short_description": (prow[1] or "").strip(),
                             "source": (prow[2] or "").strip(),
                             "updated_at": int(_dt_to_epoch(prow[3])) if prow[3] else 0,
+                            "title_norm": str(prow[4] or "").strip(),
                         }
                 except Exception:
                     prof = {}
@@ -54117,6 +55250,24 @@ def _infer_artist_album_from_folder(folder_path: Path, audio_files: List[Path]) 
     """Infer artist and album from first file tags, then folder name, then first filename."""
     artist_name = "Unknown"
     album_title_str = folder_path.name or "Unknown Album"
+    folder_name_raw = str(folder_path.name or "").strip()
+
+    def _clean_folder_token(token: str) -> str:
+        txt = str(token or "").strip().replace("_", " ")
+        txt = re.sub(r"\b(no\s*tags?|no\s*cover|gaps?|incomplete|broken|dupe|duplicate|run\s*source)\b", " ", txt, flags=re.IGNORECASE)
+        txt = " ".join(txt.split())
+        return txt.strip(" -_.")
+
+    if "__" in folder_name_raw:
+        parts = [_clean_folder_token(p) for p in folder_name_raw.split("__")]
+        parts = [p for p in parts if p]
+        if len(parts) >= 2:
+            guessed_artist = parts[0]
+            guessed_album = parts[1]
+            if guessed_artist:
+                artist_name = guessed_artist
+            if guessed_album:
+                album_title_str = guessed_album
     if not audio_files:
         return (artist_name, album_title_str)
     first_tags = extract_tags(audio_files[0])
@@ -56533,6 +57684,17 @@ def _build_improve_items_from_editions(artist_name: str, editions: list[dict]) -
     root_dirs = _files_root_dir_strings()
     seen_album_ids: set[int] = set()
     for e in editions or []:
+        folder_name = ""
+        try:
+            folder_name = Path(str(e.get("folder") or "")).name
+        except Exception:
+            folder_name = ""
+        artist_resolved, title_resolved = _apply_resolved_identity_to_edition(
+            e,
+            default_artist=str(artist_name or ""),
+            default_title=str(e.get("title_raw") or e.get("album_title") or ""),
+            folder_name=folder_name,
+        )
         try:
             album_id = int(e.get("album_id") or 0)
         except Exception:
@@ -56548,7 +57710,7 @@ def _build_improve_items_from_editions(artist_name: str, editions: list[dict]) -
             or ((e.get("meta") or {}).get("musicbrainz_id") or "")
         )
         mbid = str(mbid or "").strip()
-        title = (e.get("title_raw") or e.get("album_norm") or f"Album {album_id}")
+        title = (title_resolved or e.get("title_raw") or e.get("album_norm") or f"Album {album_id}")
         # Snapshot pre-fix health so post-processing can update live counters by delta.
         folder_path: Optional[Path] = None
         if folder_str:
@@ -56596,9 +57758,11 @@ def _build_improve_items_from_editions(artist_name: str, editions: list[dict]) -
         )
         items.append(
             {
-                "artist": (artist_name or "").strip() or "Unknown Artist",
+                "artist": artist_resolved or (artist_name or "").strip() or "Unknown Artist",
+                "artist_name": artist_resolved,
                 "album_id": album_id,
                 "album_title": str(title or "").strip() or f"Album {album_id}",
+                "title_raw": str(title or "").strip() or f"Album {album_id}",
                 "musicbrainz_id": mbid,
                 "folder": folder_str,
                 # Keep scan edition context so post-process cache refresh can preserve
@@ -56616,6 +57780,13 @@ def _build_improve_items_from_editions(artist_name: str, editions: list[dict]) -
                 "strict_match_provider": e.get("strict_match_provider") or "",
                 "strict_reject_reason": e.get("strict_reject_reason") or "",
                 "strict_tracklist_score": float(e.get("strict_tracklist_score") or 0.0),
+                "is_broken": bool(e.get("is_broken")),
+                "expected_track_count": e.get("expected_track_count"),
+                "actual_track_count": e.get("actual_track_count") or len(e.get("tracks") or []),
+                "missing_indices": list(e.get("missing_indices") or []),
+                "_lookup_artist_name": e.get("_lookup_artist_name") or "",
+                "_lookup_album_title": e.get("_lookup_album_title") or "",
+                "_lookup_identity_hint": e.get("_lookup_identity_hint") or {},
                 "br": e.get("br") or 0,
                 "sr": e.get("sr") or 0,
                 "bd": e.get("bd") or 0,
@@ -56813,8 +57984,29 @@ def _run_scan_profile_enrichment_inline(best_albums_list: list[dict], *, reason:
     for row in (best_albums_list or []):
         if not isinstance(row, dict):
             continue
-        artist_name = str(row.get("artist") or "").strip()
-        album_title = str(row.get("album_title") or row.get("title_raw") or "").strip()
+        resolved = dict(row)
+        try:
+            _apply_resolved_identity_to_edition(resolved)
+        except Exception:
+            pass
+        artist_name = str(
+            resolved.get("artist")
+            or resolved.get("_lookup_artist_name")
+            or row.get("artist")
+            or ""
+        ).strip()
+        album_title = str(
+            resolved.get("album_title")
+            or resolved.get("title_raw")
+            or resolved.get("_lookup_album_title")
+            or row.get("album_title")
+            or row.get("title_raw")
+            or ""
+        ).strip()
+        if _identity_text_is_generic(artist_name):
+            artist_name = str(resolved.get("_lookup_artist_name") or "").strip() or artist_name
+        if not album_title:
+            album_title = str(resolved.get("_lookup_album_title") or "").strip()
         if not artist_name or not album_title:
             continue
         artist_norm = _norm_artist_key(artist_name)

@@ -16,3 +16,13 @@ frontend/.git
 *.sqlite3
 *.log
 pmda.log*
+.tmp
+.venv
+__pycache__
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+htmlcov
+webp
+.DS_Store

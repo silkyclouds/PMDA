@@ -497,13 +497,13 @@ function SettingsPage() {
     async (patch: Partial<Pick<api.AIProviderPreferencesResponse, 'interactive_provider_id' | 'batch_provider_id' | 'web_search_provider_id'>>) => {
       const current = providerPreferences || {
         interactive_provider_id: 'openai-codex',
-        batch_provider_id: 'openai-api',
-        web_search_provider_id: 'openai-api',
+        batch_provider_id: 'openai-codex',
+        web_search_provider_id: 'openai-codex',
       };
       const payload = {
         interactive_provider_id: String(patch.interactive_provider_id || current.interactive_provider_id || 'openai-codex'),
-        batch_provider_id: String(patch.batch_provider_id || current.batch_provider_id || 'openai-api'),
-        web_search_provider_id: String(patch.web_search_provider_id || current.web_search_provider_id || 'openai-api'),
+        batch_provider_id: String(patch.batch_provider_id || current.batch_provider_id || 'openai-codex'),
+        web_search_provider_id: String(patch.web_search_provider_id || current.web_search_provider_id || 'openai-codex'),
       };
       setProviderPreferencesBusy(true);
       setProviderPreferences((prev) => ({ ...(prev || current), ...payload }));
@@ -1494,7 +1494,7 @@ function SettingsPage() {
                     <div className="space-y-2">
                       <Label className="text-xs">Batch</Label>
                       <Select
-                        value={providerPreferences?.batch_provider_id || config.OPENAI_PROVIDER_PREF_BATCH || 'openai-api'}
+                        value={providerPreferences?.batch_provider_id || config.OPENAI_PROVIDER_PREF_BATCH || 'openai-codex'}
                         onValueChange={(value: AIProviderId) => {
                           void saveProviderPreferences({ batch_provider_id: value });
                         }}
@@ -1525,7 +1525,7 @@ function SettingsPage() {
                       <div className="text-[11px] text-muted-foreground flex items-center gap-2">
                         <span>Effective:</span>
                         <ProviderBadge
-                          provider={config.OPENAI_PROVIDER_EFFECTIVE_BATCH || providerPreferences?.effective?.batch_provider_id || 'openai-api'}
+                          provider={config.OPENAI_PROVIDER_EFFECTIVE_BATCH || providerPreferences?.effective?.batch_provider_id || 'openai-codex'}
                           className="h-5 px-2 py-0 text-[10px]"
                         />
                       </div>
@@ -1533,7 +1533,7 @@ function SettingsPage() {
                     <div className="space-y-2">
                       <Label className="text-xs">Web search</Label>
                       <Select
-                        value={providerPreferences?.web_search_provider_id || config.OPENAI_PROVIDER_PREF_WEB_SEARCH || 'openai-api'}
+                        value={providerPreferences?.web_search_provider_id || config.OPENAI_PROVIDER_PREF_WEB_SEARCH || 'openai-codex'}
                         onValueChange={(value: AIProviderId) => {
                           void saveProviderPreferences({ web_search_provider_id: value });
                         }}
@@ -1564,7 +1564,7 @@ function SettingsPage() {
                       <div className="text-[11px] text-muted-foreground flex items-center gap-2">
                         <span>Effective:</span>
                         <ProviderBadge
-                          provider={providerPreferences?.effective?.web_search_provider_id || providerPreferences?.web_search_provider_id || 'openai-api'}
+                          provider={providerPreferences?.effective?.web_search_provider_id || providerPreferences?.web_search_provider_id || 'openai-codex'}
                           className="h-5 px-2 py-0 text-[10px]"
                         />
                       </div>
