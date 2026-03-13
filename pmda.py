@@ -23537,7 +23537,7 @@ def _fetch_discogs_release_by_id(discogs_id: str) -> Optional[dict]:
         iid = int(float(sid))
     except Exception:
         return None
-    d = _get_or_create_discogs_client()
+    d = _get_discogs_client()
     if d is None:
         return None
     try:
@@ -30496,15 +30496,28 @@ def _provider_track_titles_cached(
     edition.setdefault("lastfm_album_mbid", (lastfm_album_mbid or "").strip())
     edition.setdefault("bandcamp_album_url", (bandcamp_album_url or "").strip())
     edition.setdefault("primary_metadata_source", provider)
-    payload = _strict_payload_for_provider(
-        provider,
-        artist_name=str(artist_name or ""),
-        album_title=str(album_title or ""),
-        edition=edition,
-    )
-    tracklist = _provider_track_titles_for_strict(provider, payload or {})
-    _files_cache_set_json(cache_key, {"tracklist": tracklist}, ttl=86400 * 7)
-    return tracklist
+    try:
+        payload = _strict_payload_for_provider(
+            provider,
+            artist_name=str(artist_name or ""),
+            album_title=str(album_title or ""),
+            edition=edition,
+        )
+        tracklist = _provider_track_titles_for_strict(provider, payload or {})
+        _files_cache_set_json(cache_key, {"tracklist": tracklist}, ttl=86400 * 7)
+        return tracklist
+    except DiscogsRateLimited:
+        raise
+    except Exception as e:
+        logging.warning(
+            "Provider tracklist overlay failed for provider=%s artist=%s album=%s ref=%s: %s",
+            provider,
+            str(artist_name or "").strip() or "Unknown Artist",
+            str(album_title or "").strip() or "Unknown Album",
+            ref,
+            e,
+        )
+        return []
 
 
 def _display_tracks_with_provider_overlay(
@@ -30882,215 +30895,236 @@ def _publish_files_library_artist_from_items(
             folder_raw = (item.get("folder") or "").strip()
             if not folder_raw:
                 continue
-            folder = path_for_fs_access(Path(folder_raw))
-            if not folder.exists() or not folder.is_dir():
-                continue
-            track_entries = _files_build_track_entries_from_item(item, folder)
-            if not track_entries:
-                continue
-            first_audio = None
             try:
-                first_audio = path_for_fs_access(Path(track_entries[0]["file_path"]))
-            except Exception:
+                folder = path_for_fs_access(Path(folder_raw))
+                if not folder.exists() or not folder.is_dir():
+                    logging.warning(
+                        "Files publication skipped missing album folder artist=%s folder=%s",
+                        artist_name,
+                        folder_raw,
+                    )
+                    continue
+                track_entries = _files_build_track_entries_from_item(item, folder)
+                if not track_entries:
+                    logging.warning(
+                        "Files publication skipped album with no track entries artist=%s folder=%s",
+                        artist_name,
+                        folder_raw,
+                    )
+                    continue
                 first_audio = None
-            tags = dict(item.get("meta") or {})
-            if first_audio and first_audio.exists():
-                live_tags = extract_tags(first_audio) or {}
-                if live_tags:
-                    tags.update(live_tags)
-            resolved_artist_from_item, resolved_title_from_item = _resolve_edition_display_identity(
-                item,
-                default_artist=str(artist_name or ""),
-                default_title=str(item.get("album_title") or item.get("title_raw") or folder.name or ""),
-                folder_name=folder.name,
-            )
-            title_fallback = (
-                resolved_title_from_item
-                or (item.get("album_title") or "").strip()
-                or (item.get("title_raw") or "").strip()
-                or folder.name.replace("_", " ").strip()
-                or "Unknown Album"
-            )
-            artist_fallback = resolved_artist_from_item or (item.get("artist") or "").strip() or (artist_name or "").strip() or "Unknown Artist"
-            # The scan payload already carries the authoritative resolved display identity.
-            # Publication must not regress back to stale embedded tags for adversarial
-            # corpora such as:
-            #   - Slowdive / Souvlaki files tagged as album "Takk..."
-            #   - Sigur Rós / Von files tagged as album "Takk..."
-            # Live tags are still used for year/genre/label/etc., but album/artist display
-            # identity should stay on the scan-time resolution unless it is missing/generic.
-            artist_resolved = str(resolved_artist_from_item or artist_fallback or "").strip()
-            album_resolved = _sanitize_album_title_display(
-                str(resolved_title_from_item or title_fallback or "").strip()
-            )
-            if _identity_text_is_generic(artist_resolved):
-                artist_resolved = str(
-                    _pick_album_artist_from_tag_dicts([tags], default=artist_fallback) or artist_fallback or "Unknown Artist"
-                ).strip() or "Unknown Artist"
-            if _identity_text_is_generic(album_resolved):
-                album_resolved = _sanitize_album_title_display(
-                    str(_pick_album_title_from_tag_dicts([tags], fallback=title_fallback) or title_fallback or "Unknown Album").strip()
+                try:
+                    first_audio = path_for_fs_access(Path(track_entries[0]["file_path"]))
+                except Exception:
+                    first_audio = None
+                tags = dict(item.get("meta") or {})
+                if first_audio and first_audio.exists():
+                    live_tags = extract_tags(first_audio) or {}
+                    if live_tags:
+                        tags.update(live_tags)
+                resolved_artist_from_item, resolved_title_from_item = _resolve_edition_display_identity(
+                    item,
+                    default_artist=str(artist_name or ""),
+                    default_title=str(item.get("album_title") or item.get("title_raw") or folder.name or ""),
+                    folder_name=folder.name,
                 )
-            artist_resolved = str(artist_resolved or artist_fallback or "Unknown Artist").strip() or "Unknown Artist"
-            album_resolved = _sanitize_album_title_display(
-                str(album_resolved or title_fallback or "Unknown Album").strip() or "Unknown Album"
-            )
-            label_resolved = _pick_album_label_from_tag_dicts([tags])
-            artist_norm = _norm_artist_key(artist_resolved) or "unknown artist"
-            title_norm = norm_album_for_dedup(album_resolved, normalize_parenthetical=True) or "unknown album"
-            date_text = (tags.get("date") or tags.get("year") or "").strip()
-            year = _parse_int_loose((date_text[:4] if date_text else tags.get("year")), 0) or None
-            raw_genres = _split_genre_values(tags.get("genre") or "")
-            inferred_genre = _infer_genre_from_bandcamp_tags(raw_genres) if raw_genres else None
-            genre = inferred_genre if inferred_genre else ("; ".join(raw_genres[:6]) if raw_genres else "")
-            fmt_counts: dict[str, int] = defaultdict(int)
-            total_duration_sec = 0
-            for tr in track_entries:
-                fmt_counts[(tr.get("format") or "UNKNOWN").upper()] += 1
-                total_duration_sec += int(tr.get("duration_sec") or 0)
-            dominant_format = max(fmt_counts.items(), key=lambda x: x[1])[0] if fmt_counts else "UNKNOWN"
-            cover_path = _first_cover_path(folder)
-            has_cover = bool(cover_path and cover_path.is_file()) or album_folder_has_cover(folder)
-            artist_image_path = _files_effective_artist_image_path(
-                folder,
-                artist_resolved,
-                artist_norm,
-                conn=pg_conn,
-            )
-            has_artist_image = bool(artist_image_path and artist_image_path.is_file())
-            indices = [int(t.get("track_num") or 0) for t in track_entries if int(t.get("track_num") or 0) > 0]
-            actual_track_count = len(track_entries)
-            is_broken = bool(item.get("is_broken"))
-            expected_track_count = _parse_int_loose(item.get("expected_track_count"), 0) or None
-            missing_indices = list(item.get("missing_indices") or [])
-            if is_broken and expected_track_count and not missing_indices:
-                missing_indices = _edition_missing_indices_exact(item, int(expected_track_count or 0), actual_track_count)
-            if (not is_broken) and indices:
-                max_idx = max(indices)
-                coverage = (actual_track_count / max_idx) if max_idx else 1.0
-                # Skip broken detection when track numbering is obviously corrupt.
-                if max_idx > max(120, actual_track_count * 3) and coverage < 0.5:
-                    is_broken = False
-                    expected_track_count = None
-                    missing_indices = []
-                else:
-                    is_broken, _actual_count_from_indices, gaps = _detect_gaps_in_indices(indices)
-                    if is_broken:
-                        expected_track_count = max_idx
-                        for start_i, end_i in gaps:
-                            if (end_i - start_i) > 2000:
-                                continue
-                            missing_indices.extend(list(range(start_i + 1, end_i)))
-                            if len(missing_indices) > 5000:
-                                missing_indices = missing_indices[:5000]
-                                break
-            album_id = _parse_int_loose(item.get("album_id"), 0)
-            result = results_by_album_id.get(album_id, {})
-            mbid = (
-                (item.get("musicbrainz_id") or "").strip()
-                or _extract_musicbrainz_id_from_meta(tags)
-                or ""
-            )
-            discogs_release_id = (
-                result.get("discogs_release_id")
-                or item.get("discogs_release_id")
-                or ""
-            ).strip()
-            lastfm_album_mbid = (
-                result.get("lastfm_album_mbid")
-                or item.get("lastfm_album_mbid")
-                or ""
-            ).strip()
-            bandcamp_album_url = (
-                result.get("bandcamp_album_url")
-                or item.get("bandcamp_album_url")
-                or ""
-            ).strip()
-            strict_match_verified = bool(
-                result.get("strict_match_verified")
-                if ("strict_match_verified" in result)
-                else item.get("strict_match_verified")
-            )
-            strict_match_provider = _normalize_identity_provider(
-                str(
-                    result.get("strict_match_provider")
-                    or item.get("strict_match_provider")
+                title_fallback = (
+                    resolved_title_from_item
+                    or (item.get("album_title") or "").strip()
+                    or (item.get("title_raw") or "").strip()
+                    or folder.name.replace("_", " ").strip()
+                    or "Unknown Album"
+                )
+                artist_fallback = resolved_artist_from_item or (item.get("artist") or "").strip() or (artist_name or "").strip() or "Unknown Artist"
+                # The scan payload already carries the authoritative resolved display identity.
+                # Publication must not regress back to stale embedded tags for adversarial
+                # corpora such as:
+                #   - Slowdive / Souvlaki files tagged as album "Takk..."
+                #   - Sigur Rós / Von files tagged as album "Takk..."
+                # Live tags are still used for year/genre/label/etc., but album/artist display
+                # identity should stay on the scan-time resolution unless it is missing/generic.
+                artist_resolved = str(resolved_artist_from_item or artist_fallback or "").strip()
+                album_resolved = _sanitize_album_title_display(
+                    str(resolved_title_from_item or title_fallback or "").strip()
+                )
+                if _identity_text_is_generic(artist_resolved):
+                    artist_resolved = str(
+                        _pick_album_artist_from_tag_dicts([tags], default=artist_fallback) or artist_fallback or "Unknown Artist"
+                    ).strip() or "Unknown Artist"
+                if _identity_text_is_generic(album_resolved):
+                    album_resolved = _sanitize_album_title_display(
+                        str(_pick_album_title_from_tag_dicts([tags], fallback=title_fallback) or title_fallback or "Unknown Album").strip()
+                    )
+                artist_resolved = str(artist_resolved or artist_fallback or "Unknown Artist").strip() or "Unknown Artist"
+                album_resolved = _sanitize_album_title_display(
+                    str(album_resolved or title_fallback or "Unknown Album").strip() or "Unknown Album"
+                )
+                label_resolved = _pick_album_label_from_tag_dicts([tags])
+                artist_norm = _norm_artist_key(artist_resolved) or "unknown artist"
+                title_norm = norm_album_for_dedup(album_resolved, normalize_parenthetical=True) or "unknown album"
+                date_text = (tags.get("date") or tags.get("year") or "").strip()
+                year = _parse_int_loose((date_text[:4] if date_text else tags.get("year")), 0) or None
+                raw_genres = _split_genre_values(tags.get("genre") or "")
+                inferred_genre = _infer_genre_from_bandcamp_tags(raw_genres) if raw_genres else None
+                genre = inferred_genre if inferred_genre else ("; ".join(raw_genres[:6]) if raw_genres else "")
+                fmt_counts: dict[str, int] = defaultdict(int)
+                total_duration_sec = 0
+                for tr in track_entries:
+                    fmt_counts[(tr.get("format") or "UNKNOWN").upper()] += 1
+                    total_duration_sec += int(tr.get("duration_sec") or 0)
+                dominant_format = max(fmt_counts.items(), key=lambda x: x[1])[0] if fmt_counts else "UNKNOWN"
+                cover_path = _first_cover_path(folder)
+                has_cover = bool(cover_path and cover_path.is_file()) or album_folder_has_cover(folder)
+                artist_image_path = _files_effective_artist_image_path(
+                    folder,
+                    artist_resolved,
+                    artist_norm,
+                    conn=pg_conn,
+                )
+                has_artist_image = bool(artist_image_path and artist_image_path.is_file())
+                indices = [int(t.get("track_num") or 0) for t in track_entries if int(t.get("track_num") or 0) > 0]
+                actual_track_count = len(track_entries)
+                is_broken = bool(item.get("is_broken"))
+                expected_track_count = _parse_int_loose(item.get("expected_track_count"), 0) or None
+                missing_indices = list(item.get("missing_indices") or [])
+                if is_broken and expected_track_count and not missing_indices:
+                    missing_indices = _edition_missing_indices_exact(item, int(expected_track_count or 0), actual_track_count)
+                if (not is_broken) and indices:
+                    max_idx = max(indices)
+                    coverage = (actual_track_count / max_idx) if max_idx else 1.0
+                    # Skip broken detection when track numbering is obviously corrupt.
+                    if max_idx > max(120, actual_track_count * 3) and coverage < 0.5:
+                        is_broken = False
+                        expected_track_count = None
+                        missing_indices = []
+                    else:
+                        is_broken, _actual_count_from_indices, gaps = _detect_gaps_in_indices(indices)
+                        if is_broken:
+                            expected_track_count = max_idx
+                            for start_i, end_i in gaps:
+                                if (end_i - start_i) > 2000:
+                                    continue
+                                missing_indices.extend(list(range(start_i + 1, end_i)))
+                                if len(missing_indices) > 5000:
+                                    missing_indices = missing_indices[:5000]
+                                    break
+                album_id = _parse_int_loose(item.get("album_id"), 0)
+                result = results_by_album_id.get(album_id, {})
+                mbid = (
+                    (item.get("musicbrainz_id") or "").strip()
+                    or _extract_musicbrainz_id_from_meta(tags)
                     or ""
                 )
-            )
-            strict_reject_reason = str(
-                result.get("strict_reject_reason")
-                or item.get("strict_reject_reason")
-                or ""
-            ).strip()
-            try:
-                strict_tracklist_score = float(
-                    result.get("strict_tracklist_score")
-                    if ("strict_tracklist_score" in result)
-                    else item.get("strict_tracklist_score")
+                discogs_release_id = (
+                    result.get("discogs_release_id")
+                    or item.get("discogs_release_id")
+                    or ""
+                ).strip()
+                lastfm_album_mbid = (
+                    result.get("lastfm_album_mbid")
+                    or item.get("lastfm_album_mbid")
+                    or ""
+                ).strip()
+                bandcamp_album_url = (
+                    result.get("bandcamp_album_url")
+                    or item.get("bandcamp_album_url")
+                    or ""
+                ).strip()
+                strict_match_verified = bool(
+                    result.get("strict_match_verified")
+                    if ("strict_match_verified" in result)
+                    else item.get("strict_match_verified")
                 )
-            except Exception:
-                strict_tracklist_score = 0.0
-            missing_required = _check_required_tags(
-                tags,
-                REQUIRED_TAGS,
-                edition={"tracks": [{"title": t.get("title"), "index": t.get("track_num")} for t in track_entries]},
-            )
-            pmda_provider = (tags.get(PMDA_MATCH_PROVIDER_TAG) or "").strip()
-            source_id = int(_source_id_for_path(folder) or 0)
-            rows.append(
-                {
-                    "folder_path": _album_folder_cache_key(folder),
-                    "scan_id": scan_id,
-                    "source_id": source_id if source_id > 0 else None,
-                    "artist_name": artist_resolved,
-                    "artist_norm": artist_norm,
-                    "album_title": album_resolved,
-                    "title_norm": title_norm,
-                    "year": year,
-                    "date_text": date_text[:32] if date_text else "",
-                    "genre": genre or "",
-                    "label": (label_resolved or "").strip(),
-                    "tags_json": json.dumps(raw_genres[:20]),
-                    "format": dominant_format,
-                    "is_lossless": dominant_format in _LOSSLESS_FORMATS,
-                    "has_cover": has_cover,
-                    "cover_path": str(cover_path) if cover_path else "",
-                    "has_artist_image": has_artist_image,
-                    "artist_image_path": str(artist_image_path) if artist_image_path else "",
-                    "mb_identified": bool(strict_match_verified),
-                    "strict_match_verified": bool(strict_match_verified),
-                    "strict_match_provider": strict_match_provider,
-                    "strict_reject_reason": strict_reject_reason,
-                    "strict_tracklist_score": strict_tracklist_score,
-                    "musicbrainz_release_group_id": mbid,
-                    "discogs_release_id": discogs_release_id,
-                    "lastfm_album_mbid": lastfm_album_mbid,
-                    "bandcamp_album_url": bandcamp_album_url,
-                    "primary_metadata_source": (
-                        (
-                            strict_match_provider
-                            or result.get("provider_used")
-                            or result.get("pmda_match_provider")
-                            or item.get("primary_metadata_source")
-                            or item.get("metadata_source")
-                            or pmda_provider
-                            or ""
-                        ).strip()
-                    ),
-                    "track_count": actual_track_count,
-                    "total_duration_sec": total_duration_sec,
-                    "is_broken": bool(is_broken),
-                    "expected_track_count": expected_track_count,
-                    "actual_track_count": actual_track_count,
-                    "missing_indices_json": json.dumps(missing_indices),
-                    "missing_required_tags_json": json.dumps(missing_required),
-                    "primary_tags_json": json.dumps(tags, default=str),
-                    "tracks_json": json.dumps(track_entries),
-                    "fingerprint": (item.get("fingerprint") or "").strip(),
-                    "updated_at": now,
-                }
-            )
+                strict_match_provider = _normalize_identity_provider(
+                    str(
+                        result.get("strict_match_provider")
+                        or item.get("strict_match_provider")
+                        or ""
+                    )
+                )
+                strict_reject_reason = str(
+                    result.get("strict_reject_reason")
+                    or item.get("strict_reject_reason")
+                    or ""
+                ).strip()
+                try:
+                    strict_tracklist_score = float(
+                        result.get("strict_tracklist_score")
+                        if ("strict_tracklist_score" in result)
+                        else item.get("strict_tracklist_score")
+                    )
+                except Exception:
+                    strict_tracklist_score = 0.0
+                missing_required = _check_required_tags(
+                    tags,
+                    REQUIRED_TAGS,
+                    edition={"tracks": [{"title": t.get("title"), "index": t.get("track_num")} for t in track_entries]},
+                )
+                pmda_provider = (tags.get(PMDA_MATCH_PROVIDER_TAG) or "").strip()
+                source_id = int(_source_id_for_path(folder) or 0)
+                rows.append(
+                    {
+                        "folder_path": _album_folder_cache_key(folder),
+                        "scan_id": scan_id,
+                        "source_id": source_id if source_id > 0 else None,
+                        "artist_name": artist_resolved,
+                        "artist_norm": artist_norm,
+                        "album_title": album_resolved,
+                        "title_norm": title_norm,
+                        "year": year,
+                        "date_text": date_text[:32] if date_text else "",
+                        "genre": genre or "",
+                        "label": (label_resolved or "").strip(),
+                        "tags_json": json.dumps(raw_genres[:20]),
+                        "format": dominant_format,
+                        "is_lossless": dominant_format in _LOSSLESS_FORMATS,
+                        "has_cover": has_cover,
+                        "cover_path": str(cover_path) if cover_path else "",
+                        "has_artist_image": has_artist_image,
+                        "artist_image_path": str(artist_image_path) if artist_image_path else "",
+                        "mb_identified": bool(strict_match_verified),
+                        "strict_match_verified": bool(strict_match_verified),
+                        "strict_match_provider": strict_match_provider,
+                        "strict_reject_reason": strict_reject_reason,
+                        "strict_tracklist_score": strict_tracklist_score,
+                        "musicbrainz_release_group_id": mbid,
+                        "discogs_release_id": discogs_release_id,
+                        "lastfm_album_mbid": lastfm_album_mbid,
+                        "bandcamp_album_url": bandcamp_album_url,
+                        "primary_metadata_source": (
+                            (
+                                strict_match_provider
+                                or result.get("provider_used")
+                                or result.get("pmda_match_provider")
+                                or item.get("primary_metadata_source")
+                                or item.get("metadata_source")
+                                or pmda_provider
+                                or ""
+                            ).strip()
+                        ),
+                        "track_count": actual_track_count,
+                        "total_duration_sec": total_duration_sec,
+                        "is_broken": bool(is_broken),
+                        "expected_track_count": expected_track_count,
+                        "actual_track_count": actual_track_count,
+                        "missing_indices_json": json.dumps(missing_indices),
+                        "missing_required_tags_json": json.dumps(missing_required),
+                        "primary_tags_json": json.dumps(tags, default=str),
+                        "tracks_json": json.dumps(track_entries),
+                        "fingerprint": (item.get("fingerprint") or "").strip(),
+                        "updated_at": now,
+                    }
+                )
+            except Exception as e:
+                logging.warning(
+                    "Files publication skipped album artist=%s album=%s folder=%s: %s",
+                    artist_name,
+                    str(item.get('album_title') or item.get('title_raw') or '').strip() or 'Unknown Album',
+                    folder_raw,
+                    e,
+                    exc_info=True,
+                )
+                continue
     finally:
         try:
             if pg_conn is not None:
@@ -31173,6 +31207,13 @@ def _rebuild_files_publication_for_scan(scan_id: int | None) -> dict[str, int]:
         inserted,
         len(targets),
     )
+    if inserted < len(targets):
+        logging.warning(
+            "Files publication rebuild incomplete for scan_id=%s: published=%d target_albums=%d",
+            sid,
+            inserted,
+            len(targets),
+        )
     return {"scan_id": sid, "deleted": int(deleted), "inserted": int(inserted)}
 
 
@@ -36774,6 +36815,11 @@ def _get_discogs_client():
             _discogs_client = discogs_client.Client("PMDA/0.6.6", user_token=token)
             _discogs_client_token = token
         return _discogs_client
+
+
+def _get_or_create_discogs_client():
+    """Backward-compatible alias for older Discogs call sites."""
+    return _get_discogs_client()
 
 
 def _discogs_call(desc: str, fn, attempts: int = 2):
