@@ -56092,6 +56092,8 @@ def _fetch_album_review_web_ai(
         requested_provider="openai",
         user_id=_current_user_id_or_zero(),
     )
+    if search_source == "openai_web_search" and ai_ok:
+        source = _review_ai_provider_source(_provider_effective, _auth_mode, search_source)
     if ai_ok:
         try:
             provider = "openai"
@@ -56251,6 +56253,8 @@ def _fetch_album_review_web_ai_batch(
             continue
         summary = str(ai_summaries_by_norm.get(title_norm) or "").strip()
         source = str(entry.get("search_source") or "serper").strip() or "serper"
+        if source == "openai_web_search" and ai_ok:
+            source = _review_ai_provider_source(_provider_effective, _auth_mode, source)
         if summary:
             source = _review_ai_provider_source(_provider_effective, _auth_mode, source)
         if not summary:
