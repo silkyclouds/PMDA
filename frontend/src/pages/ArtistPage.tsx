@@ -9,11 +9,12 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/component
 import { Carousel, CarouselContent, CarouselItem, CarouselNext, CarouselPrevious } from '@/components/ui/carousel';
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { AlbumArtwork } from '@/components/library/AlbumArtwork';
+import { AlbumBadgeGroups } from '@/components/library/AlbumBadgeGroups';
 import { MatchDetailDialog } from '@/components/library/MatchDetailDialog';
 import { ProviderBadge } from '@/components/providers/ProviderBadge';
+import { useAlbumBadgesVisibility } from '@/hooks/use-album-badges';
 import { cn } from '@/lib/utils';
 import { badgeKindClass } from '@/lib/badgeStyles';
-import { FormatBadge } from '@/components/FormatBadge';
 import * as api from '@/lib/api';
 import { useToast } from '@/hooks/use-toast';
 import { ConcertsMiniMap } from '@/components/concerts/ConcertsMiniMap';
@@ -42,6 +43,9 @@ interface AlbumInfo {
   title: string;
   year?: number;
   date?: string;
+  genre?: string | null;
+  genres?: string[] | null;
+  label?: string | null;
   track_count: number;
   type: string;
   thumb?: string;
@@ -49,6 +53,12 @@ interface AlbumInfo {
   is_lossless?: boolean;
   mb_identified?: boolean;
   short_description?: string;
+  user_rating?: number | null;
+  public_rating?: number | null;
+  public_rating_votes?: number | null;
+  public_rating_source?: string | null;
+  heat_score?: number | null;
+  heat_label?: string | null;
 }
 
 interface ArtistDetailResponse {
@@ -161,6 +171,7 @@ export default function ArtistPage() {
   const navigate = useNavigate();
   const location = useLocation();
   const { startPlayback, setCurrentTrack } = usePlayback();
+  const { showBadges, setShowBadges } = useAlbumBadgesVisibility();
   const params = useParams<{ artistId: string }>();
   const artistId = Number(params.artistId);
   const { toast } = useToast();
@@ -1210,9 +1221,20 @@ export default function ArtistPage() {
         <div className="space-y-6">
           {sortedTypes.map((type) => (
             <section key={type} className="space-y-3">
-              <div className="flex items-center gap-2">
-                <Disc3 className="w-4 h-4 text-primary" />
-                <h2 className="text-lg font-semibold">{type === 'Single' ? 'Singles' : `${type}s`}</h2>
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex items-center gap-2">
+                  <Disc3 className="w-4 h-4 text-primary" />
+                  <h2 className="text-lg font-semibold">{type === 'Single' ? 'Singles' : `${type}s`}</h2>
+                </div>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="h-8 text-xs"
+                  onClick={() => setShowBadges(!showBadges)}
+                >
+                  {showBadges ? 'Hide badges' : 'Show badges'}
+                </Button>
               </div>
               <Carousel opts={{ align: 'start', dragFree: true }} className="w-full">
                 <CarouselContent className="-ml-3">
@@ -1265,19 +1287,22 @@ export default function ArtistPage() {
                           <h3 className="text-sm font-semibold truncate" title={album.title}>
                             {album.title}
                           </h3>
-                          <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground">
-                            <span>{album.year || album.date || 'Unknown'}</span>
-                            <span>{album.track_count} tracks</span>
-                          </div>
-                          <div className="flex items-center gap-1.5 flex-wrap">
-                            {album.format && <FormatBadge format={album.format} size="sm" />}
-                            <Badge
-                              variant="outline"
-                              className={`text-[10px] ${album.is_lossless ? badgeKindClass('lossless') : badgeKindClass('lossy')}`}
-                            >
-                              {album.is_lossless ? 'Lossless' : 'Lossy'}
-                            </Badge>
-                          </div>
+                          <AlbumBadgeGroups
+                            show={showBadges}
+                            compact
+                            userRating={album.user_rating}
+                            publicRating={album.public_rating}
+                            publicRatingVotes={album.public_rating_votes}
+                            heatLabel={album.heat_label}
+                            format={album.format}
+                            isLossless={album.is_lossless}
+                            year={album.year || album.date || null}
+                            trackCount={album.track_count}
+                            genres={album.genres || (album.genre ? [album.genre] : [])}
+                            label={album.label}
+                            onGenreClick={(genre) => navigate(`/library/genre/${encodeURIComponent(genre)}${location.search || ''}`)}
+                            onLabelClick={album.label ? () => navigate(`/library/label/${encodeURIComponent(album.label || '')}${location.search || ''}`) : undefined}
+                          />
                           {album.short_description && (
                             <p className={cn('text-[11px] text-muted-foreground line-clamp-3')}>
                               {album.short_description}

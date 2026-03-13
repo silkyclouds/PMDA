@@ -29,7 +29,9 @@ export function AlbumCommunitySignals({
   const normalizedUser = Number(userRating || 0);
   const normalizedPublic = Number(publicRating || 0);
   const votes = Number(publicRatingVotes || 0);
-  const hasAny = normalizedUser > 0 || normalizedPublic > 0 || Boolean(heatLabel);
+  const cleanedHeatLabel = String(heatLabel || '').trim();
+  const showHeatLabel = Boolean(cleanedHeatLabel) && cleanedHeatLabel.toLowerCase() !== 'unknown';
+  const hasAny = normalizedUser > 0 || normalizedPublic > 0 || showHeatLabel;
 
   if (!hasAny) return null;
 
@@ -61,19 +63,19 @@ export function AlbumCommunitySignals({
           ) : null}
         </div>
       ) : null}
-      {heatLabel ? (
+      {showHeatLabel ? (
         <Badge
           variant="outline"
           className={cn(
             'text-[10px] font-medium',
-            heatLabel.toLowerCase().includes('essential')
+            cleanedHeatLabel.toLowerCase().includes('essential')
               ? badgeKindClass('status_match')
-              : heatLabel.toLowerCase().includes('recommended')
+              : cleanedHeatLabel.toLowerCase().includes('recommended')
                 ? badgeKindClass('status_soft')
                 : badgeKindClass('source')
           )}
         >
-          {heatLabel}
+          {cleanedHeatLabel}
         </Badge>
       ) : null}
     </div>

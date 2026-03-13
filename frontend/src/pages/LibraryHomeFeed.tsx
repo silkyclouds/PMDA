@@ -3,13 +3,13 @@ import { useLocation, useNavigate, useOutletContext, useParams } from 'react-rou
 import { ArrowLeft, Loader2, Music, Play, UserRound } from 'lucide-react';
 
 import { AspectRatio } from '@/components/ui/aspect-ratio';
-import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
+import { AlbumBadgeGroups } from '@/components/library/AlbumBadgeGroups';
 import { AlbumArtwork } from '@/components/library/AlbumArtwork';
-import { AlbumCommunitySignals } from '@/components/library/AlbumCommunitySignals';
 import type { TrackInfo } from '@/components/library/AudioPlayer';
 import { usePlayback } from '@/contexts/PlaybackContext';
+import { useAlbumBadgesVisibility } from '@/hooks/use-album-badges';
 import { useToast } from '@/hooks/use-toast';
 import { useIsMobile } from '@/hooks/use-mobile';
 import { dedupeAlbumsForDisplay, mergeAlbumsForDisplay } from '@/lib/albumDisplayDedupe';
@@ -103,6 +103,7 @@ export default function LibraryHomeFeed() {
   const isMobile = useIsMobile();
   const { toast } = useToast();
   const { startPlayback, setCurrentTrack, recommendationSessionId, session } = usePlayback();
+  const { showBadges, setShowBadges } = useAlbumBadgesVisibility();
 
   const [loading, setLoading] = useState(false);
   const [appending, setAppending] = useState(false);
@@ -329,7 +330,22 @@ export default function LibraryHomeFeed() {
 
       <Card className="border-border/70">
         <CardContent className="p-5">
-          <h1 className="text-2xl font-bold truncate">{FEED_TITLES[section]}</h1>
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <h1 className="text-2xl font-bold truncate">{FEED_TITLES[section]}</h1>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="h-8 text-xs"
+              onClick={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                setShowBadges(!showBadges);
+              }}
+            >
+              {showBadges ? 'Hide badges' : 'Show badges'}
+            </Button>
+          </div>
           {error ? (
             <div className="mt-2 text-sm text-destructive">{error}</div>
           ) : null}
@@ -339,10 +355,6 @@ export default function LibraryHomeFeed() {
       {ALBUM_FEEDS.has(section) ? (
         <div className="grid gap-4 justify-start" style={{ gridTemplateColumns }}>
           {albums.map((a) => {
-            const primaryGenre = String(a.genre || '')
-              .split(/[;,/|]+/g)
-              .map((x) => x.trim())
-              .find(Boolean) || '';
             return (
               <div
                 key={`hf-alb-${section}-${a.album_id}`}
@@ -389,21 +401,20 @@ export default function LibraryHomeFeed() {
                     >
                       {a.artist_name}
                     </button>
-                    <div className="flex items-center gap-1.5 flex-wrap">
-                      <Badge variant="outline" className="text-[10px]">{a.year ?? '—'}</Badge>
-                      <Badge variant="outline" className="text-[10px]">{a.track_count}t</Badge>
-                    </div>
-                    <AlbumCommunitySignals
+                    <AlbumBadgeGroups
+                      show={showBadges}
+                      compact
                       userRating={a.user_rating}
                       publicRating={a.public_rating}
                       publicRatingVotes={a.public_rating_votes}
                       heatLabel={a.heat_label}
-                      compact
+                      format={a.format}
+                      isLossless={a.is_lossless}
+                      year={a.year}
+                      trackCount={a.track_count}
+                      genres={a.genres || (a.genre ? [a.genre] : [])}
+                      label={a.label}
                     />
-                    <div className="flex items-center gap-1.5 flex-wrap">
-                      {primaryGenre ? <Badge variant="secondary" className="text-[10px]">{primaryGenre}</Badge> : null}
-                      {a.label ? <Badge variant="outline" className="text-[10px]">{a.label}</Badge> : null}
-                    </div>
                   </CardContent>
                 </Card>
               </div>

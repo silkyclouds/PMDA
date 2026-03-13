@@ -180,6 +180,8 @@ for (const [id, meta] of Object.entries(PROVIDER_META) as Array<[ProviderId, Pro
 export function normalizeProviderId(raw: string | null | undefined): ProviderId {
   const value = String(raw || '').trim().toLowerCase();
   if (!value) return 'unknown';
+  if (value.includes('openai-codex')) return 'openai-codex';
+  if (value.includes('openai-api')) return 'openai-api';
   if (value.startsWith('wikipedia')) return 'wikipedia';
   if (value.startsWith('last.fm') || value.startsWith('lastfm')) return 'lastfm';
   if (value.includes('musicbrainz') || value === 'mbid' || value === 'mb') return 'musicbrainz';

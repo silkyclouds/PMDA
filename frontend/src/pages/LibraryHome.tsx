@@ -8,10 +8,11 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/com
 import { Checkbox } from '@/components/ui/checkbox';
 import { AspectRatio } from '@/components/ui/aspect-ratio';
 import { Carousel, CarouselContent, CarouselItem, CarouselNext, CarouselPrevious } from '@/components/ui/carousel';
+import { AlbumBadgeGroups } from '@/components/library/AlbumBadgeGroups';
 import { AlbumArtwork } from '@/components/library/AlbumArtwork';
-import { AlbumCommunitySignals } from '@/components/library/AlbumCommunitySignals';
 import { LibraryEmptyState } from '@/components/library/LibraryEmptyState';
 import { usePlayback } from '@/contexts/PlaybackContext';
+import { useAlbumBadgesVisibility } from '@/hooks/use-album-badges';
 import { useToast } from '@/hooks/use-toast';
 import * as api from '@/lib/api';
 import type { TrackInfo } from '@/components/library/AudioPlayer';
@@ -57,6 +58,7 @@ export default function LibraryHome() {
   const { includeUnmatched, libraryIsEmpty } = useOutletContext<LibraryOutletContext>();
   const { toast } = useToast();
   const { startPlayback, setCurrentTrack, recommendationSessionId, session } = usePlayback();
+  const { showBadges, setShowBadges } = useAlbumBadgesVisibility();
 
   const [recoLoading, setRecoLoading] = useState(false);
   const [recoError, setRecoError] = useState<string | null>(null);
@@ -335,7 +337,16 @@ export default function LibraryHome() {
 
   return (
     <div className="container pb-6 flex flex-col gap-5 md:gap-6">
-      <div className="flex items-center justify-end">
+      <div className="flex items-center justify-end gap-2">
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          className="h-8 text-xs"
+          onClick={() => setShowBadges(!showBadges)}
+        >
+          {showBadges ? 'Hide badges' : 'Show badges'}
+        </Button>
         <Button
           type="button"
           variant="ghost"
@@ -536,12 +547,21 @@ export default function LibraryHome() {
                                   {a.year ?? '—'}
                                 </Badge>
                               </div>
-                              <AlbumCommunitySignals
+                              <AlbumBadgeGroups
+                                show={showBadges}
+                                compact
                                 userRating={a.user_rating}
                                 publicRating={a.public_rating}
                                 publicRatingVotes={a.public_rating_votes}
                                 heatLabel={a.heat_label}
-                                compact
+                                format={a.format}
+                                isLossless={a.is_lossless}
+                                year={a.year}
+                                trackCount={a.track_count}
+                                genres={a.genres || (a.genre ? [a.genre] : [])}
+                                label={a.label}
+                                onGenreClick={(genreName) => navigate(`/library/genre/${encodeURIComponent(genreName)}${location.search || ''}`)}
+                                onLabelClick={a.label ? () => navigate(`/library/label/${encodeURIComponent(a.label || '')}${location.search || ''}`) : undefined}
                               />
                             </CardContent>
                           </Card>
@@ -869,12 +889,21 @@ export default function LibraryHome() {
                               {a.year ?? '—'}
                             </Badge>
                           </div>
-                          <AlbumCommunitySignals
+                          <AlbumBadgeGroups
+                            show={showBadges}
+                            compact
                             userRating={a.user_rating}
                             publicRating={a.public_rating}
                             publicRatingVotes={a.public_rating_votes}
                             heatLabel={a.heat_label}
-                            compact
+                            format={a.format}
+                            isLossless={a.is_lossless}
+                            year={a.year}
+                            trackCount={a.track_count}
+                            genres={a.genres || (a.genre ? [a.genre] : [])}
+                            label={a.label}
+                            onGenreClick={(genreName) => navigate(`/library/genre/${encodeURIComponent(genreName)}${location.search || ''}`)}
+                            onLabelClick={a.label ? () => navigate(`/library/label/${encodeURIComponent(a.label || '')}${location.search || ''}`) : undefined}
                           />
                         </CardContent>
                       </Card>
@@ -972,12 +1001,21 @@ export default function LibraryHome() {
                               {a.year ?? '—'}
                             </Badge>
                           </div>
-                          <AlbumCommunitySignals
+                          <AlbumBadgeGroups
+                            show={showBadges}
+                            compact
                             userRating={a.user_rating}
                             publicRating={a.public_rating}
                             publicRatingVotes={a.public_rating_votes}
                             heatLabel={a.heat_label}
-                            compact
+                            format={a.format}
+                            isLossless={a.is_lossless}
+                            year={a.year}
+                            trackCount={a.track_count}
+                            genres={a.genres || (a.genre ? [a.genre] : [])}
+                            label={a.label}
+                            onGenreClick={(genreName) => navigate(`/library/genre/${encodeURIComponent(genreName)}${location.search || ''}`)}
+                            onLabelClick={a.label ? () => navigate(`/library/label/${encodeURIComponent(a.label || '')}${location.search || ''}`) : undefined}
                           />
                         </CardContent>
                       </Card>

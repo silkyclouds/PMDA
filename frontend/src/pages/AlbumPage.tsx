@@ -1,6 +1,6 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
-import { ArrowLeft, Calendar, ChevronDown, ChevronUp, Disc3, Download, Flame, Info, ListPlus, Loader2, Music, Pencil, Play, Plus, Sparkles, Users } from 'lucide-react';
+import { ArrowLeft, Calendar, ChevronDown, ChevronUp, Disc3, Download, Flame, Info, ListPlus, Loader2, Music, Pencil, Play, Plus, Users } from 'lucide-react';
 
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -214,7 +214,6 @@ export default function AlbumPage() {
   const [playlists, setPlaylists] = useState<api.PlaylistSummary[]>([]);
   const [addingTrackId, setAddingTrackId] = useState<number | null>(null);
   const [downloadingAlbum, setDownloadingAlbum] = useState(false);
-  const [aiReviewBusy, setAiReviewBusy] = useState(false);
   const [matchDialogOpen, setMatchDialogOpen] = useState(false);
   const [trackDetailsLoading, setTrackDetailsLoading] = useState(false);
   const [trackDetailsError, setTrackDetailsError] = useState<string | null>(null);
@@ -475,36 +474,6 @@ export default function AlbumPage() {
     [playlists, toast]
   );
 
-  const handleGenerateAiReview = useCallback(async () => {
-    if (!data || aiReviewBusy) return;
-    setAiReviewBusy(true);
-    try {
-      const res = await api.generateAlbumReview(data.album_id);
-      await load();
-      toast({
-        title: 'Album review generated',
-        description: res.source ? `Source: ${res.source}` : 'Review updated.',
-      });
-    } catch (e) {
-      const apiMsg =
-        (e && typeof e === 'object' && 'body' in e && typeof (e as { body?: unknown }).body === 'object'
-          ? String(
-              ((e as { body?: Record<string, unknown> }).body?.error
-                || (e as { body?: Record<string, unknown> }).body?.detail
-                || (e as { body?: Record<string, unknown> }).body?.message
-                || '')
-            ).trim()
-          : '') || '';
-      toast({
-        title: 'AI review failed',
-        description: apiMsg || (e instanceof Error ? e.message : 'Unable to generate album review'),
-        variant: 'destructive',
-      });
-    } finally {
-      setAiReviewBusy(false);
-    }
-  }, [aiReviewBusy, data, load, toast]);
-
   if (loading) {
     return (
       <div className="container py-8">
@@ -581,17 +550,6 @@ export default function AlbumPage() {
           >
             <Info className="w-4 h-4" />
             Match detail
-          </Button>
-          <Button
-            size="sm"
-            variant="outline"
-            className="h-8 gap-2"
-            onClick={() => void handleGenerateAiReview()}
-            disabled={aiReviewBusy}
-            title="Generate album review via AI with safety checks"
-          >
-            {aiReviewBusy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
-            AI review
           </Button>
         </div>
       </div>
@@ -754,7 +712,7 @@ export default function AlbumPage() {
                     {formatCompactCount(ratings.public_rating_votes)} vote{Number(ratings.public_rating_votes || 0) > 1 ? 's' : ''}
                   </Badge>
                 ) : null}
-                {ratings.heat_label ? (
+                {ratings.heat_label && String(ratings.heat_label || '').trim().toLowerCase() !== 'unknown' ? (
                   <Badge
                     variant="outline"
                     className={cn(

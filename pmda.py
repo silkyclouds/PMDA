@@ -50592,7 +50592,8 @@ def api_library_artist_detail(artist_id):
                 cur.execute(
                     """
                     SELECT
-                        id, title, title_norm, year, date_text, track_count, is_broken, format, is_lossless,
+                        id, title, title_norm, year, date_text, COALESCE(genre, '') AS genre, COALESCE(label, '') AS label, COALESCE(tags_json, '[]') AS tags_json,
+                        track_count, is_broken, format, is_lossless,
                         has_cover, COALESCE(cover_path, ''), COALESCE(folder_path, ''), mb_identified, musicbrainz_release_group_id,
                         discogs_release_id, lastfm_album_mbid, bandcamp_album_url, metadata_source,
                         expected_track_count, actual_track_count, missing_indices_json,
@@ -50610,6 +50611,25 @@ def api_library_artist_detail(artist_id):
             title_norms = [str(r[2] or "") for r in rows if str(r[2] or "").strip()]
             album_profile_map = _files_get_album_profiles_cached(artist_norm, title_norms)
             profile_enriching = _files_profile_job_is_active(artist_norm)
+            user_rating_map: dict[int, int] = {}
+            user_id = int(_current_user_id_or_zero())
+            if user_id > 0 and rows:
+                album_ids = [int(r[0] or 0) for r in rows if int(r[0] or 0) > 0]
+                if album_ids:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            SELECT album_id, rating
+                            FROM files_user_album_ratings
+                            WHERE user_id = %s
+                              AND album_id = ANY(%s)
+                            """,
+                            (user_id, album_ids),
+                        )
+                        for aid, rating in cur.fetchall():
+                            parsed_rating = int(rating or 0)
+                            if int(aid or 0) > 0 and parsed_rating > 0:
+                                user_rating_map[int(aid)] = max(1, min(5, parsed_rating))
 
             albums = []
             stats_duplicates = 0
@@ -50619,24 +50639,55 @@ def api_library_artist_detail(artist_id):
             for row in rows:
                 album_id = int(row[0])
                 title_norm = str(row[2] or "")
-                track_count = int(row[5] or 0)
-                is_broken = bool(row[6])
-                fmt = (row[7] or "").strip() or None
-                is_lossless = bool(row[8])
-                has_cover = bool(row[9])
-                cover_path_raw = (row[10] or "").strip()
-                folder_path_raw = (row[11] or "").strip()
-                mb_identified = bool(row[12])
-                mbid = (row[13] or "").strip() or None
-                discogs_release_id = (row[14] or "").strip() or None
-                lastfm_album_mbid = (row[15] or "").strip() or None
-                bandcamp_album_url = (row[16] or "").strip() or None
-                metadata_source = (row[17] or "").strip() or None
-                expected_track_count = row[18]
-                actual_track_count = row[19]
-                missing_indices_raw = row[20] or "[]"
-                dup_count = int(row[21] or 0)
+                genre_raw = (row[5] or "").strip()
+                label_raw = (row[6] or "").strip()
+                tags_json_raw = row[7] or "[]"
+                track_count = int(row[8] or 0)
+                is_broken = bool(row[9])
+                fmt = (row[10] or "").strip() or None
+                is_lossless = bool(row[11])
+                has_cover = bool(row[12])
+                cover_path_raw = (row[13] or "").strip()
+                folder_path_raw = (row[14] or "").strip()
+                mb_identified = bool(row[15])
+                mbid = (row[16] or "").strip() or None
+                discogs_release_id = (row[17] or "").strip() or None
+                lastfm_album_mbid = (row[18] or "").strip() or None
+                bandcamp_album_url = (row[19] or "").strip() or None
+                metadata_source = (row[20] or "").strip() or None
+                expected_track_count = row[21]
+                actual_track_count = row[22]
+                missing_indices_raw = row[23] or "[]"
+                dup_count = int(row[24] or 0)
                 album_profile = album_profile_map.get(title_norm, {}) if title_norm else {}
+                genres_list: list[str] = []
+                try:
+                    tags_list = json.loads(tags_json_raw) if tags_json_raw else []
+                    if isinstance(tags_list, list):
+                        for t in tags_list:
+                            value = str(t or "").strip()
+                            if value:
+                                genres_list.append(value)
+                except Exception:
+                    genres_list = []
+                if not genres_list:
+                    try:
+                        genres_list = _split_genre_values(genre_raw or "")
+                    except Exception:
+                        genres_list = []
+                if genres_list:
+                    seen_genres: set[str] = set()
+                    deduped_genres: list[str] = []
+                    for genre_value in genres_list:
+                        clean_genre = re.sub(r"\s+", " ", str(genre_value or "").strip())
+                        if not clean_genre:
+                            continue
+                        genre_key = clean_genre.lower()
+                        if genre_key in seen_genres:
+                            continue
+                        seen_genres.add(genre_key)
+                        deduped_genres.append(clean_genre)
+                    genres_list = deduped_genres[:20]
 
                 has_cover_effective = has_cover
                 if not has_cover_effective:
@@ -50698,9 +50749,18 @@ def api_library_artist_detail(artist_id):
                     "in_duplicate_group": dup_count > 1,
                     "can_improve": can_improve,
                     "broken_detail": broken_detail,
+                    "genre": genre_raw or None,
+                    "genres": genres_list,
+                    "label": label_raw or None,
                     "description": album_profile.get("description"),
                     "short_description": album_profile.get("short_description"),
                     "description_source": album_profile.get("source"),
+                    "public_rating": float(album_profile.get("public_rating")) if album_profile.get("public_rating") is not None else None,
+                    "public_rating_votes": int(album_profile.get("public_rating_votes") or 0),
+                    "public_rating_source": str(album_profile.get("public_rating_source") or "").strip() or None,
+                    "heat_score": float(album_profile.get("heat_score")) if album_profile.get("heat_score") is not None else None,
+                    "heat_label": str(album_profile.get("heat_label") or "").strip() or None,
+                    "user_rating": user_rating_map.get(album_id),
                 })
 
             artist_thumb = None
@@ -55988,6 +56048,16 @@ def _review_summary_fallback_from_hits(hits: list[dict[str, Any]]) -> str:
     return _truncate_text(merged, max_chars=900) if merged else ""
 
 
+def _review_ai_provider_source(provider_effective: str, auth_mode: str, fallback_source: str) -> str:
+    provider_norm = str(provider_effective or "").strip().lower()
+    auth_norm = str(auth_mode or "").strip().lower()
+    if provider_norm in {"openai", "openai-api", "openai-codex"}:
+        return "openai-codex" if auth_norm == "oauth" else "openai-api"
+    if provider_norm:
+        return provider_norm
+    return str(fallback_source or "").strip() or "openai-api"
+
+
 def _fetch_album_review_web_ai(
     artist_name: str,
     album_title: str,
@@ -56050,7 +56120,7 @@ def _fetch_album_review_web_ai(
             )
             summary = _strip_html_text(str(ai_out or "").strip())
             if summary:
-                source = f"{search_source}+ai"
+                source = _review_ai_provider_source(_provider_effective, _auth_mode, search_source)
         except Exception:
             summary = ""
 
@@ -56182,7 +56252,7 @@ def _fetch_album_review_web_ai_batch(
         summary = str(ai_summaries_by_norm.get(title_norm) or "").strip()
         source = str(entry.get("search_source") or "serper").strip() or "serper"
         if summary:
-            source = f"{source}+ai_batch"
+            source = _review_ai_provider_source(_provider_effective, _auth_mode, source)
         if not summary:
             summary = str(entry.get("fallback_summary") or "").strip()
         if not summary:

@@ -25,6 +25,7 @@ export function ProviderBadge({
   external = false,
 }: ProviderBadgeProps) {
   const meta = getProviderMeta(provider);
+  if (meta.id === 'unknown' && !labelOverride) return null;
   const label = labelOverride || meta.label;
   return (
     <Badge variant={variant} className={cn('gap-1.5', providerBadgeClass(meta.id), className)}>
@@ -34,4 +35,3 @@ export function ProviderBadge({
     </Badge>
   );
 }
-

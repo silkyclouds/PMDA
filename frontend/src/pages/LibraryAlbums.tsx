@@ -3,46 +3,25 @@ import { useLocation, useNavigate, useOutletContext } from 'react-router-dom';
 import { Heart, Loader2, Play, UserRound } from 'lucide-react';
 
 import { AspectRatio } from '@/components/ui/aspect-ratio';
-import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Slider } from '@/components/ui/slider';
-import { FormatBadge } from '@/components/FormatBadge';
+import { AlbumBadgeGroups } from '@/components/library/AlbumBadgeGroups';
 import { AlbumArtwork } from '@/components/library/AlbumArtwork';
-import { AlbumCommunitySignals } from '@/components/library/AlbumCommunitySignals';
 import { LibraryEmptyState } from '@/components/library/LibraryEmptyState';
 import { usePlayback } from '@/contexts/PlaybackContext';
+import { useAlbumBadgesVisibility } from '@/hooks/use-album-badges';
 import { useToast } from '@/hooks/use-toast';
 import { useLibraryQuery } from '@/hooks/useLibraryQuery';
 import { useIsMobile } from '@/hooks/use-mobile';
 import { dedupeAlbumsForDisplay, mergeAlbumsForDisplay } from '@/lib/albumDisplayDedupe';
-import { badgeKindClass } from '@/lib/badgeStyles';
 import { cn } from '@/lib/utils';
 import * as api from '@/lib/api';
 import type { TrackInfo } from '@/components/library/AudioPlayer';
 import type { LibraryOutletContext } from '@/pages/LibraryLayout';
 
 type SortMode = 'recent' | 'year_desc' | 'alpha' | 'artist' | 'user_rating' | 'public_rating' | 'heat';
-
-function normalizeGenreBadges(album: api.LibraryAlbumItem): string[] {
-  const raw: unknown =
-    (album && typeof album === 'object' && 'genres' in album)
-      ? (album as { genres?: unknown }).genres
-      : undefined;
-  const base = Array.isArray(raw) ? raw : (album.genre ? String(album.genre).split(/[;,/|]+/) : []);
-  const out: string[] = [];
-  const seen = new Set<string>();
-  for (const item of base) {
-    const txt = String(item ?? '').replace(/\s+/g, ' ').trim();
-    if (!txt) continue;
-    const key = txt.toLowerCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(txt);
-  }
-  return out;
-}
 
 export default function LibraryAlbums() {
   const isMobile = useIsMobile();
@@ -51,6 +30,7 @@ export default function LibraryAlbums() {
   const { includeUnmatched, libraryIsEmpty } = useOutletContext<LibraryOutletContext>();
   const { toast } = useToast();
   const { startPlayback, setCurrentTrack } = usePlayback();
+  const { showBadges, setShowBadges } = useAlbumBadgesVisibility();
   const { search, genre, label, year } = useLibraryQuery();
 
   const [albumLoading, setAlbumLoading] = useState(false);
@@ -252,6 +232,15 @@ export default function LibraryAlbums() {
         </div>
 
         <div className="flex flex-col sm:flex-row sm:items-center gap-3">
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="h-10 sm:h-10"
+            onClick={() => setShowBadges(!showBadges)}
+          >
+            {showBadges ? 'Hide badges' : 'Show badges'}
+          </Button>
           <Select value={sort} onValueChange={(v) => setSort(v as SortMode)}>
             <SelectTrigger className="w-full sm:w-[180px] h-10 bg-background/80">
               <SelectValue placeholder="Sort" />
@@ -361,66 +350,22 @@ export default function LibraryAlbums() {
                   </button>
                 </div>
 
-                <AlbumCommunitySignals
+                <AlbumBadgeGroups
+                  show={showBadges}
+                  compact
                   userRating={a.user_rating}
                   publicRating={a.public_rating}
                   publicRatingVotes={a.public_rating_votes}
                   heatLabel={a.heat_label}
-                  compact
-                  className="gap-1.5"
+                  format={a.format}
+                  isLossless={a.is_lossless}
+                  year={a.year}
+                  trackCount={a.track_count}
+                  genres={a.genres || (a.genre ? [a.genre] : [])}
+                  label={a.label}
+                  onGenreClick={(genreName) => navigate(`/library/genre/${encodeURIComponent(genreName)}${location.search || ''}`)}
+                  onLabelClick={a.label ? () => navigate(`/library/label/${encodeURIComponent(a.label || '')}${location.search || ''}`) : undefined}
                 />
-
-                <div className="flex flex-wrap items-center gap-1.5">
-                  {a.format ? <FormatBadge format={a.format} size="sm" /> : null}
-                  <Badge
-                    variant="outline"
-                    className={cn("text-[10px]", a.is_lossless ? badgeKindClass('lossless') : badgeKindClass('lossy'))}
-                  >
-                    {a.is_lossless ? 'Lossless' : 'Lossy'}
-                  </Badge>
-                  <Badge variant="outline" className={cn("text-[10px]", badgeKindClass('year'))}>
-                    {a.year ?? '—'}
-                  </Badge>
-                  <Badge variant="outline" className={cn("text-[10px]", badgeKindClass('count'))}>
-                    {a.track_count}t
-                  </Badge>
-                </div>
-
-                {(normalizeGenreBadges(a).length > 0 || a.label) ? (
-                  <div className="flex flex-wrap items-center gap-1.5">
-                    {(() => {
-                      const genres = normalizeGenreBadges(a);
-                      const shown = genres.slice(0, 6);
-                      const more = Math.max(0, genres.length - shown.length);
-                      return (
-                        <>
-                          {shown.map((g) => (
-                            <Badge
-                              key={`alb-g-${a.album_id}-${g}`}
-                              variant="outline"
-                              className={cn("text-[10px] cursor-pointer", badgeKindClass('genre'))}
-                              title="Browse genre"
-                              onClick={() => navigate(`/library/genre/${encodeURIComponent(g)}${location.search || ''}`)}
-                            >
-                              {g}
-                            </Badge>
-                          ))}
-                          {more > 0 ? <Badge variant="outline" className={cn("text-[10px]", badgeKindClass('genre'))}>+{more}</Badge> : null}
-                        </>
-                      );
-                    })()}
-                    {a.label ? (
-                      <Badge
-                        variant="outline"
-                        className={cn("text-[10px] cursor-pointer", badgeKindClass('label'))}
-                        title="Open label"
-                        onClick={() => navigate(`/library/label/${encodeURIComponent(a.label || '')}${location.search || ''}`)}
-                      >
-                        {a.label}
-                      </Badge>
-                    ) : null}
-                  </div>
-                ) : null}
               </div>
             </div>
           </div>
