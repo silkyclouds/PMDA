@@ -39267,7 +39267,7 @@ def _openai_web_search_fallback(query: str, num: int = 10, *, reason: str = "") 
                 web_search=True,
             )
             rows = _assistant_extract_json_array(raw_text)
-            normalized = _normalize_web_results(rows, source="openai_web_search", max_items=max_items)
+            normalized = _normalize_web_results(rows, source=str(provider_for_usage or "openai-codex"), max_items=max_items)
             status = "completed"
             if normalized:
                 logging.info(
@@ -39395,7 +39395,7 @@ def _openai_web_search_fallback(query: str, num: int = 10, *, reason: str = "") 
             response_obj = resp
             raw_text = _extract_text_from_openai_response(resp)
             rows = _assistant_extract_json_array(raw_text)
-            normalized = _normalize_web_results(rows, source="openai_web_search", max_items=max(1, int(num or 10)))
+            normalized = _normalize_web_results(rows, source=str(provider_for_usage or "openai-api"), max_items=max(1, int(num or 10)))
             status = "completed"
             if normalized:
                 logging.info(
@@ -39428,7 +39428,7 @@ def _openai_web_search_fallback(query: str, num: int = 10, *, reason: str = "") 
                         web_search=True,
                     )
                     rows = _assistant_extract_json_array(raw_text)
-                    normalized = _normalize_web_results(rows, source="openai_web_search", max_items=max_items)
+                    normalized = _normalize_web_results(rows, source=str(provider_for_usage or "openai-codex"), max_items=max_items)
                     provider_for_usage = "openai-codex"
                     auth_mode_for_usage = "oauth"
                     if normalized:
@@ -56036,7 +56036,23 @@ def _review_search_source_from_hits(hits: list[dict[str, Any]]) -> str:
         for row in (hits or [])
         if isinstance(row, dict) and str(row.get("source") or "").strip()
     }
-    return "openai_web_search" if any("openai" in s for s in hit_sources) else "serper"
+    if "openai-codex" in hit_sources:
+        return "openai-codex"
+    if "openai-api" in hit_sources:
+        return "openai-api"
+    if "openai_web_search" in hit_sources:
+        try:
+            ai_ok, provider_effective, auth_mode, _reason = _resolve_ai_runtime_availability(
+                analysis_type="web_search",
+                requested_provider="openai",
+                user_id=_current_user_id_or_zero(),
+            )
+            if ai_ok:
+                return _review_ai_provider_source(provider_effective, auth_mode, "openai_web_search")
+        except Exception:
+            pass
+        return "openai_web_search"
+    return "serper"
 
 
 def _review_summary_fallback_from_hits(hits: list[dict[str, Any]]) -> str:
