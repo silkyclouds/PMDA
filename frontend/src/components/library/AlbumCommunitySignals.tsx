@@ -1,6 +1,4 @@
-import { Badge } from '@/components/ui/badge';
 import { AlbumRatingStars } from '@/components/library/AlbumRatingStars';
-import { badgeKindClass } from '@/lib/badgeStyles';
 import { cn } from '@/lib/utils';
 
 function formatCompactCount(value?: number | null): string {
@@ -13,7 +11,6 @@ type AlbumCommunitySignalsProps = {
   userRating?: number | null;
   publicRating?: number | null;
   publicRatingVotes?: number | null;
-  heatLabel?: string | null;
   className?: string;
   compact?: boolean;
 };
@@ -22,16 +19,13 @@ export function AlbumCommunitySignals({
   userRating,
   publicRating,
   publicRatingVotes,
-  heatLabel,
   className,
   compact = false,
 }: AlbumCommunitySignalsProps) {
   const normalizedUser = Number(userRating || 0);
   const normalizedPublic = Number(publicRating || 0);
   const votes = Number(publicRatingVotes || 0);
-  const cleanedHeatLabel = String(heatLabel || '').trim();
-  const showHeatLabel = Boolean(cleanedHeatLabel) && cleanedHeatLabel.toLowerCase() !== 'unknown';
-  const hasAny = normalizedUser > 0 || normalizedPublic > 0 || showHeatLabel;
+  const hasAny = normalizedUser > 0 || normalizedPublic > 0;
 
   if (!hasAny) return null;
 
@@ -62,21 +56,6 @@ export function AlbumCommunitySignals({
             </span>
           ) : null}
         </div>
-      ) : null}
-      {showHeatLabel ? (
-        <Badge
-          variant="outline"
-          className={cn(
-            'text-[10px] font-medium',
-            cleanedHeatLabel.toLowerCase().includes('essential')
-              ? badgeKindClass('status_match')
-              : cleanedHeatLabel.toLowerCase().includes('recommended')
-                ? badgeKindClass('status_soft')
-                : badgeKindClass('source')
-          )}
-        >
-          {cleanedHeatLabel}
-        </Badge>
       ) : null}
     </div>
   );

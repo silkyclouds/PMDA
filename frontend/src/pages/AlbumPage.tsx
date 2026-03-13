@@ -1,6 +1,6 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
-import { ArrowLeft, Calendar, ChevronDown, ChevronUp, Disc3, Download, Flame, Info, ListPlus, Loader2, Music, Pencil, Play, Plus, Users } from 'lucide-react';
+import { ArrowLeft, Calendar, ChevronDown, ChevronUp, Disc3, Download, Info, ListPlus, Loader2, Music, Pencil, Play, Plus, Users } from 'lucide-react';
 
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -710,22 +710,6 @@ export default function AlbumPage() {
                 {Number(ratings.public_rating_votes || 0) > 0 ? (
                   <Badge variant="outline" className={cn('text-[10px]', badgeKindClass('count'))}>
                     {formatCompactCount(ratings.public_rating_votes)} vote{Number(ratings.public_rating_votes || 0) > 1 ? 's' : ''}
-                  </Badge>
-                ) : null}
-                {ratings.heat_label && String(ratings.heat_label || '').trim().toLowerCase() !== 'unknown' ? (
-                  <Badge
-                    variant="outline"
-                    className={cn(
-                      'text-[10px]',
-                      String(ratings.heat_label || '').toLowerCase().includes('essential')
-                        ? badgeKindClass('status_match')
-                        : String(ratings.heat_label || '').toLowerCase().includes('recommended')
-                          ? badgeKindClass('status_soft')
-                          : badgeKindClass('source')
-                    )}
-                  >
-                    <Flame className="h-3 w-3 mr-1" />
-                    {ratings.heat_label}
                   </Badge>
                 ) : null}
               </div>

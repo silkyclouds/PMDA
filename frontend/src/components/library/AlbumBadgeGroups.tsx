@@ -57,8 +57,7 @@ export function AlbumBadgeGroups({
   const cleanGenres = normalizeGenres(genres);
   const cleanLabelRaw = String(label || '').trim();
   const cleanLabel = cleanLabelRaw && cleanLabelRaw.toLowerCase() !== 'unknown' ? cleanLabelRaw : '';
-  const cleanHeat = String(heatLabel || '').trim();
-  const hasPulse = Number(userRating || 0) > 0 || Number(publicRating || 0) > 0 || (cleanHeat && cleanHeat.toLowerCase() !== 'unknown');
+  const hasPulse = Number(userRating || 0) > 0 || Number(publicRating || 0) > 0;
   const hasAlbumFacts = Boolean(String(format || '').trim()) || typeof isLossless === 'boolean' || Number(year || 0) > 0 || Number(trackCount || 0) > 0;
   const hasTaxonomy = cleanGenres.length > 0 || Boolean(cleanLabel);
   const headingClass = compact
@@ -75,7 +74,6 @@ export function AlbumBadgeGroups({
             userRating={userRating}
             publicRating={publicRating}
             publicRatingVotes={publicRatingVotes}
-            heatLabel={cleanHeat}
             compact={compact}
             className="gap-1.5"
           />

@@ -20442,6 +20442,143 @@ def extract_tags(audio_path: Path) -> dict[str, str]:
             duration_sec = float(_run_ffprobe_duration_sec(str(audio_path)) or 0)
         if duration_sec > 0:
             tags["duration"] = str(int(max(1, round(duration_sec))))
+        identity_keys = {
+            "musicbrainz_releasegroupid",
+            "musicbrainz_release_group_id",
+            "musicbrainz_releaseid",
+            "musicbrainz_release_id",
+            "musicbrainz_albumid",
+            "musicbrainz_id",
+            "discogs_release_id",
+            "lastfm_album_mbid",
+            "bandcamp_album_url",
+            PMDA_ID_TAG,
+            PMDA_MATCH_PROVIDER_TAG,
+            PMDA_COVER_PROVIDER_TAG,
+            PMDA_ARTIST_PROVIDER_TAG,
+            PMDA_COMPLETE_TAG,
+        }
+        suffix = str(audio_path.suffix or "").lower()
+        need_mutagen_fallback = suffix in {".mp3", ".m4a", ".mp4", ".aac"} and not any(tags.get(k) for k in identity_keys)
+        if need_mutagen_fallback:
+            try:
+                from mutagen import File as MutagenFile  # type: ignore
+                from mutagen.id3 import ID3, TXXX  # type: ignore
+                from mutagen.mp3 import MP3  # type: ignore
+                from mutagen.mp4 import MP4  # type: ignore
+            except Exception:
+                MutagenFile = ID3 = TXXX = MP3 = MP4 = None  # type: ignore[assignment]
+
+            def _norm_custom_key(key: str) -> str:
+                raw = str(key or "").strip().lower()
+                raw = raw.replace("----:com.apple.itunes:", "")
+                raw = raw.replace("tag:", "")
+                raw = re.sub(r"[\s:/\-]+", "_", raw)
+                raw = re.sub(r"_+", "_", raw).strip("_")
+                aliases = {
+                    "musicbrainz_release_group_id": "musicbrainz_releasegroupid",
+                    "musicbrainz_releasegroupid": "musicbrainz_releasegroupid",
+                    "musicbrainz_album_id": "musicbrainz_releaseid",
+                    "musicbrainz_release_id": "musicbrainz_releaseid",
+                    "musicbrainz_releaseid": "musicbrainz_releaseid",
+                    "musicbrainz_artist_id": "musicbrainz_artistid",
+                    "musicbrainz_album_artist_id": "musicbrainz_albumartistid",
+                    "discogs_release_id": "discogs_release_id",
+                    "lastfm_album_mbid": "lastfm_album_mbid",
+                    "bandcamp_album_url": "bandcamp_album_url",
+                    "pmda_id": PMDA_ID_TAG,
+                    "pmda_match_provider": PMDA_MATCH_PROVIDER_TAG,
+                    "pmda_cover_provider": PMDA_COVER_PROVIDER_TAG,
+                    "pmda_artist_provider": PMDA_ARTIST_PROVIDER_TAG,
+                    "pmda_complete": PMDA_COMPLETE_TAG,
+                }
+                return aliases.get(raw, raw)
+
+            def _first_scalar(value: object) -> str:
+                if value is None:
+                    return ""
+                if isinstance(value, bytes):
+                    try:
+                        return value.decode("utf-8", "ignore").strip()
+                    except Exception:
+                        return ""
+                if isinstance(value, (list, tuple)):
+                    for item in value:
+                        txt = _first_scalar(item)
+                        if txt:
+                            return txt
+                    return ""
+                return str(value).strip()
+
+            def _merge_if_missing(key: str, value: object) -> None:
+                norm_key = _norm_custom_key(key)
+                txt = _first_scalar(value)
+                if not norm_key or not txt:
+                    return
+                if not tags.get(norm_key):
+                    tags[norm_key] = txt
+
+            try:
+                audio = MutagenFile(str(audio_path), easy=False) if MutagenFile is not None else None
+            except Exception:
+                audio = None
+            tag_obj = getattr(audio, "tags", None) if audio is not None else None
+            if tag_obj:
+                try:
+                    if ID3 is not None and isinstance(tag_obj, ID3):
+                        for frame in tag_obj.values():
+                            if TXXX is not None and isinstance(frame, TXXX):
+                                _merge_if_missing(str(getattr(frame, "desc", "") or ""), getattr(frame, "text", None))
+                                continue
+                            frame_id = str(getattr(frame, "FrameID", "") or "")
+                            if frame_id == "TIT2":
+                                _merge_if_missing("title", getattr(frame, "text", None))
+                            elif frame_id == "TPE1":
+                                _merge_if_missing("artist", getattr(frame, "text", None))
+                            elif frame_id == "TPE2":
+                                _merge_if_missing("albumartist", getattr(frame, "text", None))
+                            elif frame_id == "TALB":
+                                _merge_if_missing("album", getattr(frame, "text", None))
+                            elif frame_id == "TDRC":
+                                _merge_if_missing("date", getattr(frame, "text", None))
+                            elif frame_id == "TCON":
+                                _merge_if_missing("genre", getattr(frame, "text", None))
+                            elif frame_id == "TRCK":
+                                _merge_if_missing("tracknumber", getattr(frame, "text", None))
+                            elif frame_id == "TPOS":
+                                _merge_if_missing("discnumber", getattr(frame, "text", None))
+                    elif MP4 is not None and isinstance(audio, MP4):
+                        for raw_key, raw_val in dict(tag_obj).items():
+                            key_lower = str(raw_key or "").lower()
+                            if key_lower == "\xa9nam":
+                                _merge_if_missing("title", raw_val)
+                            elif key_lower == "\xa9art":
+                                _merge_if_missing("artist", raw_val)
+                            elif key_lower == "aart":
+                                _merge_if_missing("albumartist", raw_val)
+                            elif key_lower == "\xa9alb":
+                                _merge_if_missing("album", raw_val)
+                            elif key_lower == "\xa9day":
+                                _merge_if_missing("date", raw_val)
+                            elif key_lower == "\xa9gen":
+                                _merge_if_missing("genre", raw_val)
+                            elif key_lower == "trkn":
+                                if isinstance(raw_val, list) and raw_val:
+                                    pair = raw_val[0]
+                                    if isinstance(pair, tuple) and pair:
+                                        _merge_if_missing("tracknumber", pair[0])
+                            elif key_lower == "disk":
+                                if isinstance(raw_val, list) and raw_val:
+                                    pair = raw_val[0]
+                                    if isinstance(pair, tuple) and pair:
+                                        _merge_if_missing("discnumber", pair[0])
+                            elif key_lower.startswith("----:com.apple.itunes:"):
+                                _merge_if_missing(str(raw_key).split(":")[-1], raw_val)
+                    else:
+                        for raw_key, raw_val in dict(tag_obj).items():
+                            _merge_if_missing(str(raw_key or ""), raw_val)
+                except Exception:
+                    logging.debug("mutagen tag fallback failed for %s", audio_path, exc_info=True)
         return tags
     except Exception:
         return {}
@@ -20838,6 +20975,11 @@ def _dupe_norm_track_title(s: str) -> str:
         return ""
     raw = raw.replace("…", "...").replace("…", "...")
     raw = raw.replace("&", " and ")
+    raw = (
+        unicodedata.normalize("NFKD", raw)
+        .encode("ascii", "ignore")
+        .decode("ascii")
+    )
     # Drop bracket/parenthetical segments and leading album/file prefix patterns.
     raw = re.sub(r"[\(\[][^)\]]*[\)\]]", " ", raw)
     raw = re.sub(r"^\s*[^-]+?\s*-\s*[^-]+?\s*-\s*", "", raw)
@@ -27416,6 +27558,62 @@ def scan_duplicates(
         mb_cache_hits = sum(1 for e in editions if (("rg_info" in e) and bool(e.get("mb_cache_hit", False))))
         mb_cache_misses = sum(1 for e in editions if (("rg_info" in e) and (not bool(e.get("mb_cache_hit", False)))))
 
+    def _edition_track_count_for_dupe(e: dict) -> int:
+        tracks = e.get("tracks") or []
+        if isinstance(tracks, list) and tracks:
+            return int(len(tracks))
+        for key in ("track_count", "actual_track_count", "expected_track_count"):
+            try:
+                parsed = int(e.get(key) or 0)
+            except Exception:
+                parsed = 0
+            if parsed > 0:
+                return parsed
+        return 0
+
+    def _edition_total_duration_for_dupe(e: dict) -> int:
+        try:
+            parsed = int(e.get("dur") or 0)
+        except Exception:
+            parsed = 0
+        if parsed > 0:
+            return parsed
+        total = 0
+        for tr in (e.get("tracks") or []):
+            try:
+                total += int(getattr(tr, "dur", 0) or (tr.get("dur") if isinstance(tr, dict) else 0) or 0)
+            except Exception:
+                continue
+        return max(0, int(total))
+
+    def _group_has_exact_provider_trackcount_signal(group: list[dict]) -> bool:
+        if len(group or []) < 2:
+            return False
+        shared_provider_id = False
+        provider_sets = [
+            {e.get("_dupe_mb_rg") for e in group if e.get("_dupe_mb_rg")},
+            {e.get("_dupe_mb_rel") for e in group if e.get("_dupe_mb_rel")},
+            {e.get("_dupe_discogs") for e in group if e.get("_dupe_discogs")},
+            {e.get("_dupe_lastfm") for e in group if e.get("_dupe_lastfm")},
+            {e.get("_dupe_bandcamp") for e in group if e.get("_dupe_bandcamp")},
+        ]
+        for values in provider_sets:
+            if len(values) == 1:
+                shared_provider_id = True
+                break
+        if not shared_provider_id:
+            return False
+        counts = {_edition_track_count_for_dupe(e) for e in group if _edition_track_count_for_dupe(e) > 0}
+        if len(counts) != 1:
+            return False
+        durations = [_edition_total_duration_for_dupe(e) for e in group if _edition_total_duration_for_dupe(e) > 0]
+        if len(durations) >= 2:
+            lo = min(durations)
+            hi = max(durations)
+            if lo <= 0 or ((hi - lo) / float(hi)) > 0.03:
+                return False
+        return True
+
     def _append_group(
         ed_list: list[dict],
         *,
@@ -27495,6 +27693,7 @@ def scan_duplicates(
                 # Provider IDs are strong, but wrong tags can collide. If coherence is extremely low,
                 # keep for review but do not auto-move.
                 if max_jac < 0.22 and min_ratio < 0.35:
+                    exact_provider_trackcount_safe = _group_has_exact_provider_trackcount_signal(sg)
                     audio_ov = 0.0
                     try:
                         audio_ov = _maybe_audio_overlap_max(sg)
@@ -27502,7 +27701,9 @@ def scan_duplicates(
                         audio_ov = 0.0
                     if audio_ov:
                         chips.append(f"AUDIO_FP_MAX:{audio_ov:.2f}")
-                    if audio_ov < 0.87:
+                    if exact_provider_trackcount_safe:
+                        chips.append("PROVIDER_ID_EXACT_TRACKCOUNT")
+                    elif audio_ov < 0.87:
                         no_move = True
                         manual_review = True
                         chips.append("COHERENCE_LOW")
@@ -27704,6 +27905,9 @@ def scan_duplicates(
                     if len(c) >= 2:
                         candidate_groups.append(c)
 
+            if not candidate_groups and _group_has_exact_provider_trackcount_signal(grp):
+                candidate_groups.append(grp)
+
             for sub in candidate_groups:
                 mb_rg_ids = {e.get("_dupe_mb_rg") for e in sub if e.get("_dupe_mb_rg")}
                 discogs_ids = {e.get("_dupe_discogs") for e in sub if e.get("_dupe_discogs")}
@@ -27718,6 +27922,8 @@ def scan_duplicates(
                     evidence.append(f"LASTFM_MBID:{next(iter(lastfm_ids))}")
                 if len(bandcamp_urls) == 1:
                     evidence.append("BANDCAMP:" + str(next(iter(bandcamp_urls)))[:120])
+                if _group_has_exact_provider_trackcount_signal(sub):
+                    evidence.append("PROVIDER_ID_EXACT_TRACKCOUNT")
                 _append_group(sub, fuzzy=False, signal="provider_id", evidence=evidence)
 
     # Phase 3: exact grouping by track signature (strong evidence; catches bad titles).
@@ -29055,20 +29261,32 @@ def _get_library_mode() -> str:
 def _extract_musicbrainz_id_from_meta(meta: dict | None) -> str:
     """Return normalized MBID-like string from tag/meta dict (empty string when absent)."""
     m = meta or {}
-    for key in (
+    preferred_keys = (
         "musicbrainz_releasegroupid",
         "musicbrainz_release_group_id",
         "musicbrainz_releaseid",
         "musicbrainz_release_id",
         "musicbrainz_id",
         "musicbrainz_albumid",
-    ):
+    )
+    for key in preferred_keys:
         v = m.get(key)
         if v is None:
             continue
         s = str(v).strip()
         if s:
             return s
+    for raw_key, raw_value in m.items():
+        norm = re.sub(r"[^a-z0-9]+", "", str(raw_key or "").lower())
+        if norm in {
+            "musicbrainzreleasegroupid",
+            "musicbrainzreleaseid",
+            "musicbrainzalbumid",
+            "musicbrainzid",
+        }:
+            s = str(raw_value or "").strip()
+            if s:
+                return s
     return ""
 
 
@@ -49852,6 +50070,18 @@ def api_library_recently_played_albums():
         }
         _files_cache_set_json(cache_key, payload, ttl=30)
         return jsonify(payload)
+    except Exception as e:
+        logging.exception("recently_played_albums failed: %s", e)
+        return jsonify({
+            "days": int(days),
+            "total": 0,
+            "limit": int(limit),
+            "offset": int(offset),
+            "generated_at": int(time.time()),
+            "source": "playback",
+            "albums": [],
+            "error": "Recently played temporarily unavailable",
+        })
     finally:
         conn.close()
 
@@ -55851,6 +56081,33 @@ def _provider_cover_url_from_payload(provider: str, payload: dict | None) -> str
     return str(data.get("cover_url") or "").strip()
 
 
+def _cover_art_archive_front_urls(mbid: str | None) -> list[str]:
+    raw = str(mbid or "").strip()
+    if not raw or not re.fullmatch(r"[0-9a-fA-F-]{36}", raw):
+        return []
+    quoted = quote(raw, safe="")
+    return [
+        f"https://coverartarchive.org/release-group/{quoted}/front",
+        f"https://coverartarchive.org/release/{quoted}/front",
+    ]
+
+
+def _download_cover_art_archive_front(mbid: str | None, *, timeout_sec: float = 5.0) -> tuple[bytes, str, str] | None:
+    for cover_url in _cover_art_archive_front_urls(mbid):
+        try:
+            cover_resp = requests.get(cover_url, timeout=timeout_sec, allow_redirects=True)
+        except Exception:
+            continue
+        if cover_resp.status_code != 200:
+            continue
+        content = cover_resp.content
+        mime = (cover_resp.headers.get("content-type") or "").split(";")[0].strip() or "image/jpeg"
+        if not mime.startswith("image/"):
+            mime = "image/jpeg"
+        return (content, mime, cover_url)
+    return None
+
+
 def _provider_year_from_payload(payload: dict | None) -> int | None:
     data = payload if isinstance(payload, dict) else {}
     raw = str(data.get("year") or "").strip()
@@ -57288,13 +57545,9 @@ def _improve_single_album(album_id: int, db_conn, known_release_group_id: Option
     artist_image_outcome: Optional[str] = None
     if release_mbid and (not has_cover or allow_cover_replace):
         try:
-            cover_url = f"http://coverartarchive.org/release-group/{release_mbid}/front"
-            cover_resp = requests.get(cover_url, timeout=5, allow_redirects=True)
-            if cover_resp.status_code == 200:
-                content = cover_resp.content
-                mime = (cover_resp.headers.get("content-type") or "").split(";")[0].strip() or "image/jpeg"
-                if not mime.startswith("image/"):
-                    mime = "image/jpeg"
+            cover_result = _download_cover_art_archive_front(release_mbid, timeout_sec=5.0)
+            if cover_result:
+                content, mime, _cover_url = cover_result
                 # Use vision only when identity is ambiguous. When we have an MB release-group id,
                 # Cover Art Archive is considered safe and we avoid costly + flaky vision gating.
                 use_vision = bool(USE_AI_VISION_BEFORE_COVER_INJECT) and False
@@ -57386,7 +57639,8 @@ def _improve_single_album(album_id: int, db_conn, known_release_group_id: Option
     need_verified_cover = (not has_cover_now) or allow_cover_replace
     if USE_DISCOGS and (not tags_updated or need_verified_cover):
         try:
-            discogs_info = _fetch_discogs_release(artist_name, album_title_str)
+            did = str(discogs_release_id or "").strip()
+            discogs_info = _fetch_discogs_release_by_id(did) if did else _fetch_discogs_release(artist_name, album_title_str)
         except DiscogsRateLimited:
             steps.append("Discogs: rate limited (skipped)")
             discogs_info = None
@@ -58280,13 +58534,9 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
     allow_cover_replace = bool(has_cover and existing_cover_provider in {"", "local", "unknown"})
     if release_mbid and (not has_cover or allow_cover_replace):
         try:
-            cover_url = f"http://coverartarchive.org/release-group/{release_mbid}/front"
-            cover_resp = requests.get(cover_url, timeout=5, allow_redirects=True)
-            if cover_resp.status_code == 200:
-                content = cover_resp.content
-                mime = (cover_resp.headers.get("content-type") or "").split(";")[0].strip() or "image/jpeg"
-                if not mime.startswith("image/"):
-                    mime = "image/jpeg"
+            cover_result = _download_cover_art_archive_front(release_mbid, timeout_sec=5.0)
+            if cover_result:
+                content, mime, _cover_url = cover_result
                 # With a validated MB release-group id, CAA is considered trusted.
                 # Do not gate it behind vision (costly + can reject correct covers).
                 use_vision = bool(USE_AI_VISION_BEFORE_COVER_INJECT) and False
@@ -58319,7 +58569,8 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
     need_verified_cover = (not has_cover_now) or allow_cover_replace
     if USE_DISCOGS and (not tags_updated or need_verified_cover):
         try:
-            discogs_info = _fetch_discogs_release(artist_name, album_title_str)
+            did = str(discogs_release_id or current_tags.get("discogs_release_id") or "").strip()
+            discogs_info = _fetch_discogs_release_by_id(did) if did else _fetch_discogs_release(artist_name, album_title_str)
         except DiscogsRateLimited:
             steps.append("Discogs: rate limited (skipped)")
             discogs_info = None
