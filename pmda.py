@@ -56042,12 +56042,12 @@ def _review_search_source_from_hits(hits: list[dict[str, Any]]) -> str:
         return "openai-api"
     if "openai_web_search" in hit_sources:
         try:
-            ai_ok, provider_effective, auth_mode, _reason = _resolve_ai_runtime_availability(
+            _ai_ok, provider_effective, auth_mode, _reason = _resolve_ai_runtime_availability(
                 analysis_type="web_search",
                 requested_provider="openai",
                 user_id=_current_user_id_or_zero(),
             )
-            if ai_ok:
+            if str(provider_effective or "").strip():
                 return _review_ai_provider_source(provider_effective, auth_mode, "openai_web_search")
         except Exception:
             pass
@@ -56108,7 +56108,7 @@ def _fetch_album_review_web_ai(
         requested_provider="openai",
         user_id=_current_user_id_or_zero(),
     )
-    if search_source == "openai_web_search" and ai_ok:
+    if search_source == "openai_web_search" and str(_provider_effective or "").strip():
         source = _review_ai_provider_source(_provider_effective, _auth_mode, search_source)
     if ai_ok:
         try:
@@ -56269,7 +56269,7 @@ def _fetch_album_review_web_ai_batch(
             continue
         summary = str(ai_summaries_by_norm.get(title_norm) or "").strip()
         source = str(entry.get("search_source") or "serper").strip() or "serper"
-        if source == "openai_web_search" and ai_ok:
+        if source == "openai_web_search" and str(_provider_effective or "").strip():
             source = _review_ai_provider_source(_provider_effective, _auth_mode, source)
         if summary:
             source = _review_ai_provider_source(_provider_effective, _auth_mode, source)
