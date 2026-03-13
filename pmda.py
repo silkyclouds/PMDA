@@ -19935,6 +19935,8 @@ def norm_album(title: str) -> str:
     • If still empty, return a unique placeholder so different unknown titles don't collide.
     """
     raw = (title or "").strip()
+    raw = raw.replace("…", "...")
+    raw = re.sub(r"(?:\.{3,})+\s*$", "", raw).strip() or raw
     # Remove any content in parentheses or brackets
     cleaned = re.sub(r"[\(\[][^(\)\]]*[\)\]]", "", raw)
     cleaned = " ".join(cleaned.split()).lower()
@@ -19978,6 +19980,8 @@ def norm_album_for_dedup(title: str, normalize_parenthetical: bool) -> str:
     (treat "Lemodie (Flac)" and "Lemodie" as different).
     """
     raw = (title or "").strip()
+    raw = raw.replace("…", "...")
+    raw = re.sub(r"(?:\.{3,})+\s*$", "", raw).strip() or raw
     if normalize_parenthetical:
         raw = strip_parenthetical_suffixes(raw) or raw
     cleaned = " ".join(raw.split()).lower()
@@ -20078,6 +20082,8 @@ def norm_album_for_dedup_loose(title: str) -> str:
     raw = (title or "").strip()
     if not raw:
         return "__untitled__"
+    raw = raw.replace("…", "...")
+    raw = re.sub(r"(?:\.{3,})+\s*$", "", raw).strip() or raw
 
     s = raw.replace("_", " ")
     # Drop bracketed segments entirely (often pure noise).
@@ -23966,7 +23972,8 @@ def _fetch_discogs_release_by_id(discogs_id: str) -> Optional[dict]:
             f"release {iid} data",
             lambda rid=iid: d.release(int(rid)).data,
         )
-        if isinstance(rel_data, dict) and rel_data.get("id"):
+        rel_data = _discogs_hydrate_release_or_master_data("release", rel_data, iid)
+        if isinstance(rel_data, dict) and (rel_data.get("id") or iid):
             return _strict_discogs_payload_from_release_data(rel_data)
     except DiscogsRateLimited:
         raise
@@ -23977,6 +23984,7 @@ def _fetch_discogs_release_by_id(discogs_id: str) -> Optional[dict]:
             f"master {iid} data",
             lambda mid=iid: d.master(int(mid)).data,
         )
+        master_data = _discogs_hydrate_release_or_master_data("master", master_data, iid)
         if isinstance(master_data, dict):
             main_release = master_data.get("main_release")
             if isinstance(main_release, dict):
@@ -23990,7 +23998,8 @@ def _fetch_discogs_release_by_id(discogs_id: str) -> Optional[dict]:
                     f"release {rid} data",
                     lambda relid=rid: d.release(int(relid)).data,
                 )
-                if isinstance(rel_data, dict) and rel_data.get("id"):
+                rel_data = _discogs_hydrate_release_or_master_data("release", rel_data, rid)
+                if isinstance(rel_data, dict) and (rel_data.get("id") or rid):
                     payload = _strict_discogs_payload_from_release_data(rel_data)
                     payload["master_id"] = str(master_data.get("id") or payload.get("master_id") or "").strip()
                     return payload
@@ -37319,6 +37328,78 @@ def _get_or_create_discogs_client():
     return _get_discogs_client()
 
 
+def _discogs_api_get_json(url: str, *, desc: str = "discogs api", attempts: int = 2) -> Optional[dict]:
+    token = (getattr(sys.modules[__name__], "DISCOGS_USER_TOKEN", "") or "").strip()
+    target = str(url or "").strip()
+    if not token or not target:
+        return None
+    last_status = 0
+    for attempt in range(1, max(1, int(attempts or 1)) + 1):
+        _discogs_throttle()
+        try:
+            resp = requests.get(
+                target,
+                headers={
+                    "Authorization": f"Discogs token={token}",
+                    "User-Agent": "PMDA/0.6.6",
+                    "Accept": "application/json",
+                },
+                timeout=15,
+            )
+        except Exception:
+            continue
+        last_status = int(resp.status_code or 0)
+        if resp.status_code == 429:
+            backoff = min(120.0, 3.0 * (2.0 ** min(max(0, attempt - 1), 6)))
+            _discogs_penalize(backoff)
+            if attempt >= attempts:
+                raise DiscogsRateLimited(f"Discogs rate limited during {desc}: HTTP 429")
+            continue
+        if resp.status_code == 404:
+            return None
+        if resp.status_code != 200:
+            continue
+        try:
+            data = resp.json()
+        except Exception:
+            continue
+        if isinstance(data, dict):
+            return data
+    if last_status == 429:
+        raise DiscogsRateLimited(f"Discogs rate limited during {desc}: HTTP 429")
+    return None
+
+
+def _discogs_hydrate_release_or_master_data(kind: str, data: dict | None, fallback_id: int = 0) -> dict:
+    payload = dict(data or {}) if isinstance(data, dict) else {}
+    kind_norm = str(kind or "release").strip().lower() or "release"
+    title = str(payload.get("title") or "").strip()
+    artists = payload.get("artists")
+    images = payload.get("images")
+    tracklist = payload.get("tracklist")
+    looks_sparse = (
+        len(payload.keys()) <= 2
+        or (not title)
+        or not isinstance(artists, list)
+        or not isinstance(images, list)
+        or not isinstance(tracklist, list)
+    )
+    if not looks_sparse:
+        return payload
+    resource_url = str(payload.get("resource_url") or "").strip()
+    fallback_url = ""
+    if fallback_id > 0:
+        endpoint = "masters" if kind_norm == "master" else "releases"
+        fallback_url = f"https://api.discogs.com/{endpoint}/{int(fallback_id)}"
+    for candidate_url in [resource_url, fallback_url]:
+        full = _discogs_api_get_json(candidate_url, desc=f"{kind_norm} hydrate {fallback_id or payload.get('id') or ''}")
+        if isinstance(full, dict) and full:
+            merged = dict(payload)
+            merged.update(full)
+            return merged
+    return payload
+
+
 def _discogs_call(desc: str, fn, attempts: int = 2):
     """
     Execute a Discogs API call under a global throttle, with 429 backoff.
@@ -37813,6 +37894,7 @@ def _fetch_discogs_release(artist_name: str, album_title: str) -> Optional[dict]
                 continue
             try:
                 master_data = _discogs_call(f"master {iid} data", lambda mid=iid: d.master(mid).data)
+                master_data = _discogs_hydrate_release_or_master_data("master", master_data, iid)
                 main_release = master_data.get("main_release") if isinstance(master_data, dict) else None
                 if isinstance(main_release, dict):
                     main_release = main_release.get("id")
@@ -37847,6 +37929,7 @@ def _fetch_discogs_release(artist_name: str, album_title: str) -> Optional[dict]
                 f"release {release_id} data",
                 lambda rid=release_id: d.release(int(rid)).data,
             )
+            rel_data = _discogs_hydrate_release_or_master_data("release", rel_data, int(release_id))
         except DiscogsRateLimited:
             raise
         except Exception as e:
@@ -38083,19 +38166,6 @@ def _safe_bounded_float(value: Any, minimum: float = 0.0, maximum: float = 5.0) 
 
 
 def _album_heat_label(score: float | None) -> str | None:
-    if score is None:
-        return None
-    val = max(0.0, min(100.0, float(score)))
-    if val >= 88:
-        return "essential"
-    if val >= 72:
-        return "hot"
-    if val >= 56:
-        return "rising"
-    if val >= 38:
-        return "solid"
-    if val > 0:
-        return "niche"
     return None
 
 

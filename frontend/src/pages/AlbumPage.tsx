@@ -15,6 +15,7 @@ import { ProviderBadge } from '@/components/providers/ProviderBadge';
 import { ProviderLink } from '@/components/providers/ProviderLink';
 import * as api from '@/lib/api';
 import { badgeKindClass } from '@/lib/badgeStyles';
+import { normalizeProviderId } from '@/lib/providerMeta';
 import { cn } from '@/lib/utils';
 import { useToast } from '@/hooks/use-toast';
 import { usePlayback } from '@/contexts/PlaybackContext';
@@ -505,6 +506,7 @@ export default function AlbumPage() {
   const genreBadges = parseGenreBadges(data.genre || '');
   const ratings = data.ratings || {};
   const ratingSignals = ratings.signals || {};
+  const publicRatingSourceId = normalizeProviderId(ratings.public_rating_source || '');
   const albumAddedAt = Number(data.created_at || 0) > 0 ? Number(data.created_at || 0) : null;
   const albumUpdatedAt =
     Number(data.updated_at || 0) > 0
@@ -704,7 +706,7 @@ export default function AlbumPage() {
               <div className="text-[11px] font-semibold uppercase tracking-[0.22em] text-muted-foreground">Public pulse</div>
               <div className="flex flex-wrap items-center gap-2">
                 <AlbumRatingStars value={ratings.public_rating} size={18} />
-                {ratings.public_rating_source ? (
+                {ratings.public_rating_source && publicRatingSourceId !== 'unknown' ? (
                   <ProviderBadge provider={ratings.public_rating_source} className="text-[10px]" />
                 ) : null}
                 {Number(ratings.public_rating_votes || 0) > 0 ? (
