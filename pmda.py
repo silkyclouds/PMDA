@@ -15738,9 +15738,13 @@ def _run_files_profile_enrichment_job(
                                 album_title=album_title_db,
                             )
                         elif provider_name == "discogs":
-                            if not str(discogs_release_id or "").strip():
-                                continue
-                            payload = _fetch_discogs_release_by_id(str(discogs_release_id or "").strip())
+                            discogs_ref = str(discogs_release_id or "").strip()
+                            if discogs_ref:
+                                payload = _fetch_discogs_release_by_id(discogs_ref)
+                            else:
+                                payload = _fetch_discogs_release(artist_name, album_title_db)
+                                if isinstance(payload, dict):
+                                    discogs_ref = str(payload.get("release_id") or "").strip()
                             if not isinstance(payload, dict) or not _identity_ok(provider_name, payload):
                                 continue
                             cover_url = _provider_cover_url_from_payload(provider_name, payload)
@@ -15749,7 +15753,7 @@ def _run_files_profile_enrichment_job(
                             downloaded = _download_best_cover_image("Discogs", cover_url, timeout=14)
                             refreshed_source_url = _provider_reference_link(
                                 provider="discogs",
-                                ref=str(discogs_release_id or "").strip(),
+                                ref=discogs_ref,
                                 artist_name=artist_name,
                                 album_title=album_title_db,
                             )
@@ -15810,10 +15814,19 @@ def _run_files_profile_enrichment_job(
                                     UPDATE files_albums
                                     SET has_cover = TRUE,
                                         cover_path = %s,
+                                        discogs_release_id = COALESCE(NULLIF(%s, ''), discogs_release_id),
                                         updated_at = NOW()
                                     WHERE id = %s
                                     """,
-                                    (str(cached), int(album_id)),
+                                    (
+                                        str(cached),
+                                        (
+                                            str(payload.get("release_id") or "").strip()
+                                            if refreshed_provider == "discogs" and isinstance(payload, dict)
+                                            else ""
+                                        ),
+                                        int(album_id),
+                                    ),
                                 )
                         refreshed_provider = provider_name
                         refreshed_cached = cached
