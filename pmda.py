@@ -720,14 +720,15 @@ AI_USAGE_PHASES = {"scan", "post_scan", "scheduled", "manual"}
 AI_USAGE_STATUSES = {"completed", "failed"}
 AI_PRICING_VERSION = "v1"
 AI_ALLOW_ANALYSIS_OTHER = _parse_bool(os.getenv("PMDA_AI_ALLOW_ANALYSIS_OTHER", "false"))
-AI_WEB_SEARCH_MAX_CALLS_PER_HOUR = max(
-    0,
-    int(os.getenv("PMDA_AI_WEB_SEARCH_MAX_CALLS_PER_HOUR", "0") or "0"),
-)
-AI_WEB_SEARCH_MAX_CALLS_PER_DAY = max(
-    0,
-    int(os.getenv("PMDA_AI_WEB_SEARCH_MAX_CALLS_PER_DAY", "0") or "0"),
-)
+# Legacy knobs kept for backward compatibility only. PMDA no longer enforces any
+# application-level AI/web-search caps; batching, caching and provider-side limits
+# are the only remaining constraints. Keep the env reads for observability, but
+# force the effective values to 0 so an old container env cannot silently re-enable
+# throttling after an upgrade.
+_AI_WEB_SEARCH_MAX_CALLS_PER_HOUR_ENV = os.getenv("PMDA_AI_WEB_SEARCH_MAX_CALLS_PER_HOUR", "")
+_AI_WEB_SEARCH_MAX_CALLS_PER_DAY_ENV = os.getenv("PMDA_AI_WEB_SEARCH_MAX_CALLS_PER_DAY", "")
+AI_WEB_SEARCH_MAX_CALLS_PER_HOUR = 0
+AI_WEB_SEARCH_MAX_CALLS_PER_DAY = 0
 AI_WEB_SEARCH_MAX_OUTPUT_TOKENS = max(
     120,
     min(4000, int(os.getenv("PMDA_AI_WEB_SEARCH_MAX_OUTPUT_TOKENS", "900") or "900")),
