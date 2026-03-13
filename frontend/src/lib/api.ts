@@ -1482,7 +1482,6 @@ export interface LibraryAlbumItem {
   public_rating_votes?: number | null;
   public_rating_source?: string | null;
   heat_score?: number | null;
-  heat_label?: string | null;
 }
 
 export interface LibraryAlbumsResponse {
@@ -2174,7 +2173,6 @@ export interface AlbumDetailResponse {
     public_rating_votes?: number | null;
     public_rating_source?: string | null;
     heat_score?: number | null;
-    heat_label?: string | null;
     signals?: {
       discogs_have_count?: number | null;
       discogs_want_count?: number | null;

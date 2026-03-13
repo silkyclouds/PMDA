@@ -58,7 +58,6 @@ interface AlbumInfo {
   public_rating_votes?: number | null;
   public_rating_source?: string | null;
   heat_score?: number | null;
-  heat_label?: string | null;
 }
 
 interface ArtistDetailResponse {
@@ -1293,7 +1292,6 @@ export default function ArtistPage() {
                             userRating={album.user_rating}
                             publicRating={album.public_rating}
                             publicRatingVotes={album.public_rating_votes}
-                            heatLabel={album.heat_label}
                             format={album.format}
                             isLossless={album.is_lossless}
                             year={album.year || album.date || null}

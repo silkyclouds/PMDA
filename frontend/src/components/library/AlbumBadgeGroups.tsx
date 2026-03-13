@@ -10,7 +10,6 @@ type AlbumBadgeGroupsProps = {
   userRating?: number | null;
   publicRating?: number | null;
   publicRatingVotes?: number | null;
-  heatLabel?: string | null;
   format?: string | null;
   isLossless?: boolean | null;
   year?: number | string | null;
@@ -42,7 +41,6 @@ export function AlbumBadgeGroups({
   userRating,
   publicRating,
   publicRatingVotes,
-  heatLabel,
   format,
   isLossless,
   year,

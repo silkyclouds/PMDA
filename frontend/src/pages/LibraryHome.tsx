@@ -553,7 +553,6 @@ export default function LibraryHome() {
                                 userRating={a.user_rating}
                                 publicRating={a.public_rating}
                                 publicRatingVotes={a.public_rating_votes}
-                                heatLabel={a.heat_label}
                                 format={a.format}
                                 isLossless={a.is_lossless}
                                 year={a.year}
@@ -895,7 +894,6 @@ export default function LibraryHome() {
                             userRating={a.user_rating}
                             publicRating={a.public_rating}
                             publicRatingVotes={a.public_rating_votes}
-                            heatLabel={a.heat_label}
                             format={a.format}
                             isLossless={a.is_lossless}
                             year={a.year}
@@ -1007,7 +1005,6 @@ export default function LibraryHome() {
                             userRating={a.user_rating}
                             publicRating={a.public_rating}
                             publicRatingVotes={a.public_rating_votes}
-                            heatLabel={a.heat_label}
                             format={a.format}
                             isLossless={a.is_lossless}
                             year={a.year}

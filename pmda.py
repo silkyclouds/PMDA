@@ -15647,6 +15647,214 @@ def _run_files_profile_enrichment_job(
             except Exception:
                 pass
 
+            def _cover_provider_from_primary_tags(primary_tags_json: Any) -> str:
+                tags_blob = primary_tags_json
+                if isinstance(tags_blob, str):
+                    tags_blob = _safe_json_load(tags_blob, fallback={})
+                if not isinstance(tags_blob, dict):
+                    return ""
+                return _normalize_identity_provider(
+                    str(
+                        tags_blob.get(PMDA_COVER_PROVIDER_TAG)
+                        or tags_blob.get("pmda_cover_provider")
+                        or ""
+                    )
+                )
+
+            def _refresh_album_cover_from_identity(
+                *,
+                album_id: int,
+                album_title_db: str,
+                metadata_source: str,
+                strict_verified: bool,
+                mbid: str,
+                discogs_release_id: str,
+                lastfm_album_mbid: str,
+                bandcamp_album_url: str,
+                cover_path_raw: str,
+                primary_tags_json: Any,
+            ) -> bool:
+                current_cover_provider = _cover_provider_from_primary_tags(primary_tags_json)
+                cover_raw = str(cover_path_raw or "").strip()
+                if current_cover_provider and current_cover_provider not in {"local", "unknown"} and cover_raw:
+                    return False
+
+                provider_chain: list[str] = []
+                for provider_name in (
+                    metadata_source,
+                    "musicbrainz",
+                    "discogs",
+                    "bandcamp",
+                    "lastfm",
+                ):
+                    provider_norm = _normalize_identity_provider(provider_name)
+                    if provider_norm and provider_norm not in provider_chain:
+                        provider_chain.append(provider_norm)
+
+                def _identity_ok(provider_name: str, payload: dict[str, Any] | None) -> bool:
+                    if provider_name == "musicbrainz":
+                        return True
+                    payload_dict = payload if isinstance(payload, dict) else {}
+                    candidate_artist = _provider_payload_artist(provider_name, payload_dict)
+                    candidate_title = _provider_payload_title(provider_name, payload_dict)
+                    if not candidate_artist or not candidate_title:
+                        return False
+                    ok, _reason = _strict_identity_match_details(
+                        local_artist=artist_name,
+                        local_title=album_title_db,
+                        candidate_artist=candidate_artist,
+                        candidate_title=candidate_title,
+                    )
+                    return bool(ok)
+
+                refreshed_provider = ""
+                refreshed_source_url = ""
+                refreshed_cached: Optional[Path] = None
+
+                for provider_name in provider_chain:
+                    try:
+                        payload: dict[str, Any] | None = None
+                        downloaded: tuple[bytes, str, str] | None = None
+                        if provider_name == "musicbrainz":
+                            if not str(mbid or "").strip():
+                                continue
+                            downloaded = _download_cover_art_archive_front(str(mbid or "").strip(), timeout_sec=8.0)
+                            refreshed_source_url = _provider_reference_link(
+                                provider="musicbrainz",
+                                ref=str(mbid or "").strip(),
+                                artist_name=artist_name,
+                                album_title=album_title_db,
+                            )
+                        elif provider_name == "discogs":
+                            if not str(discogs_release_id or "").strip():
+                                continue
+                            payload = _fetch_discogs_release_by_id(str(discogs_release_id or "").strip())
+                            if not isinstance(payload, dict) or not _identity_ok(provider_name, payload):
+                                continue
+                            cover_url = _provider_cover_url_from_payload(provider_name, payload)
+                            if not cover_url:
+                                continue
+                            downloaded = _download_best_cover_image("Discogs", cover_url, timeout=14)
+                            refreshed_source_url = _provider_reference_link(
+                                provider="discogs",
+                                ref=str(discogs_release_id or "").strip(),
+                                artist_name=artist_name,
+                                album_title=album_title_db,
+                            )
+                        elif provider_name == "bandcamp":
+                            payload = _fetch_bandcamp_album_info(artist_name, album_title_db)
+                            if not isinstance(payload, dict) or not _identity_ok(provider_name, payload):
+                                continue
+                            cover_url = _provider_cover_url_from_payload(provider_name, payload)
+                            if not cover_url:
+                                continue
+                            downloaded = _download_best_cover_image(
+                                "Bandcamp",
+                                cover_url,
+                                cover_candidates=payload.get("cover_candidates") or [],
+                                headers={"User-Agent": "PMDA/1.0 (profile enrichment)"},
+                                timeout=14,
+                            )
+                            refreshed_source_url = str(
+                                payload.get("album_url")
+                                or payload.get("url")
+                                or bandcamp_album_url
+                                or ""
+                            ).strip()
+                        elif provider_name == "lastfm":
+                            payload = _fetch_lastfm_album_info(
+                                artist_name,
+                                album_title_db,
+                                mbid=str(lastfm_album_mbid or "").strip() or None,
+                            )
+                            if not isinstance(payload, dict) or not _identity_ok(provider_name, payload):
+                                continue
+                            cover_url = _provider_cover_url_from_payload(provider_name, payload)
+                            if not cover_url:
+                                continue
+                            downloaded = _download_best_cover_image("Last.fm", cover_url, timeout=14)
+                            refreshed_source_url = _provider_reference_link(
+                                provider="lastfm",
+                                ref=str(lastfm_album_mbid or payload.get("mbid") or "").strip(),
+                                artist_name=artist_name,
+                                album_title=album_title_db,
+                            )
+                        if not downloaded:
+                            continue
+                        raw, mime, used_url = downloaded
+                        cached = _ensure_cached_image_from_bytes(
+                            raw,
+                            mime,
+                            kind="album",
+                            cache_key_hint=f"profile-cover-refresh:{album_id}:{provider_name}:{used_url}",
+                            max_px=_MEDIA_CACHE_MASTER_PX,
+                        )
+                        if not cached or (not cached.exists()) or (not cached.is_file()):
+                            continue
+                        with conn.transaction():
+                            with conn.cursor() as cur:
+                                cur.execute(
+                                    """
+                                    UPDATE files_albums
+                                    SET has_cover = TRUE,
+                                        cover_path = %s,
+                                        updated_at = NOW()
+                                    WHERE id = %s
+                                    """,
+                                    (str(cached), int(album_id)),
+                                )
+                        refreshed_provider = provider_name
+                        refreshed_cached = cached
+                        if not refreshed_source_url:
+                            refreshed_source_url = used_url
+                        break
+                    except DiscogsRateLimited:
+                        continue
+                    except Exception:
+                        continue
+
+                if not refreshed_provider or refreshed_cached is None:
+                    return False
+
+                _record_files_match_audit_album(
+                    album_id=album_id,
+                    artist_name=str(artist_name or "").strip() or "Unknown Artist",
+                    album_title=str(album_title_db or "").strip() or f"Album {album_id}",
+                    run_kind="profile_cover_refresh",
+                    status="completed",
+                    result={
+                        "summary": f"Refreshed cover from {_match_provider_label(refreshed_provider)} after identity verification.",
+                        "provider_used": metadata_source or refreshed_provider,
+                        "cover_saved": True,
+                        "pmda_matched": bool(strict_verified or metadata_source or mbid or discogs_release_id or lastfm_album_mbid or bandcamp_album_url),
+                        "pmda_cover": True,
+                        "pmda_artist_image": False,
+                        "pmda_complete": False,
+                        "pmda_match_provider": metadata_source or None,
+                        "pmda_cover_provider": refreshed_provider,
+                        "pmda_artist_provider": None,
+                        "strict_match_verified": bool(strict_verified),
+                        "strict_match_provider": metadata_source or None,
+                        "strict_reject_reason": "",
+                        "strict_tracklist_score": 1.0 if strict_verified else 0.0,
+                    },
+                    steps=[
+                        f"Album identity verified for {artist_name} / {album_title_db}",
+                        f"Replaced local/unknown cover with provider cover from {_match_provider_label(refreshed_provider)}",
+                        f"Cached path: {str(refreshed_cached)}",
+                        f"Source: {refreshed_source_url}",
+                    ],
+                )
+                _files_cache_invalidate_all()
+                logging.info(
+                    "Files profile enrichment refreshed album cover album_id=%s provider=%s artist=%s album=%s",
+                    int(album_id),
+                    refreshed_provider,
+                    str(artist_name or "").strip() or "Unknown Artist",
+                    str(album_title_db or "").strip() or "Unknown Album",
+                )
+                return True
+
             # Album descriptions: fill missing/stale entries progressively (optional).
             if not bool(skip_album_profiles):
                 album_pairs = [(str(title or ""), str(norm or "")) for title, norm in albums if str(norm or "").strip()]
@@ -15658,19 +15866,24 @@ def _run_files_profile_enrichment_job(
                     )
                     norm_match_flags: dict[str, bool] = {}
                     norm_strict_flags: dict[str, bool] = {}
+                    album_state_by_norm: dict[str, dict[str, Any]] = {}
                     with conn.cursor() as cur:
                         placeholders = ",".join(["%s"] * len(album_pairs))
                         norms = [norm for _, norm in album_pairs]
                         cur.execute(
                             f"""
                             SELECT
+                              alb.id,
+                              COALESCE(alb.title, ''),
                               alb.title_norm,
                               alb.strict_match_verified,
                               COALESCE(alb.metadata_source, ''),
                               COALESCE(alb.musicbrainz_release_group_id, ''),
                               COALESCE(alb.discogs_release_id, ''),
                               COALESCE(alb.lastfm_album_mbid, ''),
-                              COALESCE(alb.bandcamp_album_url, '')
+                              COALESCE(alb.bandcamp_album_url, ''),
+                              COALESCE(alb.cover_path, ''),
+                              COALESCE(alb.primary_tags_json, '{{}}')
                             FROM files_albums alb
                             JOIN files_artists ar ON ar.id = alb.artist_id
                             WHERE ar.name_norm = %s
@@ -15679,6 +15892,8 @@ def _run_files_profile_enrichment_job(
                             [artist_norm, *norms],
                         )
                         for (
+                            album_id,
+                            album_title_db,
                             raw_norm,
                             strict_verified,
                             metadata_source,
@@ -15686,6 +15901,8 @@ def _run_files_profile_enrichment_job(
                             discogs_release_id,
                             lastfm_album_mbid,
                             bandcamp_album_url,
+                            cover_path_raw,
+                            primary_tags_json,
                         ) in cur.fetchall():
                             norm_key = str(raw_norm or "").strip()
                             if not norm_key:
@@ -15705,6 +15922,18 @@ def _run_files_profile_enrichment_job(
                             norm_match_flags[norm_key] = True
                             if strict_ok:
                                 norm_strict_flags[norm_key] = True
+                            album_state_by_norm[norm_key] = {
+                                "album_id": int(album_id or 0),
+                                "album_title": str(album_title_db or "").strip(),
+                                "strict_verified": strict_ok,
+                                "metadata_source": str(metadata_source or "").strip(),
+                                "mbid": str(mbid or "").strip(),
+                                "discogs_release_id": str(discogs_release_id or "").strip(),
+                                "lastfm_album_mbid": str(lastfm_album_mbid or "").strip(),
+                                "bandcamp_album_url": str(bandcamp_album_url or "").strip(),
+                                "cover_path_raw": str(cover_path_raw or "").strip(),
+                                "primary_tags_json": primary_tags_json,
+                            }
                         cur.execute(
                             f"""
                             SELECT title_norm, updated_at
@@ -15714,6 +15943,31 @@ def _run_files_profile_enrichment_job(
                             [artist_norm, *norms],
                         )
                         existing = {str(r[0] or ""): r[1] for r in cur.fetchall()}
+                    for _title, norm in album_pairs:
+                        state = album_state_by_norm.get(norm)
+                        if not state or not norm_match_flags.get(norm):
+                            continue
+                        try:
+                            _refresh_album_cover_from_identity(
+                                album_id=int(state.get("album_id") or 0),
+                                album_title_db=str(state.get("album_title") or _title or "").strip(),
+                                metadata_source=str(state.get("metadata_source") or "").strip(),
+                                strict_verified=bool(state.get("strict_verified")),
+                                mbid=str(state.get("mbid") or "").strip(),
+                                discogs_release_id=str(state.get("discogs_release_id") or "").strip(),
+                                lastfm_album_mbid=str(state.get("lastfm_album_mbid") or "").strip(),
+                                bandcamp_album_url=str(state.get("bandcamp_album_url") or "").strip(),
+                                cover_path_raw=str(state.get("cover_path_raw") or "").strip(),
+                                primary_tags_json=state.get("primary_tags_json"),
+                            )
+                        except Exception:
+                            logging.debug(
+                                "Files profile enrichment cover refresh failed artist=%s album=%s",
+                                str(artist_name or "").strip() or "Unknown Artist",
+                                str(state.get("album_title") or _title or "").strip() or "Unknown Album",
+                                exc_info=True,
+                            )
+
                     to_fetch: list[tuple[str, str]] = []
                     for title, norm in album_pairs:
                         if not norm_match_flags.get(norm):
