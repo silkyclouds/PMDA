@@ -10451,9 +10451,12 @@ def _files_pg_init_schema() -> bool:
                     cur.execute(f"ALTER TABLE files_album_profiles ADD COLUMN IF NOT EXISTS {col_name} {col_sql}")
                 except Exception:
                     pass
+            # Auth users live in SQLite settings.db, not in PostgreSQL. Keep the
+            # local user_id as an opaque identifier here and only enforce the
+            # album foreign key inside the files index.
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS files_user_album_ratings (
-                    user_id BIGINT NOT NULL REFERENCES auth_users(id) ON DELETE CASCADE,
+                    user_id BIGINT NOT NULL,
                     album_id BIGINT NOT NULL REFERENCES files_albums(id) ON DELETE CASCADE,
                     rating SMALLINT NOT NULL,
                     source TEXT NOT NULL DEFAULT 'ui',
