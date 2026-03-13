@@ -23806,6 +23806,29 @@ def _infer_identity_from_local_context_ai(
     )
     if not should_try:
         return {}
+
+    stable_filename_identity = bool(filename_artist_hint and filename_album_hint)
+    if stable_filename_identity:
+        deterministic_reason_bits: list[str] = []
+        if filename_artist_conflict:
+            deterministic_reason_bits.append("artist_conflict")
+        if filename_album_conflict:
+            deterministic_reason_bits.append("album_conflict")
+        if ("artist" in missing) or _identity_text_is_generic(local_artist_txt) or not local_artist_txt:
+            deterministic_reason_bits.append("artist_missing_or_generic")
+        if ("album" in missing) or _identity_text_is_generic(local_album_txt) or not local_album_txt:
+            deterministic_reason_bits.append("album_missing_or_generic")
+        if deterministic_reason_bits:
+            return {
+                "artist": filename_artist_hint,
+                "album": filename_album_hint,
+                "confidence": 96,
+                "reason": "stable filename pattern (" + ", ".join(deterministic_reason_bits) + ")",
+                "source": "filename_pattern",
+                "album_prefix_hint": album_prefix_hint or "",
+                "filename_artist_hint": filename_artist_hint,
+                "filename_album_hint": filename_album_hint,
+            }
     if not bool(getattr(sys.modules[__name__], "ai_provider_ready", False)):
         return {}
 
