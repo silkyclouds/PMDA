@@ -15679,14 +15679,26 @@ def _run_files_profile_enrichment_job(
                 if current_cover_provider and current_cover_provider not in {"local", "unknown"} and cover_raw:
                     return False
 
-                provider_chain: list[str] = []
-                for provider_name in (
-                    metadata_source,
+                cover_candidates_default = [
+                    str(metadata_source or "").strip(),
                     "musicbrainz",
                     "discogs",
                     "bandcamp",
                     "lastfm",
-                ):
+                ]
+                if (not bool(strict_verified)) and _normalize_identity_provider(metadata_source) == "musicbrainz":
+                    # MusicBrainz CAA is useful, but for soft MB identities we should first prefer
+                    # provider-specific commercial/retail art when available. This avoids keeping an
+                    # unrelated or generic CAA image when Discogs/Bandcamp/Last.fm expose a clearer cover.
+                    cover_candidates_default = [
+                        "discogs",
+                        "bandcamp",
+                        "lastfm",
+                        "musicbrainz",
+                    ]
+
+                provider_chain: list[str] = []
+                for provider_name in cover_candidates_default:
                     provider_norm = _normalize_identity_provider(provider_name)
                     if provider_norm and provider_norm not in provider_chain:
                         provider_chain.append(provider_norm)
@@ -37734,6 +37746,28 @@ def _fetch_discogs_release(artist_name: str, album_title: str) -> Optional[dict]
         except Exception:
             return None
 
+    candidate_meta: dict[int, dict[str, Any]] = {}
+
+    def _remember_candidate_meta(candidate_id: int, data: dict[str, Any] | None) -> None:
+        if candidate_id <= 0 or not isinstance(data, dict):
+            return
+        meta = candidate_meta.setdefault(candidate_id, {})
+        cover_image = str(data.get("cover_image") or "").strip()
+        thumb = str(data.get("thumb") or "").strip()
+        master_id = str(data.get("master_id") or "").strip()
+        resource_url = str(data.get("resource_url") or "").strip()
+        title = str(data.get("title") or "").strip()
+        if cover_image and not meta.get("cover_image"):
+            meta["cover_image"] = cover_image
+        if thumb and not meta.get("thumb"):
+            meta["thumb"] = thumb
+        if master_id and not meta.get("master_id"):
+            meta["master_id"] = master_id
+        if resource_url and not meta.get("resource_url"):
+            meta["resource_url"] = resource_url
+        if title and not meta.get("title"):
+            meta["title"] = title
+
     def _page_to_candidate_ids(page_list: list) -> list[int]:
         out: list[int] = []
         for item in page_list or []:
@@ -37748,6 +37782,7 @@ def _fetch_discogs_release(artist_name: str, album_title: str) -> Optional[dict]
             if iid is None:
                 continue
             if item_type == "release":
+                _remember_candidate_meta(iid, data if isinstance(data, dict) else None)
                 out.append(iid)
                 continue
             if item_type != "master":
@@ -37760,6 +37795,7 @@ def _fetch_discogs_release(artist_name: str, album_title: str) -> Optional[dict]
                     main_release = main_release.get("id")
             rid = _int_id(main_release)
             if rid is not None:
+                _remember_candidate_meta(rid, data if isinstance(data, dict) else None)
                 out.append(rid)
                 continue
             try:
@@ -37769,6 +37805,7 @@ def _fetch_discogs_release(artist_name: str, album_title: str) -> Optional[dict]
                     main_release = main_release.get("id")
                 rid = _int_id(main_release)
                 if rid is not None:
+                    _remember_candidate_meta(rid, data if isinstance(data, dict) else None)
                     out.append(rid)
             except DiscogsRateLimited:
                 raise
@@ -37811,12 +37848,19 @@ def _fetch_discogs_release(artist_name: str, album_title: str) -> Optional[dict]
         year_val = rel_data.get("year")
         year = str(year_val).strip() if year_val else ""
 
+        search_meta = candidate_meta.get(int(release_id), {}) if candidate_meta else {}
         cover_url = None
         images = rel_data.get("images") or []
         if isinstance(images, list) and images:
             img0 = images[0] if isinstance(images[0], dict) else None
             if img0:
                 cover_url = (img0.get("uri") or img0.get("resource_url") or "").strip() or None
+        if not cover_url:
+            cover_url = (
+                str(search_meta.get("cover_image") or "").strip()
+                or str(search_meta.get("thumb") or "").strip()
+                or None
+            )
 
         artist_str = (artist_name or "").strip()
         artists = rel_data.get("artists") or []
@@ -37853,6 +37897,8 @@ def _fetch_discogs_release(artist_name: str, album_title: str) -> Optional[dict]
             master_val = rel_data.get("master")
             if isinstance(master_val, dict):
                 master_id = str(master_val.get("id") or "").strip()
+        if not master_id:
+            master_id = str(search_meta.get("master_id") or "").strip()
 
         return {
             "title": title,
