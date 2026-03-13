@@ -6,7 +6,6 @@ import * as api from '@/lib/api';
 import type { FileSourceRoot } from '@/lib/api';
 import { Button } from '@/components/ui/button';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
-import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Switch } from '@/components/ui/switch';
@@ -240,15 +239,18 @@ export function SourcesAutonomySettings() {
         </ol>
       </div>
 
-      <div className="grid grid-cols-1 gap-2 text-xs md:grid-cols-3">
+      <div className="grid grid-cols-1 gap-2 text-xs md:grid-cols-2">
         <div className="rounded-md border border-border bg-muted/30 px-3 py-2 text-muted-foreground">
           Library roots: <span className="text-foreground font-medium">{libraryRootsCount}</span>
         </div>
         <div className="rounded-md border border-border bg-muted/30 px-3 py-2 text-muted-foreground">
           Incoming roots: <span className="text-foreground font-medium">{incomingRootsCount}</span>
         </div>
-        <div className="rounded-md border border-border bg-muted/30 px-3 py-2 text-muted-foreground">
-          Primary root: <span className="text-foreground font-medium">{currentWinnerPath || 'not set'}</span>
+        <div className="rounded-md border border-border bg-muted/30 px-3 py-2 text-muted-foreground md:col-span-2">
+          <div className="text-[11px] uppercase tracking-wide text-muted-foreground">Primary root</div>
+          <div className="mt-1 overflow-x-auto whitespace-nowrap font-mono text-xs text-foreground">
+            {currentWinnerPath || 'not set'}
+          </div>
         </div>
       </div>
 
@@ -279,41 +281,46 @@ export function SourcesAutonomySettings() {
             const sid = Number(row.source_id || 0);
             const isWinner = normalizePath(String(row.path || '')) === currentWinnerPath || (winnerId != null && sid > 0 && winnerId === sid);
             return (
-              <div key={`${row.source_id || 'new'}-${index}`} className="grid grid-cols-1 md:grid-cols-[1fr_220px_90px_110px_80px] gap-2 rounded-md border border-border bg-muted/20 p-2">
-                <Input
+              <div key={`${row.source_id || 'new'}-${index}`} className="rounded-md border border-border bg-muted/20 p-3 space-y-3">
+                <FolderBrowserInput
                   value={String(row.path || '')}
-                  onChange={(e) => updateRoot(index, { path: e.target.value })}
+                  onChange={(nextPath) => updateRoot(index, { path: nextPath })}
                   placeholder="/music/library"
+                  selectLabel="Select source root folder"
                 />
-                <Select
-                  value={row.role === 'incoming' ? 'incoming' : 'library'}
-                  onValueChange={(value: 'library' | 'incoming') => updateRoot(index, { role: value })}
-                >
-                  <SelectTrigger><SelectValue /></SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="library">Library (already in collection)</SelectItem>
-                    <SelectItem value="incoming">Incoming (new arrivals)</SelectItem>
-                  </SelectContent>
-                </Select>
-                <div className="flex items-center justify-between rounded-md border border-border px-2 py-1.5">
-                  <span className="text-xs text-muted-foreground">Enabled</span>
-                  <Switch checked={Boolean(row.enabled)} onCheckedChange={(checked) => updateRoot(index, { enabled: Boolean(checked) })} />
+                <div className="flex flex-wrap items-center gap-2">
+                  <div className="min-w-[240px] flex-1">
+                    <Select
+                      value={row.role === 'incoming' ? 'incoming' : 'library'}
+                      onValueChange={(value: 'library' | 'incoming') => updateRoot(index, { role: value })}
+                    >
+                      <SelectTrigger><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="library">Library (already in collection)</SelectItem>
+                        <SelectItem value="incoming">Incoming (new arrivals)</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div className="flex items-center justify-between rounded-md border border-border px-3 py-2 min-w-[140px]">
+                    <span className="text-xs text-muted-foreground">Enabled</span>
+                    <Switch checked={Boolean(row.enabled)} onCheckedChange={(checked) => updateRoot(index, { enabled: Boolean(checked) })} />
+                  </div>
+                  <Button
+                    type="button"
+                    variant={isWinner ? 'default' : 'outline'}
+                    size="sm"
+                    onClick={() => {
+                      setWinnerPath(normalizePath(String(row.path || '')));
+                      setWinnerId(sid > 0 ? sid : null);
+                    }}
+                    disabled={row.role === 'incoming'}
+                  >
+                    {isWinner ? 'Primary' : 'Set primary'}
+                  </Button>
+                  <Button type="button" variant="ghost" size="icon" onClick={() => removeRoot(index)} className="shrink-0">
+                    <Trash2 className="w-4 h-4" />
+                  </Button>
                 </div>
-                <Button
-                  type="button"
-                  variant={isWinner ? 'default' : 'outline'}
-                  size="sm"
-                  onClick={() => {
-                    setWinnerPath(normalizePath(String(row.path || '')));
-                    setWinnerId(sid > 0 ? sid : null);
-                  }}
-                  disabled={row.role === 'incoming'}
-                >
-                  {isWinner ? 'Primary' : 'Set primary'}
-                </Button>
-                <Button type="button" variant="ghost" size="icon" onClick={() => removeRoot(index)}>
-                  <Trash2 className="w-4 h-4" />
-                </Button>
               </div>
             );
           })}
@@ -380,9 +387,12 @@ export function SourcesAutonomySettings() {
             <p className="text-xs text-muted-foreground">
               This is the main library destination for incoming albums once PMDA has matched, checked duplicates/incompletes, and validated metadata.
             </p>
-            <p className="text-[11px] text-muted-foreground">
-              Current primary folder: <span className="font-mono text-foreground">{currentWinnerPath || 'not set yet'}</span>
-            </p>
+            <div className="rounded-md border border-border/70 bg-background/40 px-3 py-2">
+              <div className="text-[11px] uppercase tracking-wide text-muted-foreground">Current primary folder</div>
+              <div className="mt-1 overflow-x-auto whitespace-nowrap font-mono text-xs text-foreground">
+                {currentWinnerPath || 'not set yet'}
+              </div>
+            </div>
           </div>
           <Select value={strategy} onValueChange={(value: 'move' | 'hardlink' | 'symlink' | 'copy') => setStrategy(value)}>
             <SelectTrigger className="w-[220px]"><SelectValue /></SelectTrigger>

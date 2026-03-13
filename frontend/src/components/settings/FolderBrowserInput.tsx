@@ -79,17 +79,25 @@ export function FolderBrowserInput({
 
   return (
     <>
-      <div className="flex gap-2">
-        <Input
-          value={selectedPath}
-          onChange={(e) => onChange(e.target.value)}
-          placeholder={placeholder}
-          className="font-mono"
-        />
-        <Button type="button" variant="outline" className="gap-2 shrink-0" onClick={() => setOpen(true)}>
-          <FolderOpen className="w-4 h-4" />
-          Browse
-        </Button>
+      <div className="space-y-2 min-w-0">
+        <div className="rounded-md border border-border/70 bg-background/40 px-3 py-2">
+          <div className="text-[11px] uppercase tracking-wide text-muted-foreground">Current path</div>
+          <div className="mt-1 overflow-x-auto whitespace-nowrap font-mono text-xs text-foreground">
+            {selectedPath || placeholder}
+          </div>
+        </div>
+        <div className="grid grid-cols-1 gap-2 sm:grid-cols-[minmax(0,1fr)_auto]">
+          <Input
+            value={selectedPath}
+            onChange={(e) => onChange(e.target.value)}
+            placeholder={placeholder}
+            className="font-mono min-w-0"
+          />
+          <Button type="button" variant="outline" className="gap-2 shrink-0" onClick={() => setOpen(true)}>
+            <FolderOpen className="w-4 h-4" />
+            Browse
+          </Button>
+        </div>
       </div>
 
       <Dialog open={open} onOpenChange={setOpen}>
