@@ -49841,59 +49841,6 @@ def api_library_recently_played_albums():
                         }
                     )
 
-        # 6) Your highest-rated albums.
-        if user_id > 0:
-            albums = _fetch_ranked_albums(
-                "NOT (alb.id = ANY(%s)) AND COALESCE(ur.rating, 0) > 0",
-                [list(used_album_ids)],
-                limit,
-                used_album_ids,
-                order_sql="""
-                ORDER BY
-                    COALESCE(ur.rating, 0) DESC,
-                    COALESCE(pr.public_rating, 0) DESC,
-                    COALESCE(pr.heat_score, 0) DESC,
-                    alb.updated_at DESC,
-                    alb.id DESC
-                """,
-            )
-            if albums:
-                sections.append(
-                    {
-                        "key": "rated",
-                        "title": "Your favorites",
-                        "reason": "Albums you rated highest.",
-                        "seed": {"user_id": int(user_id)},
-                        "albums": albums,
-                    }
-                )
-
-        # 7) Public consensus / popularity.
-        albums = _fetch_ranked_albums(
-            "NOT (alb.id = ANY(%s)) AND (pr.public_rating IS NOT NULL OR pr.heat_score IS NOT NULL)",
-            [list(used_album_ids)],
-            limit,
-            used_album_ids,
-            order_sql="""
-            ORDER BY
-                COALESCE(pr.heat_score, 0) DESC,
-                COALESCE(pr.public_rating, 0) DESC,
-                COALESCE(pr.public_rating_votes, 0) DESC,
-                alb.updated_at DESC,
-                alb.id DESC
-            """,
-        )
-        if albums:
-            sections.append(
-                {
-                    "key": "heat",
-                    "title": "Worth hearing",
-                    "reason": "Picked from ratings, scrobbles, supporters and collection signals online.",
-                    "seed": {"kind": "heat"},
-                    "albums": albums,
-                }
-            )
-
         payload = {
             "days": int(days),
             "total": int(total),
