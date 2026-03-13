@@ -23533,6 +23533,12 @@ def _resolve_edition_display_identity(
     e = edition if isinstance(edition, dict) else {}
     hint = e.get("_lookup_identity_hint") if isinstance(e.get("_lookup_identity_hint"), dict) else {}
     missing_required = _edition_missing_required_tags_set(e)
+    hint_source = str(hint.get("source") or "").strip().lower()
+    try:
+        hint_confidence = int(float(hint.get("confidence") or 0))
+    except Exception:
+        hint_confidence = 0
+    hint_reason = str(hint.get("reason") or "").strip().lower()
     current_artist = str(
         e.get("artist")
         or e.get("artist_name")
@@ -23555,20 +23561,45 @@ def _resolve_edition_display_identity(
         or hint.get("album")
         or ""
     ).strip()
-    artist_resolved = _prefer_identity_hint_value(
-        current_value=current_artist,
-        hinted_value=hinted_artist,
-        field_name="artist",
-        missing_required=missing_required,
-        folder_name=folder_name,
+    force_hint_override = bool(
+        hinted_artist
+        and hinted_album
+        and hint_source == "filename_pattern"
+        and hint_confidence >= 90
+        and (
+            "artist_conflict" in hint_reason
+            or "album_conflict" in hint_reason
+            or "artist_missing_or_generic" in hint_reason
+            or "album_missing_or_generic" in hint_reason
+        )
     )
-    album_resolved = _prefer_identity_hint_value(
-        current_value=current_title,
-        hinted_value=hinted_album,
-        field_name="album",
-        missing_required=missing_required,
-        folder_name=folder_name,
-    )
+    if force_hint_override:
+        logging.info(
+            "[Identity] forcing filename-pattern override artist=%r -> %r album=%r -> %r reason=%s confidence=%s",
+            current_artist,
+            hinted_artist,
+            current_title,
+            hinted_album,
+            hint_reason or "",
+            hint_confidence,
+        )
+        artist_resolved = hinted_artist
+        album_resolved = hinted_album
+    else:
+        artist_resolved = _prefer_identity_hint_value(
+            current_value=current_artist,
+            hinted_value=hinted_artist,
+            field_name="artist",
+            missing_required=missing_required,
+            folder_name=folder_name,
+        )
+        album_resolved = _prefer_identity_hint_value(
+            current_value=current_title,
+            hinted_value=hinted_album,
+            field_name="album",
+            missing_required=missing_required,
+            folder_name=folder_name,
+        )
     artist_final = artist_resolved or current_artist or default_artist or "Unknown Artist"
     album_final = album_resolved or current_title or default_title or "Unknown Album"
     return (artist_final.strip(), _sanitize_album_title_display(album_final))
