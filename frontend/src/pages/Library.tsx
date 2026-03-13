@@ -815,7 +815,7 @@ export default function Library() {
                 {sec.albums.length === 0 ? (
                   <p className="text-sm text-muted-foreground">No suggestions available.</p>
                 ) : (
-                  <Carousel opts={{ align: 'start', dragFree: true }} className="w-full">
+                  <Carousel opts={{ align: 'start', dragFree: true }} effect="none" className="w-full">
                     <CarouselContent className="-ml-3">
                       {sec.albums.map((a) => (
                         <CarouselItem key={`disc-${sec.key}-${a.album_id}`} className="basis-[160px] sm:basis-[190px] md:basis-[220px] pl-3">
@@ -989,7 +989,7 @@ export default function Library() {
             ) : topArtists.length === 0 ? (
               <p className="text-sm text-muted-foreground">No listening stats yet. Start playing music to build this section.</p>
             ) : (
-              <Carousel opts={{ align: 'start', dragFree: true }} className="w-full">
+              <Carousel opts={{ align: 'start', dragFree: true }} effect="none" className="w-full">
                 <CarouselContent className="-ml-3">
                   {topArtists.map((a) => (
                     <CarouselItem key={`ta-${a.artist_id}`} className="basis-[170px] sm:basis-[200px] md:basis-[220px] pl-3">
@@ -1055,7 +1055,7 @@ export default function Library() {
             ) : recentAlbums.length === 0 ? (
               <p className="text-sm text-muted-foreground">No recent albums yet.</p>
             ) : (
-              <Carousel opts={{ align: 'start', dragFree: true }} className="w-full">
+              <Carousel opts={{ align: 'start', dragFree: true }} effect="none" className="w-full">
                 <CarouselContent className="-ml-3">
                   {recentAlbums.map((a) => (
                     <CarouselItem key={`recent-${a.album_id}`} className="basis-[160px] sm:basis-[190px] md:basis-[220px] pl-3">
@@ -1166,7 +1166,7 @@ export default function Library() {
             ) : recentlyPlayedAlbums.length === 0 ? (
               <p className="text-sm text-muted-foreground">{recentlyPlayedError ?? 'No playback history yet.'}</p>
             ) : (
-              <Carousel opts={{ align: 'start', dragFree: true }} className="w-full">
+              <Carousel opts={{ align: 'start', dragFree: true }} effect="none" className="w-full">
                 <CarouselContent className="-ml-3">
                   {recentlyPlayedAlbums.map((a) => (
                     <CarouselItem key={`rplay-${a.album_id}`} className="basis-[160px] sm:basis-[190px] md:basis-[220px] pl-3">

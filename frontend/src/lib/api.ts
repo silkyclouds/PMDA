@@ -2130,6 +2130,8 @@ export interface AlbumDetailReview {
 export interface AlbumDetailResponse {
   album_id: number;
   title: string;
+  created_at?: number | null;
+  updated_at?: number | null;
   year?: number | null;
   date_text?: string;
   genre?: string;

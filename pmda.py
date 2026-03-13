@@ -43081,15 +43081,47 @@ def api_progress():
     
     # When not scanning, attach last completed scan summary for "Scan complete – Summary" UI
     last_scan_summary = None
+    last_scan_ai_used_count = 0
+    last_scan_ai_tokens_total = 0
+    last_scan_ai_cost_usd_total = 0.0
+    last_scan_ai_unpriced_calls = 0
     if not scanning:
         try:
             con = sqlite3.connect(str(STATE_DB_FILE), timeout=2)
             cur = con.cursor()
             cur.execute(
-                "SELECT summary_json FROM scan_history WHERE status = 'completed' AND end_time IS NOT NULL ORDER BY end_time DESC LIMIT 1"
+                """
+                SELECT
+                    summary_json,
+                    COALESCE(ai_used_count, 0),
+                    COALESCE(ai_tokens_total, 0),
+                    COALESCE(ai_cost_usd_total, 0.0),
+                    COALESCE(ai_unpriced_calls, 0)
+                FROM scan_history
+                WHERE status = 'completed' AND end_time IS NOT NULL
+                ORDER BY end_time DESC
+                LIMIT 1
+                """
             )
             row = cur.fetchone()
             con.close()
+            if row:
+                try:
+                    last_scan_ai_used_count = int(row[1] or 0)
+                except Exception:
+                    last_scan_ai_used_count = 0
+                try:
+                    last_scan_ai_tokens_total = int(row[2] or 0)
+                except Exception:
+                    last_scan_ai_tokens_total = 0
+                try:
+                    last_scan_ai_cost_usd_total = float(row[3] or 0.0)
+                except Exception:
+                    last_scan_ai_cost_usd_total = 0.0
+                try:
+                    last_scan_ai_unpriced_calls = int(row[4] or 0)
+                except Exception:
+                    last_scan_ai_unpriced_calls = 0
             if row and row[0]:
                 last_scan_summary = json.loads(row[0])
                 # Merge mb_match (from scan) and discogs/lastfm/bandcamp match (from scan fallback or last fix-all run) for chart-ready summary
@@ -43128,6 +43160,58 @@ def api_progress():
                     last_scan_summary["bandcamp_match"] = {"matched": 0, "total": 0}
         except Exception as e:
             logging.debug("api_progress: could not load last_scan_summary: %s", e)
+
+    ai_used_count_effective = 0
+    try:
+        ai_used_count_effective = int(scan_ai_guard_calls_used or 0)
+    except Exception:
+        ai_used_count_effective = 0
+    if ai_used_count_effective <= 0:
+        try:
+            ai_used_count_effective = int(ai_used_count or 0)
+        except Exception:
+            ai_used_count_effective = 0
+    if not scanning and ai_used_count_effective <= 0:
+        if isinstance(last_scan_summary, dict):
+            try:
+                ai_used_count_effective = int(
+                    last_scan_summary.get("ai_calls_total")
+                    or last_scan_summary.get("ai_used_count")
+                    or 0
+                )
+            except Exception:
+                ai_used_count_effective = 0
+        if ai_used_count_effective <= 0:
+            ai_used_count_effective = int(last_scan_ai_used_count or 0)
+
+    ai_tokens_total_effective = 0
+    ai_cost_usd_total_effective = 0.0
+    ai_unpriced_calls_effective = 0
+    if isinstance(last_scan_summary, dict) and not scanning:
+        try:
+            ai_tokens_total_effective = int(
+                last_scan_summary.get("ai_tokens_total")
+                or last_scan_ai_tokens_total
+                or 0
+            )
+        except Exception:
+            ai_tokens_total_effective = int(last_scan_ai_tokens_total or 0)
+        try:
+            ai_cost_usd_total_effective = float(
+                last_scan_summary.get("ai_cost_usd_total")
+                or last_scan_ai_cost_usd_total
+                or 0.0
+            )
+        except Exception:
+            ai_cost_usd_total_effective = float(last_scan_ai_cost_usd_total or 0.0)
+        try:
+            ai_unpriced_calls_effective = int(
+                last_scan_summary.get("ai_unpriced_calls")
+                or last_scan_ai_unpriced_calls
+                or 0
+            )
+        except Exception:
+            ai_unpriced_calls_effective = int(last_scan_ai_unpriced_calls or 0)
     
     payload = {
         "scanning": scanning,
@@ -43171,7 +43255,10 @@ def api_progress():
         "files_cache_quality_recalc_started_at": files_cache_quality_recalc_started_at,
         "files_cache_quality_recalc_updated_at": files_cache_quality_recalc_updated_at,
         "files_cache_quality_recalc_finished_at": files_cache_quality_recalc_finished_at,
-        "ai_used_count": ai_used_count,
+        "ai_used_count": ai_used_count_effective,
+        "ai_tokens_total": ai_tokens_total_effective,
+        "ai_cost_usd_total": ai_cost_usd_total_effective,
+        "ai_unpriced_calls": ai_unpriced_calls_effective,
         "mb_used_count": mb_used_count,
         "ai_enabled": ai_enabled,
         "scan_ai_guard_calls_used": scan_ai_guard_calls_used,
@@ -48982,7 +49069,7 @@ def api_library_artist_detail(artist_id):
     if _get_library_mode() == "files":
         include_unmatched = _library_include_unmatched_effective()
         album_match_sql = _library_albums_match_where(include_unmatched, "alb")
-        cache_key = f"library:artist:{artist_id}:{_library_cache_unmatched_suffix(include_unmatched)}"
+        cache_key = f"library:artist:v2:{artist_id}:{_library_cache_unmatched_suffix(include_unmatched)}"
         cached = _files_cache_get_json(cache_key)
         if cached is not None:
             return jsonify(cached)
@@ -48995,7 +49082,7 @@ def api_library_artist_detail(artist_id):
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT id, name, name_norm, has_image, image_path, updated_at FROM files_artists WHERE id = %s",
+                    "SELECT id, name, name_norm, has_image, image_path, created_at, updated_at FROM files_artists WHERE id = %s",
                     (artist_id,),
                 )
                 artist_row = cur.fetchone()
@@ -49005,7 +49092,8 @@ def api_library_artist_detail(artist_id):
                 artist_norm = str(artist_row[2] or "").strip() or _norm_artist_key(artist_name)
                 has_artist_image = bool(artist_row[3])
                 artist_image_path = (artist_row[4] or "").strip()
-                artist_updated_epoch = int(_dt_to_epoch(artist_row[5])) if len(artist_row) > 5 else 0
+                artist_created_epoch = int(_dt_to_epoch(artist_row[5])) if len(artist_row) > 5 else 0
+                artist_updated_epoch = int(_dt_to_epoch(artist_row[6])) if len(artist_row) > 6 else 0
                 cur.execute(
                     """
                     SELECT
@@ -49166,6 +49254,8 @@ def api_library_artist_detail(artist_id):
             payload = {
                 "artist_id": artist_id,
                 "artist_name": artist_name,
+                "created_at": artist_created_epoch or None,
+                "updated_at": artist_updated_epoch or None,
                 "artist_thumb": artist_thumb,
                 "artist_profile": artist_profile,
                 "profile_enriching": profile_enriching,
@@ -51046,7 +51136,7 @@ def api_library_album_detail(album_id: int):
     if album_id <= 0:
         return jsonify({"error": "Invalid album id"}), 400
 
-    cache_key = f"library:album:{album_id}"
+    cache_key = f"library:album:v2:{album_id}"
     cached = _files_cache_get_json(cache_key)
     if cached is not None:
         return jsonify(cached)
@@ -51063,6 +51153,8 @@ def api_library_album_detail(album_id: int):
                     alb.title,
                     alb.title_norm,
                     alb.strict_match_verified,
+                    EXTRACT(EPOCH FROM alb.created_at)::BIGINT AS created_at,
+                    EXTRACT(EPOCH FROM alb.updated_at)::BIGINT AS updated_at,
                     COALESCE(alb.year, 0) AS year,
                     COALESCE(alb.date_text, '') AS date_text,
                     COALESCE(alb.genre, '') AS genre,
@@ -51096,6 +51188,8 @@ def api_library_album_detail(album_id: int):
                 album_title,
                 title_norm,
                 strict_match_verified,
+                album_created_at,
+                album_updated_at,
                 year,
                 date_text,
                 genre,
@@ -51280,6 +51374,8 @@ def api_library_album_detail(album_id: int):
             "album_id": int(album_id),
             "title": (album_title or "").strip(),
             "year": int(year or 0) if int(year or 0) > 0 else None,
+            "created_at": int(album_created_at or 0) or None,
+            "updated_at": int(album_updated_at or 0) or None,
             "date_text": (date_text or "").strip(),
             "genre": (genre or "").strip(),
             "label": (label or "").strip(),

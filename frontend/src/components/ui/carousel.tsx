@@ -52,6 +52,8 @@ const Carousel = React.forwardRef<HTMLDivElement, React.HTMLAttributes<HTMLDivEl
     );
     const [canScrollPrev, setCanScrollPrev] = React.useState(false);
     const [canScrollNext, setCanScrollNext] = React.useState(false);
+    const wheelDeltaRef = React.useRef(0);
+    const wheelResetRef = React.useRef<number | null>(null);
 
     const resetSlideStyles = React.useCallback((carouselApi: CarouselApi | undefined) => {
       if (!carouselApi) return;
@@ -126,6 +128,34 @@ const Carousel = React.forwardRef<HTMLDivElement, React.HTMLAttributes<HTMLDivEl
       [scrollPrev, scrollNext],
     );
 
+    const handleWheel = React.useCallback(
+      (event: React.WheelEvent<HTMLDivElement>) => {
+        if (!api || orientation !== "horizontal") return;
+        const horizontalIntent = Math.abs(event.deltaX) > Math.abs(event.deltaY) || event.shiftKey;
+        if (!horizontalIntent) return;
+        const delta = Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : event.deltaY;
+        if (Math.abs(delta) < 4) return;
+        event.preventDefault();
+        wheelDeltaRef.current += delta;
+        if (wheelResetRef.current !== null && typeof window !== "undefined") {
+          window.clearTimeout(wheelResetRef.current);
+        }
+        if (typeof window !== "undefined") {
+          wheelResetRef.current = window.setTimeout(() => {
+            wheelDeltaRef.current = 0;
+            wheelResetRef.current = null;
+          }, 160);
+        }
+        if (Math.abs(wheelDeltaRef.current) < 26) return;
+        const direction = wheelDeltaRef.current > 0 ? 1 : -1;
+        const maxIndex = Math.max(0, api.scrollSnapList().length - 1);
+        const nextIndex = Math.max(0, Math.min(maxIndex, api.selectedScrollSnap() + direction));
+        api.scrollTo(nextIndex);
+        wheelDeltaRef.current = 0;
+      },
+      [api, orientation],
+    );
+
     React.useEffect(() => {
       if (!api || !setApi) {
         return;
@@ -169,6 +199,7 @@ const Carousel = React.forwardRef<HTMLDivElement, React.HTMLAttributes<HTMLDivEl
         <div
           ref={ref}
           onKeyDownCapture={handleKeyDown}
+          onWheelCapture={handleWheel}
           className={cn("relative", className)}
           role="region"
           aria-roledescription="carousel"

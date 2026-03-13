@@ -54,6 +54,8 @@ interface AlbumInfo {
 interface ArtistDetailResponse {
   artist_id: number;
   artist_name: string;
+  created_at?: number | null;
+  updated_at?: number | null;
   artist_thumb?: string;
   albums: AlbumInfo[];
   total_albums: number;
@@ -122,6 +124,37 @@ function haversineKm(a: { lat: number; lon: number }, b: { lat: number; lon: num
   const lat2 = toRad(b.lat);
   const x = Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * (Math.sin(dLon / 2) ** 2);
   return 2 * R * Math.asin(Math.min(1, Math.sqrt(x)));
+}
+
+function formatBadgeTimestamp(ts?: number | null): string {
+  const n = Number(ts || 0);
+  if (!Number.isFinite(n) || n <= 0) return '—';
+  try {
+    return new Date(n * 1000).toLocaleString();
+  } catch {
+    return '—';
+  }
+}
+
+function formatAddedTimestamp(ts?: number | null): string {
+  const n = Number(ts || 0);
+  if (!Number.isFinite(n) || n <= 0) return '—';
+  try {
+    return new Intl.DateTimeFormat('en-GB', {
+      day: '2-digit',
+      month: '2-digit',
+      year: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: true,
+    })
+      .format(new Date(n * 1000))
+      .replace(' am', ' AM')
+      .replace(' pm', ' PM');
+  } catch {
+    return '—';
+  }
 }
 
 export default function ArtistPage() {
@@ -527,15 +560,6 @@ export default function ArtistPage() {
     }
   }, [summary, summaryLoading, ensureDescription]);
 
-  const formatUpdated = (ts?: number) => {
-    if (!ts) return '—';
-    try {
-      return new Date(ts * 1000).toLocaleDateString();
-    } catch {
-      return '—';
-    }
-  };
-
   useEffect(() => {
     if (!details || !profileEnriching) return;
     let cancelled = false;
@@ -763,6 +787,11 @@ export default function ArtistPage() {
   const isDeceased =
     factsDied.length > 0
     || /(^|\W)(died|deceased|passed away|late)(\W|$)/i.test(displayText.slice(0, 1600));
+  const artistAddedAt = Number(details.created_at || 0) > 0 ? Number(details.created_at || 0) : null;
+  const artistUpdatedAt =
+    Number(details.updated_at || 0) > 0
+      ? Number(details.updated_at || 0)
+      : (Number(displayUpdated || 0) > 0 ? Number(displayUpdated || 0) : null);
 
   const formatConcertDate = (dt?: string) => {
     const raw = (dt || '').trim();
@@ -845,9 +874,22 @@ export default function ArtistPage() {
                     {displaySource ? (
                       <ProviderBadge provider={displaySource} prefix="Source" className="text-[10px]" />
                     ) : null}
-                    <Badge variant="outline" className={`text-[10px] ${badgeKindClass('muted')}`}>
-                      Updated: {formatUpdated(displayUpdated)}
-                    </Badge>
+                    {artistAddedAt ? (
+                      <Badge variant="outline" className={`text-[10px] ${badgeKindClass('muted')}`}>
+                        Added {formatAddedTimestamp(artistAddedAt)}
+                      </Badge>
+                    ) : null}
+                    <button
+                      type="button"
+                      className={cn(
+                        'inline-flex items-center rounded-full border px-2.5 py-1 text-[10px] leading-none transition-colors hover:brightness-110',
+                        badgeKindClass('muted')
+                      )}
+                      onClick={() => setMatchDialogOpen(true)}
+                      title="Open match detail"
+                    >
+                      Updated: {formatBadgeTimestamp(artistUpdatedAt)}
+                    </button>
                     <Button
                       type="button"
                       size="sm"
@@ -1110,7 +1152,7 @@ export default function ArtistPage() {
                 ) : null}
               </DialogTitle>
               <DialogDescription>
-                {concertsMeta?.updated_at ? `Updated ${formatUpdated(concertsMeta.updated_at)}.` : 'No update timestamp.'}
+                {concertsMeta?.updated_at ? `Updated ${formatBadgeTimestamp(concertsMeta.updated_at)}.` : 'No update timestamp.'}
                 {concertHome ? ` Radius filter: ${Math.round(concertHome.radiusKm)} km.` : ''}
               </DialogDescription>
             </DialogHeader>

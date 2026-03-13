@@ -116,6 +116,37 @@ function parseGenreBadges(value: string): string[] {
   return out;
 }
 
+function formatBadgeTimestamp(ts?: number | null): string {
+  const n = Number(ts || 0);
+  if (!Number.isFinite(n) || n <= 0) return '—';
+  try {
+    return new Date(n * 1000).toLocaleString();
+  } catch {
+    return '—';
+  }
+}
+
+function formatAddedTimestamp(ts?: number | null): string {
+  const n = Number(ts || 0);
+  if (!Number.isFinite(n) || n <= 0) return '—';
+  try {
+    return new Intl.DateTimeFormat('en-GB', {
+      day: '2-digit',
+      month: '2-digit',
+      year: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: true,
+    })
+      .format(new Date(n * 1000))
+      .replace(' am', ' AM')
+      .replace(' pm', ' PM');
+  } catch {
+    return '—';
+  }
+}
+
 export default function AlbumPage() {
   const navigate = useNavigate();
   const params = useParams<{ albumId: string }>();
@@ -395,6 +426,11 @@ export default function AlbumPage() {
   const reviewSource = (data.review?.source || '').trim();
   const showReviewToggle = wordCount(reviewText) >= 80 || reviewText.length >= 420;
   const genreBadges = parseGenreBadges(data.genre || '');
+  const albumAddedAt = Number(data.created_at || 0) > 0 ? Number(data.created_at || 0) : null;
+  const albumUpdatedAt =
+    Number(data.updated_at || 0) > 0
+      ? Number(data.updated_at || 0)
+      : (Number(data.review?.updated_at || 0) > 0 ? Number(data.review?.updated_at || 0) : null);
 
   return (
     <div className="container py-4 md:py-6 space-y-5 md:space-y-6">
@@ -412,7 +448,7 @@ export default function AlbumPage() {
               onClick={() => navigate(`/library/label/${encodeURIComponent(data.label || '')}`)}
               title="Open label"
             >
-              {data.label}
+              Label: {data.label}
             </Button>
           ) : null}
           {(isAdmin || canDownload) ? (
@@ -446,10 +482,6 @@ export default function AlbumPage() {
           >
             {aiReviewBusy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
             AI review
-          </Button>
-          <Button size="sm" className="h-8 gap-2" onClick={handlePlay} disabled={playbackTracks.length === 0}>
-            <Play className="w-4 h-4" />
-            Play
           </Button>
         </div>
       </div>
@@ -529,6 +561,22 @@ export default function AlbumPage() {
                       <ProviderBadge provider={data.metadata_source} prefix="Source" className="text-[10px]" />
                     )
                   ) : null}
+                  {albumAddedAt ? (
+                    <Badge variant="outline" className={cn("text-[10px]", badgeKindClass('muted'))}>
+                      Added {formatAddedTimestamp(albumAddedAt)}
+                    </Badge>
+                  ) : null}
+                  <button
+                    type="button"
+                    className={cn(
+                      "inline-flex items-center rounded-full border px-2.5 py-1 text-[10px] leading-none transition-colors hover:brightness-110",
+                      badgeKindClass('muted')
+                    )}
+                    onClick={() => setMatchDialogOpen(true)}
+                    title="Open match detail"
+                  >
+                    Updated: {formatBadgeTimestamp(albumUpdatedAt)}
+                  </button>
                   {data.bandcamp_album_url ? (
                     <ProviderLink provider="bandcamp" href={data.bandcamp_album_url} className="inline-flex" />
                   ) : null}
@@ -594,6 +642,16 @@ export default function AlbumPage() {
               </p>
             </div>
             <div className="flex items-center gap-2">
+              <Button
+                type="button"
+                size="icon"
+                className="h-10 w-10 rounded-full"
+                onClick={handlePlay}
+                disabled={playbackTracks.length === 0}
+                title="Play album"
+              >
+                <Play className="h-4 w-4 fill-current" />
+              </Button>
               {trackDetailsLoading ? <Loader2 className="w-4 h-4 animate-spin text-muted-foreground" /> : null}
             </div>
           </div>
@@ -608,9 +666,11 @@ export default function AlbumPage() {
               <Table className="min-w-[920px]">
                 <TableHeader>
                   <TableRow className="hover:bg-transparent">
+                    <TableHead className="h-10 w-[70px] text-center text-[10px] uppercase tracking-wide">
+                      <Play className="mx-auto h-3.5 w-3.5 text-emerald-400 fill-emerald-400" />
+                    </TableHead>
                     <TableHead className="h-10 w-[80px] text-[10px] uppercase tracking-wide">#</TableHead>
                     <TableHead className="h-10 text-[10px] uppercase tracking-wide">Artist</TableHead>
-                    <TableHead className="h-10 w-[70px] text-right text-[10px] uppercase tracking-wide">Play</TableHead>
                     <TableHead className="h-10 min-w-[320px] text-[10px] uppercase tracking-wide">Track name</TableHead>
                     <TableHead className="h-10 w-[90px] text-right text-[10px] uppercase tracking-wide">Duration</TableHead>
                     <TableHead className="h-10 w-[78px] text-right text-[10px] uppercase tracking-wide">Queue</TableHead>
@@ -630,22 +690,22 @@ export default function AlbumPage() {
                     return (
                       <Fragment key={`alb-tr-${t.track_id || idx}`}>
                         <TableRow>
-                          <TableCell className="py-3 text-xs tabular-nums text-muted-foreground">{t.display_num}</TableCell>
-                          <TableCell className="py-3">
-                            <div className="max-w-[220px] truncate text-sm text-muted-foreground">{t.display_artist}</div>
-                          </TableCell>
-                          <TableCell className="py-3 text-right">
+                          <TableCell className="py-3 text-center">
                             <Button
                               type="button"
                               size="icon"
                               variant="ghost"
-                              className="h-8 w-8 rounded-full"
+                              className="h-8 w-8 rounded-full text-emerald-400 hover:bg-emerald-500/10 hover:text-emerald-300"
                               onClick={() => handlePlayTrack(t.track_id)}
                               title="Play track"
                               disabled={!canStream}
                             >
-                              <Play className="h-4 w-4" />
+                              <Play className="h-4 w-4 fill-current" />
                             </Button>
+                          </TableCell>
+                          <TableCell className="py-3 text-xs tabular-nums text-muted-foreground">{t.display_num}</TableCell>
+                          <TableCell className="py-3">
+                            <div className="max-w-[220px] truncate text-sm text-muted-foreground">{t.display_artist}</div>
                           </TableCell>
                           <TableCell className="py-3">
                             <div className="text-sm font-medium truncate">{t.display_title || 'Untitled'}</div>
