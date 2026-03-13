@@ -30243,9 +30243,27 @@ def _publish_files_library_artist_from_items(
                 or "Unknown Album"
             )
             artist_fallback = resolved_artist_from_item or (item.get("artist") or "").strip() or (artist_name or "").strip() or "Unknown Artist"
-            artist_resolved = _pick_album_artist_from_tag_dicts([tags], default=artist_fallback)
-            album_resolved = _pick_album_title_from_tag_dicts([tags], fallback=title_fallback)
-            album_resolved = _sanitize_album_title_display(album_resolved)
+            # Re-evaluate display identity on top of the live tags, but keep the scan-time
+            # identity hints attached to the item authoritative. Without this second pass the
+            # publication layer can regress back to stale embedded tags (for example a folder
+            # matched as "Slowdive / Souvlaki" getting republished as "Slowdive / Takk...").
+            artist_from_tags = _pick_album_artist_from_tag_dicts([tags], default=artist_fallback)
+            album_from_tags = _pick_album_title_from_tag_dicts([tags], fallback=title_fallback)
+            identity_candidate = dict(item)
+            identity_candidate["artist"] = artist_from_tags
+            identity_candidate["artist_name"] = artist_from_tags
+            identity_candidate["title_raw"] = album_from_tags
+            identity_candidate["album_title"] = album_from_tags
+            artist_resolved, album_resolved = _resolve_edition_display_identity(
+                identity_candidate,
+                default_artist=artist_fallback,
+                default_title=title_fallback,
+                folder_name=folder.name,
+            )
+            artist_resolved = str(artist_resolved or artist_fallback or "Unknown Artist").strip() or "Unknown Artist"
+            album_resolved = _sanitize_album_title_display(
+                str(album_resolved or title_fallback or "Unknown Album").strip() or "Unknown Album"
+            )
             label_resolved = _pick_album_label_from_tag_dicts([tags])
             artist_norm = _norm_artist_key(artist_resolved) or "unknown artist"
             title_norm = norm_album_for_dedup(album_resolved, normalize_parenthetical=True) or "unknown album"
