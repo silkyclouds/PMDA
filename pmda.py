@@ -659,7 +659,7 @@ PMDA_ARTWORK_RAM_CACHE_AUTO_MAX_MB = int(max(0, _parse_int(os.getenv("PMDA_ARTWO
 PMDA_ARTWORK_RAM_CACHE_AUTO_INTERVAL_SEC = int(max(30, _parse_int(os.getenv("PMDA_ARTWORK_RAM_CACHE_AUTO_INTERVAL_SEC", "120"), 120) or 120))
 PMDA_FILES_WATCHER_ENABLED = _parse_bool(os.getenv("PMDA_FILES_WATCHER_ENABLED", "true"))
 PMDA_FILES_WATCHER_LOG_COOLDOWN_SEC = float(os.getenv("PMDA_FILES_WATCHER_LOG_COOLDOWN_SEC", "10") or "10")
-PMDA_AUTO_CHANGED_ONLY_SCAN = _parse_bool(os.getenv("PMDA_AUTO_CHANGED_ONLY_SCAN", "true"))
+PMDA_AUTO_CHANGED_ONLY_SCAN = _parse_bool(os.getenv("PMDA_AUTO_CHANGED_ONLY_SCAN", "false"))
 PMDA_AUTO_CHANGED_ONLY_SCAN_DEBOUNCE_SEC = float(os.getenv("PMDA_AUTO_CHANGED_ONLY_SCAN_DEBOUNCE_SEC", "60") or "60")
 PMDA_AUTO_CHANGED_ONLY_SCAN_COOLDOWN_SEC = float(os.getenv("PMDA_AUTO_CHANGED_ONLY_SCAN_COOLDOWN_SEC", "300") or "300")
 PMDA_AUTO_CHANGED_ONLY_SCAN_MIN_PENDING = int(os.getenv("PMDA_AUTO_CHANGED_ONLY_SCAN_MIN_PENDING", "1") or "1")
@@ -7308,8 +7308,31 @@ def _pipeline_bootstrap_reset() -> None:
         logging.debug("Failed to reset pipeline bootstrap state", exc_info=True)
 
 
+def _auto_changed_only_mode_effective() -> bool:
+    """Whether watcher-driven changed-only scans are currently allowed."""
+    try:
+        if not PMDA_AUTO_CHANGED_ONLY_SCAN:
+            return False
+        if not PMDA_FILES_WATCHER_ENABLED:
+            return False
+        if bool(_scheduler_paused):
+            return False
+        if _get_library_mode() != "files":
+            return False
+    except Exception:
+        return False
+    return True
+
+
+def _scan_autonomous_mode_effective() -> bool:
+    bootstrap = _pipeline_bootstrap_status()
+    return bool(bootstrap.get("autonomous_mode")) and _auto_changed_only_mode_effective()
+
+
 def get_default_scan_type() -> str:
-    return "full" if bool(_pipeline_bootstrap_status().get("bootstrap_required")) else "changed_only"
+    if bool(_pipeline_bootstrap_status().get("bootstrap_required")):
+        return "full"
+    return "changed_only" if _auto_changed_only_mode_effective() else "full"
 
 
 def _files_source_roots_replace(roots_payload: list[dict], *, winner_source_root_id: int | None = None) -> list[dict]:
@@ -12097,11 +12120,7 @@ _auto_changed_only_scan_last_started_ts = 0.0
 def _start_auto_changed_only_scan_scheduler() -> None:
     """Start a background scheduler that can trigger changed-only scans from watcher events."""
     global _auto_changed_only_scan_thread
-    if not PMDA_AUTO_CHANGED_ONLY_SCAN:
-        return
-    if not PMDA_FILES_WATCHER_ENABLED:
-        return
-    if _get_library_mode() != "files":
+    if not _auto_changed_only_mode_effective():
         return
     if not _files_watcher_available():
         return
@@ -12120,9 +12139,7 @@ def _auto_changed_only_scan_loop() -> None:
     while True:
         try:
             time.sleep(poll_sec)
-            if not PMDA_AUTO_CHANGED_ONLY_SCAN:
-                continue
-            if _get_library_mode() != "files":
+            if not _auto_changed_only_mode_effective():
                 continue
             if bool(_pipeline_bootstrap_status().get("bootstrap_required")):
                 continue
@@ -38490,7 +38507,7 @@ def api_scan_defaults():
         {
             "default_scan_type": get_default_scan_type(),
             "bootstrap_required": bool(bootstrap.get("bootstrap_required")),
-            "autonomous_mode": bool(bootstrap.get("autonomous_mode")),
+            "autonomous_mode": _scan_autonomous_mode_effective(),
             "has_completed_full_scan": not bool(bootstrap.get("bootstrap_required")),
             "first_full_scan_id": bootstrap.get("first_full_scan_id"),
             "first_full_completed_at": bootstrap.get("first_full_completed_at"),
@@ -38504,7 +38521,7 @@ def api_pipeline_bootstrap_status():
     return jsonify(
         {
             "bootstrap_required": bool(bootstrap.get("bootstrap_required")),
-            "autonomous_mode": bool(bootstrap.get("autonomous_mode")),
+            "autonomous_mode": _scan_autonomous_mode_effective(),
             "first_full_scan_id": bootstrap.get("first_full_scan_id"),
             "first_full_completed_at": bootstrap.get("first_full_completed_at"),
             "default_scan_type": get_default_scan_type(),
@@ -43184,7 +43201,7 @@ def api_progress():
         "scan_player_sync_ok": scan_player_sync_ok,
         "scan_player_sync_message": scan_player_sync_message,
         "bootstrap_required": bool(bootstrap_status.get("bootstrap_required")),
-        "autonomous_mode": bool(bootstrap_status.get("autonomous_mode")),
+        "autonomous_mode": _scan_autonomous_mode_effective(),
         "has_completed_full_scan": bool(has_completed_full_scan),
         "default_scan_type": str(default_scan_type or "full"),
         "elapsed_seconds": elapsed_seconds,
