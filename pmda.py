@@ -51471,18 +51471,11 @@ def api_library_artist_summary_ai(artist_id: int):
                         events = json.loads(crow[1] or "[]") if crow[1] else []
                     except Exception:
                         events = []
-                # If missing, fetch once (Songkick first; Bandsintown may be blocked with 403).
+                # If missing, fetch once using the shared provider selector.
                 if not events:
-                    provider = "songkick"
-                    events, sk_url = _songkick_fetch_upcoming_events(artist_name)
-                    if sk_url:
-                        source_url = sk_url
-                    if not events:
-                        provider = "bandsintown"
-                        app_id = str(_get_config_from_db("BANDSINTOWN_APP_ID", "") or "").strip() or "pmda"
-                        events = _bandsintown_fetch_upcoming_events(artist_name, app_id)
-                        if not source_url:
-                            source_url = f"https://www.bandsintown.com/a/{quote(artist_name, safe='')}" if artist_name else ""
+                    provider, events, fetched_source_url = _concerts_fetch_upcoming_events(artist_name, "auto")
+                    if fetched_source_url:
+                        source_url = fetched_source_url
                     with conn.transaction():
                         with conn.cursor() as cur:
                             cur.execute(
@@ -51621,7 +51614,42 @@ def api_library_artist_summary_ai(artist_id: int):
         conn.close()
 
 
-def _bandsintown_fetch_upcoming_events(artist_name: str, app_id: str) -> list[dict]:
+_BANDSINTOWN_BLOCK_UNTIL_TS = 0.0
+_BANDSINTOWN_BLOCK_REASON = ""
+_BANDSINTOWN_BLOCK_LOGGED_UNTIL_TS = 0.0
+_BANDSINTOWN_BLOCK_LOCK = threading.Lock()
+_BANDSINTOWN_FORBIDDEN_TTL_SEC = 60 * 60 * 12
+_BANDSINTOWN_RATE_LIMIT_TTL_SEC = 60 * 30
+
+
+def _bandsintown_block_state() -> tuple[bool, float, str]:
+    now = float(time.time())
+    with _BANDSINTOWN_BLOCK_LOCK:
+        until_ts = float(_BANDSINTOWN_BLOCK_UNTIL_TS or 0.0)
+        reason = str(_BANDSINTOWN_BLOCK_REASON or "")
+    return (until_ts > now, until_ts, reason)
+
+
+def _bandsintown_mark_blocked(*, ttl_sec: int, reason: str) -> None:
+    global _BANDSINTOWN_BLOCK_UNTIL_TS, _BANDSINTOWN_BLOCK_REASON, _BANDSINTOWN_BLOCK_LOGGED_UNTIL_TS
+    now = float(time.time())
+    until_ts = now + max(60, int(ttl_sec or 0))
+    msg = str(reason or "temporarily disabled").strip() or "temporarily disabled"
+    with _BANDSINTOWN_BLOCK_LOCK:
+        _BANDSINTOWN_BLOCK_UNTIL_TS = until_ts
+        _BANDSINTOWN_BLOCK_REASON = msg
+        already_logged = float(_BANDSINTOWN_BLOCK_LOGGED_UNTIL_TS or 0.0) >= until_ts - 1.0
+        if not already_logged:
+            _BANDSINTOWN_BLOCK_LOGGED_UNTIL_TS = until_ts
+    if not already_logged:
+        logging.warning(
+            "[Concerts] Bandsintown temporarily disabled for %.1fh (%s)",
+            max(0.0, (until_ts - now) / 3600.0),
+            msg,
+        )
+
+
+def _bandsintown_fetch_upcoming_events(artist_name: str, app_id: str, *, force: bool = False) -> list[dict]:
     """
     Fetch upcoming events for an artist from Bandsintown.
     Notes:
@@ -51630,6 +51658,15 @@ def _bandsintown_fetch_upcoming_events(artist_name: str, app_id: str) -> list[di
     """
     name = (artist_name or "").strip()
     if not name:
+        return []
+    blocked, until_ts, reason = _bandsintown_block_state()
+    if blocked and not force:
+        logging.debug(
+            "[Concerts] Bandsintown skipped (temporarily disabled until %s; reason=%s) artist=%s",
+            datetime.fromtimestamp(until_ts).strftime("%Y-%m-%d %H:%M:%S"),
+            reason or "n/a",
+            name,
+        )
         return []
     encoded = quote(name, safe="")
     url = f"https://rest.bandsintown.com/artists/{encoded}/events"
@@ -51645,7 +51682,19 @@ def _bandsintown_fetch_upcoming_events(artist_name: str, app_id: str) -> list[di
         # Bandsintown frequently returns 403 from some hosting environments.
         # Keep it non-fatal so we can fall back to Songkick scraping.
         if r.status_code == 403:
+            body = ""
+            try:
+                body = str((r.text or "")[:240]).strip()
+            except Exception:
+                body = ""
+            _bandsintown_mark_blocked(
+                ttl_sec=_BANDSINTOWN_FORBIDDEN_TTL_SEC,
+                reason=f"HTTP 403 explicit deny{': ' + body if body else ''}",
+            )
             logging.info("[Concerts] Bandsintown forbidden (403) for artist=%s", name)
+            return []
+        if r.status_code == 429:
+            _bandsintown_mark_blocked(ttl_sec=_BANDSINTOWN_RATE_LIMIT_TTL_SEC, reason="HTTP 429 rate limited")
             return []
         r.raise_for_status()
         data = r.json()
@@ -51685,6 +51734,40 @@ def _bandsintown_fetch_upcoming_events(artist_name: str, app_id: str) -> list[di
         return out
     except Exception:
         return []
+
+
+def _concerts_fetch_upcoming_events(artist_name: str, preferred_provider: str = "auto") -> tuple[str, list[dict], str | None]:
+    """
+    Centralized concert provider selection.
+    Strategy:
+    - `songkick`: Songkick only
+    - `bandsintown`: Bandsintown only (unless temporarily blocked)
+    - `auto`: Songkick first, Bandsintown only if Songkick has no events and Bandsintown is available
+    """
+    provider = str(preferred_provider or "auto").strip().lower() or "auto"
+    name = (artist_name or "").strip()
+    if not name:
+        return ("songkick" if provider == "auto" else provider, [], None)
+    if provider == "songkick":
+        events, source_url = _songkick_fetch_upcoming_events(name)
+        return ("songkick", events, source_url)
+    if provider == "bandsintown":
+        app_id = str(_get_config_from_db("BANDSINTOWN_APP_ID", "") or "").strip() or "pmda"
+        events = _bandsintown_fetch_upcoming_events(name, app_id)
+        source_url = f"https://www.bandsintown.com/a/{quote(name, safe='')}" if name else None
+        return ("bandsintown", events, source_url)
+    events, source_url = _songkick_fetch_upcoming_events(name)
+    if events:
+        return ("songkick", events, source_url)
+    blocked, _, _ = _bandsintown_block_state()
+    if blocked:
+        return ("songkick", [], source_url)
+    app_id = str(_get_config_from_db("BANDSINTOWN_APP_ID", "") or "").strip() or "pmda"
+    events = _bandsintown_fetch_upcoming_events(name, app_id)
+    if events:
+        source_url = f"https://www.bandsintown.com/a/{quote(name, safe='')}" if name else source_url
+        return ("bandsintown", events, source_url)
+    return ("songkick", [], source_url)
 
 
 # --- Geo helpers (concert map) ------------------------------------------------
@@ -51974,27 +52057,7 @@ def api_library_artist_concerts(artist_id: int):
                 )
 
         # Refresh from provider.
-        events: list[dict] = []
-        source_url: str | None = None
-        provider_used = provider
-        if provider == "songkick":
-            events, source_url = _songkick_fetch_upcoming_events(artist_name)
-            provider_used = "songkick"
-        elif provider == "bandsintown":
-            app_id = str(_get_config_from_db("BANDSINTOWN_APP_ID", "") or "").strip() or "pmda"
-            events = _bandsintown_fetch_upcoming_events(artist_name, app_id)
-            source_url = f"https://www.bandsintown.com/a/{quote(artist_name, safe='')}" if artist_name else None
-            provider_used = "bandsintown"
-        else:
-            # auto: prefer Songkick HTML (works reliably when Bandsintown blocks API access).
-            events, source_url = _songkick_fetch_upcoming_events(artist_name)
-            provider_used = "songkick"
-            if not events:
-                app_id = str(_get_config_from_db("BANDSINTOWN_APP_ID", "") or "").strip() or "pmda"
-                events = _bandsintown_fetch_upcoming_events(artist_name, app_id)
-                if events:
-                    provider_used = "bandsintown"
-                    source_url = f"https://www.bandsintown.com/a/{quote(artist_name, safe='')}" if artist_name else source_url
+        provider_used, events, source_url = _concerts_fetch_upcoming_events(artist_name, provider)
 
         events_json = json.dumps(events, ensure_ascii=False)
         with conn.transaction():
