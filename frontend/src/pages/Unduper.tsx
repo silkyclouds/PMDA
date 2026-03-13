@@ -1,5 +1,5 @@
 import { useState, useMemo, useCallback, useEffect, useRef } from 'react';
-import { Trash2, Loader2, GitMerge, Undo2 } from 'lucide-react';
+import { Trash2, Loader2, GitMerge, Undo2, Disc3, Search } from 'lucide-react';
 import { toast } from 'sonner';
 import { useQueryClient } from '@tanstack/react-query';
 import { useSearchParams } from 'react-router-dom';
@@ -12,6 +12,7 @@ import { EmptyState } from '@/components/EmptyState';
 import { ProviderBadge } from '@/components/providers/ProviderBadge';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
+import { ScanMoveReviewDialog } from '@/components/scan-moves/ScanMoveReviewDialog';
 import {
   useDuplicates,
   useScanControls,
@@ -84,6 +85,7 @@ export default function Unduper() {
   const [restoringMoveIds, setRestoringMoveIds] = useState<Set<number>>(new Set());
   const [restoringAllMoves, setRestoringAllMoves] = useState(false);
   const [reviewMovesFilter, setReviewMovesFilter] = useState<'all' | 'active' | 'restored'>('all');
+  const [selectedReviewMove, setSelectedReviewMove] = useState<ScanMove | null>(null);
 
   // Data hooks (refetch duplicates every 2s during scan so list grows as artists finish, 1s during dedupe)
   const { progress: scanProgress, dedupeProgress } = useScanProgressShared({ pollInterval: 2500 });
@@ -167,12 +169,12 @@ export default function Unduper() {
     [reviewScanMoves],
   );
   const dedupeMovesForReview = useMemo(() => {
-    if (reviewMovesFilter === 'active') return dedupeMovesForReviewAll.filter((m) => !m.restored);
-    if (reviewMovesFilter === 'restored') return dedupeMovesForReviewAll.filter((m) => Boolean(m.restored));
+    if (reviewMovesFilter === 'active') return dedupeMovesForReviewAll.filter((m) => String(m.status || (m.restored ? 'restored' : 'moved')).toLowerCase() !== 'restored');
+    if (reviewMovesFilter === 'restored') return dedupeMovesForReviewAll.filter((m) => String(m.status || (m.restored ? 'restored' : 'moved')).toLowerCase() === 'restored');
     return dedupeMovesForReviewAll;
   }, [dedupeMovesForReviewAll, reviewMovesFilter]);
   const dedupeMovesPending = useMemo(
-    () => dedupeMovesForReviewAll.filter((m) => !m.restored),
+    () => dedupeMovesForReviewAll.filter((m) => String(m.status || (m.restored ? 'restored' : 'moved')).toLowerCase() !== 'restored'),
     [dedupeMovesForReviewAll],
   );
   const hasReviewHistory = Boolean(reviewScanId && dedupeMovesForReviewAll.length > 0);
@@ -329,12 +331,12 @@ export default function Unduper() {
                 Dedupe moves review for run #{reviewScanId}
               </p>
               <Badge variant="outline">{dedupeMovesForReviewAll.length} moved loser album(s)</Badge>
-              <Badge variant="outline">{dedupeMovesPending.length} pending rollback</Badge>
+              <Badge variant="outline">{dedupeMovesPending.length} active move(s)</Badge>
               <Button size="sm" variant={reviewMovesFilter === 'all' ? 'default' : 'outline'} onClick={() => setReviewMovesFilter('all')}>
                 All
               </Button>
               <Button size="sm" variant={reviewMovesFilter === 'active' ? 'default' : 'outline'} onClick={() => setReviewMovesFilter('active')}>
-                Pending
+                Moved
               </Button>
               <Button size="sm" variant={reviewMovesFilter === 'restored' ? 'default' : 'outline'} onClick={() => setReviewMovesFilter('restored')}>
                 Restored
@@ -365,7 +367,7 @@ export default function Unduper() {
                     : 'No dedupe moves for this filter in this run.'}
               </p>
             ) : (
-              <div className="max-h-72 overflow-auto rounded-md border">
+              <div className="max-h-[36rem] overflow-auto rounded-md border">
                 <table className="w-full text-sm">
                   <thead className="bg-muted/50 sticky top-0">
                     <tr>
@@ -376,28 +378,61 @@ export default function Unduper() {
                     </tr>
                   </thead>
                   <tbody>
-                    {dedupeMovesForReview.map((move) => (
-                      <tr key={move.move_id} className="border-t border-border align-top">
+                    {dedupeMovesForReview.map((move) => {
+                      const status = String(move.status || (move.restored ? 'restored' : 'moved')).toLowerCase();
+                      return (
+                      <tr
+                        key={move.move_id}
+                        className="border-t border-border align-top cursor-pointer hover:bg-muted/20"
+                        onClick={() => setSelectedReviewMove(move)}
+                      >
                         <td className="px-3 py-2">
-                          <p className="font-medium">{move.artist}</p>
-                          <p>{move.album_title || `Album #${move.album_id}`}</p>
-                          <p className="text-xs text-muted-foreground break-all" title={move.moved_to_path}>
-                            {move.moved_to_path}
-                          </p>
+                          <div className="flex gap-3">
+                            <div className="w-14 h-14 rounded-xl overflow-hidden border border-border/70 bg-muted shrink-0">
+                              {move.thumb_url ? (
+                                <img src={move.thumb_url} alt={move.album_title || move.artist} className="w-full h-full object-cover" />
+                              ) : (
+                                <div className="w-full h-full flex items-center justify-center">
+                                  <Disc3 className="w-4 h-4 text-muted-foreground" />
+                                </div>
+                              )}
+                            </div>
+                            <div className="min-w-0">
+                              <p className="font-medium">{move.artist}</p>
+                              <p>{move.album_title || `Album #${move.album_id}`}</p>
+                              <p className="text-xs text-muted-foreground break-all" title={move.moved_to_path}>
+                                {move.moved_to_path}
+                              </p>
+                            </div>
+                          </div>
                         </td>
                         <td className="px-3 py-2">
-                          <p>{move.winner_title || 'n/a'}</p>
-                          {move.winner_path ? (
-                            <p className="text-xs text-muted-foreground break-all" title={move.winner_path}>
-                              {move.winner_path}
-                            </p>
-                          ) : null}
+                          <div className="flex gap-3">
+                            <div className="w-14 h-14 rounded-xl overflow-hidden border border-border/70 bg-muted shrink-0">
+                              {move.winner_thumb_url ? (
+                                <img src={move.winner_thumb_url} alt={move.winner_title || move.artist} className="w-full h-full object-cover" />
+                              ) : (
+                                <div className="w-full h-full flex items-center justify-center">
+                                  <Disc3 className="w-4 h-4 text-muted-foreground" />
+                                </div>
+                              )}
+                            </div>
+                            <div className="min-w-0">
+                              <p>{move.winner_title || 'n/a'}</p>
+                              {move.winner_path ? (
+                                <p className="text-xs text-muted-foreground break-all" title={move.winner_path}>
+                                  {move.winner_path}
+                                </p>
+                              ) : null}
+                            </div>
+                          </div>
                         </td>
                         <td className="px-3 py-2">
                           <div className="flex flex-wrap items-center gap-1">
-                            <Badge variant={move.restored ? 'secondary' : 'default'}>
-                              {move.restored ? 'Restored' : 'Pending'}
+                            <Badge variant={status === 'restored' ? 'secondary' : 'default'}>
+                              {status === 'restored' ? 'Restored' : status === 'missing' ? 'Missing' : 'Moved'}
                             </Badge>
+                            {move.reason_label ? <Badge variant="outline">{move.reason_label}</Badge> : null}
                             {move.decision_provider ? <ProviderBadge provider={move.decision_provider} prefix="Provider" /> : null}
                             {move.decision_source ? <ProviderBadge provider={move.decision_source} prefix="Source" /> : null}
                             {move.decision_confidence != null ? (
@@ -409,23 +444,40 @@ export default function Unduper() {
                           ) : null}
                         </td>
                         <td className="px-3 py-2">
-                          <Button
-                            size="sm"
-                            variant="outline"
-                            className="gap-1.5"
-                            onClick={() => void handleRestoreReviewMoves([move.move_id])}
-                            disabled={restoringAllMoves || restoringMoveIds.size > 0 || Boolean(move.restored)}
-                          >
-                            {restoringMoveIds.has(move.move_id) ? (
-                              <Loader2 className="w-4 h-4 animate-spin" />
-                            ) : (
-                              <Undo2 className="w-4 h-4" />
-                            )}
-                            Rollback
-                          </Button>
+                          <div className="flex items-center gap-2">
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              className="gap-1.5"
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                setSelectedReviewMove(move);
+                              }}
+                            >
+                              <Search className="w-4 h-4" />
+                              Review
+                            </Button>
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              className="gap-1.5"
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                void handleRestoreReviewMoves([move.move_id]);
+                              }}
+                              disabled={restoringAllMoves || restoringMoveIds.size > 0 || status === 'restored'}
+                            >
+                              {restoringMoveIds.has(move.move_id) ? (
+                                <Loader2 className="w-4 h-4 animate-spin" />
+                              ) : (
+                                <Undo2 className="w-4 h-4" />
+                              )}
+                              Rollback
+                            </Button>
+                          </div>
                         </td>
                       </tr>
-                    ))}
+                    )})}
                   </tbody>
                 </table>
               </div>
@@ -557,6 +609,18 @@ export default function Unduper() {
           best_title={selectedDuplicate.best_title}
         />
       )}
+      <ScanMoveReviewDialog
+        move={selectedReviewMove}
+        open={Boolean(selectedReviewMove)}
+        onOpenChange={(open) => {
+          if (!open) setSelectedReviewMove(null);
+        }}
+        restoring={selectedReviewMove ? restoringMoveIds.has(selectedReviewMove.move_id) : false}
+        onRestore={async (moveId) => {
+          await handleRestoreReviewMoves([moveId]);
+          setSelectedReviewMove(null);
+        }}
+      />
     </div>
   );
 }

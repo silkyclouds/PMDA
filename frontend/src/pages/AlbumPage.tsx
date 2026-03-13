@@ -1,6 +1,6 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
-import { ArrowLeft, Calendar, ChevronDown, ChevronUp, Download, Info, ListPlus, Loader2, Music, Pencil, Play, Plus, Sparkles } from 'lucide-react';
+import { ArrowLeft, Calendar, ChevronDown, ChevronUp, Disc3, Download, Flame, Info, ListPlus, Loader2, Music, Pencil, Play, Plus, Sparkles, Users } from 'lucide-react';
 
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -9,6 +9,7 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/component
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { FormatBadge } from '@/components/FormatBadge';
+import { AlbumRatingStars } from '@/components/library/AlbumRatingStars';
 import { MatchDetailDialog } from '@/components/library/MatchDetailDialog';
 import { ProviderBadge } from '@/components/providers/ProviderBadge';
 import { ProviderLink } from '@/components/providers/ProviderLink';
@@ -52,6 +53,50 @@ function wordCount(text: string): number {
 
 function normalizeArtistName(value: string): string {
   return (value || '').trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
+function escapeRegExp(value: string): string {
+  return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function albumTitleVariants(value: string): string[] {
+  const raw = String(value || '').trim();
+  if (!raw) return [];
+  const candidates = [raw];
+  if (raw.endsWith('...')) candidates.push(raw.slice(0, -3).trim());
+  if (raw.endsWith('…')) candidates.push(raw.slice(0, -1).trim());
+  return Array.from(new Set(candidates.filter(Boolean)));
+}
+
+function cleanAlbumTrackTitle(rawTitle: string, albumTitle: string, fallbackTrack: number): string {
+  const raw = String(rawTitle || '').trim();
+  if (!raw) return `Track ${Math.max(1, fallbackTrack || 1)}`;
+  let cleaned = raw.replace(/_/g, ' ').trim();
+  for (const variant of albumTitleVariants(albumTitle)) {
+    const escaped = escapeRegExp(variant);
+    cleaned = cleaned.replace(new RegExp(`^${escaped}\\s*-\\s*`, 'i'), '');
+    cleaned = cleaned.replace(new RegExp(`^${escaped}\\s*`, 'i'), '');
+  }
+  cleaned = cleaned.replace(/^(?:cd|disc)\s*\d{1,2}\s*[-_. ]\s*\d{1,3}\s*[-_. ]*/i, '');
+  cleaned = cleaned.replace(/^\d{1,2}\s*[-_.]\s*\d{1,3}\s*[-_. ]*/i, '');
+  cleaned = cleaned.replace(/^(?:side\s*)?[a-z]\s*[-_. ]\s*\d{1,3}\s*[-_. ]*/i, '');
+  cleaned = cleaned.replace(/^\d{1,3}\s*[-_. ]*/, '');
+  cleaned = cleaned.replace(/\s+/g, ' ').replace(/^[-. ]+|[-. ]+$/g, '').trim();
+  return cleaned || raw || `Track ${Math.max(1, fallbackTrack || 1)}`;
+}
+
+function groupAlbumTracksByDisc(
+  tracks: Array<api.AlbumDetailTrack & { display_num: string; display_artist: string; display_title: string; disc_label_text: string }>
+) {
+  const grouped = new Map<string, { key: string; label: string; tracks: typeof tracks }>();
+  for (const track of tracks) {
+    const discNum = Math.max(1, Number(track.disc_num || 1));
+    const label = String(track.disc_label_text || '').trim() || `Disc ${discNum}`;
+    const key = `${discNum}:${label.toLowerCase()}`;
+    if (!grouped.has(key)) grouped.set(key, { key, label, tracks: [] as typeof tracks });
+    grouped.get(key)?.tracks.push(track);
+  }
+  return Array.from(grouped.values());
 }
 
 function shouldSplitInlineTrackArtist(tracks: api.AlbumDetailTrack[]): boolean {
@@ -147,6 +192,12 @@ function formatAddedTimestamp(ts?: number | null): string {
   }
 }
 
+function formatCompactCount(value?: number | null): string {
+  const num = Number(value || 0);
+  if (!Number.isFinite(num) || num <= 0) return '0';
+  return new Intl.NumberFormat('en', { notation: 'compact', maximumFractionDigits: 1 }).format(num);
+}
+
 export default function AlbumPage() {
   const navigate = useNavigate();
   const params = useParams<{ albumId: string }>();
@@ -169,6 +220,7 @@ export default function AlbumPage() {
   const [trackDetailsError, setTrackDetailsError] = useState<string | null>(null);
   const [expandedTrackId, setExpandedTrackId] = useState<number | null>(null);
   const [trackDetailsById, setTrackDetailsById] = useState<Record<number, api.AlbumTrackDetailItem>>({});
+  const [savingUserRating, setSavingUserRating] = useState(false);
   const durationRefreshAttemptsRef = useRef(0);
 
   const load = useCallback(async () => {
@@ -267,18 +319,27 @@ export default function AlbumPage() {
   const trackRows = useMemo(() => {
     const tracks = data?.tracks || [];
     const albumArtist = data?.artist_name || '';
+    const albumTitle = data?.title || '';
     const inlineArtistMode = shouldSplitInlineTrackArtist(tracks);
+    const maxDisc = tracks.reduce((acc, track) => Math.max(acc, Number(track.disc_num || 1)), 1);
     return tracks.map((t, idx) => {
-      const parsed = splitInlineTrackArtistTitle(t.title || '', albumArtist, inlineArtistMode);
+      const trackNum = t.track_num > 0 ? t.track_num : idx + 1;
+      const cleanedTitle = cleanAlbumTrackTitle(t.title || '', albumTitle, trackNum);
+      const parsed = splitInlineTrackArtistTitle(cleanedTitle, albumArtist, inlineArtistMode);
+      const discNum = Math.max(1, Number(t.disc_num || 1));
       const n = t.track_num > 0 ? t.track_num : idx + 1;
       return {
         ...t,
-        display_num: t.disc_num > 1 ? `${t.disc_num}.${n}` : String(n),
+        display_num: String(n),
         display_artist: (parsed.artist || albumArtist || 'Unknown artist').trim(),
-        display_title: (parsed.title || t.title || `Track ${idx + 1}`).trim(),
+        display_title: (parsed.title || cleanedTitle || t.title || `Track ${idx + 1}`).trim(),
+        disc_label_text: String(t.disc_label || '').trim() || (maxDisc > 1 ? `Disc ${discNum}` : ''),
       };
     });
-  }, [data?.artist_name, data?.tracks]);
+  }, [data?.artist_name, data?.title, data?.tracks]);
+
+  const trackGroups = useMemo(() => groupAlbumTracksByDisc(trackRows), [trackRows]);
+  const showDiscSections = trackGroups.length > 1;
 
   const playbackTracks = useMemo<TrackInfo[]>(() => {
     if (!data) return [];
@@ -345,6 +406,53 @@ export default function AlbumPage() {
       setDownloadingAlbum(false);
     }
   }, [data, downloadingAlbum, toast]);
+
+  const handleUserRatingChange = useCallback(async (rating: number | null) => {
+    if (!data || savingUserRating) return;
+    const previous = data.ratings?.user_rating ?? null;
+    setSavingUserRating(true);
+    setData((prev) => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        ratings: {
+          ...(prev.ratings || {}),
+          user_rating: rating,
+        },
+      };
+    });
+    try {
+      const res = await api.setAlbumRating(data.album_id, rating, 'ui_album_page');
+      setData((prev) => {
+        if (!prev) return prev;
+        return {
+          ...prev,
+          ratings: {
+            ...(prev.ratings || {}),
+            user_rating: res.rating ?? null,
+          },
+        };
+      });
+    } catch (e) {
+      setData((prev) => {
+        if (!prev) return prev;
+        return {
+          ...prev,
+          ratings: {
+            ...(prev.ratings || {}),
+            user_rating: previous,
+          },
+        };
+      });
+      toast({
+        title: 'Rating failed',
+        description: e instanceof Error ? e.message : 'Failed to save your rating',
+        variant: 'destructive',
+      });
+    } finally {
+      setSavingUserRating(false);
+    }
+  }, [data, savingUserRating, toast]);
 
   const handleAddTrackToPlaylist = useCallback(
     async (trackId: number, playlistId: number) => {
@@ -426,6 +534,8 @@ export default function AlbumPage() {
   const reviewSource = (data.review?.source || '').trim();
   const showReviewToggle = wordCount(reviewText) >= 80 || reviewText.length >= 420;
   const genreBadges = parseGenreBadges(data.genre || '');
+  const ratings = data.ratings || {};
+  const ratingSignals = ratings.signals || {};
   const albumAddedAt = Number(data.created_at || 0) > 0 ? Number(data.created_at || 0) : null;
   const albumUpdatedAt =
     Number(data.updated_at || 0) > 0
@@ -506,11 +616,21 @@ export default function AlbumPage() {
                       <Music className="w-8 h-8 text-muted-foreground" />
                     </div>
                   )}
+                  <button
+                    type="button"
+                    onClick={handlePlay}
+                    className="absolute inset-0 flex items-center justify-center bg-black/0 opacity-0 transition-all duration-200 group-hover:bg-black/28 group-hover:opacity-100"
+                    title="Play album"
+                  >
+                    <span className="flex h-14 w-14 items-center justify-center rounded-full border border-white/20 bg-white/15 backdrop-blur-sm shadow-lg">
+                      <Play className="h-6 w-6 fill-white text-white" />
+                    </span>
+                  </button>
                   <Button
                     type="button"
                     size="icon"
                     variant="secondary"
-                    className="absolute right-1.5 bottom-1.5 h-7 w-7 opacity-0 group-hover:opacity-100 transition-opacity"
+                    className="absolute right-1.5 bottom-1.5 z-10 h-7 w-7 opacity-0 group-hover:opacity-100 transition-opacity"
                     title="Edit cover source"
                     onClick={() => setMatchDialogOpen(true)}
                   >
@@ -582,17 +702,22 @@ export default function AlbumPage() {
                   ) : null}
                 </div>
                 {genreBadges.length > 0 ? (
-                  <div className="mt-3 flex flex-wrap gap-1.5">
-                    {genreBadges.map((genre) => (
-                      <Badge
-                        key={`album-genre-${genre}`}
-                        variant="outline"
-                        className={cn("text-[10px] cursor-pointer", badgeKindClass('genre'))}
-                        onClick={() => navigate(`/library/genre/${encodeURIComponent(genre)}`)}
-                      >
-                        {genre}
-                      </Badge>
-                    ))}
+                  <div className="mt-3 space-y-1.5">
+                    <div className="text-[10px] font-medium uppercase tracking-[0.22em] text-muted-foreground/85">
+                      Genres
+                    </div>
+                    <div className="flex flex-wrap gap-1.5">
+                      {genreBadges.map((genre) => (
+                        <Badge
+                          key={`album-genre-${genre}`}
+                          variant="outline"
+                          className={cn("text-[10px] cursor-pointer", badgeKindClass('genre'))}
+                          onClick={() => navigate(`/library/genre/${encodeURIComponent(genre)}`)}
+                        >
+                          {genre}
+                        </Badge>
+                      ))}
+                    </div>
                   </div>
                 ) : null}
               </div>
@@ -600,6 +725,86 @@ export default function AlbumPage() {
           </div>
         </div>
         <CardContent className="pt-4 pb-5 space-y-4">
+          <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,1fr),minmax(0,1fr)] gap-4">
+            <div className="rounded-2xl border border-border/60 bg-background/35 p-4 space-y-2">
+              <div className="text-[11px] font-semibold uppercase tracking-[0.22em] text-muted-foreground">Your rating</div>
+              <div className="flex items-center gap-3">
+                <AlbumRatingStars
+                  value={ratings.user_rating}
+                  editable={!savingUserRating}
+                  onChange={(value) => void handleUserRatingChange(value)}
+                  size={18}
+                />
+                {savingUserRating ? <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" /> : null}
+              </div>
+              <p className="text-xs text-muted-foreground">
+                Rate this album from 1 to 5 stars. Click the same value again to clear it.
+              </p>
+            </div>
+
+            <div className="rounded-2xl border border-border/60 bg-background/35 p-4 space-y-3">
+              <div className="text-[11px] font-semibold uppercase tracking-[0.22em] text-muted-foreground">Public pulse</div>
+              <div className="flex flex-wrap items-center gap-2">
+                <AlbumRatingStars value={ratings.public_rating} size={18} />
+                {ratings.public_rating_source ? (
+                  <ProviderBadge provider={ratings.public_rating_source} className="text-[10px]" />
+                ) : null}
+                {Number(ratings.public_rating_votes || 0) > 0 ? (
+                  <Badge variant="outline" className={cn('text-[10px]', badgeKindClass('count'))}>
+                    {formatCompactCount(ratings.public_rating_votes)} vote{Number(ratings.public_rating_votes || 0) > 1 ? 's' : ''}
+                  </Badge>
+                ) : null}
+                {ratings.heat_label ? (
+                  <Badge
+                    variant="outline"
+                    className={cn(
+                      'text-[10px]',
+                      String(ratings.heat_label || '').toLowerCase().includes('essential')
+                        ? badgeKindClass('status_match')
+                        : String(ratings.heat_label || '').toLowerCase().includes('recommended')
+                          ? badgeKindClass('status_soft')
+                          : badgeKindClass('source')
+                    )}
+                  >
+                    <Flame className="h-3 w-3 mr-1" />
+                    {ratings.heat_label}
+                  </Badge>
+                ) : null}
+              </div>
+              <div className="flex flex-wrap items-center gap-1.5">
+                {Number(ratingSignals.discogs_have_count || 0) > 0 ? (
+                  <Badge variant="outline" className={cn('gap-1 text-[10px]', badgeKindClass('label'))}>
+                    <Disc3 className="h-3 w-3" />
+                    {formatCompactCount(ratingSignals.discogs_have_count)} owned
+                  </Badge>
+                ) : null}
+                {Number(ratingSignals.discogs_want_count || 0) > 0 ? (
+                  <Badge variant="outline" className={cn('gap-1 text-[10px]', badgeKindClass('source'))}>
+                    <Users className="h-3 w-3" />
+                    {formatCompactCount(ratingSignals.discogs_want_count)} wanted
+                  </Badge>
+                ) : null}
+                {Number(ratingSignals.bandcamp_supporter_count || 0) > 0 ? (
+                  <Badge variant="outline" className={cn('gap-1 text-[10px]', badgeKindClass('genre'))}>
+                    <Users className="h-3 w-3" />
+                    {formatCompactCount(ratingSignals.bandcamp_supporter_count)} supporters
+                  </Badge>
+                ) : null}
+                {Number(ratingSignals.lastfm_scrobbles || 0) > 0 ? (
+                  <Badge variant="outline" className={cn('gap-1 text-[10px]', badgeKindClass('duration'))}>
+                    <Users className="h-3 w-3" />
+                    {formatCompactCount(ratingSignals.lastfm_scrobbles)} scrobbles
+                  </Badge>
+                ) : null}
+                {Number(ratingSignals.lastfm_listeners || 0) > 0 ? (
+                  <Badge variant="outline" className={cn('gap-1 text-[10px]', badgeKindClass('count'))}>
+                    <Users className="h-3 w-3" />
+                    {formatCompactCount(ratingSignals.lastfm_listeners)} listeners
+                  </Badge>
+                ) : null}
+              </div>
+            </div>
+          </div>
           <div className="space-y-2">
             <div className="text-xs font-medium text-muted-foreground">Review</div>
             {reviewText ? (
@@ -681,14 +886,25 @@ export default function AlbumPage() {
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {trackRows.map((t, idx) => {
+                  {trackGroups.map((group) => (
+                    <Fragment key={group.key}>
+                      {showDiscSections ? (
+                        <TableRow className="bg-muted/30 hover:bg-muted/30">
+                          <TableCell colSpan={isAdmin ? 8 : 7} className="py-2 px-4">
+                            <div className="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">
+                              {group.label}
+                            </div>
+                          </TableCell>
+                        </TableRow>
+                      ) : null}
+                      {group.tracks.map((t, idx) => {
                     const canStream = playbackByTrackId.has(t.track_id);
                     const detail = trackDetailsById[t.track_id];
                     const detailOpen = expandedTrackId === t.track_id;
                     const detailTagEntries = Object.entries(detail?.tags || {}).sort((a, b) => a[0].localeCompare(b[0]));
                     const detailsColspan = isAdmin ? 8 : 7;
                     return (
-                      <Fragment key={`alb-tr-${t.track_id || idx}`}>
+                      <Fragment key={`alb-tr-${t.track_id || `${group.key}-${idx}`}`}>
                         <TableRow>
                           <TableCell className="py-3 text-center">
                             <Button
@@ -851,6 +1067,8 @@ export default function AlbumPage() {
                       </Fragment>
                     );
                   })}
+                    </Fragment>
+                  ))}
                 </TableBody>
               </Table>
             </div>

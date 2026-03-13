@@ -42,7 +42,7 @@ function useCarousel() {
 
 const Carousel = React.forwardRef<HTMLDivElement, React.HTMLAttributes<HTMLDivElement> & CarouselProps>(
   ({ orientation = "horizontal", opts, setApi, plugins, effect, className, children, ...props }, ref) => {
-    const resolvedEffect = effect ?? (orientation === "horizontal" ? "tilt3d" : "none");
+    const resolvedEffect = effect ?? "none";
     const [carouselRef, api] = useEmblaCarousel(
       {
         ...opts,

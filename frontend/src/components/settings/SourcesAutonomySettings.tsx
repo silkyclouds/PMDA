@@ -27,6 +27,7 @@ export function SourcesAutonomySettings() {
 
   const [roots, setRoots] = useState<FileSourceRoot[]>([]);
   const [winnerId, setWinnerId] = useState<number | null>(null);
+  const [winnerPath, setWinnerPath] = useState<string>('');
   const [strategy, setStrategy] = useState<'move' | 'hardlink' | 'symlink' | 'copy'>('move');
 
   const [bootstrap, setBootstrap] = useState<api.BootstrapStatus | null>(null);
@@ -47,6 +48,10 @@ export function SourcesAutonomySettings() {
       ]);
       setRoots(Array.isArray(sourcesRes.roots) ? sourcesRes.roots : []);
       setWinnerId(typeof sourcesRes.winner_source_root_id === 'number' ? sourcesRes.winner_source_root_id : null);
+      const winnerRow = Array.isArray(sourcesRes.roots)
+        ? (sourcesRes.roots.find((row) => Boolean(row.is_winner_root)) ?? null)
+        : null;
+      setWinnerPath(normalizePath(String(winnerRow?.path || '')));
       setStrategy((sourcesRes.winner_placement_strategy || 'move') as 'move' | 'hardlink' | 'symlink' | 'copy');
       setBootstrap(bootstrapRes);
       setIncomingStatus(incomingRes);
@@ -80,13 +85,45 @@ export function SourcesAutonomySettings() {
     [roots],
   );
 
+  const currentWinnerPath = useMemo(() => {
+    if (winnerPath) return winnerPath;
+    const byId = roots.find((row) => Number(row.source_id || 0) > 0 && Number(row.source_id || 0) === Number(winnerId || 0));
+    return normalizePath(String(byId?.path || ''));
+  }, [roots, winnerId, winnerPath]);
+
   const updateRoot = useCallback((index: number, patch: Partial<FileSourceRoot>) => {
-    setRoots((prev) => prev.map((row, i) => (i === index ? { ...row, ...patch } : row)));
-  }, []);
+    setRoots((prev) => {
+      const next: FileSourceRoot[] = prev.map((row, i) => {
+        if (i === index) return { ...row, ...patch };
+        if (patch.role === 'incoming') return { ...row, role: 'library' as const };
+        return row;
+      });
+      if (patch.role === 'incoming') {
+        const targetPath = normalizePath(String(next[index]?.path || ''));
+        if (targetPath && targetPath === currentWinnerPath) {
+          const fallback = next.find((row, i) => i !== index && row.role === 'library' && row.enabled)
+            ?? next.find((row, i) => i !== index && row.role === 'library')
+            ?? null;
+          setWinnerPath(normalizePath(String(fallback?.path || '')));
+          setWinnerId(Number(fallback?.source_id || 0) > 0 ? Number(fallback?.source_id || 0) : null);
+        }
+      }
+      return next;
+    });
+  }, [currentWinnerPath]);
 
   const removeRoot = useCallback((index: number) => {
-    setRoots((prev) => prev.filter((_, i) => i !== index));
-  }, []);
+    setRoots((prev) => {
+      const removed = prev[index];
+      const next = prev.filter((_, i) => i !== index);
+      if (normalizePath(String(removed?.path || '')) === currentWinnerPath) {
+        const fallback = next.find((row) => row.role === 'library' && row.enabled) ?? next.find((row) => row.role === 'library') ?? next[0];
+        setWinnerPath(normalizePath(String(fallback?.path || '')));
+        setWinnerId(Number(fallback?.source_id || 0) > 0 ? Number(fallback?.source_id || 0) : null);
+      }
+      return next;
+    });
+  }, [currentWinnerPath]);
 
   const addRoot = useCallback(() => {
     const normalized = normalizePath(pendingPath);
@@ -96,7 +133,7 @@ export function SourcesAutonomySettings() {
         return prev;
       }
       const nextPriority = (prev.reduce((acc, row) => Math.max(acc, Number(row.priority || 0)), 0) || 0) + 10;
-      return [
+      const nextRows: FileSourceRoot[] = [
         ...prev,
         {
           path: normalized,
@@ -105,10 +142,20 @@ export function SourcesAutonomySettings() {
           priority: nextPriority,
           is_winner_root: false,
         },
-      ];
+      ].map((row, idx, all) => {
+        if (pendingRole === 'incoming' && idx !== all.length - 1 && row.role === 'incoming') {
+          return { ...row, role: 'library' as const };
+        }
+        return row;
+      });
+      if (!currentWinnerPath && pendingRole === 'library') {
+        setWinnerPath(normalized);
+        setWinnerId(null);
+      }
+      return nextRows;
     });
     setPendingPath('');
-  }, [pendingPath, pendingRole]);
+  }, [currentWinnerPath, pendingPath, pendingRole]);
 
   const save = useCallback(async () => {
     if (roots.length === 0) {
@@ -121,13 +168,15 @@ export function SourcesAutonomySettings() {
         .map((row, idx) => {
           const normalized = normalizePath(row.path);
           if (!normalized) return null;
+          const selectedByPath = currentWinnerPath && normalizePath(normalized) === currentWinnerPath;
+          const selectedById = winnerId != null && Number(row.source_id || 0) === Number(winnerId);
           return {
             source_id: row.source_id,
             path: normalized,
             role: row.role === 'incoming' ? 'incoming' : 'library',
             enabled: Boolean(row.enabled),
             priority: Math.max(1, Number(row.priority || ((idx + 1) * 10))),
-            is_winner_root: winnerId != null && Number(row.source_id || 0) === Number(winnerId),
+            is_winner_root: Boolean(selectedByPath || selectedById),
           } satisfies FileSourceRoot;
         })
         .filter((row) => row != null) as FileSourceRoot[];
@@ -142,15 +191,17 @@ export function SourcesAutonomySettings() {
       });
       setRoots(Array.isArray(res.roots) ? res.roots : payloadRoots);
       setWinnerId(typeof res.winner_source_root_id === 'number' ? res.winner_source_root_id : winnerId);
+      const savedWinner = Array.isArray(res.roots) ? res.roots.find((row) => Boolean(row.is_winner_root)) : null;
+      setWinnerPath(normalizePath(String(savedWinner?.path || currentWinnerPath || '')));
       setStrategy((res.winner_placement_strategy || strategy) as 'move' | 'hardlink' | 'symlink' | 'copy');
-      toast.success('Sources & autonomy settings saved');
+      toast.success('Folders saved');
       await load();
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : 'Failed to save source roots');
+      toast.error(error instanceof Error ? error.message : 'Failed to save folders');
     } finally {
       setSaving(false);
     }
-  }, [roots, winnerId, strategy, load]);
+  }, [roots, winnerId, currentWinnerPath, strategy, load]);
 
   const runIncoming = useCallback(async () => {
     setRunningIncoming(true);
@@ -180,11 +231,12 @@ export function SourcesAutonomySettings() {
   return (
     <div className="space-y-5">
       <div className="rounded-lg border border-border bg-muted/20 p-4 space-y-2">
-        <p className="text-sm font-medium">How to configure this</p>
+        <p className="text-sm font-medium">Configuration flow</p>
         <ol className="list-decimal pl-4 text-xs text-muted-foreground space-y-1">
-          <li>Add your folders, then mark each one as <span className="text-foreground">Library</span> or <span className="text-foreground">Incoming</span>.</li>
-          <li>Pick one <span className="text-foreground">Primary library</span> folder (winner destination).</li>
-          <li>Save, then optionally trigger an incoming changed-only scan.</li>
+          <li>Add every folder PMDA is allowed to read from.</li>
+          <li>If you use an autosnatch/drop folder, mark that single folder as <span className="text-foreground">Incoming</span>.</li>
+          <li>Choose the <span className="text-foreground">Primary library</span> destination where validated winners will be placed.</li>
+          <li>Save once, then optionally run an incoming scan immediately.</li>
         </ol>
       </div>
 
@@ -196,33 +248,23 @@ export function SourcesAutonomySettings() {
           Incoming roots: <span className="text-foreground font-medium">{incomingRootsCount}</span>
         </div>
         <div className="rounded-md border border-border bg-muted/30 px-3 py-2 text-muted-foreground">
-          Primary root: <span className="text-foreground font-medium">{winnerId ? `#${winnerId}` : 'not set'}</span>
+          Primary root: <span className="text-foreground font-medium">{currentWinnerPath || 'not set'}</span>
         </div>
       </div>
 
-      <div className="space-y-3 rounded-lg border border-border p-4">
+      <div className="space-y-3 rounded-xl border border-cyan-500/20 bg-cyan-500/[0.04] p-4">
         <div className="flex items-center justify-between gap-3">
           <div className="space-y-1">
-            <Label>Primary library placement</Label>
-            <p className="text-xs text-muted-foreground">How PMDA writes the winner album into the primary library root.</p>
-          </div>
-          <Select value={strategy} onValueChange={(value: 'move' | 'hardlink' | 'symlink' | 'copy') => setStrategy(value)}>
-            <SelectTrigger className="w-[220px]"><SelectValue /></SelectTrigger>
-            <SelectContent>
-              <SelectItem value="move">Move (single copy)</SelectItem>
-              <SelectItem value="hardlink">Hardlink (recommended)</SelectItem>
-              <SelectItem value="symlink">Symlink</SelectItem>
-              <SelectItem value="copy">Copy (extra space)</SelectItem>
-            </SelectContent>
-          </Select>
-        </div>
-      </div>
-
-      <div className="space-y-3 rounded-lg border border-border p-4">
-        <div className="flex items-center justify-between gap-3">
-          <div className="space-y-1">
-            <Label>Source folders</Label>
-            <p className="text-xs text-muted-foreground">Library = your current collection. Incoming = new arrivals to process.</p>
+            <div className="flex items-center gap-2">
+              <span className="inline-flex h-7 w-7 items-center justify-center rounded-full bg-cyan-500/15 text-cyan-200 text-xs font-semibold">1</span>
+              <Label className="text-sm">What are your music source folders?</Label>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              Add every music folder PMDA must scan. You can add as many source folders as you want.
+            </p>
+            <p className="text-[11px] text-muted-foreground">
+              PMDA reads from these folders, builds the library index, and compares new arrivals against what already exists.
+            </p>
           </div>
           <Button type="button" variant="outline" size="sm" onClick={load} className="gap-1.5">
             <RefreshCw className="w-4 h-4" />
@@ -235,7 +277,7 @@ export function SourcesAutonomySettings() {
             <div className="text-xs text-muted-foreground border rounded-md px-3 py-2">No source roots configured.</div>
           ) : roots.map((row, index) => {
             const sid = Number(row.source_id || 0);
-            const isWinner = winnerId != null && sid > 0 && winnerId === sid;
+            const isWinner = normalizePath(String(row.path || '')) === currentWinnerPath || (winnerId != null && sid > 0 && winnerId === sid);
             return (
               <div key={`${row.source_id || 'new'}-${index}`} className="grid grid-cols-1 md:grid-cols-[1fr_220px_90px_110px_80px] gap-2 rounded-md border border-border bg-muted/20 p-2">
                 <Input
@@ -261,8 +303,11 @@ export function SourcesAutonomySettings() {
                   type="button"
                   variant={isWinner ? 'default' : 'outline'}
                   size="sm"
-                  onClick={() => setWinnerId(sid > 0 ? sid : null)}
-                  disabled={sid <= 0}
+                  onClick={() => {
+                    setWinnerPath(normalizePath(String(row.path || '')));
+                    setWinnerId(sid > 0 ? sid : null);
+                  }}
+                  disabled={row.role === 'incoming'}
                 >
                   {isWinner ? 'Primary' : 'Set primary'}
                 </Button>
@@ -274,7 +319,20 @@ export function SourcesAutonomySettings() {
           })}
         </div>
 
-        <div className="grid grid-cols-1 md:grid-cols-[1fr_220px_110px] gap-2">
+        <div className="rounded-lg border border-border/70 bg-background/30 p-3 space-y-3">
+          <div className="space-y-1">
+            <div className="flex items-center gap-2">
+              <span className="inline-flex h-7 w-7 items-center justify-center rounded-full bg-cyan-500/15 text-cyan-200 text-xs font-semibold">2</span>
+              <Label className="text-sm">Which folder is your incoming drop zone?</Label>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              Incoming is optional. Use it for one watched folder where new albums arrive from autosnatch, downloads, or manual drops.
+            </p>
+            <p className="text-[11px] text-muted-foreground">
+              PMDA will monitor it, run the normal pipeline, compare with the indexed library, detect duplicates/incomplete albums, enrich metadata, then place validated winners into the primary library folder above.
+            </p>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-[1fr_220px_110px] gap-2">
           <FolderBrowserInput
             value={pendingPath}
             onChange={setPendingPath}
@@ -284,8 +342,8 @@ export function SourcesAutonomySettings() {
           <Select value={pendingRole} onValueChange={(value: 'library' | 'incoming') => setPendingRole(value)}>
             <SelectTrigger><SelectValue /></SelectTrigger>
             <SelectContent>
-              <SelectItem value="library">Library (already in collection)</SelectItem>
-              <SelectItem value="incoming">Incoming (new arrivals)</SelectItem>
+              <SelectItem value="library">Regular source folder</SelectItem>
+              <SelectItem value="incoming">Incoming drop folder</SelectItem>
             </SelectContent>
           </Select>
           <Button type="button" variant="outline" onClick={addRoot} disabled={!normalizePath(pendingPath)} className="gap-1.5">
@@ -293,16 +351,48 @@ export function SourcesAutonomySettings() {
             Add root
           </Button>
         </div>
+          {incomingRootsCount > 0 ? (
+            <p className="text-[11px] text-muted-foreground">
+              Only one incoming folder is kept in this simplified UI. If you mark another root as Incoming, the previous one becomes a regular source folder.
+            </p>
+          ) : null}
+        </div>
 
         <div className="flex flex-wrap items-center gap-2">
           <Button type="button" onClick={save} disabled={saving} className="gap-2">
             {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
-            Save sources
+            Save folders
           </Button>
           <Button type="button" variant="outline" onClick={runIncoming} disabled={runningIncoming} className="gap-2">
             {runningIncoming ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
             Run incoming scan now
           </Button>
+        </div>
+      </div>
+
+      <div className="space-y-3 rounded-xl border border-cyan-500/20 bg-cyan-500/[0.04] p-4">
+        <div className="flex items-center justify-between gap-3">
+          <div className="space-y-1">
+            <div className="flex items-center gap-2">
+              <span className="inline-flex h-7 w-7 items-center justify-center rounded-full bg-cyan-500/15 text-cyan-200 text-xs font-semibold">3</span>
+              <Label className="text-sm">Where should processed albums end up?</Label>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              This is the main library destination for incoming albums once PMDA has matched, checked duplicates/incompletes, and validated metadata.
+            </p>
+            <p className="text-[11px] text-muted-foreground">
+              Current primary folder: <span className="font-mono text-foreground">{currentWinnerPath || 'not set yet'}</span>
+            </p>
+          </div>
+          <Select value={strategy} onValueChange={(value: 'move' | 'hardlink' | 'symlink' | 'copy') => setStrategy(value)}>
+            <SelectTrigger className="w-[220px]"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="move">Move (single physical copy)</SelectItem>
+              <SelectItem value="hardlink">Hardlink (recommended, no extra space)</SelectItem>
+              <SelectItem value="symlink">Symlink (references original files)</SelectItem>
+              <SelectItem value="copy">Copy (duplicates files on disk)</SelectItem>
+            </SelectContent>
+          </Select>
         </div>
       </div>
 

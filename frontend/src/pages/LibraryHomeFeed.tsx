@@ -7,6 +7,7 @@ import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { AlbumArtwork } from '@/components/library/AlbumArtwork';
+import { AlbumCommunitySignals } from '@/components/library/AlbumCommunitySignals';
 import type { TrackInfo } from '@/components/library/AudioPlayer';
 import { usePlayback } from '@/contexts/PlaybackContext';
 import { useToast } from '@/hooks/use-toast';
@@ -392,6 +393,13 @@ export default function LibraryHomeFeed() {
                       <Badge variant="outline" className="text-[10px]">{a.year ?? '—'}</Badge>
                       <Badge variant="outline" className="text-[10px]">{a.track_count}t</Badge>
                     </div>
+                    <AlbumCommunitySignals
+                      userRating={a.user_rating}
+                      publicRating={a.public_rating}
+                      publicRatingVotes={a.public_rating_votes}
+                      heatLabel={a.heat_label}
+                      compact
+                    />
                     <div className="flex items-center gap-1.5 flex-wrap">
                       {primaryGenre ? <Badge variant="secondary" className="text-[10px]">{primaryGenre}</Badge> : null}
                       {a.label ? <Badge variant="outline" className="text-[10px]">{a.label}</Badge> : null}

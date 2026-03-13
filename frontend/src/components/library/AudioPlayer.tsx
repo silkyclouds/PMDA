@@ -7,6 +7,8 @@ import { cn } from '@/lib/utils';
 import * as api from '@/lib/api';
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Badge } from '@/components/ui/badge';
+import { FormatBadge } from '@/components/FormatBadge';
+import { badgeKindClass } from '@/lib/badgeStyles';
 import { useTheme } from 'next-themes';
 
 export interface TrackInfo {
@@ -33,9 +35,26 @@ interface AudioPlayerProps {
 
 function formatDuration(seconds: number): string {
   const s = Math.max(0, Math.floor(seconds));
-  const m = Math.floor(s / 60);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
   const sec = s % 60;
+  if (h > 0) return `${h}:${m.toString().padStart(2, '0')}:${sec.toString().padStart(2, '0')}`;
   return `${m}:${sec.toString().padStart(2, '0')}`;
+}
+
+function parseGenreBadges(value?: string | null): string[] {
+  const raw = String(value || '').trim();
+  if (!raw) return [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const item of raw.split(/[;,/|]+/g).map((part) => part.trim()).filter(Boolean)) {
+    const norm = item.toLowerCase();
+    if (seen.has(norm)) continue;
+    seen.add(norm);
+    out.push(item);
+    if (out.length >= 6) break;
+  }
+  return out;
 }
 
 export function AudioPlayer({
@@ -58,6 +77,7 @@ export function AudioPlayer({
   const [showNowPlaying, setShowNowPlaying] = useState(false);
   const [coverError, setCoverError] = useState(false);
   const [trackLiked, setTrackLiked] = useState(false);
+  const [albumMeta, setAlbumMeta] = useState<api.AlbumDetailResponse | null>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
   const lastTrackLoadTimeRef = useRef<number>(0);
   const activeTrackRef = useRef<TrackInfo | null>(null);
@@ -68,6 +88,21 @@ export function AudioPlayer({
   const displayDuration = duration > 0 ? duration : (currentTrack?.duration ?? 0);
   const { resolvedTheme } = useTheme();
   const isLightTheme = resolvedTheme === 'light';
+  const releaseYear = (() => {
+    const year = Number(albumMeta?.year || 0);
+    if (Number.isFinite(year) && year > 0) return String(year);
+    const dateText = String(albumMeta?.date_text || '').trim();
+    const m = dateText.match(/\b(19|20)\d{2}\b/);
+    return m ? m[0] : '';
+  })();
+  const genres = parseGenreBadges(albumMeta?.genre);
+  const labelText = String(albumMeta?.label || '').trim();
+  const trackCountText = Number(albumMeta?.track_count || 0) > 0 ? `${Number(albumMeta?.track_count || 0)} tracks` : '';
+  const discCountText = (() => {
+    const rows = Array.isArray(albumMeta?.tracks) ? albumMeta?.tracks : [];
+    const discNums = Array.from(new Set(rows.map((track) => Math.max(1, Number(track.disc_num || 1))))).sort((a, b) => a - b);
+    return discNums.length > 1 ? `${discNums.length} discs` : '';
+  })();
 
   const sendRecoEvent = (eventType: api.RecoEventType, track: TrackInfo | null, playedSeconds?: number) => {
     if (!track || !recommendationSessionId) return;
@@ -138,6 +173,26 @@ export function AudioPlayer({
   useEffect(() => {
     setCoverError(false);
   }, [albumId, albumThumb]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const run = async () => {
+      if (!Number.isFinite(albumId) || albumId <= 0) {
+        if (!cancelled) setAlbumMeta(null);
+        return;
+      }
+      try {
+        const detail = await api.getAlbumDetail(albumId);
+        if (!cancelled) setAlbumMeta(detail);
+      } catch {
+        if (!cancelled) setAlbumMeta(null);
+      }
+    };
+    void run();
+    return () => {
+      cancelled = true;
+    };
+  }, [albumId]);
 
   useEffect(() => {
     let cancelled = false;
@@ -567,6 +622,61 @@ export function AudioPlayer({
                       {currentTrack?.title ?? '—'}
                     </div>
                     <div className={cn("text-sm truncate", isLightTheme ? "text-muted-foreground/90" : "text-white/55")}>{albumTitle}</div>
+                    {albumMeta ? (
+                      <div className="mt-4 flex max-w-[920px] flex-col items-center gap-2">
+                        <div className={cn("text-[11px] uppercase tracking-[0.24em]", isLightTheme ? "text-muted-foreground/80" : "text-white/45")}>
+                          Album metadata
+                        </div>
+                        <div className="flex flex-wrap items-center justify-center gap-2">
+                          {releaseYear ? (
+                            <Badge variant="outline" className={cn("h-7 rounded-full px-3 text-xs", badgeKindClass('year'))}>
+                              {releaseYear}
+                            </Badge>
+                          ) : null}
+                          {albumMeta.total_duration_sec > 0 ? (
+                            <Badge variant="outline" className={cn("h-7 rounded-full px-3 text-xs", badgeKindClass('duration'))}>
+                              {formatDuration(albumMeta.total_duration_sec)}
+                            </Badge>
+                          ) : null}
+                          {albumMeta.format ? (
+                            <FormatBadge format={albumMeta.format} size="sm" className="h-7 rounded-full px-3 py-1 text-xs" />
+                          ) : null}
+                          <Badge
+                            variant="outline"
+                            className={cn(
+                              "h-7 rounded-full px-3 text-xs",
+                              badgeKindClass(albumMeta.is_lossless ? 'lossless' : 'lossy')
+                            )}
+                          >
+                            {albumMeta.is_lossless ? 'Lossless' : 'Lossy'}
+                          </Badge>
+                          {trackCountText ? (
+                            <Badge variant="outline" className={cn("h-7 rounded-full px-3 text-xs", badgeKindClass('count'))}>
+                              {trackCountText}
+                            </Badge>
+                          ) : null}
+                          {discCountText ? (
+                            <Badge variant="outline" className={cn("h-7 rounded-full px-3 text-xs", badgeKindClass('count'))}>
+                              {discCountText}
+                            </Badge>
+                          ) : null}
+                          {labelText ? (
+                            <Badge variant="outline" className={cn("h-7 rounded-full px-3 text-xs", badgeKindClass('label'))}>
+                              {`Label: ${labelText}`}
+                            </Badge>
+                          ) : null}
+                        </div>
+                        {genres.length > 0 ? (
+                          <div className="flex flex-wrap items-center justify-center gap-2">
+                            {genres.map((genre) => (
+                              <Badge key={genre} variant="outline" className={cn("h-7 rounded-full px-3 text-xs", badgeKindClass('genre'))}>
+                                {genre}
+                              </Badge>
+                            ))}
+                          </div>
+                        ) : null}
+                      </div>
+                    ) : null}
                   </div>
 
                   <div className="w-full max-w-[780px] space-y-2">

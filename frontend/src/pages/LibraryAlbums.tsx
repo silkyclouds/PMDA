@@ -10,6 +10,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { Slider } from '@/components/ui/slider';
 import { FormatBadge } from '@/components/FormatBadge';
 import { AlbumArtwork } from '@/components/library/AlbumArtwork';
+import { AlbumCommunitySignals } from '@/components/library/AlbumCommunitySignals';
 import { LibraryEmptyState } from '@/components/library/LibraryEmptyState';
 import { usePlayback } from '@/contexts/PlaybackContext';
 import { useToast } from '@/hooks/use-toast';
@@ -22,7 +23,7 @@ import * as api from '@/lib/api';
 import type { TrackInfo } from '@/components/library/AudioPlayer';
 import type { LibraryOutletContext } from '@/pages/LibraryLayout';
 
-type SortMode = 'recent' | 'year_desc' | 'alpha' | 'artist';
+type SortMode = 'recent' | 'year_desc' | 'alpha' | 'artist' | 'user_rating' | 'public_rating' | 'heat';
 
 function normalizeGenreBadges(album: api.LibraryAlbumItem): string[] {
   const raw: unknown =
@@ -260,6 +261,9 @@ export default function LibraryAlbums() {
               <SelectItem value="year_desc">Year (desc)</SelectItem>
               <SelectItem value="alpha">Title (A-Z)</SelectItem>
               <SelectItem value="artist">Artist</SelectItem>
+              <SelectItem value="user_rating">Your rating</SelectItem>
+              <SelectItem value="public_rating">Public rating</SelectItem>
+              <SelectItem value="heat">Worth hearing</SelectItem>
             </SelectContent>
           </Select>
 
@@ -356,6 +360,15 @@ export default function LibraryAlbums() {
                     {a.artist_name}
                   </button>
                 </div>
+
+                <AlbumCommunitySignals
+                  userRating={a.user_rating}
+                  publicRating={a.public_rating}
+                  publicRatingVotes={a.public_rating_votes}
+                  heatLabel={a.heat_label}
+                  compact
+                  className="gap-1.5"
+                />
 
                 <div className="flex flex-wrap items-center gap-1.5">
                   {a.format ? <FormatBadge format={a.format} size="sm" /> : null}

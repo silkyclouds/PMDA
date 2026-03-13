@@ -3730,6 +3730,51 @@ def _clear_openai_codex_exchanged_api_key() -> None:
         pass
 
 
+def _settings_db_set_value(key: str, value: str) -> None:
+    init_settings_db()
+    con = sqlite3.connect(str(SETTINGS_DB_FILE), timeout=10)
+    try:
+        con.execute("PRAGMA busy_timeout=5000;")
+        cur = con.cursor()
+        cur.execute(
+            "INSERT OR REPLACE INTO settings(key, value) VALUES(?, ?)",
+            (str(key or "").strip(), "" if value is None else str(value)),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def _settings_db_delete_keys(*keys: str) -> None:
+    cleaned = [str(k or "").strip() for k in keys if str(k or "").strip()]
+    if not cleaned:
+        return
+    init_settings_db()
+    con = sqlite3.connect(str(SETTINGS_DB_FILE), timeout=10)
+    try:
+        con.execute("PRAGMA busy_timeout=5000;")
+        cur = con.cursor()
+        cur.executemany("DELETE FROM settings WHERE key = ?", [(k,) for k in cleaned])
+        con.commit()
+    finally:
+        con.close()
+
+
+def _settings_db_get_secret(key: str) -> str:
+    try:
+        return str(_auth_decrypt(_get_config_from_db(key, "") or "") or "").strip()
+    except Exception:
+        return ""
+
+
+def _settings_db_set_secret(key: str, value: str) -> None:
+    token = str(value or "").strip()
+    if not token:
+        _settings_db_delete_keys(key)
+        return
+    _settings_db_set_value(key, _auth_encrypt(token))
+
+
 def _get_openai_codex_exchanged_api_key() -> str:
     key = str(getattr(sys.modules[__name__], "OPENAI_CODEX_EXCHANGED_API_KEY", "") or "").strip()
     if key:
@@ -10375,9 +10420,46 @@ def _files_pg_init_schema() -> bool:
                     description TEXT,
                     short_description TEXT,
                     tags_json TEXT NOT NULL DEFAULT '[]',
+                    public_rating DOUBLE PRECISION,
+                    public_rating_votes INTEGER NOT NULL DEFAULT 0,
+                    public_rating_source TEXT,
+                    discogs_have_count INTEGER NOT NULL DEFAULT 0,
+                    discogs_want_count INTEGER NOT NULL DEFAULT 0,
+                    bandcamp_supporter_count INTEGER NOT NULL DEFAULT 0,
+                    lastfm_scrobbles BIGINT NOT NULL DEFAULT 0,
+                    lastfm_listeners BIGINT NOT NULL DEFAULT 0,
+                    heat_score DOUBLE PRECISION,
+                    heat_label TEXT,
                     source TEXT,
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     PRIMARY KEY (artist_norm, title_norm)
+                )
+            """)
+            for col_name, col_sql in [
+                ("public_rating", "DOUBLE PRECISION"),
+                ("public_rating_votes", "INTEGER NOT NULL DEFAULT 0"),
+                ("public_rating_source", "TEXT"),
+                ("discogs_have_count", "INTEGER NOT NULL DEFAULT 0"),
+                ("discogs_want_count", "INTEGER NOT NULL DEFAULT 0"),
+                ("bandcamp_supporter_count", "INTEGER NOT NULL DEFAULT 0"),
+                ("lastfm_scrobbles", "BIGINT NOT NULL DEFAULT 0"),
+                ("lastfm_listeners", "BIGINT NOT NULL DEFAULT 0"),
+                ("heat_score", "DOUBLE PRECISION"),
+                ("heat_label", "TEXT"),
+            ]:
+                try:
+                    cur.execute(f"ALTER TABLE files_album_profiles ADD COLUMN IF NOT EXISTS {col_name} {col_sql}")
+                except Exception:
+                    pass
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS files_user_album_ratings (
+                    user_id BIGINT NOT NULL REFERENCES auth_users(id) ON DELETE CASCADE,
+                    album_id BIGINT NOT NULL REFERENCES files_albums(id) ON DELETE CASCADE,
+                    rating SMALLINT NOT NULL,
+                    source TEXT NOT NULL DEFAULT 'ui',
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (user_id, album_id)
                 )
             """)
             # Cached artist images that do not live on disk next to audio files.
@@ -10599,6 +10681,10 @@ def _files_pg_init_schema() -> bool:
             cur.execute("CREATE INDEX IF NOT EXISTS idx_files_reco_sessions_last_event ON files_reco_sessions(last_event_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_files_artist_profiles_updated_at ON files_artist_profiles(updated_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_files_album_profiles_updated_at ON files_album_profiles(updated_at DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_files_album_profiles_heat_score ON files_album_profiles(heat_score DESC NULLS LAST, updated_at DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_files_album_profiles_public_rating ON files_album_profiles(public_rating DESC NULLS LAST, public_rating_votes DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_files_user_album_ratings_album_id ON files_user_album_ratings(album_id)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_files_user_album_ratings_user_updated ON files_user_album_ratings(user_id, updated_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_assistant_messages_session_time ON assistant_messages(session_id, created_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_assistant_messages_created_at ON assistant_messages(created_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_assistant_docs_entity ON assistant_docs(entity_type, entity_id)")
@@ -14605,7 +14691,23 @@ def _files_get_album_profiles_cached(artist_norm: str, title_norms: list[str]) -
         with conn.cursor() as cur:
             cur.execute(
                 f"""
-                SELECT title_norm, description, short_description, tags_json, source, updated_at
+                SELECT
+                    title_norm,
+                    description,
+                    short_description,
+                    tags_json,
+                    source,
+                    updated_at,
+                    public_rating,
+                    public_rating_votes,
+                    public_rating_source,
+                    discogs_have_count,
+                    discogs_want_count,
+                    bandcamp_supporter_count,
+                    lastfm_scrobbles,
+                    lastfm_listeners,
+                    heat_score,
+                    heat_label
                 FROM files_album_profiles
                 WHERE artist_norm = %s AND title_norm IN ({placeholders})
                 """,
@@ -14625,6 +14727,16 @@ def _files_get_album_profiles_cached(artist_norm: str, title_norms: list[str]) -
                 "source": row[4] or "",
                 "updated_at": int(_dt_to_epoch(row[5])) if row[5] else 0,
                 "stale": _is_profile_stale(row[5]),
+                "public_rating": float(row[6]) if row[6] is not None else None,
+                "public_rating_votes": int(row[7] or 0),
+                "public_rating_source": str(row[8] or "").strip() or None,
+                "discogs_have_count": int(row[9] or 0),
+                "discogs_want_count": int(row[10] or 0),
+                "bandcamp_supporter_count": int(row[11] or 0),
+                "lastfm_scrobbles": int(row[12] or 0),
+                "lastfm_listeners": int(row[13] or 0),
+                "heat_score": float(row[14]) if row[14] is not None else None,
+                "heat_label": str(row[15] or "").strip() or None,
             }
             for alt_key in _profile_title_norm_variants(str(row[0] or "")):
                 if alt_key not in out:
@@ -14668,16 +14780,85 @@ def _files_upsert_artist_profile(conn, artist_norm: str, artist_name: str, profi
 
 def _files_upsert_album_profile(conn, artist_norm: str, title_norm: str, album_title: str, profile: dict) -> None:
     tags_json = json.dumps((profile or {}).get("tags") or [])
+    public_rating_raw = (profile or {}).get("public_rating")
+    try:
+        public_rating = float(public_rating_raw) if public_rating_raw is not None else None
+    except Exception:
+        public_rating = None
+    if public_rating is not None:
+        public_rating = max(0.0, min(5.0, public_rating))
+    try:
+        public_rating_votes = max(0, int((profile or {}).get("public_rating_votes") or 0))
+    except Exception:
+        public_rating_votes = 0
+    try:
+        discogs_have_count = max(0, int((profile or {}).get("discogs_have_count") or 0))
+    except Exception:
+        discogs_have_count = 0
+    try:
+        discogs_want_count = max(0, int((profile or {}).get("discogs_want_count") or 0))
+    except Exception:
+        discogs_want_count = 0
+    try:
+        bandcamp_supporter_count = max(0, int((profile or {}).get("bandcamp_supporter_count") or 0))
+    except Exception:
+        bandcamp_supporter_count = 0
+    try:
+        lastfm_scrobbles = max(0, int((profile or {}).get("lastfm_scrobbles") or 0))
+    except Exception:
+        lastfm_scrobbles = 0
+    try:
+        lastfm_listeners = max(0, int((profile or {}).get("lastfm_listeners") or 0))
+    except Exception:
+        lastfm_listeners = 0
+    heat_score_raw = (profile or {}).get("heat_score")
+    try:
+        heat_score = float(heat_score_raw) if heat_score_raw is not None else None
+    except Exception:
+        heat_score = None
+    if heat_score is not None:
+        heat_score = max(0.0, min(100.0, heat_score))
+    public_rating_source = str((profile or {}).get("public_rating_source") or "").strip()
+    heat_label = str((profile or {}).get("heat_label") or "").strip()
     with conn.cursor() as cur:
         cur.execute(
             """
-            INSERT INTO files_album_profiles(artist_norm, title_norm, album_title, description, short_description, tags_json, source, updated_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
+            INSERT INTO files_album_profiles(
+                artist_norm,
+                title_norm,
+                album_title,
+                description,
+                short_description,
+                tags_json,
+                public_rating,
+                public_rating_votes,
+                public_rating_source,
+                discogs_have_count,
+                discogs_want_count,
+                bandcamp_supporter_count,
+                lastfm_scrobbles,
+                lastfm_listeners,
+                heat_score,
+                heat_label,
+                source,
+                updated_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
             ON CONFLICT (artist_norm, title_norm) DO UPDATE
             SET album_title = EXCLUDED.album_title,
                 description = EXCLUDED.description,
                 short_description = EXCLUDED.short_description,
                 tags_json = EXCLUDED.tags_json,
+                public_rating = EXCLUDED.public_rating,
+                public_rating_votes = EXCLUDED.public_rating_votes,
+                public_rating_source = EXCLUDED.public_rating_source,
+                discogs_have_count = EXCLUDED.discogs_have_count,
+                discogs_want_count = EXCLUDED.discogs_want_count,
+                bandcamp_supporter_count = EXCLUDED.bandcamp_supporter_count,
+                lastfm_scrobbles = EXCLUDED.lastfm_scrobbles,
+                lastfm_listeners = EXCLUDED.lastfm_listeners,
+                heat_score = EXCLUDED.heat_score,
+                heat_label = EXCLUDED.heat_label,
                 source = EXCLUDED.source,
                 updated_at = NOW()
             """,
@@ -14688,9 +14869,47 @@ def _files_upsert_album_profile(conn, artist_norm: str, title_norm: str, album_t
                 (profile or {}).get("description") or "",
                 (profile or {}).get("short_description") or "",
                 tags_json,
+                public_rating,
+                public_rating_votes,
+                public_rating_source or None,
+                discogs_have_count,
+                discogs_want_count,
+                bandcamp_supporter_count,
+                lastfm_scrobbles,
+                lastfm_listeners,
+                heat_score,
+                heat_label or None,
                 (profile or {}).get("source") or "",
             ),
         )
+
+
+def _album_profile_has_payload(profile: dict | None) -> bool:
+    if not isinstance(profile, dict):
+        return False
+    if str(profile.get("description") or "").strip():
+        return True
+    if str(profile.get("short_description") or "").strip():
+        return True
+    tags = profile.get("tags") or []
+    if isinstance(tags, list) and any(str(t or "").strip() for t in tags):
+        return True
+    for key in (
+        "public_rating",
+        "public_rating_votes",
+        "discogs_have_count",
+        "discogs_want_count",
+        "bandcamp_supporter_count",
+        "lastfm_scrobbles",
+        "lastfm_listeners",
+        "heat_score",
+    ):
+        try:
+            if float(profile.get(key) or 0) > 0:
+                return True
+        except Exception:
+            continue
+    return False
 
 
 _FILES_EXTERNAL_ARTIST_IMAGE_MAX_AGE_SEC = 120 * 24 * 3600
@@ -15528,11 +15747,7 @@ def _run_files_profile_enrichment_job(
                         ) or {}
                         if not isinstance(profile, dict):
                             continue
-                        has_desc = bool(
-                            str(profile.get("description") or "").strip()
-                            or str(profile.get("short_description") or "").strip()
-                        )
-                        if not has_desc:
+                        if not _album_profile_has_payload(profile):
                             continue
                         with conn.transaction():
                             _files_upsert_album_profile(conn, artist_norm, norm, title, profile)
@@ -17159,10 +17374,14 @@ def _assistant_detect_tool_intent(user_message: str, *, context_artist_id: int) 
     # "Top" / "most present" / "most represented"
     if ("genre" in s) and any(tok in s for tok in ["plus present", "plus frequent", "most common", "most frequent", "most present"]):
         return "library_top_genres"
+    if ("label" in s or "labels" in s) and any(tok in s for tok in ["plus present", "plus frequent", "most common", "most frequent", "most present", "top", "principaux", "main labels"]):
+        return "library_top_labels"
     if any(tok in s for tok in ["artistes les plus presents", "artistes les plus presents", "most represented artists", "top artists", "artistes les plus representes"]):
         return "library_top_artists"
 
     if context_artist_id > 0:
+        if "concert" in s or "concerts" in s or "tour" in s or "shows" in s or "dates" in s:
+            return "artist_concerts"
         if ("artiste similaire" in s) or ("artistes similaires" in s) or ("similar artists" in s) or ("similaires" in s and "artiste" in s):
             return "artist_similar_artists"
         if ("album" in s or "albums" in s) and any(tok in s for tok in ["liste", "list", "quels", "which", "dispose", "dans ma collection", "local"]):
@@ -17218,6 +17437,34 @@ def _assistant_tool_library_top_genres(conn, *, limit: int = 10) -> list[tuple[s
         if not gg:
             continue
         out.append((gg, int(c or 0)))
+    return out
+
+
+def _assistant_tool_library_top_labels(conn, *, limit: int = 10) -> list[tuple[str, int]]:
+    limit = max(1, min(50, int(limit or 10)))
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            WITH label_tokens AS (
+                SELECT TRIM(COALESCE(alb.label, '')) AS label
+                FROM files_albums alb
+                WHERE COALESCE(TRIM(alb.label), '') <> ''
+            )
+            SELECT label, COUNT(*) AS c
+            FROM label_tokens
+            GROUP BY label
+            ORDER BY c DESC, label ASC
+            LIMIT %s
+            """,
+            (int(limit),),
+        )
+        rows = cur.fetchall()
+    out: list[tuple[str, int]] = []
+    for label, c in rows:
+        lab = str(label or "").strip()
+        if not lab:
+            continue
+        out.append((lab, int(c or 0)))
     return out
 
 
@@ -17299,6 +17546,56 @@ def _assistant_tool_artist_list_albums(conn, *, artist_id: int, limit: int = 80)
             }
         )
     return artist_name, albums
+
+
+def _assistant_tool_artist_concerts(conn, *, artist_id: int, limit: int = 12) -> tuple[str, str, list[dict]]:
+    artist_id = int(artist_id or 0)
+    limit = max(1, min(30, int(limit or 12)))
+    with conn.cursor() as cur:
+        cur.execute("SELECT name FROM files_artists WHERE id = %s", (artist_id,))
+        row = cur.fetchone()
+        artist_name = str((row[0] if row else "") or "").strip()
+        cur.execute(
+            """
+            SELECT provider, events_json, source_url
+            FROM files_artist_concerts
+            WHERE artist_id = %s
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+            (artist_id,),
+        )
+        crow = cur.fetchone()
+    if not crow:
+        return artist_name, "", []
+    provider = str(crow[0] or "").strip()
+    source_url = str(crow[2] or "").strip()
+    try:
+        events = json.loads(crow[1] or "[]") if crow[1] else []
+    except Exception:
+        events = []
+    out: list[dict] = []
+    if isinstance(events, list):
+        for it in events[:limit]:
+            if not isinstance(it, dict):
+                continue
+            title = str(it.get("title") or "").strip()
+            city = str(it.get("city") or "").strip()
+            country = str(it.get("country") or "").strip()
+            venue = str(it.get("venue") or "").strip()
+            when = str(it.get("date") or it.get("datetime") or "").strip()
+            href = str(it.get("url") or source_url or "").strip()
+            out.append(
+                {
+                    "title": title,
+                    "city": city,
+                    "country": country,
+                    "venue": venue,
+                    "when": when,
+                    "href": href,
+                }
+            )
+    return artist_name, provider, out
 
 
 def _assistant_tool_artist_similar(conn, *, artist_id: int, base_url: str, limit: int = 18) -> tuple[str, str, list[dict]]:
@@ -17408,6 +17705,28 @@ def _assistant_try_handle_tool_query(conn, *, user_message: str, context_artist_
         snippet = ", ".join([f"{g}={c}" for g, c in top[:6]])
         return {"handled": True, "tool": intent, "assistant_text": "\n".join(lines), "citations": _cit("library", 1, "Library genres", snippet), "links": [], "ts": now_ts}
 
+    if intent == "library_top_labels":
+        top = _assistant_tool_library_top_labels(conn, limit=12)
+        if not top:
+            text = "Je n'ai trouve aucun label exploitable dans ta bibliotheque." if lang == "fr" else "I could not find any usable labels in your library."
+            return {"handled": True, "tool": intent, "assistant_text": text, "citations": _cit("library", 1, "Library labels", "no labels found"), "links": [], "ts": now_ts}
+        lines = ["Labels les plus presents (par #albums):"] if lang == "fr" else ["Most present labels (by #albums):"]
+        links: list[dict] = []
+        for label, count in top[:12]:
+            lines.append(f"- {label}: {count}")
+            links.append(
+                {
+                    "kind": "internal",
+                    "label": label,
+                    "href": f"/library/label/{quote(label)}",
+                    "entity_type": "label",
+                    "entity_id": 0,
+                    "thumb": None,
+                }
+            )
+        snippet = ", ".join([f"{label}={count}" for label, count in top[:6]])
+        return {"handled": True, "tool": intent, "assistant_text": "\n".join(lines), "citations": _cit("library", 1, "Library labels", snippet), "links": links[:18], "ts": now_ts}
+
     if intent == "library_top_artists":
         items = _assistant_tool_library_top_artists(conn, base_url=base_url, limit=16)
         if not items:
@@ -17494,6 +17813,44 @@ def _assistant_try_handle_tool_query(conn, *, user_message: str, context_artist_
                 )
         snippet = ", ".join([str(it.get("name") or "") for it in (sim or [])[:8] if str(it.get("name") or "").strip()])
         return {"handled": True, "tool": intent, "assistant_text": "\n".join(lines).strip(), "citations": _cit("artist", int(context_artist_id), artist_name or "Similar artists", snippet, doc_type="artist_similar_tool"), "links": links[:28], "ts": now_ts}
+
+    if intent == "artist_concerts" and int(context_artist_id or 0) > 0:
+        artist_name, source, events = _assistant_tool_artist_concerts(conn, artist_id=int(context_artist_id), limit=10)
+        if not events:
+            text = (
+                f"Je n'ai trouve aucun concert a venir en cache pour {artist_name or f'Artist #{int(context_artist_id)}'}."
+                if lang == "fr"
+                else f"I couldn't find any cached upcoming concerts for {artist_name or f'Artist #{int(context_artist_id)}'}."
+            )
+            return {"handled": True, "tool": intent, "assistant_text": text, "citations": _cit("artist", int(context_artist_id), artist_name or "Artist concerts", "no cached concerts"), "links": [], "ts": now_ts}
+        lines = (
+            [f"Concerts a venir pour {artist_name or f'Artist #{int(context_artist_id)}'} (source: {source or 'unknown'}):"]
+            if lang == "fr"
+            else [f"Upcoming concerts for {artist_name or f'Artist #{int(context_artist_id)}'} (source: {source or 'unknown'}):"]
+        )
+        links: list[dict] = []
+        for ev in events[:10]:
+            city = str(ev.get("city") or "").strip()
+            country = str(ev.get("country") or "").strip()
+            venue = str(ev.get("venue") or "").strip()
+            when = str(ev.get("when") or "").strip()
+            location = ", ".join([part for part in [city, country] if part])
+            fragments = [frag for frag in [when, venue, location] if frag]
+            lines.append(f"- {' · '.join(fragments) if fragments else (ev.get('title') or 'Concert')}")
+            href = str(ev.get("href") or "").strip()
+            if href.startswith(("http://", "https://")):
+                links.append(
+                    {
+                        "kind": "external",
+                        "label": venue or location or when or (ev.get("title") or "Concert"),
+                        "href": href,
+                        "entity_type": "concert",
+                        "entity_id": 0,
+                        "thumb": None,
+                    }
+                )
+        snippet = "; ".join([" / ".join([str(ev.get("when") or "").strip(), str(ev.get("venue") or "").strip(), str(ev.get("city") or "").strip()]).strip(" /") for ev in events[:4]])
+        return {"handled": True, "tool": intent, "assistant_text": "\n".join(lines).strip(), "citations": _cit("artist", int(context_artist_id), artist_name or "Artist concerts", snippet or "cached concerts", doc_type="artist_concerts_tool"), "links": links[:10], "ts": now_ts}
 
     return {"handled": False}
 
@@ -20463,7 +20820,7 @@ def signature(tracks: List[Track]) -> tuple:
     return tuple(sorted((
         t.disc,
         t.idx,
-        t.title,
+        _dupe_norm_track_title(getattr(t, "title", "") or "") or _norm_track_title_strict(getattr(t, "title", "") or ""),
         int(round(t.dur/1000))
     ) for t in tracks))
 
@@ -20472,12 +20829,18 @@ def overlap(a: set, b: set) -> float:
 
 def _dupe_norm_track_title(s: str) -> str:
     """Normalize a track title for dupe similarity (robust to tags/filename noise)."""
-    raw = (s or "").strip().lower()
+    cleaned = _clean_track_title_from_text(str(s or ""), 1)
+    raw = (cleaned or s or "").strip().lower()
     if not raw:
         return ""
-    # Drop bracket/parenthetical segments and leading index patterns.
+    raw = raw.replace("…", "...").replace("…", "...")
+    raw = raw.replace("&", " and ")
+    # Drop bracket/parenthetical segments and leading album/file prefix patterns.
     raw = re.sub(r"[\(\[][^)\]]*[\)\]]", " ", raw)
+    raw = re.sub(r"^\s*[^-]+?\s*-\s*[^-]+?\s*-\s*", "", raw)
+    raw = re.sub(r"^\s*[^-]+?\s*-\s*", "", raw)
     raw = re.sub(r"^\s*\d+\s*[-.)]\s*", "", raw)
+    raw = re.sub(r"^\s*\d{1,2}\s*[-_.]\s*\d{1,3}\s*[-_. ]*", "", raw)
     raw = re.sub(r"\s+", " ", raw)
     raw = raw.strip()
     # Strip punctuation, keep letters/numbers/spaces.
@@ -29919,6 +30282,272 @@ def _files_collect_ordered_audio_paths(folder: Path, ordered_paths_raw: list | N
     return sorted(discovered, key=lambda p: str(p))
 
 
+def _infer_disc_track_from_text(text: str, fallback_track: int) -> tuple[int, int]:
+    raw = str(text or "").strip()
+    if not raw:
+        return (1, max(1, int(fallback_track or 1)))
+    disc = 1
+    track = max(1, int(fallback_track or 1))
+    m = re.match(r"^\s*(?:cd|disc)\s*(\d{1,2})\s*[-_. ]\s*(\d{1,3})\b", raw, flags=re.IGNORECASE)
+    if m:
+        return (_parse_int_loose(m.group(1), 1) or 1, _parse_int_loose(m.group(2), track) or track)
+    m = re.match(r"^\s*(\d{1,2})\s*[-_.]\s*(\d{1,3})\b", raw)
+    if m:
+        return (_parse_int_loose(m.group(1), 1) or 1, _parse_int_loose(m.group(2), track) or track)
+    m = re.match(r"^\s*([A-Z])\s*(?:[-_. ]?\s*(\d{1,3}))\b", raw, flags=re.IGNORECASE)
+    if m:
+        disc = (ord(m.group(1).upper()) - ord("A")) + 1
+        track = _parse_int_loose(m.group(2), 1) or 1
+        return (max(1, disc), max(1, track))
+    m = re.match(r"^\s*(\d{1,3})\b", raw)
+    if m:
+        track = _parse_int_loose(m.group(1), track) or track
+        return (1, max(1, track))
+    return (disc, track)
+
+
+def _disc_label_from_text(text: str, disc_num: int) -> str:
+    raw = str(text or "").strip()
+    if raw:
+        m = re.match(r"^\s*([A-Z])\s*(?:[-_. ]?\s*\d{1,3})\b", raw, flags=re.IGNORECASE)
+        if m:
+            side = str(m.group(1) or "").upper()
+            if side:
+                return f"Side {side}"
+    disc_i = max(1, int(disc_num or 1))
+    return f"Disc {disc_i}"
+
+
+def _track_text_candidates(raw_text: str) -> list[str]:
+    raw = str(raw_text or "").strip()
+    if not raw:
+        return []
+    candidates: list[str] = [raw]
+    patterns = [
+        r"^\s*[^-]+?\s*-\s*[^-]+?\s*-\s*(.+)$",
+        r"^\s*[^-]+?\s*-\s*(.+)$",
+    ]
+    for pat in patterns:
+        try:
+            m = re.match(pat, raw, flags=re.IGNORECASE)
+        except re.error:
+            m = None
+        if m:
+            tail = str(m.group(1) or "").strip()
+            if tail:
+                candidates.append(tail)
+    seen: set[str] = set()
+    out: list[str] = []
+    for cand in candidates:
+        norm = cand.strip().lower()
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        out.append(cand.strip())
+    return out
+
+
+def _clean_track_title_from_text(text: str, fallback_index: int) -> str:
+    raw = str(text or "").strip()
+    if not raw:
+        return f"Track {max(1, int(fallback_index or 1))}"
+    cleaned = re.sub(
+        r"^\s*[^-]+?\s*-\s*\d{1,2}\s*[-_. ]\s*\d{1,3}\s*[-_. ]*",
+        "",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    if cleaned != raw:
+        cleaned = cleaned.strip(" -_.")
+        return cleaned or raw or f"Track {fallback_index}"
+    cleaned = re.sub(
+        r"^\s*[^-]+?\s*-\s*\d{1,3}\s*[-_. ]*",
+        "",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    if cleaned != raw:
+        cleaned = cleaned.strip(" -_.")
+        return cleaned or raw or f"Track {fallback_index}"
+    cleaned = re.sub(
+        r"^\s*[^-]+?\s*-\s*[^-]+?\s*-\s*\d{1,2}\s*[-_. ]\s*\d{1,3}\s*[-_. ]*",
+        "",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    if cleaned != raw:
+        cleaned = cleaned.strip(" -_.")
+        return cleaned or raw or f"Track {fallback_index}"
+    cleaned = re.sub(
+        r"^\s*[^-]+?\s*-\s*[^-]+?\s*-\s*\d{1,3}\s*[-_. ]*",
+        "",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    if cleaned != raw:
+        cleaned = cleaned.strip(" -_.")
+        return cleaned or raw or f"Track {fallback_index}"
+    cleaned = re.sub(
+        r"^\s*[^-]+?\s*-\s*\d{1,2}\s*[-_. ]\s*\d{1,3}\s*[-_. ]*",
+        "",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    if cleaned != raw:
+        cleaned = cleaned.strip(" -_.")
+        return cleaned or raw or f"Track {fallback_index}"
+    cleaned = re.sub(r"^\s*(?:cd|disc)\s*\d{1,2}\s*[-_. ]\s*\d{1,3}\s*[-_. ]*", "", raw, flags=re.IGNORECASE)
+    cleaned = re.sub(r"^\s*\d{1,2}\s*[-_.]\s*\d{1,3}\s*[-_. ]*", "", cleaned)
+    cleaned = re.sub(r"^\s*[A-Z]\s*(?:[-_. ]?\s*\d{1,3})\s*[-_. ]*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"^\s*\d{1,3}\s*[-_. ]*", "", cleaned)
+    cleaned = cleaned.strip(" -_.")
+    return cleaned or raw or f"Track {fallback_index}"
+
+
+def _track_display_fields_from_sources(
+    *,
+    raw_title: str,
+    file_path: str,
+    fallback_disc: int,
+    fallback_track: int,
+) -> dict[str, Any]:
+    disc_num = max(1, int(fallback_disc or 1))
+    track_num = max(1, int(fallback_track or 1))
+    title_out = str(raw_title or "").strip()
+    candidates: list[str] = []
+    for source in (raw_title, Path(file_path).stem if str(file_path or "").strip() else ""):
+        candidates.extend(_track_text_candidates(source))
+    seen: set[str] = set()
+    uniq_candidates: list[str] = []
+    for cand in candidates:
+        norm = cand.strip().lower()
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        uniq_candidates.append(cand)
+    for cand in uniq_candidates:
+        parsed_disc, parsed_track = _infer_disc_track_from_text(cand, track_num)
+        looks_structured = bool(
+            re.match(
+                r"^\s*(?:[^-]+?\s*-\s*){0,2}(?:cd|disc\s*)?\d{1,2}\s*[-_. ]\s*\d{1,3}\b",
+                cand,
+                flags=re.IGNORECASE,
+            )
+            or re.match(r"^\s*[A-Z]\s*(?:[-_. ]?\s*\d{1,3})\b", cand, flags=re.IGNORECASE)
+        )
+        if looks_structured or (parsed_disc != 1 or parsed_track != track_num):
+            disc_num = max(1, int(parsed_disc or disc_num))
+            track_num = max(1, int(parsed_track or track_num))
+            break
+    for cand in uniq_candidates:
+        cleaned = _clean_track_title_from_text(cand, track_num)
+        if cleaned and _norm_track_title_strict(cleaned):
+            title_out = cleaned
+            break
+    title_out = str(title_out or "").strip() or f"Track {track_num}"
+    disc_label = ""
+    for cand in uniq_candidates:
+        cand_label = _disc_label_from_text(cand, disc_num)
+        if cand_label:
+            disc_label = cand_label
+            break
+    if not disc_label and disc_num > 1:
+        disc_label = f"Disc {disc_num}"
+    return {
+        "display_title": title_out,
+        "display_disc_num": disc_num,
+        "display_track_num": track_num,
+        "display_disc_label": disc_label,
+    }
+
+
+def _provider_track_titles_cached(
+    *,
+    artist_name: str,
+    album_title: str,
+    metadata_source: str,
+    musicbrainz_release_group_id: str = "",
+    discogs_release_id: str = "",
+    lastfm_album_mbid: str = "",
+    bandcamp_album_url: str = "",
+    edition_payload: dict | None = None,
+) -> list[str]:
+    provider = _normalize_identity_provider(metadata_source)
+    if not provider:
+        return []
+    ref = (
+        (musicbrainz_release_group_id or "").strip()
+        or (discogs_release_id or "").strip()
+        or (lastfm_album_mbid or "").strip()
+        or (bandcamp_album_url or "").strip()
+        or f"{_norm_artist_key(artist_name)}::{norm_album_for_dedup(album_title, normalize_parenthetical=True)}"
+    )
+    cache_key = f"provider:tracklist:{provider}:{hashlib.sha1(ref.encode('utf-8', errors='ignore')).hexdigest()}"
+    cached = _files_cache_get_json(cache_key)
+    if isinstance(cached, dict) and isinstance(cached.get("tracklist"), list):
+        return [str(t or "").strip() for t in cached.get("tracklist") or [] if str(t or "").strip()]
+
+    edition = dict(edition_payload or {})
+    edition.setdefault("musicbrainz_id", (musicbrainz_release_group_id or "").strip())
+    edition.setdefault("discogs_release_id", (discogs_release_id or "").strip())
+    edition.setdefault("lastfm_album_mbid", (lastfm_album_mbid or "").strip())
+    edition.setdefault("bandcamp_album_url", (bandcamp_album_url or "").strip())
+    edition.setdefault("primary_metadata_source", provider)
+    payload = _strict_payload_for_provider(
+        provider,
+        artist_name=str(artist_name or ""),
+        album_title=str(album_title or ""),
+        edition=edition,
+    )
+    tracklist = _provider_track_titles_for_strict(provider, payload or {})
+    _files_cache_set_json(cache_key, {"tracklist": tracklist}, ttl=86400 * 7)
+    return tracklist
+
+
+def _display_tracks_with_provider_overlay(
+    rows: list[dict[str, Any]],
+    *,
+    artist_name: str,
+    album_title: str,
+    metadata_source: str,
+    musicbrainz_release_group_id: str = "",
+    discogs_release_id: str = "",
+    lastfm_album_mbid: str = "",
+    bandcamp_album_url: str = "",
+    edition_payload: dict | None = None,
+) -> list[dict[str, Any]]:
+    out = [dict(r or {}) for r in (rows or [])]
+    out.sort(
+        key=lambda t: (
+            int(t.get("disc_num") or 1),
+            int(t.get("track_num") or 0),
+            int(t.get("track_id") or 0),
+            str(t.get("file_path") or ""),
+        )
+    )
+    provider_track_titles = _provider_track_titles_cached(
+        artist_name=artist_name,
+        album_title=album_title,
+        metadata_source=metadata_source,
+        musicbrainz_release_group_id=musicbrainz_release_group_id,
+        discogs_release_id=discogs_release_id,
+        lastfm_album_mbid=lastfm_album_mbid,
+        bandcamp_album_url=bandcamp_album_url,
+        edition_payload=edition_payload,
+    )
+    if provider_track_titles and len(provider_track_titles) == len(out):
+        for i, title in enumerate(provider_track_titles):
+            cleaned = str(title or "").strip()
+            if not cleaned:
+                continue
+            out[i]["title"] = cleaned
+            out[i]["provider_title_used"] = True
+    max_disc = max((int(t.get("disc_num") or 1) for t in out), default=1)
+    for t in out:
+        t["disc_label"] = str(t.get("disc_label") or "").strip() or (f"Disc {int(t.get('disc_num') or 1)}" if max_disc > 1 else "")
+    return out
+
+
 def _files_track_value(track_obj, attr: str, fallback=None):
     if track_obj is None:
         return fallback
@@ -29951,12 +30580,23 @@ def _files_build_track_entries_from_item(item: dict, folder: Path) -> list[dict]
     br = _parse_int_loose(item.get("br"), 0)
     sr = _parse_int_loose(item.get("sr"), 0)
     bd = _parse_int_loose(item.get("bd"), 0)
+    artist_hint = str(item.get("artist") or (item.get("meta") or {}).get("artist") or "").strip()
+    album_hint = str(item.get("title_raw") or item.get("album_title") or (item.get("meta") or {}).get("album") or folder.name or "").strip()
     out: list[dict] = []
     for idx, p in enumerate(ordered_paths):
         track_obj = fallback_tracks[idx] if idx < len(fallback_tracks) else None
-        title = (_files_track_value(track_obj, "title", "") or "").strip() or p.stem or f"Track {idx + 1}"
+        raw_title = (_files_track_value(track_obj, "title", "") or "").strip() or p.stem or f"Track {idx + 1}"
         disc_num = _parse_int_loose(_files_track_value(track_obj, "disc", 1), 1) or 1
         track_num = _parse_int_loose(_files_track_value(track_obj, "idx", idx + 1), idx + 1) or (idx + 1)
+        display = _track_display_fields_from_sources(
+            raw_title=raw_title,
+            file_path=str(p),
+            fallback_disc=disc_num,
+            fallback_track=track_num,
+        )
+        title = str(display.get("display_title") or raw_title or f"Track {idx + 1}").strip()
+        disc_num = int(display.get("display_disc_num") or disc_num or 1)
+        track_num = int(display.get("display_track_num") or track_num or (idx + 1))
         raw_dur = _files_track_value(track_obj, "dur", 0)
         dur_sec = 0
         try:
@@ -29980,6 +30620,7 @@ def _files_build_track_entries_from_item(item: dict, folder: Path) -> list[dict]
                 "file_path": str(p),
                 "title": title,
                 "disc_num": disc_num,
+                "disc_label": str(display.get("display_disc_label") or "").strip(),
                 "track_num": track_num,
                 "duration_sec": max(0, dur_sec),
                 "format": fmt,
@@ -29989,7 +30630,32 @@ def _files_build_track_entries_from_item(item: dict, folder: Path) -> list[dict]
                 "file_size_bytes": file_size,
             }
         )
+    metadata_source = _normalize_identity_provider(
+        str(
+            item.get("strict_match_provider")
+            or item.get("primary_metadata_source")
+            or item.get("metadata_source")
+            or (item.get("meta") or {}).get(PMDA_MATCH_PROVIDER_TAG)
+            or ""
+        )
+    )
+    provider_track_titles = _provider_track_titles_cached(
+        artist_name=artist_hint,
+        album_title=album_hint,
+        metadata_source=metadata_source,
+        musicbrainz_release_group_id=str(item.get("musicbrainz_id") or item.get("musicbrainz_release_group_id") or "").strip(),
+        discogs_release_id=str(item.get("discogs_release_id") or "").strip(),
+        lastfm_album_mbid=str(item.get("lastfm_album_mbid") or "").strip(),
+        bandcamp_album_url=str(item.get("bandcamp_album_url") or "").strip(),
+        edition_payload=item,
+    )
     out.sort(key=lambda t: (int(t.get("disc_num") or 1), int(t.get("track_num") or 0), str(t.get("file_path") or "")))
+    if provider_track_titles and len(provider_track_titles) == len(out):
+        for i, title in enumerate(provider_track_titles):
+            cleaned = str(title or "").strip()
+            if not cleaned:
+                continue
+            out[i]["title"] = cleaned
     return out
 
 
@@ -31300,6 +31966,15 @@ def _build_files_editions(
     def _title_from_filename(path: Path, fallback_index: int) -> str:
         stem = path.stem.strip()
         cleaned = re.sub(
+            r"^\s*[^-]+?\s*-\s*[^-]+?\s*-\s*\d{1,2}\s*[-_. ]\s*\d{1,3}\s*[-_. ]*",
+            "",
+            stem,
+            flags=re.IGNORECASE,
+        )
+        if cleaned != stem:
+            cleaned = cleaned.strip(" -_.")
+            return cleaned or stem or f"Track {fallback_index}"
+        cleaned = re.sub(
             r"^\s*[^-]+?\s*-\s*[^-]+?\s*-\s*\d{1,3}\s*-\s*",
             "",
             stem,
@@ -31316,6 +31991,112 @@ def _build_files_editions(
         cleaned = re.sub(r"^\s*\d{1,3}\s*[-_. ]*", "", cleaned)
         cleaned = cleaned.strip(" -_.")
         return cleaned or stem or f"Track {fallback_index}"
+
+    def _filename_tail_for_track_parsing(path: Path | str) -> str:
+        try:
+            stem = Path(path).stem.strip()
+        except Exception:
+            stem = str(path or "").strip()
+        if not stem:
+            return ""
+        m = re.match(r"^\s*[^-]+?\s*-\s*[^-]+?\s*-\s*(.+)$", stem, flags=re.IGNORECASE)
+        if m:
+            tail = str(m.group(1) or "").strip()
+            if tail:
+                return tail
+        return stem
+
+    def _infer_disc_track_from_track_context(
+        file_path: str,
+        fallback_disc: int,
+        fallback_track: int,
+    ) -> tuple[int, int]:
+        disc = max(1, int(fallback_disc or 1))
+        track = max(1, int(fallback_track or 1))
+        raw = str(file_path or "").strip()
+        if not raw:
+            return (disc, track)
+        tail = _filename_tail_for_track_parsing(raw)
+        if not tail:
+            return (disc, track)
+        try:
+            parsed_disc, parsed_track = _infer_disc_track_from_filename(Path(tail), track)
+        except Exception:
+            parsed_disc, parsed_track = (disc, track)
+        return (
+            max(1, int(parsed_disc or disc)),
+            max(1, int(parsed_track or track)),
+        )
+
+    def _disc_label_from_track_context(file_path: str, disc_num: int) -> str | None:
+        raw = str(file_path or "").strip()
+        if not raw:
+            return None
+        tail = _filename_tail_for_track_parsing(raw)
+        if not tail:
+            return None
+        m = re.match(r"^\s*([A-Z])\s*(?:[-_. ]?\s*\d{1,3})\b", tail, flags=re.IGNORECASE)
+        if not m:
+            return None
+        side = str(m.group(1) or "").upper()
+        if not side:
+            return None
+        return f"Side {side}"
+
+    def _clean_track_display_title(
+        raw_title: str,
+        *,
+        file_path: str = "",
+        fallback_index: int = 1,
+    ) -> str:
+        file_raw = str(file_path or "").strip()
+        if file_raw:
+            try:
+                tail = _filename_tail_for_track_parsing(file_raw)
+                file_title = _title_from_filename(Path(tail), fallback_index)
+                file_title = re.sub(r"^\s*\d{1,2}\s*[-_. ]\s*\d{1,3}\s*[-_. ]*", "", file_title)
+                file_title = file_title.strip(" -_.")
+                if file_title:
+                    return file_title
+            except Exception:
+                pass
+
+        title = str(raw_title or "").strip()
+        if not title:
+            return f"Track {fallback_index}"
+        cleaned = re.sub(
+            r"^\s*[^-]+?\s*-\s*[^-]+?\s*-\s*\d{1,2}\s*[-_. ]\s*\d{1,3}\s*[-_. ]*",
+            "",
+            title,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(
+            r"^\s*[^-]+?\s*-\s*[^-]+?\s*-\s*\d{1,3}\s*[-_. ]*",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(r"^\s*(?:cd|disc)\s*\d{1,2}\s*[-_. ]\s*\d{1,3}\s*[-_. ]*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"^\s*\d{1,2}\s*[-_.]\s*\d{1,3}\s*[-_. ]*", "", cleaned)
+        cleaned = re.sub(r"^\s*\d{1,3}\s*[-_. ]*", "", cleaned)
+        cleaned = cleaned.strip(" -_.")
+        return cleaned or title or f"Track {fallback_index}"
+
+    def _track_title_looks_filename_noise(raw_title: str, album_title: str = "") -> bool:
+        title = str(raw_title or "").strip()
+        if not title:
+            return False
+        if re.match(r"^\s*[^-]+?\s*-\s*[^-]+?\s*-\s*\d{1,2}\s*[-_. ]\s*\d{1,3}\b", title, flags=re.IGNORECASE):
+            return True
+        if re.match(r"^\s*[^-]+?\s*-\s*[^-]+?\s*-\s*\d{1,3}\b", title, flags=re.IGNORECASE):
+            return True
+        if re.match(r"^\s*(?:cd|disc)\s*\d{1,2}\s*[-_. ]\s*\d{1,3}\b", title, flags=re.IGNORECASE):
+            return True
+        album_norm = _normalize_identity_text_strict(album_title or "")
+        title_norm = _normalize_identity_text_strict(title)
+        if album_norm and title_norm.startswith(f"{album_norm} "):
+            return True
+        return False
 
     def _filename_has_explicit_track_number(path: Path) -> bool:
         """Return True when filename contains an explicit track/disc+track prefix."""
@@ -36074,6 +36855,191 @@ def _run_lastfm_preflight() -> tuple[bool, str]:
         return False, f"Last.fm unreachable: {e}"
 
 
+_LASTFM_API_ROOT = "https://ws.audioscrobbler.com/2.0/"
+_LASTFM_AUTH_ROOT = "https://www.last.fm/api/auth/"
+_LASTFM_SESSION_KEY_SETTING = "LASTFM_SESSION_KEY_ENC"
+_LASTFM_SESSION_NAME_SETTING = "LASTFM_SESSION_NAME"
+_LASTFM_AUTH_TOKEN_SETTING = "LASTFM_AUTH_TOKEN_ENC"
+
+
+def _lastfm_credentials_effective() -> tuple[str, str]:
+    api_key = str(_get_config_from_db("LASTFM_API_KEY", getattr(sys.modules[__name__], "LASTFM_API_KEY", "")) or "").strip()
+    api_secret = str(_get_config_from_db("LASTFM_API_SECRET", getattr(sys.modules[__name__], "LASTFM_API_SECRET", "")) or "").strip()
+    return api_key, api_secret
+
+
+def _lastfm_session_name() -> str:
+    return str(_get_config_from_db(_LASTFM_SESSION_NAME_SETTING, "") or "").strip()
+
+
+def _lastfm_session_key() -> str:
+    return _settings_db_get_secret(_LASTFM_SESSION_KEY_SETTING)
+
+
+def _lastfm_pending_token() -> str:
+    return _settings_db_get_secret(_LASTFM_AUTH_TOKEN_SETTING)
+
+
+def _lastfm_scrobble_enabled() -> bool:
+    return bool(_parse_bool(_get_config_from_db("LASTFM_SCROBBLE_ENABLED", getattr(sys.modules[__name__], "LASTFM_SCROBBLE_ENABLED", False))))
+
+
+def _lastfm_now_playing_enabled() -> bool:
+    return bool(_parse_bool(_get_config_from_db("LASTFM_NOW_PLAYING_ENABLED", getattr(sys.modules[__name__], "LASTFM_NOW_PLAYING_ENABLED", False))))
+
+
+def _lastfm_auth_url_for_token(token: str) -> str:
+    api_key, _ = _lastfm_credentials_effective()
+    return f"{_LASTFM_AUTH_ROOT}?api_key={quote_plus(api_key)}&token={quote_plus(str(token or '').strip())}"
+
+
+def _lastfm_api_sig(params: dict[str, Any], api_secret: str) -> str:
+    parts: list[str] = []
+    for key in sorted(str(k) for k in params.keys()):
+        if key in {"format", "callback", "api_sig"}:
+            continue
+        value = params.get(key)
+        if value is None:
+            continue
+        parts.append(f"{key}{value}")
+    parts.append(str(api_secret or ""))
+    return hashlib.md5("".join(parts).encode("utf-8", errors="ignore")).hexdigest()
+
+
+def _lastfm_signed_post(params: dict[str, Any], *, timeout: float = 15.0) -> dict:
+    api_key, api_secret = _lastfm_credentials_effective()
+    if not api_key or not api_secret:
+        raise RuntimeError("Last.fm API key/secret are required")
+    payload = {str(k): str(v) for k, v in (params or {}).items() if v not in (None, "")}
+    payload["api_key"] = api_key
+    payload["api_sig"] = _lastfm_api_sig(payload, api_secret)
+    payload["format"] = "json"
+    resp = requests.post(_LASTFM_API_ROOT, data=payload, timeout=timeout)
+    data = resp.json() if resp.content else {}
+    if resp.status_code != 200:
+        message = ""
+        if isinstance(data, dict):
+            message = str(data.get("message") or data.get("error") or "").strip()
+        raise RuntimeError(message or f"Last.fm HTTP {resp.status_code}")
+    if isinstance(data, dict) and data.get("error"):
+        raise RuntimeError(str(data.get("message") or f"Last.fm error {data.get('error')}").strip())
+    return data if isinstance(data, dict) else {}
+
+
+def _lastfm_playback_track_payload(track_id: int) -> Optional[dict[str, Any]]:
+    conn = _files_pg_connect()
+    if conn is None:
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    COALESCE(tr.title, ''),
+                    COALESCE(tr.duration_sec, 0),
+                    COALESCE(tr.track_num, 0),
+                    COALESCE(alb.title, ''),
+                    COALESCE(ar.name, '')
+                FROM files_tracks tr
+                JOIN files_albums alb ON alb.id = tr.album_id
+                JOIN files_artists ar ON ar.id = alb.artist_id
+                WHERE tr.id = %s
+                LIMIT 1
+                """,
+                (int(track_id),),
+            )
+            row = cur.fetchone()
+        if not row:
+            return None
+        return {
+            "track": str(row[0] or "").strip(),
+            "duration_sec": int(row[1] or 0),
+            "track_num": int(row[2] or 0),
+            "album": str(row[3] or "").strip(),
+            "artist": str(row[4] or "").strip(),
+        }
+    except Exception:
+        logging.debug("Last.fm playback payload lookup failed for track_id=%s", track_id, exc_info=True)
+        return None
+    finally:
+        conn.close()
+
+
+def _lastfm_scrobble_threshold_seconds(duration_sec: int) -> int:
+    dur = max(0, int(duration_sec or 0))
+    if dur <= 0:
+        return 30
+    return max(30, min(240, int(math.ceil(dur / 2.0))))
+
+
+def _lastfm_submit_now_playing(track_id: int) -> None:
+    if not _lastfm_now_playing_enabled():
+        return
+    session_key = _lastfm_session_key()
+    if not session_key:
+        return
+    payload = _lastfm_playback_track_payload(track_id)
+    if not payload or not payload.get("artist") or not payload.get("track"):
+        return
+    try:
+        _lastfm_signed_post(
+            {
+                "method": "track.updateNowPlaying",
+                "sk": session_key,
+                "artist": payload["artist"],
+                "track": payload["track"],
+                "album": payload.get("album") or "",
+                "trackNumber": payload.get("track_num") or "",
+                "duration": payload.get("duration_sec") or "",
+            },
+            timeout=10.0,
+        )
+    except Exception as exc:
+        logging.info("Last.fm now-playing update failed for track_id=%s: %s", track_id, exc)
+
+
+def _lastfm_submit_scrobble(track_id: int, played_seconds: int) -> None:
+    if not _lastfm_scrobble_enabled():
+        return
+    session_key = _lastfm_session_key()
+    if not session_key:
+        return
+    payload = _lastfm_playback_track_payload(track_id)
+    if not payload or not payload.get("artist") or not payload.get("track"):
+        return
+    duration_sec = int(payload.get("duration_sec") or 0)
+    if duration_sec > 0 and played_seconds < _lastfm_scrobble_threshold_seconds(duration_sec):
+        return
+    try:
+        _lastfm_signed_post(
+            {
+                "method": "track.scrobble",
+                "sk": session_key,
+                "artist": payload["artist"],
+                "track": payload["track"],
+                "album": payload.get("album") or "",
+                "trackNumber": payload.get("track_num") or "",
+                "duration": duration_sec or "",
+                "timestamp": int(time.time()),
+            },
+            timeout=12.0,
+        )
+    except Exception as exc:
+        logging.info("Last.fm scrobble failed for track_id=%s: %s", track_id, exc)
+
+
+def _lastfm_handle_playback_event_async(track_id: int, event_type: str, played_seconds: int) -> None:
+    try:
+        event = str(event_type or "").strip().lower()
+        if event == "play_start":
+            _lastfm_submit_now_playing(track_id)
+            return
+        if event in {"play_complete", "play_partial", "stop"}:
+            _lastfm_submit_scrobble(track_id, max(0, int(played_seconds or 0)))
+    except Exception:
+        logging.debug("Last.fm playback hook failed", exc_info=True)
+
+
 def _run_fanart_preflight() -> tuple[bool, str]:
     """Test Fanart.tv API key validity and connectivity. Returns (ok, message)."""
     api_key = (getattr(sys.modules[__name__], "FANART_API_KEY", "") or "").strip()
@@ -36353,6 +37319,12 @@ def _fetch_discogs_release(artist_name: str, album_title: str) -> Optional[dict]
             parts = [_strip_html_text(str(x or "").strip()) for x in notes if str(x or "").strip()]
             if parts:
                 notes_text = _truncate_text(" ".join(parts), max_chars=2400)
+        community = rel_data.get("community") if isinstance(rel_data.get("community"), dict) else {}
+        rating_block = community.get("rating") if isinstance(community.get("rating"), dict) else {}
+        public_rating = _safe_bounded_float(rating_block.get("average"))
+        public_rating_votes = _safe_nonneg_int(rating_block.get("count"))
+        discogs_have_count = _safe_nonneg_int(community.get("have"))
+        discogs_want_count = _safe_nonneg_int(community.get("want"))
 
         release_id_str = str(rel_data.get("id") or release_id or "").strip()
         master_id = str(rel_data.get("master_id") or "").strip()
@@ -36370,6 +37342,11 @@ def _fetch_discogs_release(artist_name: str, album_title: str) -> Optional[dict]
             "notes": notes_text,
             "release_id": release_id_str,
             "master_id": master_id,
+            "public_rating": public_rating,
+            "public_rating_votes": public_rating_votes,
+            "public_rating_source": "discogs",
+            "discogs_have_count": discogs_have_count,
+            "discogs_want_count": discogs_want_count,
         }
     return None
 
@@ -36471,6 +37448,8 @@ def _fetch_lastfm_album_info(artist_name: str, album_title: str, mbid: Optional[
                     tracklist.append(tname)
         except Exception:
             tracklist = []
+        playcount = _safe_nonneg_int(album.get("playcount"))
+        listeners = _safe_nonneg_int(album.get("listeners"))
         return {
             "cover_url": cover_url,
             "toptags": toptags,
@@ -36480,6 +37459,8 @@ def _fetch_lastfm_album_info(artist_name: str, album_title: str, mbid: Optional[
             "wiki_summary": wiki_summary or "",
             "wiki_content": wiki_content or "",
             "tracklist": tracklist,
+            "lastfm_scrobbles": playcount,
+            "lastfm_listeners": listeners,
         }
     except Exception as e:
         logging.warning("Last.fm fetch failed for %s / %s: %s", artist_name, album_title, e)
@@ -36502,6 +37483,133 @@ def _truncate_text(value: str, max_chars: int = 420) -> str:
         return txt
     clipped = txt[:max_chars].rsplit(" ", 1)[0].strip()
     return f"{clipped}..." if clipped else txt[:max_chars]
+
+
+def _safe_nonneg_int(value: Any) -> int:
+    try:
+        return max(0, int(float(str(value or 0).strip())))
+    except Exception:
+        return 0
+
+
+def _safe_bounded_float(value: Any, minimum: float = 0.0, maximum: float = 5.0) -> float | None:
+    try:
+        out = float(value)
+    except Exception:
+        return None
+    if not math.isfinite(out):
+        return None
+    return max(minimum, min(maximum, out))
+
+
+def _album_heat_label(score: float | None) -> str | None:
+    if score is None:
+        return None
+    val = max(0.0, min(100.0, float(score)))
+    if val >= 88:
+        return "essential"
+    if val >= 72:
+        return "hot"
+    if val >= 56:
+        return "rising"
+    if val >= 38:
+        return "solid"
+    if val > 0:
+        return "niche"
+    return None
+
+
+def _compute_album_heat_score(
+    *,
+    discogs_have_count: int = 0,
+    discogs_want_count: int = 0,
+    bandcamp_supporter_count: int = 0,
+    lastfm_scrobbles: int = 0,
+    lastfm_listeners: int = 0,
+    public_rating: float | None = None,
+    public_rating_votes: int = 0,
+) -> float | None:
+    have_norm = min(1.0, math.log10(discogs_have_count + 1) / 4.2) if discogs_have_count > 0 else 0.0
+    want_norm = min(1.0, math.log10(discogs_want_count + 1) / 4.0) if discogs_want_count > 0 else 0.0
+    bandcamp_norm = min(1.0, math.log10(bandcamp_supporter_count + 1) / 3.0) if bandcamp_supporter_count > 0 else 0.0
+    scrobble_norm = min(1.0, math.log10(lastfm_scrobbles + 1) / 6.2) if lastfm_scrobbles > 0 else 0.0
+    listener_norm = min(1.0, math.log10(lastfm_listeners + 1) / 5.4) if lastfm_listeners > 0 else 0.0
+    rating_norm = min(1.0, max(0.0, float(public_rating or 0.0)) / 5.0) if public_rating is not None else 0.0
+    vote_norm = min(1.0, math.log10(max(0, int(public_rating_votes or 0)) + 1) / 3.0) if public_rating_votes else 0.0
+    score = (
+        (have_norm * 0.20)
+        + (want_norm * 0.18)
+        + (bandcamp_norm * 0.15)
+        + (scrobble_norm * 0.24)
+        + (listener_norm * 0.13)
+        + (rating_norm * 0.07)
+        + (vote_norm * 0.03)
+    )
+    if score <= 0:
+        return None
+    return round(max(0.0, min(100.0, score * 100.0)), 1)
+
+
+def _derive_public_rating_from_heat(heat_score: float | None) -> float | None:
+    if heat_score is None:
+        return None
+    scaled = 2.2 + (max(0.0, min(100.0, float(heat_score))) / 100.0) * 2.6
+    return round(max(0.0, min(5.0, scaled)), 1)
+
+
+def _merge_album_public_metrics(*metrics_sources: dict[str, Any]) -> dict[str, Any]:
+    merged: dict[str, Any] = {
+        "public_rating": None,
+        "public_rating_votes": 0,
+        "public_rating_source": "",
+        "discogs_have_count": 0,
+        "discogs_want_count": 0,
+        "bandcamp_supporter_count": 0,
+        "lastfm_scrobbles": 0,
+        "lastfm_listeners": 0,
+        "heat_score": None,
+        "heat_label": None,
+    }
+    explicit_rating = None
+    explicit_votes = 0
+    explicit_source = ""
+    for metrics in metrics_sources:
+        if not isinstance(metrics, dict):
+            continue
+        merged["discogs_have_count"] = max(int(merged["discogs_have_count"] or 0), _safe_nonneg_int(metrics.get("discogs_have_count")))
+        merged["discogs_want_count"] = max(int(merged["discogs_want_count"] or 0), _safe_nonneg_int(metrics.get("discogs_want_count")))
+        merged["bandcamp_supporter_count"] = max(int(merged["bandcamp_supporter_count"] or 0), _safe_nonneg_int(metrics.get("bandcamp_supporter_count")))
+        merged["lastfm_scrobbles"] = max(int(merged["lastfm_scrobbles"] or 0), _safe_nonneg_int(metrics.get("lastfm_scrobbles")))
+        merged["lastfm_listeners"] = max(int(merged["lastfm_listeners"] or 0), _safe_nonneg_int(metrics.get("lastfm_listeners")))
+        cand_rating = _safe_bounded_float(metrics.get("public_rating"))
+        cand_votes = _safe_nonneg_int(metrics.get("public_rating_votes"))
+        cand_source = str(metrics.get("public_rating_source") or "").strip()
+        if cand_rating is not None and (explicit_rating is None or cand_votes > explicit_votes):
+            explicit_rating = cand_rating
+            explicit_votes = cand_votes
+            explicit_source = cand_source
+    heat_score = _compute_album_heat_score(
+        discogs_have_count=int(merged["discogs_have_count"] or 0),
+        discogs_want_count=int(merged["discogs_want_count"] or 0),
+        bandcamp_supporter_count=int(merged["bandcamp_supporter_count"] or 0),
+        lastfm_scrobbles=int(merged["lastfm_scrobbles"] or 0),
+        lastfm_listeners=int(merged["lastfm_listeners"] or 0),
+        public_rating=explicit_rating,
+        public_rating_votes=explicit_votes,
+    )
+    public_rating = explicit_rating
+    public_rating_votes = explicit_votes
+    public_rating_source = explicit_source
+    if public_rating is None and heat_score is not None:
+        public_rating = _derive_public_rating_from_heat(heat_score)
+        public_rating_source = "aggregated"
+        public_rating_votes = 0
+    merged["public_rating"] = public_rating
+    merged["public_rating_votes"] = public_rating_votes
+    merged["public_rating_source"] = public_rating_source or None
+    merged["heat_score"] = heat_score
+    merged["heat_label"] = _album_heat_label(heat_score)
+    return merged
 
 
 def _norm_artist_key(name: str) -> str:
@@ -37565,6 +38673,29 @@ def _fetch_bandcamp_album_info(artist_name: str, album_title: str) -> Optional[d
             tags = _dedupe_keep_order([t for t in tags if isinstance(t, str) and t.strip()])
         except Exception:
             tags = []
+        supporter_count = 0
+        try:
+            support_line = re.search(
+                r"supported by\s+(\d[\d,]*)\s+fans?\s+who\s+also\s+own",
+                page,
+                flags=re.IGNORECASE,
+            )
+            if support_line:
+                supporter_count = _safe_nonneg_int(support_line.group(1))
+            if supporter_count <= 0:
+                shown_thumbs_block = re.search(
+                    r'&quot;shown_thumbs&quot;:\[(.*?)\](?:,&quot;more_thumbs_available&quot;|,&quot;reviews&quot;)',
+                    page,
+                    flags=re.IGNORECASE | re.DOTALL,
+                )
+                if shown_thumbs_block:
+                    supporter_count = len(re.findall(r"&quot;fan_id&quot;:", shown_thumbs_block.group(1)))
+            if supporter_count <= 0:
+                sponsor_block = re.search(r'"sponsor"\s*:\s*\[(.*?)\]\s*,\s*"numTracks"', page, flags=re.IGNORECASE | re.DOTALL)
+                if sponsor_block:
+                    supporter_count = len(re.findall(r'"@type"\s*:\s*"Person"', sponsor_block.group(1), flags=re.IGNORECASE))
+        except Exception:
+            supporter_count = 0
 
         return {
             "title": title,
@@ -37576,6 +38707,7 @@ def _fetch_bandcamp_album_info(artist_name: str, album_title: str) -> Optional[d
             "tags": tags,
             "description": description,
             "album_url": album_url,
+            "bandcamp_supporter_count": supporter_count,
         }
 
     try:
@@ -39539,6 +40671,85 @@ def api_openai_check():
         return jsonify({"success": False, "message": f"Error: {error_msg}"}), 500
 
 
+# ───────────────────────── Last.fm user auth / scrobble ─────────────────────────
+
+@app.get("/api/lastfm/auth/status")
+def api_lastfm_auth_status():
+    api_key, api_secret = _lastfm_credentials_effective()
+    pending_token = _lastfm_pending_token()
+    session_name = _lastfm_session_name()
+    session_key = _lastfm_session_key()
+    connected = bool(api_key and api_secret and session_key)
+    return jsonify(
+        {
+            "configured": bool(api_key and api_secret),
+            "connected": connected,
+            "pending": bool(pending_token and not connected),
+            "session_name": session_name or "",
+            "auth_url": _lastfm_auth_url_for_token(pending_token) if pending_token and api_key else "",
+            "error": "",
+        }
+    )
+
+
+@app.post("/api/lastfm/auth/start")
+def api_lastfm_auth_start():
+    api_key, api_secret = _lastfm_credentials_effective()
+    if not api_key or not api_secret:
+        return jsonify({"ok": False, "message": "Configure Last.fm API key and secret first."}), 400
+    try:
+        data = _lastfm_signed_post({"method": "auth.getToken"}, timeout=12.0)
+        token = str((data.get("token") if isinstance(data, dict) else "") or "").strip()
+        if not token:
+            raise RuntimeError("Last.fm did not return an auth token")
+        _settings_db_set_secret(_LASTFM_AUTH_TOKEN_SETTING, token)
+        return jsonify({"ok": True, "pending": True, "token": token, "auth_url": _lastfm_auth_url_for_token(token)})
+    except Exception as exc:
+        logging.warning("Last.fm auth start failed: %s", exc)
+        return jsonify({"ok": False, "message": str(exc) or "Last.fm authorization failed"}), 500
+
+
+@app.post("/api/lastfm/auth/complete")
+def api_lastfm_auth_complete():
+    api_key, api_secret = _lastfm_credentials_effective()
+    if not api_key or not api_secret:
+        return jsonify({"ok": False, "message": "Configure Last.fm API key and secret first."}), 400
+    token = _lastfm_pending_token()
+    if not token:
+        return jsonify({"ok": False, "message": "No Last.fm authorization is pending."}), 409
+    try:
+        data = _lastfm_signed_post({"method": "auth.getSession", "token": token}, timeout=12.0)
+        session = data.get("session") if isinstance(data, dict) else {}
+        if not isinstance(session, dict):
+            raise RuntimeError("Last.fm did not return a session")
+        session_key = str(session.get("key") or "").strip()
+        session_name = str(session.get("name") or "").strip()
+        if not session_key:
+            raise RuntimeError("Last.fm session key is missing")
+        _settings_db_set_secret(_LASTFM_SESSION_KEY_SETTING, session_key)
+        _settings_db_set_value(_LASTFM_SESSION_NAME_SETTING, session_name)
+        _settings_db_delete_keys(_LASTFM_AUTH_TOKEN_SETTING)
+        return jsonify({"ok": True, "connected": True, "session_name": session_name, "message": f"Connected to Last.fm as {session_name or 'your account'}"})
+    except Exception as exc:
+        message = str(exc or "").strip() or "Last.fm authorization is not complete yet"
+        lowered = message.lower()
+        if "not been authorized" in lowered or "unauthorized token" in lowered:
+            return jsonify({"ok": False, "message": "Authorize PMDA on Last.fm first, then click Finish authorization."}), 409
+        if "invalid method signature" in lowered or "invalid api key" in lowered:
+            return jsonify({"ok": False, "message": message}), 400
+        logging.warning("Last.fm auth completion failed: %s", exc)
+        return jsonify({"ok": False, "message": message}), 500
+
+
+@app.post("/api/lastfm/auth/disconnect")
+def api_lastfm_auth_disconnect():
+    try:
+        _settings_db_delete_keys(_LASTFM_AUTH_TOKEN_SETTING, _LASTFM_SESSION_KEY_SETTING, _LASTFM_SESSION_NAME_SETTING)
+        return jsonify({"ok": True, "message": "Last.fm disconnected"})
+    except Exception as exc:
+        return jsonify({"ok": False, "message": str(exc) or "Failed to disconnect Last.fm"}), 500
+
+
 # ───────────────────────── OpenAI OAuth (ChatGPT / Codex) ─────────────────────────
 
 _OPENAI_OAUTH_ISSUER = "https://auth.openai.com"
@@ -40489,6 +41700,7 @@ MASKED_SECRET_KEYS: set[str] = {
     "OPENAI_OAUTH_REFRESH_TOKEN",
     "ANTHROPIC_API_KEY", "GOOGLE_API_KEY",
     "DISCOGS_USER_TOKEN", "LASTFM_API_KEY", "LASTFM_API_SECRET",
+    "LASTFM_SESSION_KEY_ENC", "LASTFM_AUTH_TOKEN_ENC",
     "FANART_API_KEY", "THEAUDIODB_API_KEY",
     "SERPER_API_KEY", "ACOUSTID_API_KEY",
     "LIDARR_API_KEY", "AUTOBRR_API_KEY",
@@ -40789,6 +42001,9 @@ def api_config_get():
     discogs_token_eff = get_setting("DISCOGS_USER_TOKEN", DISCOGS_USER_TOKEN)
     lastfm_key_eff = get_setting("LASTFM_API_KEY", LASTFM_API_KEY)
     lastfm_secret_eff = get_setting("LASTFM_API_SECRET", LASTFM_API_SECRET)
+    lastfm_session_name_eff = str(_get_config_from_db(_LASTFM_SESSION_NAME_SETTING, "") or "").strip()
+    lastfm_session_connected_eff = bool(_lastfm_session_key())
+    lastfm_pending_eff = bool(_lastfm_pending_token())
     fanart_key_eff = get_setting("FANART_API_KEY", FANART_API_KEY)
     theaudiodb_key_eff = get_setting("THEAUDIODB_API_KEY", THEAUDIODB_API_KEY)
     serper_key_eff = get_setting("SERPER_API_KEY", SERPER_API_KEY)
@@ -40968,6 +42183,11 @@ def api_config_get():
         "LASTFM_API_KEY_SET": _is_set(lastfm_key_eff),
         "LASTFM_API_SECRET": str(lastfm_secret_eff or ""),
         "LASTFM_API_SECRET_SET": _is_set(lastfm_secret_eff),
+        "LASTFM_SCROBBLE_ENABLED": get_setting_bool("LASTFM_SCROBBLE_ENABLED", getattr(sys.modules[__name__], "LASTFM_SCROBBLE_ENABLED", False)),
+        "LASTFM_NOW_PLAYING_ENABLED": get_setting_bool("LASTFM_NOW_PLAYING_ENABLED", getattr(sys.modules[__name__], "LASTFM_NOW_PLAYING_ENABLED", False)),
+        "LASTFM_SCROBBLE_CONNECTED": bool(lastfm_session_connected_eff),
+        "LASTFM_SCROBBLE_USER": str(lastfm_session_name_eff or ""),
+        "LASTFM_SCROBBLE_PENDING": bool(lastfm_pending_eff and not lastfm_session_connected_eff),
         "FANART_API_KEY": str(fanart_key_eff or ""),
         "FANART_API_KEY_SET": _is_set(fanart_key_eff),
         "THEAUDIODB_API_KEY": str(theaudiodb_key_eff or ""),
@@ -41694,6 +42914,10 @@ def _apply_settings_in_memory(updates: dict):
         v = str(updates["LASTFM_API_SECRET"] or "").strip()
         if not _is_masked_secret_placeholder(v):
             mod.LASTFM_API_SECRET = v
+    if "LASTFM_SCROBBLE_ENABLED" in updates:
+        mod.LASTFM_SCROBBLE_ENABLED = bool(_parse_bool(updates["LASTFM_SCROBBLE_ENABLED"]))
+    if "LASTFM_NOW_PLAYING_ENABLED" in updates:
+        mod.LASTFM_NOW_PLAYING_ENABLED = bool(_parse_bool(updates["LASTFM_NOW_PLAYING_ENABLED"]))
     if "FANART_API_KEY" in updates:
         v = str(updates["FANART_API_KEY"] or "").strip()
         if not _is_masked_secret_placeholder(v):
@@ -41811,7 +43035,8 @@ def api_config_put():
         "ARTIST_CREDIT_MODE", "LIVE_DEDUPE_MODE",
         "LIDARR_URL", "LIDARR_API_KEY", "AUTOBRR_URL", "AUTOBRR_API_KEY", "AUTO_FIX_BROKEN_ALBUMS",
         "BROKEN_ALBUM_CONSECUTIVE_THRESHOLD", "BROKEN_ALBUM_PERCENTAGE_THRESHOLD", "REQUIRED_TAGS",
-        "USE_DISCOGS", "DISCOGS_USER_TOKEN", "USE_LASTFM", "LASTFM_API_KEY", "LASTFM_API_SECRET", "USE_BANDCAMP",
+        "USE_DISCOGS", "DISCOGS_USER_TOKEN", "USE_LASTFM", "LASTFM_API_KEY", "LASTFM_API_SECRET",
+        "LASTFM_SCROBBLE_ENABLED", "LASTFM_NOW_PLAYING_ENABLED", "USE_BANDCAMP",
         "FANART_API_KEY", "THEAUDIODB_API_KEY",
         "JELLYFIN_URL", "JELLYFIN_API_KEY",
         "NAVIDROME_URL", "NAVIDROME_USERNAME", "NAVIDROME_PASSWORD", "NAVIDROME_API_KEY",
@@ -41856,6 +43081,8 @@ def api_config_put():
     if "PIPELINE_PLAYER_TARGET" in updates:
         updates["PIPELINE_PLAYER_TARGET"] = _normalize_player_target(updates["PIPELINE_PLAYER_TARGET"])
     for _k in (
+        "LASTFM_SCROBBLE_ENABLED",
+        "LASTFM_NOW_PLAYING_ENABLED",
         "PIPELINE_POST_SCAN_ASYNC",
         "TASK_NOTIFICATIONS_ENABLED",
         "TASK_NOTIFICATIONS_SUCCESS",
@@ -44774,8 +46001,9 @@ def api_library_discover():
     refresh = bool(_parse_bool(request.args.get("refresh")))
     include_unmatched = _library_include_unmatched_effective()
     matched_where = _library_albums_match_where(include_unmatched, "alb")
+    user_id = _current_user_id_or_zero()
 
-    cache_key = f"library:discover:{days}:{limit}:{_library_cache_unmatched_suffix(include_unmatched)}"
+    cache_key = f"library:discover:u{user_id}:{days}:{limit}:{_library_cache_unmatched_suffix(include_unmatched)}"
     if not refresh:
         cached = _files_cache_get_json(cache_key)
         if cached is not None:
@@ -44828,6 +46056,12 @@ def api_library_discover():
             artist_name,
             short_desc,
             profile_source,
+            public_rating,
+            public_rating_votes,
+            public_rating_source,
+            heat_score,
+            heat_label,
+            user_rating,
         ) in rows:
             aid = int(album_id or 0)
             arid = int(artist_id or 0)
@@ -44875,6 +46109,12 @@ def api_library_discover():
                     "artist_name": artist_name or "",
                     "short_description": short_desc_clean or None,
                     "profile_source": (profile_source or "").strip() or None,
+                    "public_rating": float(public_rating) if public_rating is not None else None,
+                    "public_rating_votes": int(public_rating_votes or 0),
+                    "public_rating_source": (public_rating_source or "").strip() or None,
+                    "heat_score": float(heat_score) if heat_score is not None else None,
+                    "heat_label": (heat_label or "").strip() or None,
+                    "user_rating": int(user_rating or 0) if int(user_rating or 0) > 0 else None,
                 }
             )
         return albums_out
@@ -44903,17 +46143,26 @@ def api_library_discover():
                     ar.id AS artist_id,
                     ar.name AS artist_name,
                     CASE WHEN alb.strict_match_verified THEN COALESCE(pr.short_description, '') ELSE '' END AS short_description,
-                    CASE WHEN alb.strict_match_verified THEN COALESCE(pr.source, '') ELSE '' END AS profile_source
+                    CASE WHEN alb.strict_match_verified THEN COALESCE(pr.source, '') ELSE '' END AS profile_source,
+                    pr.public_rating,
+                    COALESCE(pr.public_rating_votes, 0) AS public_rating_votes,
+                    COALESCE(pr.public_rating_source, '') AS public_rating_source,
+                    pr.heat_score,
+                    COALESCE(pr.heat_label, '') AS heat_label,
+                    COALESCE(ur.rating, 0) AS user_rating
                 FROM files_albums alb
                 JOIN files_artists ar ON ar.id = alb.artist_id
                 LEFT JOIN files_album_profiles pr
                        ON pr.artist_norm = ar.name_norm
                       AND pr.title_norm = alb.title_norm
+                LEFT JOIN files_user_album_ratings ur
+                       ON ur.album_id = alb.id
+                      AND ur.user_id = %s
                 WHERE {where_all}
                 ORDER BY random()
                 LIMIT %s
                 """,
-                [*params, int(n)],
+                [int(user_id), *params, int(n)],
             )
             rows = cur.fetchall()
         albums = _album_rows_to_payload(rows)
@@ -44924,6 +46173,62 @@ def api_library_discover():
             if aid <= 0:
                 continue
             if aid in exclude_album_ids:
+                continue
+            out.append(a)
+            exclude_album_ids.add(aid)
+        return out
+
+    def _fetch_ranked_albums(where_sql: str, params: list, n: int, exclude_album_ids: set[int], *, order_sql: str) -> list[dict]:
+        if n <= 0:
+            return []
+        where_all = f"({matched_where}) AND ({where_sql})"
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT
+                    alb.id,
+                    alb.title,
+                    COALESCE(alb.year, 0) AS year,
+                    COALESCE(alb.genre, '') AS genre,
+                    COALESCE(alb.label, '') AS label,
+                    COALESCE(alb.tags_json, '[]') AS tags_json,
+                    alb.track_count,
+                    COALESCE(alb.format, '') AS format,
+                    alb.is_lossless,
+                    alb.has_cover,
+                    COALESCE(alb.cover_path, '') AS cover_path,
+                    COALESCE(alb.folder_path, '') AS folder_path,
+                    alb.mb_identified,
+                    ar.id AS artist_id,
+                    ar.name AS artist_name,
+                    CASE WHEN alb.strict_match_verified THEN COALESCE(pr.short_description, '') ELSE '' END AS short_description,
+                    CASE WHEN alb.strict_match_verified THEN COALESCE(pr.source, '') ELSE '' END AS profile_source,
+                    pr.public_rating,
+                    COALESCE(pr.public_rating_votes, 0) AS public_rating_votes,
+                    COALESCE(pr.public_rating_source, '') AS public_rating_source,
+                    pr.heat_score,
+                    COALESCE(pr.heat_label, '') AS heat_label,
+                    COALESCE(ur.rating, 0) AS user_rating
+                FROM files_albums alb
+                JOIN files_artists ar ON ar.id = alb.artist_id
+                LEFT JOIN files_album_profiles pr
+                       ON pr.artist_norm = ar.name_norm
+                      AND pr.title_norm = alb.title_norm
+                LEFT JOIN files_user_album_ratings ur
+                       ON ur.album_id = alb.id
+                      AND ur.user_id = %s
+                WHERE {where_all}
+                {order_sql}
+                LIMIT %s
+                """,
+                [int(user_id), *params, int(n)],
+            )
+            rows = cur.fetchall()
+        albums = _album_rows_to_payload(rows)
+        out: list[dict] = []
+        for a in albums:
+            aid = int(a.get("album_id") or 0)
+            if aid <= 0 or aid in exclude_album_ids:
                 continue
             out.append(a)
             exclude_album_ids.add(aid)
@@ -46237,10 +47542,11 @@ def api_library_albums():
     include_unmatched = _library_include_unmatched_effective()
     album_match_sql = _library_albums_match_where(include_unmatched, "alb")
     sort = (request.args.get("sort") or "recent").strip().lower()
+    user_id = _current_user_id_or_zero()
     limit = max(1, min(240, _parse_int_loose(request.args.get("limit"), 80)))
     offset = max(0, _parse_int_loose(request.args.get("offset"), 0))
 
-    cache_key = f"library:albums:{search_query.lower()}:{genre.lower()}:{label.lower()}:{int(year or 0)}:{sort}:{limit}:{offset}:{_library_cache_unmatched_suffix(include_unmatched)}"
+    cache_key = f"library:albums:u{user_id}:{search_query.lower()}:{genre.lower()}:{label.lower()}:{int(year or 0)}:{sort}:{limit}:{offset}:{_library_cache_unmatched_suffix(include_unmatched)}"
     cached = _files_cache_get_json(cache_key)
     if cached is not None:
         return jsonify(cached)
@@ -46302,6 +47608,12 @@ def api_library_albums():
             order_sql = "ORDER BY alb.title ASC, alb.id DESC"
         elif sort == "artist":
             order_sql = "ORDER BY ar.name ASC, COALESCE(alb.year, 0) DESC, alb.title ASC, alb.id DESC"
+        elif sort == "user_rating":
+            order_sql = "ORDER BY COALESCE(ur.rating, 0) DESC, COALESCE(pr.public_rating, 0) DESC, COALESCE(pr.heat_score, 0) DESC, alb.updated_at DESC, alb.id DESC"
+        elif sort == "public_rating":
+            order_sql = "ORDER BY COALESCE(pr.public_rating, 0) DESC, COALESCE(pr.public_rating_votes, 0) DESC, COALESCE(pr.heat_score, 0) DESC, alb.updated_at DESC, alb.id DESC"
+        elif sort == "heat":
+            order_sql = "ORDER BY COALESCE(pr.heat_score, 0) DESC, COALESCE(pr.public_rating, 0) DESC, COALESCE(pr.public_rating_votes, 0) DESC, alb.updated_at DESC, alb.id DESC"
         else:
             # recent (default): created/updated activity during index build
             order_sql = "ORDER BY alb.created_at DESC, alb.id DESC"
@@ -46337,23 +47649,32 @@ def api_library_albums():
                     ar.id AS artist_id,
                     ar.name AS artist_name,
                     CASE WHEN alb.strict_match_verified THEN COALESCE(pr.short_description, '') ELSE '' END AS short_description,
-                    CASE WHEN alb.strict_match_verified THEN COALESCE(pr.source, '') ELSE '' END AS profile_source
+                    CASE WHEN alb.strict_match_verified THEN COALESCE(pr.source, '') ELSE '' END AS profile_source,
+                    pr.public_rating,
+                    COALESCE(pr.public_rating_votes, 0) AS public_rating_votes,
+                    COALESCE(pr.public_rating_source, '') AS public_rating_source,
+                    pr.heat_score,
+                    COALESCE(pr.heat_label, '') AS heat_label,
+                    COALESCE(ur.rating, 0) AS user_rating
                 FROM files_albums alb
                 JOIN files_artists ar ON ar.id = alb.artist_id
                 LEFT JOIN files_album_profiles pr
                        ON pr.artist_norm = ar.name_norm
                       AND pr.title_norm = alb.title_norm
+                LEFT JOIN files_user_album_ratings ur
+                       ON ur.album_id = alb.id
+                      AND ur.user_id = %s
                 WHERE {" AND ".join(where_parts)}
                 {order_sql}
                 LIMIT %s OFFSET %s
                 """,
-                [*params, int(limit), int(offset)],
+                [int(user_id), *params, int(limit), int(offset)],
             )
             rows = cur.fetchall()
 
         base_url = request.url_root.rstrip("/")
         albums = []
-        for album_id, title, year, genre, label, tags_json, track_count, fmt, is_lossless, has_cover, cover_path_raw, folder_path_raw, mb_identified, artist_id, artist_name, short_desc, profile_source in rows:
+        for album_id, title, year, genre, label, tags_json, track_count, fmt, is_lossless, has_cover, cover_path_raw, folder_path_raw, mb_identified, artist_id, artist_name, short_desc, profile_source, public_rating, public_rating_votes, public_rating_source, heat_score, heat_label, user_rating in rows:
             aid = int(album_id or 0)
             arid = int(artist_id or 0)
             has_cover_effective = bool(has_cover)
@@ -46415,6 +47736,12 @@ def api_library_albums():
                     "artist_name": artist_name or "",
                     "short_description": short_desc_clean or None,
                     "profile_source": (profile_source or "").strip() or None,
+                    "public_rating": float(public_rating) if public_rating is not None else None,
+                    "public_rating_votes": int(public_rating_votes or 0),
+                    "public_rating_source": (public_rating_source or "").strip() or None,
+                    "heat_score": float(heat_score) if heat_score is not None else None,
+                    "heat_label": (heat_label or "").strip() or None,
+                    "user_rating": int(user_rating or 0) if int(user_rating or 0) > 0 else None,
                 }
             )
 
@@ -46731,6 +48058,109 @@ def api_library_likes_put():
                     (entity_type, int(entity_id), bool(liked), source),
                 )
         return jsonify({"entity_type": entity_type, "entity_id": int(entity_id), "liked": bool(liked), "updated_at": int(time.time())})
+    finally:
+        conn.close()
+
+
+@app.get("/api/library/album/<int:album_id>/rating")
+def api_library_album_rating_get(album_id: int):
+    if _get_library_mode() != "files":
+        return jsonify({"error": "Files mode required"}), 400
+    ok, err = _ensure_files_index_ready()
+    if not ok:
+        return jsonify({"error": err or "Files index unavailable"}), 503
+    uid = _current_user_id_or_zero()
+    if uid <= 0:
+        return jsonify({"error": "Authentication required"}), 401
+    album_id = int(album_id or 0)
+    if album_id <= 0:
+        return jsonify({"error": "Invalid album id"}), 400
+    conn = _files_pg_connect()
+    if conn is None:
+        return jsonify({"error": "PostgreSQL unavailable"}), 503
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT rating, EXTRACT(EPOCH FROM updated_at)::BIGINT
+                FROM files_user_album_ratings
+                WHERE user_id = %s AND album_id = %s
+                LIMIT 1
+                """,
+                (int(uid), int(album_id)),
+            )
+            row = cur.fetchone()
+        rating = int(row[0] or 0) if row else 0
+        updated_at = int(row[1] or 0) if row else 0
+        return jsonify(
+            {
+                "album_id": int(album_id),
+                "user_id": int(uid),
+                "rating": max(1, min(5, rating)) if rating > 0 else None,
+                "updated_at": updated_at or None,
+            }
+        )
+    finally:
+        conn.close()
+
+
+@app.put("/api/library/album/<int:album_id>/rating")
+def api_library_album_rating_put(album_id: int):
+    if _get_library_mode() != "files":
+        return jsonify({"error": "Files mode required"}), 400
+    ok, err = _ensure_files_index_ready()
+    if not ok:
+        return jsonify({"error": err or "Files index unavailable"}), 503
+    uid = _current_user_id_or_zero()
+    if uid <= 0:
+        return jsonify({"error": "Authentication required"}), 401
+    album_id = int(album_id or 0)
+    if album_id <= 0:
+        return jsonify({"error": "Invalid album id"}), 400
+    data = request.get_json(silent=True) or {}
+    raw_rating = data.get("rating")
+    try:
+        rating = int(raw_rating) if raw_rating is not None and str(raw_rating).strip() != "" else 0
+    except Exception:
+        return jsonify({"error": "rating must be an integer between 1 and 5, or 0 to clear"}), 400
+    source = str(data.get("source") or "ui").strip()[:64] or "ui"
+    if rating < 0 or rating > 5:
+        return jsonify({"error": "rating must be between 1 and 5, or 0 to clear"}), 400
+    conn = _files_pg_connect()
+    if conn is None:
+        return jsonify({"error": "PostgreSQL unavailable"}), 503
+    try:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM files_albums WHERE id = %s LIMIT 1", (int(album_id),))
+                if not cur.fetchone():
+                    return jsonify({"error": "Album not found"}), 404
+                if rating <= 0:
+                    cur.execute(
+                        "DELETE FROM files_user_album_ratings WHERE user_id = %s AND album_id = %s",
+                        (int(uid), int(album_id)),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        INSERT INTO files_user_album_ratings(user_id, album_id, rating, source, created_at, updated_at)
+                        VALUES (%s, %s, %s, %s, NOW(), NOW())
+                        ON CONFLICT (user_id, album_id) DO UPDATE SET
+                            rating = EXCLUDED.rating,
+                            source = EXCLUDED.source,
+                            updated_at = NOW()
+                        """,
+                        (int(uid), int(album_id), int(rating), source),
+                    )
+        _files_cache_invalidate_all()
+        return jsonify(
+            {
+                "album_id": int(album_id),
+                "user_id": int(uid),
+                "rating": int(rating) if rating > 0 else None,
+                "updated_at": int(time.time()),
+            }
+        )
     finally:
         conn.close()
 
@@ -48356,6 +49786,59 @@ def api_library_recently_played_albums():
                         }
                     )
 
+        # 6) Your highest-rated albums.
+        if user_id > 0:
+            albums = _fetch_ranked_albums(
+                "NOT (alb.id = ANY(%s)) AND COALESCE(ur.rating, 0) > 0",
+                [list(used_album_ids)],
+                limit,
+                used_album_ids,
+                order_sql="""
+                ORDER BY
+                    COALESCE(ur.rating, 0) DESC,
+                    COALESCE(pr.public_rating, 0) DESC,
+                    COALESCE(pr.heat_score, 0) DESC,
+                    alb.updated_at DESC,
+                    alb.id DESC
+                """,
+            )
+            if albums:
+                sections.append(
+                    {
+                        "key": "rated",
+                        "title": "Your favorites",
+                        "reason": "Albums you rated highest.",
+                        "seed": {"user_id": int(user_id)},
+                        "albums": albums,
+                    }
+                )
+
+        # 7) Public consensus / popularity.
+        albums = _fetch_ranked_albums(
+            "NOT (alb.id = ANY(%s)) AND (pr.public_rating IS NOT NULL OR pr.heat_score IS NOT NULL)",
+            [list(used_album_ids)],
+            limit,
+            used_album_ids,
+            order_sql="""
+            ORDER BY
+                COALESCE(pr.heat_score, 0) DESC,
+                COALESCE(pr.public_rating, 0) DESC,
+                COALESCE(pr.public_rating_votes, 0) DESC,
+                alb.updated_at DESC,
+                alb.id DESC
+            """,
+        )
+        if albums:
+            sections.append(
+                {
+                    "key": "heat",
+                    "title": "Worth hearing",
+                    "reason": "Picked from ratings, scrobbles, supporters and collection signals online.",
+                    "seed": {"kind": "heat"},
+                    "albums": albums,
+                }
+            )
+
         payload = {
             "days": int(days),
             "total": int(total),
@@ -48772,6 +50255,16 @@ def api_library_playback_event():
                     """,
                     (int(user_id), int(track_id), str(event_type), int(played_seconds)),
                 )
+        try:
+            if event_type in {"play_start", "play_complete", "play_partial", "stop"}:
+                threading.Thread(
+                    target=_lastfm_handle_playback_event_async,
+                    args=(int(track_id), str(event_type), int(played_seconds)),
+                    name=f"lastfm-playback-{track_id}",
+                    daemon=True,
+                ).start()
+        except Exception:
+            logging.debug("Failed to enqueue Last.fm playback hook", exc_info=True)
         return jsonify({"ok": True, "track_id": int(track_id), "event_type": event_type, "played_seconds": int(played_seconds)})
     finally:
         conn.close()
@@ -51124,6 +52617,33 @@ def _schedule_album_detail_enrichment(album_id: int, *, rows: list[tuple[int, in
     ).start()
 
 
+def _files_album_user_ratings_map(conn, user_id: int, album_ids: list[int]) -> dict[int, int]:
+    uid = max(0, int(user_id or 0))
+    ids = sorted({int(aid) for aid in (album_ids or []) if int(aid or 0) > 0})
+    if uid <= 0 or not ids:
+        return {}
+    out: dict[int, int] = {}
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT album_id, rating
+            FROM files_user_album_ratings
+            WHERE user_id = %s
+              AND album_id = ANY(%s)
+            """,
+            (uid, ids),
+        )
+        for album_id, rating in cur.fetchall():
+            try:
+                aid = int(album_id or 0)
+                val = max(1, min(5, int(rating or 0)))
+            except Exception:
+                continue
+            if aid > 0 and val > 0:
+                out[aid] = val
+    return out
+
+
 @app.get("/api/library/album/<int:album_id>")
 def api_library_album_detail(album_id: int):
     """Return album details + tracklist (for album page). Files mode only."""
@@ -51135,8 +52655,9 @@ def api_library_album_detail(album_id: int):
     album_id = int(album_id or 0)
     if album_id <= 0:
         return jsonify({"error": "Invalid album id"}), 400
+    user_id = _current_user_id_or_zero()
 
-    cache_key = f"library:album:v2:{album_id}"
+    cache_key = f"library:album:v4:u{user_id}:{album_id}"
     cached = _files_cache_get_json(cache_key)
     if cached is not None:
         return jsonify(cached)
@@ -51232,7 +52753,22 @@ def api_library_album_detail(album_id: int):
                     placeholders = ",".join(["%s"] * len(norm_variants))
                     cur.execute(
                         f"""
-                        SELECT description, short_description, source, updated_at, title_norm
+                        SELECT
+                            description,
+                            short_description,
+                            source,
+                            updated_at,
+                            title_norm,
+                            public_rating,
+                            COALESCE(public_rating_votes, 0),
+                            COALESCE(public_rating_source, ''),
+                            COALESCE(discogs_have_count, 0),
+                            COALESCE(discogs_want_count, 0),
+                            COALESCE(bandcamp_supporter_count, 0),
+                            COALESCE(lastfm_scrobbles, 0),
+                            COALESCE(lastfm_listeners, 0),
+                            heat_score,
+                            COALESCE(heat_label, '')
                         FROM files_album_profiles
                         WHERE artist_norm = %s
                           AND title_norm IN ({placeholders})
@@ -51249,9 +52785,38 @@ def api_library_album_detail(album_id: int):
                             "source": (prow[2] or "").strip(),
                             "updated_at": int(_dt_to_epoch(prow[3])) if prow[3] else 0,
                             "title_norm": str(prow[4] or "").strip(),
+                            "public_rating": float(prow[5]) if prow[5] is not None else None,
+                            "public_rating_votes": int(prow[6] or 0),
+                            "public_rating_source": str(prow[7] or "").strip() or None,
+                            "discogs_have_count": int(prow[8] or 0),
+                            "discogs_want_count": int(prow[9] or 0),
+                            "bandcamp_supporter_count": int(prow[10] or 0),
+                            "lastfm_scrobbles": int(prow[11] or 0),
+                            "lastfm_listeners": int(prow[12] or 0),
+                            "heat_score": float(prow[13]) if prow[13] is not None else None,
+                            "heat_label": str(prow[14] or "").strip() or None,
                         }
                 except Exception:
                     prof = {}
+            user_rating = None
+            if user_id > 0:
+                try:
+                    cur.execute(
+                        """
+                        SELECT rating
+                        FROM files_user_album_ratings
+                        WHERE user_id = %s AND album_id = %s
+                        LIMIT 1
+                        """,
+                        (int(user_id), int(album_id)),
+                    )
+                    rrow = cur.fetchone()
+                    if rrow:
+                        parsed_rating = int(rrow[0] or 0)
+                        if parsed_rating > 0:
+                            user_rating = max(1, min(5, parsed_rating))
+                except Exception:
+                    user_rating = None
 
             # Keep this endpoint low-latency:
             # do not perform network/provider/AI review lookup synchronously here.
@@ -51302,21 +52867,30 @@ def api_library_album_detail(album_id: int):
         )
 
         base_url = request.url_root.rstrip("/")
-        tracks = []
-        for r in track_rows:
+        raw_tracks: list[dict[str, Any]] = []
+        for idx, r in enumerate(track_rows, start=1):
             tid = int(r[0] or 0)
-            title = str(r[1] or "").strip()
-            disc_num = int(r[2] or 0)
-            track_num = int(r[3] or 0)
+            raw_title = str(r[1] or "").strip()
+            disc_num = int(r[2] or 0) or 1
+            track_num = int(r[3] or 0) or idx
+            file_path = str(r[10] or "").strip()
+            display = _track_display_fields_from_sources(
+                raw_title=raw_title,
+                file_path=file_path,
+                fallback_disc=disc_num,
+                fallback_track=track_num,
+            )
+            title = str(display.get("display_title") or raw_title or f"Track {idx}").strip()
+            disc_num = int(display.get("display_disc_num") or disc_num or 1)
+            track_num = int(display.get("display_track_num") or track_num or idx)
+            disc_label = str(display.get("display_disc_label") or "").strip()
             dur = int(r[4] or 0)
             t_fmt = (r[5] or "").strip()
             bitrate = int(r[6] or 0)
             sample_rate = int(r[7] or 0)
             bit_depth = int(r[8] or 0)
             size_bytes = int(r[9] or 0)
-            file_path = str(r[10] or "").strip()
 
-            # Heuristic: extract featured artists from title for nicer UI ("collab").
             feat = ""
             try:
                 m = re.search(r"\\b(?:feat\\.?|ft\\.?|featuring)\\s+([^\\)\\]\\-]+)", title, flags=re.IGNORECASE)
@@ -51325,12 +52899,13 @@ def api_library_album_detail(album_id: int):
             except Exception:
                 feat = ""
 
-            tracks.append(
+            raw_tracks.append(
                 {
                     "track_id": tid,
                     "title": title,
                     "disc_num": disc_num,
                     "track_num": track_num,
+                    "disc_label": disc_label,
                     "duration_sec": dur,
                     "format": t_fmt,
                     "bitrate": bitrate,
@@ -51342,6 +52917,16 @@ def api_library_album_detail(album_id: int):
                     "file_url": f"{base_url}/api/library/track/{tid}/stream" if tid > 0 else "",
                 }
             )
+        tracks = _display_tracks_with_provider_overlay(
+            raw_tracks,
+            artist_name=str(artist_name or ""),
+            album_title=str(album_title or ""),
+            metadata_source=str(metadata_source or ""),
+            musicbrainz_release_group_id=str(musicbrainz_release_group_id or ""),
+            discogs_release_id=str(discogs_release_id or ""),
+            lastfm_album_mbid=str(lastfm_album_mbid or ""),
+            bandcamp_album_url=str(bandcamp_album_url or ""),
+        )
 
         # Best-effort total duration (keep existing album value when present).
         try:
@@ -51395,6 +52980,21 @@ def api_library_album_detail(album_id: int):
                 "short_description": str(prof.get("short_description") or "").strip(),
                 "source": str(prof.get("source") or "").strip(),
                 "updated_at": int(prof.get("updated_at") or 0),
+            },
+            "ratings": {
+                "user_rating": int(user_rating or 0) if user_rating else None,
+                "public_rating": float(prof.get("public_rating")) if prof.get("public_rating") is not None else None,
+                "public_rating_votes": int(prof.get("public_rating_votes") or 0),
+                "public_rating_source": str(prof.get("public_rating_source") or "").strip() or None,
+                "heat_score": float(prof.get("heat_score")) if prof.get("heat_score") is not None else None,
+                "heat_label": str(prof.get("heat_label") or "").strip() or None,
+                "signals": {
+                    "discogs_have_count": int(prof.get("discogs_have_count") or 0),
+                    "discogs_want_count": int(prof.get("discogs_want_count") or 0),
+                    "bandcamp_supporter_count": int(prof.get("bandcamp_supporter_count") or 0),
+                    "lastfm_scrobbles": int(prof.get("lastfm_scrobbles") or 0),
+                    "lastfm_listeners": int(prof.get("lastfm_listeners") or 0),
+                },
             },
             "tracks": tracks,
         }
@@ -51607,7 +53207,7 @@ def api_library_files_album_cover(album_id):
 
     if cover_raw:
         cover_path = path_for_fs_access(Path(cover_raw))
-        if cover_path.exists() and cover_path.is_file() and _is_media_cache_file(cover_path, kind="album"):
+        if cover_path.exists() and cover_path.is_file():
             cached = _ensure_cached_image_for_path(cover_path, kind="album", max_px=size)
             to_send = cached or cover_path
             return _serve_image_file_cached(to_send, max_age=0, revalidate=True)
@@ -54801,6 +56401,14 @@ def _fetch_best_album_profile(
         return {}
 
     info = _fetch_lastfm_album_info(artist, album) or {}
+    try:
+        fetched = _fetch_album_provider_fallbacks_parallel(artist, album) or {}
+    except Exception:
+        fetched = {}
+    discogs_info = fetched.get("discogs") if isinstance(fetched.get("discogs"), dict) else {}
+    bandcamp_info = fetched.get("bandcamp") if isinstance(fetched.get("bandcamp"), dict) else {}
+    lastfm_info = fetched.get("lastfm") if isinstance(fetched.get("lastfm"), dict) else {}
+    metrics = _merge_album_public_metrics(info, lastfm_info, discogs_info, bandcamp_info)
     if info:
         full_desc = _strip_html_text((info.get("wiki_content") or info.get("wiki_summary") or "").strip())
         short_desc = _truncate_text(info.get("wiki_summary") or full_desc, max_chars=320)
@@ -54817,6 +56425,7 @@ def _fetch_best_album_profile(
                 "short_description": short_desc or _truncate_text(full_desc, max_chars=320),
                 "tags": toptags if isinstance(toptags, list) else [],
                 "source": "lastfm",
+                **metrics,
             }
 
     web_profile = {}
@@ -54847,8 +56456,9 @@ def _fetch_best_album_profile(
             "short_description": short_desc,
             "tags": [],
             "source": str(web_profile.get("source") or "serper").strip() or "serper",
+            **metrics,
         }
-    return {}
+    return metrics if _album_profile_has_payload(metrics) else {}
 
 
 def _build_album_provider_crosscheck(
@@ -55517,9 +57127,11 @@ def _improve_single_album(album_id: int, db_conn, known_release_group_id: Option
         and f.suffix.lower() in [".jpg", ".jpeg", ".png", ".webp"]
         for f in folder.iterdir() if f.is_file()
     )
+    existing_cover_provider = _normalize_identity_provider(str(current_tags.get(PMDA_COVER_PROVIDER_TAG) or ""))
+    allow_cover_replace = bool(has_cover and existing_cover_provider in {"", "local", "unknown"})
     cover_outcome: Optional[str] = "already_present" if has_cover else None
     artist_image_outcome: Optional[str] = None
-    if not has_cover and release_mbid:
+    if release_mbid and (not has_cover or allow_cover_replace):
         try:
             cover_url = f"http://coverartarchive.org/release-group/{release_mbid}/front"
             cover_resp = requests.get(cover_url, timeout=5, allow_redirects=True)
@@ -55616,7 +57228,8 @@ def _improve_single_album(album_id: int, db_conn, known_release_group_id: Option
 
     # Fallback: Discogs then Last.fm/Bandcamp to fill in what MusicBrainz did not provide
     has_cover_now = has_cover or cover_saved
-    if USE_DISCOGS and (not tags_updated or not has_cover_now):
+    need_verified_cover = (not has_cover_now) or allow_cover_replace
+    if USE_DISCOGS and (not tags_updated or need_verified_cover):
         try:
             discogs_info = _fetch_discogs_release(artist_name, album_title_str)
         except DiscogsRateLimited:
@@ -55656,7 +57269,7 @@ def _improve_single_album(album_id: int, db_conn, known_release_group_id: Option
                     tags_updated = True
                     files_updated = n
                     steps.append(f"Updated tags from Discogs on {n} file(s)")
-            if not has_cover_now and discogs_info.get("cover_url"):
+            if need_verified_cover and discogs_info.get("cover_url"):
                 try:
                     best_cover = _download_best_cover_image("Discogs", discogs_info.get("cover_url"))
                     if best_cover:
@@ -55672,6 +57285,7 @@ def _improve_single_album(album_id: int, db_conn, known_release_group_id: Option
                                     f.write(content)
                                 cover_saved = True
                                 has_cover_now = True
+                                need_verified_cover = False
                                 cover_outcome = "Discogs_saved"
                                 try:
                                     _files_watcher_suppress_folder(folder, seconds=120.0, reason="cover_write")
@@ -55691,6 +57305,7 @@ def _improve_single_album(album_id: int, db_conn, known_release_group_id: Option
                                 f.write(content)
                             cover_saved = True
                             has_cover_now = True
+                            need_verified_cover = False
                             try:
                                 _files_watcher_suppress_folder(folder, seconds=120.0, reason="cover_write")
                             except Exception:
@@ -55710,7 +57325,7 @@ def _improve_single_album(album_id: int, db_conn, known_release_group_id: Option
 
     # Priority cover pass: Bandcamp before Last.fm.
     # Many niche/self-released catalogs exist only on Bandcamp, so try it first for missing covers.
-    if USE_BANDCAMP and not has_cover_now:
+    if USE_BANDCAMP and need_verified_cover:
         bandcamp_cover_info = _fetch_bandcamp_album_info(artist_name, album_title_str)
         bandcamp_cover_strict_ok = False
         if bandcamp_cover_info:
@@ -55755,6 +57370,7 @@ def _improve_single_album(album_id: int, db_conn, known_release_group_id: Option
                             f.write(content)
                         cover_saved = True
                         has_cover_now = True
+                        need_verified_cover = False
                         cover_outcome = "Bandcamp_saved"
                         try:
                             _files_watcher_suppress_folder(folder, seconds=120.0, reason="cover_write")
@@ -55776,7 +57392,7 @@ def _improve_single_album(album_id: int, db_conn, known_release_group_id: Option
     # Always allow Last.fm when some required tags (e.g. genre) are still missing,
     # even if MusicBrainz already provided basic tags.
     lastfm_used_for_tags = False
-    if USE_LASTFM and ((not tags_updated or not has_cover_now) or ("genre" in missing_required)):
+    if USE_LASTFM and ((not tags_updated or need_verified_cover) or ("genre" in missing_required)):
         lastfm_info = _fetch_lastfm_album_info(artist_name, album_title_str, release_mbid)
         lastfm_strict_ok = False
         if lastfm_info:
@@ -55822,7 +57438,7 @@ def _improve_single_album(album_id: int, db_conn, known_release_group_id: Option
                     if primary_genre:
                         # Keep current_tags in sync for downstream fallback decisions (Bandcamp genre).
                         current_tags["genre"] = primary_genre
-            if not has_cover_now and lastfm_info.get("cover_url"):
+            if need_verified_cover and lastfm_info.get("cover_url"):
                 try:
                     best_cover = _download_best_cover_image("Last.fm", lastfm_info.get("cover_url"))
                     if best_cover:
@@ -55839,6 +57455,7 @@ def _improve_single_album(album_id: int, db_conn, known_release_group_id: Option
                                     f.write(content)
                                 cover_saved = True
                                 has_cover_now = True
+                                need_verified_cover = False
                                 try:
                                     _files_watcher_suppress_folder(folder, seconds=120.0, reason="cover_write")
                                 except Exception:
@@ -55857,6 +57474,7 @@ def _improve_single_album(album_id: int, db_conn, known_release_group_id: Option
                                 f.write(content)
                             cover_saved = True
                             has_cover_now = True
+                            need_verified_cover = False
                             try:
                                 _files_watcher_suppress_folder(folder, seconds=120.0, reason="cover_write")
                             except Exception:
@@ -55882,7 +57500,7 @@ def _improve_single_album(album_id: int, db_conn, known_release_group_id: Option
     # when available (Bandcamp often exposes multiple useful genre tags).
     mb_identity_used = bool(mb_release_info and artist_mbid)
     want_bandcamp_genre = bool(lastfm_used_for_tags and not mb_identity_used and ("genre" in missing_required))
-    if USE_BANDCAMP and ((not tags_updated or not has_cover_now) or genre_missing_now or want_bandcamp_genre):
+    if USE_BANDCAMP and ((not tags_updated or need_verified_cover) or genre_missing_now or want_bandcamp_genre):
         bandcamp_info = _fetch_bandcamp_album_info(artist_name, album_title_str)
         bandcamp_strict_ok = False
         if bandcamp_info:
@@ -55924,7 +57542,7 @@ def _improve_single_album(album_id: int, db_conn, known_release_group_id: Option
                     steps.append(f"Updated tags from Bandcamp on {n} file(s)")
                     if inferred_genre:
                         current_tags["genre"] = inferred_genre
-            if not has_cover_now and bandcamp_info.get("cover_url"):
+            if need_verified_cover and bandcamp_info.get("cover_url"):
                 try:
                     best_cover = _download_best_cover_image(
                         "Bandcamp",
@@ -55946,6 +57564,7 @@ def _improve_single_album(album_id: int, db_conn, known_release_group_id: Option
                                     f.write(content)
                                 cover_saved = True
                                 has_cover_now = True
+                                need_verified_cover = False
                                 try:
                                     _files_watcher_suppress_folder(folder, seconds=120.0, reason="cover_write")
                                 except Exception:
@@ -55964,6 +57583,7 @@ def _improve_single_album(album_id: int, db_conn, known_release_group_id: Option
                                 f.write(content)
                             cover_saved = True
                             has_cover_now = True
+                            need_verified_cover = False
                             try:
                                 _files_watcher_suppress_folder(folder, seconds=120.0, reason="cover_write")
                             except Exception:
@@ -55985,7 +57605,7 @@ def _improve_single_album(album_id: int, db_conn, known_release_group_id: Option
     # Web+AI+vision fallback for cover when all providers failed but cover likely exists on the web.
     # Search backend is IA-first; Serper is used as backup when available.
     if (
-        not has_cover_now
+        need_verified_cover
         and not cover_saved
         and (
             bool(_ai_web_search_available())
@@ -56027,6 +57647,7 @@ def _improve_single_album(album_id: int, db_conn, known_release_group_id: Option
                     f.write(content)
                 cover_saved = True
                 has_cover_now = True
+                need_verified_cover = False
                 cover_outcome = "Web_saved"
                 pmda_cover_provider = "web_ai"
                 log_cov("Fix-all [album_id=%s] source=Web search saved cover to %s", album_id, cover_path)
@@ -56500,7 +58121,9 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
         and f.suffix.lower() in [".jpg", ".jpeg", ".png", ".webp"]
         for f in folder_path.iterdir() if f.is_file()
     )
-    if not has_cover and release_mbid:
+    existing_cover_provider = _normalize_identity_provider(str(current_tags.get(PMDA_COVER_PROVIDER_TAG) or ""))
+    allow_cover_replace = bool(has_cover and existing_cover_provider in {"", "local", "unknown"})
+    if release_mbid and (not has_cover or allow_cover_replace):
         try:
             cover_url = f"http://coverartarchive.org/release-group/{release_mbid}/front"
             cover_resp = requests.get(cover_url, timeout=5, allow_redirects=True)
@@ -56538,7 +58161,8 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
         provider_used = "musicbrainz"
 
     has_cover_now = has_cover or cover_saved
-    if USE_DISCOGS and (not tags_updated or not has_cover_now):
+    need_verified_cover = (not has_cover_now) or allow_cover_replace
+    if USE_DISCOGS and (not tags_updated or need_verified_cover):
         try:
             discogs_info = _fetch_discogs_release(artist_name, album_title_str)
         except DiscogsRateLimited:
@@ -56577,7 +58201,7 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
                     tags_updated = True
                     files_updated = n
                     steps.append(f"Updated tags from Discogs on {n} file(s)")
-            if not has_cover_now and discogs_info.get("cover_url"):
+            if need_verified_cover and discogs_info.get("cover_url"):
                 try:
                     best_cover = _download_best_cover_image("Discogs", discogs_info.get("cover_url"))
                     if best_cover:
@@ -56594,6 +58218,7 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
                                     f.write(content)
                                 cover_saved = True
                                 has_cover_now = True
+                                need_verified_cover = False
                                 pmda_cover_provider = "discogs"
                                 try:
                                     _files_watcher_suppress_folder(folder_path, seconds=120.0, reason="cover_write")
@@ -56607,6 +58232,7 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
                                 f.write(content)
                             cover_saved = True
                             has_cover_now = True
+                            need_verified_cover = False
                             pmda_cover_provider = "discogs"
                             try:
                                 _files_watcher_suppress_folder(folder_path, seconds=120.0, reason="cover_write")
@@ -56622,7 +58248,7 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
     # Always allow Last.fm when some required tags (e.g. genre) are still missing,
     # even if MusicBrainz already provided basic tags.
     lastfm_used_for_tags = False
-    if USE_LASTFM and ((not tags_updated or not has_cover_now) or ("genre" in missing_required)):
+    if USE_LASTFM and ((not tags_updated or need_verified_cover) or ("genre" in missing_required)):
         lastfm_info = _fetch_lastfm_album_info(artist_name, album_title_str, release_mbid)
         lastfm_strict_ok = False
         if lastfm_info:
@@ -56665,7 +58291,7 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
                     lastfm_used_for_tags = True
                     if primary_genre:
                         current_tags["genre"] = primary_genre
-            if not has_cover_now and lastfm_info.get("cover_url"):
+            if need_verified_cover and lastfm_info.get("cover_url"):
                 try:
                     best_cover = _download_best_cover_image("Last.fm", lastfm_info.get("cover_url"))
                     if best_cover:
@@ -56682,6 +58308,7 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
                                     f.write(content)
                                 cover_saved = True
                                 has_cover_now = True
+                                need_verified_cover = False
                                 pmda_cover_provider = "lastfm"
                                 try:
                                     _files_watcher_suppress_folder(folder_path, seconds=120.0, reason="cover_write")
@@ -56695,6 +58322,7 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
                                 f.write(content)
                             cover_saved = True
                             has_cover_now = True
+                            need_verified_cover = False
                             pmda_cover_provider = "lastfm"
                             try:
                                 _files_watcher_suppress_folder(folder_path, seconds=120.0, reason="cover_write")
@@ -56712,7 +58340,7 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
     # when available (Bandcamp often exposes multiple useful genre tags).
     mb_identity_used = bool(mb_release_info and artist_mbid)
     want_bandcamp_genre = bool(lastfm_used_for_tags and not mb_identity_used and ("genre" in missing_required))
-    if USE_BANDCAMP and ((not tags_updated or not has_cover_now) or genre_missing_now or want_bandcamp_genre):
+    if USE_BANDCAMP and ((not tags_updated or need_verified_cover) or genre_missing_now or want_bandcamp_genre):
         bandcamp_info = _fetch_bandcamp_album_info(artist_name, album_title_str)
         bandcamp_strict_ok = False
         if bandcamp_info:
@@ -56750,7 +58378,7 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
                     steps.append(f"Updated tags from Bandcamp on {n} file(s)")
                     if inferred_genre:
                         current_tags["genre"] = inferred_genre
-            if not has_cover_now and bandcamp_info.get("cover_url"):
+            if need_verified_cover and bandcamp_info.get("cover_url"):
                 try:
                     best_cover = _download_best_cover_image(
                         "Bandcamp",
@@ -56772,6 +58400,7 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
                                     f.write(content)
                                 cover_saved = True
                                 has_cover_now = True
+                                need_verified_cover = False
                                 pmda_cover_provider = "bandcamp"
                                 try:
                                     _files_watcher_suppress_folder(folder_path, seconds=120.0, reason="cover_write")
@@ -56785,6 +58414,7 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
                                 f.write(content)
                             cover_saved = True
                             has_cover_now = True
+                            need_verified_cover = False
                             pmda_cover_provider = "bandcamp"
                             try:
                                 _files_watcher_suppress_folder(folder_path, seconds=120.0, reason="cover_write")
@@ -59858,6 +61488,309 @@ def api_scan_ai_costs(scan_id: int):
     )
     return jsonify(payload)
 
+
+def _scan_move_reason_label(reason: str | None, details: dict | None = None, move_reason: str | None = None) -> str:
+    code = str(reason or "").strip().lower()
+    details_map = details if isinstance(details, dict) else {}
+    if not code:
+        code = str(details_map.get("strict_reject_reason") or details_map.get("classification") or move_reason or "").strip().lower()
+    mapping = {
+        "track_count_mismatch": "Track count mismatch",
+        "broken_album": "Incomplete album",
+        "broken_album_missing_tracks": "Missing tracks",
+        "provider_no_tracklist": "Provider tracklist missing",
+        "track_title_mismatch": "Track titles mismatch",
+        "artist_mismatch": "Artist mismatch",
+        "album_mismatch": "Album title mismatch",
+        "strict_reject": "Strict match rejected",
+        "dedupe": "Duplicate edition",
+        "incomplete": "Incomplete album",
+    }
+    if code in mapping:
+        return mapping[code]
+    human = re.sub(r"[_\\-]+", " ", code).strip()
+    return human[:1].upper() + human[1:] if human else ("Duplicate edition" if str(move_reason or "").strip().lower() == "dedupe" else "Incomplete album")
+
+
+def _scan_move_status(restored: bool, original_path: str, moved_to_path: str) -> str:
+    if bool(restored):
+        return "restored"
+    try:
+        moved_exists = bool(moved_to_path) and path_for_fs_access(Path(moved_to_path)).exists()
+    except Exception:
+        moved_exists = False
+    if moved_exists:
+        return "moved"
+    try:
+        original_exists = bool(original_path) and path_for_fs_access(Path(original_path)).exists()
+    except Exception:
+        original_exists = False
+    if original_exists:
+        return "restored"
+    return "missing"
+
+
+def _scan_move_active_folder(*, original_path: str, moved_to_path: str, restored: bool) -> Optional[Path]:
+    candidates: list[str] = []
+    if bool(restored):
+        candidates.extend([original_path, moved_to_path])
+    else:
+        candidates.extend([moved_to_path, original_path])
+    for raw in candidates:
+        txt = str(raw or "").strip()
+        if not txt:
+            continue
+        try:
+            folder = path_for_fs_access(Path(txt))
+        except Exception:
+            continue
+        if folder.exists() and folder.is_dir():
+            return folder
+    return None
+
+
+def _scan_move_folder_artwork_url(move_id: int, *, target: str = "moved", size: int = 160) -> str:
+    try:
+        base = request.url_root.rstrip("/")
+    except Exception:
+        base = ""
+    path = f"/api/scan-move/{int(move_id)}/artwork?target={quote_plus(str(target or 'moved'))}&size={int(size)}"
+    return f"{base}{path}" if base else path
+
+
+def _scan_move_folder_artwork_response(folder: Path, *, size: int) -> Response:
+    if not folder.exists() or not folder.is_dir():
+        return _transparent_png_response(max_age=0, revalidate=True)
+    cover_path = _first_cover_path(folder)
+    if cover_path and cover_path.exists() and cover_path.is_file():
+        cached = _ensure_cached_image_for_path(cover_path, kind="album", max_px=size)
+        return _serve_image_file_cached(cached or cover_path, max_age=0, revalidate=True)
+    return _transparent_png_response(max_age=0, revalidate=True)
+
+
+def _scan_move_track_entries_from_folder(
+    folder: Path,
+    *,
+    artist_name: str,
+    album_title: str,
+    metadata_source: str = "",
+    details: dict | None = None,
+) -> list[dict[str, Any]]:
+    if not folder or not folder.exists() or not folder.is_dir():
+        return []
+    ordered_paths = _files_collect_ordered_audio_paths(folder, [])
+    if not ordered_paths:
+        return []
+    first_tags: dict[str, Any] = {}
+    track_objs: list[dict[str, Any]] = []
+    for index, audio_path in enumerate(ordered_paths, start=1):
+        try:
+            tags = dict(extract_tags(audio_path) or {})
+        except Exception:
+            tags = {}
+        if index == 1:
+            first_tags = dict(tags)
+        raw_dur = tags.get("duration") or tags.get("length") or tags.get("dur") or 0
+        try:
+            dur_ms = int(float(raw_dur) * 1000.0) if float(raw_dur or 0) < 5000 else int(float(raw_dur or 0))
+        except Exception:
+            dur_ms = 0
+        track_objs.append(
+            {
+                "title": str(tags.get("title") or tags.get("tit2") or tags.get("track_title") or "").strip(),
+                "idx": _parse_int_loose(tags.get("track") or tags.get("tracknumber") or tags.get("trck"), index) or index,
+                "disc": _parse_int_loose(tags.get("disc") or tags.get("discnumber") or tags.get("disc_num") or tags.get("tpas"), 1) or 1,
+                "dur": dur_ms,
+            }
+        )
+    item = {
+        "artist": artist_name,
+        "title_raw": album_title,
+        "album_title": album_title,
+        "tracks": track_objs,
+        "meta": first_tags,
+        "musicbrainz_id": str(first_tags.get("musicbrainz_releasegroupid") or first_tags.get("musicbrainz_releaseid") or "").strip(),
+        "discogs_release_id": str(first_tags.get("discogs_release_id") or "").strip(),
+        "lastfm_album_mbid": str(first_tags.get("lastfm_album_mbid") or "").strip(),
+        "bandcamp_album_url": str(first_tags.get("bandcamp_album_url") or "").strip(),
+        "strict_match_provider": str((details or {}).get("strict_match_provider") or metadata_source or first_tags.get(PMDA_MATCH_PROVIDER_TAG) or "").strip(),
+        "primary_metadata_source": str(metadata_source or (details or {}).get("strict_match_provider") or first_tags.get(PMDA_MATCH_PROVIDER_TAG) or "").strip(),
+        "metadata_source": str(metadata_source or "").strip(),
+        "br": 0,
+        "sr": 0,
+        "bd": 0,
+    }
+    tracks = _files_build_track_entries_from_item(item, folder)
+    max_disc = max((int(t.get("disc_num") or 1) for t in tracks), default=1)
+    for t in tracks:
+        if not str(t.get("disc_label") or "").strip():
+            t["disc_label"] = f"Disc {int(t.get('disc_num') or 1)}" if max_disc > 1 else ""
+    return tracks
+
+
+def _scan_move_expected_tracks(
+    *,
+    folder: Path | None,
+    artist_name: str,
+    album_title: str,
+    metadata_source: str,
+    details: dict | None = None,
+) -> list[dict[str, Any]]:
+    details_map = details if isinstance(details, dict) else {}
+    first_tags: dict[str, Any] = {}
+    if folder and folder.exists() and folder.is_dir():
+        ordered_paths = _files_collect_ordered_audio_paths(folder, [])
+        if ordered_paths:
+            try:
+                first_tags = dict(extract_tags(ordered_paths[0]) or {})
+            except Exception:
+                first_tags = {}
+    titles = _provider_track_titles_cached(
+        artist_name=artist_name,
+        album_title=album_title,
+        metadata_source=str(metadata_source or details_map.get("strict_match_provider") or first_tags.get(PMDA_MATCH_PROVIDER_TAG) or ""),
+        musicbrainz_release_group_id=str(first_tags.get("musicbrainz_releasegroupid") or first_tags.get("musicbrainz_releaseid") or "").strip(),
+        discogs_release_id=str(first_tags.get("discogs_release_id") or "").strip(),
+        lastfm_album_mbid=str(first_tags.get("lastfm_album_mbid") or "").strip(),
+        bandcamp_album_url=str(first_tags.get("bandcamp_album_url") or "").strip(),
+        edition_payload={"meta": first_tags},
+    )
+    return [
+        {
+            "index": index,
+            "title": str(title or "").strip() or f"Track {index}",
+        }
+        for index, title in enumerate(titles, start=1)
+    ]
+
+
+def _scan_move_detail_payload(move_id: int) -> Optional[dict[str, Any]]:
+    import sqlite3
+
+    con = sqlite3.connect(str(STATE_DB_FILE))
+    con.row_factory = sqlite3.Row
+    try:
+        cur = con.cursor()
+        cur.execute(
+            """
+            SELECT move_id, scan_id, artist, album_id, original_path, moved_to_path, size_mb, moved_at, restored,
+                   COALESCE(album_title, '') AS album_title,
+                   COALESCE(fmt_text, '') AS fmt_text,
+                   COALESCE(move_reason, 'dedupe') AS move_reason,
+                   winner_album_id,
+                   COALESCE(winner_title, '') AS winner_title,
+                   COALESCE(winner_path, '') AS winner_path,
+                   COALESCE(decision_source, '') AS decision_source,
+                   COALESCE(decision_provider, '') AS decision_provider,
+                   COALESCE(decision_reason, '') AS decision_reason,
+                   decision_confidence,
+                   COALESCE(details_json, '{}') AS details_json
+            FROM scan_moves
+            WHERE move_id = ?
+            LIMIT 1
+            """,
+            (int(move_id),),
+        )
+        row = cur.fetchone()
+    finally:
+        con.close()
+    if not row:
+        return None
+    try:
+        details = json.loads(str(row["details_json"] or "{}"))
+        if not isinstance(details, dict):
+            details = {}
+    except Exception:
+        details = {}
+
+    move_reason = str(row["move_reason"] or "dedupe").strip().lower() or "dedupe"
+    status = _scan_move_status(bool(row["restored"]), str(row["original_path"] or ""), str(row["moved_to_path"] or ""))
+    reason_label = _scan_move_reason_label(str(row["decision_reason"] or ""), details, move_reason)
+    moved_folder = _scan_move_active_folder(
+        original_path=str(row["original_path"] or ""),
+        moved_to_path=str(row["moved_to_path"] or ""),
+        restored=bool(row["restored"]),
+    )
+    winner_folder = None
+    winner_path_raw = str(row["winner_path"] or "").strip()
+    if winner_path_raw:
+        try:
+            candidate = path_for_fs_access(Path(winner_path_raw))
+            if candidate.exists() and candidate.is_dir():
+                winner_folder = candidate
+        except Exception:
+            winner_folder = None
+
+    moved_tracks = _scan_move_track_entries_from_folder(
+        moved_folder,
+        artist_name=str(row["artist"] or ""),
+        album_title=str(row["album_title"] or ""),
+        metadata_source=str(row["decision_provider"] or ""),
+        details=details,
+    ) if moved_folder else []
+    winner_details = details.get("winner") if isinstance(details.get("winner"), dict) else {}
+    winner_tracks = _scan_move_track_entries_from_folder(
+        winner_folder,
+        artist_name=str(row["artist"] or ""),
+        album_title=str(row["winner_title"] or row["album_title"] or ""),
+        metadata_source=str((winner_details or {}).get("strict_match_provider") or row["decision_provider"] or ""),
+        details=(winner_details or {}),
+    ) if winner_folder else []
+
+    payload: dict[str, Any] = {
+        "move_id": int(row["move_id"] or 0),
+        "scan_id": int(row["scan_id"] or 0),
+        "artist": str(row["artist"] or ""),
+        "album_id": int(row["album_id"] or 0),
+        "album_title": str(row["album_title"] or ""),
+        "move_reason": move_reason,
+        "reason_label": reason_label,
+        "status": status,
+        "moved_at": float(row["moved_at"] or 0),
+        "decision_source": str(row["decision_source"] or ""),
+        "decision_provider": str(row["decision_provider"] or ""),
+        "decision_reason": str(row["decision_reason"] or ""),
+        "decision_confidence": float(row["decision_confidence"]) if row["decision_confidence"] is not None else None,
+        "details": details,
+        "moved": {
+            "path": str(moved_folder or row["moved_to_path"] or row["original_path"] or ""),
+            "thumb_url": _scan_move_folder_artwork_url(int(row["move_id"] or 0), target="moved", size=256),
+            "tracks": moved_tracks,
+            "track_count": len(moved_tracks),
+            "fmt_text": str(row["fmt_text"] or ""),
+        },
+    }
+    if move_reason == "dedupe":
+        analysis = details.get("analysis") if isinstance(details.get("analysis"), dict) else {}
+        payload["winner"] = {
+            "album_id": int(row["winner_album_id"]) if row["winner_album_id"] is not None else None,
+            "album_title": str(row["winner_title"] or ""),
+            "path": str(winner_folder or row["winner_path"] or ""),
+            "thumb_url": _scan_move_folder_artwork_url(int(row["move_id"] or 0), target="winner", size=256) if winner_folder else None,
+            "tracks": winner_tracks,
+            "track_count": len(winner_tracks),
+            "analysis": analysis,
+        }
+    else:
+        payload["incomplete"] = {
+            "expected_track_count": int(details.get("expected_track_count") or 0),
+            "actual_track_count": int(details.get("actual_track_count") or 0),
+            "missing_indices": list(details.get("missing_indices") or []),
+            "missing_required_tags": list(details.get("missing_required_tags") or []),
+            "strict_match_provider": str(details.get("strict_match_provider") or ""),
+            "strict_reject_reason": str(details.get("strict_reject_reason") or ""),
+            "strict_tracklist_score": float(details.get("strict_tracklist_score") or 0.0),
+            "expected_tracks": _scan_move_expected_tracks(
+                folder=moved_folder,
+                artist_name=str(row["artist"] or ""),
+                album_title=str(row["album_title"] or ""),
+                metadata_source=str(row["decision_provider"] or ""),
+                details=details,
+            ),
+        }
+    return payload
+
+
 @app.get("/api/scan-history/<int:scan_id>/moves")
 def api_scan_history_moves(scan_id):
     """Return all moves for a specific scan (with review metadata when available)."""
@@ -59958,6 +61891,14 @@ def api_scan_history_moves(scan_id):
             except Exception:
                 details_obj = {}
         m["details"] = details_obj
+        m["status"] = _scan_move_status(m["restored"], m["original_path"], m["moved_to_path"])
+        m["reason_label"] = _scan_move_reason_label(m.get("decision_reason"), details_obj, m.get("move_reason"))
+        m["thumb_url"] = _scan_move_folder_artwork_url(int(m["move_id"]), target="moved", size=128)
+        m["winner_thumb_url"] = (
+            _scan_move_folder_artwork_url(int(m["move_id"]), target="winner", size=128)
+            if str(m.get("winner_path") or "").strip()
+            else None
+        )
         moves.append(m)
 
     return jsonify(moves)
@@ -60029,6 +61970,35 @@ def api_scan_history_moves_summary(scan_id: int):
             "by_reason": by_reason,
         }
     )
+
+
+@app.get("/api/scan-move/<int:move_id>/artwork")
+def api_scan_move_artwork(move_id: int):
+    size = max(64, min(1024, _parse_int_loose(request.args.get("size"), 320)))
+    target = str(request.args.get("target") or "moved").strip().lower() or "moved"
+    detail = _scan_move_detail_payload(int(move_id))
+    if not isinstance(detail, dict):
+        return _transparent_png_response(max_age=0, revalidate=True)
+    if target == "winner":
+        payload = detail.get("winner") if isinstance(detail.get("winner"), dict) else {}
+    else:
+        payload = detail.get("moved") if isinstance(detail.get("moved"), dict) else {}
+    folder_raw = str((payload or {}).get("path") or "").strip()
+    if not folder_raw:
+        return _transparent_png_response(max_age=0, revalidate=True)
+    try:
+        folder = path_for_fs_access(Path(folder_raw))
+    except Exception:
+        return _transparent_png_response(max_age=0, revalidate=True)
+    return _scan_move_folder_artwork_response(folder, size=size)
+
+
+@app.get("/api/scan-move/<int:move_id>/detail")
+def api_scan_move_detail(move_id: int):
+    payload = _scan_move_detail_payload(int(move_id))
+    if not isinstance(payload, dict):
+        return jsonify({"error": "Move not found"}), 404
+    return jsonify(payload)
 
 @app.post("/api/scan-history/<int:scan_id>/restore")
 def api_scan_history_restore(scan_id):
@@ -60694,13 +62664,17 @@ def dedupe_selected():
 @app.get("/api/assistant/status")
 def api_assistant_status():
     """Lightweight health/status endpoint for the in-UI assistant."""
+    postgres_ready = False
+    if _get_library_mode() == "files":
+        postgres_ready = bool(_files_pg_init_schema())
     payload = {
         "library_mode": _get_library_mode(),
         "ai_provider": getattr(sys.modules[__name__], "AI_PROVIDER", "openai"),
         "ai_model": getattr(sys.modules[__name__], "RESOLVED_MODEL", None) or getattr(sys.modules[__name__], "OPENAI_MODEL", ""),
         "ai_ready": bool(getattr(sys.modules[__name__], "ai_provider_ready", False)),
         "ai_error": getattr(sys.modules[__name__], "AI_FUNCTIONAL_ERROR_MSG", None) if not bool(getattr(sys.modules[__name__], "ai_provider_ready", False)) else None,
-        "postgres_ready": False,
+        "postgres_ready": postgres_ready,
+        "db_tools_ready": postgres_ready and _get_library_mode() == "files",
         "pg_host": PMDA_PG_HOST,
         "pg_port": PMDA_PG_PORT,
         "pg_db": PMDA_PG_DB,
@@ -60708,8 +62682,6 @@ def api_assistant_status():
         "config_dir": str(CONFIG_DIR),
         "config_sources": {k: ENV_SOURCES.get(k, "") for k in ("AI_PROVIDER", "OPENAI_API_KEY", "OPENAI_MODEL", "FILES_ROOTS", "LIBRARY_MODE")},
     }
-    if _get_library_mode() == "files":
-        payload["postgres_ready"] = bool(_files_pg_init_schema())
     return jsonify(payload)
 
 
@@ -60770,9 +62742,6 @@ def api_assistant_chat():
     """Chat endpoint: uses Postgres-backed RAG (artist profiles + local library snapshot)."""
     if _get_library_mode() != "files":
         return jsonify({"error": "Assistant is available in Files mode only"}), 400
-    if not bool(getattr(sys.modules[__name__], "ai_provider_ready", False)):
-        msg = getattr(sys.modules[__name__], "AI_FUNCTIONAL_ERROR_MSG", None) or "AI is not configured"
-        return jsonify({"error": msg}), 503
     data = request.get_json() or {}
     if not isinstance(data, dict):
         return jsonify({"error": "Invalid JSON body"}), 400
@@ -60870,6 +62839,11 @@ def api_assistant_chat():
                     "citations": citations,
                 }
             )
+
+        ai_ready = bool(getattr(sys.modules[__name__], "ai_provider_ready", False))
+        ai_error = getattr(sys.modules[__name__], "AI_FUNCTIONAL_ERROR_MSG", None) or "AI is not configured"
+        if not ai_ready:
+            return jsonify({"error": ai_error, "db_tools_only": True}), 503
 
         # Slow path: LLM-assisted SQL query over the library DB (read-only).
         try:

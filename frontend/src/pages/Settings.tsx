@@ -261,6 +261,8 @@ function SettingsPage() {
   const [openaiModels, setOpenaiModels] = useState<string[]>([]);
   const [openaiModelsError, setOpenaiModelsError] = useState<string | null>(null);
   const [openaiCodexStatus, setOpenaiCodexStatus] = useState<api.OpenAICodexOAuthStatusResponse | null>(null);
+  const [lastfmAuthStatus, setLastfmAuthStatus] = useState<api.LastfmAuthStatusResponse | null>(null);
+  const [lastfmAuthBusy, setLastfmAuthBusy] = useState(false);
   const [providerPreferences, setProviderPreferences] = useState<api.AIProviderPreferencesResponse | null>(null);
   const [providerPreferencesBusy, setProviderPreferencesBusy] = useState(false);
   const [rebuildIndexLoading, setRebuildIndexLoading] = useState(false);
@@ -392,18 +394,30 @@ function SettingsPage() {
     }
   }, []);
 
+  const refreshLastfmAuthStatus = useCallback(async () => {
+    try {
+      const status = await api.getLastfmAuthStatus();
+      setLastfmAuthStatus(status);
+      return status;
+    } catch {
+      return null;
+    }
+  }, []);
+
   const loadOptionalProviderState = useCallback(async () => {
     try {
-      const [codexStatus, prefs] = await Promise.all([
+      const [codexStatus, lastfmStatus, prefs] = await Promise.all([
         refreshOpenAICodexStatus(false),
+        refreshLastfmAuthStatus(),
         api.getAIProviderPreferences().catch(() => null),
       ]);
       if (codexStatus) setOpenaiCodexStatus(codexStatus);
+      if (lastfmStatus) setLastfmAuthStatus(lastfmStatus);
       if (prefs) setProviderPreferences(prefs);
     } catch {
       // Keep Settings responsive even if optional provider checks fail.
     }
-  }, [refreshOpenAICodexStatus]);
+  }, [refreshLastfmAuthStatus, refreshOpenAICodexStatus]);
 
   const loadConfig = async () => {
     setIsLoading(true);
@@ -461,6 +475,55 @@ function SettingsPage() {
       setOpenaiOAuthBusy(false);
     }
   }, [loadConfig]);
+
+  const startLastfmScrobbleAuth = useCallback(async () => {
+    setLastfmAuthBusy(true);
+    try {
+      const result = await api.startLastfmAuth();
+      if (!result.ok || !result.auth_url) {
+        throw new Error('Failed to start Last.fm authorization');
+      }
+      window.open(result.auth_url, '_blank', 'noopener,noreferrer');
+      toast.success('Last.fm authorization opened in a new tab');
+      await refreshLastfmAuthStatus();
+    } catch (e) {
+      toast.error(getApiErrorMessage(e) || (e instanceof Error ? e.message : 'Failed to start Last.fm authorization'));
+    } finally {
+      setLastfmAuthBusy(false);
+    }
+  }, [getApiErrorMessage, refreshLastfmAuthStatus]);
+
+  const completeLastfmScrobbleAuth = useCallback(async () => {
+    setLastfmAuthBusy(true);
+    try {
+      const result = await api.completeLastfmAuth();
+      if (!result.ok || !result.connected) {
+        throw new Error(result.message || 'Last.fm authorization is not complete yet');
+      }
+      toast.success(result.message || `Last.fm connected${result.session_name ? ` as ${result.session_name}` : ''}`);
+      await refreshLastfmAuthStatus();
+    } catch (e) {
+      toast.error(getApiErrorMessage(e) || (e instanceof Error ? e.message : 'Failed to complete Last.fm authorization'));
+    } finally {
+      setLastfmAuthBusy(false);
+    }
+  }, [getApiErrorMessage, refreshLastfmAuthStatus]);
+
+  const disconnectLastfmScrobbleAuth = useCallback(async () => {
+    setLastfmAuthBusy(true);
+    try {
+      const result = await api.disconnectLastfmAuth();
+      if (!result.ok) {
+        throw new Error(result.message || 'Failed to disconnect Last.fm');
+      }
+      toast.success(result.message || 'Last.fm disconnected');
+      await refreshLastfmAuthStatus();
+    } catch (e) {
+      toast.error(getApiErrorMessage(e) || (e instanceof Error ? e.message : 'Failed to disconnect Last.fm'));
+    } finally {
+      setLastfmAuthBusy(false);
+    }
+  }, [getApiErrorMessage, refreshLastfmAuthStatus]);
 
   const pollOpenAIOAuth = useCallback(async () => {
     if (!openaiOAuth?.sessionId || openaiOAuthBusy) return;
@@ -833,63 +896,110 @@ function SettingsPage() {
                   Configure scan roots, incoming/library roles, cache folders, and export destinations in one place.
                 </CardDescription>
               </CardHeader>
-              <CardContent className="space-y-4">
-                <div className="space-y-2 rounded-lg border border-border p-3">
-                  <div className="flex items-center justify-between gap-3">
-                    <div className="space-y-1">
-                      <Label>Library index</Label>
-                      <p className="text-xs text-muted-foreground">
-                        Rebuild indexed files from currently enabled source roots.
-                      </p>
+              <CardContent className="space-y-5">
+                <div className="rounded-xl border border-cyan-500/20 bg-cyan-500/[0.05] p-4 md:p-5 space-y-3">
+                  <div className="space-y-1">
+                    <div className="flex items-center gap-2">
+                      <span className="inline-flex h-7 w-7 items-center justify-center rounded-full bg-cyan-500/15 text-cyan-200 text-xs font-semibold">1</span>
+                      <Label className="text-sm">What are your music source folders?</Label>
                     </div>
-                    <AlertDialog>
-                      <AlertDialogTrigger asChild>
-                        <Button
-                          type="button"
-                          variant="outline"
-                          size="sm"
-                          className="gap-2 shrink-0"
-                          disabled={filesRoots.length === 0 || rebuildIndexLoading}
-                        >
-                          {rebuildIndexLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
-                          Rebuild index
-                        </Button>
-                      </AlertDialogTrigger>
-                      <AlertDialogContent className="max-w-lg">
-                        <AlertDialogHeader>
-                          <AlertDialogTitle>Rebuild library index from scratch?</AlertDialogTitle>
-                          <AlertDialogDescription>
-                            This clears files-library rows and rebuilds from the enabled source roots below.
-                          </AlertDialogDescription>
-                        </AlertDialogHeader>
-                        <div className="rounded-md border border-border bg-muted/30 p-3 text-xs text-muted-foreground space-y-1">
-                          <p className="font-medium text-foreground">Current roots</p>
-                          {filesRoots.map((rootPath) => (
-                            <p key={`rebuild-${rootPath}`} className="font-mono truncate" title={rootPath}>{rootPath}</p>
-                          ))}
-                        </div>
-                        <AlertDialogFooter>
-                          <AlertDialogCancel disabled={rebuildIndexLoading}>Cancel</AlertDialogCancel>
-                          <AlertDialogAction onClick={handleRebuildFilesIndex} disabled={rebuildIndexLoading}>
-                            {rebuildIndexLoading ? (
-                              <span className="inline-flex items-center gap-2">
-                                <Loader2 className="w-4 h-4 animate-spin" />
-                                Rebuilding...
-                              </span>
-                            ) : (
-                              'Yes, rebuild from scratch'
-                            )}
-                          </AlertDialogAction>
-                        </AlertDialogFooter>
-                      </AlertDialogContent>
-                    </AlertDialog>
+                    <p className="text-xs text-muted-foreground">
+                      Start here. Add every folder PMDA is allowed to scan. You can add one folder or many.
+                    </p>
+                  </div>
+                  <SourcesAutonomySettings />
+                </div>
+
+                <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
+                  <div className="rounded-xl border border-orange-500/20 bg-orange-500/[0.04] p-4 md:p-5 space-y-2">
+                    <div className="flex items-center gap-2">
+                      <span className="inline-flex h-7 w-7 items-center justify-center rounded-full bg-orange-500/15 text-orange-200 text-xs font-semibold">4</span>
+                      <Label className="text-sm">Where should duplicates go?</Label>
+                    </div>
+                    <p className="text-xs text-muted-foreground">
+                      When PMDA decides an album is a duplicate loser, it moves it here so you can review and restore it later if needed.
+                    </p>
+                    <FolderBrowserInput
+                      value={config.DUPE_ROOT ?? '/dupes'}
+                      onChange={(path) => updateConfig({ DUPE_ROOT: path || '/dupes' })}
+                      placeholder="/dupes"
+                      selectLabel="Select duplicates destination folder"
+                    />
+                  </div>
+
+                  <div className="rounded-xl border border-amber-500/20 bg-amber-500/[0.04] p-4 md:p-5 space-y-2">
+                    <div className="flex items-center gap-2">
+                      <span className="inline-flex h-7 w-7 items-center justify-center rounded-full bg-amber-500/15 text-amber-200 text-xs font-semibold">5</span>
+                      <Label className="text-sm">Where should incomplete albums go?</Label>
+                    </div>
+                    <p className="text-xs text-muted-foreground">
+                      If PMDA detects missing tracks, it quarantines the album here instead of mixing it into your clean library.
+                    </p>
+                    <FolderBrowserInput
+                      value={config.INCOMPLETE_ALBUMS_TARGET_DIR ?? '/dupes/incomplete_albums'}
+                      onChange={(path) => updateConfig({ INCOMPLETE_ALBUMS_TARGET_DIR: path || '/dupes/incomplete_albums' })}
+                      placeholder="/dupes/incomplete_albums"
+                      selectLabel="Select incomplete albums destination folder"
+                    />
                   </div>
                 </div>
-                <div className="space-y-2">
-                  <Label>Media cache folder</Label>
-                  <p className="text-xs text-muted-foreground">
-                    NVMe cache for instant artist/album artwork rendering (thumbnails pre-generated by PMDA).
-                  </p>
+
+                <div className="rounded-xl border border-emerald-500/20 bg-emerald-500/[0.04] p-4 md:p-5 space-y-4">
+                  <div className="space-y-1">
+                    <div className="flex items-center gap-2">
+                      <span className="inline-flex h-7 w-7 items-center justify-center rounded-full bg-emerald-500/15 text-emerald-200 text-xs font-semibold">6</span>
+                      <Label className="text-sm">Where should PMDA build the clean exported library?</Label>
+                    </div>
+                    <p className="text-xs text-muted-foreground">
+                      This folder is the clean library PMDA generates automatically. It is required because PMDA keeps your processed output predictable and ready for players.
+                    </p>
+                    <p className="text-[11px] text-muted-foreground">
+                      If the folder does not exist yet, PMDA will create it when the export pipeline runs.
+                    </p>
+                  </div>
+                  <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,1fr),320px] gap-3 items-start">
+                    <FolderBrowserInput
+                      value={config.EXPORT_ROOT ?? '/music/library'}
+                      onChange={(path) => updateConfig({ EXPORT_ROOT: path || '/music/library' })}
+                      placeholder="/music/library"
+                      selectLabel="Select library export destination folder"
+                    />
+                    <div className="space-y-2">
+                      <Label>Export method</Label>
+                      <Select
+                        value={(config.EXPORT_LINK_STRATEGY as 'hardlink' | 'symlink' | 'copy' | 'move' | undefined) ?? 'hardlink'}
+                        onValueChange={(value: 'hardlink' | 'symlink' | 'copy' | 'move') => updateConfig({ EXPORT_LINK_STRATEGY: value })}
+                      >
+                        <SelectTrigger className="w-full">
+                          <SelectValue placeholder="Select strategy" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="hardlink">Hardlink: fastest, no extra space</SelectItem>
+                          <SelectItem value="symlink">Symlink: references original files</SelectItem>
+                          <SelectItem value="copy">Copy: safest but duplicates files</SelectItem>
+                          <SelectItem value="move">Move: relocates files physically</SelectItem>
+                        </SelectContent>
+                      </Select>
+                      <p className="text-[11px] text-muted-foreground">
+                        Recommended for most users: <span className="text-foreground">Hardlink</span>.
+                      </p>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="rounded-xl border border-violet-500/20 bg-violet-500/[0.04] p-4 md:p-5 space-y-3">
+                  <div className="space-y-1">
+                    <div className="flex items-center gap-2">
+                      <span className="inline-flex h-7 w-7 items-center justify-center rounded-full bg-violet-500/15 text-violet-200 text-xs font-semibold">7</span>
+                      <Label className="text-sm">Where should PMDA keep its artwork cache?</Label>
+                    </div>
+                    <p className="text-xs text-muted-foreground">
+                      Use an <span className="text-foreground">NVMe or SSD</span> folder here. PMDA pre-generates and serves artwork thumbnails from this location for fast browsing.
+                    </p>
+                    <p className="text-[11px] text-muted-foreground">
+                      Do <span className="text-foreground">not</span> use a mechanical HDD unless you accept slower artwork rendering and higher latency.
+                    </p>
+                  </div>
                   <FolderBrowserInput
                     value={config.MEDIA_CACHE_ROOT ?? '/config/media_cache'}
                     onChange={(path) => updateConfig({ MEDIA_CACHE_ROOT: path || '/config/media_cache' })}
@@ -1009,73 +1119,74 @@ function SettingsPage() {
                     </div>
                   </Collapsible>
                 </div>
-                <div className="space-y-1">
-                  <Label>Incomplete albums folder</Label>
-                  <p className="text-xs text-muted-foreground">
-                    Destination used by the incomplete step. Default is <span className="font-mono">/dupes/incomplete_albums</span>.
-                  </p>
-                  <FolderBrowserInput
-                    value={config.INCOMPLETE_ALBUMS_TARGET_DIR ?? '/dupes/incomplete_albums'}
-                    onChange={(path) => updateConfig({ INCOMPLETE_ALBUMS_TARGET_DIR: path || '/dupes/incomplete_albums' })}
-                    placeholder="/dupes/incomplete_albums"
-                    selectLabel="Select incomplete albums destination folder"
-                  />
-                </div>
-                <div className="space-y-1">
-                  <Label>Duplicates folder</Label>
-                  <p className="text-xs text-muted-foreground">
-                    Destination used by the dedupe step. Default is <span className="font-mono">/dupes</span>, but you can choose another writable folder.
-                  </p>
-                  <FolderBrowserInput
-                    value={config.DUPE_ROOT ?? '/dupes'}
-                    onChange={(path) => updateConfig({ DUPE_ROOT: path || '/dupes' })}
-                    placeholder="/dupes"
-                    selectLabel="Select duplicates destination folder"
-                  />
-                </div>
-                <Separator />
-                <div className="space-y-2">
-                  <Label>Library export folder</Label>
-                  <p className="text-xs text-muted-foreground">
-                    Destination used by the export step when enabled.
-                  </p>
-                  <FolderBrowserInput
-                    value={config.EXPORT_ROOT ?? '/music/library'}
-                    onChange={(path) => updateConfig({ EXPORT_ROOT: path || '/music/library' })}
-                    placeholder="/music/library"
-                    selectLabel="Select library export destination folder"
-                  />
-                </div>
-                <div className="space-y-2">
-                  <Label>Export strategy</Label>
-                  <p className="text-xs text-muted-foreground">
-                    Choose how PMDA writes files to the export library folder.
-                  </p>
-                  <Select
-                    value={(config.EXPORT_LINK_STRATEGY as 'hardlink' | 'symlink' | 'copy' | 'move' | undefined) ?? 'hardlink'}
-                    onValueChange={(value: 'hardlink' | 'symlink' | 'copy' | 'move') => updateConfig({ EXPORT_LINK_STRATEGY: value })}
-                  >
-                    <SelectTrigger className="w-full md:w-[320px]">
-                      <SelectValue placeholder="Select strategy" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="hardlink">Hardlink (fast, no extra space)</SelectItem>
-                      <SelectItem value="symlink">Symlink (keeps original files)</SelectItem>
-                      <SelectItem value="copy">Copy (duplicates files)</SelectItem>
-                      <SelectItem value="move">Move (relocate files)</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </div>
-                <Separator />
-                <div className="space-y-3">
-                  <div className="space-y-1">
-                    <Label>Source folders (Library / Incoming)</Label>
-                    <p className="text-xs text-muted-foreground">
-                      Add all scan roots here, set each one as Library or Incoming, and pick the primary Library destination.
-                    </p>
+
+                <Collapsible>
+                  <div className="rounded-xl border border-border/70 bg-muted/20">
+                    <CollapsibleTrigger asChild>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        className="w-full justify-between rounded-none px-4 py-3 text-left"
+                      >
+                        <span className="text-sm font-medium">Folder maintenance</span>
+                        <ChevronDown className="w-4 h-4" />
+                      </Button>
+                    </CollapsibleTrigger>
+                    <CollapsibleContent>
+                      <div className="border-t border-border/60 p-4">
+                        <div className="flex items-center justify-between gap-3">
+                          <div className="space-y-1">
+                            <Label>Library index</Label>
+                            <p className="text-xs text-muted-foreground">
+                              Rebuild indexed files from the currently enabled source folders.
+                            </p>
+                          </div>
+                          <AlertDialog>
+                            <AlertDialogTrigger asChild>
+                              <Button
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                className="gap-2 shrink-0"
+                                disabled={filesRoots.length === 0 || rebuildIndexLoading}
+                              >
+                                {rebuildIndexLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
+                                Rebuild index
+                              </Button>
+                            </AlertDialogTrigger>
+                            <AlertDialogContent className="max-w-lg">
+                              <AlertDialogHeader>
+                                <AlertDialogTitle>Rebuild library index from scratch?</AlertDialogTitle>
+                                <AlertDialogDescription>
+                                  This clears files-library rows and rebuilds from the enabled source roots below.
+                                </AlertDialogDescription>
+                              </AlertDialogHeader>
+                              <div className="rounded-md border border-border bg-muted/30 p-3 text-xs text-muted-foreground space-y-1">
+                                <p className="font-medium text-foreground">Current roots</p>
+                                {filesRoots.map((rootPath) => (
+                                  <p key={`rebuild-${rootPath}`} className="font-mono truncate" title={rootPath}>{rootPath}</p>
+                                ))}
+                              </div>
+                              <AlertDialogFooter>
+                                <AlertDialogCancel disabled={rebuildIndexLoading}>Cancel</AlertDialogCancel>
+                                <AlertDialogAction onClick={handleRebuildFilesIndex} disabled={rebuildIndexLoading}>
+                                  {rebuildIndexLoading ? (
+                                    <span className="inline-flex items-center gap-2">
+                                      <Loader2 className="w-4 h-4 animate-spin" />
+                                      Rebuilding...
+                                    </span>
+                                  ) : (
+                                    'Yes, rebuild from scratch'
+                                  )}
+                                </AlertDialogAction>
+                              </AlertDialogFooter>
+                            </AlertDialogContent>
+                          </AlertDialog>
+                        </div>
+                      </div>
+                    </CollapsibleContent>
                   </div>
-                  <SourcesAutonomySettings />
-                </div>
+                </Collapsible>
               </CardContent>
             </Card>
 
@@ -1133,7 +1244,7 @@ function SettingsPage() {
                     </div>
                     <Switch
                       checked={!schedulerPaused}
-                      onCheckedChange={(checked) => updateConfig({ SCHEDULER_PAUSED: !Boolean(checked) })}
+                      onCheckedChange={(checked) => updateConfig({ SCHEDULER_PAUSED: !checked })}
                     />
                   </div>
                   <div className="flex items-center justify-between gap-3 rounded-md border border-border/60 px-3 py-2">
@@ -1690,6 +1801,9 @@ function SettingsPage() {
                     {(() => {
                       const configured = Boolean(String(config.LASTFM_API_KEY || '').trim() && String(config.LASTFM_API_SECRET || '').trim());
                       const state = providerState('lastfm', configured);
+                      const scrobbleConnected = Boolean(lastfmAuthStatus?.connected);
+                      const scrobblePending = Boolean(lastfmAuthStatus?.pending);
+                      const scrobbleReady = configured && scrobbleConnected;
                       return (
                         <div className="space-y-3 rounded-lg border border-border p-3">
                           <div className="flex flex-wrap items-center justify-between gap-2">
@@ -1717,6 +1831,106 @@ function SettingsPage() {
                               value={config.LASTFM_API_SECRET || ''}
                               onChange={(e) => updateConfig({ LASTFM_API_SECRET: e.target.value })}
                             />
+                          </div>
+                          <Separator />
+                          <div className="space-y-3">
+                            <div className="flex flex-wrap items-center justify-between gap-2">
+                              <div className="space-y-1">
+                                <Label>Last.fm scrobbling</Label>
+                                <p className="text-xs text-muted-foreground">
+                                  Connect a Last.fm user session to scrobble finished tracks and optionally update now playing.
+                                </p>
+                              </div>
+                              <div className="flex flex-wrap items-center gap-2">
+                                <Badge variant={scrobbleConnected ? 'default' : scrobblePending ? 'secondary' : 'outline'}>
+                                  {scrobbleConnected ? `Connected${lastfmAuthStatus?.session_name ? `: ${lastfmAuthStatus.session_name}` : ''}` : scrobblePending ? 'Authorization pending' : 'Not connected'}
+                                </Badge>
+                                {lastfmAuthStatus?.auth_url ? (
+                                  <Button
+                                    type="button"
+                                    size="sm"
+                                    variant="outline"
+                                    className="h-8 gap-2"
+                                    onClick={() => window.open(lastfmAuthStatus.auth_url, '_blank', 'noopener,noreferrer')}
+                                  >
+                                    <ExternalLink className="w-3.5 h-3.5" />
+                                    Open Last.fm
+                                  </Button>
+                                ) : null}
+                                <Button
+                                  type="button"
+                                  size="sm"
+                                  variant="outline"
+                                  className="h-8 gap-2"
+                                  onClick={() => void refreshLastfmAuthStatus()}
+                                  disabled={lastfmAuthBusy}
+                                >
+                                  {lastfmAuthBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />}
+                                  Check status
+                                </Button>
+                              </div>
+                            </div>
+                            <div className="flex flex-wrap items-center gap-2">
+                              <Button
+                                type="button"
+                                size="sm"
+                                className="h-8 gap-2"
+                                onClick={() => void startLastfmScrobbleAuth()}
+                                disabled={!configured || lastfmAuthBusy}
+                              >
+                                {lastfmAuthBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Check className="w-3.5 h-3.5" />}
+                                Connect
+                              </Button>
+                              <Button
+                                type="button"
+                                size="sm"
+                                variant="outline"
+                                className="h-8 gap-2"
+                                onClick={() => void completeLastfmScrobbleAuth()}
+                                disabled={!configured || !scrobblePending || lastfmAuthBusy}
+                              >
+                                Finish authorization
+                              </Button>
+                              <Button
+                                type="button"
+                                size="sm"
+                                variant="outline"
+                                className="h-8 gap-2"
+                                onClick={() => void disconnectLastfmScrobbleAuth()}
+                                disabled={!scrobbleConnected || lastfmAuthBusy}
+                              >
+                                <X className="w-3.5 h-3.5" />
+                                Disconnect
+                              </Button>
+                            </div>
+                            <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+                              <div className="rounded-lg border border-border/70 p-3">
+                                <div className="flex items-center justify-between gap-3">
+                                  <div className="space-y-1">
+                                    <div className="text-sm font-medium">Scrobble completed tracks</div>
+                                    <p className="text-xs text-muted-foreground">Send qualifying completed listens to Last.fm.</p>
+                                  </div>
+                                  <Switch
+                                    checked={Boolean(config.LASTFM_SCROBBLE_ENABLED)}
+                                    onCheckedChange={(checked) => updateConfig({ LASTFM_SCROBBLE_ENABLED: checked })}
+                                    disabled={!scrobbleReady}
+                                  />
+                                </div>
+                              </div>
+                              <div className="rounded-lg border border-border/70 p-3">
+                                <div className="flex items-center justify-between gap-3">
+                                  <div className="space-y-1">
+                                    <div className="text-sm font-medium">Update now playing</div>
+                                    <p className="text-xs text-muted-foreground">Push live current-track status to Last.fm on playback start.</p>
+                                  </div>
+                                  <Switch
+                                    checked={Boolean(config.LASTFM_NOW_PLAYING_ENABLED)}
+                                    onCheckedChange={(checked) => updateConfig({ LASTFM_NOW_PLAYING_ENABLED: checked })}
+                                    disabled={!scrobbleReady}
+                                  />
+                                </div>
+                              </div>
+                            </div>
                           </div>
                         </div>
                       );

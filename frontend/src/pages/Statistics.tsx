@@ -1234,10 +1234,7 @@ export default function Statistics() {
         </div>
 
         <div className="flex flex-wrap items-center justify-between gap-2">
-          <div className="space-y-1">
-            <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Period picker</p>
-            <p className="text-xs text-muted-foreground">Same quick-range control as Listening stats.</p>
-          </div>
+          <div />
           <Tabs value={period} onValueChange={(value) => setPeriod(value as PeriodKey)}>
             <TabsList>
               {PERIODS.map((p) => (

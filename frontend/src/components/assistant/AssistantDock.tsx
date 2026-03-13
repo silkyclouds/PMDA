@@ -83,11 +83,13 @@ export function AssistantDock({ bottomOffsetPx = 16 }: { bottomOffsetPx?: number
   const panelInputRef = useRef<HTMLInputElement | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
 
-  const assistantOnline = Boolean(status?.ai_ready && status?.postgres_ready);
+  const dbToolsReady = Boolean(status?.db_tools_ready ?? status?.postgres_ready);
+  const assistantOnline = dbToolsReady;
+  const llmReady = Boolean(status?.ai_ready);
   const offlineReason = useMemo(() => {
     if (!status) return 'Assistant unavailable (status endpoint failed)';
     if (!status.postgres_ready) return 'PostgreSQL is not ready (check PMDA_PG_* settings)';
-    if (!status.ai_ready) return (status.ai_error || 'AI is not ready (check API key + model)') as string;
+    if (!status.ai_ready) return (status.ai_error || 'LLM is still warming up. Library questions remain available.') as string;
     return '';
   }, [status]);
 
@@ -282,7 +284,10 @@ export function AssistantDock({ bottomOffsetPx = 16 }: { bottomOffsetPx?: number
                   </SheetTitle>
                   <div className="mt-2 flex flex-wrap items-center gap-2">
                     <Badge variant={assistantOnline ? 'secondary' : 'outline'}>
-                      {assistantOnline ? 'Online' : 'Offline'}
+                      {assistantOnline ? 'Library ready' : 'Offline'}
+                    </Badge>
+                    <Badge variant={llmReady ? 'secondary' : 'outline'}>
+                      {llmReady ? 'LLM ready' : 'DB tools only'}
                     </Badge>
                     {status?.ai_provider ? (
                       <div className="inline-flex items-center gap-1.5 max-w-full">
@@ -314,7 +319,7 @@ export function AssistantDock({ bottomOffsetPx = 16 }: { bottomOffsetPx?: number
                       New chat
                     </Button>
                   </div>
-                  {!assistantOnline && offlineReason ? (
+                  {offlineReason ? (
                     <div className="mt-2 text-xs text-muted-foreground">
                       {offlineReason}
                     </div>
@@ -360,7 +365,9 @@ export function AssistantDock({ bottomOffsetPx = 16 }: { bottomOffsetPx?: number
 
                   {messages.length === 0 && !loadingHistory ? (
                     <div className="rounded-xl border border-border/60 bg-muted/30 p-4 text-sm text-muted-foreground">
-                      Ask questions about your local library. On artist pages, the assistant uses the current artist context automatically.
+                      {llmReady
+                        ? 'Ask questions about your local library. On artist pages, the assistant uses the current artist context automatically.'
+                        : 'Ask questions about your local library. Artist, album, label, genre and concert queries work even while the LLM is still warming up.'}
                     </div>
                   ) : null}
 
@@ -494,7 +501,7 @@ export function AssistantDock({ bottomOffsetPx = 16 }: { bottomOffsetPx?: number
                   ref={panelInputRef}
                   value={draft}
                   onChange={(e) => setDraft(e.target.value)}
-                  placeholder={assistantOnline ? 'Ask PMDA…' : 'Assistant unavailable'}
+                  placeholder={assistantOnline ? (llmReady ? 'Ask PMDA…' : 'Ask about your library…') : 'Assistant unavailable'}
                   disabled={!assistantOnline || sending}
                   onKeyDown={(e) => {
                     if (e.key === 'Enter' && !e.shiftKey) {

@@ -716,6 +716,11 @@ export interface PMDAConfig {
   USE_LASTFM: boolean;
   LASTFM_API_KEY: string;
   LASTFM_API_SECRET: string;
+  LASTFM_SCROBBLE_ENABLED?: boolean;
+  LASTFM_NOW_PLAYING_ENABLED?: boolean;
+  LASTFM_SCROBBLE_CONNECTED?: boolean;
+  LASTFM_SCROBBLE_USER?: string;
+  LASTFM_SCROBBLE_PENDING?: boolean;
   /** fanart.tv API key (optional). Used for additional artist artwork (MBID-based). */
   FANART_API_KEY?: string;
   USE_BANDCAMP: boolean;
@@ -1149,6 +1154,14 @@ export interface ScanMove {
   decision_provider?: string;
   decision_reason?: string;
   decision_confidence?: number | null;
+  /** Current filesystem state for the moved edition. */
+  status?: 'moved' | 'restored' | 'missing' | string;
+  /** Human-readable reason label for the move. */
+  reason_label?: string;
+  /** Thumbnail for the moved edition. */
+  thumb_url?: string | null;
+  /** Thumbnail for the dedupe winner, when available. */
+  winner_thumb_url?: string | null;
   /** Full move review payload (winner/loser analysis or incomplete diagnostics). */
   details?: Record<string, unknown>;
 }
@@ -1375,7 +1388,7 @@ export async function getScanMovesAudit(scanId?: number): Promise<ScanMovesAudit
   return fetchApi<ScanMovesAuditResponse>(`/api/statistics/scan-moves-audit${qs ? `?${qs}` : ''}`);
 }
 
-export type LibraryDiscoverSectionKey = 'genre' | 'artists' | 'similar' | 'labels' | 'year' | 'random';
+export type LibraryDiscoverSectionKey = 'genre' | 'artists' | 'similar' | 'labels' | 'year' | 'rated' | 'heat' | 'random';
 
 export interface LibraryDiscoverSection {
   key: LibraryDiscoverSectionKey;
@@ -1464,6 +1477,12 @@ export interface LibraryAlbumItem {
   artist_name: string;
   short_description?: string | null;
   profile_source?: string | null;
+  user_rating?: number | null;
+  public_rating?: number | null;
+  public_rating_votes?: number | null;
+  public_rating_source?: string | null;
+  heat_score?: number | null;
+  heat_label?: string | null;
 }
 
 export interface LibraryAlbumsResponse {
@@ -1515,7 +1534,7 @@ export async function getLibraryDigestWithOptions(
 
 export async function getLibraryAlbums(options?: {
   search?: string;
-  sort?: 'recent' | 'year_desc' | 'alpha' | 'artist';
+  sort?: 'recent' | 'year_desc' | 'alpha' | 'artist' | 'user_rating' | 'public_rating' | 'heat';
   genre?: string;
   label?: string;
   year?: number;
@@ -2109,6 +2128,7 @@ export interface AlbumDetailTrack {
   title: string;
   disc_num: number;
   track_num: number;
+  disc_label?: string | null;
   duration_sec: number;
   format?: string;
   bitrate?: number;
@@ -2148,12 +2168,46 @@ export interface AlbumDetailResponse {
   artist_id: number;
   artist_name: string;
   review?: AlbumDetailReview;
+  ratings?: {
+    user_rating?: number | null;
+    public_rating?: number | null;
+    public_rating_votes?: number | null;
+    public_rating_source?: string | null;
+    heat_score?: number | null;
+    heat_label?: string | null;
+    signals?: {
+      discogs_have_count?: number | null;
+      discogs_want_count?: number | null;
+      bandcamp_supporter_count?: number | null;
+      lastfm_scrobbles?: number | null;
+      lastfm_listeners?: number | null;
+    };
+  };
   tracks: AlbumDetailTrack[];
 }
 
 export async function getAlbumDetail(albumId: number): Promise<AlbumDetailResponse> {
   return fetchApi<AlbumDetailResponse>(`/api/library/album/${encodeURIComponent(String(albumId))}`, {
     timeoutMs: 30000,
+  });
+}
+
+export interface AlbumUserRatingResponse {
+  album_id: number;
+  user_id: number;
+  rating?: number | null;
+  updated_at?: number | null;
+}
+
+export async function getAlbumRating(albumId: number): Promise<AlbumUserRatingResponse> {
+  return fetchApi<AlbumUserRatingResponse>(`/api/library/album/${encodeURIComponent(String(albumId))}/rating`);
+}
+
+export async function setAlbumRating(albumId: number, rating: number | null, source = 'ui'): Promise<AlbumUserRatingResponse> {
+  const normalized = rating == null ? 0 : Math.max(0, Math.min(5, Math.round(rating)));
+  return fetchApi<AlbumUserRatingResponse>(`/api/library/album/${encodeURIComponent(String(albumId))}/rating`, {
+    method: 'PUT',
+    body: JSON.stringify({ rating: normalized, source }),
   });
 }
 
@@ -2507,7 +2561,7 @@ function parseContentDispositionFilename(headerValue: string | null): string | n
       return utf8Match[1];
     }
   }
-  const plainMatch = raw.match(/filename=\"?([^\";]+)\"?/i);
+  const plainMatch = raw.match(/filename="?([^";]+)"?/i);
   if (plainMatch?.[1]) return plainMatch[1];
   return null;
 }
@@ -3394,6 +3448,15 @@ export interface OpenAICodexOAuthStatusResponse {
   error?: string;
 }
 
+export interface LastfmAuthStatusResponse {
+  configured: boolean;
+  connected: boolean;
+  pending: boolean;
+  session_name?: string;
+  auth_url?: string;
+  error?: string;
+}
+
 export interface AIProviderPreferencesResponse {
   interactive_provider_id: string;
   batch_provider_id: string;
@@ -3427,6 +3490,28 @@ export async function getOpenAICodexOAuthStatus(options?: { checkRuntime?: boole
 
 export async function disconnectOpenAICodexOAuth(): Promise<{ ok: boolean; message?: string }> {
   return fetchApi<{ ok: boolean; message?: string }>('/api/ai/providers/openai-codex/oauth/disconnect', {
+    method: 'POST',
+  });
+}
+
+export async function getLastfmAuthStatus(): Promise<LastfmAuthStatusResponse> {
+  return fetchApi<LastfmAuthStatusResponse>('/api/lastfm/auth/status');
+}
+
+export async function startLastfmAuth(): Promise<{ ok: boolean; auth_url: string; pending: boolean; token?: string }> {
+  return fetchApi<{ ok: boolean; auth_url: string; pending: boolean; token?: string }>('/api/lastfm/auth/start', {
+    method: 'POST',
+  });
+}
+
+export async function completeLastfmAuth(): Promise<{ ok: boolean; connected: boolean; session_name?: string; message?: string }> {
+  return fetchApi<{ ok: boolean; connected: boolean; session_name?: string; message?: string }>('/api/lastfm/auth/complete', {
+    method: 'POST',
+  });
+}
+
+export async function disconnectLastfmAuth(): Promise<{ ok: boolean; message?: string }> {
+  return fetchApi<{ ok: boolean; message?: string }>('/api/lastfm/auth/disconnect', {
     method: 'POST',
   });
 }
@@ -3557,6 +3642,67 @@ export async function getScanMovesSummary(scanId: number): Promise<ScanMovesSumm
   return fetchApi<ScanMovesSummary>(`/api/scan-history/${scanId}/moves/summary`);
 }
 
+export interface ScanMoveDetailTrack {
+  track_id?: number;
+  title: string;
+  disc_num: number;
+  disc_label?: string | null;
+  track_num: number;
+  duration_sec?: number;
+  format?: string;
+  bitrate?: number;
+  sample_rate?: number;
+  bit_depth?: number;
+  file_size_bytes?: number;
+  file_path?: string;
+}
+
+export interface ScanMoveDetailEdition {
+  album_id?: number | null;
+  album_title?: string;
+  path: string;
+  thumb_url?: string | null;
+  tracks: ScanMoveDetailTrack[];
+  track_count: number;
+  fmt_text?: string;
+  analysis?: Record<string, unknown>;
+}
+
+export interface ScanMoveDetailResponse {
+  move_id: number;
+  scan_id: number;
+  artist: string;
+  album_id: number;
+  album_title: string;
+  move_reason: 'dedupe' | 'incomplete' | string;
+  reason_label: string;
+  status: 'moved' | 'restored' | 'missing' | string;
+  moved_at: number;
+  decision_source?: string;
+  decision_provider?: string;
+  decision_reason?: string;
+  decision_confidence?: number | null;
+  details?: Record<string, unknown>;
+  moved: ScanMoveDetailEdition;
+  winner?: ScanMoveDetailEdition;
+  incomplete?: {
+    expected_track_count: number;
+    actual_track_count: number;
+    missing_indices: number[];
+    missing_required_tags: string[];
+    strict_match_provider?: string;
+    strict_reject_reason?: string;
+    strict_tracklist_score?: number;
+    expected_tracks: Array<{ index: number; title: string }>;
+  };
+}
+
+export async function getScanMoveDetail(moveId: number): Promise<ScanMoveDetailResponse> {
+  return fetchApi<ScanMoveDetailResponse>(`/api/scan-move/${encodeURIComponent(String(moveId))}/detail`, {
+    timeoutMs: 30000,
+  });
+}
+
 export interface RestoreMovesResult {
   restored: number;
   artists_refreshed: number;
@@ -3653,6 +3799,7 @@ export interface AssistantStatus {
   ai_ready: boolean;
   ai_error?: string | null;
   postgres_ready: boolean;
+  db_tools_ready?: boolean;
   pg_host?: string;
   pg_port?: number;
   pg_db?: string;

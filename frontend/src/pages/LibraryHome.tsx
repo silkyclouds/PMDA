@@ -9,6 +9,7 @@ import { Checkbox } from '@/components/ui/checkbox';
 import { AspectRatio } from '@/components/ui/aspect-ratio';
 import { Carousel, CarouselContent, CarouselItem, CarouselNext, CarouselPrevious } from '@/components/ui/carousel';
 import { AlbumArtwork } from '@/components/library/AlbumArtwork';
+import { AlbumCommunitySignals } from '@/components/library/AlbumCommunitySignals';
 import { LibraryEmptyState } from '@/components/library/LibraryEmptyState';
 import { usePlayback } from '@/contexts/PlaybackContext';
 import { useToast } from '@/hooks/use-toast';
@@ -477,7 +478,7 @@ export default function LibraryHome() {
               {sec.albums.length === 0 ? (
                 <p className="text-sm text-muted-foreground">No suggestions available.</p>
               ) : (
-                <Carousel opts={{ align: 'start', dragFree: true }} className="w-full pmda-fade-mask">
+                <Carousel opts={{ align: 'start', dragFree: true }} effect="none" className="w-full pmda-fade-mask">
                   <CarouselContent className="-ml-3">
                     {sec.albums.map((a) => (
                       <CarouselItem key={`disc-${sec.key}-${a.album_id}`} className="basis-[160px] sm:basis-[190px] md:basis-[220px] pl-3">
@@ -535,6 +536,13 @@ export default function LibraryHome() {
                                   {a.year ?? '—'}
                                 </Badge>
                               </div>
+                              <AlbumCommunitySignals
+                                userRating={a.user_rating}
+                                publicRating={a.public_rating}
+                                publicRatingVotes={a.public_rating_votes}
+                                heatLabel={a.heat_label}
+                                compact
+                              />
                             </CardContent>
                           </Card>
                         </div>
@@ -661,7 +669,7 @@ export default function LibraryHome() {
           ) : topArtists.length === 0 ? (
             <p className="text-sm text-muted-foreground">No listening stats yet. Start playing music to build this section.</p>
           ) : (
-            <Carousel opts={{ align: 'start', dragFree: true }} className="w-full pmda-fade-mask">
+            <Carousel opts={{ align: 'start', dragFree: true }} effect="none" className="w-full pmda-fade-mask">
               <CarouselContent className="-ml-3">
                 {topArtists.map((a) => (
                   <CarouselItem key={`ta-${a.artist_id}`} className="basis-[170px] sm:basis-[200px] md:basis-[220px] pl-3">
@@ -736,7 +744,7 @@ export default function LibraryHome() {
           ) : recentArtists.length === 0 ? (
             <p className="text-sm text-muted-foreground">No recently added artists yet.</p>
           ) : (
-            <Carousel opts={{ align: 'start', dragFree: true }} className="w-full pmda-fade-mask">
+            <Carousel opts={{ align: 'start', dragFree: true }} effect="none" className="w-full pmda-fade-mask">
               <CarouselContent className="-ml-3">
                 {recentArtists.map((a) => (
                   <CarouselItem key={`ra-${a.artist_id}`} className="basis-[170px] sm:basis-[200px] md:basis-[220px] pl-3">
@@ -816,7 +824,7 @@ export default function LibraryHome() {
           ) : recentlyPlayedAlbums.length === 0 ? (
             <p className="text-sm text-muted-foreground">{recentlyPlayedError ?? 'No playback history yet.'}</p>
           ) : (
-            <Carousel opts={{ align: 'start', dragFree: true }} className="w-full pmda-fade-mask">
+            <Carousel opts={{ align: 'start', dragFree: true }} effect="none" className="w-full pmda-fade-mask">
               <CarouselContent className="-ml-3">
                 {recentlyPlayedAlbums.map((a) => (
                   <CarouselItem key={`rplay-${a.album_id}`} className="basis-[160px] sm:basis-[190px] md:basis-[220px] pl-3">
@@ -861,6 +869,13 @@ export default function LibraryHome() {
                               {a.year ?? '—'}
                             </Badge>
                           </div>
+                          <AlbumCommunitySignals
+                            userRating={a.user_rating}
+                            publicRating={a.public_rating}
+                            publicRatingVotes={a.public_rating_votes}
+                            heatLabel={a.heat_label}
+                            compact
+                          />
                         </CardContent>
                       </Card>
                     </div>
@@ -912,7 +927,7 @@ export default function LibraryHome() {
           ) : recentAlbums.length === 0 ? (
             <p className="text-sm text-muted-foreground">No recent albums yet.</p>
           ) : (
-            <Carousel opts={{ align: 'start', dragFree: true }} className="w-full pmda-fade-mask">
+            <Carousel opts={{ align: 'start', dragFree: true }} effect="none" className="w-full pmda-fade-mask">
               <CarouselContent className="-ml-3">
                 {recentAlbums.map((a) => (
                   <CarouselItem key={`recent-${a.album_id}`} className="basis-[160px] sm:basis-[190px] md:basis-[220px] pl-3">
@@ -957,6 +972,13 @@ export default function LibraryHome() {
                               {a.year ?? '—'}
                             </Badge>
                           </div>
+                          <AlbumCommunitySignals
+                            userRating={a.user_rating}
+                            publicRating={a.public_rating}
+                            publicRatingVotes={a.public_rating_votes}
+                            heatLabel={a.heat_label}
+                            compact
+                          />
                         </CardContent>
                       </Card>
                     </div>

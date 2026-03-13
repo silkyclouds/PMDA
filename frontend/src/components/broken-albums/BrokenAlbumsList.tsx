@@ -1,10 +1,12 @@
 import { useState, useEffect, useMemo } from 'react';
 import { useSearchParams } from 'react-router-dom';
-import { AlertCircle, Loader2, Music, Undo2 } from 'lucide-react';
+import { AlertCircle, Disc3, Loader2, Music, Search, Undo2 } from 'lucide-react';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Alert, AlertDescription } from '@/components/ui/alert';
+import { ScanMoveReviewDialog } from '@/components/scan-moves/ScanMoveReviewDialog';
+import { ProviderBadge } from '@/components/providers/ProviderBadge';
 import * as api from '@/lib/api';
 import { useToast } from '@/hooks/use-toast';
 
@@ -34,6 +36,7 @@ export function BrokenAlbumsList() {
   const [movesFilter, setMovesFilter] = useState<'all' | 'active' | 'restored'>('all');
   const [loading, setLoading] = useState(true);
   const [restoring, setRestoring] = useState<number | 'all' | null>(null);
+  const [selectedMove, setSelectedMove] = useState<api.ScanMove | null>(null);
   const { toast } = useToast();
 
   useEffect(() => {
@@ -91,12 +94,12 @@ export function BrokenAlbumsList() {
     }
   };
   const movedIncompletesFiltered = useMemo(() => {
-    if (movesFilter === 'active') return movedIncompletes.filter((m) => !m.restored);
-    if (movesFilter === 'restored') return movedIncompletes.filter((m) => Boolean(m.restored));
+    if (movesFilter === 'active') return movedIncompletes.filter((m) => String(m.status || (m.restored ? 'restored' : 'moved')).toLowerCase() !== 'restored');
+    if (movesFilter === 'restored') return movedIncompletes.filter((m) => String(m.status || (m.restored ? 'restored' : 'moved')).toLowerCase() === 'restored');
     return movedIncompletes;
   }, [movedIncompletes, movesFilter]);
   const movedIncompletesPending = useMemo(
-    () => movedIncompletes.filter((m) => !m.restored),
+    () => movedIncompletes.filter((m) => String(m.status || '').toLowerCase() !== 'restored'),
     [movedIncompletes],
   );
 
@@ -129,12 +132,12 @@ export function BrokenAlbumsList() {
               <CardContent className="space-y-3">
                 <div className="flex items-center gap-2">
                   <Badge variant="outline">{movedIncompletes.length} moved album(s)</Badge>
-                  <Badge variant="outline">{movedIncompletesPending.length} pending rollback</Badge>
+                  <Badge variant="outline">{movedIncompletesPending.length} active move(s)</Badge>
                   <Button size="sm" variant={movesFilter === 'all' ? 'default' : 'outline'} onClick={() => setMovesFilter('all')}>
                     All
                   </Button>
                   <Button size="sm" variant={movesFilter === 'active' ? 'default' : 'outline'} onClick={() => setMovesFilter('active')}>
-                    Pending
+                    Moved
                   </Button>
                   <Button size="sm" variant={movesFilter === 'restored' ? 'default' : 'outline'} onClick={() => setMovesFilter('restored')}>
                     Restored
@@ -160,37 +163,79 @@ export function BrokenAlbumsList() {
                       const expected = Number(details.expected_track_count ?? 0);
                       const actual = Number(details.actual_track_count ?? 0);
                       const missing = fmtMissingIndices(details.missing_indices);
-                      const reason = move.decision_reason || String(details.classification || 'incomplete_album');
+                      const reason = move.reason_label || move.decision_reason || String(details.classification || 'Incomplete album');
+                      const status = String(move.status || (move.restored ? 'restored' : 'moved')).toLowerCase();
                       return (
-                        <div key={move.move_id} className="rounded-md border p-3 space-y-2">
-                          <div className="flex flex-wrap items-center gap-2">
-                            <span className="font-medium">{move.artist}</span>
-                            <span className="text-muted-foreground">•</span>
-                            <span>{move.album_title || `Album #${move.album_id}`}</span>
-                            <Badge variant="outline">{reason}</Badge>
-                            <Badge variant="outline">Moved: {new Date(move.moved_at * 1000).toLocaleString()}</Badge>
-                            <Badge variant={move.restored ? 'secondary' : 'default'}>
-                              {move.restored ? 'Restored' : 'Pending'}
-                            </Badge>
+                        <div
+                          key={move.move_id}
+                          className="rounded-xl border p-4 space-y-3 cursor-pointer hover:border-primary/40 transition-colors"
+                          onClick={() => setSelectedMove(move)}
+                          role="button"
+                          tabIndex={0}
+                          onKeyDown={(event) => {
+                            if (event.key === 'Enter' || event.key === ' ') {
+                              event.preventDefault();
+                              setSelectedMove(move);
+                            }
+                          }}
+                        >
+                          <div className="flex gap-4">
+                            <div className="w-20 h-20 rounded-2xl overflow-hidden border border-border/70 bg-muted shrink-0">
+                              {move.thumb_url ? (
+                                <img src={move.thumb_url} alt={move.album_title || move.artist} className="w-full h-full object-cover" />
+                              ) : (
+                                <div className="w-full h-full flex items-center justify-center">
+                                  <Disc3 className="w-5 h-5 text-muted-foreground" />
+                                </div>
+                              )}
+                            </div>
+                            <div className="min-w-0 flex-1 space-y-2">
+                              <div className="flex flex-wrap items-center gap-2">
+                                <span className="font-medium">{move.artist}</span>
+                                <span className="text-muted-foreground">•</span>
+                                <span>{move.album_title || `Album #${move.album_id}`}</span>
+                                <Badge variant="outline">{reason}</Badge>
+                                <Badge variant="outline">Moved: {new Date(move.moved_at * 1000).toLocaleString()}</Badge>
+                                <Badge variant={status === 'restored' ? 'secondary' : 'default'}>
+                                  {status === 'restored' ? 'Restored' : status === 'missing' ? 'Missing' : 'Moved'}
+                                </Badge>
+                                {move.decision_provider ? <ProviderBadge provider={move.decision_provider} prefix="Provider" className="text-[10px]" /> : null}
+                              </div>
+                              <div className="text-xs text-muted-foreground break-all">
+                                From: {move.original_path}
+                              </div>
+                              <div className="text-xs text-muted-foreground break-all">
+                                To: {move.moved_to_path}
+                              </div>
+                              <div className="flex flex-wrap items-center gap-2 text-xs">
+                                {expected > 0 ? <Badge variant="outline">Expected {expected}</Badge> : null}
+                                {actual > 0 ? <Badge variant="outline">Actual {actual}</Badge> : null}
+                                {missing ? <Badge variant="outline">Missing {missing}</Badge> : null}
+                              </div>
+                            </div>
                           </div>
-                          <div className="text-xs text-muted-foreground break-all">
-                            From: {move.original_path}
-                          </div>
-                          <div className="text-xs text-muted-foreground break-all">
-                            To: {move.moved_to_path}
-                          </div>
-                          <div className="flex flex-wrap items-center gap-2 text-xs">
-                            {expected > 0 ? <Badge variant="outline">Expected {expected}</Badge> : null}
-                            {actual > 0 ? <Badge variant="outline">Actual {actual}</Badge> : null}
-                            {missing ? <Badge variant="outline">Missing {missing}</Badge> : null}
-                          </div>
-                          <div>
+                          <div className="flex items-center gap-2">
                             <Button
                               size="sm"
                               variant="outline"
                               className="gap-1.5"
-                              onClick={() => void restoreMoves([move.move_id])}
-                              disabled={restoring !== null || Boolean(move.restored)}
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                setSelectedMove(move);
+                              }}
+                            >
+                              <Search className="w-4 h-4" />
+                              Review
+                            </Button>
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              className="gap-1.5"
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                void restoreMoves([move.move_id]);
+                              }}
+                              disabled={restoring !== null || status === 'restored'}
                             >
                               {restoring === move.move_id ? <Loader2 className="w-4 h-4 animate-spin" /> : <Undo2 className="w-4 h-4" />}
                               Rollback
@@ -267,6 +312,19 @@ export function BrokenAlbumsList() {
           )}
         </>
       )}
+
+      <ScanMoveReviewDialog
+        move={selectedMove}
+        open={Boolean(selectedMove)}
+        onOpenChange={(open) => {
+          if (!open) setSelectedMove(null);
+        }}
+        restoring={selectedMove ? restoring === selectedMove.move_id : false}
+        onRestore={async (moveId) => {
+          await restoreMoves([moveId]);
+          setSelectedMove(null);
+        }}
+      />
     </div>
   );
 }
