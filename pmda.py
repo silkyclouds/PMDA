@@ -26043,6 +26043,7 @@ def scan_duplicates(
                             local_album=lookup_title_for_search,
                             folder_path=album_folder_arg,
                             track_titles=list(tracks_edition) if tracks_edition else list(tracks or []),
+                            file_paths=list(e.get("ordered_paths") or []),
                             missing_required_tags=list(e.get("missing_required_tags") or []),
                         )
                         if isinstance(ai_identity_hint, dict) and ai_identity_hint:
