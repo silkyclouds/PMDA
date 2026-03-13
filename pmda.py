@@ -49662,10 +49662,11 @@ def api_library_recently_played_albums():
     limit = max(1, min(200, _parse_int_loose(request.args.get("limit"), 18)))
     offset = max(0, _parse_int_loose(request.args.get("offset"), 0))
     refresh = bool(_parse_bool(request.args.get("refresh")))
+    user_id = _current_user_id_or_zero()
     include_unmatched = _library_include_unmatched_effective()
     album_match_sql = _library_albums_match_where(include_unmatched, "alb")
 
-    cache_key = f"library:recently_played_albums:{days}:{limit}:{offset}:{_library_cache_unmatched_suffix(include_unmatched)}"
+    cache_key = f"library:recently_played_albums:{user_id}:{days}:{limit}:{offset}:{_library_cache_unmatched_suffix(include_unmatched)}"
     if not refresh:
         cached = _files_cache_get_json(cache_key)
         if cached is not None:
@@ -49683,16 +49684,21 @@ def api_library_recently_played_albums():
                 """
                 SELECT COUNT(*)
                 FROM files_playback_events
-                WHERE user_id = 1
+                WHERE user_id = %s
                   AND created_at >= NOW() - (%s || ' days')::interval
                   AND played_seconds >= 12
                 """,
-                (int(days),),
+                (int(user_id), int(days)),
             )
             playback_count = int((cur.fetchone() or [0])[0] or 0)
             use_reco = playback_count <= 0
             ev_table = "files_reco_events" if use_reco else "files_playback_events"
-            ev_user_filter = "1=1" if use_reco else "e.user_id = 1"
+            ev_user_filter = "1=1" if use_reco else "e.user_id = %s"
+            count_params = [int(days)]
+            rows_params = [int(days), int(limit), int(offset)]
+            if not use_reco:
+                count_params.insert(0, int(user_id))
+                rows_params.insert(0, int(user_id))
 
             cur.execute(
                 f"""
@@ -49708,7 +49714,7 @@ def api_library_recently_played_albums():
                     GROUP BY t.album_id
                 ) AS ranked
                 """,
-                (int(days),),
+                tuple(count_params),
             )
             total = int((cur.fetchone() or [0])[0] or 0)
 
@@ -49728,7 +49734,7 @@ def api_library_recently_played_albums():
                 ORDER BY last_played_at DESC
                 LIMIT %s OFFSET %s
                 """,
-                (int(days), int(limit), int(offset)),
+                tuple(rows_params),
             )
             rows = cur.fetchall()
 
