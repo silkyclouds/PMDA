@@ -30243,23 +30243,25 @@ def _publish_files_library_artist_from_items(
                 or "Unknown Album"
             )
             artist_fallback = resolved_artist_from_item or (item.get("artist") or "").strip() or (artist_name or "").strip() or "Unknown Artist"
-            # Re-evaluate display identity on top of the live tags, but keep the scan-time
-            # identity hints attached to the item authoritative. Without this second pass the
-            # publication layer can regress back to stale embedded tags (for example a folder
-            # matched as "Slowdive / Souvlaki" getting republished as "Slowdive / Takk...").
-            artist_from_tags = _pick_album_artist_from_tag_dicts([tags], default=artist_fallback)
-            album_from_tags = _pick_album_title_from_tag_dicts([tags], fallback=title_fallback)
-            identity_candidate = dict(item)
-            identity_candidate["artist"] = artist_from_tags
-            identity_candidate["artist_name"] = artist_from_tags
-            identity_candidate["title_raw"] = album_from_tags
-            identity_candidate["album_title"] = album_from_tags
-            artist_resolved, album_resolved = _resolve_edition_display_identity(
-                identity_candidate,
-                default_artist=artist_fallback,
-                default_title=title_fallback,
-                folder_name=folder.name,
+            # The scan payload already carries the authoritative resolved display identity.
+            # Publication must not regress back to stale embedded tags for adversarial
+            # corpora such as:
+            #   - Slowdive / Souvlaki files tagged as album "Takk..."
+            #   - Sigur Rós / Von files tagged as album "Takk..."
+            # Live tags are still used for year/genre/label/etc., but album/artist display
+            # identity should stay on the scan-time resolution unless it is missing/generic.
+            artist_resolved = str(resolved_artist_from_item or artist_fallback or "").strip()
+            album_resolved = _sanitize_album_title_display(
+                str(resolved_title_from_item or title_fallback or "").strip()
             )
+            if _identity_text_is_generic(artist_resolved):
+                artist_resolved = str(
+                    _pick_album_artist_from_tag_dicts([tags], default=artist_fallback) or artist_fallback or "Unknown Artist"
+                ).strip() or "Unknown Artist"
+            if _identity_text_is_generic(album_resolved):
+                album_resolved = _sanitize_album_title_display(
+                    str(_pick_album_title_from_tag_dicts([tags], fallback=title_fallback) or title_fallback or "Unknown Album").strip()
+                )
             artist_resolved = str(artist_resolved or artist_fallback or "Unknown Artist").strip() or "Unknown Artist"
             album_resolved = _sanitize_album_title_display(
                 str(album_resolved or title_fallback or "Unknown Album").strip() or "Unknown Album"
