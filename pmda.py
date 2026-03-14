@@ -15686,15 +15686,39 @@ def _run_files_profile_enrichment_job(
                     "bandcamp",
                     "lastfm",
                 ]
-                # Always try the exact identity source first. Using Discogs/Bandcamp ahead of
-                # a MusicBrainz-linked release-group caused incorrect cover replacement on albums
-                # like "Von" where the soft identity was still right but third-party search art was not.
 
                 provider_chain: list[str] = []
                 for provider_name in cover_candidates_default:
                     provider_norm = _normalize_identity_provider(provider_name)
                     if provider_norm and provider_norm not in provider_chain:
                         provider_chain.append(provider_norm)
+
+                edition_payload = {
+                    "musicbrainz_id": str(mbid or "").strip(),
+                    "musicbrainz_release_group_id": str(mbid or "").strip(),
+                    "discogs_release_id": str(discogs_release_id or "").strip(),
+                    "lastfm_album_mbid": str(lastfm_album_mbid or "").strip(),
+                    "bandcamp_album_url": str(bandcamp_album_url or "").strip(),
+                    "primary_metadata_source": str(metadata_source or "").strip(),
+                }
+
+                exact_provider_ids: dict[str, str] = {}
+                for provider_name in ("musicbrainz", "discogs", "bandcamp", "lastfm"):
+                    try:
+                        expected_id = _strict_expected_provider_id(provider_name, edition_payload)
+                    except Exception:
+                        expected_id = ""
+                    if expected_id:
+                        exact_provider_ids[provider_name] = expected_id
+
+                if exact_provider_ids:
+                    # Covers are more reliable when we privilege authoritative visual sources,
+                    # not the metadata seed. Last.fm exact IDs can still point to alternate art.
+                    provider_chain = [
+                        provider_name
+                        for provider_name in ("musicbrainz", "discogs", "bandcamp", "lastfm")
+                        if provider_name in exact_provider_ids
+                    ]
 
                 def _identity_ok(provider_name: str, payload: dict[str, Any] | None) -> bool:
                     if provider_name == "musicbrainz":
@@ -31671,13 +31695,13 @@ def _authoritative_publication_cover(
             exact_provider_ids[provider] = expected_id
 
     if exact_provider_ids:
-        exact_chain: list[str] = []
-        if provider_seed and provider_seed in exact_provider_ids:
-            exact_chain.append(provider_seed)
-        for provider in ("musicbrainz", "discogs", "bandcamp", "lastfm"):
-            if provider in exact_provider_ids and provider not in exact_chain:
-                exact_chain.append(provider)
-        provider_chain = exact_chain
+        # Do not privilege metadata_source here. For covers, MusicBrainz/Discogs/Bandcamp
+        # are materially more trustworthy than Last.fm when several exact identities exist.
+        provider_chain = [
+            provider
+            for provider in ("musicbrainz", "discogs", "bandcamp", "lastfm")
+            if provider in exact_provider_ids
+        ]
 
     for provider in provider_chain:
         try:

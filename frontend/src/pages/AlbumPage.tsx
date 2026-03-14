@@ -63,10 +63,29 @@ function escapeRegExp(value: string): string {
 function albumTitleVariants(value: string): string[] {
   const raw = String(value || '').trim();
   if (!raw) return [];
-  const candidates = [raw];
+  const compact = raw
+    .normalize('NFKD')
+    .replace(/[^\w\s.]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const deEllipsed = raw.replace(/[.…]+$/g, '').trim();
+  const candidates = [raw, compact, deEllipsed];
   if (raw.endsWith('...')) candidates.push(raw.slice(0, -3).trim());
   if (raw.endsWith('…')) candidates.push(raw.slice(0, -1).trim());
   return Array.from(new Set(candidates.filter(Boolean)));
+}
+
+function inferDiscAndTrackFromTitle(rawTitle: string): { discNum?: number; trackNum?: number } {
+  const raw = String(rawTitle || '').trim();
+  if (!raw) return {};
+  const match = raw.match(/(?:^|[-\s])(\d{1,2})\s*[-_.]\s*(\d{1,2})(?:\s*[-_.]|\s+)/);
+  if (!match) return {};
+  const discNum = Number(match[1] || 0);
+  const trackNum = Number(match[2] || 0);
+  return {
+    discNum: Number.isFinite(discNum) && discNum > 0 ? discNum : undefined,
+    trackNum: Number.isFinite(trackNum) && trackNum > 0 ? trackNum : undefined,
+  };
 }
 
 function cleanAlbumTrackTitle(rawTitle: string, albumTitle: string, fallbackTrack: number): string {
@@ -80,6 +99,7 @@ function cleanAlbumTrackTitle(rawTitle: string, albumTitle: string, fallbackTrac
   }
   cleaned = cleaned.replace(/^(?:cd|disc)\s*\d{1,2}\s*[-_. ]\s*\d{1,3}\s*[-_. ]*/i, '');
   cleaned = cleaned.replace(/^\d{1,2}\s*[-_.]\s*\d{1,3}\s*[-_. ]*/i, '');
+  cleaned = cleaned.replace(/^\d{1,2}\s*[-_.]\s*\d{1,2}\s*[-_.]\s*\d{1,3}\s*[-_. ]*/i, '');
   cleaned = cleaned.replace(/^(?:side\s*)?[a-z]\s*[-_. ]\s*\d{1,3}\s*[-_. ]*/i, '');
   cleaned = cleaned.replace(/^\d{1,3}\s*[-_. ]*/, '');
   cleaned = cleaned.replace(/\s+/g, ' ').replace(/^[-. ]+|[-. ]+$/g, '').trim();
@@ -321,16 +341,22 @@ export default function AlbumPage() {
     const albumArtist = data?.artist_name || '';
     const albumTitle = data?.title || '';
     const inlineArtistMode = shouldSplitInlineTrackArtist(tracks);
-    const maxDisc = tracks.reduce((acc, track) => Math.max(acc, Number(track.disc_num || 1)), 1);
+    const maxDisc = tracks.reduce((acc, track) => {
+      const inferred = inferDiscAndTrackFromTitle(track.title || '');
+      return Math.max(acc, Number(track.disc_num || inferred.discNum || 1));
+    }, 1);
     return tracks.map((t, idx) => {
-      const trackNum = t.track_num > 0 ? t.track_num : idx + 1;
+      const inferred = inferDiscAndTrackFromTitle(t.title || '');
+      const discNum = Math.max(1, Number(t.disc_num || inferred.discNum || 1));
+      const trackNum = t.track_num > 0 ? t.track_num : Number(inferred.trackNum || idx + 1);
       const cleanedTitle = cleanAlbumTrackTitle(t.title || '', albumTitle, trackNum);
       const parsed = splitInlineTrackArtistTitle(cleanedTitle, albumArtist, inlineArtistMode);
-      const discNum = Math.max(1, Number(t.disc_num || 1));
       const n = t.track_num > 0 ? t.track_num : idx + 1;
       return {
         ...t,
-        display_num: String(n),
+        disc_num: discNum,
+        track_num: trackNum,
+        display_num: String(trackNum > 0 ? trackNum : n),
         display_artist: (parsed.artist || albumArtist || 'Unknown artist').trim(),
         display_title: (parsed.title || cleanedTitle || t.title || `Track ${idx + 1}`).trim(),
         disc_label_text: String(t.disc_label || '').trim() || (maxDisc > 1 ? `Disc ${discNum}` : ''),
