@@ -1017,7 +1017,13 @@ export default function AlbumPage() {
                                   {playlistsLoading ? (
                                     <DropdownMenuItem disabled>Loading playlists…</DropdownMenuItem>
                                   ) : playlists.length === 0 ? (
-                                    <DropdownMenuItem onSelect={() => navigate('/library/playlists')}>
+                                    <DropdownMenuItem
+                                      onSelect={() =>
+                                        navigate('/library/playlists', {
+                                          state: { playlistSeed: { track_id: t.track_id } },
+                                        })
+                                      }
+                                    >
                                       Create a playlist
                                     </DropdownMenuItem>
                                   ) : (

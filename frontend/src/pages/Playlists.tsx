@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useLocation, useNavigate } from 'react-router-dom';
 import { ListMusic, Loader2, Plus } from 'lucide-react';
 
 import * as api from '@/lib/api';
@@ -13,6 +13,7 @@ import { Badge } from '@/components/ui/badge';
 
 export default function Playlists() {
   const navigate = useNavigate();
+  const location = useLocation();
   const { toast } = useToast();
 
   const [loading, setLoading] = useState(false);
@@ -23,6 +24,22 @@ export default function Playlists() {
   const [createName, setCreateName] = useState('');
   const [createDescription, setCreateDescription] = useState('');
   const [creating, setCreating] = useState(false);
+  const [pendingSeed, setPendingSeed] = useState<{ track_id?: number; album_id?: number } | null>(() => {
+    const seed = (location.state as { playlistSeed?: { track_id?: number; album_id?: number } } | null)?.playlistSeed;
+    if (!seed) return null;
+    const trackId = Number(seed.track_id || 0);
+    const albumId = Number(seed.album_id || 0);
+    if (trackId > 0) return { track_id: trackId };
+    if (albumId > 0) return { album_id: albumId };
+    return null;
+  });
+
+  const createDescriptionText = useMemo(() => {
+    if (!pendingSeed) return 'Name it, then start dragging tracks into it.';
+    return pendingSeed.track_id
+      ? 'Name it and PMDA will create the playlist with the selected track already inside.'
+      : 'Name it and PMDA will create the playlist with the selected album already inside.';
+  }, [pendingSeed]);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -42,16 +59,29 @@ export default function Playlists() {
     void load();
   }, [load]);
 
+  useEffect(() => {
+    if (pendingSeed) setCreateOpen(true);
+  }, [pendingSeed]);
+
   const create = useCallback(async () => {
     const name = createName.trim();
     if (!name) return;
     setCreating(true);
     try {
       const pl = await api.createPlaylist({ name, description: createDescription.trim() || undefined });
-      toast({ title: 'Playlist created', description: pl.name });
+      if (pendingSeed?.track_id) {
+        await api.addPlaylistItems(pl.playlist_id, { track_id: pendingSeed.track_id });
+      } else if (pendingSeed?.album_id) {
+        await api.addPlaylistItems(pl.playlist_id, { album_id: pendingSeed.album_id });
+      }
+      toast({
+        title: 'Playlist created',
+        description: pendingSeed ? `${pl.name} is ready with your selection.` : pl.name,
+      });
       setCreateOpen(false);
       setCreateName('');
       setCreateDescription('');
+      setPendingSeed(null);
       await load();
       navigate(`/library/playlists/${pl.playlist_id}`);
     } catch (e) {
@@ -59,7 +89,7 @@ export default function Playlists() {
     } finally {
       setCreating(false);
     }
-  }, [createDescription, createName, load, navigate, toast]);
+  }, [createDescription, createName, load, navigate, pendingSeed, toast]);
 
   return (
     <div className="container py-6 space-y-6">
@@ -80,7 +110,7 @@ export default function Playlists() {
           <DialogContent>
             <DialogHeader>
               <DialogTitle>Create playlist</DialogTitle>
-              <DialogDescription>Name it, then start dragging tracks into it.</DialogDescription>
+              <DialogDescription>{createDescriptionText}</DialogDescription>
             </DialogHeader>
             <div className="space-y-3">
               <div className="space-y-1">
@@ -93,7 +123,14 @@ export default function Playlists() {
               </div>
             </div>
             <DialogFooter>
-              <Button variant="outline" onClick={() => setCreateOpen(false)} disabled={creating}>
+              <Button
+                variant="outline"
+                onClick={() => {
+                  setCreateOpen(false);
+                  setPendingSeed(null);
+                }}
+                disabled={creating}
+              >
                 Cancel
               </Button>
               <Button onClick={() => void create()} disabled={creating || !createName.trim()} className="gap-2">

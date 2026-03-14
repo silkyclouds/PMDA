@@ -87,6 +87,8 @@ export default function PlaylistDetail() {
       title: it.track.title,
       artist: it.track.artist_name,
       album: it.track.album_title,
+      album_id: it.track.album_id,
+      album_thumb: it.track.thumb || null,
       duration: it.track.duration_sec,
       index: it.track.track_num,
       file_url: it.track.file_url,
@@ -103,7 +105,7 @@ export default function PlaylistDetail() {
       toast({ title: 'Empty playlist', description: 'Add some tracks first.' });
       return;
     }
-    startPlayback(-detail.playlist_id, detail.name || 'Playlist', null, tracksForPlayback);
+    startPlayback(-detail.playlist_id, detail.name || 'Playlist', detail.items[0]?.track.thumb || null, tracksForPlayback);
     setCurrentTrack(tracksForPlayback[0]);
   };
 

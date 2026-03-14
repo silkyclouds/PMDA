@@ -16,6 +16,8 @@ export interface TrackInfo {
   title: string;
   artist: string;
   album: string;
+  album_id?: number;
+  album_thumb?: string | null;
   duration: number;
   index: number;
   file_url: string;
@@ -88,6 +90,13 @@ export function AudioPlayer({
   const displayDuration = duration > 0 ? duration : (currentTrack?.duration ?? 0);
   const { resolvedTheme } = useTheme();
   const isLightTheme = resolvedTheme === 'light';
+  const resolvedAlbumId = (() => {
+    if (Number.isFinite(albumId) && albumId > 0) return albumId;
+    const trackAlbumId = Number(currentTrack?.album_id || 0);
+    return Number.isFinite(trackAlbumId) && trackAlbumId > 0 ? trackAlbumId : albumId;
+  })();
+  const displayAlbumTitle = String(currentTrack?.album || '').trim() || albumTitle;
+  const displayAlbumThumb = albumThumb || currentTrack?.album_thumb || null;
   const releaseYear = (() => {
     const year = Number(albumMeta?.year || 0);
     if (Number.isFinite(year) && year > 0) return String(year);
@@ -172,17 +181,17 @@ export function AudioPlayer({
   // Reset cover error when album or thumb URL changes so we retry showing the image for the new session
   useEffect(() => {
     setCoverError(false);
-  }, [albumId, albumThumb]);
+  }, [resolvedAlbumId, displayAlbumThumb]);
 
   useEffect(() => {
     let cancelled = false;
     const run = async () => {
-      if (!Number.isFinite(albumId) || albumId <= 0) {
+      if (!Number.isFinite(resolvedAlbumId) || resolvedAlbumId <= 0) {
         if (!cancelled) setAlbumMeta(null);
         return;
       }
       try {
-        const detail = await api.getAlbumDetail(albumId);
+        const detail = await api.getAlbumDetail(resolvedAlbumId);
         if (!cancelled) setAlbumMeta(detail);
       } catch {
         if (!cancelled) setAlbumMeta(null);
@@ -192,7 +201,7 @@ export function AudioPlayer({
     return () => {
       cancelled = true;
     };
-  }, [albumId]);
+  }, [resolvedAlbumId]);
 
   useEffect(() => {
     let cancelled = false;
@@ -363,17 +372,17 @@ export function AudioPlayer({
               draggable
               onDragStart={(e) => {
                 try {
-                  e.dataTransfer.setData('application/x-pmda-album', JSON.stringify({ album_id: albumId }));
-                  e.dataTransfer.setData('text/plain', albumTitle || 'Album');
+                  e.dataTransfer.setData('application/x-pmda-album', JSON.stringify({ album_id: resolvedAlbumId }));
+                  e.dataTransfer.setData('text/plain', displayAlbumTitle || 'Album');
                   e.dataTransfer.effectAllowed = 'copy';
                 } catch {
                   // ignore
                 }
               }}
             >
-              {(albumThumb && !coverError) ? (
+              {(displayAlbumThumb && !coverError) ? (
                 <img
-                  src={albumThumb}
+                  src={displayAlbumThumb}
                   alt=""
                   className="h-full w-full object-cover"
                   onError={() => setCoverError(true)}
@@ -394,7 +403,7 @@ export function AudioPlayer({
                 {currentTrack?.title ?? '—'}
               </p>
               <p className="truncate text-xs text-zinc-400">
-                {currentTrack?.artist} · {albumTitle}
+                {currentTrack?.artist} · {displayAlbumTitle}
               </p>
             </button>
           </div>
@@ -621,7 +630,7 @@ export function AudioPlayer({
                     <div className={cn("text-3xl md:text-4xl font-semibold tracking-tight truncate", isLightTheme ? "text-foreground" : "text-white")}>
                       {currentTrack?.title ?? '—'}
                     </div>
-                    <div className={cn("text-sm truncate", isLightTheme ? "text-muted-foreground/90" : "text-white/55")}>{albumTitle}</div>
+                    <div className={cn("text-sm truncate", isLightTheme ? "text-muted-foreground/90" : "text-white/55")}>{displayAlbumTitle}</div>
                     {albumMeta ? (
                       <div className="mt-4 flex max-w-[920px] flex-col items-center gap-2">
                         <div className={cn("text-[11px] uppercase tracking-[0.24em]", isLightTheme ? "text-muted-foreground/80" : "text-white/45")}>
