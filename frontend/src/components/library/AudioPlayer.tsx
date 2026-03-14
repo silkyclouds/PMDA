@@ -165,6 +165,13 @@ export function AudioPlayer({
     // UI state follows the audio element events; reset to avoid showing stale play state during source swap.
     setIsPlaying(false);
     sendRecoEvent('play_start', currentTrack, 0);
+    void api.postPlaybackEvent({
+      track_id: currentTrack.track_id,
+      event_type: 'play_start',
+      played_seconds: 0,
+    }).catch(() => {
+      // Non-blocking telemetry/scrobble path.
+    });
     lastTrackLoadTimeRef.current = Date.now();
     setCurrentTime(0);
     setDuration(currentTrack.duration || 0);
