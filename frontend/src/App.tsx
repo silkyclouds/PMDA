@@ -138,7 +138,7 @@ function AppRoutesWithPlayer() {
           <Route path="/playlists/:playlistId" element={<PlaylistLegacyRedirect />} />
           <Route path="/tag-fixer" element={adminOnly(<TagFixer />)} />
           <Route path="/broken-albums" element={adminOnly(<BrokenAlbumsList />)} />
-          <Route path="/settings" element={adminOnly(<Settings />)} />
+          <Route path="/settings" element={<Settings />} />
           <Route path="/admin/users" element={adminOnly(<AdminUsersPage />)} />
           <Route path="*" element={<NotFound />} />
         </Route>

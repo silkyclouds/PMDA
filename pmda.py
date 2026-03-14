@@ -964,16 +964,28 @@ def _auth_token_hash(raw_token: str) -> str:
 def _auth_public_user(row: sqlite3.Row | dict | None) -> dict:
     if not row:
         return {}
+    def _get(name: str, default: Any = None) -> Any:
+        try:
+            if isinstance(row, dict):
+                return row.get(name, default)
+            keys = row.keys() if hasattr(row, "keys") else ()
+            if name in keys:
+                return row[name]
+        except Exception:
+            pass
+        return default
     return {
-        "id": int(row["id"]),
-        "username": str(row["username"] or ""),
-        "is_admin": bool(int(row["is_admin"] or 0)),
-        "can_download": bool(int(row["can_download"] or 0)),
-        "can_view_statistics": bool(int(row["can_view_statistics"] or 0)),
-        "is_active": bool(int(row["is_active"] or 0)),
-        "created_at": int(row["created_at"] or 0),
-        "updated_at": int(row["updated_at"] or 0),
-        "last_login_at": int(row["last_login_at"] or 0) if row["last_login_at"] is not None else None,
+        "id": int(_get("id", 0) or 0),
+        "username": str(_get("username", "") or ""),
+        "is_admin": bool(int(_get("is_admin", 0) or 0)),
+        "can_download": bool(int(_get("can_download", 0) or 0)),
+        "can_view_statistics": bool(int(_get("can_view_statistics", 0) or 0)),
+        "is_active": bool(int(_get("is_active", 0) or 0)),
+        "accept_shares": bool(int(_get("accept_shares", 1) or 0)),
+        "avatar_data_url": str(_get("avatar_data_url", "") or "").strip() or None,
+        "created_at": int(_get("created_at", 0) or 0),
+        "updated_at": int(_get("updated_at", 0) or 0),
+        "last_login_at": int(_get("last_login_at", 0) or 0) if _get("last_login_at") is not None else None,
     }
 
 
@@ -997,6 +1009,28 @@ def _auth_validate_password(password: str) -> tuple[bool, str]:
     return True, ""
 
 
+def _auth_validate_avatar_data_url(value: Any) -> tuple[bool, Optional[str], str]:
+    raw = str(value or "").strip()
+    if not raw:
+        return True, None, ""
+    if len(raw) > 400_000:
+        return False, None, "Avatar image is too large"
+    m = re.match(r"^data:image/(png|jpeg|jpg|webp|gif);base64,([A-Za-z0-9+/=\\s]+)$", raw, flags=re.IGNORECASE)
+    if not m:
+        return False, None, "Avatar must be a PNG, JPEG, WEBP, or GIF image"
+    try:
+        payload = re.sub(r"\s+", "", m.group(2))
+        decoded = base64.b64decode(payload, validate=True)
+    except Exception:
+        return False, None, "Avatar image payload is invalid"
+    if len(decoded) > 256 * 1024:
+        return False, None, "Avatar image must be 256 KB or smaller"
+    mime = m.group(1).lower()
+    if mime == "jpg":
+        mime = "jpeg"
+    return True, f"data:image/{mime};base64,{payload}", ""
+
+
 def _auth_get_user_by_username(username: str) -> Optional[sqlite3.Row]:
     u = str(username or "").strip()
     if not u:
@@ -1006,7 +1040,7 @@ def _auth_get_user_by_username(username: str) -> Optional[sqlite3.Row]:
         cur = con.cursor()
         cur.execute(
             """
-            SELECT id, username, password_hash, password_salt, is_admin, can_download, can_view_statistics, is_active, created_at, updated_at, last_login_at
+            SELECT id, username, password_hash, password_salt, is_admin, can_download, can_view_statistics, is_active, accept_shares, avatar_data_url, created_at, updated_at, last_login_at
             FROM auth_users
             WHERE username = ?
             LIMIT 1
@@ -1031,7 +1065,7 @@ def _auth_get_user_by_id(user_id: int) -> Optional[sqlite3.Row]:
         cur = con.cursor()
         cur.execute(
             """
-            SELECT id, username, password_hash, password_salt, is_admin, can_download, can_view_statistics, is_active, created_at, updated_at, last_login_at
+            SELECT id, username, password_hash, password_salt, is_admin, can_download, can_view_statistics, is_active, accept_shares, avatar_data_url, created_at, updated_at, last_login_at
             FROM auth_users
             WHERE id = ?
             LIMIT 1
@@ -1323,6 +1357,8 @@ def _auth_resolve_session(raw_token: str) -> Optional[dict]:
                     u.can_download,
                     u.can_view_statistics,
                     u.is_active,
+                    u.accept_shares,
+                    u.avatar_data_url,
                     u.created_at,
                     u.updated_at,
                     u.last_login_at
@@ -3089,16 +3125,20 @@ def _auth_user_snapshot(user_id: int) -> dict[str, Any]:
         return {"id": 0, "username": ""}
     row = _auth_get_user_by_id(uid)
     pub = _auth_public_user(row)
-    return {"id": uid, "username": str(pub.get("username") or "").strip()}
+    return {
+        "id": uid,
+        "username": str(pub.get("username") or "").strip(),
+        "avatar_data_url": str(pub.get("avatar_data_url") or "").strip() or None,
+    }
 
 
-def _auth_active_users_list(*, exclude_user_id: int = 0) -> list[dict[str, Any]]:
+def _auth_active_users_list(*, exclude_user_id: int = 0, require_accept_shares: bool = False) -> list[dict[str, Any]]:
     con = _auth_db_connect()
     try:
         cur = con.cursor()
         cur.execute(
             """
-            SELECT id, username, is_admin, can_download, can_view_statistics, is_active, created_at, updated_at, last_login_at
+            SELECT id, username, is_admin, can_download, can_view_statistics, is_active, accept_shares, avatar_data_url, created_at, updated_at, last_login_at
             FROM auth_users
             WHERE is_active = 1
             ORDER BY username COLLATE NOCASE ASC
@@ -3109,6 +3149,8 @@ def _auth_active_users_list(*, exclude_user_id: int = 0) -> list[dict[str, Any]]
         for row in rows:
             pub = _auth_public_user(row)
             if int(pub.get("id") or 0) == int(exclude_user_id or 0):
+                continue
+            if require_accept_shares and not bool(pub.get("accept_shares")):
                 continue
             users.append(pub)
         return users
@@ -6701,6 +6743,8 @@ def init_settings_db():
             can_download INTEGER NOT NULL DEFAULT 0,
             can_view_statistics INTEGER NOT NULL DEFAULT 0,
             is_active INTEGER NOT NULL DEFAULT 1,
+            accept_shares INTEGER NOT NULL DEFAULT 1,
+            avatar_data_url TEXT,
             created_at INTEGER NOT NULL,
             updated_at INTEGER NOT NULL,
             last_login_at INTEGER
@@ -6766,6 +6810,10 @@ def init_settings_db():
         cur.execute("ALTER TABLE auth_users ADD COLUMN can_view_statistics INTEGER NOT NULL DEFAULT 0")
     if "is_active" not in auth_user_cols:
         cur.execute("ALTER TABLE auth_users ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1")
+    if "accept_shares" not in auth_user_cols:
+        cur.execute("ALTER TABLE auth_users ADD COLUMN accept_shares INTEGER NOT NULL DEFAULT 1")
+    if "avatar_data_url" not in auth_user_cols:
+        cur.execute("ALTER TABLE auth_users ADD COLUMN avatar_data_url TEXT")
     if "last_login_at" not in auth_user_cols:
         cur.execute("ALTER TABLE auth_users ADD COLUMN last_login_at INTEGER")
 
@@ -6867,6 +6915,7 @@ def _auth_is_self_path(path: str) -> bool:
     p = str(path or "")
     if p in {
         "/api/auth/me",
+        "/api/auth/profile",
         "/api/auth/logout",
         "/api/ai/providers/preferences",
     }:
@@ -6900,6 +6949,41 @@ def _auth_non_admin_read_allowed(path: str, method: str, can_download: bool, can
         or p.startswith("/api/scan-history")
         or p.startswith("/api/scans/")
     )
+
+
+def _auth_non_admin_write_allowed(path: str, method: str) -> bool:
+    p = str(path or "")
+    m = str(method or "").upper()
+    if m not in {"POST", "PUT", "DELETE"}:
+        return False
+    allowed_exact = {
+        ("PUT", "/api/library/likes"),
+        ("POST", "/api/library/playlists"),
+        ("POST", "/api/library/reco/event"),
+        ("POST", "/api/library/playback/event"),
+        ("POST", "/api/assistant/chat"),
+        ("POST", "/api/library/entity-discover"),
+    }
+    if (m, p) in allowed_exact:
+        return True
+    allowed_prefixes = (
+        ("PUT", "/api/library/album/"),
+        ("POST", "/api/library/share"),
+        ("POST", "/api/library/recommendations/"),
+        ("POST", "/api/library/notifications/"),
+        ("DELETE", "/api/library/playlists/"),
+        ("POST", "/api/library/playlists/"),
+    )
+    for allowed_method, allowed_prefix in allowed_prefixes:
+        if m == allowed_method and p.startswith(allowed_prefix):
+            if allowed_prefix == "/api/library/album/" and not p.endswith("/rating"):
+                continue
+            if allowed_prefix == "/api/library/recommendations/" and not p.endswith("/like"):
+                continue
+            if allowed_prefix == "/api/library/notifications/" and not p.endswith("/read"):
+                continue
+            return True
+    return False
 
 
 @app.before_request
@@ -6955,6 +7039,9 @@ def _auth_guard():
         bool(user.get("can_download")),
         bool(user.get("can_view_statistics")),
     ):
+        return None
+
+    if _auth_non_admin_write_allowed(path, request.method):
         return None
 
     return jsonify({"error": "Forbidden: admin access required"}), 403
@@ -44000,6 +44087,63 @@ def api_auth_me():
     return jsonify({"ok": True, "user": user})
 
 
+@app.put("/api/auth/profile")
+def api_auth_profile_update():
+    user = dict(getattr(g, "current_user", {}) or {})
+    uid = int(user.get("id") or 0)
+    if uid <= 0:
+        return jsonify({"error": "Not authenticated"}), 401
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        data = {}
+
+    updates: list[str] = []
+    params: list[Any] = []
+
+    if "accept_shares" in data:
+        updates.append("accept_shares = ?")
+        params.append(1 if bool(_parse_bool(data.get("accept_shares"))) else 0)
+
+    if "avatar_data_url" in data:
+        ok_avatar, avatar_data_url, avatar_err = _auth_validate_avatar_data_url(data.get("avatar_data_url"))
+        if not ok_avatar:
+            return jsonify({"error": avatar_err}), 400
+        updates.append("avatar_data_url = ?")
+        params.append(avatar_data_url)
+
+    if not updates:
+        row = _auth_get_user_by_id(uid)
+        return jsonify({"ok": True, "user": _auth_public_user(row)})
+
+    con = _auth_db_connect()
+    try:
+        cur = con.cursor()
+        updates.append("updated_at = ?")
+        params.append(_auth_now_ts())
+        params.append(uid)
+        cur.execute(
+            f"UPDATE auth_users SET {', '.join(updates)} WHERE id = ?",
+            tuple(params),
+        )
+        con.commit()
+    except Exception as e:
+        try:
+            con.rollback()
+        except Exception:
+            pass
+        return jsonify({"error": f"Profile update failed: {e}"}), 500
+    finally:
+        con.close()
+
+    raw_token = _auth_get_bearer_token()
+    if raw_token:
+        _auth_session_cache_drop(_auth_token_hash(raw_token))
+    row = _auth_get_user_by_id(uid)
+    updated_user = _auth_public_user(row)
+    g.current_user = updated_user
+    return jsonify({"ok": True, "user": updated_user})
+
+
 @app.post("/api/auth/logout")
 def api_auth_logout():
     raw_token = _auth_get_bearer_token()
@@ -44025,7 +44169,7 @@ def api_admin_users_get():
         cur = con.cursor()
         cur.execute(
             """
-            SELECT id, username, is_admin, can_download, can_view_statistics, is_active, created_at, updated_at, last_login_at
+            SELECT id, username, is_admin, can_download, can_view_statistics, is_active, accept_shares, avatar_data_url, created_at, updated_at, last_login_at
             FROM auth_users
             ORDER BY is_admin DESC, username ASC
             """
@@ -44074,7 +44218,7 @@ def api_admin_users_update(user_id: int):
         cur = con.cursor()
         cur.execute(
             """
-            SELECT id, username, password_hash, password_salt, is_admin, can_download, can_view_statistics, is_active, created_at, updated_at, last_login_at
+            SELECT id, username, password_hash, password_salt, is_admin, can_download, can_view_statistics, is_active, accept_shares, avatar_data_url, created_at, updated_at, last_login_at
             FROM auth_users
             WHERE id = ?
             LIMIT 1
@@ -44167,7 +44311,7 @@ def api_admin_users_update(user_id: int):
 
         cur.execute(
             """
-            SELECT id, username, is_admin, can_download, can_view_statistics, is_active, created_at, updated_at, last_login_at
+            SELECT id, username, is_admin, can_download, can_view_statistics, is_active, accept_shares, avatar_data_url, created_at, updated_at, last_login_at
             FROM auth_users
             WHERE id = ?
             LIMIT 1
@@ -52869,7 +53013,7 @@ def api_library_social_users():
     uid = _current_user_id_or_zero()
     if uid <= 0:
         return jsonify({"error": "Authentication required", "users": []}), 401
-    return jsonify({"users": _auth_active_users_list(exclude_user_id=uid)})
+    return jsonify({"users": _auth_active_users_list(exclude_user_id=uid, require_accept_shares=True)})
 
 
 @app.post("/api/library/share")
@@ -52914,7 +53058,7 @@ def api_library_share():
             with conn.cursor() as cur:
                 valid_recipients = {
                     int(item.get("id") or 0): item
-                    for item in _auth_active_users_list(exclude_user_id=uid)
+                    for item in _auth_active_users_list(exclude_user_id=uid, require_accept_shares=True)
                     if int(item.get("id") or 0) in recipient_ids
                 }
                 if not valid_recipients:

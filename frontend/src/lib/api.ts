@@ -1865,6 +1865,8 @@ export interface SocialUser {
   can_download: boolean;
   can_view_statistics: boolean;
   is_active: boolean;
+  accept_shares?: boolean;
+  avatar_data_url?: string | null;
   created_at: number;
   updated_at: number;
   last_login_at?: number | null;
@@ -3271,6 +3273,8 @@ export interface AuthUser {
   can_download: boolean;
   can_view_statistics: boolean;
   is_active: boolean;
+  accept_shares?: boolean;
+  avatar_data_url?: string | null;
   created_at: number;
   updated_at: number;
   last_login_at?: number | null;
@@ -3301,6 +3305,16 @@ export interface AuthLoginResponse {
 }
 
 export interface AuthMeResponse {
+  ok: boolean;
+  user: AuthUser;
+}
+
+export interface AuthProfileUpdateRequest {
+  accept_shares?: boolean;
+  avatar_data_url?: string | null;
+}
+
+export interface AuthProfileUpdateResponse {
   ok: boolean;
   user: AuthUser;
 }
@@ -3359,6 +3373,13 @@ export async function login(payload: AuthLoginRequest): Promise<AuthLoginRespons
 
 export async function me(): Promise<AuthMeResponse> {
   return fetchApi<AuthMeResponse>('/api/auth/me');
+}
+
+export async function updateAuthProfile(payload: AuthProfileUpdateRequest): Promise<AuthProfileUpdateResponse> {
+  return fetchApi<AuthProfileUpdateResponse>('/api/auth/profile', {
+    method: 'PUT',
+    body: JSON.stringify(payload),
+  });
 }
 
 export async function logout(): Promise<{ ok: boolean }> {

@@ -3,10 +3,12 @@ import { Save, Loader2, Check, FolderOutput, RefreshCw, X, Database, Sparkles, E
 import { Button } from '@/components/ui/button';
 import { toast } from 'sonner';
 import { IntegrationsSettings } from '@/components/settings/IntegrationsSettings';
+import { ProfileSharingSettings } from '@/components/settings/ProfileSharingSettings';
 import { SchedulerSettings } from '@/components/settings/SchedulerSettings';
 import { SourcesAutonomySettings } from '@/components/settings/SourcesAutonomySettings';
 import { ProviderBadge } from '@/components/providers/ProviderBadge';
 import { ProviderIcon } from '@/components/providers/ProviderIcon';
+import { useAuth } from '@/contexts/AuthContext';
 import * as api from '@/lib/api';
 import type { PMDAConfig } from '@/lib/api';
 import { normalizeConfigForUI } from '@/lib/configUtils';
@@ -241,6 +243,7 @@ function parsePathListValue(value: unknown): string[] {
 }
 
 function SettingsPage() {
+  const auth = useAuth();
   const [config, setConfig] = useState<Partial<PMDAConfig>>({});
   const [isLoading, setIsLoading] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
@@ -333,8 +336,12 @@ function SettingsPage() {
   }, [getApiErrorMessage]);
 
   useEffect(() => {
-    loadConfig();
-  }, []);
+    if (auth.isAdmin) {
+      void loadConfig();
+      return;
+    }
+    setIsLoading(false);
+  }, [auth.isAdmin]);
 
   useEffect(() => {
     const pickActiveFromHash = () => {
@@ -809,6 +816,20 @@ function SettingsPage() {
     );
   }
 
+  if (!auth.isAdmin) {
+    return (
+      <div className="container mx-auto max-w-3xl p-6">
+        <div className="mb-6">
+          <h1 className="text-3xl font-bold">Settings</h1>
+          <p className="mt-1 text-muted-foreground">
+            Personal profile preferences for sharing and identification inside PMDA.
+          </p>
+        </div>
+        <ProfileSharingSettings />
+      </div>
+    );
+  }
+
   return (
     <div className="container mx-auto p-6 max-w-5xl">
         <div className="flex items-center justify-between mb-6">
@@ -884,6 +905,7 @@ function SettingsPage() {
           </nav>
 
           <div className="min-w-0 flex-1 space-y-6">
+            <ProfileSharingSettings compact />
             <Card id="settings-files-export" className={`scroll-mt-24 ${getSettingsSection('settings-files-export').cardClass}`}>
               <CardHeader>
                 <CardTitle className="flex items-center gap-2">

@@ -6,6 +6,7 @@ import * as api from '@/lib/api';
 import { useAuth } from '@/contexts/AuthContext';
 import { cn } from '@/lib/utils';
 import { useToast } from '@/hooks/use-toast';
+import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
 import { Button } from '@/components/ui/button';
 import {
   Sidebar,
@@ -70,6 +71,10 @@ export function AppSidebar() {
   const [dragOverPlaylistId, setDragOverPlaylistId] = useState<number | null>(null);
   const [toolsBadgeCount, setToolsBadgeCount] = useState(0);
   const [recommendationsUnreadCount, setRecommendationsUnreadCount] = useState(0);
+  const userInitials = useMemo(() => {
+    const clean = String(user?.username || '').trim();
+    return clean ? clean.slice(0, 2).toUpperCase() : 'U';
+  }, [user?.username]);
 
   const refreshPlaylists = useCallback(async () => {
     try {
@@ -161,10 +166,11 @@ export function AppSidebar() {
           { to: '/admin/users', label: 'Users', icon: Shield },
         ];
       }
+      const items = [{ to: '/settings', label: 'Settings', icon: Settings2 }];
       if (canViewStatistics) {
-        return [{ to: '/statistics', label: 'Statistics', icon: BarChart3 }];
+        items.unshift({ to: '/statistics', label: 'Statistics', icon: BarChart3 });
       }
-      return [];
+      return items;
     },
     [canViewStatistics, isAdmin]
   );
@@ -371,9 +377,15 @@ export function AppSidebar() {
       </SidebarContent>
 
       <SidebarFooter className="group-data-[collapsible=icon]:items-center">
-        <div className="px-2 py-2 text-xs text-muted-foreground group-data-[collapsible=icon]:hidden">
-          <div className="truncate font-medium text-foreground">{user?.username || 'Unknown user'}</div>
-          <div>{isAdmin ? 'Administrator' : 'Library user'}</div>
+        <div className="flex items-center gap-3 px-2 py-2 text-xs text-muted-foreground group-data-[collapsible=icon]:justify-center">
+          <Avatar className="h-10 w-10 rounded-xl border border-border/60 group-data-[collapsible=icon]:h-8 group-data-[collapsible=icon]:w-8">
+            {user?.avatar_data_url ? <AvatarImage src={user.avatar_data_url} alt={user?.username || 'User avatar'} /> : null}
+            <AvatarFallback className="rounded-xl text-xs font-semibold">{userInitials}</AvatarFallback>
+          </Avatar>
+          <div className="min-w-0 group-data-[collapsible=icon]:hidden">
+            <div className="truncate font-medium text-foreground">{user?.username || 'Unknown user'}</div>
+            <div>{isAdmin ? 'Administrator' : 'Library user'}</div>
+          </div>
         </div>
         <div className="px-2 pb-2 group-data-[collapsible=icon]:px-0.5 group-data-[collapsible=icon]:pb-1">
           <Button

@@ -5,6 +5,7 @@ import * as api from '@/lib/api';
 import { useAuth } from '@/contexts/AuthContext';
 import { useToast } from '@/hooks/use-toast';
 import { Button } from '@/components/ui/button';
+import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
 import { Checkbox } from '@/components/ui/checkbox';
 import {
   Dialog,
@@ -28,6 +29,11 @@ type ShareDialogProps = {
   trigger?: ReactNode;
   onShared?: (count: number) => void;
 };
+
+function getInitials(username: string): string {
+  const clean = String(username || '').trim();
+  return clean ? clean.slice(0, 2).toUpperCase() : 'U';
+}
 
 export function ShareDialog({
   entityType,
@@ -193,6 +199,10 @@ export function ShareDialog({
                         checked={selectedUserIds.includes(candidate.id)}
                         onCheckedChange={() => toggleUser(candidate.id)}
                       />
+                      <Avatar className="h-9 w-9 rounded-xl border border-border/60">
+                        {candidate.avatar_data_url ? <AvatarImage src={candidate.avatar_data_url} alt={candidate.username} /> : null}
+                        <AvatarFallback className="rounded-xl text-xs font-semibold">{getInitials(candidate.username)}</AvatarFallback>
+                      </Avatar>
                       <div className="min-w-0">
                         <div className="truncate text-sm font-medium">{candidate.username}</div>
                         <div className="truncate text-xs text-muted-foreground">
