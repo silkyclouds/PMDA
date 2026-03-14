@@ -17425,6 +17425,7 @@ def _assistant_find_artist_ids_for_query(conn, query: str, limit: int = 3) -> li
     q = (query or "").strip()
     if not q:
         return []
+    q_norm = _assistant_simplify_for_intent(q)
     limit = max(1, min(10, int(limit or 3)))
     with conn.cursor() as cur:
         # 1) Strong heuristic: if the message contains an artist name verbatim, prefer that.
@@ -17444,8 +17445,25 @@ def _assistant_find_artist_ids_for_query(conn, query: str, limit: int = 3) -> li
         if rows:
             return [int(r[0] or 0) for r in rows if int(r[0] or 0) > 0]
 
+        if q_norm:
+            cur.execute(
+                """
+                SELECT id
+                FROM files_artists
+                WHERE length(name_norm) >= 3
+                  AND position(name_norm in %s) > 0
+                ORDER BY length(name_norm) DESC, album_count DESC, name ASC
+                LIMIT %s
+                """,
+                (q_norm, limit),
+            )
+            rows = cur.fetchall()
+            if rows:
+                return [int(r[0] or 0) for r in rows if int(r[0] or 0) > 0]
+
         # 2) Fallback: similarity / ILIKE when pg_trgm is available.
         like = f"%{q}%"
+        like_norm = f"%{q_norm}%" if q_norm else ""
         try:
             cur.execute(
                 """
@@ -17469,6 +17487,30 @@ def _assistant_find_artist_ids_for_query(conn, query: str, limit: int = 3) -> li
                 (like, limit),
             )
         rows = cur.fetchall()
+        if (not rows) and like_norm:
+            try:
+                cur.execute(
+                    """
+                    SELECT id
+                    FROM files_artists
+                    WHERE name_norm ILIKE %s
+                    ORDER BY similarity(name_norm, %s) DESC, album_count DESC, name ASC
+                    LIMIT %s
+                    """,
+                    (like_norm, q_norm, limit),
+                )
+            except Exception:
+                cur.execute(
+                    """
+                    SELECT id
+                    FROM files_artists
+                    WHERE name_norm ILIKE %s
+                    ORDER BY album_count DESC, name ASC
+                    LIMIT %s
+                    """,
+                    (like_norm, limit),
+                )
+            rows = cur.fetchall()
     return [int(r[0] or 0) for r in rows if int(r[0] or 0) > 0]
 
 
@@ -17910,6 +17952,134 @@ def _assistant_links_from_web_results(web_results: list[dict[str, Any]]) -> list
             }
         )
     return out[:8]
+
+
+def _entity_discover_make_internal_link(*, entity_type: str, entity_id: int, label: str, base_url: str, subtitle: str = "", provider: str = "", thumb: str | None = None) -> dict[str, Any]:
+    et = str(entity_type or "").strip().lower()
+    eid = int(entity_id or 0)
+    base = (base_url or "").rstrip("/")
+    href = ""
+    if et == "artist" and eid > 0:
+        href = f"/library/artist/{eid}"
+        thumb = thumb or f"{base}/api/library/files/artist/{eid}/image?size=192"
+    elif et == "album" and eid > 0:
+        href = f"/library/album/{eid}"
+        thumb = thumb or f"{base}/api/library/files/album/{eid}/cover?size=192"
+    elif et == "label" and label:
+        href = f"/library/label/{quote(label)}"
+    elif et == "genre" and label:
+        href = f"/library/genre/{quote(label)}"
+    else:
+        href = ""
+    return {
+        "kind": "internal",
+        "entity_type": et,
+        "entity_id": eid,
+        "label": str(label or "").strip(),
+        "subtitle": str(subtitle or "").strip() or None,
+        "href": href,
+        "thumb": thumb,
+        "provider": str(provider or "").strip() or None,
+    }
+
+
+def _entity_discover_dedup_links(links: list[dict[str, Any]], *, limit: int = 12) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for link in links or []:
+        if not isinstance(link, dict):
+            continue
+        href = str(link.get("href") or "").strip()
+        label = str(link.get("label") or "").strip()
+        if not href or not label:
+            continue
+        key = f"{href}||{label}"
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(link)
+        if len(out) >= int(limit):
+            break
+    return out
+
+
+def _entity_discover_fallback_summary(*, entity_type: str, entity_label: str, sections: list[dict[str, Any]]) -> str:
+    counts = []
+    for sec in sections:
+        title = str(sec.get("title") or "").strip()
+        count = len(sec.get("links") or [])
+        if title and count > 0:
+            counts.append(f"{title}: {count}")
+    base = f"Discovery for {entity_type} {entity_label}."
+    if counts:
+        return f"{base} Relevant paths found in PMDA and on the web: {'; '.join(counts[:4])}."
+    return f"{base} No strong recommendations were found yet."
+
+
+def _entity_discover_ai_summary(
+    *,
+    entity_type: str,
+    entity_label: str,
+    context_lines: list[str],
+    sections: list[dict[str, Any]],
+    user_id: int = 0,
+) -> tuple[str, str, str, bool]:
+    runtime = _assistant_runtime_status(user_id=user_id)
+    if not bool(runtime.get("ai_ready")):
+        return ("", str(runtime.get("ai_provider") or ""), str(runtime.get("ai_model") or ""), False)
+    provider = str(runtime.get("ai_provider") or getattr(sys.modules[__name__], "AI_PROVIDER", "openai")).strip() or "openai"
+    model = str(runtime.get("ai_model") or getattr(sys.modules[__name__], "RESOLVED_MODEL", "") or getattr(sys.modules[__name__], "OPENAI_MODEL", "")).strip()
+    system_msg = (
+        "You are PMDA Intelligence. Write concise music-discovery guidance for a local music-library UI.\n"
+        "Output ONLY a JSON object with keys:\n"
+        "- summary: string\n"
+        "- section_reasons: object mapping section key -> short reason string\n"
+        "Rules:\n"
+        "- Use only the provided local-library context and web findings.\n"
+        "- Prefer recommending items already present in the local library.\n"
+        "- Mention external links only as discovery extensions when they are not already local.\n"
+        "- Keep summary under 140 words.\n"
+    )
+    payload = {
+        "entity_type": entity_type,
+        "entity_label": entity_label,
+        "context": context_lines[:20],
+        "sections": [
+            {
+                "key": str(sec.get("key") or ""),
+                "title": str(sec.get("title") or ""),
+                "links": [
+                    {
+                        "label": str(link.get("label") or ""),
+                        "subtitle": str(link.get("subtitle") or ""),
+                        "kind": str(link.get("kind") or ""),
+                    }
+                    for link in (sec.get("links") or [])[:8]
+                ],
+            }
+            for sec in sections[:6]
+        ],
+    }
+    raw = call_ai_provider_longform(
+        provider,
+        model,
+        system_msg,
+        json.dumps(payload, ensure_ascii=False),
+        max_tokens=500,
+        analysis_type="other",
+    )
+    obj = _assistant_extract_json_obj(raw)
+    if not isinstance(obj, dict):
+        return ("", provider, model, False)
+    summary = str(obj.get("summary") or "").strip()
+    section_reasons = obj.get("section_reasons") if isinstance(obj.get("section_reasons"), dict) else {}
+    if summary:
+        for sec in sections:
+            key = str(sec.get("key") or "").strip()
+            if key and str(section_reasons.get(key) or "").strip():
+                sec["reason"] = str(section_reasons.get(key) or "").strip()
+        return (summary, provider, model, True)
+    return ("", provider, model, False)
 
 
 def _assistant_should_include_web_discovery(user_message: str, *, retrieved_chunks_count: int) -> bool:
@@ -66217,6 +66387,376 @@ def api_assistant_chat():
                 "user_message": user_msg_row,
                 "assistant_message": assistant_msg_row,
                 "citations": retrieved.get("citations") or [],
+            }
+        )
+    finally:
+        conn.close()
+
+
+@app.post("/api/library/entity-discover")
+def api_library_entity_discover():
+    if _get_library_mode() != "files":
+        return jsonify({"error": "Files mode required"}), 400
+    ok, err = _ensure_files_index_ready()
+    if not ok:
+        return jsonify({"error": err or "Files index unavailable"}), 503
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        data = {}
+    entity_type = str(data.get("entity_type") or "").strip().lower()
+    if entity_type not in {"artist", "album", "label"}:
+        return jsonify({"error": "unsupported entity_type"}), 400
+    artist_id = _parse_int_loose(data.get("artist_id"), 0)
+    album_id = _parse_int_loose(data.get("album_id"), 0)
+    label_value = str(data.get("label") or "").strip()
+    base_url = request.url_root.rstrip("/")
+    uid = _current_user_id_or_zero()
+    conn = _files_pg_connect()
+    if conn is None:
+        return jsonify({"error": "PostgreSQL unavailable"}), 503
+    try:
+        entity_label = ""
+        query_terms = ""
+        context_lines: list[str] = []
+        sections: list[dict[str, Any]] = []
+
+        with conn.cursor() as cur:
+            if entity_type == "artist":
+                if artist_id <= 0:
+                    return jsonify({"error": "artist_id is required"}), 400
+                cur.execute(
+                    """
+                    SELECT id, name, album_count, track_count, COALESCE(name_norm, '')
+                    FROM files_artists
+                    WHERE id = %s
+                    """,
+                    (int(artist_id),),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return jsonify({"error": "Artist not found"}), 404
+                artist_id = int(row[0] or 0)
+                entity_label = str(row[1] or "").strip()
+                artist_norm = str(row[4] or "").strip()
+                context_lines.append(f"Artist: {entity_label}")
+                context_lines.append(f"Local albums: {int(row[2] or 0)}")
+                context_lines.append(f"Local tracks: {int(row[3] or 0)}")
+                query_terms = f"{entity_label} similar artists last.fm bandcamp"
+
+                cur.execute(
+                    """
+                    SELECT alb.id, alb.title, COALESCE(alb.year, 0), alb.track_count, COALESCE(alb.format, ''), alb.is_lossless
+                    FROM files_albums alb
+                    WHERE alb.artist_id = %s
+                    ORDER BY COALESCE(alb.year, 0) DESC, alb.title ASC
+                    LIMIT 12
+                    """,
+                    (artist_id,),
+                )
+                local_album_links = [
+                    _entity_discover_make_internal_link(
+                        entity_type="album",
+                        entity_id=int(aid or 0),
+                        label=str(title or "").strip(),
+                        base_url=base_url,
+                        subtitle=" · ".join(
+                            part for part in [
+                                str(int(year or 0)) if int(year or 0) > 0 else "",
+                                f"{int(track_count or 0)} tracks" if int(track_count or 0) > 0 else "",
+                                (str(fmt or "").strip() or "") + (" lossless" if bool(is_lossless) and str(fmt or "").strip() else (" lossy" if str(fmt or "").strip() else "")),
+                            ] if part
+                        ),
+                    )
+                    for aid, title, year, track_count, fmt, is_lossless in cur.fetchall()
+                    if int(aid or 0) > 0 and str(title or "").strip()
+                ]
+                if local_album_links:
+                    sections.append({
+                        "key": "local_albums",
+                        "title": "In your library",
+                        "reason": "Start from the albums you already own.",
+                        "links": _entity_discover_dedup_links(local_album_links, limit=12),
+                    })
+
+                cur.execute(
+                    """
+                    SELECT COALESCE(similar_json, '[]')
+                    FROM files_artist_profiles
+                    WHERE name_norm = %s
+                    LIMIT 1
+                    """,
+                    (artist_norm,),
+                )
+                similar_row = cur.fetchone()
+                similar_payload = []
+                try:
+                    similar_payload = json.loads(str((similar_row[0] if similar_row else "[]") or "[]"))
+                except Exception:
+                    similar_payload = []
+                similar_names: list[str] = []
+                for item in similar_payload if isinstance(similar_payload, list) else []:
+                    if isinstance(item, dict):
+                        nm = str(item.get("name") or "").strip()
+                    else:
+                        nm = str(item or "").strip()
+                    if nm:
+                        similar_names.append(nm)
+                library_similar_links: list[dict[str, Any]] = []
+                for nm in similar_names[:12]:
+                    cur.execute(
+                        """
+                        SELECT id, name
+                        FROM files_artists
+                        WHERE name_norm = %s
+                        LIMIT 1
+                        """,
+                        (_norm_artist_key(nm),),
+                    )
+                    match = cur.fetchone()
+                    if not match:
+                        continue
+                    library_similar_links.append(
+                        _entity_discover_make_internal_link(
+                            entity_type="artist",
+                            entity_id=int(match[0] or 0),
+                            label=str(match[1] or "").strip(),
+                            base_url=base_url,
+                            subtitle="Also present in your library",
+                            provider="lastfm",
+                        )
+                    )
+                if library_similar_links:
+                    sections.append({
+                        "key": "similar_in_library",
+                        "title": "Also in your library",
+                        "reason": "Artists already present locally and adjacent to this artist.",
+                        "links": _entity_discover_dedup_links(library_similar_links, limit=10),
+                    })
+
+            elif entity_type == "album":
+                if album_id <= 0:
+                    return jsonify({"error": "album_id is required"}), 400
+                cur.execute(
+                    """
+                    SELECT alb.id, alb.title, COALESCE(alb.title_norm, ''), COALESCE(alb.genre, ''), COALESCE(alb.label, ''),
+                           alb.artist_id, ar.name, COALESCE(ar.name_norm, ''), COALESCE(alb.year, 0)
+                    FROM files_albums alb
+                    JOIN files_artists ar ON ar.id = alb.artist_id
+                    WHERE alb.id = %s
+                    """,
+                    (int(album_id),),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return jsonify({"error": "Album not found"}), 404
+                album_id = int(row[0] or 0)
+                entity_label = str(row[1] or "").strip()
+                title_norm = str(row[2] or "").strip()
+                genre_text = str(row[3] or "").strip()
+                label_text = str(row[4] or "").strip()
+                artist_id = int(row[5] or 0)
+                artist_name = str(row[6] or "").strip()
+                artist_norm = str(row[7] or "").strip()
+                year = int(row[8] or 0)
+                context_lines.extend([
+                    f"Album: {entity_label}",
+                    f"Artist: {artist_name}",
+                    f"Year: {year}" if year > 0 else "",
+                    f"Genres: {genre_text}" if genre_text else "",
+                    f"Label: {label_text}" if label_text else "",
+                ])
+                context_lines = [line for line in context_lines if line]
+                query_terms = f"{artist_name} {entity_label} similar albums review last.fm bandcamp"
+
+                cur.execute(
+                    """
+                    SELECT id, title, COALESCE(year, 0), track_count, COALESCE(format, ''), is_lossless
+                    FROM files_albums
+                    WHERE artist_id = %s AND id <> %s
+                    ORDER BY COALESCE(year, 0) DESC, title ASC
+                    LIMIT 8
+                    """,
+                    (artist_id, album_id),
+                )
+                artist_album_links = [
+                    _entity_discover_make_internal_link(
+                        entity_type="album",
+                        entity_id=int(aid or 0),
+                        label=str(title or "").strip(),
+                        base_url=base_url,
+                        subtitle=" · ".join(
+                            part for part in [
+                                str(int(year2 or 0)) if int(year2 or 0) > 0 else "",
+                                f"{int(track_count or 0)} tracks" if int(track_count or 0) > 0 else "",
+                                str(fmt or "").strip(),
+                            ] if part
+                        ),
+                    )
+                    for aid, title, year2, track_count, fmt, _lossless in cur.fetchall()
+                    if int(aid or 0) > 0 and str(title or "").strip()
+                ]
+                if artist_album_links:
+                    sections.append({
+                        "key": "more_from_artist",
+                        "title": f"More from {artist_name}",
+                        "reason": "The closest next step is usually another album by the same artist.",
+                        "links": _entity_discover_dedup_links(artist_album_links, limit=8),
+                    })
+
+                genre_values = _split_genre_values(genre_text)[:4]
+                same_vibe_links: list[dict[str, Any]] = []
+                if genre_values:
+                    cur.execute(
+                        """
+                        SELECT alb.id, alb.title, ar.id, ar.name, COALESCE(alb.year, 0), COALESCE(alb.format, ''), alb.is_lossless
+                        FROM files_albums alb
+                        JOIN files_artists ar ON ar.id = alb.artist_id
+                        WHERE alb.id <> %s
+                          AND ar.id <> %s
+                          AND (
+                            lower(COALESCE(alb.genre, '')) LIKE ANY(%s)
+                            OR EXISTS (
+                              SELECT 1
+                              FROM jsonb_array_elements_text(COALESCE(alb.tags_json, '[]'::jsonb)) AS t(tag)
+                              WHERE lower(t.tag) = ANY(%s)
+                            )
+                          )
+                        ORDER BY COALESCE(alb.updated_at, alb.created_at) DESC, alb.id DESC
+                        LIMIT 10
+                        """,
+                        (
+                            album_id,
+                            artist_id,
+                            [f"%{g.lower()}%" for g in genre_values],
+                            [g.lower() for g in genre_values],
+                        ),
+                    )
+                    same_vibe_links = [
+                        _entity_discover_make_internal_link(
+                            entity_type="album",
+                            entity_id=int(aid or 0),
+                            label=str(title or "").strip(),
+                            base_url=base_url,
+                            subtitle=" · ".join(
+                                part for part in [
+                                    str(an or "").strip(),
+                                    str(int(year2 or 0)) if int(year2 or 0) > 0 else "",
+                                    str(fmt or "").strip(),
+                                ] if part
+                            ),
+                        )
+                        for aid, title, _arid, an, year2, fmt, _lossless in cur.fetchall()
+                        if int(aid or 0) > 0 and str(title or "").strip()
+                    ]
+                if same_vibe_links:
+                    sections.append({
+                        "key": "same_vibe_library",
+                        "title": "Same vibe in your library",
+                        "reason": "Albums nearby by genre and listening context.",
+                        "links": _entity_discover_dedup_links(same_vibe_links, limit=8),
+                    })
+
+            else:
+                if not label_value:
+                    return jsonify({"error": "label is required"}), 400
+                entity_label = label_value
+                query_terms = f"{entity_label} record label artists discogs bandcamp"
+                context_lines.append(f"Label: {entity_label}")
+                cur.execute(
+                    """
+                    SELECT alb.id, alb.title, ar.id, ar.name, COALESCE(alb.year, 0), alb.track_count, COALESCE(alb.format, ''), alb.is_lossless
+                    FROM files_albums alb
+                    JOIN files_artists ar ON ar.id = alb.artist_id
+                    WHERE lower(trim(COALESCE(alb.label, ''))) = lower(trim(%s))
+                    ORDER BY COALESCE(alb.updated_at, alb.created_at) DESC, alb.id DESC
+                    LIMIT 12
+                    """,
+                    (label_value,),
+                )
+                label_release_links: list[dict[str, Any]] = []
+                label_artist_links: list[dict[str, Any]] = []
+                seen_artist_ids: set[int] = set()
+                for aid, title, arid, aname, year2, track_count, fmt, _lossless in cur.fetchall():
+                    if int(aid or 0) > 0 and str(title or "").strip():
+                        label_release_links.append(
+                            _entity_discover_make_internal_link(
+                                entity_type="album",
+                                entity_id=int(aid or 0),
+                                label=str(title or "").strip(),
+                                base_url=base_url,
+                                subtitle=" · ".join(
+                                    part for part in [
+                                        str(aname or "").strip(),
+                                        str(int(year2 or 0)) if int(year2 or 0) > 0 else "",
+                                        f"{int(track_count or 0)} tracks" if int(track_count or 0) > 0 else "",
+                                        str(fmt or "").strip(),
+                                    ] if part
+                                ),
+                            )
+                        )
+                    if int(arid or 0) > 0 and int(arid or 0) not in seen_artist_ids:
+                        seen_artist_ids.add(int(arid or 0))
+                        label_artist_links.append(
+                            _entity_discover_make_internal_link(
+                                entity_type="artist",
+                                entity_id=int(arid or 0),
+                                label=str(aname or "").strip(),
+                                base_url=base_url,
+                                subtitle=f"On {entity_label}",
+                            )
+                        )
+                if label_release_links:
+                    sections.append({
+                        "key": "releases_on_label",
+                        "title": "Releases on this label",
+                        "reason": "Start with albums already indexed locally for this label.",
+                        "links": _entity_discover_dedup_links(label_release_links, limit=10),
+                    })
+                if label_artist_links:
+                    sections.append({
+                        "key": "artists_on_label",
+                        "title": "Artists on this label",
+                        "reason": "These artists are already represented in your library.",
+                        "links": _entity_discover_dedup_links(label_artist_links, limit=10),
+                    })
+
+        web_results: list[dict[str, Any]] = []
+        if query_terms:
+            try:
+                web_results = _web_search_serper(query_terms, num=6, allow_ai_fallback=True) or []
+            except Exception:
+                web_results = []
+        external_links = _assistant_links_from_web_results(web_results)
+        if external_links:
+            sections.append({
+                "key": "on_the_web",
+                "title": "Go deeper on the web",
+                "reason": "Useful references and next-listen paths outside your current library.",
+                "links": _entity_discover_dedup_links(external_links, limit=8),
+            })
+
+        sections = [sec for sec in sections if len(sec.get("links") or []) > 0]
+        summary = _entity_discover_fallback_summary(entity_type=entity_type, entity_label=entity_label, sections=sections)
+        ai_summary, provider_used, model_used, ai_used = _entity_discover_ai_summary(
+            entity_type=entity_type,
+            entity_label=entity_label,
+            context_lines=context_lines,
+            sections=sections,
+            user_id=uid,
+        )
+        if ai_summary:
+            summary = ai_summary
+        return jsonify(
+            {
+                "entity_type": entity_type,
+                "entity_label": entity_label,
+                "generated_at": int(time.time()),
+                "summary": summary,
+                "sections": sections,
+                "provider": provider_used or None,
+                "model": model_used or None,
+                "ai_used": bool(ai_used),
+                "fallback_used": not bool(ai_used),
             }
         )
     finally:

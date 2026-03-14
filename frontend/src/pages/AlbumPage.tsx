@@ -10,6 +10,7 @@ import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel,
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { FormatBadge } from '@/components/FormatBadge';
 import { AlbumRatingStars } from '@/components/library/AlbumRatingStars';
+import { EntityDiscoverDialog } from '@/components/library/EntityDiscoverDialog';
 import { MatchDetailDialog } from '@/components/library/MatchDetailDialog';
 import { ProviderBadge } from '@/components/providers/ProviderBadge';
 import { ProviderLink } from '@/components/providers/ProviderLink';
@@ -622,6 +623,12 @@ export default function AlbumPage() {
                 Share
               </Button>
             )}
+          />
+          <EntityDiscoverDialog
+            entityType="album"
+            albumId={data.album_id}
+            entityLabel={data.title}
+            triggerLabel="Discover"
           />
         </div>
       </div>

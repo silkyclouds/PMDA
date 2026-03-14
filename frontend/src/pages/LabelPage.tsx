@@ -6,6 +6,7 @@ import { AspectRatio } from '@/components/ui/aspect-ratio';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
+import { EntityDiscoverDialog } from '@/components/library/EntityDiscoverDialog';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { AlbumArtwork } from '@/components/library/AlbumArtwork';
 import { AlbumBadgeGroups } from '@/components/library/AlbumBadgeGroups';
@@ -259,6 +260,12 @@ export default function LabelPage() {
                   Share
                 </Button>
               )}
+            />
+            <EntityDiscoverDialog
+              entityType="label"
+              label={label}
+              entityLabel={label || 'Label'}
+              triggerLabel="Discover"
             />
           </div>
 

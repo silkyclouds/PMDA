@@ -10,6 +10,7 @@ import { Carousel, CarouselContent, CarouselItem, CarouselNext, CarouselPrevious
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { AlbumArtwork } from '@/components/library/AlbumArtwork';
 import { AlbumBadgeGroups } from '@/components/library/AlbumBadgeGroups';
+import { EntityDiscoverDialog } from '@/components/library/EntityDiscoverDialog';
 import { MatchDetailDialog } from '@/components/library/MatchDetailDialog';
 import { ProviderBadge } from '@/components/providers/ProviderBadge';
 import { ShareDialog } from '@/components/social/ShareDialog';
@@ -918,6 +919,12 @@ export default function ArtistPage() {
                       {aiProcessBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />}
                       AI research
                     </Button>
+                    <EntityDiscoverDialog
+                      entityType="artist"
+                      artistId={details.artist_id}
+                      entityLabel={details.artist_name}
+                      triggerLabel="Discover"
+                    />
                     <Button
                       type="button"
                       size="sm"
