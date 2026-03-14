@@ -18376,7 +18376,7 @@ def _assistant_recommend_albums_from_query(
             alb.has_cover,
             COALESCE(pr.public_rating, 0) AS public_rating,
             COALESCE(pr.heat_score, 0) AS heat_score,
-            COALESCE(pr.rating_votes, 0) AS rating_votes
+            COALESCE(pr.public_rating_votes, 0) AS rating_votes
         FROM files_albums alb
         JOIN files_artists art ON art.id = alb.artist_id
         LEFT JOIN files_album_profiles pr
@@ -18389,7 +18389,7 @@ def _assistant_recommend_albums_from_query(
         ORDER BY
             COALESCE(pr.public_rating, 0) DESC,
             COALESCE(pr.heat_score, 0) DESC,
-            COALESCE(pr.rating_votes, 0) DESC,
+            COALESCE(pr.public_rating_votes, 0) DESC,
             COALESCE(alb.year, 0) DESC,
             art.name ASC,
             alb.title ASC
@@ -18412,7 +18412,7 @@ def _assistant_recommend_albums_from_query(
                     alb.has_cover,
                     COALESCE(pr.public_rating, 0) AS public_rating,
                     COALESCE(pr.heat_score, 0) AS heat_score,
-                    COALESCE(pr.rating_votes, 0) AS rating_votes
+                    COALESCE(pr.public_rating_votes, 0) AS rating_votes
                 FROM files_albums alb
                 JOIN files_artists art ON art.id = alb.artist_id
                 LEFT JOIN files_album_profiles pr
@@ -18421,7 +18421,7 @@ def _assistant_recommend_albums_from_query(
                 ORDER BY
                     COALESCE(pr.public_rating, 0) DESC,
                     COALESCE(pr.heat_score, 0) DESC,
-                    COALESCE(pr.rating_votes, 0) DESC,
+                    COALESCE(pr.public_rating_votes, 0) DESC,
                     COALESCE(alb.year, 0) DESC,
                     art.name ASC,
                     alb.title ASC
