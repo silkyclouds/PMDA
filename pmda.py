@@ -15686,16 +15686,9 @@ def _run_files_profile_enrichment_job(
                     "bandcamp",
                     "lastfm",
                 ]
-                if (not bool(strict_verified)) and _normalize_identity_provider(metadata_source) == "musicbrainz":
-                    # MusicBrainz CAA is useful, but for soft MB identities we should first prefer
-                    # provider-specific commercial/retail art when available. This avoids keeping an
-                    # unrelated or generic CAA image when Discogs/Bandcamp/Last.fm expose a clearer cover.
-                    cover_candidates_default = [
-                        "discogs",
-                        "bandcamp",
-                        "lastfm",
-                        "musicbrainz",
-                    ]
+                # Always try the exact identity source first. Using Discogs/Bandcamp ahead of
+                # a MusicBrainz-linked release-group caused incorrect cover replacement on albums
+                # like "Von" where the soft identity was still right but third-party search art was not.
 
                 provider_chain: list[str] = []
                 for provider_name in cover_candidates_default:
@@ -15822,7 +15815,7 @@ def _run_files_profile_enrichment_job(
                                         str(cached),
                                         (
                                             str(payload.get("release_id") or "").strip()
-                                            if refreshed_provider == "discogs" and isinstance(payload, dict)
+                                            if provider_name == "discogs" and isinstance(payload, dict)
                                             else ""
                                         ),
                                         int(album_id),
@@ -24489,6 +24482,11 @@ def _album_hint_from_track_titles(track_titles: list[str]) -> str:
     Extract a likely album-title prefix from filename-like track titles:
     Example: "Takk... - 01 - Glosoli" -> "Takk..."
     """
+    def _strip_filename_edge_separators(value: str) -> str:
+        # Preserve meaningful trailing dots/ellipsis in album titles ("Takk..."),
+        # while still trimming filename separators around the extracted token.
+        return str(value or "").strip(" -_")
+
     prefixes: list[str] = []
     for title in track_titles or []:
         t = str(title or "").strip()
@@ -24497,7 +24495,7 @@ def _album_hint_from_track_titles(track_titles: list[str]) -> str:
         m = re.match(r"^\s*(.+?)\s*[-–—]\s*\d{1,3}\s*[-–—]\s*.+$", t)
         if not m:
             continue
-        prefix = str(m.group(1) or "").strip(" -_.")
+        prefix = _strip_filename_edge_separators(str(m.group(1) or ""))
         if prefix:
             prefixes.append(prefix)
     if not prefixes:
@@ -24529,6 +24527,8 @@ def _filename_identity_hints(file_paths: list[Path | str] | None) -> dict[str, s
     """
     artist_candidates: list[str] = []
     album_candidates: list[str] = []
+    def _strip_filename_edge_separators(value: str) -> str:
+        return str(value or "").strip(" -_")
     for raw in (file_paths or [])[:80]:
         try:
             p = raw if isinstance(raw, Path) else Path(str(raw))
@@ -24543,8 +24543,8 @@ def _filename_identity_hints(file_paths: list[Path | str] | None) -> dict[str, s
         track_marker = parts[2]
         if not re.match(r"^(?:\d{1,3}|\d{1,2}\s*[-_.]\s*\d{1,2})$", track_marker):
             continue
-        artist_guess = str(parts[0] or "").strip(" -_.")
-        album_guess = str(parts[1] or "").strip(" -_.")
+        artist_guess = _strip_filename_edge_separators(str(parts[0] or ""))
+        album_guess = _strip_filename_edge_separators(str(parts[1] or ""))
         if artist_guess:
             artist_candidates.append(artist_guess)
         if album_guess:
@@ -30946,6 +30946,8 @@ def _clean_track_title_from_text(text: str, fallback_index: int) -> str:
     raw = str(text or "").strip()
     if not raw:
         return f"Track {max(1, int(fallback_index or 1))}"
+    def _trim_title_separators(value: str) -> str:
+        return str(value or "").strip(" -_")
     cleaned = re.sub(
         r"^\s*[^-]+?\s*-\s*\d{1,2}\s*[-_. ]\s*\d{1,3}\s*[-_. ]*",
         "",
@@ -30953,7 +30955,7 @@ def _clean_track_title_from_text(text: str, fallback_index: int) -> str:
         flags=re.IGNORECASE,
     )
     if cleaned != raw:
-        cleaned = cleaned.strip(" -_.")
+        cleaned = _trim_title_separators(cleaned)
         return cleaned or raw or f"Track {fallback_index}"
     cleaned = re.sub(
         r"^\s*[^-]+?\s*-\s*\d{1,3}\s*[-_. ]*",
@@ -30962,7 +30964,7 @@ def _clean_track_title_from_text(text: str, fallback_index: int) -> str:
         flags=re.IGNORECASE,
     )
     if cleaned != raw:
-        cleaned = cleaned.strip(" -_.")
+        cleaned = _trim_title_separators(cleaned)
         return cleaned or raw or f"Track {fallback_index}"
     cleaned = re.sub(
         r"^\s*[^-]+?\s*-\s*[^-]+?\s*-\s*\d{1,2}\s*[-_. ]\s*\d{1,3}\s*[-_. ]*",
@@ -30971,7 +30973,7 @@ def _clean_track_title_from_text(text: str, fallback_index: int) -> str:
         flags=re.IGNORECASE,
     )
     if cleaned != raw:
-        cleaned = cleaned.strip(" -_.")
+        cleaned = _trim_title_separators(cleaned)
         return cleaned or raw or f"Track {fallback_index}"
     cleaned = re.sub(
         r"^\s*[^-]+?\s*-\s*[^-]+?\s*-\s*\d{1,3}\s*[-_. ]*",
@@ -30980,7 +30982,7 @@ def _clean_track_title_from_text(text: str, fallback_index: int) -> str:
         flags=re.IGNORECASE,
     )
     if cleaned != raw:
-        cleaned = cleaned.strip(" -_.")
+        cleaned = _trim_title_separators(cleaned)
         return cleaned or raw or f"Track {fallback_index}"
     cleaned = re.sub(
         r"^\s*[^-]+?\s*-\s*\d{1,2}\s*[-_. ]\s*\d{1,3}\s*[-_. ]*",
@@ -30989,13 +30991,13 @@ def _clean_track_title_from_text(text: str, fallback_index: int) -> str:
         flags=re.IGNORECASE,
     )
     if cleaned != raw:
-        cleaned = cleaned.strip(" -_.")
+        cleaned = _trim_title_separators(cleaned)
         return cleaned or raw or f"Track {fallback_index}"
     cleaned = re.sub(r"^\s*(?:cd|disc)\s*\d{1,2}\s*[-_. ]\s*\d{1,3}\s*[-_. ]*", "", raw, flags=re.IGNORECASE)
     cleaned = re.sub(r"^\s*\d{1,2}\s*[-_.]\s*\d{1,3}\s*[-_. ]*", "", cleaned)
     cleaned = re.sub(r"^\s*[A-Z]\s*(?:[-_. ]?\s*\d{1,3})\s*[-_. ]*", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"^\s*\d{1,3}\s*[-_. ]*", "", cleaned)
-    cleaned = cleaned.strip(" -_.")
+    cleaned = _trim_title_separators(cleaned)
     return cleaned or raw or f"Track {fallback_index}"
 
 
@@ -31025,7 +31027,7 @@ def _strip_album_artist_prefixes_from_track_title(
             cleaned,
             flags=re.IGNORECASE,
         )
-    cleaned = cleaned.strip(" -_.")
+    cleaned = cleaned.strip(" -_")
     return cleaned or raw
 
 
@@ -31658,6 +31660,24 @@ def _authoritative_publication_cover(
         edition_payload["bandcamp_album_url"] = bandcamp_album_url
     if metadata_source:
         edition_payload["primary_metadata_source"] = metadata_source
+
+    exact_provider_ids: dict[str, str] = {}
+    for provider in ("musicbrainz", "discogs", "bandcamp", "lastfm"):
+        try:
+            expected_id = _strict_expected_provider_id(provider, edition_payload)
+        except Exception:
+            expected_id = ""
+        if expected_id:
+            exact_provider_ids[provider] = expected_id
+
+    if exact_provider_ids:
+        exact_chain: list[str] = []
+        if provider_seed and provider_seed in exact_provider_ids:
+            exact_chain.append(provider_seed)
+        for provider in ("musicbrainz", "discogs", "bandcamp", "lastfm"):
+            if provider in exact_provider_ids and provider not in exact_chain:
+                exact_chain.append(provider)
+        provider_chain = exact_chain
 
     for provider in provider_chain:
         try:
@@ -32879,6 +32899,8 @@ def _build_files_editions(
 
     def _title_from_filename(path: Path, fallback_index: int) -> str:
         stem = path.stem.strip()
+        def _trim_title_separators(value: str) -> str:
+            return str(value or "").strip(" -_")
         cleaned = re.sub(
             r"^\s*[^-]+?\s*-\s*[^-]+?\s*-\s*\d{1,2}\s*[-_. ]\s*\d{1,3}\s*[-_. ]*",
             "",
@@ -32886,7 +32908,7 @@ def _build_files_editions(
             flags=re.IGNORECASE,
         )
         if cleaned != stem:
-            cleaned = cleaned.strip(" -_.")
+            cleaned = _trim_title_separators(cleaned)
             return cleaned or stem or f"Track {fallback_index}"
         cleaned = re.sub(
             r"^\s*[^-]+?\s*-\s*[^-]+?\s*-\s*\d{1,3}\s*-\s*",
@@ -32895,7 +32917,7 @@ def _build_files_editions(
             flags=re.IGNORECASE,
         )
         if cleaned != stem:
-            cleaned = cleaned.strip(" -_.")
+            cleaned = _trim_title_separators(cleaned)
             return cleaned or stem or f"Track {fallback_index}"
         cleaned = re.sub(r"^\s*(?:cd|disc)\s*\d{1,2}\s*[-_. ]\s*\d{1,3}\s*[-_. ]*", "", stem, flags=re.IGNORECASE)
         cleaned = re.sub(r"^\s*\d{1,2}\s*[-_.]\s*\d{1,3}\s*[-_. ]*", "", cleaned)
@@ -32903,7 +32925,7 @@ def _build_files_editions(
         # from normal names (e.g. "Ochre - ...").
         cleaned = re.sub(r"^\s*[A-Z]\s*(?:[-_. ]?\s*\d{1,3})\s*[-_. ]*", "", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"^\s*\d{1,3}\s*[-_. ]*", "", cleaned)
-        cleaned = cleaned.strip(" -_.")
+        cleaned = _trim_title_separators(cleaned)
         return cleaned or stem or f"Track {fallback_index}"
 
     def _filename_tail_for_track_parsing(path: Path | str) -> str:
@@ -32969,7 +32991,7 @@ def _build_files_editions(
                 tail = _filename_tail_for_track_parsing(file_raw)
                 file_title = _title_from_filename(Path(tail), fallback_index)
                 file_title = re.sub(r"^\s*\d{1,2}\s*[-_. ]\s*\d{1,3}\s*[-_. ]*", "", file_title)
-                file_title = file_title.strip(" -_.")
+                file_title = file_title.strip(" -_")
                 if file_title:
                     return file_title
             except Exception:
@@ -32993,7 +33015,7 @@ def _build_files_editions(
         cleaned = re.sub(r"^\s*(?:cd|disc)\s*\d{1,2}\s*[-_. ]\s*\d{1,3}\s*[-_. ]*", "", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"^\s*\d{1,2}\s*[-_.]\s*\d{1,3}\s*[-_. ]*", "", cleaned)
         cleaned = re.sub(r"^\s*\d{1,3}\s*[-_. ]*", "", cleaned)
-        cleaned = cleaned.strip(" -_.")
+        cleaned = cleaned.strip(" -_")
         return cleaned or title or f"Track {fallback_index}"
 
     def _track_title_looks_filename_noise(raw_title: str, album_title: str = "") -> bool:
@@ -58979,7 +59001,7 @@ def _infer_artist_album_from_folder(folder_path: Path, audio_files: List[Path]) 
         txt = str(token or "").strip().replace("_", " ")
         txt = re.sub(r"\b(no\s*tags?|no\s*cover|gaps?|incomplete|broken|dupe|duplicate|run\s*source)\b", " ", txt, flags=re.IGNORECASE)
         txt = " ".join(txt.split())
-        return txt.strip(" -_.")
+        return txt.strip(" -_")
 
     if "__" in folder_name_raw:
         parts = [_clean_folder_token(p) for p in folder_name_raw.split("__")]
