@@ -15676,23 +15676,6 @@ def _run_files_profile_enrichment_job(
             ) -> bool:
                 current_cover_provider = _cover_provider_from_primary_tags(primary_tags_json)
                 cover_raw = str(cover_path_raw or "").strip()
-                if current_cover_provider and current_cover_provider not in {"local", "unknown"} and cover_raw:
-                    return False
-
-                cover_candidates_default = [
-                    str(metadata_source or "").strip(),
-                    "musicbrainz",
-                    "discogs",
-                    "bandcamp",
-                    "lastfm",
-                ]
-
-                provider_chain: list[str] = []
-                for provider_name in cover_candidates_default:
-                    provider_norm = _normalize_identity_provider(provider_name)
-                    if provider_norm and provider_norm not in provider_chain:
-                        provider_chain.append(provider_norm)
-
                 edition_payload = {
                     "musicbrainz_id": str(mbid or "").strip(),
                     "musicbrainz_release_group_id": str(mbid or "").strip(),
@@ -15711,6 +15694,20 @@ def _run_files_profile_enrichment_job(
                     if expected_id:
                         exact_provider_ids[provider_name] = expected_id
 
+                cover_candidates_default = [
+                    str(metadata_source or "").strip(),
+                    "musicbrainz",
+                    "discogs",
+                    "bandcamp",
+                    "lastfm",
+                ]
+
+                provider_chain: list[str] = []
+                for provider_name in cover_candidates_default:
+                    provider_norm = _normalize_identity_provider(provider_name)
+                    if provider_norm and provider_norm not in provider_chain:
+                        provider_chain.append(provider_norm)
+
                 if exact_provider_ids:
                     # Covers are more reliable when we privilege authoritative visual sources,
                     # not the metadata seed. Last.fm exact IDs can still point to alternate art.
@@ -15719,6 +15716,15 @@ def _run_files_profile_enrichment_job(
                         for provider_name in ("musicbrainz", "discogs", "bandcamp", "lastfm")
                         if provider_name in exact_provider_ids
                     ]
+
+                current_cover_provider_norm = _normalize_identity_provider(current_cover_provider)
+                if current_cover_provider_norm and current_cover_provider_norm not in {"local", "unknown"} and cover_raw:
+                    if exact_provider_ids:
+                        preferred_provider = provider_chain[0] if provider_chain else ""
+                        if current_cover_provider_norm == preferred_provider:
+                            return False
+                    else:
+                        return False
 
                 def _identity_ok(provider_name: str, payload: dict[str, Any] | None) -> bool:
                     if provider_name == "musicbrainz":
@@ -31634,19 +31640,13 @@ def _authoritative_publication_cover(
 ) -> tuple[str, bool, str]:
     local_cover = _first_cover_path(folder)
     local_cover_ok = bool(local_cover and local_cover.is_file())
-    if local_cover_ok and not _publication_cover_needs_provider_refresh(
-        tags,
-        artist_resolved=artist_resolved,
-        album_resolved=album_resolved,
-    ):
-        return (str(local_cover), True, "local")
-
-    if not _has_trusted_album_identity(
+    trusted_identity = _has_trusted_album_identity(
         musicbrainz_id=musicbrainz_release_group_id or musicbrainz_release_id,
         discogs_release_id=discogs_release_id,
         lastfm_album_mbid=lastfm_album_mbid,
         bandcamp_album_url=bandcamp_album_url,
-    ):
+    )
+    if not trusted_identity:
         return (str(local_cover) if local_cover_ok else "", bool(local_cover_ok), "local" if local_cover_ok else "")
 
     provider_seed = _normalize_identity_provider(
@@ -31693,6 +31693,16 @@ def _authoritative_publication_cover(
             expected_id = ""
         if expected_id:
             exact_provider_ids[provider] = expected_id
+
+    # If we do not have an exact provider identity, keep a usable local cover.
+    # Once an exact identity exists, prefer authoritative external art over any
+    # embedded/local image because legacy files can carry stale or incorrect art.
+    if (not exact_provider_ids) and local_cover_ok and not _publication_cover_needs_provider_refresh(
+        tags,
+        artist_resolved=artist_resolved,
+        album_resolved=album_resolved,
+    ):
+        return (str(local_cover), True, "local")
 
     if exact_provider_ids:
         # Do not privilege metadata_source here. For covers, MusicBrainz/Discogs/Bandcamp
