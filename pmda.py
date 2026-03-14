@@ -39134,6 +39134,54 @@ def _lastfm_pending_token() -> str:
     return _settings_db_get_secret(_LASTFM_AUTH_TOKEN_SETTING)
 
 
+def _lastfm_has_stored_session_ciphertext() -> bool:
+    raw = str(_get_config_from_db(_LASTFM_SESSION_KEY_SETTING, "") or "").strip()
+    return bool(raw)
+
+
+def _lastfm_has_stored_pending_ciphertext() -> bool:
+    raw = str(_get_config_from_db(_LASTFM_AUTH_TOKEN_SETTING, "") or "").strip()
+    return bool(raw)
+
+
+def _lastfm_status_snapshot() -> dict[str, Any]:
+    api_key, api_secret = _lastfm_credentials_effective()
+    pending_token = _lastfm_pending_token()
+    session_name = _lastfm_session_name()
+    session_key = _lastfm_session_key()
+    pending_cipher = _lastfm_has_stored_pending_ciphertext()
+    session_cipher = _lastfm_has_stored_session_ciphertext()
+    configured = bool(api_key and api_secret)
+    connected = bool(configured and session_key)
+    pending = bool(pending_token and not connected)
+    corrupt_session = bool(configured and session_cipher and not session_key)
+    corrupt_pending = bool(configured and pending_cipher and not pending_token and not connected)
+    reconnect_required = bool(corrupt_session or corrupt_pending)
+    auth_url = _lastfm_auth_url_for_token(pending_token) if pending_token and api_key else ""
+    message = ""
+    if reconnect_required:
+        message = "Stored Last.fm authorization can no longer be decrypted. Reconnect Last.fm."
+    elif pending:
+        message = "Authorize PMDA on Last.fm, then click Finish authorization."
+    elif connected:
+        message = f"Connected to Last.fm as {session_name or 'your account'}."
+    elif configured:
+        message = "Last.fm credentials are configured. Connect a user session to enable scrobbling."
+    else:
+        message = "Configure Last.fm API key and secret first."
+    return {
+        "configured": configured,
+        "connected": connected,
+        "pending": pending,
+        "session_name": session_name or "",
+        "auth_url": auth_url,
+        "error": "",
+        "reconnect_required": reconnect_required,
+        "corrupt_session": corrupt_session,
+        "message": message,
+    }
+
+
 def _lastfm_scrobble_enabled() -> bool:
     return bool(_parse_bool(_get_config_from_db("LASTFM_SCROBBLE_ENABLED", getattr(sys.modules[__name__], "LASTFM_SCROBBLE_ENABLED", False))))
 
@@ -43154,21 +43202,7 @@ def api_openai_check():
 
 @app.get("/api/lastfm/auth/status")
 def api_lastfm_auth_status():
-    api_key, api_secret = _lastfm_credentials_effective()
-    pending_token = _lastfm_pending_token()
-    session_name = _lastfm_session_name()
-    session_key = _lastfm_session_key()
-    connected = bool(api_key and api_secret and session_key)
-    return jsonify(
-        {
-            "configured": bool(api_key and api_secret),
-            "connected": connected,
-            "pending": bool(pending_token and not connected),
-            "session_name": session_name or "",
-            "auth_url": _lastfm_auth_url_for_token(pending_token) if pending_token and api_key else "",
-            "error": "",
-        }
-    )
+    return jsonify(_lastfm_status_snapshot())
 
 
 @app.post("/api/lastfm/auth/start")
@@ -43177,6 +43211,10 @@ def api_lastfm_auth_start():
     if not api_key or not api_secret:
         return jsonify({"ok": False, "message": "Configure Last.fm API key and secret first."}), 400
     try:
+        # If an old encrypted token/session is no longer decryptable, clear it before starting a new auth flow.
+        snapshot = _lastfm_status_snapshot()
+        if snapshot.get("reconnect_required"):
+            _settings_db_delete_keys(_LASTFM_AUTH_TOKEN_SETTING, _LASTFM_SESSION_KEY_SETTING, _LASTFM_SESSION_NAME_SETTING)
         data = _lastfm_signed_post({"method": "auth.getToken"}, timeout=12.0)
         token = str((data.get("token") if isinstance(data, dict) else "") or "").strip()
         if not token:
@@ -43208,6 +43246,18 @@ def api_lastfm_auth_complete():
         _settings_db_set_secret(_LASTFM_SESSION_KEY_SETTING, session_key)
         _settings_db_set_value(_LASTFM_SESSION_NAME_SETTING, session_name)
         _settings_db_delete_keys(_LASTFM_AUTH_TOKEN_SETTING)
+        if _get_config_from_db("LASTFM_SCROBBLE_ENABLED") is None:
+            _settings_db_set_value("LASTFM_SCROBBLE_ENABLED", "1")
+            try:
+                sys.modules[__name__].LASTFM_SCROBBLE_ENABLED = True
+            except Exception:
+                pass
+        if _get_config_from_db("LASTFM_NOW_PLAYING_ENABLED") is None:
+            _settings_db_set_value("LASTFM_NOW_PLAYING_ENABLED", "1")
+            try:
+                sys.modules[__name__].LASTFM_NOW_PLAYING_ENABLED = True
+            except Exception:
+                pass
         try:
             uid = max(0, int(_current_user_id_or_zero() or 0))
             if uid > 0:

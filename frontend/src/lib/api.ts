@@ -3566,6 +3566,9 @@ export interface LastfmAuthStatusResponse {
   session_name?: string;
   auth_url?: string;
   error?: string;
+  reconnect_required?: boolean;
+  corrupt_session?: boolean;
+  message?: string;
 }
 
 export interface AIProviderPreferencesResponse {

@@ -1803,6 +1803,7 @@ function SettingsPage() {
                       const state = providerState('lastfm', configured);
                       const scrobbleConnected = Boolean(lastfmAuthStatus?.connected);
                       const scrobblePending = Boolean(lastfmAuthStatus?.pending);
+                      const scrobbleReconnectRequired = Boolean(lastfmAuthStatus?.reconnect_required);
                       const scrobbleReady = configured && scrobbleConnected;
                       return (
                         <div className="space-y-3 rounded-lg border border-border p-3">
@@ -1836,15 +1837,20 @@ function SettingsPage() {
                           <div className="space-y-3">
                             <div className="flex flex-wrap items-center justify-between gap-2">
                               <div className="space-y-1">
-                                <Label>Last.fm scrobbling</Label>
-                                <p className="text-xs text-muted-foreground">
-                                  Connect a Last.fm user session to scrobble finished tracks and optionally update now playing.
+                              <Label>Last.fm scrobbling</Label>
+                              <p className="text-xs text-muted-foreground">
+                                Connect a Last.fm user session to scrobble finished tracks and optionally update now playing.
+                              </p>
+                              {lastfmAuthStatus?.message ? (
+                                <p className={`text-xs ${scrobbleReconnectRequired ? 'text-amber-500' : 'text-muted-foreground'}`}>
+                                  {lastfmAuthStatus.message}
                                 </p>
-                              </div>
-                              <div className="flex flex-wrap items-center gap-2">
-                                <Badge variant={scrobbleConnected ? 'default' : scrobblePending ? 'secondary' : 'outline'}>
-                                  {scrobbleConnected ? `Connected${lastfmAuthStatus?.session_name ? `: ${lastfmAuthStatus.session_name}` : ''}` : scrobblePending ? 'Authorization pending' : 'Not connected'}
-                                </Badge>
+                              ) : null}
+                            </div>
+                            <div className="flex flex-wrap items-center gap-2">
+                              <Badge variant={scrobbleConnected ? 'default' : scrobbleReconnectRequired ? 'destructive' : scrobblePending ? 'secondary' : 'outline'}>
+                                  {scrobbleConnected ? `Connected${lastfmAuthStatus?.session_name ? `: ${lastfmAuthStatus.session_name}` : ''}` : scrobbleReconnectRequired ? 'Reconnect required' : scrobblePending ? 'Authorization pending' : 'Not connected'}
+                              </Badge>
                                 {lastfmAuthStatus?.auth_url ? (
                                   <Button
                                     type="button"
@@ -1907,13 +1913,13 @@ function SettingsPage() {
                               <div className="rounded-lg border border-border/70 p-3">
                                 <div className="flex items-center justify-between gap-3">
                                   <div className="space-y-1">
-                                    <div className="text-sm font-medium">Scrobble completed tracks</div>
-                                    <p className="text-xs text-muted-foreground">Send qualifying completed listens to Last.fm.</p>
+                                  <div className="text-sm font-medium">Scrobble completed tracks</div>
+                                    <p className="text-xs text-muted-foreground">Send qualifying completed listens to Last.fm. This preference is saved even before reconnecting.</p>
                                   </div>
                                   <Switch
                                     checked={Boolean(config.LASTFM_SCROBBLE_ENABLED)}
                                     onCheckedChange={(checked) => updateConfig({ LASTFM_SCROBBLE_ENABLED: checked })}
-                                    disabled={!scrobbleReady}
+                                    disabled={!configured}
                                   />
                                 </div>
                               </div>
@@ -1921,12 +1927,12 @@ function SettingsPage() {
                                 <div className="flex items-center justify-between gap-3">
                                   <div className="space-y-1">
                                     <div className="text-sm font-medium">Update now playing</div>
-                                    <p className="text-xs text-muted-foreground">Push live current-track status to Last.fm on playback start.</p>
+                                    <p className="text-xs text-muted-foreground">Push live current-track status to Last.fm on playback start. This preference is saved even before reconnecting.</p>
                                   </div>
                                   <Switch
                                     checked={Boolean(config.LASTFM_NOW_PLAYING_ENABLED)}
                                     onCheckedChange={(checked) => updateConfig({ LASTFM_NOW_PLAYING_ENABLED: checked })}
-                                    disabled={!scrobbleReady}
+                                    disabled={!configured}
                                   />
                                 </div>
                               </div>
