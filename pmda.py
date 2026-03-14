@@ -32946,6 +32946,39 @@ def _authoritative_publication_cover(
     return (str(local_cover) if local_cover_ok else "", bool(local_cover_ok), "local" if local_cover_ok else "")
 
 
+def _filter_existing_files_album_items(
+    items: list[dict] | None,
+    *,
+    context: str = "",
+    artist_name: str = "",
+) -> tuple[list[dict], int]:
+    filtered: list[dict] = []
+    skipped = 0
+    for item in items or []:
+        folder_raw = str((item or {}).get("folder") or "").strip()
+        if not folder_raw:
+            skipped += 1
+            continue
+        try:
+            folder = path_for_fs_access(Path(folder_raw))
+        except Exception:
+            skipped += 1
+            continue
+        if not folder.exists() or not folder.is_dir():
+            skipped += 1
+            continue
+        filtered.append(item)
+    if skipped:
+        logging.info(
+            "Files album items filtered missing folders%s%s: kept=%d skipped=%d",
+            f" context={context}" if context else "",
+            f" artist={artist_name}" if artist_name else "",
+            len(filtered),
+            skipped,
+        )
+    return filtered, skipped
+
+
 def _publish_files_library_artist_from_items(
     artist_name: str,
     items: list[dict],
@@ -32975,8 +33008,8 @@ def _publish_files_library_artist_from_items(
             try:
                 folder = path_for_fs_access(Path(folder_raw))
                 if not folder.exists() or not folder.is_dir():
-                    logging.warning(
-                        "Files publication skipped missing album folder artist=%s folder=%s",
+                    logging.info(
+                        "Files publication skipped non-existent/moved album folder artist=%s folder=%s",
                         artist_name,
                         folder_raw,
                     )
@@ -33267,6 +33300,11 @@ def _rebuild_files_publication_for_scan(scan_id: int | None) -> dict[str, int]:
         return {"scan_id": int(sid or 0), "deleted": 0, "inserted": 0}
 
     targets = _scan_collect_profile_enrich_targets(sid)
+    raw_target_count = len(targets)
+    targets, filtered_missing_targets = _filter_existing_files_album_items(
+        targets,
+        context=f"scan_publication_rebuild:{sid}",
+    )
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for item in targets:
         if not isinstance(item, dict):
@@ -33329,12 +33367,13 @@ def _rebuild_files_publication_for_scan(scan_id: int | None) -> dict[str, int]:
             continue
 
     logging.info(
-        "Files publication rebuild for scan_id=%s: deleted=%d inserted=%d target_albums=%d surviving_targets=%d",
+        "Files publication rebuild for scan_id=%s: deleted=%d inserted=%d target_albums=%d surviving_targets=%d filtered_missing=%d",
         sid,
         deleted,
         inserted,
-        len(targets),
+        raw_target_count,
         surviving_targets,
+        filtered_missing_targets,
     )
     if inserted < surviving_targets:
         logging.warning(
@@ -33342,7 +33381,7 @@ def _rebuild_files_publication_for_scan(scan_id: int | None) -> dict[str, int]:
             sid,
             inserted,
             surviving_targets,
-            len(targets),
+            raw_target_count,
         )
     return {"scan_id": sid, "deleted": int(deleted), "inserted": int(inserted)}
 
@@ -36476,6 +36515,11 @@ def background_scan():
                         scan_post_queue.task_done()
                         break
                     artist_name_for_batch, items = payload
+                    items, _filtered_missing = _filter_existing_files_album_items(
+                        items,
+                        context="scan_postprocess_worker",
+                        artist_name=artist_name_for_batch,
+                    )
                     batch_results: dict[int, dict] = {}
                     try:
                         for item in items:
@@ -36756,6 +36800,7 @@ def background_scan():
                         publish_items = _build_improve_items_from_editions(
                             artist_name,
                             all_editions_by_artist.get(artist_name, []),
+                            groups,
                         )
                     _set_resume_artist_status(
                         resume_run_id,
@@ -63721,7 +63766,11 @@ def _improve_one_album_item(item: dict) -> tuple:
         db_conn.close()
 
 
-def _build_improve_items_from_editions(artist_name: str, editions: list[dict]) -> list[dict]:
+def _build_improve_items_from_editions(
+    artist_name: str,
+    editions: list[dict],
+    groups: list[dict] | None = None,
+) -> list[dict]:
     """
     Convert scan editions for one artist into improve-album items, deduplicated by album_id.
     Used to stream post-processing artist-by-artist in Files mode.
@@ -63729,6 +63778,17 @@ def _build_improve_items_from_editions(artist_name: str, editions: list[dict]) -
     items: list[dict] = []
     root_dirs = _files_root_dir_strings()
     seen_album_ids: set[int] = set()
+    skip_album_ids: set[int] = set()
+    for group in groups or []:
+        if not isinstance(group, dict):
+            continue
+        for loser in list(group.get("losers") or []):
+            try:
+                loser_album_id = int((loser or {}).get("album_id") or 0)
+            except Exception:
+                loser_album_id = 0
+            if loser_album_id > 0:
+                skip_album_ids.add(loser_album_id)
     for e in editions or []:
         folder_name = ""
         try:
@@ -63745,11 +63805,13 @@ def _build_improve_items_from_editions(artist_name: str, editions: list[dict]) -
             album_id = int(e.get("album_id") or 0)
         except Exception:
             album_id = 0
-        if album_id <= 0 or album_id in seen_album_ids:
+        if album_id <= 0 or album_id in seen_album_ids or album_id in skip_album_ids:
             continue
         seen_album_ids.add(album_id)
         folder_raw = e.get("folder")
         folder_str = str(folder_raw).strip() if folder_raw is not None else ""
+        if bool(e.get("is_broken")):
+            continue
         mbid = (
             (e.get("musicbrainz_id") or "")
             or ((e.get("meta") or {}).get("musicbrainz_releasegroupid") or "")
@@ -63761,9 +63823,11 @@ def _build_improve_items_from_editions(artist_name: str, editions: list[dict]) -
         folder_path: Optional[Path] = None
         if folder_str:
             try:
-                folder_path = Path(folder_str)
+                folder_path = path_for_fs_access(Path(folder_str))
             except Exception:
                 folder_path = None
+        if folder_path is None or (not folder_path.exists()) or (not folder_path.is_dir()):
+            continue
         meta_snapshot = dict(e.get("meta") or {})
         # Required tags check needs tracks; derive them if absent (so "tracks" requirement is meaningful).
         edition_for_required = dict(e)
