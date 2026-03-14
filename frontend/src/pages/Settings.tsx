@@ -177,7 +177,7 @@ const DANGER_PRESETS: DangerPresetMeta[] = [
     id: 'reset_all_keep_settings',
     title: 'Reset PMDA (keep settings)',
     description:
-      'Clears NVMe media cache, resets cache.db, resets state.db, clears PostgreSQL files index, and empties the visible library until the next full scan. Settings, users, and provider keys are preserved.',
+      'Fully resets PMDA library data: media cache, scan/cache state, published library, playlists, likes, recommendations, notifications, concerts, assistant/RAG data, and playback history. Settings, users, OAuth/API credentials, and folder/provider configuration are preserved.',
     buttonLabel: 'Reset PMDA now',
     resetActions: ['media_cache', 'cache_db', 'state_db', 'files_index'],
   },
@@ -2142,17 +2142,17 @@ function SettingsPage() {
             <Separator />
 
             <Card id="settings-danger-zone" className={`scroll-mt-24 ${getSettingsSection('settings-danger-zone').cardClass}`}>
-              <CardHeader>
-                <CardTitle className="flex items-center gap-2 text-destructive">
+                <CardHeader>
+                  <CardTitle className="flex items-center gap-2 text-destructive">
                   <span className={`inline-flex h-8 w-8 items-center justify-center rounded-md ${getSettingsSection('settings-danger-zone').iconClass}`}>
                     <AlertTriangle className="w-4 h-4" />
                   </span>
                   Danger Zone
-                </CardTitle>
-                <CardDescription>
-                  Full maintenance reset. This clears library/cache/state data and restarts PMDA automatically, while keeping settings and credentials.
-                </CardDescription>
-              </CardHeader>
+                  </CardTitle>
+                  <CardDescription>
+                  Full maintenance reset. This clears PMDA library data and restarts automatically, while keeping settings, users, and stored credentials.
+                  </CardDescription>
+                </CardHeader>
               <CardContent className="space-y-3">
                 {DANGER_PRESETS.map((action) => (
                   <div

@@ -42714,6 +42714,11 @@ def _maintenance_clear_files_index() -> dict[str, Any]:
                     cur.execute(
                         """
                         TRUNCATE TABLE
+                            assistant_messages,
+                            assistant_doc_chunks,
+                            assistant_docs,
+                            assistant_entity_facts,
+                            assistant_sessions,
                             files_track_embeddings,
                             files_reco_track_stats,
                             files_reco_events,
@@ -42726,12 +42731,14 @@ def _maintenance_clear_files_index() -> dict[str, Any]:
                             files_entity_likes,
                             files_playlist_items,
                             files_playlists,
+                            files_artist_concerts,
                             files_external_artist_images,
                             files_artist_profiles,
                             files_album_profiles,
                             files_tracks,
                             files_albums,
-                            files_artists
+                            files_artists,
+                            files_index_meta
                         RESTART IDENTITY CASCADE
                         """
                     )
