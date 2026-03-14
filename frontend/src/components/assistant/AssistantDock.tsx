@@ -184,6 +184,33 @@ export function AssistantDock({ bottomOffsetPx = 16 }: { bottomOffsetPx?: number
     }
   };
 
+  const navigateEntity = useCallback(
+    (entityType?: string, entityId?: number, title?: string) => {
+      const et = String(entityType || '').trim().toLowerCase();
+      const id = Number(entityId || 0);
+      if (et === 'artist' && id > 0) {
+        navigate(`/library/artist/${id}`);
+        return;
+      }
+      if (et === 'album' && id > 0) {
+        navigate(`/library/album/${id}`);
+        return;
+      }
+      if (et === 'playlist' && id > 0) {
+        navigate(`/library/playlists/${id}`);
+        return;
+      }
+      if (et === 'label' && title) {
+        navigate(`/library/label/${encodeURIComponent(title)}`);
+        return;
+      }
+      if (et === 'genre' && title) {
+        navigate(`/library/genre/${encodeURIComponent(title)}`);
+      }
+    },
+    [navigate]
+  );
+
   const resetSession = () => {
     setMessages([]);
     setSessionId('');
@@ -345,6 +372,9 @@ export function AssistantDock({ bottomOffsetPx = 16 }: { bottomOffsetPx?: number
                     <Button type="button" size="sm" variant="secondary" className="h-8" onClick={() => setDraft('Recommande-moi 10 morceaux a partir de ce que j ecoute souvent.')}>
                       Recommendations
                     </Button>
+                    <Button type="button" size="sm" variant="secondary" className="h-8" onClick={() => setDraft('Cree-moi une playlist de 10 morceaux a partir de ce que j ecoute souvent dans ma bibliotheque.')}>
+                      Build playlist
+                    </Button>
                     <Button type="button" size="sm" variant="secondary" className="h-8" onClick={() => setDraft('Quels sont mes artistes les plus presents dans ma bibliotheque ?')}>
                       My library
                     </Button>
@@ -459,9 +489,7 @@ export function AssistantDock({ bottomOffsetPx = 16 }: { bottomOffsetPx?: number
                                     key={`${c.chunk_id}`}
                                     type="button"
                                     className="w-full text-left rounded-lg px-2 py-1.5 hover:bg-accent transition-colors"
-                                    onClick={() => {
-                                      if (c.entity_type === 'artist' && c.entity_id) navigate(`/library/artist/${c.entity_id}`);
-                                    }}
+                                    onClick={() => navigateEntity(c.entity_type, c.entity_id, c.title)}
                                   >
                                     <div className="flex items-center justify-between gap-2">
                                       <div className="text-xs font-medium truncate">
