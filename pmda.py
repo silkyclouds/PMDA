@@ -3554,6 +3554,31 @@ def _resolve_ai_runtime_availability(
     return (False, provider_effective, auth_mode, "Unsupported AI provider")
 
 
+def _assistant_runtime_status(*, user_id: int | None = None) -> dict[str, Any]:
+    uid = _current_user_id_or_zero() if user_id is None else max(0, int(user_id or 0))
+    requested_provider = str(getattr(sys.modules[__name__], "AI_PROVIDER", "openai") or "openai").strip() or "openai"
+    ai_ready, provider_effective, auth_mode, ai_error = _resolve_ai_runtime_availability(
+        analysis_type="assistant_chat",
+        requested_provider=requested_provider,
+        user_id=uid,
+    )
+    model_name = str(
+        getattr(sys.modules[__name__], "RESOLVED_MODEL", None)
+        or getattr(sys.modules[__name__], "OPENAI_MODEL", "")
+        or ""
+    ).strip()
+    provider_norm = str(provider_effective or requested_provider).strip().lower()
+    if provider_norm == "openai-codex" and not model_name:
+        model_name = "codex"
+    return {
+        "ai_ready": bool(ai_ready),
+        "ai_provider": str(provider_effective or requested_provider or "openai"),
+        "ai_auth_mode": str(auth_mode or ""),
+        "ai_model": model_name,
+        "ai_error": str(ai_error or "").strip() if not bool(ai_ready) else None,
+    }
+
+
 def _auth_encryption_seed() -> bytes:
     global _auth_seed_cached
     seed = str(os.getenv("PMDA_AUTH_ENCRYPTION_KEY") or "").strip()
@@ -65068,12 +65093,14 @@ def api_assistant_status():
     postgres_ready = False
     if _get_library_mode() == "files":
         postgres_ready = bool(_files_pg_init_schema())
+    runtime_status = _assistant_runtime_status()
     payload = {
         "library_mode": _get_library_mode(),
-        "ai_provider": getattr(sys.modules[__name__], "AI_PROVIDER", "openai"),
-        "ai_model": getattr(sys.modules[__name__], "RESOLVED_MODEL", None) or getattr(sys.modules[__name__], "OPENAI_MODEL", ""),
-        "ai_ready": bool(getattr(sys.modules[__name__], "ai_provider_ready", False)),
-        "ai_error": getattr(sys.modules[__name__], "AI_FUNCTIONAL_ERROR_MSG", None) if not bool(getattr(sys.modules[__name__], "ai_provider_ready", False)) else None,
+        "ai_provider": str(runtime_status.get("ai_provider") or getattr(sys.modules[__name__], "AI_PROVIDER", "openai")),
+        "ai_model": str(runtime_status.get("ai_model") or getattr(sys.modules[__name__], "OPENAI_MODEL", "")),
+        "ai_auth_mode": str(runtime_status.get("ai_auth_mode") or ""),
+        "ai_ready": bool(runtime_status.get("ai_ready")),
+        "ai_error": runtime_status.get("ai_error"),
         "postgres_ready": postgres_ready,
         "db_tools_ready": postgres_ready and _get_library_mode() == "files",
         "pg_host": PMDA_PG_HOST,
@@ -65241,8 +65268,9 @@ def api_assistant_chat():
                 }
             )
 
-        ai_ready = bool(getattr(sys.modules[__name__], "ai_provider_ready", False))
-        ai_error = getattr(sys.modules[__name__], "AI_FUNCTIONAL_ERROR_MSG", None) or "AI is not configured"
+        runtime_status = _assistant_runtime_status()
+        ai_ready = bool(runtime_status.get("ai_ready"))
+        ai_error = str(runtime_status.get("ai_error") or "").strip() or "AI is not configured"
         if not ai_ready:
             return jsonify({"error": ai_error, "db_tools_only": True}), 503
 

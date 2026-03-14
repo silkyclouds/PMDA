@@ -3907,6 +3907,7 @@ export interface AssistantStatus {
   library_mode: string;
   ai_provider: string;
   ai_model: string;
+  ai_auth_mode?: string;
   ai_ready: boolean;
   ai_error?: string | null;
   postgres_ready: boolean;
