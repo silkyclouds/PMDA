@@ -51385,11 +51385,12 @@ def api_library_liked_summary():
                 SELECT alb.id, alb.title, ar.id, ar.name, alb.year, alb.has_cover,
                        COALESCE(alb.label, ''), COALESCE(alb.genre, ''), COALESCE(alb.tags_json, '[]'),
                        alb.track_count, COALESCE(alb.format, ''), alb.is_lossless,
-                       ur.rating, alb.public_rating, alb.public_rating_votes, alb.heat_score
+                       ur.rating, pr.public_rating, COALESCE(pr.public_rating_votes, 0), pr.heat_score
                 FROM files_user_entity_likes l
                 JOIN files_albums alb ON alb.id = l.entity_id
                 JOIN files_artists ar ON ar.id = alb.artist_id
                 LEFT JOIN files_user_album_ratings ur ON ur.user_id = %s AND ur.album_id = alb.id
+                LEFT JOIN files_album_profiles pr ON pr.album_id = alb.id
                 WHERE l.user_id = %s AND l.entity_type = 'album' AND l.liked = TRUE
                 ORDER BY l.updated_at DESC, alb.id DESC
                 LIMIT 48
@@ -51471,10 +51472,11 @@ def api_library_liked_summary():
                 SELECT alb.id, alb.title, ar.id, ar.name, alb.year, alb.has_cover,
                        COALESCE(alb.label, ''), COALESCE(alb.genre, ''), COALESCE(alb.tags_json, '[]'),
                        alb.track_count, COALESCE(alb.format, ''), alb.is_lossless,
-                       ur.rating, alb.public_rating, alb.public_rating_votes, alb.heat_score
+                       ur.rating, pr.public_rating, COALESCE(pr.public_rating_votes, 0), pr.heat_score
                 FROM files_albums alb
                 JOIN files_artists ar ON ar.id = alb.artist_id
                 LEFT JOIN files_user_album_ratings ur ON ur.user_id = %s AND ur.album_id = alb.id
+                LEFT JOIN files_album_profiles pr ON pr.album_id = alb.id
                 WHERE (
                     ar.id IN (SELECT entity_id FROM liked_artists)
                     OR lower(trim(COALESCE(alb.label, ''))) IN (
@@ -51485,8 +51487,8 @@ def api_library_liked_summary():
                 )
                   AND alb.id NOT IN (SELECT entity_id FROM liked_albums)
                 ORDER BY COALESCE(ur.rating, 0) DESC,
-                         COALESCE(alb.public_rating, 0) DESC,
-                         COALESCE(alb.heat_score, 0) DESC,
+                         COALESCE(pr.public_rating, 0) DESC,
+                         COALESCE(pr.heat_score, 0) DESC,
                          alb.updated_at DESC
                 LIMIT 24
                 """,
