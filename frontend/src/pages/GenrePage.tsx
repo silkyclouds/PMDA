@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useLocation, useNavigate, useOutletContext, useParams } from 'react-router-dom';
-import { ArrowLeft, Loader2, Play, UserRound } from 'lucide-react';
+import { ArrowLeft, Heart, Loader2, Play, Share2, UserRound } from 'lucide-react';
 
 import { AspectRatio } from '@/components/ui/aspect-ratio';
 import { Badge } from '@/components/ui/badge';
@@ -8,10 +8,14 @@ import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { AlbumArtwork } from '@/components/library/AlbumArtwork';
+import { AlbumBadgeGroups } from '@/components/library/AlbumBadgeGroups';
+import { ShareDialog } from '@/components/social/ShareDialog';
 import { usePlayback } from '@/contexts/PlaybackContext';
 import { useToast } from '@/hooks/use-toast';
 import { useIsMobile } from '@/hooks/use-mobile';
 import { dedupeAlbumsForDisplay, mergeAlbumsForDisplay } from '@/lib/albumDisplayDedupe';
+import { resolveBackLink, withBackLinkState } from '@/lib/backNavigation';
+import { cn } from '@/lib/utils';
 import * as api from '@/lib/api';
 import type { TrackInfo } from '@/components/library/AudioPlayer';
 import type { LibraryOutletContext } from '@/pages/LibraryLayout';
@@ -28,6 +32,7 @@ export default function GenrePage() {
 
   const [profileLoading, setProfileLoading] = useState(false);
   const [profile, setProfile] = useState<api.GenreProfileResponse | null>(null);
+  const [genreLiked, setGenreLiked] = useState(false);
 
   const [loading, setLoading] = useState(false);
   const [appending, setAppending] = useState(false);
@@ -157,6 +162,26 @@ export default function GenrePage() {
     void loadAlbumsPage({ reset: true, pageOffset: 0 });
   }, [genre, includeUnmatched, loadAlbumsPage, loadProfile]);
 
+  useEffect(() => {
+    let cancelled = false;
+    if (!genre) {
+      setGenreLiked(false);
+      return;
+    }
+    void (async () => {
+      try {
+        const res = await api.getLikes('genre', undefined, [genre]);
+        const liked = Boolean((res.items || []).find((item) => String(item.entity_key || '').trim().toLowerCase() === genre.toLowerCase())?.liked);
+        if (!cancelled) setGenreLiked(liked);
+      } catch {
+        if (!cancelled) setGenreLiked(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [genre]);
+
   const loadMore = useCallback(async () => {
     if (!hasMore || loading || loadingMoreRef.current) return;
     loadingMoreRef.current = true;
@@ -186,13 +211,30 @@ export default function GenrePage() {
   }, [loadMore]);
 
   const topArtists = useMemo(() => profile?.top_artists || [], [profile?.top_artists]);
+  const backLink = useMemo(
+    () => resolveBackLink(location, { path: `/library/genres${location.search || ''}`, label: 'Genres' }),
+    [location],
+  );
+
+  const toggleGenreLike = useCallback(async () => {
+    if (!genre) return;
+    const next = !genreLiked;
+    setGenreLiked(next);
+    try {
+      await api.setLike({ entity_type: 'genre', entity_key: genre, liked: next, source: 'ui_genre' });
+      toast({ title: next ? 'Liked' : 'Unliked', description: next ? 'Genre saved to favorites.' : 'Genre removed from favorites.' });
+    } catch (e) {
+      setGenreLiked(!next);
+      toast({ title: 'Like failed', description: e instanceof Error ? e.message : 'Failed to update like', variant: 'destructive' });
+    }
+  }, [genre, genreLiked, toast]);
 
   return (
     <div className="container py-4 md:py-6 space-y-5 md:space-y-6">
       <div className="flex items-center justify-between gap-3">
-        <Button variant="ghost" className="gap-2" onClick={() => navigate(`/library${location.search || ''}`)}>
+        <Button variant="ghost" className="gap-2" onClick={() => navigate(backLink.path)}>
           <ArrowLeft className="w-4 h-4" />
-          Back to Library
+          {`Back to ${backLink.label}`}
         </Button>
         <div className="text-xs text-muted-foreground">
           {total > 0 ? `${Math.min(offset, total).toLocaleString()} / ${total.toLocaleString()}` : `${albums.length.toLocaleString()} loaded`}
@@ -215,6 +257,25 @@ export default function GenrePage() {
             ) : null}
           </div>
 
+          <div className="flex flex-wrap items-center gap-2">
+            <Button type="button" size="sm" variant={genreLiked ? 'default' : 'outline'} className="h-8 gap-2" onClick={() => void toggleGenreLike()}>
+              <Heart className={cn('h-4 w-4', genreLiked ? 'fill-current' : '')} />
+              {genreLiked ? 'Liked' : 'Like'}
+            </Button>
+            <ShareDialog
+              entityType="genre"
+              entityKey={genre}
+              entityLabel={genre || 'Genre'}
+              entitySubtitle={`${(profile?.album_count || total || 0).toLocaleString()} albums`}
+              trigger={(
+                <Button type="button" size="sm" variant="outline" className="h-8 gap-2">
+                  <Share2 className="h-4 w-4" />
+                  Share
+                </Button>
+              )}
+            />
+          </div>
+
           {profileLoading ? (
             <div className="flex items-center gap-2 text-sm text-muted-foreground">
               <Loader2 className="w-4 h-4 animate-spin" /> Loading genre profile…
@@ -233,7 +294,7 @@ export default function GenrePage() {
                       key={`genre-top-${a.artist_id}`}
                       type="button"
                       className="inline-flex items-center gap-2 rounded-full border border-border/60 bg-muted/40 px-3 py-1.5 text-[11px] hover:bg-muted transition-colors"
-                      onClick={() => navigate(`/library/artist/${a.artist_id}${location.search || ''}`)}
+                      onClick={() => navigate(`/library/artist/${a.artist_id}${location.search || ''}`, { state: withBackLinkState(location) })}
                       title="Open artist"
                     >
                       <span className="truncate max-w-[16rem]">{a.artist_name}</span>
@@ -257,7 +318,7 @@ export default function GenrePage() {
                       key={`genre-lab-${l.label}`}
                       type="button"
                       className="inline-flex items-center gap-2 rounded-full border border-border/60 bg-muted/40 px-3 py-1.5 text-[11px] hover:bg-muted transition-colors"
-                      onClick={() => navigate(`/library/label/${encodeURIComponent(l.label)}${location.search || ''}`)}
+                      onClick={() => navigate(`/library/label/${encodeURIComponent(l.label)}${location.search || ''}`, { state: withBackLinkState(location) })}
                       title="Open label"
                     >
                       <span className="truncate max-w-[16rem]">{l.label}</span>
@@ -291,11 +352,11 @@ export default function GenrePage() {
               className="text-left group"
               role="button"
               tabIndex={0}
-              onClick={() => navigate(`/library/album/${a.album_id}${location.search || ''}`)}
+              onClick={() => navigate(`/library/album/${a.album_id}${location.search || ''}`, { state: withBackLinkState(location) })}
               onKeyDown={(e) => {
                 if (e.key === 'Enter' || e.key === ' ') {
                   e.preventDefault();
-                  navigate(`/library/album/${a.album_id}${location.search || ''}`);
+                  navigate(`/library/album/${a.album_id}${location.search || ''}`, { state: withBackLinkState(location) });
                 }
               }}
               title="Open album"
@@ -325,7 +386,7 @@ export default function GenrePage() {
                         onClick={(e) => {
                           e.preventDefault();
                           e.stopPropagation();
-                          navigate(`/library/artist/${a.artist_id}${location.search || ''}`);
+                          navigate(`/library/artist/${a.artist_id}${location.search || ''}`, { state: withBackLinkState(location) });
                         }}
                         title="Open artist"
                       >
@@ -342,30 +403,27 @@ export default function GenrePage() {
                     onClick={(e) => {
                       e.preventDefault();
                       e.stopPropagation();
-                      navigate(`/library/artist/${a.artist_id}${location.search || ''}`);
+                      navigate(`/library/artist/${a.artist_id}${location.search || ''}`, { state: withBackLinkState(location) });
                     }}
                     title="Open artist"
                   >
                     {a.artist_name}
                   </button>
-                  <div className="flex items-center gap-1.5 flex-wrap">
-                    <Badge variant="outline" className="text-[10px]">{a.year ?? '—'}</Badge>
-                    <Badge variant="outline" className="text-[10px]">{a.track_count}t</Badge>
-                    {a.label ? (
-                      <Badge
-                        variant="outline"
-                        className="text-[10px]"
-                        onClick={(e) => {
-                          e.preventDefault();
-                          e.stopPropagation();
-                          navigate(`/library/label/${encodeURIComponent(a.label || '')}${location.search || ''}`);
-                        }}
-                        title="Open label"
-                      >
-                        {a.label}
-                      </Badge>
-                    ) : null}
-                  </div>
+                  <AlbumBadgeGroups
+                    show
+                    compact
+                    userRating={a.user_rating}
+                    publicRating={a.public_rating}
+                    publicRatingVotes={a.public_rating_votes}
+                    format={a.format}
+                    isLossless={a.is_lossless}
+                    year={a.year}
+                    trackCount={a.track_count}
+                    genres={a.genres || (a.genre ? [a.genre] : [])}
+                    label={a.label}
+                    onGenreClick={(genreName) => navigate(`/library/genre/${encodeURIComponent(genreName)}${location.search || ''}`, { state: withBackLinkState(location) })}
+                    onLabelClick={a.label ? () => navigate(`/library/label/${encodeURIComponent(a.label || '')}${location.search || ''}`, { state: withBackLinkState(location) }) : undefined}
+                  />
                 </div>
               </div>
             </div>

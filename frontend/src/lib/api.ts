@@ -1828,10 +1828,11 @@ export async function getRecentlyAddedArtists(limit = 18, offset = 0, options?: 
   return fetchApi<RecentlyAddedArtistsResponse>(`/api/library/artists/recent?${q.toString()}`);
 }
 
-export type LikeEntityType = 'artist' | 'album' | 'track';
+export type LikeEntityType = 'artist' | 'album' | 'track' | 'label' | 'genre' | 'playlist';
 
 export interface LikeItem {
   entity_id: number;
+  entity_key?: string | null;
   liked: boolean;
   updated_at: number;
 }
@@ -1842,17 +1843,129 @@ export interface LikesResponse {
   error?: string;
 }
 
-export async function getLikes(entityType: LikeEntityType, ids?: number[]): Promise<LikesResponse> {
+export async function getLikes(entityType: LikeEntityType, ids?: number[], keys?: string[]): Promise<LikesResponse> {
   const q = new URLSearchParams();
   q.set('entity_type', entityType);
   if (ids && ids.length > 0) q.set('ids', ids.join(','));
+  if (keys && keys.length > 0) q.set('keys', keys.join(','));
   return fetchApi<LikesResponse>(`/api/library/likes?${q.toString()}`);
 }
 
-export async function setLike(payload: { entity_type: LikeEntityType; entity_id: number; liked: boolean; source?: string }): Promise<{ entity_type: LikeEntityType; entity_id: number; liked: boolean; updated_at: number }> {
+export async function setLike(payload: { entity_type: LikeEntityType; entity_id?: number; entity_key?: string; liked: boolean; source?: string }): Promise<{ entity_type: LikeEntityType; entity_id: number; entity_key?: string | null; liked: boolean; updated_at: number }> {
   return fetchApi(`/api/library/likes`, {
     method: 'PUT',
     body: JSON.stringify(payload),
+  });
+}
+
+export interface SocialUser {
+  id: number;
+  username: string;
+  is_admin: boolean;
+  can_download: boolean;
+  can_view_statistics: boolean;
+  is_active: boolean;
+  created_at: number;
+  updated_at: number;
+  last_login_at?: number | null;
+}
+
+export interface LikedSummaryResponse {
+  albums: LibraryAlbumItem[];
+  artists: RecentlyAddedArtistItem[];
+  labels: Array<{ label: string; updated_at: number }>;
+  recommended_albums: LibraryAlbumItem[];
+}
+
+export interface ShareEntityPayload {
+  entity_type: LikeEntityType;
+  entity_id?: number;
+  entity_key?: string;
+  recipient_user_ids: number[];
+  message?: string;
+  parent_recommendation_id?: number;
+}
+
+export interface RecommendationItem {
+  recommendation_id: number;
+  sender_user_id: number;
+  sender_username: string;
+  recipient_user_id: number;
+  recipient_username: string;
+  entity_type: LikeEntityType;
+  entity_id?: number | null;
+  entity_key?: string | null;
+  entity_label: string;
+  entity_subtitle?: string | null;
+  entity_href?: string | null;
+  entity_thumb?: string | null;
+  entity_meta?: Record<string, unknown>;
+  message?: string | null;
+  parent_recommendation_id?: number | null;
+  liked_by_recipient: boolean;
+  created_at: number;
+  read_at?: number | null;
+  status: string;
+}
+
+export interface RecommendationListResponse {
+  received: RecommendationItem[];
+  sent: RecommendationItem[];
+  unread_count: number;
+}
+
+export interface UserNotificationItem {
+  notification_id: number;
+  actor_user_id?: number | null;
+  actor_username?: string | null;
+  kind: string;
+  title: string;
+  body: string;
+  entity_type?: LikeEntityType | null;
+  entity_id?: number | null;
+  entity_key?: string | null;
+  recommendation_id?: number | null;
+  payload?: Record<string, unknown>;
+  is_read: boolean;
+  created_at: number;
+  read_at?: number | null;
+}
+
+export async function getLikedSummary(): Promise<LikedSummaryResponse> {
+  return fetchApi<LikedSummaryResponse>('/api/library/liked');
+}
+
+export async function getSocialUsers(): Promise<{ users: SocialUser[] }> {
+  return fetchApi<{ users: SocialUser[] }>('/api/library/social/users');
+}
+
+export async function shareLibraryEntity(payload: ShareEntityPayload): Promise<{ ok: boolean; count: number; recommendation_ids: number[] }> {
+  return fetchApi('/api/library/share', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function getRecommendations(): Promise<RecommendationListResponse> {
+  return fetchApi<RecommendationListResponse>('/api/library/recommendations');
+}
+
+export async function likeRecommendation(recommendationId: number): Promise<{ ok: boolean; recommendation_id: number; liked_by_recipient: boolean }> {
+  return fetchApi(`/api/library/recommendations/${encodeURIComponent(String(recommendationId))}/like`, {
+    method: 'POST',
+  });
+}
+
+export async function getNotifications(limit = 50, unreadOnly = false): Promise<{ notifications: UserNotificationItem[] }> {
+  const q = new URLSearchParams();
+  q.set('limit', String(Math.max(1, Math.min(200, limit))));
+  if (unreadOnly) q.set('unread_only', '1');
+  return fetchApi<{ notifications: UserNotificationItem[] }>(`/api/library/notifications?${q.toString()}`);
+}
+
+export async function markNotificationRead(notificationId: number): Promise<{ ok: boolean; notification_id: number }> {
+  return fetchApi(`/api/library/notifications/${encodeURIComponent(String(notificationId))}/read`, {
+    method: 'POST',
   });
 }
 

@@ -12,9 +12,12 @@ import { AlbumArtwork } from '@/components/library/AlbumArtwork';
 import { AlbumBadgeGroups } from '@/components/library/AlbumBadgeGroups';
 import { MatchDetailDialog } from '@/components/library/MatchDetailDialog';
 import { ProviderBadge } from '@/components/providers/ProviderBadge';
+import { ShareDialog } from '@/components/social/ShareDialog';
 import { useAlbumBadgesVisibility } from '@/hooks/use-album-badges';
 import { cn } from '@/lib/utils';
 import { badgeKindClass } from '@/lib/badgeStyles';
+import { resolveBackLink, withBackLinkState } from '@/lib/backNavigation';
+import { formatBadgeDateTime } from '@/lib/dateFormat';
 import * as api from '@/lib/api';
 import { useToast } from '@/hooks/use-toast';
 import { ConcertsMiniMap } from '@/components/concerts/ConcertsMiniMap';
@@ -133,37 +136,6 @@ function haversineKm(a: { lat: number; lon: number }, b: { lat: number; lon: num
   const lat2 = toRad(b.lat);
   const x = Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * (Math.sin(dLon / 2) ** 2);
   return 2 * R * Math.asin(Math.min(1, Math.sqrt(x)));
-}
-
-function formatBadgeTimestamp(ts?: number | null): string {
-  const n = Number(ts || 0);
-  if (!Number.isFinite(n) || n <= 0) return '—';
-  try {
-    return new Date(n * 1000).toLocaleString();
-  } catch {
-    return '—';
-  }
-}
-
-function formatAddedTimestamp(ts?: number | null): string {
-  const n = Number(ts || 0);
-  if (!Number.isFinite(n) || n <= 0) return '—';
-  try {
-    return new Intl.DateTimeFormat('en-GB', {
-      day: '2-digit',
-      month: '2-digit',
-      year: 'numeric',
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit',
-      hour12: true,
-    })
-      .format(new Date(n * 1000))
-      .replace(' am', ' AM')
-      .replace(' pm', ' PM');
-  } catch {
-    return '—';
-  }
 }
 
 export default function ArtistPage() {
@@ -409,7 +381,7 @@ export default function ArtistPage() {
       const exact = items.find((it) => it.type === 'artist' && (it.title || '').trim().toLowerCase() === norm);
       const best = exact || items.find((it) => it.type === 'artist');
       if (best?.artist_id && best.artist_id > 0) {
-        navigate(`/library/artist/${best.artist_id}${location.search || ''}`);
+        navigate(`/library/artist/${best.artist_id}${location.search || ''}`, { state: withBackLinkState(location) });
         return;
       }
       toast({ title: 'Not found', description: `No artist matched "${q}".`, variant: 'destructive' });
@@ -712,13 +684,17 @@ export default function ArtistPage() {
   }
 
   if (error || !details) {
+    const fallbackBackLink = resolveBackLink(location, {
+      path: `/library${location.search || ''}`,
+      label: 'Library',
+    });
     return (
       <div className="container py-8">
         <Card>
           <CardContent className="p-8 space-y-4 text-center">
             <p className="text-muted-foreground">{error || 'Artist not found'}</p>
-            <Button variant="outline" onClick={() => navigate(`/library${location.search || ''}`)}>
-              Back to Library
+            <Button variant="outline" onClick={() => navigate(fallbackBackLink.path)}>
+              {`Back to ${fallbackBackLink.label}`}
             </Button>
           </CardContent>
         </Card>
@@ -802,6 +778,10 @@ export default function ArtistPage() {
     Number(details.updated_at || 0) > 0
       ? Number(details.updated_at || 0)
       : (Number(displayUpdated || 0) > 0 ? Number(displayUpdated || 0) : null);
+  const effectiveBackLink = resolveBackLink(location, {
+    path: `/library${location.search || ''}`,
+    label: 'Library',
+  });
 
   const formatConcertDate = (dt?: string) => {
     const raw = (dt || '').trim();
@@ -818,9 +798,9 @@ export default function ArtistPage() {
   return (
     <div className="container py-4 md:py-6 space-y-5 md:space-y-6">
         <div className="flex flex-wrap items-start justify-between gap-3">
-          <Button variant="ghost" className="gap-2" onClick={() => navigate(`/library${location.search || ''}`)}>
+          <Button variant="ghost" className="gap-2" onClick={() => navigate(effectiveBackLink.path)}>
             <ArrowLeft className="w-4 h-4" />
-            Back to Library
+            {`Back to ${effectiveBackLink.label}`}
           </Button>
           {profileEnriching && (
             <Badge variant="outline" className={`gap-1.5 ${badgeKindClass('source')}`}>
@@ -837,8 +817,8 @@ export default function ArtistPage() {
 
         <Card className="overflow-hidden border-border/70">
           <div className="relative overflow-hidden">
-            <div className="absolute inset-0 z-10 bg-background/18 backdrop-blur-md" />
-            <div className="absolute inset-0 z-10 bg-gradient-to-r from-background/76 via-background/58 to-background/42" />
+            <div className="absolute inset-0 z-10 bg-background/34 backdrop-blur-md" />
+            <div className="absolute inset-0 z-10 bg-gradient-to-r from-background/88 via-background/70 to-background/58" />
             {heroImage ? (
               <img src={heroImage} alt={details.artist_name} className="w-full h-64 md:h-96 object-cover blur-[1.4px] scale-[1.06]" />
             ) : (
@@ -855,9 +835,11 @@ export default function ArtistPage() {
                     </div>
                   )}
                 </div>
-                <div className="min-w-0 md:pl-2">
-                  <h1 className="text-2xl sm:text-3xl md:text-5xl font-bold tracking-tight leading-tight">{details.artist_name}</h1>
-                  <p className="text-base text-muted-foreground mt-1.5">
+                <div className="min-w-0 md:pl-2 rounded-2xl bg-background/22 px-4 py-3 backdrop-blur-sm shadow-[0_10px_35px_rgba(0,0,0,0.18)]">
+                  <h1 className="text-2xl sm:text-3xl md:text-5xl font-bold tracking-tight leading-tight text-white drop-shadow-[0_2px_10px_rgba(0,0,0,0.55)]">
+                    {details.artist_name}
+                  </h1>
+                  <p className="text-base text-white/82 mt-1.5">
                     {details.total_albums.toLocaleString()} album{details.total_albums !== 1 ? 's' : ''}
                   </p>
                   {tags.length > 0 && (
@@ -886,7 +868,7 @@ export default function ArtistPage() {
                     ) : null}
                     {artistAddedAt ? (
                       <Badge variant="outline" className={`text-[10px] ${badgeKindClass('muted')}`}>
-                        Added {formatAddedTimestamp(artistAddedAt)}
+                        Added {formatBadgeDateTime(artistAddedAt)}
                       </Badge>
                     ) : null}
                     <button
@@ -898,8 +880,20 @@ export default function ArtistPage() {
                       onClick={() => setMatchDialogOpen(true)}
                       title="Open match detail"
                     >
-                      Updated: {formatBadgeTimestamp(artistUpdatedAt)}
+                      Updated: {formatBadgeDateTime(artistUpdatedAt)}
                     </button>
+                    <ShareDialog
+                      entityType="artist"
+                      entityId={details.artist_id}
+                      entityLabel={details.artist_name}
+                      entitySubtitle={`${details.total_albums} album${details.total_albums !== 1 ? 's' : ''}`}
+                      trigger={(
+                        <Button type="button" size="sm" variant="outline" className="h-8 gap-2">
+                          <Users className="h-3.5 w-3.5" />
+                          Share
+                        </Button>
+                      )}
+                    />
                     <Button
                       type="button"
                       size="sm"
@@ -1026,7 +1020,7 @@ export default function ArtistPage() {
                       variant="outline"
                       className={`h-6 px-2 text-[11px] ${badgeKindClass('genre')}`}
                       title="Open genre"
-                      onClick={() => navigate(`/library/genre/${encodeURIComponent(g)}${location.search || ''}`)}
+                      onClick={() => navigate(`/library/genre/${encodeURIComponent(g)}${location.search || ''}`, { state: withBackLinkState(location) })}
                     >
                       {g}
                     </Button>
@@ -1043,7 +1037,7 @@ export default function ArtistPage() {
                       size="sm"
                       variant="outline"
                       className="h-6 px-2 text-[11px]"
-                      onClick={() => navigate(`/library/label/${encodeURIComponent(x)}${location.search || ''}`)}
+                      onClick={() => navigate(`/library/label/${encodeURIComponent(x)}${location.search || ''}`, { state: withBackLinkState(location) })}
                       title="Open label"
                     >
                       {x}
@@ -1162,7 +1156,7 @@ export default function ArtistPage() {
                 ) : null}
               </DialogTitle>
               <DialogDescription>
-                {concertsMeta?.updated_at ? `Updated ${formatBadgeTimestamp(concertsMeta.updated_at)}.` : 'No update timestamp.'}
+                {concertsMeta?.updated_at ? `Updated ${formatBadgeDateTime(concertsMeta.updated_at)}.` : 'No update timestamp.'}
                 {concertHome ? ` Radius filter: ${Math.round(concertHome.radiusKm)} km.` : ''}
               </DialogDescription>
             </DialogHeader>
@@ -1243,11 +1237,11 @@ export default function ArtistPage() {
                         className="group h-full overflow-hidden border-border/70 bg-card/90 cursor-pointer transition-all duration-300 hover:-translate-y-1 hover:border-primary/35 hover:bg-muted/20"
                         role="button"
                         tabIndex={0}
-                        onClick={() => navigate(`/library/album/${album.album_id}${location.search || ''}`)}
+                        onClick={() => navigate(`/library/album/${album.album_id}${location.search || ''}`, { state: withBackLinkState(location) })}
                         onKeyDown={(e) => {
                           if (e.key === "Enter" || e.key === " ") {
                             e.preventDefault();
-                            navigate(`/library/album/${album.album_id}${location.search || ''}`);
+                            navigate(`/library/album/${album.album_id}${location.search || ''}`, { state: withBackLinkState(location) });
                           }
                         }}
                         title="Open album"
@@ -1298,10 +1292,15 @@ export default function ArtistPage() {
                             trackCount={album.track_count}
                             genres={album.genres || (album.genre ? [album.genre] : [])}
                             label={album.label}
-                            onGenreClick={(genre) => navigate(`/library/genre/${encodeURIComponent(genre)}${location.search || ''}`)}
-                            onLabelClick={album.label ? () => navigate(`/library/label/${encodeURIComponent(album.label || '')}${location.search || ''}`) : undefined}
+                            onGenreClick={(genre) => navigate(`/library/genre/${encodeURIComponent(genre)}${location.search || ''}`, { state: withBackLinkState(location) })}
+                            onLabelClick={album.label ? () => navigate(`/library/label/${encodeURIComponent(album.label || '')}${location.search || ''}`, { state: withBackLinkState(location) }) : undefined}
                           />
-                          {album.short_description && (
+                          {!showBadges && (album.year || album.date) ? (
+                            <p className="text-[11px] text-muted-foreground">
+                              {album.year || album.date}
+                            </p>
+                          ) : null}
+                          {showBadges && album.short_description && (
                             <p className={cn('text-[11px] text-muted-foreground line-clamp-3')}>
                               {album.short_description}
                             </p>
@@ -1342,7 +1341,7 @@ export default function ArtistPage() {
 	                  tabIndex={0}
 	                  onClick={() => {
 	                    if (artist.artist_id) {
-	                      navigate(`/library/artist/${artist.artist_id}${location.search || ''}`);
+	                      navigate(`/library/artist/${artist.artist_id}${location.search || ''}`, { state: withBackLinkState(location) });
 	                      return;
 	                    }
 	                    const href = `https://bandcamp.com/search?q=${encodeURIComponent(artist.name || '')}`;
@@ -1352,7 +1351,7 @@ export default function ArtistPage() {
 	                    if (e.key === "Enter" || e.key === " ") {
 	                      e.preventDefault();
 	                      if (artist.artist_id) {
-	                        navigate(`/library/artist/${artist.artist_id}${location.search || ''}`);
+	                        navigate(`/library/artist/${artist.artist_id}${location.search || ''}`, { state: withBackLinkState(location) });
 	                      } else {
 	                        const href = `https://bandcamp.com/search?q=${encodeURIComponent(artist.name || '')}`;
 	                        window.open(href, '_blank', 'noopener,noreferrer');

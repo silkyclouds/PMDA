@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
-import { BarChart3, Building2, Disc3, House, Library, ListMusic, LogOut, Plus, Scan, Settings2, Shield, Tags, Users, Wrench } from 'lucide-react';
+import { BarChart3, Building2, Disc3, Heart, House, Library, ListMusic, LogOut, Plus, Scan, Settings2, Share2, Shield, Tags, Users, Wrench } from 'lucide-react';
 
 import * as api from '@/lib/api';
 import { useAuth } from '@/contexts/AuthContext';
@@ -69,6 +69,7 @@ export function AppSidebar() {
   const [loadingPlaylists, setLoadingPlaylists] = useState(false);
   const [dragOverPlaylistId, setDragOverPlaylistId] = useState<number | null>(null);
   const [toolsBadgeCount, setToolsBadgeCount] = useState(0);
+  const [recommendationsUnreadCount, setRecommendationsUnreadCount] = useState(0);
 
   const refreshPlaylists = useCallback(async () => {
     try {
@@ -110,15 +111,26 @@ export function AppSidebar() {
     }
   }, [isAdmin]);
 
+  const refreshRecommendationsBadge = useCallback(async () => {
+    try {
+      const res = await api.getRecommendations();
+      setRecommendationsUnreadCount(Math.max(0, Number(res.unread_count || 0)));
+    } catch {
+      setRecommendationsUnreadCount(0);
+    }
+  }, []);
+
   useEffect(() => {
     void refreshPlaylists();
     void refreshToolsBadge();
+    void refreshRecommendationsBadge();
     const t = setInterval(() => {
       void refreshPlaylists();
       void refreshToolsBadge();
+      void refreshRecommendationsBadge();
     }, 60_000);
     return () => clearInterval(t);
-  }, [refreshPlaylists, refreshToolsBadge]);
+  }, [refreshPlaylists, refreshRecommendationsBadge, refreshToolsBadge]);
 
   const mainItems = useMemo(
     () => [{ to: '/library', label: 'Library', icon: Library }],
@@ -132,6 +144,8 @@ export function AppSidebar() {
       { to: '/library/albums', label: 'Albums', icon: Disc3 },
       { to: '/library/genres', label: 'Genres', icon: Tags },
       { to: '/library/labels', label: 'Labels', icon: Building2 },
+      { to: '/library/liked', label: 'Liked', icon: Heart },
+      { to: '/library/recommendations', label: 'Recommendations', icon: Share2 },
     ],
     []
   );
@@ -162,7 +176,6 @@ export function AppSidebar() {
     e.preventDefault();
     e.stopPropagation();
     setDragOverPlaylistId(null);
-    if (!isAdmin) return;
     const payload = parseDropPayload(e);
     if (!payload) return;
     try {
@@ -236,9 +249,11 @@ export function AppSidebar() {
                   (it.to === '/library/artists' && (path.startsWith('/library/artists') || path.startsWith('/library/artist/'))) ||
                   (it.to === '/library/albums' && (path.startsWith('/library/albums') || path.startsWith('/library/album/'))) ||
                   (it.to === '/library/genres' && (path.startsWith('/library/genres') || path.startsWith('/library/genre/'))) ||
-                  (it.to === '/library/labels' && (path.startsWith('/library/labels') || path.startsWith('/library/label/')));
+                  (it.to === '/library/labels' && (path.startsWith('/library/labels') || path.startsWith('/library/label/'))) ||
+                  (it.to === '/library/liked' && path.startsWith('/library/liked')) ||
+                  (it.to === '/library/recommendations' && path.startsWith('/library/recommendations'));
                 return (
-                  <SidebarMenuItem key={`library-sub-${it.to}`}>
+                  <SidebarMenuItem key={`library-sub-${it.to}`} className="relative">
                     <SidebarMenuButton
                       isActive={active}
                       tooltip={it.label}
@@ -249,6 +264,11 @@ export function AppSidebar() {
                       <Icon className="h-3.5 w-3.5" />
                       <span>{it.label}</span>
                     </SidebarMenuButton>
+                    {it.to === '/library/recommendations' && recommendationsUnreadCount > 0 ? (
+                      <SidebarMenuBadge className="text-[10px]">
+                        {recommendationsUnreadCount > 99 ? '99+' : recommendationsUnreadCount}
+                      </SidebarMenuBadge>
+                    ) : null}
                   </SidebarMenuItem>
                 );
               })}
@@ -270,19 +290,17 @@ export function AppSidebar() {
 
         <SidebarGroup className={cn(isMobile ? 'pt-1' : '', 'group-data-[collapsible=icon]:hidden')}>
           <SidebarGroupLabel>Playlists</SidebarGroupLabel>
-          {isAdmin ? (
-            <SidebarGroupAction asChild title="New playlist">
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon"
-                className="h-7 w-7"
-                onClick={() => navigate('/library/playlists')}
-              >
-                <Plus className="h-4 w-4" />
-              </Button>
-            </SidebarGroupAction>
-          ) : null}
+          <SidebarGroupAction asChild title="New playlist">
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              className="h-7 w-7"
+              onClick={() => navigate('/library/playlists')}
+            >
+              <Plus className="h-4 w-4" />
+            </Button>
+          </SidebarGroupAction>
           <SidebarGroupContent>
             {loadingPlaylists && visiblePlaylistItems.length === 0 ? (
               <div className="px-2 py-2 text-xs text-muted-foreground group-data-[collapsible=icon]:hidden">Loading…</div>
@@ -298,7 +316,6 @@ export function AppSidebar() {
                         tooltip={pl.name}
                         onClick={() => navigate(`/library/playlists/${pl.playlist_id}`)}
                         onDragOver={(e) => {
-                          if (!isAdmin) return;
                           e.preventDefault();
                           setDragOverPlaylistId(pl.playlist_id);
                         }}
@@ -356,7 +373,7 @@ export function AppSidebar() {
       <SidebarFooter className="group-data-[collapsible=icon]:items-center">
         <div className="px-2 py-2 text-xs text-muted-foreground group-data-[collapsible=icon]:hidden">
           <div className="truncate font-medium text-foreground">{user?.username || 'Unknown user'}</div>
-          <div>{isAdmin ? 'Administrator' : 'Read-only user'}</div>
+          <div>{isAdmin ? 'Administrator' : 'Library user'}</div>
         </div>
         <div className="px-2 pb-2 group-data-[collapsible=icon]:px-0.5 group-data-[collapsible=icon]:pb-1">
           <Button

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useLocation, useNavigate, useOutletContext, useParams } from 'react-router-dom';
-import { ArrowLeft, Loader2, Play, UserRound } from 'lucide-react';
+import { ArrowLeft, Heart, Loader2, Play, Share2, UserRound } from 'lucide-react';
 
 import { AspectRatio } from '@/components/ui/aspect-ratio';
 import { Badge } from '@/components/ui/badge';
@@ -8,10 +8,14 @@ import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { AlbumArtwork } from '@/components/library/AlbumArtwork';
+import { AlbumBadgeGroups } from '@/components/library/AlbumBadgeGroups';
+import { ShareDialog } from '@/components/social/ShareDialog';
 import { usePlayback } from '@/contexts/PlaybackContext';
 import { useToast } from '@/hooks/use-toast';
 import { useIsMobile } from '@/hooks/use-mobile';
 import { dedupeAlbumsForDisplay, mergeAlbumsForDisplay } from '@/lib/albumDisplayDedupe';
+import { resolveBackLink, withBackLinkState } from '@/lib/backNavigation';
+import { cn } from '@/lib/utils';
 import * as api from '@/lib/api';
 import type { TrackInfo } from '@/components/library/AudioPlayer';
 import type { LibraryOutletContext } from '@/pages/LibraryLayout';
@@ -28,6 +32,7 @@ export default function LabelPage() {
 
   const [profileLoading, setProfileLoading] = useState(false);
   const [profile, setProfile] = useState<api.LabelProfileResponse | null>(null);
+  const [labelLiked, setLabelLiked] = useState(false);
 
   const [loading, setLoading] = useState(false);
   const [appending, setAppending] = useState(false);
@@ -142,6 +147,26 @@ export default function LabelPage() {
     void loadAlbumsPage({ reset: true, pageOffset: 0 });
   }, [label, includeUnmatched, loadAlbumsPage, loadProfile]);
 
+  useEffect(() => {
+    let cancelled = false;
+    if (!label) {
+      setLabelLiked(false);
+      return;
+    }
+    void (async () => {
+      try {
+        const res = await api.getLikes('label', undefined, [label]);
+        const liked = Boolean((res.items || []).find((item) => String(item.entity_key || '').trim().toLowerCase() === label.toLowerCase())?.liked);
+        if (!cancelled) setLabelLiked(liked);
+      } catch {
+        if (!cancelled) setLabelLiked(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [label]);
+
   const loadMore = useCallback(async () => {
     if (!hasMore || loading || loadingMoreRef.current) return;
     loadingMoreRef.current = true;
@@ -172,13 +197,30 @@ export default function LabelPage() {
 
   const topArtists = useMemo(() => profile?.influential_artists || [], [profile?.influential_artists]);
   const topGenres = useMemo(() => profile?.genres || [], [profile?.genres]);
+  const backLink = useMemo(
+    () => resolveBackLink(location, { path: `/library/labels${location.search || ''}`, label: 'Labels' }),
+    [location],
+  );
+
+  const toggleLabelLike = useCallback(async () => {
+    if (!label) return;
+    const next = !labelLiked;
+    setLabelLiked(next);
+    try {
+      await api.setLike({ entity_type: 'label', entity_key: label, liked: next, source: 'ui_label' });
+      toast({ title: next ? 'Liked' : 'Unliked', description: next ? 'Label saved to favorites.' : 'Label removed from favorites.' });
+    } catch (e) {
+      setLabelLiked(!next);
+      toast({ title: 'Like failed', description: e instanceof Error ? e.message : 'Failed to update like', variant: 'destructive' });
+    }
+  }, [label, labelLiked, toast]);
 
   return (
     <div className="container py-4 md:py-6 space-y-5 md:space-y-6">
       <div className="flex items-center justify-between gap-3">
-        <Button variant="ghost" className="gap-2" onClick={() => navigate(`/library${location.search || ''}`)}>
+        <Button variant="ghost" className="gap-2" onClick={() => navigate(backLink.path)}>
           <ArrowLeft className="w-4 h-4" />
-          Back to Library
+          {`Back to ${backLink.label}`}
         </Button>
         <div className="text-xs text-muted-foreground">
           {total > 0 ? `${Math.min(offset, total).toLocaleString()} / ${total.toLocaleString()}` : `${albums.length.toLocaleString()} loaded`}
@@ -199,6 +241,25 @@ export default function LabelPage() {
                 {error}
               </Badge>
             ) : null}
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            <Button type="button" size="sm" variant={labelLiked ? 'default' : 'outline'} className="h-8 gap-2" onClick={() => void toggleLabelLike()}>
+              <Heart className={cn('h-4 w-4', labelLiked ? 'fill-current' : '')} />
+              {labelLiked ? 'Liked' : 'Like'}
+            </Button>
+            <ShareDialog
+              entityType="label"
+              entityKey={label}
+              entityLabel={label || 'Label'}
+              entitySubtitle={`${(profile?.album_count || total || 0).toLocaleString()} releases`}
+              trigger={(
+                <Button type="button" size="sm" variant="outline" className="h-8 gap-2">
+                  <Share2 className="h-4 w-4" />
+                  Share
+                </Button>
+              )}
+            />
           </div>
 
           {profileLoading ? (
@@ -226,7 +287,7 @@ export default function LabelPage() {
                       key={`lab-top-${a.artist_id}`}
                       type="button"
                       className="inline-flex items-center gap-2 rounded-full border border-border/60 bg-muted/40 px-3 py-1.5 text-[11px] hover:bg-muted transition-colors"
-                      onClick={() => navigate(`/library/artist/${a.artist_id}${location.search || ''}`)}
+                      onClick={() => navigate(`/library/artist/${a.artist_id}${location.search || ''}`, { state: withBackLinkState(location) })}
                       title="Open artist"
                     >
                       <span className="truncate max-w-[16rem]">{a.artist_name}</span>
@@ -248,7 +309,7 @@ export default function LabelPage() {
                       key={`lab-gen-${g.genre}`}
                       type="button"
                       className="inline-flex items-center gap-2 rounded-full border border-border/60 bg-muted/40 px-3 py-1.5 text-[11px] hover:bg-muted transition-colors"
-                      onClick={() => navigate(`/library/genre/${encodeURIComponent(g.genre)}${location.search || ''}`)}
+                      onClick={() => navigate(`/library/genre/${encodeURIComponent(g.genre)}${location.search || ''}`, { state: withBackLinkState(location) })}
                       title="Open genre"
                     >
                       <span className="truncate max-w-[16rem]">{g.genre}</span>
@@ -282,11 +343,11 @@ export default function LabelPage() {
               className="text-left group"
               role="button"
               tabIndex={0}
-              onClick={() => navigate(`/library/album/${a.album_id}${location.search || ''}`)}
+              onClick={() => navigate(`/library/album/${a.album_id}${location.search || ''}`, { state: withBackLinkState(location) })}
               onKeyDown={(e) => {
                 if (e.key === 'Enter' || e.key === ' ') {
                   e.preventDefault();
-                  navigate(`/library/album/${a.album_id}${location.search || ''}`);
+                  navigate(`/library/album/${a.album_id}${location.search || ''}`, { state: withBackLinkState(location) });
                 }
               }}
               title="Open album"
@@ -316,7 +377,7 @@ export default function LabelPage() {
                         onClick={(e) => {
                           e.preventDefault();
                           e.stopPropagation();
-                          navigate(`/library/artist/${a.artist_id}${location.search || ''}`);
+                          navigate(`/library/artist/${a.artist_id}${location.search || ''}`, { state: withBackLinkState(location) });
                         }}
                         title="Open artist"
                       >
@@ -333,15 +394,26 @@ export default function LabelPage() {
                     onClick={(e) => {
                       e.preventDefault();
                       e.stopPropagation();
-                      navigate(`/library/artist/${a.artist_id}${location.search || ''}`);
+                      navigate(`/library/artist/${a.artist_id}${location.search || ''}`, { state: withBackLinkState(location) });
                     }}
                   >
                     {a.artist_name}
                   </button>
-                  <div className="flex items-center gap-1.5 flex-wrap">
-                    <Badge variant="outline" className="text-[10px]">{a.year ?? '—'}</Badge>
-                    <Badge variant="outline" className="text-[10px]">{a.track_count}t</Badge>
-                  </div>
+                  <AlbumBadgeGroups
+                    show
+                    compact
+                    userRating={a.user_rating}
+                    publicRating={a.public_rating}
+                    publicRatingVotes={a.public_rating_votes}
+                    format={a.format}
+                    isLossless={a.is_lossless}
+                    year={a.year}
+                    trackCount={a.track_count}
+                    genres={a.genres || (a.genre ? [a.genre] : [])}
+                    label={a.label}
+                    onGenreClick={(genreName) => navigate(`/library/genre/${encodeURIComponent(genreName)}${location.search || ''}`, { state: withBackLinkState(location) })}
+                    onLabelClick={a.label ? () => navigate(`/library/label/${encodeURIComponent(a.label || '')}${location.search || ''}`, { state: withBackLinkState(location) }) : undefined}
+                  />
                 </div>
               </div>
             </div>

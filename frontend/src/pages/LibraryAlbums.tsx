@@ -16,6 +16,7 @@ import { useToast } from '@/hooks/use-toast';
 import { useLibraryQuery } from '@/hooks/useLibraryQuery';
 import { useIsMobile } from '@/hooks/use-mobile';
 import { dedupeAlbumsForDisplay, mergeAlbumsForDisplay } from '@/lib/albumDisplayDedupe';
+import { withBackLinkState } from '@/lib/backNavigation';
 import { cn } from '@/lib/utils';
 import * as api from '@/lib/api';
 import type { TrackInfo } from '@/components/library/AudioPlayer';
@@ -323,7 +324,7 @@ export default function LibraryAlbums() {
                       <Play className="h-4 w-4" />
                       Play
                     </Button>
-                    <Button size="sm" variant="outline" className="h-9 rounded-full" onClick={() => navigate(`/library/artist/${a.artist_id}${location.search || ''}`)} title="Open artist">
+                    <Button size="sm" variant="outline" className="h-9 rounded-full" onClick={() => navigate(`/library/artist/${a.artist_id}${location.search || ''}`, { state: withBackLinkState(location) })} title="Open artist">
                       <UserRound className="h-4 w-4" />
                     </Button>
                   </div>
@@ -336,14 +337,14 @@ export default function LibraryAlbums() {
                     type="button"
                     className="text-sm font-semibold leading-snug line-clamp-3 min-h-[3.6rem] hover:underline text-left w-full"
                     title="Open album"
-                    onClick={() => navigate(`/library/album/${a.album_id}${location.search || ''}`)}
+                    onClick={() => navigate(`/library/album/${a.album_id}${location.search || ''}`, { state: withBackLinkState(location) })}
                   >
                     {a.title}
                   </button>
                   <button
                     type="button"
                     className="text-xs text-muted-foreground truncate hover:underline"
-                    onClick={() => navigate(`/library/artist/${a.artist_id}${location.search || ''}`)}
+                    onClick={() => navigate(`/library/artist/${a.artist_id}${location.search || ''}`, { state: withBackLinkState(location) })}
                     title="Open artist"
                   >
                     {a.artist_name}
@@ -362,9 +363,12 @@ export default function LibraryAlbums() {
                   trackCount={a.track_count}
                   genres={a.genres || (a.genre ? [a.genre] : [])}
                   label={a.label}
-                  onGenreClick={(genreName) => navigate(`/library/genre/${encodeURIComponent(genreName)}${location.search || ''}`)}
-                  onLabelClick={a.label ? () => navigate(`/library/label/${encodeURIComponent(a.label || '')}${location.search || ''}`) : undefined}
+                  onGenreClick={(genreName) => navigate(`/library/genre/${encodeURIComponent(genreName)}${location.search || ''}`, { state: withBackLinkState(location) })}
+                  onLabelClick={a.label ? () => navigate(`/library/label/${encodeURIComponent(a.label || '')}${location.search || ''}`, { state: withBackLinkState(location) }) : undefined}
                 />
+                {!showBadges && a.year ? (
+                  <div className="text-[11px] text-muted-foreground">{a.year}</div>
+                ) : null}
               </div>
             </div>
           </div>

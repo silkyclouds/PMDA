@@ -1,17 +1,18 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useNavigate, useParams } from 'react-router-dom';
-import { ArrowLeft, GripVertical, ListMusic, Loader2, Play, RefreshCw, Trash2 } from 'lucide-react';
+import { useLocation, useNavigate, useParams } from 'react-router-dom';
+import { ArrowLeft, GripVertical, ListMusic, Loader2, Play, RefreshCw, Share2, Trash2 } from 'lucide-react';
 
 import * as api from '@/lib/api';
 import { cn } from '@/lib/utils';
 import { useToast } from '@/hooks/use-toast';
 import { usePlayback } from '@/contexts/PlaybackContext';
-import { useAuth } from '@/contexts/AuthContext';
 import type { TrackInfo } from '@/components/library/AudioPlayer';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from '@/components/ui/dialog';
+import { ShareDialog } from '@/components/social/ShareDialog';
+import { resolveBackLink } from '@/lib/backNavigation';
 
 function parseDropPayload(e: React.DragEvent): { track_id?: number; album_id?: number } | null {
   const rawTrack = e.dataTransfer.getData('application/x-pmda-track');
@@ -39,9 +40,9 @@ function parseDropPayload(e: React.DragEvent): { track_id?: number; album_id?: n
 
 export default function PlaylistDetail() {
   const navigate = useNavigate();
+  const location = useLocation();
   const params = useParams<{ playlistId: string }>();
   const playlistId = Number(params.playlistId);
-  const { isAdmin } = useAuth();
 
   const { toast } = useToast();
   const { startPlayback, setCurrentTrack } = usePlayback();
@@ -91,6 +92,10 @@ export default function PlaylistDetail() {
       file_url: it.track.file_url,
     }));
   }, [detail?.items]);
+  const backLink = useMemo(
+    () => resolveBackLink(location, { path: '/library/playlists', label: 'Playlists' }),
+    [location],
+  );
 
   const handlePlay = () => {
     if (!detail) return;
@@ -106,7 +111,6 @@ export default function PlaylistDetail() {
     async (e: React.DragEvent) => {
       e.preventDefault();
       e.stopPropagation();
-      if (!isAdmin) return;
       if (!detail) return;
       const payload = parseDropPayload(e);
       if (!payload) return;
@@ -122,12 +126,11 @@ export default function PlaylistDetail() {
         setDropping(false);
       }
     },
-    [detail, isAdmin, load, toast]
+    [detail, load, toast]
   );
 
   const handleReorder = useCallback(
     async (fromItemId: number, toIndex: number) => {
-      if (!isAdmin) return;
       if (!detail) return;
       const current = [...(detail.items || [])];
       const fromIndex = current.findIndex((x) => x.item_id === fromItemId);
@@ -146,12 +149,11 @@ export default function PlaylistDetail() {
         setSavingOrder(false);
       }
     },
-    [detail, isAdmin, load]
+    [detail, load]
   );
 
   const removeItem = useCallback(
     async (itemId: number) => {
-      if (!isAdmin) return;
       if (!detail) return;
       try {
         await api.deletePlaylistItem(detail.playlist_id, itemId);
@@ -160,11 +162,10 @@ export default function PlaylistDetail() {
         toast({ title: 'Remove failed', description: e instanceof Error ? e.message : 'Failed to remove', variant: 'destructive' });
       }
     },
-    [detail, isAdmin, toast]
+    [detail, toast]
   );
 
   const deletePlaylist = useCallback(async () => {
-    if (!isAdmin) return;
     if (!detail) return;
     try {
       await api.deletePlaylist(detail.playlist_id);
@@ -174,7 +175,7 @@ export default function PlaylistDetail() {
     } catch (e) {
       toast({ title: 'Delete failed', description: e instanceof Error ? e.message : 'Failed to delete', variant: 'destructive' });
     }
-  }, [detail, isAdmin, navigate, toast]);
+  }, [detail, navigate, toast]);
 
   if (loading) {
     return (
@@ -192,7 +193,7 @@ export default function PlaylistDetail() {
         <Card>
           <CardContent className="p-8 space-y-3 text-center">
             <div className="text-sm text-muted-foreground">{error || 'Playlist not found'}</div>
-            <Button variant="outline" onClick={() => navigate('/library/playlists')}>Back</Button>
+            <Button variant="outline" onClick={() => navigate(backLink.path)}>{`Back to ${backLink.label}`}</Button>
           </CardContent>
         </Card>
       </div>
@@ -203,9 +204,9 @@ export default function PlaylistDetail() {
     <div className="container py-6 space-y-6">
       <div className="flex items-start justify-between gap-4">
         <div className="space-y-2">
-          <Button variant="ghost" className="gap-2" onClick={() => navigate('/library/playlists')}>
+          <Button variant="ghost" className="gap-2" onClick={() => navigate(backLink.path)}>
             <ArrowLeft className="h-4 w-4" />
-            Back to Playlists
+            {`Back to ${backLink.label}`}
           </Button>
           <div>
             <h1 className="text-3xl font-bold tracking-tight">{detail.name}</h1>
@@ -226,54 +227,58 @@ export default function PlaylistDetail() {
             <Play className="h-4 w-4" />
             Play
           </Button>
-          {isAdmin ? (
-            <Dialog open={deleteOpen} onOpenChange={setDeleteOpen}>
-              <DialogTrigger asChild>
-                <Button variant="destructive" className="gap-2">
-                  <Trash2 className="h-4 w-4" />
-                  Delete
-                </Button>
-              </DialogTrigger>
-              <DialogContent>
-                <DialogHeader>
-                  <DialogTitle>Delete playlist?</DialogTitle>
-                  <DialogDescription>This cannot be undone.</DialogDescription>
-                </DialogHeader>
-                <DialogFooter>
-                  <Button variant="outline" onClick={() => setDeleteOpen(false)}>Cancel</Button>
-                  <Button variant="destructive" onClick={() => void deletePlaylist()}>Delete</Button>
-                </DialogFooter>
-              </DialogContent>
-            </Dialog>
-          ) : null}
+          <ShareDialog
+            entityType="playlist"
+            entityId={detail.playlist_id}
+            entityLabel={detail.name}
+            entitySubtitle={detail.description || `${detail.items.length} track(s)`}
+            trigger={(
+              <Button type="button" size="sm" variant="outline" className="gap-2">
+                <Share2 className="h-4 w-4" />
+                Share
+              </Button>
+            )}
+          />
+          <Dialog open={deleteOpen} onOpenChange={setDeleteOpen}>
+            <DialogTrigger asChild>
+              <Button variant="destructive" className="gap-2">
+                <Trash2 className="h-4 w-4" />
+                Delete
+              </Button>
+            </DialogTrigger>
+            <DialogContent>
+              <DialogHeader>
+                <DialogTitle>Delete playlist?</DialogTitle>
+                <DialogDescription>This cannot be undone.</DialogDescription>
+              </DialogHeader>
+              <DialogFooter>
+                <Button variant="outline" onClick={() => setDeleteOpen(false)}>Cancel</Button>
+                <Button variant="destructive" onClick={() => void deletePlaylist()}>Delete</Button>
+              </DialogFooter>
+            </DialogContent>
+          </Dialog>
         </div>
       </div>
 
-      {isAdmin ? (
-        <div
-          className={cn(
-            'rounded-2xl border border-dashed p-4',
-            'bg-muted/20 border-border/70',
-            'transition-colors',
-            dropping ? 'opacity-70 pointer-events-none' : 'hover:bg-accent/20'
-          )}
-          onDragOver={(e) => e.preventDefault()}
-          onDrop={(e) => void handleDrop(e)}
-        >
-          <div className="flex items-center gap-2 text-sm">
-            <ListMusic className="h-4 w-4 text-primary" />
-            <span className="font-medium">Drop tracks here</span>
-            {dropping ? <Loader2 className="h-4 w-4 animate-spin ml-1 text-muted-foreground" /> : null}
-          </div>
-          <div className="text-xs text-muted-foreground mt-1">
-            Drag from Now Playing queue (bottom player) into this playlist, or drop onto a playlist in the sidebar.
-          </div>
+      <div
+        className={cn(
+          'rounded-2xl border border-dashed p-4',
+          'bg-muted/20 border-border/70',
+          'transition-colors',
+          dropping ? 'opacity-70 pointer-events-none' : 'hover:bg-accent/20'
+        )}
+        onDragOver={(e) => e.preventDefault()}
+        onDrop={(e) => void handleDrop(e)}
+      >
+        <div className="flex items-center gap-2 text-sm">
+          <ListMusic className="h-4 w-4 text-primary" />
+          <span className="font-medium">Drop tracks here</span>
+          {dropping ? <Loader2 className="h-4 w-4 animate-spin ml-1 text-muted-foreground" /> : null}
         </div>
-      ) : (
-        <div className="rounded-2xl border border-border/70 bg-muted/20 p-4 text-xs text-muted-foreground">
-          Read-only account: playlist editing is disabled.
+        <div className="text-xs text-muted-foreground mt-1">
+          Drag from Now Playing queue (bottom player) into this playlist, or drop onto a playlist in the sidebar.
         </div>
-      )}
+      </div>
 
       <Card className="border-border/70 overflow-hidden">
         <CardContent className="p-0">
@@ -288,24 +293,20 @@ export default function PlaylistDetail() {
                     'flex items-center gap-3 px-4 py-3',
                     dragOverIndex === idx ? 'bg-accent/25' : 'bg-background'
                   )}
-                  draggable={isAdmin}
+                  draggable
                   onDragStart={(e) => {
-                    if (!isAdmin) return;
                     dragItemIdRef.current = it.item_id;
                     e.dataTransfer.setData('text/plain', it.track.title);
                     e.dataTransfer.effectAllowed = 'move';
                   }}
                   onDragOver={(e) => {
-                    if (!isAdmin) return;
                     e.preventDefault();
                     setDragOverIndex(idx);
                   }}
                   onDragLeave={() => {
-                    if (!isAdmin) return;
                     setDragOverIndex(null);
                   }}
                   onDrop={(e) => {
-                    if (!isAdmin) return;
                     e.preventDefault();
                     const from = dragItemIdRef.current;
                     dragItemIdRef.current = null;
@@ -313,18 +314,16 @@ export default function PlaylistDetail() {
                     if (from) void handleReorder(from, idx);
                   }}
                   >
-                  <GripVertical className={cn('h-4 w-4 text-muted-foreground', isAdmin ? 'cursor-grab active:cursor-grabbing' : 'opacity-50')} />
+                  <GripVertical className="h-4 w-4 cursor-grab text-muted-foreground active:cursor-grabbing" />
                   <div className="min-w-0 flex-1">
                     <div className="text-sm font-medium truncate">{it.track.title}</div>
                     <div className="text-xs text-muted-foreground truncate">
                       {it.track.artist_name} · {it.track.album_title}
                     </div>
                   </div>
-                  {isAdmin ? (
-                    <Button variant="ghost" size="sm" onClick={() => void removeItem(it.item_id)} className="text-muted-foreground hover:text-destructive">
-                      Remove
-                    </Button>
-                  ) : null}
+                  <Button variant="ghost" size="sm" onClick={() => void removeItem(it.item_id)} className="text-muted-foreground hover:text-destructive">
+                    Remove
+                  </Button>
                 </div>
               ))}
             </div>

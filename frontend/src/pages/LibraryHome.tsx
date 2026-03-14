@@ -14,6 +14,7 @@ import { LibraryEmptyState } from '@/components/library/LibraryEmptyState';
 import { usePlayback } from '@/contexts/PlaybackContext';
 import { useAlbumBadgesVisibility } from '@/hooks/use-album-badges';
 import { useToast } from '@/hooks/use-toast';
+import { withBackLinkState } from '@/lib/backNavigation';
 import * as api from '@/lib/api';
 import type { TrackInfo } from '@/components/library/AudioPlayer';
 import type { LibraryOutletContext } from '@/pages/LibraryLayout';
@@ -259,11 +260,11 @@ export default function LibraryHome() {
   }, [location.search, navigate]);
 
   const openLabel = useCallback((lab: string) => {
-    navigate(`/library/label/${encodeURIComponent(lab)}${location.search || ''}`);
+    navigate(`/library/label/${encodeURIComponent(lab)}${location.search || ''}`, { state: withBackLinkState(location) });
   }, [location.search, navigate]);
 
   const openGenre = useCallback((g: string) => {
-    navigate(`/library/genre/${encodeURIComponent(g)}${location.search || ''}`);
+    navigate(`/library/genre/${encodeURIComponent(g)}${location.search || ''}`, { state: withBackLinkState(location) });
   }, [location.search, navigate]);
 
   const moveSectionTo = useCallback((movingKey: HomeSectionKey, targetKey: HomeSectionKey) => {
@@ -297,7 +298,7 @@ export default function LibraryHome() {
               : key === 'recently_played'
                 ? '/library/home/feed/recently_played'
                 : '/library/home/feed/recently_added';
-    navigate(`${target}${suffix}`);
+    navigate(`${target}${suffix}`, { state: withBackLinkState(location) });
   }, [location.search, navigate]);
 
   useEffect(() => {
@@ -526,7 +527,7 @@ export default function LibraryHome() {
                                 <div className="min-w-0 text-left">
                                   <button
                                     type="button"
-                                    onClick={() => navigate(`/library/album/${a.album_id}${location.search || ''}`)}
+                                    onClick={() => navigate(`/library/album/${a.album_id}${location.search || ''}`, { state: withBackLinkState(location) })}
                                     className="block min-w-0 text-left hover:underline"
                                     title="Open album"
                                   >
@@ -536,7 +537,7 @@ export default function LibraryHome() {
                                   </button>
                                   <button
                                     type="button"
-                                    onClick={() => navigate(`/library/artist/${a.artist_id}${location.search || ''}`)}
+                                    onClick={() => navigate(`/library/artist/${a.artist_id}${location.search || ''}`, { state: withBackLinkState(location) })}
                                     className="block text-xs text-muted-foreground truncate hover:underline"
                                     title="Open artist"
                                   >
@@ -559,8 +560,8 @@ export default function LibraryHome() {
                                 trackCount={a.track_count}
                                 genres={a.genres || (a.genre ? [a.genre] : [])}
                                 label={a.label}
-                                onGenreClick={(genreName) => navigate(`/library/genre/${encodeURIComponent(genreName)}${location.search || ''}`)}
-                                onLabelClick={a.label ? () => navigate(`/library/label/${encodeURIComponent(a.label || '')}${location.search || ''}`) : undefined}
+                                onGenreClick={(genreName) => navigate(`/library/genre/${encodeURIComponent(genreName)}${location.search || ''}`, { state: withBackLinkState(location) })}
+                                onLabelClick={a.label ? () => navigate(`/library/label/${encodeURIComponent(a.label || '')}${location.search || ''}`, { state: withBackLinkState(location) }) : undefined}
                               />
                             </CardContent>
                           </Card>
@@ -692,7 +693,7 @@ export default function LibraryHome() {
               <CarouselContent className="-ml-3">
                 {topArtists.map((a) => (
                   <CarouselItem key={`ta-${a.artist_id}`} className="basis-[170px] sm:basis-[200px] md:basis-[220px] pl-3">
-                    <button type="button" onClick={() => navigate(`/library/artist/${a.artist_id}${location.search || ''}`)} className="w-full text-left group">
+                    <button type="button" onClick={() => navigate(`/library/artist/${a.artist_id}${location.search || ''}`, { state: withBackLinkState(location) })} className="w-full text-left group">
                       <Card className="overflow-hidden border-border/60 bg-card/90 transition-all duration-300 hover:-translate-y-1 hover:border-primary/35 hover:bg-accent/20">
                         <CardContent className="p-4 space-y-3">
                           <div className="flex items-center gap-3">
@@ -767,7 +768,7 @@ export default function LibraryHome() {
               <CarouselContent className="-ml-3">
                 {recentArtists.map((a) => (
                   <CarouselItem key={`ra-${a.artist_id}`} className="basis-[170px] sm:basis-[200px] md:basis-[220px] pl-3">
-                    <button type="button" onClick={() => navigate(`/library/artist/${a.artist_id}${location.search || ''}`)} className="w-full text-left group">
+                    <button type="button" onClick={() => navigate(`/library/artist/${a.artist_id}${location.search || ''}`, { state: withBackLinkState(location) })} className="w-full text-left group">
                       <Card className="overflow-hidden border-border/60 bg-card/90 transition-all duration-300 hover:-translate-y-1 hover:border-primary/35 hover:bg-accent/20">
                         <CardContent className="p-4 space-y-3">
                           <div className="flex items-center gap-3">
@@ -867,7 +868,7 @@ export default function LibraryHome() {
                             <div className="min-w-0 text-left">
                               <button
                                 type="button"
-                                onClick={() => navigate(`/library/album/${a.album_id}${location.search || ''}`)}
+                                onClick={() => navigate(`/library/album/${a.album_id}${location.search || ''}`, { state: withBackLinkState(location) })}
                                 className="block min-w-0 text-left hover:underline"
                                 title="Open album"
                               >
@@ -877,7 +878,7 @@ export default function LibraryHome() {
                               </button>
                               <button
                                 type="button"
-                                onClick={() => navigate(`/library/artist/${a.artist_id}${location.search || ''}`)}
+                                onClick={() => navigate(`/library/artist/${a.artist_id}${location.search || ''}`, { state: withBackLinkState(location) })}
                                 className="block text-xs text-muted-foreground truncate hover:underline"
                                 title="Open artist"
                               >
@@ -900,8 +901,8 @@ export default function LibraryHome() {
                             trackCount={a.track_count}
                             genres={a.genres || (a.genre ? [a.genre] : [])}
                             label={a.label}
-                            onGenreClick={(genreName) => navigate(`/library/genre/${encodeURIComponent(genreName)}${location.search || ''}`)}
-                            onLabelClick={a.label ? () => navigate(`/library/label/${encodeURIComponent(a.label || '')}${location.search || ''}`) : undefined}
+                            onGenreClick={(genreName) => navigate(`/library/genre/${encodeURIComponent(genreName)}${location.search || ''}`, { state: withBackLinkState(location) })}
+                            onLabelClick={a.label ? () => navigate(`/library/label/${encodeURIComponent(a.label || '')}${location.search || ''}`, { state: withBackLinkState(location) }) : undefined}
                           />
                         </CardContent>
                       </Card>
@@ -978,7 +979,7 @@ export default function LibraryHome() {
                             <div className="min-w-0 text-left">
                               <button
                                 type="button"
-                                onClick={() => navigate(`/library/album/${a.album_id}${location.search || ''}`)}
+                                onClick={() => navigate(`/library/album/${a.album_id}${location.search || ''}`, { state: withBackLinkState(location) })}
                                 className="block min-w-0 text-left hover:underline"
                                 title="Open album"
                               >
@@ -988,7 +989,7 @@ export default function LibraryHome() {
                               </button>
                               <button
                                 type="button"
-                                onClick={() => navigate(`/library/artist/${a.artist_id}${location.search || ''}`)}
+                                onClick={() => navigate(`/library/artist/${a.artist_id}${location.search || ''}`, { state: withBackLinkState(location) })}
                                 className="block text-xs text-muted-foreground truncate hover:underline"
                                 title="Open artist"
                               >
@@ -1011,8 +1012,8 @@ export default function LibraryHome() {
                             trackCount={a.track_count}
                             genres={a.genres || (a.genre ? [a.genre] : [])}
                             label={a.label}
-                            onGenreClick={(genreName) => navigate(`/library/genre/${encodeURIComponent(genreName)}${location.search || ''}`)}
-                            onLabelClick={a.label ? () => navigate(`/library/label/${encodeURIComponent(a.label || '')}${location.search || ''}`) : undefined}
+                            onGenreClick={(genreName) => navigate(`/library/genre/${encodeURIComponent(genreName)}${location.search || ''}`, { state: withBackLinkState(location) })}
+                            onLabelClick={a.label ? () => navigate(`/library/label/${encodeURIComponent(a.label || '')}${location.search || ''}`, { state: withBackLinkState(location) }) : undefined}
                           />
                         </CardContent>
                       </Card>

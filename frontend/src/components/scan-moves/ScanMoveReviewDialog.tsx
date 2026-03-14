@@ -14,6 +14,7 @@ import {
 import { ProviderBadge } from '@/components/providers/ProviderBadge';
 import { cn } from '@/lib/utils';
 import { badgeKindClass } from '@/lib/badgeStyles';
+import { formatBadgeDateTime } from '@/lib/dateFormat';
 
 interface ScanMoveReviewDialogProps {
   move: api.ScanMove | null;
@@ -270,7 +271,7 @@ export function ScanMoveReviewDialog({
               {detail?.reason_label || move?.reason_label || 'Moved'}
             </Badge>
             <Badge variant="outline" className={cn('text-[10px]', badgeKindClass('muted'))}>
-              {new Date(((detail?.moved_at ?? move?.moved_at) || 0) * 1000).toLocaleString()}
+              {formatBadgeDateTime((detail?.moved_at ?? move?.moved_at) || 0)}
             </Badge>
             {detail?.decision_provider ? <ProviderBadge provider={detail.decision_provider} prefix="Provider" className="text-[10px]" /> : null}
             {detail?.decision_source ? <ProviderBadge provider={detail.decision_source} prefix="Source" className="text-[10px]" /> : null}

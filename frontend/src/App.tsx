@@ -15,6 +15,8 @@ import LibraryAlbums from "./pages/LibraryAlbums";
 import LibraryArtists from "./pages/LibraryArtists";
 import LibraryGenres from "./pages/LibraryGenres";
 import LibraryLabels from "./pages/LibraryLabels";
+import LikedPage from "./pages/LikedPage";
+import RecommendationsPage from "./pages/RecommendationsPage";
 import ArtistPage from "./pages/ArtistPage";
 import LabelPage from "./pages/LabelPage";
 import GenrePage from "./pages/GenrePage";
@@ -122,6 +124,8 @@ function AppRoutesWithPlayer() {
             <Route path="albums" element={<LibraryAlbums />} />
             <Route path="genres" element={<LibraryGenres />} />
             <Route path="labels" element={<LibraryLabels />} />
+            <Route path="liked" element={<LikedPage />} />
+            <Route path="recommendations" element={<RecommendationsPage />} />
             <Route path="artist/:artistId" element={<ArtistPage />} />
             <Route path="label/:label" element={<LabelPage />} />
             <Route path="genre/:genre" element={<GenrePage />} />
@@ -141,7 +145,7 @@ function AppRoutesWithPlayer() {
         <Route path="/auth/login" element={<Navigate to="/library" replace />} />
         <Route path="/auth/bootstrap" element={<Navigate to="/library" replace />} />
       </Routes>
-      {auth.isAdmin ? <AssistantDock bottomOffsetPx={session ? 128 : 16} /> : null}
+      <AssistantDock bottomOffsetPx={session ? 128 : 16} />
       {session && (
         <AudioPlayer
           albumId={session.albumId}

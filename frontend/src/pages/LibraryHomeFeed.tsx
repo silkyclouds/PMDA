@@ -13,6 +13,7 @@ import { useAlbumBadgesVisibility } from '@/hooks/use-album-badges';
 import { useToast } from '@/hooks/use-toast';
 import { useIsMobile } from '@/hooks/use-mobile';
 import { dedupeAlbumsForDisplay, mergeAlbumsForDisplay } from '@/lib/albumDisplayDedupe';
+import { resolveBackLink, withBackLinkState } from '@/lib/backNavigation';
 import * as api from '@/lib/api';
 import type { LibraryOutletContext } from '@/pages/LibraryLayout';
 
@@ -140,6 +141,10 @@ export default function LibraryHomeFeed() {
     const col = Math.max(140, Math.min(340, Math.floor(coverSize)));
     return `repeat(auto-fill, minmax(${col}px, ${col}px))`;
   }, [coverSize, isMobile]);
+  const backLink = useMemo(
+    () => resolveBackLink(location, { path: `/library${location.search || ''}`, label: 'Home' }),
+    [location],
+  );
 
   const handlePlayAlbum = useCallback(async (albumId: number, fallbackTitle: string, fallbackThumb?: string | null) => {
     try {
@@ -319,9 +324,9 @@ export default function LibraryHomeFeed() {
   return (
     <div className="container py-4 md:py-6 space-y-5 md:space-y-6">
       <div className="flex items-center justify-between gap-3">
-        <Button variant="ghost" className="gap-2" onClick={() => navigate(`/library${location.search || ''}`)}>
+        <Button variant="ghost" className="gap-2" onClick={() => navigate(backLink.path)}>
           <ArrowLeft className="w-4 h-4" />
-          Back to Home
+          {`Back to ${backLink.label}`}
         </Button>
         <div className="text-xs text-muted-foreground">
           {total != null ? `${Math.min(offset, total).toLocaleString()} / ${total.toLocaleString()}` : `${offset.toLocaleString()} loaded`}
@@ -361,11 +366,11 @@ export default function LibraryHomeFeed() {
                 role="button"
                 tabIndex={0}
                 className="group text-left"
-                onClick={() => navigate(`/library/album/${a.album_id}${location.search || ''}`)}
+                onClick={() => navigate(`/library/album/${a.album_id}${location.search || ''}`, { state: withBackLinkState(location) })}
                 onKeyDown={(e) => {
                   if (e.key === 'Enter' || e.key === ' ') {
                     e.preventDefault();
-                    navigate(`/library/album/${a.album_id}${location.search || ''}`);
+                    navigate(`/library/album/${a.album_id}${location.search || ''}`, { state: withBackLinkState(location) });
                   }
                 }}
               >
@@ -395,7 +400,7 @@ export default function LibraryHomeFeed() {
                       onClick={(e) => {
                         e.preventDefault();
                         e.stopPropagation();
-                        navigate(`/library/artist/${a.artist_id}${location.search || ''}`);
+                        navigate(`/library/artist/${a.artist_id}${location.search || ''}`, { state: withBackLinkState(location) });
                       }}
                       title="Open artist"
                     >
@@ -429,7 +434,7 @@ export default function LibraryHomeFeed() {
               key={`hf-art-${section}-${a.artist_id}`}
               type="button"
               className="text-left"
-              onClick={() => navigate(`/library/artist/${a.artist_id}${location.search || ''}`)}
+              onClick={() => navigate(`/library/artist/${a.artist_id}${location.search || ''}`, { state: withBackLinkState(location) })}
             >
               <Card className="border-border/60 bg-card hover:bg-accent/30 transition-colors p-4">
                 <div className="flex items-center gap-3">

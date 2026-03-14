@@ -6,6 +6,7 @@ import { Badge } from '@/components/ui/badge';
 import { Card } from '@/components/ui/card';
 import { LibraryEmptyState } from '@/components/library/LibraryEmptyState';
 import { useLibraryQuery } from '@/hooks/useLibraryQuery';
+import { withBackLinkState } from '@/lib/backNavigation';
 import * as api from '@/lib/api';
 import { cn } from '@/lib/utils';
 import type { LibraryOutletContext } from '@/pages/LibraryLayout';
@@ -142,7 +143,7 @@ export default function LibraryLabels() {
                 key={`label-${l.value}`}
                 type="button"
                 className={cn('w-full px-4 py-3 text-left hover:bg-accent/40 transition-colors')}
-                onClick={() => navigate(`/library/label/${encodeURIComponent(l.value)}${location.search || ''}`)}
+                onClick={() => navigate(`/library/label/${encodeURIComponent(l.value)}${location.search || ''}`, { state: withBackLinkState(location) })}
                 title="Open label"
               >
                 <div className="flex items-center justify-between gap-3">

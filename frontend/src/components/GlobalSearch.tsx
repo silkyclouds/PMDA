@@ -1,13 +1,15 @@
 import { useEffect, useMemo, useRef, useState, type KeyboardEventHandler } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useLocation, useNavigate } from 'react-router-dom';
 import { Disc3, Loader2, Music2, Search, Tags, UserRound } from 'lucide-react';
 import { Input } from '@/components/ui/input';
+import { withBackLinkState } from '@/lib/backNavigation';
 import { cn } from '@/lib/utils';
 import type { LibrarySearchSuggestionItem } from '@/lib/api';
 import * as api from '@/lib/api';
 
 export function GlobalSearch({ className }: { className?: string }) {
   const navigate = useNavigate();
+  const location = useLocation();
   const rootRef = useRef<HTMLDivElement | null>(null);
   const [query, setQuery] = useState('');
   const [items, setItems] = useState<LibrarySearchSuggestionItem[]>([]);
@@ -69,20 +71,21 @@ export function GlobalSearch({ className }: { className?: string }) {
   }, []);
 
   const goToItem = (item: LibrarySearchSuggestionItem | undefined) => {
+    const navState = withBackLinkState(location);
     if (!item) return;
     if (item.type === 'genre') {
       const g = String(item.title || '').trim();
-      if (g) navigate(`/library/genre/${encodeURIComponent(g)}`);
-      else navigate('/library/genres');
+      if (g) navigate(`/library/genre/${encodeURIComponent(g)}`, { state: navState });
+      else navigate('/library/genres', { state: navState });
     } else if (item.type === 'track' && item.album_id) {
       const trackParam = item.track_id && item.track_id > 0 ? `?track_id=${item.track_id}` : '';
-      navigate(`/library/album/${item.album_id}${trackParam}`);
+      navigate(`/library/album/${item.album_id}${trackParam}`, { state: navState });
     } else if (item.type === 'album' && item.album_id) {
-      navigate(`/library/album/${item.album_id}`);
+      navigate(`/library/album/${item.album_id}`, { state: navState });
     } else if (item.artist_id) {
-      navigate(`/library/artist/${item.artist_id}`);
+      navigate(`/library/artist/${item.artist_id}`, { state: navState });
     } else {
-      navigate('/library');
+      navigate('/library', { state: navState });
     }
     setQuery('');
     setOpen(false);

@@ -8,6 +8,7 @@ import { Alert, AlertDescription } from '@/components/ui/alert';
 import { ScanMoveReviewDialog } from '@/components/scan-moves/ScanMoveReviewDialog';
 import { ProviderBadge } from '@/components/providers/ProviderBadge';
 import * as api from '@/lib/api';
+import { formatBadgeDateTime } from '@/lib/dateFormat';
 import { useToast } from '@/hooks/use-toast';
 
 function fmtMissingIndices(raw: unknown): string {
@@ -195,7 +196,7 @@ export function BrokenAlbumsList() {
                                 <span className="text-muted-foreground">•</span>
                                 <span>{move.album_title || `Album #${move.album_id}`}</span>
                                 <Badge variant="outline">{reason}</Badge>
-                                <Badge variant="outline">Moved: {new Date(move.moved_at * 1000).toLocaleString()}</Badge>
+                                <Badge variant="outline">Moved: {formatBadgeDateTime(move.moved_at)}</Badge>
                                 <Badge variant={status === 'restored' ? 'secondary' : 'default'}>
                                   {status === 'restored' ? 'Restored' : status === 'missing' ? 'Missing' : 'Moved'}
                                 </Badge>

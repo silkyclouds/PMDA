@@ -26,6 +26,7 @@ import {
 import { useToast } from '@/hooks/use-toast';
 import * as api from '@/lib/api';
 import { badgeKindClass, matchTypeBadgeClass } from '@/lib/badgeStyles';
+import { formatBadgeDateTime } from '@/lib/dateFormat';
 import { normalizeProviderId, providerLabel } from '@/lib/providerMeta';
 import { cn } from '@/lib/utils';
 
@@ -49,11 +50,7 @@ function matchBadgeVariant(value?: string | null): 'secondary' | 'outline' | 'de
 function formatTs(ts?: number | null): string {
   const n = Number(ts || 0);
   if (!Number.isFinite(n) || n <= 0) return '—';
-  try {
-    return new Date(n * 1000).toLocaleString();
-  } catch {
-    return '—';
-  }
+  return formatBadgeDateTime(n);
 }
 
 type MatchEntity =

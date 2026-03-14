@@ -34,7 +34,7 @@ export function AlbumRatingStars({
               style={{ width: size, height: size }}
             >
               <Star
-                className="absolute inset-0 text-white/15"
+                className="absolute inset-0 text-slate-500 fill-slate-300/20 dark:text-white/45 dark:fill-white/10"
                 style={{ width: size, height: size }}
                 strokeWidth={1.8}
               />

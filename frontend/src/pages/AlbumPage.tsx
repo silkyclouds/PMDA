@@ -1,6 +1,6 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useNavigate, useParams } from 'react-router-dom';
-import { ArrowLeft, Calendar, ChevronDown, ChevronUp, Disc3, Download, Info, ListPlus, Loader2, Music, Pencil, Play, Plus, Users } from 'lucide-react';
+import { useLocation, useNavigate, useParams } from 'react-router-dom';
+import { ArrowLeft, Calendar, ChevronDown, ChevronUp, Disc3, Download, Heart, Info, ListPlus, Loader2, Music, Pencil, Play, Plus, Share2, Users } from 'lucide-react';
 
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -13,8 +13,11 @@ import { AlbumRatingStars } from '@/components/library/AlbumRatingStars';
 import { MatchDetailDialog } from '@/components/library/MatchDetailDialog';
 import { ProviderBadge } from '@/components/providers/ProviderBadge';
 import { ProviderLink } from '@/components/providers/ProviderLink';
+import { ShareDialog } from '@/components/social/ShareDialog';
 import * as api from '@/lib/api';
 import { badgeKindClass } from '@/lib/badgeStyles';
+import { resolveBackLink, withBackLinkState } from '@/lib/backNavigation';
+import { formatBadgeDateTime } from '@/lib/dateFormat';
 import { normalizeProviderId } from '@/lib/providerMeta';
 import { cn } from '@/lib/utils';
 import { useToast } from '@/hooks/use-toast';
@@ -182,37 +185,6 @@ function parseGenreBadges(value: string): string[] {
   return out;
 }
 
-function formatBadgeTimestamp(ts?: number | null): string {
-  const n = Number(ts || 0);
-  if (!Number.isFinite(n) || n <= 0) return '—';
-  try {
-    return new Date(n * 1000).toLocaleString();
-  } catch {
-    return '—';
-  }
-}
-
-function formatAddedTimestamp(ts?: number | null): string {
-  const n = Number(ts || 0);
-  if (!Number.isFinite(n) || n <= 0) return '—';
-  try {
-    return new Intl.DateTimeFormat('en-GB', {
-      day: '2-digit',
-      month: '2-digit',
-      year: 'numeric',
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit',
-      hour12: true,
-    })
-      .format(new Date(n * 1000))
-      .replace(' am', ' AM')
-      .replace(' pm', ' PM');
-  } catch {
-    return '—';
-  }
-}
-
 function formatCompactCount(value?: number | null): string {
   const num = Number(value || 0);
   if (!Number.isFinite(num) || num <= 0) return '0';
@@ -221,6 +193,7 @@ function formatCompactCount(value?: number | null): string {
 
 export default function AlbumPage() {
   const navigate = useNavigate();
+  const location = useLocation();
   const params = useParams<{ albumId: string }>();
   const albumId = Number(params.albumId);
   const { startPlayback, setCurrentTrack, queueTrack } = usePlayback();
@@ -241,6 +214,7 @@ export default function AlbumPage() {
   const [expandedTrackId, setExpandedTrackId] = useState<number | null>(null);
   const [trackDetailsById, setTrackDetailsById] = useState<Record<number, api.AlbumTrackDetailItem>>({});
   const [savingUserRating, setSavingUserRating] = useState(false);
+  const [albumLiked, setAlbumLiked] = useState(false);
   const durationRefreshAttemptsRef = useRef(0);
 
   const load = useCallback(async () => {
@@ -335,6 +309,26 @@ export default function AlbumPage() {
   useEffect(() => {
     void loadPlaylists();
   }, [loadPlaylists]);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!Number.isFinite(albumId) || albumId <= 0) {
+      setAlbumLiked(false);
+      return;
+    }
+    void (async () => {
+      try {
+        const res = await api.getLikes('album', [albumId]);
+        const liked = Boolean((res.items || []).find((item) => Number(item.entity_id || 0) === albumId)?.liked);
+        if (!cancelled) setAlbumLiked(liked);
+      } catch {
+        if (!cancelled) setAlbumLiked(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [albumId]);
 
   const trackRows = useMemo(() => {
     const tracks = data?.tracks || [];
@@ -480,6 +474,26 @@ export default function AlbumPage() {
     }
   }, [data, savingUserRating, toast]);
 
+  const toggleAlbumLike = useCallback(async () => {
+    if (!data) return;
+    const next = !albumLiked;
+    setAlbumLiked(next);
+    try {
+      await api.setLike({ entity_type: 'album', entity_id: data.album_id, liked: next, source: 'ui_album_page' });
+      toast({
+        title: next ? 'Liked' : 'Unliked',
+        description: next ? 'Album saved to favorites.' : 'Album removed from favorites.',
+      });
+    } catch (e) {
+      setAlbumLiked(!next);
+      toast({
+        title: 'Like failed',
+        description: e instanceof Error ? e.message : 'Failed to update like',
+        variant: 'destructive',
+      });
+    }
+  }, [albumLiked, data, toast]);
+
   const handleAddTrackToPlaylist = useCallback(
     async (trackId: number, playlistId: number) => {
       if (!trackId || !playlistId) return;
@@ -512,13 +526,17 @@ export default function AlbumPage() {
   }
 
   if (error || !data) {
+    const fallbackBackLink = resolveBackLink(location, {
+      path: `/library${location.search || ''}`,
+      label: 'Library',
+    });
     return (
       <div className="container py-8">
         <Card className="border-border/70">
           <CardContent className="p-8 space-y-4 text-center">
             <p className="text-muted-foreground">{error || 'Album not found'}</p>
-            <Button variant="outline" onClick={() => navigate('/library')}>
-              Back to Library
+            <Button variant="outline" onClick={() => navigate(fallbackBackLink.path)}>
+              {`Back to ${fallbackBackLink.label}`}
             </Button>
           </CardContent>
         </Card>
@@ -538,21 +556,35 @@ export default function AlbumPage() {
     Number(data.updated_at || 0) > 0
       ? Number(data.updated_at || 0)
       : (Number(data.review?.updated_at || 0) > 0 ? Number(data.review?.updated_at || 0) : null);
+  const effectiveBackLink = resolveBackLink(location, {
+    path: `/library/artist/${data.artist_id}${location.search || ''}`,
+    label: 'Artist',
+  });
 
   return (
     <div className="container py-4 md:py-6 space-y-5 md:space-y-6">
       <div className="flex flex-wrap items-start justify-between gap-3">
-        <Button variant="ghost" className="gap-2" onClick={() => navigate(`/library/artist/${data.artist_id}`)}>
+            <Button variant="ghost" className="gap-2" onClick={() => navigate(effectiveBackLink.path)}>
           <ArrowLeft className="w-4 h-4" />
-          Back to Artist
+          {`Back to ${effectiveBackLink.label}`}
         </Button>
         <div className="flex flex-wrap items-center gap-2">
+          <Button
+            size="sm"
+            variant={albumLiked ? 'default' : 'outline'}
+            className="h-8 gap-2"
+            onClick={() => void toggleAlbumLike()}
+            title={albumLiked ? 'Unlike album' : 'Like album'}
+          >
+            <Heart className={cn('w-4 h-4', albumLiked ? 'fill-current' : '')} />
+            {albumLiked ? 'Liked' : 'Like'}
+          </Button>
           {data.label ? (
             <Button
               size="sm"
               variant="outline"
               className="h-8"
-              onClick={() => navigate(`/library/label/${encodeURIComponent(data.label || '')}`)}
+              onClick={() => navigate(`/library/label/${encodeURIComponent(data.label || '')}${location.search || ''}`, { state: withBackLinkState(location) })}
               title="Open label"
             >
               Label: {data.label}
@@ -579,13 +611,25 @@ export default function AlbumPage() {
             <Info className="w-4 h-4" />
             Match detail
           </Button>
+          <ShareDialog
+            entityType="album"
+            entityId={data.album_id}
+            entityLabel={data.title}
+            entitySubtitle={data.artist_name}
+            trigger={(
+              <Button size="sm" variant="outline" className="h-8 gap-2">
+                <Share2 className="w-4 h-4" />
+                Share
+              </Button>
+            )}
+          />
         </div>
       </div>
 
       <Card className="overflow-hidden border-border/70">
         <div className="relative overflow-hidden">
-          <div className="absolute inset-0 z-10 bg-background/18 backdrop-blur-md" />
-          <div className="absolute inset-0 z-10 bg-gradient-to-r from-background/76 via-background/58 to-background/42" />
+          <div className="absolute inset-0 z-10 bg-background/34 backdrop-blur-md" />
+          <div className="absolute inset-0 z-10 bg-gradient-to-r from-background/88 via-background/70 to-background/58" />
           {data.cover_url ? (
             <img src={data.cover_url} alt={data.title} className="w-full h-64 md:h-72 object-cover blur-[1.4px] scale-[1.06]" />
           ) : (
@@ -624,12 +668,14 @@ export default function AlbumPage() {
                   </Button>
                 </div>
               </div>
-              <div className="min-w-0">
-                <h1 className="text-2xl md:text-4xl font-bold tracking-tight truncate">{data.title}</h1>
+              <div className="min-w-0 rounded-2xl bg-background/22 px-4 py-3 backdrop-blur-sm shadow-[0_10px_35px_rgba(0,0,0,0.18)]">
+                <h1 className="text-2xl md:text-4xl font-bold tracking-tight truncate text-white drop-shadow-[0_2px_10px_rgba(0,0,0,0.55)]">
+                  {data.title}
+                </h1>
                 <button
                   type="button"
-                  className="text-sm text-muted-foreground mt-1 hover:underline truncate"
-                  onClick={() => navigate(`/library/artist/${data.artist_id}`)}
+                  className="text-sm text-white/82 mt-1 hover:underline truncate"
+                  onClick={() => navigate(`/library/artist/${data.artist_id}${location.search || ''}`, { state: withBackLinkState(location) })}
                   title="Open artist"
                 >
                   {data.artist_name}
@@ -669,7 +715,7 @@ export default function AlbumPage() {
                   ) : null}
                   {albumAddedAt ? (
                     <Badge variant="outline" className={cn("text-[10px]", badgeKindClass('muted'))}>
-                      Added {formatAddedTimestamp(albumAddedAt)}
+                      Added {formatBadgeDateTime(albumAddedAt)}
                     </Badge>
                   ) : null}
                   <button
@@ -681,7 +727,7 @@ export default function AlbumPage() {
                     onClick={() => setMatchDialogOpen(true)}
                     title="Open match detail"
                   >
-                    Updated: {formatBadgeTimestamp(albumUpdatedAt)}
+                    Updated: {formatBadgeDateTime(albumUpdatedAt)}
                   </button>
                   {data.bandcamp_album_url ? (
                     <ProviderLink provider="bandcamp" href={data.bandcamp_album_url} className="inline-flex" />
@@ -689,7 +735,7 @@ export default function AlbumPage() {
                 </div>
                 {genreBadges.length > 0 ? (
                   <div className="mt-3 space-y-1.5">
-                    <div className="text-[10px] font-medium uppercase tracking-[0.22em] text-muted-foreground/85">
+                    <div className="text-[10px] font-medium uppercase tracking-[0.22em] text-white/72">
                       Genres
                     </div>
                     <div className="flex flex-wrap gap-1.5">
@@ -698,7 +744,7 @@ export default function AlbumPage() {
                           key={`album-genre-${genre}`}
                           variant="outline"
                           className={cn("text-[10px] cursor-pointer", badgeKindClass('genre'))}
-                          onClick={() => navigate(`/library/genre/${encodeURIComponent(genre)}`)}
+                          onClick={() => navigate(`/library/genre/${encodeURIComponent(genre)}${location.search || ''}`, { state: withBackLinkState(location) })}
                         >
                           {genre}
                         </Badge>

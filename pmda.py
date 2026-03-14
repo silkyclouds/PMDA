@@ -3078,6 +3078,44 @@ def _current_user_id_or_zero() -> int:
     return max(0, uid)
 
 
+def _current_username_or_blank() -> str:
+    user = dict(getattr(g, "current_user", {}) or {}) if has_request_context() else {}
+    return str(user.get("username") or "").strip()
+
+
+def _auth_user_snapshot(user_id: int) -> dict[str, Any]:
+    uid = max(0, int(user_id or 0))
+    if uid <= 0:
+        return {"id": 0, "username": ""}
+    row = _auth_get_user_by_id(uid)
+    pub = _auth_public_user(row)
+    return {"id": uid, "username": str(pub.get("username") or "").strip()}
+
+
+def _auth_active_users_list(*, exclude_user_id: int = 0) -> list[dict[str, Any]]:
+    con = _auth_db_connect()
+    try:
+        cur = con.cursor()
+        cur.execute(
+            """
+            SELECT id, username, is_admin, can_download, can_view_statistics, is_active, created_at, updated_at, last_login_at
+            FROM auth_users
+            WHERE is_active = 1
+            ORDER BY username COLLATE NOCASE ASC
+            """
+        )
+        rows = cur.fetchall()
+        users: list[dict[str, Any]] = []
+        for row in rows:
+            pub = _auth_public_user(row)
+            if int(pub.get("id") or 0) == int(exclude_user_id or 0):
+                continue
+            users.append(pub)
+        return users
+    finally:
+        con.close()
+
+
 def _normalize_provider_id(provider_id: str, *, fallback: str = "openai-api") -> str:
     raw = str(provider_id or "").strip().lower()
     if not raw:
@@ -10509,12 +10547,15 @@ def _files_pg_init_schema() -> bool:
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS files_playlists (
                     id BIGSERIAL PRIMARY KEY,
+                    user_id INTEGER NOT NULL DEFAULT 1,
                     name TEXT NOT NULL,
                     description TEXT,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
             """)
+            cur.execute("ALTER TABLE files_playlists ADD COLUMN IF NOT EXISTS user_id INTEGER NOT NULL DEFAULT 1")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_files_playlists_user_updated ON files_playlists(user_id, updated_at DESC, id DESC)")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS files_playlist_items (
                     id BIGSERIAL PRIMARY KEY,
@@ -10543,6 +10584,84 @@ def _files_pg_init_schema() -> bool:
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_files_entity_likes_updated_at ON files_entity_likes(updated_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_files_entity_likes_type_liked ON files_entity_likes(entity_type, liked)")
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS files_user_entity_likes (
+                    id BIGSERIAL PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    entity_type TEXT NOT NULL,
+                    entity_id BIGINT NOT NULL DEFAULT 0,
+                    entity_key TEXT NOT NULL DEFAULT '',
+                    liked BOOLEAN NOT NULL DEFAULT TRUE,
+                    source TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    CONSTRAINT uq_files_user_entity_likes UNIQUE (user_id, entity_type, entity_id, entity_key)
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_files_user_entity_likes_user_updated ON files_user_entity_likes(user_id, updated_at DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_files_user_entity_likes_lookup ON files_user_entity_likes(user_id, entity_type, liked)")
+            cur.execute(
+                """
+                INSERT INTO files_user_entity_likes(user_id, entity_type, entity_id, entity_key, liked, source, created_at, updated_at)
+                SELECT
+                    1,
+                    entity_type,
+                    entity_id,
+                    '',
+                    liked,
+                    source,
+                    created_at,
+                    updated_at
+                FROM files_entity_likes
+                ON CONFLICT (user_id, entity_type, entity_id, entity_key) DO NOTHING
+                """
+            )
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS files_social_recommendations (
+                    id BIGSERIAL PRIMARY KEY,
+                    sender_user_id INTEGER NOT NULL,
+                    sender_username TEXT NOT NULL DEFAULT '',
+                    recipient_user_id INTEGER NOT NULL,
+                    recipient_username TEXT NOT NULL DEFAULT '',
+                    entity_type TEXT NOT NULL,
+                    entity_id BIGINT NOT NULL DEFAULT 0,
+                    entity_key TEXT NOT NULL DEFAULT '',
+                    entity_label TEXT NOT NULL DEFAULT '',
+                    entity_subtitle TEXT NOT NULL DEFAULT '',
+                    entity_href TEXT NOT NULL DEFAULT '',
+                    entity_thumb TEXT NOT NULL DEFAULT '',
+                    entity_meta_json TEXT NOT NULL DEFAULT '{}',
+                    message TEXT,
+                    parent_recommendation_id BIGINT NULL REFERENCES files_social_recommendations(id) ON DELETE SET NULL,
+                    liked_by_recipient BOOLEAN NOT NULL DEFAULT FALSE,
+                    liked_at TIMESTAMPTZ NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    read_at TIMESTAMPTZ NULL,
+                    status TEXT NOT NULL DEFAULT 'sent'
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_files_social_recommendations_recipient_created ON files_social_recommendations(recipient_user_id, created_at DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_files_social_recommendations_sender_created ON files_social_recommendations(sender_user_id, created_at DESC)")
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS files_user_notifications (
+                    id BIGSERIAL PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    actor_user_id INTEGER NULL,
+                    actor_username TEXT NOT NULL DEFAULT '',
+                    kind TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    body TEXT NOT NULL DEFAULT '',
+                    entity_type TEXT NOT NULL DEFAULT '',
+                    entity_id BIGINT NOT NULL DEFAULT 0,
+                    entity_key TEXT NOT NULL DEFAULT '',
+                    recommendation_id BIGINT NULL REFERENCES files_social_recommendations(id) ON DELETE SET NULL,
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    is_read BOOLEAN NOT NULL DEFAULT FALSE,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    read_at TIMESTAMPTZ NULL
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_files_user_notifications_user_created ON files_user_notifications(user_id, is_read, created_at DESC)")
 
             # ───────────────────── Concert Cache (Files mode) ─────────────────────
             # Cached upcoming concerts for artist pages. Providers may be added later
@@ -18306,8 +18425,10 @@ def _assistant_sql_agent_generate_query(
         "mb_identified, musicbrainz_release_group_id, discogs_release_id, lastfm_album_mbid, bandcamp_album_url, metadata_source, track_count, total_duration_sec, "
         "is_broken, expected_track_count, actual_track_count, missing_indices_json, missing_required_tags_json, primary_tags_json, created_at, updated_at)\n"
         "files_tracks(id, album_id, file_path, title, disc_num, track_num, duration_sec, format, bitrate, sample_rate, bit_depth, file_size_bytes, created_at, updated_at)\n"
-        "files_playback_events(user_id, track_id, event_type, played_seconds, created_at)  # user_id is always 1\n"
-        "files_entity_likes(entity_type, entity_id, liked, source, created_at, updated_at)\n"
+        "files_playback_events(user_id, track_id, event_type, played_seconds, created_at)\n"
+        "files_user_entity_likes(user_id, entity_type, entity_id, entity_key, liked, source, created_at, updated_at)\n"
+        "files_playlists(id, user_id, name, description, created_at, updated_at)\n"
+        "files_social_recommendations(id, sender_user_id, recipient_user_id, entity_type, entity_id, entity_key, entity_label, entity_subtitle, entity_href, message, liked_by_recipient, created_at, read_at, status)\n"
         "files_reco_events(session_id, track_id, album_id, artist_id, event_type, played_seconds, created_at)\n"
         "files_artist_profiles(name_norm, artist_name, bio, short_bio, tags_json, similar_json, source, updated_at)\n"
         "files_album_profiles(artist_norm, title_norm, album_title, description, short_description, tags_json, source, updated_at)\n"
@@ -18324,7 +18445,7 @@ def _assistant_sql_agent_generate_query(
         "- Never use INSERT/UPDATE/DELETE/CREATE/DROP/ALTER/TRUNCATE/COPY/CALL/DO.\n"
         "- Prefer parameterized values (%s) for user-provided strings.\n"
         "- For non-aggregate queries, include LIMIT <= 100.\n"
-        "- If the user asks about their listening stats, use files_playback_events (user_id=1).\n"
+        "- If the user asks about their listening stats, use files_playback_events filtered by the current authenticated user.\n"
         "Formatting rules for downstream UI:\n"
         "- If returning artists, include columns: artist_id, artist_name.\n"
         "- If returning labels, include a column named: label.\n"
@@ -41345,7 +41466,12 @@ def _maintenance_clear_files_index() -> dict[str, Any]:
                             files_playback_events,
                             files_match_audit,
                             files_user_album_ratings,
+                            files_user_notifications,
+                            files_social_recommendations,
+                            files_user_entity_likes,
                             files_entity_likes,
+                            files_playlist_items,
+                            files_playlists,
                             files_external_artist_images,
                             files_artist_profiles,
                             files_album_profiles,
@@ -47512,12 +47638,15 @@ def api_library_discover():
             cur.execute(
                 """
                 SELECT l.entity_id, a.name, a.name_norm, EXTRACT(EPOCH FROM l.updated_at)::BIGINT AS ts
-                FROM files_entity_likes l
+                FROM files_user_entity_likes l
                 JOIN files_artists a ON a.id = l.entity_id
-                WHERE l.entity_type = 'artist' AND l.liked = TRUE
+                WHERE l.user_id = %s
+                  AND l.entity_type = 'artist'
+                  AND l.liked = TRUE
                 ORDER BY l.updated_at DESC, l.entity_id DESC
                 LIMIT 10
-                """
+                """,
+                (int(_current_user_id_or_zero() or 1),),
             )
             liked_artist_rows = cur.fetchall()
 
@@ -49100,6 +49229,232 @@ def api_library_digest():
         conn.close()
 
 
+_SOCIAL_ENTITY_TYPES = {"artist", "album", "track", "label", "genre", "playlist"}
+
+
+def _social_entity_type_allowed(entity_type: str) -> bool:
+    return str(entity_type or "").strip().lower() in _SOCIAL_ENTITY_TYPES
+
+
+def _social_entity_key_norm(entity_type: str, entity_key: str) -> str:
+    et = str(entity_type or "").strip().lower()
+    raw = re.sub(r"\s+", " ", str(entity_key or "").strip())
+    if et in {"label", "genre"}:
+        return raw
+    if et == "playlist":
+        return raw[:160]
+    return raw
+
+
+def _social_notification_insert(
+    cur,
+    *,
+    user_id: int,
+    actor_user_id: int | None,
+    actor_username: str,
+    kind: str,
+    title: str,
+    body: str,
+    entity_type: str = "",
+    entity_id: int = 0,
+    entity_key: str = "",
+    recommendation_id: int | None = None,
+    payload: dict[str, Any] | None = None,
+) -> None:
+    cur.execute(
+        """
+        INSERT INTO files_user_notifications(
+            user_id, actor_user_id, actor_username, kind, title, body,
+            entity_type, entity_id, entity_key, recommendation_id, payload_json,
+            is_read, created_at, read_at
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, FALSE, NOW(), NULL)
+        """,
+        (
+            int(user_id),
+            int(actor_user_id or 0) if actor_user_id else None,
+            str(actor_username or "").strip(),
+            str(kind or "").strip()[:64],
+            str(title or "").strip()[:200],
+            str(body or "").strip()[:1200],
+            str(entity_type or "").strip()[:32],
+            int(entity_id or 0),
+            str(entity_key or "").strip()[:240],
+            int(recommendation_id or 0) if recommendation_id else None,
+            json.dumps(payload or {}, ensure_ascii=False),
+        ),
+    )
+
+
+def _social_build_entity_snapshot(
+    conn,
+    *,
+    entity_type: str,
+    entity_id: int = 0,
+    entity_key: str = "",
+    owner_user_id: int = 0,
+) -> dict[str, Any] | None:
+    base_url = request.url_root.rstrip("/")
+    et = str(entity_type or "").strip().lower()
+    ek = _social_entity_key_norm(et, entity_key)
+    with conn.cursor() as cur:
+        if et == "album" and int(entity_id or 0) > 0:
+            cur.execute(
+                """
+                SELECT alb.id, alb.title, ar.name, alb.year, alb.has_cover,
+                       COALESCE(alb.label, ''), COALESCE(alb.genre, ''), COALESCE(alb.tags_json, '[]')
+                FROM files_albums alb
+                JOIN files_artists ar ON ar.id = alb.artist_id
+                WHERE alb.id = %s
+                LIMIT 1
+                """,
+                (int(entity_id),),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            aid = int(row[0] or 0)
+            return {
+                "entity_type": et,
+                "entity_id": aid,
+                "entity_key": "",
+                "label": str(row[1] or "").strip(),
+                "subtitle": str(row[2] or "").strip(),
+                "href": f"/library/album/{aid}",
+                "thumb": f"{base_url}/api/library/files/album/{aid}/cover?size=320" if bool(row[4]) else None,
+                "meta": {
+                    "year": int(row[3] or 0) or None,
+                    "label": str(row[5] or "").strip() or None,
+                    "genre": str(row[6] or "").strip() or None,
+                    "tags_json": str(row[7] or "[]"),
+                },
+            }
+        if et == "artist" and int(entity_id or 0) > 0:
+            cur.execute(
+                """
+                SELECT id, name, album_count, has_image
+                FROM files_artists
+                WHERE id = %s
+                LIMIT 1
+                """,
+                (int(entity_id),),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            aid = int(row[0] or 0)
+            return {
+                "entity_type": et,
+                "entity_id": aid,
+                "entity_key": "",
+                "label": str(row[1] or "").strip(),
+                "subtitle": f"{int(row[2] or 0)} album(s)",
+                "href": f"/library/artist/{aid}",
+                "thumb": f"{base_url}/api/library/files/artist/{aid}/image?size=320" if bool(row[3]) else None,
+                "meta": {"album_count": int(row[2] or 0)},
+            }
+        if et == "track" and int(entity_id or 0) > 0:
+            cur.execute(
+                """
+                SELECT tr.id, tr.title, ar.name, alb.id, alb.title, alb.has_cover
+                FROM files_tracks tr
+                JOIN files_albums alb ON alb.id = tr.album_id
+                JOIN files_artists ar ON ar.id = alb.artist_id
+                WHERE tr.id = %s
+                LIMIT 1
+                """,
+                (int(entity_id),),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            tid = int(row[0] or 0)
+            album_id = int(row[3] or 0)
+            return {
+                "entity_type": et,
+                "entity_id": tid,
+                "entity_key": "",
+                "label": str(row[1] or "").strip(),
+                "subtitle": f"{str(row[2] or '').strip()} · {str(row[4] or '').strip()}",
+                "href": f"/library/album/{album_id}",
+                "thumb": f"{base_url}/api/library/files/album/{album_id}/cover?size=320" if bool(row[5]) else None,
+                "meta": {"album_id": album_id},
+            }
+        if et == "playlist" and int(entity_id or 0) > 0:
+            cur.execute(
+                """
+                SELECT pl.id, pl.name, COALESCE(pl.description, ''), COUNT(it.id)
+                FROM files_playlists pl
+                LEFT JOIN files_playlist_items it ON it.playlist_id = pl.id
+                WHERE pl.id = %s AND pl.user_id = %s
+                GROUP BY pl.id
+                LIMIT 1
+                """,
+                (int(entity_id), int(owner_user_id or 0)),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            pid = int(row[0] or 0)
+            return {
+                "entity_type": et,
+                "entity_id": pid,
+                "entity_key": "",
+                "label": str(row[1] or "").strip(),
+                "subtitle": str(row[2] or "").strip() or f"{int(row[3] or 0)} track(s)",
+                "href": f"/library/playlists/{pid}",
+                "thumb": None,
+                "meta": {"item_count": int(row[3] or 0)},
+            }
+        if et == "label" and ek:
+            return {
+                "entity_type": et,
+                "entity_id": 0,
+                "entity_key": ek,
+                "label": ek,
+                "subtitle": "Label",
+                "href": f"/library/label/{quote(ek)}",
+                "thumb": None,
+                "meta": {},
+            }
+        if et == "genre" and ek:
+            return {
+                "entity_type": et,
+                "entity_id": 0,
+                "entity_key": ek,
+                "label": ek,
+                "subtitle": "Genre",
+                "href": f"/library/genre/{quote(ek)}",
+                "thumb": None,
+                "meta": {},
+            }
+    return None
+
+
+def _social_recommendation_payload(row) -> dict[str, Any]:
+    return {
+        "recommendation_id": int(row[0] or 0),
+        "sender_user_id": int(row[1] or 0),
+        "sender_username": str(row[2] or "").strip(),
+        "recipient_user_id": int(row[3] or 0),
+        "recipient_username": str(row[4] or "").strip(),
+        "entity_type": str(row[5] or "").strip(),
+        "entity_id": int(row[6] or 0),
+        "entity_key": str(row[7] or "").strip(),
+        "entity_label": str(row[8] or "").strip(),
+        "entity_subtitle": str(row[9] or "").strip(),
+        "entity_href": str(row[10] or "").strip(),
+        "entity_thumb": str(row[11] or "").strip() or None,
+        "entity_meta": json.loads(str(row[12] or "{}") or "{}") if str(row[12] or "").strip() else {},
+        "message": str(row[13] or "").strip() or None,
+        "parent_recommendation_id": int(row[14] or 0) or None,
+        "liked_by_recipient": bool(row[15]),
+        "created_at": int(_dt_to_epoch(row[16])) if row[16] else 0,
+        "read_at": int(_dt_to_epoch(row[17])) if row[17] else None,
+        "status": str(row[18] or "sent").strip() or "sent",
+    }
+
+
 @app.get("/api/library/likes")
 def api_library_likes_get():
     """Return like state for one or more entities (Files mode only)."""
@@ -49108,10 +49463,14 @@ def api_library_likes_get():
     ok, err = _ensure_files_index_ready()
     if not ok:
         return jsonify({"items": [], "error": err or "Files index unavailable"}), 503
+    uid = _current_user_id_or_zero()
+    if uid <= 0:
+        return jsonify({"items": [], "error": "Authentication required"}), 401
     entity_type = (request.args.get("entity_type") or "").strip().lower()
-    if entity_type not in {"artist", "album", "track"}:
-        return jsonify({"items": [], "error": "entity_type must be one of: artist, album, track"}), 400
+    if not _social_entity_type_allowed(entity_type):
+        return jsonify({"items": [], "error": "unsupported entity_type"}), 400
     ids_raw = str(request.args.get("ids") or "").strip()
+    keys_raw = str(request.args.get("keys") or "").strip()
     limit = max(1, min(1000, _parse_int_loose(request.args.get("limit"), 250)))
 
     ids: list[int] = []
@@ -49128,6 +49487,15 @@ def api_library_likes_get():
                 ids.append(n)
             if len(ids) >= 1000:
                 break
+    keys: list[str] = []
+    if keys_raw:
+        for part in keys_raw.split(","):
+            key = _social_entity_key_norm(entity_type, part)
+            if not key:
+                continue
+            keys.append(key)
+            if len(keys) >= 1000:
+                break
 
     conn = _files_pg_connect()
     if conn is None:
@@ -49137,30 +49505,48 @@ def api_library_likes_get():
             if ids:
                 cur.execute(
                     """
-                    SELECT entity_id, liked, EXTRACT(EPOCH FROM updated_at)::BIGINT
-                    FROM files_entity_likes
-                    WHERE entity_type = %s
+                    SELECT entity_id, entity_key, liked, EXTRACT(EPOCH FROM updated_at)::BIGINT
+                    FROM files_user_entity_likes
+                    WHERE user_id = %s
+                      AND entity_type = %s
                       AND entity_id = ANY(%s)
                     """,
-                    (entity_type, ids),
+                    (int(uid), entity_type, ids),
+                )
+            elif keys:
+                cur.execute(
+                    """
+                    SELECT entity_id, entity_key, liked, EXTRACT(EPOCH FROM updated_at)::BIGINT
+                    FROM files_user_entity_likes
+                    WHERE user_id = %s
+                      AND entity_type = %s
+                      AND entity_key = ANY(%s)
+                    """,
+                    (int(uid), entity_type, keys),
                 )
             else:
                 cur.execute(
                     """
-                    SELECT entity_id, liked, EXTRACT(EPOCH FROM updated_at)::BIGINT
-                    FROM files_entity_likes
-                    WHERE entity_type = %s
+                    SELECT entity_id, entity_key, liked, EXTRACT(EPOCH FROM updated_at)::BIGINT
+                    FROM files_user_entity_likes
+                    WHERE user_id = %s
+                      AND entity_type = %s
                       AND liked = TRUE
                     ORDER BY updated_at DESC, entity_id DESC
                     LIMIT %s
                     """,
-                    (entity_type, int(limit)),
+                    (int(uid), entity_type, int(limit)),
                 )
             rows = cur.fetchall()
         items = [
-            {"entity_id": int(r[0] or 0), "liked": bool(r[1]), "updated_at": int(r[2] or 0)}
+            {
+                "entity_id": int(r[0] or 0),
+                "entity_key": str(r[1] or "").strip() or None,
+                "liked": bool(r[2]),
+                "updated_at": int(r[3] or 0),
+            }
             for r in rows
-            if int(r[0] or 0) > 0
+            if int(r[0] or 0) > 0 or str(r[1] or "").strip()
         ]
         return jsonify({"entity_type": entity_type, "items": items})
     finally:
@@ -49178,12 +49564,16 @@ def api_library_likes_put():
     data = request.get_json(silent=True) or {}
     if not isinstance(data, dict):
         data = {}
+    uid = _current_user_id_or_zero()
+    if uid <= 0:
+        return jsonify({"error": "Authentication required"}), 401
     entity_type = str(data.get("entity_type") or "").strip().lower()
-    if entity_type not in {"artist", "album", "track"}:
-        return jsonify({"error": "entity_type must be one of: artist, album, track"}), 400
+    if not _social_entity_type_allowed(entity_type):
+        return jsonify({"error": "unsupported entity_type"}), 400
     entity_id = _parse_int_loose(data.get("entity_id"), 0)
-    if entity_id <= 0:
-        return jsonify({"error": "entity_id must be a positive integer"}), 400
+    entity_key = _social_entity_key_norm(entity_type, data.get("entity_key"))
+    if entity_id <= 0 and not entity_key:
+        return jsonify({"error": "entity_id or entity_key is required"}), 400
     liked = bool(_parse_bool(data.get("liked") if data.get("liked") is not None else True))
     source = str(data.get("source") or "ui").strip()[:64] or "ui"
 
@@ -49195,16 +49585,22 @@ def api_library_likes_put():
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    INSERT INTO files_entity_likes(entity_type, entity_id, liked, source, created_at, updated_at)
-                    VALUES (%s, %s, %s, %s, NOW(), NOW())
-                    ON CONFLICT (entity_type, entity_id) DO UPDATE SET
+                    INSERT INTO files_user_entity_likes(user_id, entity_type, entity_id, entity_key, liked, source, created_at, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, NOW(), NOW())
+                    ON CONFLICT (user_id, entity_type, entity_id, entity_key) DO UPDATE SET
                         liked = EXCLUDED.liked,
                         source = EXCLUDED.source,
                         updated_at = NOW()
                     """,
-                    (entity_type, int(entity_id), bool(liked), source),
+                    (int(uid), entity_type, int(entity_id), entity_key, bool(liked), source),
                 )
-        return jsonify({"entity_type": entity_type, "entity_id": int(entity_id), "liked": bool(liked), "updated_at": int(time.time())})
+        return jsonify({
+            "entity_type": entity_type,
+            "entity_id": int(entity_id),
+            "entity_key": entity_key or None,
+            "liked": bool(liked),
+            "updated_at": int(time.time()),
+        })
     finally:
         conn.close()
 
@@ -50967,11 +51363,459 @@ def api_library_recently_played_albums():
         conn.close()
 
 
+@app.get("/api/library/liked")
+def api_library_liked_summary():
+    if _get_library_mode() != "files":
+        return jsonify({"error": "Files mode required"}), 400
+    ok, err = _ensure_files_index_ready()
+    if not ok:
+        return jsonify({"error": err or "Files index unavailable"}), 503
+    uid = _current_user_id_or_zero()
+    if uid <= 0:
+        return jsonify({"error": "Authentication required"}), 401
+    base_url = request.url_root.rstrip("/")
+    conn = _files_pg_connect()
+    if conn is None:
+        return jsonify({"error": "PostgreSQL unavailable"}), 503
+    try:
+        payload: dict[str, Any] = {"albums": [], "artists": [], "labels": [], "recommended_albums": []}
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT alb.id, alb.title, ar.id, ar.name, alb.year, alb.has_cover,
+                       COALESCE(alb.label, ''), COALESCE(alb.genre, ''), COALESCE(alb.tags_json, '[]'),
+                       alb.track_count, COALESCE(alb.format, ''), alb.is_lossless,
+                       ur.rating, alb.public_rating, alb.public_rating_votes, alb.heat_score
+                FROM files_user_entity_likes l
+                JOIN files_albums alb ON alb.id = l.entity_id
+                JOIN files_artists ar ON ar.id = alb.artist_id
+                LEFT JOIN files_user_album_ratings ur ON ur.user_id = %s AND ur.album_id = alb.id
+                WHERE l.user_id = %s AND l.entity_type = 'album' AND l.liked = TRUE
+                ORDER BY l.updated_at DESC, alb.id DESC
+                LIMIT 48
+                """,
+                (int(uid), int(uid)),
+            )
+            for row in cur.fetchall():
+                aid = int(row[0] or 0)
+                payload["albums"].append(
+                    {
+                        "album_id": aid,
+                        "title": str(row[1] or "").strip(),
+                        "artist_id": int(row[2] or 0),
+                        "artist_name": str(row[3] or "").strip(),
+                        "year": int(row[4] or 0) or None,
+                        "thumb": f"{base_url}/api/library/files/album/{aid}/cover?size=512" if bool(row[5]) else None,
+                        "label": str(row[6] or "").strip() or None,
+                        "genre": str(row[7] or "").strip() or None,
+                        "genres": json.loads(str(row[8] or "[]") or "[]") if str(row[8] or "").strip() else [],
+                        "track_count": int(row[9] or 0),
+                        "format": str(row[10] or "").strip() or None,
+                        "is_lossless": bool(row[11]),
+                        "user_rating": float(row[12]) if row[12] is not None else None,
+                        "public_rating": float(row[13]) if row[13] is not None else None,
+                        "public_rating_votes": int(row[14] or 0) if row[14] is not None else None,
+                        "heat_score": float(row[15]) if row[15] is not None else None,
+                    }
+                )
+            cur.execute(
+                """
+                SELECT a.id, a.name, a.album_count, a.has_image
+                FROM files_user_entity_likes l
+                JOIN files_artists a ON a.id = l.entity_id
+                WHERE l.user_id = %s AND l.entity_type = 'artist' AND l.liked = TRUE
+                ORDER BY l.updated_at DESC, a.id DESC
+                LIMIT 48
+                """,
+                (int(uid),),
+            )
+            for row in cur.fetchall():
+                aid = int(row[0] or 0)
+                payload["artists"].append(
+                    {
+                        "artist_id": aid,
+                        "artist_name": str(row[1] or "").strip(),
+                        "album_count": int(row[2] or 0),
+                        "thumb": f"{base_url}/api/library/files/artist/{aid}/image?size=320" if bool(row[3]) else None,
+                    }
+                )
+            cur.execute(
+                """
+                SELECT entity_key, EXTRACT(EPOCH FROM updated_at)::BIGINT
+                FROM files_user_entity_likes
+                WHERE user_id = %s AND entity_type = 'label' AND liked = TRUE AND COALESCE(entity_key, '') <> ''
+                ORDER BY updated_at DESC, entity_key ASC
+                LIMIT 48
+                """,
+                (int(uid),),
+            )
+            for row in cur.fetchall():
+                payload["labels"].append(
+                    {
+                        "label": str(row[0] or "").strip(),
+                        "updated_at": int(row[1] or 0),
+                    }
+                )
+            cur.execute(
+                """
+                WITH liked_artists AS (
+                    SELECT entity_id
+                    FROM files_user_entity_likes
+                    WHERE user_id = %s AND entity_type = 'artist' AND liked = TRUE
+                ),
+                liked_albums AS (
+                    SELECT entity_id
+                    FROM files_user_entity_likes
+                    WHERE user_id = %s AND entity_type = 'album' AND liked = TRUE
+                )
+                SELECT alb.id, alb.title, ar.id, ar.name, alb.year, alb.has_cover,
+                       COALESCE(alb.label, ''), COALESCE(alb.genre, ''), COALESCE(alb.tags_json, '[]'),
+                       alb.track_count, COALESCE(alb.format, ''), alb.is_lossless,
+                       ur.rating, alb.public_rating, alb.public_rating_votes, alb.heat_score
+                FROM files_albums alb
+                JOIN files_artists ar ON ar.id = alb.artist_id
+                LEFT JOIN files_user_album_ratings ur ON ur.user_id = %s AND ur.album_id = alb.id
+                WHERE (
+                    ar.id IN (SELECT entity_id FROM liked_artists)
+                    OR lower(trim(COALESCE(alb.label, ''))) IN (
+                        SELECT lower(trim(entity_key))
+                        FROM files_user_entity_likes
+                        WHERE user_id = %s AND entity_type = 'label' AND liked = TRUE
+                    )
+                )
+                  AND alb.id NOT IN (SELECT entity_id FROM liked_albums)
+                ORDER BY COALESCE(ur.rating, 0) DESC,
+                         COALESCE(alb.public_rating, 0) DESC,
+                         COALESCE(alb.heat_score, 0) DESC,
+                         alb.updated_at DESC
+                LIMIT 24
+                """,
+                (int(uid), int(uid), int(uid), int(uid)),
+            )
+            seen_album_ids: set[int] = set()
+            for row in cur.fetchall():
+                aid = int(row[0] or 0)
+                if aid <= 0 or aid in seen_album_ids:
+                    continue
+                seen_album_ids.add(aid)
+                payload["recommended_albums"].append(
+                    {
+                        "album_id": aid,
+                        "title": str(row[1] or "").strip(),
+                        "artist_id": int(row[2] or 0),
+                        "artist_name": str(row[3] or "").strip(),
+                        "year": int(row[4] or 0) or None,
+                        "thumb": f"{base_url}/api/library/files/album/{aid}/cover?size=512" if bool(row[5]) else None,
+                        "label": str(row[6] or "").strip() or None,
+                        "genre": str(row[7] or "").strip() or None,
+                        "genres": json.loads(str(row[8] or "[]") or "[]") if str(row[8] or "").strip() else [],
+                        "track_count": int(row[9] or 0),
+                        "format": str(row[10] or "").strip() or None,
+                        "is_lossless": bool(row[11]),
+                        "user_rating": float(row[12]) if row[12] is not None else None,
+                        "public_rating": float(row[13]) if row[13] is not None else None,
+                        "public_rating_votes": int(row[14] or 0) if row[14] is not None else None,
+                        "heat_score": float(row[15]) if row[15] is not None else None,
+                    }
+                )
+        return jsonify(payload)
+    finally:
+        conn.close()
+
+
+@app.get("/api/library/social/users")
+def api_library_social_users():
+    uid = _current_user_id_or_zero()
+    if uid <= 0:
+        return jsonify({"error": "Authentication required", "users": []}), 401
+    return jsonify({"users": _auth_active_users_list(exclude_user_id=uid)})
+
+
+@app.post("/api/library/share")
+def api_library_share():
+    if _get_library_mode() != "files":
+        return jsonify({"error": "Files mode required"}), 400
+    uid = _current_user_id_or_zero()
+    if uid <= 0:
+        return jsonify({"error": "Authentication required"}), 401
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        data = {}
+    entity_type = str(data.get("entity_type") or "").strip().lower()
+    if not _social_entity_type_allowed(entity_type):
+        return jsonify({"error": "unsupported entity_type"}), 400
+    entity_id = _parse_int_loose(data.get("entity_id"), 0)
+    entity_key = _social_entity_key_norm(entity_type, data.get("entity_key"))
+    recipient_ids_raw = data.get("recipient_user_ids")
+    if not isinstance(recipient_ids_raw, list):
+        recipient_ids_raw = []
+    recipient_ids = [int(x) for x in recipient_ids_raw if _parse_int_loose(x, 0) > 0 and int(x) != int(uid)]
+    if not recipient_ids:
+        return jsonify({"error": "recipient_user_ids is required"}), 400
+    message = str(data.get("message") or "").strip()[:1200]
+    parent_recommendation_id = _parse_int_loose(data.get("parent_recommendation_id"), 0)
+    sender = _auth_user_snapshot(uid)
+    conn = _files_pg_connect()
+    if conn is None:
+        return jsonify({"error": "PostgreSQL unavailable"}), 503
+    try:
+        snapshot = _social_build_entity_snapshot(
+            conn,
+            entity_type=entity_type,
+            entity_id=entity_id,
+            entity_key=entity_key,
+            owner_user_id=uid,
+        )
+        if not snapshot:
+            return jsonify({"error": "Entity not found"}), 404
+        inserted_ids: list[int] = []
+        with conn.transaction():
+            with conn.cursor() as cur:
+                valid_recipients = {
+                    int(item.get("id") or 0): item
+                    for item in _auth_active_users_list(exclude_user_id=uid)
+                    if int(item.get("id") or 0) in recipient_ids
+                }
+                if not valid_recipients:
+                    return jsonify({"error": "No valid recipients"}), 400
+                for rid, recipient in valid_recipients.items():
+                    cur.execute(
+                        """
+                        INSERT INTO files_social_recommendations(
+                            sender_user_id, sender_username, recipient_user_id, recipient_username,
+                            entity_type, entity_id, entity_key, entity_label, entity_subtitle, entity_href, entity_thumb,
+                            entity_meta_json, message, parent_recommendation_id, liked_by_recipient,
+                            created_at, read_at, status
+                        )
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, FALSE, NOW(), NULL, 'sent')
+                        RETURNING id
+                        """,
+                        (
+                            int(uid),
+                            str(sender.get("username") or "").strip(),
+                            int(rid),
+                            str(recipient.get("username") or "").strip(),
+                            snapshot["entity_type"],
+                            int(snapshot.get("entity_id") or 0),
+                            str(snapshot.get("entity_key") or ""),
+                            str(snapshot.get("label") or "")[:240],
+                            str(snapshot.get("subtitle") or "")[:240],
+                            str(snapshot.get("href") or "")[:512],
+                            str(snapshot.get("thumb") or "")[:1024] or None,
+                            json.dumps(snapshot.get("meta") or {}, ensure_ascii=False),
+                            message or None,
+                            int(parent_recommendation_id or 0) if parent_recommendation_id > 0 else None,
+                        ),
+                    )
+                    rec_id = int((cur.fetchone() or [0])[0] or 0)
+                    inserted_ids.append(rec_id)
+                    body = f"{sender.get('username') or 'Someone'} recommended {snapshot.get('label') or 'something'}"
+                    if message:
+                        body = f"{body}: {message}"
+                    _social_notification_insert(
+                        cur,
+                        user_id=rid,
+                        actor_user_id=uid,
+                        actor_username=str(sender.get("username") or "").strip(),
+                        kind="recommendation_received",
+                        title="New recommendation",
+                        body=body,
+                        entity_type=snapshot["entity_type"],
+                        entity_id=int(snapshot.get("entity_id") or 0),
+                        entity_key=str(snapshot.get("entity_key") or ""),
+                        recommendation_id=rec_id,
+                        payload={"href": snapshot.get("href")},
+                    )
+        return jsonify({"ok": True, "count": len(inserted_ids), "recommendation_ids": inserted_ids})
+    finally:
+        conn.close()
+
+
+@app.get("/api/library/recommendations")
+def api_library_recommendations():
+    uid = _current_user_id_or_zero()
+    if uid <= 0:
+        return jsonify({"error": "Authentication required"}), 401
+    conn = _files_pg_connect()
+    if conn is None:
+        return jsonify({"error": "PostgreSQL unavailable"}), 503
+    try:
+        payload = {"received": [], "sent": [], "unread_count": 0}
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, sender_user_id, sender_username, recipient_user_id, recipient_username,
+                       entity_type, entity_id, entity_key, entity_label, entity_subtitle, entity_href, entity_thumb,
+                       COALESCE(entity_meta_json, '{}'), COALESCE(message, ''), parent_recommendation_id,
+                       liked_by_recipient, created_at, read_at, COALESCE(status, 'sent')
+                FROM files_social_recommendations
+                WHERE recipient_user_id = %s
+                ORDER BY created_at DESC, id DESC
+                LIMIT 200
+                """,
+                (int(uid),),
+            )
+            payload["received"] = [_social_recommendation_payload(row) for row in cur.fetchall()]
+            cur.execute(
+                """
+                SELECT id, sender_user_id, sender_username, recipient_user_id, recipient_username,
+                       entity_type, entity_id, entity_key, entity_label, entity_subtitle, entity_href, entity_thumb,
+                       COALESCE(entity_meta_json, '{}'), COALESCE(message, ''), parent_recommendation_id,
+                       liked_by_recipient, created_at, read_at, COALESCE(status, 'sent')
+                FROM files_social_recommendations
+                WHERE sender_user_id = %s
+                ORDER BY created_at DESC, id DESC
+                LIMIT 200
+                """,
+                (int(uid),),
+            )
+            payload["sent"] = [_social_recommendation_payload(row) for row in cur.fetchall()]
+            cur.execute(
+                "SELECT COUNT(*) FROM files_user_notifications WHERE user_id = %s AND is_read = FALSE",
+                (int(uid),),
+            )
+            payload["unread_count"] = int((cur.fetchone() or [0])[0] or 0)
+        return jsonify(payload)
+    finally:
+        conn.close()
+
+
+@app.post("/api/library/recommendations/<int:recommendation_id>/like")
+def api_library_recommendation_like(recommendation_id: int):
+    uid = _current_user_id_or_zero()
+    if uid <= 0:
+        return jsonify({"error": "Authentication required"}), 401
+    conn = _files_pg_connect()
+    if conn is None:
+        return jsonify({"error": "PostgreSQL unavailable"}), 503
+    try:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id, sender_user_id, sender_username, recipient_user_id, entity_type, entity_id, entity_key, entity_label, liked_by_recipient
+                    FROM files_social_recommendations
+                    WHERE id = %s AND recipient_user_id = %s
+                    LIMIT 1
+                    """,
+                    (int(recommendation_id), int(uid)),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return jsonify({"error": "Recommendation not found"}), 404
+                if bool(row[8]):
+                    return jsonify({"ok": True, "recommendation_id": int(recommendation_id), "liked_by_recipient": True})
+                cur.execute(
+                    """
+                    UPDATE files_social_recommendations
+                    SET liked_by_recipient = TRUE, liked_at = NOW(), read_at = COALESCE(read_at, NOW()), status = 'liked'
+                    WHERE id = %s
+                    """,
+                    (int(recommendation_id),),
+                )
+                actor = _auth_user_snapshot(uid)
+                _social_notification_insert(
+                    cur,
+                    user_id=int(row[1] or 0),
+                    actor_user_id=uid,
+                    actor_username=str(actor.get("username") or "").strip(),
+                    kind="recommendation_liked",
+                    title="Recommendation liked",
+                    body=f"{actor.get('username') or 'Someone'} liked your recommendation for {str(row[7] or '').strip() or 'an item'}",
+                    entity_type=str(row[4] or "").strip(),
+                    entity_id=int(row[5] or 0),
+                    entity_key=str(row[6] or "").strip(),
+                    recommendation_id=int(recommendation_id),
+                    payload={"label": str(row[7] or "").strip()},
+                )
+        return jsonify({"ok": True, "recommendation_id": int(recommendation_id), "liked_by_recipient": True})
+    finally:
+        conn.close()
+
+
+@app.get("/api/library/notifications")
+def api_library_notifications():
+    uid = _current_user_id_or_zero()
+    if uid <= 0:
+        return jsonify({"error": "Authentication required", "notifications": []}), 401
+    limit = max(1, min(200, _parse_int_loose(request.args.get("limit"), 50)))
+    unread_only = bool(_parse_bool(request.args.get("unread_only")))
+    conn = _files_pg_connect()
+    if conn is None:
+        return jsonify({"error": "PostgreSQL unavailable", "notifications": []}), 503
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT id, actor_user_id, COALESCE(actor_username, ''), kind, title, body,
+                       entity_type, entity_id, entity_key, recommendation_id, COALESCE(payload_json, '{{}}'),
+                       is_read, created_at, read_at
+                FROM files_user_notifications
+                WHERE user_id = %s
+                  {'AND is_read = FALSE' if unread_only else ''}
+                ORDER BY created_at DESC, id DESC
+                LIMIT %s
+                """,
+                (int(uid), int(limit)),
+            )
+            notifications = [
+                {
+                    "notification_id": int(row[0] or 0),
+                    "actor_user_id": int(row[1] or 0) or None,
+                    "actor_username": str(row[2] or "").strip() or None,
+                    "kind": str(row[3] or "").strip(),
+                    "title": str(row[4] or "").strip(),
+                    "body": str(row[5] or "").strip(),
+                    "entity_type": str(row[6] or "").strip() or None,
+                    "entity_id": int(row[7] or 0) or None,
+                    "entity_key": str(row[8] or "").strip() or None,
+                    "recommendation_id": int(row[9] or 0) or None,
+                    "payload": json.loads(str(row[10] or "{}") or "{}") if str(row[10] or "").strip() else {},
+                    "is_read": bool(row[11]),
+                    "created_at": int(_dt_to_epoch(row[12])) if row[12] else 0,
+                    "read_at": int(_dt_to_epoch(row[13])) if row[13] else None,
+                }
+                for row in cur.fetchall()
+            ]
+        return jsonify({"notifications": notifications})
+    finally:
+        conn.close()
+
+
+@app.post("/api/library/notifications/<int:notification_id>/read")
+def api_library_notifications_mark_read(notification_id: int):
+    uid = _current_user_id_or_zero()
+    if uid <= 0:
+        return jsonify({"error": "Authentication required"}), 401
+    conn = _files_pg_connect()
+    if conn is None:
+        return jsonify({"error": "PostgreSQL unavailable"}), 503
+    try:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE files_user_notifications
+                    SET is_read = TRUE, read_at = COALESCE(read_at, NOW())
+                    WHERE id = %s AND user_id = %s
+                    """,
+                    (int(notification_id), int(uid)),
+                )
+                if cur.rowcount <= 0:
+                    return jsonify({"error": "Notification not found"}), 404
+        return jsonify({"ok": True, "notification_id": int(notification_id)})
+    finally:
+        conn.close()
+
+
 @app.get("/api/library/playlists")
 def api_library_playlists():
     """List local playlists (Files mode only)."""
     if _get_library_mode() != "files":
         return jsonify({"playlists": [], "error": "Files mode required"}), 400
+    uid = _current_user_id_or_zero()
+    if uid <= 0:
+        return jsonify({"playlists": [], "error": "Authentication required"}), 401
     conn = _files_pg_connect()
     if conn is None:
         return jsonify({"playlists": [], "error": "PostgreSQL unavailable"}), 503
@@ -50987,9 +51831,12 @@ def api_library_playlists():
                     COUNT(it.id) AS item_count
                 FROM files_playlists pl
                 LEFT JOIN files_playlist_items it ON it.playlist_id = pl.id
+                WHERE pl.user_id = %s
                 GROUP BY pl.id
                 ORDER BY pl.updated_at DESC, pl.id DESC
                 """
+                ,
+                (int(uid),),
             )
             rows = cur.fetchall()
         playlists = [
@@ -51015,6 +51862,9 @@ def api_library_playlists_create():
     ok, err = _ensure_files_index_ready()
     if not ok:
         return jsonify({"error": err or "Files index unavailable"}), 503
+    uid = _current_user_id_or_zero()
+    if uid <= 0:
+        return jsonify({"error": "Authentication required"}), 401
     data = request.get_json(silent=True) or {}
     if not isinstance(data, dict):
         data = {}
@@ -51031,8 +51881,8 @@ def api_library_playlists_create():
         with conn.transaction():
             with conn.cursor() as cur:
                 cur.execute(
-                    "INSERT INTO files_playlists(name, description, created_at, updated_at) VALUES (%s, %s, NOW(), NOW()) RETURNING id",
-                    (name, description),
+                    "INSERT INTO files_playlists(user_id, name, description, created_at, updated_at) VALUES (%s, %s, %s, NOW(), NOW()) RETURNING id",
+                    (int(uid), name, description),
                 )
                 pid = int((cur.fetchone() or [0])[0] or 0)
         return jsonify({"playlist_id": pid, "name": name, "description": description or "", "item_count": 0, "updated_at": int(time.time())})
@@ -51048,12 +51898,18 @@ def api_library_playlist_detail(playlist_id: int):
     ok, err = _ensure_files_index_ready()
     if not ok:
         return jsonify({"error": err or "Files index unavailable"}), 503
+    uid = _current_user_id_or_zero()
+    if uid <= 0:
+        return jsonify({"error": "Authentication required"}), 401
     conn = _files_pg_connect()
     if conn is None:
         return jsonify({"error": "PostgreSQL unavailable"}), 503
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT id, name, COALESCE(description, ''), updated_at FROM files_playlists WHERE id = %s", (int(playlist_id),))
+            cur.execute(
+                "SELECT id, name, COALESCE(description, ''), updated_at FROM files_playlists WHERE id = %s AND user_id = %s",
+                (int(playlist_id), int(uid)),
+            )
             pl = cur.fetchone()
             if not pl:
                 return jsonify({"error": "Playlist not found"}), 404
@@ -51131,13 +51987,16 @@ def api_library_playlist_delete(playlist_id: int):
     ok, err = _ensure_files_index_ready()
     if not ok:
         return jsonify({"error": err or "Files index unavailable"}), 503
+    uid = _current_user_id_or_zero()
+    if uid <= 0:
+        return jsonify({"error": "Authentication required"}), 401
     conn = _files_pg_connect()
     if conn is None:
         return jsonify({"error": "PostgreSQL unavailable"}), 503
     try:
         with conn.transaction():
             with conn.cursor() as cur:
-                cur.execute("DELETE FROM files_playlists WHERE id = %s", (int(playlist_id),))
+                cur.execute("DELETE FROM files_playlists WHERE id = %s AND user_id = %s", (int(playlist_id), int(uid)))
                 if cur.rowcount <= 0:
                     return jsonify({"error": "Playlist not found"}), 404
         return jsonify({"ok": True, "playlist_id": int(playlist_id)})
@@ -51153,6 +52012,9 @@ def api_library_playlist_items_add(playlist_id: int):
     ok, err = _ensure_files_index_ready()
     if not ok:
         return jsonify({"error": err or "Files index unavailable"}), 503
+    uid = _current_user_id_or_zero()
+    if uid <= 0:
+        return jsonify({"error": "Authentication required"}), 401
     data = request.get_json(silent=True) or {}
     if not isinstance(data, dict):
         data = {}
@@ -51175,7 +52037,7 @@ def api_library_playlist_items_add(playlist_id: int):
     try:
         with conn.transaction():
             with conn.cursor() as cur:
-                cur.execute("SELECT id FROM files_playlists WHERE id = %s", (int(playlist_id),))
+                cur.execute("SELECT id FROM files_playlists WHERE id = %s AND user_id = %s", (int(playlist_id), int(uid)))
                 if not cur.fetchone():
                     return jsonify({"error": "Playlist not found"}), 404
 
@@ -51229,12 +52091,18 @@ def api_library_playlist_item_delete(playlist_id: int, item_id: int):
     ok, err = _ensure_files_index_ready()
     if not ok:
         return jsonify({"error": err or "Files index unavailable"}), 503
+    uid = _current_user_id_or_zero()
+    if uid <= 0:
+        return jsonify({"error": "Authentication required"}), 401
     conn = _files_pg_connect()
     if conn is None:
         return jsonify({"error": "PostgreSQL unavailable"}), 503
     try:
         with conn.transaction():
             with conn.cursor() as cur:
+                cur.execute("SELECT id FROM files_playlists WHERE id = %s AND user_id = %s", (int(playlist_id), int(uid)))
+                if not cur.fetchone():
+                    return jsonify({"error": "Playlist not found"}), 404
                 cur.execute(
                     "DELETE FROM files_playlist_items WHERE id = %s AND playlist_id = %s",
                     (int(item_id), int(playlist_id)),
@@ -51255,6 +52123,9 @@ def api_library_playlist_reorder(playlist_id: int):
     ok, err = _ensure_files_index_ready()
     if not ok:
         return jsonify({"error": err or "Files index unavailable"}), 503
+    uid = _current_user_id_or_zero()
+    if uid <= 0:
+        return jsonify({"error": "Authentication required"}), 401
     data = request.get_json(silent=True) or {}
     if not isinstance(data, dict):
         data = {}
@@ -51275,7 +52146,7 @@ def api_library_playlist_reorder(playlist_id: int):
     try:
         with conn.transaction():
             with conn.cursor() as cur:
-                cur.execute("SELECT id FROM files_playlists WHERE id = %s", (int(playlist_id),))
+                cur.execute("SELECT id FROM files_playlists WHERE id = %s AND user_id = %s", (int(playlist_id), int(uid)))
                 if not cur.fetchone():
                     return jsonify({"error": "Playlist not found"}), 404
                 for idx, iid in enumerate(item_ids):

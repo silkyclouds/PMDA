@@ -6,6 +6,7 @@ import { Badge } from '@/components/ui/badge';
 import { Card } from '@/components/ui/card';
 import { LibraryEmptyState } from '@/components/library/LibraryEmptyState';
 import { useLibraryQuery } from '@/hooks/useLibraryQuery';
+import { withBackLinkState } from '@/lib/backNavigation';
 import * as api from '@/lib/api';
 import type { LibraryOutletContext } from '@/pages/LibraryLayout';
 
@@ -139,7 +140,7 @@ export default function LibraryArtists() {
           <button
             key={`artist-${a.artist_id}`}
             type="button"
-            onClick={() => navigate(`/library/artist/${a.artist_id}${location.search || ''}`)}
+            onClick={() => navigate(`/library/artist/${a.artist_id}${location.search || ''}`, { state: withBackLinkState(location) })}
             className="text-left"
             title="Open artist"
           >
