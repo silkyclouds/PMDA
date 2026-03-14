@@ -15697,9 +15697,9 @@ def _run_files_profile_enrichment_job(
                 cover_candidates_default = [
                     str(metadata_source or "").strip(),
                     "musicbrainz",
-                    "discogs",
                     "bandcamp",
                     "lastfm",
+                    "discogs",
                 ]
 
                 provider_chain: list[str] = []
@@ -15709,11 +15709,12 @@ def _run_files_profile_enrichment_job(
                         provider_chain.append(provider_norm)
 
                 if exact_provider_ids:
-                    # Covers are more reliable when we privilege authoritative visual sources,
-                    # not the metadata seed. Last.fm exact IDs can still point to alternate art.
+                    # Prefer canonical artwork sources first. Discogs is valuable, but for
+                    # exact identities it often reflects variant/reissue sleeves rather than
+                    # the canonical album art users expect in the library UI.
                     provider_chain = [
                         provider_name
-                        for provider_name in ("musicbrainz", "discogs", "bandcamp", "lastfm")
+                        for provider_name in ("musicbrainz", "bandcamp", "lastfm", "discogs")
                         if provider_name in exact_provider_ids
                     ]
 
@@ -31705,11 +31706,12 @@ def _authoritative_publication_cover(
         return (str(local_cover), True, "local")
 
     if exact_provider_ids:
-        # Do not privilege metadata_source here. For covers, MusicBrainz/Discogs/Bandcamp
-        # are materially more trustworthy than Last.fm when several exact identities exist.
+        # Prefer canonical artwork sources first. Discogs exact editions frequently carry
+        # alternate sleeves, while MusicBrainz release-group art and primary provider art
+        # are closer to the canonical cover users expect in the library UI.
         provider_chain = [
             provider
-            for provider in ("musicbrainz", "discogs", "bandcamp", "lastfm")
+            for provider in ("musicbrainz", "bandcamp", "lastfm", "discogs")
             if provider in exact_provider_ids
         ]
 
