@@ -51390,7 +51390,9 @@ def api_library_liked_summary():
                 JOIN files_albums alb ON alb.id = l.entity_id
                 JOIN files_artists ar ON ar.id = alb.artist_id
                 LEFT JOIN files_user_album_ratings ur ON ur.user_id = %s AND ur.album_id = alb.id
-                LEFT JOIN files_album_profiles pr ON pr.album_id = alb.id
+                LEFT JOIN files_album_profiles pr
+                  ON pr.artist_norm = ar.name_norm
+                 AND pr.title_norm = alb.title_norm
                 WHERE l.user_id = %s AND l.entity_type = 'album' AND l.liked = TRUE
                 ORDER BY l.updated_at DESC, alb.id DESC
                 LIMIT 48
@@ -51476,7 +51478,9 @@ def api_library_liked_summary():
                 FROM files_albums alb
                 JOIN files_artists ar ON ar.id = alb.artist_id
                 LEFT JOIN files_user_album_ratings ur ON ur.user_id = %s AND ur.album_id = alb.id
-                LEFT JOIN files_album_profiles pr ON pr.album_id = alb.id
+                LEFT JOIN files_album_profiles pr
+                  ON pr.artist_norm = ar.name_norm
+                 AND pr.title_norm = alb.title_norm
                 WHERE (
                     ar.id IN (SELECT entity_id FROM liked_artists)
                     OR lower(trim(COALESCE(alb.label, ''))) IN (
