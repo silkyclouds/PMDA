@@ -137,11 +137,15 @@ export function AssistantDock({ bottomOffsetPx = 16 }: { bottomOffsetPx?: number
 
   useEffect(() => {
     void loadStatus();
+  }, [loadStatus]);
+
+  useEffect(() => {
+    const refreshMs = open ? (llmReady ? 30_000 : 8_000) : 60_000;
     const t = setInterval(() => {
       void loadStatus();
-    }, 60_000);
+    }, refreshMs);
     return () => clearInterval(t);
-  }, [loadStatus]);
+  }, [loadStatus, llmReady, open]);
 
   useEffect(() => {
     if (!open) return;
@@ -348,7 +352,7 @@ export function AssistantDock({ bottomOffsetPx = 16 }: { bottomOffsetPx?: number
                   </div>
                   {offlineReason ? (
                     <div className="mt-2 text-xs text-muted-foreground">
-                      {offlineReason}
+                      {llmReady ? offlineReason : `Library Q&A is ready. Broader AI answers are still initializing. ${offlineReason}`}
                     </div>
                   ) : null}
                 </div>
@@ -396,8 +400,8 @@ export function AssistantDock({ bottomOffsetPx = 16 }: { bottomOffsetPx?: number
                   {messages.length === 0 && !loadingHistory ? (
                     <div className="rounded-xl border border-border/60 bg-muted/30 p-4 text-sm text-muted-foreground">
                       {llmReady
-                        ? 'Ask questions about your local library. On artist pages, the assistant uses the current artist context automatically.'
-                        : 'Ask questions about your local library. Artist, album, label, genre and concert queries work even while the LLM is still warming up.'}
+                        ? 'Ask questions about your local library. The assistant can navigate artists, albums, labels and playlists, and can create playlists when you ask.'
+                        : 'Ask questions about your local library. Artist, album, label, genre and concert queries already work while the broader AI layer finishes initializing.'}
                     </div>
                   ) : null}
 

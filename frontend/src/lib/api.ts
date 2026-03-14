@@ -3952,6 +3952,36 @@ export interface AssistantChatResponse {
   citations: AssistantCitation[];
 }
 
+export interface EntityDiscoverLink {
+  kind: 'internal' | 'external';
+  label: string;
+  href: string;
+  entity_type?: string;
+  entity_id?: number;
+  thumb?: string | null;
+  subtitle?: string | null;
+  provider?: string | null;
+}
+
+export interface EntityDiscoverSection {
+  key: string;
+  title: string;
+  reason?: string | null;
+  links: EntityDiscoverLink[];
+}
+
+export interface EntityDiscoverResponse {
+  entity_type: 'artist' | 'album' | 'label';
+  entity_label: string;
+  generated_at: number;
+  summary: string;
+  sections: EntityDiscoverSection[];
+  provider?: string | null;
+  model?: string | null;
+  ai_used: boolean;
+  fallback_used: boolean;
+}
+
 export async function getAssistantStatus(): Promise<AssistantStatus> {
   return fetchApi<AssistantStatus>('/api/assistant/status');
 }
@@ -3967,6 +3997,18 @@ export async function postAssistantChat(input: {
   context?: { artist_id?: number; context_inferred?: boolean; [k: string]: unknown };
 }): Promise<AssistantChatResponse> {
   return fetchApi<AssistantChatResponse>('/api/assistant/chat', {
+    method: 'POST',
+    body: JSON.stringify(input),
+  });
+}
+
+export async function postEntityDiscover(input: {
+  entity_type: 'artist' | 'album' | 'label';
+  artist_id?: number;
+  album_id?: number;
+  label?: string;
+}): Promise<EntityDiscoverResponse> {
+  return fetchApi<EntityDiscoverResponse>('/api/library/entity-discover', {
     method: 'POST',
     body: JSON.stringify(input),
   });

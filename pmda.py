@@ -17498,11 +17498,14 @@ def _assistant_fetch_session_messages(conn, session_id: str, limit: int = 12) ->
     return out
 
 
-def _assistant_retrieve_chunks(conn, query: str, *, artist_id: int | None = None, k: int = 8) -> dict:
+def _assistant_retrieve_chunks(conn, query: str, *, artist_id: int | None = None, artist_ids: list[int] | None = None, k: int = 8) -> dict:
     """Return top-k chunks with citation metadata (artist + library snapshot)."""
     query = (query or "").strip()
     k = max(1, min(16, int(k or 8)))
     artist_id = int(artist_id or 0) if artist_id else 0
+    artist_ids_list = [int(x or 0) for x in (artist_ids or []) if int(x or 0) > 0]
+    if artist_id > 0 and artist_id not in artist_ids_list:
+        artist_ids_list.insert(0, artist_id)
     if not query:
         return {"chunks": [], "citations": []}
 
@@ -17522,17 +17525,17 @@ def _assistant_retrieve_chunks(conn, query: str, *, artist_id: int | None = None
     except Exception:
         pass
 
-    if artist_id > 0:
+    if artist_ids_list:
         try:
             with conn.cursor() as cur:
                 cur.execute(
                     """
                     SELECT id
                     FROM assistant_docs
-                    WHERE entity_type = 'artist' AND entity_id = %s
+                    WHERE entity_type = 'artist' AND entity_id = ANY(%s)
                     ORDER BY updated_at DESC
                     """,
-                    (artist_id,),
+                    (artist_ids_list,),
                 )
                 doc_ids.extend([int(r[0] or 0) for r in cur.fetchall() if int(r[0] or 0) > 0])
         except Exception:
@@ -17725,6 +17728,7 @@ def _assistant_build_prompt(
     retrieved: dict,
     history: list[dict],
     context_info: dict,
+    web_results: list[dict[str, Any]] | None = None,
 ) -> tuple[str, str]:
     system_msg = (
         "You are PMDA Intelligence, an audiophile-focused music librarian for a LOCAL library.\n"
@@ -17762,16 +17766,178 @@ def _assistant_build_prompt(
     hist_block = "\n".join(hist_lines).strip()
 
     focus = ""
-    if context_info.get("artist_name"):
-        focus = f"Context: Current artist = {context_info.get('artist_name')}\n"
+    artist_names: list[str] = []
+    if isinstance(context_info.get("artist_names"), list):
+        artist_names = [str(x or "").strip() for x in context_info.get("artist_names") if str(x or "").strip()]
+    elif context_info.get("artist_name"):
+        artist_names = [str(context_info.get("artist_name") or "").strip()]
+    if artist_names:
+        if len(artist_names) == 1:
+            focus = f"Context: Current artist = {artist_names[0]}\n"
+        else:
+            focus = f"Context: Focus artists = {', '.join(artist_names[:6])}\n"
+
+    web_block = ""
+    if isinstance(web_results, list) and web_results:
+        web_lines = []
+        for idx, row in enumerate(web_results[:6], start=1):
+            if not isinstance(row, dict):
+                continue
+            title = str(row.get("title") or "").strip()
+            link = str(row.get("link") or "").strip()
+            snippet = str(row.get("snippet") or "").strip()
+            source = str(row.get("source") or "").strip() or "web"
+            if not title and not snippet:
+                continue
+            web_lines.append(f"[W{idx}] ({source}{', title=' + title if title else ''}{', link=' + link if link else ''})")
+            if snippet:
+                web_lines.append(snippet)
+            web_lines.append("")
+        web_block = "\n".join(web_lines).strip()
 
     user_prompt = (
         f"{focus}"
         f"User question:\n{(user_message or '').strip()}\n\n"
         f"Conversation (most recent last):\n{hist_block if hist_block else '(none)'}\n\n"
-        f"Context excerpts:\n{ctx_block if ctx_block else '(none)'}\n"
+        f"Context excerpts:\n{ctx_block if ctx_block else '(none)'}\n\n"
+        f"Optional web discovery snippets:\n{web_block if web_block else '(none)'}\n"
     )
     return system_msg, user_prompt
+
+
+def _assistant_links_from_citations(*, citations: list[dict], base_url: str) -> list[dict]:
+    base = (base_url or "").rstrip("/")
+    out: list[dict] = []
+    seen: set[str] = set()
+
+    def _push(link: dict) -> None:
+        href = str(link.get("href") or "").strip()
+        label = str(link.get("label") or "").strip()
+        if not href or not label:
+            return
+        key = f"{href}||{label}"
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(link)
+
+    for cit in citations or []:
+        if not isinstance(cit, dict):
+            continue
+        entity_type = str(cit.get("entity_type") or "").strip().lower()
+        entity_id = int(cit.get("entity_id") or 0)
+        title = str(cit.get("title") or "").strip()
+        if entity_type == "artist" and entity_id > 0:
+            _push(
+                {
+                    "kind": "internal",
+                    "label": title or f"Artist #{entity_id}",
+                    "href": f"/library/artist/{entity_id}",
+                    "entity_type": "artist",
+                    "entity_id": entity_id,
+                    "thumb": f"{base}/api/library/files/artist/{entity_id}/image?size=96",
+                }
+            )
+        elif entity_type == "album" and entity_id > 0:
+            _push(
+                {
+                    "kind": "internal",
+                    "label": title or f"Album #{entity_id}",
+                    "href": f"/library/album/{entity_id}",
+                    "entity_type": "album",
+                    "entity_id": entity_id,
+                    "thumb": f"{base}/api/library/files/album/{entity_id}/cover?size=96",
+                }
+            )
+        elif entity_type == "playlist" and entity_id > 0:
+            _push(
+                {
+                    "kind": "internal",
+                    "label": title or f"Playlist #{entity_id}",
+                    "href": f"/library/playlists/{entity_id}",
+                    "entity_type": "playlist",
+                    "entity_id": entity_id,
+                    "thumb": None,
+                }
+            )
+        elif entity_type == "label" and title:
+            _push(
+                {
+                    "kind": "internal",
+                    "label": title,
+                    "href": f"/library/label/{quote(title)}",
+                    "entity_type": "label",
+                    "entity_id": 0,
+                    "thumb": None,
+                }
+            )
+        elif entity_type == "genre" and title:
+            _push(
+                {
+                    "kind": "internal",
+                    "label": title,
+                    "href": f"/library/genre/{quote(title)}",
+                    "entity_type": "genre",
+                    "entity_id": 0,
+                    "thumb": None,
+                }
+            )
+    return out[:18]
+
+
+def _assistant_links_from_web_results(web_results: list[dict[str, Any]]) -> list[dict]:
+    out: list[dict] = []
+    seen: set[str] = set()
+    for row in (web_results or [])[:8]:
+        if not isinstance(row, dict):
+            continue
+        href = str(row.get("link") or "").strip()
+        label = str(row.get("title") or "").strip()
+        if not href or not label:
+            continue
+        key = f"{href}||{label}"
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(
+            {
+                "kind": "external",
+                "label": label,
+                "href": href,
+                "entity_type": "external",
+                "entity_id": 0,
+                "thumb": None,
+            }
+        )
+    return out[:8]
+
+
+def _assistant_should_include_web_discovery(user_message: str, *, retrieved_chunks_count: int) -> bool:
+    s = _assistant_simplify_for_intent(user_message)
+    if not s:
+        return False
+    if retrieved_chunks_count <= 1:
+        return True
+    return any(
+        tok in s
+        for tok in [
+            "qui est",
+            "who is",
+            "parle moi de",
+            "parle de",
+            "raconte",
+            "biographie",
+            "biography",
+            "recommend",
+            "recommande",
+            "recommandation",
+            "discover",
+            "decouvrir",
+            "decouverte",
+            "similar",
+            "similaire",
+        ]
+    )
 
 
 def _assistant_simplify_for_intent(text: str) -> str:
@@ -17804,6 +17970,26 @@ def _assistant_detect_tool_intent(user_message: str, *, context_artist_id: int) 
     s = _assistant_simplify_for_intent(user_message)
     if not s:
         return None
+    complex_prompt = any(
+        tok in s
+        for tok in [
+            "qui est",
+            "who is",
+            "tell me about",
+            "parle moi de",
+            "parle de",
+            "raconte",
+            "biographie",
+            "biography",
+            "compare",
+            "comparaison",
+            "versus",
+            "vs",
+            "analyse",
+            "why",
+            "pourquoi",
+        ]
+    )
 
     if any(
         tok in s
@@ -17847,13 +18033,53 @@ def _assistant_detect_tool_intent(user_message: str, *, context_artist_id: int) 
 
     if context_artist_id > 0:
         if "concert" in s or "concerts" in s or "tour" in s or "shows" in s or "dates" in s:
+            if complex_prompt:
+                return None
             return "artist_concerts"
         if ("artiste similaire" in s) or ("artistes similaires" in s) or ("similar artists" in s) or ("similaires" in s and "artiste" in s):
+            if complex_prompt:
+                return None
             return "artist_similar_artists"
         if ("album" in s or "albums" in s) and any(tok in s for tok in ["liste", "list", "quels", "which", "dispose", "dans ma collection", "local"]):
+            if complex_prompt:
+                return None
             return "artist_list_albums"
 
     return None
+
+
+def _assistant_should_force_llm_rag(user_message: str) -> bool:
+    s = _assistant_simplify_for_intent(user_message)
+    if not s:
+        return False
+    rich_tokens = [
+        "qui est",
+        "who is",
+        "tell me about",
+        "parle moi de",
+        "parle de",
+        "raconte",
+        "biographie",
+        "biography",
+        "compare",
+        "comparaison",
+        "versus",
+        "vs",
+        "analyse",
+        "why",
+        "pourquoi",
+        "background",
+        "story",
+        "influence",
+        "scene",
+    ]
+    if any(tok in s for tok in rich_tokens):
+        return True
+    # Rich hybrid prompts like "recommend X and explain why" should not be reduced to DB-only tools.
+    if any(tok in s for tok in ["recommend", "recommande", "recommandation", "suggest", "devrais je ecouter"]):
+        if any(tok in s for tok in ["because", "pourquoi", "why", "explique", "explain", "compare", "parce que"]):
+            return True
+    return False
 
 
 def _assistant_tool_library_counts(conn) -> dict:
@@ -18872,7 +19098,33 @@ def _assistant_should_try_sql_agent(user_message: str) -> bool:
         return False
 
     # Avoid running the SQL agent for biography-like prompts; those should use RAG docs.
-    if any(tok in s for tok in ["qui est", "who is", "biographie", "biography", "resume", "resumer", "summarize", "tell me about", "dis m en plus"]):
+    if any(
+        tok in s
+        for tok in [
+            "qui est",
+            "who is",
+            "biographie",
+            "biography",
+            "resume",
+            "resumer",
+            "summarize",
+            "tell me about",
+            "dis m en plus",
+            "raconte",
+            "parle moi de",
+            "parle de",
+            "compare",
+            "comparaison",
+            "versus",
+            "vs",
+            "recommend",
+            "recommande",
+            "recommandation",
+            "discover",
+            "decouvrir",
+            "decouverte",
+        ]
+    ):
         return False
 
     # Strong signals that the question is about the user's local collection / statistics.
@@ -65766,21 +66018,39 @@ def api_assistant_chat():
             pass
 
         context_artist_id = _parse_int_loose(ctx.get("artist_id"), 0)
+        context_artist_ids: list[int] = []
         context_inferred = False
         context_info: dict = {}
 
         if context_artist_id and int(context_artist_id) > 0:
-            context_info = _assistant_ingest_artist_rag(conn, int(context_artist_id))
+            context_artist_id = int(context_artist_id)
+            context_artist_ids = [context_artist_id]
+            context_info = _assistant_ingest_artist_rag(conn, context_artist_id)
+            context_info["artist_names"] = [str(context_info.get("artist_name") or "").strip()] if str(context_info.get("artist_name") or "").strip() else []
         else:
             # Best-effort inference for "Ask PMDA" from anywhere.
-            inferred_ids = _assistant_find_artist_ids_for_query(conn, user_message, limit=1)
+            inferred_ids = _assistant_find_artist_ids_for_query(conn, user_message, limit=4)
             if inferred_ids:
                 context_inferred = True
-                context_artist_id = inferred_ids[0]
+                context_artist_id = int(inferred_ids[0] or 0)
+                context_artist_ids = [int(x or 0) for x in inferred_ids if int(x or 0) > 0][:4]
                 ctx = dict(ctx)
                 ctx["artist_id"] = int(context_artist_id)
                 ctx["context_inferred"] = True
-                context_info = _assistant_ingest_artist_rag(conn, int(context_artist_id))
+                first_context = _assistant_ingest_artist_rag(conn, int(context_artist_id))
+                artist_names: list[str] = []
+                if str(first_context.get("artist_name") or "").strip():
+                    artist_names.append(str(first_context.get("artist_name") or "").strip())
+                for extra_artist_id in context_artist_ids[1:]:
+                    try:
+                        extra_context = _assistant_ingest_artist_rag(conn, int(extra_artist_id))
+                        extra_name = str(extra_context.get("artist_name") or "").strip()
+                        if extra_name and extra_name not in artist_names:
+                            artist_names.append(extra_name)
+                    except Exception:
+                        continue
+                context_info = dict(first_context or {})
+                context_info["artist_names"] = artist_names
 
         # Persist the user message.
         user_msg_row = _assistant_insert_message(
@@ -65792,16 +66062,23 @@ def api_assistant_chat():
             metadata={},
         )
 
+        runtime_status = _assistant_runtime_status()
+        ai_ready = bool(runtime_status.get("ai_ready"))
+        ai_error = str(runtime_status.get("ai_error") or "").strip() or "AI is not configured"
+        force_llm_rag = bool(ai_ready) and _assistant_should_force_llm_rag(user_message)
+
         # Fast path: answer common DB-grounded questions without paying LLM tokens.
-        try:
-            tool = _assistant_try_handle_tool_query(
-                conn,
-                user_message=user_message,
-                context_artist_id=int(context_artist_id or 0),
-                base_url=request.url_root.rstrip("/"),
-            )
-        except Exception:
-            tool = {"handled": False}
+        tool = {"handled": False}
+        if not force_llm_rag:
+            try:
+                tool = _assistant_try_handle_tool_query(
+                    conn,
+                    user_message=user_message,
+                    context_artist_id=int(context_artist_id or 0),
+                    base_url=request.url_root.rstrip("/"),
+                )
+            except Exception:
+                tool = {"handled": False}
 
         if tool.get("handled"):
             assistant_text = str(tool.get("assistant_text") or "").strip()
@@ -65832,22 +66109,21 @@ def api_assistant_chat():
                 }
             )
 
-        runtime_status = _assistant_runtime_status()
-        ai_ready = bool(runtime_status.get("ai_ready"))
-        ai_error = str(runtime_status.get("ai_error") or "").strip() or "AI is not configured"
         if not ai_ready:
             return jsonify({"error": ai_error, "db_tools_only": True}), 503
 
         # Slow path: LLM-assisted SQL query over the library DB (read-only).
-        try:
-            sql_tool = _assistant_try_handle_sql_agent_query(
-                conn,
-                user_message=user_message,
-                context_artist_id=int(context_artist_id or 0),
-                base_url=request.url_root.rstrip("/"),
-            )
-        except Exception:
-            sql_tool = {"handled": False}
+        sql_tool = {"handled": False}
+        if not force_llm_rag:
+            try:
+                sql_tool = _assistant_try_handle_sql_agent_query(
+                    conn,
+                    user_message=user_message,
+                    context_artist_id=int(context_artist_id or 0),
+                    base_url=request.url_root.rstrip("/"),
+                )
+            except Exception:
+                sql_tool = {"handled": False}
 
         if sql_tool.get("handled"):
             assistant_text = str(sql_tool.get("assistant_text") or "").strip()
@@ -65878,12 +66154,29 @@ def api_assistant_chat():
                 }
             )
 
-        retrieved = _assistant_retrieve_chunks(conn, user_message, artist_id=int(context_artist_id or 0), k=8)
+        retrieved = _assistant_retrieve_chunks(
+            conn,
+            user_message,
+            artist_id=int(context_artist_id or 0),
+            artist_ids=context_artist_ids,
+            k=8,
+        )
+        web_results: list[dict[str, Any]] = []
+        if _assistant_should_include_web_discovery(user_message, retrieved_chunks_count=len(retrieved.get("chunks") or [])):
+            try:
+                discovery_query = str(user_message or "").strip()
+                artist_names = [str(x or "").strip() for x in (context_info.get("artist_names") or []) if str(x or "").strip()]
+                if artist_names:
+                    discovery_query = f"{discovery_query} {' '.join(artist_names[:2])}".strip()
+                web_results = _web_search_serper(discovery_query, num=5, allow_ai_fallback=True) or []
+            except Exception:
+                web_results = []
         system_msg, prompt = _assistant_build_prompt(
             user_message=user_message,
             retrieved=retrieved,
             history=history,
             context_info=context_info,
+            web_results=web_results,
         )
 
         provider = getattr(sys.modules[__name__], "AI_PROVIDER", "openai")
@@ -65897,12 +66190,17 @@ def api_assistant_chat():
             analysis_type="other",
         )
 
+        assistant_links = _assistant_links_from_citations(
+            citations=retrieved.get("citations") or [],
+            base_url=request.url_root.rstrip("/"),
+        )
+        assistant_links.extend(_assistant_links_from_web_results(web_results))
         assistant_meta = {
             "provider": provider,
             "model": model,
             "context_inferred": bool(context_inferred),
             "citations": retrieved.get("citations") or [],
-            "links": [],
+            "links": assistant_links[:18],
         }
         assistant_msg_row = _assistant_insert_message(
             conn,
