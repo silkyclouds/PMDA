@@ -15696,9 +15696,9 @@ def _run_files_profile_enrichment_job(
 
                 cover_candidates_default = [
                     str(metadata_source or "").strip(),
-                    "musicbrainz",
                     "bandcamp",
                     "lastfm",
+                    "musicbrainz",
                     "discogs",
                 ]
 
@@ -15709,14 +15709,7 @@ def _run_files_profile_enrichment_job(
                         provider_chain.append(provider_norm)
 
                 if exact_provider_ids:
-                    # Prefer canonical artwork sources first. Discogs is valuable, but for
-                    # exact identities it often reflects variant/reissue sleeves rather than
-                    # the canonical album art users expect in the library UI.
-                    provider_chain = [
-                        provider_name
-                        for provider_name in ("musicbrainz", "bandcamp", "lastfm", "discogs")
-                        if provider_name in exact_provider_ids
-                    ]
+                    provider_chain = [provider_name for provider_name in ("bandcamp", "lastfm", "musicbrainz", "discogs") if provider_name in provider_chain]
 
                 current_cover_provider_norm = _normalize_identity_provider(current_cover_provider)
                 if current_cover_provider_norm and current_cover_provider_norm not in {"local", "unknown"} and cover_raw:
@@ -31622,6 +31615,45 @@ def _publication_cover_needs_provider_refresh(tags: dict, *, artist_resolved: st
     return False
 
 
+def _cover_provider_from_primary_tags_blob(primary_tags_json: Any) -> str:
+    tags_blob = primary_tags_json
+    if isinstance(tags_blob, str):
+        tags_blob = _safe_json_load(tags_blob, fallback={})
+    if not isinstance(tags_blob, dict):
+        return ""
+    return _normalize_identity_provider(
+        str(
+            tags_blob.get(PMDA_COVER_PROVIDER_TAG)
+            or tags_blob.get("pmda_cover_provider")
+            or ""
+        )
+    )
+
+
+def _publication_cover_identity_ok(
+    provider_name: str,
+    payload: dict[str, Any] | None,
+    *,
+    artist_name: str,
+    album_title: str,
+) -> bool:
+    provider_norm = _normalize_identity_provider(provider_name)
+    if provider_norm == "musicbrainz":
+        return True
+    payload_dict = payload if isinstance(payload, dict) else {}
+    candidate_artist = _provider_payload_artist(provider_norm, payload_dict)
+    candidate_title = _provider_payload_title(provider_norm, payload_dict)
+    if not candidate_artist or not candidate_title:
+        return False
+    ok, _reason = _strict_identity_match_details(
+        local_artist=artist_name,
+        local_title=album_title,
+        candidate_artist=candidate_artist,
+        candidate_title=candidate_title,
+    )
+    return bool(ok)
+
+
 def _authoritative_publication_cover(
     *,
     folder: Path,
@@ -31638,6 +31670,8 @@ def _authoritative_publication_cover(
     discogs_release_id: str,
     lastfm_album_mbid: str,
     bandcamp_album_url: str,
+    current_cover_path: str = "",
+    current_cover_provider: str = "",
 ) -> tuple[str, bool, str]:
     local_cover = _first_cover_path(folder)
     local_cover_ok = bool(local_cover and local_cover.is_file())
@@ -31661,13 +31695,11 @@ def _authoritative_publication_cover(
             or ""
         )
     )
+    preferred_cover_order = ["bandcamp", "lastfm", "musicbrainz", "discogs"]
     provider_chain: list[str] = []
-    if provider_seed == "musicbrainz" and not strict_match_verified:
-        provider_chain.extend(["discogs", "bandcamp", "lastfm", "musicbrainz"])
-    else:
-        if provider_seed:
-            provider_chain.append(provider_seed)
-        provider_chain.extend(["discogs", "bandcamp", "lastfm", "musicbrainz"])
+    if provider_seed:
+        provider_chain.append(provider_seed)
+    provider_chain.extend(preferred_cover_order)
     seen: set[str] = set()
     provider_chain = [p for p in provider_chain if p and not (p in seen or seen.add(p))]
     edition_payload = dict(item or {})
@@ -31706,14 +31738,30 @@ def _authoritative_publication_cover(
         return (str(local_cover), True, "local")
 
     if exact_provider_ids:
-        # Prefer canonical artwork sources first. Discogs exact editions frequently carry
-        # alternate sleeves, while MusicBrainz release-group art and primary provider art
-        # are closer to the canonical cover users expect in the library UI.
-        provider_chain = [
-            provider
-            for provider in ("musicbrainz", "bandcamp", "lastfm", "discogs")
-            if provider in exact_provider_ids
-        ]
+        # Prefer listener-facing canonical covers first. Last.fm/Bandcamp are often closer
+        # to the artwork users expect than release-group CAA or a specific Discogs reissue.
+        provider_chain = [provider for provider in preferred_cover_order if provider in provider_chain]
+
+    current_cover_provider_norm = _normalize_identity_provider(str(current_cover_provider or ""))
+    current_cover_cached: Optional[Path] = None
+    current_cover_raw = str(current_cover_path or "").strip()
+    if current_cover_raw:
+        try:
+            cand = path_for_fs_access(Path(current_cover_raw))
+            if cand.exists() and cand.is_file():
+                current_cover_cached = cand
+        except Exception:
+            current_cover_cached = None
+    if current_cover_cached and current_cover_provider_norm and current_cover_provider_norm not in {"local", "unknown"}:
+        preferred_provider = provider_chain[0] if provider_chain else ""
+        if exact_provider_ids:
+            if current_cover_provider_norm == preferred_provider:
+                return (str(current_cover_cached), True, current_cover_provider_norm)
+        elif current_cover_provider_norm in {
+            provider_seed,
+            _normalize_identity_provider(str(metadata_source or "")),
+        }:
+            return (str(current_cover_cached), True, current_cover_provider_norm)
 
     for provider in provider_chain:
         try:
@@ -31724,6 +31772,13 @@ def _authoritative_publication_cover(
                 edition=edition_payload,
             )
             payload_dict = payload if isinstance(payload, dict) else {}
+            if provider != "musicbrainz" and not _publication_cover_identity_ok(
+                provider,
+                payload_dict,
+                artist_name=artist_resolved,
+                album_title=album_resolved,
+            ):
+                continue
             cover_url = _provider_cover_url_from_payload(provider, payload_dict)
             if not cover_url:
                 continue
@@ -31966,6 +32021,7 @@ def _publish_files_library_artist_from_items(
                         or ""
                     ).strip()
                 )
+                current_cover_provider = _cover_provider_from_primary_tags_blob(item.get("primary_tags_json"))
                 cover_path_resolved, has_cover, cover_provider = _authoritative_publication_cover(
                     folder=folder,
                     item=item,
@@ -31981,6 +32037,8 @@ def _publish_files_library_artist_from_items(
                     discogs_release_id=discogs_release_id,
                     lastfm_album_mbid=lastfm_album_mbid,
                     bandcamp_album_url=bandcamp_album_url,
+                    current_cover_path=str(item.get("cover_path") or "").strip(),
+                    current_cover_provider=current_cover_provider,
                 )
                 primary_tags_authoritative = _authoritative_primary_tags_for_publication(
                     tags=tags,
@@ -32126,18 +32184,32 @@ def _rebuild_files_publication_for_scan(scan_id: int | None) -> dict[str, int]:
                 exc_info=True,
             )
 
+    surviving_targets = 0
+    for item in targets:
+        try:
+            folder_raw = str((item or {}).get("folder") or "").strip()
+            if not folder_raw:
+                continue
+            folder_live = path_for_fs_access(Path(folder_raw))
+            if folder_live.exists() and folder_live.is_dir():
+                surviving_targets += 1
+        except Exception:
+            continue
+
     logging.info(
-        "Files publication rebuild for scan_id=%s: deleted=%d inserted=%d target_albums=%d",
+        "Files publication rebuild for scan_id=%s: deleted=%d inserted=%d target_albums=%d surviving_targets=%d",
         sid,
         deleted,
         inserted,
         len(targets),
+        surviving_targets,
     )
-    if inserted < len(targets):
+    if inserted < surviving_targets:
         logging.warning(
-            "Files publication rebuild incomplete for scan_id=%s: published=%d target_albums=%d",
+            "Files publication rebuild incomplete for scan_id=%s: published=%d surviving_targets=%d raw_targets=%d",
             sid,
             inserted,
+            surviving_targets,
             len(targets),
         )
     return {"scan_id": sid, "deleted": int(deleted), "inserted": int(inserted)}
@@ -41271,6 +41343,9 @@ def _maintenance_clear_files_index() -> dict[str, Any]:
                             files_reco_track_stats,
                             files_reco_events,
                             files_playback_events,
+                            files_match_audit,
+                            files_user_album_ratings,
+                            files_entity_likes,
                             files_external_artist_images,
                             files_artist_profiles,
                             files_album_profiles,
@@ -61990,6 +62065,139 @@ def _scan_collect_profile_enrich_targets(scan_id: int | None) -> list[dict]:
     except Exception:
         logging.debug("Failed to collect scan profile enrichment targets for scan_id=%s", sid, exc_info=True)
         return []
+    folder_paths = [str((row or {}).get("folder") or "").strip() for row in rows if str((row or {}).get("folder") or "").strip()]
+    if not folder_paths:
+        return rows
+    live_by_folder: dict[str, dict[str, Any]] = {}
+    try:
+        conn = _files_pg_connect()
+        if conn is not None:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT
+                            alb.folder_path,
+                            COALESCE(art.name, ''),
+                            COALESCE(alb.title, ''),
+                            COALESCE(alb.year, 0),
+                            COALESCE(alb.date_text, ''),
+                            COALESCE(alb.genre, ''),
+                            COALESCE(alb.label, ''),
+                            COALESCE(alb.musicbrainz_release_group_id, ''),
+                            COALESCE(alb.discogs_release_id, ''),
+                            COALESCE(alb.lastfm_album_mbid, ''),
+                            COALESCE(alb.bandcamp_album_url, ''),
+                            COALESCE(alb.metadata_source, ''),
+                            COALESCE(alb.strict_match_verified, FALSE),
+                            COALESCE(alb.strict_match_provider, ''),
+                            COALESCE(alb.strict_reject_reason, ''),
+                            COALESCE(alb.strict_tracklist_score, 0.0),
+                            COALESCE(alb.cover_path, ''),
+                            COALESCE(alb.primary_tags_json, '{}')
+                        FROM files_albums alb
+                        JOIN files_artists art ON art.id = alb.artist_id
+                        WHERE alb.folder_path = ANY(%s)
+                        """,
+                        (folder_paths,),
+                    )
+                    for (
+                        folder_path,
+                        artist_name,
+                        album_title,
+                        year,
+                        date_text,
+                        genre,
+                        label,
+                        mbid,
+                        discogs_release_id,
+                        lastfm_album_mbid,
+                        bandcamp_album_url,
+                        metadata_source,
+                        strict_match_verified,
+                        strict_match_provider,
+                        strict_reject_reason,
+                        strict_tracklist_score,
+                        cover_path,
+                        primary_tags_json,
+                    ) in cur.fetchall():
+                        live_by_folder[str(folder_path or "").strip()] = {
+                            "artist": str(artist_name or "").strip(),
+                            "album_title": _sanitize_album_title_display(str(album_title or "").strip()),
+                            "year": int(_parse_int_loose(year, 0) or 0) or None,
+                            "date_text": str(date_text or "").strip(),
+                            "genre": str(genre or "").strip(),
+                            "label": str(label or "").strip(),
+                            "musicbrainz_id": str(mbid or "").strip(),
+                            "discogs_release_id": str(discogs_release_id or "").strip(),
+                            "lastfm_album_mbid": str(lastfm_album_mbid or "").strip(),
+                            "bandcamp_album_url": str(bandcamp_album_url or "").strip(),
+                            "metadata_source": _normalize_identity_provider(str(metadata_source or "")),
+                            "strict_match_verified": bool(strict_match_verified),
+                            "strict_match_provider": _normalize_identity_provider(str(strict_match_provider or "")),
+                            "strict_reject_reason": str(strict_reject_reason or "").strip(),
+                            "strict_tracklist_score": float(strict_tracklist_score or 0.0),
+                            "cover_path": str(cover_path or "").strip(),
+                            "primary_tags_json": primary_tags_json or "{}",
+                        }
+            finally:
+                conn.close()
+    except Exception:
+        logging.debug("Failed to merge live publication hints for scan_id=%s", sid, exc_info=True)
+    if not live_by_folder:
+        return rows
+    for row in rows:
+        folder_key = str((row or {}).get("folder") or "").strip()
+        live = live_by_folder.get(folder_key)
+        if not live:
+            continue
+        live_artist = str(live.get("artist") or "").strip()
+        if live_artist and not _identity_text_is_generic(live_artist):
+            row["artist"] = _choose_preferred_identity_display(str(row.get("artist") or ""), live_artist) or live_artist
+        live_title = _sanitize_album_title_display(str(live.get("album_title") or "").strip())
+        if live_title and not _identity_text_is_generic(live_title):
+            row["album_title"] = _choose_preferred_identity_display(str(row.get("album_title") or ""), live_title) or live_title
+            row["title_raw"] = row["album_title"]
+        for key in (
+            "musicbrainz_id",
+            "discogs_release_id",
+            "lastfm_album_mbid",
+            "bandcamp_album_url",
+            "metadata_source",
+            "strict_match_provider",
+            "strict_reject_reason",
+            "cover_path",
+            "primary_tags_json",
+        ):
+            live_value = live.get(key)
+            if isinstance(live_value, str):
+                live_value = live_value.strip()
+            if live_value:
+                row[key] = live_value
+        if live.get("strict_match_verified"):
+            row["strict_match_verified"] = True
+        try:
+            live_score = float(live.get("strict_tracklist_score") or 0.0)
+        except Exception:
+            live_score = 0.0
+        try:
+            row_score = float(row.get("strict_tracklist_score") or 0.0)
+        except Exception:
+            row_score = 0.0
+        if live_score > row_score:
+            row["strict_tracklist_score"] = live_score
+        row_meta = row.get("meta")
+        if not isinstance(row_meta, dict):
+            row_meta = {}
+            row["meta"] = row_meta
+        if live.get("year") and not row_meta.get("year"):
+            row_meta["year"] = live.get("year")
+        if live.get("date_text") and not row_meta.get("date"):
+            row_meta["date"] = live.get("date_text")
+        if live.get("genre") and not row_meta.get("genre"):
+            row_meta["genre"] = live.get("genre")
+        if live.get("label") and not row_meta.get("label"):
+            row_meta["label"] = live.get("label")
     return rows
 
 
