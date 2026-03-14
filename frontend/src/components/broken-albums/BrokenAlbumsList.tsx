@@ -183,7 +183,13 @@ export function BrokenAlbumsList() {
                           <div className="flex gap-4">
                             <div className="w-20 h-20 rounded-2xl overflow-hidden border border-border/70 bg-muted shrink-0">
                               {move.thumb_url ? (
-                                <img src={move.thumb_url} alt={move.album_title || move.artist} className="w-full h-full object-cover" />
+                                <img
+                                  src={move.thumb_url}
+                                  alt={move.album_title || move.artist}
+                                  className="w-full h-full object-cover"
+                                  loading="lazy"
+                                  decoding="async"
+                                />
                               ) : (
                                 <div className="w-full h-full flex items-center justify-center">
                                   <Disc3 className="w-5 h-5 text-muted-foreground" />

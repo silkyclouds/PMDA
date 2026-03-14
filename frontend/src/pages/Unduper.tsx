@@ -390,7 +390,13 @@ export default function Unduper() {
                           <div className="flex gap-3">
                             <div className="w-14 h-14 rounded-xl overflow-hidden border border-border/70 bg-muted shrink-0">
                               {move.thumb_url ? (
-                                <img src={move.thumb_url} alt={move.album_title || move.artist} className="w-full h-full object-cover" />
+                                <img
+                                  src={move.thumb_url}
+                                  alt={move.album_title || move.artist}
+                                  className="w-full h-full object-cover"
+                                  loading="lazy"
+                                  decoding="async"
+                                />
                               ) : (
                                 <div className="w-full h-full flex items-center justify-center">
                                   <Disc3 className="w-4 h-4 text-muted-foreground" />
@@ -410,7 +416,13 @@ export default function Unduper() {
                           <div className="flex gap-3">
                             <div className="w-14 h-14 rounded-xl overflow-hidden border border-border/70 bg-muted shrink-0">
                               {move.winner_thumb_url ? (
-                                <img src={move.winner_thumb_url} alt={move.winner_title || move.artist} className="w-full h-full object-cover" />
+                                <img
+                                  src={move.winner_thumb_url}
+                                  alt={move.winner_title || move.artist}
+                                  className="w-full h-full object-cover"
+                                  loading="lazy"
+                                  decoding="async"
+                                />
                               ) : (
                                 <div className="w-full h-full flex items-center justify-center">
                                   <Disc3 className="w-4 h-4 text-muted-foreground" />

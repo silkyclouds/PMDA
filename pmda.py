@@ -65461,6 +65461,103 @@ def _scan_move_folder_artwork_url(move_id: int, *, target: str = "moved", size: 
     return f"{base}{path}" if base else path
 
 
+def _scan_move_artwork_source_path(move_id: int, *, target: str = "moved") -> Optional[Path]:
+    target_key = str(target or "moved").strip().lower() or "moved"
+    import sqlite3
+
+    con = sqlite3.connect(str(STATE_DB_FILE))
+    con.row_factory = sqlite3.Row
+    try:
+        cur = con.cursor()
+        cur.execute(
+            """
+            SELECT move_id,
+                   COALESCE(original_path, '') AS original_path,
+                   COALESCE(moved_to_path, '') AS moved_to_path,
+                   COALESCE(restored, 0) AS restored,
+                   COALESCE(winner_path, '') AS winner_path
+            FROM scan_moves
+            WHERE move_id = ?
+            LIMIT 1
+            """,
+            (int(move_id),),
+        )
+        row = cur.fetchone()
+    finally:
+        con.close()
+    if not row:
+        return None
+
+    original_path = str(row["original_path"] or "").strip()
+    moved_to_path = str(row["moved_to_path"] or "").strip()
+    winner_path = str(row["winner_path"] or "").strip()
+    restored = bool(row["restored"])
+    version_seed = "|".join(
+        [
+            str(int(move_id)),
+            target_key,
+            "1" if restored else "0",
+            original_path,
+            moved_to_path,
+            winner_path,
+            "v1",
+        ]
+    )
+    lookup_key = f"scan_move_artwork:{hashlib.sha1(version_seed.encode('utf-8', errors='ignore')).hexdigest()}"
+    cached = _files_cache_get_json(lookup_key)
+    if isinstance(cached, dict):
+        cached_cover = _existing_file_path(str(cached.get("cover_path") or ""))
+        if cached_cover is not None:
+            return cached_cover
+
+    folder: Optional[Path] = None
+    if target_key == "winner":
+        if winner_path:
+            try:
+                candidate = path_for_fs_access(Path(winner_path))
+                if candidate.exists() and candidate.is_dir():
+                    folder = candidate
+            except Exception:
+                folder = None
+    else:
+        folder = _scan_move_active_folder(
+            original_path=original_path,
+            moved_to_path=moved_to_path,
+            restored=restored,
+        )
+    if folder is None or not folder.exists() or not folder.is_dir():
+        return None
+
+    cover_path = _first_cover_path(folder)
+    if cover_path is None or not cover_path.exists() or not cover_path.is_file():
+        return None
+
+    _files_cache_set_json(
+        lookup_key,
+        {
+            "folder_path": str(folder),
+            "cover_path": str(cover_path),
+        },
+        ttl=60 * 60,
+    )
+    return cover_path
+
+
+def _scan_move_prewarm_artwork(move_id: int, *, target: str = "moved", size: int = 160) -> None:
+    cover_path = _scan_move_artwork_source_path(int(move_id), target=target)
+    if cover_path is None:
+        return
+    try:
+        _ensure_cached_image_for_path(cover_path, kind="album", max_px=max(64, min(1024, int(size or 160))))
+    except Exception:
+        logging.debug(
+            "Scan move artwork prewarm failed for move_id=%s target=%s",
+            int(move_id),
+            str(target or "moved"),
+            exc_info=True,
+        )
+
+
 def _scan_move_folder_artwork_response(folder: Path, *, size: int) -> Response:
     if not folder.exists() or not folder.is_dir():
         return _transparent_png_response(max_age=0, revalidate=True)
@@ -65663,6 +65760,7 @@ def _scan_move_detail_payload(move_id: int) -> Optional[dict[str, Any]]:
             "fmt_text": str(row["fmt_text"] or ""),
         },
     }
+    _scan_move_prewarm_artwork(int(row["move_id"] or 0), target="moved", size=256)
     if move_reason == "dedupe":
         analysis = details.get("analysis") if isinstance(details.get("analysis"), dict) else {}
         payload["winner"] = {
@@ -65674,6 +65772,8 @@ def _scan_move_detail_payload(move_id: int) -> Optional[dict[str, Any]]:
             "track_count": len(winner_tracks),
             "analysis": analysis,
         }
+        if winner_folder:
+            _scan_move_prewarm_artwork(int(row["move_id"] or 0), target="winner", size=256)
     else:
         payload["incomplete"] = {
             "expected_track_count": int(details.get("expected_track_count") or 0),
@@ -65802,6 +65902,9 @@ def api_scan_history_moves(scan_id):
             if str(m.get("winner_path") or "").strip()
             else None
         )
+        _scan_move_prewarm_artwork(int(m["move_id"]), target="moved", size=128)
+        if m["winner_thumb_url"]:
+            _scan_move_prewarm_artwork(int(m["move_id"]), target="winner", size=128)
         moves.append(m)
 
     return jsonify(moves)
@@ -65879,21 +65982,14 @@ def api_scan_history_moves_summary(scan_id: int):
 def api_scan_move_artwork(move_id: int):
     size = max(64, min(1024, _parse_int_loose(request.args.get("size"), 320)))
     target = str(request.args.get("target") or "moved").strip().lower() or "moved"
-    detail = _scan_move_detail_payload(int(move_id))
-    if not isinstance(detail, dict):
-        return _transparent_png_response(max_age=0, revalidate=True)
-    if target == "winner":
-        payload = detail.get("winner") if isinstance(detail.get("winner"), dict) else {}
-    else:
-        payload = detail.get("moved") if isinstance(detail.get("moved"), dict) else {}
-    folder_raw = str((payload or {}).get("path") or "").strip()
-    if not folder_raw:
+    cover_path = _scan_move_artwork_source_path(int(move_id), target=target)
+    if cover_path is None:
         return _transparent_png_response(max_age=0, revalidate=True)
     try:
-        folder = path_for_fs_access(Path(folder_raw))
+        cached = _ensure_cached_image_for_path(cover_path, kind="album", max_px=size)
     except Exception:
-        return _transparent_png_response(max_age=0, revalidate=True)
-    return _scan_move_folder_artwork_response(folder, size=size)
+        cached = cover_path
+    return _serve_image_file_cached(cached or cover_path, max_age=300, revalidate=True)
 
 
 @app.get("/api/scan-move/<int:move_id>/detail")

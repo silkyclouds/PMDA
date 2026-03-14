@@ -111,7 +111,13 @@ function EditionPanel({
       <div className="flex items-start gap-4">
         <div className="w-24 h-24 rounded-2xl overflow-hidden border border-border/70 bg-muted shrink-0">
           {edition.thumb_url ? (
-            <img src={edition.thumb_url} alt={edition.album_title || title} className="w-full h-full object-cover" />
+            <img
+              src={edition.thumb_url}
+              alt={edition.album_title || title}
+              className="w-full h-full object-cover"
+              loading="lazy"
+              decoding="async"
+            />
           ) : (
             <div className="w-full h-full flex items-center justify-center">
               <Disc3 className="w-6 h-6 text-muted-foreground" />
