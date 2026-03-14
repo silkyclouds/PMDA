@@ -17805,6 +17805,23 @@ def _assistant_detect_tool_intent(user_message: str, *, context_artist_id: int) 
     if not s:
         return None
 
+    if any(
+        tok in s
+        for tok in [
+            "recommend",
+            "recommendation",
+            "recommande",
+            "recommandation",
+            "devrais je ecouter",
+            "que dois je ecouter",
+            "what should i listen",
+            "what should i hear",
+            "suggest me",
+            "suggestions",
+        ]
+    ):
+        return "library_recommend_albums"
+
     if ("playlist" in s or "mix" in s or "mixtape" in s) and any(
         tok in s
         for tok in ["create", "build", "make", "generate", "fais", "cree", "creer", "genere", "fabrique", "compose"]
@@ -18314,6 +18331,187 @@ def _assistant_create_playlist_from_query(
     }
 
 
+def _assistant_recommend_albums_from_query(
+    conn,
+    *,
+    user_message: str,
+    context_artist_id: int,
+    base_url: str,
+) -> dict:
+    count = _assistant_extract_requested_count(user_message, default=5, minimum=3, maximum=12)
+    artist_ids = _assistant_find_artist_ids_for_query(conn, user_message, limit=4)
+    if int(context_artist_id or 0) > 0 and int(context_artist_id) not in artist_ids:
+        artist_ids.insert(0, int(context_artist_id))
+    artist_ids = [aid for aid in artist_ids if aid > 0][:4]
+    genre = _assistant_find_genre_for_query(conn, user_message)
+    lang = _assistant_lang_for_message(user_message)
+    base = (base_url or "").rstrip("/")
+    params: list[Any] = []
+    where_clauses: list[str] = []
+    if artist_ids:
+        where_clauses.append("alb.artist_id = ANY(%s)")
+        params.append(artist_ids)
+    elif genre:
+        genre_norm = _assistant_simplify_for_intent(genre)
+        where_clauses.append(
+            """
+            (
+                LOWER(COALESCE(alb.genre, '')) = %s
+                OR EXISTS (
+                    SELECT 1
+                    FROM jsonb_array_elements_text(COALESCE(alb.tags_json, '[]')::jsonb) AS g(value)
+                    WHERE LOWER(TRIM(g.value)) = %s
+                )
+            )
+            """
+        )
+        params.extend([genre_norm, genre_norm])
+    sql = """
+        SELECT
+            alb.id,
+            alb.title,
+            COALESCE(alb.year, 0) AS year,
+            art.id AS artist_id,
+            art.name AS artist_name,
+            alb.has_cover,
+            COALESCE(pr.public_rating, 0) AS public_rating,
+            COALESCE(pr.heat_score, 0) AS heat_score,
+            COALESCE(pr.rating_votes, 0) AS rating_votes
+        FROM files_albums alb
+        JOIN files_artists art ON art.id = alb.artist_id
+        LEFT JOIN files_album_profiles pr
+          ON pr.artist_norm = art.name_norm
+         AND pr.title_norm = alb.title_norm
+    """
+    if where_clauses:
+        sql += " WHERE " + " AND ".join(where_clauses) + " "
+    sql += """
+        ORDER BY
+            COALESCE(pr.public_rating, 0) DESC,
+            COALESCE(pr.heat_score, 0) DESC,
+            COALESCE(pr.rating_votes, 0) DESC,
+            COALESCE(alb.year, 0) DESC,
+            art.name ASC,
+            alb.title ASC
+        LIMIT %s
+    """
+    params.append(int(count))
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+    if not rows and artist_ids:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    alb.id,
+                    alb.title,
+                    COALESCE(alb.year, 0) AS year,
+                    art.id AS artist_id,
+                    art.name AS artist_name,
+                    alb.has_cover,
+                    COALESCE(pr.public_rating, 0) AS public_rating,
+                    COALESCE(pr.heat_score, 0) AS heat_score,
+                    COALESCE(pr.rating_votes, 0) AS rating_votes
+                FROM files_albums alb
+                JOIN files_artists art ON art.id = alb.artist_id
+                LEFT JOIN files_album_profiles pr
+                  ON pr.artist_norm = art.name_norm
+                 AND pr.title_norm = alb.title_norm
+                ORDER BY
+                    COALESCE(pr.public_rating, 0) DESC,
+                    COALESCE(pr.heat_score, 0) DESC,
+                    COALESCE(pr.rating_votes, 0) DESC,
+                    COALESCE(alb.year, 0) DESC,
+                    art.name ASC,
+                    alb.title ASC
+                LIMIT %s
+                """,
+                (int(count),),
+            )
+            rows = cur.fetchall()
+    if not rows:
+        return {"handled": False}
+
+    focus_labels: list[str] = []
+    if artist_ids:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, name FROM files_artists WHERE id = ANY(%s)", (artist_ids,))
+            id_to_name = {int(r[0] or 0): str(r[1] or "").strip() for r in cur.fetchall()}
+        focus_labels = [id_to_name.get(aid, "") for aid in artist_ids if id_to_name.get(aid, "")]
+    if not focus_labels and genre:
+        focus_labels = [genre]
+    if lang == "fr":
+        heading = "Voici ce que je te conseillerais dans ta bibliotheque"
+        if focus_labels:
+            heading += f" autour de {', '.join(focus_labels)}"
+        heading += " :"
+    else:
+        heading = "Here is what I would recommend from your library"
+        if focus_labels:
+            heading += f" around {', '.join(focus_labels)}"
+        heading += ":"
+    lines = [heading]
+    links: list[dict[str, Any]] = []
+    citations: list[dict[str, Any]] = []
+    for row in rows:
+        album_id = int(row[0] or 0)
+        title = str(row[1] or "").strip() or f"Album #{album_id}"
+        year = int(row[2] or 0)
+        artist_id = int(row[3] or 0)
+        artist_name = str(row[4] or "").strip()
+        has_cover = bool(row[5])
+        public_rating = float(row[6] or 0.0)
+        heat_score = float(row[7] or 0.0)
+        rating_votes = int(row[8] or 0)
+        rating_txt = f"{public_rating:.1f}" if public_rating > 0 else "—"
+        if lang == "fr":
+            lines.append(f"- {artist_name} — {title} ({year if year > 0 else '—'}) · note publique {rating_txt} · score {heat_score:.0f}")
+        else:
+            lines.append(f"- {artist_name} — {title} ({year if year > 0 else '—'}) · public rating {rating_txt} · heat {heat_score:.0f}")
+        links.append(
+            {
+                "kind": "internal",
+                "label": title,
+                "href": f"/library/album/{album_id}",
+                "entity_type": "album",
+                "entity_id": album_id,
+                "thumb": has_cover and f"{base}/api/library/files/album/{album_id}/cover?size=96" or None,
+            }
+        )
+        if artist_id > 0:
+            links.append(
+                {
+                    "kind": "internal",
+                    "label": artist_name,
+                    "href": f"/library/artist/{artist_id}",
+                    "entity_type": "artist",
+                    "entity_id": artist_id,
+                    "thumb": f"{base}/api/library/files/artist/{artist_id}/image?size=192",
+                }
+            )
+        citations.append(
+            {
+                "entity_type": "album",
+                "entity_id": album_id,
+                "doc_type": "album_recommendation_tool",
+                "source": "pmda_db",
+                "title": title,
+                "chunk_id": -1,
+                "score": 1.0,
+                "snippet": f"{artist_name} — {title} · public_rating={public_rating:.1f} · votes={rating_votes} · heat={heat_score:.0f}",
+            }
+        )
+    return {
+        "handled": True,
+        "tool": "library_recommend_albums",
+        "assistant_text": "\n".join(lines).strip(),
+        "citations": citations[: min(len(citations), 8)],
+        "links": links[:16],
+        "ts": int(time.time()),
+    }
+
+
 def _assistant_tool_artist_concerts(conn, *, artist_id: int, limit: int = 12) -> tuple[str, str, list[dict]]:
     artist_id = int(artist_id or 0)
     limit = max(1, min(30, int(limit or 12)))
@@ -18436,6 +18634,14 @@ def _assistant_try_handle_tool_query(conn, *, user_message: str, context_artist_
         return _assistant_create_playlist_from_query(
             conn,
             user_id=_current_user_id_or_zero(),
+            user_message=user_message,
+            context_artist_id=int(context_artist_id or 0),
+            base_url=base_url,
+        )
+
+    if intent == "library_recommend_albums":
+        return _assistant_recommend_albums_from_query(
+            conn,
             user_message=user_message,
             context_artist_id=int(context_artist_id or 0),
             base_url=base_url,
