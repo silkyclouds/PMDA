@@ -59347,30 +59347,43 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
             resolved = resolve_mbid_to_release_group(release_mbid, tag_src)
             if resolved:
                 release_group_id = resolved
-        try:
-            result = musicbrainzngs.get_release_group_by_id(release_group_id, includes=["releases", "artist-credits"])
-            mb_release_info = result.get("release-group", {})
-            if mb_release_info:
-                strict_ok, strict_reason = _strict_identity_match_details(
-                    local_artist=artist_name,
-                    local_title=album_title_str,
-                    candidate_artist=_extract_mb_artist_names(mb_release_info),
-                    candidate_title=mb_release_info.get("title") or "",
-                )
-                if not strict_ok:
-                    logging.warning(
-                        "improve-folder: rejected MBID %s for %s / %s (%s)",
-                        release_group_id,
-                        artist_name,
-                        album_title_str,
-                        strict_reason,
+        missing_rg_cache = _mb_missing_release_group_ids_cache()
+        if release_group_id in missing_rg_cache:
+            steps.append(f"MusicBrainz release group unavailable: {release_group_id}")
+        else:
+            try:
+                result = musicbrainzngs.get_release_group_by_id(release_group_id, includes=["releases", "artist-credits"])
+                mb_release_info = result.get("release-group", {})
+                if mb_release_info:
+                    strict_ok, strict_reason = _strict_identity_match_details(
+                        local_artist=artist_name,
+                        local_title=album_title_str,
+                        candidate_artist=_extract_mb_artist_names(mb_release_info),
+                        candidate_title=mb_release_info.get("title") or "",
                     )
-                    steps.append(f"MusicBrainz rejected by strict identity: {strict_reason}")
-                    mb_release_info = None
-                    release_mbid = None
-        except Exception as e:
-            logging.warning("improve-folder: failed to fetch release group %s: %s", release_group_id, e)
-            steps.append(f"MusicBrainz lookup failed: {e}")
+                    if not strict_ok:
+                        logging.warning(
+                            "improve-folder: rejected MBID %s for %s / %s (%s)",
+                            release_group_id,
+                            artist_name,
+                            album_title_str,
+                            strict_reason,
+                        )
+                        steps.append(f"MusicBrainz rejected by strict identity: {strict_reason}")
+                        mb_release_info = None
+                        release_mbid = None
+            except Exception as e:
+                err_text = str(e or "").strip()
+                if "HTTP Error 404" in err_text:
+                    missing_rg_cache.add(release_group_id)
+                    logging.info(
+                        "improve-folder: release group %s not found; caching miss and skipping future direct fetches",
+                        release_group_id,
+                    )
+                    steps.append(f"MusicBrainz release group missing: {release_group_id}")
+                else:
+                    logging.warning("improve-folder: failed to fetch release group %s: %s", release_group_id, e)
+                    steps.append(f"MusicBrainz lookup failed: {e}")
 
     artist_mbid = current_tags.get("musicbrainz_albumartistid") or current_tags.get("musicbrainz_artistid")
     if not artist_mbid and USE_MUSICBRAINZ:
@@ -62145,7 +62158,29 @@ def _scan_collect_profile_enrich_targets(scan_id: int | None) -> list[dict]:
     except Exception:
         logging.debug("Failed to merge live publication hints for scan_id=%s", sid, exc_info=True)
     if not live_by_folder:
-        return rows
+        filtered_rows: list[dict] = []
+        skipped_missing = 0
+        for row in rows:
+            folder_key = str((row or {}).get("folder") or "").strip()
+            if not folder_key:
+                continue
+            try:
+                folder_live = path_for_fs_access(Path(folder_key))
+            except Exception:
+                skipped_missing += 1
+                continue
+            if not folder_live.exists() or not folder_live.is_dir():
+                skipped_missing += 1
+                continue
+            filtered_rows.append(row)
+        if skipped_missing:
+            logging.info(
+                "Scan profile/publication targets filtered missing folders for scan_id=%s: kept=%d skipped=%d",
+                sid,
+                len(filtered_rows),
+                skipped_missing,
+            )
+        return filtered_rows
     for row in rows:
         folder_key = str((row or {}).get("folder") or "").strip()
         live = live_by_folder.get(folder_key)
@@ -62198,7 +62233,29 @@ def _scan_collect_profile_enrich_targets(scan_id: int | None) -> list[dict]:
             row_meta["genre"] = live.get("genre")
         if live.get("label") and not row_meta.get("label"):
             row_meta["label"] = live.get("label")
-    return rows
+    filtered_rows: list[dict] = []
+    skipped_missing = 0
+    for row in rows:
+        folder_key = str((row or {}).get("folder") or "").strip()
+        if not folder_key:
+            continue
+        try:
+            folder_live = path_for_fs_access(Path(folder_key))
+        except Exception:
+            skipped_missing += 1
+            continue
+        if not folder_live.exists() or not folder_live.is_dir():
+            skipped_missing += 1
+            continue
+        filtered_rows.append(row)
+    if skipped_missing:
+        logging.info(
+            "Scan profile/publication targets filtered missing folders for scan_id=%s: kept=%d skipped=%d",
+            sid,
+            len(filtered_rows),
+            skipped_missing,
+        )
+    return filtered_rows
 
 
 def _run_improve_all_albums(artist_id: int, album_ids: list, album_titles: dict):
@@ -62288,6 +62345,15 @@ def _run_improve_all_albums(artist_id: int, album_ids: list, album_titles: dict)
             if state.get("improve_all"):
                 state["improve_all"]["running"] = False
                 state["improve_all"]["error"] = str(e)
+
+
+def _mb_missing_release_group_ids_cache() -> set[str]:
+    mod = sys.modules[__name__]
+    cache = getattr(mod, "_MB_MISSING_RELEASE_GROUP_IDS", None)
+    if not isinstance(cache, set):
+        cache = set()
+        setattr(mod, "_MB_MISSING_RELEASE_GROUP_IDS", cache)
+    return cache
 
 
 @app.post("/api/library/improve-all-albums")
