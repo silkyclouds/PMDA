@@ -388,11 +388,11 @@ export function AppSidebar() {
             <div>{isAdmin ? 'Administrator' : 'Library user'}</div>
           </div>
         </div>
-        <div className="px-2 pb-2 group-data-[collapsible=icon]:px-0.5">
+        <div className="flex justify-start px-2 pb-2 group-data-[collapsible=icon]:justify-center group-data-[collapsible=icon]:px-0.5">
           <ThemeToggle
-            showLabel
+            showLabel={false}
             align="start"
-            className="w-full group-data-[collapsible=icon]:h-8 group-data-[collapsible=icon]:w-8 group-data-[collapsible=icon]:justify-center group-data-[collapsible=icon]:px-0"
+            className="h-9 w-9 group-data-[collapsible=icon]:h-8 group-data-[collapsible=icon]:w-8"
           />
         </div>
         <div className="px-2 pb-2 group-data-[collapsible=icon]:px-0.5 group-data-[collapsible=icon]:pb-1">
