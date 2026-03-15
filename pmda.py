@@ -3122,6 +3122,10 @@ def _current_user_id_or_zero() -> int:
     return max(0, uid)
 
 
+def _current_user_or_empty() -> dict[str, Any]:
+    return dict(getattr(g, "current_user", {}) or {}) if has_request_context() else {}
+
+
 def _current_username_or_blank() -> str:
     user = dict(getattr(g, "current_user", {}) or {}) if has_request_context() else {}
     return str(user.get("username") or "").strip()
@@ -55683,7 +55687,7 @@ def api_library_artist_summary_ai(artist_id: int):
     """Generate/refresh an AI summary (100-200 words) for an artist and persist it in PostgreSQL."""
     if _get_library_mode() != "files":
         return jsonify({"error": "Artist summary endpoint is available in Files mode only"}), 400
-    if not _auth_user_can_use_ai(_current_user()):
+    if not _auth_user_can_use_ai(_current_user_or_empty()):
         return jsonify({"error": "AI access is disabled for this user"}), 403
     ai_ok, _provider_effective, _auth_mode, ai_reason = _resolve_ai_runtime_availability(
         analysis_type="assistant_chat",
@@ -63675,7 +63679,7 @@ def api_library_album_review_generate(album_id: int):
     """Manually generate/persist one album review profile (web+AI first, then provider fallback)."""
     if _get_library_mode() != "files":
         return jsonify({"error": "Files mode required"}), 400
-    if not _auth_user_can_use_ai(_current_user()):
+    if not _auth_user_can_use_ai(_current_user_or_empty()):
         return jsonify({"error": "AI access is disabled for this user"}), 403
     ok, err = _ensure_files_index_ready()
     if not ok:
@@ -67603,7 +67607,7 @@ def api_assistant_chat():
     """Chat endpoint: uses Postgres-backed RAG (artist profiles + local library snapshot)."""
     if _get_library_mode() != "files":
         return jsonify({"error": "Assistant is available in Files mode only"}), 400
-    if not _auth_user_can_use_ai(_current_user()):
+    if not _auth_user_can_use_ai(_current_user_or_empty()):
         return jsonify({"error": "AI access is disabled for this user"}), 403
     data = request.get_json() or {}
     if not isinstance(data, dict):
@@ -67846,7 +67850,7 @@ def api_assistant_chat():
 def api_library_entity_discover():
     if _get_library_mode() != "files":
         return jsonify({"error": "Files mode required"}), 400
-    if not _auth_user_can_use_ai(_current_user()):
+    if not _auth_user_can_use_ai(_current_user_or_empty()):
         return jsonify({"error": "AI access is disabled for this user"}), 403
     ok, err = _ensure_files_index_ready()
     if not ok:
