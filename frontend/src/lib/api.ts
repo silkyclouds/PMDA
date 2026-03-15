@@ -1864,8 +1864,11 @@ export interface SocialUser {
   is_admin: boolean;
   can_download: boolean;
   can_view_statistics: boolean;
+  allow_ai_calls?: boolean;
   is_active: boolean;
   accept_shares?: boolean;
+  share_liked_public?: boolean;
+  share_recommendations_public?: boolean;
   avatar_data_url?: string | null;
   created_at: number;
   updated_at: number;
@@ -1873,6 +1876,7 @@ export interface SocialUser {
 }
 
 export interface LikedSummaryResponse {
+  owner?: SocialUser | null;
   albums: LibraryAlbumItem[];
   artists: RecentlyAddedArtistItem[];
   labels: Array<{ label: string; updated_at: number }>;
@@ -1911,9 +1915,15 @@ export interface RecommendationItem {
 }
 
 export interface RecommendationListResponse {
+  owner?: SocialUser | null;
   received: RecommendationItem[];
   sent: RecommendationItem[];
   unread_count: number;
+}
+
+export interface SocialContextResponse {
+  liked_by: SocialUser[];
+  recommended_by: SocialUser[];
 }
 
 export interface UserNotificationItem {
@@ -1933,12 +1943,28 @@ export interface UserNotificationItem {
   read_at?: number | null;
 }
 
-export async function getLikedSummary(): Promise<LikedSummaryResponse> {
-  return fetchApi<LikedSummaryResponse>('/api/library/liked');
+export async function getLikedSummary(userId?: number): Promise<LikedSummaryResponse> {
+  const q = new URLSearchParams();
+  if (userId && userId > 0) q.set('user_id', String(userId));
+  return fetchApi<LikedSummaryResponse>(`/api/library/liked${q.toString() ? `?${q.toString()}` : ''}`);
 }
 
-export async function getSocialUsers(): Promise<{ users: SocialUser[] }> {
-  return fetchApi<{ users: SocialUser[] }>('/api/library/social/users');
+export async function getSocialUsers(mode: 'shares' | 'liked' | 'recommendations' = 'shares'): Promise<{ users: SocialUser[] }> {
+  const q = new URLSearchParams();
+  q.set('mode', mode);
+  return fetchApi<{ users: SocialUser[] }>(`/api/library/social/users?${q.toString()}`);
+}
+
+export async function getSocialContext(input: {
+  entity_type: 'artist' | 'album' | 'track' | 'label' | 'genre' | 'playlist';
+  entity_id?: number;
+  entity_key?: string;
+}): Promise<SocialContextResponse> {
+  const q = new URLSearchParams();
+  q.set('entity_type', input.entity_type);
+  if (input.entity_id && input.entity_id > 0) q.set('entity_id', String(input.entity_id));
+  if (input.entity_key) q.set('entity_key', input.entity_key);
+  return fetchApi<SocialContextResponse>(`/api/library/social/context?${q.toString()}`);
 }
 
 export async function shareLibraryEntity(payload: ShareEntityPayload): Promise<{ ok: boolean; count: number; recommendation_ids: number[] }> {
@@ -1948,8 +1974,10 @@ export async function shareLibraryEntity(payload: ShareEntityPayload): Promise<{
   });
 }
 
-export async function getRecommendations(): Promise<RecommendationListResponse> {
-  return fetchApi<RecommendationListResponse>('/api/library/recommendations');
+export async function getRecommendations(userId?: number): Promise<RecommendationListResponse> {
+  const q = new URLSearchParams();
+  if (userId && userId > 0) q.set('user_id', String(userId));
+  return fetchApi<RecommendationListResponse>(`/api/library/recommendations${q.toString() ? `?${q.toString()}` : ''}`);
 }
 
 export async function likeRecommendation(recommendationId: number): Promise<{ ok: boolean; recommendation_id: number; liked_by_recipient: boolean }> {
@@ -3272,8 +3300,11 @@ export interface AuthUser {
   is_admin: boolean;
   can_download: boolean;
   can_view_statistics: boolean;
+  allow_ai_calls?: boolean;
   is_active: boolean;
   accept_shares?: boolean;
+  share_liked_public?: boolean;
+  share_recommendations_public?: boolean;
   avatar_data_url?: string | null;
   created_at: number;
   updated_at: number;
@@ -3311,6 +3342,8 @@ export interface AuthMeResponse {
 
 export interface AuthProfileUpdateRequest {
   accept_shares?: boolean;
+  share_liked_public?: boolean;
+  share_recommendations_public?: boolean;
   avatar_data_url?: string | null;
 }
 
@@ -3330,6 +3363,7 @@ export interface AdminUserCreateRequest {
   is_admin?: boolean;
   can_download?: boolean;
   can_view_statistics?: boolean;
+  allow_ai_calls?: boolean;
   is_active?: boolean;
 }
 
@@ -3339,6 +3373,7 @@ export interface AdminUserUpdateRequest {
   is_admin?: boolean;
   can_download?: boolean;
   can_view_statistics?: boolean;
+  allow_ai_calls?: boolean;
   is_active?: boolean;
 }
 

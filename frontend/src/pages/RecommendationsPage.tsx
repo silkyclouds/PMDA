@@ -3,11 +3,13 @@ import { Heart, Inbox, Loader2, MessageSquareShare, Send, Share2 } from 'lucide-
 import { useLocation, useNavigate } from 'react-router-dom';
 
 import * as api from '@/lib/api';
+import { useAuth } from '@/contexts/AuthContext';
 import { AlbumArtwork } from '@/components/library/AlbumArtwork';
 import { ShareDialog } from '@/components/social/ShareDialog';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { useToast } from '@/hooks/use-toast';
 import { withBackLinkState } from '@/lib/backNavigation';
@@ -30,18 +32,29 @@ function openEntity(
 export default function RecommendationsPage() {
   const navigate = useNavigate();
   const location = useLocation();
+  const { user } = useAuth();
   const { toast } = useToast();
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [tab, setTab] = useState<'received' | 'sent'>('received');
   const [data, setData] = useState<api.RecommendationListResponse | null>(null);
   const [likingId, setLikingId] = useState<number | null>(null);
+  const [visibleUsers, setVisibleUsers] = useState<api.SocialUser[]>([]);
+  const [selectedUserId, setSelectedUserId] = useState<string>('me');
+  const requestedUserId = useMemo(() => {
+    const value = new URLSearchParams(location.search).get('user');
+    return value && /^\d+$/.test(value) ? value : 'me';
+  }, [location.search]);
+
+  useEffect(() => {
+    setSelectedUserId(requestedUserId);
+  }, [requestedUserId]);
 
   const load = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
-      const res = await api.getRecommendations();
+      const res = await api.getRecommendations(selectedUserId === 'me' ? undefined : Number(selectedUserId));
       setData(res);
     } catch (err) {
       setData(null);
@@ -49,11 +62,37 @@ export default function RecommendationsPage() {
     } finally {
       setLoading(false);
     }
+  }, [selectedUserId]);
+
+  const loadUsers = useCallback(async () => {
+    try {
+      const res = await api.getSocialUsers('recommendations');
+      setVisibleUsers(Array.isArray(res.users) ? res.users : []);
+    } catch {
+      setVisibleUsers([]);
+    }
   }, []);
 
   useEffect(() => {
     void load();
   }, [load]);
+
+  useEffect(() => {
+    void loadUsers();
+  }, [loadUsers]);
+
+  useEffect(() => {
+    const qs = new URLSearchParams(location.search);
+    if (selectedUserId === 'me') {
+      qs.delete('user');
+    } else {
+      qs.set('user', selectedUserId);
+    }
+    const nextSearch = qs.toString() ? `?${qs.toString()}` : '';
+    if (nextSearch !== location.search) {
+      navigate({ pathname: location.pathname, search: nextSearch }, { replace: true });
+    }
+  }, [location.pathname, location.search, navigate, selectedUserId]);
 
   const items = useMemo(
     () => (tab === 'received' ? (data?.received || []) : (data?.sent || [])),
@@ -88,6 +127,19 @@ export default function RecommendationsPage() {
           </p>
         </div>
         <div className="flex items-center gap-2">
+          <Select value={selectedUserId} onValueChange={setSelectedUserId}>
+            <SelectTrigger className="w-[240px]">
+              <SelectValue placeholder="Choose a user" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="me">My recommendations</SelectItem>
+              {visibleUsers.map((candidate) => (
+                <SelectItem key={`recommend-user-${candidate.id}`} value={String(candidate.id)}>
+                  {candidate.username}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
           {Number(data?.unread_count || 0) > 0 ? (
             <Badge variant="outline" className="text-[11px]">
               {data?.unread_count} unread
@@ -111,6 +163,12 @@ export default function RecommendationsPage() {
           </TabsTrigger>
         </TabsList>
       </Tabs>
+
+      {data?.owner?.username ? (
+        <div className="text-sm text-muted-foreground">
+          Viewing recommendations for <span className="font-medium text-foreground">{selectedUserId === 'me' ? (user?.username || data.owner.username) : data.owner.username}</span>
+        </div>
+      ) : null}
 
       {loading ? (
         <div className="flex items-center justify-center py-24 text-muted-foreground">

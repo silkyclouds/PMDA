@@ -145,7 +145,7 @@ function AppRoutesWithPlayer() {
         <Route path="/auth/login" element={<Navigate to="/library" replace />} />
         <Route path="/auth/bootstrap" element={<Navigate to="/library" replace />} />
       </Routes>
-      <AssistantDock bottomOffsetPx={session ? 128 : 16} />
+      {auth.canUseAI ? <AssistantDock bottomOffsetPx={session ? 128 : 16} /> : null}
       {session && (
         <AudioPlayer
           albumId={session.albumId}

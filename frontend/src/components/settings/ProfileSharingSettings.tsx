@@ -23,6 +23,46 @@ function getApiErrorMessage(error: unknown): string {
   return 'Request failed';
 }
 
+async function readImageDataUrl(file: File): Promise<string> {
+  return await new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = typeof reader.result === 'string' ? reader.result : '';
+      if (!result.startsWith('data:image/')) {
+        reject(new Error('Unsupported avatar image'));
+        return;
+      }
+      resolve(result);
+    };
+    reader.onerror = () => reject(new Error('Failed to read avatar image'));
+    reader.readAsDataURL(file);
+  });
+}
+
+async function optimizeAvatarDataUrl(file: File): Promise<string> {
+  const input = await readImageDataUrl(file);
+  const image = await new Promise<HTMLImageElement>((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error('Failed to decode avatar image'));
+    img.src = input;
+  });
+  const side = 512;
+  const canvas = document.createElement('canvas');
+  canvas.width = side;
+  canvas.height = side;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return input;
+  const srcSide = Math.min(image.naturalWidth, image.naturalHeight);
+  const sx = Math.max(0, Math.floor((image.naturalWidth - srcSide) / 2));
+  const sy = Math.max(0, Math.floor((image.naturalHeight - srcSide) / 2));
+  ctx.clearRect(0, 0, side, side);
+  ctx.drawImage(image, sx, sy, srcSide, srcSide, 0, 0, side, side);
+  const webp = canvas.toDataURL('image/webp', 0.84);
+  if (webp.length <= 1024 * 1024) return webp;
+  return canvas.toDataURL('image/jpeg', 0.82);
+}
+
 type Props = {
   compact?: boolean;
 };
@@ -30,18 +70,28 @@ type Props = {
 export function ProfileSharingSettings({ compact = false }: Props) {
   const { user, refreshSession } = useAuth();
   const [acceptShares, setAcceptShares] = useState<boolean>(Boolean(user?.accept_shares ?? true));
+  const [shareLikedPublic, setShareLikedPublic] = useState<boolean>(Boolean(user?.share_liked_public ?? false));
+  const [shareRecommendationsPublic, setShareRecommendationsPublic] = useState<boolean>(Boolean(user?.share_recommendations_public ?? false));
   const [avatarDataUrl, setAvatarDataUrl] = useState<string | null>(user?.avatar_data_url ?? null);
   const [saving, setSaving] = useState(false);
+  const [avatarBusy, setAvatarBusy] = useState(false);
   const inputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
     setAcceptShares(Boolean(user?.accept_shares ?? true));
+    setShareLikedPublic(Boolean(user?.share_liked_public ?? false));
+    setShareRecommendationsPublic(Boolean(user?.share_recommendations_public ?? false));
     setAvatarDataUrl(user?.avatar_data_url ?? null);
-  }, [user?.accept_shares, user?.avatar_data_url]);
+  }, [user?.accept_shares, user?.avatar_data_url, user?.share_liked_public, user?.share_recommendations_public]);
 
   const hasChanges = useMemo(
-    () => Boolean(acceptShares !== Boolean(user?.accept_shares ?? true) || (avatarDataUrl ?? null) !== (user?.avatar_data_url ?? null)),
-    [acceptShares, avatarDataUrl, user?.accept_shares, user?.avatar_data_url],
+    () => Boolean(
+      acceptShares !== Boolean(user?.accept_shares ?? true)
+      || shareLikedPublic !== Boolean(user?.share_liked_public ?? false)
+      || shareRecommendationsPublic !== Boolean(user?.share_recommendations_public ?? false)
+      || (avatarDataUrl ?? null) !== (user?.avatar_data_url ?? null)
+    ),
+    [acceptShares, avatarDataUrl, shareLikedPublic, shareRecommendationsPublic, user?.accept_shares, user?.avatar_data_url, user?.share_liked_public, user?.share_recommendations_public],
   );
 
   const saveProfile = async () => {
@@ -49,6 +99,8 @@ export function ProfileSharingSettings({ compact = false }: Props) {
     try {
       await api.updateAuthProfile({
         accept_shares: acceptShares,
+        share_liked_public: shareLikedPublic,
+        share_recommendations_public: shareRecommendationsPublic,
         avatar_data_url: avatarDataUrl,
       });
       await refreshSession();
@@ -68,22 +120,15 @@ export function ProfileSharingSettings({ compact = false }: Props) {
       event.target.value = '';
       return;
     }
-    if (file.size > 256 * 1024) {
-      toast.error('Avatar image must be 256 KB or smaller');
-      event.target.value = '';
-      return;
+    setAvatarBusy(true);
+    try {
+      const optimized = await optimizeAvatarDataUrl(file);
+      setAvatarDataUrl(optimized);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'Failed to process avatar image');
+    } finally {
+      setAvatarBusy(false);
     }
-    const reader = new FileReader();
-    reader.onload = () => {
-      const result = typeof reader.result === 'string' ? reader.result : '';
-      if (!result.startsWith('data:image/')) {
-        toast.error('Unsupported avatar image');
-        return;
-      }
-      setAvatarDataUrl(result);
-    };
-    reader.onerror = () => toast.error('Failed to read avatar image');
-    reader.readAsDataURL(file);
     event.target.value = '';
   };
 
@@ -118,8 +163,8 @@ export function ProfileSharingSettings({ compact = false }: Props) {
               onChange={onSelectAvatar}
             />
             <Button type="button" variant="outline" className="gap-2" onClick={() => inputRef.current?.click()}>
-              <Upload className="h-4 w-4" />
-              Upload avatar
+              {avatarBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
+              {avatarBusy ? 'Processing avatar…' : 'Upload avatar'}
             </Button>
             <Button
               type="button"
@@ -145,6 +190,40 @@ export function ProfileSharingSettings({ compact = false }: Props) {
               </p>
             </div>
             <Switch id="accept-shares" checked={acceptShares} onCheckedChange={setAcceptShares} />
+          </div>
+        </div>
+
+        <div className="grid gap-4 lg:grid-cols-2">
+          <div className="rounded-xl border border-border/60 bg-background/40 p-4">
+            <div className="flex items-start justify-between gap-4">
+              <div className="space-y-1">
+                <Label htmlFor="share-liked-public" className="text-sm font-medium">
+                  Let others browse your liked page
+                </Label>
+                <p className="text-xs text-muted-foreground">
+                  If enabled, other users can open your liked albums, artists and labels from social badges and the liked page user picker.
+                </p>
+              </div>
+              <Switch id="share-liked-public" checked={shareLikedPublic} onCheckedChange={setShareLikedPublic} />
+            </div>
+          </div>
+
+          <div className="rounded-xl border border-border/60 bg-background/40 p-4">
+            <div className="flex items-start justify-between gap-4">
+              <div className="space-y-1">
+                <Label htmlFor="share-recommendations-public" className="text-sm font-medium">
+                  Let others browse your recommendations
+                </Label>
+                <p className="text-xs text-muted-foreground">
+                  If enabled, other users can browse recommendations you received or sent when you choose to make them public.
+                </p>
+              </div>
+              <Switch
+                id="share-recommendations-public"
+                checked={shareRecommendationsPublic}
+                onCheckedChange={setShareRecommendationsPublic}
+              />
+            </div>
           </div>
         </div>
 

@@ -16,6 +16,7 @@ interface UserDraft {
   is_admin: boolean;
   can_download: boolean;
   can_view_statistics: boolean;
+  allow_ai_calls: boolean;
   is_active: boolean;
   password: string;
 }
@@ -26,6 +27,7 @@ function toDraft(user: api.AuthUser): UserDraft {
     is_admin: Boolean(user.is_admin),
     can_download: Boolean(user.can_download),
     can_view_statistics: Boolean(user.can_view_statistics),
+    allow_ai_calls: Boolean(user.allow_ai_calls ?? true),
     is_active: Boolean(user.is_active),
     password: '',
   };
@@ -62,6 +64,7 @@ export default function AdminUsersPage() {
     is_admin: false,
     can_download: false,
     can_view_statistics: false,
+    allow_ai_calls: true,
   });
 
   const loadUsers = useCallback(async () => {
@@ -98,6 +101,7 @@ export default function AdminUsersPage() {
           is_admin: false,
           can_download: false,
           can_view_statistics: false,
+          allow_ai_calls: true,
           is_active: true,
           password: '',
         }),
@@ -117,6 +121,7 @@ export default function AdminUsersPage() {
           is_admin: Boolean(draft.is_admin),
           can_download: Boolean(draft.can_download),
           can_view_statistics: Boolean(draft.can_view_statistics),
+          allow_ai_calls: Boolean(draft.allow_ai_calls),
           is_active: Boolean(draft.is_active),
         };
         if (draft.password.trim()) {
@@ -152,6 +157,7 @@ export default function AdminUsersPage() {
         is_admin: newUser.is_admin,
         can_download: newUser.can_download,
         can_view_statistics: newUser.can_view_statistics,
+        allow_ai_calls: newUser.allow_ai_calls,
       });
       toast.success('User created');
       setNewUser({
@@ -161,6 +167,7 @@ export default function AdminUsersPage() {
         is_admin: false,
         can_download: false,
         can_view_statistics: false,
+        allow_ai_calls: true,
       });
       await loadUsers();
     } catch (error) {
@@ -234,7 +241,7 @@ export default function AdminUsersPage() {
                     <p className="text-sm font-medium">#{u.id} · {u.username}</p>
                     <p className="text-xs text-muted-foreground">Last login: {formatLastLogin(u.last_login_at)}</p>
                   </div>
-                  <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-7">
+                  <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-8">
                     <div className="space-y-1">
                       <Label htmlFor={`username-${u.id}`}>Username</Label>
                       <Input
@@ -280,6 +287,16 @@ export default function AdminUsersPage() {
                           id={`statistics-${u.id}`}
                           checked={Boolean(draft.can_view_statistics)}
                           onCheckedChange={(checked) => updateDraft(u.id, { can_view_statistics: Boolean(checked) })}
+                        />
+                      </div>
+                    </div>
+                    <div className="space-y-1">
+                      <Label htmlFor={`ai-calls-${u.id}`}>Allow AI calls</Label>
+                      <div className="flex h-10 items-center">
+                        <Switch
+                          id={`ai-calls-${u.id}`}
+                          checked={Boolean(draft.allow_ai_calls)}
+                          onCheckedChange={(checked) => updateDraft(u.id, { allow_ai_calls: Boolean(checked) })}
                         />
                       </div>
                     </div>
@@ -386,6 +403,14 @@ export default function AdminUsersPage() {
                 onCheckedChange={(checked) => setNewUser((prev) => ({ ...prev, can_view_statistics: Boolean(checked) }))}
               />
               <Label htmlFor="new-can-view-statistics">Can view statistics</Label>
+            </div>
+            <div className="flex items-center gap-2">
+              <Switch
+                id="new-allow-ai-calls"
+                checked={Boolean(newUser.allow_ai_calls)}
+                onCheckedChange={(checked) => setNewUser((prev) => ({ ...prev, allow_ai_calls: Boolean(checked) }))}
+              />
+              <Label htmlFor="new-allow-ai-calls">Allow AI calls</Label>
             </div>
           </div>
             <Button type="button" onClick={() => void onCreateUser()} disabled={createBusy}>

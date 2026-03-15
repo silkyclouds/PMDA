@@ -198,7 +198,7 @@ export default function AlbumPage() {
   const params = useParams<{ albumId: string }>();
   const albumId = Number(params.albumId);
   const { startPlayback, setCurrentTrack, queueTrack } = usePlayback();
-  const { isAdmin, canDownload } = useAuth();
+  const { isAdmin, canDownload, canUseAI } = useAuth();
   const { toast } = useToast();
 
   const [loading, setLoading] = useState(true);
@@ -624,12 +624,14 @@ export default function AlbumPage() {
               </Button>
             )}
           />
-          <EntityDiscoverDialog
-            entityType="album"
-            albumId={data.album_id}
-            entityLabel={data.title}
-            triggerLabel="Discover"
-          />
+          {canUseAI ? (
+            <EntityDiscoverDialog
+              entityType="album"
+              albumId={data.album_id}
+              entityLabel={data.title}
+              triggerLabel="Discover"
+            />
+          ) : null}
         </div>
       </div>
 

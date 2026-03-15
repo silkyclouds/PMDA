@@ -980,8 +980,11 @@ def _auth_public_user(row: sqlite3.Row | dict | None) -> dict:
         "is_admin": bool(int(_get("is_admin", 0) or 0)),
         "can_download": bool(int(_get("can_download", 0) or 0)),
         "can_view_statistics": bool(int(_get("can_view_statistics", 0) or 0)),
+        "allow_ai_calls": bool(int(_get("allow_ai_calls", 1) or 0)),
         "is_active": bool(int(_get("is_active", 0) or 0)),
         "accept_shares": bool(int(_get("accept_shares", 1) or 0)),
+        "share_liked_public": bool(int(_get("share_liked_public", 0) or 0)),
+        "share_recommendations_public": bool(int(_get("share_recommendations_public", 0) or 0)),
         "avatar_data_url": str(_get("avatar_data_url", "") or "").strip() or None,
         "created_at": int(_get("created_at", 0) or 0),
         "updated_at": int(_get("updated_at", 0) or 0),
@@ -1023,8 +1026,8 @@ def _auth_validate_avatar_data_url(value: Any) -> tuple[bool, Optional[str], str
         decoded = base64.b64decode(payload, validate=True)
     except Exception:
         return False, None, "Avatar image payload is invalid"
-    if len(decoded) > 256 * 1024:
-        return False, None, "Avatar image must be 256 KB or smaller"
+    if len(decoded) > 1024 * 1024:
+        return False, None, "Avatar image must be 1 MB or smaller after PMDA processing"
     mime = m.group(1).lower()
     if mime == "jpg":
         mime = "jpeg"
@@ -1040,7 +1043,7 @@ def _auth_get_user_by_username(username: str) -> Optional[sqlite3.Row]:
         cur = con.cursor()
         cur.execute(
             """
-            SELECT id, username, password_hash, password_salt, is_admin, can_download, can_view_statistics, is_active, accept_shares, avatar_data_url, created_at, updated_at, last_login_at
+            SELECT id, username, password_hash, password_salt, is_admin, can_download, can_view_statistics, allow_ai_calls, is_active, accept_shares, share_liked_public, share_recommendations_public, avatar_data_url, created_at, updated_at, last_login_at
             FROM auth_users
             WHERE username = ?
             LIMIT 1
@@ -1065,7 +1068,7 @@ def _auth_get_user_by_id(user_id: int) -> Optional[sqlite3.Row]:
         cur = con.cursor()
         cur.execute(
             """
-            SELECT id, username, password_hash, password_salt, is_admin, can_download, can_view_statistics, is_active, accept_shares, avatar_data_url, created_at, updated_at, last_login_at
+            SELECT id, username, password_hash, password_salt, is_admin, can_download, can_view_statistics, allow_ai_calls, is_active, accept_shares, share_liked_public, share_recommendations_public, avatar_data_url, created_at, updated_at, last_login_at
             FROM auth_users
             WHERE id = ?
             LIMIT 1
@@ -1115,6 +1118,7 @@ def _auth_create_user(
     is_admin: bool,
     can_download: bool,
     can_view_statistics: bool,
+    allow_ai_calls: bool = True,
     is_active: bool = True,
 ) -> tuple[bool, str, Optional[dict]]:
     ok_u, user_or_msg = _auth_validate_username(username)
@@ -1132,9 +1136,9 @@ def _auth_create_user(
         cur.execute(
             """
             INSERT INTO auth_users(
-                username, password_hash, password_salt, is_admin, can_download, can_view_statistics, is_active, created_at, updated_at
+                username, password_hash, password_salt, is_admin, can_download, can_view_statistics, allow_ai_calls, is_active, created_at, updated_at
             )
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 username_clean,
@@ -1143,6 +1147,7 @@ def _auth_create_user(
                 1 if is_admin else 0,
                 1 if can_download else 0,
                 1 if can_view_statistics else 0,
+                1 if allow_ai_calls else 0,
                 1 if is_active else 0,
                 now,
                 now,
@@ -1356,8 +1361,11 @@ def _auth_resolve_session(raw_token: str) -> Optional[dict]:
                     u.is_admin,
                     u.can_download,
                     u.can_view_statistics,
+                    u.allow_ai_calls,
                     u.is_active,
                     u.accept_shares,
+                    u.share_liked_public,
+                    u.share_recommendations_public,
                     u.avatar_data_url,
                     u.created_at,
                     u.updated_at,
@@ -3132,13 +3140,19 @@ def _auth_user_snapshot(user_id: int) -> dict[str, Any]:
     }
 
 
-def _auth_active_users_list(*, exclude_user_id: int = 0, require_accept_shares: bool = False) -> list[dict[str, Any]]:
+def _auth_active_users_list(
+    *,
+    exclude_user_id: int = 0,
+    require_accept_shares: bool = False,
+    require_public_likes: bool = False,
+    require_public_recommendations: bool = False,
+) -> list[dict[str, Any]]:
     con = _auth_db_connect()
     try:
         cur = con.cursor()
         cur.execute(
             """
-            SELECT id, username, is_admin, can_download, can_view_statistics, is_active, accept_shares, avatar_data_url, created_at, updated_at, last_login_at
+            SELECT id, username, is_admin, can_download, can_view_statistics, allow_ai_calls, is_active, accept_shares, share_liked_public, share_recommendations_public, avatar_data_url, created_at, updated_at, last_login_at
             FROM auth_users
             WHERE is_active = 1
             ORDER BY username COLLATE NOCASE ASC
@@ -3152,10 +3166,42 @@ def _auth_active_users_list(*, exclude_user_id: int = 0, require_accept_shares: 
                 continue
             if require_accept_shares and not bool(pub.get("accept_shares")):
                 continue
+            if require_public_likes and not bool(pub.get("share_liked_public")):
+                continue
+            if require_public_recommendations and not bool(pub.get("share_recommendations_public")):
+                continue
             users.append(pub)
         return users
     finally:
         con.close()
+
+
+def _auth_user_can_use_ai(user: dict[str, Any] | None) -> bool:
+    if not user:
+        return False
+    if bool(user.get("is_admin")):
+        return True
+    return bool(user.get("allow_ai_calls", True))
+
+
+def _auth_resolve_public_user_scope(
+    requested_user_id: Any,
+    *,
+    current_user_id: int,
+    visibility_key: str,
+) -> tuple[int, Optional[dict], Optional[tuple[str, int]]]:
+    target_user_id = _parse_int_loose(requested_user_id, 0)
+    if target_user_id <= 0 or target_user_id == int(current_user_id or 0):
+        row = _auth_get_user_by_id(int(current_user_id or 0))
+        pub = _auth_public_user(row)
+        return int(current_user_id or 0), pub if pub else None, None
+    row = _auth_get_user_by_id(int(target_user_id))
+    pub = _auth_public_user(row)
+    if not pub or not bool(pub.get("is_active")):
+        return 0, None, ("User not found", 404)
+    if not bool(pub.get(visibility_key)):
+        return 0, None, ("This user does not share this view", 403)
+    return int(target_user_id), pub, None
 
 
 def _normalize_provider_id(provider_id: str, *, fallback: str = "openai-api") -> str:
@@ -6742,8 +6788,11 @@ def init_settings_db():
             is_admin INTEGER NOT NULL DEFAULT 0,
             can_download INTEGER NOT NULL DEFAULT 0,
             can_view_statistics INTEGER NOT NULL DEFAULT 0,
+            allow_ai_calls INTEGER NOT NULL DEFAULT 1,
             is_active INTEGER NOT NULL DEFAULT 1,
             accept_shares INTEGER NOT NULL DEFAULT 1,
+            share_liked_public INTEGER NOT NULL DEFAULT 0,
+            share_recommendations_public INTEGER NOT NULL DEFAULT 0,
             avatar_data_url TEXT,
             created_at INTEGER NOT NULL,
             updated_at INTEGER NOT NULL,
@@ -6808,10 +6857,16 @@ def init_settings_db():
         cur.execute("ALTER TABLE auth_users ADD COLUMN can_download INTEGER NOT NULL DEFAULT 0")
     if "can_view_statistics" not in auth_user_cols:
         cur.execute("ALTER TABLE auth_users ADD COLUMN can_view_statistics INTEGER NOT NULL DEFAULT 0")
+    if "allow_ai_calls" not in auth_user_cols:
+        cur.execute("ALTER TABLE auth_users ADD COLUMN allow_ai_calls INTEGER NOT NULL DEFAULT 1")
     if "is_active" not in auth_user_cols:
         cur.execute("ALTER TABLE auth_users ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1")
     if "accept_shares" not in auth_user_cols:
         cur.execute("ALTER TABLE auth_users ADD COLUMN accept_shares INTEGER NOT NULL DEFAULT 1")
+    if "share_liked_public" not in auth_user_cols:
+        cur.execute("ALTER TABLE auth_users ADD COLUMN share_liked_public INTEGER NOT NULL DEFAULT 0")
+    if "share_recommendations_public" not in auth_user_cols:
+        cur.execute("ALTER TABLE auth_users ADD COLUMN share_recommendations_public INTEGER NOT NULL DEFAULT 0")
     if "avatar_data_url" not in auth_user_cols:
         cur.execute("ALTER TABLE auth_users ADD COLUMN avatar_data_url TEXT")
     if "last_login_at" not in auth_user_cols:
@@ -7002,6 +7057,7 @@ def _auth_guard():
             "is_admin": True,
             "can_download": True,
             "can_view_statistics": True,
+            "allow_ai_calls": True,
             "is_active": True,
         }
         return None
@@ -10752,6 +10808,18 @@ def _files_pg_init_schema() -> bool:
                     status TEXT NOT NULL DEFAULT 'sent'
                 )
             """)
+            cur.execute("ALTER TABLE files_social_recommendations ADD COLUMN IF NOT EXISTS sender_username TEXT NOT NULL DEFAULT ''")
+            cur.execute("ALTER TABLE files_social_recommendations ADD COLUMN IF NOT EXISTS recipient_user_id INTEGER NOT NULL DEFAULT 0")
+            cur.execute("ALTER TABLE files_social_recommendations ADD COLUMN IF NOT EXISTS recipient_username TEXT NOT NULL DEFAULT ''")
+            cur.execute("ALTER TABLE files_social_recommendations ADD COLUMN IF NOT EXISTS entity_subtitle TEXT NOT NULL DEFAULT ''")
+            cur.execute("ALTER TABLE files_social_recommendations ADD COLUMN IF NOT EXISTS entity_href TEXT NOT NULL DEFAULT ''")
+            cur.execute("ALTER TABLE files_social_recommendations ADD COLUMN IF NOT EXISTS entity_thumb TEXT NOT NULL DEFAULT ''")
+            cur.execute("ALTER TABLE files_social_recommendations ADD COLUMN IF NOT EXISTS entity_meta_json TEXT NOT NULL DEFAULT '{}'")
+            cur.execute("ALTER TABLE files_social_recommendations ADD COLUMN IF NOT EXISTS parent_recommendation_id BIGINT NULL")
+            cur.execute("ALTER TABLE files_social_recommendations ADD COLUMN IF NOT EXISTS liked_by_recipient BOOLEAN NOT NULL DEFAULT FALSE")
+            cur.execute("ALTER TABLE files_social_recommendations ADD COLUMN IF NOT EXISTS liked_at TIMESTAMPTZ NULL")
+            cur.execute("ALTER TABLE files_social_recommendations ADD COLUMN IF NOT EXISTS read_at TIMESTAMPTZ NULL")
+            cur.execute("ALTER TABLE files_social_recommendations ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'sent'")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_files_social_recommendations_recipient_created ON files_social_recommendations(recipient_user_id, created_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_files_social_recommendations_sender_created ON files_social_recommendations(sender_user_id, created_at DESC)")
             cur.execute("""
@@ -10773,6 +10841,12 @@ def _files_pg_init_schema() -> bool:
                     read_at TIMESTAMPTZ NULL
                 )
             """)
+            cur.execute("ALTER TABLE files_user_notifications ADD COLUMN IF NOT EXISTS actor_user_id INTEGER NULL")
+            cur.execute("ALTER TABLE files_user_notifications ADD COLUMN IF NOT EXISTS actor_username TEXT NOT NULL DEFAULT ''")
+            cur.execute("ALTER TABLE files_user_notifications ADD COLUMN IF NOT EXISTS recommendation_id BIGINT NULL")
+            cur.execute("ALTER TABLE files_user_notifications ADD COLUMN IF NOT EXISTS payload_json TEXT NOT NULL DEFAULT '{}'")
+            cur.execute("ALTER TABLE files_user_notifications ADD COLUMN IF NOT EXISTS is_read BOOLEAN NOT NULL DEFAULT FALSE")
+            cur.execute("ALTER TABLE files_user_notifications ADD COLUMN IF NOT EXISTS read_at TIMESTAMPTZ NULL")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_files_user_notifications_user_created ON files_user_notifications(user_id, is_read, created_at DESC)")
 
             # ───────────────────── Concert Cache (Files mode) ─────────────────────
@@ -24471,12 +24545,450 @@ def _extract_mb_artist_names(payload: dict | None) -> list[str]:
     return deduped
 
 
+_CLASSICAL_GENRE_HINTS = {
+    "classical",
+    "baroque",
+    "romantic",
+    "opera",
+    "orchestral",
+    "chamber",
+    "choral",
+    "sacred",
+    "symphony",
+    "concerto",
+}
+_CLASSICAL_WORK_KEYWORDS = {
+    "symphony",
+    "concerto",
+    "sonata",
+    "suite",
+    "requiem",
+    "mass",
+    "missa",
+    "quartet",
+    "quintet",
+    "sextet",
+    "septet",
+    "octet",
+    "trio",
+    "duo",
+    "partita",
+    "cantata",
+    "oratorio",
+    "overture",
+    "prelude",
+    "fugue",
+    "mazurka",
+    "waltz",
+    "etude",
+    "étude",
+    "nocturne",
+    "ballade",
+    "impromptu",
+    "rhapsody",
+    "variation",
+    "variations",
+    "scherzo",
+    "lied",
+}
+_CLASSICAL_PERFORMANCE_TAG_KEYS = (
+    "artist",
+    "albumartist",
+    "album_artist",
+    "album artist",
+    "performer",
+    "performers",
+    "soloist",
+    "soloists",
+    "orchestra",
+    "ensemble",
+    "choir",
+    "chorus",
+    "conductor",
+    "arranger",
+)
+_CLASSICAL_COMPOSER_TAG_KEYS = (
+    "composer",
+    "composers",
+    "composer_sort",
+    "composer_sort_name",
+    "workcomposer",
+)
+_CLASSICAL_WORK_TAG_KEYS = (
+    "grouping",
+    "work",
+    "work_title",
+    "subtitle",
+    "movement",
+    "movementname",
+)
+_CLASSICAL_LABEL_TAG_KEYS = (
+    "label",
+    "organization",
+    "recordlabel",
+    "publisher",
+)
+_CLASSICAL_CATALOG_RE = re.compile(
+    r"\b(?:op(?:us)?|bwv|kv|k|hob|d|sz|rv|hwv|s|wq|wwv|twv|buxwv|l|p)\s*\.?\s*\d+[a-z0-9\-/:]*\b",
+    flags=re.IGNORECASE,
+)
+_CLASSICAL_SPLIT_RE = re.compile(r"\s*(?:;|,|/|&|\band\b|\bwith\b|\bfeat\.?\b|\bfeaturing\b)\s*", flags=re.IGNORECASE)
+
+
+def _classical_norm_text(value: str | None) -> str:
+    return _normalize_identity_text_strict(value)
+
+
+def _classical_split_values(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        raw_items = list(value)
+    else:
+        raw_items = [value]
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_items:
+        txt = html.unescape(str(raw or "")).strip()
+        if not txt:
+            continue
+        parts = [p.strip() for p in _CLASSICAL_SPLIT_RE.split(txt) if str(p or "").strip()]
+        if not parts:
+            parts = [txt]
+        for part in parts:
+            cleaned = re.sub(r"\s+", " ", part).strip(" -–—")
+            if not cleaned:
+                continue
+            key = _classical_norm_text(cleaned)
+            if key and key not in seen:
+                out.append(cleaned)
+                seen.add(key)
+    return out
+
+
+def _classical_collect_tag_values(tags: dict | None, keys: tuple[str, ...]) -> list[str]:
+    if not isinstance(tags, dict):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    lowered = {str(k or "").strip().lower(): v for k, v in tags.items()}
+    for key in keys:
+        for cand in {
+            key,
+            key.replace(" ", ""),
+            key.replace(" ", "_"),
+            key.replace("_", ""),
+            key.replace("_", " "),
+        }:
+            raw = lowered.get(cand)
+            for value in _classical_split_values(raw):
+                norm = _classical_norm_text(value)
+                if norm and norm not in seen:
+                    out.append(value)
+                    seen.add(norm)
+    return out
+
+
+def _classical_work_tokens_from_texts(texts: list[str]) -> set[str]:
+    joined = " \n ".join([str(t or "").strip() for t in texts if str(t or "").strip()])
+    if not joined:
+        return set()
+    norm = _classical_norm_text(joined)
+    if not norm:
+        return set()
+    out: set[str] = set()
+    for match in _CLASSICAL_CATALOG_RE.findall(joined):
+        token = _classical_norm_text(match)
+        if token:
+            out.add(token)
+    for keyword in _CLASSICAL_WORK_KEYWORDS:
+        pattern = re.compile(
+            rf"\b{re.escape(keyword)}(?:\s+no\s*\d+)?(?:\s+in\s+[a-g](?:\s+(?:major|minor))?)?(?:\s+op\s*\d+)?\b",
+            flags=re.IGNORECASE,
+        )
+        for match in pattern.findall(joined):
+            token = _classical_norm_text(match)
+            if token:
+                out.add(token)
+    if not out:
+        title_line = _classical_norm_text(texts[0] if texts else "")
+        if title_line:
+            out.add(title_line[:180])
+    return out
+
+
+def _classical_people_tokens(values: list[str]) -> set[str]:
+    out: set[str] = set()
+    for value in values or []:
+        norm = _classical_norm_text(value)
+        if not norm:
+            continue
+        if len(norm) >= 3:
+            out.add(norm[:120])
+    return out
+
+
+def _classical_track_entries(track_source: Any) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    if not isinstance(track_source, list):
+        return out
+    for i, tr in enumerate(track_source):
+        title = ""
+        disc = 1
+        idx = i + 1
+        dur_ms = 0
+        if isinstance(tr, dict):
+            title = str(tr.get("title") or tr.get("name") or "").strip()
+            disc = _parse_int_loose(tr.get("disc") or tr.get("disc_num"), 1) or 1
+            idx = _parse_int_loose(tr.get("idx") or tr.get("index") or tr.get("track") or tr.get("track_num"), i + 1) or (i + 1)
+            dur_raw = tr.get("dur") or tr.get("duration_ms") or tr.get("duration")
+            if isinstance(dur_raw, str):
+                dur_ms = int(max(0.0, _parse_duration_seconds_loose(dur_raw, 0.0)) * 1000)
+            else:
+                try:
+                    dur_ms = int(dur_raw or 0)
+                except Exception:
+                    dur_ms = 0
+        elif isinstance(tr, str):
+            title = tr.strip()
+        else:
+            title = str(getattr(tr, "title", "") or "").strip()
+            disc = _parse_int_loose(getattr(tr, "disc", 1), 1) or 1
+            idx = _parse_int_loose(getattr(tr, "idx", i + 1), i + 1) or (i + 1)
+            try:
+                dur_ms = int(getattr(tr, "dur", 0) or 0)
+            except Exception:
+                dur_ms = 0
+        if title:
+            out.append({"title": title, "disc": disc, "idx": idx, "dur_ms": max(0, dur_ms)})
+    out.sort(key=lambda item: (int(item.get("disc") or 1), int(item.get("idx") or 0)))
+    return out
+
+
+def _classical_total_duration_ms_for_paths(paths: list[Any]) -> int:
+    total = 0
+    for raw in (paths or [])[:80]:
+        try:
+            path = Path(str(raw))
+        except Exception:
+            continue
+        try:
+            sec = float(_run_ffprobe_duration_sec(str(path)) or 0.0)
+        except Exception:
+            sec = 0.0
+        if sec > 0:
+            total += int(sec * 1000)
+    return max(0, total)
+
+
+def _classical_identity_context(
+    *,
+    local_artist: str,
+    local_title: str,
+    local_tracks: list[Any] | None = None,
+    local_tags: dict | None = None,
+    local_paths: list[Any] | None = None,
+    provider: str = "",
+    provider_payload: dict | None = None,
+    candidate_artist: str | list[str] | tuple[str, ...] | None = None,
+    candidate_title: str = "",
+) -> dict[str, Any]:
+    tags = local_tags if isinstance(local_tags, dict) else {}
+    track_entries = _classical_track_entries(list(local_tracks or []))
+    track_titles = [str(item.get("title") or "").strip() for item in track_entries if str(item.get("title") or "").strip()]
+    title_value = str(candidate_title or local_title or "").strip()
+    artist_values = []
+    if isinstance(candidate_artist, (list, tuple)):
+        artist_values.extend([str(x or "").strip() for x in candidate_artist if str(x or "").strip()])
+    else:
+        artist_values.append(str(candidate_artist or local_artist or "").strip())
+    artist_values.extend(_classical_collect_tag_values(tags, _CLASSICAL_PERFORMANCE_TAG_KEYS))
+    composer_values = _classical_collect_tag_values(tags, _CLASSICAL_COMPOSER_TAG_KEYS)
+    work_values = _classical_collect_tag_values(tags, _CLASSICAL_WORK_TAG_KEYS)
+    label_values = _classical_collect_tag_values(tags, _CLASSICAL_LABEL_TAG_KEYS)
+    genre_values = _classical_collect_tag_values(tags, ("genre", "style"))
+    meta_title_texts = [title_value] + work_values + track_titles[:20]
+    work_tokens = _classical_work_tokens_from_texts(meta_title_texts)
+    composer_tokens = _classical_people_tokens(composer_values)
+    performance_tokens = _classical_people_tokens(artist_values)
+    performance_tokens -= composer_tokens
+    disc_count = 0
+    if track_entries:
+        disc_count = max(int(item.get("disc") or 1) for item in track_entries)
+    track_count = len(track_entries)
+    total_duration_ms = sum(int(item.get("dur_ms") or 0) for item in track_entries)
+    if total_duration_ms <= 0 and local_paths and track_count:
+        total_duration_ms = _classical_total_duration_ms_for_paths(list(local_paths or []))
+    year = ""
+    for year_key in ("date", "originaldate", "year"):
+        year = _mb_extract_year((tags or {}).get(year_key))
+        if year:
+            break
+    genre_norms = {_classical_norm_text(v) for v in genre_values if _classical_norm_text(v)}
+    is_classical = bool(
+        composer_tokens
+        or work_tokens
+        or (genre_norms and any(any(h in g for h in _CLASSICAL_GENRE_HINTS) for g in genre_norms))
+        or any(keyword in _classical_norm_text(title_value) for keyword in _CLASSICAL_WORK_KEYWORDS)
+        or bool(_CLASSICAL_CATALOG_RE.search(title_value))
+        or bool(_CLASSICAL_CATALOG_RE.search(" ".join(track_titles[:12])))
+    )
+    return {
+        "is_classical": bool(is_classical),
+        "composer_tokens": composer_tokens,
+        "work_tokens": work_tokens,
+        "performance_tokens": performance_tokens,
+        "label_tokens": _classical_people_tokens(label_values),
+        "genre_tokens": genre_norms,
+        "track_count": int(track_count or 0),
+        "disc_count": int(disc_count or 0),
+        "total_duration_ms": int(total_duration_ms or 0),
+        "year": year,
+        "title_norm": _normalize_identity_album_strict(title_value),
+        "artist_norms": [_classical_norm_text(v) for v in artist_values if _classical_norm_text(v)],
+        "track_titles": track_titles,
+        "provider": str(provider or "").strip().lower(),
+    }
+
+
+def _provider_classical_context(
+    *,
+    provider: str,
+    payload: dict | None,
+    candidate_artist: str | list[str] | tuple[str, ...] | None,
+    candidate_title: str,
+) -> dict[str, Any]:
+    payload_dict = payload if isinstance(payload, dict) else {}
+    tags = {}
+    raw_tags = payload_dict.get("tags") or payload_dict.get("toptags")
+    if isinstance(raw_tags, list):
+        tags["genre"] = ", ".join([str(x or "").strip() for x in raw_tags if str(x or "").strip()])
+    elif isinstance(raw_tags, str):
+        tags["genre"] = raw_tags
+    for key in ("label", "publisher", "organization", "composer", "conductor", "orchestra", "ensemble", "performer"):
+        if payload_dict.get(key):
+            tags[key] = payload_dict.get(key)
+    year_val = payload_dict.get("year") or payload_dict.get("date") or payload_dict.get("first-release-date")
+    if year_val:
+        tags["year"] = year_val
+    return _classical_identity_context(
+        local_artist="",
+        local_title="",
+        local_tracks=list(payload_dict.get("tracklist") or payload_dict.get("track_titles") or []),
+        local_tags=tags,
+        local_paths=None,
+        provider=provider,
+        provider_payload=payload_dict,
+        candidate_artist=candidate_artist,
+        candidate_title=candidate_title,
+    )
+
+
+def _classical_identity_match_details(
+    *,
+    local_artist: str,
+    local_title: str,
+    candidate_artist: str | list[str] | tuple[str, ...] | None,
+    candidate_title: str,
+    local_tracks: list[Any] | None = None,
+    local_tags: dict | None = None,
+    local_paths: list[Any] | None = None,
+    provider: str = "",
+    provider_payload: dict | None = None,
+    local_context: dict | None = None,
+) -> tuple[bool, str]:
+    local_ctx = local_context if isinstance(local_context, dict) else _classical_identity_context(
+        local_artist=local_artist,
+        local_title=local_title,
+        local_tracks=list(local_tracks or []),
+        local_tags=local_tags if isinstance(local_tags, dict) else {},
+        local_paths=list(local_paths or []),
+    )
+    provider_ctx = _provider_classical_context(
+        provider=provider,
+        payload=provider_payload,
+        candidate_artist=candidate_artist,
+        candidate_title=candidate_title,
+    )
+    if not bool(local_ctx.get("is_classical") or provider_ctx.get("is_classical")):
+        return (False, "classical_context_missing")
+
+    local_title_norm = str(local_ctx.get("title_norm") or _normalize_identity_album_strict(local_title))
+    provider_title_norm = str(provider_ctx.get("title_norm") or _normalize_identity_album_strict(candidate_title))
+    local_work = set(local_ctx.get("work_tokens") or set())
+    provider_work = set(provider_ctx.get("work_tokens") or set())
+    local_composer = set(local_ctx.get("composer_tokens") or set())
+    provider_composer = set(provider_ctx.get("composer_tokens") or set())
+    local_perf = set(local_ctx.get("performance_tokens") or set())
+    provider_perf = set(provider_ctx.get("performance_tokens") or set())
+
+    title_exact = bool(local_title_norm and provider_title_norm and local_title_norm == provider_title_norm)
+    work_overlap = local_work & provider_work if local_work and provider_work else set()
+    composer_overlap = local_composer & provider_composer if local_composer and provider_composer else set()
+    perf_overlap = local_perf & provider_perf if local_perf and provider_perf else set()
+
+    if local_work and provider_work and not work_overlap and not title_exact:
+        return (False, "classical_work_mismatch")
+    if local_composer and provider_composer and not composer_overlap:
+        return (False, "classical_composer_mismatch")
+    if local_perf and provider_perf and not perf_overlap:
+        return (False, "classical_performance_mismatch")
+
+    local_track_count = int(local_ctx.get("track_count") or 0)
+    provider_track_count = int(provider_ctx.get("track_count") or 0)
+    if local_track_count > 0 and provider_track_count > 0 and local_track_count != provider_track_count:
+        return (False, f"classical_track_count_mismatch local={local_track_count} provider={provider_track_count}")
+
+    local_disc_count = int(local_ctx.get("disc_count") or 0)
+    provider_disc_count = int(provider_ctx.get("disc_count") or 0)
+    if local_disc_count > 0 and provider_disc_count > 0 and local_disc_count != provider_disc_count:
+        return (False, f"classical_disc_count_mismatch local={local_disc_count} provider={provider_disc_count}")
+
+    local_total = int(local_ctx.get("total_duration_ms") or 0)
+    provider_total = int(provider_ctx.get("total_duration_ms") or 0)
+    if local_total > 0 and provider_total > 0:
+        hi = max(local_total, provider_total)
+        diff = abs(local_total - provider_total)
+        if hi > 0 and diff > max(90000, int(hi * 0.03)):
+            return (False, f"classical_duration_mismatch local={local_total} provider={provider_total}")
+
+    local_label = set(local_ctx.get("label_tokens") or set())
+    provider_label = set(provider_ctx.get("label_tokens") or set())
+    if local_label and provider_label and not (local_label & provider_label) and local_perf and provider_perf and not perf_overlap:
+        return (False, "classical_label_plus_performance_mismatch")
+
+    local_year = _mb_extract_year(local_ctx.get("year"))
+    provider_year = _mb_extract_year(provider_ctx.get("year"))
+    if local_year and provider_year:
+        try:
+            if abs(int(local_year) - int(provider_year)) > 15 and local_perf and provider_perf and not perf_overlap:
+                return (False, f"classical_year_mismatch local={local_year} provider={provider_year}")
+        except Exception:
+            pass
+
+    if local_perf and provider_perf and perf_overlap:
+        return (True, "classical identity ok (performance overlap)")
+    if local_composer and provider_composer and composer_overlap and (work_overlap or title_exact):
+        return (True, "classical identity ok (composer/work overlap)")
+    if work_overlap and title_exact:
+        return (True, "classical identity ok (work/title overlap)")
+    if title_exact and local_track_count > 0 and provider_track_count > 0 and local_track_count == provider_track_count:
+        return (True, "classical identity ok (title/structure exact)")
+    return (False, "classical_context_insufficient")
+
+
 def _strict_identity_match_details(
     *,
     local_artist: str,
     local_title: str,
     candidate_artist: str | list[str] | tuple[str, ...] | None,
     candidate_title: str,
+    local_tracks: list[Any] | None = None,
+    local_tags: dict | None = None,
+    local_paths: list[Any] | None = None,
+    provider: str = "",
+    provider_payload: dict | None = None,
+    local_context: dict | None = None,
 ) -> tuple[bool, str]:
     """
     Strict identity gate:
@@ -24491,6 +25003,22 @@ def _strict_identity_match_details(
         candidate_artist_values = [str(x or "") for x in candidate_artist]
     else:
         candidate_artist_values = [str(candidate_artist or "")]
+    classical_ok, classical_reason = _classical_identity_match_details(
+        local_artist=local_artist,
+        local_title=local_title,
+        candidate_artist=candidate_artist_values,
+        candidate_title=candidate_title,
+        local_tracks=list(local_tracks or []),
+        local_tags=local_tags if isinstance(local_tags, dict) else {},
+        local_paths=list(local_paths or []),
+        provider=provider,
+        provider_payload=provider_payload if isinstance(provider_payload, dict) else {},
+        local_context=local_context if isinstance(local_context, dict) else None,
+    )
+    if classical_ok:
+        return (True, classical_reason)
+    if classical_reason and classical_reason != "classical_context_missing":
+        return (False, classical_reason)
     candidate_artist_norms = [
         n for n in (_normalize_identity_text_strict(v) for v in candidate_artist_values) if n
     ]
@@ -24563,6 +25091,24 @@ def _strict_reject_code(raw_reason: str) -> str:
     reason = str(raw_reason or "").strip().lower()
     if not reason:
         return "strict_reject"
+    if "classical_work_mismatch" in reason:
+        return "classical_work_mismatch"
+    if "classical_composer_mismatch" in reason:
+        return "classical_composer_mismatch"
+    if "classical_performance_mismatch" in reason:
+        return "classical_performance_mismatch"
+    if "classical_track_count_mismatch" in reason:
+        return "classical_track_count_mismatch"
+    if "classical_disc_count_mismatch" in reason:
+        return "classical_disc_count_mismatch"
+    if "classical_duration_mismatch" in reason:
+        return "classical_duration_mismatch"
+    if "classical_label_plus_performance_mismatch" in reason:
+        return "classical_label_plus_performance_mismatch"
+    if "classical_year_mismatch" in reason:
+        return "classical_year_mismatch"
+    if "classical_context_insufficient" in reason:
+        return "classical_context_insufficient"
     if "local artist missing" in reason or "candidate artist missing" in reason or "artist mismatch" in reason:
         return "artist_mismatch"
     if "local title missing" in reason or "candidate title missing" in reason or "title mismatch" in reason:
@@ -24682,6 +25228,9 @@ def _strict_provider_match_100(
     local_artist: str,
     local_title: str,
     local_tracks: List,
+    local_tags: dict | None = None,
+    local_paths: list[Any] | None = None,
+    local_context: dict | None = None,
     provider: str,
     provider_payload: dict | None,
     expected_provider_id: str = "",
@@ -24723,6 +25272,12 @@ def _strict_provider_match_100(
         local_title=local_title,
         candidate_artist=candidate_artist,
         candidate_title=str(candidate_title or ""),
+        local_tracks=list(local_tracks or []),
+        local_tags=local_tags if isinstance(local_tags, dict) else {},
+        local_paths=list(local_paths or []),
+        provider=p,
+        provider_payload=payload,
+        local_context=local_context if isinstance(local_context, dict) else None,
     )
     if not id_ok:
         out["strict_reject_reason"] = _strict_reject_code(id_reason)
@@ -24773,11 +25328,22 @@ def _build_provider_identity_candidates(
     album_title: str,
     local_track_titles: List[str],
     provider_payloads: dict,
+    *,
+    local_tags: dict | None = None,
+    local_paths: list[Any] | None = None,
+    local_context: dict | None = None,
 ) -> list[dict]:
     """Build scored provider candidates in deterministic priority order."""
     out: list[dict] = []
     local_titles = [str(t or "").strip() for t in (local_track_titles or []) if str(t or "").strip()]
     local_track_count = len(local_titles)
+    resolved_local_context = local_context if isinstance(local_context, dict) else _classical_identity_context(
+        local_artist=artist_name,
+        local_title=album_title,
+        local_tracks=list(local_titles or []),
+        local_tags=local_tags if isinstance(local_tags, dict) else {},
+        local_paths=list(local_paths or []),
+    )
     provider_order = ("discogs", "bandcamp", "lastfm")
     for provider in provider_order:
         payload = provider_payloads.get(provider)
@@ -24798,14 +25364,33 @@ def _build_provider_identity_candidates(
             local_title=album_title,
             candidate_artist=src_artist,
             candidate_title=src_title,
+            local_tracks=list(local_titles or []),
+            local_tags=local_tags if isinstance(local_tags, dict) else {},
+            local_paths=list(local_paths or []),
+            provider=provider,
+            provider_payload=payload,
+            local_context=resolved_local_context,
         )
         strict_verdict = _strict_provider_match_100(
             local_artist=artist_name,
             local_title=album_title,
             local_tracks=list(local_titles or []),
+            local_tags=local_tags if isinstance(local_tags, dict) else {},
+            local_paths=list(local_paths or []),
+            local_context=resolved_local_context,
             provider=provider,
             provider_payload=payload,
             expected_provider_id=_provider_candidate_id(payload, provider),
+        )
+        provider_context = _provider_classical_context(
+            provider=provider,
+            payload=payload,
+            candidate_artist=src_artist,
+            candidate_title=src_title,
+        )
+        classical_guard_applies = bool(
+            (resolved_local_context.get("is_classical") if isinstance(resolved_local_context, dict) else False)
+            or provider_context.get("is_classical")
         )
         provider_titles = _provider_track_titles_for_strict(provider, payload)
         provider_track_count = len(provider_titles)
@@ -24847,6 +25432,8 @@ def _build_provider_identity_candidates(
                 confidence = (title_score * 0.56) + (artist_score * 0.44)
             if strict_ok:
                 confidence += 0.04
+            if classical_guard_applies and not strict_ok:
+                confidence = min(confidence, 0.45)
             confidence = max(0.0, min(1.0, confidence))
 
         provider_id = _provider_candidate_id(payload, provider)
@@ -24871,6 +25458,9 @@ def _build_provider_identity_candidates(
                 "provider_track_count": int(provider_track_count),
                 "local_track_count": int(local_track_count),
                 "track_count_ratio": float(track_count_ratio),
+                "classical_guard_applies": bool(classical_guard_applies),
+                "classical_guard_ok": bool((not classical_guard_applies) or strict_ok),
+                "classical_guard_reason": str(strict_reason or ""),
             }
         )
     return out
@@ -24894,6 +25484,8 @@ def _provider_candidate_soft_identity_ok(
     has_provider_tracklist = bool(candidate.get("has_provider_tracklist"))
     has_local_tracklist = bool(candidate.get("has_local_tracklist"))
     track_count_ratio = float(candidate.get("track_count_ratio") or 0.0)
+    if bool(candidate.get("classical_guard_applies")) and not bool(candidate.get("classical_guard_ok")):
+        return (False, str(candidate.get("classical_guard_reason") or "classical_context_insufficient"))
 
     if title_score < 0.78:
         return (False, "album_mismatch")
@@ -25006,9 +25598,21 @@ def _arbitrate_provider_identity(
     album_title: str,
     local_track_titles: List[str],
     provider_payloads: dict,
+    *,
+    local_tags: dict | None = None,
+    local_paths: list[Any] | None = None,
+    local_context: dict | None = None,
 ) -> dict | None:
     """Provider arbitration: strict first, then conservative soft-match, then AI as last resort."""
-    candidates = _build_provider_identity_candidates(artist_name, album_title, local_track_titles, provider_payloads)
+    candidates = _build_provider_identity_candidates(
+        artist_name,
+        album_title,
+        local_track_titles,
+        provider_payloads,
+        local_tags=local_tags,
+        local_paths=local_paths,
+        local_context=local_context,
+    )
     if not candidates:
         logging.info(
             "[Providers Arbitration] %r – %r: rejected (no provider candidates)",
@@ -25493,6 +26097,8 @@ def _strict_validate_edition_match(
             local_artist=artist_name,
             local_title=album_title,
             local_tracks=local_tracks,
+            local_tags=edition.get("tags") if isinstance(edition.get("tags"), dict) else {},
+            local_paths=list(edition.get("ordered_paths") or []),
             provider=provider,
             provider_payload=payload or {},
             expected_provider_id=expected_id,
@@ -26035,6 +26641,8 @@ def search_mb_release_group_by_metadata(
     tracks: set[str],
     title_raw: Optional[str] = None,
     album_folder: Optional[Path] = None,
+    local_tags: Optional[dict] = None,
+    local_paths: Optional[list[Any]] = None,
 ) -> tuple[dict | None, bool]:
     """
     Fallback search on MusicBrainz by artist name, normalized album title, and optional track titles.
@@ -26056,6 +26664,15 @@ def search_mb_release_group_by_metadata(
     use_ai_for_mb_match = bool(getattr(sys.modules[__name__], "USE_AI_FOR_MB_MATCH", False))
     use_ai_for_mb_verify = bool(getattr(sys.modules[__name__], "USE_AI_FOR_MB_VERIFY", False))
     use_ai_for_mb = bool(use_ai_for_mb_match or use_ai_for_mb_verify)
+    search_local_tags = local_tags if isinstance(local_tags, dict) else {}
+    search_local_paths = list(local_paths or [])
+    search_local_context = _classical_identity_context(
+        local_artist=artist,
+        local_title=title_raw or album_norm or "",
+        local_tracks=list(tracks or []),
+        local_tags=search_local_tags,
+        local_paths=search_local_paths,
+    )
 
     def _mb_budget_exceeded() -> bool:
         if mb_budget_sec <= 0:
@@ -26216,11 +26833,24 @@ def search_mb_release_group_by_metadata(
                 rg_id_final = info.get('id', rg['id'])
                 mb_title = str(info.get("title") or rg.get("title") or "").strip()
                 mb_artists = _extract_mb_artist_names(info) or _extract_mb_artist_names(rg)
+                mb_provider_payload = {
+                    "id": rg_id_final,
+                    "title": mb_title,
+                    "mb_artist_names": mb_artists,
+                    "tracklist": list(info.get("track_titles") or []),
+                    "year": _mb_extract_year(info.get("first-release-date") or rg.get("first-release-date") or ""),
+                }
                 strict_ok, strict_reason = _strict_identity_match_details(
                     local_artist=artist,
                     local_title=title_raw or album_norm,
                     candidate_artist=mb_artists,
                     candidate_title=mb_title,
+                    local_tracks=list(tracks or []),
+                    local_tags=search_local_tags,
+                    local_paths=search_local_paths,
+                    provider="musicbrainz",
+                    provider_payload=mb_provider_payload,
+                    local_context=search_local_context,
                 )
                 if not strict_ok:
                     log_mb(
@@ -26255,6 +26885,7 @@ def search_mb_release_group_by_metadata(
                             else:
                                 rel_resp = _fetch_release_recordings(first_release_id)
                             result_dict['track_titles'] = _extract_track_titles_from_mb_release(rel_resp)
+                            mb_provider_payload["tracklist"] = list(result_dict.get("track_titles") or [])
                         except musicbrainzngs.WebServiceError:
                             pass
                 all_fetched.append((rg, result_dict))
@@ -26373,11 +27004,23 @@ def search_mb_release_group_by_metadata(
                                 rg_id_final = info.get("id", suggested_mbid)
                                 mb_title = str(info.get("title") or "").strip()
                                 mb_artists = _extract_mb_artist_names(info)
+                                mb_provider_payload = {
+                                    "id": rg_id_final,
+                                    "title": mb_title,
+                                    "mb_artist_names": mb_artists,
+                                    "year": _mb_extract_year(info.get("first-release-date") or ""),
+                                }
                                 strict_ok, strict_reason = _strict_identity_match_details(
                                     local_artist=artist,
                                     local_title=title_for_zero or album_norm,
                                     candidate_artist=mb_artists,
                                     candidate_title=mb_title,
+                                    local_tracks=list(tracks or []),
+                                    local_tags=search_local_tags,
+                                    local_paths=search_local_paths,
+                                    provider="musicbrainz",
+                                    provider_payload=mb_provider_payload,
+                                    local_context=search_local_context,
                                 )
                                 if not strict_ok:
                                     log_mb(
@@ -26459,6 +27102,12 @@ def search_mb_release_group_by_metadata(
                         local_title=title_for_strict,
                         candidate_artist=cand_artists,
                         candidate_title=cand_title,
+                        local_tracks=list(tracks or []),
+                        local_tags=search_local_tags,
+                        local_paths=search_local_paths,
+                        provider="musicbrainz",
+                        provider_payload=info if isinstance(info, dict) else {},
+                        local_context=search_local_context,
                     )
                     if ok:
                         strict_matches.append((rg, info))
@@ -26504,6 +27153,12 @@ def search_mb_release_group_by_metadata(
                     local_title=title_raw or album_norm,
                     candidate_artist=chosen_artists,
                     candidate_title=chosen_title,
+                    local_tracks=list(tracks or []),
+                    local_tags=search_local_tags,
+                    local_paths=search_local_paths,
+                    provider="musicbrainz",
+                    provider_payload=chosen[1] if isinstance(chosen[1], dict) else {},
+                    local_context=search_local_context,
                 )
                 if not strict_ok:
                     log_mb(
@@ -26634,6 +27289,12 @@ def search_mb_release_group_by_metadata(
                                         local_title=title_for_web or album_norm,
                                         candidate_artist=picked.get("mb_artist_names") or _extract_mb_artist_names(all_fetched[idx][0]),
                                         candidate_title=picked.get("mb_title") or all_fetched[idx][0].get("title") or "",
+                                        local_tracks=list(tracks or []),
+                                        local_tags=search_local_tags,
+                                        local_paths=search_local_paths,
+                                        provider="musicbrainz",
+                                        provider_payload=picked if isinstance(picked, dict) else {},
+                                        local_context=search_local_context,
                                     )
                                     if strict_ok:
                                         set_cached_mb_info(picked['id'], picked)
@@ -26661,11 +27322,23 @@ def search_mb_release_group_by_metadata(
                                         rg_id_final = info.get("id", suggested_mbid)
                                         mb_title = str(info.get("title") or "").strip()
                                         mb_artists = _extract_mb_artist_names(info)
+                                        mb_provider_payload = {
+                                            "id": rg_id_final,
+                                            "title": mb_title,
+                                            "mb_artist_names": mb_artists,
+                                            "year": _mb_extract_year(info.get("first-release-date") or ""),
+                                        }
                                         strict_ok, strict_reason = _strict_identity_match_details(
                                             local_artist=artist,
                                             local_title=title_for_web or album_norm,
                                             candidate_artist=mb_artists,
                                             candidate_title=mb_title,
+                                            local_tracks=list(tracks or []),
+                                            local_tags=search_local_tags,
+                                            local_paths=search_local_paths,
+                                            provider="musicbrainz",
+                                            provider_payload=mb_provider_payload,
+                                            local_context=search_local_context,
                                         )
                                         if not strict_ok:
                                             log_mb(
@@ -28332,6 +29005,8 @@ def scan_duplicates(
                                         album_title=title_raw_mb or album_norm,
                                         local_track_titles=local_titles_prefetch,
                                         provider_payloads=provider_payloads_prefetched,
+                                        local_tags=e.get("tags") if isinstance(e.get("tags"), dict) else {},
+                                        local_paths=list(e.get("ordered_paths") or []),
                                     )
                                     if prefetched_arbitration and str(prefetched_arbitration.get("provider") or "").strip().lower() == "bandcamp":
                                         track_score_prefetch = float(prefetched_arbitration.get("track_score") or 0.0)
@@ -28359,6 +29034,8 @@ def scan_duplicates(
                                     tracks,
                                     title_raw=lookup_title_for_search or title_raw_mb,
                                     album_folder=album_folder_arg,
+                                    local_tags=e.get("tags") if isinstance(e.get("tags"), dict) else {},
+                                    local_paths=list(e.get("ordered_paths") or []),
                                 )
                         if rg_info and rg_info.get("track_titles") and tracks:
                             track_min = getattr(sys.modules[__name__], "TRACKLIST_MATCH_MIN", 0.8)
@@ -28564,6 +29241,8 @@ def scan_duplicates(
                             album_title=title_raw,
                             local_track_titles=local_titles,
                             provider_payloads=provider_payloads,
+                            local_tags=e.get("tags") if isinstance(e.get("tags"), dict) else {},
+                            local_paths=list(e.get("ordered_paths") or []),
                         )
                         # If arbitration fails with only Last.fm (no tracklist), progressively fetch other providers.
                         if not arbitration:
@@ -28579,6 +29258,8 @@ def scan_duplicates(
                                     album_title=title_raw,
                                     local_track_titles=local_titles,
                                     provider_payloads=provider_payloads,
+                                    local_tags=e.get("tags") if isinstance(e.get("tags"), dict) else {},
+                                    local_paths=list(e.get("ordered_paths") or []),
                                 )
                             if (not arbitration) and USE_BANDCAMP and not isinstance(provider_payloads.get("bandcamp"), dict):
                                 _ensure_provider_payload("bandcamp")
@@ -28592,6 +29273,8 @@ def scan_duplicates(
                                     album_title=title_raw,
                                     local_track_titles=local_titles,
                                     provider_payloads=provider_payloads,
+                                    local_tags=e.get("tags") if isinstance(e.get("tags"), dict) else {},
+                                    local_paths=list(e.get("ordered_paths") or []),
                                 )
                             # Refresh UI step response to reflect newly used fallback sources.
                             if fallback_sources and artist in state.get("scan_active_artists", {}) and e["album_id"] == state["scan_active_artists"][artist].get("current_album", {}).get("album_id"):
@@ -29006,32 +29689,56 @@ def scan_duplicates(
         return ts
 
     def _is_classical(ed_list: list[dict]) -> bool:
-        genres: list[str] = []
         for e in ed_list:
-            g = ""
-            try:
-                g = (e.get("meta") or {}).get("genre") or ""
-            except Exception:
-                g = ""
-            if g:
-                genres.append(str(g).lower())
-        return bool(genres) and all("classical" in g for g in genres)
+            tags: dict[str, Any] = {}
+            if isinstance(e.get("meta"), dict):
+                tags.update(e.get("meta") or {})
+            if isinstance(e.get("tags"), dict):
+                tags.update(e.get("tags") or {})
+            ctx = _classical_identity_context(
+                local_artist=str(e.get("artist_name") or e.get("artist") or e.get("album_artist") or "").strip(),
+                local_title=str(e.get("title_raw") or e.get("plex_title") or e.get("album_title") or "").strip(),
+                local_tracks=list(e.get("tracks") or []),
+                local_tags=tags,
+                local_paths=list(e.get("ordered_paths") or []),
+            )
+            if bool(ctx.get("is_classical")):
+                return True
+        return False
 
     def _split_classical(ed_list: list[dict]) -> list[list[dict]]:
-        subgroups: list[dict] = []
+        subgroups: dict[tuple, list[dict]] = {}
         for e in ed_list:
-            meta = e.get("meta", {}) or {}
-            year = meta.get("date") or meta.get("originaldate") or ""
-            dur0 = e["tracks"][0].dur if e.get("tracks") else 0
-            placed = False
-            for sg in subgroups:
-                if sg["year"] == year and abs(int(sg["dur0"]) - int(dur0)) <= 10000:
-                    sg["editions"].append(e)
-                    placed = True
-                    break
-            if not placed:
-                subgroups.append({"year": year, "dur0": dur0, "editions": [e]})
-        return [sg["editions"] for sg in subgroups if sg.get("editions")]
+            tags: dict[str, Any] = {}
+            if isinstance(e.get("meta"), dict):
+                tags.update(e.get("meta") or {})
+            if isinstance(e.get("tags"), dict):
+                tags.update(e.get("tags") or {})
+            ctx = _classical_identity_context(
+                local_artist=str(e.get("artist_name") or e.get("artist") or e.get("album_artist") or "").strip(),
+                local_title=str(e.get("title_raw") or e.get("plex_title") or e.get("album_title") or "").strip(),
+                local_tracks=list(e.get("tracks") or []),
+                local_tags=tags,
+                local_paths=list(e.get("ordered_paths") or []),
+            )
+            work_sig = tuple(sorted(ctx.get("work_tokens") or set()))[:8]
+            composer_sig = tuple(sorted(ctx.get("composer_tokens") or set()))[:4]
+            performance_sig = tuple(sorted(ctx.get("performance_tokens") or set()))[:8]
+            label_sig = tuple(sorted(ctx.get("label_tokens") or set()))[:2]
+            total_duration_ms = int(ctx.get("total_duration_ms") or 0)
+            duration_bucket = int(round(total_duration_ms / 120000.0)) if total_duration_ms > 0 else 0
+            key = (
+                composer_sig or ("__no_composer__",),
+                work_sig or (str(ctx.get("title_norm") or "__no_work__"),),
+                performance_sig or ("__no_performance__",),
+                label_sig or ("__no_label__",),
+                int(ctx.get("disc_count") or 0),
+                int(ctx.get("track_count") or 0),
+                duration_bucket,
+                str(ctx.get("year") or ""),
+            )
+            subgroups.setdefault(key, []).append(e)
+        return [items for items in subgroups.values() if items]
 
     def _group_pair_metrics(ed_list: list[dict]) -> tuple[float, float]:
         # Return (max_jaccard, min_track_ratio) across all pairs in this group.
@@ -44104,6 +44811,14 @@ def api_auth_profile_update():
         updates.append("accept_shares = ?")
         params.append(1 if bool(_parse_bool(data.get("accept_shares"))) else 0)
 
+    if "share_liked_public" in data:
+        updates.append("share_liked_public = ?")
+        params.append(1 if bool(_parse_bool(data.get("share_liked_public"))) else 0)
+
+    if "share_recommendations_public" in data:
+        updates.append("share_recommendations_public = ?")
+        params.append(1 if bool(_parse_bool(data.get("share_recommendations_public"))) else 0)
+
     if "avatar_data_url" in data:
         ok_avatar, avatar_data_url, avatar_err = _auth_validate_avatar_data_url(data.get("avatar_data_url"))
         if not ok_avatar:
@@ -44169,7 +44884,7 @@ def api_admin_users_get():
         cur = con.cursor()
         cur.execute(
             """
-            SELECT id, username, is_admin, can_download, can_view_statistics, is_active, accept_shares, avatar_data_url, created_at, updated_at, last_login_at
+            SELECT id, username, is_admin, can_download, can_view_statistics, allow_ai_calls, is_active, accept_shares, share_liked_public, share_recommendations_public, avatar_data_url, created_at, updated_at, last_login_at
             FROM auth_users
             ORDER BY is_admin DESC, username ASC
             """
@@ -44194,6 +44909,7 @@ def api_admin_users_create():
     is_admin = bool(_parse_bool(data.get("is_admin")))
     can_download = bool(_parse_bool(data.get("can_download")))
     can_view_statistics = bool(_parse_bool(data.get("can_view_statistics")))
+    allow_ai_calls = True if data.get("allow_ai_calls") is None else bool(_parse_bool(data.get("allow_ai_calls")))
     is_active = True if data.get("is_active") is None else bool(_parse_bool(data.get("is_active")))
     ok, msg, user = _auth_create_user(
         username=username,
@@ -44201,6 +44917,7 @@ def api_admin_users_create():
         is_admin=is_admin,
         can_download=can_download,
         can_view_statistics=can_view_statistics,
+        allow_ai_calls=allow_ai_calls,
         is_active=is_active,
     )
     if not ok:
@@ -44218,7 +44935,7 @@ def api_admin_users_update(user_id: int):
         cur = con.cursor()
         cur.execute(
             """
-            SELECT id, username, password_hash, password_salt, is_admin, can_download, can_view_statistics, is_active, accept_shares, avatar_data_url, created_at, updated_at, last_login_at
+            SELECT id, username, password_hash, password_salt, is_admin, can_download, can_view_statistics, allow_ai_calls, is_active, accept_shares, share_liked_public, share_recommendations_public, avatar_data_url, created_at, updated_at, last_login_at
             FROM auth_users
             WHERE id = ?
             LIMIT 1
@@ -44239,6 +44956,7 @@ def api_admin_users_update(user_id: int):
         is_admin = bool(int(row["is_admin"] or 0))
         can_download = bool(int(row["can_download"] or 0))
         can_view_statistics = bool(int(row["can_view_statistics"] or 0))
+        allow_ai_calls = bool(int(row["allow_ai_calls"] or 1))
         is_active = bool(int(row["is_active"] or 0))
 
         if "is_admin" in data:
@@ -44247,6 +44965,8 @@ def api_admin_users_update(user_id: int):
             can_download = bool(_parse_bool(data.get("can_download")))
         if "can_view_statistics" in data:
             can_view_statistics = bool(_parse_bool(data.get("can_view_statistics")))
+        if "allow_ai_calls" in data:
+            allow_ai_calls = bool(_parse_bool(data.get("allow_ai_calls")))
         if "is_active" in data:
             is_active = bool(_parse_bool(data.get("is_active")))
 
@@ -44285,6 +45005,7 @@ def api_admin_users_update(user_id: int):
                     is_admin = ?,
                     can_download = ?,
                     can_view_statistics = ?,
+                    allow_ai_calls = ?,
                     is_active = ?,
                     updated_at = ?
                 WHERE id = ?
@@ -44296,6 +45017,7 @@ def api_admin_users_update(user_id: int):
                     1 if is_admin else 0,
                     1 if can_download else 0,
                     1 if can_view_statistics else 0,
+                    1 if allow_ai_calls else 0,
                     1 if is_active else 0,
                     _auth_now_ts(),
                     int(user_id),
@@ -44311,7 +45033,7 @@ def api_admin_users_update(user_id: int):
 
         cur.execute(
             """
-            SELECT id, username, is_admin, can_download, can_view_statistics, is_active, accept_shares, avatar_data_url, created_at, updated_at, last_login_at
+            SELECT id, username, is_admin, can_download, can_view_statistics, allow_ai_calls, is_active, accept_shares, share_liked_public, share_recommendations_public, avatar_data_url, created_at, updated_at, last_login_at
             FROM auth_users
             WHERE id = ?
             LIMIT 1
@@ -52852,12 +53574,25 @@ def api_library_liked_summary():
     uid = _current_user_id_or_zero()
     if uid <= 0:
         return jsonify({"error": "Authentication required"}), 401
+    target_uid, target_user, scope_err = _auth_resolve_public_user_scope(
+        request.args.get("user_id"),
+        current_user_id=uid,
+        visibility_key="share_liked_public",
+    )
+    if scope_err:
+        return jsonify({"error": scope_err[0]}), int(scope_err[1])
     base_url = request.url_root.rstrip("/")
     conn = _files_pg_connect()
     if conn is None:
         return jsonify({"error": "PostgreSQL unavailable"}), 503
     try:
-        payload: dict[str, Any] = {"albums": [], "artists": [], "labels": [], "recommended_albums": []}
+        payload: dict[str, Any] = {
+            "owner": target_user or _auth_user_snapshot(target_uid),
+            "albums": [],
+            "artists": [],
+            "labels": [],
+            "recommended_albums": [],
+        }
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -52876,7 +53611,7 @@ def api_library_liked_summary():
                 ORDER BY l.updated_at DESC, alb.id DESC
                 LIMIT 48
                 """,
-                (int(uid), int(uid)),
+                (int(target_uid), int(target_uid)),
             )
             for row in cur.fetchall():
                 aid = int(row[0] or 0)
@@ -52909,7 +53644,7 @@ def api_library_liked_summary():
                 ORDER BY l.updated_at DESC, a.id DESC
                 LIMIT 48
                 """,
-                (int(uid),),
+                (int(target_uid),),
             )
             for row in cur.fetchall():
                 aid = int(row[0] or 0)
@@ -52929,7 +53664,7 @@ def api_library_liked_summary():
                 ORDER BY updated_at DESC, entity_key ASC
                 LIMIT 48
                 """,
-                (int(uid),),
+                (int(target_uid),),
             )
             for row in cur.fetchall():
                 payload["labels"].append(
@@ -52975,7 +53710,7 @@ def api_library_liked_summary():
                          alb.updated_at DESC
                 LIMIT 24
                 """,
-                (int(uid), int(uid), int(uid), int(uid)),
+                (int(target_uid), int(target_uid), int(target_uid), int(target_uid)),
             )
             seen_album_ids: set[int] = set()
             for row in cur.fetchall():
@@ -53013,7 +53748,96 @@ def api_library_social_users():
     uid = _current_user_id_or_zero()
     if uid <= 0:
         return jsonify({"error": "Authentication required", "users": []}), 401
-    return jsonify({"users": _auth_active_users_list(exclude_user_id=uid, require_accept_shares=True)})
+    mode = str(request.args.get("mode") or "shares").strip().lower()
+    require_accept_shares = mode == "shares"
+    require_public_likes = mode == "liked"
+    require_public_recommendations = mode == "recommendations"
+    return jsonify(
+        {
+            "users": _auth_active_users_list(
+                exclude_user_id=uid,
+                require_accept_shares=require_accept_shares,
+                require_public_likes=require_public_likes,
+                require_public_recommendations=require_public_recommendations,
+            )
+        }
+    )
+
+
+@app.get("/api/library/social/context")
+def api_library_social_context():
+    uid = _current_user_id_or_zero()
+    if uid <= 0:
+        return jsonify({"error": "Authentication required"}), 401
+    entity_type = str(request.args.get("entity_type") or "").strip().lower()
+    if not _social_entity_type_allowed(entity_type):
+        return jsonify({"error": "unsupported entity_type"}), 400
+    entity_id = _parse_int_loose(request.args.get("entity_id"), 0)
+    entity_key = _social_entity_key_norm(entity_type, request.args.get("entity_key"))
+    if entity_id <= 0 and not entity_key:
+        return jsonify({"error": "entity_id or entity_key is required"}), 400
+    conn = _files_pg_connect()
+    if conn is None:
+        return jsonify({"error": "PostgreSQL unavailable"}), 503
+    try:
+        liked_public_users = {
+            int(item.get("id") or 0): item
+            for item in _auth_active_users_list(exclude_user_id=0, require_public_likes=True)
+        }
+        reco_public_users = {
+            int(item.get("id") or 0): item
+            for item in _auth_active_users_list(exclude_user_id=0, require_public_recommendations=True)
+        }
+        payload: dict[str, Any] = {"liked_by": [], "recommended_by": []}
+        with conn.cursor() as cur:
+            if entity_id > 0:
+                cur.execute(
+                    """
+                    SELECT DISTINCT user_id
+                    FROM files_user_entity_likes
+                    WHERE entity_type = %s AND entity_id = %s AND liked = TRUE
+                    ORDER BY user_id ASC
+                    """,
+                    (entity_type, int(entity_id)),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT DISTINCT user_id
+                    FROM files_user_entity_likes
+                    WHERE entity_type = %s AND entity_key = %s AND liked = TRUE
+                    ORDER BY user_id ASC
+                    """,
+                    (entity_type, entity_key),
+                )
+            liked_ids = [int(row[0] or 0) for row in cur.fetchall() if int(row[0] or 0) > 0]
+            payload["liked_by"] = [liked_public_users[user_id] for user_id in liked_ids if user_id in liked_public_users]
+
+            if entity_id > 0:
+                cur.execute(
+                    """
+                    SELECT DISTINCT sender_user_id
+                    FROM files_social_recommendations
+                    WHERE entity_type = %s AND entity_id = %s
+                    ORDER BY sender_user_id ASC
+                    """,
+                    (entity_type, int(entity_id)),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT DISTINCT sender_user_id
+                    FROM files_social_recommendations
+                    WHERE entity_type = %s AND entity_key = %s
+                    ORDER BY sender_user_id ASC
+                    """,
+                    (entity_type, entity_key),
+                )
+            reco_ids = [int(row[0] or 0) for row in cur.fetchall() if int(row[0] or 0) > 0]
+            payload["recommended_by"] = [reco_public_users[user_id] for user_id in reco_ids if user_id in reco_public_users]
+        return jsonify(payload)
+    finally:
+        conn.close()
 
 
 @app.post("/api/library/share")
@@ -53086,7 +53910,7 @@ def api_library_share():
                             str(snapshot.get("label") or "")[:240],
                             str(snapshot.get("subtitle") or "")[:240],
                             str(snapshot.get("href") or "")[:512],
-                            str(snapshot.get("thumb") or "")[:1024] or None,
+                            str(snapshot.get("thumb") or "")[:1024],
                             json.dumps(snapshot.get("meta") or {}, ensure_ascii=False),
                             message or None,
                             int(parent_recommendation_id or 0) if parent_recommendation_id > 0 else None,
@@ -53112,6 +53936,17 @@ def api_library_share():
                         payload={"href": snapshot.get("href")},
                     )
         return jsonify({"ok": True, "count": len(inserted_ids), "recommendation_ids": inserted_ids})
+    except Exception as exc:
+        logging.exception(
+            "[Share] failed entity_type=%s entity_id=%s entity_key=%r uid=%s recipients=%s: %s",
+            entity_type,
+            int(entity_id or 0),
+            entity_key,
+            int(uid or 0),
+            recipient_ids,
+            exc,
+        )
+        return jsonify({"error": "Could not send recommendation"}), 500
     finally:
         conn.close()
 
@@ -53121,11 +53956,18 @@ def api_library_recommendations():
     uid = _current_user_id_or_zero()
     if uid <= 0:
         return jsonify({"error": "Authentication required"}), 401
+    target_uid, target_user, scope_err = _auth_resolve_public_user_scope(
+        request.args.get("user_id"),
+        current_user_id=uid,
+        visibility_key="share_recommendations_public",
+    )
+    if scope_err:
+        return jsonify({"error": scope_err[0]}), int(scope_err[1])
     conn = _files_pg_connect()
     if conn is None:
         return jsonify({"error": "PostgreSQL unavailable"}), 503
     try:
-        payload = {"received": [], "sent": [], "unread_count": 0}
+        payload = {"owner": target_user or _auth_user_snapshot(target_uid), "received": [], "sent": [], "unread_count": 0}
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -53138,7 +53980,7 @@ def api_library_recommendations():
                 ORDER BY created_at DESC, id DESC
                 LIMIT 200
                 """,
-                (int(uid),),
+                (int(target_uid),),
             )
             payload["received"] = [_social_recommendation_payload(row) for row in cur.fetchall()]
             cur.execute(
@@ -53152,14 +53994,15 @@ def api_library_recommendations():
                 ORDER BY created_at DESC, id DESC
                 LIMIT 200
                 """,
-                (int(uid),),
+                (int(target_uid),),
             )
             payload["sent"] = [_social_recommendation_payload(row) for row in cur.fetchall()]
-            cur.execute(
-                "SELECT COUNT(*) FROM files_user_notifications WHERE user_id = %s AND is_read = FALSE",
-                (int(uid),),
-            )
-            payload["unread_count"] = int((cur.fetchone() or [0])[0] or 0)
+            if int(target_uid) == int(uid):
+                cur.execute(
+                    "SELECT COUNT(*) FROM files_user_notifications WHERE user_id = %s AND is_read = FALSE",
+                    (int(uid),),
+                )
+                payload["unread_count"] = int((cur.fetchone() or [0])[0] or 0)
         return jsonify(payload)
     finally:
         conn.close()
@@ -54840,6 +55683,8 @@ def api_library_artist_summary_ai(artist_id: int):
     """Generate/refresh an AI summary (100-200 words) for an artist and persist it in PostgreSQL."""
     if _get_library_mode() != "files":
         return jsonify({"error": "Artist summary endpoint is available in Files mode only"}), 400
+    if not _auth_user_can_use_ai(_current_user()):
+        return jsonify({"error": "AI access is disabled for this user"}), 403
     ai_ok, _provider_effective, _auth_mode, ai_reason = _resolve_ai_runtime_availability(
         analysis_type="assistant_chat",
         requested_provider="openai",
@@ -60660,7 +61505,14 @@ def _improve_single_album(album_id: int, db_conn, known_release_group_id: Option
                     tracks.add(t)
         except Exception:
             pass
-        rg_info, _verified_by_ai = search_mb_release_group_by_metadata(artist_name, album_norm, tracks, title_raw=album_title_str)
+        rg_info, _verified_by_ai = search_mb_release_group_by_metadata(
+            artist_name,
+            album_norm,
+            tracks,
+            title_raw=album_title_str,
+            local_tags=current_tags if isinstance(current_tags, dict) else {},
+            local_paths=[str(p) for p in audio_files[:80]],
+        )
         if rg_info and isinstance(rg_info.get("id"), str):
             release_mbid = rg_info["id"]
             steps.append("Found MusicBrainz release group via search")
@@ -61679,7 +62531,13 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
         except Exception:
             pass
         rg_info, _ = search_mb_release_group_by_metadata(
-            artist_name, album_norm, tracks, title_raw=album_title_str, album_folder=folder_path
+            artist_name,
+            album_norm,
+            tracks,
+            title_raw=album_title_str,
+            album_folder=folder_path,
+            local_tags=current_tags if isinstance(current_tags, dict) else {},
+            local_paths=[str(p) for p in audio_files[:80]],
         )
         if rg_info and isinstance(rg_info.get("id"), str):
             release_mbid = rg_info["id"]
@@ -62817,6 +63675,8 @@ def api_library_album_review_generate(album_id: int):
     """Manually generate/persist one album review profile (web+AI first, then provider fallback)."""
     if _get_library_mode() != "files":
         return jsonify({"error": "Files mode required"}), 400
+    if not _auth_user_can_use_ai(_current_user()):
+        return jsonify({"error": "AI access is disabled for this user"}), 403
     ok, err = _ensure_files_index_ready()
     if not ok:
         return jsonify({"error": err or "Files index unavailable"}), 503
@@ -66743,6 +67603,8 @@ def api_assistant_chat():
     """Chat endpoint: uses Postgres-backed RAG (artist profiles + local library snapshot)."""
     if _get_library_mode() != "files":
         return jsonify({"error": "Assistant is available in Files mode only"}), 400
+    if not _auth_user_can_use_ai(_current_user()):
+        return jsonify({"error": "AI access is disabled for this user"}), 403
     data = request.get_json() or {}
     if not isinstance(data, dict):
         return jsonify({"error": "Invalid JSON body"}), 400
@@ -66984,6 +67846,8 @@ def api_assistant_chat():
 def api_library_entity_discover():
     if _get_library_mode() != "files":
         return jsonify({"error": "Files mode required"}), 400
+    if not _auth_user_can_use_ai(_current_user()):
+        return jsonify({"error": "AI access is disabled for this user"}), 403
     ok, err = _ensure_files_index_ready()
     if not ok:
         return jsonify({"error": err or "Files index unavailable"}), 503
@@ -67204,7 +68068,12 @@ def api_library_entity_discover():
                             lower(COALESCE(alb.genre, '')) LIKE ANY(%s)
                             OR EXISTS (
                               SELECT 1
-                              FROM jsonb_array_elements_text(COALESCE(alb.tags_json, '[]'::jsonb)) AS t(tag)
+                              FROM jsonb_array_elements_text(
+                                CASE
+                                  WHEN trim(COALESCE(alb.tags_json, '')) = '' THEN '[]'::jsonb
+                                  ELSE alb.tags_json::jsonb
+                                END
+                              ) AS t(tag)
                               WHERE lower(t.tag) = ANY(%s)
                             )
                           )

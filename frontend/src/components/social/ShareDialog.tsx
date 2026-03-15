@@ -60,7 +60,7 @@ export function ShareDialog({
     const run = async () => {
       setLoadingUsers(true);
       try {
-        const res = await api.getSocialUsers();
+        const res = await api.getSocialUsers('shares');
         if (cancelled) return;
         const all = Array.isArray(res.users) ? res.users : [];
         setUsers(all.filter((candidate) => candidate.is_active && candidate.id !== user?.id));

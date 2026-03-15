@@ -24,6 +24,7 @@ import { useToast } from '@/hooks/use-toast';
 import { ConcertsMiniMap } from '@/components/concerts/ConcertsMiniMap';
 import { usePlayback } from '@/contexts/PlaybackContext';
 import type { TrackInfo } from '@/components/library/AudioPlayer';
+import { useAuth } from '@/contexts/AuthContext';
 
 interface SimilarArtist {
   name: string;
@@ -143,6 +144,7 @@ export default function ArtistPage() {
   const navigate = useNavigate();
   const location = useLocation();
   const { startPlayback, setCurrentTrack } = usePlayback();
+  const { canUseAI } = useAuth();
   const { showBadges, setShowBadges } = useAlbumBadgesVisibility();
   const params = useParams<{ artistId: string }>();
   const artistId = Number(params.artistId);
@@ -774,6 +776,9 @@ export default function ArtistPage() {
   const isDeceased =
     factsDied.length > 0
     || /(^|\W)(died|deceased|passed away|late)(\W|$)/i.test(displayText.slice(0, 1600));
+  const hasConcertSignals = concertsLoading || Boolean(concertsError) || concertList.events.length > 0 || Boolean(isDeceased);
+  const hasConnectionSignals = factsLoading || factsLoadedOnce || connectionCount > 0;
+  const showInsightsCard = hasConcertSignals || hasConnectionSignals;
   const artistAddedAt = Number(details.created_at || 0) > 0 ? Number(details.created_at || 0) : null;
   const artistUpdatedAt =
     Number(details.updated_at || 0) > 0
@@ -907,24 +912,28 @@ export default function ArtistPage() {
                       {refreshAllBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
                       Refresh
                     </Button>
-                    <Button
-                      type="button"
-                      size="sm"
-                      variant="outline"
-                      className="h-8 gap-2"
-                      onClick={() => void runArtistAiResearch()}
-                      disabled={aiProcessBusy}
-                      title="Run AI research and consistency checks for this artist and albums"
-                    >
-                      {aiProcessBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />}
-                      AI research
-                    </Button>
-                    <EntityDiscoverDialog
-                      entityType="artist"
-                      artistId={details.artist_id}
-                      entityLabel={details.artist_name}
-                      triggerLabel="Discover"
-                    />
+                    {canUseAI ? (
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        className="h-8 gap-2"
+                        onClick={() => void runArtistAiResearch()}
+                        disabled={aiProcessBusy}
+                        title="Run AI research and consistency checks for this artist and albums"
+                      >
+                        {aiProcessBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />}
+                        AI research
+                      </Button>
+                    ) : null}
+                    {canUseAI ? (
+                      <EntityDiscoverDialog
+                        entityType="artist"
+                        artistId={details.artist_id}
+                        entityLabel={details.artist_name}
+                        triggerLabel="Discover"
+                      />
+                    ) : null}
                     <Button
                       type="button"
                       size="sm"
@@ -979,26 +988,31 @@ export default function ArtistPage() {
           </CardContent>
         </Card>
 
+        {showInsightsCard ? (
         <Card className="border-border/70">
           <CardContent className="p-5 space-y-4">
             <div className="flex flex-wrap items-center gap-2">
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                className="h-8 gap-2"
-                onClick={() => setShowConcertsModal(true)}
-              >
-                <Calendar className="h-3.5 w-3.5" />
-                Concerts
-                <Badge variant={concertList.events.length > 0 ? 'secondary' : 'outline'} className="h-5 px-1.5 text-[10px]">
-                  {concertList.events.length}
+              {hasConcertSignals ? (
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="h-8 gap-2"
+                  onClick={() => setShowConcertsModal(true)}
+                >
+                  <Calendar className="h-3.5 w-3.5" />
+                  Concerts
+                  <Badge variant={concertList.events.length > 0 ? 'secondary' : 'outline'} className="h-5 px-1.5 text-[10px]">
+                    {concertList.events.length}
+                  </Badge>
+                </Button>
+              ) : null}
+              {connectionCount > 0 ? (
+                <Badge variant="outline" className={`h-8 px-2.5 text-[11px] gap-1.5 ${badgeKindClass('count')}`}>
+                  <Users className="h-3.5 w-3.5" />
+                  Connections: {connectionCountDisplay}
                 </Badge>
-              </Button>
-              <Badge variant="outline" className={`h-8 px-2.5 text-[11px] gap-1.5 ${badgeKindClass('count')}`}>
-                <Users className="h-3.5 w-3.5" />
-                Connections: {connectionCountDisplay}
-              </Badge>
+              ) : null}
               {isDeceased ? (
                 <Badge
                   variant="secondary"
@@ -1072,6 +1086,7 @@ export default function ArtistPage() {
               ) : null}
             </div>
 
+            {hasConnectionSignals ? (
             <Collapsible open={connectionDetailsOpen} onOpenChange={setConnectionDetailsOpen}>
               <CollapsibleTrigger asChild>
                 <Button type="button" variant="ghost" size="sm" className="gap-1.5 px-0">
@@ -1146,8 +1161,10 @@ export default function ArtistPage() {
                 )}
               </CollapsibleContent>
             </Collapsible>
+            ) : null}
           </CardContent>
         </Card>
+        ) : null}
 
         <Dialog open={showConcertsModal} onOpenChange={setShowConcertsModal}>
           <DialogContent className="max-w-4xl max-h-[86vh] overflow-y-auto">

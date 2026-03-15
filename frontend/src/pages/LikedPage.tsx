@@ -3,28 +3,42 @@ import { Heart, Loader2 } from 'lucide-react';
 import { useLocation, useNavigate } from 'react-router-dom';
 
 import * as api from '@/lib/api';
+import { useAuth } from '@/contexts/AuthContext';
 import { AlbumArtwork } from '@/components/library/AlbumArtwork';
 import { AlbumBadgeGroups } from '@/components/library/AlbumBadgeGroups';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { ScrollArea } from '@/components/ui/scroll-area';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { useAlbumBadgesVisibility } from '@/hooks/use-album-badges';
 import { withBackLinkState } from '@/lib/backNavigation';
 
 export default function LikedPage() {
   const navigate = useNavigate();
   const location = useLocation();
+  const { user } = useAuth();
   const { showBadges, setShowBadges } = useAlbumBadgesVisibility();
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [data, setData] = useState<api.LikedSummaryResponse | null>(null);
+  const [usersLoading, setUsersLoading] = useState(false);
+  const [visibleUsers, setVisibleUsers] = useState<api.SocialUser[]>([]);
+  const [selectedUserId, setSelectedUserId] = useState<string>('me');
+  const requestedUserId = useMemo(() => {
+    const value = new URLSearchParams(location.search).get('user');
+    return value && /^\d+$/.test(value) ? value : 'me';
+  }, [location.search]);
+
+  useEffect(() => {
+    setSelectedUserId(requestedUserId);
+  }, [requestedUserId]);
 
   const load = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
-      const res = await api.getLikedSummary();
+      const res = await api.getLikedSummary(selectedUserId === 'me' ? undefined : Number(selectedUserId));
       setData(res);
     } catch (err) {
       setData(null);
@@ -32,11 +46,40 @@ export default function LikedPage() {
     } finally {
       setLoading(false);
     }
+  }, [selectedUserId]);
+
+  const loadUsers = useCallback(async () => {
+    setUsersLoading(true);
+    try {
+      const res = await api.getSocialUsers('liked');
+      setVisibleUsers(Array.isArray(res.users) ? res.users : []);
+    } catch {
+      setVisibleUsers([]);
+    } finally {
+      setUsersLoading(false);
+    }
   }, []);
 
   useEffect(() => {
     void load();
   }, [load]);
+
+  useEffect(() => {
+    void loadUsers();
+  }, [loadUsers]);
+
+  useEffect(() => {
+    const qs = new URLSearchParams(location.search);
+    if (selectedUserId === 'me') {
+      qs.delete('user');
+    } else {
+      qs.set('user', selectedUserId);
+    }
+    const nextSearch = qs.toString() ? `?${qs.toString()}` : '';
+    if (nextSearch !== location.search) {
+      navigate({ pathname: location.pathname, search: nextSearch }, { replace: true });
+    }
+  }, [location.pathname, location.search, navigate, selectedUserId]);
 
   const albums = useMemo(() => data?.albums || [], [data?.albums]);
   const artists = useMemo(() => data?.artists || [], [data?.artists]);
@@ -56,11 +99,33 @@ export default function LikedPage() {
           <Button type="button" variant="outline" size="sm" onClick={() => setShowBadges(!showBadges)}>
             {showBadges ? 'Hide badges' : 'Show badges'}
           </Button>
+          <Select value={selectedUserId} onValueChange={setSelectedUserId}>
+            <SelectTrigger className="w-[220px]">
+              <SelectValue placeholder="Choose a user" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="me">My liked</SelectItem>
+              {visibleUsers.map((candidate) => (
+                <SelectItem key={`liked-user-${candidate.id}`} value={String(candidate.id)}>
+                  {candidate.username}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
           <Button type="button" variant="outline" size="sm" onClick={() => void load()}>
             Refresh
           </Button>
         </div>
       </div>
+
+      {usersLoading ? (
+        <p className="text-xs text-muted-foreground">Loading visible user lists…</p>
+      ) : null}
+      {data?.owner?.username ? (
+        <div className="text-sm text-muted-foreground">
+          Viewing liked content for <span className="font-medium text-foreground">{selectedUserId === 'me' ? (user?.username || data.owner.username) : data.owner.username}</span>
+        </div>
+      ) : null}
 
       {loading ? (
         <div className="flex items-center justify-center py-24 text-muted-foreground">

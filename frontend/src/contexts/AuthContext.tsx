@@ -9,6 +9,7 @@ interface AuthContextValue {
   isAdmin: boolean;
   canDownload: boolean;
   canViewStatistics: boolean;
+  canUseAI: boolean;
   login: (username: string, password: string, rememberMe?: boolean) => Promise<void>;
   bootstrapAdmin: (username: string, password: string, passwordConfirm: string) => Promise<void>;
   logout: () => Promise<void>;
@@ -107,6 +108,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       isAdmin: Boolean(user?.is_admin),
       canDownload: Boolean(user?.can_download),
       canViewStatistics: Boolean(user?.is_admin || user?.can_view_statistics),
+      canUseAI: Boolean(user?.is_admin || user?.allow_ai_calls),
       login,
       bootstrapAdmin,
       logout,

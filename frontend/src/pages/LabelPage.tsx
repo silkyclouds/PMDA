@@ -20,6 +20,7 @@ import { cn } from '@/lib/utils';
 import * as api from '@/lib/api';
 import type { TrackInfo } from '@/components/library/AudioPlayer';
 import type { LibraryOutletContext } from '@/pages/LibraryLayout';
+import { useAuth } from '@/contexts/AuthContext';
 
 export default function LabelPage() {
   const isMobile = useIsMobile();
@@ -27,6 +28,7 @@ export default function LabelPage() {
   const location = useLocation();
   const { includeUnmatched } = useOutletContext<LibraryOutletContext>();
   const { startPlayback, setCurrentTrack } = usePlayback();
+  const { canUseAI } = useAuth();
   const { toast } = useToast();
   const params = useParams<{ label: string }>();
   const label = decodeURIComponent(String(params.label || '')).trim();
@@ -261,12 +263,14 @@ export default function LabelPage() {
                 </Button>
               )}
             />
-            <EntityDiscoverDialog
-              entityType="label"
-              label={label}
-              entityLabel={label || 'Label'}
-              triggerLabel="Discover"
-            />
+            {canUseAI ? (
+              <EntityDiscoverDialog
+                entityType="label"
+                label={label}
+                entityLabel={label || 'Label'}
+                triggerLabel="Discover"
+              />
+            ) : null}
           </div>
 
           {profileLoading ? (
