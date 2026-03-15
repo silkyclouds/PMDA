@@ -11,6 +11,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { FormatBadge } from '@/components/FormatBadge';
 import { AlbumRatingStars } from '@/components/library/AlbumRatingStars';
 import { EntityDiscoverDialog } from '@/components/library/EntityDiscoverDialog';
+import { SocialActivityBadges } from '@/components/social/SocialActivityBadges';
 import { MatchDetailDialog } from '@/components/library/MatchDetailDialog';
 import { ProviderBadge } from '@/components/providers/ProviderBadge';
 import { ProviderLink } from '@/components/providers/ProviderLink';
@@ -828,6 +829,11 @@ export default function AlbumPage() {
                   </Badge>
                 ) : null}
               </div>
+              <SocialActivityBadges
+                entityType="album"
+                entityId={data.album_id}
+                compact
+              />
             </div>
           </div>
           <div className="space-y-2">

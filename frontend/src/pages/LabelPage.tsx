@@ -7,6 +7,7 @@ import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { EntityDiscoverDialog } from '@/components/library/EntityDiscoverDialog';
+import { SocialActivityBadges } from '@/components/social/SocialActivityBadges';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { AlbumArtwork } from '@/components/library/AlbumArtwork';
 import { AlbumBadgeGroups } from '@/components/library/AlbumBadgeGroups';
@@ -287,6 +288,12 @@ export default function LabelPage() {
               <Badge key={`sub-${sub}`} variant="outline" className="text-[11px]">{sub}</Badge>
             ))}
           </div>
+
+          <SocialActivityBadges
+            entityType="label"
+            entityKey={label}
+            compact
+          />
 
           {topArtists.length > 0 ? (
             <div className="space-y-2">

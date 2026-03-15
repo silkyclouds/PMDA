@@ -67861,8 +67861,9 @@ def api_library_entity_discover():
     entity_type = str(data.get("entity_type") or "").strip().lower()
     if entity_type not in {"artist", "album", "label"}:
         return jsonify({"error": "unsupported entity_type"}), 400
-    artist_id = _parse_int_loose(data.get("artist_id"), 0)
-    album_id = _parse_int_loose(data.get("album_id"), 0)
+    entity_id = _parse_int_loose(data.get("entity_id"), 0)
+    artist_id = _parse_int_loose(data.get("artist_id"), 0) or (entity_id if entity_type == "artist" else 0)
+    album_id = _parse_int_loose(data.get("album_id"), 0) or (entity_id if entity_type == "album" else 0)
     label_value = str(data.get("label") or "").strip()
     base_url = request.url_root.rstrip("/")
     uid = _current_user_id_or_zero()

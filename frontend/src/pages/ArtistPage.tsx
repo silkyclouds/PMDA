@@ -11,6 +11,7 @@ import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } f
 import { AlbumArtwork } from '@/components/library/AlbumArtwork';
 import { AlbumBadgeGroups } from '@/components/library/AlbumBadgeGroups';
 import { EntityDiscoverDialog } from '@/components/library/EntityDiscoverDialog';
+import { SocialActivityBadges } from '@/components/social/SocialActivityBadges';
 import { MatchDetailDialog } from '@/components/library/MatchDetailDialog';
 import { ProviderBadge } from '@/components/providers/ProviderBadge';
 import { ShareDialog } from '@/components/social/ShareDialog';
@@ -950,6 +951,11 @@ export default function ArtistPage() {
             </div>
           </div>
           <CardContent className="pt-4 pb-5 space-y-4">
+            <SocialActivityBadges
+              entityType="artist"
+              entityId={details.artist_id}
+              compact
+            />
             {displayText ? (
               <Collapsible open={descExpanded} onOpenChange={setDescExpanded}>
                 {!descExpanded ? (
