@@ -18225,26 +18225,37 @@ def _entity_discover_ai_summary(
             for sec in sections[:6]
         ],
     }
-    raw = call_ai_provider_longform(
-        provider,
-        model,
-        system_msg,
-        json.dumps(payload, ensure_ascii=False),
-        max_tokens=500,
-        analysis_type="other",
-    )
-    obj = _assistant_extract_json_obj(raw)
-    if not isinstance(obj, dict):
+    try:
+        raw = call_ai_provider_longform(
+            provider,
+            model,
+            system_msg,
+            json.dumps(payload, ensure_ascii=False),
+            max_tokens=500,
+            analysis_type="other",
+        )
+        obj = _assistant_extract_json_obj(raw)
+        if not isinstance(obj, dict):
+            return ("", provider, model, False)
+        summary = str(obj.get("summary") or "").strip()
+        section_reasons = obj.get("section_reasons") if isinstance(obj.get("section_reasons"), dict) else {}
+        if summary:
+            for sec in sections:
+                key = str(sec.get("key") or "").strip()
+                if key and str(section_reasons.get(key) or "").strip():
+                    sec["reason"] = str(section_reasons.get(key) or "").strip()
+            return (summary, provider, model, True)
         return ("", provider, model, False)
-    summary = str(obj.get("summary") or "").strip()
-    section_reasons = obj.get("section_reasons") if isinstance(obj.get("section_reasons"), dict) else {}
-    if summary:
-        for sec in sections:
-            key = str(sec.get("key") or "").strip()
-            if key and str(section_reasons.get(key) or "").strip():
-                sec["reason"] = str(section_reasons.get(key) or "").strip()
-        return (summary, provider, model, True)
-    return ("", provider, model, False)
+    except Exception as exc:
+        logging.warning(
+            "Entity discover AI summary failed entity_type=%s entity_label=%s provider=%s model=%s: %s",
+            entity_type,
+            entity_label,
+            provider,
+            model,
+            exc,
+        )
+        return ("", provider, model, False)
 
 
 def _assistant_should_include_web_discovery(user_message: str, *, retrieved_chunks_count: int) -> bool:
@@ -40025,6 +40036,82 @@ def _lastfm_status_snapshot() -> dict[str, Any]:
     }
 
 
+def _lastfm_try_complete_pending_authorization_if_needed(*, enqueue_loved_sync: bool = False) -> dict[str, Any]:
+    snapshot = _lastfm_status_snapshot()
+    if bool(snapshot.get("connected")) or not bool(snapshot.get("pending")):
+        return snapshot
+    ok, message = _lastfm_try_complete_pending_authorization(enqueue_loved_sync=enqueue_loved_sync)
+    refreshed = _lastfm_status_snapshot()
+    if not ok and message:
+        refreshed["message"] = message
+    return refreshed
+
+
+def _lastfm_store_session_payload(session: dict[str, Any]) -> tuple[bool, str]:
+    if not isinstance(session, dict):
+        return False, "Last.fm did not return a session"
+    session_key = str(session.get("key") or "").strip()
+    session_name = str(session.get("name") or "").strip()
+    if not session_key:
+        return False, "Last.fm session key is missing"
+    _settings_db_set_secret(_LASTFM_SESSION_KEY_SETTING, session_key)
+    _settings_db_set_value(_LASTFM_SESSION_NAME_SETTING, session_name)
+    _settings_db_delete_keys(_LASTFM_AUTH_TOKEN_SETTING)
+    if _get_config_from_db("LASTFM_SCROBBLE_ENABLED") is None:
+        _settings_db_set_value("LASTFM_SCROBBLE_ENABLED", "1")
+        try:
+            sys.modules[__name__].LASTFM_SCROBBLE_ENABLED = True
+        except Exception:
+            pass
+    if _get_config_from_db("LASTFM_NOW_PLAYING_ENABLED") is None:
+        _settings_db_set_value("LASTFM_NOW_PLAYING_ENABLED", "1")
+        try:
+            sys.modules[__name__].LASTFM_NOW_PLAYING_ENABLED = True
+        except Exception:
+            pass
+    return True, session_name
+
+
+def _lastfm_try_complete_pending_authorization(*, enqueue_loved_sync: bool = False) -> tuple[bool, str]:
+    api_key, api_secret = _lastfm_credentials_effective()
+    if not api_key or not api_secret:
+        return False, "Last.fm API key/secret are required"
+    if _lastfm_session_key():
+        return True, _lastfm_session_name()
+    token = _lastfm_pending_token()
+    if not token:
+        return False, "No Last.fm authorization is pending."
+    try:
+        data = _lastfm_signed_post({"method": "auth.getSession", "token": token}, timeout=12.0)
+        ok, session_name = _lastfm_store_session_payload(data.get("session") if isinstance(data, dict) else {})
+        if not ok:
+            return False, session_name
+        if enqueue_loved_sync:
+            try:
+                uid = max(0, int(_current_user_id_or_zero() or 0))
+                if uid > 0:
+                    threading.Thread(
+                        target=_lastfm_sync_loved_tracks_to_pmda,
+                        args=(uid,),
+                        kwargs={"force": True},
+                        name="lastfm-loved-sync-auth",
+                        daemon=True,
+                    ).start()
+            except Exception:
+                logging.debug("Failed to enqueue Last.fm loved-track sync after auth", exc_info=True)
+        logging.info("Last.fm authorization completed automatically for session=%s", session_name or "unknown")
+        return True, session_name
+    except Exception as exc:
+        message = str(exc or "").strip() or "Last.fm authorization is not complete yet"
+        lowered = message.lower()
+        if "not been authorized" in lowered or "unauthorized token" in lowered:
+            return False, "Authorize PMDA on Last.fm first, then click Finish authorization."
+        if "invalid method signature" in lowered or "invalid api key" in lowered:
+            return False, message
+        logging.info("Last.fm pending authorization not complete yet: %s", message)
+        return False, message
+
+
 def _lastfm_scrobble_enabled() -> bool:
     return bool(_parse_bool(_get_config_from_db("LASTFM_SCROBBLE_ENABLED", getattr(sys.modules[__name__], "LASTFM_SCROBBLE_ENABLED", False))))
 
@@ -40167,8 +40254,16 @@ def _lastfm_set_track_love(track_id: int, loved: bool) -> None:
     session_key = _lastfm_session_key()
     action = "track.love" if loved else "track.unlove"
     if not session_key:
-        logging.info("Last.fm %s skipped for track_id=%s: session key missing", action, track_id)
-        return
+        snapshot = _lastfm_try_complete_pending_authorization_if_needed(enqueue_loved_sync=True)
+        session_key = _lastfm_session_key()
+        if not session_key:
+            logging.info(
+                "Last.fm %s skipped for track_id=%s: session key missing%s",
+                action,
+                track_id,
+                f" ({snapshot.get('message')})" if snapshot.get("message") else "",
+            )
+            return
     payload = _lastfm_playback_track_payload(track_id)
     if not payload or not payload.get("artist") or not payload.get("track"):
         logging.info("Last.fm %s skipped for track_id=%s: track payload unavailable", action, track_id)
@@ -40297,8 +40392,15 @@ def _lastfm_submit_now_playing(track_id: int) -> None:
         return
     session_key = _lastfm_session_key()
     if not session_key:
-        logging.info("Last.fm now-playing skipped for track_id=%s: session key missing", track_id)
-        return
+        snapshot = _lastfm_try_complete_pending_authorization_if_needed(enqueue_loved_sync=True)
+        session_key = _lastfm_session_key()
+        if not session_key:
+            logging.info(
+                "Last.fm now-playing skipped for track_id=%s: session key missing%s",
+                track_id,
+                f" ({snapshot.get('message')})" if snapshot.get("message") else "",
+            )
+            return
     payload = _lastfm_playback_track_payload(track_id)
     if not payload or not payload.get("artist") or not payload.get("track"):
         logging.info("Last.fm now-playing skipped for track_id=%s: track payload unavailable", track_id)
@@ -40326,8 +40428,15 @@ def _lastfm_submit_scrobble(track_id: int, played_seconds: int) -> None:
         return
     session_key = _lastfm_session_key()
     if not session_key:
-        logging.info("Last.fm scrobble skipped for track_id=%s: session key missing", track_id)
-        return
+        snapshot = _lastfm_try_complete_pending_authorization_if_needed(enqueue_loved_sync=True)
+        session_key = _lastfm_session_key()
+        if not session_key:
+            logging.info(
+                "Last.fm scrobble skipped for track_id=%s: session key missing%s",
+                track_id,
+                f" ({snapshot.get('message')})" if snapshot.get("message") else "",
+            )
+            return
     payload = _lastfm_playback_track_payload(track_id)
     if not payload or not payload.get("artist") or not payload.get("track"):
         logging.info("Last.fm scrobble skipped for track_id=%s: track payload unavailable", track_id)
@@ -44052,7 +44161,7 @@ def api_openai_check():
 
 @app.get("/api/lastfm/auth/status")
 def api_lastfm_auth_status():
-    return jsonify(_lastfm_status_snapshot())
+    return jsonify(_lastfm_try_complete_pending_authorization_if_needed(enqueue_loved_sync=True))
 
 
 @app.post("/api/lastfm/auth/start")
@@ -44085,41 +44194,15 @@ def api_lastfm_auth_complete():
     if not token:
         return jsonify({"ok": False, "message": "No Last.fm authorization is pending."}), 409
     try:
-        data = _lastfm_signed_post({"method": "auth.getSession", "token": token}, timeout=12.0)
-        session = data.get("session") if isinstance(data, dict) else {}
-        if not isinstance(session, dict):
-            raise RuntimeError("Last.fm did not return a session")
-        session_key = str(session.get("key") or "").strip()
-        session_name = str(session.get("name") or "").strip()
-        if not session_key:
-            raise RuntimeError("Last.fm session key is missing")
-        _settings_db_set_secret(_LASTFM_SESSION_KEY_SETTING, session_key)
-        _settings_db_set_value(_LASTFM_SESSION_NAME_SETTING, session_name)
-        _settings_db_delete_keys(_LASTFM_AUTH_TOKEN_SETTING)
-        if _get_config_from_db("LASTFM_SCROBBLE_ENABLED") is None:
-            _settings_db_set_value("LASTFM_SCROBBLE_ENABLED", "1")
-            try:
-                sys.modules[__name__].LASTFM_SCROBBLE_ENABLED = True
-            except Exception:
-                pass
-        if _get_config_from_db("LASTFM_NOW_PLAYING_ENABLED") is None:
-            _settings_db_set_value("LASTFM_NOW_PLAYING_ENABLED", "1")
-            try:
-                sys.modules[__name__].LASTFM_NOW_PLAYING_ENABLED = True
-            except Exception:
-                pass
-        try:
-            uid = max(0, int(_current_user_id_or_zero() or 0))
-            if uid > 0:
-                threading.Thread(
-                    target=_lastfm_sync_loved_tracks_to_pmda,
-                    args=(uid,),
-                    kwargs={"force": True},
-                    name="lastfm-loved-sync-auth",
-                    daemon=True,
-                ).start()
-        except Exception:
-            logging.debug("Failed to enqueue Last.fm loved-track sync after auth", exc_info=True)
+        ok, message = _lastfm_try_complete_pending_authorization(enqueue_loved_sync=True)
+        if not ok:
+            lowered = str(message or "").strip().lower()
+            if "authorize pmda on last.fm first" in lowered or "no last.fm authorization is pending" in lowered:
+                return jsonify({"ok": False, "message": message or "Authorize PMDA on Last.fm first, then click Finish authorization."}), 409
+            if "invalid method signature" in lowered or "invalid api key" in lowered:
+                return jsonify({"ok": False, "message": message}), 400
+            return jsonify({"ok": False, "message": message or "Last.fm authorization is not complete yet"}), 409
+        session_name = _lastfm_session_name()
         return jsonify({"ok": True, "connected": True, "session_name": session_name, "message": f"Connected to Last.fm as {session_name or 'your account'}"})
     except Exception as exc:
         message = str(exc or "").strip() or "Last.fm authorization is not complete yet"

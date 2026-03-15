@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import {
   Loader2,
@@ -69,7 +69,7 @@ const AI_COST_ALBUM_LIMIT = 200;
 const AI_COST_SCAN_ROWS_LIMIT = 30;
 
 type PeriodKey = (typeof PERIODS)[number]['key'];
-type StatsTab = 'overview' | 'metadata' | 'quality' | 'operations' | 'ai' | 'benchmark';
+type StatsTab = 'overview' | 'metadata' | 'quality' | 'operations' | 'duplicates' | 'incompletes' | 'ai' | 'benchmark';
 
 interface ScanSnapshot {
   scanId: number;
@@ -569,6 +569,33 @@ export default function Statistics() {
     refetchIntervalInBackground: true,
   });
   const {
+    data: scanMovesSummary,
+  } = useQuery({
+    queryKey: ['scan-moves-summary', latestCompletedScanId],
+    queryFn: () => api.getScanMovesSummary(latestCompletedScanId ?? 0),
+    enabled: (latestCompletedScanId ?? 0) > 0,
+    refetchInterval: 60000,
+    refetchIntervalInBackground: true,
+  });
+  const {
+    data: duplicateMoves = [],
+  } = useQuery({
+    queryKey: ['scan-moves', latestCompletedScanId, 'dedupe'],
+    queryFn: () => api.getScanMoves(latestCompletedScanId ?? 0, { reason: 'dedupe', status: 'all' }),
+    enabled: (latestCompletedScanId ?? 0) > 0,
+    refetchInterval: 60000,
+    refetchIntervalInBackground: true,
+  });
+  const {
+    data: incompleteMoves = [],
+  } = useQuery({
+    queryKey: ['scan-moves', latestCompletedScanId, 'incomplete'],
+    queryFn: () => api.getScanMoves(latestCompletedScanId ?? 0, { reason: 'incomplete', status: 'all' }),
+    enabled: (latestCompletedScanId ?? 0) > 0,
+    refetchInterval: 60000,
+    refetchIntervalInBackground: true,
+  });
+  const {
     data: benchmarkReportsResponse,
   } = useQuery({
     queryKey: ['benchmark-reports'],
@@ -590,6 +617,48 @@ export default function Statistics() {
     () => benchmarkReports.reduce((acc, row) => Math.max(acc, Number(row.score || 0)), 0),
     [benchmarkReports],
   );
+  const summarizeMoveReasons = useCallback((moves: api.ScanMove[]) => {
+    const counts = new Map<string, number>();
+    for (const move of moves) {
+      const label = String(move.reason_label || move.decision_reason || move.move_reason || 'Other').trim() || 'Other';
+      counts.set(label, (counts.get(label) || 0) + 1);
+    }
+    const entries = Array.from(counts.entries()).sort((a, b) => b[1] - a[1]).slice(0, 8);
+    return {
+      labels: entries.map(([label]) => label),
+      values: entries.map(([, value]) => value),
+    };
+  }, []);
+  const summarizeMoveProviders = useCallback((moves: api.ScanMove[]) => {
+    const counts = new Map<string, number>();
+    for (const move of moves) {
+      const label = String(move.decision_provider || 'Unknown').trim() || 'Unknown';
+      counts.set(label, (counts.get(label) || 0) + 1);
+    }
+    const entries = Array.from(counts.entries()).sort((a, b) => b[1] - a[1]).slice(0, 8);
+    return {
+      labels: entries.map(([label]) => label),
+      values: entries.map(([, value]) => value),
+    };
+  }, []);
+  const summarizeMoveStatuses = useCallback((moves: api.ScanMove[]) => {
+    const counts = new Map<string, number>();
+    for (const move of moves) {
+      const label = String(move.status || 'unknown').trim() || 'unknown';
+      counts.set(label, (counts.get(label) || 0) + 1);
+    }
+    const entries = Array.from(counts.entries()).sort((a, b) => b[1] - a[1]);
+    return {
+      labels: entries.map(([label]) => label),
+      values: entries.map(([, value]) => value),
+    };
+  }, []);
+  const duplicateReasonSummary = useMemo(() => summarizeMoveReasons(duplicateMoves), [duplicateMoves, summarizeMoveReasons]);
+  const duplicateProviderSummary = useMemo(() => summarizeMoveProviders(duplicateMoves), [duplicateMoves, summarizeMoveProviders]);
+  const duplicateStatusSummary = useMemo(() => summarizeMoveStatuses(duplicateMoves), [duplicateMoves, summarizeMoveStatuses]);
+  const incompleteReasonSummary = useMemo(() => summarizeMoveReasons(incompleteMoves), [incompleteMoves, summarizeMoveReasons]);
+  const incompleteProviderSummary = useMemo(() => summarizeMoveProviders(incompleteMoves), [incompleteMoves, summarizeMoveProviders]);
+  const incompleteStatusSummary = useMemo(() => summarizeMoveStatuses(incompleteMoves), [incompleteMoves, summarizeMoveStatuses]);
 
   const liveScan = useMemo(() => {
     if (!scanProgress || !isLiveRunActive) return null;
@@ -1458,6 +1527,24 @@ export default function Statistics() {
                   <span className="flex items-center gap-2">
                     <Gauge className="w-4 h-4" />
                     Operations
+                  </span>
+                </TabsTrigger>
+                <TabsTrigger
+                  value="duplicates"
+                  className="h-11 justify-start rounded-lg border border-border/60 bg-card/70 px-3 text-left text-sm font-semibold text-foreground transition-colors hover:bg-accent/70 data-[state=active]:border-rose-400/60 data-[state=active]:bg-rose-500/20 data-[state=active]:text-rose-100 data-[state=active]:shadow-[0_0_0_1px_rgba(251,113,133,0.22)]"
+                >
+                  <span className="flex items-center gap-2">
+                    <Layers className="w-4 h-4" />
+                    Duplicates
+                  </span>
+                </TabsTrigger>
+                <TabsTrigger
+                  value="incompletes"
+                  className="h-11 justify-start rounded-lg border border-border/60 bg-card/70 px-3 text-left text-sm font-semibold text-foreground transition-colors hover:bg-accent/70 data-[state=active]:border-orange-400/60 data-[state=active]:bg-orange-500/20 data-[state=active]:text-orange-100 data-[state=active]:shadow-[0_0_0_1px_rgba(251,146,60,0.22)]"
+                >
+                  <span className="flex items-center gap-2">
+                    <AlertCircle className="w-4 h-4" />
+                    Incompletes
                   </span>
                 </TabsTrigger>
                 <TabsTrigger
@@ -2442,6 +2529,209 @@ export default function Statistics() {
                   )}
                 </CardContent>
               </Card>
+            </TabsContent>
+            <TabsContent value="duplicates" className="space-y-4">
+              <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
+                <StatCard
+                  title="Moved duplicates"
+                  icon={<Layers className="w-4 h-4 text-rose-400" />}
+                  value={duplicateMoves.length.toLocaleString()}
+                  description={`Latest scan #${latestCompletedScanId ?? '—'}`}
+                />
+                <StatCard
+                  title="Active moves"
+                  icon={<AlertCircle className="w-4 h-4 text-warning" />}
+                  value={duplicateMoves.filter((move) => String(move.status || '').toLowerCase() === 'moved').length.toLocaleString()}
+                  description="Still quarantined in dupe storage"
+                />
+                <StatCard
+                  title="Restored"
+                  icon={<RefreshCw className="w-4 h-4 text-success" />}
+                  value={duplicateMoves.filter((move) => String(move.status || '').toLowerCase() === 'restored').length.toLocaleString()}
+                  description="Rolled back by the user"
+                />
+                <StatCard
+                  title="Space involved"
+                  icon={<HardDrive className="w-4 h-4 text-info" />}
+                  value={formatBytes(Math.round(duplicateMoves.reduce((acc, move) => acc + Number(move.size_mb || 0), 0) * 1024 * 1024))}
+                  description="Total moved duplicate footprint"
+                />
+              </div>
+              <div className="grid grid-cols-1 xl:grid-cols-3 gap-4">
+                <Card>
+                  <CardHeader>
+                    <CardTitle className="text-sm">Why duplicates were moved</CardTitle>
+                    <CardDescription>Top decision reasons captured for duplicate losers.</CardDescription>
+                  </CardHeader>
+                  <CardContent>
+                    <div className="h-[260px] flex items-center justify-center">
+                      <Doughnut
+                        data={{
+                          labels: duplicateReasonSummary.labels,
+                          datasets: [{
+                            data: duplicateReasonSummary.values,
+                            backgroundColor: ['#fb7185', '#f97316', '#f59e0b', '#ef4444', '#ec4899', '#a855f7', '#14b8a6', '#60a5fa'],
+                            borderWidth: 0,
+                          }],
+                        }}
+                        options={{ ...chartOptions, cutout: '58%' }}
+                      />
+                    </div>
+                  </CardContent>
+                </Card>
+                <Card>
+                  <CardHeader>
+                    <CardTitle className="text-sm">Duplicate providers</CardTitle>
+                    <CardDescription>Which provider supplied the dedupe decision context.</CardDescription>
+                  </CardHeader>
+                  <CardContent>
+                    <div className="h-[260px]">
+                      <Bar
+                        data={{
+                          labels: duplicateProviderSummary.labels,
+                          datasets: [{
+                            label: 'Moves',
+                            data: duplicateProviderSummary.values,
+                            backgroundColor: '#fb7185',
+                            borderRadius: 8,
+                          }],
+                        }}
+                        options={{ ...chartOptions, plugins: { ...chartOptions.plugins, legend: { display: false } }, scales: { y: { beginAtZero: true } } }}
+                      />
+                    </div>
+                  </CardContent>
+                </Card>
+                <Card>
+                  <CardHeader>
+                    <CardTitle className="text-sm">Duplicate move status</CardTitle>
+                    <CardDescription>Current lifecycle of duplicate moves from the latest scan.</CardDescription>
+                  </CardHeader>
+                  <CardContent>
+                    <div className="space-y-3">
+                      {duplicateStatusSummary.labels.length === 0 ? (
+                        <p className="text-sm text-muted-foreground">No duplicate move data available yet.</p>
+                      ) : duplicateStatusSummary.labels.map((label, idx) => (
+                        <div key={`dup-status-${label}`} className="flex items-center justify-between rounded-lg border border-border p-3 text-sm">
+                          <span className="capitalize text-muted-foreground">{label.replace(/_/g, ' ')}</span>
+                          <span className="font-semibold tabular-nums">{duplicateStatusSummary.values[idx].toLocaleString()}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </CardContent>
+                </Card>
+              </div>
+            </TabsContent>
+            <TabsContent value="incompletes" className="space-y-4">
+              <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
+                <StatCard
+                  title="Moved incompletes"
+                  icon={<AlertCircle className="w-4 h-4 text-orange-400" />}
+                  value={incompleteMoves.length.toLocaleString()}
+                  description={`Latest scan #${latestCompletedScanId ?? '—'}`}
+                />
+                <StatCard
+                  title="Active moves"
+                  icon={<Layers className="w-4 h-4 text-warning" />}
+                  value={incompleteMoves.filter((move) => String(move.status || '').toLowerCase() === 'moved').length.toLocaleString()}
+                  description="Still quarantined as incomplete"
+                />
+                <StatCard
+                  title="Restored"
+                  icon={<RefreshCw className="w-4 h-4 text-success" />}
+                  value={incompleteMoves.filter((move) => String(move.status || '').toLowerCase() === 'restored').length.toLocaleString()}
+                  description="Rolled back by the user"
+                />
+                <StatCard
+                  title="Space involved"
+                  icon={<HardDrive className="w-4 h-4 text-info" />}
+                  value={formatBytes(Math.round(incompleteMoves.reduce((acc, move) => acc + Number(move.size_mb || 0), 0) * 1024 * 1024))}
+                  description="Total moved incomplete footprint"
+                />
+              </div>
+              <div className="grid grid-cols-1 xl:grid-cols-3 gap-4">
+                <Card>
+                  <CardHeader>
+                    <CardTitle className="text-sm">Why albums were marked incomplete</CardTitle>
+                    <CardDescription>Trend of incomplete reasons from the latest scan.</CardDescription>
+                  </CardHeader>
+                  <CardContent>
+                    <div className="h-[260px] flex items-center justify-center">
+                      <Doughnut
+                        data={{
+                          labels: incompleteReasonSummary.labels,
+                          datasets: [{
+                            data: incompleteReasonSummary.values,
+                            backgroundColor: ['#fb923c', '#f59e0b', '#f97316', '#f43f5e', '#facc15', '#22c55e', '#38bdf8', '#a855f7'],
+                            borderWidth: 0,
+                          }],
+                        }}
+                        options={{ ...chartOptions, cutout: '58%' }}
+                      />
+                    </div>
+                  </CardContent>
+                </Card>
+                <Card>
+                  <CardHeader>
+                    <CardTitle className="text-sm">Incomplete providers</CardTitle>
+                    <CardDescription>Providers involved in incomplete diagnostics and move decisions.</CardDescription>
+                  </CardHeader>
+                  <CardContent>
+                    <div className="h-[260px]">
+                      <Bar
+                        data={{
+                          labels: incompleteProviderSummary.labels,
+                          datasets: [{
+                            label: 'Moves',
+                            data: incompleteProviderSummary.values,
+                            backgroundColor: '#fb923c',
+                            borderRadius: 8,
+                          }],
+                        }}
+                        options={{ ...chartOptions, plugins: { ...chartOptions.plugins, legend: { display: false } }, scales: { y: { beginAtZero: true } } }}
+                      />
+                    </div>
+                  </CardContent>
+                </Card>
+                <Card>
+                  <CardHeader>
+                    <CardTitle className="text-sm">Incomplete move status</CardTitle>
+                    <CardDescription>Current lifecycle of incomplete moves from the latest scan.</CardDescription>
+                  </CardHeader>
+                  <CardContent>
+                    <div className="space-y-3">
+                      {incompleteStatusSummary.labels.length === 0 ? (
+                        <p className="text-sm text-muted-foreground">No incomplete move data available yet.</p>
+                      ) : incompleteStatusSummary.labels.map((label, idx) => (
+                        <div key={`inc-status-${label}`} className="flex items-center justify-between rounded-lg border border-border p-3 text-sm">
+                          <span className="capitalize text-muted-foreground">{label.replace(/_/g, ' ')}</span>
+                          <span className="font-semibold tabular-nums">{incompleteStatusSummary.values[idx].toLocaleString()}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </CardContent>
+                </Card>
+              </div>
+              {scanMovesSummary ? (
+                <Card>
+                  <CardHeader>
+                    <CardTitle className="text-sm">Move summary snapshot</CardTitle>
+                    <CardDescription>Latest scan-level move totals persisted by PMDA.</CardDescription>
+                  </CardHeader>
+                  <CardContent className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3">
+                    {Object.entries(scanMovesSummary.by_reason || {}).map(([reason, stats]) => (
+                      <div key={`move-summary-${reason}`} className="rounded-lg border border-border p-3 text-sm">
+                        <div className="font-medium capitalize">{reason}</div>
+                        <div className="mt-2 space-y-1 text-muted-foreground">
+                          <div>Total moved: {Number(stats.total_moved || 0).toLocaleString()}</div>
+                          <div>Active: {Number(stats.pending || 0).toLocaleString()}</div>
+                          <div>Restored: {Number(stats.restored || 0).toLocaleString()}</div>
+                          <div>Size: {formatBytes(Math.round(Number(stats.size_mb || 0) * 1024 * 1024))}</div>
+                        </div>
+                      </div>
+                    ))}
+                  </CardContent>
+                </Card>
+              ) : null}
             </TabsContent>
           </Tabs>
         )}

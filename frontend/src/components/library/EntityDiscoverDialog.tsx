@@ -40,6 +40,11 @@ export function EntityDiscoverDialog({
     try {
       const payload = await api.postEntityDiscover({
         entity_type: entityType,
+        entity_id: entityType === 'artist'
+          ? artistId
+          : entityType === 'album'
+            ? albumId
+            : undefined,
         artist_id: artistId,
         album_id: albumId,
         label,

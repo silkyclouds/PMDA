@@ -4063,6 +4063,7 @@ export async function postAssistantChat(input: {
 
 export async function postEntityDiscover(input: {
   entity_type: 'artist' | 'album' | 'label';
+  entity_id?: number;
   artist_id?: number;
   album_id?: number;
   label?: string;

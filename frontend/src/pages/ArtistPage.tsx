@@ -778,7 +778,7 @@ export default function ArtistPage() {
     factsDied.length > 0
     || /(^|\W)(died|deceased|passed away|late)(\W|$)/i.test(displayText.slice(0, 1600));
   const hasConcertSignals = concertsLoading || Boolean(concertsError) || concertList.events.length > 0 || Boolean(isDeceased);
-  const hasConnectionSignals = factsLoading || factsLoadedOnce || connectionCount > 0;
+  const hasConnectionSignals = factsLoading || connectionCount > 0;
   const showInsightsCard = hasConcertSignals || hasConnectionSignals;
   const artistAddedAt = Number(details.created_at || 0) > 0 ? Number(details.created_at || 0) : null;
   const artistUpdatedAt =
@@ -1101,11 +1101,7 @@ export default function ArtistPage() {
                 </Button>
               </CollapsibleTrigger>
               <CollapsibleContent className="pt-2">
-                {!factsLoadedOnce && !factsLoading ? (
-                  <p className="text-sm text-muted-foreground">
-                    Connections are loaded on demand from cached scan data. Open once to fetch.
-                  </p>
-                ) : connectionCount === 0 ? (
+                {connectionCount === 0 ? (
                   <p className="text-sm text-muted-foreground">
                     No connections found yet. Use Refresh to analyze labels, collaborations, and related acts.
                   </p>
