@@ -8,6 +8,7 @@ import { cn } from '@/lib/utils';
 import { useToast } from '@/hooks/use-toast';
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
 import { Button } from '@/components/ui/button';
+import { ThemeToggle } from '@/components/ThemeToggle';
 import {
   Sidebar,
   SidebarContent,
@@ -386,6 +387,13 @@ export function AppSidebar() {
             <div className="truncate font-medium text-foreground">{user?.username || 'Unknown user'}</div>
             <div>{isAdmin ? 'Administrator' : 'Library user'}</div>
           </div>
+        </div>
+        <div className="px-2 pb-2 group-data-[collapsible=icon]:px-0.5">
+          <ThemeToggle
+            showLabel
+            align="start"
+            className="w-full group-data-[collapsible=icon]:h-8 group-data-[collapsible=icon]:w-8 group-data-[collapsible=icon]:justify-center group-data-[collapsible=icon]:px-0"
+          />
         </div>
         <div className="px-2 pb-2 group-data-[collapsible=icon]:px-0.5 group-data-[collapsible=icon]:pb-1">
           <Button

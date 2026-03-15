@@ -2,7 +2,6 @@ import { useState, useEffect, useRef } from 'react';
 import { useLocation } from 'react-router-dom';
 import { RefreshCw } from 'lucide-react';
 import { WelcomeModal } from '@/components/WelcomeModal';
-import { ThemeToggle } from '@/components/ThemeToggle';
 import { Progress } from '@/components/ui/progress';
 import { GlobalStatusBar } from '@/components/GlobalStatusBar';
 import { GlobalSearch } from '@/components/GlobalSearch';
@@ -94,18 +93,10 @@ export function Header() {
   return (
     <>
       <header className="sticky top-0 z-50 safe-top border-b border-border/70 bg-card/85 backdrop-blur-xl supports-[backdrop-filter]:bg-card/70">
-        <div className="container py-2.5 md:py-3">
-          <div className="space-y-2.5 md:space-y-3">
-              <div className="flex items-center justify-between gap-2">
-                <div className="min-w-0" />
-                <div className="flex items-center gap-1.5">
-                  <ThemeToggle />
-              </div>
-            </div>
-            {showGlobalSearch ? (
-              <GlobalSearch className="max-w-none animate-in fade-in-0 slide-in-from-bottom-1 duration-300" />
-            ) : null}
-          </div>
+        <div className="container py-2 md:py-2.5">
+          {showGlobalSearch ? (
+            <GlobalSearch className="max-w-none animate-in fade-in-0 slide-in-from-bottom-1 duration-300" />
+          ) : null}
         </div>
       </header>
       
