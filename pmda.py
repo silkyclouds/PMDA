@@ -203,6 +203,13 @@ app = Flask(__name__)
 _FRONTEND_DIST = os.path.join(os.path.dirname(os.path.abspath(__file__)), "frontend", "dist")
 _HAS_STATIC_UI = os.path.isdir(_FRONTEND_DIST)
 
+
+def _normalize_match_cover_ocr_mode(value: Any) -> str:
+    mode = str(value or "smart").strip().lower()
+    if mode not in {"off", "smart", "always"}:
+        return "smart"
+    return mode
+
 # CORS: locked down by explicit origin allow-list.
 _DEFAULT_CORS_ORIGINS = {
     "http://localhost:3000",
@@ -2055,6 +2062,7 @@ merged = {
     # Provider identity arbitration (Discogs/Last.fm/Bandcamp when MB is unavailable).
     "PROVIDER_IDENTITY_STRICT": _get("PROVIDER_IDENTITY_STRICT", default=True, cast=_parse_bool),
     "PROVIDER_IDENTITY_USE_AI": _get("PROVIDER_IDENTITY_USE_AI", default=True, cast=_parse_bool),
+    "MATCH_COVER_OCR_MODE": _get("MATCH_COVER_OCR_MODE", default="smart", cast=_normalize_match_cover_ocr_mode),
     "PROVIDER_IDENTITY_MIN_SCORE": _get(
         "PROVIDER_IDENTITY_MIN_SCORE",
         default=0.72,
@@ -2252,6 +2260,7 @@ MB_TRACKLIST_FETCH_LIMIT: int = int(merged.get("MB_TRACKLIST_FETCH_LIMIT", 0))
 MB_FAST_FALLBACK_MODE: bool = bool(merged.get("MB_FAST_FALLBACK_MODE", False))
 PROVIDER_IDENTITY_STRICT: bool = bool(merged.get("PROVIDER_IDENTITY_STRICT", True))
 PROVIDER_IDENTITY_USE_AI: bool = bool(merged.get("PROVIDER_IDENTITY_USE_AI", True))
+MATCH_COVER_OCR_MODE: str = _normalize_match_cover_ocr_mode(merged.get("MATCH_COVER_OCR_MODE", "smart"))
 PROVIDER_IDENTITY_MIN_SCORE: float = float(merged.get("PROVIDER_IDENTITY_MIN_SCORE", 0.72))
 PROVIDER_IDENTITY_SCORE_MARGIN: float = float(merged.get("PROVIDER_IDENTITY_SCORE_MARGIN", 0.08))
 PROVIDER_CACHE_FOUND_TTL_SEC: int = int(merged.get("PROVIDER_CACHE_FOUND_TTL_SEC", 60 * 60 * 24 * 30))
@@ -14295,6 +14304,14 @@ def _rebuild_files_library_index(reason: str = "manual", wait_if_running: bool =
                         missing_indices = []
                     else:
                         is_broken, _actual_count_from_indices, gaps = _detect_gaps_in_indices(indices)
+                        if is_broken and _classical_gap_anomaly_should_be_ignored(
+                            first_tags,
+                            actual_count=actual_track_count,
+                            max_idx=max_idx,
+                            gaps=gaps,
+                        ):
+                            is_broken = False
+                            gaps = []
                         if is_broken:
                             expected_track_count = max_idx
                             for start_i, end_i in gaps:
@@ -22226,6 +22243,197 @@ def _cover_ocr_candidates_for_folder(folder: Path) -> list[tuple[str, bytes, str
             out.append(("embedded", bytes(raw), str(mime or "image/jpeg")))
     return out
 
+
+def _cover_ocr_mode() -> str:
+    return _normalize_match_cover_ocr_mode(getattr(sys.modules[__name__], "MATCH_COVER_OCR_MODE", "smart"))
+
+
+def _track_titles_look_unreliable_for_identity(local_tracks: list[Any] | None) -> bool:
+    items = _local_track_titles_for_strict(list(local_tracks or []))
+    if not items:
+        return True
+    suspicious = 0
+    for title in items[:24]:
+        raw = str(title or "").strip()
+        if not raw:
+            suspicious += 1
+            continue
+        low = raw.lower()
+        if re.search(r"\.(flac|mp3|m4a|wav|aiff|ogg)\b", low):
+            suspicious += 1
+            continue
+        if re.match(r"^(track|audio|piste|titre)\s*\d+\b", low):
+            suspicious += 1
+            continue
+        if re.match(r"^\d{1,2}[-_. ]\d{1,2}\b", low):
+            suspicious += 1
+            continue
+    return suspicious >= max(1, math.ceil(len(items[:24]) * 0.45))
+
+
+def _cover_ocr_smart_trigger(
+    *,
+    local_artist: str,
+    local_title: str,
+    local_tracks: list[Any] | None = None,
+    local_tags: dict | None = None,
+    local_paths: list[Any] | None = None,
+    provider_candidate_count: int = 0,
+) -> bool:
+    mode = _cover_ocr_mode()
+    if mode == "off":
+        return False
+    if mode == "always":
+        return True
+    folder = _folder_from_local_paths(local_paths)
+    if folder is None:
+        return False
+    tags = local_tags if isinstance(local_tags, dict) else {}
+    title_norm = _normalize_identity_album_strict(local_title)
+    artist_norm = _normalize_identity_text_strict(local_artist)
+    genre_values = _classical_collect_tag_values(tags, ("genre", "style"))
+    genre_norms = {_classical_norm_text(v) for v in genre_values if _classical_norm_text(v)}
+    track_titles = _local_track_titles_for_strict(list(local_tracks or []))
+    work_tokens = _classical_work_tokens_from_texts(([local_title] if str(local_title or "").strip() else []) + track_titles[:20])
+    looks_classical = bool(
+        work_tokens
+        or (genre_norms and any(any(h in g for h in _CLASSICAL_GENRE_HINTS) for g in genre_norms))
+        or any(keyword in _classical_norm_text(local_title) for keyword in _CLASSICAL_WORK_KEYWORDS)
+        or bool(_CLASSICAL_CATALOG_RE.search(str(local_title or "")))
+    )
+    missing_identity = (
+        not title_norm
+        or not artist_norm
+        or title_norm in {"unknown album", "unknown", "untitled"}
+        or artist_norm in {"unknown artist", "unknown"}
+    )
+    label_values = _classical_collect_tag_values(tags, _CLASSICAL_LABEL_TAG_KEYS)
+    composer_values = _classical_collect_tag_values(tags, _CLASSICAL_COMPOSER_TAG_KEYS)
+    performance_values = _classical_collect_tag_values(tags, _CLASSICAL_PERFORMANCE_TAG_KEYS)
+    work_values = _classical_collect_tag_values(tags, _CLASSICAL_WORK_TAG_KEYS)
+    year_value = ""
+    for year_key in ("date", "originaldate", "year"):
+        year_value = _mb_extract_year(tags.get(year_key))
+        if year_value:
+            break
+    sparse_metadata = sum(
+        1 for present in (
+            bool(title_norm),
+            bool(artist_norm),
+            bool(track_titles),
+            bool(label_values),
+            bool(year_value),
+            bool(composer_values),
+            bool(performance_values),
+            bool(work_values),
+        ) if present
+    ) <= 3
+    return bool(
+        looks_classical
+        or missing_identity
+        or sparse_metadata
+        or _track_titles_look_unreliable_for_identity(local_tracks)
+        or provider_candidate_count > 1
+    )
+
+
+def _identity_cover_ocr_context(
+    *,
+    local_artist: str = "",
+    local_title: str = "",
+    local_tracks: list[Any] | None = None,
+    local_tags: dict | None = None,
+    local_paths: list[Any] | None = None,
+    provider_candidate_count: int = 0,
+) -> dict[str, Any]:
+    if not _cover_ocr_smart_trigger(
+        local_artist=local_artist,
+        local_title=local_title,
+        local_tracks=local_tracks,
+        local_tags=local_tags,
+        local_paths=local_paths,
+        provider_candidate_count=provider_candidate_count,
+    ):
+        return {}
+    folder = _folder_from_local_paths(local_paths)
+    if not folder or not folder.is_dir():
+        return {}
+    candidates = _cover_ocr_candidates_for_folder(folder)
+    if not candidates:
+        return {}
+    chosen_text = ""
+    all_lines: list[str] = []
+    used_sources: list[str] = []
+    for source, raw, mime in candidates[:2]:
+        text = _ocr_cover_text_from_image_bytes(raw, mime)
+        if _ocr_text_quality_score(text) > _ocr_text_quality_score(chosen_text):
+            chosen_text = text
+        if text:
+            used_sources.append(source)
+            for raw_line in text.splitlines():
+                line = re.sub(r"\s+", " ", str(raw_line or "")).strip(" -–—")
+                if len(line) >= 3 and line not in all_lines:
+                    all_lines.append(line)
+    if not all_lines and not chosen_text:
+        return {}
+    text_blob = "\n".join(all_lines) if all_lines else chosen_text
+    label_values: list[str] = []
+    norm_blob = _classical_norm_text(text_blob)
+    for canonical, aliases in _CLASSICAL_LABEL_OCR_ALIASES.items():
+        alias_norms = [_classical_norm_text(alias) for alias in aliases]
+        if any(alias and alias in norm_blob for alias in alias_norms):
+            label_values.append(canonical)
+    title_texts = [str(local_title or "").strip(), *all_lines[:20]]
+    artist_texts = [str(local_artist or "").strip(), *all_lines[:20]]
+    title_norms: set[str] = set()
+    artist_norms: set[str] = set()
+    for line in all_lines[:20]:
+        title_norm = _normalize_identity_album_strict(line)
+        artist_norm = _normalize_identity_text_strict(line)
+        if title_norm:
+            title_norms.add(title_norm)
+        if artist_norm:
+            artist_norms.add(artist_norm)
+    catalog_tokens = _classical_release_catalog_tokens_from_texts(all_lines[:20])
+    work_tokens = _classical_work_tokens_from_texts(title_texts)
+    performance_tokens = _classical_people_tokens(artist_texts[:12])
+    return {
+        "source": ", ".join(used_sources) if used_sources else "",
+        "text": text_blob,
+        "lines": all_lines[:20],
+        "title_norms": title_norms,
+        "artist_norms": artist_norms,
+        "label_values": label_values,
+        "label_tokens": _classical_label_tokens(label_values),
+        "catalog_tokens": catalog_tokens,
+        "work_tokens": work_tokens,
+        "performance_tokens": performance_tokens,
+    }
+
+
+def _cover_ocr_best_match_score(local_context: dict | None, candidate_value: str, *, album_mode: bool) -> float:
+    if not isinstance(local_context, dict):
+        return 0.0
+    raw_value = str(candidate_value or "").strip()
+    if not raw_value:
+        return 0.0
+    norm_key = "cover_ocr_title_norms" if album_mode else "cover_ocr_artist_norms"
+    candidate_norm = _normalize_identity_album_strict(raw_value) if album_mode else _normalize_identity_text_strict(raw_value)
+    norms = local_context.get(norm_key) or set()
+    try:
+        norm_values = set(norms)
+    except Exception:
+        norm_values = set()
+    if candidate_norm and candidate_norm in norm_values:
+        return 1.0
+    best = 0.0
+    for line in list(local_context.get("cover_ocr_lines") or [])[:20]:
+        best = max(best, _provider_identity_text_score(raw_value, str(line or "")))
+    text_blob = str(local_context.get("cover_ocr_text") or "").strip()
+    if text_blob:
+        best = max(best, _provider_identity_text_score(raw_value, text_blob))
+    return float(max(0.0, min(1.0, best)))
+
 def extract_tags(audio_path: Path) -> dict[str, str]:
     """
     Return *all* container‑level metadata tags for the given audio file
@@ -23578,7 +23786,13 @@ def editions_share_confident_signal(ed_list: List[dict]) -> bool:
 
     return False
 
-def detect_broken_album(db_conn, album_id: int, tracks: List[Track], mb_release_group_info: dict | None) -> tuple[bool, int | None, int, list]:
+def detect_broken_album(
+    db_conn,
+    album_id: int,
+    tracks: List[Track],
+    mb_release_group_info: dict | None,
+    tags: dict | None = None,
+) -> tuple[bool, int | None, int, list]:
     """
     Detect if an album is broken (missing tracks).
     Returns (is_broken, expected_track_count, actual_track_count, missing_indices)
@@ -23643,6 +23857,13 @@ def detect_broken_album(db_conn, album_id: int, tracks: List[Track], mb_release_
                         missing_indices = [i for i in range(1, min(expected, 200) + 1) if i not in indices_set]
                 except Exception:
                     missing_indices = []
+                if _classical_gap_anomaly_should_be_ignored(
+                    tags,
+                    actual_count=actual_count,
+                    max_idx=expected,
+                    gaps=_missing_indices_to_gap_pairs(missing_indices),
+                ):
+                    return False, None, actual_count, []
                 return True, expected, actual_count, missing_indices
 
     # Method 2: heuristic (gaps). If track indices are sane (guarded above) and we see any gap,
@@ -23658,6 +23879,13 @@ def detect_broken_album(db_conn, album_id: int, tracks: List[Track], mb_release_
             if len(missing_indices) > 5000:
                 missing_indices = missing_indices[:5000]
                 break
+        if _classical_gap_anomaly_should_be_ignored(
+            tags,
+            actual_count=actual_count,
+            max_idx=max_idx,
+            gaps=gaps,
+        ):
+            return False, None, actual_count, []
         return True, max_idx, actual_count, missing_indices
     
     return False, None, actual_count, []
@@ -23686,6 +23914,78 @@ def _detect_gaps_in_indices(indices: list) -> tuple[bool, int, list]:
         return False, actual_count, []
     # Any gap is considered incomplete when indices are sane (caller ensures this).
     return True, actual_count, gaps
+
+
+def _classical_gap_anomaly_should_be_ignored(
+    tags: dict | None,
+    *,
+    actual_count: int,
+    max_idx: int,
+    gaps: list[tuple[int, int]] | None,
+) -> bool:
+    tag_map = tags if isinstance(tags, dict) else {}
+    composer_values = _classical_collect_tag_values(tag_map, _CLASSICAL_COMPOSER_TAG_KEYS)
+    performance_values = _classical_collect_tag_values(tag_map, _CLASSICAL_PERFORMANCE_TAG_KEYS)
+    work_values = _classical_collect_tag_values(tag_map, _CLASSICAL_WORK_TAG_KEYS)
+    genre_values = _classical_collect_tag_values(tag_map, ("genre", "style"))
+    genre_norms = {_classical_norm_text(value) for value in genre_values if _classical_norm_text(value)}
+    looks_classical = bool(
+        composer_values
+        or work_values
+        or performance_values
+        or (genre_norms and any(any(hint in g for hint in _CLASSICAL_GENRE_HINTS) for g in genre_norms))
+    )
+    if not looks_classical:
+        return False
+    actual_total = max(0, int(actual_count or 0))
+    highest_index = max(0, int(max_idx or 0))
+    if actual_total < 12 or highest_index <= 0:
+        return False
+    coverage = (actual_total / highest_index) if highest_index else 1.0
+    if coverage < 0.95:
+        return False
+    missing_total = 0
+    non_leading_gaps: list[tuple[int, int]] = []
+    for start_i, end_i in list(gaps or []):
+        start = int(start_i or 0)
+        end = int(end_i or 0)
+        if end <= start + 1:
+            continue
+        if start <= 0:
+            return False
+        non_leading_gaps.append((start, end))
+        missing_total += max(0, end - start - 1)
+    if not non_leading_gaps:
+        return False
+    if len(non_leading_gaps) > 1:
+        return False
+    if missing_total > 1:
+        return False
+    return True
+
+
+def _missing_indices_to_gap_pairs(values: list[int] | None) -> list[tuple[int, int]]:
+    missing_flat: list[int] = []
+    for value in list(values or []):
+        try:
+            parsed = int(value)
+        except Exception:
+            continue
+        if parsed > 0:
+            missing_flat.append(parsed)
+    if not missing_flat:
+        return []
+    missing_flat = sorted(set(missing_flat))
+    gaps: list[tuple[int, int]] = []
+    start = prev = missing_flat[0]
+    for value in missing_flat[1:]:
+        if value == prev + 1:
+            prev = value
+            continue
+        gaps.append((start - 1, prev + 1))
+        start = prev = value
+    gaps.append((start - 1, prev + 1))
+    return gaps
 
 
 def _edition_exact_expected_track_count(edition: dict | None, mb_hint: dict | None = None) -> int:
@@ -24962,6 +25262,80 @@ def _classical_collect_tag_values(tags: dict | None, keys: tuple[str, ...]) -> l
     return out
 
 
+def _classical_display_values(values: list[str], *, limit: int = 6) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values or []:
+        clean = re.sub(r"\s+", " ", str(value or "").strip(" -–—"))
+        if not clean:
+            continue
+        key = _classical_norm_text(clean)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(clean)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _classical_display_payload(
+    tags: dict | None,
+    *,
+    fallback_title: str = "",
+    fallback_artist: str = "",
+) -> dict[str, Any] | None:
+    tag_map = tags if isinstance(tags, dict) else {}
+    composer = _classical_display_values(_classical_collect_tag_values(tag_map, _CLASSICAL_COMPOSER_TAG_KEYS))
+    work = _classical_display_values(_classical_collect_tag_values(tag_map, _CLASSICAL_WORK_TAG_KEYS), limit=4)
+    conductor = _classical_display_values(_classical_collect_tag_values(tag_map, ("conductor",)), limit=4)
+    orchestra = _classical_display_values(_classical_collect_tag_values(tag_map, ("orchestra", "ensemble", "choir", "chorus")), limit=4)
+    soloists = _classical_display_values(_classical_collect_tag_values(tag_map, ("soloist", "soloists")), limit=6)
+    performers_raw = _classical_display_values(_classical_collect_tag_values(tag_map, ("performer", "performers", "artist", "albumartist", "album_artist")), limit=8)
+    catalog_numbers = _classical_display_values(_classical_collect_tag_values(tag_map, _CLASSICAL_RELEASE_CATALOG_TAG_KEYS), limit=6)
+    genre_values = _classical_collect_tag_values(tag_map, ("genre", "style"))
+    genre_norms = {_classical_norm_text(v) for v in genre_values if _classical_norm_text(v)}
+    work_tokens = _classical_work_tokens_from_texts(([fallback_title] if str(fallback_title or "").strip() else []) + work)
+    looks_classical = bool(
+        composer
+        or work
+        or conductor
+        or orchestra
+        or soloists
+        or catalog_numbers
+        or work_tokens
+        or (genre_norms and any(any(h in g for h in _CLASSICAL_GENRE_HINTS) for g in genre_norms))
+        or any(keyword in _classical_norm_text(fallback_title) for keyword in _CLASSICAL_WORK_KEYWORDS)
+        or bool(_CLASSICAL_CATALOG_RE.search(str(fallback_title or "")))
+    )
+    if not looks_classical:
+        return None
+    composer_norms = {_classical_norm_text(v) for v in composer}
+    conductor_norms = {_classical_norm_text(v) for v in conductor}
+    orchestra_norms = {_classical_norm_text(v) for v in orchestra}
+    soloist_norms = {_classical_norm_text(v) for v in soloists}
+    filtered_performers = [
+        value for value in performers_raw
+        if _classical_norm_text(value) not in composer_norms
+        and _classical_norm_text(value) not in conductor_norms
+        and _classical_norm_text(value) not in orchestra_norms
+        and _classical_norm_text(value) not in soloist_norms
+    ]
+    if not work and str(fallback_title or "").strip():
+        work = _classical_display_values([fallback_title], limit=2)
+    if not composer and str(fallback_artist or "").strip() and not conductor and not orchestra:
+        composer = _classical_display_values([fallback_artist], limit=2)
+    return {
+        "composer": composer,
+        "work": work,
+        "conductor": conductor,
+        "orchestra": orchestra,
+        "soloists": soloists,
+        "performers": filtered_performers[:6],
+        "catalog_numbers": catalog_numbers,
+    }
+
+
 def _classical_label_tokens(values: list[str]) -> set[str]:
     out: set[str] = set()
     for value in values or []:
@@ -25004,57 +25378,11 @@ def _classical_cover_ocr_context(
     local_paths: list[Any] | None = None,
     title_hint: str = "",
 ) -> dict[str, Any]:
-    folder = _folder_from_local_paths(local_paths)
-    if not folder or not folder.is_dir():
-        return {}
-    candidates = _cover_ocr_candidates_for_folder(folder)
-    if not candidates:
-        return {}
-    chosen_text = ""
-    all_lines: list[str] = []
-    used_sources: list[str] = []
-    for source, raw, mime in candidates[:2]:
-        text = _ocr_cover_text_from_image_bytes(raw, mime)
-        if _ocr_text_quality_score(text) > _ocr_text_quality_score(chosen_text):
-            chosen_text = text
-        if text:
-            used_sources.append(source)
-            for raw_line in text.splitlines():
-                line = re.sub(r"\s+", " ", str(raw_line or "")).strip(" -–—")
-                if len(line) >= 3 and line not in all_lines:
-                    all_lines.append(line)
-    if not all_lines and not chosen_text:
-        return {}
-    text_blob = "\n".join(all_lines) if all_lines else chosen_text
-    label_values: list[str] = []
-    norm_blob = _classical_norm_text(text_blob)
-    for canonical, aliases in _CLASSICAL_LABEL_OCR_ALIASES.items():
-        alias_norms = [_classical_norm_text(alias) for alias in aliases]
-        if any(alias and alias in norm_blob for alias in alias_norms):
-            label_values.append(canonical)
-    work_tokens = _classical_work_tokens_from_texts(([title_hint] if str(title_hint or "").strip() else []) + all_lines[:20])
-    catalog_tokens = _classical_release_catalog_tokens_from_texts(all_lines[:20])
-    performance_lines: list[str] = []
-    for line in all_lines[:20]:
-        norm_line = _classical_norm_text(line)
-        if not norm_line:
-            continue
-        if any(alias and alias in norm_line for aliases in _CLASSICAL_LABEL_OCR_ALIASES.values() for alias in [_classical_norm_text(a) for a in aliases]):
-            continue
-        if _classical_release_catalog_tokens_from_texts([line]):
-            continue
-        performance_lines.append(line)
-    performance_tokens = _classical_people_tokens(performance_lines[:12])
-    return {
-        "source": ", ".join(used_sources) if used_sources else "",
-        "text": text_blob,
-        "lines": all_lines[:20],
-        "label_values": label_values,
-        "label_tokens": _classical_label_tokens(label_values),
-        "catalog_tokens": catalog_tokens,
-        "work_tokens": work_tokens,
-        "performance_tokens": performance_tokens,
-    }
+    return _identity_cover_ocr_context(
+        local_title=title_hint,
+        local_paths=list(local_paths or []),
+        provider_candidate_count=1,
+    )
 
 
 def _classical_work_tokens_from_texts(texts: list[str]) -> set[str]:
@@ -25184,6 +25512,7 @@ def _classical_identity_context(
     local_tracks: list[Any] | None = None,
     local_tags: dict | None = None,
     local_paths: list[Any] | None = None,
+    provider_payloads: dict | None = None,
     provider: str = "",
     provider_payload: dict | None = None,
     candidate_artist: str | list[str] | tuple[str, ...] | None = None,
@@ -25243,10 +25572,17 @@ def _classical_identity_context(
         or bool(_CLASSICAL_CATALOG_RE.search(title_value))
         or bool(_CLASSICAL_CATALOG_RE.search(" ".join(track_titles[:12])))
     )
-    cover_ocr_ctx = _classical_cover_ocr_context(
+    provider_candidate_count = 0
+    if isinstance(provider_payloads, dict):
+        provider_candidate_count = sum(1 for value in provider_payloads.values() if isinstance(value, dict))
+    cover_ocr_ctx = _identity_cover_ocr_context(
+        local_artist="; ".join(base_artist_values[:3]),
+        local_title=title_value,
+        local_tracks=track_entries,
+        local_tags=tags,
         local_paths=list(local_paths or []),
-        title_hint=title_value,
-    ) if pre_is_classical and local_paths else {}
+        provider_candidate_count=provider_candidate_count,
+    )
     if cover_ocr_ctx:
         label_values.extend([str(v or "").strip() for v in cover_ocr_ctx.get("label_values") or [] if str(v or "").strip()])
         meta_title_texts.extend([str(v or "").strip() for v in cover_ocr_ctx.get("lines") or [] if str(v or "").strip()])
@@ -25279,6 +25615,10 @@ def _classical_identity_context(
         "track_titles": track_titles,
         "provider": str(provider or "").strip().lower(),
         "cover_ocr_source": str(cover_ocr_ctx.get("source") or "").strip(),
+        "cover_ocr_text": str(cover_ocr_ctx.get("text") or "").strip(),
+        "cover_ocr_lines": list(cover_ocr_ctx.get("lines") or [])[:20],
+        "cover_ocr_title_norms": set(cover_ocr_ctx.get("title_norms") or set()),
+        "cover_ocr_artist_norms": set(cover_ocr_ctx.get("artist_norms") or set()),
     }
 
 
@@ -25734,8 +26074,23 @@ def _strict_identity_match_details(
         and local_artist_norm in candidate_artist_norms
     )
     title_ok = bool(local_title_norm and candidate_title_norm and local_title_norm == candidate_title_norm)
+    ocr_title_ok = False
+    ocr_artist_ok = False
+    if isinstance(local_context, dict):
+        ocr_title_ok = _cover_ocr_best_match_score(local_context, candidate_title, album_mode=True) >= 0.92
+        ocr_artist_ok = any(
+            _cover_ocr_best_match_score(local_context, value, album_mode=False) >= 0.88
+            for value in candidate_artist_values
+            if str(value or "").strip()
+        )
     if artist_ok and title_ok:
         return (True, "strict identity ok (artist/title exact)")
+    if title_ok and not local_artist_norm and ocr_artist_ok:
+        return (True, "strict identity ok (cover ocr artist)")
+    if artist_ok and not local_title_norm and ocr_title_ok:
+        return (True, "strict identity ok (cover ocr title)")
+    if not local_title_norm and not local_artist_norm and ocr_title_ok and ocr_artist_ok:
+        return (True, "strict identity ok (cover ocr)")
     reasons: list[str] = []
     if not local_artist_norm:
         reasons.append("local artist missing")
@@ -26049,6 +26404,7 @@ def _build_provider_identity_candidates(
         local_tracks=list(local_titles or []),
         local_tags=local_tags if isinstance(local_tags, dict) else {},
         local_paths=list(local_paths or []),
+        provider_payloads=provider_payloads if isinstance(provider_payloads, dict) else None,
     )
     provider_order = ("discogs", "bandcamp", "lastfm")
     for provider in provider_order:
@@ -26117,6 +26473,8 @@ def _build_provider_identity_candidates(
 
         title_score = _provider_identity_text_score(album_title, src_title)
         artist_score = _provider_identity_text_score(artist_name, src_artist)
+        ocr_title_score = _cover_ocr_best_match_score(resolved_local_context, src_title, album_mode=True)
+        ocr_artist_score = _cover_ocr_best_match_score(resolved_local_context, src_artist, album_mode=False)
         strict_verified = bool(strict_verdict.get("strict_match_verified"))
 
         if strict_verified:
@@ -26136,6 +26494,26 @@ def _build_provider_identity_candidates(
                 confidence = (title_score * 0.50) + (artist_score * 0.35) + (track_score * 0.15)
             else:
                 confidence = (title_score * 0.56) + (artist_score * 0.44)
+            if ocr_title_score >= 0.92:
+                confidence += 0.08
+            elif ocr_title_score >= 0.82:
+                confidence += 0.04
+            if ocr_artist_score >= 0.90:
+                confidence += 0.05
+            elif ocr_artist_score >= 0.80:
+                confidence += 0.02
+            if (
+                title_score < 0.76
+                and ocr_title_score >= 0.90
+                and max(artist_score, ocr_artist_score) >= 0.70
+            ):
+                confidence = max(confidence, 0.74)
+            if (
+                not has_provider_tracklist
+                and ocr_title_score < 0.55
+                and title_score < 0.75
+            ):
+                confidence = min(confidence, 0.58)
             if strict_ok:
                 confidence += 0.04
             if classical_guard_applies and not strict_ok:
@@ -26150,6 +26528,8 @@ def _build_provider_identity_candidates(
                 "provider_id": provider_id,
                 "title_score": title_score,
                 "artist_score": artist_score,
+                "ocr_title_score": ocr_title_score,
+                "ocr_artist_score": ocr_artist_score,
                 "track_score": track_score,
                 "confidence": confidence,
                 "title": src_title,
@@ -26185,6 +26565,8 @@ def _provider_candidate_soft_identity_ok(
     """
     title_score = float(candidate.get("title_score") or 0.0)
     artist_score = float(candidate.get("artist_score") or 0.0)
+    ocr_title_score = float(candidate.get("ocr_title_score") or 0.0)
+    ocr_artist_score = float(candidate.get("ocr_artist_score") or 0.0)
     track_score = float(candidate.get("track_score") or 0.0)
     confidence = float(candidate.get("confidence") or 0.0)
     has_provider_tracklist = bool(candidate.get("has_provider_tracklist"))
@@ -26193,9 +26575,9 @@ def _provider_candidate_soft_identity_ok(
     if bool(candidate.get("classical_guard_applies")) and not bool(candidate.get("classical_guard_ok")):
         return (False, str(candidate.get("classical_guard_reason") or "classical_context_insufficient"))
 
-    if title_score < 0.78:
+    if title_score < 0.78 and ocr_title_score < 0.90:
         return (False, "album_mismatch")
-    if artist_score < 0.74:
+    if artist_score < 0.74 and ocr_artist_score < 0.88:
         return (False, "artist_mismatch")
     if confidence < float(min_confidence):
         return (False, f"confidence_below_min({confidence:.2f}<{float(min_confidence):.2f})")
@@ -26218,8 +26600,8 @@ def _provider_candidate_soft_identity_ok(
     else:
         # No provider tracklist: keep it possible, but require stronger artist/title confidence.
         if (not has_provider_tracklist) and (
-            title_score < 0.86
-            or artist_score < 0.82
+            max(title_score, ocr_title_score) < 0.86
+            or max(artist_score, ocr_artist_score) < 0.82
             or confidence < max(float(min_confidence), 0.82)
         ):
             return (False, "provider_no_tracklist")
@@ -30370,11 +30752,20 @@ def scan_duplicates(
                     exp = 0
                 if exp > 0:
                     mb_hint = {"track_count": exp, "source": "provider_tracklist"}
+            first_track_tags = None
+            try:
+                folder_for_tags = Path(str(e.get("folder") or ""))
+                first_audio = next((p for p in folder_for_tags.rglob("*") if AUDIO_RE.search(p.name)), None)
+                if first_audio and first_audio.exists():
+                    first_track_tags = extract_tags(first_audio) or {}
+            except Exception:
+                first_track_tags = None
             is_broken, expected_count, actual_count, missing_indices = detect_broken_album(
                 db_conn,
                 e["album_id"],
                 e["tracks"],
                 mb_hint,
+                tags=first_track_tags,
             )
             strict_reject_reason = str(e.get("strict_reject_reason") or "").strip().lower()
             if (not is_broken) and strict_reject_reason == "track_count_mismatch":
@@ -34825,6 +35216,14 @@ def _publish_files_library_artist_from_items(
                         missing_indices = []
                     else:
                         is_broken, _actual_count_from_indices, gaps = _detect_gaps_in_indices(indices)
+                        if is_broken and _classical_gap_anomaly_should_be_ignored(
+                            tags,
+                            actual_count=actual_track_count,
+                            max_idx=max_idx,
+                            gaps=gaps,
+                        ):
+                            is_broken = False
+                            gaps = []
                         if is_broken:
                             expected_track_count = max_idx
                             for start_i, end_i in gaps:
@@ -46208,6 +46607,7 @@ def _reload_musicbrainz_settings_from_db():
     """Reload MusicBrainz-related settings from SQLite so scans use the latest UI values without restart."""
     global USE_MUSICBRAINZ
     global MB_SEARCH_ALBUM_TIMEOUT_SEC, MB_CANDIDATE_FETCH_LIMIT, MB_TRACKLIST_FETCH_LIMIT, MB_FAST_FALLBACK_MODE
+    global MATCH_COVER_OCR_MODE
     global MB_QUEUE_ENABLED
     global _mb_queue
 
@@ -46288,6 +46688,14 @@ def _reload_musicbrainz_settings_from_db():
         MB_FAST_FALLBACK_MODE = bool(fast_fallback)
         mod.merged["MB_FAST_FALLBACK_MODE"] = MB_FAST_FALLBACK_MODE
         changed["MB_FAST_FALLBACK_MODE"] = MB_FAST_FALLBACK_MODE
+
+    raw_ocr_mode = _get_config_from_db("MATCH_COVER_OCR_MODE")
+    if raw_ocr_mode is not None:
+        new_ocr_mode = _normalize_match_cover_ocr_mode(raw_ocr_mode)
+        if new_ocr_mode != MATCH_COVER_OCR_MODE:
+            MATCH_COVER_OCR_MODE = new_ocr_mode
+            mod.merged["MATCH_COVER_OCR_MODE"] = MATCH_COVER_OCR_MODE
+            changed["MATCH_COVER_OCR_MODE"] = MATCH_COVER_OCR_MODE
 
     if changed:
         summary = ", ".join([f"{k}={v}" for k, v in changed.items()])
@@ -46578,6 +46986,7 @@ def api_config_get():
         "MB_FAST_FALLBACK_MODE": get_setting_bool("MB_FAST_FALLBACK_MODE", MB_FAST_FALLBACK_MODE),
         "PROVIDER_IDENTITY_STRICT": get_setting_bool("PROVIDER_IDENTITY_STRICT", PROVIDER_IDENTITY_STRICT),
         "PROVIDER_IDENTITY_USE_AI": get_setting_bool("PROVIDER_IDENTITY_USE_AI", PROVIDER_IDENTITY_USE_AI),
+        "MATCH_COVER_OCR_MODE": _normalize_match_cover_ocr_mode(get_setting("MATCH_COVER_OCR_MODE", MATCH_COVER_OCR_MODE)),
         "PROVIDER_IDENTITY_MIN_SCORE": get_setting("PROVIDER_IDENTITY_MIN_SCORE", PROVIDER_IDENTITY_MIN_SCORE),
         "PROVIDER_IDENTITY_SCORE_MARGIN": get_setting("PROVIDER_IDENTITY_SCORE_MARGIN", PROVIDER_IDENTITY_SCORE_MARGIN),
         "PROVIDER_CACHE_FOUND_TTL_SEC": get_setting("PROVIDER_CACHE_FOUND_TTL_SEC", PROVIDER_CACHE_FOUND_TTL_SEC),
@@ -46895,6 +47304,10 @@ def _apply_settings_in_memory(updates: dict):
     if "PROVIDER_IDENTITY_USE_AI" in updates:
         global PROVIDER_IDENTITY_USE_AI
         PROVIDER_IDENTITY_USE_AI = bool(_parse_bool(updates["PROVIDER_IDENTITY_USE_AI"]))
+    if "MATCH_COVER_OCR_MODE" in updates:
+        global MATCH_COVER_OCR_MODE
+        MATCH_COVER_OCR_MODE = _normalize_match_cover_ocr_mode(updates["MATCH_COVER_OCR_MODE"])
+        mod.merged["MATCH_COVER_OCR_MODE"] = MATCH_COVER_OCR_MODE
     if "PROVIDER_IDENTITY_MIN_SCORE" in updates:
         global PROVIDER_IDENTITY_MIN_SCORE
         try:
@@ -47490,7 +47903,7 @@ def api_config_put():
         "OPENAI_MODEL_FALLBACKS", "ANTHROPIC_API_KEY", "GOOGLE_API_KEY", "OLLAMA_URL",
         "DISCORD_WEBHOOK", "USE_MUSICBRAINZ", "MUSICBRAINZ_EMAIL", "MB_RETRY_NOT_FOUND",
         "MB_SEARCH_ALBUM_TIMEOUT_SEC", "MB_CANDIDATE_FETCH_LIMIT", "MB_TRACKLIST_FETCH_LIMIT", "MB_FAST_FALLBACK_MODE",
-        "PROVIDER_IDENTITY_STRICT", "PROVIDER_IDENTITY_USE_AI", "PROVIDER_IDENTITY_MIN_SCORE", "PROVIDER_IDENTITY_SCORE_MARGIN",
+        "PROVIDER_IDENTITY_STRICT", "PROVIDER_IDENTITY_USE_AI", "MATCH_COVER_OCR_MODE", "PROVIDER_IDENTITY_MIN_SCORE", "PROVIDER_IDENTITY_SCORE_MARGIN",
         "PROVIDER_CACHE_FOUND_TTL_SEC", "PROVIDER_CACHE_NOT_FOUND_TTL_SEC", "PROVIDER_CACHE_ERROR_TTL_SEC",
         "USE_AI_FOR_MB_MATCH", "USE_AI_FOR_MB_VERIFY", "USE_AI_FOR_DEDUPE", "USE_AI_FOR_SOFT_MATCH_PROFILES",
         "USE_AI_VISION_FOR_COVER", "AI_CONFIDENCE_MIN", "OPENAI_VISION_MODEL", "USE_AI_VISION_BEFORE_COVER_INJECT", "USE_WEB_SEARCH_FOR_MB", "SERPER_API_KEY",
@@ -47590,6 +48003,8 @@ def api_config_put():
         normalized_level = _normalize_ai_usage_level(str(updates.get("AI_USAGE_LEVEL") or "medium"))
         updates["AI_USAGE_LEVEL"] = normalized_level
         updates.update(_ai_usage_level_overrides(normalized_level))
+    if "MATCH_COVER_OCR_MODE" in updates:
+        updates["MATCH_COVER_OCR_MODE"] = _normalize_match_cover_ocr_mode(updates["MATCH_COVER_OCR_MODE"])
     if "JELLYFIN_URL" in updates:
         updates["JELLYFIN_URL"] = _normalize_http_base_url(updates["JELLYFIN_URL"])
     if "NAVIDROME_URL" in updates:
@@ -49753,7 +50168,7 @@ def _run_incomplete_albums_scan():
                         if state.get("incomplete_scan"):
                             state["incomplete_scan"]["progress"] = processed
                     continue
-                is_broken, _exp, actual_count, _gaps = detect_broken_album(db_conn, aid, tracks, None)
+                is_broken, _exp, actual_count, _gaps = detect_broken_album(db_conn, aid, tracks, None, tags=None)
                 if not is_broken:
                     processed += 1
                     with lock:
@@ -55922,7 +56337,7 @@ def api_library_artist_detail(artist_id):
                         id, title, title_norm, year, date_text, COALESCE(genre, '') AS genre, COALESCE(label, '') AS label, COALESCE(tags_json, '[]') AS tags_json,
                         track_count, is_broken, format, is_lossless,
                         has_cover, COALESCE(cover_path, ''), COALESCE(folder_path, ''), mb_identified, musicbrainz_release_group_id,
-                        discogs_release_id, lastfm_album_mbid, bandcamp_album_url, metadata_source,
+                        discogs_release_id, lastfm_album_mbid, bandcamp_album_url, metadata_source, COALESCE(primary_tags_json, '{}') AS primary_tags_json,
                         expected_track_count, actual_track_count, missing_indices_json,
                         COUNT(*) OVER (PARTITION BY title_norm) AS dup_count
                     FROM files_albums alb
@@ -55982,10 +56397,11 @@ def api_library_artist_detail(artist_id):
                 lastfm_album_mbid = (row[18] or "").strip() or None
                 bandcamp_album_url = (row[19] or "").strip() or None
                 metadata_source = (row[20] or "").strip() or None
-                expected_track_count = row[21]
-                actual_track_count = row[22]
-                missing_indices_raw = row[23] or "[]"
-                dup_count = int(row[24] or 0)
+                primary_tags_json_raw = row[21] or "{}"
+                expected_track_count = row[22]
+                actual_track_count = row[23]
+                missing_indices_raw = row[24] or "[]"
+                dup_count = int(row[25] or 0)
                 album_profile = album_profile_map.get(title_norm, {}) if title_norm else {}
                 genres_list: list[str] = []
                 try:
@@ -56044,6 +56460,14 @@ def api_library_artist_detail(artist_id):
                     missing_indices = json.loads(missing_indices_raw) if missing_indices_raw else []
                 except (TypeError, ValueError):
                     missing_indices = []
+                primary_tags_map = _safe_json_load(primary_tags_json_raw, fallback={})
+                if not isinstance(primary_tags_map, dict):
+                    primary_tags_map = {}
+                classical_payload = _classical_display_payload(
+                    primary_tags_map,
+                    fallback_title=str(row[1] or ""),
+                    fallback_artist=str(artist_name or ""),
+                )
 
                 broken_detail = None
                 if is_broken:
@@ -56079,6 +56503,7 @@ def api_library_artist_detail(artist_id):
                     "genre": genre_raw or None,
                     "genres": genres_list,
                     "label": label_raw or None,
+                    "classical": classical_payload,
                     "description": album_profile.get("description"),
                     "short_description": album_profile.get("short_description"),
                     "description_source": album_profile.get("source"),
@@ -56358,6 +56783,30 @@ def api_library_artist_detail(artist_id):
                 first_audio = next((p for p in folder.rglob("*") if AUDIO_RE.search(p.name)), None)
                 if first_audio:
                     meta = extract_tags(first_audio)
+                    if is_broken and broken_detail and isinstance(broken_detail.get("missing_indices"), list):
+                        try:
+                            max_idx = max(int(i) for i in indices_by_album.get(album_id, []) if int(i) > 0)
+                        except Exception:
+                            max_idx = 0
+                        gap_pairs: list[tuple[int, int]] = []
+                        missing_flat = [int(i) for i in (broken_detail.get("missing_indices") or []) if int(i) > 0]
+                        if missing_flat:
+                            start = prev = missing_flat[0]
+                            for value in missing_flat[1:]:
+                                if value == prev + 1:
+                                    prev = value
+                                    continue
+                                gap_pairs.append((start - 1, prev + 1))
+                                start = prev = value
+                            gap_pairs.append((start - 1, prev + 1))
+                        if _classical_gap_anomaly_should_be_ignored(
+                            meta,
+                            actual_count=int(broken_detail.get("actual_track_count") or 0),
+                            max_idx=max_idx,
+                            gaps=gap_pairs,
+                        ):
+                            is_broken = False
+                            broken_detail = None
                     mb_identified = bool(meta.get("musicbrainz_releasegroupid") or meta.get("musicbrainz_releaseid"))
                     if meta.get("compilation") == "1" or meta.get("compilation") == "true":
                         album_type = "Compilation"
@@ -58442,6 +58891,11 @@ def api_library_album_detail(album_id: int):
             artist_name=str(artist_name or ""),
             album_title=str(album_title or ""),
         ) if metadata_source_norm else None
+        classical_payload = _classical_display_payload(
+            primary_tags,
+            fallback_title=str(album_title or ""),
+            fallback_artist=str(artist_name or ""),
+        )
 
         payload = {
             "album_id": int(album_id),
@@ -58463,6 +58917,7 @@ def api_library_album_detail(album_id: int):
             "metadata_source_url": metadata_source_url,
             "artist_id": int(artist_id or 0),
             "artist_name": (artist_name or "").strip(),
+            "classical": classical_payload,
             "review": {
                 "description": str(prof.get("description") or "").strip(),
                 "short_description": str(prof.get("short_description") or "").strip(),

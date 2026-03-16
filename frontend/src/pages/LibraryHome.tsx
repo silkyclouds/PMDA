@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useLocation, useNavigate, useOutletContext } from 'react-router-dom';
-import { ArrowUpRight, Flame, GripVertical, Loader2, Music, Play, RefreshCw, Sparkles, UserRound } from 'lucide-react';
+import { ArrowUpRight, Flame, GripVertical, Heart, LibraryBig, Loader2, Music, Play, RefreshCw, Sparkles, UserRound } from 'lucide-react';
 
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -51,6 +51,15 @@ function normalizeHomeSectionOrder(raw: unknown): HomeSectionKey[] {
     if (!seen.has(key)) out.push(key);
   }
   return out;
+}
+
+function joinClassical(values?: string[] | null, limit = 2): string {
+  if (!Array.isArray(values)) return '';
+  return values
+    .map((value) => String(value || '').trim())
+    .filter(Boolean)
+    .slice(0, limit)
+    .join(' • ');
 }
 
 export default function LibraryHome() {
@@ -322,6 +331,18 @@ export default function LibraryHome() {
     [hiddenSections, sectionOrder]
   );
 
+  const discoverAlbumCount = useMemo(
+    () => (discover?.sections || []).reduce((sum, section) => sum + (Array.isArray(section.albums) ? section.albums.length : 0), 0),
+    [discover]
+  );
+
+  const spotlightAlbum = useMemo(() => {
+    const fromDiscover = (discover?.sections || []).flatMap((section) => section.albums || [])[0];
+    return fromDiscover || recentAlbums[0] || recentlyPlayedAlbums[0] || null;
+  }, [discover, recentAlbums, recentlyPlayedAlbums]);
+
+  const spotlightArtist = useMemo(() => topArtists[0] || recentArtists[0] || null, [topArtists, recentArtists]);
+
   const sectionOrderStyle = useCallback((key: HomeSectionKey): { order: number; display?: string } => {
     const idx = visibleSectionOrder.indexOf(key);
     if (idx < 0) return { order: 999, display: 'none' };
@@ -338,6 +359,137 @@ export default function LibraryHome() {
 
   return (
     <div className="container pb-6 flex flex-col gap-5 md:gap-6">
+      <section className="grid gap-4 xl:grid-cols-[1.35fr_0.95fr]">
+        <Card className="overflow-hidden border-white/10 bg-[radial-gradient(circle_at_top_left,rgba(45,212,191,0.22),transparent_36%),radial-gradient(circle_at_78%_18%,rgba(245,158,11,0.18),transparent_28%),linear-gradient(135deg,rgba(15,23,42,0.98),rgba(17,24,39,0.94))] text-white shadow-[0_28px_90px_-48px_rgba(15,23,42,0.95)]">
+          <CardContent className="p-6 md:p-8">
+            <div className="flex flex-col gap-6">
+              <div className="space-y-3">
+                <div className="inline-flex items-center gap-2 rounded-full border border-white/15 bg-white/8 px-3 py-1 text-[11px] font-medium uppercase tracking-[0.28em] text-white/78">
+                  <Sparkles className="h-3.5 w-3.5 text-emerald-300" />
+                  Listening Notes
+                </div>
+                <div className="max-w-2xl space-y-3">
+                  <h1 className="max-w-xl text-3xl font-semibold tracking-tight text-white sm:text-4xl">
+                    Navigate your library like a collection, not a file dump.
+                  </h1>
+                  <p className="max-w-xl text-sm leading-6 text-white/72 sm:text-[15px]">
+                    PMDA uses your local listening history, ratings, discovery feeds and library metadata to surface what deserves attention next, what slipped past you, and where to dive deeper.
+                  </p>
+                </div>
+              </div>
+              <div className="grid gap-3 sm:grid-cols-3">
+                <div className="rounded-2xl border border-white/10 bg-black/18 p-4 backdrop-blur-sm">
+                  <div className="text-[11px] uppercase tracking-[0.22em] text-white/48">Discovery queue</div>
+                  <div className="mt-2 text-3xl font-semibold text-white">{discoverAlbumCount}</div>
+                  <p className="mt-1 text-xs leading-5 text-white/60">Albums surfaced from your listening history and neighboring records.</p>
+                </div>
+                <div className="rounded-2xl border border-white/10 bg-black/18 p-4 backdrop-blur-sm">
+                  <div className="text-[11px] uppercase tracking-[0.22em] text-white/48">For you</div>
+                  <div className="mt-2 text-3xl font-semibold text-white">{recommendations.length}</div>
+                  <p className="mt-1 text-xs leading-5 text-white/60">Track recommendations shaped by what you actually finish and replay.</p>
+                </div>
+                <div className="rounded-2xl border border-white/10 bg-black/18 p-4 backdrop-blur-sm">
+                  <div className="text-[11px] uppercase tracking-[0.22em] text-white/48">Recent motion</div>
+                  <div className="mt-2 text-3xl font-semibold text-white">{recentlyPlayedAlbums.length || recentAlbums.length}</div>
+                  <p className="mt-1 text-xs leading-5 text-white/60">Recently played and recently added records ready for the next session.</p>
+                </div>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <Button type="button" className="h-10 rounded-full bg-white text-slate-950 hover:bg-white/90" onClick={() => openSectionPage('discover')}>
+                  Open discovery
+                </Button>
+                <Button type="button" variant="secondary" className="h-10 rounded-full border border-white/12 bg-white/10 text-white hover:bg-white/16" onClick={() => navigate(`/library/recommendations${location.search || ''}`, { state: withBackLinkState(location) })}>
+                  Recommendations
+                </Button>
+                <Button type="button" variant="secondary" className="h-10 rounded-full border border-white/12 bg-white/10 text-white hover:bg-white/16" onClick={() => navigate(`/library/liked${location.search || ''}`, { state: withBackLinkState(location) })}>
+                  Liked
+                </Button>
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+        <div className="grid gap-4">
+          <Card className="overflow-hidden border-border/60 bg-card/95 shadow-[0_24px_64px_-44px_rgba(15,23,42,0.55)]">
+            <CardContent className="p-5">
+              <div className="flex items-start gap-4">
+                <div className="w-28 shrink-0">
+                  <AspectRatio ratio={1} className="overflow-hidden rounded-2xl bg-muted">
+                    <AlbumArtwork albumThumb={spotlightAlbum?.thumb || null} artistId={spotlightAlbum?.artist_id} alt={spotlightAlbum?.title || 'Spotlight album'} size={320} priority />
+                  </AspectRatio>
+                </div>
+                <div className="min-w-0 flex-1 space-y-2">
+                  <div className="text-[11px] uppercase tracking-[0.24em] text-muted-foreground">Spotlight record</div>
+                  {spotlightAlbum ? (
+                    <>
+                      <button
+                        type="button"
+                        className="block text-left text-xl font-semibold tracking-tight hover:text-primary"
+                        onClick={() => navigate(`/library/album/${spotlightAlbum.album_id}${location.search || ''}`, { state: withBackLinkState(location) })}
+                      >
+                        {spotlightAlbum.title}
+                      </button>
+                      <button
+                        type="button"
+                        className="block text-left text-sm text-muted-foreground hover:text-foreground"
+                        onClick={() => navigate(`/library/artist/${spotlightAlbum.artist_id}${location.search || ''}`, { state: withBackLinkState(location) })}
+                      >
+                        {spotlightAlbum.artist_name}
+                      </button>
+                      {spotlightAlbum.classical ? (
+                        <div className="space-y-1 text-xs leading-5 text-muted-foreground">
+                          {joinClassical(spotlightAlbum.classical.work, 1) ? <div>{joinClassical(spotlightAlbum.classical.work, 1)}</div> : null}
+                          {joinClassical(spotlightAlbum.classical.composer, 1) ? <div>Composer: {joinClassical(spotlightAlbum.classical.composer, 1)}</div> : null}
+                          {joinClassical(spotlightAlbum.classical.conductor, 1) || joinClassical(spotlightAlbum.classical.orchestra, 1) ? (
+                            <div>{[joinClassical(spotlightAlbum.classical.conductor, 1), joinClassical(spotlightAlbum.classical.orchestra, 1)].filter(Boolean).join(' • ')}</div>
+                          ) : null}
+                        </div>
+                      ) : (
+                        <p className="text-xs leading-5 text-muted-foreground line-clamp-3">
+                          {spotlightAlbum.short_description || 'Jump back into a record that is already pulling the rest of the library into view.'}
+                        </p>
+                      )}
+                      <div className="flex flex-wrap gap-2 pt-1">
+                        <Badge variant="outline">{spotlightAlbum.year ?? '—'}</Badge>
+                        <Badge variant="outline">{spotlightAlbum.track_count} tracks</Badge>
+                        {spotlightAlbum.label ? <Badge variant="outline">{spotlightAlbum.label}</Badge> : null}
+                      </div>
+                    </>
+                  ) : (
+                    <p className="text-sm text-muted-foreground">Start listening to generate a spotlight record.</p>
+                  )}
+                </div>
+              </div>
+            </CardContent>
+          </Card>
+          <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-1">
+            <Card className="border-border/60 bg-card/92">
+              <CardContent className="flex items-start gap-3 p-5">
+                <div className="flex h-10 w-10 items-center justify-center rounded-2xl bg-primary/10 text-primary">
+                  <Heart className="h-4 w-4" />
+                </div>
+                <div className="space-y-1">
+                  <div className="text-sm font-semibold">Follow your own taste</div>
+                  <p className="text-xs leading-5 text-muted-foreground">Use Likes and ratings as an explicit memory layer. PMDA can then surface albums that sit near those choices.</p>
+                </div>
+              </CardContent>
+            </Card>
+            <Card className="border-border/60 bg-card/92">
+              <CardContent className="flex items-start gap-3 p-5">
+                <div className="flex h-10 w-10 items-center justify-center rounded-2xl bg-primary/10 text-primary">
+                  <LibraryBig className="h-4 w-4" />
+                </div>
+                <div className="space-y-1">
+                  <div className="text-sm font-semibold">Read the collection in context</div>
+                  <p className="text-xs leading-5 text-muted-foreground">
+                    {spotlightArtist ? `${spotlightArtist.artist_name} is the current anchor across your library activity. Use artist, label and genre pages to move outward from there.` : 'Browse artists, labels and genres as connected shelves rather than isolated folders.'}
+                  </p>
+                </div>
+              </CardContent>
+            </Card>
+          </div>
+        </div>
+      </section>
+
       <div className="flex items-center justify-end gap-2">
         <Button
           type="button"

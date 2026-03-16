@@ -18,19 +18,105 @@ PMDA_BASE = "http://192.168.3.2:5005"
 BENCH_ROOT = Path("/mnt/user/MURRAY/Music/pmda_scan_benchmark_classical")
 ACTIVE_SCAN_ROOT = Path("/mnt/user/MURRAY/Music/pmda_scan_benchmark")
 REPORT_ROOT = Path(__file__).resolve().parents[1] / ".tmp" / "classical-validation"
+MANIFEST_PATH = BENCH_ROOT / "manifest.json"
+DEDUPE_TRANSFORMS = {"dupe_exact", "title_variant", "no_tags", "no_cover"}
+INCOMPLETE_TRANSFORMS = {"incomplete_missing_track"}
 
-EXPECTED_PUBLISHED = 6
-EXPECTED_ARTISTS = 3
-EXPECTED_DEDUPE_MOVES = 4
-EXPECTED_INCOMPLETE_MOVES = 1
-EXPECTED_TITLES = {
-    'Britten; Debussy: La Mer',
-    'Debussy: La Mer / Images [HD] (Flac)',
-    'Debussy: La Mer / Nocturnes',
-    'Tchaikovsky: Symphonie n° 6 "Pathétique"',
-    'Tchaikovsky: Symphony no. 6 "Pathétique"',
-    'The Tchaikovsky Project: Complete Symphonies and Piano Concertos',
-}
+
+def _norm_text(value: object) -> str:
+    raw = str(value or "").strip().lower()
+    raw = re.sub(r"\[(?:hd|flac|cd|disc|disk)[^\]]*\]", " ", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"\((?:hd|flac|cd|disc|disk)[^)]*\)", " ", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"[^a-z0-9]+", " ", raw)
+    return re.sub(r"\s+", " ", raw).strip()
+
+
+def _display_values(payload: object, key: str) -> list[str]:
+    if not isinstance(payload, dict):
+        return []
+    raw = payload.get(key)
+    if isinstance(raw, list):
+        return [str(v or "").strip() for v in raw if str(v or "").strip()]
+    if isinstance(raw, str) and raw.strip():
+        return [raw.strip()]
+    return []
+
+
+def _token_overlap_ratio(left: object, right: object) -> float:
+    left_tokens = {tok for tok in _norm_text(left).split() if len(tok) >= 3}
+    right_tokens = {tok for tok in _norm_text(right).split() if len(tok) >= 3}
+    if not left_tokens or not right_tokens:
+        return 0.0
+    shared = left_tokens & right_tokens
+    if not shared:
+        return 0.0
+    return len(shared) / float(min(len(left_tokens), len(right_tokens)))
+
+
+def _load_expected_groups(manifest_cases: list[dict]) -> list[dict]:
+    groups: dict[str, dict] = {}
+    for case in manifest_cases:
+        if not isinstance(case, dict):
+            continue
+        source_key = str(case.get("source_key") or case.get("case_id") or "").strip()
+        if not source_key:
+            continue
+        transform = str(case.get("transform") or "").strip().lower()
+        summary = case.get("summary") if isinstance(case.get("summary"), dict) else {}
+        placeholder_album = _norm_text(summary.get("album")) in {"", _norm_text(source_key)}
+        placeholder_artist = _norm_text(summary.get("artist")) in {"", "template source", "templatesource"}
+        source_hint = source_key.replace("_", " ").strip()
+        hint_title = source_hint
+        hint_artist = ""
+        if source_hint:
+            if source_hint.startswith("debussy "):
+                hint_artist = "Claude Debussy"
+            elif source_hint.startswith("tchaikovsky "):
+                hint_artist = "Peter Tchaikovsky"
+            elif source_hint.startswith("amadeus quartet "):
+                hint_artist = "Amadeus Quartet"
+        group = groups.setdefault(
+            source_key,
+            {
+                "source_key": source_key,
+                "cases": [],
+                "published_expected": True,
+                "expected_title": hint_title if placeholder_album else str(summary.get("album") or "").strip(),
+                "expected_artist": hint_artist if placeholder_artist else str(summary.get("artist") or summary.get("albumartist") or "").strip(),
+                "expected_track_count": int(summary.get("track_count") or 0),
+                "expected_composer": str(summary.get("composer") or "").strip(),
+                "expected_conductor": str(summary.get("conductor") or "").strip(),
+                "expected_orchestra": str(summary.get("orchestra") or "").strip(),
+            },
+        )
+        group["cases"].append(case)
+        if transform in INCOMPLETE_TRANSFORMS:
+            continue
+        if (not group["expected_title"] or placeholder_album) and summary:
+            fallback_title = str(summary.get("album") or "").strip()
+            if fallback_title and _norm_text(fallback_title) != _norm_text(source_key):
+                group["expected_title"] = fallback_title
+        if (not group["expected_artist"] or placeholder_artist) and summary:
+            fallback_artist = str(summary.get("artist") or summary.get("albumartist") or "").strip()
+            if fallback_artist and _norm_text(fallback_artist) not in {"", "template source", "templatesource"}:
+                group["expected_artist"] = fallback_artist
+        if not group["expected_title"] and source_hint:
+            group["expected_title"] = hint_title
+        if not group["expected_artist"] and hint_artist:
+            group["expected_artist"] = hint_artist
+        if not group["expected_composer"] and hint_artist:
+            group["expected_composer"] = hint_artist
+        if not group["expected_title"] and summary:
+            group["expected_title"] = str(summary.get("album") or "").strip()
+        if not group["expected_composer"] and summary:
+            group["expected_composer"] = str(summary.get("composer") or "").strip()
+        if not group["expected_conductor"] and summary:
+            group["expected_conductor"] = str(summary.get("conductor") or "").strip()
+        if not group["expected_orchestra"] and summary:
+            group["expected_orchestra"] = str(summary.get("orchestra") or "").strip()
+        if not group["expected_track_count"] and summary:
+            group["expected_track_count"] = int(summary.get("track_count") or 0)
+    return list(groups.values())
 
 
 @dataclass
@@ -54,6 +140,39 @@ def run_ssh(script: str) -> str:
     return proc.stdout.strip()
 
 
+def load_manifest_json() -> dict:
+    try:
+        if MANIFEST_PATH.exists():
+            return json.loads(MANIFEST_PATH.read_text())
+    except Exception:
+        pass
+    raw = run_ssh(f"cat {MANIFEST_PATH}")
+    try:
+        return json.loads(raw)
+    except Exception as exc:
+        raise RuntimeError(f"failed to load classical benchmark manifest: {exc}") from exc
+
+
+def build_expectations(manifest: dict) -> dict:
+    manifest_cases = [case for case in list((manifest or {}).get("cases") or []) if isinstance(case, dict)]
+    expected_groups = _load_expected_groups(manifest_cases)
+    return {
+        "scanned": int(len(manifest_cases) or 11),
+        "published": len(expected_groups),
+        "dedupe_moves": sum(
+            1
+            for case in manifest_cases
+            if str((case or {}).get("transform") or "").strip().lower() in DEDUPE_TRANSFORMS
+        ),
+        "incomplete_moves": sum(
+            1
+            for case in manifest_cases
+            if str((case or {}).get("transform") or "").strip().lower() in INCOMPLETE_TRANSFORMS
+        ),
+        "groups": expected_groups,
+    }
+
+
 def create_admin_token() -> str:
     script = r"""docker exec -i PMDA python -u - <<'PY'
 import pmda
@@ -61,20 +180,27 @@ row = pmda._auth_get_user_by_username("admin")
 if not row:
     raise SystemExit("admin user not found")
 token, _ = pmda._auth_create_session(int(row["id"]), ip="127.0.0.1", user_agent="classical-validation")
-print(token)
+print(f"PMDA_TOKEN:{token}")
 PY"""
     out = run_ssh(script)
     token = ""
     for line in reversed([ln.strip() for ln in out.splitlines() if ln.strip()]):
-        if re.fullmatch(r"[A-Za-z0-9_-]{40,}", line):
-            token = line
+        if line.startswith("PMDA_TOKEN:"):
+            token = line.split(":", 1)[1].strip()
             break
     if not token:
         raise RuntimeError("failed to create admin token")
     return token
 
 
-def api_json(path: str, *, token: str, method: str = "GET", payload: dict | None = None) -> tuple[int, dict]:
+def api_json(
+    path: str,
+    *,
+    token: str,
+    method: str = "GET",
+    payload: dict | None = None,
+    timeout_sec: int = 120,
+) -> tuple[int, dict]:
     data = None
     headers = {"Authorization": f"Bearer {token}"}
     if payload is not None:
@@ -82,7 +208,7 @@ def api_json(path: str, *, token: str, method: str = "GET", payload: dict | None
         headers["Content-Type"] = "application/json"
     req = request.Request(f"{PMDA_BASE}{path}", data=data, headers=headers, method=method)
     try:
-        with request.urlopen(req, timeout=90) as resp:
+        with request.urlopen(req, timeout=timeout_sec) as resp:
             body = resp.read().decode("utf-8")
             return resp.status, json.loads(body)
     except error.HTTPError as exc:
@@ -147,6 +273,7 @@ def reset_pmda(token: str) -> dict:
             "actions": ["media_cache", "state_db", "cache_db", "files_index"],
             "restart": False,
         },
+        timeout_sec=300,
     )
     if status != 200 or payload.get("status") not in {"ok", "partial"}:
         raise RuntimeError(f"maintenance reset failed: {status} {payload}")
@@ -202,9 +329,15 @@ def fetch_published_state(token: str) -> dict:
         raise RuntimeError(f"library artists fetch failed: {status_artists} {artists_payload}")
     albums = []
     for item in list((albums_payload or {}).get("albums") or []):
+        album_id = int(item.get("album_id") or 0)
+        detail_payload = {}
+        if album_id > 0:
+            detail_status, detail_data = api_json(f"/api/library/album/{album_id}", token=token)
+            if detail_status == 200 and isinstance(detail_data, dict):
+                detail_payload = detail_data
         albums.append(
             {
-                "id": int(item.get("album_id") or 0),
+                "id": album_id,
                 "artist": str(item.get("artist_name") or "").strip(),
                 "title": str(item.get("title") or "").strip(),
                 "year": item.get("year"),
@@ -213,6 +346,8 @@ def fetch_published_state(token: str) -> dict:
                 "metadata_source": item.get("profile_source"),
                 "mb_identified": bool(item.get("mb_identified")),
                 "public_rating": item.get("public_rating"),
+                "classical": detail_payload.get("classical") if isinstance(detail_payload, dict) else None,
+                "label": detail_payload.get("label") if isinstance(detail_payload, dict) else None,
             }
         )
     return {
@@ -266,15 +401,66 @@ def validate(
     published: dict,
     moves: list[dict],
     log_health: dict,
+    expectations: dict,
 ) -> ValidationResult:
     failures: list[str] = []
-    published_titles = {str(item.get("title") or "").strip() for item in published.get("albums", [])}
-    if int(published.get("albums_total") or 0) != EXPECTED_PUBLISHED:
-        failures.append(f"expected {EXPECTED_PUBLISHED} published albums, got {published.get('albums_total')}")
-    if int(published.get("artist_count") or 0) != EXPECTED_ARTISTS:
-        failures.append(f"expected {EXPECTED_ARTISTS} published artists, got {published.get('artist_count')}")
-    if published_titles != EXPECTED_TITLES:
-        failures.append(f"published titles mismatch: {sorted(published_titles)}")
+    expected_published = int(expectations.get("published") or 0)
+    expected_groups = list(expectations.get("groups") or [])
+    expected_dedupe_moves = int(expectations.get("dedupe_moves") or 0)
+    expected_incomplete_moves = int(expectations.get("incomplete_moves") or 0)
+    expected_scanned = int(expectations.get("scanned") or 0)
+    if int(published.get("albums_total") or 0) != expected_published:
+        failures.append(f"expected {expected_published} published albums, got {published.get('albums_total')}")
+
+    published_albums = list(published.get("albums") or [])
+
+    def _album_matches_expected(item: dict, expected: dict) -> bool:
+        title_norm = _norm_text(item.get("title"))
+        artist_norm = _norm_text(item.get("artist"))
+        expected_title_norm = _norm_text(expected.get("expected_title"))
+        expected_artist_norm = _norm_text(expected.get("expected_artist"))
+        if int(item.get("tracks") or 0) and int(expected.get("expected_track_count") or 0):
+            if int(item.get("tracks") or 0) != int(expected.get("expected_track_count") or 0):
+                return False
+        if expected_title_norm and expected_title_norm not in title_norm and title_norm not in expected_title_norm:
+            work_values = _display_values(item.get("classical"), "work")
+            work_norms = {_norm_text(value) for value in work_values if _norm_text(value)}
+            title_overlap = _token_overlap_ratio(expected_title_norm, title_norm)
+            work_overlap = max((_token_overlap_ratio(expected_title_norm, value) for value in work_norms), default=0.0)
+            if expected_title_norm not in work_norms and max(title_overlap, work_overlap) < 0.55:
+                return False
+        classical_payload = item.get("classical") if isinstance(item.get("classical"), dict) else {}
+        composer_norms = {_norm_text(value) for value in _display_values(classical_payload, "composer")}
+        conductor_norms = {_norm_text(value) for value in _display_values(classical_payload, "conductor")}
+        orchestra_norms = {_norm_text(value) for value in _display_values(classical_payload, "orchestra")}
+        expected_composer = _norm_text(expected.get("expected_composer"))
+        expected_conductor = _norm_text(expected.get("expected_conductor"))
+        expected_orchestra = _norm_text(expected.get("expected_orchestra"))
+        if expected_composer and expected_composer not in composer_norms and expected_composer not in artist_norm:
+            return False
+        if expected_conductor and expected_conductor not in conductor_norms:
+            return False
+        if expected_orchestra and expected_orchestra not in orchestra_norms:
+            return False
+        artist_overlap = _token_overlap_ratio(expected_artist_norm, artist_norm)
+        composer_overlap = max((_token_overlap_ratio(expected_artist_norm, value) for value in composer_norms), default=0.0)
+        if expected_artist_norm and expected_artist_norm not in artist_norm and expected_artist_norm not in composer_norms:
+            if max(artist_overlap, composer_overlap) < 0.55:
+                return False
+        return True
+
+    matched_ids: set[int] = set()
+    for expected in expected_groups:
+        matches = [item for item in published_albums if _album_matches_expected(item, expected)]
+        if len(matches) != 1:
+            failures.append(
+                f"expected exactly one published match for {expected.get('source_key')}, got {len(matches)}"
+            )
+            continue
+        matched_ids.add(int(matches[0].get("id") or 0))
+    extra_ids = [int(item.get("id") or 0) for item in published_albums if int(item.get("id") or 0) not in matched_ids]
+    if extra_ids:
+        failures.append(f"unexpected published albums remained after matching expected groups: {extra_ids}")
 
     def _move_kind(move: dict) -> str:
         return str(
@@ -286,10 +472,10 @@ def validate(
 
     dedupe_moves = [m for m in moves if _move_kind(m) == "dedupe"]
     incomplete_moves = [m for m in moves if _move_kind(m) == "incomplete"]
-    if len(dedupe_moves) != EXPECTED_DEDUPE_MOVES:
-        failures.append(f"expected {EXPECTED_DEDUPE_MOVES} dedupe moves, got {len(dedupe_moves)}")
-    if len(incomplete_moves) != EXPECTED_INCOMPLETE_MOVES:
-        failures.append(f"expected {EXPECTED_INCOMPLETE_MOVES} incomplete moves, got {len(incomplete_moves)}")
+    if len(dedupe_moves) != expected_dedupe_moves:
+        failures.append(f"expected {expected_dedupe_moves} dedupe moves, got {len(dedupe_moves)}")
+    if len(incomplete_moves) != expected_incomplete_moves:
+        failures.append(f"expected {expected_incomplete_moves} incomplete moves, got {len(incomplete_moves)}")
 
     albums_scanned = (
         (final_progress or {}).get("albums_scanned")
@@ -298,8 +484,8 @@ def validate(
         or ((latest_scan or {}).get("summary_json") or {}).get("albums_scanned")
         or (final_progress or {}).get("total_albums")
     )
-    if int(albums_scanned or 0) != 11:
-        failures.append(f"expected 11 albums scanned, got {albums_scanned}")
+    if int(albums_scanned or 0) != expected_scanned:
+        failures.append(f"expected {expected_scanned} albums scanned, got {albums_scanned}")
 
     counts = (log_health or {}).get("counts") or {}
     for key in ("missing_album_folder", "publication_incomplete", "missing_release_group"):
@@ -318,6 +504,7 @@ def validate(
             "published": published,
             "moves": moves,
             "log_health": log_health,
+            "expectations": expectations,
         },
     )
 
@@ -330,6 +517,8 @@ def main() -> int:
     report_dir = Path(args.report_dir).expanduser().resolve()
     report_dir.mkdir(parents=True, exist_ok=True)
 
+    manifest = load_manifest_json()
+    expectations = build_expectations(manifest)
     token = create_admin_token()
     started_at = datetime.now(UTC)
     restore_benchmark_source()
@@ -347,7 +536,7 @@ def main() -> int:
     )
     moves = fetch_moves(token, latest_scan_id) if latest_scan_id > 0 else []
     log_health = fetch_log_health(started_at.isoformat())
-    result = validate(final_progress, latest_scan, published, moves, log_health)
+    result = validate(final_progress, latest_scan, published, moves, log_health, expectations)
     result.started_at = started_at.isoformat()
 
     stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")

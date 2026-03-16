@@ -193,6 +193,12 @@ function formatCompactCount(value?: number | null): string {
   return new Intl.NumberFormat('en', { notation: 'compact', maximumFractionDigits: 1 }).format(num);
 }
 
+function joinClassical(values?: string[] | null, limit = 3): string | null {
+  const items = Array.isArray(values) ? values.filter((value) => typeof value === 'string' && value.trim()) : [];
+  if (!items.length) return null;
+  return items.slice(0, limit).join(' · ');
+}
+
 export default function AlbumPage() {
   const navigate = useNavigate();
   const location = useLocation();
@@ -760,6 +766,46 @@ export default function AlbumPage() {
                         </Badge>
                       ))}
                     </div>
+                  </div>
+                ) : null}
+                {data.classical ? (
+                  <div className="mt-3 grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
+                    {joinClassical(data.classical.composer, 3) ? (
+                      <div className="rounded-xl border border-white/12 bg-black/18 px-3 py-2">
+                        <div className="text-[10px] font-medium uppercase tracking-[0.2em] text-white/60">Composer</div>
+                        <div className="mt-1 text-xs text-white/92 line-clamp-2">{joinClassical(data.classical.composer, 3)}</div>
+                      </div>
+                    ) : null}
+                    {joinClassical(data.classical.work, 3) ? (
+                      <div className="rounded-xl border border-white/12 bg-black/18 px-3 py-2">
+                        <div className="text-[10px] font-medium uppercase tracking-[0.2em] text-white/60">Work</div>
+                        <div className="mt-1 text-xs text-white/92 line-clamp-2">{joinClassical(data.classical.work, 3)}</div>
+                      </div>
+                    ) : null}
+                    {joinClassical(data.classical.conductor, 3) ? (
+                      <div className="rounded-xl border border-white/12 bg-black/18 px-3 py-2">
+                        <div className="text-[10px] font-medium uppercase tracking-[0.2em] text-white/60">Conductor</div>
+                        <div className="mt-1 text-xs text-white/92 line-clamp-2">{joinClassical(data.classical.conductor, 3)}</div>
+                      </div>
+                    ) : null}
+                    {joinClassical(data.classical.orchestra, 3) ? (
+                      <div className="rounded-xl border border-white/12 bg-black/18 px-3 py-2">
+                        <div className="text-[10px] font-medium uppercase tracking-[0.2em] text-white/60">Orchestra</div>
+                        <div className="mt-1 text-xs text-white/92 line-clamp-2">{joinClassical(data.classical.orchestra, 3)}</div>
+                      </div>
+                    ) : null}
+                    {joinClassical(data.classical.soloists, 3) ? (
+                      <div className="rounded-xl border border-white/12 bg-black/18 px-3 py-2">
+                        <div className="text-[10px] font-medium uppercase tracking-[0.2em] text-white/60">Soloists</div>
+                        <div className="mt-1 text-xs text-white/92 line-clamp-2">{joinClassical(data.classical.soloists, 3)}</div>
+                      </div>
+                    ) : null}
+                    {joinClassical(data.classical.catalog_numbers, 3) ? (
+                      <div className="rounded-xl border border-white/12 bg-black/18 px-3 py-2">
+                        <div className="text-[10px] font-medium uppercase tracking-[0.2em] text-white/60">Catalog</div>
+                        <div className="mt-1 text-xs text-white/92 line-clamp-2">{joinClassical(data.classical.catalog_numbers, 3)}</div>
+                      </div>
+                    ) : null}
                   </div>
                 ) : null}
               </div>

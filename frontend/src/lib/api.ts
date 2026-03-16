@@ -1482,6 +1482,7 @@ export interface LibraryAlbumItem {
   public_rating_votes?: number | null;
   public_rating_source?: string | null;
   heat_score?: number | null;
+  classical?: ClassicalIdentityPayload | null;
 }
 
 export interface LibraryAlbumsResponse {
@@ -2289,6 +2290,16 @@ export interface AlbumDetailReview {
   updated_at?: number;
 }
 
+export interface ClassicalIdentityPayload {
+  composer?: string[];
+  work?: string[];
+  conductor?: string[];
+  orchestra?: string[];
+  soloists?: string[];
+  performers?: string[];
+  catalog_numbers?: string[];
+}
+
 export interface AlbumDetailResponse {
   album_id: number;
   title: string;
@@ -2309,6 +2320,7 @@ export interface AlbumDetailResponse {
   metadata_source_url?: string | null;
   artist_id: number;
   artist_name: string;
+  classical?: ClassicalIdentityPayload | null;
   review?: AlbumDetailReview;
   ratings?: {
     user_rating?: number | null;

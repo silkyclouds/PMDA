@@ -64,6 +64,7 @@ interface AlbumInfo {
   public_rating_votes?: number | null;
   public_rating_source?: string | null;
   heat_score?: number | null;
+  classical?: api.ClassicalIdentityPayload | null;
 }
 
 interface ArtistDetailResponse {
@@ -121,6 +122,12 @@ function initialsFromName(name: string): string {
   const a = words[0]?.[0] || '?';
   const b = words.length > 1 ? (words[1]?.[0] || '') : '';
   return (a + b).toUpperCase();
+}
+
+function joinClassical(values?: string[] | null, limit = 2): string | null {
+  const items = Array.isArray(values) ? values.filter((value) => typeof value === 'string' && value.trim()) : [];
+  if (!items.length) return null;
+  return items.slice(0, limit).join(' · ');
 }
 
 function toCoord(s?: string): number | null {
@@ -1306,6 +1313,30 @@ export default function ArtistPage() {
                           <h3 className="text-sm font-semibold truncate" title={album.title}>
                             {album.title}
                           </h3>
+                          {album.classical ? (
+                            <div className="space-y-1">
+                              {joinClassical(album.classical.work, 2) ? (
+                                <p className="text-[10px] font-medium text-foreground/85 line-clamp-2">
+                                  {joinClassical(album.classical.work, 2)}
+                                </p>
+                              ) : null}
+                              {joinClassical(album.classical.composer, 2) ? (
+                                <p className="text-[10px] text-muted-foreground line-clamp-1">
+                                  Composer: {joinClassical(album.classical.composer, 2)}
+                                </p>
+                              ) : null}
+                              {joinClassical(album.classical.conductor, 2) || joinClassical(album.classical.orchestra, 2) ? (
+                                <p className="text-[10px] text-muted-foreground line-clamp-2">
+                                  {[joinClassical(album.classical.conductor, 2), joinClassical(album.classical.orchestra, 2)].filter(Boolean).join(' • ')}
+                                </p>
+                              ) : null}
+                              {joinClassical(album.classical.soloists, 2) ? (
+                                <p className="text-[10px] text-muted-foreground line-clamp-2">
+                                  Soloists: {joinClassical(album.classical.soloists, 2)}
+                                </p>
+                              ) : null}
+                            </div>
+                          ) : null}
                           <AlbumBadgeGroups
                             show={showBadges}
                             compact
