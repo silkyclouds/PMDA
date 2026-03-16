@@ -30188,6 +30188,65 @@ def scan_duplicates(
                 return False
         return True
 
+    _CLASSICAL_SAME_RECORDING_REASONS = {
+        "same_recording_exact_structure",
+        "same_recording_missing_performance_context",
+        "same_recording_subset_structure",
+        "same_recording_similarity",
+    }
+
+    def _expand_classical_same_recording_group(group: list[dict], best: dict | None) -> list[dict]:
+        if not group or not isinstance(best, dict) or not _is_classical(group):
+            return list(group or [])
+        expanded = list(group)
+        present_ids = {
+            _parse_int_loose((e or {}).get("album_id"), 0)
+            for e in expanded
+            if isinstance(e, dict)
+        }
+        present_ids.discard(0)
+        best_ctx = _classical_context_for_edition(best)
+        best_count = int(best_ctx.get("track_count") or 0) or _edition_track_count_for_dupe(best)
+        added = 0
+        for candidate in editions:
+            if not isinstance(candidate, dict):
+                continue
+            aid = _parse_int_loose(candidate.get("album_id"), 0)
+            if aid <= 0 or aid in present_ids or aid in used_ids:
+                continue
+            same_recording, same_reason = _classical_same_recording_pair_details(best, candidate)
+            if (not same_recording) or same_reason not in _CLASSICAL_SAME_RECORDING_REASONS:
+                continue
+            cand_ctx = _classical_context_for_edition(candidate)
+            cand_count = int(cand_ctx.get("track_count") or 0) or _edition_track_count_for_dupe(candidate)
+            if best_count > 0 and cand_count > 0 and cand_count < best_count and (best_count - cand_count) <= 2:
+                if not bool(candidate.get("is_broken")):
+                    candidate["is_broken"] = True
+                    candidate["expected_track_count"] = best_count
+                    candidate["actual_track_count"] = cand_count
+                    candidate["missing_indices"] = _edition_missing_indices_exact(candidate, best_count, cand_count)
+                    candidate["_classical_sibling_incomplete"] = True
+                    logging.warning(
+                        "[Artist %s] Album %s (%s) forced incomplete from classical winner family: actual=%s expected=%s missing=%s",
+                        artist,
+                        candidate.get("album_id"),
+                        candidate.get("title_raw") or candidate.get("plex_title") or "",
+                        cand_count,
+                        best_count,
+                        list(candidate.get("missing_indices") or [])[:24],
+                    )
+            expanded.append(candidate)
+            present_ids.add(aid)
+            added += 1
+        if added > 0:
+            logging.info(
+                "[Artist %s] classical same-recording expansion: winner=%s added=%s sibling(s)",
+                artist,
+                best.get("album_id"),
+                added,
+            )
+        return expanded
+
     def _append_group(
         ed_list: list[dict],
         *,
@@ -30310,6 +30369,13 @@ def scan_duplicates(
                 _dr_inc("groups_by_signal", signal)
                 continue
 
+            original_len = len(sg)
+            if _is_classical(sg):
+                sg = _expand_classical_same_recording_group(sg, best)
+                refined_best = choose_best(sg, defer_ai=True)
+                if refined_best is not None:
+                    best = refined_best
+
             # Never keep broken editions as duplicate losers: they belong to incomplete handling.
             losers = [
                 e
@@ -30320,6 +30386,8 @@ def scan_duplicates(
                 used_ids.update(e.get("album_id") for e in sg if e.get("album_id") is not None)
                 continue
 
+            if _is_classical(sg) and len(sg) > original_len:
+                chips.append(f"CLASSICAL_SATELLITES:{len(sg) - original_len}")
             best["dupe_evidence"] = chips
             if best.get("used_ai", False):
                 ai_used_count += 1
