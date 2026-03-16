@@ -6143,6 +6143,7 @@ def init_state_db():
             bd INTEGER,
             meta_json TEXT,
             musicbrainz_id TEXT,
+            musicbrainz_release_id TEXT,
             is_broken INTEGER DEFAULT 0,
             expected_track_count INTEGER,
             actual_track_count INTEGER,
@@ -6161,6 +6162,8 @@ def init_state_db():
     try:
         cur.execute("PRAGMA table_info(scan_editions)")
         se_cols = [r[1] for r in cur.fetchall()]
+        if "musicbrainz_release_id" not in se_cols:
+            cur.execute("ALTER TABLE scan_editions ADD COLUMN musicbrainz_release_id TEXT")
         if "discogs_release_id" not in se_cols:
             cur.execute("ALTER TABLE scan_editions ADD COLUMN discogs_release_id TEXT")
         if "lastfm_album_mbid" not in se_cols:
@@ -6225,6 +6228,7 @@ def init_state_db():
             strict_reject_reason TEXT,
             strict_tracklist_score REAL NOT NULL DEFAULT 0.0,
             musicbrainz_id TEXT,
+            musicbrainz_release_id TEXT,
             discogs_release_id TEXT,
             lastfm_album_mbid TEXT,
             bandcamp_album_url TEXT,
@@ -6561,6 +6565,7 @@ def init_state_db():
             strict_reject_reason TEXT,
             strict_tracklist_score REAL NOT NULL DEFAULT 0.0,
             musicbrainz_release_group_id TEXT,
+            musicbrainz_release_id TEXT,
             discogs_release_id TEXT,
             lastfm_album_mbid TEXT,
             bandcamp_album_url TEXT,
@@ -6594,6 +6599,7 @@ def init_state_db():
         ("strict_match_provider", "TEXT"),
         ("strict_reject_reason", "TEXT"),
         ("strict_tracklist_score", "REAL NOT NULL DEFAULT 0.0"),
+        ("musicbrainz_release_id", "TEXT"),
     ]:
         if col_name not in files_cache_cols:
             cur.execute(f"ALTER TABLE files_album_scan_cache ADD COLUMN {col_name} {col_type}")
@@ -6624,6 +6630,7 @@ def init_state_db():
         ("strict_reject_reason", "TEXT"),
         ("strict_tracklist_score", "REAL NOT NULL DEFAULT 0.0"),
         ("musicbrainz_release_group_id", "TEXT"),
+        ("musicbrainz_release_id", "TEXT"),
         ("discogs_release_id", "TEXT"),
         ("lastfm_album_mbid", "TEXT"),
         ("bandcamp_album_url", "TEXT"),
@@ -10509,6 +10516,7 @@ def _files_pg_init_schema() -> bool:
                     strict_reject_reason TEXT,
                     strict_tracklist_score REAL NOT NULL DEFAULT 0.0,
                     musicbrainz_release_group_id TEXT,
+                    musicbrainz_release_id TEXT,
                     discogs_release_id TEXT,
                     lastfm_album_mbid TEXT,
                     bandcamp_album_url TEXT,
@@ -10528,6 +10536,7 @@ def _files_pg_init_schema() -> bool:
             # Backward-compatible schema evolution for files_albums.
             for col_name, col_sql in [
                 ("label", "TEXT"),
+                ("musicbrainz_release_id", "TEXT"),
                 ("discogs_release_id", "TEXT"),
                 ("lastfm_album_mbid", "TEXT"),
                 ("bandcamp_album_url", "TEXT"),
@@ -10696,6 +10705,7 @@ def _files_pg_init_schema() -> bool:
                 CREATE TABLE IF NOT EXISTS files_match_audit (
                     id BIGSERIAL PRIMARY KEY,
                     album_id BIGINT,
+                    folder_path TEXT,
                     artist_name TEXT,
                     album_title TEXT,
                     run_kind TEXT NOT NULL DEFAULT 'manual',
@@ -10712,6 +10722,11 @@ def _files_pg_init_schema() -> bool:
                 """
             )
             cur.execute("CREATE INDEX IF NOT EXISTS idx_files_match_audit_album_created ON files_match_audit(album_id, created_at DESC)")
+            try:
+                cur.execute("ALTER TABLE files_match_audit ADD COLUMN IF NOT EXISTS folder_path TEXT")
+            except Exception:
+                pass
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_files_match_audit_folder_created ON files_match_audit(folder_path, created_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_files_match_audit_created ON files_match_audit(created_at DESC)")
             # ───────────────────── Playlists (Files mode) ─────────────────────
             # Lightweight local playlists stored in PostgreSQL so they are fast and
@@ -13889,6 +13904,7 @@ def _rebuild_files_library_index_for_artist(
                                 str(album.get("strict_reject_reason") or "").strip(),
                                 float(album.get("strict_tracklist_score") or 0.0),
                                 album["musicbrainz_release_group_id"],
+                                album.get("musicbrainz_release_id") or "",
                                 album.get("discogs_release_id") or "",
                                 album.get("lastfm_album_mbid") or "",
                                 album.get("bandcamp_album_url") or "",
@@ -13910,7 +13926,7 @@ def _rebuild_files_library_index_for_artist(
                                 artist_id, title, title_norm, folder_path, year, date_text, genre, label, tags_json,
                                 format, is_lossless, has_cover, cover_path, mb_identified,
                                 strict_match_verified, strict_match_provider, strict_reject_reason, strict_tracklist_score,
-                                musicbrainz_release_group_id,
+                                musicbrainz_release_group_id, musicbrainz_release_id,
                                 discogs_release_id, lastfm_album_mbid, bandcamp_album_url, metadata_source,
                                 track_count, total_duration_sec, is_broken, expected_track_count, actual_track_count,
                                 missing_indices_json, missing_required_tags_json, primary_tags_json,
@@ -13919,7 +13935,7 @@ def _rebuild_files_library_index_for_artist(
                                 %s, %s, %s, %s, %s, %s, %s, %s, %s,
                                 %s, %s, %s, %s, %s,
                                 %s, %s, %s, %s,
-                                %s, %s, %s, %s, %s,
+                                %s, %s, %s, %s, %s, %s,
                                 %s, %s, %s, %s, %s,
                                 %s, %s, %s,
                                 NOW(), NOW()
@@ -13943,6 +13959,7 @@ def _rebuild_files_library_index_for_artist(
                                 strict_reject_reason = EXCLUDED.strict_reject_reason,
                                 strict_tracklist_score = EXCLUDED.strict_tracklist_score,
                                 musicbrainz_release_group_id = EXCLUDED.musicbrainz_release_group_id,
+                                musicbrainz_release_id = EXCLUDED.musicbrainz_release_id,
                                 discogs_release_id = EXCLUDED.discogs_release_id,
                                 lastfm_album_mbid = EXCLUDED.lastfm_album_mbid,
                                 bandcamp_album_url = EXCLUDED.bandcamp_album_url,
@@ -14416,6 +14433,7 @@ def _rebuild_files_library_index(reason: str = "manual", wait_if_running: bool =
                                 str(album.get("strict_reject_reason") or "").strip(),
                                 float(album.get("strict_tracklist_score") or 0.0),
                                 album["musicbrainz_release_group_id"],
+                                album.get("musicbrainz_release_id") or "",
                                 album.get("discogs_release_id") or "",
                                 album.get("lastfm_album_mbid") or "",
                                 album.get("bandcamp_album_url") or "",
@@ -14437,7 +14455,7 @@ def _rebuild_files_library_index(reason: str = "manual", wait_if_running: bool =
                                 artist_id, title, title_norm, folder_path, year, date_text, genre, label, tags_json,
                                 format, is_lossless, has_cover, cover_path, mb_identified,
                                 strict_match_verified, strict_match_provider, strict_reject_reason, strict_tracklist_score,
-                                musicbrainz_release_group_id,
+                                musicbrainz_release_group_id, musicbrainz_release_id,
                                 discogs_release_id, lastfm_album_mbid, bandcamp_album_url, metadata_source,
                                 track_count, total_duration_sec, is_broken, expected_track_count, actual_track_count,
                                 missing_indices_json, missing_required_tags_json, primary_tags_json,
@@ -14446,7 +14464,7 @@ def _rebuild_files_library_index(reason: str = "manual", wait_if_running: bool =
                                 %s, %s, %s, %s, %s, %s, %s, %s, %s,
                                 %s, %s, %s, %s, %s,
                                 %s, %s, %s, %s,
-                                %s, %s, %s, %s, %s,
+                                %s, %s, %s, %s, %s, %s,
                                 %s, %s, %s, %s, %s,
                                 %s, %s, %s,
                                 NOW(), NOW()
@@ -23627,7 +23645,22 @@ def resolve_mbid_to_release_group(mbid: str, tag_source: str = "", use_queue: bo
         return None
     mbid = mbid.strip()
     if tag_source == "musicbrainz_releasegroupid":
-        return mbid
+        try:
+            def _fetch_release_group_probe():
+                return musicbrainzngs.get_release_group_by_id(mbid, includes=[])["release-group"]
+            if use_queue and MB_QUEUE_ENABLED and USE_MUSICBRAINZ:
+                get_mb_queue().submit(f"rg_probe_{mbid}", _fetch_release_group_probe)
+            else:
+                _fetch_release_group_probe()
+            return mbid
+        except Exception as e:
+            err_text = str(e or "").lower()
+            # Some files incorrectly store a release ID in the release-group tag.
+            # If MB says the "release-group" does not exist, fall through and try
+            # to resolve it as a release ID instead of trusting the malformed tag.
+            if "404" not in err_text and "not found" not in err_text:
+                logging.debug("resolve_mbid_to_release_group: release-group probe failed for mbid=%s: %s", mbid, e)
+                return mbid
     # Release ID (musicbrainz_releaseid, musicbrainz_albumid) or unknown: resolve via get_release_by_id
     # MusicBrainz API expects "release-groups" (plural) for release lookup includes
     try:
@@ -31077,9 +31110,17 @@ def save_scan_editions_to_db(scan_id: int, all_editions_by_artist: Dict[str, Lis
                 lastfm_album_mbid = identity_fields["lastfm_album_mbid"]
                 bandcamp_album_url = identity_fields["bandcamp_album_url"]
                 metadata_source = identity_fields["metadata_source"]
+                musicbrainz_release_id = str(identity_fields.get("musicbrainz_release_id") or "").strip()
             else:
                 mbid = (e.get("musicbrainz_id") or meta.get("musicbrainz_releasegroupid") or meta.get("musicbrainz_id") or "")
                 mbid = (mbid.strip() if isinstance(mbid, str) else str(mbid or "").strip()) or ""
+                musicbrainz_release_id = str(
+                    e.get("musicbrainz_release_id")
+                    or meta.get("musicbrainz_releaseid")
+                    or meta.get("musicbrainz_release_id")
+                    or meta.get("musicbrainz_albumid")
+                    or ""
+                ).strip()
                 discogs_release_id = str(
                     e.get("discogs_release_id")
                     or meta.get("discogs_release_id")
@@ -31110,11 +31151,11 @@ def save_scan_editions_to_db(scan_id: int, all_editions_by_artist: Dict[str, Lis
             strict_tracklist_score = float(e.get("strict_tracklist_score") or 0.0)
             cur.execute("""
                 INSERT INTO scan_editions
-                (scan_id, artist, album_id, title_raw, folder, fmt_text, br, sr, bd, meta_json, musicbrainz_id,
+                (scan_id, artist, album_id, title_raw, folder, fmt_text, br, sr, bd, meta_json, musicbrainz_id, musicbrainz_release_id,
                  is_broken, expected_track_count, actual_track_count, missing_indices, has_cover, missing_required_tags,
                  discogs_release_id, lastfm_album_mbid, bandcamp_album_url, metadata_source,
                  strict_match_verified, strict_match_provider, strict_reject_reason, strict_tracklist_score)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 scan_id,
                 artist_resolved,
@@ -31127,6 +31168,7 @@ def save_scan_editions_to_db(scan_id: int, all_editions_by_artist: Dict[str, Lis
                 e.get("bd") or 0,
                 json.dumps(meta, default=str),
                 mbid,
+                musicbrainz_release_id,
                 1 if e.get("is_broken") else 0,
                 e.get("expected_track_count"),
                 e.get("actual_track_count") or len(e.get("tracks", [])),
@@ -31279,6 +31321,13 @@ def save_scan_editions_artist_to_db(scan_id: int, artist_name: str, editions_lis
             meta_json_str = "{}"
         mbid = (e.get("musicbrainz_id") or meta.get("musicbrainz_releasegroupid") or meta.get("musicbrainz_id") or "")
         mbid = (mbid.strip() if isinstance(mbid, str) else str(mbid or "").strip()) or ""
+        musicbrainz_release_id = str(
+            e.get("musicbrainz_release_id")
+            or meta.get("musicbrainz_releaseid")
+            or meta.get("musicbrainz_release_id")
+            or meta.get("musicbrainz_albumid")
+            or ""
+        ).strip()
         discogs_release_id = str(
             e.get("discogs_release_id")
             or meta.get("discogs_release_id")
@@ -31309,11 +31358,11 @@ def save_scan_editions_artist_to_db(scan_id: int, artist_name: str, editions_lis
         strict_tracklist_score = float(e.get("strict_tracklist_score") or 0.0)
         cur.execute("""
             INSERT INTO scan_editions
-            (scan_id, artist, album_id, title_raw, folder, fmt_text, br, sr, bd, meta_json, musicbrainz_id,
+            (scan_id, artist, album_id, title_raw, folder, fmt_text, br, sr, bd, meta_json, musicbrainz_id, musicbrainz_release_id,
              is_broken, expected_track_count, actual_track_count, missing_indices, has_cover, missing_required_tags,
              discogs_release_id, lastfm_album_mbid, bandcamp_album_url, metadata_source,
              strict_match_verified, strict_match_provider, strict_reject_reason, strict_tracklist_score)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             scan_id,
             artist_resolved,
@@ -31326,6 +31375,7 @@ def save_scan_editions_artist_to_db(scan_id: int, artist_name: str, editions_lis
             e.get("bd") or 0,
             meta_json_str,
             mbid,
+            musicbrainz_release_id,
             1 if e.get("is_broken") else 0,
             e.get("expected_track_count"),
             e.get("actual_track_count") or len(e.get("tracks", [])),
@@ -32171,6 +32221,12 @@ def _extract_files_identity_fields(
             or ""
         ).strip()
     )
+    musicbrainz_release_id = str(
+        edition.get("musicbrainz_release_id")
+        or _extract_musicbrainz_release_id_from_meta(tags)
+        or cached.get("musicbrainz_release_id")
+        or ""
+    ).strip()
     discogs_release_id = str(
         edition.get("discogs_release_id")
         or tags.get("discogs_release_id")
@@ -32280,6 +32336,7 @@ def _extract_files_identity_fields(
                 identity_provider = metadata_source
     return {
         "musicbrainz_id": mbid,
+        "musicbrainz_release_id": musicbrainz_release_id,
         "has_mbid": bool(mbid),
         "discogs_release_id": discogs_release_id,
         "lastfm_album_mbid": lastfm_album_mbid,
@@ -32341,6 +32398,7 @@ def _load_files_album_scan_cache_map() -> dict[str, dict]:
         has_lastfm_col = "lastfm_album_mbid" in cols
         has_bandcamp_col = "bandcamp_album_url" in cols
         has_metadata_source_col = "metadata_source" in cols
+        has_mb_release_id_col = "musicbrainz_release_id" in cols
         has_strict_verified_col = "strict_match_verified" in cols
         has_strict_provider_col = "strict_match_provider" in cols
         has_strict_reason_col = "strict_reject_reason" in cols
@@ -32356,6 +32414,7 @@ def _load_files_album_scan_cache_map() -> dict[str, dict]:
                 has_complete_tags,
                 has_mbid,
                 {'musicbrainz_id' if has_mbid_col else "''"} AS musicbrainz_id,
+                {'musicbrainz_release_id' if has_mb_release_id_col else "''"} AS musicbrainz_release_id,
                 {'has_identity' if has_identity_col else '0'} AS has_identity,
                 {'identity_provider' if has_identity_provider_col else "''"} AS identity_provider,
                 {'discogs_release_id' if has_discogs_col else "''"} AS discogs_release_id,
@@ -32379,21 +32438,21 @@ def _load_files_album_scan_cache_map() -> dict[str, dict]:
             if not folder_path:
                 continue
             try:
-                missing_required = json.loads(row[17] or "[]")
+                missing_required = json.loads(row[18] or "[]")
                 if not isinstance(missing_required, list):
                     missing_required = []
             except Exception:
                 missing_required = []
-            identity_provider = _normalize_identity_provider(str(row[8] or ""))
-            metadata_source = _normalize_identity_provider(str(row[12] or ""))
-            strict_match_verified = bool(row[13])
-            strict_match_provider = _normalize_identity_provider(str(row[14] or ""))
-            strict_reject_reason = str(row[15] or "").strip()
+            identity_provider = _normalize_identity_provider(str(row[9] or ""))
+            metadata_source = _normalize_identity_provider(str(row[13] or ""))
+            strict_match_verified = bool(row[14])
+            strict_match_provider = _normalize_identity_provider(str(row[15] or ""))
+            strict_reject_reason = str(row[16] or "").strip()
             try:
-                strict_tracklist_score = float(row[16] or 0.0)
+                strict_tracklist_score = float(row[17] or 0.0)
             except Exception:
                 strict_tracklist_score = 0.0
-            has_identity = bool(row[7]) or bool(strict_match_verified)
+            has_identity = bool(row[8]) or bool(strict_match_verified)
             out[folder_path] = {
                 "fingerprint": row[1] or "",
                 "has_cover": bool(row[2]),
@@ -32401,21 +32460,22 @@ def _load_files_album_scan_cache_map() -> dict[str, dict]:
                 "has_complete_tags": bool(row[4]),
                 "has_mbid": bool(row[5]),
                 "musicbrainz_id": (row[6] or "").strip(),
+                "musicbrainz_release_id": (row[7] or "").strip(),
                 "has_identity": has_identity,
                 "identity_provider": strict_match_provider or identity_provider,
-                "discogs_release_id": (row[9] or "").strip(),
-                "lastfm_album_mbid": (row[10] or "").strip(),
-                "bandcamp_album_url": (row[11] or "").strip(),
+                "discogs_release_id": (row[10] or "").strip(),
+                "lastfm_album_mbid": (row[11] or "").strip(),
+                "bandcamp_album_url": (row[12] or "").strip(),
                 "metadata_source": metadata_source,
                 "strict_match_verified": strict_match_verified,
                 "strict_match_provider": strict_match_provider,
                 "strict_reject_reason": strict_reject_reason,
                 "strict_tracklist_score": strict_tracklist_score,
                 "missing_required_tags": missing_required,
-                "updated_at": float(row[18] or 0),
-                "artist_name": row[19] or "",
-                "album_title": row[20] or "",
-                "source_id": int(row[21] or 0) if len(row) > 21 else 0,
+                "updated_at": float(row[19] or 0),
+                "artist_name": row[20] or "",
+                "album_title": row[21] or "",
+                "source_id": int(row[22] or 0) if len(row) > 22 else 0,
             }
         con.close()
     except Exception:
@@ -32436,10 +32496,10 @@ def _upsert_files_album_scan_cache_rows(rows: list[dict]) -> None:
             (folder_path, source_id, fingerprint, artist_name, album_title,
              has_cover, has_artist_image, has_complete_tags, has_mbid, has_identity,
              identity_provider, strict_match_verified, strict_match_provider, strict_reject_reason, strict_tracklist_score,
-             musicbrainz_id, discogs_release_id, lastfm_album_mbid,
+             musicbrainz_id, musicbrainz_release_id, discogs_release_id, lastfm_album_mbid,
              bandcamp_album_url, metadata_source,
              missing_required_tags, last_scan_id, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(folder_path) DO UPDATE SET
               source_id=excluded.source_id,
               fingerprint=excluded.fingerprint,
@@ -32456,6 +32516,7 @@ def _upsert_files_album_scan_cache_rows(rows: list[dict]) -> None:
               strict_reject_reason=excluded.strict_reject_reason,
               strict_tracklist_score=excluded.strict_tracklist_score,
               musicbrainz_id=excluded.musicbrainz_id,
+              musicbrainz_release_id=excluded.musicbrainz_release_id,
               discogs_release_id=excluded.discogs_release_id,
               lastfm_album_mbid=excluded.lastfm_album_mbid,
               bandcamp_album_url=excluded.bandcamp_album_url,
@@ -32482,6 +32543,7 @@ def _upsert_files_album_scan_cache_rows(rows: list[dict]) -> None:
                     str(r.get("strict_reject_reason") or "").strip(),
                     float(r.get("strict_tracklist_score") or 0.0),
                     r.get("musicbrainz_id") or "",
+                    r.get("musicbrainz_release_id") or "",
                     r.get("discogs_release_id") or "",
                     r.get("lastfm_album_mbid") or "",
                     r.get("bandcamp_album_url") or "",
@@ -32545,6 +32607,7 @@ def _build_files_cache_row_from_prescan_item(item: dict, *, scan_id: int | None 
         "strict_reject_reason": identity_fields.get("strict_reject_reason") or "",
         "strict_tracklist_score": float(identity_fields.get("strict_tracklist_score") or 0.0),
         "musicbrainz_id": identity_fields["musicbrainz_id"],
+        "musicbrainz_release_id": identity_fields.get("musicbrainz_release_id") or "",
         "discogs_release_id": identity_fields["discogs_release_id"],
         "lastfm_album_mbid": identity_fields["lastfm_album_mbid"],
         "bandcamp_album_url": identity_fields["bandcamp_album_url"],
@@ -33709,7 +33772,7 @@ def _upsert_files_library_published_rows(rows: list[dict]) -> int:
                 year, date_text, genre, label, tags_json, format, is_lossless,
                 has_cover, cover_path, has_artist_image, artist_image_path,
                 mb_identified, strict_match_verified, strict_match_provider, strict_reject_reason, strict_tracklist_score,
-                musicbrainz_release_group_id, discogs_release_id, lastfm_album_mbid,
+                musicbrainz_release_group_id, musicbrainz_release_id, discogs_release_id, lastfm_album_mbid,
                 bandcamp_album_url, primary_metadata_source, track_count, total_duration_sec,
                 is_broken, expected_track_count, actual_track_count, missing_indices_json,
                 missing_required_tags_json, primary_tags_json, tracks_json, fingerprint, source_id, updated_at
@@ -33718,7 +33781,7 @@ def _upsert_files_library_published_rows(rows: list[dict]) -> int:
                 ?, ?, ?, ?, ?, ?, ?,
                 ?, ?, ?, ?,
                 ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?,
                 ?, ?, ?, ?,
                 ?, ?, ?, ?,
                 ?, ?, ?, ?
@@ -33746,6 +33809,7 @@ def _upsert_files_library_published_rows(rows: list[dict]) -> int:
                 strict_reject_reason=excluded.strict_reject_reason,
                 strict_tracklist_score=excluded.strict_tracklist_score,
                 musicbrainz_release_group_id=excluded.musicbrainz_release_group_id,
+                musicbrainz_release_id=excluded.musicbrainz_release_id,
                 discogs_release_id=excluded.discogs_release_id,
                 lastfm_album_mbid=excluded.lastfm_album_mbid,
                 bandcamp_album_url=excluded.bandcamp_album_url,
@@ -33788,6 +33852,7 @@ def _upsert_files_library_published_rows(rows: list[dict]) -> int:
                     str(r.get("strict_reject_reason") or "").strip(),
                     float(r.get("strict_tracklist_score") or 0.0),
                     r.get("musicbrainz_release_group_id") or "",
+                    r.get("musicbrainz_release_id") or "",
                     r.get("discogs_release_id") or "",
                     r.get("lastfm_album_mbid") or "",
                     r.get("bandcamp_album_url") or "",
@@ -34016,9 +34081,10 @@ def _authoritative_publication_cover(
         return (str(local_cover), True, "local")
 
     if exact_provider_ids:
-        # Prefer listener-facing canonical covers first. Last.fm/Bandcamp are often closer
-        # to the artwork users expect than release-group CAA or a specific Discogs reissue.
-        provider_chain = [provider for provider in preferred_cover_order if provider in provider_chain]
+        if musicbrainz_release_id or discogs_release_id:
+            provider_chain = [provider for provider in ("musicbrainz", "discogs", "bandcamp", "lastfm") if provider in provider_chain]
+        else:
+            provider_chain = [provider for provider in preferred_cover_order if provider in provider_chain]
 
     current_cover_provider_norm = _normalize_identity_provider(str(current_cover_provider or ""))
     current_cover_cached: Optional[Path] = None
@@ -34030,12 +34096,8 @@ def _authoritative_publication_cover(
                 current_cover_cached = cand
         except Exception:
             current_cover_cached = None
-    if current_cover_cached and current_cover_provider_norm and current_cover_provider_norm not in {"local", "unknown"}:
-        preferred_provider = provider_chain[0] if provider_chain else ""
-        if exact_provider_ids:
-            if current_cover_provider_norm == preferred_provider:
-                return (str(current_cover_cached), True, current_cover_provider_norm)
-        elif current_cover_provider_norm in {
+    if current_cover_cached and current_cover_provider_norm and current_cover_provider_norm not in {"local", "unknown"} and not exact_provider_ids:
+        if current_cover_provider_norm in {
             provider_seed,
             _normalize_identity_provider(str(metadata_source or "")),
         }:
@@ -34393,6 +34455,7 @@ def _publish_files_library_artist_from_items(
                         "strict_reject_reason": strict_reject_reason,
                         "strict_tracklist_score": strict_tracklist_score,
                         "musicbrainz_release_group_id": mb_release_group_id,
+                        "musicbrainz_release_id": mb_release_id,
                         "discogs_release_id": discogs_release_id,
                         "lastfm_album_mbid": lastfm_album_mbid,
                         "bandcamp_album_url": bandcamp_album_url,
@@ -34612,7 +34675,7 @@ def _rows_to_files_library_payload(rows: list[tuple]) -> tuple[dict[str, dict], 
         except Exception:
             tags_json = []
         try:
-            tracks = json.loads(row[30] or "[]") if row[30] else []
+            tracks = json.loads(row[31] or "[]") if row[31] else []
             if not isinstance(tracks, list):
                 tracks = []
         except Exception:
@@ -34625,9 +34688,10 @@ def _rows_to_files_library_payload(rows: list[tuple]) -> tuple[dict[str, dict], 
         except Exception:
             strict_tracklist_score = 0.0
         musicbrainz_id = (row[21] or "").strip()
-        discogs_release_id = (row[31] or "").strip()
-        lastfm_album_mbid = (row[32] or "").strip()
-        bandcamp_album_url = (row[33] or "").strip()
+        musicbrainz_release_id = (row[22] or "").strip()
+        discogs_release_id = (row[32] or "").strip()
+        lastfm_album_mbid = (row[33] or "").strip()
+        bandcamp_album_url = (row[34] or "").strip()
         has_cover_row = bool(row[12])
         if not has_cover_row:
             try:
@@ -34655,20 +34719,21 @@ def _rows_to_files_library_payload(rows: list[tuple]) -> tuple[dict[str, dict], 
                 "strict_reject_reason": strict_reject_reason,
                 "strict_tracklist_score": strict_tracklist_score,
                 "musicbrainz_release_group_id": musicbrainz_id,
-                "track_count": int(row[22] or 0),
-                "total_duration_sec": int(row[23] or 0),
-                "is_broken": bool(row[24]),
-                "expected_track_count": row[25],
-                "actual_track_count": int(row[26] or 0),
-                "missing_indices_json": row[27] or "[]",
-                "missing_required_tags_json": row[28] or "[]",
-                "primary_tags_json": row[29] or "{}",
+                "musicbrainz_release_id": musicbrainz_release_id,
+                "track_count": int(row[23] or 0),
+                "total_duration_sec": int(row[24] or 0),
+                "is_broken": bool(row[25]),
+                "expected_track_count": row[26],
+                "actual_track_count": int(row[27] or 0),
+                "missing_indices_json": row[28] or "[]",
+                "missing_required_tags_json": row[29] or "[]",
+                "primary_tags_json": row[30] or "{}",
                 "tracks": tracks,
                 "discogs_release_id": discogs_release_id,
                 "lastfm_album_mbid": lastfm_album_mbid,
                 "bandcamp_album_url": bandcamp_album_url,
-                "metadata_source": _normalize_identity_provider((row[34] or "").strip()),
-                "source_id": int(row[35] or 0) if len(row) > 35 and row[35] is not None else None,
+                "metadata_source": _normalize_identity_provider((row[35] or "").strip()),
+                "source_id": int(row[36] or 0) if len(row) > 36 and row[36] is not None else None,
             }
         )
     _apply_genre_defaults_to_albums_payload(albums_payload)
@@ -34687,7 +34752,7 @@ def _load_files_library_published_payload() -> tuple[dict[str, dict], list[dict]
                 year, date_text, genre, label, tags_json, format, is_lossless,
                 has_cover, cover_path, has_artist_image, artist_image_path,
                 mb_identified, strict_match_verified, strict_match_provider, strict_reject_reason, strict_tracklist_score,
-                musicbrainz_release_group_id, track_count, total_duration_sec,
+                musicbrainz_release_group_id, musicbrainz_release_id, track_count, total_duration_sec,
                 is_broken, expected_track_count, actual_track_count, missing_indices_json,
                 missing_required_tags_json, primary_tags_json, tracks_json,
                 discogs_release_id, lastfm_album_mbid, bandcamp_album_url, primary_metadata_source, source_id
@@ -34721,7 +34786,7 @@ def _load_files_library_published_payload_for_artist(artist_hint: str) -> tuple[
                 year, date_text, genre, label, tags_json, format, is_lossless,
                 has_cover, cover_path, has_artist_image, artist_image_path,
                 mb_identified, strict_match_verified, strict_match_provider, strict_reject_reason, strict_tracklist_score,
-                musicbrainz_release_group_id, track_count, total_duration_sec,
+                musicbrainz_release_group_id, musicbrainz_release_id, track_count, total_duration_sec,
                 is_broken, expected_track_count, actual_track_count, missing_indices_json,
                 missing_required_tags_json, primary_tags_json, tracks_json,
                 discogs_release_id, lastfm_album_mbid, bandcamp_album_url, primary_metadata_source, source_id
@@ -60417,6 +60482,7 @@ def _match_type_from_flags(
 def _record_files_match_audit_album(
     *,
     album_id: int,
+    folder_path: str = "",
     artist_name: str,
     album_title: str,
     run_kind: str,
@@ -60430,6 +60496,7 @@ def _record_files_match_audit_album(
     aid = int(album_id or 0)
     if aid <= 0:
         return False
+    folder_path_txt = str(folder_path or "").strip()
     row_result = dict(result or {})
     step_lines = [str(s or "").strip() for s in (steps or []) if str(s or "").strip()]
     provider_used = _normalize_identity_provider(
@@ -60500,19 +60567,28 @@ def _record_files_match_audit_album(
     if conn is None:
         return False
     try:
+        if not folder_path_txt and aid > 0:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT COALESCE(folder_path, '') FROM files_albums WHERE id = %s LIMIT 1", (aid,))
+                    folder_row = cur.fetchone()
+                folder_path_txt = str((folder_row or [""])[0] or "").strip()
+            except Exception:
+                folder_path_txt = ""
         with conn.transaction():
             with conn.cursor() as cur:
                 cur.execute(
                     """
                     INSERT INTO files_match_audit(
-                        album_id, artist_name, album_title, run_kind, status,
+                        album_id, folder_path, artist_name, album_title, run_kind, status,
                         match_type, confidence, ai_used, ai_confidence, provider_used,
                         summary, details_json, created_at
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
                     """,
                     (
                         aid,
+                        folder_path_txt or None,
                         str(artist_name or "").strip() or None,
                         str(album_title or "").strip() or None,
                         str(run_kind or "").strip() or "manual",
@@ -60560,6 +60636,7 @@ def _serialize_match_audit_row(row: tuple[Any, ...]) -> dict[str, Any]:
 def _album_match_links(
     *,
     mbid: str,
+    musicbrainz_release_id: str = "",
     discogs_release_id: str,
     lastfm_album_mbid: str,
     bandcamp_album_url: str,
@@ -60570,12 +60647,18 @@ def _album_match_links(
     artist_clean = str(artist_name or "").strip()
     album_clean = str(album_title or "").strip()
     for provider, ref, label in [
-        ("musicbrainz", mbid, "MusicBrainz release-group"),
+        ("musicbrainz", musicbrainz_release_id or mbid, "MusicBrainz release" if str(musicbrainz_release_id or "").strip() else "MusicBrainz release-group"),
         ("discogs", discogs_release_id, "Discogs release"),
         ("lastfm", lastfm_album_mbid, "Last.fm MBID"),
         ("bandcamp", bandcamp_album_url, "Bandcamp album"),
     ]:
-        href = _provider_reference_link(provider=provider, ref=ref, artist_name=artist_name, album_title=album_title)
+        if provider == "musicbrainz" and str(ref or "").strip():
+            if str(musicbrainz_release_id or "").strip():
+                href = f"https://musicbrainz.org/release/{quote(str(ref or '').strip(), safe='')}"
+            else:
+                href = f"https://musicbrainz.org/release-group/{quote(str(ref or '').strip(), safe='')}"
+        else:
+            href = _provider_reference_link(provider=provider, ref=ref, artist_name=artist_name, album_title=album_title)
         if href:
             links.append(
                 {
@@ -60618,10 +60701,30 @@ def _provider_cover_url_from_payload(provider: str, payload: dict | None) -> str
     p = _normalize_identity_provider(provider)
     data = payload if isinstance(payload, dict) else {}
     if p == "musicbrainz":
-        mbid = str(data.get("id") or "").strip()
-        if not mbid:
-            return ""
-        return f"https://coverartarchive.org/release-group/{quote(mbid, safe='')}/front"
+        cover_url = str(data.get("cover_url") or "").strip()
+        if cover_url:
+            return cover_url
+        payload_id = str(data.get("id") or data.get("musicbrainz_id") or "").strip()
+        release_id = str(
+            data.get("musicbrainz_release_id")
+            or data.get("release_id")
+            or ""
+        ).strip()
+        release_group_id = str(
+            data.get("release_group_id")
+            or data.get("musicbrainz_release_group_id")
+            or ""
+        ).strip()
+        ref_url = str(data.get("url") or "").strip().lower()
+        if not release_id and payload_id and "/release/" in ref_url:
+            release_id = payload_id
+        if not release_group_id and payload_id and "/release-group/" in ref_url:
+            release_group_id = payload_id
+        if release_id:
+            return f"https://coverartarchive.org/release/{quote(release_id, safe='')}/front"
+        if release_group_id:
+            return f"https://coverartarchive.org/release-group/{quote(release_group_id, safe='')}/front"
+        return ""
     return str(data.get("cover_url") or "").strip()
 
 
@@ -61979,10 +62082,9 @@ def _improve_single_album(album_id: int, db_conn, known_release_group_id: Option
     if release_mbid:
         release_group_id = release_mbid
         tag_src = "musicbrainz_releasegroupid" if current_tags.get("musicbrainz_releasegroupid") else ("musicbrainz_releaseid" if current_tags.get("musicbrainz_releaseid") else "")
-        if tag_src:
-            resolved = resolve_mbid_to_release_group(release_mbid, tag_src)
-            if resolved:
-                release_group_id = resolved
+        resolved = resolve_mbid_to_release_group(release_mbid, tag_src)
+        if resolved:
+            release_group_id = resolved
         try:
             result = musicbrainzngs.get_release_group_by_id(release_group_id, includes=["releases", "artist-credits"])
             mb_release_info = result.get("release-group", {})
@@ -62985,10 +63087,9 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
     if release_mbid:
         release_group_id = release_mbid
         tag_src = "musicbrainz_releasegroupid" if current_tags.get("musicbrainz_releasegroupid") else ("musicbrainz_releaseid" if current_tags.get("musicbrainz_releaseid") else "")
-        if tag_src:
-            resolved = resolve_mbid_to_release_group(release_mbid, tag_src)
-            if resolved:
-                release_group_id = resolved
+        resolved = resolve_mbid_to_release_group(release_mbid, tag_src)
+        if resolved:
+            release_group_id = resolved
         missing_rg_cache = _mb_missing_release_group_ids_cache()
         if release_group_id in missing_rg_cache:
             steps.append(f"MusicBrainz release group unavailable: {release_group_id}")
@@ -63592,6 +63693,7 @@ def api_library_album_match_detail(album_id: int):
                     alb.id,
                     alb.title,
                     alb.title_norm,
+                    COALESCE(alb.folder_path, ''),
                     COALESCE(alb.year, 0),
                     COALESCE(alb.track_count, 0),
                     alb.strict_match_verified,
@@ -63599,6 +63701,7 @@ def api_library_album_match_detail(album_id: int):
                     COALESCE(alb.strict_reject_reason, ''),
                     COALESCE(alb.strict_tracklist_score, 0.0),
                     COALESCE(alb.musicbrainz_release_group_id, ''),
+                    COALESCE(alb.musicbrainz_release_id, ''),
                     COALESCE(alb.discogs_release_id, ''),
                     COALESCE(alb.lastfm_album_mbid, ''),
                     COALESCE(alb.bandcamp_album_url, ''),
@@ -63628,6 +63731,7 @@ def api_library_album_match_detail(album_id: int):
                 _aid,
                 album_title,
                 title_norm,
+                folder_path,
                 year,
                 track_count,
                 strict_verified,
@@ -63635,6 +63739,7 @@ def api_library_album_match_detail(album_id: int):
                 strict_reason,
                 strict_score,
                 mbid,
+                musicbrainz_release_id,
                 discogs_release_id,
                 lastfm_album_mbid,
                 bandcamp_album_url,
@@ -63710,11 +63815,12 @@ def api_library_album_match_detail(album_id: int):
                     COALESCE(details_json, '{}'),
                     EXTRACT(EPOCH FROM created_at)::BIGINT
                 FROM files_match_audit
-                WHERE album_id = %s
+                WHERE (folder_path IS NOT NULL AND folder_path <> '' AND folder_path = %s)
+                   OR album_id = %s
                 ORDER BY created_at DESC, id DESC
                 LIMIT 20
                 """,
-                (album_id,),
+                (str(folder_path or "").strip(), album_id),
             )
             audit_rows = cur.fetchall()
 
@@ -63759,6 +63865,7 @@ def api_library_album_match_detail(album_id: int):
 
         links = _album_match_links(
             mbid=str(mbid or "").strip(),
+            musicbrainz_release_id=str(musicbrainz_release_id or "").strip(),
             discogs_release_id=str(discogs_release_id or "").strip(),
             lastfm_album_mbid=str(lastfm_album_mbid or "").strip(),
             bandcamp_album_url=str(bandcamp_album_url or "").strip(),
@@ -65664,6 +65771,7 @@ def _scan_collect_profile_enrich_targets(scan_id: int | None) -> list[dict]:
             SELECT artist, album_id, title_raw, folder,
                    meta_json,
                    musicbrainz_id,
+                   musicbrainz_release_id,
                    discogs_release_id,
                    lastfm_album_mbid,
                    bandcamp_album_url,
@@ -65689,6 +65797,7 @@ def _scan_collect_profile_enrich_targets(scan_id: int | None) -> list[dict]:
             folder,
             meta_json,
             musicbrainz_id,
+            musicbrainz_release_id,
             discogs_release_id,
             lastfm_album_mbid,
             bandcamp_album_url,
@@ -65719,6 +65828,7 @@ def _scan_collect_profile_enrich_targets(scan_id: int | None) -> list[dict]:
                     "folder": str(folder or "").strip(),
                     "meta": meta if isinstance(meta, dict) else {},
                     "musicbrainz_id": str(musicbrainz_id or "").strip(),
+                    "musicbrainz_release_id": str(musicbrainz_release_id or "").strip(),
                     "discogs_release_id": str(discogs_release_id or "").strip(),
                     "lastfm_album_mbid": str(lastfm_album_mbid or "").strip(),
                     "bandcamp_album_url": str(bandcamp_album_url or "").strip(),
@@ -65761,6 +65871,7 @@ def _scan_collect_profile_enrich_targets(scan_id: int | None) -> list[dict]:
                             COALESCE(alb.genre, ''),
                             COALESCE(alb.label, ''),
                             COALESCE(alb.musicbrainz_release_group_id, ''),
+                            COALESCE(alb.musicbrainz_release_id, ''),
                             COALESCE(alb.discogs_release_id, ''),
                             COALESCE(alb.lastfm_album_mbid, ''),
                             COALESCE(alb.bandcamp_album_url, ''),
@@ -65769,7 +65880,6 @@ def _scan_collect_profile_enrich_targets(scan_id: int | None) -> list[dict]:
                             COALESCE(alb.strict_match_provider, ''),
                             COALESCE(alb.strict_reject_reason, ''),
                             COALESCE(alb.strict_tracklist_score, 0.0),
-                            COALESCE(alb.cover_path, ''),
                             COALESCE(alb.primary_tags_json, '{}')
                         FROM files_albums alb
                         JOIN files_artists art ON art.id = alb.artist_id
@@ -65786,6 +65896,7 @@ def _scan_collect_profile_enrich_targets(scan_id: int | None) -> list[dict]:
                         genre,
                         label,
                         mbid,
+                        musicbrainz_release_id,
                         discogs_release_id,
                         lastfm_album_mbid,
                         bandcamp_album_url,
@@ -65794,7 +65905,6 @@ def _scan_collect_profile_enrich_targets(scan_id: int | None) -> list[dict]:
                         strict_match_provider,
                         strict_reject_reason,
                         strict_tracklist_score,
-                        cover_path,
                         primary_tags_json,
                     ) in cur.fetchall():
                         live_by_folder[str(folder_path or "").strip()] = {
@@ -65805,6 +65915,7 @@ def _scan_collect_profile_enrich_targets(scan_id: int | None) -> list[dict]:
                             "genre": str(genre or "").strip(),
                             "label": str(label or "").strip(),
                             "musicbrainz_id": str(mbid or "").strip(),
+                            "musicbrainz_release_id": str(musicbrainz_release_id or "").strip(),
                             "discogs_release_id": str(discogs_release_id or "").strip(),
                             "lastfm_album_mbid": str(lastfm_album_mbid or "").strip(),
                             "bandcamp_album_url": str(bandcamp_album_url or "").strip(),
@@ -65813,7 +65924,6 @@ def _scan_collect_profile_enrich_targets(scan_id: int | None) -> list[dict]:
                             "strict_match_provider": _normalize_identity_provider(str(strict_match_provider or "")),
                             "strict_reject_reason": str(strict_reject_reason or "").strip(),
                             "strict_tracklist_score": float(strict_tracklist_score or 0.0),
-                            "cover_path": str(cover_path or "").strip(),
                             "primary_tags_json": primary_tags_json or "{}",
                         }
             finally:
@@ -65858,13 +65968,13 @@ def _scan_collect_profile_enrich_targets(scan_id: int | None) -> list[dict]:
             row["title_raw"] = row["album_title"]
         for key in (
             "musicbrainz_id",
+            "musicbrainz_release_id",
             "discogs_release_id",
             "lastfm_album_mbid",
             "bandcamp_album_url",
             "metadata_source",
             "strict_match_provider",
             "strict_reject_reason",
-            "cover_path",
             "primary_tags_json",
         ):
             live_value = live.get(key)
