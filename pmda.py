@@ -24574,8 +24574,12 @@ _CLASSICAL_GENRE_HINTS = {
 }
 _CLASSICAL_WORK_KEYWORDS = {
     "symphony",
+    "symphonie",
+    "sinfonia",
+    "sinfonie",
     "concerto",
     "sonata",
+    "sonate",
     "suite",
     "requiem",
     "mass",
@@ -24718,13 +24722,35 @@ def _classical_work_tokens_from_texts(texts: list[str]) -> set[str]:
             out.add(token)
     for keyword in _CLASSICAL_WORK_KEYWORDS:
         pattern = re.compile(
-            rf"\b{re.escape(keyword)}(?:\s+no\s*\d+)?(?:\s+in\s+[a-g](?:\s+(?:major|minor))?)?(?:\s+op\s*\d+)?\b",
+            rf"\b{re.escape(keyword)}(?:\s+(?:no|nr|n|n°|nº)\s*\.?\s*\d+)?(?:\s+in\s+[a-g](?:\s+(?:major|minor))?)?(?:\s+op\s*\d+)?\b",
             flags=re.IGNORECASE,
         )
         for match in pattern.findall(joined):
             token = _classical_norm_text(match)
             if token:
                 out.add(token)
+    canonical_patterns = (
+        ("symphony", re.compile(r"\b(?:symphony|symphonie|sinfonia|sinfonie)\s*(?:no|nr|n|n°|nº)?\s*\.?\s*(\d+)\b", flags=re.IGNORECASE)),
+        ("concerto", re.compile(r"\bconcerto\s*(?:no|nr|n|n°|nº)?\s*\.?\s*(\d+)\b", flags=re.IGNORECASE)),
+        ("sonata", re.compile(r"\b(?:sonata|sonate)\s*(?:no|nr|n|n°|nº)?\s*\.?\s*(\d+)\b", flags=re.IGNORECASE)),
+        ("quartet", re.compile(r"\bquartet\s*(?:no|nr|n|n°|nº)?\s*\.?\s*(\d+)\b", flags=re.IGNORECASE)),
+        ("quintet", re.compile(r"\bquintet\s*(?:no|nr|n|n°|nº)?\s*\.?\s*(\d+)\b", flags=re.IGNORECASE)),
+    )
+    for canonical_name, pattern in canonical_patterns:
+        for match in pattern.findall(joined):
+            token = str(match or "").strip()
+            if token:
+                out.add(f"{canonical_name} {token}")
+    split_patterns = re.compile(r"\s*(?:/|;|:|\||–|—)\s*")
+    for raw_text in texts or []:
+        raw = html.unescape(str(raw_text or "")).strip()
+        if not raw:
+            continue
+        raw = re.sub(r"[\(\[][^)\]]*[\)\]]", " ", raw)
+        for part in split_patterns.split(raw):
+            norm_part = _classical_norm_text(part)
+            if norm_part and len(norm_part) >= 4:
+                out.add(norm_part[:180])
     if not out:
         title_line = _classical_norm_text(texts[0] if texts else "")
         if title_line:
@@ -24734,12 +24760,18 @@ def _classical_work_tokens_from_texts(texts: list[str]) -> set[str]:
 
 def _classical_people_tokens(values: list[str]) -> set[str]:
     out: set[str] = set()
+    ensemble_hints = {"orchestra", "philharmonic", "ensemble", "choir", "chorus", "quartet", "quintet", "trio", "symphonieorchester", "symphony"}
     for value in values or []:
         norm = _classical_norm_text(value)
         if not norm:
             continue
         if len(norm) >= 3:
             out.add(norm[:120])
+            parts = [p for p in norm.split() if p]
+            if len(parts) >= 2 and not any(p in ensemble_hints for p in parts):
+                surname = parts[-1]
+                if len(surname) >= 4:
+                    out.add(surname[:80])
     return out
 
 
@@ -24817,13 +24849,26 @@ def _classical_identity_context(
         artist_values.extend([str(x or "").strip() for x in candidate_artist if str(x or "").strip()])
     else:
         artist_values.append(str(candidate_artist or local_artist or "").strip())
-    artist_values.extend(_classical_collect_tag_values(tags, _CLASSICAL_PERFORMANCE_TAG_KEYS))
+    base_artist_values = [v for v in artist_values if str(v or "").strip()]
+    performance_tag_values = _classical_collect_tag_values(tags, _CLASSICAL_PERFORMANCE_TAG_KEYS)
+    artist_values.extend(performance_tag_values)
     composer_values = _classical_collect_tag_values(tags, _CLASSICAL_COMPOSER_TAG_KEYS)
     work_values = _classical_collect_tag_values(tags, _CLASSICAL_WORK_TAG_KEYS)
     label_values = _classical_collect_tag_values(tags, _CLASSICAL_LABEL_TAG_KEYS)
     genre_values = _classical_collect_tag_values(tags, ("genre", "style"))
     meta_title_texts = [title_value] + work_values + track_titles[:20]
     work_tokens = _classical_work_tokens_from_texts(meta_title_texts)
+    if not composer_values and base_artist_values:
+        genre_norms_probe = {_classical_norm_text(v) for v in genre_values if _classical_norm_text(v)}
+        looks_classical = bool(
+            work_tokens
+            or (genre_norms_probe and any(any(h in g for h in _CLASSICAL_GENRE_HINTS) for g in genre_norms_probe))
+            or any(keyword in _classical_norm_text(title_value) for keyword in _CLASSICAL_WORK_KEYWORDS)
+            or bool(_CLASSICAL_CATALOG_RE.search(title_value))
+            or bool(_CLASSICAL_CATALOG_RE.search(" ".join(track_titles[:12])))
+        )
+        if looks_classical and not performance_tag_values:
+            composer_values.extend(base_artist_values)
     composer_tokens = _classical_people_tokens(composer_values)
     performance_tokens = _classical_people_tokens(artist_values)
     performance_tokens -= composer_tokens
@@ -24876,6 +24921,11 @@ def _provider_classical_context(
     payload_dict = payload if isinstance(payload, dict) else {}
     tags = {}
     raw_tags = payload_dict.get("tags") or payload_dict.get("toptags")
+    candidate_artist_values: list[str] = []
+    if isinstance(candidate_artist, (list, tuple)):
+        candidate_artist_values = [str(x or "").strip() for x in candidate_artist if str(x or "").strip()]
+    else:
+        candidate_artist_values = [str(candidate_artist or "").strip()] if str(candidate_artist or "").strip() else []
     if isinstance(raw_tags, list):
         tags["genre"] = ", ".join([str(x or "").strip() for x in raw_tags if str(x or "").strip()])
     elif isinstance(raw_tags, str):
@@ -24886,6 +24936,14 @@ def _provider_classical_context(
     year_val = payload_dict.get("year") or payload_dict.get("date") or payload_dict.get("first-release-date")
     if year_val:
         tags["year"] = year_val
+    explicit_composer = _classical_collect_tag_values(tags, _CLASSICAL_COMPOSER_TAG_KEYS)
+    explicit_performance = _classical_collect_tag_values(tags, _CLASSICAL_PERFORMANCE_TAG_KEYS)
+    candidate_artist_for_context: str | list[str] | tuple[str, ...] | None = candidate_artist
+    if candidate_artist_values and not explicit_composer:
+        # Provider artist credit for classical releases is often the composer. Treat it as such
+        # unless the payload already exposes a richer performance context.
+        tags["composer"] = candidate_artist_values
+        candidate_artist_for_context = candidate_artist if explicit_performance else ""
     return _classical_identity_context(
         local_artist="",
         local_title="",
@@ -24894,9 +24952,226 @@ def _provider_classical_context(
         local_paths=None,
         provider=provider,
         provider_payload=payload_dict,
-        candidate_artist=candidate_artist,
+        candidate_artist=candidate_artist_for_context,
         candidate_title=candidate_title,
     )
+
+
+def _classical_context_for_edition(edition: dict | None) -> dict[str, Any]:
+    e = edition if isinstance(edition, dict) else {}
+    cached = e.get("_classical_ctx")
+    if isinstance(cached, dict):
+        return cached
+    tags: dict[str, Any] = {}
+    if isinstance(e.get("meta"), dict):
+        tags.update(e.get("meta") or {})
+    if isinstance(e.get("tags"), dict):
+        tags.update(e.get("tags") or {})
+    ctx = _classical_identity_context(
+        local_artist=str(e.get("artist_name") or e.get("artist") or e.get("album_artist") or "").strip(),
+        local_title=str(e.get("title_raw") or e.get("plex_title") or e.get("album_title") or "").strip(),
+        local_tracks=list(e.get("tracks") or []),
+        local_tags=tags,
+        local_paths=list(e.get("ordered_paths") or []),
+    )
+    e["_classical_ctx"] = ctx
+    return ctx
+
+
+def _classical_track_title_set_for_edition(edition: dict | None) -> set[str]:
+    e = edition if isinstance(edition, dict) else {}
+    cached = e.get("_dupe_track_title_set")
+    if isinstance(cached, set):
+        return cached
+    ts = _dupe_track_title_set(list(e.get("tracks") or []))
+    e["_dupe_track_title_set"] = ts
+    return ts
+
+
+def _classical_same_recording_pair_details(a: dict | None, b: dict | None) -> tuple[bool, str]:
+    ctx_a = _classical_context_for_edition(a)
+    ctx_b = _classical_context_for_edition(b)
+    if not bool(ctx_a.get("is_classical") or ctx_b.get("is_classical")):
+        return (False, "not_classical")
+
+    composer_a = set(ctx_a.get("composer_tokens") or set())
+    composer_b = set(ctx_b.get("composer_tokens") or set())
+    if composer_a and composer_b and not (composer_a & composer_b):
+        return (False, "composer_mismatch")
+
+    work_a = set(ctx_a.get("work_tokens") or set())
+    work_b = set(ctx_b.get("work_tokens") or set())
+    title_a = str(ctx_a.get("title_norm") or "")
+    title_b = str(ctx_b.get("title_norm") or "")
+    if work_a and work_b and not (work_a & work_b) and title_a != title_b:
+        return (False, "work_mismatch")
+
+    perf_a = set(ctx_a.get("performance_tokens") or set())
+    perf_b = set(ctx_b.get("performance_tokens") or set())
+    if perf_a and perf_b and not (perf_a & perf_b):
+        return (False, "performance_mismatch")
+
+    disc_a = int(ctx_a.get("disc_count") or 0)
+    disc_b = int(ctx_b.get("disc_count") or 0)
+    if disc_a > 0 and disc_b > 0 and disc_a != disc_b:
+        return (False, "disc_count_mismatch")
+
+    labels_a = set(ctx_a.get("label_tokens") or set())
+    labels_b = set(ctx_b.get("label_tokens") or set())
+    years_a = _mb_extract_year(ctx_a.get("year"))
+    years_b = _mb_extract_year(ctx_b.get("year"))
+
+    tracks_a = _classical_track_title_set_for_edition(a)
+    tracks_b = _classical_track_title_set_for_edition(b)
+    jac = _dupe_jaccard(tracks_a, tracks_b)
+    contain = _dupe_track_title_containment(tracks_a, tracks_b)
+    count_a = max(0, int(ctx_a.get("track_count") or 0))
+    count_b = max(0, int(ctx_b.get("track_count") or 0))
+    ratio = (float(min(count_a, count_b)) / float(max(count_a, count_b))) if count_a > 0 and count_b > 0 else 0.0
+
+    total_a = int(ctx_a.get("total_duration_ms") or 0)
+    total_b = int(ctx_b.get("total_duration_ms") or 0)
+    dur_ratio = 0.0
+    if total_a > 0 and total_b > 0:
+        hi = max(total_a, total_b)
+        dur_ratio = (float(min(total_a, total_b)) / float(hi)) if hi > 0 else 0.0
+
+    label_ok = (not labels_a) or (not labels_b) or bool(labels_a & labels_b)
+    year_ok = True
+    if years_a and years_b:
+        try:
+            year_ok = abs(int(years_a) - int(years_b)) <= 3
+        except Exception:
+            year_ok = True
+
+    if count_a > 0 and count_b > 0 and count_a == count_b:
+        if contain >= 0.98 and (dur_ratio == 0.0 or dur_ratio >= 0.94):
+            return (True, "same_recording_exact_structure")
+        if (not perf_a or not perf_b) and contain >= 0.98 and label_ok and year_ok and (dur_ratio == 0.0 or dur_ratio >= 0.92):
+            return (True, "same_recording_missing_performance_context")
+
+    if count_a > 0 and count_b > 0 and abs(count_a - count_b) <= 2:
+        if contain >= 0.98 and label_ok and year_ok:
+            # Tail-truncated siblings should stay in the same recording family so they can be
+            # marked incomplete later, but different interpretations remain blocked above.
+            return (True, "same_recording_subset_structure")
+
+    if (not perf_a or not perf_b) and jac >= 0.82 and ratio >= 0.75 and label_ok and year_ok:
+        if dur_ratio == 0.0 or dur_ratio >= 0.90:
+            return (True, "same_recording_similarity")
+
+    return (False, "recording_context_insufficient")
+
+
+def _classical_cluster_same_recording(editions: list[dict]) -> list[list[dict]]:
+    if not editions:
+        return []
+
+    coarse_buckets: dict[tuple, list[dict]] = {}
+    for e in editions:
+        ctx = _classical_context_for_edition(e)
+        composer_sig = tuple(sorted(ctx.get("composer_tokens") or set()))[:4]
+        work_sig = tuple(sorted(ctx.get("work_tokens") or set()))[:12]
+        key = (
+            composer_sig or tuple(str(x) for x in (ctx.get("artist_norms") or [])[:2]) or ("__no_composer__",),
+            work_sig or (str(ctx.get("title_norm") or "__no_work__"),),
+        )
+        coarse_buckets.setdefault(key, []).append(e)
+
+    clusters: list[list[dict]] = []
+    for bucket in coarse_buckets.values():
+        if len(bucket) <= 1:
+            clusters.append(bucket)
+            continue
+        n = len(bucket)
+        parent = list(range(n))
+        rank = [0] * n
+
+        def find(i: int) -> int:
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+
+        def union(i: int, j: int) -> None:
+            ri = find(i)
+            rj = find(j)
+            if ri == rj:
+                return
+            if rank[ri] < rank[rj]:
+                parent[ri] = rj
+            elif rank[ri] > rank[rj]:
+                parent[rj] = ri
+            else:
+                parent[rj] = ri
+                rank[ri] += 1
+
+        for i in range(n):
+            for j in range(i + 1, n):
+                ok, _reason = _classical_same_recording_pair_details(bucket[i], bucket[j])
+                if ok:
+                    union(i, j)
+        grouped: dict[int, list[dict]] = defaultdict(list)
+        for i, edition in enumerate(bucket):
+            grouped[find(i)].append(edition)
+        clusters.extend([items for items in grouped.values() if items])
+    return clusters
+
+
+def _mark_classical_sibling_incompletes(editions: list[dict], artist_name: str = "") -> None:
+    classical_editions = [e for e in (editions or []) if bool(_classical_context_for_edition(e).get("is_classical"))]
+    if len(classical_editions) < 2:
+        return
+
+    for cluster in _classical_cluster_same_recording(classical_editions):
+        if len(cluster) < 2:
+            continue
+        max_count = max((_edition_exact_expected_track_count(e) or int(_classical_context_for_edition(e).get("track_count") or 0)) for e in cluster)
+        if max_count <= 0:
+            max_count = max(int(_classical_context_for_edition(e).get("track_count") or 0) for e in cluster)
+        if max_count <= 0:
+            continue
+        leaders = [e for e in cluster if int(_classical_context_for_edition(e).get("track_count") or 0) == max_count]
+        if not leaders:
+            continue
+        leader_title_norms = {str(_classical_context_for_edition(e).get("title_norm") or "") for e in leaders}
+        for e in cluster:
+            if bool(e.get("is_broken")):
+                continue
+            ctx = _classical_context_for_edition(e)
+            actual_count = int(ctx.get("track_count") or 0)
+            if actual_count <= 0 or actual_count >= max_count or (max_count - actual_count) > 2:
+                continue
+            if leader_title_norms and str(ctx.get("title_norm") or "") not in leader_title_norms:
+                continue
+            e_tracks = _classical_track_title_set_for_edition(e)
+            if not e_tracks:
+                continue
+            sibling_match = False
+            for leader in leaders:
+                leader_ctx = _classical_context_for_edition(leader)
+                if str(leader_ctx.get("title_norm") or "") != str(ctx.get("title_norm") or ""):
+                    continue
+                contain = _dupe_track_title_containment(e_tracks, _classical_track_title_set_for_edition(leader))
+                if contain >= 0.98:
+                    sibling_match = True
+                    break
+            if not sibling_match:
+                continue
+            e["is_broken"] = True
+            e["expected_track_count"] = max_count
+            e["actual_track_count"] = actual_count
+            e["missing_indices"] = _edition_missing_indices_exact(e, max_count, actual_count)
+            e["_classical_sibling_incomplete"] = True
+            logging.warning(
+                "[Artist %s] Album %s (%s) forced incomplete from classical sibling cluster: actual=%s expected=%s missing=%s",
+                artist_name or str(e.get("artist_name") or ""),
+                e.get("album_id"),
+                e.get("title_raw") or e.get("plex_title") or "",
+                actual_count,
+                max_count,
+                list(e.get("missing_indices") or [])[:24],
+            )
 
 
 def _classical_identity_match_details(
@@ -29582,6 +29857,7 @@ def scan_duplicates(
             missing,
             mb_lookup_time,
         )
+        _mark_classical_sibling_incompletes(editions, artist_name=artist)
 
     # Detect and collapse Box Set discs (skip as duplicates)
     from collections import defaultdict
@@ -29705,55 +29981,13 @@ def scan_duplicates(
 
     def _is_classical(ed_list: list[dict]) -> bool:
         for e in ed_list:
-            tags: dict[str, Any] = {}
-            if isinstance(e.get("meta"), dict):
-                tags.update(e.get("meta") or {})
-            if isinstance(e.get("tags"), dict):
-                tags.update(e.get("tags") or {})
-            ctx = _classical_identity_context(
-                local_artist=str(e.get("artist_name") or e.get("artist") or e.get("album_artist") or "").strip(),
-                local_title=str(e.get("title_raw") or e.get("plex_title") or e.get("album_title") or "").strip(),
-                local_tracks=list(e.get("tracks") or []),
-                local_tags=tags,
-                local_paths=list(e.get("ordered_paths") or []),
-            )
+            ctx = _classical_context_for_edition(e)
             if bool(ctx.get("is_classical")):
                 return True
         return False
 
     def _split_classical(ed_list: list[dict]) -> list[list[dict]]:
-        subgroups: dict[tuple, list[dict]] = {}
-        for e in ed_list:
-            tags: dict[str, Any] = {}
-            if isinstance(e.get("meta"), dict):
-                tags.update(e.get("meta") or {})
-            if isinstance(e.get("tags"), dict):
-                tags.update(e.get("tags") or {})
-            ctx = _classical_identity_context(
-                local_artist=str(e.get("artist_name") or e.get("artist") or e.get("album_artist") or "").strip(),
-                local_title=str(e.get("title_raw") or e.get("plex_title") or e.get("album_title") or "").strip(),
-                local_tracks=list(e.get("tracks") or []),
-                local_tags=tags,
-                local_paths=list(e.get("ordered_paths") or []),
-            )
-            work_sig = tuple(sorted(ctx.get("work_tokens") or set()))[:8]
-            composer_sig = tuple(sorted(ctx.get("composer_tokens") or set()))[:4]
-            performance_sig = tuple(sorted(ctx.get("performance_tokens") or set()))[:8]
-            label_sig = tuple(sorted(ctx.get("label_tokens") or set()))[:2]
-            total_duration_ms = int(ctx.get("total_duration_ms") or 0)
-            duration_bucket = int(round(total_duration_ms / 120000.0)) if total_duration_ms > 0 else 0
-            key = (
-                composer_sig or ("__no_composer__",),
-                work_sig or (str(ctx.get("title_norm") or "__no_work__"),),
-                performance_sig or ("__no_performance__",),
-                label_sig or ("__no_label__",),
-                int(ctx.get("disc_count") or 0),
-                int(ctx.get("track_count") or 0),
-                duration_bucket,
-                str(ctx.get("year") or ""),
-            )
-            subgroups.setdefault(key, []).append(e)
-        return [items for items in subgroups.values() if items]
+        return _classical_cluster_same_recording(ed_list)
 
     def _group_pair_metrics(ed_list: list[dict]) -> tuple[float, float]:
         # Return (max_jaccard, min_track_ratio) across all pairs in this group.
