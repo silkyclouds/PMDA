@@ -25118,6 +25118,24 @@ def _classical_cluster_same_recording(editions: list[dict]) -> list[list[dict]]:
     return clusters
 
 
+def _classical_group_is_same_recording_confident(editions: list[dict]) -> bool:
+    ed_list = [e for e in (editions or []) if isinstance(e, dict)]
+    if len(ed_list) < 2:
+        return False
+    allowed_reasons = {
+        "same_recording_exact_structure",
+        "same_recording_missing_performance_context",
+        "same_recording_subset_structure",
+        "same_recording_similarity",
+    }
+    for i in range(len(ed_list)):
+        for j in range(i + 1, len(ed_list)):
+            ok, reason = _classical_same_recording_pair_details(ed_list[i], ed_list[j])
+            if not ok or reason not in allowed_reasons:
+                return False
+    return True
+
+
 def _mark_classical_sibling_incompletes(editions: list[dict], artist_name: str = "") -> None:
     classical_editions = [e for e in (editions or []) if bool(_classical_context_for_edition(e).get("is_classical"))]
     if len(classical_editions) < 2:
@@ -25142,18 +25160,29 @@ def _mark_classical_sibling_incompletes(editions: list[dict], artist_name: str =
             actual_count = int(ctx.get("track_count") or 0)
             if actual_count <= 0 or actual_count >= max_count or (max_count - actual_count) > 2:
                 continue
-            if leader_title_norms and str(ctx.get("title_norm") or "") not in leader_title_norms:
-                continue
             e_tracks = _classical_track_title_set_for_edition(e)
             if not e_tracks:
                 continue
             sibling_match = False
             for leader in leaders:
                 leader_ctx = _classical_context_for_edition(leader)
-                if str(leader_ctx.get("title_norm") or "") != str(ctx.get("title_norm") or ""):
+                same_recording, same_recording_reason = _classical_same_recording_pair_details(e, leader)
+                if not same_recording:
+                    continue
+                title_norm_match = str(leader_ctx.get("title_norm") or "") == str(ctx.get("title_norm") or "")
+                work_overlap = bool(
+                    set(leader_ctx.get("work_tokens") or set())
+                    & set(ctx.get("work_tokens") or set())
+                )
+                if leader_title_norms and not title_norm_match and not work_overlap:
                     continue
                 contain = _dupe_track_title_containment(e_tracks, _classical_track_title_set_for_edition(leader))
-                if contain >= 0.98:
+                if contain >= 0.98 and same_recording_reason in {
+                    "same_recording_exact_structure",
+                    "same_recording_missing_performance_context",
+                    "same_recording_subset_structure",
+                    "same_recording_similarity",
+                }:
                     sibling_match = True
                     break
             if not sibling_match:
@@ -30188,8 +30217,14 @@ def scan_duplicates(
             sg = [e for e in sg if e.get("album_id") not in used_ids]
             if len(sg) < 2:
                 continue
+            if _is_classical(sg):
+                _mark_classical_sibling_incompletes(sg, artist_name=artist)
 
-            if signal not in {"provider_id", "track_sig", "audio_fp", "user_label"} and not editions_share_confident_signal(sg):
+            if (
+                signal not in {"provider_id", "track_sig", "audio_fp", "user_label"}
+                and not editions_share_confident_signal(sg)
+                and not (_is_classical(sg) and _classical_group_is_same_recording_confident(sg))
+            ):
                 _dr_inc("rejected_by_reason", "low_confidence")
                 continue
 
