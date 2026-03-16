@@ -63056,6 +63056,7 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
             "mutation_blocked_reason": reason,
         }
     strict_provider = _normalize_identity_provider(str(strict_verdict.get("strict_match_provider") or ""))
+    exact_cover_provider_lock = strict_provider if strict_provider in {"musicbrainz", "discogs", "bandcamp", "lastfm"} else ""
     strict_provider_label = {
         "musicbrainz": "MusicBrainz",
         "discogs": "Discogs",
@@ -63234,7 +63235,12 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
         for f in folder_path.iterdir() if f.is_file()
     )
     existing_cover_provider = _normalize_identity_provider(str(current_tags.get(PMDA_COVER_PROVIDER_TAG) or ""))
-    allow_cover_replace = bool(has_cover and existing_cover_provider in {"", "local", "unknown"})
+    preserve_local_cover_for_exact_identity = bool(exact_cover_provider_lock and has_cover)
+    allow_cover_replace = bool(
+        has_cover
+        and existing_cover_provider in {"", "local", "unknown"}
+        and not preserve_local_cover_for_exact_identity
+    )
     if release_mbid and (not has_cover or allow_cover_replace):
         try:
             cover_result = _download_cover_art_archive_front(release_mbid, timeout_sec=5.0)
@@ -63269,7 +63275,14 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
         provider_used = "musicbrainz"
 
     has_cover_now = has_cover or cover_saved
-    need_verified_cover = (not has_cover_now) or allow_cover_replace
+    if exact_cover_provider_lock and not cover_saved:
+        if has_cover_now:
+            steps.append(f"Preserved local cover; skipped cross-provider cover replacement for exact {strict_provider_label} match")
+        else:
+            steps.append(f"No authoritative cover available from exact {strict_provider_label} match; skipped cross-provider cover replacement")
+        need_verified_cover = False
+    else:
+        need_verified_cover = (not has_cover_now) or allow_cover_replace
     if USE_DISCOGS and (not tags_updated or need_verified_cover):
         try:
             did = str(discogs_release_id or current_tags.get("discogs_release_id") or "").strip()
