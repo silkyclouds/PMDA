@@ -22055,6 +22055,177 @@ def _encode_local_cover_to_data_uri(cover_path: Path) -> Optional[str]:
         logging.debug("[Vision] Failed to encode cover %s: %s", cover_path, e)
         return None
 
+
+_OCR_PREFERRED_LANGS = ("eng", "fra", "deu", "spa", "ita")
+_CLASSICAL_COVER_OCR_CACHE_LOCK = threading.Lock()
+_CLASSICAL_COVER_OCR_CACHE: "OrderedDict[str, str]" = OrderedDict()
+_CLASSICAL_COVER_OCR_CACHE_MAX = 256
+
+
+def _ocr_tesseract_available_langs() -> list[str]:
+    cached = getattr(sys.modules[__name__], "_OCR_TESSERACT_AVAILABLE_LANGS", None)
+    if isinstance(cached, list):
+        return cached
+    if not shutil.which("tesseract"):
+        langs: list[str] = []
+        setattr(sys.modules[__name__], "_OCR_TESSERACT_AVAILABLE_LANGS", langs)
+        return langs
+    try:
+        proc = subprocess.run(
+            ["tesseract", "--list-langs"],
+            capture_output=True,
+            text=True,
+            timeout=12,
+        )
+        raw = "\n".join([proc.stdout or "", proc.stderr or ""])
+        langs = [
+            line.strip()
+            for line in raw.splitlines()
+            if line.strip() and not line.lower().startswith("list of available languages")
+        ]
+    except Exception:
+        langs = []
+    setattr(sys.modules[__name__], "_OCR_TESSERACT_AVAILABLE_LANGS", langs)
+    return langs
+
+
+def _ocr_tesseract_lang_spec(preferred_langs: tuple[str, ...] = _OCR_PREFERRED_LANGS) -> str:
+    available = {str(lang or "").strip() for lang in _ocr_tesseract_available_langs() if str(lang or "").strip()}
+    if not available:
+        return ""
+    chosen = [lang for lang in preferred_langs if lang in available]
+    if not chosen:
+        if "eng" in available:
+            chosen = ["eng"]
+        else:
+            chosen = [sorted(available)[0]]
+    return "+".join(chosen)
+
+
+def _ocr_text_quality_score(text: str) -> int:
+    raw = str(text or "").strip()
+    if not raw:
+        return 0
+    tokens = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9][A-Za-zÀ-ÖØ-öø-ÿ0-9'’&./:-]{2,}", raw)
+    uniq = {tok.lower() for tok in tokens if len(tok) >= 3}
+    return len(uniq)
+
+
+def _ocr_prepare_cover_bytes(image_bytes: bytes) -> bytes:
+    from io import BytesIO
+    from PIL import Image, ImageFilter, ImageOps
+
+    img = Image.open(BytesIO(image_bytes))
+    img = ImageOps.exif_transpose(img)
+    if img.mode != "L":
+        img = ImageOps.grayscale(img)
+    img = ImageOps.autocontrast(img)
+    w, h = img.size
+    longest = max(1, max(w, h))
+    if longest < 1800:
+        scale = min(3, max(1, int(round(1800 / float(longest)))))
+        if scale > 1:
+            img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.Resampling.LANCZOS)
+    img = img.filter(ImageFilter.SHARPEN)
+    buf = BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+
+def _ocr_cover_text_from_image_bytes(image_bytes: bytes, mime: str = "") -> str:
+    raw = bytes(image_bytes or b"")
+    if not raw or not shutil.which("tesseract"):
+        return ""
+    cache_key = hashlib.sha1(raw).hexdigest()
+    with _CLASSICAL_COVER_OCR_CACHE_LOCK:
+        cached = _CLASSICAL_COVER_OCR_CACHE.get(cache_key)
+        if isinstance(cached, str):
+            _CLASSICAL_COVER_OCR_CACHE.move_to_end(cache_key)
+            return cached
+
+    lang_spec = _ocr_tesseract_lang_spec()
+    if not lang_spec:
+        return ""
+
+    temp_path: Optional[Path] = None
+    best_text = ""
+    try:
+        prepared = _ocr_prepare_cover_bytes(raw)
+        with tempfile.NamedTemporaryFile(prefix="pmda-cover-ocr-", suffix=".png", delete=False) as tmp:
+            tmp.write(prepared)
+            temp_path = Path(tmp.name)
+        for psm in ("6", "11"):
+            cmd = ["tesseract", str(temp_path), "stdout", "--psm", psm, "-l", lang_spec, "quiet"]
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=25,
+            )
+            text = str(proc.stdout or "").strip()
+            if _ocr_text_quality_score(text) > _ocr_text_quality_score(best_text):
+                best_text = text
+            if _ocr_text_quality_score(best_text) >= 6:
+                break
+    except Exception as exc:
+        logging.debug("Cover OCR failed: %s", exc)
+        best_text = ""
+    finally:
+        if temp_path:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    with _CLASSICAL_COVER_OCR_CACHE_LOCK:
+        _CLASSICAL_COVER_OCR_CACHE[cache_key] = best_text
+        _CLASSICAL_COVER_OCR_CACHE.move_to_end(cache_key)
+        while len(_CLASSICAL_COVER_OCR_CACHE) > _CLASSICAL_COVER_OCR_CACHE_MAX:
+            _CLASSICAL_COVER_OCR_CACHE.popitem(last=False)
+    return best_text
+
+
+def _folder_from_local_paths(local_paths: list[Any] | None) -> Optional[Path]:
+    for raw in (local_paths or []):
+        try:
+            path = Path(str(raw))
+        except Exception:
+            continue
+        try:
+            if path.is_file():
+                return path.parent
+        except Exception:
+            continue
+    return None
+
+
+def _cover_ocr_candidates_for_folder(folder: Path) -> list[tuple[str, bytes, str]]:
+    if not folder or not folder.is_dir():
+        return []
+    out: list[tuple[str, bytes, str]] = []
+    seen_hashes: set[str] = set()
+    cover_path = _first_cover_path(folder)
+    if cover_path and cover_path.is_file():
+        try:
+            raw = cover_path.read_bytes()
+            digest = hashlib.sha1(raw).hexdigest()
+            if digest not in seen_hashes:
+                seen_hashes.add(digest)
+                out.append((f"file:{cover_path.name}", raw, _mime_from_path(cover_path)))
+        except Exception:
+            pass
+    try:
+        embedded = _extract_embedded_cover_from_folder(folder, max_audio_files=6)
+    except Exception:
+        embedded = None
+    if embedded:
+        raw, mime = embedded
+        digest = hashlib.sha1(bytes(raw or b"")).hexdigest()
+        if raw and digest not in seen_hashes:
+            seen_hashes.add(digest)
+            out.append(("embedded", bytes(raw), str(mime or "image/jpeg")))
+    return out
+
 def extract_tags(audio_path: Path) -> dict[str, str]:
     """
     Return *all* container‑level metadata tags for the given audio file
@@ -24697,11 +24868,44 @@ _CLASSICAL_LABEL_TAG_KEYS = (
     "recordlabel",
     "publisher",
 )
+_CLASSICAL_RELEASE_CATALOG_TAG_KEYS = (
+    "catalog_number",
+    "catalog_numbers",
+    "catalog_no",
+    "catalogue_number",
+    "catalogue_no",
+    "catno",
+)
 _CLASSICAL_CATALOG_RE = re.compile(
     r"\b(?:op(?:us)?|bwv|kv|k|hob|d|sz|rv|hwv|s|wq|wwv|twv|buxwv|l|p)\s*\.?\s*\d+[a-z0-9\-/:]*\b",
     flags=re.IGNORECASE,
 )
 _CLASSICAL_SPLIT_RE = re.compile(r"\s*(?:;|,|/|&|\band\b|\bwith\b|\bfeat\.?\b|\bfeaturing\b)\s*", flags=re.IGNORECASE)
+_CLASSICAL_RELEASE_CATALOG_PATTERNS = (
+    re.compile(r"\b[A-Z]{1,6}\s*\d(?:[\s./-]?\d){2,}\b"),
+    re.compile(r"\b\d{1,4}(?:[\s./-]\d{1,4}){1,4}\b"),
+)
+_CLASSICAL_LABEL_OCR_ALIASES = {
+    "Deutsche Grammophon": ("deutsche grammophon", "deutsche grammophone", "dgg"),
+    "His Master's Voice": ("his master's voice", "his masters voice", "hmv", "la voix de son maitre"),
+    "Philips": ("philips",),
+    "Erato": ("erato",),
+    "Warner Classics": ("warner classics", "warner",),
+    "EMI Classics": ("emi classics", "emi",),
+    "Decca Classics": ("decca classics", "decca"),
+    "Sony Classical": ("sony classical", "sony music classical"),
+    "ATMA Classique": ("atma classique", "atma"),
+    "Archiv Produktion": ("archiv produktion", "archiv"),
+    "Harmonia Mundi": ("harmonia mundi",),
+    "Naxos": ("naxos",),
+    "Chandos": ("chandos",),
+    "BIS": ("bis",),
+    "Hyperion": ("hyperion",),
+    "Teldec": ("teldec",),
+    "Virgin Classics": ("virgin classics",),
+    "RCA Red Seal": ("rca red seal", "red seal"),
+    "ECM New Series": ("ecm new series",),
+}
 
 
 def _classical_norm_text(value: str | None) -> str:
@@ -24756,6 +24960,101 @@ def _classical_collect_tag_values(tags: dict | None, keys: tuple[str, ...]) -> l
                     out.append(value)
                     seen.add(norm)
     return out
+
+
+def _classical_label_tokens(values: list[str]) -> set[str]:
+    out: set[str] = set()
+    for value in values or []:
+        norm = _classical_norm_text(value)
+        if not norm:
+            continue
+        out.add(norm[:120])
+        for canonical, aliases in _CLASSICAL_LABEL_OCR_ALIASES.items():
+            alias_norms = [_classical_norm_text(alias) for alias in aliases]
+            if any(alias and alias in norm for alias in alias_norms):
+                out.add(_classical_norm_text(canonical))
+    return out
+
+
+def _classical_normalize_release_catalog_token(raw_value: str) -> str:
+    token = re.sub(r"[^A-Z0-9]", "", str(raw_value or "").upper())
+    if len(token) < 4:
+        return ""
+    if token.isdigit() and len(token) == 4:
+        return ""
+    return token[:40]
+
+
+def _classical_release_catalog_tokens_from_texts(texts: list[str]) -> set[str]:
+    out: set[str] = set()
+    for raw_text in texts or []:
+        raw = str(raw_text or "").strip()
+        if not raw:
+            continue
+        for pattern in _CLASSICAL_RELEASE_CATALOG_PATTERNS:
+            for match in pattern.finditer(raw.upper()):
+                token = _classical_normalize_release_catalog_token(match.group(0))
+                if token:
+                    out.add(token)
+    return out
+
+
+def _classical_cover_ocr_context(
+    *,
+    local_paths: list[Any] | None = None,
+    title_hint: str = "",
+) -> dict[str, Any]:
+    folder = _folder_from_local_paths(local_paths)
+    if not folder or not folder.is_dir():
+        return {}
+    candidates = _cover_ocr_candidates_for_folder(folder)
+    if not candidates:
+        return {}
+    chosen_text = ""
+    all_lines: list[str] = []
+    used_sources: list[str] = []
+    for source, raw, mime in candidates[:2]:
+        text = _ocr_cover_text_from_image_bytes(raw, mime)
+        if _ocr_text_quality_score(text) > _ocr_text_quality_score(chosen_text):
+            chosen_text = text
+        if text:
+            used_sources.append(source)
+            for raw_line in text.splitlines():
+                line = re.sub(r"\s+", " ", str(raw_line or "")).strip(" -–—")
+                if len(line) >= 3 and line not in all_lines:
+                    all_lines.append(line)
+    if not all_lines and not chosen_text:
+        return {}
+    text_blob = "\n".join(all_lines) if all_lines else chosen_text
+    label_values: list[str] = []
+    norm_blob = _classical_norm_text(text_blob)
+    for canonical, aliases in _CLASSICAL_LABEL_OCR_ALIASES.items():
+        alias_norms = [_classical_norm_text(alias) for alias in aliases]
+        if any(alias and alias in norm_blob for alias in alias_norms):
+            label_values.append(canonical)
+    work_tokens = _classical_work_tokens_from_texts(([title_hint] if str(title_hint or "").strip() else []) + all_lines[:20])
+    catalog_tokens = _classical_release_catalog_tokens_from_texts(all_lines[:20])
+    performance_lines: list[str] = []
+    for line in all_lines[:20]:
+        norm_line = _classical_norm_text(line)
+        if not norm_line:
+            continue
+        if any(alias and alias in norm_line for aliases in _CLASSICAL_LABEL_OCR_ALIASES.values() for alias in [_classical_norm_text(a) for a in aliases]):
+            continue
+        if _classical_release_catalog_tokens_from_texts([line]):
+            continue
+        performance_lines.append(line)
+    performance_tokens = _classical_people_tokens(performance_lines[:12])
+    return {
+        "source": ", ".join(used_sources) if used_sources else "",
+        "text": text_blob,
+        "lines": all_lines[:20],
+        "label_values": label_values,
+        "label_tokens": _classical_label_tokens(label_values),
+        "catalog_tokens": catalog_tokens,
+        "work_tokens": work_tokens,
+        "performance_tokens": performance_tokens,
+    }
 
 
 def _classical_work_tokens_from_texts(texts: list[str]) -> set[str]:
@@ -24905,6 +25204,7 @@ def _classical_identity_context(
     composer_values = _classical_collect_tag_values(tags, _CLASSICAL_COMPOSER_TAG_KEYS)
     work_values = _classical_collect_tag_values(tags, _CLASSICAL_WORK_TAG_KEYS)
     label_values = _classical_collect_tag_values(tags, _CLASSICAL_LABEL_TAG_KEYS)
+    catalog_values = _classical_collect_tag_values(tags, _CLASSICAL_RELEASE_CATALOG_TAG_KEYS)
     genre_values = _classical_collect_tag_values(tags, ("genre", "style"))
     meta_title_texts = [title_value] + work_values + track_titles[:20]
     work_tokens = _classical_work_tokens_from_texts(meta_title_texts)
@@ -24935,7 +25235,7 @@ def _classical_identity_context(
         if year:
             break
     genre_norms = {_classical_norm_text(v) for v in genre_values if _classical_norm_text(v)}
-    is_classical = bool(
+    pre_is_classical = bool(
         composer_tokens
         or work_tokens
         or (genre_norms and any(any(h in g for h in _CLASSICAL_GENRE_HINTS) for g in genre_norms))
@@ -24943,12 +25243,32 @@ def _classical_identity_context(
         or bool(_CLASSICAL_CATALOG_RE.search(title_value))
         or bool(_CLASSICAL_CATALOG_RE.search(" ".join(track_titles[:12])))
     )
+    cover_ocr_ctx = _classical_cover_ocr_context(
+        local_paths=list(local_paths or []),
+        title_hint=title_value,
+    ) if pre_is_classical and local_paths else {}
+    if cover_ocr_ctx:
+        label_values.extend([str(v or "").strip() for v in cover_ocr_ctx.get("label_values") or [] if str(v or "").strip()])
+        meta_title_texts.extend([str(v or "").strip() for v in cover_ocr_ctx.get("lines") or [] if str(v or "").strip()])
+        work_tokens = _classical_work_tokens_from_texts(meta_title_texts[:32])
+    label_tokens = _classical_label_tokens(label_values)
+    label_tokens |= set(cover_ocr_ctx.get("label_tokens") or set())
+    catalog_tokens = _classical_release_catalog_tokens_from_texts(catalog_values)
+    catalog_tokens |= set(cover_ocr_ctx.get("catalog_tokens") or set())
+    performance_tokens |= set(cover_ocr_ctx.get("performance_tokens") or set())
+    performance_tokens -= composer_tokens
+    is_classical = bool(
+        pre_is_classical
+        or cover_ocr_ctx.get("work_tokens")
+        or label_tokens
+    )
     return {
         "is_classical": bool(is_classical),
         "composer_tokens": composer_tokens,
         "work_tokens": work_tokens,
         "performance_tokens": performance_tokens,
-        "label_tokens": _classical_people_tokens(label_values),
+        "label_tokens": label_tokens,
+        "catalog_tokens": catalog_tokens,
         "genre_tokens": genre_norms,
         "track_count": int(track_count or 0),
         "disc_count": int(disc_count or 0),
@@ -24958,6 +25278,7 @@ def _classical_identity_context(
         "artist_norms": [_classical_norm_text(v) for v in artist_values if _classical_norm_text(v)],
         "track_titles": track_titles,
         "provider": str(provider or "").strip().lower(),
+        "cover_ocr_source": str(cover_ocr_ctx.get("source") or "").strip(),
     }
 
 
@@ -24980,7 +25301,7 @@ def _provider_classical_context(
         tags["genre"] = ", ".join([str(x or "").strip() for x in raw_tags if str(x or "").strip()])
     elif isinstance(raw_tags, str):
         tags["genre"] = raw_tags
-    for key in ("label", "publisher", "organization", "composer", "conductor", "orchestra", "ensemble", "performer"):
+    for key in ("label", "publisher", "organization", "composer", "conductor", "orchestra", "ensemble", "performer", "catalog_number", "catalog_numbers", "catno"):
         if payload_dict.get(key):
             tags[key] = payload_dict.get(key)
     year_val = payload_dict.get("year") or payload_dict.get("date") or payload_dict.get("first-release-date")
@@ -24994,7 +25315,7 @@ def _provider_classical_context(
         # unless the payload already exposes a richer performance context.
         tags["composer"] = candidate_artist_values
         candidate_artist_for_context = candidate_artist if explicit_performance else ""
-    return _classical_identity_context(
+    ctx = _classical_identity_context(
         local_artist="",
         local_title="",
         local_tracks=list(payload_dict.get("tracklist") or payload_dict.get("track_titles") or []),
@@ -25005,6 +25326,8 @@ def _provider_classical_context(
         candidate_artist=candidate_artist_for_context,
         candidate_title=candidate_title,
     )
+    ctx["identity_scope"] = str(payload_dict.get("identity_scope") or "").strip().lower()
+    return ctx
 
 
 def _classical_context_for_edition(edition: dict | None) -> dict[str, Any]:
@@ -25068,6 +25391,8 @@ def _classical_same_recording_pair_details(a: dict | None, b: dict | None) -> tu
 
     labels_a = set(ctx_a.get("label_tokens") or set())
     labels_b = set(ctx_b.get("label_tokens") or set())
+    catalogs_a = set(ctx_a.get("catalog_tokens") or set())
+    catalogs_b = set(ctx_b.get("catalog_tokens") or set())
     years_a = _mb_extract_year(ctx_a.get("year"))
     years_b = _mb_extract_year(ctx_b.get("year"))
 
@@ -25087,6 +25412,7 @@ def _classical_same_recording_pair_details(a: dict | None, b: dict | None) -> tu
         dur_ratio = (float(min(total_a, total_b)) / float(hi)) if hi > 0 else 0.0
 
     label_ok = (not labels_a) or (not labels_b) or bool(labels_a & labels_b)
+    catalog_ok = (not catalogs_a) or (not catalogs_b) or bool(catalogs_a & catalogs_b)
     year_ok = True
     if years_a and years_b:
         try:
@@ -25095,18 +25421,18 @@ def _classical_same_recording_pair_details(a: dict | None, b: dict | None) -> tu
             year_ok = True
 
     if count_a > 0 and count_b > 0 and count_a == count_b:
-        if contain >= 0.98 and (dur_ratio == 0.0 or dur_ratio >= 0.94):
+        if contain >= 0.98 and (dur_ratio == 0.0 or dur_ratio >= 0.94) and catalog_ok:
             return (True, "same_recording_exact_structure")
-        if (not perf_a or not perf_b) and contain >= 0.98 and label_ok and year_ok and (dur_ratio == 0.0 or dur_ratio >= 0.92):
+        if (not perf_a or not perf_b) and contain >= 0.98 and label_ok and catalog_ok and year_ok and (dur_ratio == 0.0 or dur_ratio >= 0.92):
             return (True, "same_recording_missing_performance_context")
 
     if count_a > 0 and count_b > 0 and abs(count_a - count_b) <= 2:
-        if contain >= 0.98 and label_ok and year_ok:
+        if contain >= 0.98 and label_ok and catalog_ok and year_ok:
             # Tail-truncated siblings should stay in the same recording family so they can be
             # marked incomplete later, but different interpretations remain blocked above.
             return (True, "same_recording_subset_structure")
 
-    if (not perf_a or not perf_b) and jac >= 0.82 and ratio >= 0.75 and label_ok and year_ok:
+    if (not perf_a or not perf_b) and jac >= 0.82 and ratio >= 0.75 and label_ok and catalog_ok and year_ok:
         if dur_ratio == 0.0 or dur_ratio >= 0.90:
             return (True, "same_recording_similarity")
 
@@ -25290,11 +25616,18 @@ def _classical_identity_match_details(
     provider_composer = set(provider_ctx.get("composer_tokens") or set())
     local_perf = set(local_ctx.get("performance_tokens") or set())
     provider_perf = set(provider_ctx.get("performance_tokens") or set())
+    local_label = set(local_ctx.get("label_tokens") or set())
+    provider_label = set(provider_ctx.get("label_tokens") or set())
+    local_catalog = set(local_ctx.get("catalog_tokens") or set())
+    provider_catalog = set(provider_ctx.get("catalog_tokens") or set())
+    provider_scope = str(provider_ctx.get("identity_scope") or "").strip().lower()
 
     title_exact = bool(local_title_norm and provider_title_norm and local_title_norm == provider_title_norm)
     work_overlap = local_work & provider_work if local_work and provider_work else set()
     composer_overlap = local_composer & provider_composer if local_composer and provider_composer else set()
     perf_overlap = local_perf & provider_perf if local_perf and provider_perf else set()
+    label_overlap = local_label & provider_label if local_label and provider_label else set()
+    catalog_overlap = local_catalog & provider_catalog if local_catalog and provider_catalog else set()
 
     if local_work and provider_work and not work_overlap and not title_exact:
         return (False, "classical_work_mismatch")
@@ -25302,6 +25635,8 @@ def _classical_identity_match_details(
         return (False, "classical_composer_mismatch")
     if local_perf and provider_perf and not perf_overlap:
         return (False, "classical_performance_mismatch")
+    if local_catalog and provider_catalog and not catalog_overlap and provider_scope in {"release", "discogs_release", "discogs_master_resolved"}:
+        return (False, "classical_catalog_mismatch")
 
     local_track_count = int(local_ctx.get("track_count") or 0)
     provider_track_count = int(provider_ctx.get("track_count") or 0)
@@ -25321,8 +25656,6 @@ def _classical_identity_match_details(
         if hi > 0 and diff > max(90000, int(hi * 0.03)):
             return (False, f"classical_duration_mismatch local={local_total} provider={provider_total}")
 
-    local_label = set(local_ctx.get("label_tokens") or set())
-    provider_label = set(provider_ctx.get("label_tokens") or set())
     if local_label and provider_label and not (local_label & provider_label) and local_perf and provider_perf and not perf_overlap:
         return (False, "classical_label_plus_performance_mismatch")
 
@@ -25335,8 +25668,12 @@ def _classical_identity_match_details(
         except Exception:
             pass
 
+    if catalog_overlap and composer_overlap and (work_overlap or title_exact):
+        return (True, "classical identity ok (catalog overlap)")
     if local_perf and provider_perf and perf_overlap:
         return (True, "classical identity ok (performance overlap)")
+    if label_overlap and composer_overlap and (work_overlap or title_exact):
+        return (True, "classical identity ok (label overlap)")
     if local_composer and provider_composer and composer_overlap and (work_overlap or title_exact):
         return (True, "classical identity ok (composer/work overlap)")
     if work_overlap and title_exact:
@@ -26145,6 +26482,17 @@ def _strict_discogs_payload_from_release_data(rel_data: dict) -> dict:
         t_title = (tr.get("title") or "").strip()
         if t_title:
             tracklist.append(t_title)
+    labels: list[str] = []
+    catalog_numbers: list[str] = []
+    for label_info in rel_data.get("labels") or []:
+        if not isinstance(label_info, dict):
+            continue
+        label_name = str(label_info.get("name") or "").strip()
+        if label_name:
+            labels.append(label_name)
+        catno = str(label_info.get("catno") or "").strip()
+        if catno:
+            catalog_numbers.append(catno)
     release_id = str(rel_data.get("id") or "").strip()
     master_id = str(rel_data.get("master_id") or "").strip()
     if not master_id:
@@ -26157,8 +26505,11 @@ def _strict_discogs_payload_from_release_data(rel_data: dict) -> dict:
         "cover_url": cover_url,
         "artist_name": artist_str,
         "tracklist": tracklist,
+        "label": labels,
+        "catalog_number": catalog_numbers,
         "release_id": release_id,
         "master_id": master_id,
+        "identity_scope": "discogs_release",
     }
 
 
@@ -26227,6 +26578,35 @@ def _mb_extract_year(raw_value: Any) -> str:
     return str(match.group(0)) if match else ""
 
 
+def _extract_musicbrainz_release_label_info(release_data: dict | None) -> tuple[list[str], list[str]]:
+    if not isinstance(release_data, dict):
+        return ([], [])
+    labels: list[str] = []
+    catalog_numbers: list[str] = []
+    for info in release_data.get("label-info-list") or release_data.get("label_list") or []:
+        if not isinstance(info, dict):
+            continue
+        label_payload = info.get("label") if isinstance(info.get("label"), dict) else {}
+        label_name = str(
+            label_payload.get("name")
+            or info.get("name")
+            or ""
+        ).strip()
+        if label_name:
+            labels.append(label_name)
+        catalog_number = str(
+            info.get("catalog-number")
+            or info.get("catalog_number")
+            or info.get("catalog-number-list")
+            or ""
+        ).strip()
+        if catalog_number:
+            catalog_numbers.append(catalog_number)
+    dedup_labels = _dedupe_keep_order([str(v or "").strip() for v in labels if str(v or "").strip()])
+    dedup_catalogs = _dedupe_keep_order([str(v or "").strip() for v in catalog_numbers if str(v or "").strip()])
+    return (dedup_labels, dedup_catalogs)
+
+
 def _fetch_musicbrainz_release_group_versions(release_group_id: str) -> tuple[int, list[dict[str, Any]], dict[str, Any]]:
     rgid = str(release_group_id or "").strip()
     if not rgid or not USE_MUSICBRAINZ:
@@ -26284,6 +26664,9 @@ def _fetch_musicbrainz_strict_payload(mbid: str) -> dict:
         "versions": [],
         "release_group_id": "",
         "url": "",
+        "label": [],
+        "catalog_number": [],
+        "identity_scope": "",
     }
     ref_id = str(mbid or "").strip()
     if not ref_id or not USE_MUSICBRAINZ:
@@ -26294,7 +26677,7 @@ def _fetch_musicbrainz_strict_payload(mbid: str) -> dict:
         def _fetch_rel():
             return musicbrainzngs.get_release_by_id(
                 ref_id,
-                includes=["recordings", "release-groups", "artist-credits"],
+                includes=["recordings", "release-groups", "artist-credits", "labels"],
             )
         rel_resp = get_mb_queue().submit(f"rel_strict_{ref_id}", _fetch_rel) if (MB_QUEUE_ENABLED and USE_MUSICBRAINZ) else _fetch_rel()
         release_data = (rel_resp or {}).get("release") or {}
@@ -26309,6 +26692,8 @@ def _fetch_musicbrainz_strict_payload(mbid: str) -> dict:
             out["tracklist"] = _extract_track_titles_from_mb_release(rel_resp)
             out["year"] = _mb_extract_year(release_data.get("date"))
             out["cover_url"] = f"https://coverartarchive.org/release/{quote(release_id, safe='')}/front"
+            out["label"], out["catalog_number"] = _extract_musicbrainz_release_label_info(release_data)
+            out["identity_scope"] = "release"
             if release_group_id:
                 out["release_group_id"] = release_group_id
                 release_count, versions, rg_raw = _fetch_musicbrainz_release_group_versions(release_group_id)
@@ -26350,14 +26735,111 @@ def _fetch_musicbrainz_strict_payload(mbid: str) -> dict:
         if release_id:
             try:
                 def _fetch_rel():
-                    return musicbrainzngs.get_release_by_id(release_id, includes=["recordings"])
+                    return musicbrainzngs.get_release_by_id(release_id, includes=["recordings", "labels", "artist-credits"])
                 rel_resp = get_mb_queue().submit(f"rel_strict_rg_{release_id}", _fetch_rel) if (MB_QUEUE_ENABLED and USE_MUSICBRAINZ) else _fetch_rel()
                 out["tracklist"] = _extract_track_titles_from_mb_release(rel_resp)
+                release_data = (rel_resp or {}).get("release") or {}
+                out["label"], out["catalog_number"] = _extract_musicbrainz_release_label_info(release_data)
+                out["identity_scope"] = "release_group_fallback"
             except Exception:
                 out["tracklist"] = []
     except Exception:
         pass
     return out
+
+
+def _score_musicbrainz_release_payload_for_local_context(payload: dict | None, local_ctx: dict | None) -> float:
+    if not isinstance(payload, dict) or not isinstance(local_ctx, dict):
+        return -999.0
+    score = 0.0
+    local_title_norm = str(local_ctx.get("title_norm") or "")
+    provider_title_norm = _normalize_identity_album_strict(str(payload.get("title") or ""))
+    if local_title_norm and provider_title_norm and local_title_norm == provider_title_norm:
+        score += 2.0
+
+    local_track_count = int(local_ctx.get("track_count") or 0)
+    provider_track_count = len(payload.get("tracklist") or [])
+    if local_track_count > 0 and provider_track_count > 0:
+        if local_track_count == provider_track_count:
+            score += 2.0
+        else:
+            score -= min(2.0, abs(local_track_count - provider_track_count) * 0.5)
+
+    local_year = _mb_extract_year(local_ctx.get("year"))
+    provider_year = _mb_extract_year(payload.get("year"))
+    if local_year and provider_year:
+        try:
+            diff = abs(int(local_year) - int(provider_year))
+        except Exception:
+            diff = 99
+        if diff == 0:
+            score += 1.5
+        elif diff <= 1:
+            score += 1.0
+        elif diff <= 5:
+            score += 0.4
+        else:
+            score -= min(1.5, diff / 10.0)
+
+    local_label = set(local_ctx.get("label_tokens") or set())
+    provider_label = _classical_label_tokens(_classical_split_values(payload.get("label") or []))
+    if local_label and provider_label:
+        if local_label & provider_label:
+            score += 2.5
+        else:
+            score -= 1.5
+
+    local_catalog = set(local_ctx.get("catalog_tokens") or set())
+    provider_catalog = _classical_release_catalog_tokens_from_texts(_classical_split_values(payload.get("catalog_number") or []))
+    if local_catalog and provider_catalog:
+        if local_catalog & provider_catalog:
+            score += 4.0
+        else:
+            score -= 2.0
+    return score
+
+
+def _fetch_musicbrainz_strict_payload_for_edition(mbid: str, edition: dict | None) -> dict | None:
+    payload = _fetch_musicbrainz_strict_payload(mbid)
+    if not isinstance(payload, dict) or not isinstance(edition, dict):
+        return payload if isinstance(payload, dict) else None
+    local_ctx = _classical_context_for_edition(edition)
+    if not bool(local_ctx.get("is_classical")):
+        return payload
+    versions = payload.get("versions") or []
+    if not isinstance(versions, list) or not versions:
+        return payload
+    if not (local_ctx.get("label_tokens") or local_ctx.get("catalog_tokens") or str(local_ctx.get("year") or "").strip()):
+        return payload
+
+    best_payload = payload
+    best_score = _score_musicbrainz_release_payload_for_local_context(payload, local_ctx)
+    ranked_versions = list(versions[:10])
+    local_year = _mb_extract_year(local_ctx.get("year"))
+    if local_year:
+        def _year_distance(item: dict[str, Any]) -> int:
+            try:
+                year = int(_mb_extract_year(item.get("date")))
+                return abs(int(local_year) - year)
+            except Exception:
+                return 999
+        ranked_versions.sort(key=_year_distance)
+
+    for version in ranked_versions:
+        release_id = str((version or {}).get("id") or "").strip()
+        if not release_id or release_id == str(payload.get("id") or "").strip():
+            continue
+        try:
+            candidate = _fetch_musicbrainz_strict_payload(release_id)
+        except Exception:
+            candidate = None
+        if not isinstance(candidate, dict):
+            continue
+        candidate_score = _score_musicbrainz_release_payload_for_local_context(candidate, local_ctx)
+        if candidate_score > (best_score + 0.35):
+            best_payload = candidate
+            best_score = candidate_score
+    return best_payload
 
 
 def _strict_expected_provider_id(provider: str, edition: dict) -> str:
@@ -26408,7 +26890,7 @@ def _strict_payload_for_provider(
         mbid = _strict_expected_provider_id("musicbrainz", edition)
         if not mbid:
             return None
-        return _fetch_musicbrainz_strict_payload(mbid)
+        return _fetch_musicbrainz_strict_payload_for_edition(mbid, edition)
     if p == "discogs":
         payload = edition.get("fallback_discogs") if isinstance(edition.get("fallback_discogs"), dict) else None
         expected_id = _strict_expected_provider_id("discogs", edition)
@@ -41223,6 +41705,17 @@ def _fetch_discogs_release(artist_name: str, album_title: str) -> Optional[dict]
             t_title = tr.get("title")
             if t_title:
                 tracklist.append(str(t_title))
+        labels: list[str] = []
+        catalog_numbers: list[str] = []
+        for label_info in rel_data.get("labels") or []:
+            if not isinstance(label_info, dict):
+                continue
+            label_name = str(label_info.get("name") or "").strip()
+            if label_name:
+                labels.append(label_name)
+            catno = str(label_info.get("catno") or "").strip()
+            if catno:
+                catalog_numbers.append(catno)
         notes = rel_data.get("notes")
         notes_text = ""
         if isinstance(notes, str):
@@ -41253,6 +41746,8 @@ def _fetch_discogs_release(artist_name: str, album_title: str) -> Optional[dict]
             "cover_url": cover_url,
             "artist_name": artist_str,
             "tracklist": tracklist,
+            "label": _dedupe_keep_order(labels),
+            "catalog_number": _dedupe_keep_order(catalog_numbers),
             "notes": notes_text,
             "release_id": release_id_str,
             "master_id": master_id,
@@ -41261,6 +41756,7 @@ def _fetch_discogs_release(artist_name: str, album_title: str) -> Optional[dict]
             "public_rating_source": "discogs",
             "discogs_have_count": discogs_have_count,
             "discogs_want_count": discogs_want_count,
+            "identity_scope": "discogs_release",
         }
     return None
 

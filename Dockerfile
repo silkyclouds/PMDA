@@ -35,6 +35,12 @@ RUN mkdir -p /etc/postgresql-common && \
       npm \
       sqlite3 \
       libchromaprint-tools \
+      tesseract-ocr \
+      tesseract-ocr-eng \
+      tesseract-ocr-fra \
+      tesseract-ocr-deu \
+      tesseract-ocr-spa \
+      tesseract-ocr-ita \
       postgresql \
       postgresql-contrib \
       redis-server \
