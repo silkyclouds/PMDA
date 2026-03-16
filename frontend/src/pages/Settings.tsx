@@ -490,27 +490,16 @@ function SettingsPage() {
       if (!result.ok || !result.auth_url) {
         throw new Error('Failed to start Last.fm authorization');
       }
-      window.open(result.auth_url, '_blank', 'noopener,noreferrer');
-      toast.success('Last.fm authorization opened in a new tab');
+      const popup = window.open(result.auth_url, 'pmda-lastfm-auth', 'popup=yes,width=720,height=840,resizable=yes,scrollbars=yes');
+      if (!popup) {
+        window.location.href = result.auth_url;
+        return;
+      }
+      popup.focus();
+      toast.success('Authorize PMDA on Last.fm. The connection will finish automatically.');
       await refreshLastfmAuthStatus();
     } catch (e) {
       toast.error(getApiErrorMessage(e) || (e instanceof Error ? e.message : 'Failed to start Last.fm authorization'));
-    } finally {
-      setLastfmAuthBusy(false);
-    }
-  }, [getApiErrorMessage, refreshLastfmAuthStatus]);
-
-  const completeLastfmScrobbleAuth = useCallback(async () => {
-    setLastfmAuthBusy(true);
-    try {
-      const result = await api.completeLastfmAuth();
-      if (!result.ok || !result.connected) {
-        throw new Error(result.message || 'Last.fm authorization is not complete yet');
-      }
-      toast.success(result.message || `Last.fm connected${result.session_name ? ` as ${result.session_name}` : ''}`);
-      await refreshLastfmAuthStatus();
-    } catch (e) {
-      toast.error(getApiErrorMessage(e) || (e instanceof Error ? e.message : 'Failed to complete Last.fm authorization'));
     } finally {
       setLastfmAuthBusy(false);
     }
@@ -531,6 +520,36 @@ function SettingsPage() {
       setLastfmAuthBusy(false);
     }
   }, [getApiErrorMessage, refreshLastfmAuthStatus]);
+
+  useEffect(() => {
+    const onMessage = (event: MessageEvent) => {
+      if (event.origin !== window.location.origin) return;
+      const data = event.data as { type?: string; ok?: boolean; message?: string; session_name?: string } | null;
+      if (!data || data.type !== 'pmda:lastfm-auth-complete') return;
+      void (async () => {
+        const status = await refreshLastfmAuthStatus();
+        if (status?.connected) {
+          toast.success(status.message || `Last.fm connected${status.session_name ? `: ${status.session_name}` : ''}`);
+          return;
+        }
+        if (data.ok) {
+          toast.success(data.message || 'Last.fm connected');
+        } else if (data.message) {
+          toast.error(data.message);
+        }
+      })();
+    };
+    window.addEventListener('message', onMessage);
+    return () => window.removeEventListener('message', onMessage);
+  }, [refreshLastfmAuthStatus]);
+
+  useEffect(() => {
+    if (!lastfmAuthStatus?.pending || lastfmAuthBusy) return;
+    const t = setTimeout(() => {
+      void refreshLastfmAuthStatus();
+    }, 2000);
+    return () => clearTimeout(t);
+  }, [lastfmAuthBusy, lastfmAuthStatus?.pending, refreshLastfmAuthStatus]);
 
   const pollOpenAIOAuth = useCallback(async () => {
     if (!openaiOAuth?.sessionId || openaiOAuthBusy) return;
@@ -1861,7 +1880,7 @@ function SettingsPage() {
                               <div className="space-y-1">
                               <Label>Last.fm scrobbling</Label>
                               <p className="text-xs text-muted-foreground">
-                                Connect a Last.fm user session to scrobble finished tracks and optionally update now playing.
+                                Connect a Last.fm user session to scrobble finished tracks and optionally update now playing. After you authorize PMDA on Last.fm, the connection completes automatically.
                               </p>
                               {lastfmAuthStatus?.message ? (
                                 <p className={`text-xs ${scrobbleReconnectRequired ? 'text-amber-500' : 'text-muted-foreground'}`}>
@@ -1907,17 +1926,7 @@ function SettingsPage() {
                                 disabled={!configured || lastfmAuthBusy}
                               >
                                 {lastfmAuthBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Check className="w-3.5 h-3.5" />}
-                                Connect
-                              </Button>
-                              <Button
-                                type="button"
-                                size="sm"
-                                variant="outline"
-                                className="h-8 gap-2"
-                                onClick={() => void completeLastfmScrobbleAuth()}
-                                disabled={!configured || !scrobblePending || lastfmAuthBusy}
-                              >
-                                Finish authorization
+                                {scrobblePending ? 'Reconnect' : 'Connect'}
                               </Button>
                               <Button
                                 type="button"

@@ -41327,7 +41327,7 @@ def _lastfm_status_snapshot() -> dict[str, Any]:
     if reconnect_required:
         message = "Stored Last.fm authorization can no longer be decrypted. Reconnect Last.fm."
     elif pending:
-        message = "Authorize PMDA on Last.fm, then click Finish authorization."
+        message = "Authorize PMDA on Last.fm. PMDA will complete the connection automatically."
     elif connected:
         message = f"Connected to Last.fm as {session_name or 'your account'}."
     elif configured:
@@ -41416,7 +41416,7 @@ def _lastfm_try_complete_pending_authorization(*, enqueue_loved_sync: bool = Fal
         message = str(exc or "").strip() or "Last.fm authorization is not complete yet"
         lowered = message.lower()
         if "not been authorized" in lowered or "unauthorized token" in lowered:
-            return False, "Authorize PMDA on Last.fm first, then click Finish authorization."
+            return False, "Authorize PMDA on Last.fm first."
         if "invalid method signature" in lowered or "invalid api key" in lowered:
             return False, message
         logging.info("Last.fm pending authorization not complete yet: %s", message)
@@ -41431,9 +41431,88 @@ def _lastfm_now_playing_enabled() -> bool:
     return bool(_parse_bool(_get_config_from_db("LASTFM_NOW_PLAYING_ENABLED", getattr(sys.modules[__name__], "LASTFM_NOW_PLAYING_ENABLED", False))))
 
 
-def _lastfm_auth_url_for_token(token: str) -> str:
+def _lastfm_auth_callback_url(base_url: str) -> str:
+    base = str(base_url or "").strip().rstrip("/")
+    if not base:
+        return ""
+    return f"{base}/api/lastfm/auth/callback"
+
+
+def _lastfm_auth_url_for_token(token: str, callback_url: str = "") -> str:
     api_key, _ = _lastfm_credentials_effective()
-    return f"{_LASTFM_AUTH_ROOT}?api_key={quote_plus(api_key)}&token={quote_plus(str(token or '').strip())}"
+    url = f"{_LASTFM_AUTH_ROOT}?api_key={quote_plus(api_key)}&token={quote_plus(str(token or '').strip())}"
+    cb = str(callback_url or "").strip()
+    if cb:
+        url += f"&cb={quote_plus(cb)}"
+    return url
+
+
+def _lastfm_callback_html(*, ok: bool, message: str, session_name: str = "") -> str:
+    safe_message = html.escape(str(message or "").strip() or ("Last.fm connected." if ok else "Last.fm authorization failed."))
+    safe_session_name = html.escape(str(session_name or "").strip())
+    status = "connected" if ok else "error"
+    title = "Last.fm connected" if ok else "Last.fm authorization failed"
+    return f"""<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{html.escape(title)}</title>
+    <style>
+      :root {{
+        color-scheme: dark light;
+        font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }}
+      body {{
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        background: #0b1020;
+        color: #f5f7fb;
+      }}
+      .card {{
+        width: min(92vw, 440px);
+        padding: 24px;
+        border-radius: 18px;
+        background: rgba(16, 24, 40, 0.96);
+        border: 1px solid rgba(148, 163, 184, 0.18);
+        box-shadow: 0 24px 64px rgba(0, 0, 0, 0.35);
+      }}
+      h1 {{ margin: 0 0 10px; font-size: 1.2rem; }}
+      p {{ margin: 0; line-height: 1.5; color: #cbd5e1; }}
+      .hint {{ margin-top: 14px; font-size: 0.9rem; color: #94a3b8; }}
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1>{html.escape(title)}</h1>
+      <p>{safe_message}</p>
+      <p class="hint">{'PMDA will return you automatically.' if ok else 'You can close this window and try again from PMDA settings.'}</p>
+    </div>
+    <script>
+      (function() {{
+        var payload = {{
+          type: 'pmda:lastfm-auth-complete',
+          status: {json.dumps(status)},
+          ok: {json.dumps(bool(ok))},
+          message: {json.dumps(str(message or "").strip())},
+          session_name: {json.dumps(str(session_name or "").strip())}
+        }};
+        try {{
+          if (window.opener && !window.opener.closed) {{
+            window.opener.postMessage(payload, window.location.origin);
+            setTimeout(function() {{ window.close(); }}, 150);
+            return;
+          }}
+        }} catch (err) {{}}
+        setTimeout(function() {{
+          window.location.replace('/settings#settings-providers');
+        }}, {250 if ok else 1500});
+      }})();
+    </script>
+  </body>
+</html>"""
 
 
 def _lastfm_api_sig(params: dict[str, Any], api_secret: str) -> str:
@@ -45486,7 +45565,14 @@ def api_openai_check():
 
 @app.get("/api/lastfm/auth/status")
 def api_lastfm_auth_status():
-    return jsonify(_lastfm_try_complete_pending_authorization_if_needed(enqueue_loved_sync=True))
+    snapshot = _lastfm_try_complete_pending_authorization_if_needed(enqueue_loved_sync=True)
+    if snapshot.get("pending") and snapshot.get("auth_url") and has_request_context():
+        base_url = request.url_root.rstrip("/")
+        callback_url = _lastfm_auth_callback_url(base_url)
+        token = _lastfm_pending_token()
+        if token:
+            snapshot["auth_url"] = _lastfm_auth_url_for_token(token, callback_url)
+    return jsonify(snapshot)
 
 
 @app.post("/api/lastfm/auth/start")
@@ -45504,10 +45590,42 @@ def api_lastfm_auth_start():
         if not token:
             raise RuntimeError("Last.fm did not return an auth token")
         _settings_db_set_secret(_LASTFM_AUTH_TOKEN_SETTING, token)
-        return jsonify({"ok": True, "pending": True, "token": token, "auth_url": _lastfm_auth_url_for_token(token)})
+        callback_url = _lastfm_auth_callback_url(request.url_root.rstrip("/"))
+        return jsonify({"ok": True, "pending": True, "token": token, "auth_url": _lastfm_auth_url_for_token(token, callback_url)})
     except Exception as exc:
         logging.warning("Last.fm auth start failed: %s", exc)
         return jsonify({"ok": False, "message": str(exc) or "Last.fm authorization failed"}), 500
+
+
+@app.get("/api/lastfm/auth/callback")
+def api_lastfm_auth_callback():
+    api_key, api_secret = _lastfm_credentials_effective()
+    if not api_key or not api_secret:
+        html_body = _lastfm_callback_html(ok=False, message="Configure Last.fm API key and secret first.")
+        return Response(html_body, status=400, mimetype="text/html")
+    token_from_query = str(request.args.get("token") or "").strip()
+    if token_from_query and not _lastfm_pending_token():
+        try:
+            _settings_db_set_secret(_LASTFM_AUTH_TOKEN_SETTING, token_from_query)
+        except Exception:
+            logging.debug("Failed to restore Last.fm pending token from callback query", exc_info=True)
+    try:
+        ok, message = _lastfm_try_complete_pending_authorization(enqueue_loved_sync=True)
+        if ok:
+            session_name = _lastfm_session_name()
+            html_body = _lastfm_callback_html(
+                ok=True,
+                message=f"Connected to Last.fm as {session_name or 'your account'}.",
+                session_name=session_name,
+            )
+            return Response(html_body, status=200, mimetype="text/html")
+        html_body = _lastfm_callback_html(ok=False, message=message or "Last.fm authorization is not complete yet.")
+        return Response(html_body, status=409, mimetype="text/html")
+    except Exception as exc:
+        message = str(exc or "").strip() or "Last.fm authorization failed"
+        logging.warning("Last.fm auth callback failed: %s", exc)
+        html_body = _lastfm_callback_html(ok=False, message=message)
+        return Response(html_body, status=500, mimetype="text/html")
 
 
 @app.post("/api/lastfm/auth/complete")
@@ -45523,7 +45641,7 @@ def api_lastfm_auth_complete():
         if not ok:
             lowered = str(message or "").strip().lower()
             if "authorize pmda on last.fm first" in lowered or "no last.fm authorization is pending" in lowered:
-                return jsonify({"ok": False, "message": message or "Authorize PMDA on Last.fm first, then click Finish authorization."}), 409
+                return jsonify({"ok": False, "message": message or "Authorize PMDA on Last.fm first."}), 409
             if "invalid method signature" in lowered or "invalid api key" in lowered:
                 return jsonify({"ok": False, "message": message}), 400
             return jsonify({"ok": False, "message": message or "Last.fm authorization is not complete yet"}), 409
@@ -45533,7 +45651,7 @@ def api_lastfm_auth_complete():
         message = str(exc or "").strip() or "Last.fm authorization is not complete yet"
         lowered = message.lower()
         if "not been authorized" in lowered or "unauthorized token" in lowered:
-            return jsonify({"ok": False, "message": "Authorize PMDA on Last.fm first, then click Finish authorization."}), 409
+            return jsonify({"ok": False, "message": "Authorize PMDA on Last.fm first."}), 409
         if "invalid method signature" in lowered or "invalid api key" in lowered:
             return jsonify({"ok": False, "message": message}), 400
         logging.warning("Last.fm auth completion failed: %s", exc)
