@@ -75,6 +75,15 @@ def _load_expected_groups(manifest_cases: list[dict]) -> list[dict]:
                 hint_artist = "Peter Tchaikovsky"
             elif source_hint.startswith("amadeus quartet "):
                 hint_artist = "Amadeus Quartet"
+        if source_key == "tchaikovsky_iolanta_live_opera":
+            hint_title = "Tchaikovsky Iolanta Live"
+            hint_artist = "Peter Ilyich Tchaikovsky"
+        elif source_key == "debussy_complete_piano_works_recital":
+            hint_title = "Complete Piano Works"
+            hint_artist = "Claude Debussy"
+        elif source_key == "amadeus_quartet_modernism_multicomposer_box":
+            hint_title = "Bartok Tippett Britten RIAS Amadeus Quartet Modernism"
+            hint_artist = "Amadeus Quartet"
         group = groups.setdefault(
             source_key,
             {
