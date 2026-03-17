@@ -44,6 +44,43 @@ export default function LibraryStatsPage() {
     staleTime: 10_000,
     refetchOnWindowFocus: false,
   });
+  const { data: matchedStats, isLoading: matchedStatsLoading } = useQuery({
+    queryKey: ['library-stats-summary', 'matched'],
+    queryFn: () => api.getLibraryStats(),
+    staleTime: 10_000,
+    refetchOnWindowFocus: false,
+  });
+  const { data: totalStats, isLoading: totalStatsLoading } = useQuery({
+    queryKey: ['library-stats-summary', 'all'],
+    queryFn: () => api.getLibraryStats({ includeUnmatched: true }),
+    staleTime: 10_000,
+    refetchOnWindowFocus: false,
+  });
+
+  const coverage = useMemo(() => {
+    const matchedAlbums = Number(matchedStats?.albums || 0);
+    const totalAlbums = Math.max(matchedAlbums, Number(totalStats?.albums || 0));
+    const unmatchedAlbums = Math.max(0, totalAlbums - matchedAlbums);
+    const matchedArtists = Number(matchedStats?.artists || 0);
+    const totalArtists = Math.max(matchedArtists, Number(totalStats?.artists || 0));
+    const matchedTracks = Number(matchedStats?.tracks || 0);
+    const totalTracks = Math.max(matchedTracks, Number(totalStats?.tracks || 0));
+    const albumPct = totalAlbums > 0 ? Math.round((matchedAlbums / totalAlbums) * 100) : 100;
+    const artistPct = totalArtists > 0 ? Math.round((matchedArtists / totalArtists) * 100) : 100;
+    const trackPct = totalTracks > 0 ? Math.round((matchedTracks / totalTracks) * 100) : 100;
+    return {
+      matchedAlbums,
+      totalAlbums,
+      unmatchedAlbums,
+      matchedArtists,
+      totalArtists,
+      matchedTracks,
+      totalTracks,
+      albumPct,
+      artistPct,
+      trackPct,
+    };
+  }, [matchedStats, totalStats]);
 
   const yearsChart = useMemo(() => {
     const pts = data?.years || [];
@@ -259,6 +296,63 @@ export default function LibraryStatsPage() {
         <Badge variant="outline">Albums: {isLoading ? '—' : (data?.albums ?? 0).toLocaleString()}</Badge>
         <Badge variant="outline">Tracks: {isLoading ? '—' : (data?.tracks ?? 0).toLocaleString()}</Badge>
       </div>
+
+      <Card className="pmda-flat-surface overflow-hidden">
+        <CardContent className="p-5 space-y-4">
+          <div className="flex flex-wrap items-start justify-between gap-4">
+            <div className="space-y-1">
+              <div className="text-[11px] uppercase tracking-[0.24em] text-muted-foreground">PMDA coverage</div>
+              <h2 className="text-xl font-semibold tracking-tight">What PMDA matched, and what still needs help</h2>
+              <p className="max-w-2xl text-sm text-muted-foreground">
+                This compares confidently published library rows against everything PMDA has indexed, including albums still unmatched.
+              </p>
+            </div>
+            <Badge variant="outline" className="text-sm">
+              Coverage: {(matchedStatsLoading || totalStatsLoading) ? '—' : `${coverage.albumPct}%`}
+            </Badge>
+          </div>
+
+          <div className="space-y-2">
+            <div className="flex items-center justify-between text-xs text-muted-foreground">
+              <span>Albums matched</span>
+              <span>
+                {(matchedStatsLoading || totalStatsLoading)
+                  ? '—'
+                  : `${coverage.matchedAlbums.toLocaleString()} / ${coverage.totalAlbums.toLocaleString()}`}
+              </span>
+            </div>
+            <div className="h-2 overflow-hidden bg-muted">
+              <div className="h-full bg-primary transition-all duration-500" style={{ width: `${Math.max(0, Math.min(100, coverage.albumPct))}%` }} />
+            </div>
+          </div>
+
+          <div className="grid gap-4 md:grid-cols-3">
+            <div className="border border-border/60 bg-muted/20 p-4">
+              <div className="text-[11px] uppercase tracking-[0.22em] text-muted-foreground">Matched albums</div>
+              <div className="mt-2 text-3xl font-semibold">
+                {matchedStatsLoading ? '—' : coverage.matchedAlbums.toLocaleString()}
+              </div>
+              <p className="mt-1 text-xs text-muted-foreground">Confidently identified and published in the clean library.</p>
+            </div>
+            <div className="border border-border/60 bg-muted/20 p-4">
+              <div className="text-[11px] uppercase tracking-[0.22em] text-muted-foreground">Still unmatched</div>
+              <div className="mt-2 text-3xl font-semibold">
+                {totalStatsLoading ? '—' : coverage.unmatchedAlbums.toLocaleString()}
+              </div>
+              <p className="mt-1 text-xs text-muted-foreground">Indexed albums PMDA has seen but could not confidently publish yet.</p>
+            </div>
+            <div className="border border-border/60 bg-muted/20 p-4">
+              <div className="text-[11px] uppercase tracking-[0.22em] text-muted-foreground">Coverage score</div>
+              <div className="mt-2 text-3xl font-semibold">
+                {(matchedStatsLoading || totalStatsLoading) ? '—' : `${coverage.albumPct}%`}
+              </div>
+              <p className="mt-1 text-xs text-muted-foreground">
+                Artists {matchedStatsLoading || totalStatsLoading ? '—' : `${coverage.artistPct}%`} · Tracks {matchedStatsLoading || totalStatsLoading ? '—' : `${coverage.trackPct}%`}
+              </p>
+            </div>
+          </div>
+        </CardContent>
+      </Card>
 
       <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
         <Card className="border-border/70">

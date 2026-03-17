@@ -11,6 +11,7 @@ import { Carousel, CarouselContent, CarouselItem, CarouselNext, CarouselPrevious
 import { AlbumBadgeGroups } from '@/components/library/AlbumBadgeGroups';
 import { AlbumArtwork } from '@/components/library/AlbumArtwork';
 import { LibraryEmptyState } from '@/components/library/LibraryEmptyState';
+import { useAuth } from '@/contexts/AuthContext';
 import { usePlayback } from '@/contexts/PlaybackContext';
 import { useAlbumBadgesVisibility } from '@/hooks/use-album-badges';
 import { useToast } from '@/hooks/use-toast';
@@ -66,6 +67,7 @@ export default function LibraryHome() {
   const navigate = useNavigate();
   const location = useLocation();
   const { includeUnmatched, libraryIsEmpty } = useOutletContext<LibraryOutletContext>();
+  const { user } = useAuth();
   const { toast } = useToast();
   const { startPlayback, setCurrentTrack, recommendationSessionId, session } = usePlayback();
   const { showBadges, setShowBadges } = useAlbumBadgesVisibility();
@@ -342,6 +344,17 @@ export default function LibraryHome() {
   }, [discover, recentAlbums, recentlyPlayedAlbums]);
 
   const spotlightArtist = useMemo(() => topArtists[0] || recentArtists[0] || null, [topArtists, recentArtists]);
+  const greetingName = useMemo(() => {
+    const raw = String(user?.username || '').trim();
+    if (!raw) return '';
+    return raw
+      .replace(/[_-]+/g, ' ')
+      .split(/\s+/)
+      .filter(Boolean)
+      .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+      .join(' ');
+  }, [user?.username]);
+  const greetingTitle = greetingName ? `Welcome back, ${greetingName}.` : 'Welcome back.';
 
   const sectionOrderStyle = useCallback((key: HomeSectionKey): { order: number; display?: string } => {
     const idx = visibleSectionOrder.indexOf(key);
@@ -370,10 +383,10 @@ export default function LibraryHome() {
                 </div>
                 <div className="max-w-2xl space-y-3">
                   <h1 className="max-w-xl text-3xl font-semibold tracking-tight text-white sm:text-[3rem]">
-                    Navigate your library like a collection, not a file dump.
+                    {greetingTitle}
                   </h1>
                   <p className="max-w-xl text-sm leading-6 text-white/72 sm:text-[15px]">
-                    PMDA uses your local listening history, ratings, discovery feeds and library metadata to surface what deserves attention next, what slipped past you, and where to dive deeper.
+                    Here&apos;s what deserves a closer listen today.
                   </p>
                 </div>
               </div>

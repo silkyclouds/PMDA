@@ -1303,7 +1303,7 @@ export default function ArtistPage() {
                           </div>
                         </AspectRatio>
                         <CardContent className="p-3 space-y-2">
-                          <h3 className="text-sm font-semibold truncate" title={album.title}>
+                          <h3 className="min-h-[3.6rem] text-sm font-semibold leading-snug line-clamp-3" title={album.title}>
                             {album.title}
                           </h3>
                           {album.classical ? (

@@ -241,11 +241,11 @@ export default function GenrePage() {
         </div>
       </div>
 
-      <Card className="border-border/70">
+      <Card className="pmda-flat-surface overflow-hidden">
         <CardContent className="p-5 space-y-4">
           <div className="flex items-start justify-between gap-4">
             <div className="min-w-0">
-              <h1 className="text-2xl font-bold truncate">{genre || 'Genre'}</h1>
+              <h1 className="text-2xl font-bold leading-tight break-words">{genre || 'Genre'}</h1>
               <p className="text-xs text-muted-foreground mt-1">
                 {(profile?.album_count || total || 0).toLocaleString()} album{(profile?.album_count || total || 0) !== 1 ? 's' : ''}
               </p>
@@ -293,7 +293,7 @@ export default function GenrePage() {
                     <button
                       key={`genre-top-${a.artist_id}`}
                       type="button"
-                      className="inline-flex items-center gap-2 rounded-full border border-border/60 bg-muted/40 px-3 py-1.5 text-[11px] hover:bg-muted transition-colors"
+                      className="inline-flex items-center gap-2 border border-border/60 bg-muted/40 px-3 py-1.5 text-[11px] hover:bg-muted transition-colors"
                       onClick={() => navigate(`/library/artist/${a.artist_id}${location.search || ''}`, { state: withBackLinkState(location) })}
                       title="Open artist"
                     >
@@ -333,7 +333,7 @@ export default function GenrePage() {
       </Card>
 
       {loading && albums.length === 0 ? (
-        <Card className="border-border/70">
+        <Card className="pmda-flat-surface">
           <CardContent className="p-8 text-sm text-muted-foreground">
             <span className="inline-flex items-center gap-2">
               <Loader2 className="w-4 h-4 animate-spin" /> Loading…
@@ -341,7 +341,7 @@ export default function GenrePage() {
           </CardContent>
         </Card>
       ) : albums.length === 0 ? (
-        <Card className="border-border/70">
+        <Card className="pmda-flat-surface">
           <CardContent className="p-8 text-sm text-muted-foreground">No albums found for this genre.</CardContent>
         </Card>
       ) : (
@@ -361,7 +361,7 @@ export default function GenrePage() {
               }}
               title="Open album"
             >
-              <div className="relative overflow-hidden rounded-2xl border border-border/60 bg-card shadow-sm">
+              <div className="pmda-flat-tile relative overflow-hidden">
                 <AspectRatio ratio={1} className="bg-muted">
                   <AlbumArtwork albumThumb={a.thumb} artistId={a.artist_id} alt={a.title} size={320} imageClassName="w-full h-full object-cover" />
                   <div className="absolute inset-0 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity bg-black/25" />
@@ -369,7 +369,7 @@ export default function GenrePage() {
                     <div className="flex items-center justify-between gap-2">
                       <Button
                         size="sm"
-                        className="h-9 rounded-full gap-2"
+                        className="h-9 gap-2"
                         onClick={(e) => {
                           e.preventDefault();
                           e.stopPropagation();
@@ -382,7 +382,7 @@ export default function GenrePage() {
                       <Button
                         size="sm"
                         variant="outline"
-                        className="h-9 rounded-full"
+                        className="h-9"
                         onClick={(e) => {
                           e.preventDefault();
                           e.stopPropagation();

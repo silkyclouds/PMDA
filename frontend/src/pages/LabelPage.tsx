@@ -235,7 +235,7 @@ export default function LabelPage() {
         <CardContent className="p-5 space-y-4">
           <div className="flex items-start justify-between gap-4">
             <div className="min-w-0">
-              <h1 className="text-2xl font-bold truncate">{label || 'Label'}</h1>
+              <h1 className="text-2xl font-bold leading-tight break-words">{label || 'Label'}</h1>
               <p className="text-xs text-muted-foreground mt-1">
                 {(profile?.album_count || total || 0).toLocaleString()} release{(profile?.album_count || total || 0) !== 1 ? 's' : ''}
               </p>
