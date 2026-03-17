@@ -1886,6 +1886,19 @@ export interface SocialUser {
 
 export interface LikedSummaryResponse {
   owner?: SocialUser | null;
+  tracks: Array<{
+    track_id: number;
+    title: string;
+    artist_id: number;
+    artist_name: string;
+    album_id: number;
+    album_title: string;
+    duration_sec: number;
+    track_num?: number;
+    disc_num?: number;
+    thumb?: string | null;
+    updated_at: number;
+  }>;
   albums: LibraryAlbumItem[];
   artists: RecentlyAddedArtistItem[];
   labels: Array<{ label: string; updated_at: number }>;

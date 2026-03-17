@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { Heart, Loader2 } from 'lucide-react';
+import { Heart, Loader2, Music2 } from 'lucide-react';
 import { useLocation, useNavigate } from 'react-router-dom';
 
 import * as api from '@/lib/api';
@@ -82,9 +82,24 @@ export default function LikedPage() {
   }, [location.pathname, location.search, navigate, selectedUserId]);
 
   const albums = useMemo(() => data?.albums || [], [data?.albums]);
+  const tracks = useMemo(() => data?.tracks || [], [data?.tracks]);
   const artists = useMemo(() => data?.artists || [], [data?.artists]);
   const labels = useMemo(() => data?.labels || [], [data?.labels]);
   const suggestions = useMemo(() => data?.recommended_albums || [], [data?.recommended_albums]);
+
+  const formatDuration = (seconds: number) => {
+    const safe = Math.max(0, Math.floor(seconds || 0));
+    const minutes = Math.floor(safe / 60);
+    const secs = safe % 60;
+    return `${minutes}:${secs.toString().padStart(2, '0')}`;
+  };
+
+  const likedTrackHref = (trackId: number, albumId: number) => {
+    const qs = new URLSearchParams(location.search);
+    qs.set('track_id', String(trackId));
+    const search = qs.toString();
+    return `/library/album/${albumId}${search ? `?${search}` : ''}`;
+  };
 
   return (
     <div className="container py-6 space-y-6">
@@ -138,6 +153,49 @@ export default function LikedPage() {
         </Card>
       ) : (
         <>
+          <section className="space-y-3">
+            <div className="flex items-center gap-2">
+              <Music2 className="h-4 w-4 text-primary" />
+              <h2 className="text-lg font-semibold">Liked tracks</h2>
+              <Badge variant="outline" className="text-[10px]">{tracks.length}</Badge>
+            </div>
+            {tracks.length === 0 ? (
+              <Card><CardContent className="p-6 text-sm text-muted-foreground">No liked tracks yet.</CardContent></Card>
+            ) : (
+              <Card className="pmda-flat-surface">
+                <CardContent className="p-0">
+                  <div className="divide-y divide-border/70">
+                    {tracks.map((track) => (
+                      <button
+                        key={`liked-track-${track.track_id}`}
+                        type="button"
+                        className="flex w-full items-center gap-3 px-4 py-3 text-left transition-colors hover:bg-accent/40"
+                        onClick={() => navigate(likedTrackHref(track.track_id, track.album_id), { state: withBackLinkState(location) })}
+                      >
+                        <div className="h-12 w-12 shrink-0 overflow-hidden bg-muted">
+                          {track.thumb ? <img src={track.thumb} alt={track.album_title} className="h-full w-full object-cover" /> : null}
+                        </div>
+                        <div className="min-w-0 flex-1">
+                          <div className="truncate text-sm font-semibold">{track.title}</div>
+                          <div className="truncate text-xs text-muted-foreground">
+                            {track.artist_name} · {track.album_title}
+                          </div>
+                        </div>
+                        <div className="shrink-0 text-right text-[11px] text-muted-foreground">
+                          {track.disc_num && track.disc_num > 1 ? <div>D{track.disc_num}</div> : null}
+                          {track.track_num && track.track_num > 0 ? <div>#{track.track_num}</div> : null}
+                        </div>
+                        <div className="shrink-0 text-xs tabular-nums text-muted-foreground">
+                          {formatDuration(track.duration_sec)}
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                </CardContent>
+              </Card>
+            )}
+          </section>
+
           <section className="space-y-3">
             <div className="flex items-center gap-2">
               <Heart className="h-4 w-4 text-primary" />

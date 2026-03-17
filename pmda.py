@@ -55667,12 +55667,55 @@ def api_library_liked_summary():
     try:
         payload: dict[str, Any] = {
             "owner": target_user or _auth_user_snapshot(target_uid),
+            "tracks": [],
             "albums": [],
             "artists": [],
             "labels": [],
             "recommended_albums": [],
         }
         with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    tr.id,
+                    tr.title,
+                    ar.id,
+                    ar.name,
+                    alb.id,
+                    alb.title,
+                    tr.duration_sec,
+                    tr.track_num,
+                    tr.disc_num,
+                    alb.has_cover,
+                    EXTRACT(EPOCH FROM l.updated_at)::BIGINT
+                FROM files_user_entity_likes l
+                JOIN files_tracks tr ON tr.id = l.entity_id
+                JOIN files_albums alb ON alb.id = tr.album_id
+                JOIN files_artists ar ON ar.id = alb.artist_id
+                WHERE l.user_id = %s AND l.entity_type = 'track' AND l.liked = TRUE
+                ORDER BY l.updated_at DESC, tr.id DESC
+                LIMIT 96
+                """,
+                (int(target_uid),),
+            )
+            for row in cur.fetchall():
+                track_id = int(row[0] or 0)
+                album_id = int(row[4] or 0)
+                payload["tracks"].append(
+                    {
+                        "track_id": track_id,
+                        "title": str(row[1] or "").strip(),
+                        "artist_id": int(row[2] or 0),
+                        "artist_name": str(row[3] or "").strip(),
+                        "album_id": album_id,
+                        "album_title": str(row[5] or "").strip(),
+                        "duration_sec": int(row[6] or 0),
+                        "track_num": int(row[7] or 0),
+                        "disc_num": int(row[8] or 0),
+                        "thumb": f"{base_url}/api/library/files/album/{album_id}/cover?size=320" if bool(row[9]) and album_id > 0 else None,
+                        "updated_at": int(row[10] or 0),
+                    }
+                )
             cur.execute(
                 """
                 SELECT alb.id, alb.title, ar.id, ar.name, alb.year, alb.has_cover,
@@ -55758,11 +55801,22 @@ def api_library_liked_summary():
                     SELECT entity_id
                     FROM files_user_entity_likes
                     WHERE user_id = %s AND entity_type = 'artist' AND liked = TRUE
+                    UNION
+                    SELECT DISTINCT alb.artist_id
+                    FROM files_user_entity_likes ltr
+                    JOIN files_tracks tr ON tr.id = ltr.entity_id
+                    JOIN files_albums alb ON alb.id = tr.album_id
+                    WHERE ltr.user_id = %s AND ltr.entity_type = 'track' AND ltr.liked = TRUE
                 ),
                 liked_albums AS (
                     SELECT entity_id
                     FROM files_user_entity_likes
                     WHERE user_id = %s AND entity_type = 'album' AND liked = TRUE
+                    UNION
+                    SELECT DISTINCT tr.album_id
+                    FROM files_user_entity_likes ltr
+                    JOIN files_tracks tr ON tr.id = ltr.entity_id
+                    WHERE ltr.user_id = %s AND ltr.entity_type = 'track' AND ltr.liked = TRUE
                 )
                 SELECT alb.id, alb.title, ar.id, ar.name, alb.year, alb.has_cover,
                        COALESCE(alb.label, ''), COALESCE(alb.genre, ''), COALESCE(alb.tags_json, '[]'),
@@ -55789,7 +55843,7 @@ def api_library_liked_summary():
                          alb.updated_at DESC
                 LIMIT 24
                 """,
-                (int(target_uid), int(target_uid), int(target_uid), int(target_uid)),
+                (int(target_uid), int(target_uid), int(target_uid), int(target_uid), int(target_uid), int(target_uid)),
             )
             seen_album_ids: set[int] = set()
             for row in cur.fetchall():
