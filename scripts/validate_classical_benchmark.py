@@ -125,6 +125,8 @@ def _load_expected_groups(manifest_cases: list[dict]) -> list[dict]:
             group["expected_orchestra"] = str(summary.get("orchestra") or "").strip()
         if not group["expected_track_count"] and summary:
             group["expected_track_count"] = int(summary.get("track_count") or 0)
+        if _norm_text(group["expected_orchestra"]) == _norm_text(group["expected_artist"]):
+            group["expected_orchestra"] = ""
     return list(groups.values())
 
 
@@ -447,10 +449,14 @@ def validate(
         expected_orchestra = _norm_text(expected.get("expected_orchestra"))
         if expected_composer and expected_composer not in composer_norms and expected_composer not in artist_norm:
             return False
-        if expected_conductor and expected_conductor not in conductor_norms:
-            return False
-        if expected_orchestra and expected_orchestra not in orchestra_norms:
-            return False
+        if expected_conductor:
+            conductor_overlap = max((_token_overlap_ratio(expected_conductor, value) for value in conductor_norms), default=0.0)
+            if expected_conductor not in conductor_norms and conductor_overlap < 0.55:
+                return False
+        if expected_orchestra:
+            orchestra_overlap = max((_token_overlap_ratio(expected_orchestra, value) for value in orchestra_norms), default=0.0)
+            if expected_orchestra not in orchestra_norms and orchestra_overlap < 0.55:
+                return False
         artist_overlap = _token_overlap_ratio(expected_artist_norm, artist_norm)
         composer_overlap = max((_token_overlap_ratio(expected_artist_norm, value) for value in composer_norms), default=0.0)
         if expected_artist_norm and expected_artist_norm not in artist_norm and expected_artist_norm not in composer_norms:

@@ -646,8 +646,8 @@ export default function AlbumPage() {
 
       <Card className="pmda-flat-surface overflow-hidden">
         <div className="relative overflow-hidden">
-          <div className="absolute inset-0 z-10 bg-background/42 backdrop-blur-xl" />
-          <div className="absolute inset-0 z-10 bg-gradient-to-r from-background via-background/92 to-background/70" />
+          <div className="absolute inset-0 z-10 bg-background/34 backdrop-blur-xl" />
+          <div className="absolute inset-0 z-10 bg-gradient-to-r from-white/86 via-white/48 to-white/16 dark:from-background dark:via-background/92 dark:to-background/70" />
           <div className="absolute inset-0 z-10 bg-gradient-to-t from-background/76 via-transparent to-transparent" />
           {data.cover_url ? (
             <img src={data.cover_url} alt={data.title} className="h-[22rem] w-full scale-[1.04] object-cover blur-[1.8px] saturate-[0.92] md:h-[26rem]" />
@@ -690,13 +690,13 @@ export default function AlbumPage() {
                   </Button>
                 </div>
               </button>
-              <div className="min-w-0 border border-white/10 bg-background/58 px-5 py-5 backdrop-blur-md">
-                <h1 className="text-3xl font-bold tracking-tight text-white drop-shadow-[0_2px_10px_rgba(0,0,0,0.7)] md:text-5xl">
+              <div className="min-w-0 border border-border/70 bg-white/52 px-5 py-5 backdrop-blur-md dark:border-white/10 dark:bg-background/58">
+                <h1 className="text-3xl font-bold tracking-tight text-slate-950 drop-shadow-[0_1px_4px_rgba(255,255,255,0.55)] dark:text-white dark:drop-shadow-[0_2px_10px_rgba(0,0,0,0.7)] md:text-5xl">
                   {data.title}
                 </h1>
                 <button
                   type="button"
-                  className="mt-2 truncate text-sm text-white/82 hover:underline"
+                  className="mt-2 truncate text-sm text-slate-800 hover:underline dark:text-white/82"
                   onClick={() => navigate(`/library/artist/${data.artist_id}${location.search || ''}`, { state: withBackLinkState(location) })}
                   title="Open artist"
                 >
@@ -757,7 +757,7 @@ export default function AlbumPage() {
                 </div>
                 {genreBadges.length > 0 ? (
                   <div className="mt-4 space-y-1.5">
-                    <div className="text-[10px] font-medium uppercase tracking-[0.22em] text-white/68">
+                    <div className="text-[10px] font-medium uppercase tracking-[0.22em] text-slate-700 dark:text-white/68">
                       Genres
                     </div>
                     <div className="flex flex-wrap gap-1.5">
@@ -777,39 +777,39 @@ export default function AlbumPage() {
                 {data.classical ? (
                   <div className="mt-4 grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
                     {joinClassical(data.classical.composer, 3) ? (
-                      <div className="border border-white/12 bg-black/26 px-3 py-3">
-                        <div className="text-[10px] font-medium uppercase tracking-[0.2em] text-white/60">Composer</div>
-                        <div className="mt-1 text-sm text-white line-clamp-2">{joinClassical(data.classical.composer, 3)}</div>
+                      <div className="border border-border/70 bg-white/45 px-3 py-3 dark:border-white/12 dark:bg-black/26">
+                        <div className="text-[10px] font-medium uppercase tracking-[0.2em] text-slate-700 dark:text-white/60">Composer</div>
+                        <div className="mt-1 text-sm text-slate-900 line-clamp-2 dark:text-white">{joinClassical(data.classical.composer, 3)}</div>
                       </div>
                     ) : null}
                     {joinClassical(data.classical.work, 3) ? (
-                      <div className="border border-white/12 bg-black/26 px-3 py-3">
-                        <div className="text-[10px] font-medium uppercase tracking-[0.2em] text-white/60">Work</div>
-                        <div className="mt-1 text-sm text-white line-clamp-2">{joinClassical(data.classical.work, 3)}</div>
+                      <div className="border border-border/70 bg-white/45 px-3 py-3 dark:border-white/12 dark:bg-black/26">
+                        <div className="text-[10px] font-medium uppercase tracking-[0.2em] text-slate-700 dark:text-white/60">Work</div>
+                        <div className="mt-1 text-sm text-slate-900 line-clamp-2 dark:text-white">{joinClassical(data.classical.work, 3)}</div>
                       </div>
                     ) : null}
                     {joinClassical(data.classical.conductor, 3) ? (
-                      <div className="border border-white/12 bg-black/26 px-3 py-3">
-                        <div className="text-[10px] font-medium uppercase tracking-[0.2em] text-white/60">Conductor</div>
-                        <div className="mt-1 text-sm text-white line-clamp-2">{joinClassical(data.classical.conductor, 3)}</div>
+                      <div className="border border-border/70 bg-white/45 px-3 py-3 dark:border-white/12 dark:bg-black/26">
+                        <div className="text-[10px] font-medium uppercase tracking-[0.2em] text-slate-700 dark:text-white/60">Conductor</div>
+                        <div className="mt-1 text-sm text-slate-900 line-clamp-2 dark:text-white">{joinClassical(data.classical.conductor, 3)}</div>
                       </div>
                     ) : null}
                     {joinClassical(data.classical.orchestra, 3) ? (
-                      <div className="border border-white/12 bg-black/26 px-3 py-3">
-                        <div className="text-[10px] font-medium uppercase tracking-[0.2em] text-white/60">Orchestra</div>
-                        <div className="mt-1 text-sm text-white line-clamp-2">{joinClassical(data.classical.orchestra, 3)}</div>
+                      <div className="border border-border/70 bg-white/45 px-3 py-3 dark:border-white/12 dark:bg-black/26">
+                        <div className="text-[10px] font-medium uppercase tracking-[0.2em] text-slate-700 dark:text-white/60">Orchestra</div>
+                        <div className="mt-1 text-sm text-slate-900 line-clamp-2 dark:text-white">{joinClassical(data.classical.orchestra, 3)}</div>
                       </div>
                     ) : null}
                     {joinClassical(data.classical.soloists, 3) ? (
-                      <div className="border border-white/12 bg-black/26 px-3 py-3">
-                        <div className="text-[10px] font-medium uppercase tracking-[0.2em] text-white/60">Soloists</div>
-                        <div className="mt-1 text-sm text-white line-clamp-2">{joinClassical(data.classical.soloists, 3)}</div>
+                      <div className="border border-border/70 bg-white/45 px-3 py-3 dark:border-white/12 dark:bg-black/26">
+                        <div className="text-[10px] font-medium uppercase tracking-[0.2em] text-slate-700 dark:text-white/60">Soloists</div>
+                        <div className="mt-1 text-sm text-slate-900 line-clamp-2 dark:text-white">{joinClassical(data.classical.soloists, 3)}</div>
                       </div>
                     ) : null}
                     {joinClassical(data.classical.catalog_numbers, 3) ? (
-                      <div className="border border-white/12 bg-black/26 px-3 py-3">
-                        <div className="text-[10px] font-medium uppercase tracking-[0.2em] text-white/60">Catalog</div>
-                        <div className="mt-1 text-sm text-white line-clamp-2">{joinClassical(data.classical.catalog_numbers, 3)}</div>
+                      <div className="border border-border/70 bg-white/45 px-3 py-3 dark:border-white/12 dark:bg-black/26">
+                        <div className="text-[10px] font-medium uppercase tracking-[0.2em] text-slate-700 dark:text-white/60">Catalog</div>
+                        <div className="mt-1 text-sm text-slate-900 line-clamp-2 dark:text-white">{joinClassical(data.classical.catalog_numbers, 3)}</div>
                       </div>
                     ) : null}
                   </div>

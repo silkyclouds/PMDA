@@ -831,8 +831,8 @@ export default function ArtistPage() {
 
         <Card className="pmda-flat-surface overflow-hidden">
           <div className="relative overflow-hidden">
-            <div className="absolute inset-0 z-10 bg-background/42 backdrop-blur-xl" />
-            <div className="absolute inset-0 z-10 bg-gradient-to-r from-background via-background/92 to-background/70" />
+            <div className="absolute inset-0 z-10 bg-background/34 backdrop-blur-xl" />
+            <div className="absolute inset-0 z-10 bg-gradient-to-r from-white/86 via-white/48 to-white/16 dark:from-background dark:via-background/92 dark:to-background/70" />
             <div className="absolute inset-0 z-10 bg-gradient-to-t from-background/76 via-transparent to-transparent" />
             {heroImage ? (
               <img src={heroImage} alt={details.artist_name} className="w-full h-[24rem] md:h-[30rem] object-cover blur-[1.8px] scale-[1.04]" />
@@ -850,11 +850,11 @@ export default function ArtistPage() {
                     </div>
                   )}
                 </div>
-                <div className="min-w-0 md:pl-2 border border-white/10 bg-background/58 px-5 py-5 backdrop-blur-md">
-                  <h1 className="text-2xl sm:text-3xl md:text-5xl font-bold tracking-tight leading-tight text-white drop-shadow-[0_2px_10px_rgba(0,0,0,0.55)]">
+                <div className="min-w-0 md:pl-2 border border-border/70 bg-white/52 px-5 py-5 backdrop-blur-md dark:border-white/10 dark:bg-background/58">
+                  <h1 className="text-2xl sm:text-3xl md:text-5xl font-bold tracking-tight leading-tight text-slate-950 drop-shadow-[0_1px_4px_rgba(255,255,255,0.55)] dark:text-white dark:drop-shadow-[0_2px_10px_rgba(0,0,0,0.55)]">
                     {details.artist_name}
                   </h1>
-                  <p className="text-base text-white/82 mt-1.5">
+                  <p className="mt-1.5 text-base text-slate-800 dark:text-white/82">
                     {details.total_albums.toLocaleString()} album{details.total_albums !== 1 ? 's' : ''}
                   </p>
                   {tags.length > 0 && (
