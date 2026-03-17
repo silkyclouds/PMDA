@@ -10494,6 +10494,9 @@ def _files_pg_init_schema() -> bool:
                     id BIGSERIAL PRIMARY KEY,
                     name TEXT NOT NULL,
                     name_norm TEXT NOT NULL UNIQUE,
+                    entity_kind TEXT NOT NULL DEFAULT 'artist',
+                    roles_json TEXT NOT NULL DEFAULT '[]',
+                    aliases_json TEXT NOT NULL DEFAULT '[]',
                     album_count INTEGER NOT NULL DEFAULT 0,
                     track_count INTEGER NOT NULL DEFAULT 0,
                     broken_albums_count INTEGER NOT NULL DEFAULT 0,
@@ -10503,6 +10506,15 @@ def _files_pg_init_schema() -> bool:
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
             """)
+            for col_name, col_sql in [
+                ("entity_kind", "TEXT NOT NULL DEFAULT 'artist'"),
+                ("roles_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("aliases_json", "TEXT NOT NULL DEFAULT '[]'"),
+            ]:
+                try:
+                    cur.execute(f"ALTER TABLE files_artists ADD COLUMN IF NOT EXISTS {col_name} {col_sql}")
+                except Exception:
+                    pass
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS files_albums (
                     id BIGSERIAL PRIMARY KEY,
@@ -10540,6 +10552,17 @@ def _files_pg_init_schema() -> bool:
                     primary_tags_json TEXT NOT NULL DEFAULT '{}',
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS files_artist_album_links (
+                    artist_id BIGINT NOT NULL REFERENCES files_artists(id) ON DELETE CASCADE,
+                    album_id BIGINT NOT NULL REFERENCES files_albums(id) ON DELETE CASCADE,
+                    role TEXT NOT NULL DEFAULT 'artist',
+                    is_primary BOOLEAN NOT NULL DEFAULT FALSE,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (artist_id, album_id, role)
                 )
             """)
             # Backward-compatible schema evolution for files_albums.
@@ -10967,7 +10990,10 @@ def _files_pg_init_schema() -> bool:
                 )
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_files_artists_name ON files_artists(name)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_files_artists_entity_kind ON files_artists(entity_kind)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_files_albums_artist_id ON files_albums(artist_id)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_files_artist_album_links_artist ON files_artist_album_links(artist_id, role, album_id)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_files_artist_album_links_album ON files_artist_album_links(album_id, artist_id)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_files_albums_title ON files_albums(title)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_files_albums_title_norm ON files_albums(title_norm)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_files_albums_genre ON files_albums(genre)")
@@ -14030,7 +14056,7 @@ def _rebuild_files_library_index_for_artist(
                             cur.execute(
                                 """
                                 DELETE FROM files_artists
-                                WHERE id NOT IN (SELECT DISTINCT artist_id FROM files_albums)
+                                WHERE id NOT IN (SELECT DISTINCT artist_id FROM files_artist_album_links)
                                 """
                             )
                             _files_index_write_meta(cur, "last_reason", reason)
@@ -14065,6 +14091,17 @@ def _rebuild_files_library_index_for_artist(
                 "source": "published_rows_artist_cleanup",
             }
 
+        _apply_genre_defaults_to_albums_payload(albums_payload)
+        artists_map, album_links_by_folder = _build_files_browse_artist_entities(artists_map, albums_payload)
+        for album in albums_payload:
+            folder_key = str(album.get("folder_path") or "").strip()
+            primary_link = next(
+                (link for link in (album_links_by_folder.get(folder_key) or []) if bool(link.get("is_primary"))),
+                None,
+            )
+            if primary_link and str(primary_link.get("artist_norm") or "").strip():
+                album["artist_norm"] = str(primary_link.get("artist_norm") or "").strip()
+
         _files_index_set_state(phase="media_prepare")
         covers_promoted, artists_promoted = _promote_files_media_paths_to_cache(artists_map, albums_payload)
 
@@ -14080,6 +14117,9 @@ def _rebuild_files_library_index_for_artist(
                         (
                             data["name"],
                             norm,
+                            str(data.get("entity_kind") or "artist"),
+                            str(data.get("roles_json") or "[]"),
+                            str(data.get("aliases_json") or "[]"),
                             bool(data.get("has_image")),
                             data.get("image_path") or "",
                         )
@@ -14088,10 +14128,13 @@ def _rebuild_files_library_index_for_artist(
                     if artist_rows:
                         cur.executemany(
                             """
-                            INSERT INTO files_artists (name, name_norm, has_image, image_path, created_at, updated_at)
-                            VALUES (%s, %s, %s, %s, NOW(), NOW())
+                            INSERT INTO files_artists (name, name_norm, entity_kind, roles_json, aliases_json, has_image, image_path, created_at, updated_at)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
                             ON CONFLICT (name_norm) DO UPDATE SET
                                 name = EXCLUDED.name,
+                                entity_kind = EXCLUDED.entity_kind,
+                                roles_json = EXCLUDED.roles_json,
+                                aliases_json = EXCLUDED.aliases_json,
                                 has_image = EXCLUDED.has_image,
                                 image_path = CASE
                                     WHEN EXCLUDED.image_path IS NULL OR EXCLUDED.image_path = '' THEN files_artists.image_path
@@ -14101,6 +14144,7 @@ def _rebuild_files_library_index_for_artist(
                             """,
                             artist_rows,
                         )
+                    _files_promote_artist_alias_cache(conn, artists_map)
                     artist_norms = [norm for norm in artists_map.keys()]
                     cur.execute(
                         "SELECT id, name_norm FROM files_artists WHERE name_norm = ANY(%s)",
@@ -14109,7 +14153,17 @@ def _rebuild_files_library_index_for_artist(
                     artist_id_by_norm = {str(r[1]): int(r[0]) for r in cur.fetchall()}
                     target_artist_ids = sorted({aid for aid in artist_id_by_norm.values() if aid > 0})
                     if target_artist_ids:
-                        cur.execute("DELETE FROM files_albums WHERE artist_id = ANY(%s)", (target_artist_ids,))
+                        cur.execute(
+                            """
+                            DELETE FROM files_albums
+                            WHERE id IN (
+                                SELECT DISTINCT album_id
+                                FROM files_artist_album_links
+                                WHERE artist_id = ANY(%s)
+                            )
+                            """,
+                            (target_artist_ids,),
+                        )
 
                     album_rows = []
                     for album in albums_payload:
@@ -14217,6 +14271,30 @@ def _rebuild_files_library_index_for_artist(
                     )
                     album_id_by_folder = {str(r[1]): int(r[0]) for r in cur.fetchall()}
                     album_ids_written = sorted({aid for aid in album_id_by_folder.values() if aid > 0})
+                    if album_ids_written:
+                        cur.execute("DELETE FROM files_artist_album_links WHERE album_id = ANY(%s)", (album_ids_written,))
+                    link_rows: list[tuple[int, int, str, bool]] = []
+                    for album in albums_payload:
+                        album_id = album_id_by_folder.get(str(album.get("folder_path") or "").strip())
+                        if not album_id:
+                            continue
+                        for link in (album_links_by_folder.get(str(album.get("folder_path") or "").strip()) or []):
+                            link_artist_id = artist_id_by_norm.get(str(link.get("artist_norm") or "").strip())
+                            if not link_artist_id:
+                                continue
+                            role = str(link.get("role") or "artist").strip().lower() or "artist"
+                            link_rows.append((int(link_artist_id), int(album_id), role, bool(link.get("is_primary"))))
+                    if link_rows:
+                        cur.executemany(
+                            """
+                            INSERT INTO files_artist_album_links (artist_id, album_id, role, is_primary, created_at, updated_at)
+                            VALUES (%s, %s, %s, %s, NOW(), NOW())
+                            ON CONFLICT (artist_id, album_id, role) DO UPDATE
+                            SET is_primary = EXCLUDED.is_primary,
+                                updated_at = NOW()
+                            """,
+                            link_rows,
+                        )
 
                     for album in albums_payload:
                         album_id = album_id_by_folder.get(str(album.get("folder_path") or ""))
@@ -14291,8 +14369,16 @@ def _rebuild_files_library_index_for_artist(
                                     COUNT(*) AS album_count,
                                     COALESCE(SUM(track_count), 0) AS track_count,
                                     COALESCE(SUM(CASE WHEN is_broken THEN 1 ELSE 0 END), 0) AS broken_albums_count
-                                FROM files_albums
-                                WHERE artist_id = ANY(%s)
+                                FROM (
+                                    SELECT DISTINCT
+                                        link.artist_id,
+                                        link.album_id,
+                                        alb.track_count,
+                                        alb.is_broken
+                                    FROM files_artist_album_links link
+                                    JOIN files_albums alb ON alb.id = link.album_id
+                                    WHERE link.artist_id = ANY(%s)
+                                ) artist_album_rollup
                                 GROUP BY artist_id
                             ) s
                             WHERE a.id = s.artist_id
@@ -14303,7 +14389,7 @@ def _rebuild_files_library_index_for_artist(
                             """
                             DELETE FROM files_artists
                             WHERE id = ANY(%s)
-                              AND id NOT IN (SELECT DISTINCT artist_id FROM files_albums)
+                              AND id NOT IN (SELECT DISTINCT artist_id FROM files_artist_album_links)
                             """,
                             (target_artist_ids,),
                         )
@@ -14315,6 +14401,9 @@ def _rebuild_files_library_index_for_artist(
         finally:
             conn.close()
 
+        _files_index_set_state(phase="artist_enrichment")
+        _files_enrich_artists_blocking(artists_map)
+        artists_map = _files_refresh_artist_media_map_from_db(artists_map)
         _files_index_set_state(phase="media_cache")
         covers_cached, artists_cached = _precache_files_media_assets(artists_map, albums_payload)
         _files_cache_invalidate_all()
@@ -14596,6 +14685,12 @@ def _rebuild_files_library_index(reason: str = "manual", wait_if_running: bool =
         # Fill missing genres from dominant artist genres (when available), and keep
         # missing-required tags aligned with non-blocking genre behavior.
         _apply_genre_defaults_to_albums_payload(albums_payload)
+        artists_map, album_links_by_folder = _build_files_browse_artist_entities(artists_map, albums_payload)
+        for album in albums_payload:
+            folder_key = str(album.get("folder_path") or "").strip()
+            primary_link = next((link for link in (album_links_by_folder.get(folder_key) or []) if bool(link.get("is_primary"))), None)
+            if primary_link and str(primary_link.get("artist_norm") or "").strip():
+                album["artist_norm"] = str(primary_link.get("artist_norm") or "").strip()
 
         _files_index_set_state(phase="media_prepare")
         covers_promoted, artists_promoted = _promote_files_media_paths_to_cache(artists_map, albums_payload)
@@ -14608,7 +14703,7 @@ def _rebuild_files_library_index(reason: str = "manual", wait_if_running: bool =
         try:
             with conn.transaction():
                 with conn.cursor() as cur:
-                    cur.execute("TRUNCATE TABLE files_tracks, files_albums, files_artists RESTART IDENTITY CASCADE")
+                    cur.execute("TRUNCATE TABLE files_tracks, files_artist_album_links, files_albums, files_artists RESTART IDENTITY CASCADE")
                     ext_artist_images: dict[str, str] = {}
                     try:
                         norms = list(artists_map.keys())
@@ -14632,6 +14727,9 @@ def _rebuild_files_library_index(reason: str = "manual", wait_if_running: bool =
                         (
                             data["name"],
                             norm,
+                            str(data.get("entity_kind") or "artist"),
+                            str(data.get("roles_json") or "[]"),
+                            str(data.get("aliases_json") or "[]"),
                             bool(data["has_image"]) or bool(ext_artist_images.get(norm)),
                             (data.get("image_path") or "").strip() or ext_artist_images.get(norm) or "",
                         )
@@ -14640,11 +14738,12 @@ def _rebuild_files_library_index(reason: str = "manual", wait_if_running: bool =
                     if artist_rows:
                         cur.executemany(
                             """
-                            INSERT INTO files_artists (name, name_norm, has_image, image_path, created_at, updated_at)
-                            VALUES (%s, %s, %s, %s, NOW(), NOW())
+                            INSERT INTO files_artists (name, name_norm, entity_kind, roles_json, aliases_json, has_image, image_path, created_at, updated_at)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
                             """,
                             artist_rows,
                         )
+                    _files_promote_artist_alias_cache(conn, artists_map)
                     cur.execute("SELECT id, name_norm FROM files_artists")
                     artist_id_by_norm = {str(r[1]): int(r[0]) for r in cur.fetchall()}
 
@@ -14715,6 +14814,28 @@ def _rebuild_files_library_index(reason: str = "manual", wait_if_running: bool =
                         )
                     cur.execute("SELECT id, folder_path FROM files_albums")
                     album_id_by_folder = {str(r[1]): int(r[0]) for r in cur.fetchall()}
+                    link_rows: list[tuple[int, int, str, bool]] = []
+                    for album in albums_payload:
+                        album_id = album_id_by_folder.get(str(album.get("folder_path") or ""))
+                        if not album_id:
+                            continue
+                        for link in (album_links_by_folder.get(str(album.get("folder_path") or "").strip()) or []):
+                            artist_id = artist_id_by_norm.get(str(link.get("artist_norm") or "").strip())
+                            if not artist_id:
+                                continue
+                            role = str(link.get("role") or "artist").strip().lower() or "artist"
+                            link_rows.append((artist_id, int(album_id), role, bool(link.get("is_primary"))))
+                    if link_rows:
+                        cur.executemany(
+                            """
+                            INSERT INTO files_artist_album_links(artist_id, album_id, role, is_primary, created_at, updated_at)
+                            VALUES (%s, %s, %s, %s, NOW(), NOW())
+                            ON CONFLICT (artist_id, album_id, role) DO UPDATE
+                            SET is_primary = EXCLUDED.is_primary,
+                                updated_at = NOW()
+                            """,
+                            link_rows,
+                        )
 
                     total_tracks = 0
                     for album in albums_payload:
@@ -14789,7 +14910,15 @@ def _rebuild_files_library_index(reason: str = "manual", wait_if_running: bool =
                                 COUNT(*) AS album_count,
                                 COALESCE(SUM(track_count), 0) AS track_count,
                                 COALESCE(SUM(CASE WHEN is_broken THEN 1 ELSE 0 END), 0) AS broken_albums_count
-                            FROM files_albums
+                            FROM (
+                                SELECT DISTINCT
+                                    link.artist_id,
+                                    link.album_id,
+                                    alb.track_count,
+                                    alb.is_broken
+                                FROM files_artist_album_links link
+                                JOIN files_albums alb ON alb.id = link.album_id
+                            ) artist_album_rollup
                             GROUP BY artist_id
                         ) s
                         WHERE a.id = s.artist_id
@@ -14807,6 +14936,9 @@ def _rebuild_files_library_index(reason: str = "manual", wait_if_running: bool =
         finally:
             conn.close()
 
+        _files_index_set_state(phase="artist_enrichment")
+        _files_enrich_artists_blocking(artists_map)
+        artists_map = _files_refresh_artist_media_map_from_db(artists_map)
         _files_index_set_state(phase="media_cache")
         covers_cached, artists_cached = _precache_files_media_assets(artists_map, albums_payload)
         _files_cache_invalidate_all()
@@ -15802,6 +15934,350 @@ def _files_attach_similar_artist_refs(conn, similar_artists: list, base_url: str
     return out
 
 
+def _files_promote_artist_alias_cache(conn, artists_map: dict[str, dict[str, Any]]) -> None:
+    if not artists_map:
+        return
+    for artist_norm, payload in artists_map.items():
+        canonical_norm = str(artist_norm or "").strip()
+        if not canonical_norm:
+            continue
+        aliases_raw = _safe_json_load((payload or {}).get("aliases_json") or "[]", fallback=[])
+        alias_norms = [
+            _norm_artist_key(alias)
+            for alias in (aliases_raw if isinstance(aliases_raw, list) else [])
+            if _norm_artist_key(alias)
+        ]
+        alias_norms = [value for value in alias_norms if value and value != canonical_norm]
+        if not alias_norms:
+            continue
+
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT COALESCE(bio, ''), COALESCE(short_bio, ''), COALESCE(tags_json, '[]'), COALESCE(similar_json, '[]'), COALESCE(source, ''), updated_at
+                FROM files_artist_profiles
+                WHERE name_norm = %s
+                LIMIT 1
+                """,
+                (canonical_norm,),
+            )
+            current_profile_row = cur.fetchone()
+            current_bio = str((current_profile_row[0] if current_profile_row else "") or "").strip()
+            current_short = str((current_profile_row[1] if current_profile_row else "") or "").strip()
+            needs_profile = _is_garbage_bio(current_bio) and _is_garbage_bio(current_short)
+            if needs_profile:
+                cur.execute(
+                    """
+                    SELECT name_norm, artist_name, bio, short_bio, tags_json, similar_json, source, updated_at
+                    FROM files_artist_profiles
+                    WHERE name_norm = ANY(%s)
+                    ORDER BY updated_at DESC NULLS LAST
+                    """,
+                    (alias_norms,),
+                )
+                best_profile: Optional[tuple[Any, ...]] = None
+                best_score = -1
+                for row in cur.fetchall():
+                    bio = str(row[2] or "").strip()
+                    short_bio = str(row[3] or "").strip()
+                    score = 0
+                    if bio and not _is_garbage_bio(bio):
+                        score += max(10, _word_count(bio))
+                    if short_bio and not _is_garbage_bio(short_bio):
+                        score += max(6, _word_count(short_bio))
+                    if score > best_score:
+                        best_profile = row
+                        best_score = score
+                if best_profile and best_score > 0:
+                    _files_upsert_artist_profile(
+                        conn,
+                        canonical_norm,
+                        str((payload or {}).get("name") or best_profile[1] or "").strip(),
+                        {
+                            "bio": str(best_profile[2] or "").strip(),
+                            "short_bio": str(best_profile[3] or "").strip(),
+                            "tags": _safe_json_load(best_profile[4] or "[]", fallback=[]),
+                            "similar": _safe_json_load(best_profile[5] or "[]", fallback=[]),
+                            "source": str(best_profile[6] or "").strip(),
+                        },
+                    )
+
+            cur.execute(
+                """
+                SELECT COALESCE(image_path, ''), COALESCE(image_url, ''), COALESCE(provider, ''), updated_at
+                FROM files_external_artist_images
+                WHERE name_norm = %s
+                LIMIT 1
+                """,
+                (canonical_norm,),
+            )
+            current_ext_row = cur.fetchone()
+            current_ext_path = str((current_ext_row[0] if current_ext_row else "") or "").strip()
+            current_has_ext = bool(current_ext_path and _existing_file_path(current_ext_path))
+            if not current_has_ext:
+                cur.execute(
+                    """
+                    SELECT name_norm, artist_name, provider, COALESCE(image_path, ''), COALESCE(image_url, ''), updated_at
+                    FROM files_external_artist_images
+                    WHERE name_norm = ANY(%s)
+                    ORDER BY updated_at DESC NULLS LAST
+                    """,
+                    (alias_norms,),
+                )
+                for alias_row in cur.fetchall():
+                    candidate_path = str(alias_row[3] or "").strip()
+                    if candidate_path and _existing_file_path(candidate_path):
+                        _files_upsert_external_artist_image(
+                            conn,
+                            name_norm=canonical_norm,
+                            artist_name=str((payload or {}).get("name") or alias_row[1] or "").strip(),
+                            provider=str(alias_row[2] or "").strip(),
+                            image_path=candidate_path,
+                            image_url=str(alias_row[4] or "").strip() or None,
+                        )
+                        break
+
+
+def _files_refresh_artist_media_map_from_db(artists_map: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    if not artists_map:
+        return {}
+    norms = [str(norm or "").strip() for norm in artists_map.keys() if str(norm or "").strip()]
+    if not norms:
+        return artists_map
+    conn = _files_pg_connect()
+    if conn is None:
+        return artists_map
+    try:
+        artist_rows: dict[str, tuple[str, bool, str]] = {}
+        ext_rows: dict[str, str] = {}
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT name_norm, COALESCE(name, ''), has_image, COALESCE(image_path, '')
+                FROM files_artists
+                WHERE name_norm = ANY(%s)
+                """,
+                (norms,),
+            )
+            for name_norm, name, has_image, image_path in cur.fetchall():
+                artist_rows[str(name_norm or "").strip()] = (
+                    str(name or "").strip(),
+                    bool(has_image),
+                    str(image_path or "").strip(),
+                )
+            cur.execute(
+                """
+                SELECT name_norm, COALESCE(image_path, '')
+                FROM files_external_artist_images
+                WHERE name_norm = ANY(%s)
+                """,
+                (norms,),
+            )
+            for name_norm, image_path in cur.fetchall():
+                ext_rows[str(name_norm or "").strip()] = str(image_path or "").strip()
+        refreshed: dict[str, dict[str, Any]] = {}
+        for norm, payload in artists_map.items():
+            key = str(norm or "").strip()
+            current = dict(payload or {})
+            row = artist_rows.get(key)
+            if row:
+                current["name"] = _choose_preferred_identity_display(str(current.get("name") or ""), row[0])
+                current["has_image"] = bool(row[1])
+                current["image_path"] = row[2]
+            if (not current.get("has_image")) and ext_rows.get(key):
+                current["has_image"] = True
+                current["image_path"] = ext_rows.get(key) or ""
+            refreshed[key] = current
+        return refreshed
+    except Exception:
+        return artists_map
+    finally:
+        conn.close()
+
+
+def _files_build_local_artist_profile(
+    conn,
+    *,
+    artist_id: int,
+    artist_name: str,
+    artist_norm: str,
+    entity_kind: str = "artist",
+    roles_json: str = "[]",
+) -> dict[str, Any]:
+    roles = _safe_json_load(roles_json or "[]", fallback=[])
+    if not isinstance(roles, list):
+        roles = []
+    role_set = [str(role or "").strip().lower() for role in roles if str(role or "").strip()]
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT DISTINCT
+                alb.id,
+                COALESCE(alb.title, ''),
+                COALESCE(alb.year, 0),
+                COALESCE(alb.label, ''),
+                COALESCE(alb.genre, ''),
+                COALESCE(alb.tags_json, '[]')
+            FROM files_artist_album_links link
+            JOIN files_albums alb ON alb.id = link.album_id
+            WHERE link.artist_id = %s
+            ORDER BY COALESCE(alb.year, 0) DESC, alb.title ASC
+            LIMIT 18
+            """,
+            (int(artist_id),),
+        )
+        rows = cur.fetchall()
+        cur.execute(
+            "SELECT COUNT(DISTINCT album_id) FROM files_artist_album_links WHERE artist_id = %s",
+            (int(artist_id),),
+        )
+        album_count = int((cur.fetchone() or [0])[0] or 0)
+    years = [int(r[2] or 0) for r in rows if int(r[2] or 0) > 0]
+    top_titles = [str(r[1] or "").strip() for r in rows if str(r[1] or "").strip()][:3]
+    label_counts: dict[str, int] = {}
+    genre_counts: dict[str, int] = {}
+    for _album_id, _title, _year, label, genre, tags_json in rows:
+        label_clean = re.sub(r"\s+", " ", str(label or "").strip())
+        if label_clean:
+            label_counts[label_clean] = label_counts.get(label_clean, 0) + 1
+        try:
+            tags = json.loads(tags_json or "[]") if tags_json else []
+        except Exception:
+            tags = []
+        values: list[str] = []
+        if isinstance(tags, list):
+            values.extend([str(v or "").strip() for v in tags if str(v or "").strip()])
+        if not values and str(genre or "").strip():
+            values.extend(_split_genre_values(str(genre or "")))
+        for value in values:
+            clean = re.sub(r"\s+", " ", str(value or "").strip())
+            if clean:
+                genre_counts[clean] = genre_counts.get(clean, 0) + 1
+    top_labels = [name for name, _ in sorted(label_counts.items(), key=lambda item: (-item[1], item[0].lower()))[:3]]
+    top_genres = [name for name, _ in sorted(genre_counts.items(), key=lambda item: (-item[1], item[0].lower()))[:5]]
+    role_phrase = {
+        "composer": "appears in your library as a composer",
+        "conductor": "appears in your library as a conductor",
+        "orchestra": "appears in your library as an orchestra",
+        "ensemble": "appears in your library as an ensemble",
+        "soloist": "appears in your library as a soloist",
+        "performer": "appears in your library as a performer",
+        "artist": "appears in your library as an artist",
+    }.get(entity_kind or "artist", "appears in your library")
+    year_phrase = ""
+    if years:
+        min_year = min(years)
+        max_year = max(years)
+        year_phrase = f" spanning {min_year}" if min_year == max_year else f" spanning {min_year} to {max_year}"
+    title_phrase = ""
+    if top_titles:
+        if len(top_titles) == 1:
+            title_phrase = f" Notable recording: {top_titles[0]}."
+        else:
+            title_phrase = " Notable recordings: " + ", ".join(top_titles[:3]) + "."
+    label_phrase = f" Common labels here: {', '.join(top_labels)}." if top_labels else ""
+    genre_phrase = f" Library cues: {', '.join(top_genres)}." if top_genres else ""
+    role_tags = [role.replace("_", " ") for role in role_set if role]
+    bio = (
+        f"{artist_name} {role_phrase} on {album_count} album(s){year_phrase}."
+        f"{' Roles seen: ' + ', '.join(role_tags[:4]) + '.' if role_tags else ''}"
+        f"{title_phrase}{label_phrase}{genre_phrase}"
+    ).strip()
+    short_bio = f"{artist_name} {role_phrase} on {album_count} album(s).".strip()
+    return {
+        "bio": bio,
+        "short_bio": short_bio,
+        "tags": top_genres[:8],
+        "similar": [],
+        "source": "pmda-local",
+    }
+
+
+def _files_ensure_local_artist_profile(conn, *, artist_id: int, artist_name: str, artist_norm: str, entity_kind: str = "artist", roles_json: str = "[]") -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT COALESCE(bio, ''), COALESCE(short_bio, '')
+            FROM files_artist_profiles
+            WHERE name_norm = %s
+            LIMIT 1
+            """,
+            (artist_norm,),
+        )
+        row = cur.fetchone()
+    bio = str((row[0] if row else "") or "").strip()
+    short_bio = str((row[1] if row else "") or "").strip()
+    if not (_is_garbage_bio(bio) and _is_garbage_bio(short_bio)):
+        return
+    fallback = _files_build_local_artist_profile(
+        conn,
+        artist_id=int(artist_id or 0),
+        artist_name=artist_name,
+        artist_norm=artist_norm,
+        entity_kind=entity_kind,
+        roles_json=roles_json,
+    )
+    if _word_count(str(fallback.get("bio") or "")) > 4:
+        _files_upsert_artist_profile(conn, artist_norm, artist_name, fallback)
+
+
+def _files_enrich_artists_blocking(artists_map: dict[str, dict[str, Any]]) -> None:
+    if not artists_map:
+        return
+    for artist_norm, payload in artists_map.items():
+        name = str((payload or {}).get("name") or "").strip()
+        if not artist_norm or not name:
+            continue
+        try:
+            conn = _files_pg_connect()
+            if conn is None:
+                continue
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT a.id, COALESCE(a.entity_kind, 'artist'), COALESCE(a.roles_json, '[]'), COALESCE(prof.bio, ''), COALESCE(prof.short_bio, ''), COALESCE(ext.image_path, '')
+                        FROM files_artists a
+                        LEFT JOIN files_artist_profiles prof ON prof.name_norm = a.name_norm
+                        LEFT JOIN files_external_artist_images ext ON ext.name_norm = a.name_norm
+                        WHERE a.name_norm = %s
+                        LIMIT 1
+                        """,
+                        (artist_norm,),
+                    )
+                    prow = cur.fetchone()
+                artist_id = int(prow[0] or 0) if prow else 0
+                entity_kind = str((prow[1] if prow else "artist") or "artist")
+                roles_json = str((prow[2] if prow else "[]") or "[]")
+                bio = str((prow[3] if prow else "") or "").strip()
+                short_bio = str((prow[4] if prow else "") or "").strip()
+                ext_path = str((prow[5] if prow else "") or "").strip()
+                local_has_image = bool((payload or {}).get("has_image")) and bool(str((payload or {}).get("image_path") or "").strip())
+                has_profile = not (_is_garbage_bio(bio) and _is_garbage_bio(short_bio))
+                has_external_image = bool(ext_path and _existing_file_path(ext_path))
+                if not (has_profile and (local_has_image or has_external_image)):
+                    _run_files_profile_enrichment_job(
+                        job_key=f"publish:{artist_norm}",
+                        artist_name=name,
+                        artist_norm=artist_norm,
+                        albums=[],
+                        skip_album_profiles=True,
+                    )
+                if artist_id > 0:
+                    _files_ensure_local_artist_profile(
+                        conn,
+                        artist_id=artist_id,
+                        artist_name=name,
+                        artist_norm=artist_norm,
+                        entity_kind=entity_kind,
+                        roles_json=roles_json,
+                    )
+            finally:
+                conn.close()
+        except Exception:
+            logging.debug("Blocking artist enrichment failed for %s", name, exc_info=True)
+
+
 def _files_similar_artists_by_genre(conn, artist_id: int, *, limit: int = 20) -> list[dict]:
     """
     Local fallback: suggest similar artists from the local library by overlapping inferred genres.
@@ -15816,9 +16292,10 @@ def _files_similar_artists_by_genre(conn, artist_id: int, *, limit: int = 20) ->
             cur.execute(
                 """
                 SELECT LOWER(TRIM(g.value)) AS g, COUNT(DISTINCT alb.id) AS c
-                FROM files_albums alb
+                FROM files_artist_album_links link
+                JOIN files_albums alb ON alb.id = link.album_id
                 CROSS JOIN LATERAL jsonb_array_elements_text(COALESCE(alb.tags_json, '[]')::jsonb) AS g(value)
-                WHERE alb.artist_id = %s
+                WHERE link.artist_id = %s
                   AND COALESCE(TRIM(g.value), '') <> ''
                 GROUP BY LOWER(TRIM(g.value))
                 ORDER BY COUNT(DISTINCT alb.id) DESC, g ASC
@@ -15838,7 +16315,8 @@ def _files_similar_artists_by_genre(conn, artist_id: int, *, limit: int = 20) ->
                     COUNT(DISTINCT LOWER(TRIM(g.value))) AS score,
                     ARRAY_AGG(DISTINCT LOWER(TRIM(g.value))) AS matched_genres
                 FROM files_artists a
-                JOIN files_albums alb ON alb.artist_id = a.id
+                JOIN files_artist_album_links link ON link.artist_id = a.id
+                JOIN files_albums alb ON alb.id = link.album_id
                 CROSS JOIN LATERAL jsonb_array_elements_text(COALESCE(alb.tags_json, '[]')::jsonb) AS g(value)
                 WHERE a.id <> %s
                   AND COALESCE(TRIM(g.value), '') <> ''
@@ -17556,9 +18034,14 @@ def _assistant_ingest_artist_rag(conn, artist_id: int) -> dict:
 
         cur.execute(
             """
-            SELECT id, title, title_norm, COALESCE(year, 0) AS year, track_count, COALESCE(format, ''), is_lossless, has_cover
-            FROM files_albums
-            WHERE artist_id = %s
+            WITH artist_albums AS (
+                SELECT DISTINCT album_id
+                FROM files_artist_album_links
+                WHERE artist_id = %s
+            )
+            SELECT alb.id, alb.title, alb.title_norm, COALESCE(alb.year, 0) AS year, alb.track_count, COALESCE(alb.format, ''), alb.is_lossless, alb.has_cover
+            FROM artist_albums aa
+            JOIN files_albums alb ON alb.id = aa.album_id
             ORDER BY COALESCE(year, 0) DESC, title ASC
             LIMIT 160
             """,
@@ -17573,15 +18056,17 @@ def _assistant_ingest_artist_rag(conn, artist_id: int) -> dict:
                 WITH genre_tokens AS (
                     SELECT
                         LOWER(TRIM(g.value)) AS genre
-                    FROM files_albums alb
+                    FROM files_artist_album_links link
+                    JOIN files_albums alb ON alb.id = link.album_id
                     CROSS JOIN LATERAL jsonb_array_elements_text(COALESCE(alb.tags_json, '[]')::jsonb) AS g(value)
-                    WHERE alb.artist_id = %s
+                    WHERE link.artist_id = %s
                       AND COALESCE(TRIM(g.value), '') <> ''
                     UNION ALL
                     SELECT
                         LOWER(TRIM(alb.genre)) AS genre
-                    FROM files_albums alb
-                    WHERE alb.artist_id = %s
+                    FROM files_artist_album_links link
+                    JOIN files_albums alb ON alb.id = link.album_id
+                    WHERE link.artist_id = %s
                       AND COALESCE(TRIM(alb.genre), '') <> ''
                       AND COALESCE(alb.tags_json, '[]') = '[]'
                 )
@@ -18837,9 +19322,14 @@ def _assistant_tool_artist_list_albums(conn, *, artist_id: int, limit: int = 80)
         artist_name = str((row[0] if row else "") or "").strip()
         cur.execute(
             """
-            SELECT id, title, COALESCE(year, 0) AS year, track_count, COALESCE(format, '') AS fmt, is_lossless, has_cover
-            FROM files_albums
-            WHERE artist_id = %s
+            WITH artist_albums AS (
+                SELECT DISTINCT album_id
+                FROM files_artist_album_links
+                WHERE artist_id = %s
+            )
+            SELECT alb.id, alb.title, COALESCE(alb.year, 0) AS year, alb.track_count, COALESCE(alb.format, '') AS fmt, alb.is_lossless, alb.has_cover
+            FROM artist_albums aa
+            JOIN files_albums alb ON alb.id = aa.album_id
             ORDER BY COALESCE(year, 0) DESC, title ASC
             LIMIT %s
             """,
@@ -18953,9 +19443,16 @@ def _assistant_playlist_candidate_tracks(
             LIMIT %s
         """
         params: list[Any] = [uid]
-        sql = select_sql + play_sql + profile_sql
+        extra_join_sql = ""
+        sql = select_sql
         if artist_id > 0:
-            sql += " WHERE alb.artist_id = %s "
+            extra_join_sql = """
+                JOIN (SELECT DISTINCT artist_id, album_id FROM files_artist_album_links) link_filter
+                  ON link_filter.album_id = alb.id
+            """
+        sql += extra_join_sql + play_sql + profile_sql
+        if artist_id > 0:
+            sql += " WHERE link_filter.artist_id = %s "
             params.append(artist_id)
         elif genre_norm:
             sql += """
@@ -19196,8 +19693,15 @@ def _assistant_recommend_albums_from_query(
     base = (base_url or "").rstrip("/")
     params: list[Any] = []
     where_clauses: list[str] = []
+    extra_join_sql = ""
     if artist_ids:
-        where_clauses.append("alb.artist_id = ANY(%s)")
+        extra_join_sql = """
+            JOIN (
+                SELECT DISTINCT artist_id, album_id
+                FROM files_artist_album_links
+            ) artist_filter ON artist_filter.album_id = alb.id
+        """
+        where_clauses.append("artist_filter.artist_id = ANY(%s)")
         params.append(artist_ids)
     elif genre:
         genre_norm = _assistant_simplify_for_intent(genre)
@@ -19231,6 +19735,7 @@ def _assistant_recommend_albums_from_query(
           ON pr.artist_norm = art.name_norm
          AND pr.title_norm = alb.title_norm
     """
+    sql += extra_join_sql
     if where_clauses:
         sql += " WHERE " + " AND ".join(where_clauses) + " "
     sql += """
@@ -25684,7 +26189,8 @@ def _classical_display_payload(
     composer = _classical_display_values(_classical_collect_tag_values(tag_map, _CLASSICAL_COMPOSER_TAG_KEYS))
     work = _classical_display_values(_classical_collect_tag_values(tag_map, _CLASSICAL_WORK_TAG_KEYS), limit=4)
     conductor = _classical_display_values(_classical_collect_tag_values(tag_map, ("conductor",)), limit=4)
-    orchestra = _classical_display_values(_classical_collect_tag_values(tag_map, ("orchestra", "ensemble", "choir", "chorus")), limit=4)
+    orchestra = _classical_display_values(_classical_collect_tag_values(tag_map, ("orchestra",)), limit=4)
+    ensemble = _classical_display_values(_classical_collect_tag_values(tag_map, ("ensemble", "choir", "chorus")), limit=4)
     soloists = _classical_display_values(_classical_collect_tag_values(tag_map, ("soloist", "soloists")), limit=6)
     performers_raw = _classical_display_values(_classical_collect_tag_values(tag_map, ("performer", "performers", "artist", "albumartist", "album_artist")), limit=8)
     catalog_numbers = _classical_display_values(_classical_collect_tag_values(tag_map, _CLASSICAL_RELEASE_CATALOG_TAG_KEYS), limit=6)
@@ -25696,6 +26202,7 @@ def _classical_display_payload(
         or work
         or conductor
         or orchestra
+        or ensemble
         or soloists
         or catalog_numbers
         or work_tokens
@@ -25708,27 +26215,305 @@ def _classical_display_payload(
     composer_norms = {_classical_norm_text(v) for v in composer}
     conductor_norms = {_classical_norm_text(v) for v in conductor}
     orchestra_norms = {_classical_norm_text(v) for v in orchestra}
+    ensemble_norms = {_classical_norm_text(v) for v in ensemble}
     soloist_norms = {_classical_norm_text(v) for v in soloists}
     filtered_performers = [
         value for value in performers_raw
         if _classical_norm_text(value) not in composer_norms
         and _classical_norm_text(value) not in conductor_norms
         and _classical_norm_text(value) not in orchestra_norms
+        and _classical_norm_text(value) not in ensemble_norms
         and _classical_norm_text(value) not in soloist_norms
     ]
     if not work and str(fallback_title or "").strip():
         work = _classical_display_values([fallback_title], limit=2)
-    if not composer and str(fallback_artist or "").strip() and not conductor and not orchestra:
+    if not composer and str(fallback_artist or "").strip() and not conductor and not orchestra and not ensemble:
         composer = _classical_display_values([fallback_artist], limit=2)
     return {
         "composer": composer,
         "work": work,
         "conductor": conductor,
         "orchestra": orchestra,
+        "ensemble": ensemble,
         "soloists": soloists,
         "performers": filtered_performers[:6],
         "catalog_numbers": catalog_numbers,
     }
+
+
+_FILES_BROWSE_PRIMARY_ROLES = {"artist"}
+_FILES_BROWSE_PERSON_ROLES = {"artist", "composer", "conductor", "soloist", "performer"}
+_FILES_BROWSE_ENSEMBLE_ROLES = {"orchestra", "ensemble"}
+_FILES_BROWSE_ROLE_PRIORITY = {
+    "artist": 0,
+    "composer": 1,
+    "conductor": 2,
+    "orchestra": 3,
+    "ensemble": 4,
+    "soloist": 5,
+    "performer": 6,
+}
+_CLASSICAL_PERSON_NAME_PARTICLES = {
+    "de",
+    "del",
+    "della",
+    "der",
+    "di",
+    "du",
+    "la",
+    "le",
+    "van",
+    "von",
+}
+_CLASSICAL_PERSON_NAME_HONORIFICS = {
+    "sir",
+    "dame",
+    "maestro",
+    "master",
+    "prof",
+    "professor",
+    "dr",
+    "doctor",
+}
+
+
+def _files_browse_entity_kind_from_roles(roles: set[str]) -> str:
+    ordered = {str(r or "").strip().lower() for r in (roles or set()) if str(r or "").strip()}
+    if not ordered:
+        return "artist"
+    if ordered <= _FILES_BROWSE_ENSEMBLE_ROLES:
+        return "ensemble"
+    if ordered <= {"composer"}:
+        return "composer"
+    if ordered <= {"conductor"}:
+        return "conductor"
+    if ordered <= {"soloist", "performer"}:
+        return "performer"
+    if ordered == {"artist"}:
+        return "artist"
+    return "mixed"
+
+
+def _classical_person_alias_signature(name: str) -> dict[str, Any]:
+    norm = _classical_norm_text(name)
+    if not norm:
+        return {}
+    parts = [p for p in re.findall(r"[a-z0-9]+", norm) if p]
+    if not parts:
+        return {}
+    cleaned: list[str] = []
+    for idx, token in enumerate(parts):
+        if idx == 0 and token in _CLASSICAL_PERSON_NAME_HONORIFICS:
+            continue
+        cleaned.append(token)
+    if len(cleaned) < 2:
+        return {}
+    surname = ""
+    surname_idx = len(cleaned) - 1
+    for idx in range(len(cleaned) - 1, -1, -1):
+        token = cleaned[idx]
+        if token not in _CLASSICAL_PERSON_NAME_PARTICLES:
+            surname = token
+            surname_idx = idx
+            break
+    if not surname:
+        surname = cleaned[-1]
+        surname_idx = len(cleaned) - 1
+    givens = [tok for tok in cleaned[:surname_idx] if tok and tok not in _CLASSICAL_PERSON_NAME_PARTICLES]
+    long_givens = {tok for tok in givens if len(tok) >= 2}
+    initials = {tok[0] for tok in givens if tok}
+    return {
+        "surname": surname,
+        "givens": givens,
+        "long_givens": long_givens,
+        "initials": initials,
+        "token_count": len(cleaned),
+    }
+
+
+def _classical_person_names_equivalent(left: str, right: str) -> bool:
+    ls = _classical_person_alias_signature(left)
+    rs = _classical_person_alias_signature(right)
+    if not ls or not rs:
+        return False
+    if str(ls.get("surname") or "") != str(rs.get("surname") or ""):
+        return False
+    left_long = set(ls.get("long_givens") or set())
+    right_long = set(rs.get("long_givens") or set())
+    if left_long and right_long and (left_long <= right_long or right_long <= left_long):
+        return True
+    left_initials = set(ls.get("initials") or set())
+    right_initials = set(rs.get("initials") or set())
+    if left_initials and right_initials and (left_initials <= right_initials or right_initials <= left_initials):
+        return True
+    return False
+
+
+def _files_extract_browse_entities_for_album(
+    album: dict[str, Any],
+    artists_map: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    artist_norm = str(album.get("artist_norm") or "").strip()
+    artist_name = str(((artists_map.get(artist_norm) or {}).get("name") if artist_norm else "") or "").strip()
+    source_image_path = str(((artists_map.get(artist_norm) or {}).get("image_path") if artist_norm else "") or "").strip()
+    source_has_image = bool((artists_map.get(artist_norm) or {}).get("has_image")) if artist_norm else False
+    entities: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def _append_entity(name: str, role: str, *, is_primary: bool = False, image_path: str = "", has_image: bool = False) -> None:
+        clean = re.sub(r"\s+", " ", str(name or "").strip()).strip(" -–—")
+        role_key = str(role or "").strip().lower() or "artist"
+        if not clean:
+            return
+        norm = _norm_artist_key(clean)
+        if not norm:
+            return
+        key = (norm, role_key)
+        if key in seen:
+            return
+        seen.add(key)
+        entities.append(
+            {
+                "name": clean,
+                "norm": norm,
+                "role": role_key,
+                "is_primary": bool(is_primary),
+                "has_image": bool(has_image),
+                "image_path": str(image_path or "").strip(),
+            }
+        )
+
+    if artist_name:
+        _append_entity(
+            artist_name,
+            "artist",
+            is_primary=True,
+            image_path=source_image_path,
+            has_image=source_has_image,
+        )
+
+    tags_map = _safe_json_load(album.get("primary_tags_json") or "{}", fallback={})
+    classical_payload = _classical_display_payload(
+        tags_map if isinstance(tags_map, dict) else {},
+        fallback_title=str(album.get("title") or "").strip(),
+        fallback_artist=artist_name,
+    )
+    if not isinstance(classical_payload, dict):
+        return entities
+
+    for role_name, values in (
+        ("composer", classical_payload.get("composer") or []),
+        ("conductor", classical_payload.get("conductor") or []),
+        ("orchestra", classical_payload.get("orchestra") or []),
+        ("ensemble", classical_payload.get("ensemble") or []),
+        ("soloist", classical_payload.get("soloists") or []),
+        ("performer", classical_payload.get("performers") or []),
+    ):
+        for value in values:
+            _append_entity(value, role_name, is_primary=False)
+    return entities
+
+
+def _build_files_browse_artist_entities(
+    artists_map: dict[str, dict[str, Any]],
+    albums_payload: list[dict[str, Any]],
+) -> tuple[dict[str, dict[str, Any]], dict[str, list[dict[str, Any]]]]:
+    raw_entities: list[dict[str, Any]] = []
+    for album in albums_payload:
+        for entity in _files_extract_browse_entities_for_album(album, artists_map):
+            item = dict(entity)
+            item["folder_path"] = str(album.get("folder_path") or "").strip()
+            item["track_count"] = int(album.get("track_count") or 0)
+            item["is_broken"] = bool(album.get("is_broken"))
+            raw_entities.append(item)
+
+    person_alias_targets: list[dict[str, Any]] = sorted(
+        [item for item in raw_entities if str(item.get("role") or "").strip().lower() in _FILES_BROWSE_PERSON_ROLES],
+        key=lambda entry: (
+            -_identity_display_quality_score(str(entry.get("name") or ""))[0],
+            -_classical_person_alias_signature(str(entry.get("name") or "")).get("token_count", 0),
+            -len(str(entry.get("name") or "")),
+            str(entry.get("name") or "").lower(),
+        ),
+    )
+    canonical_norm_by_raw_norm: dict[str, str] = {}
+    canonical_name_by_norm: dict[str, str] = {}
+    for entry in person_alias_targets:
+        raw_name = str(entry.get("name") or "").strip()
+        raw_norm = str(entry.get("norm") or "").strip()
+        if not raw_norm:
+            continue
+        matched_norm = None
+        for candidate_norm, candidate_name in canonical_name_by_norm.items():
+            if _classical_person_names_equivalent(raw_name, candidate_name):
+                matched_norm = candidate_norm
+                preferred = _choose_preferred_identity_display(candidate_name, raw_name)
+                if preferred != candidate_name:
+                    canonical_name_by_norm[candidate_norm] = preferred
+                break
+        if matched_norm is None:
+            canonical_name_by_norm[raw_norm] = raw_name
+            matched_norm = raw_norm
+        canonical_norm_by_raw_norm[raw_norm] = matched_norm
+
+    entity_map: dict[str, dict[str, Any]] = {}
+    album_links_by_folder: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for entry in raw_entities:
+        role = str(entry.get("role") or "").strip().lower() or "artist"
+        raw_norm = str(entry.get("norm") or "").strip()
+        canonical_norm = raw_norm
+        if role in _FILES_BROWSE_PERSON_ROLES:
+            canonical_norm = canonical_norm_by_raw_norm.get(raw_norm, raw_norm)
+        canonical_name = canonical_name_by_norm.get(canonical_norm, str(entry.get("name") or "").strip())
+        if not canonical_norm or not canonical_name:
+            continue
+        bucket = entity_map.setdefault(
+            canonical_norm,
+            {
+                "name": canonical_name,
+                "has_image": False,
+                "image_path": "",
+                "roles": set(),
+                "aliases": set(),
+                "album_ids": set(),
+                "track_total": 0,
+                "broken_count": 0,
+            },
+        )
+        bucket["name"] = _choose_preferred_identity_display(str(bucket.get("name") or ""), canonical_name)
+        bucket["roles"].add(role)
+        bucket["aliases"].add(str(entry.get("name") or "").strip())
+        bucket["aliases"].add(canonical_name)
+        if bool(entry.get("has_image")) and str(entry.get("image_path") or "").strip():
+            if not bucket.get("has_image"):
+                bucket["has_image"] = True
+                bucket["image_path"] = str(entry.get("image_path") or "").strip()
+        folder_path = str(entry.get("folder_path") or "").strip()
+        if folder_path:
+            album_links_by_folder[folder_path].append(
+                {
+                    "artist_norm": canonical_norm,
+                    "role": role,
+                    "is_primary": bool(entry.get("is_primary")),
+                }
+            )
+
+    for canonical_norm, bucket in entity_map.items():
+        bucket["entity_kind"] = _files_browse_entity_kind_from_roles(set(bucket.get("roles") or set()))
+        bucket["roles_json"] = json.dumps(
+            sorted(set(bucket.get("roles") or set()), key=lambda role: (_FILES_BROWSE_ROLE_PRIORITY.get(role, 99), role)),
+            ensure_ascii=False,
+        )
+        alias_values = [
+            value
+            for value in sorted(
+                {str(v or "").strip() for v in (bucket.get("aliases") or set()) if str(v or "").strip()},
+                key=lambda value: (-_identity_display_quality_score(value)[0], -len(value), value.lower()),
+            )
+            if _norm_artist_key(value) != canonical_norm
+        ]
+        bucket["aliases_json"] = json.dumps(alias_values[:12], ensure_ascii=False)
+    return entity_map, dict(album_links_by_folder)
 
 
 def _classical_label_tokens(values: list[str]) -> set[str]:
@@ -52218,8 +53003,9 @@ def api_library_artists():
                     f"""
                     EXISTS (
                         SELECT 1
-                        FROM files_albums alb
-                        WHERE alb.artist_id = a.id
+                        FROM files_artist_album_links link
+                        JOIN files_albums alb ON alb.id = link.album_id
+                        WHERE link.artist_id = a.id
                           AND {album_match_sql}
                     )
                     """
@@ -52234,8 +53020,9 @@ def api_library_artists():
                             a.name ILIKE %s
                             OR EXISTS (
                                 SELECT 1
-                                FROM files_albums alb2
-                                WHERE alb2.artist_id = a.id
+                                FROM files_artist_album_links link2
+                                JOIN files_albums alb2 ON alb2.id = link2.album_id
+                                WHERE link2.artist_id = a.id
                                   AND {search_album_match}
                                   AND (
                                       alb2.title ILIKE %s
@@ -52257,8 +53044,9 @@ def api_library_artists():
                         """
                         EXISTS (
                             SELECT 1
-                            FROM files_albums alb
-                            WHERE alb.artist_id = a.id
+                            FROM files_artist_album_links link
+                            JOIN files_albums alb ON alb.id = link.album_id
+                            WHERE link.artist_id = a.id
                               AND """ + album_match_sql + """
                               AND COALESCE(alb.year, 0) = %s
                         )
@@ -52273,8 +53061,9 @@ def api_library_artists():
                             """
                             EXISTS (
                                 SELECT 1
-                                FROM files_albums alb
-                                WHERE alb.artist_id = a.id
+                                FROM files_artist_album_links link
+                                JOIN files_albums alb ON alb.id = link.album_id
+                                WHERE link.artist_id = a.id
                                   AND """ + album_match_sql + """
                                   AND lower(trim(COALESCE(alb.label, ''))) = ANY(%s)
                             )
@@ -52290,8 +53079,9 @@ def api_library_artists():
                             """
                             EXISTS (
                                 SELECT 1
-                                FROM files_albums alb
-                                WHERE alb.artist_id = a.id
+                                FROM files_artist_album_links link
+                                JOIN files_albums alb ON alb.id = link.album_id
+                                WHERE link.artist_id = a.id
                                   AND """ + album_match_sql + """
                                   AND (
                                     EXISTS (
@@ -52329,14 +53119,27 @@ def api_library_artists():
                             SELECT
                                 a.id,
                                 a.name,
+                                COALESCE(a.entity_kind, 'artist') AS entity_kind,
+                                COALESCE(a.roles_json, '[]') AS roles_json,
                                 (
-                                    SELECT COUNT(*)
-                                    FROM files_albums alb_cnt
-                                    WHERE alb_cnt.artist_id = a.id
+                                    SELECT COUNT(DISTINCT link_cnt.album_id)
+                                    FROM files_artist_album_links link_cnt
+                                    JOIN files_albums alb_cnt ON alb_cnt.id = link_cnt.album_id
+                                    WHERE link_cnt.artist_id = a.id
                                       AND {album_count_match_sql}
                                 ) AS album_count,
                                 a.broken_albums_count,
-                                (a.has_image OR COALESCE(ext.image_path, '') <> '') AS has_image,
+                                (
+                                    a.has_image
+                                    OR COALESCE(ext.image_path, '') <> ''
+                                    OR EXISTS (
+                                        SELECT 1
+                                        FROM files_artist_album_links link_cov
+                                        JOIN files_albums alb_cov ON alb_cov.id = link_cov.album_id
+                                        WHERE link_cov.artist_id = a.id
+                                          AND COALESCE(alb_cov.has_cover, FALSE) = TRUE
+                                    )
+                                ) AS has_image,
                                 similarity(a.name, %s) AS score,
                                 CASE WHEN lower(a.name) LIKE lower(%s) || '%%' THEN 0 ELSE 1 END AS prefix_rank
                             FROM files_artists a
@@ -52353,14 +53156,27 @@ def api_library_artists():
                             SELECT
                                 a.id,
                                 a.name,
+                                COALESCE(a.entity_kind, 'artist') AS entity_kind,
+                                COALESCE(a.roles_json, '[]') AS roles_json,
                                 (
-                                    SELECT COUNT(*)
-                                    FROM files_albums alb_cnt
-                                    WHERE alb_cnt.artist_id = a.id
+                                    SELECT COUNT(DISTINCT link_cnt.album_id)
+                                    FROM files_artist_album_links link_cnt
+                                    JOIN files_albums alb_cnt ON alb_cnt.id = link_cnt.album_id
+                                    WHERE link_cnt.artist_id = a.id
                                       AND {album_count_match_sql}
                                 ) AS album_count,
                                 a.broken_albums_count,
-                                (a.has_image OR COALESCE(ext.image_path, '') <> '') AS has_image
+                                (
+                                    a.has_image
+                                    OR COALESCE(ext.image_path, '') <> ''
+                                    OR EXISTS (
+                                        SELECT 1
+                                        FROM files_artist_album_links link_cov
+                                        JOIN files_albums alb_cov ON alb_cov.id = link_cov.album_id
+                                        WHERE link_cov.artist_id = a.id
+                                          AND COALESCE(alb_cov.has_cover, FALSE) = TRUE
+                                    )
+                                ) AS has_image
                             FROM files_artists a
                             LEFT JOIN files_external_artist_images ext ON ext.name_norm = a.name_norm
                             WHERE {" AND ".join(where_parts)}
@@ -52375,14 +53191,27 @@ def api_library_artists():
                         SELECT
                             a.id,
                             a.name,
+                            COALESCE(a.entity_kind, 'artist') AS entity_kind,
+                            COALESCE(a.roles_json, '[]') AS roles_json,
                             (
-                                SELECT COUNT(*)
-                                FROM files_albums alb_cnt
-                                WHERE alb_cnt.artist_id = a.id
+                                SELECT COUNT(DISTINCT link_cnt.album_id)
+                                FROM files_artist_album_links link_cnt
+                                JOIN files_albums alb_cnt ON alb_cnt.id = link_cnt.album_id
+                                WHERE link_cnt.artist_id = a.id
                                   AND {album_count_match_sql}
                             ) AS album_count,
                             a.broken_albums_count,
-                            (a.has_image OR COALESCE(ext.image_path, '') <> '') AS has_image
+                            (
+                                a.has_image
+                                OR COALESCE(ext.image_path, '') <> ''
+                                OR EXISTS (
+                                    SELECT 1
+                                    FROM files_artist_album_links link_cov
+                                    JOIN files_albums alb_cov ON alb_cov.id = link_cov.album_id
+                                    WHERE link_cov.artist_id = a.id
+                                      AND COALESCE(alb_cov.has_cover, FALSE) = TRUE
+                                )
+                            ) AS has_image
                         FROM files_artists a
                         LEFT JOIN files_external_artist_images ext ON ext.name_norm = a.name_norm
                         WHERE {" AND ".join(where_parts)}
@@ -52398,9 +53227,11 @@ def api_library_artists():
                     {
                         "artist_id": int(r[0]),
                         "artist_name": r[1] or "",
-                        "album_count": int(r[2] or 0),
-                        "broken_albums_count": int(r[3] or 0),
-                        "artist_thumb": f"{base_url}/api/library/files/artist/{int(r[0])}/image?size=96" if bool(r[4]) else None,
+                        "entity_kind": str(r[2] or "artist"),
+                        "roles": _safe_json_load(r[3] or "[]", fallback=[]),
+                        "album_count": int(r[4] or 0),
+                        "broken_albums_count": int(r[5] or 0),
+                        "artist_thumb": f"{base_url}/api/library/files/artist/{int(r[0])}/image?size=96" if bool(r[6]) else None,
                     }
                     for r in rows
                 ],
@@ -52544,18 +53375,35 @@ def api_library_artists_suggest():
                     SELECT
                         a.id,
                         a.name,
-                        a.album_count,
+                        COALESCE(a.entity_kind, 'artist') AS entity_kind,
+                        COALESCE(a.roles_json, '[]') AS roles_json,
+                        (
+                            SELECT COUNT(DISTINCT link_cnt.album_id)
+                            FROM files_artist_album_links link_cnt
+                            JOIN files_albums alb_cnt ON alb_cnt.id = link_cnt.album_id
+                            WHERE link_cnt.artist_id = a.id
+                        ) AS album_count,
                         a.broken_albums_count,
-                        (a.has_image OR COALESCE(ext.image_path, '') <> '') AS has_image,
+                        (
+                            a.has_image
+                            OR COALESCE(ext.image_path, '') <> ''
+                            OR EXISTS (
+                                SELECT 1
+                                FROM files_artist_album_links link_cov
+                                JOIN files_albums alb_cov ON alb_cov.id = link_cov.album_id
+                                WHERE link_cov.artist_id = a.id
+                                  AND COALESCE(alb_cov.has_cover, FALSE) = TRUE
+                            )
+                        ) AS has_image,
                         similarity(a.name, %s) AS score,
                         CASE WHEN lower(a.name) LIKE lower(%s) || '%%' THEN 0 ELSE 1 END AS prefix_rank
                     FROM files_artists a
                     LEFT JOIN files_external_artist_images ext ON ext.name_norm = a.name_norm
-                    WHERE a.name ILIKE %s
+                    WHERE (a.name ILIKE %s OR COALESCE(a.aliases_json, '[]') ILIKE %s)
                     ORDER BY prefix_rank ASC, score DESC, a.album_count DESC, a.name ASC
                     LIMIT %s
                     """,
-                    (query, query, like, limit),
+                    (query, query, like, like, limit),
                 )
             except Exception:
                 cur.execute(
@@ -52563,16 +53411,33 @@ def api_library_artists_suggest():
                     SELECT
                         a.id,
                         a.name,
-                        a.album_count,
+                        COALESCE(a.entity_kind, 'artist') AS entity_kind,
+                        COALESCE(a.roles_json, '[]') AS roles_json,
+                        (
+                            SELECT COUNT(DISTINCT link_cnt.album_id)
+                            FROM files_artist_album_links link_cnt
+                            JOIN files_albums alb_cnt ON alb_cnt.id = link_cnt.album_id
+                            WHERE link_cnt.artist_id = a.id
+                        ) AS album_count,
                         a.broken_albums_count,
-                        (a.has_image OR COALESCE(ext.image_path, '') <> '') AS has_image
+                        (
+                            a.has_image
+                            OR COALESCE(ext.image_path, '') <> ''
+                            OR EXISTS (
+                                SELECT 1
+                                FROM files_artist_album_links link_cov
+                                JOIN files_albums alb_cov ON alb_cov.id = link_cov.album_id
+                                WHERE link_cov.artist_id = a.id
+                                  AND COALESCE(alb_cov.has_cover, FALSE) = TRUE
+                            )
+                        ) AS has_image
                     FROM files_artists a
                     LEFT JOIN files_external_artist_images ext ON ext.name_norm = a.name_norm
-                    WHERE a.name ILIKE %s
+                    WHERE (a.name ILIKE %s OR COALESCE(a.aliases_json, '[]') ILIKE %s)
                     ORDER BY a.album_count DESC, a.name ASC
                     LIMIT %s
                     """,
-                    (like, limit),
+                    (like, like, limit),
                 )
             rows = cur.fetchall()
         base_url = request.url_root.rstrip("/")
@@ -52582,9 +53447,11 @@ def api_library_artists_suggest():
                 {
                     "artist_id": int(r[0]),
                     "artist_name": r[1] or "",
-                    "album_count": int(r[2] or 0),
-                    "broken_albums_count": int(r[3] or 0),
-                    "artist_thumb": f"{base_url}/api/library/files/artist/{int(r[0])}/image?size=96" if bool(r[4]) else None,
+                    "entity_kind": str(r[2] or "artist"),
+                    "roles": _safe_json_load(r[3] or "[]", fallback=[]),
+                    "album_count": int(r[4] or 0),
+                    "broken_albums_count": int(r[5] or 0),
+                    "artist_thumb": f"{base_url}/api/library/files/artist/{int(r[0])}/image?size=96" if bool(r[6]) else None,
                 }
                 for r in rows
             ],
@@ -52633,23 +53500,42 @@ def api_library_search_suggest():
                     SELECT
                         a.id,
                         a.name,
-                        a.album_count,
-                        (a.has_image OR COALESCE(ext.image_path, '') <> '') AS has_image,
+                        COALESCE(a.entity_kind, 'artist') AS entity_kind,
+                        COALESCE(a.roles_json, '[]') AS roles_json,
+                        (
+                            SELECT COUNT(DISTINCT link_cnt.album_id)
+                            FROM files_artist_album_links link_cnt
+                            JOIN files_albums alb_cnt ON alb_cnt.id = link_cnt.album_id
+                            WHERE link_cnt.artist_id = a.id
+                              AND """ + artist_match_sql + """
+                        ) AS album_count,
+                        (
+                            a.has_image
+                            OR COALESCE(ext.image_path, '') <> ''
+                            OR EXISTS (
+                                SELECT 1
+                                FROM files_artist_album_links link_cov
+                                JOIN files_albums alb_cov ON alb_cov.id = link_cov.album_id
+                                WHERE link_cov.artist_id = a.id
+                                  AND COALESCE(alb_cov.has_cover, FALSE) = TRUE
+                            )
+                        ) AS has_image,
                         similarity(a.name, %s) AS score,
                         CASE WHEN lower(a.name) LIKE lower(%s) || '%%' THEN 0 ELSE 1 END AS prefix_rank
                     FROM files_artists a
                     LEFT JOIN files_external_artist_images ext ON ext.name_norm = a.name_norm
-                    WHERE a.name ILIKE %s
+                    WHERE (a.name ILIKE %s OR COALESCE(a.aliases_json, '[]') ILIKE %s)
                       AND EXISTS (
                         SELECT 1
-                        FROM files_albums alb2
-                        WHERE alb2.artist_id = a.id
+                        FROM files_artist_album_links link2
+                        JOIN files_albums alb2 ON alb2.id = link2.album_id
+                        WHERE link2.artist_id = a.id
                           AND """ + artist_match_sql + """
                       )
                     ORDER BY prefix_rank ASC, score DESC, a.album_count DESC, a.name ASC
                     LIMIT %s
                     """,
-                    (query, query, like, per_kind),
+                    (query, query, like, like, per_kind),
                 )
             except Exception:
                 cur.execute(
@@ -52657,35 +53543,58 @@ def api_library_search_suggest():
                     SELECT
                         a.id,
                         a.name,
-                        a.album_count,
-                        (a.has_image OR COALESCE(ext.image_path, '') <> '') AS has_image,
+                        COALESCE(a.entity_kind, 'artist') AS entity_kind,
+                        COALESCE(a.roles_json, '[]') AS roles_json,
+                        (
+                            SELECT COUNT(DISTINCT link_cnt.album_id)
+                            FROM files_artist_album_links link_cnt
+                            JOIN files_albums alb_cnt ON alb_cnt.id = link_cnt.album_id
+                            WHERE link_cnt.artist_id = a.id
+                              AND """ + artist_match_sql + """
+                        ) AS album_count,
+                        (
+                            a.has_image
+                            OR COALESCE(ext.image_path, '') <> ''
+                            OR EXISTS (
+                                SELECT 1
+                                FROM files_artist_album_links link_cov
+                                JOIN files_albums alb_cov ON alb_cov.id = link_cov.album_id
+                                WHERE link_cov.artist_id = a.id
+                                  AND COALESCE(alb_cov.has_cover, FALSE) = TRUE
+                            )
+                        ) AS has_image,
                         0.0 AS score,
                         1 AS prefix_rank
                     FROM files_artists a
                     LEFT JOIN files_external_artist_images ext ON ext.name_norm = a.name_norm
-                    WHERE a.name ILIKE %s
+                    WHERE (a.name ILIKE %s OR COALESCE(a.aliases_json, '[]') ILIKE %s)
                       AND EXISTS (
                         SELECT 1
-                        FROM files_albums alb2
-                        WHERE alb2.artist_id = a.id
+                        FROM files_artist_album_links link2
+                        JOIN files_albums alb2 ON alb2.id = link2.album_id
+                        WHERE link2.artist_id = a.id
                           AND """ + artist_match_sql + """
                       )
                     ORDER BY a.album_count DESC, a.name ASC
                     LIMIT %s
                     """,
-                    (like, per_kind),
+                    (like, like, per_kind),
                 )
             for row in cur.fetchall():
                 artist_id = int(row[0] or 0)
+                entity_kind = str(row[2] or "artist").strip().lower() or "artist"
+                roles = _safe_json_load(row[3] or "[]", fallback=[])
+                label = entity_kind.replace("_", " ").title()
                 merged.append(
                     {
-                        "type": "artist",
+                        "type": entity_kind,
                         "artist_id": artist_id,
                         "title": row[1] or "",
-                        "subtitle": f"{int(row[2] or 0)} album(s)",
-                        "thumb": f"{base_url}/api/library/files/artist/{artist_id}/image?size=96" if artist_id > 0 else None,
-                        "_score": float(row[4] or 0.0),
-                        "_prefix": int(row[5] or 1),
+                        "subtitle": f"{label} · {int(row[4] or 0)} album(s)",
+                        "roles": roles if isinstance(roles, list) else [],
+                        "thumb": f"{base_url}/api/library/files/artist/{artist_id}/image?size=96" if bool(row[5]) and artist_id > 0 else None,
+                        "_score": float(row[6] or 0.0),
+                        "_prefix": int(row[7] or 1),
                         "_rank": 0,
                     }
                 )
@@ -52710,7 +53619,7 @@ def api_library_search_suggest():
                     JOIN files_artists ar ON ar.id = alb.artist_id
                     WHERE COALESCE(alb.tags_json, '') <> ''
                       AND COALESCE(alb.tags_json, '') NOT IN ('[]', '{}')
-                      AND alb.tags_json ILIKE %s
+                      AND alb.primary_tags_json ILIKE %s
                       AND """
                     + album_match_sql
                     + """
@@ -52748,6 +53657,7 @@ def api_library_search_suggest():
                         ("composer", classical_payload.get("composer") or []),
                         ("conductor", classical_payload.get("conductor") or []),
                         ("orchestra", classical_payload.get("orchestra") or []),
+                        ("ensemble", classical_payload.get("ensemble") or []),
                     ):
                         for value in values:
                             display_name = re.sub(r"\s+", " ", str(value or "").strip())
@@ -53056,13 +53966,32 @@ def api_library_search_suggest():
                 str(x.get("title", "")).lower(),
             )
         )
+        def _dedupe_key(item: dict[str, Any]) -> tuple[Any, ...]:
+            item_type = str(item.get("type") or "").strip().lower()
+            if item_type in {"artist", "composer", "conductor", "orchestra", "ensemble", "soloist", "performer"}:
+                return ("entity", item_type, _norm_artist_key(str(item.get("title") or "")))
+            if item_type == "album":
+                return ("album", int(item.get("album_id") or 0))
+            if item_type == "track":
+                return ("track", int(item.get("track_id") or 0))
+            if item_type == "genre":
+                return ("genre", str(item.get("title") or "").strip().lower())
+            return (item_type, str(item.get("title") or "").strip().lower())
+
         items = []
-        for item in merged[:limit]:
+        seen_keys: set[tuple[Any, ...]] = set()
+        for item in merged:
+            key = _dedupe_key(item)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
             clean = dict(item)
             clean.pop("_score", None)
             clean.pop("_prefix", None)
             clean.pop("_rank", None)
             items.append(clean)
+            if len(items) >= limit:
+                break
         payload = {"query": query, "items": items}
         _files_cache_set_json(cache_key, payload, ttl=20)
         return jsonify(payload)
@@ -54023,7 +54952,8 @@ def api_library_top_artists():
                         FROM files_reco_events e
                         JOIN files_tracks tr ON tr.id = e.track_id
                         JOIN files_albums alb ON alb.id = tr.album_id
-                        JOIN files_artists ar ON ar.id = alb.artist_id
+                        JOIN (SELECT DISTINCT artist_id, album_id FROM files_artist_album_links) link ON link.album_id = alb.id
+                        JOIN files_artists ar ON ar.id = link.artist_id
                         WHERE e.created_at >= (NOW() - (%s || ' days')::INTERVAL)
                           AND """
                     + album_match_sql
@@ -54040,21 +54970,34 @@ def api_library_top_artists():
                         ar.id,
                         ar.name,
                         (
-                            SELECT COUNT(*)
-                            FROM files_albums alb_cnt
-                            WHERE alb_cnt.artist_id = ar.id
+                            SELECT COUNT(DISTINCT link_cnt.album_id)
+                            FROM files_artist_album_links link_cnt
+                            JOIN files_albums alb_cnt ON alb_cnt.id = link_cnt.album_id
+                            WHERE link_cnt.artist_id = ar.id
                               AND """ + album_count_sql + """
                         ) AS album_count,
-                        ar.has_image,
+                        (
+                            ar.has_image
+                            OR COALESCE(ext.image_path, '') <> ''
+                            OR EXISTS (
+                                SELECT 1
+                                FROM files_artist_album_links link_cov
+                                JOIN files_albums alb_cov ON alb_cov.id = link_cov.album_id
+                                WHERE link_cov.artist_id = ar.id
+                                  AND COALESCE(alb_cov.has_cover, FALSE) = TRUE
+                            )
+                        ) AS has_image,
                         COALESCE(SUM(CASE WHEN e.event_type IN ('play_complete', 'like') THEN 1 ELSE 0 END), 0) AS completion_count,
                         COALESCE(SUM(CASE WHEN e.event_type IN ('play_start', 'play_partial', 'play_complete', 'like') THEN 1 ELSE 0 END), 0) AS play_events
                     FROM files_reco_events e
                     JOIN files_tracks tr ON tr.id = e.track_id
                     JOIN files_albums alb ON alb.id = tr.album_id
-                    JOIN files_artists ar ON ar.id = alb.artist_id
+                    JOIN (SELECT DISTINCT artist_id, album_id FROM files_artist_album_links) link ON link.album_id = alb.id
+                    JOIN files_artists ar ON ar.id = link.artist_id
+                    LEFT JOIN files_external_artist_images ext ON ext.name_norm = ar.name_norm
                     WHERE e.created_at >= (NOW() - (%s || ' days')::INTERVAL)
                       AND """ + album_match_sql + """
-                    GROUP BY ar.id
+                    GROUP BY ar.id, ar.has_image, ext.image_path
                     ORDER BY completion_count DESC, play_events DESC, album_count DESC, ar.name ASC
                     LIMIT %s OFFSET %s
                     """,
@@ -54068,7 +55011,8 @@ def api_library_top_artists():
                         FROM files_reco_track_stats st
                         JOIN files_tracks tr ON tr.id = st.track_id
                         JOIN files_albums alb ON alb.id = tr.album_id
-                        JOIN files_artists ar ON ar.id = alb.artist_id
+                        JOIN (SELECT DISTINCT artist_id, album_id FROM files_artist_album_links) link ON link.album_id = alb.id
+                        JOIN files_artists ar ON ar.id = link.artist_id
                         WHERE """
                     + album_match_sql
                     + """
@@ -54083,20 +55027,33 @@ def api_library_top_artists():
                         ar.id,
                         ar.name,
                         (
-                            SELECT COUNT(*)
-                            FROM files_albums alb_cnt
-                            WHERE alb_cnt.artist_id = ar.id
+                            SELECT COUNT(DISTINCT link_cnt.album_id)
+                            FROM files_artist_album_links link_cnt
+                            JOIN files_albums alb_cnt ON alb_cnt.id = link_cnt.album_id
+                            WHERE link_cnt.artist_id = ar.id
                               AND """ + album_count_sql + """
                         ) AS album_count,
-                        ar.has_image,
+                        (
+                            ar.has_image
+                            OR COALESCE(ext.image_path, '') <> ''
+                            OR EXISTS (
+                                SELECT 1
+                                FROM files_artist_album_links link_cov
+                                JOIN files_albums alb_cov ON alb_cov.id = link_cov.album_id
+                                WHERE link_cov.artist_id = ar.id
+                                  AND COALESCE(alb_cov.has_cover, FALSE) = TRUE
+                            )
+                        ) AS has_image,
                         COALESCE(SUM(st.completion_count), 0) AS completion_count,
                         COALESCE(SUM(st.play_count), 0) AS play_count
                     FROM files_reco_track_stats st
                     JOIN files_tracks tr ON tr.id = st.track_id
                     JOIN files_albums alb ON alb.id = tr.album_id
-                    JOIN files_artists ar ON ar.id = alb.artist_id
+                    JOIN (SELECT DISTINCT artist_id, album_id FROM files_artist_album_links) link ON link.album_id = alb.id
+                    JOIN files_artists ar ON ar.id = link.artist_id
+                    LEFT JOIN files_external_artist_images ext ON ext.name_norm = ar.name_norm
                     WHERE """ + album_match_sql + """
-                    GROUP BY ar.id
+                    GROUP BY ar.id, ar.has_image, ext.image_path
                     ORDER BY completion_count DESC, play_count DESC, album_count DESC, ar.name ASC
                     LIMIT %s OFFSET %s
                     """,
@@ -54156,11 +55113,22 @@ def api_library_recent_artists():
                 SELECT
                     ar.id,
                     ar.name,
-                    (ar.has_image OR COALESCE(ext.image_path, '') <> '') AS has_image,
-                    COUNT(*)::BIGINT AS album_count,
+                    (
+                        ar.has_image
+                        OR COALESCE(ext.image_path, '') <> ''
+                        OR EXISTS (
+                            SELECT 1
+                            FROM files_artist_album_links link_cov
+                            JOIN files_albums alb_cov ON alb_cov.id = link_cov.album_id
+                            WHERE link_cov.artist_id = ar.id
+                              AND COALESCE(alb_cov.has_cover, FALSE) = TRUE
+                        )
+                    ) AS has_image,
+                    COUNT(DISTINCT aa.album_id)::BIGINT AS album_count,
                     EXTRACT(EPOCH FROM MAX(alb.created_at))::BIGINT AS last_added_at
-                FROM files_albums alb
-                JOIN files_artists ar ON ar.id = alb.artist_id
+                FROM (SELECT DISTINCT artist_id, album_id FROM files_artist_album_links) aa
+                JOIN files_albums alb ON alb.id = aa.album_id
+                JOIN files_artists ar ON ar.id = aa.artist_id
                 LEFT JOIN files_external_artist_images ext ON ext.name_norm = ar.name_norm
                 WHERE """
                 + album_match_sql
@@ -57024,7 +57992,7 @@ def api_library_artist_detail(artist_id):
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT id, name, name_norm, has_image, image_path, created_at, updated_at FROM files_artists WHERE id = %s",
+                    "SELECT id, name, name_norm, has_image, image_path, COALESCE(entity_kind, 'artist'), COALESCE(roles_json, '[]'), created_at, updated_at FROM files_artists WHERE id = %s",
                     (artist_id,),
                 )
                 artist_row = cur.fetchone()
@@ -57034,10 +58002,19 @@ def api_library_artist_detail(artist_id):
                 artist_norm = str(artist_row[2] or "").strip() or _norm_artist_key(artist_name)
                 has_artist_image = bool(artist_row[3])
                 artist_image_path = (artist_row[4] or "").strip()
-                artist_created_epoch = int(_dt_to_epoch(artist_row[5])) if len(artist_row) > 5 else 0
-                artist_updated_epoch = int(_dt_to_epoch(artist_row[6])) if len(artist_row) > 6 else 0
+                artist_entity_kind = str(artist_row[5] or "artist").strip() or "artist"
+                artist_roles = _safe_json_load(artist_row[6] or "[]", fallback=[])
+                artist_created_epoch = int(_dt_to_epoch(artist_row[7])) if len(artist_row) > 7 else 0
+                artist_updated_epoch = int(_dt_to_epoch(artist_row[8])) if len(artist_row) > 8 else 0
                 cur.execute(
                     """
+                    WITH artist_albums AS (
+                        SELECT DISTINCT link.album_id
+                        FROM files_artist_album_links link
+                        JOIN files_albums alb ON alb.id = link.album_id
+                        WHERE link.artist_id = %s
+                          AND """ + album_match_sql + """
+                    )
                     SELECT
                         id, title, title_norm, year, date_text, COALESCE(genre, '') AS genre, COALESCE(label, '') AS label, COALESCE(tags_json, '[]') AS tags_json,
                         track_count, is_broken, format, is_lossless,
@@ -57046,14 +58023,21 @@ def api_library_artist_detail(artist_id):
                         expected_track_count, actual_track_count, missing_indices_json,
                         COUNT(*) OVER (PARTITION BY title_norm) AS dup_count
                     FROM files_albums alb
-                    WHERE alb.artist_id = %s
-                      AND """ + album_match_sql + """
+                    JOIN artist_albums aa ON aa.album_id = alb.id
                     ORDER BY COALESCE(year, 0) DESC, title ASC
                     """,
                     (artist_id,),
                 )
                 rows = cur.fetchall()
 
+            _files_ensure_local_artist_profile(
+                conn,
+                artist_id=int(artist_id),
+                artist_name=artist_name,
+                artist_norm=artist_norm,
+                entity_kind=artist_entity_kind,
+                roles_json=json.dumps(artist_roles if isinstance(artist_roles, list) else []),
+            )
             artist_profile = _files_get_artist_profile_cached(artist_name, artist_norm)
             title_norms = [str(r[2] or "") for r in rows if str(r[2] or "").strip()]
             album_profile_map = _files_get_album_profiles_cached(artist_norm, title_norms)
@@ -57241,6 +58225,26 @@ def api_library_artist_detail(artist_id):
                         artist_thumb = f"{base_url}/api/library/external/artist-image/{quote(artist_norm, safe='')}?size=320{v}"
                 except Exception:
                     pass
+            if not artist_thumb:
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            SELECT alb.id
+                            FROM files_artist_album_links link
+                            JOIN files_albums alb ON alb.id = link.album_id
+                            WHERE link.artist_id = %s
+                              AND COALESCE(alb.has_cover, FALSE) = TRUE
+                            ORDER BY link.is_primary DESC, COALESCE(alb.year, 0) DESC, alb.updated_at DESC, alb.id DESC
+                            LIMIT 1
+                            """,
+                            (int(artist_id),),
+                        )
+                        crow = cur.fetchone()
+                    if crow and int(crow[0] or 0) > 0:
+                        artist_thumb = f"{base_url}/api/library/files/album/{int(crow[0])}/cover?size=320"
+                except Exception:
+                    pass
             # Patch similar artists with local IDs + images (local first, then cached external).
             try:
                 if isinstance(artist_profile, dict):
@@ -57266,6 +58270,8 @@ def api_library_artist_detail(artist_id):
             payload = {
                 "artist_id": artist_id,
                 "artist_name": artist_name,
+                "entity_kind": artist_entity_kind,
+                "roles": artist_roles if isinstance(artist_roles, list) else [],
                 "created_at": artist_created_epoch or None,
                 "updated_at": artist_updated_epoch or None,
                 "artist_thumb": artist_thumb,
@@ -57626,7 +58632,7 @@ def api_library_artist_profile(artist_id: int):
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT id, name, name_norm
+                SELECT id, name, name_norm, COALESCE(entity_kind, 'artist'), COALESCE(roles_json, '[]')
                 FROM files_artists
                 WHERE id = %s
                 """,
@@ -57637,17 +58643,32 @@ def api_library_artist_profile(artist_id: int):
                 return jsonify({"error": "Artist not found"}), 404
             artist_name = row[1] or ""
             artist_norm = str(row[2] or "").strip() or _norm_artist_key(artist_name)
+            artist_entity_kind = str(row[3] or "artist").strip() or "artist"
+            artist_roles = str(row[4] or "[]")
             cur.execute(
                 """
-                SELECT title, title_norm
-                FROM files_albums
-                WHERE artist_id = %s
+                WITH artist_albums AS (
+                    SELECT DISTINCT album_id
+                    FROM files_artist_album_links
+                    WHERE artist_id = %s
+                )
+                SELECT alb.title, alb.title_norm
+                FROM artist_albums aa
+                JOIN files_albums alb ON alb.id = aa.album_id
                 ORDER BY COALESCE(year, 0) DESC, title ASC
                 LIMIT 180
                 """,
                 (artist_id,),
             )
             albums = [(str(r[0] or ""), str(r[1] or "")) for r in cur.fetchall()]
+        _files_ensure_local_artist_profile(
+            conn,
+            artist_id=int(artist_id),
+            artist_name=artist_name,
+            artist_norm=artist_norm,
+            entity_kind=artist_entity_kind,
+            roles_json=artist_roles,
+        )
         profile = _files_get_artist_profile_cached(artist_name, artist_norm)
         force_refresh = str(request.args.get("refresh", "")).strip().lower() in {"1", "true", "yes"}
         enriching = _files_profile_job_is_active(artist_norm)
@@ -57708,9 +58729,14 @@ def api_library_artist_ai_enrich(artist_id: int):
             artist_norm = str(row[2] or "").strip() or _norm_artist_key(artist_name)
             cur.execute(
                 """
-                SELECT id, title, title_norm
-                FROM files_albums
-                WHERE artist_id = %s
+                WITH artist_albums AS (
+                    SELECT DISTINCT album_id
+                    FROM files_artist_album_links
+                    WHERE artist_id = %s
+                )
+                SELECT alb.id, alb.title, alb.title_norm
+                FROM artist_albums aa
+                JOIN files_albums alb ON alb.id = aa.album_id
                 ORDER BY COALESCE(year, 0) DESC, title ASC
                 LIMIT 300
                 """,
@@ -57764,12 +58790,20 @@ def api_library_artist_summary(artist_id: int):
         return jsonify({"error": "PostgreSQL unavailable"}), 503
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT id, name, name_norm FROM files_artists WHERE id = %s", (int(artist_id),))
+            cur.execute("SELECT id, name, name_norm, COALESCE(entity_kind, 'artist'), COALESCE(roles_json, '[]') FROM files_artists WHERE id = %s", (int(artist_id),))
             row = cur.fetchone()
             if not row:
                 return jsonify({"error": "Artist not found"}), 404
             artist_name = (row[1] or "").strip()
             artist_norm = (row[2] or "").strip() or _norm_artist_key(artist_name)
+            _files_ensure_local_artist_profile(
+                conn,
+                artist_id=int(artist_id),
+                artist_name=artist_name,
+                artist_norm=artist_norm,
+                entity_kind=str(row[3] or "artist").strip() or "artist",
+                roles_json=str(row[4] or "[]"),
+            )
 
             cur.execute(
                 """
@@ -60118,6 +61152,33 @@ def api_library_files_artist_image(artist_id):
                 int(artist_id),
                 str(ext_path),
             )
+
+    conn = _files_pg_connect()
+    if conn is not None:
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT COALESCE(alb.cover_path, '')
+                    FROM files_artist_album_links link
+                    JOIN files_albums alb ON alb.id = link.album_id
+                    WHERE link.artist_id = %s
+                      AND COALESCE(alb.has_cover, FALSE) = TRUE
+                    ORDER BY link.is_primary DESC, COALESCE(alb.year, 0) DESC, alb.updated_at DESC, alb.id DESC
+                    LIMIT 1
+                    """,
+                    (int(artist_id),),
+                )
+                crow = cur.fetchone()
+            cover_raw = str((crow[0] if crow else "") or "").strip()
+            if cover_raw:
+                cover_path = path_for_fs_access(Path(cover_raw))
+                if cover_path.exists() and cover_path.is_file():
+                    cached = _ensure_cached_image_for_path(cover_path, kind="album", max_px=size)
+                    to_send = cached or cover_path
+                    return _serve_image_file_cached(to_send, max_age=0, revalidate=True)
+        finally:
+            conn.close()
 
     if no_image_cached:
         return _transparent_png_response(max_age=3600)
@@ -66508,7 +67569,11 @@ def api_library_artist_match_detail(artist_id: int):
                     COALESCE(primary_tags_json, '{}'),
                     EXTRACT(EPOCH FROM updated_at)::BIGINT
                 FROM files_albums
-                WHERE artist_id = %s
+                WHERE id IN (
+                    SELECT DISTINCT album_id
+                    FROM files_artist_album_links
+                    WHERE artist_id = %s
+                )
                 ORDER BY COALESCE(year, 0) DESC, title ASC
                 """,
                 (artist_id,),
@@ -66663,6 +67728,7 @@ def api_library_artist_match_detail(artist_id: int):
         artist_image_mode = "none"
         artist_image_provider = None
         artist_image_source_url = None
+        has_visual = bool(arow[3]) or bool(ext_artist_row)
         if bool(arow[3]) and str(arow[4] or "").strip():
             artist_image_mode = "local"
             artist_image_provider = "local"
@@ -66670,6 +67736,26 @@ def api_library_artist_match_detail(artist_id: int):
             artist_image_mode = "external_cached"
             artist_image_provider = _normalize_identity_provider(str(ext_artist_row[0] or "")) or None
             artist_image_source_url = str(ext_artist_row[1] or "").strip() or None
+        else:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT 1
+                        FROM files_artist_album_links link
+                        JOIN files_albums alb ON alb.id = link.album_id
+                        WHERE link.artist_id = %s
+                          AND COALESCE(alb.has_cover, FALSE) = TRUE
+                        LIMIT 1
+                        """,
+                        (artist_id,),
+                    )
+                    has_visual = bool(cur.fetchone())
+                if has_visual:
+                    artist_image_mode = "album_cover_fallback"
+                    artist_image_provider = "local"
+            except Exception:
+                has_visual = bool(arow[3]) or bool(ext_artist_row)
 
         payload = {
             "artist_id": int(arow[0] or 0),
@@ -66678,13 +67764,13 @@ def api_library_artist_match_detail(artist_id: int):
             "artist_profile_source": (str(profile_row[0] or "").strip() if profile_row else "") or None,
             "artist_profile_updated_at": int(profile_row[1] or 0) if profile_row else None,
             "artist_image": {
-                "has_image": bool(arow[3]) or bool(ext_artist_row),
+                "has_image": bool(has_visual),
                 "mode": artist_image_mode,
                 "provider": artist_image_provider,
                 "source_url": artist_image_source_url,
                 "url": (
                     f"{request.url_root.rstrip('/')}/api/library/files/artist/{artist_id}/image?size=320"
-                    if (bool(arow[3]) or bool(ext_artist_row))
+                    if bool(has_visual)
                     else None
                 ),
             },
@@ -66846,7 +67932,11 @@ def api_library_artist_rematch(artist_id: int):
                     COALESCE(strict_reject_reason, ''),
                     COALESCE(strict_tracklist_score, 0.0)
                 FROM files_albums
-                WHERE artist_id = %s
+                WHERE id IN (
+                    SELECT DISTINCT album_id
+                    FROM files_artist_album_links
+                    WHERE artist_id = %s
+                )
                 ORDER BY title ASC
                 """,
                 (artist_id,),
@@ -68012,7 +69102,11 @@ def api_library_improve_all_albums():
                         COALESCE(strict_reject_reason, ''),
                         COALESCE(strict_tracklist_score, 0.0)
                     FROM files_albums
-                    WHERE artist_id = %s
+                    WHERE id IN (
+                        SELECT DISTINCT album_id
+                        FROM files_artist_album_links
+                        WHERE artist_id = %s
+                    )
                     ORDER BY title ASC
                     """,
                     (artist_id,),
@@ -70272,9 +71366,14 @@ def api_library_entity_discover():
 
                 cur.execute(
                     """
+                    WITH artist_albums AS (
+                        SELECT DISTINCT album_id
+                        FROM files_artist_album_links
+                        WHERE artist_id = %s
+                    )
                     SELECT alb.id, alb.title, COALESCE(alb.year, 0), alb.track_count, COALESCE(alb.format, ''), alb.is_lossless
-                    FROM files_albums alb
-                    WHERE alb.artist_id = %s
+                    FROM artist_albums aa
+                    JOIN files_albums alb ON alb.id = aa.album_id
                     ORDER BY COALESCE(alb.year, 0) DESC, alb.title ASC
                     LIMIT 12
                     """,
@@ -70397,9 +71496,15 @@ def api_library_entity_discover():
 
                 cur.execute(
                     """
-                    SELECT id, title, COALESCE(year, 0), track_count, COALESCE(format, ''), is_lossless
-                    FROM files_albums
-                    WHERE artist_id = %s AND id <> %s
+                    WITH artist_albums AS (
+                        SELECT DISTINCT album_id
+                        FROM files_artist_album_links
+                        WHERE artist_id = %s
+                    )
+                    SELECT alb.id, alb.title, COALESCE(alb.year, 0), alb.track_count, COALESCE(alb.format, ''), alb.is_lossless
+                    FROM artist_albums aa
+                    JOIN files_albums alb ON alb.id = aa.album_id
+                    WHERE alb.id <> %s
                     ORDER BY COALESCE(year, 0) DESC, title ASC
                     LIMIT 8
                     """,
