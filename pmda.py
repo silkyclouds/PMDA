@@ -10596,10 +10596,15 @@ def _files_pg_init_schema() -> bool:
                     sample_rate INTEGER,
                     bit_depth INTEGER,
                     file_size_bytes BIGINT NOT NULL DEFAULT 0,
+                    primary_tags_json TEXT NOT NULL DEFAULT '{}',
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
             """)
+            try:
+                cur.execute("ALTER TABLE files_tracks ADD COLUMN IF NOT EXISTS primary_tags_json TEXT NOT NULL DEFAULT '{}'")
+            except Exception:
+                pass
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS files_track_embeddings (
                     track_id BIGINT PRIMARY KEY REFERENCES files_tracks(id) ON DELETE CASCADE,
@@ -14325,6 +14330,7 @@ def _rebuild_files_library_index_for_artist(
                                     sample_rate,
                                     bit_depth,
                                     file_size_bytes,
+                                    str(t.get("primary_tags_json") or "{}"),
                                 )
                             )
                         if not track_rows:
@@ -14333,10 +14339,10 @@ def _rebuild_files_library_index_for_artist(
                             """
                             INSERT INTO files_tracks (
                                 album_id, file_path, title, disc_num, track_num, duration_sec, format,
-                                bitrate, sample_rate, bit_depth, file_size_bytes, created_at, updated_at
+                                bitrate, sample_rate, bit_depth, file_size_bytes, primary_tags_json, created_at, updated_at
                             ) VALUES (
                                 %s, %s, %s, %s, %s, %s, %s,
-                                %s, %s, %s, %s, NOW(), NOW()
+                                %s, %s, %s, %s, %s, NOW(), NOW()
                             )
                             ON CONFLICT (file_path) DO UPDATE SET
                                 album_id = EXCLUDED.album_id,
@@ -14349,6 +14355,7 @@ def _rebuild_files_library_index_for_artist(
                                 sample_rate = EXCLUDED.sample_rate,
                                 bit_depth = EXCLUDED.bit_depth,
                                 file_size_bytes = EXCLUDED.file_size_bytes,
+                                primary_tags_json = EXCLUDED.primary_tags_json,
                                 updated_at = NOW()
                             """,
                             track_rows,
@@ -14562,6 +14569,7 @@ def _rebuild_files_library_index(reason: str = "manual", wait_if_running: bool =
                             "sample_rate": sample_rate,
                             "bit_depth": bit_depth,
                             "file_size_bytes": file_size,
+                            "primary_tags_json": json.dumps(tags or {}, default=str),
                         }
                     )
 
@@ -14869,6 +14877,7 @@ def _rebuild_files_library_index(reason: str = "manual", wait_if_running: bool =
                                 sample_rate,
                                 bit_depth,
                                 file_size_bytes,
+                                str(t.get("primary_tags_json") or "{}"),
                             )
                         track_rows = list(track_by_path.values())
                         if track_rows:
@@ -14876,10 +14885,10 @@ def _rebuild_files_library_index(reason: str = "manual", wait_if_running: bool =
                                 """
                                 INSERT INTO files_tracks (
                                     album_id, file_path, title, disc_num, track_num, duration_sec, format,
-                                    bitrate, sample_rate, bit_depth, file_size_bytes, created_at, updated_at
+                                    bitrate, sample_rate, bit_depth, file_size_bytes, primary_tags_json, created_at, updated_at
                                 ) VALUES (
                                     %s, %s, %s, %s, %s, %s, %s,
-                                    %s, %s, %s, %s, NOW(), NOW()
+                                    %s, %s, %s, %s, %s, NOW(), NOW()
                                 )
                                 ON CONFLICT (file_path) DO UPDATE
                                 SET album_id = EXCLUDED.album_id,
@@ -14892,6 +14901,7 @@ def _rebuild_files_library_index(reason: str = "manual", wait_if_running: bool =
                                     sample_rate = EXCLUDED.sample_rate,
                                     bit_depth = EXCLUDED.bit_depth,
                                     file_size_bytes = EXCLUDED.file_size_bytes,
+                                    primary_tags_json = EXCLUDED.primary_tags_json,
                                     updated_at = NOW()
                                 """,
                                 track_rows,
@@ -15325,6 +15335,15 @@ def _files_backfill_artist_browse_entities_from_existing_index() -> dict[str, in
                 """
             )
             album_rows = cur.fetchall()
+            cur.execute(
+                """
+                SELECT album_id, COALESCE(primary_tags_json, '{}')
+                FROM files_tracks
+                WHERE COALESCE(NULLIF(TRIM(primary_tags_json), ''), '{}') <> '{}'
+                ORDER BY album_id ASC, disc_num ASC, track_num ASC, id ASC
+                """
+            )
+            track_tag_rows = cur.fetchall()
 
         artists_seed: dict[str, dict[str, Any]] = {}
         for _artist_id, name, name_norm, has_image, image_path in artist_rows:
@@ -15339,6 +15358,14 @@ def _files_backfill_artist_browse_entities_from_existing_index() -> dict[str, in
 
         albums_payload: list[dict[str, Any]] = []
         album_id_by_folder: dict[str, int] = {}
+        track_tags_by_album_id: dict[int, list[str]] = defaultdict(list)
+        for album_id, primary_tags_json in track_tag_rows:
+            key = int(album_id or 0)
+            if key <= 0:
+                continue
+            raw = str(primary_tags_json or "").strip()
+            if raw:
+                track_tags_by_album_id[key].append(raw)
         for album_id, folder_path, title, track_count, is_broken, primary_tags_json, artist_name, artist_norm in album_rows:
             folder = str(folder_path or "").strip()
             norm = str(artist_norm or "").strip() or _norm_artist_key(str(artist_name or "").strip())
@@ -15354,6 +15381,7 @@ def _files_backfill_artist_browse_entities_from_existing_index() -> dict[str, in
                     "track_count": int(track_count or 0),
                     "is_broken": bool(is_broken),
                     "primary_tags_json": str(primary_tags_json or "{}"),
+                    "track_primary_tags_jsons": track_tags_by_album_id.get(int(album_id or 0), []),
                 }
             )
 
@@ -16330,7 +16358,7 @@ def _files_build_local_artist_profile(
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT DISTINCT
+            SELECT
                 alb.id,
                 COALESCE(alb.title, ''),
                 COALESCE(alb.year, 0),
@@ -16340,6 +16368,7 @@ def _files_build_local_artist_profile(
             FROM files_artist_album_links link
             JOIN files_albums alb ON alb.id = link.album_id
             WHERE link.artist_id = %s
+            GROUP BY alb.id, alb.title, alb.year, alb.label, alb.genre, alb.tags_json
             ORDER BY COALESCE(alb.year, 0) DESC, alb.title ASC
             LIMIT 18
             """,
@@ -26295,7 +26324,7 @@ _CLASSICAL_CATALOG_RE = re.compile(
     r"\b(?:op(?:us)?|bwv|kv|k|hob|d|sz|rv|hwv|s|wq|wwv|twv|buxwv|l|p)\s*\.?\s*\d+[a-z0-9\-/:]*\b",
     flags=re.IGNORECASE,
 )
-_CLASSICAL_SPLIT_RE = re.compile(r"\s*(?:;|,|/|&|\band\b|\bwith\b|\bfeat\.?\b|\bfeaturing\b)\s*", flags=re.IGNORECASE)
+_CLASSICAL_SPLIT_RE = re.compile(r"\s*(?:;|/|&|\band\b|\bwith\b|\bfeat\.?\b|\bfeaturing\b)\s*", flags=re.IGNORECASE)
 _CLASSICAL_RELEASE_CATALOG_PATTERNS = (
     re.compile(r"\b[A-Z]{1,6}\s*\d(?:[\s./-]?\d){2,}\b"),
     re.compile(r"\b\d{1,4}(?:[\s./-]\d{1,4}){1,4}\b"),
@@ -26325,10 +26354,48 @@ _CLASSICAL_LABEL_OCR_ALIASES = {
     "Alpha Classics": ("alpha classics", "alpha"),
     "Naive Classique": ("naive classique", "naive"),
 }
+_CLASSICAL_PERSON_SORT_KEY_NORMALS = {
+    "composersort",
+    "composersortname",
+    "conductorsort",
+    "artistsort",
+    "albumartistsort",
+    "performernamesort",
+    "soloistsort",
+}
 
 
 def _classical_norm_text(value: str | None) -> str:
     return _normalize_identity_text_strict(value)
+
+
+def _classical_key_norm(key: str | None) -> str:
+    return re.sub(r"[\s_]+", "", str(key or "").strip().lower())
+
+
+def _classical_sort_name_to_display(value: str | None) -> str:
+    txt = re.sub(r"\s+", " ", str(value or "").strip(" -–—"))
+    if not txt or "," not in txt:
+        return txt
+    parts = [p.strip() for p in txt.split(",") if p.strip()]
+    if len(parts) < 2:
+        return txt
+    surname = parts[0]
+    rest = parts[1:]
+    prefix_tokens: list[str] = []
+    given_tokens: list[str] = []
+    suffix_tokens: list[str] = []
+    suffix_norms = {"jr", "sr", "ii", "iii", "iv"}
+    for token in rest:
+        norm = _classical_norm_text(token)
+        if norm in _CLASSICAL_PERSON_NAME_HONORIFICS:
+            prefix_tokens.append(token)
+        elif norm in suffix_norms:
+            suffix_tokens.append(token)
+        else:
+            given_tokens.append(token)
+    reordered = " ".join([*prefix_tokens, *given_tokens, surname, *suffix_tokens]).strip()
+    return reordered or txt
 
 
 def _classical_split_values(value: Any) -> list[str]:
@@ -26365,6 +26432,7 @@ def _classical_collect_tag_values(tags: dict | None, keys: tuple[str, ...]) -> l
     seen: set[str] = set()
     lowered = {str(k or "").strip().lower(): v for k, v in tags.items()}
     for key in keys:
+        key_norm = _classical_key_norm(key)
         for cand in {
             key,
             key.replace(" ", ""),
@@ -26373,7 +26441,16 @@ def _classical_collect_tag_values(tags: dict | None, keys: tuple[str, ...]) -> l
             key.replace("_", " "),
         }:
             raw = lowered.get(cand)
-            for value in _classical_split_values(raw):
+            raw_values = raw if isinstance(raw, (list, tuple, set)) else [raw]
+            normalized_values: list[str] = []
+            for raw_value in raw_values:
+                txt = html.unescape(str(raw_value or "")).strip()
+                if not txt:
+                    continue
+                if key_norm in _CLASSICAL_PERSON_SORT_KEY_NORMALS:
+                    txt = _classical_sort_name_to_display(txt)
+                normalized_values.append(txt)
+            for value in _classical_split_values(normalized_values):
                 norm = _classical_norm_text(value)
                 if norm and norm not in seen:
                     out.append(value)
@@ -26458,6 +26535,73 @@ def _classical_display_payload(
         "performers": filtered_performers[:6],
         "catalog_numbers": catalog_numbers,
     }
+
+
+def _files_collect_album_classical_payload(
+    album: dict[str, Any],
+    *,
+    fallback_artist: str = "",
+) -> dict[str, list[str]] | None:
+    merged: dict[str, list[str]] = {
+        "composer": [],
+        "work": [],
+        "conductor": [],
+        "orchestra": [],
+        "ensemble": [],
+        "soloists": [],
+        "performers": [],
+        "catalog_numbers": [],
+    }
+    seen_per_key: dict[str, set[str]] = {key: set() for key in merged}
+    any_payload = False
+    seen_sources: set[str] = set()
+
+    sources: list[tuple[str, str]] = []
+    primary_tags_raw = str(album.get("primary_tags_json") or "{}").strip()
+    if primary_tags_raw:
+        sources.append((primary_tags_raw, str(album.get("title") or "").strip()))
+    for track in (album.get("tracks") or []):
+        raw = str((track or {}).get("primary_tags_json") or "").strip()
+        if raw:
+            sources.append((raw, str((track or {}).get("title") or album.get("title") or "").strip()))
+    for raw in (album.get("track_primary_tags_jsons") or []):
+        raw_txt = str(raw or "").strip()
+        if raw_txt:
+            sources.append((raw_txt, str(album.get("title") or "").strip()))
+
+    for raw, fallback_title in sources:
+        if raw in seen_sources:
+            continue
+        seen_sources.add(raw)
+        tag_map = _safe_json_load(raw, fallback={})
+        if not isinstance(tag_map, dict):
+            continue
+        payload = _classical_display_payload(
+            tag_map,
+            fallback_title=fallback_title,
+            fallback_artist=fallback_artist,
+        )
+        if not isinstance(payload, dict):
+            continue
+        any_payload = True
+        for key in merged:
+            for value in (payload.get(key) or []):
+                clean = re.sub(r"\s+", " ", str(value or "").strip(" -–—"))
+                if not clean:
+                    continue
+                norm = _classical_norm_text(clean)
+                if not norm or norm in seen_per_key[key]:
+                    continue
+                seen_per_key[key].add(norm)
+                merged[key].append(clean)
+    fallback_artist_norm = _classical_norm_text(fallback_artist)
+    if fallback_artist_norm and len(merged["composer"]) > 1:
+        merged["composer"] = [
+            value
+            for value in merged["composer"]
+            if _classical_norm_text(value) != fallback_artist_norm
+        ]
+    return merged if any_payload else None
 
 
 _FILES_BROWSE_PRIMARY_ROLES = {"artist"}
@@ -26554,6 +26698,14 @@ def _classical_person_names_equivalent(left: str, right: str) -> bool:
     ls = _classical_person_alias_signature(left)
     rs = _classical_person_alias_signature(right)
     if not ls or not rs:
+        left_norm = _classical_norm_text(left)
+        right_norm = _classical_norm_text(right)
+        if left_norm and right_norm and left_norm == right_norm:
+            return True
+        if left_norm and rs and left_norm == str(rs.get("surname") or ""):
+            return True
+        if right_norm and ls and right_norm == str(ls.get("surname") or ""):
+            return True
         return False
     if str(ls.get("surname") or "") != str(rs.get("surname") or ""):
         return False
@@ -26611,12 +26763,7 @@ def _files_extract_browse_entities_for_album(
             has_image=source_has_image,
         )
 
-    tags_map = _safe_json_load(album.get("primary_tags_json") or "{}", fallback={})
-    classical_payload = _classical_display_payload(
-        tags_map if isinstance(tags_map, dict) else {},
-        fallback_title=str(album.get("title") or "").strip(),
-        fallback_artist=artist_name,
-    )
+    classical_payload = _files_collect_album_classical_payload(album, fallback_artist=artist_name)
     if not isinstance(classical_payload, dict):
         return entities
 
@@ -26674,6 +26821,24 @@ def _build_files_browse_artist_entities(
             canonical_name_by_norm[raw_norm] = raw_name
             matched_norm = raw_norm
         canonical_norm_by_raw_norm[raw_norm] = matched_norm
+
+    surname_targets: dict[str, list[str]] = defaultdict(list)
+    for candidate_norm, candidate_name in canonical_name_by_norm.items():
+        sig = _classical_person_alias_signature(candidate_name)
+        surname = str(sig.get("surname") or "").strip()
+        if surname:
+            surname_targets[surname].append(candidate_norm)
+    for entry in person_alias_targets:
+        raw_name = str(entry.get("name") or "").strip()
+        raw_norm = str(entry.get("norm") or "").strip()
+        if not raw_norm:
+            continue
+        tokens = [tok for tok in re.findall(r"[a-z0-9]+", _classical_norm_text(raw_name)) if tok]
+        if len(tokens) != 1:
+            continue
+        candidates = [cand for cand in surname_targets.get(tokens[0], []) if cand != raw_norm]
+        if len(candidates) == 1:
+            canonical_norm_by_raw_norm[raw_norm] = candidates[0]
 
     entity_map: dict[str, dict[str, Any]] = {}
     album_links_by_folder: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -53200,11 +53365,10 @@ def api_library_artists():
         genre = (request.args.get("genre") or "").strip()
         label = (request.args.get("label") or "").strip()
         year = _parse_int_loose(request.args.get("year"), 0)
-        include_unmatched = _library_include_unmatched_effective()
-        album_match_sql = _library_albums_match_where(include_unmatched, "alb")
+        browse_album_match_sql = "1=1"
         limit = max(1, min(500, _parse_int_loose(request.args.get("limit"), 100)))
         offset = max(0, _parse_int_loose(request.args.get("offset"), 0))
-        cache_key = f"library:artists:{search_query.lower()}:{genre.lower()}:{label.lower()}:{int(year or 0)}:{limit}:{offset}:{_library_cache_unmatched_suffix(include_unmatched)}"
+        cache_key = f"library:artists:{search_query.lower()}:{genre.lower()}:{label.lower()}:{int(year or 0)}:{limit}:{offset}:browseall"
         cached = _files_cache_get_json(cache_key)
         if cached is not None:
             return jsonify(cached)
@@ -53225,14 +53389,14 @@ def api_library_artists():
                         FROM files_artist_album_links link
                         JOIN files_albums alb ON alb.id = link.album_id
                         WHERE link.artist_id = a.id
-                          AND {album_match_sql}
+                          AND {browse_album_match_sql}
                     )
                     """
                 )
 
                 if search_query:
                     like = f"%{search_query}%"
-                    search_album_match = _library_albums_match_where(include_unmatched, "alb2")
+                    search_album_match = browse_album_match_sql
                     where_parts.append(
                         f"""
                         (
@@ -53266,7 +53430,7 @@ def api_library_artists():
                             FROM files_artist_album_links link
                             JOIN files_albums alb ON alb.id = link.album_id
                             WHERE link.artist_id = a.id
-                              AND """ + album_match_sql + """
+                              AND """ + browse_album_match_sql + """
                               AND COALESCE(alb.year, 0) = %s
                         )
                         """
@@ -53280,10 +53444,10 @@ def api_library_artists():
                             """
                             EXISTS (
                                 SELECT 1
-                                FROM files_artist_album_links link
-                                JOIN files_albums alb ON alb.id = link.album_id
-                                WHERE link.artist_id = a.id
-                                  AND """ + album_match_sql + """
+                            FROM files_artist_album_links link
+                            JOIN files_albums alb ON alb.id = link.album_id
+                            WHERE link.artist_id = a.id
+                                  AND """ + browse_album_match_sql + """
                                   AND lower(trim(COALESCE(alb.label, ''))) = ANY(%s)
                             )
                             """
@@ -53298,10 +53462,10 @@ def api_library_artists():
                             """
                             EXISTS (
                                 SELECT 1
-                                FROM files_artist_album_links link
-                                JOIN files_albums alb ON alb.id = link.album_id
-                                WHERE link.artist_id = a.id
-                                  AND """ + album_match_sql + """
+                            FROM files_artist_album_links link
+                            JOIN files_albums alb ON alb.id = link.album_id
+                            WHERE link.artist_id = a.id
+                                  AND """ + browse_album_match_sql + """
                                   AND (
                                     EXISTS (
                                         SELECT 1
@@ -53329,7 +53493,7 @@ def api_library_artists():
                 )
                 total = int((cur.fetchone() or [0])[0] or 0)
 
-                album_count_match_sql = _library_albums_match_where(include_unmatched, "alb_cnt")
+                album_count_match_sql = browse_album_match_sql
 
                 if search_query:
                     try:
@@ -53686,16 +53850,15 @@ def api_library_search_suggest():
     """Unified typeahead search across artists, classical entities, albums, tracks and genres (Files mode)."""
     query = (request.args.get("q") or "").strip()
     limit = max(1, min(40, _parse_int_loose(request.args.get("limit"), 12)))
-    include_unmatched = _library_include_unmatched_effective()
-    album_match_sql = _library_albums_match_where(include_unmatched, "alb")
-    artist_match_sql = _library_albums_match_where(include_unmatched, "alb2")
-    artist_count_match_sql = _library_albums_match_where(include_unmatched, "alb_cnt")
+    album_match_sql = "1=1"
+    artist_match_sql = "1=1"
+    artist_count_match_sql = "1=1"
     if not query:
         return jsonify({"query": "", "items": []})
     if _get_library_mode() != "files":
         return jsonify({"query": query, "items": []})
 
-    cache_key = f"library:search:suggest:{query.lower()}:{limit}:{_library_cache_unmatched_suffix(include_unmatched)}"
+    cache_key = f"library:search:suggest:{query.lower()}:{limit}:browseall"
     cached = _files_cache_get_json(cache_key)
     if cached is not None:
         return jsonify(cached)
