@@ -288,7 +288,7 @@ export default function LibraryAlbums() {
         {albums.map((a, idx) => (
           <div key={`alb-${a.album_id}`} className="group">
             <div className={cn(
-              'relative overflow-hidden rounded-2xl border border-border/60 bg-card shadow-sm'
+              'relative overflow-hidden border border-border/60 bg-card'
             )}>
               <AspectRatio
                 ratio={1}

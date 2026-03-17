@@ -200,6 +200,17 @@ function joinClassical(values?: string[] | null, limit = 3): string | null {
   return items.slice(0, limit).join(' · ');
 }
 
+function albumHeroTitleClass(title: string): string {
+  const length = String(title || '').trim().length;
+  if (length >= 70) {
+    return 'text-[1.95rem] leading-[1.04] md:text-[2.25rem] md:leading-[1.02] xl:text-[2.85rem] xl:leading-[1]';
+  }
+  if (length >= 48) {
+    return 'text-[2.2rem] leading-[1.03] md:text-[2.55rem] md:leading-[1.01] xl:text-[3.35rem] xl:leading-[0.99]';
+  }
+  return 'text-3xl leading-[1.02] md:text-[2.85rem] md:leading-[0.98] xl:text-5xl xl:leading-[1.01]';
+}
+
 export default function AlbumPage() {
   const navigate = useNavigate();
   const location = useLocation();
@@ -706,8 +717,11 @@ export default function AlbumPage() {
                   </Button>
                 </div>
               </button>
-              <div className="min-w-0 overflow-hidden border border-border/70 bg-white/52 px-5 py-5 backdrop-blur-md dark:border-white/10 dark:bg-background/58">
-                <h1 className="pr-2 pt-1 text-3xl font-bold leading-[1.02] tracking-tight text-slate-950 [text-wrap:balance] drop-shadow-[0_1px_4px_rgba(255,255,255,0.55)] break-words dark:text-white dark:drop-shadow-[0_2px_10px_rgba(0,0,0,0.7)] md:text-[2.85rem] md:leading-[0.98] xl:text-5xl xl:leading-[1.01]">
+              <div className="min-w-0 border border-border/70 bg-white/52 px-5 py-5 backdrop-blur-md dark:border-white/10 dark:bg-background/58">
+                <h1 className={cn(
+                  'max-w-[18ch] pr-2 pt-1 font-bold tracking-tight text-slate-950 [text-wrap:balance] drop-shadow-[0_1px_4px_rgba(255,255,255,0.55)] break-words dark:text-white dark:drop-shadow-[0_2px_10px_rgba(0,0,0,0.7)]',
+                  albumHeroTitleClass(data.title)
+                )}>
                   {data.title}
                 </h1>
                 <button
