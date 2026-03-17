@@ -1423,13 +1423,21 @@ export async function getLibraryDiscoverWithOptions(
   return fetchApi<LibraryDiscoverResponse>(`/api/library/discover?${qs.toString()}`);
 }
 
-export type LibrarySearchItemType = 'artist' | 'album' | 'track' | 'genre';
+export type LibrarySearchItemType =
+  | 'artist'
+  | 'album'
+  | 'track'
+  | 'genre'
+  | 'composer'
+  | 'conductor'
+  | 'orchestra';
 
 export interface LibrarySearchSuggestionItem {
   type: LibrarySearchItemType;
   title: string;
   subtitle?: string;
   thumb?: string | null;
+  search_query?: string;
   artist_id?: number;
   album_id?: number;
   track_id?: number;

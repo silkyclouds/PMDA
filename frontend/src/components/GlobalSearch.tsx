@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type KeyboardEventHandler } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
-import { Disc3, Loader2, Music2, Search, Tags, UserRound } from 'lucide-react';
+import { Disc3, Loader2, Music2, Search, Tags, UserRound, Users } from 'lucide-react';
 import { Input } from '@/components/ui/input';
 import { withBackLinkState } from '@/lib/backNavigation';
 import { cn } from '@/lib/utils';
@@ -64,6 +64,9 @@ export function GlobalSearch({ className }: { className?: string }) {
   const groupedLabel = useMemo(() => {
     return (item: LibrarySearchSuggestionItem) => {
       if (item.type === 'artist') return 'Artist';
+      if (item.type === 'composer') return 'Composer';
+      if (item.type === 'conductor') return 'Conductor';
+      if (item.type === 'orchestra') return 'Orchestra';
       if (item.type === 'album') return 'Album';
       if (item.type === 'genre') return 'Genre';
       return 'Track';
@@ -77,6 +80,15 @@ export function GlobalSearch({ className }: { className?: string }) {
       const g = String(item.title || '').trim();
       if (g) navigate(`/library/genre/${encodeURIComponent(g)}`, { state: navState });
       else navigate('/library/genres', { state: navState });
+    } else if (item.type === 'composer' || item.type === 'conductor' || item.type === 'orchestra') {
+      if (item.artist_id) {
+        navigate(`/library/artist/${item.artist_id}`, { state: navState });
+      } else {
+        const next = new URLSearchParams();
+        const q = String(item.search_query || item.title || '').trim();
+        if (q) next.set('search', q);
+        navigate(`/library/albums${next.toString() ? `?${next.toString()}` : ''}`, { state: navState });
+      }
     } else if (item.type === 'track' && item.album_id) {
       const trackParam = item.track_id && item.track_id > 0 ? `?track_id=${item.track_id}` : '';
       navigate(`/library/album/${item.album_id}${trackParam}`, { state: navState });
@@ -122,6 +134,8 @@ export function GlobalSearch({ className }: { className?: string }) {
 
   const iconFor = (type: LibrarySearchSuggestionItem['type']) => {
     if (type === 'artist') return <UserRound className="w-4 h-4 text-muted-foreground" />;
+    if (type === 'composer' || type === 'conductor') return <UserRound className="w-4 h-4 text-muted-foreground" />;
+    if (type === 'orchestra') return <Users className="w-4 h-4 text-muted-foreground" />;
     if (type === 'album') return <Disc3 className="w-4 h-4 text-muted-foreground" />;
     if (type === 'genre') return <Tags className="w-4 h-4 text-muted-foreground" />;
     return <Music2 className="w-4 h-4 text-muted-foreground" />;
@@ -135,7 +149,7 @@ export function GlobalSearch({ className }: { className?: string }) {
         onChange={(e) => setQuery(e.target.value)}
         onFocus={() => setOpen(items.length > 0)}
         onKeyDown={onKeyDown}
-        placeholder="Search artist, album, track, genre..."
+        placeholder="Search artist, composer, orchestra, album, track, genre..."
         className="h-11 pl-9 pr-9 rounded-xl bg-background/85 border-border/70"
       />
       {loading ? (
@@ -154,18 +168,17 @@ export function GlobalSearch({ className }: { className?: string }) {
                   type="button"
                   onMouseEnter={() => setActiveIndex(idx)}
                   onClick={() => goToItem(item)}
-                  className={cn(
-                    'w-full px-3 py-2.5 text-left border-b border-border/50 last:border-b-0 hover:bg-accent/70 transition-colors',
-                    idx === activeIndex && 'bg-accent'
-                  )}
+                    className={cn(
+                      'w-full px-3 py-2.5 text-left border-b border-border/50 last:border-b-0 hover:bg-accent/70 transition-colors',
+                      idx === activeIndex && 'bg-accent'
+                    )}
                 >
                   <div className="flex items-center gap-3 min-w-0">
-                    <div className="w-9 h-9 rounded-md bg-muted overflow-hidden shrink-0 flex items-center justify-center">
+                    <div className="relative w-9 h-9 rounded-md bg-muted overflow-hidden shrink-0 flex items-center justify-center">
+                      <div className="absolute inset-0 flex items-center justify-center">{iconFor(item.type)}</div>
                       {item.thumb ? (
-                        <img src={item.thumb} alt={item.title} className="w-full h-full object-cover" />
-                      ) : (
-                        iconFor(item.type)
-                      )}
+                        <img src={item.thumb} alt={item.title} className="absolute inset-0 w-full h-full object-cover" />
+                      ) : null}
                     </div>
                     <div className="min-w-0 flex-1">
                       <div className="flex items-center gap-2">

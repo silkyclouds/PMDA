@@ -52597,7 +52597,7 @@ def api_library_artists_suggest():
 
 @app.get("/api/library/search/suggest")
 def api_library_search_suggest():
-    """Unified typeahead search across artists, albums, tracks and genres (Files mode)."""
+    """Unified typeahead search across artists, classical entities, albums, tracks and genres (Files mode)."""
     query = (request.args.get("q") or "").strip()
     limit = max(1, min(40, _parse_int_loose(request.args.get("limit"), 12)))
     include_unmatched = _library_include_unmatched_effective()
@@ -52683,12 +52683,149 @@ def api_library_search_suggest():
                         "artist_id": artist_id,
                         "title": row[1] or "",
                         "subtitle": f"{int(row[2] or 0)} album(s)",
-                        "thumb": f"{base_url}/api/library/files/artist/{artist_id}/image?size=96" if bool(row[3]) else None,
+                        "thumb": f"{base_url}/api/library/files/artist/{artist_id}/image?size=96" if artist_id > 0 else None,
                         "_score": float(row[4] or 0.0),
                         "_prefix": int(row[5] or 1),
                         "_rank": 0,
                     }
                 )
+
+            # Classical entities (composer / conductor / orchestra)
+            classical_fetch_limit = max(72, min(360, per_kind * 18))
+            classical_like = like
+            classical_query_norm = _classical_norm_text(query)
+            classical_merged: dict[tuple[str, str], dict[str, Any]] = {}
+            if classical_query_norm:
+                cur.execute(
+                    """
+                    SELECT
+                        alb.id,
+                        alb.title,
+                        ar.id AS artist_id,
+                        ar.name AS artist_name,
+                        COALESCE(alb.year, 0) AS year,
+                        alb.has_cover,
+                        COALESCE(alb.tags_json, '{}') AS tags_json
+                    FROM files_albums alb
+                    JOIN files_artists ar ON ar.id = alb.artist_id
+                    WHERE COALESCE(alb.tags_json, '') <> ''
+                      AND COALESCE(alb.tags_json, '') NOT IN ('[]', '{}')
+                      AND alb.tags_json ILIKE %s
+                      AND """
+                    + album_match_sql
+                    + """
+                    ORDER BY alb.track_count DESC, alb.title ASC
+                    LIMIT %s
+                    """,
+                    (classical_like, int(classical_fetch_limit)),
+                )
+                role_labels = {
+                    "composer": "Composer",
+                    "conductor": "Conductor",
+                    "orchestra": "Orchestra",
+                }
+                for row in cur.fetchall():
+                    album_id = int(row[0] or 0)
+                    album_title = str(row[1] or "").strip()
+                    artist_id = int(row[2] or 0)
+                    artist_name = str(row[3] or "").strip()
+                    album_year = int(row[4] or 0)
+                    album_has_cover = bool(row[5])
+                    try:
+                        tags_map = json.loads(row[6] or "{}") if row[6] else {}
+                    except Exception:
+                        tags_map = {}
+                    if not isinstance(tags_map, dict):
+                        continue
+                    classical_payload = _classical_display_payload(
+                        tags_map,
+                        fallback_title=album_title,
+                        fallback_artist=artist_name,
+                    )
+                    if not isinstance(classical_payload, dict):
+                        continue
+                    for entity_type, values in (
+                        ("composer", classical_payload.get("composer") or []),
+                        ("conductor", classical_payload.get("conductor") or []),
+                        ("orchestra", classical_payload.get("orchestra") or []),
+                    ):
+                        for value in values:
+                            display_name = re.sub(r"\s+", " ", str(value or "").strip())
+                            display_norm = _classical_norm_text(display_name)
+                            if not display_norm or classical_query_norm not in display_norm:
+                                continue
+                            key = (entity_type, display_norm)
+                            entry = classical_merged.get(key)
+                            if entry is None:
+                                entry = {
+                                    "type": entity_type,
+                                    "title": display_name,
+                                    "label": role_labels.get(entity_type, "Classical"),
+                                    "search_query": display_name,
+                                    "album_ids": set(),
+                                    "representative_album_id": album_id if album_id > 0 else None,
+                                    "representative_artist_id": artist_id if artist_id > 0 else None,
+                                    "representative_artist_name": artist_name,
+                                    "representative_year": album_year if album_year > 0 else None,
+                                    "representative_has_cover": bool(album_has_cover),
+                                    "_prefix": 0 if display_norm.startswith(classical_query_norm) else 1,
+                                    "_score": 0.0,
+                                }
+                                classical_merged[key] = entry
+                            entry["album_ids"].add(album_id)
+                            current_has_cover = bool(entry.get("representative_has_cover"))
+                            if album_has_cover and not current_has_cover:
+                                entry["representative_album_id"] = album_id if album_id > 0 else entry.get("representative_album_id")
+                                entry["representative_artist_id"] = artist_id if artist_id > 0 else entry.get("representative_artist_id")
+                                entry["representative_artist_name"] = artist_name or entry.get("representative_artist_name")
+                                entry["representative_year"] = album_year if album_year > 0 else entry.get("representative_year")
+                                entry["representative_has_cover"] = True
+                if classical_merged:
+                    entity_norms = [key[1] for key in classical_merged.keys()]
+                    artist_by_norm: dict[str, int] = {}
+                    external_image_norms: set[str] = set()
+                    if entity_norms:
+                        cur.execute(
+                            "SELECT id, name_norm FROM files_artists WHERE name_norm = ANY(%s)",
+                            (entity_norms,),
+                        )
+                        for artist_id, name_norm in cur.fetchall():
+                            norm_key = str(name_norm or "").strip()
+                            if norm_key:
+                                artist_by_norm[norm_key] = int(artist_id or 0)
+                        cur.execute(
+                            "SELECT name_norm FROM files_external_artist_images WHERE name_norm = ANY(%s) AND COALESCE(image_path, '') <> ''",
+                            (entity_norms,),
+                        )
+                        for (name_norm,) in cur.fetchall():
+                            norm_key = str(name_norm or "").strip()
+                            if norm_key:
+                                external_image_norms.add(norm_key)
+                    for (entity_type, entity_norm), entry in classical_merged.items():
+                        album_count = len(entry.get("album_ids") or set())
+                        direct_artist_id = int(artist_by_norm.get(entity_norm) or 0)
+                        rep_album_id = int(entry.get("representative_album_id") or 0)
+                        thumb = None
+                        if direct_artist_id > 0:
+                            thumb = f"{base_url}/api/library/files/artist/{direct_artist_id}/image?size=96"
+                        elif entity_norm in external_image_norms:
+                            thumb = f"{base_url}/api/library/external/artist-image/{quote(entity_norm, safe='')}?size=96"
+                        elif rep_album_id > 0 and bool(entry.get('representative_has_cover')):
+                            thumb = f"{base_url}/api/library/files/album/{rep_album_id}/cover?size=96"
+                        merged.append(
+                            {
+                                "type": entity_type,
+                                "artist_id": direct_artist_id if direct_artist_id > 0 else None,
+                                "album_id": rep_album_id if rep_album_id > 0 else None,
+                                "title": str(entry.get("title") or ""),
+                                "subtitle": f"{album_count} album(s)",
+                                "thumb": thumb,
+                                "search_query": str(entry.get("search_query") or entry.get("title") or ""),
+                                "_score": float(album_count) + (3.0 if direct_artist_id > 0 else 0.0),
+                                "_prefix": int(entry.get("_prefix") or 1),
+                                "_rank": 1,
+                            }
+                        )
 
             # Albums
             try:
@@ -52751,7 +52888,7 @@ def api_library_search_suggest():
                         "thumb": f"{base_url}/api/library/files/album/{album_id}/cover?size=96" if bool(row[5]) else None,
                         "_score": float(row[6] or 0.0),
                         "_prefix": int(row[7] or 2),
-                        "_rank": 1,
+                        "_rank": 2,
                     }
                 )
 
@@ -52835,7 +52972,7 @@ def api_library_search_suggest():
                         "thumb": f"{base_url}/api/library/files/album/{album_id}/cover?size=96" if bool(row[8]) else None,
                         "_score": float(row[10] or 0.0),
                         "_prefix": int(row[11] or 3),
-                        "_rank": 2,
+                        "_rank": 3,
                     }
                 )
 
@@ -52907,7 +53044,7 @@ def api_library_search_suggest():
                         "subtitle": f"{int(row[1] or 0)} album(s)",
                         "_score": float(row[1] or 0.0),
                         "_prefix": int(row[2] or 1),
-                        "_rank": 3,
+                        "_rank": 4,
                     }
                 )
 
