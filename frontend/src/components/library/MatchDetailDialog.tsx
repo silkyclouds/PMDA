@@ -24,6 +24,7 @@ import {
   TableRow,
 } from '@/components/ui/table';
 import { useToast } from '@/hooks/use-toast';
+import { useAuth } from '@/contexts/AuthContext';
 import * as api from '@/lib/api';
 import { badgeKindClass, matchTypeBadgeClass } from '@/lib/badgeStyles';
 import { formatBadgeDateTime } from '@/lib/dateFormat';
@@ -67,6 +68,7 @@ interface MatchDetailDialogProps {
 export function MatchDetailDialog({ open, onOpenChange, entity, onDataChanged }: MatchDetailDialogProps) {
   const navigate = useNavigate();
   const { toast } = useToast();
+  const { canUseAI } = useAuth();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [rematchBusy, setRematchBusy] = useState(false);
@@ -828,7 +830,7 @@ export function MatchDetailDialog({ open, onOpenChange, entity, onDataChanged }:
             Refresh details
           </Button>
           <div className="flex flex-wrap items-center gap-2">
-            {isAlbum ? (
+            {isAlbum && canUseAI ? (
               <Button
                 type="button"
                 variant="outline"
@@ -840,7 +842,7 @@ export function MatchDetailDialog({ open, onOpenChange, entity, onDataChanged }:
                 Generate AI review
               </Button>
             ) : null}
-            {isArtist ? (
+            {isArtist && canUseAI ? (
               <Button
                 type="button"
                 variant="outline"

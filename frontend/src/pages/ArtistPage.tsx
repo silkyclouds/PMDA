@@ -370,6 +370,7 @@ export default function ArtistPage() {
   }, [artistLiked, artistId, toast]);
 
   const ensureDescription = useCallback(async () => {
+    if (!canUseAI) return;
     if (!Number.isFinite(artistId) || artistId <= 0) return;
     try {
       setSummaryLoading(true);
@@ -380,7 +381,7 @@ export default function ArtistPage() {
     } finally {
       setSummaryLoading(false);
     }
-  }, [artistId, loadSummary]);
+  }, [artistId, canUseAI, loadSummary]);
 
   const openArtistByName = useCallback(async (name: string) => {
     const q = (name || '').trim();
@@ -440,7 +441,7 @@ export default function ArtistPage() {
       setSummary(res);
       const orig = (res.original?.text || '').trim();
       const ai = (res.ai?.text || '').trim();
-      if (orig === '' && ai === '') {
+      if (canUseAI && orig === '' && ai === '') {
         await ensureDescription();
       }
 
@@ -455,7 +456,7 @@ export default function ArtistPage() {
     } finally {
       setRefreshAllBusy(false);
     }
-  }, [artistId, refreshAllBusy, fetchArtist, fetchProfile, loadConcerts, ensureDescription, connectionDetailsOpen, loadFacts, toast]);
+  }, [artistId, canUseAI, refreshAllBusy, fetchArtist, fetchProfile, loadConcerts, ensureDescription, connectionDetailsOpen, loadFacts, toast]);
 
   const runArtistAiResearch = useCallback(async () => {
     if (!Number.isFinite(artistId) || artistId <= 0) return;
@@ -547,11 +548,11 @@ export default function ArtistPage() {
     if (autoAiRequestedRef.current) return;
     const orig = (summary.original?.text || '').trim();
     const ai = (summary.ai?.text || '').trim();
-    if (orig === '' && ai === '') {
+    if (canUseAI && orig === '' && ai === '') {
       autoAiRequestedRef.current = true;
       void ensureDescription();
     }
-  }, [summary, summaryLoading, ensureDescription]);
+  }, [canUseAI, summary, summaryLoading, ensureDescription]);
 
   useEffect(() => {
     if (!details || !profileEnriching) return;
@@ -787,7 +788,6 @@ export default function ArtistPage() {
   const hasConcertSignals = concertsLoading || Boolean(concertsError) || concertList.events.length > 0 || Boolean(isDeceased);
   const hasConnectionSignals = factsLoading || connectionCount > 0;
   const showInsightsCard = hasConcertSignals || hasConnectionSignals;
-  const artistAddedAt = Number(details.created_at || 0) > 0 ? Number(details.created_at || 0) : null;
   const artistUpdatedAt =
     Number(details.updated_at || 0) > 0
       ? Number(details.updated_at || 0)
@@ -882,25 +882,6 @@ export default function ArtistPage() {
                       <Heart className={cn('h-4 w-4', artistLiked ? 'fill-current' : '')} />
                       {artistLiked ? 'Liked' : 'Like'}
                     </Button>
-                    {displaySource ? (
-                      <ProviderBadge provider={displaySource} prefix="Source" className="text-[10px]" />
-                    ) : null}
-                    {artistAddedAt ? (
-                      <Badge variant="outline" className={`text-[10px] ${badgeKindClass('muted')}`}>
-                        Added {formatBadgeDateTime(artistAddedAt)}
-                      </Badge>
-                    ) : null}
-                    <button
-                      type="button"
-                      className={cn(
-                        'inline-flex items-center rounded-full border px-2.5 py-1 text-[10px] leading-none transition-colors hover:brightness-110',
-                        badgeKindClass('muted')
-                      )}
-                      onClick={() => setMatchDialogOpen(true)}
-                      title="Open match detail"
-                    >
-                      Updated: {formatBadgeDateTime(artistUpdatedAt)}
-                    </button>
                     <ShareDialog
                       entityType="artist"
                       entityId={details.artist_id}
@@ -913,6 +894,24 @@ export default function ArtistPage() {
                         </Button>
                       )}
                     />
+                    {canUseAI ? (
+                      <EntityDiscoverDialog
+                        entityType="artist"
+                        artistId={details.artist_id}
+                        entityLabel={details.artist_name}
+                        triggerLabel="Discover"
+                      />
+                    ) : null}
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      className="h-8 gap-2"
+                      onClick={() => setMatchDialogOpen(true)}
+                    >
+                      <Info className="h-3.5 w-3.5" />
+                      Match detail
+                    </Button>
                     <Button
                       type="button"
                       size="sm"
@@ -939,24 +938,22 @@ export default function ArtistPage() {
                         AI research
                       </Button>
                     ) : null}
-                    {canUseAI ? (
-                      <EntityDiscoverDialog
-                        entityType="artist"
-                        artistId={details.artist_id}
-                        entityLabel={details.artist_name}
-                        triggerLabel="Discover"
-                      />
+                    {displaySource ? (
+                      <ProviderBadge provider={displaySource} prefix="Source" className="text-[10px]" />
                     ) : null}
-                    <Button
-                      type="button"
-                      size="sm"
-                      variant="outline"
-                      className="h-8 gap-2"
-                      onClick={() => setMatchDialogOpen(true)}
-                    >
-                      <Info className="h-3.5 w-3.5" />
-                      Match detail
-                    </Button>
+                    {artistUpdatedAt ? (
+                      <button
+                        type="button"
+                        className={cn(
+                          'inline-flex items-center rounded-full border px-2.5 py-1 text-[10px] leading-none transition-colors hover:brightness-110',
+                          badgeKindClass('muted')
+                        )}
+                        onClick={() => setMatchDialogOpen(true)}
+                        title="Open match detail"
+                      >
+                        Updated: {formatBadgeDateTime(artistUpdatedAt)}
+                      </button>
+                    ) : null}
                   </div>
                 </div>
               </div>
@@ -1029,15 +1026,6 @@ export default function ArtistPage() {
                 <Badge variant="outline" className={`h-8 px-2.5 text-[11px] gap-1.5 ${badgeKindClass('count')}`}>
                   <Users className="h-3.5 w-3.5" />
                   Connections: {connectionCountDisplay}
-                </Badge>
-              ) : null}
-              {isDeceased ? (
-                <Badge
-                  variant="secondary"
-                  className={`h-8 px-2.5 text-[11px] ${badgeKindClass('status_soft')}`}
-                  title="At best you'll see a cover band."
-                >
-                  No more concerts
                 </Badge>
               ) : null}
               {factsLoading ? (

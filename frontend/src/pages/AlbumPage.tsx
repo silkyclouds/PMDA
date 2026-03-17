@@ -561,7 +561,6 @@ export default function AlbumPage() {
   const ratings = data.ratings || {};
   const ratingSignals = ratings.signals || {};
   const publicRatingSourceId = normalizeProviderId(ratings.public_rating_source || '');
-  const albumAddedAt = Number(data.created_at || 0) > 0 ? Number(data.created_at || 0) : null;
   const albumUpdatedAt =
     Number(data.updated_at || 0) > 0
       ? Number(data.updated_at || 0)
@@ -589,6 +588,35 @@ export default function AlbumPage() {
             <Heart className={cn('w-4 h-4', albumLiked ? 'fill-current' : '')} />
             {albumLiked ? 'Liked' : 'Like'}
           </Button>
+          <ShareDialog
+            entityType="album"
+            entityId={data.album_id}
+            entityLabel={data.title}
+            entitySubtitle={data.artist_name}
+            trigger={(
+              <Button size="sm" variant="outline" className="h-8 gap-2">
+                <Share2 className="w-4 h-4" />
+                Share
+              </Button>
+            )}
+          />
+          {canUseAI ? (
+            <EntityDiscoverDialog
+              entityType="album"
+              albumId={data.album_id}
+              entityLabel={data.title}
+              triggerLabel="Discover"
+            />
+          ) : null}
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-8 gap-2"
+            onClick={() => setMatchDialogOpen(true)}
+          >
+            <Info className="w-4 h-4" />
+            Match detail
+          </Button>
           {data.label ? (
             <Button
               size="sm"
@@ -612,34 +640,18 @@ export default function AlbumPage() {
               Download
             </Button>
           ) : null}
-          <Button
-            size="sm"
-            variant="outline"
-            className="h-8 gap-2"
-            onClick={() => setMatchDialogOpen(true)}
-          >
-            <Info className="w-4 h-4" />
-            Match detail
-          </Button>
-          <ShareDialog
-            entityType="album"
-            entityId={data.album_id}
-            entityLabel={data.title}
-            entitySubtitle={data.artist_name}
-            trigger={(
-              <Button size="sm" variant="outline" className="h-8 gap-2">
-                <Share2 className="w-4 h-4" />
-                Share
-              </Button>
-            )}
-          />
-          {canUseAI ? (
-            <EntityDiscoverDialog
-              entityType="album"
-              albumId={data.album_id}
-              entityLabel={data.title}
-              triggerLabel="Discover"
-            />
+          {albumUpdatedAt ? (
+            <button
+              type="button"
+              className={cn(
+                "inline-flex items-center border px-2.5 py-1 text-[10px] leading-none transition-colors hover:brightness-110",
+                badgeKindClass('muted')
+              )}
+              onClick={() => setMatchDialogOpen(true)}
+              title="Open match detail"
+            >
+              Updated: {formatBadgeDateTime(albumUpdatedAt)}
+            </button>
           ) : null}
         </div>
       </div>
@@ -739,22 +751,6 @@ export default function AlbumPage() {
                       <ProviderBadge provider={data.metadata_source} prefix="Source" className="text-[10px]" />
                     )
                   ) : null}
-                  {albumAddedAt ? (
-                    <Badge variant="outline" className={cn("text-[10px]", badgeKindClass('muted'))}>
-                      Added {formatBadgeDateTime(albumAddedAt)}
-                    </Badge>
-                  ) : null}
-                  <button
-                    type="button"
-                    className={cn(
-                      "inline-flex items-center border px-2.5 py-1 text-[10px] leading-none transition-colors hover:brightness-110",
-                      badgeKindClass('muted')
-                    )}
-                    onClick={() => setMatchDialogOpen(true)}
-                    title="Open match detail"
-                  >
-                    Updated: {formatBadgeDateTime(albumUpdatedAt)}
-                  </button>
                   {data.bandcamp_album_url ? (
                     <ProviderLink provider="bandcamp" href={data.bandcamp_album_url} className="inline-flex" />
                   ) : null}
