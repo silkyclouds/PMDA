@@ -46,7 +46,7 @@
     --input: 220 13% 88%;
     --ring: 174 72% 40%;
 
-    --radius: 0.625rem;
+    --radius: 0.4rem;
 
     --sidebar-background: 220 20% 97%;
     --sidebar-foreground: 220 30% 10%;
@@ -142,8 +142,8 @@
     font-feature-settings: "rlig" 1, "calt" 1;
     overflow-x: hidden;
     background-image:
-      radial-gradient(1200px circle at 0% -20%, hsl(var(--primary) / 0.08), transparent 42%),
-      radial-gradient(1000px circle at 100% -10%, hsl(var(--secondary) / 0.06), transparent 40%),
+      radial-gradient(1200px circle at 0% -20%, hsl(var(--primary) / 0.05), transparent 42%),
+      radial-gradient(1000px circle at 100% -10%, hsl(var(--secondary) / 0.04), transparent 40%),
       linear-gradient(180deg, hsl(var(--background)), hsl(var(--background)));
   }
 
@@ -204,7 +204,7 @@
 
   /* Duplicate card */
   .dupe-card {
-    @apply relative overflow-hidden rounded-xl bg-card border border-border p-4;
+    @apply relative overflow-hidden rounded-md bg-card border border-border p-4;
     @apply transition-all duration-200 ease-out;
     @apply hover:border-primary/50 hover:shadow-lg;
     background: var(--gradient-card);
@@ -220,8 +220,35 @@
 
   /* Cover image */
   .cover-image {
-    @apply aspect-square rounded-lg overflow-hidden bg-muted;
+    @apply aspect-square rounded-sm overflow-hidden bg-muted;
     @apply ring-1 ring-border/50;
+  }
+
+  .pmda-flat-surface {
+    @apply border border-border/60 bg-card/95 shadow-none;
+    border-radius: 10px;
+  }
+
+  .pmda-flat-tile {
+    @apply overflow-hidden border border-border/60 bg-card/95 transition-colors;
+    border-radius: 8px;
+  }
+
+  .pmda-flat-tile:hover {
+    @apply border-primary/35 bg-accent/10;
+  }
+
+  .pmda-hero-panel {
+    @apply border border-white/10 bg-background/58 backdrop-blur-md;
+    border-radius: 10px;
+  }
+
+  .pmda-meta-grid {
+    @apply grid gap-2 sm:grid-cols-2 xl:grid-cols-3;
+  }
+
+  .pmda-meta-cell {
+    @apply border border-white/12 bg-black/26 px-3 py-3;
   }
 
   /* Format badge */

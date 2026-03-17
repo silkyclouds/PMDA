@@ -188,11 +188,11 @@ export default function RecommendationsPage() {
       ) : (
         <div className="space-y-4">
           {items.map((item) => (
-            <Card key={`recommendation-${item.recommendation_id}`} className="border-border/70">
+            <Card key={`recommendation-${item.recommendation_id}`} className="pmda-flat-surface">
               <CardContent className="p-5">
                 <div className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
                   <div className="flex min-w-0 gap-4">
-                    <div className="h-24 w-24 shrink-0 overflow-hidden rounded-2xl bg-muted">
+                    <div className="h-24 w-24 shrink-0 overflow-hidden rounded-sm bg-muted">
                       {item.entity_thumb ? (
                         <img src={item.entity_thumb} alt={item.entity_label} className="h-full w-full object-cover" />
                       ) : null}
@@ -218,7 +218,7 @@ export default function RecommendationsPage() {
                         ) : null}
                       </div>
                       {item.message ? (
-                        <div className="rounded-2xl border border-border/60 bg-muted/20 px-4 py-3 text-sm text-muted-foreground">
+                        <div className="border border-border/60 bg-muted/20 px-4 py-3 text-sm text-muted-foreground">
                           “{item.message}”
                         </div>
                       ) : null}

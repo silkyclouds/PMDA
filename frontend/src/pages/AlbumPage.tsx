@@ -9,6 +9,7 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/component
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { FormatBadge } from '@/components/FormatBadge';
+import { AlbumArtworkGalleryDialog } from '@/components/library/AlbumArtworkGalleryDialog';
 import { AlbumRatingStars } from '@/components/library/AlbumRatingStars';
 import { EntityDiscoverDialog } from '@/components/library/EntityDiscoverDialog';
 import { SocialActivityBadges } from '@/components/social/SocialActivityBadges';
@@ -217,6 +218,7 @@ export default function AlbumPage() {
   const [addingTrackId, setAddingTrackId] = useState<number | null>(null);
   const [downloadingAlbum, setDownloadingAlbum] = useState(false);
   const [matchDialogOpen, setMatchDialogOpen] = useState(false);
+  const [artworkGalleryOpen, setArtworkGalleryOpen] = useState(false);
   const [trackDetailsLoading, setTrackDetailsLoading] = useState(false);
   const [trackDetailsError, setTrackDetailsError] = useState<string | null>(null);
   const [expandedTrackId, setExpandedTrackId] = useState<number | null>(null);
@@ -642,62 +644,66 @@ export default function AlbumPage() {
         </div>
       </div>
 
-      <Card className="overflow-hidden border-border/70">
+      <Card className="pmda-flat-surface overflow-hidden">
         <div className="relative overflow-hidden">
-          <div className="absolute inset-0 z-10 bg-background/34 backdrop-blur-md" />
-          <div className="absolute inset-0 z-10 bg-gradient-to-r from-background/88 via-background/70 to-background/58" />
+          <div className="absolute inset-0 z-10 bg-background/42 backdrop-blur-xl" />
+          <div className="absolute inset-0 z-10 bg-gradient-to-r from-background via-background/92 to-background/70" />
+          <div className="absolute inset-0 z-10 bg-gradient-to-t from-background/76 via-transparent to-transparent" />
           {data.cover_url ? (
-            <img src={data.cover_url} alt={data.title} className="w-full h-64 md:h-72 object-cover blur-[1.4px] scale-[1.06]" />
+            <img src={data.cover_url} alt={data.title} className="h-[22rem] w-full scale-[1.04] object-cover blur-[1.8px] saturate-[0.92] md:h-[26rem]" />
           ) : (
-            <div className="h-64 md:h-72 bg-gradient-to-br from-muted via-muted/70 to-accent/20" />
+            <div className="h-[22rem] md:h-[26rem] bg-gradient-to-br from-muted via-muted/70 to-accent/20" />
           )}
-          <div className="absolute inset-0 z-20 p-6 md:p-8 flex items-end">
-            <div className="grid grid-cols-1 md:grid-cols-[12rem,1fr] gap-5 w-full items-end">
-              <div className="w-36 h-36 md:w-48 md:h-48 rounded-3xl overflow-hidden border border-border bg-muted shrink-0 shadow-md">
-                <div className="relative w-full h-full group">
+          <div className="absolute inset-0 z-20 flex items-end p-6 md:p-8 xl:p-10">
+            <div className="grid w-full grid-cols-1 items-end gap-6 md:grid-cols-[15rem,1fr]">
+              <button
+                type="button"
+                className="group relative h-40 w-40 overflow-hidden border border-white/12 bg-muted shadow-[0_28px_80px_-48px_rgba(0,0,0,0.9)] md:h-56 md:w-56"
+                onClick={() => setArtworkGalleryOpen(true)}
+                title="View artwork stack"
+              >
+                <div className="relative h-full w-full">
                   {data.cover_url ? (
-                    <img src={data.cover_url} alt={data.title} className="w-full h-full object-cover animate-in fade-in-0 duration-300" />
+                    <img src={data.cover_url} alt={data.title} className="h-full w-full object-cover animate-in fade-in-0 duration-300" />
                   ) : (
-                    <div className="w-full h-full flex items-center justify-center">
-                      <Music className="w-8 h-8 text-muted-foreground" />
+                    <div className="flex h-full w-full items-center justify-center">
+                      <Music className="h-8 w-8 text-muted-foreground" />
                     </div>
                   )}
-                  <button
-                    type="button"
-                    onClick={handlePlay}
-                    className="absolute inset-0 flex items-center justify-center bg-black/0 opacity-0 transition-all duration-200 group-hover:bg-black/28 group-hover:opacity-100"
-                    title="Play album"
-                  >
-                    <span className="flex h-14 w-14 items-center justify-center rounded-full border border-white/20 bg-white/15 backdrop-blur-sm shadow-lg">
-                      <Play className="h-6 w-6 fill-white text-white" />
+                  <div className="absolute inset-0 flex items-center justify-center bg-black/0 opacity-0 transition-all duration-200 group-hover:bg-black/36 group-hover:opacity-100">
+                    <span className="inline-flex items-center border border-white/20 bg-black/35 px-3 py-2 text-[11px] font-medium uppercase tracking-[0.24em] text-white backdrop-blur-sm">
+                      View sleeves
                     </span>
-                  </button>
+                  </div>
                   <Button
                     type="button"
                     size="icon"
                     variant="secondary"
-                    className="absolute right-1.5 bottom-1.5 z-10 h-7 w-7 opacity-0 group-hover:opacity-100 transition-opacity"
+                    className="absolute right-2 top-2 z-10 h-8 w-8 opacity-0 transition-opacity group-hover:opacity-100"
                     title="Edit cover source"
-                    onClick={() => setMatchDialogOpen(true)}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      setMatchDialogOpen(true);
+                    }}
                   >
-                    <Pencil className="w-3.5 h-3.5" />
+                    <Pencil className="h-3.5 w-3.5" />
                   </Button>
                 </div>
-              </div>
-              <div className="min-w-0 rounded-2xl bg-background/22 px-4 py-3 backdrop-blur-sm shadow-[0_10px_35px_rgba(0,0,0,0.18)]">
-                <h1 className="text-2xl md:text-4xl font-bold tracking-tight truncate text-white drop-shadow-[0_2px_10px_rgba(0,0,0,0.55)]">
+              </button>
+              <div className="min-w-0 border border-white/10 bg-background/58 px-5 py-5 backdrop-blur-md">
+                <h1 className="text-3xl font-bold tracking-tight text-white drop-shadow-[0_2px_10px_rgba(0,0,0,0.7)] md:text-5xl">
                   {data.title}
                 </h1>
                 <button
                   type="button"
-                  className="text-sm text-white/82 mt-1 hover:underline truncate"
+                  className="mt-2 truncate text-sm text-white/82 hover:underline"
                   onClick={() => navigate(`/library/artist/${data.artist_id}${location.search || ''}`, { state: withBackLinkState(location) })}
                   title="Open artist"
                 >
                   {data.artist_name}
                 </button>
 
-                <div className="flex flex-wrap items-center gap-2 mt-4">
+                <div className="mt-5 flex flex-wrap items-center gap-2">
                   {data.year ? (
                     <Badge variant="outline" className={cn("gap-1.5 text-[10px]", badgeKindClass('year'))}>
                       <Calendar className="w-3 h-3" />
@@ -737,7 +743,7 @@ export default function AlbumPage() {
                   <button
                     type="button"
                     className={cn(
-                      "inline-flex items-center rounded-full border px-2.5 py-1 text-[10px] leading-none transition-colors hover:brightness-110",
+                      "inline-flex items-center border px-2.5 py-1 text-[10px] leading-none transition-colors hover:brightness-110",
                       badgeKindClass('muted')
                     )}
                     onClick={() => setMatchDialogOpen(true)}
@@ -750,8 +756,8 @@ export default function AlbumPage() {
                   ) : null}
                 </div>
                 {genreBadges.length > 0 ? (
-                  <div className="mt-3 space-y-1.5">
-                    <div className="text-[10px] font-medium uppercase tracking-[0.22em] text-white/72">
+                  <div className="mt-4 space-y-1.5">
+                    <div className="text-[10px] font-medium uppercase tracking-[0.22em] text-white/68">
                       Genres
                     </div>
                     <div className="flex flex-wrap gap-1.5">
@@ -769,41 +775,41 @@ export default function AlbumPage() {
                   </div>
                 ) : null}
                 {data.classical ? (
-                  <div className="mt-3 grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
+                  <div className="mt-4 grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
                     {joinClassical(data.classical.composer, 3) ? (
-                      <div className="rounded-xl border border-white/12 bg-black/18 px-3 py-2">
+                      <div className="border border-white/12 bg-black/26 px-3 py-3">
                         <div className="text-[10px] font-medium uppercase tracking-[0.2em] text-white/60">Composer</div>
-                        <div className="mt-1 text-xs text-white/92 line-clamp-2">{joinClassical(data.classical.composer, 3)}</div>
+                        <div className="mt-1 text-sm text-white line-clamp-2">{joinClassical(data.classical.composer, 3)}</div>
                       </div>
                     ) : null}
                     {joinClassical(data.classical.work, 3) ? (
-                      <div className="rounded-xl border border-white/12 bg-black/18 px-3 py-2">
+                      <div className="border border-white/12 bg-black/26 px-3 py-3">
                         <div className="text-[10px] font-medium uppercase tracking-[0.2em] text-white/60">Work</div>
-                        <div className="mt-1 text-xs text-white/92 line-clamp-2">{joinClassical(data.classical.work, 3)}</div>
+                        <div className="mt-1 text-sm text-white line-clamp-2">{joinClassical(data.classical.work, 3)}</div>
                       </div>
                     ) : null}
                     {joinClassical(data.classical.conductor, 3) ? (
-                      <div className="rounded-xl border border-white/12 bg-black/18 px-3 py-2">
+                      <div className="border border-white/12 bg-black/26 px-3 py-3">
                         <div className="text-[10px] font-medium uppercase tracking-[0.2em] text-white/60">Conductor</div>
-                        <div className="mt-1 text-xs text-white/92 line-clamp-2">{joinClassical(data.classical.conductor, 3)}</div>
+                        <div className="mt-1 text-sm text-white line-clamp-2">{joinClassical(data.classical.conductor, 3)}</div>
                       </div>
                     ) : null}
                     {joinClassical(data.classical.orchestra, 3) ? (
-                      <div className="rounded-xl border border-white/12 bg-black/18 px-3 py-2">
+                      <div className="border border-white/12 bg-black/26 px-3 py-3">
                         <div className="text-[10px] font-medium uppercase tracking-[0.2em] text-white/60">Orchestra</div>
-                        <div className="mt-1 text-xs text-white/92 line-clamp-2">{joinClassical(data.classical.orchestra, 3)}</div>
+                        <div className="mt-1 text-sm text-white line-clamp-2">{joinClassical(data.classical.orchestra, 3)}</div>
                       </div>
                     ) : null}
                     {joinClassical(data.classical.soloists, 3) ? (
-                      <div className="rounded-xl border border-white/12 bg-black/18 px-3 py-2">
+                      <div className="border border-white/12 bg-black/26 px-3 py-3">
                         <div className="text-[10px] font-medium uppercase tracking-[0.2em] text-white/60">Soloists</div>
-                        <div className="mt-1 text-xs text-white/92 line-clamp-2">{joinClassical(data.classical.soloists, 3)}</div>
+                        <div className="mt-1 text-sm text-white line-clamp-2">{joinClassical(data.classical.soloists, 3)}</div>
                       </div>
                     ) : null}
                     {joinClassical(data.classical.catalog_numbers, 3) ? (
-                      <div className="rounded-xl border border-white/12 bg-black/18 px-3 py-2">
+                      <div className="border border-white/12 bg-black/26 px-3 py-3">
                         <div className="text-[10px] font-medium uppercase tracking-[0.2em] text-white/60">Catalog</div>
-                        <div className="mt-1 text-xs text-white/92 line-clamp-2">{joinClassical(data.classical.catalog_numbers, 3)}</div>
+                        <div className="mt-1 text-sm text-white line-clamp-2">{joinClassical(data.classical.catalog_numbers, 3)}</div>
                       </div>
                     ) : null}
                   </div>
@@ -814,7 +820,7 @@ export default function AlbumPage() {
         </div>
         <CardContent className="pt-4 pb-5 space-y-4">
           <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,1fr),minmax(0,1fr)] gap-4">
-            <div className="rounded-2xl border border-border/60 bg-background/35 p-4 space-y-2">
+            <div className="border border-border/60 bg-background/35 p-4 space-y-2">
               <div className="text-[11px] font-semibold uppercase tracking-[0.22em] text-muted-foreground">Your rating</div>
               <div className="flex items-center gap-3">
                 <AlbumRatingStars
@@ -830,7 +836,7 @@ export default function AlbumPage() {
               </p>
             </div>
 
-            <div className="rounded-2xl border border-border/60 bg-background/35 p-4 space-y-3">
+            <div className="border border-border/60 bg-background/35 p-4 space-y-3">
               <div className="text-[11px] font-semibold uppercase tracking-[0.22em] text-muted-foreground">Public pulse</div>
               <div className="flex flex-wrap items-center gap-2">
                 <AlbumRatingStars value={ratings.public_rating} size={18} />
@@ -1166,6 +1172,12 @@ export default function AlbumPage() {
         onDataChanged={() => {
           void load();
         }}
+      />
+      <AlbumArtworkGalleryDialog
+        albumId={data.album_id}
+        albumTitle={data.title}
+        open={artworkGalleryOpen}
+        onOpenChange={setArtworkGalleryOpen}
       />
     </div>
   );

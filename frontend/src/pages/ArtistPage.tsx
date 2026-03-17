@@ -829,18 +829,19 @@ export default function ArtistPage() {
           ) : null}
         </div>
 
-        <Card className="overflow-hidden border-border/70">
+        <Card className="pmda-flat-surface overflow-hidden">
           <div className="relative overflow-hidden">
-            <div className="absolute inset-0 z-10 bg-background/34 backdrop-blur-md" />
-            <div className="absolute inset-0 z-10 bg-gradient-to-r from-background/88 via-background/70 to-background/58" />
+            <div className="absolute inset-0 z-10 bg-background/42 backdrop-blur-xl" />
+            <div className="absolute inset-0 z-10 bg-gradient-to-r from-background via-background/92 to-background/70" />
+            <div className="absolute inset-0 z-10 bg-gradient-to-t from-background/76 via-transparent to-transparent" />
             {heroImage ? (
-              <img src={heroImage} alt={details.artist_name} className="w-full h-64 md:h-96 object-cover blur-[1.4px] scale-[1.06]" />
+              <img src={heroImage} alt={details.artist_name} className="w-full h-[24rem] md:h-[30rem] object-cover blur-[1.8px] scale-[1.04]" />
             ) : (
-              <div className="h-64 md:h-96 bg-gradient-to-br from-zinc-900 via-zinc-800 to-zinc-900" />
+              <div className="h-[24rem] md:h-[30rem] bg-gradient-to-br from-zinc-900 via-zinc-800 to-zinc-900" />
             )}
             <div className="absolute inset-0 z-20 p-6 md:p-8 flex items-end">
               <div className="grid grid-cols-1 md:grid-cols-[15rem,minmax(0,1fr)] gap-8 md:gap-14 w-full items-center">
-                <div className="w-28 h-28 sm:w-36 sm:h-36 md:w-56 md:h-56 lg:w-60 lg:h-60 rounded-3xl overflow-hidden border border-border/60 bg-muted shrink-0 shadow-[0_24px_60px_rgba(0,0,0,0.35)]">
+                <div className="w-28 h-28 sm:w-36 sm:h-36 md:w-56 md:h-56 lg:w-60 lg:h-60 overflow-hidden border border-white/12 bg-muted shrink-0 shadow-[0_24px_60px_rgba(0,0,0,0.5)]">
                   {heroImage ? (
                     <img src={heroImage} alt={details.artist_name} className="w-full h-full object-cover animate-in fade-in-0 duration-300" />
                   ) : (
@@ -849,7 +850,7 @@ export default function ArtistPage() {
                     </div>
                   )}
                 </div>
-                <div className="min-w-0 md:pl-2 rounded-2xl bg-background/22 px-4 py-3 backdrop-blur-sm shadow-[0_10px_35px_rgba(0,0,0,0.18)]">
+                <div className="min-w-0 md:pl-2 border border-white/10 bg-background/58 px-5 py-5 backdrop-blur-md">
                   <h1 className="text-2xl sm:text-3xl md:text-5xl font-bold tracking-tight leading-tight text-white drop-shadow-[0_2px_10px_rgba(0,0,0,0.55)]">
                     {details.artist_name}
                   </h1>
@@ -1267,7 +1268,7 @@ export default function ArtistPage() {
                   {grouped[type].map((album) => (
                     <CarouselItem key={album.album_id} className="pl-3 basis-[180px] sm:basis-[200px] md:basis-[220px]">
                       <Card
-                        className="group h-full overflow-hidden border-border/70 bg-card/90 cursor-pointer transition-all duration-300 hover:-translate-y-1 hover:border-primary/35 hover:bg-muted/20"
+                        className="pmda-flat-tile group h-full cursor-pointer transition-all duration-300 hover:-translate-y-1"
                         role="button"
                         tabIndex={0}
                         onClick={() => navigate(`/library/album/${album.album_id}${location.search || ''}`, { state: withBackLinkState(location) })}
@@ -1297,7 +1298,7 @@ export default function ArtistPage() {
                           <div className="absolute inset-x-0 bottom-0 p-2.5 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity">
                             <Button
                               size="sm"
-                              className="h-8 w-full gap-2 rounded-full"
+                              className="h-8 w-full gap-2"
                               onClick={(e) => {
                                 e.preventDefault();
                                 e.stopPropagation();

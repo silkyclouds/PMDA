@@ -91,7 +91,7 @@ def _load_expected_groups(manifest_cases: list[dict]) -> list[dict]:
                 "cases": [],
                 "published_expected": True,
                 "expected_title": hint_title if placeholder_album else str(summary.get("album") or "").strip(),
-                "expected_artist": hint_artist if placeholder_artist else str(summary.get("artist") or summary.get("albumartist") or "").strip(),
+                "expected_artist": hint_artist if placeholder_artist else str(summary.get("albumartist") or summary.get("artist") or "").strip(),
                 "expected_track_count": int(summary.get("track_count") or 0),
                 "expected_composer": str(summary.get("composer") or "").strip(),
                 "expected_conductor": str(summary.get("conductor") or "").strip(),
@@ -106,7 +106,7 @@ def _load_expected_groups(manifest_cases: list[dict]) -> list[dict]:
             if fallback_title and _norm_text(fallback_title) != _norm_text(source_key):
                 group["expected_title"] = fallback_title
         if (not group["expected_artist"] or placeholder_artist) and summary:
-            fallback_artist = str(summary.get("artist") or summary.get("albumartist") or "").strip()
+            fallback_artist = str(summary.get("albumartist") or summary.get("artist") or "").strip()
             if fallback_artist and _norm_text(fallback_artist) not in {"", "template source", "templatesource"}:
                 group["expected_artist"] = fallback_artist
         if not group["expected_title"] and source_hint:

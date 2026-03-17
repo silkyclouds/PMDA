@@ -13363,6 +13363,230 @@ def _precache_files_media_assets(artists_map: dict[str, dict], albums_payload: l
     return covers_done, artists_done
 
 
+def _album_artwork_gallery_cache_key(album_id: int) -> str:
+    return f"artwork_gallery:album:{int(album_id)}"
+
+
+def _cover_art_archive_gallery_items(release_id: str, release_group_id: str = "") -> list[dict[str, Any]]:
+    rel_id = str(release_id or "").strip()
+    rg_id = str(release_group_id or "").strip()
+    urls: list[tuple[str, str]] = []
+    if rel_id and re.fullmatch(r"[0-9a-fA-F-]{36}", rel_id):
+        urls.append((f"https://coverartarchive.org/release/{quote(rel_id, safe='')}", "musicbrainz"))
+    if not urls and rg_id and re.fullmatch(r"[0-9a-fA-F-]{36}", rg_id):
+        urls.append((f"https://coverartarchive.org/release-group/{quote(rg_id, safe='')}", "musicbrainz"))
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for url, provider in urls:
+        try:
+            resp = requests.get(url, timeout=12)
+            if resp.status_code != 200:
+                continue
+            payload = resp.json() if "json" in (resp.headers.get("content-type") or "").lower() else {}
+        except Exception:
+            continue
+        images = payload.get("images") if isinstance(payload, dict) else []
+        if not isinstance(images, list):
+            continue
+        for idx, image in enumerate(images[:12], start=1):
+            if not isinstance(image, dict):
+                continue
+            image_url = str(
+                ((image.get("thumbnails") or {}).get("1200"))
+                or ((image.get("thumbnails") or {}).get("large"))
+                or image.get("image")
+                or ""
+            ).strip()
+            if not image_url or image_url in seen:
+                continue
+            seen.add(image_url)
+            types = [str(t or "").strip().lower() for t in list(image.get("types") or []) if str(t or "").strip()]
+            slot = "front" if bool(image.get("front")) or "front" in types else "other"
+            if bool(image.get("back")) or "back" in types:
+                slot = "back"
+            elif any(t in {"booklet", "booklet page", "booklet-page"} for t in types):
+                slot = "booklet"
+            elif any(t in {"medium", "disc"} for t in types):
+                slot = "disc"
+            out.append(
+                {
+                    "provider": provider,
+                    "slot": slot,
+                    "label": _artwork_slot_label(slot),
+                    "source_url": image_url,
+                    "types": types,
+                    "selected": slot == "front",
+                }
+            )
+    return out
+
+
+def _discogs_gallery_items(discogs_release_id: str) -> list[dict[str, Any]]:
+    payload = _fetch_discogs_release_by_id(discogs_release_id)
+    data = payload if isinstance(payload, dict) else {}
+    raw_images = data.get("images") if isinstance(data.get("images"), list) else []
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for idx, image in enumerate(raw_images[:12], start=1):
+        if not isinstance(image, dict):
+            continue
+        image_url = str(image.get("uri") or image.get("resource_url") or "").strip()
+        if not image_url or image_url in seen:
+            continue
+        seen.add(image_url)
+        image_type = str(image.get("type") or "").strip().lower()
+        slot = "front" if image_type == "primary" else "other"
+        out.append(
+            {
+                "provider": "discogs",
+                "slot": slot,
+                "label": _artwork_slot_label(slot),
+                "source_url": image_url,
+                "types": [image_type] if image_type else [],
+                "selected": slot == "front" and idx == 1,
+            }
+        )
+    cover_url = str(data.get("cover_url") or "").strip()
+    if cover_url and cover_url not in seen:
+        out.insert(
+            0,
+            {
+                "provider": "discogs",
+                "slot": "front",
+                "label": _artwork_slot_label("front"),
+                "source_url": cover_url,
+                "types": ["primary"],
+                "selected": True,
+            },
+        )
+    return out
+
+
+def _album_artwork_gallery_manifest(
+    *,
+    album_id: int,
+    folder_path_raw: str,
+    cover_path_raw: str,
+    musicbrainz_release_id: str,
+    musicbrainz_release_group_id: str,
+    discogs_release_id: str,
+) -> dict[str, Any]:
+    _ensure_media_cache_dirs()
+    folder = path_for_fs_access(Path(folder_path_raw)) if str(folder_path_raw or "").strip() else None
+    cover_path = path_for_fs_access(Path(cover_path_raw)) if str(cover_path_raw or "").strip() else None
+    items: list[dict[str, Any]] = []
+    seen_file_keys: set[str] = set()
+    seen_source_urls: set[str] = set()
+
+    def _push_local(path: Path, slot: str, *, origin: str = "local_file", selected: bool = False, source_name: str = "") -> None:
+        if not path or not path.exists() or not path.is_file():
+            return
+        cache_path = _ensure_cached_image_for_path(path, kind="album", max_px=_MEDIA_CACHE_MASTER_PX) or path
+        cache_key = hashlib.sha1(f"{origin}|{slot}|{cache_path}".encode("utf-8", errors="ignore")).hexdigest()
+        if cache_key in seen_file_keys:
+            return
+        seen_file_keys.add(cache_key)
+        items.append(
+            {
+                "id": cache_key,
+                "slot": slot,
+                "label": _artwork_slot_label(slot),
+                "origin": origin,
+                "provider": "local",
+                "selected": bool(selected),
+                "cache_path": str(cache_path),
+                "source_name": source_name or path.name,
+            }
+        )
+
+    def _push_bytes(raw: bytes, mime: str, slot: str, *, origin: str, source_name: str = "", source_url: str | None = None, provider: str = "local", selected: bool = False) -> None:
+        cache_path = _ensure_cached_image_from_bytes(
+            raw,
+            mime,
+            kind="album",
+            cache_key_hint=f"gallery:{album_id}:{origin}:{slot}:{source_name}:{source_url or ''}",
+            max_px=_MEDIA_CACHE_MASTER_PX,
+        )
+        if cache_path is None:
+            return
+        cache_key = hashlib.sha1(f"{origin}|{slot}|{cache_path}".encode("utf-8", errors="ignore")).hexdigest()
+        if cache_key in seen_file_keys:
+            return
+        seen_file_keys.add(cache_key)
+        items.append(
+            {
+                "id": cache_key,
+                "slot": slot,
+                "label": _artwork_slot_label(slot),
+                "origin": origin,
+                "provider": provider,
+                "selected": bool(selected),
+                "cache_path": str(cache_path),
+                "source_name": source_name or origin,
+                "source_url": source_url,
+            }
+        )
+
+    if cover_path and cover_path.exists() and cover_path.is_file():
+        _push_local(cover_path, "front", selected=True, source_name=cover_path.name)
+    if folder and folder.exists() and folder.is_dir():
+        for path, slot in _collect_folder_artwork_files(folder, max_items=10):
+            selected = bool(cover_path and path.resolve() == cover_path.resolve())
+            _push_local(path, slot, selected=selected, source_name=path.name)
+        for raw, mime, slot, source_name, desc in _extract_embedded_artworks_from_folder(folder, max_audio_files=8, max_items=8):
+            _push_bytes(
+                raw,
+                mime,
+                slot,
+                origin="embedded",
+                source_name=f"{source_name}:{desc or slot}",
+                provider="embedded",
+                selected=slot == "front" and not any(bool(item.get("selected")) for item in items),
+            )
+
+    remote_items = _cover_art_archive_gallery_items(musicbrainz_release_id, musicbrainz_release_group_id)
+    if not remote_items and discogs_release_id:
+        remote_items = _discogs_gallery_items(discogs_release_id)
+    for idx, entry in enumerate(remote_items[:10], start=1):
+        source_url = str(entry.get("source_url") or "").strip()
+        if not source_url or source_url in seen_source_urls:
+            continue
+        seen_source_urls.add(source_url)
+        try:
+            resp = requests.get(source_url, timeout=12, allow_redirects=True)
+            if resp.status_code != 200 or not resp.content:
+                continue
+            mime = (resp.headers.get("content-type") or "").split(";", 1)[0].strip() or "image/jpeg"
+        except Exception:
+            continue
+        _push_bytes(
+            resp.content,
+            mime,
+            str(entry.get("slot") or "other"),
+            origin="provider",
+            source_name=f"{entry.get('provider') or 'provider'}-{idx}",
+            source_url=source_url,
+            provider=str(entry.get("provider") or "provider"),
+            selected=bool(entry.get("selected")),
+        )
+
+    items.sort(
+        key=lambda item: (
+            _artwork_slot_sort_key(str(item.get("slot") or "other")),
+            0 if bool(item.get("selected")) else 1,
+            str(item.get("origin") or ""),
+            str(item.get("source_name") or ""),
+        )
+    )
+    if items and not any(bool(item.get("selected")) for item in items):
+        items[0]["selected"] = True
+    return {
+        "album_id": int(album_id),
+        "items": items,
+        "updated_at": int(time.time()),
+    }
+
+
 def _parse_int_loose(value, default: int = 0) -> int:
     if value is None:
         return default
@@ -21860,6 +22084,38 @@ _COVER_NAMES_LOWER = {n.lower() for n in _COVER_NAMES}
 
 _COVER_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tif", ".tiff"}
 _COVER_STEM_PREFIXES = ("cover", "folder", "front", "artwork", "albumart", "thumb")
+_ARTWORK_SLOT_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "front": ("cover", "folder", "front", "artwork", "albumart", "thumb", "jacket", "sleeve"),
+    "back": ("back", "rear", "tray", "backcover", "back_cover"),
+    "inside": ("inside", "inner", "inlay", "gatefold", "book"),
+    "booklet": ("booklet", "insert", "liner", "leaflet"),
+    "disc": ("disc", "cd", "vinyl", "lp", "media", "side"),
+    "obi": ("obi",),
+}
+_ARTWORK_SLOT_LABELS = {
+    "front": "Front cover",
+    "back": "Back cover",
+    "inside": "Inside sleeve",
+    "booklet": "Booklet / insert",
+    "disc": "Disc / media",
+    "obi": "Obi / wrap",
+    "other": "Additional artwork",
+}
+_ARTWORK_SLOT_ORDER = {
+    "front": 0,
+    "back": 1,
+    "inside": 2,
+    "booklet": 3,
+    "disc": 4,
+    "obi": 5,
+    "other": 6,
+}
+_EMBEDDED_ARTWORK_TYPE_MAP = {
+    3: "front",
+    4: "back",
+    5: "booklet",
+    6: "disc",
+}
 
 
 def _is_probable_cover_filename(name: str) -> bool:
@@ -21877,6 +22133,133 @@ def _is_probable_cover_filename(name: str) -> bool:
         return True
     return False
 
+
+def _artwork_slot_from_name(name: str) -> str:
+    low = str(name or "").strip().lower()
+    if not low:
+        return ""
+    stem = Path(low).stem
+    for slot, keywords in _ARTWORK_SLOT_KEYWORDS.items():
+        if any(keyword and keyword in stem for keyword in keywords):
+            return slot
+    if _is_probable_cover_filename(low):
+        return "front"
+    return ""
+
+
+def _artwork_slot_label(slot: str) -> str:
+    return str(_ARTWORK_SLOT_LABELS.get(str(slot or "").strip().lower()) or "Artwork")
+
+
+def _artwork_slot_sort_key(slot: str) -> tuple[int, str]:
+    low = str(slot or "").strip().lower() or "other"
+    return (int(_ARTWORK_SLOT_ORDER.get(low, 99)), low)
+
+
+def _collect_folder_artwork_files(folder: Path, *, max_items: int = 12) -> list[tuple[Path, str]]:
+    if not folder or not folder.is_dir():
+        return []
+    explicit: list[tuple[Path, str]] = []
+    generic: list[Path] = []
+    seen: set[str] = set()
+    try:
+        for p in sorted(folder.iterdir(), key=lambda x: x.name.lower()):
+            if not p.is_file() or p.suffix.lower() not in _COVER_EXTS:
+                continue
+            slot = _artwork_slot_from_name(p.name)
+            if slot:
+                key = str(p.resolve())
+                if key not in seen:
+                    seen.add(key)
+                    explicit.append((p, slot))
+            else:
+                generic.append(p)
+    except OSError:
+        return []
+    if not any(slot == "front" for _, slot in explicit):
+        if len(generic) == 1:
+            key = str(generic[0].resolve())
+            if key not in seen:
+                seen.add(key)
+                explicit.append((generic[0], "front"))
+        elif not explicit and len(generic) <= 4:
+            for p in generic[: max(1, int(max_items or 1))]:
+                key = str(p.resolve())
+                if key in seen:
+                    continue
+                seen.add(key)
+                explicit.append((p, "other"))
+    explicit.sort(key=lambda item: (_artwork_slot_sort_key(item[1]), item[0].name.lower()))
+    return explicit[: max(1, int(max_items or 1))]
+
+
+def _embedded_artwork_slot(type_value: Any, desc: str = "") -> str:
+    try:
+        pic_type = int(type_value)
+    except Exception:
+        pic_type = 0
+    mapped = _EMBEDDED_ARTWORK_TYPE_MAP.get(pic_type)
+    if mapped:
+        return mapped
+    desc_slot = _artwork_slot_from_name(desc)
+    return desc_slot or "other"
+
+
+def _extract_embedded_artworks_from_audio(
+    audio_path: Path,
+    *,
+    max_items: int = 6,
+) -> list[tuple[bytes, str, str, str]]:
+    if not audio_path or not audio_path.is_file():
+        return []
+    out: list[tuple[bytes, str, str, str]] = []
+    seen_hashes: set[str] = set()
+
+    def _push(data: Any, mime: Any, slot: str, desc: str) -> None:
+        raw = bytes(data or b"")
+        if not raw:
+            return
+        digest = hashlib.sha1(raw).hexdigest()
+        if digest in seen_hashes:
+            return
+        seen_hashes.add(digest)
+        out.append((raw, str(mime or "image/jpeg"), str(slot or "other"), str(desc or "").strip()))
+
+    try:
+        from mutagen import File as MutagenFile
+
+        f = MutagenFile(str(audio_path))
+        if f is None:
+            return []
+        if hasattr(f, "pictures") and f.pictures:
+            for pic in list(f.pictures or [])[: max(1, int(max_items or 1))]:
+                mime = getattr(pic, "mime", "image/jpeg") or "image/jpeg"
+                desc = str(getattr(pic, "desc", "") or "").strip()
+                slot = _embedded_artwork_slot(getattr(pic, "type", 0), desc)
+                _push(getattr(pic, "data", b""), mime, slot, desc)
+        if hasattr(f, "tags") and f.tags:
+            apics = f.tags.getall("APIC") if hasattr(f.tags, "getall") else []
+            if not apics and "APIC:Cover" in f.tags:
+                apics = [f.tags["APIC:Cover"]]
+            for apic in list(apics or [])[: max(1, int(max_items or 1))]:
+                desc = str(getattr(apic, "desc", "") or "").strip()
+                slot = _embedded_artwork_slot(getattr(apic, "type", 0), desc)
+                _push(getattr(apic, "data", b""), getattr(apic, "mime", "image/jpeg"), slot, desc)
+        if hasattr(f, "get") and f.get("covr"):
+            for idx, covr in enumerate(list(f["covr"])[: max(1, int(max_items or 1))], start=1):
+                if isinstance(covr, bytes):
+                    raw = covr
+                elif hasattr(covr, "rawdata"):
+                    raw = bytes(covr.rawdata)
+                else:
+                    raw = b""
+                _push(raw, "image/jpeg", "front", f"covr-{idx}")
+    except Exception as e:
+        logging.debug("[Vision] Extract embedded artwork from %s failed: %s", audio_path, e)
+        return []
+    out.sort(key=lambda item: (_artwork_slot_sort_key(item[2]), len(item[0]) * -1))
+    return out[: max(1, int(max_items or 1))]
+
 def _extract_embedded_cover_from_folder(
     folder: Path,
     *,
@@ -21890,16 +22273,13 @@ def _extract_embedded_cover_from_folder(
     if not folder or not folder.is_dir():
         return None
     try:
-        checked = 0
-        for p in sorted(folder.rglob("*")):
-            if not AUDIO_RE.search(p.name):
-                continue
-            embedded = _extract_embedded_cover_from_audio(p)
-            if embedded:
-                return embedded
-            checked += 1
-            if checked >= max(1, int(max_audio_files or 1)):
-                break
+        artworks = _extract_embedded_artworks_from_folder(folder, max_audio_files=max_audio_files, max_items=6)
+        for raw, mime, slot, _source, _desc in artworks:
+            if slot == "front":
+                return (raw, mime)
+        if artworks:
+            raw, mime, _slot, _source, _desc = artworks[0]
+            return (raw, mime)
     except OSError:
         return None
     return None
@@ -21954,37 +22334,47 @@ def _extract_embedded_cover_from_audio(audio_path: Path) -> Optional[tuple[bytes
     Extract the first embedded cover image from an audio file (FLAC, MP3, M4A, etc.).
     Returns (image_bytes, mime_type) or None. Used when no cover file exists in the folder.
     """
-    if not audio_path or not audio_path.is_file():
-        return None
-    try:
-        from mutagen import File as MutagenFile
-        f = MutagenFile(str(audio_path))
-        if f is None:
-            return None
-        # FLAC: pictures
-        if hasattr(f, "pictures") and f.pictures:
-            pic = f.pictures[0]
-            mime = getattr(pic, "mime", "image/jpeg") or "image/jpeg"
-            return (pic.data, mime)
-        # MP3: ID3 APIC
-        if hasattr(f, "tags") and f.tags:
-            apics = f.tags.getall("APIC") if hasattr(f.tags, "getall") else []
-            if not apics and "APIC:Cover" in f.tags:
-                apics = [f.tags["APIC:Cover"]]
-            for apic in apics:
-                if getattr(apic, "data", None):
-                    mime = getattr(apic, "mime", "image/jpeg") or "image/jpeg"
-                    return (bytes(apic.data), mime)
-        # MP4/M4A: covr
-        if hasattr(f, "get") and f.get("covr"):
-            covr = f["covr"][0]
-            if isinstance(covr, bytes):
-                return (covr, "image/jpeg")
-            if hasattr(covr, "rawdata"):
-                return (bytes(covr.rawdata), "image/jpeg")
-    except Exception as e:
-        logging.debug("[Vision] Extract embedded cover from %s failed: %s", audio_path, e)
+    artworks = _extract_embedded_artworks_from_audio(audio_path, max_items=6)
+    for raw, mime, slot, _desc in artworks:
+        if slot == "front":
+            return (raw, mime)
+    if artworks:
+        raw, mime, _slot, _desc = artworks[0]
+        return (raw, mime)
     return None
+
+
+def _extract_embedded_artworks_from_folder(
+    folder: Path,
+    *,
+    max_audio_files: int = 6,
+    max_items: int = 8,
+) -> list[tuple[bytes, str, str, str, str]]:
+    if not folder or not folder.is_dir():
+        return []
+    out: list[tuple[bytes, str, str, str, str]] = []
+    seen_hashes: set[str] = set()
+    try:
+        checked = 0
+        for p in sorted(folder.rglob("*")):
+            if not AUDIO_RE.search(p.name):
+                continue
+            artworks = _extract_embedded_artworks_from_audio(p, max_items=max_items)
+            for raw, mime, slot, desc in artworks:
+                digest = hashlib.sha1(bytes(raw or b"")).hexdigest()
+                if not raw or digest in seen_hashes:
+                    continue
+                seen_hashes.add(digest)
+                out.append((raw, mime, slot, p.name, desc))
+                if len(out) >= max(1, int(max_items or 1)):
+                    break
+            checked += 1
+            if checked >= max(1, int(max_audio_files or 1)) or len(out) >= max(1, int(max_items or 1)):
+                break
+    except OSError:
+        return []
+    out.sort(key=lambda item: (_artwork_slot_sort_key(item[2]), item[3].lower()))
+    return out[: max(1, int(max_items or 1))]
 
 
 def _get_local_cover_data_uri_for_vision(folder: Path) -> Optional[str]:
@@ -22221,26 +22611,27 @@ def _cover_ocr_candidates_for_folder(folder: Path) -> list[tuple[str, bytes, str
         return []
     out: list[tuple[str, bytes, str]] = []
     seen_hashes: set[str] = set()
-    cover_path = _first_cover_path(folder)
-    if cover_path and cover_path.is_file():
+    for cover_path, slot in _collect_folder_artwork_files(folder, max_items=6):
+        if not cover_path.is_file():
+            continue
         try:
             raw = cover_path.read_bytes()
             digest = hashlib.sha1(raw).hexdigest()
             if digest not in seen_hashes:
                 seen_hashes.add(digest)
-                out.append((f"file:{cover_path.name}", raw, _mime_from_path(cover_path)))
+                out.append((f"file:{slot}:{cover_path.name}", raw, _mime_from_path(cover_path)))
         except Exception:
             pass
     try:
-        embedded = _extract_embedded_cover_from_folder(folder, max_audio_files=6)
+        embedded_items = _extract_embedded_artworks_from_folder(folder, max_audio_files=6, max_items=6)
     except Exception:
-        embedded = None
-    if embedded:
-        raw, mime = embedded
+        embedded_items = []
+    for raw, mime, slot, source_name, desc in embedded_items:
         digest = hashlib.sha1(bytes(raw or b"")).hexdigest()
         if raw and digest not in seen_hashes:
             seen_hashes.add(digest)
-            out.append(("embedded", bytes(raw), str(mime or "image/jpeg")))
+            suffix = f":{desc}" if desc else ""
+            out.append((f"embedded:{slot}:{source_name}{suffix}", bytes(raw), str(mime or "image/jpeg")))
     return out
 
 
@@ -22364,7 +22755,7 @@ def _identity_cover_ocr_context(
     chosen_text = ""
     all_lines: list[str] = []
     used_sources: list[str] = []
-    for source, raw, mime in candidates[:2]:
+    for source, raw, mime in candidates[:4]:
         text = _ocr_cover_text_from_image_bytes(raw, mime)
         if _ocr_text_quality_score(text) > _ocr_text_quality_score(chosen_text):
             chosen_text = text
@@ -26891,6 +27282,7 @@ def _strict_discogs_payload_from_release_data(rel_data: dict) -> dict:
         "catalog_number": catalog_numbers,
         "release_id": release_id,
         "master_id": master_id,
+        "images": images if isinstance(images, list) else [],
         "identity_scope": "discogs_release",
     }
 
@@ -59149,6 +59541,85 @@ def api_library_album_download(album_id: int):
     )
 
 
+@app.get("/api/library/album/<int:album_id>/artwork-gallery")
+def api_library_album_artwork_gallery(album_id: int):
+    if _get_library_mode() != "files":
+        return jsonify({"error": "Files mode required"}), 400
+    ok, err = _ensure_files_index_ready()
+    if not ok:
+        return jsonify({"error": err or "Files index unavailable"}), 503
+    album_id = int(album_id or 0)
+    if album_id <= 0:
+        return jsonify({"error": "Invalid album id"}), 400
+    cache_key = _album_artwork_gallery_cache_key(album_id)
+    cached = _files_cache_get_json(cache_key)
+    if not isinstance(cached, dict):
+        conn = _files_pg_connect()
+        if conn is None:
+            return jsonify({"error": "PostgreSQL unavailable"}), 503
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        COALESCE(folder_path, ''),
+                        COALESCE(cover_path, ''),
+                        COALESCE(musicbrainz_release_id, ''),
+                        COALESCE(musicbrainz_release_group_id, ''),
+                        COALESCE(discogs_release_id, ''),
+                        COALESCE(title, '')
+                    FROM files_albums
+                    WHERE id = %s
+                    LIMIT 1
+                    """,
+                    (album_id,),
+                )
+                row = cur.fetchone()
+        finally:
+            conn.close()
+        if not row:
+            return jsonify({"error": "Album not found"}), 404
+        cached = _album_artwork_gallery_manifest(
+            album_id=album_id,
+            folder_path_raw=str(row[0] or "").strip(),
+            cover_path_raw=str(row[1] or "").strip(),
+            musicbrainz_release_id=str(row[2] or "").strip(),
+            musicbrainz_release_group_id=str(row[3] or "").strip(),
+            discogs_release_id=str(row[4] or "").strip(),
+        )
+        cached["title"] = str(row[5] or "").strip()
+        _files_cache_set_json(cache_key, cached, ttl=21600)
+    items_payload: list[dict[str, Any]] = []
+    for item in list(cached.get("items") or []):
+        if not isinstance(item, dict):
+            continue
+        item_id = str(item.get("id") or "").strip()
+        if not item_id:
+            continue
+        items_payload.append(
+            {
+                "id": item_id,
+                "slot": str(item.get("slot") or "other"),
+                "label": str(item.get("label") or _artwork_slot_label(str(item.get("slot") or "other"))),
+                "origin": str(item.get("origin") or ""),
+                "provider": str(item.get("provider") or ""),
+                "selected": bool(item.get("selected")),
+                "source_name": str(item.get("source_name") or "").strip() or None,
+                "source_url": str(item.get("source_url") or "").strip() or None,
+                "image_url": f"{request.url_root.rstrip('/')}/api/library/files/album/{album_id}/artwork/{quote(item_id, safe='')}?size=1600",
+                "thumb_url": f"{request.url_root.rstrip('/')}/api/library/files/album/{album_id}/artwork/{quote(item_id, safe='')}?size=320",
+            }
+        )
+    return jsonify(
+        {
+            "album_id": album_id,
+            "title": str(cached.get("title") or "").strip() or None,
+            "items": items_payload,
+            "updated_at": int(cached.get("updated_at") or 0) or None,
+        }
+    )
+
+
 def _track_file_path(db_conn, track_id: int) -> Optional[Path]:
     """Return the filesystem path for a track (metadata_item id), or None if not found."""
     row = db_conn.execute(
@@ -59287,6 +59758,71 @@ def api_library_files_album_cover(album_id):
         },
         ttl=3600 if no_cover_cached else 900,
     )
+    return _transparent_png_response(max_age=0, revalidate=True)
+
+
+@app.get("/api/library/files/album/<int:album_id>/artwork/<artwork_id>")
+def api_library_files_album_artwork_item(album_id, artwork_id):
+    if _get_library_mode() != "files":
+        return jsonify({"error": "Files mode required"}), 400
+    size = max(64, min(2048, _parse_int_loose(request.args.get("size"), 640)))
+    ok, err = _ensure_files_index_ready()
+    if not ok:
+        return jsonify({"error": err or "Files index unavailable"}), 503
+    cache_key = _album_artwork_gallery_cache_key(int(album_id))
+    manifest = _files_cache_get_json(cache_key)
+    if not isinstance(manifest, dict):
+        conn = _files_pg_connect()
+        if conn is None:
+            return jsonify({"error": "PostgreSQL unavailable"}), 503
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        COALESCE(folder_path, ''),
+                        COALESCE(cover_path, ''),
+                        COALESCE(musicbrainz_release_id, ''),
+                        COALESCE(musicbrainz_release_group_id, ''),
+                        COALESCE(discogs_release_id, ''),
+                        COALESCE(title, '')
+                    FROM files_albums
+                    WHERE id = %s
+                    LIMIT 1
+                    """,
+                    (int(album_id),),
+                )
+                row = cur.fetchone()
+        finally:
+            conn.close()
+        if row:
+            manifest = _album_artwork_gallery_manifest(
+                album_id=int(album_id),
+                folder_path_raw=str(row[0] or "").strip(),
+                cover_path_raw=str(row[1] or "").strip(),
+                musicbrainz_release_id=str(row[2] or "").strip(),
+                musicbrainz_release_group_id=str(row[3] or "").strip(),
+                discogs_release_id=str(row[4] or "").strip(),
+            )
+            manifest["title"] = str(row[5] or "").strip()
+            _files_cache_set_json(cache_key, manifest, ttl=21600)
+    if not isinstance(manifest, dict):
+        return _transparent_png_response(max_age=0, revalidate=True)
+    wanted = str(artwork_id or "").strip()
+    for item in list(manifest.get("items") or []):
+        if not isinstance(item, dict) or str(item.get("id") or "").strip() != wanted:
+            continue
+        cache_raw = str(item.get("cache_path") or "").strip()
+        if not cache_raw:
+            break
+        try:
+            image_path = path_for_fs_access(Path(cache_raw))
+        except Exception:
+            image_path = Path(cache_raw)
+        if image_path.exists() and image_path.is_file():
+            cached = _ensure_cached_image_for_path(image_path, kind="album", max_px=size)
+            return _serve_image_file_cached(cached or image_path, max_age=86400, revalidate=False)
+        break
     return _transparent_png_response(max_age=0, revalidate=True)
 
 

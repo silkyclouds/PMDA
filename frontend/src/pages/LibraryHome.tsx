@@ -359,17 +359,17 @@ export default function LibraryHome() {
 
   return (
     <div className="container pb-6 flex flex-col gap-5 md:gap-6">
-      <section className="grid gap-4 xl:grid-cols-[1.35fr_0.95fr]">
-        <Card className="overflow-hidden border-white/10 bg-[radial-gradient(circle_at_top_left,rgba(45,212,191,0.22),transparent_36%),radial-gradient(circle_at_78%_18%,rgba(245,158,11,0.18),transparent_28%),linear-gradient(135deg,rgba(15,23,42,0.98),rgba(17,24,39,0.94))] text-white shadow-[0_28px_90px_-48px_rgba(15,23,42,0.95)]">
+      <section className="grid gap-4 xl:grid-cols-[1.45fr_0.9fr]">
+        <Card className="overflow-hidden border-border/60 bg-[linear-gradient(135deg,rgba(27,29,36,0.98),rgba(17,19,25,0.96)),radial-gradient(circle_at_top_left,rgba(221,119,87,0.18),transparent_38%),radial-gradient(circle_at_78%_18%,rgba(235,184,120,0.14),transparent_28%)] text-white shadow-none">
           <CardContent className="p-6 md:p-8">
             <div className="flex flex-col gap-6">
               <div className="space-y-3">
-                <div className="inline-flex items-center gap-2 rounded-full border border-white/15 bg-white/8 px-3 py-1 text-[11px] font-medium uppercase tracking-[0.28em] text-white/78">
+                <div className="inline-flex items-center gap-2 border border-white/12 bg-white/6 px-3 py-1 text-[11px] font-medium uppercase tracking-[0.28em] text-white/78">
                   <Sparkles className="h-3.5 w-3.5 text-emerald-300" />
                   Listening Notes
                 </div>
                 <div className="max-w-2xl space-y-3">
-                  <h1 className="max-w-xl text-3xl font-semibold tracking-tight text-white sm:text-4xl">
+                  <h1 className="max-w-xl text-3xl font-semibold tracking-tight text-white sm:text-[3rem]">
                     Navigate your library like a collection, not a file dump.
                   </h1>
                   <p className="max-w-xl text-sm leading-6 text-white/72 sm:text-[15px]">
@@ -378,30 +378,30 @@ export default function LibraryHome() {
                 </div>
               </div>
               <div className="grid gap-3 sm:grid-cols-3">
-                <div className="rounded-2xl border border-white/10 bg-black/18 p-4 backdrop-blur-sm">
+                <div className="border border-white/10 bg-black/16 p-4 backdrop-blur-sm">
                   <div className="text-[11px] uppercase tracking-[0.22em] text-white/48">Discovery queue</div>
                   <div className="mt-2 text-3xl font-semibold text-white">{discoverAlbumCount}</div>
                   <p className="mt-1 text-xs leading-5 text-white/60">Albums surfaced from your listening history and neighboring records.</p>
                 </div>
-                <div className="rounded-2xl border border-white/10 bg-black/18 p-4 backdrop-blur-sm">
+                <div className="border border-white/10 bg-black/16 p-4 backdrop-blur-sm">
                   <div className="text-[11px] uppercase tracking-[0.22em] text-white/48">For you</div>
                   <div className="mt-2 text-3xl font-semibold text-white">{recommendations.length}</div>
                   <p className="mt-1 text-xs leading-5 text-white/60">Track recommendations shaped by what you actually finish and replay.</p>
                 </div>
-                <div className="rounded-2xl border border-white/10 bg-black/18 p-4 backdrop-blur-sm">
+                <div className="border border-white/10 bg-black/16 p-4 backdrop-blur-sm">
                   <div className="text-[11px] uppercase tracking-[0.22em] text-white/48">Recent motion</div>
                   <div className="mt-2 text-3xl font-semibold text-white">{recentlyPlayedAlbums.length || recentAlbums.length}</div>
                   <p className="mt-1 text-xs leading-5 text-white/60">Recently played and recently added records ready for the next session.</p>
                 </div>
               </div>
               <div className="flex flex-wrap gap-2">
-                <Button type="button" className="h-10 rounded-full bg-white text-slate-950 hover:bg-white/90" onClick={() => openSectionPage('discover')}>
+                <Button type="button" className="h-10 bg-white text-slate-950 hover:bg-white/90" onClick={() => openSectionPage('discover')}>
                   Open discovery
                 </Button>
-                <Button type="button" variant="secondary" className="h-10 rounded-full border border-white/12 bg-white/10 text-white hover:bg-white/16" onClick={() => navigate(`/library/recommendations${location.search || ''}`, { state: withBackLinkState(location) })}>
+                <Button type="button" variant="secondary" className="h-10 border border-white/12 bg-white/10 text-white hover:bg-white/16" onClick={() => navigate(`/library/recommendations${location.search || ''}`, { state: withBackLinkState(location) })}>
                   Recommendations
                 </Button>
-                <Button type="button" variant="secondary" className="h-10 rounded-full border border-white/12 bg-white/10 text-white hover:bg-white/16" onClick={() => navigate(`/library/liked${location.search || ''}`, { state: withBackLinkState(location) })}>
+                <Button type="button" variant="secondary" className="h-10 border border-white/12 bg-white/10 text-white hover:bg-white/16" onClick={() => navigate(`/library/liked${location.search || ''}`, { state: withBackLinkState(location) })}>
                   Liked
                 </Button>
               </div>
@@ -409,11 +409,11 @@ export default function LibraryHome() {
           </CardContent>
         </Card>
         <div className="grid gap-4">
-          <Card className="overflow-hidden border-border/60 bg-card/95 shadow-[0_24px_64px_-44px_rgba(15,23,42,0.55)]">
+          <Card className="pmda-flat-surface overflow-hidden">
             <CardContent className="p-5">
               <div className="flex items-start gap-4">
                 <div className="w-28 shrink-0">
-                  <AspectRatio ratio={1} className="overflow-hidden rounded-2xl bg-muted">
+                  <AspectRatio ratio={1} className="overflow-hidden border border-border/60 bg-muted">
                     <AlbumArtwork albumThumb={spotlightAlbum?.thumb || null} artistId={spotlightAlbum?.artist_id} alt={spotlightAlbum?.title || 'Spotlight album'} size={320} priority />
                   </AspectRatio>
                 </div>
@@ -462,9 +462,9 @@ export default function LibraryHome() {
             </CardContent>
           </Card>
           <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-1">
-            <Card className="border-border/60 bg-card/92">
+            <Card className="pmda-flat-surface">
               <CardContent className="flex items-start gap-3 p-5">
-                <div className="flex h-10 w-10 items-center justify-center rounded-2xl bg-primary/10 text-primary">
+                <div className="flex h-10 w-10 items-center justify-center border border-primary/20 bg-primary/10 text-primary">
                   <Heart className="h-4 w-4" />
                 </div>
                 <div className="space-y-1">
@@ -473,9 +473,9 @@ export default function LibraryHome() {
                 </div>
               </CardContent>
             </Card>
-            <Card className="border-border/60 bg-card/92">
+            <Card className="pmda-flat-surface">
               <CardContent className="flex items-start gap-3 p-5">
-                <div className="flex h-10 w-10 items-center justify-center rounded-2xl bg-primary/10 text-primary">
+                <div className="flex h-10 w-10 items-center justify-center border border-primary/20 bg-primary/10 text-primary">
                   <LibraryBig className="h-4 w-4" />
                 </div>
                 <div className="space-y-1">
@@ -511,7 +511,7 @@ export default function LibraryHome() {
         </Button>
       </div>
       {homeEditMode ? (
-        <Card className="pmda-shelf overflow-hidden animate-in fade-in-0 slide-in-from-bottom-2 duration-200">
+        <Card className="pmda-flat-surface animate-in fade-in-0 slide-in-from-bottom-2 duration-200">
           <CardHeader className="pb-2">
             <CardTitle className="text-sm">Home Sections</CardTitle>
             <CardDescription>Drag to reorder, uncheck to hide.</CardDescription>
@@ -550,7 +550,7 @@ export default function LibraryHome() {
       ) : null}
       {/* Discover */}
       <div style={sectionOrderStyle('discover')}>
-      <Card className="pmda-shelf overflow-hidden animate-in fade-in-0 slide-in-from-bottom-2 duration-300">
+      <Card className="pmda-flat-surface animate-in fade-in-0 slide-in-from-bottom-2 duration-300">
         <CardHeader className="pb-3">
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div className="space-y-1">
@@ -647,7 +647,7 @@ export default function LibraryHome() {
                     {sec.albums.map((a) => (
                       <CarouselItem key={`disc-${sec.key}-${a.album_id}`} className="basis-[160px] sm:basis-[190px] md:basis-[220px] pl-3">
                         <div className="group">
-                          <Card className="overflow-hidden border-border/60 bg-card/90 transition-all duration-300 hover:-translate-y-1 hover:border-primary/35 hover:shadow-card-hover">
+                          <Card className="pmda-flat-tile overflow-hidden transition-all duration-300 hover:-translate-y-1 hover:border-primary/35">
                             <AspectRatio
                               ratio={1}
                               className="bg-muted"
@@ -669,7 +669,7 @@ export default function LibraryHome() {
                                 className="absolute inset-0 flex items-center justify-center opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity bg-black/35"
                                 title="Play"
                               >
-                                <div className="h-10 w-10 sm:h-12 sm:w-12 rounded-full bg-white/15 backdrop-blur-sm border border-white/20 flex items-center justify-center">
+                                <div className="h-10 w-10 sm:h-12 sm:w-12 border border-white/20 bg-white/15 backdrop-blur-sm flex items-center justify-center">
                                   <Play className="h-5 w-5 text-white fill-white" />
                                 </div>
                               </button>
@@ -735,7 +735,7 @@ export default function LibraryHome() {
 
       {/* For You */}
       <div style={sectionOrderStyle('for_you')}>
-      <Card className="pmda-shelf overflow-hidden animate-in fade-in-0 slide-in-from-bottom-2 duration-300">
+      <Card className="pmda-flat-surface animate-in fade-in-0 slide-in-from-bottom-2 duration-300">
         <CardHeader className="pb-3">
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div className="space-y-1">
@@ -777,10 +777,10 @@ export default function LibraryHome() {
                   key={`rec-${rec.track_id}`}
                   type="button"
                   onClick={() => void handlePlayRecommendedTrack(rec)}
-                  className="group rounded-xl border border-border/60 bg-card/90 p-3 text-left hover:-translate-y-0.5 hover:border-primary/40 hover:bg-accent/20 transition-all duration-300"
+                  className="group border border-border/60 bg-card/90 p-3 text-left hover:-translate-y-0.5 hover:border-primary/40 hover:bg-accent/20 transition-all duration-300"
                 >
                   <div className="flex items-start gap-3">
-                    <div className="w-12 h-12 rounded-lg bg-muted overflow-hidden shrink-0 flex items-center justify-center">
+                    <div className="w-12 h-12 border border-border/60 bg-muted overflow-hidden shrink-0 flex items-center justify-center">
                       {rec.thumb ? (
                         <img src={rec.thumb} alt={rec.album_title} className="w-full h-full object-cover animate-in fade-in-0 duration-300" />
                       ) : (
@@ -808,7 +808,7 @@ export default function LibraryHome() {
 
       {/* Top Artists */}
       <div style={sectionOrderStyle('top_artists')}>
-      <Card className="pmda-shelf overflow-hidden animate-in fade-in-0 slide-in-from-bottom-2 duration-300">
+      <Card className="pmda-flat-surface animate-in fade-in-0 slide-in-from-bottom-2 duration-300">
         <CardHeader className="pb-3">
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div className="space-y-1">
@@ -846,10 +846,10 @@ export default function LibraryHome() {
                 {topArtists.map((a) => (
                   <CarouselItem key={`ta-${a.artist_id}`} className="basis-[170px] sm:basis-[200px] md:basis-[220px] pl-3">
                     <button type="button" onClick={() => navigate(`/library/artist/${a.artist_id}${location.search || ''}`, { state: withBackLinkState(location) })} className="w-full text-left group">
-                      <Card className="overflow-hidden border-border/60 bg-card/90 transition-all duration-300 hover:-translate-y-1 hover:border-primary/35 hover:bg-accent/20">
+                      <Card className="pmda-flat-tile overflow-hidden transition-all duration-300 hover:-translate-y-1 hover:border-primary/35 hover:bg-accent/20">
                         <CardContent className="p-4 space-y-3">
                           <div className="flex items-center gap-3">
-                            <div className="h-12 w-12 rounded-full bg-muted overflow-hidden shrink-0 flex items-center justify-center border border-border/60">
+                            <div className="h-12 w-12 bg-muted overflow-hidden shrink-0 flex items-center justify-center border border-border/60">
                               {a.thumb ? (
                                 <img src={a.thumb} alt={a.artist_name} className="w-full h-full object-cover animate-in fade-in-0 duration-300" />
                               ) : (
@@ -883,7 +883,7 @@ export default function LibraryHome() {
 
       {/* Recently Added Artists */}
       <div style={sectionOrderStyle('recent_artists')}>
-      <Card className="pmda-shelf overflow-hidden animate-in fade-in-0 slide-in-from-bottom-2 duration-300">
+      <Card className="pmda-flat-surface animate-in fade-in-0 slide-in-from-bottom-2 duration-300">
         <CardHeader className="pb-3">
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div className="space-y-1">
@@ -921,10 +921,10 @@ export default function LibraryHome() {
                 {recentArtists.map((a) => (
                   <CarouselItem key={`ra-${a.artist_id}`} className="basis-[170px] sm:basis-[200px] md:basis-[220px] pl-3">
                     <button type="button" onClick={() => navigate(`/library/artist/${a.artist_id}${location.search || ''}`, { state: withBackLinkState(location) })} className="w-full text-left group">
-                      <Card className="overflow-hidden border-border/60 bg-card/90 transition-all duration-300 hover:-translate-y-1 hover:border-primary/35 hover:bg-accent/20">
+                      <Card className="pmda-flat-tile overflow-hidden transition-all duration-300 hover:-translate-y-1 hover:border-primary/35 hover:bg-accent/20">
                         <CardContent className="p-4 space-y-3">
                           <div className="flex items-center gap-3">
-                            <div className="h-12 w-12 rounded-full bg-muted overflow-hidden shrink-0 flex items-center justify-center border border-border/60">
+                            <div className="h-12 w-12 bg-muted overflow-hidden shrink-0 flex items-center justify-center border border-border/60">
                               {a.thumb ? (
                                 <img src={a.thumb} alt={a.artist_name} className="w-full h-full object-cover animate-in fade-in-0 duration-300" />
                               ) : (
@@ -957,7 +957,7 @@ export default function LibraryHome() {
 
       {/* Recently Played */}
       <div style={sectionOrderStyle('recently_played')}>
-      <Card className="pmda-shelf overflow-hidden animate-in fade-in-0 slide-in-from-bottom-2 duration-300">
+      <Card className="pmda-flat-surface animate-in fade-in-0 slide-in-from-bottom-2 duration-300">
         <CardHeader className="pb-3">
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div className="space-y-1">
@@ -1001,7 +1001,7 @@ export default function LibraryHome() {
                 {recentlyPlayedAlbums.map((a) => (
                   <CarouselItem key={`rplay-${a.album_id}`} className="basis-[160px] sm:basis-[190px] md:basis-[220px] pl-3">
                     <div className="group">
-                      <Card className="overflow-hidden border-border/60 bg-card/90 transition-all duration-300 hover:-translate-y-1 hover:border-primary/35 hover:shadow-card-hover">
+                      <Card className="pmda-flat-tile overflow-hidden transition-all duration-300 hover:-translate-y-1 hover:border-primary/35">
                         <AspectRatio ratio={1} className="bg-muted">
                           <AlbumArtwork albumThumb={a.thumb} artistId={a.artist_id} alt={a.title} size={320} priority />
                           <button
@@ -1010,7 +1010,7 @@ export default function LibraryHome() {
                             className="absolute inset-0 flex items-center justify-center opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity bg-black/35"
                             title="Play"
                           >
-                            <div className="h-10 w-10 sm:h-12 sm:w-12 rounded-full bg-white/15 backdrop-blur-sm border border-white/20 flex items-center justify-center">
+                            <div className="h-10 w-10 sm:h-12 sm:w-12 border border-white/20 bg-white/15 backdrop-blur-sm flex items-center justify-center">
                               <Play className="h-5 w-5 text-white fill-white" />
                             </div>
                           </button>
@@ -1074,7 +1074,7 @@ export default function LibraryHome() {
 
       {/* Recently Added */}
       <div style={sectionOrderStyle('recently_added')}>
-      <Card className="pmda-shelf overflow-hidden animate-in fade-in-0 slide-in-from-bottom-2 duration-300">
+      <Card className="pmda-flat-surface animate-in fade-in-0 slide-in-from-bottom-2 duration-300">
         <CardHeader className="pb-3">
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div className="space-y-1">
@@ -1112,7 +1112,7 @@ export default function LibraryHome() {
                 {recentAlbums.map((a) => (
                   <CarouselItem key={`recent-${a.album_id}`} className="basis-[160px] sm:basis-[190px] md:basis-[220px] pl-3">
                     <div className="group">
-                      <Card className="overflow-hidden border-border/60 bg-card/90 transition-all duration-300 hover:-translate-y-1 hover:border-primary/35 hover:shadow-card-hover">
+                      <Card className="pmda-flat-tile overflow-hidden transition-all duration-300 hover:-translate-y-1 hover:border-primary/35">
                         <AspectRatio ratio={1} className="bg-muted">
                           <AlbumArtwork albumThumb={a.thumb} artistId={a.artist_id} alt={a.title} size={320} priority />
                           <button
@@ -1121,7 +1121,7 @@ export default function LibraryHome() {
                             className="absolute inset-0 flex items-center justify-center opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity bg-black/35"
                             title="Play"
                           >
-                            <div className="h-10 w-10 sm:h-12 sm:w-12 rounded-full bg-white/15 backdrop-blur-sm border border-white/20 flex items-center justify-center">
+                            <div className="h-10 w-10 sm:h-12 sm:w-12 border border-white/20 bg-white/15 backdrop-blur-sm flex items-center justify-center">
                               <Play className="h-5 w-5 text-white fill-white" />
                             </div>
                           </button>

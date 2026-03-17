@@ -2300,6 +2300,26 @@ export interface ClassicalIdentityPayload {
   catalog_numbers?: string[];
 }
 
+export interface AlbumArtworkGalleryItem {
+  id: string;
+  slot: string;
+  label: string;
+  origin: string;
+  provider?: string | null;
+  selected?: boolean;
+  source_name?: string | null;
+  source_url?: string | null;
+  image_url: string;
+  thumb_url: string;
+}
+
+export interface AlbumArtworkGalleryResponse {
+  album_id: number;
+  title?: string | null;
+  updated_at?: number | null;
+  items: AlbumArtworkGalleryItem[];
+}
+
 export interface AlbumDetailResponse {
   album_id: number;
   title: string;
@@ -2341,6 +2361,12 @@ export interface AlbumDetailResponse {
 
 export async function getAlbumDetail(albumId: number): Promise<AlbumDetailResponse> {
   return fetchApi<AlbumDetailResponse>(`/api/library/album/${encodeURIComponent(String(albumId))}`, {
+    timeoutMs: 30000,
+  });
+}
+
+export async function getAlbumArtworkGallery(albumId: number): Promise<AlbumArtworkGalleryResponse> {
+  return fetchApi<AlbumArtworkGalleryResponse>(`/api/library/album/${encodeURIComponent(String(albumId))}/artwork-gallery`, {
     timeoutMs: 30000,
   });
 }

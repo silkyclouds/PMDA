@@ -151,7 +151,7 @@ export default function LikedPage() {
                 {albums.map((album) => (
                   <Card
                     key={`liked-album-${album.album_id}`}
-                    className="overflow-hidden cursor-pointer border-border/70 hover:border-primary/35 transition-colors"
+                    className="pmda-flat-tile cursor-pointer"
                     role="button"
                     tabIndex={0}
                     onClick={() => navigate(`/library/album/${album.album_id}${location.search || ''}`, { state: withBackLinkState(location) })}
@@ -208,11 +208,11 @@ export default function LikedPage() {
                   <button
                     key={`liked-artist-${artist.artist_id}`}
                     type="button"
-                    className="rounded-2xl border border-border/70 bg-card p-4 text-left transition-colors hover:border-primary/35"
+                    className="pmda-flat-surface p-4 text-left transition-colors"
                     onClick={() => navigate(`/library/artist/${artist.artist_id}${location.search || ''}`, { state: withBackLinkState(location) })}
                   >
                     <div className="flex items-center gap-3">
-                      <div className="h-14 w-14 overflow-hidden rounded-2xl bg-muted">
+                      <div className="h-14 w-14 overflow-hidden rounded-sm bg-muted">
                         {artist.thumb ? (
                           <img src={artist.thumb} alt={artist.artist_name} className="h-full w-full object-cover" />
                         ) : null}
@@ -235,7 +235,7 @@ export default function LikedPage() {
             {labels.length === 0 ? (
               <Card><CardContent className="p-6 text-sm text-muted-foreground">No liked labels yet.</CardContent></Card>
             ) : (
-              <ScrollArea className="w-full whitespace-nowrap rounded-2xl border border-border/70 bg-card">
+              <ScrollArea className="w-full whitespace-nowrap border border-border/70 bg-card">
                 <div className="flex gap-2 p-4">
                   {labels.map((label) => (
                     <Button
@@ -262,7 +262,7 @@ export default function LikedPage() {
                 {suggestions.map((album) => (
                   <Card
                     key={`liked-suggestion-${album.album_id}`}
-                    className="overflow-hidden cursor-pointer border-border/70 hover:border-primary/35 transition-colors"
+                    className="pmda-flat-tile cursor-pointer"
                     role="button"
                     tabIndex={0}
                     onClick={() => navigate(`/library/album/${album.album_id}${location.search || ''}`, { state: withBackLinkState(location) })}
