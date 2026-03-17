@@ -645,16 +645,20 @@ export default function AlbumPage() {
       </div>
 
       <Card className="pmda-flat-surface overflow-hidden">
-        <div className="relative overflow-hidden">
+        <div className="relative min-h-[22rem] overflow-hidden md:min-h-[26rem]">
+          {data.cover_url ? (
+            <img
+              src={data.cover_url}
+              alt={data.title}
+              className="absolute inset-0 h-full w-full scale-[1.04] object-cover blur-[1.8px] saturate-[0.92]"
+            />
+          ) : (
+            <div className="absolute inset-0 bg-gradient-to-br from-muted via-muted/70 to-accent/20" />
+          )}
           <div className="absolute inset-0 z-10 bg-background/34 backdrop-blur-xl" />
           <div className="absolute inset-0 z-10 bg-gradient-to-r from-white/86 via-white/48 to-white/16 dark:from-background dark:via-background/92 dark:to-background/70" />
           <div className="absolute inset-0 z-10 bg-gradient-to-t from-background/76 via-transparent to-transparent" />
-          {data.cover_url ? (
-            <img src={data.cover_url} alt={data.title} className="h-[22rem] w-full scale-[1.04] object-cover blur-[1.8px] saturate-[0.92] md:h-[26rem]" />
-          ) : (
-            <div className="h-[22rem] md:h-[26rem] bg-gradient-to-br from-muted via-muted/70 to-accent/20" />
-          )}
-          <div className="absolute inset-0 z-20 flex items-end p-6 md:p-8 xl:p-10">
+          <div className="relative z-20 flex min-h-[22rem] items-end p-6 md:min-h-[26rem] md:p-8 xl:p-10">
             <div className="grid w-full grid-cols-1 items-end gap-6 md:grid-cols-[15rem,1fr]">
               <button
                 type="button"
@@ -690,8 +694,8 @@ export default function AlbumPage() {
                   </Button>
                 </div>
               </button>
-              <div className="min-w-0 border border-border/70 bg-white/52 px-5 py-5 backdrop-blur-md dark:border-white/10 dark:bg-background/58">
-                <h1 className="text-3xl font-bold tracking-tight text-slate-950 drop-shadow-[0_1px_4px_rgba(255,255,255,0.55)] dark:text-white dark:drop-shadow-[0_2px_10px_rgba(0,0,0,0.7)] md:text-5xl">
+              <div className="min-w-0 overflow-hidden border border-border/70 bg-white/52 px-5 py-5 backdrop-blur-md dark:border-white/10 dark:bg-background/58">
+                <h1 className="pr-2 pt-1 text-3xl font-bold leading-[1.02] tracking-tight text-slate-950 [text-wrap:balance] drop-shadow-[0_1px_4px_rgba(255,255,255,0.55)] break-words dark:text-white dark:drop-shadow-[0_2px_10px_rgba(0,0,0,0.7)] md:text-[2.85rem] md:leading-[0.98] xl:text-5xl xl:leading-[1.01]">
                   {data.title}
                 </h1>
                 <button

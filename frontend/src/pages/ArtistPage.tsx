@@ -830,16 +830,20 @@ export default function ArtistPage() {
         </div>
 
         <Card className="pmda-flat-surface overflow-hidden">
-          <div className="relative overflow-hidden">
+          <div className="relative min-h-[24rem] overflow-hidden md:min-h-[30rem]">
+            {heroImage ? (
+              <img
+                src={heroImage}
+                alt={details.artist_name}
+                className="absolute inset-0 h-full w-full object-cover blur-[1.8px] scale-[1.04]"
+              />
+            ) : (
+              <div className="absolute inset-0 bg-gradient-to-br from-zinc-900 via-zinc-800 to-zinc-900" />
+            )}
             <div className="absolute inset-0 z-10 bg-background/34 backdrop-blur-xl" />
             <div className="absolute inset-0 z-10 bg-gradient-to-r from-white/86 via-white/48 to-white/16 dark:from-background dark:via-background/92 dark:to-background/70" />
             <div className="absolute inset-0 z-10 bg-gradient-to-t from-background/76 via-transparent to-transparent" />
-            {heroImage ? (
-              <img src={heroImage} alt={details.artist_name} className="w-full h-[24rem] md:h-[30rem] object-cover blur-[1.8px] scale-[1.04]" />
-            ) : (
-              <div className="h-[24rem] md:h-[30rem] bg-gradient-to-br from-zinc-900 via-zinc-800 to-zinc-900" />
-            )}
-            <div className="absolute inset-0 z-20 p-6 md:p-8 flex items-end">
+            <div className="relative z-20 flex min-h-[24rem] items-end p-6 md:min-h-[30rem] md:p-8">
               <div className="grid grid-cols-1 md:grid-cols-[15rem,minmax(0,1fr)] gap-8 md:gap-14 w-full items-center">
                 <div className="w-28 h-28 sm:w-36 sm:h-36 md:w-56 md:h-56 lg:w-60 lg:h-60 overflow-hidden border border-white/12 bg-muted shrink-0 shadow-[0_24px_60px_rgba(0,0,0,0.5)]">
                   {heroImage ? (
@@ -851,7 +855,7 @@ export default function ArtistPage() {
                   )}
                 </div>
                 <div className="min-w-0 md:pl-2 border border-border/70 bg-white/52 px-5 py-5 backdrop-blur-md dark:border-white/10 dark:bg-background/58">
-                  <h1 className="text-2xl sm:text-3xl md:text-5xl font-bold tracking-tight leading-tight text-slate-950 drop-shadow-[0_1px_4px_rgba(255,255,255,0.55)] dark:text-white dark:drop-shadow-[0_2px_10px_rgba(0,0,0,0.55)]">
+                  <h1 className="pr-2 pt-1 text-2xl font-bold tracking-tight leading-[1.02] text-slate-950 [text-wrap:balance] break-words drop-shadow-[0_1px_4px_rgba(255,255,255,0.55)] dark:text-white dark:drop-shadow-[0_2px_10px_rgba(0,0,0,0.55)] sm:text-3xl md:text-[2.9rem] md:leading-[0.98] xl:text-5xl xl:leading-[1.01]">
                     {details.artist_name}
                   </h1>
                   <p className="mt-1.5 text-base text-slate-800 dark:text-white/82">
