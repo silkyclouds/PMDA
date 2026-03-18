@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Music } from 'lucide-react';
-import { getAuthToken } from '@/lib/api';
+import { getAuthToken, normalizePmdaAssetUrl } from '@/lib/api';
 
 interface AlbumArtworkProps {
   albumThumb?: string | null;
@@ -14,7 +14,7 @@ interface AlbumArtworkProps {
 }
 
 function normalizeUrl(value?: string | null): string | null {
-  const txt = String(value || '').trim();
+  const txt = normalizePmdaAssetUrl(value);
   return txt || null;
 }
 

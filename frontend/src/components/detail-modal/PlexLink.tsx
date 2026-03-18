@@ -4,6 +4,22 @@ import { Button } from '@/components/ui/button';
 import * as api from '@/lib/api';
 import type { Edition } from '@/lib/api';
 
+function isLikelyLanOrigin(): boolean {
+  if (typeof window === 'undefined') return false;
+  const host = String(window.location.hostname || '').trim().toLowerCase();
+  if (!host) return false;
+  if (host === 'localhost' || host.endsWith('.local')) return true;
+  if (/^127(?:\.\d{1,3}){3}$/.test(host)) return true;
+  if (/^10(?:\.\d{1,3}){3}$/.test(host)) return true;
+  if (/^192\.168(?:\.\d{1,3}){2}$/.test(host)) return true;
+  const m = host.match(/^172\.(\d{1,3})(?:\.\d{1,3}){2}$/);
+  if (m) {
+    const n = Number(m[1] || 0);
+    if (Number.isFinite(n) && n >= 16 && n <= 31) return true;
+  }
+  return false;
+}
+
 /** Build Plex Web URL for a rating key (artist or album). */
 export function buildPlexMetadataUrl(plexHost: string, ratingKey: number): string {
   const base = plexHost.replace(/\/$/, '');
@@ -21,6 +37,7 @@ export function PlexLink({ artistId, editions, selectedEditionIndex }: PlexLinkP
   const [plexHost, setPlexHost] = useState<string | null>(null);
 
   useEffect(() => {
+    if (!isLikelyLanOrigin()) return;
     api.getConfig().then(config => {
       if (config.LIBRARY_MODE === 'plex' && config.PLEX_HOST) {
         setPlexHost(config.PLEX_HOST.replace(/\/$/, ''));
@@ -66,6 +83,7 @@ export function PlexOpenLink({ ratingKey, label = 'Open in Plex', variant = 'out
   const [plexHost, setPlexHost] = useState<string | null>(null);
 
   useEffect(() => {
+    if (!isLikelyLanOrigin()) return;
     api.getConfig().then(config => {
       if (config.LIBRARY_MODE === 'plex' && config.PLEX_HOST) {
         setPlexHost(config.PLEX_HOST.replace(/\/$/, ''));

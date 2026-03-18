@@ -681,11 +681,11 @@ export default function AlbumPage() {
           <div className="absolute inset-0 z-10 bg-background/34 backdrop-blur-xl" />
           <div className="absolute inset-0 z-10 bg-gradient-to-r from-white/86 via-white/48 to-white/16 dark:from-background dark:via-background/92 dark:to-background/70" />
           <div className="absolute inset-0 z-10 bg-gradient-to-t from-background/76 via-transparent to-transparent" />
-          <div className="relative z-20 flex min-h-[22rem] items-end p-6 md:min-h-[26rem] md:p-8 xl:p-10">
-            <div className="grid w-full grid-cols-1 items-end gap-6 md:grid-cols-[15rem,1fr]">
+          <div className="relative z-20 flex min-h-[22rem] items-end p-6 md:min-h-[28rem] md:p-8 xl:p-10">
+            <div className="grid w-full grid-cols-1 items-end gap-6 md:grid-cols-[18rem,1fr] xl:grid-cols-[20rem,1fr]">
               <button
                 type="button"
-                className="group relative h-40 w-40 overflow-hidden border border-white/12 bg-muted shadow-[0_28px_80px_-48px_rgba(0,0,0,0.9)] md:h-56 md:w-56"
+                className="group relative h-52 w-52 overflow-hidden border border-white/12 bg-muted shadow-[0_28px_80px_-48px_rgba(0,0,0,0.9)] md:h-72 md:w-72 xl:h-80 xl:w-80"
                 onClick={() => setArtworkGalleryOpen(true)}
                 title="View artwork stack"
               >

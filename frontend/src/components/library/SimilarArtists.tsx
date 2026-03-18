@@ -221,17 +221,13 @@ export function SimilarArtists({ artistId, artistName }: SimilarArtistsProps) {
         </div>
       </CardHeader>
       <CardContent>
-        <div className="space-y-2">
+        <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-3">
           {similarArtists.map((artist) => (
             <div
               key={artistKey(artist)}
-              className="flex items-center gap-3 p-3 rounded-lg border border-border hover:bg-accent/50 transition-colors"
+              className="border border-border hover:bg-accent/50 transition-colors"
             >
-              <Checkbox
-                checked={selected.has(artistKey(artist))}
-                onCheckedChange={() => handleToggle(artistKey(artist))}
-              />
-              <div className="w-9 h-9 rounded-full bg-muted overflow-hidden flex items-center justify-center border border-border/60 shrink-0">
+              <div className="relative aspect-square w-full bg-muted overflow-hidden border-b border-border/60 flex items-center justify-center">
                 {artist.image_url && !isProbablyPlaceholderArtistImageUrl(artist.image_url) ? (
                   <img
                     src={artist.image_url}
@@ -240,20 +236,27 @@ export function SimilarArtists({ artistId, artistName }: SimilarArtistsProps) {
                     loading="lazy"
                   />
                 ) : (
-                  <div className="w-full h-full flex items-center justify-center bg-gradient-to-br from-amber-500/30 via-slate-500/10 to-emerald-500/30 text-[10px] font-semibold text-foreground/80">
+                  <div className="w-full h-full flex items-center justify-center bg-gradient-to-br from-amber-500/30 via-slate-500/10 to-emerald-500/30 text-lg font-semibold text-foreground/80">
                     {initialsFromName(artist.name)}
                   </div>
                 )}
+                <div className="absolute left-3 top-3">
+                  <Checkbox
+                    checked={selected.has(artistKey(artist))}
+                    onCheckedChange={() => handleToggle(artistKey(artist))}
+                    className="bg-background/85"
+                  />
+                </div>
               </div>
-              <div className="flex-1 min-w-0">
-                <div className="font-medium truncate">{artist.name}</div>
+              <div className="space-y-2 p-4">
+                <div className="font-medium leading-tight line-clamp-2 min-h-[2.5rem]">{artist.name}</div>
                 <div className="text-xs text-muted-foreground">
                   {artist.type || 'Similar'}
                 </div>
+                <Badge variant="outline" className={cn("text-xs", artist.mbid ? "" : "opacity-70")}>
+                  {artist.mbid ? `${artist.mbid.slice(0, 8)}…` : (artist.artist_id ? `#${artist.artist_id}` : '—')}
+                </Badge>
               </div>
-              <Badge variant="outline" className={cn("text-xs", artist.mbid ? "" : "opacity-70")}>
-                {artist.mbid ? `${artist.mbid.slice(0, 8)}…` : (artist.artist_id ? `#${artist.artist_id}` : '—')}
-              </Badge>
             </div>
           ))}
         </div>

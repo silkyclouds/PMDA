@@ -844,8 +844,8 @@ export default function ArtistPage() {
             <div className="absolute inset-0 z-10 bg-gradient-to-r from-white/86 via-white/48 to-white/16 dark:from-background dark:via-background/92 dark:to-background/70" />
             <div className="absolute inset-0 z-10 bg-gradient-to-t from-background/76 via-transparent to-transparent" />
             <div className="relative z-20 flex min-h-[24rem] items-end p-6 md:min-h-[30rem] md:p-8">
-              <div className="grid grid-cols-1 md:grid-cols-[15rem,minmax(0,1fr)] gap-8 md:gap-14 w-full items-center">
-                <div className="w-28 h-28 sm:w-36 sm:h-36 md:w-56 md:h-56 lg:w-60 lg:h-60 overflow-hidden border border-white/12 bg-muted shrink-0 shadow-[0_24px_60px_rgba(0,0,0,0.5)]">
+              <div className="grid grid-cols-1 md:grid-cols-[18rem,minmax(0,1fr)] xl:grid-cols-[20rem,minmax(0,1fr)] gap-8 md:gap-14 w-full items-center">
+                <div className="w-40 h-48 sm:w-48 sm:h-56 md:w-72 md:h-80 xl:w-80 xl:h-[28rem] overflow-hidden border border-white/12 bg-muted shrink-0 shadow-[0_24px_60px_rgba(0,0,0,0.5)]">
                   {heroImage ? (
                     <img src={heroImage} alt={details.artist_name} className="w-full h-full object-cover animate-in fade-in-0 duration-300" />
                   ) : (
@@ -1379,12 +1379,12 @@ export default function ArtistPage() {
               <CardContent className="p-5 text-sm text-muted-foreground">No similar artists available yet.</CardContent>
             </Card>
           ) : (
-            <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-6 gap-3">
+            <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-4">
               {similar.map((artist) => (
 	                <Card
 	                  key={`${artist.artist_id || ''}-${artist.name}-${artist.mbid || ''}`}
 	                  className={cn(
-	                    "border-border/70 transition-colors",
+	                    "pmda-flat-tile overflow-hidden border-border/70 transition-colors",
 	                    "cursor-pointer hover:bg-muted/40"
 	                  )}
 	                  role="button"
@@ -1409,8 +1409,8 @@ export default function ArtistPage() {
 	                    }
 	                  }}
 	                >
-	                  <CardContent className="p-3 space-y-2">
-	                    <div className="relative w-12 h-12 rounded-full bg-muted mx-auto overflow-hidden flex items-center justify-center border border-border/60">
+	                  <CardContent className="p-0">
+	                    <div className="relative aspect-square w-full bg-muted overflow-hidden flex items-center justify-center border-b border-border/60">
 	                      {artist.image_url && !isProbablyPlaceholderArtistImageUrl(artist.image_url) ? (
 	                        <img
 	                          src={artist.image_url}
@@ -1419,20 +1419,22 @@ export default function ArtistPage() {
 	                          loading="lazy"
 	                        />
 	                      ) : (
-	                        <div className="w-full h-full flex items-center justify-center bg-gradient-to-br from-amber-500/30 via-slate-500/10 to-emerald-500/30 text-[11px] font-semibold text-foreground/80">
+	                        <div className="w-full h-full flex items-center justify-center bg-gradient-to-br from-amber-500/30 via-slate-500/10 to-emerald-500/30 text-lg font-semibold text-foreground/80">
 	                          {initialsFromName(artist.name)}
 	                        </div>
 	                      )}
 	                      {!artist.artist_id ? (
-	                        <div className="absolute -right-1 -bottom-1 w-5 h-5 rounded-full bg-background border border-border/60 flex items-center justify-center">
+	                        <div className="absolute right-2 top-2 h-7 w-7 bg-background/88 border border-border/60 flex items-center justify-center">
 	                          <ExternalLink className="w-3 h-3 text-muted-foreground" />
 	                        </div>
 	                      ) : null}
 	                    </div>
-	                    <p className="text-xs font-medium text-center line-clamp-2 min-h-[2.2rem]">{artist.name}</p>
-	                    {artist.type ? (
-	                      <p className="text-[10px] text-muted-foreground text-center truncate">{artist.type}</p>
-	                    ) : null}
+                      <div className="space-y-2 p-4">
+                        <p className="text-sm font-medium leading-tight line-clamp-2 min-h-[2.5rem]">{artist.name}</p>
+                        {artist.type ? (
+                          <p className="text-[11px] text-muted-foreground truncate">{artist.type}</p>
+                        ) : null}
+                      </div>
                   </CardContent>
                 </Card>
               ))}

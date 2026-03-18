@@ -857,26 +857,28 @@ export default function LibraryHome() {
             <Carousel opts={{ align: 'start', dragFree: true }} effect="none" className="w-full pmda-fade-mask">
               <CarouselContent className="-ml-3">
                 {topArtists.map((a) => (
-                  <CarouselItem key={`ta-${a.artist_id}`} className="basis-[170px] sm:basis-[200px] md:basis-[220px] pl-3">
+                  <CarouselItem key={`ta-${a.artist_id}`} className="basis-[220px] sm:basis-[250px] md:basis-[270px] pl-3">
                     <button type="button" onClick={() => navigate(`/library/artist/${a.artist_id}${location.search || ''}`, { state: withBackLinkState(location) })} className="w-full text-left group">
                       <Card className="pmda-flat-tile overflow-hidden transition-all duration-300 hover:-translate-y-1 hover:border-primary/35 hover:bg-accent/20">
-                        <CardContent className="p-4 space-y-3">
-                          <div className="flex items-center gap-3">
-                            <div className="h-12 w-12 bg-muted overflow-hidden shrink-0 flex items-center justify-center border border-border/60">
+                        <CardContent className="p-0">
+                          <AspectRatio ratio={1}>
+                            <div className="h-full w-full bg-muted overflow-hidden border-b border-border/60 flex items-center justify-center">
                               {a.thumb ? (
                                 <img src={a.thumb} alt={a.artist_name} className="w-full h-full object-cover animate-in fade-in-0 duration-300" />
                               ) : (
-                                <UserRound className="w-5 h-5 text-muted-foreground" />
+                                <UserRound className="w-10 h-10 text-muted-foreground" />
                               )}
                             </div>
-                            <div className="min-w-0">
-                              <div className="text-sm font-semibold truncate">{a.artist_name}</div>
+                          </AspectRatio>
+                          <div className="space-y-3 p-4">
+                            <div className="space-y-1">
+                              <div className="text-base font-semibold leading-tight line-clamp-2 min-h-[2.5rem]">{a.artist_name}</div>
                               <div className="text-xs text-muted-foreground truncate">{a.album_count} albums</div>
                             </div>
-                          </div>
-                          <div className="flex items-center justify-between text-[11px] text-muted-foreground tabular-nums">
-                            <span>{a.completion_count} completes</span>
-                            <span>{a.play_count} plays</span>
+                            <div className="flex items-center justify-between text-[11px] text-muted-foreground tabular-nums">
+                              <span>{a.completion_count} completes</span>
+                              <span>{a.play_count} plays</span>
+                            </div>
                           </div>
                         </CardContent>
                       </Card>
@@ -932,25 +934,27 @@ export default function LibraryHome() {
             <Carousel opts={{ align: 'start', dragFree: true }} effect="none" className="w-full pmda-fade-mask">
               <CarouselContent className="-ml-3">
                 {recentArtists.map((a) => (
-                  <CarouselItem key={`ra-${a.artist_id}`} className="basis-[170px] sm:basis-[200px] md:basis-[220px] pl-3">
+                  <CarouselItem key={`ra-${a.artist_id}`} className="basis-[220px] sm:basis-[250px] md:basis-[270px] pl-3">
                     <button type="button" onClick={() => navigate(`/library/artist/${a.artist_id}${location.search || ''}`, { state: withBackLinkState(location) })} className="w-full text-left group">
                       <Card className="pmda-flat-tile overflow-hidden transition-all duration-300 hover:-translate-y-1 hover:border-primary/35 hover:bg-accent/20">
-                        <CardContent className="p-4 space-y-3">
-                          <div className="flex items-center gap-3">
-                            <div className="h-12 w-12 bg-muted overflow-hidden shrink-0 flex items-center justify-center border border-border/60">
+                        <CardContent className="p-0">
+                          <AspectRatio ratio={1}>
+                            <div className="h-full w-full bg-muted overflow-hidden border-b border-border/60 flex items-center justify-center">
                               {a.thumb ? (
                                 <img src={a.thumb} alt={a.artist_name} className="w-full h-full object-cover animate-in fade-in-0 duration-300" />
                               ) : (
-                                <UserRound className="w-5 h-5 text-muted-foreground" />
+                                <UserRound className="w-10 h-10 text-muted-foreground" />
                               )}
                             </div>
-                            <div className="min-w-0">
-                              <div className="text-sm font-semibold truncate">{a.artist_name}</div>
+                          </AspectRatio>
+                          <div className="space-y-3 p-4">
+                            <div className="space-y-1">
+                              <div className="text-base font-semibold leading-tight line-clamp-2 min-h-[2.5rem]">{a.artist_name}</div>
                               <div className="text-xs text-muted-foreground truncate">{a.album_count} albums</div>
                             </div>
-                          </div>
-                          <div className="text-[11px] text-muted-foreground tabular-nums">
-                            {a.last_added_at ? `Added ${new Date(a.last_added_at * 1000).toLocaleDateString()}` : ''}
+                            <div className="text-[11px] text-muted-foreground tabular-nums">
+                              {a.last_added_at ? `Added ${new Date(a.last_added_at * 1000).toLocaleDateString()}` : ''}
+                            </div>
                           </div>
                         </CardContent>
                       </Card>

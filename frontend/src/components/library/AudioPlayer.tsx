@@ -29,6 +29,7 @@ import { Badge } from '@/components/ui/badge';
 import { FormatBadge } from '@/components/FormatBadge';
 import { badgeKindClass } from '@/lib/badgeStyles';
 import { useTheme } from 'next-themes';
+import { normalizePmdaAssetUrl } from '@/lib/api';
 
 export interface TrackInfo {
   track_id: number;
@@ -542,8 +543,10 @@ export function AudioPlayer({
       el.load();
       return;
     }
-    if (el.src !== track.file_url) {
-      el.src = track.file_url;
+    const trackUrl = normalizePmdaAssetUrl(track.file_url);
+    if (!trackUrl) return;
+    if (el.src !== trackUrl) {
+      el.src = trackUrl;
       el.load();
     }
   }, [deckRefs, stopDeck]);

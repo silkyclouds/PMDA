@@ -1534,6 +1534,57 @@ def _auth_ip_is_private_or_loopback(ip_value: str) -> bool:
         return False
 
 
+def _browser_base_url() -> str:
+    """
+    Keep frontend-facing PMDA links host-agnostic.
+
+    JSON payloads for the Web UI are cached in-process. If we cache absolute URLs
+    derived from request.url_root, a payload generated from a LAN origin can be
+    replayed to the public hostname (or vice versa), which makes browsers attempt
+    cross-origin/private-network fetches for covers, images, or audio streams.
+    Returning an empty base keeps every PMDA-served asset same-origin.
+    """
+    return ""
+
+
+def _browser_api_url(path: str) -> str:
+    raw = str(path or "").strip()
+    if not raw:
+        return "/"
+    api_idx = raw.find("/api/")
+    if api_idx > 0:
+        raw = raw[api_idx:]
+    if not raw.startswith("/"):
+        raw = "/" + raw
+    return raw
+
+
+def _normalize_browser_payload_urls(value):
+    """
+    Recursively strip host/scheme from PMDA-served API URLs before they reach caches
+    or browsers. This keeps asset URLs same-origin across LAN/public hosts.
+    """
+    if isinstance(value, dict):
+        for key, inner in list(value.items()):
+            value[key] = _normalize_browser_payload_urls(inner)
+        return value
+    if isinstance(value, list):
+        for idx, inner in enumerate(list(value)):
+            value[idx] = _normalize_browser_payload_urls(inner)
+        return value
+    if isinstance(value, tuple):
+        return tuple(_normalize_browser_payload_urls(inner) for inner in value)
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw or "/api/" not in raw:
+            return value
+        try:
+            return _browser_api_url(raw)
+        except Exception:
+            return value
+    return value
+
+
 def _auth_resolve_session(raw_token: str) -> Optional[dict]:
     token = str(raw_token or "").strip()
     if not token:
@@ -11506,17 +11557,21 @@ def _files_local_cache_clear() -> None:
 def _files_cache_get_json(cache_key: str):
     cli = _files_redis_client()
     if cli is None:
-        return _files_local_cache_get(cache_key)
+        cached = _files_local_cache_get(cache_key)
+        if cached is None:
+            return None
+        return _normalize_browser_payload_urls(cached)
     try:
         raw = cli.get(FILES_CACHE_PREFIX + cache_key)
         if not raw:
             return None
-        return json.loads(raw)
+        return _normalize_browser_payload_urls(json.loads(raw))
     except Exception:
         return None
 
 
 def _files_cache_set_json(cache_key: str, payload, ttl: int = 60) -> None:
+    payload = _normalize_browser_payload_urls(payload)
     cli = _files_redis_client()
     if cli is None:
         _files_local_cache_set(cache_key, payload, ttl=ttl)

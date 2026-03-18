@@ -42,6 +42,33 @@ export function clearAuthToken(): void {
   }
 }
 
+export function normalizePmdaAssetUrl(value?: string | null): string {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  const apiIdx = raw.indexOf('/api/');
+  if (apiIdx > 0) {
+    return raw.slice(apiIdx);
+  }
+  return raw;
+}
+
+function normalizePmdaPayloadUrls<T>(value: T): T {
+  if (Array.isArray(value)) {
+    return value.map((item) => normalizePmdaPayloadUrls(item)) as T;
+  }
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [key, inner] of Object.entries(value as Record<string, unknown>)) {
+      out[key] = normalizePmdaPayloadUrls(inner);
+    }
+    return out as T;
+  }
+  if (typeof value === 'string') {
+    return normalizePmdaAssetUrl(value) as T;
+  }
+  return value;
+}
+
 function withAuthHeaders(input?: HeadersInit): HeadersInit {
   const token = getAuthToken();
   const headers = new Headers(input || undefined);
@@ -1262,7 +1289,8 @@ async function executeFetchApi<T>(endpoint: string, options?: FetchApiRequestIni
     }
     const ct = response.headers.get('content-type');
     if (ct?.includes('application/json')) {
-      return response.json();
+      const data = await response.json();
+      return normalizePmdaPayloadUrls(data);
     }
     return undefined as T;
   } catch (error) {
