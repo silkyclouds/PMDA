@@ -58077,7 +58077,6 @@ def api_library_playlist_detail(playlist_id: int):
                 (int(playlist_id),),
             )
             rows = cur.fetchall()
-        base_url = request.url_root.rstrip("/")
         items: list[dict] = []
         for r in rows:
             item_id = int(r[0] or 0)
@@ -58099,8 +58098,8 @@ def api_library_playlist_detail(playlist_id: int):
                         "duration_sec": int(r[5] or 0),
                         "track_num": int(r[6] or 0),
                         "disc_num": int(r[7] or 0),
-                        "thumb": f"{base_url}/api/library/files/album/{album_id}/cover?size=96" if has_cover else None,
-                        "file_url": f"{base_url}/api/library/track/{track_id}/stream",
+                        "thumb": _browser_api_url(f"/api/library/files/album/{album_id}/cover?size=96") if has_cover else None,
+                        "file_url": _browser_api_url(f"/api/library/track/{track_id}/stream"),
                     },
                 }
             )
@@ -58643,7 +58642,6 @@ def api_library_reco_for_you():
         total = len(candidates)
         ranked_all = _reco_rank_candidates(profile, candidates, max(1, min(4000, offset + limit)))
         ranked = ranked_all[offset: offset + limit]
-        base_url = request.url_root.rstrip("/")
         tracks = []
         for c in ranked:
             track_id = int(c.get("track_id") or 0)
@@ -58663,8 +58661,8 @@ def api_library_reco_for_you():
                     "track_num": int(c.get("track_num") or 0),
                     "score": round(float(c.get("score") or 0.0), 4),
                     "reasons": c.get("reasons") or [],
-                    "thumb": f"{base_url}/api/library/files/album/{album_id}/cover?size=96" if bool(c.get("has_cover")) else None,
-                    "file_url": f"{base_url}/api/library/track/{track_id}/stream",
+                    "thumb": _browser_api_url(f"/api/library/files/album/{album_id}/cover?size=96") if bool(c.get("has_cover")) else None,
+                    "file_url": _browser_api_url(f"/api/library/track/{track_id}/stream"),
                 }
             )
         payload = {
@@ -60748,7 +60746,6 @@ def api_library_album_tracks(album_id):
                 has_cover=bool(has_cover),
                 cover_path_raw="",
             )
-            base_url = request.url_root.rstrip("/")
             tracks = [
                 {
                     "track_id": int(r[0]),
@@ -60757,11 +60754,11 @@ def api_library_album_tracks(album_id):
                     "album": album_title,
                     "duration": int(r[2] or 0),
                     "index": int(r[3] or 0),
-                    "file_url": f"{base_url}/api/library/track/{int(r[0])}/stream",
+                    "file_url": _browser_api_url(f"/api/library/track/{int(r[0])}/stream"),
                 }
                 for r in rows
             ]
-            album_thumb = f"{base_url}/api/library/files/album/{album_id}/cover?size=320"
+            album_thumb = _browser_api_url(f"/api/library/files/album/{album_id}/cover?size=320")
             return jsonify({"tracks": tracks, "album_thumb": album_thumb})
         finally:
             conn.close()
@@ -60786,7 +60783,6 @@ def api_library_album_tracks(album_id):
             if artist_row:
                 artist_name = artist_row[0] or ""
         raw = get_tracks_with_ids(db_conn, album_id)
-        base_url = request.url_root.rstrip("/")
         tracks = [
             {
                 "track_id": t["id"],
@@ -60795,7 +60791,7 @@ def api_library_album_tracks(album_id):
                 "album": album_title or "",
                 "duration": (t["duration_ms"] or 0) // 1000,
                 "index": t["index"],
-                "file_url": f"{base_url}/api/library/track/{t['id']}/stream",
+                "file_url": _browser_api_url(f"/api/library/track/{t['id']}/stream"),
             }
             for t in raw
         ]
@@ -61219,7 +61215,6 @@ def api_library_album_detail(album_id: int):
             cover_path_raw=cover_path_effective,
         )
 
-        base_url = request.url_root.rstrip("/")
         raw_tracks: list[dict[str, Any]] = []
         primary_tags = _safe_json_load(primary_tags_json, fallback={})
         if not isinstance(primary_tags, dict):
@@ -61298,7 +61293,7 @@ def api_library_album_detail(album_id: int):
                     "file_size_bytes": size_bytes,
                     "file_path": file_path,
                     "featured": feat,
-                    "file_url": f"{base_url}/api/library/track/{tid}/stream" if tid > 0 else "",
+                    "file_url": _browser_api_url(f"/api/library/track/{tid}/stream") if tid > 0 else "",
                 }
             )
         tracks = _display_tracks_with_provider_overlay(
