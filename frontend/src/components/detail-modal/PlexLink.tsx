@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import { ExternalLink } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import * as api from '@/lib/api';
+import { useAuth } from '@/contexts/AuthContext';
 import type { Edition } from '@/lib/api';
 
 function isLikelyLanOrigin(): boolean {
@@ -34,16 +35,17 @@ interface PlexLinkProps {
 }
 
 export function PlexLink({ artistId, editions, selectedEditionIndex }: PlexLinkProps) {
+  const { isAdmin } = useAuth();
   const [plexHost, setPlexHost] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!isLikelyLanOrigin()) return;
+    if (!isAdmin || !isLikelyLanOrigin()) return;
     api.getConfig().then(config => {
       if (config.LIBRARY_MODE === 'plex' && config.PLEX_HOST) {
         setPlexHost(config.PLEX_HOST.replace(/\/$/, ''));
       }
     });
-  }, []);
+  }, [isAdmin]);
 
   if (!plexHost) return null;
 
@@ -80,16 +82,17 @@ interface PlexOpenLinkProps {
 }
 
 export function PlexOpenLink({ ratingKey, label = 'Open in Plex', variant = 'outline', size = 'sm', className }: PlexOpenLinkProps) {
+  const { isAdmin } = useAuth();
   const [plexHost, setPlexHost] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!isLikelyLanOrigin()) return;
+    if (!isAdmin || !isLikelyLanOrigin()) return;
     api.getConfig().then(config => {
       if (config.LIBRARY_MODE === 'plex' && config.PLEX_HOST) {
         setPlexHost(config.PLEX_HOST.replace(/\/$/, ''));
       }
     });
-  }, []);
+  }, [isAdmin]);
 
   if (!plexHost || ratingKey <= 0) return null;
 

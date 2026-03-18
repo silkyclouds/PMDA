@@ -107,7 +107,14 @@ export function installGlobalAuthFetchInterceptor(): void {
       init?.headers
       ?? (input instanceof Request ? input.headers : undefined);
     const headers = new Headers(withAuthHeaders(inheritedHeaders));
-    return nativeFetch(input, { ...init, headers });
+    return nativeFetch(input, { ...init, headers }).then((response) => {
+      const originalJson = response.json.bind(response);
+      (response as Response & { json: typeof response.json }).json = async () => {
+        const payload = await originalJson();
+        return normalizePmdaPayloadUrls(payload);
+      };
+      return response;
+    });
   };
   authFetchInterceptorInstalled = true;
 }
