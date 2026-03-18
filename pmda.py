@@ -628,6 +628,22 @@ AUTH_LOGIN_RATE_LIMIT_USER_MAX_ATTEMPTS = max(3, int(os.getenv("PMDA_AUTH_LOGIN_
 AUTH_BOOTSTRAP_RATE_LIMIT_IP_MAX_ATTEMPTS = max(3, int(os.getenv("PMDA_AUTH_BOOTSTRAP_RATE_LIMIT_IP_MAX_ATTEMPTS", "10") or "10"))
 AUTH_ALLOW_PUBLIC_BOOTSTRAP = _parse_bool(os.getenv("PMDA_AUTH_ALLOW_PUBLIC_BOOTSTRAP", "false"))
 AUTH_TRUST_PROXY_HEADERS = _parse_bool(os.getenv("PMDA_AUTH_TRUST_PROXY_HEADERS", "false"))
+AUTH_IP_BAN_ENABLED = _parse_bool(os.getenv("PMDA_AUTH_IP_BAN_ENABLED", "true"))
+AUTH_IP_BAN_WINDOW_SEC = max(
+    AUTH_LOGIN_RATE_LIMIT_WINDOW_SEC,
+    int(os.getenv("PMDA_AUTH_IP_BAN_WINDOW_SEC", str(AUTH_LOGIN_RATE_LIMIT_WINDOW_SEC)) or str(AUTH_LOGIN_RATE_LIMIT_WINDOW_SEC)),
+)
+AUTH_IP_BAN_SHORT_THRESHOLD = max(3, int(os.getenv("PMDA_AUTH_IP_BAN_SHORT_THRESHOLD", "5") or "5"))
+AUTH_IP_BAN_SHORT_DURATION_SEC = max(60, int(os.getenv("PMDA_AUTH_IP_BAN_SHORT_DURATION_SEC", "900") or "900"))
+AUTH_IP_BAN_LONG_THRESHOLD = max(
+    AUTH_IP_BAN_SHORT_THRESHOLD,
+    int(os.getenv("PMDA_AUTH_IP_BAN_LONG_THRESHOLD", "10") or "10"),
+)
+AUTH_IP_BAN_LONG_DURATION_SEC = max(
+    AUTH_IP_BAN_SHORT_DURATION_SEC,
+    int(os.getenv("PMDA_AUTH_IP_BAN_LONG_DURATION_SEC", str(24 * 3600)) or str(24 * 3600)),
+)
+AUTH_IP_BAN_EXEMPT_PRIVATE = _parse_bool(os.getenv("PMDA_AUTH_IP_BAN_EXEMPT_PRIVATE", "true"))
 AUTH_SESSION_COOKIE_NAME = (os.getenv("PMDA_AUTH_SESSION_COOKIE_NAME", "pmda_session") or "pmda_session").strip() or "pmda_session"
 AUTH_SESSION_COOKIE_SECURE = _parse_bool(os.getenv("PMDA_AUTH_SESSION_COOKIE_SECURE", "false"))
 _AUTH_SESSION_COOKIE_SAMESITE_RAW = str(os.getenv("PMDA_AUTH_SESSION_COOKIE_SAMESITE", "Lax") or "Lax").strip().lower()
@@ -1272,6 +1288,174 @@ def _auth_rate_limit_clear(kind: str, key: str) -> None:
         _AUTH_RATE_LIMIT_BUCKETS.pop(bucket_key, None)
 
 
+def _auth_normalize_ip(ip_value: str) -> str:
+    raw = str(ip_value or "").strip()
+    if not raw:
+        return ""
+    if raw.lower().startswith("::ffff:"):
+        raw = raw[7:]
+    return raw.strip().lower()
+
+
+def _auth_should_exempt_persistent_ip_ban(ip_value: str) -> bool:
+    normalized = _auth_normalize_ip(ip_value)
+    if not normalized:
+        return True
+    return bool(AUTH_IP_BAN_EXEMPT_PRIVATE and _auth_ip_is_private_or_loopback(normalized))
+
+
+def _auth_failure_retention_sec() -> int:
+    return max(
+        24 * 3600,
+        int(AUTH_IP_BAN_WINDOW_SEC or 0) * 4,
+        int(AUTH_LOGIN_RATE_LIMIT_WINDOW_SEC or 0) * 4,
+        int(AUTH_IP_BAN_LONG_DURATION_SEC or 0) * 2,
+    )
+
+
+def _auth_cleanup_failure_tracking(con: sqlite3.Connection, now_ts: int) -> None:
+    cutoff = int(now_ts or 0) - _auth_failure_retention_sec()
+    cur = con.cursor()
+    cur.execute("DELETE FROM auth_failure_events WHERE failure_ts < ?", (cutoff,))
+    cur.execute("DELETE FROM auth_ip_bans WHERE ban_until <= ? AND updated_at < ?", (int(now_ts or 0), cutoff))
+
+
+def _auth_persistent_ip_block_info(ip_value: str) -> tuple[bool, int]:
+    if not AUTH_IP_BAN_ENABLED:
+        return False, 0
+    ip_key = _auth_normalize_ip(ip_value)
+    if not ip_key or _auth_should_exempt_persistent_ip_ban(ip_key):
+        return False, 0
+    now_ts = _auth_now_ts()
+    con = _auth_db_connect()
+    try:
+        cur = con.cursor()
+        _auth_cleanup_failure_tracking(con, now_ts)
+        cur.execute("SELECT ban_until FROM auth_ip_bans WHERE ip = ? LIMIT 1", (ip_key,))
+        row = cur.fetchone()
+        if not row:
+            con.commit()
+            return False, 0
+        ban_until = int((row["ban_until"] if isinstance(row, sqlite3.Row) else row[0]) or 0)
+        if ban_until > now_ts:
+            con.commit()
+            return True, max(1, ban_until - now_ts)
+        cur.execute("DELETE FROM auth_ip_bans WHERE ip = ?", (ip_key,))
+        con.commit()
+        return False, 0
+    except Exception:
+        con.rollback()
+        return False, 0
+    finally:
+        con.close()
+
+
+def _auth_record_persistent_ip_failure(ip_value: str, *, username: str = "", path: str = "", reason: str = "") -> tuple[bool, int, int]:
+    if not AUTH_IP_BAN_ENABLED:
+        return False, 0, 0
+    ip_key = _auth_normalize_ip(ip_value)
+    if not ip_key or _auth_should_exempt_persistent_ip_ban(ip_key):
+        return False, 0, 0
+    now_ts = _auth_now_ts()
+    con = _auth_db_connect()
+    try:
+        cur = con.cursor()
+        _auth_cleanup_failure_tracking(con, now_ts)
+        cur.execute(
+            """
+            INSERT INTO auth_failure_events(kind, subject_key, failure_ts, path, username)
+            VALUES('ip', ?, ?, ?, ?)
+            """,
+            (ip_key, now_ts, str(path or "")[:128], str(username or "")[:80]),
+        )
+        cutoff = now_ts - int(AUTH_IP_BAN_WINDOW_SEC or 0)
+        cur.execute(
+            "DELETE FROM auth_failure_events WHERE kind = 'ip' AND subject_key = ? AND failure_ts < ?",
+            (ip_key, cutoff),
+        )
+        cur.execute(
+            "SELECT COUNT(*) FROM auth_failure_events WHERE kind = 'ip' AND subject_key = ? AND failure_ts >= ?",
+            (ip_key, cutoff),
+        )
+        row = cur.fetchone()
+        failure_count = int((row[0] if row else 0) or 0)
+        ban_duration = 0
+        ban_reason = ""
+        if failure_count >= int(AUTH_IP_BAN_LONG_THRESHOLD or 0):
+            ban_duration = int(AUTH_IP_BAN_LONG_DURATION_SEC or 0)
+            ban_reason = "persistent_ip_ban_long"
+        elif failure_count >= int(AUTH_IP_BAN_SHORT_THRESHOLD or 0):
+            ban_duration = int(AUTH_IP_BAN_SHORT_DURATION_SEC or 0)
+            ban_reason = "persistent_ip_ban_short"
+        if ban_duration > 0:
+            ban_until = now_ts + ban_duration
+            cur.execute("SELECT ban_until, created_at FROM auth_ip_bans WHERE ip = ? LIMIT 1", (ip_key,))
+            existing = cur.fetchone()
+            existing_until = int((existing["ban_until"] if isinstance(existing, sqlite3.Row) else existing[0]) or 0) if existing else 0
+            created_at = int((existing["created_at"] if isinstance(existing, sqlite3.Row) else existing[1]) or now_ts) if existing else now_ts
+            if existing_until > ban_until:
+                ban_until = existing_until
+            cur.execute(
+                """
+                INSERT INTO auth_ip_bans(ip, ban_until, fail_count, window_sec, last_reason, created_at, updated_at)
+                VALUES(?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(ip) DO UPDATE SET
+                    ban_until = excluded.ban_until,
+                    fail_count = excluded.fail_count,
+                    window_sec = excluded.window_sec,
+                    last_reason = excluded.last_reason,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    ip_key,
+                    ban_until,
+                    failure_count,
+                    int(AUTH_IP_BAN_WINDOW_SEC or 0),
+                    str(reason or ban_reason or "persistent_ip_ban")[:160],
+                    created_at,
+                    now_ts,
+                ),
+            )
+            con.commit()
+            return True, max(1, ban_until - now_ts), failure_count
+        con.commit()
+        return False, 0, failure_count
+    except Exception:
+        con.rollback()
+        return False, 0, 0
+    finally:
+        con.close()
+
+
+def _auth_clear_persistent_ip_failures(ip_value: str) -> None:
+    if not AUTH_IP_BAN_ENABLED:
+        return
+    ip_key = _auth_normalize_ip(ip_value)
+    if not ip_key or _auth_should_exempt_persistent_ip_ban(ip_key):
+        return
+    con = _auth_db_connect()
+    try:
+        cur = con.cursor()
+        cur.execute("DELETE FROM auth_failure_events WHERE kind = 'ip' AND subject_key = ?", (ip_key,))
+        cur.execute("DELETE FROM auth_ip_bans WHERE ip = ?", (ip_key,))
+        con.commit()
+    except Exception:
+        con.rollback()
+    finally:
+        con.close()
+
+
+def _auth_retry_response(message: str, *, retry_after_sec: int = 0) -> Response:
+    payload = {"error": str(message or "Too many failed login attempts. Please wait and retry.")}
+    if int(retry_after_sec or 0) > 0:
+        payload["retry_after_sec"] = int(retry_after_sec)
+    response = jsonify(payload)
+    response.status_code = 429
+    if int(retry_after_sec or 0) > 0:
+        response.headers["Retry-After"] = str(int(retry_after_sec))
+    return response
+
+
 def _auth_get_bearer_token() -> str:
     authz = (request.headers.get("Authorization") or "").strip()
     if authz.lower().startswith("bearer "):
@@ -1286,11 +1470,18 @@ def _auth_get_bearer_token() -> str:
 
 
 def _auth_client_ip() -> str:
+    remote_ip = _auth_normalize_ip(request.remote_addr or "")
     if AUTH_TRUST_PROXY_HEADERS:
+        cf_ip = _auth_normalize_ip(request.headers.get("CF-Connecting-IP") or "")
+        if cf_ip:
+            return cf_ip
         forwarded = str(request.headers.get("X-Forwarded-For") or "").strip()
         if forwarded:
-            return str(forwarded.split(",", 1)[0] or "").strip()
-    return str(request.remote_addr or "").strip()
+            return _auth_normalize_ip(forwarded.split(",", 1)[0] or "")
+        real_ip = _auth_normalize_ip(request.headers.get("X-Real-IP") or "")
+        if real_ip:
+            return real_ip
+    return remote_ip
 
 
 def _auth_log_safe(value: str, *, max_len: int = 160) -> str:
@@ -6834,10 +7025,38 @@ def init_settings_db():
         )
         """
     )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS auth_failure_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL,
+            subject_key TEXT NOT NULL,
+            failure_ts INTEGER NOT NULL,
+            path TEXT NOT NULL DEFAULT '',
+            username TEXT NOT NULL DEFAULT ''
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS auth_ip_bans (
+            ip TEXT PRIMARY KEY,
+            ban_until INTEGER NOT NULL,
+            fail_count INTEGER NOT NULL DEFAULT 0,
+            window_sec INTEGER NOT NULL DEFAULT 0,
+            last_reason TEXT NOT NULL DEFAULT '',
+            created_at INTEGER NOT NULL DEFAULT 0,
+            updated_at INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
     cur.execute("CREATE INDEX IF NOT EXISTS idx_auth_users_admin_active ON auth_users(is_admin, is_active)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_auth_users_username ON auth_users(username)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_auth_sessions_user ON auth_sessions(user_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_auth_sessions_expires ON auth_sessions(expires_at)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_auth_failure_events_subject ON auth_failure_events(kind, subject_key, failure_ts)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_auth_failure_events_ts ON auth_failure_events(failure_ts)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_auth_ip_bans_until ON auth_ip_bans(ban_until)")
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS ai_auth_profiles (
@@ -47708,22 +47927,42 @@ def api_auth_bootstrap():
             reason="public_bootstrap_disabled",
         )
         return jsonify({"error": "Bootstrap is restricted to private/local network addresses."}), 403
-    if _auth_rate_limit_is_blocked("bootstrap_ip", client_ip, max_attempts=AUTH_BOOTSTRAP_RATE_LIMIT_IP_MAX_ATTEMPTS):
+    ip_banned, ip_retry_after = _auth_persistent_ip_block_info(client_ip)
+    if ip_banned:
         _auth_security_event(
             "bootstrap_blocked",
             ip=client_ip,
             username=str((request.get_json(silent=True) or {}).get("username") or ""),
             path="/api/auth/bootstrap",
             outcome="blocked",
+            reason="persistent_ip_ban",
+        )
+        return _auth_retry_response("Too many failed bootstrap attempts. This IP is temporarily blocked.", retry_after_sec=ip_retry_after)
+    if _auth_rate_limit_is_blocked("bootstrap_ip", client_ip, max_attempts=AUTH_BOOTSTRAP_RATE_LIMIT_IP_MAX_ATTEMPTS):
+        banned_now, ban_retry_after, _ = _auth_record_persistent_ip_failure(
+            client_ip,
+            username=str((request.get_json(silent=True) or {}).get("username") or ""),
+            path="/api/auth/bootstrap",
             reason="rate_limit_ip",
         )
-        return jsonify({"error": "Too many bootstrap attempts. Please wait and retry."}), 429
+        _auth_security_event(
+            "bootstrap_blocked",
+            ip=client_ip,
+            username=str((request.get_json(silent=True) or {}).get("username") or ""),
+            path="/api/auth/bootstrap",
+            outcome="blocked",
+            reason="persistent_ip_ban" if banned_now else "rate_limit_ip",
+        )
+        retry_after = ban_retry_after if banned_now else AUTH_LOGIN_RATE_LIMIT_WINDOW_SEC
+        message = "Too many failed bootstrap attempts. This IP is temporarily blocked." if banned_now else "Too many bootstrap attempts. Please wait and retry."
+        return _auth_retry_response(message, retry_after_sec=retry_after)
     data = request.get_json(silent=True) or {}
     username = str(data.get("username") or "").strip()
     password = str(data.get("password") or "")
     password_confirm = str(data.get("password_confirm") or password)
     if password != password_confirm:
         _auth_rate_limit_record_failure("bootstrap_ip", client_ip)
+        _auth_record_persistent_ip_failure(client_ip, username=username, path="/api/auth/bootstrap", reason="password_mismatch")
         _auth_security_event(
             "bootstrap_failed",
             ip=client_ip,
@@ -47743,6 +47982,7 @@ def api_auth_bootstrap():
     )
     if not ok:
         _auth_rate_limit_record_failure("bootstrap_ip", client_ip)
+        _auth_record_persistent_ip_failure(client_ip, username=username, path="/api/auth/bootstrap", reason=str(msg or "create_user_failed"))
         _auth_security_event(
             "bootstrap_failed",
             ip=client_ip,
@@ -47753,6 +47993,7 @@ def api_auth_bootstrap():
         )
         return jsonify({"error": msg}), 400
     _auth_rate_limit_clear("bootstrap_ip", client_ip)
+    _auth_clear_persistent_ip_failures(client_ip)
     _auth_security_event(
         "bootstrap_success",
         ip=client_ip,
@@ -47777,24 +48018,50 @@ def api_auth_login():
     client_ip = _auth_client_ip().lower()
     username_key = username.lower()
     remember_me = bool(_parse_bool(data.get("remember_me")))
-    if _auth_rate_limit_is_blocked("login_ip", client_ip, max_attempts=AUTH_LOGIN_RATE_LIMIT_IP_MAX_ATTEMPTS):
+    ip_banned, ip_retry_after = _auth_persistent_ip_block_info(client_ip)
+    if ip_banned:
         _auth_security_event(
             "login_blocked",
             ip=client_ip,
             username=username,
             outcome="blocked",
+            reason="persistent_ip_ban",
+        )
+        return _auth_retry_response("Too many failed login attempts. This IP is temporarily blocked.", retry_after_sec=ip_retry_after)
+    if _auth_rate_limit_is_blocked("login_ip", client_ip, max_attempts=AUTH_LOGIN_RATE_LIMIT_IP_MAX_ATTEMPTS):
+        banned_now, ban_retry_after, _ = _auth_record_persistent_ip_failure(
+            client_ip,
+            username=username,
+            path="/api/auth/login",
             reason="rate_limit_ip",
         )
-        return jsonify({"error": "Too many failed login attempts. Please wait and retry."}), 429
-    if username_key and _auth_rate_limit_is_blocked("login_user", username_key, max_attempts=AUTH_LOGIN_RATE_LIMIT_USER_MAX_ATTEMPTS):
         _auth_security_event(
             "login_blocked",
             ip=client_ip,
             username=username,
             outcome="blocked",
+            reason="persistent_ip_ban" if banned_now else "rate_limit_ip",
+        )
+        retry_after = ban_retry_after if banned_now else AUTH_LOGIN_RATE_LIMIT_WINDOW_SEC
+        message = "Too many failed login attempts. This IP is temporarily blocked." if banned_now else "Too many failed login attempts. Please wait and retry."
+        return _auth_retry_response(message, retry_after_sec=retry_after)
+    if username_key and _auth_rate_limit_is_blocked("login_user", username_key, max_attempts=AUTH_LOGIN_RATE_LIMIT_USER_MAX_ATTEMPTS):
+        banned_now, ban_retry_after, _ = _auth_record_persistent_ip_failure(
+            client_ip,
+            username=username,
+            path="/api/auth/login",
             reason="rate_limit_user",
         )
-        return jsonify({"error": "Too many failed login attempts. Please wait and retry."}), 429
+        _auth_security_event(
+            "login_blocked",
+            ip=client_ip,
+            username=username,
+            outcome="blocked",
+            reason="persistent_ip_ban" if banned_now else "rate_limit_user",
+        )
+        retry_after = ban_retry_after if banned_now else AUTH_LOGIN_RATE_LIMIT_WINDOW_SEC
+        message = "Too many failed login attempts. This IP is temporarily blocked." if banned_now else "Too many failed login attempts. Please wait and retry."
+        return _auth_retry_response(message, retry_after_sec=retry_after)
     if not username or not password:
         _auth_security_event(
             "login_invalid_request",
@@ -47808,37 +48075,40 @@ def api_auth_login():
     if not row:
         _auth_rate_limit_record_failure("login_ip", client_ip)
         _auth_rate_limit_record_failure("login_user", username_key)
+        banned_now, _, _ = _auth_record_persistent_ip_failure(client_ip, username=username, path="/api/auth/login", reason="invalid_credentials")
         _auth_apply_failure_delay()
         _auth_security_event(
             "login_failed",
             ip=client_ip,
             username=username,
             outcome="failed",
-            reason="invalid_credentials",
+            reason="persistent_ip_ban" if banned_now else "invalid_credentials",
         )
         return jsonify({"error": "Invalid credentials"}), 401
     if not bool(int(row["is_active"] or 0)):
         _auth_rate_limit_record_failure("login_ip", client_ip)
         _auth_rate_limit_record_failure("login_user", username_key)
+        banned_now, _, _ = _auth_record_persistent_ip_failure(client_ip, username=username, path="/api/auth/login", reason="inactive_user")
         _auth_apply_failure_delay()
         _auth_security_event(
             "login_failed",
             ip=client_ip,
             username=username,
             outcome="failed",
-            reason="inactive_user",
+            reason="persistent_ip_ban" if banned_now else "inactive_user",
         )
         return jsonify({"error": "Invalid credentials"}), 401
     if not _auth_verify_password(password, str(row["password_hash"] or ""), str(row["password_salt"] or "")):
         _auth_rate_limit_record_failure("login_ip", client_ip)
         _auth_rate_limit_record_failure("login_user", username_key)
+        banned_now, _, _ = _auth_record_persistent_ip_failure(client_ip, username=username, path="/api/auth/login", reason="invalid_credentials")
         _auth_apply_failure_delay()
         _auth_security_event(
             "login_failed",
             ip=client_ip,
             username=username,
             outcome="failed",
-            reason="invalid_credentials",
+            reason="persistent_ip_ban" if banned_now else "invalid_credentials",
         )
         return jsonify({"error": "Invalid credentials"}), 401
     session_ttl = AUTH_SESSION_REMEMBER_TTL_SEC if remember_me else AUTH_SESSION_TTL_SEC
@@ -47851,6 +48121,7 @@ def api_auth_login():
     _auth_touch_login(int(row["id"]), ip=_auth_client_ip())
     _auth_rate_limit_clear("login_ip", client_ip)
     _auth_rate_limit_clear("login_user", username_key)
+    _auth_clear_persistent_ip_failures(client_ip)
     _auth_security_event(
         "login_success",
         ip=client_ip,
