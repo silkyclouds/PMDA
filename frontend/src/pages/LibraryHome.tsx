@@ -10,6 +10,7 @@ import { AspectRatio } from '@/components/ui/aspect-ratio';
 import { Carousel, CarouselContent, CarouselItem, CarouselNext, CarouselPrevious } from '@/components/ui/carousel';
 import { AlbumBadgeGroups } from '@/components/library/AlbumBadgeGroups';
 import { AlbumArtwork } from '@/components/library/AlbumArtwork';
+import { AuthenticatedImage } from '@/components/library/AuthenticatedImage';
 import { LibraryEmptyState } from '@/components/library/LibraryEmptyState';
 import { useAuth } from '@/contexts/AuthContext';
 import { usePlayback } from '@/contexts/PlaybackContext';
@@ -795,7 +796,11 @@ export default function LibraryHome() {
                   <div className="flex items-start gap-3">
                     <div className="w-12 h-12 border border-border/60 bg-muted overflow-hidden shrink-0 flex items-center justify-center">
                       {rec.thumb ? (
-                        <img src={rec.thumb} alt={rec.album_title} className="w-full h-full object-cover animate-in fade-in-0 duration-300" />
+                        <AuthenticatedImage
+                          src={rec.thumb}
+                          alt={rec.album_title}
+                          className="w-full h-full object-cover animate-in fade-in-0 duration-300"
+                        />
                       ) : (
                         <Music className="w-5 h-5 text-muted-foreground" />
                       )}
@@ -864,7 +869,11 @@ export default function LibraryHome() {
                           <AspectRatio ratio={1}>
                             <div className="h-full w-full bg-muted overflow-hidden border-b border-border/60 flex items-center justify-center">
                               {a.thumb ? (
-                                <img src={a.thumb} alt={a.artist_name} className="w-full h-full object-cover animate-in fade-in-0 duration-300" />
+                                <AuthenticatedImage
+                                  src={a.thumb}
+                                  alt={a.artist_name}
+                                  className="w-full h-full object-cover animate-in fade-in-0 duration-300"
+                                />
                               ) : (
                                 <UserRound className="w-10 h-10 text-muted-foreground" />
                               )}
@@ -941,7 +950,11 @@ export default function LibraryHome() {
                           <AspectRatio ratio={1}>
                             <div className="h-full w-full bg-muted overflow-hidden border-b border-border/60 flex items-center justify-center">
                               {a.thumb ? (
-                                <img src={a.thumb} alt={a.artist_name} className="w-full h-full object-cover animate-in fade-in-0 duration-300" />
+                                <AuthenticatedImage
+                                  src={a.thumb}
+                                  alt={a.artist_name}
+                                  className="w-full h-full object-cover animate-in fade-in-0 duration-300"
+                                />
                               ) : (
                                 <UserRound className="w-10 h-10 text-muted-foreground" />
                               )}

@@ -9,6 +9,7 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/component
 import { Carousel, CarouselContent, CarouselItem, CarouselNext, CarouselPrevious } from '@/components/ui/carousel';
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { AlbumArtwork } from '@/components/library/AlbumArtwork';
+import { AuthenticatedImage } from '@/components/library/AuthenticatedImage';
 import { AlbumBadgeGroups } from '@/components/library/AlbumBadgeGroups';
 import { EntityDiscoverDialog } from '@/components/library/EntityDiscoverDialog';
 import { SocialActivityBadges } from '@/components/social/SocialActivityBadges';
@@ -832,7 +833,7 @@ export default function ArtistPage() {
         <Card className="pmda-flat-surface overflow-hidden">
           <div className="relative min-h-[24rem] overflow-hidden md:min-h-[30rem]">
             {heroImage ? (
-              <img
+              <AuthenticatedImage
                 src={heroImage}
                 alt={details.artist_name}
                 className="absolute inset-0 h-full w-full object-cover blur-[1.8px] scale-[1.04]"
@@ -847,7 +848,11 @@ export default function ArtistPage() {
               <div className="grid grid-cols-1 md:grid-cols-[18rem,minmax(0,1fr)] xl:grid-cols-[20rem,minmax(0,1fr)] gap-8 md:gap-14 w-full items-center">
                 <div className="w-40 h-48 sm:w-48 sm:h-56 md:w-72 md:h-80 xl:w-80 xl:h-[28rem] overflow-hidden border border-white/12 bg-muted shrink-0 shadow-[0_24px_60px_rgba(0,0,0,0.5)]">
                   {heroImage ? (
-                    <img src={heroImage} alt={details.artist_name} className="w-full h-full object-cover animate-in fade-in-0 duration-300" />
+                    <AuthenticatedImage
+                      src={heroImage}
+                      alt={details.artist_name}
+                      className="w-full h-full object-cover animate-in fade-in-0 duration-300"
+                    />
                   ) : (
                     <div className="w-full h-full flex items-center justify-center">
                       <Music className="w-12 h-12 text-muted-foreground" />
@@ -1412,8 +1417,8 @@ export default function ArtistPage() {
 	                  <CardContent className="p-0">
 	                    <div className="relative aspect-square w-full bg-muted overflow-hidden flex items-center justify-center border-b border-border/60">
 	                      {artist.image_url && !isProbablyPlaceholderArtistImageUrl(artist.image_url) ? (
-	                        <img
-	                          src={artist.image_url}
+	                        <AuthenticatedImage
+                            src={artist.image_url}
 	                          alt={artist.name}
 	                          className="w-full h-full object-cover animate-in fade-in-0 duration-300"
 	                          loading="lazy"

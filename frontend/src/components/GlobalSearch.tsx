@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState, type KeyboardEventHandler } from 
 import { useLocation, useNavigate } from 'react-router-dom';
 import { Disc3, Loader2, Music2, Search, Tags, UserRound, Users } from 'lucide-react';
 import { Input } from '@/components/ui/input';
+import { AuthenticatedImage } from '@/components/library/AuthenticatedImage';
 import { withBackLinkState } from '@/lib/backNavigation';
 import { cn } from '@/lib/utils';
 import type { LibrarySearchSuggestionItem } from '@/lib/api';
@@ -177,7 +178,11 @@ export function GlobalSearch({ className }: { className?: string }) {
                     <div className="relative w-9 h-9 rounded-md bg-muted overflow-hidden shrink-0 flex items-center justify-center">
                       <div className="absolute inset-0 flex items-center justify-center">{iconFor(item.type)}</div>
                       {item.thumb ? (
-                        <img src={item.thumb} alt={item.title} className="absolute inset-0 w-full h-full object-cover" />
+                        <AuthenticatedImage
+                          src={item.thumb}
+                          alt={item.title}
+                          className="absolute inset-0 w-full h-full object-cover"
+                        />
                       ) : null}
                     </div>
                     <div className="min-w-0 flex-1">

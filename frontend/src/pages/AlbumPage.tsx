@@ -9,6 +9,7 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/component
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { FormatBadge } from '@/components/FormatBadge';
+import { AuthenticatedImage } from '@/components/library/AuthenticatedImage';
 import { AlbumArtworkGalleryDialog } from '@/components/library/AlbumArtworkGalleryDialog';
 import { AlbumRatingStars } from '@/components/library/AlbumRatingStars';
 import { EntityDiscoverDialog } from '@/components/library/EntityDiscoverDialog';
@@ -670,7 +671,7 @@ export default function AlbumPage() {
       <Card className="pmda-flat-surface overflow-hidden">
         <div className="relative min-h-[22rem] overflow-hidden md:min-h-[26rem]">
           {data.cover_url ? (
-            <img
+            <AuthenticatedImage
               src={data.cover_url}
               alt={data.title}
               className="absolute inset-0 h-full w-full scale-[1.04] object-cover blur-[1.8px] saturate-[0.92]"
@@ -691,7 +692,11 @@ export default function AlbumPage() {
               >
                 <div className="relative h-full w-full">
                   {data.cover_url ? (
-                    <img src={data.cover_url} alt={data.title} className="h-full w-full object-cover animate-in fade-in-0 duration-300" />
+                    <AuthenticatedImage
+                      src={data.cover_url}
+                      alt={data.title}
+                      className="h-full w-full object-cover animate-in fade-in-0 duration-300"
+                    />
                   ) : (
                     <div className="flex h-full w-full items-center justify-center">
                       <Music className="h-8 w-8 text-muted-foreground" />

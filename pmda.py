@@ -61317,7 +61317,7 @@ def api_library_album_detail(album_id: int):
             total_duration_sec = sum(int(t.get("duration_sec") or 0) for t in tracks)
 
         # Always expose the cover endpoint; it can still resolve folder/embedded art lazily.
-        cover_url = f"{base_url}/api/library/files/album/{album_id}/cover?size=640"
+        cover_url = _browser_api_url(f"/api/library/files/album/{album_id}/cover?size=640")
         metadata_source_norm = _normalize_identity_provider(str(metadata_source or ""))
         metadata_ref = ""
         if metadata_source_norm == "musicbrainz":

@@ -8,6 +8,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/com
 import { Badge } from '@/components/ui/badge';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { SimilarArtists } from '@/components/library/SimilarArtists';
+import { AuthenticatedImage } from '@/components/library/AuthenticatedImage';
 import { AlbumEditor } from '@/components/library/AlbumEditor';
 import { ImproveAlbumDialog } from '@/components/library/ImproveAlbumDialog';
 import { ProviderBadge } from '@/components/providers/ProviderBadge';
@@ -913,7 +914,7 @@ export default function LibraryBrowser() {
                             <div className="flex items-center gap-3">
                               <div className="w-12 h-12 rounded-full bg-muted flex items-center justify-center shrink-0 overflow-hidden">
                                 {artist.artist_thumb ? (
-                                  <img
+                                  <AuthenticatedImage
                                     src={artist.artist_thumb}
                                     alt={artist.artist_name}
                                     className="w-12 h-12 object-cover"

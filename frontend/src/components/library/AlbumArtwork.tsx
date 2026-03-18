@@ -8,6 +8,7 @@ interface AlbumArtworkProps {
   alt: string;
   size?: number;
   priority?: boolean;
+  allowArtistFallback?: boolean;
   imageClassName?: string;
   fallbackClassName?: string;
   iconClassName?: string;
@@ -34,6 +35,7 @@ export function AlbumArtwork({
   alt,
   size = 512,
   priority = false,
+  allowArtistFallback = false,
   imageClassName = 'w-full h-full object-cover animate-in fade-in-0 duration-300',
   fallbackClassName = 'w-full h-full flex items-center justify-center',
   iconClassName = 'w-10 h-10 text-muted-foreground',
@@ -43,11 +45,12 @@ export function AlbumArtwork({
     [albumThumb, size]
   );
   const artistUrl = useMemo(() => {
+    if (!allowArtistFallback) return null;
     const id = Number(artistId || 0);
     if (!Number.isFinite(id) || id <= 0) return null;
     const px = Math.max(64, Math.min(2048, Math.floor(size)));
     return `/api/library/files/artist/${id}/image?size=${px}`;
-  }, [artistId, size]);
+  }, [allowArtistFallback, artistId, size]);
 
   const [src, setSrc] = useState<string | null>(null);
   const objectUrlRef = useRef<string | null>(null);

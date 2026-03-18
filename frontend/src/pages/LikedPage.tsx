@@ -5,6 +5,7 @@ import { useLocation, useNavigate } from 'react-router-dom';
 import * as api from '@/lib/api';
 import { useAuth } from '@/contexts/AuthContext';
 import { AlbumArtwork } from '@/components/library/AlbumArtwork';
+import { AuthenticatedImage } from '@/components/library/AuthenticatedImage';
 import { AlbumBadgeGroups } from '@/components/library/AlbumBadgeGroups';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -173,7 +174,9 @@ export default function LikedPage() {
                         onClick={() => navigate(likedTrackHref(track.track_id, track.album_id), { state: withBackLinkState(location) })}
                       >
                         <div className="h-12 w-12 shrink-0 overflow-hidden bg-muted">
-                          {track.thumb ? <img src={track.thumb} alt={track.album_title} className="h-full w-full object-cover" /> : null}
+                          {track.thumb ? (
+                            <AuthenticatedImage src={track.thumb} alt={track.album_title} className="h-full w-full object-cover" />
+                          ) : null}
                         </div>
                         <div className="min-w-0 flex-1">
                           <div className="truncate text-sm font-semibold">{track.title}</div>
@@ -272,7 +275,7 @@ export default function LikedPage() {
                     <div className="flex items-center gap-3">
                       <div className="h-14 w-14 overflow-hidden rounded-sm bg-muted">
                         {artist.thumb ? (
-                          <img src={artist.thumb} alt={artist.artist_name} className="h-full w-full object-cover" />
+                          <AuthenticatedImage src={artist.thumb} alt={artist.artist_name} className="h-full w-full object-cover" />
                         ) : null}
                       </div>
                       <div className="min-w-0">

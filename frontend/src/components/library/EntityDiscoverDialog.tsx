@@ -6,6 +6,7 @@ import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogTrigger } from '@/components/ui/dialog';
 import { Badge } from '@/components/ui/badge';
 import { ScrollArea } from '@/components/ui/scroll-area';
+import { AuthenticatedImage } from '@/components/library/AuthenticatedImage';
 import * as api from '@/lib/api';
 import { ProviderBadge } from '@/components/providers/ProviderBadge';
 import { useToast } from '@/hooks/use-toast';
@@ -135,7 +136,7 @@ export function EntityDiscoverDialog({
                           className="flex items-start gap-3 rounded-xl border border-border/60 bg-background/60 p-3 text-left transition-colors hover:bg-muted/30"
                         >
                           {link.thumb ? (
-                            <img src={link.thumb} alt={link.label} className="h-12 w-12 rounded-lg object-cover" />
+                            <AuthenticatedImage src={link.thumb} alt={link.label} className="h-12 w-12 rounded-lg object-cover" />
                           ) : (
                             <div className="flex h-12 w-12 items-center justify-center rounded-lg border border-border/60 bg-muted/30">
                               <Sparkles className="h-4 w-4 text-muted-foreground" />

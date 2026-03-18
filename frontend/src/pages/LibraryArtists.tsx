@@ -3,6 +3,7 @@ import { useLocation, useNavigate, useOutletContext } from 'react-router-dom';
 import { Loader2, UserRound } from 'lucide-react';
 
 import { Badge } from '@/components/ui/badge';
+import { AuthenticatedImage } from '@/components/library/AuthenticatedImage';
 import { Card } from '@/components/ui/card';
 import { LibraryEmptyState } from '@/components/library/LibraryEmptyState';
 import { useLibraryQuery } from '@/hooks/useLibraryQuery';
@@ -135,7 +136,7 @@ export default function LibraryArtists() {
         </div>
       ) : null}
 
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3">
+      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-4">
         {artists.map((a) => (
           <button
             key={`artist-${a.artist_id}`}
@@ -144,20 +145,24 @@ export default function LibraryArtists() {
             className="text-left"
             title="Open artist"
           >
-            <Card className="border-border/60 bg-card hover:bg-accent/30 transition-colors p-4">
-              <div className="flex items-center gap-3">
-                <div className="h-12 w-12 rounded-full bg-muted overflow-hidden shrink-0 flex items-center justify-center border border-border/60">
-                  {a.artist_thumb ? (
-                    <img src={a.artist_thumb} alt={a.artist_name} className="w-full h-full object-cover animate-in fade-in-0 duration-300" />
-                  ) : (
-                    <UserRound className="w-5 h-5 text-muted-foreground" />
-                  )}
+            <Card className="pmda-flat-tile overflow-hidden transition-all duration-300 hover:-translate-y-1 hover:border-primary/35 hover:bg-accent/20">
+              <div className="aspect-square w-full bg-muted overflow-hidden border-b border-border/60 flex items-center justify-center">
+                {a.artist_thumb ? (
+                  <AuthenticatedImage
+                    src={a.artist_thumb}
+                    alt={a.artist_name}
+                    className="w-full h-full object-cover animate-in fade-in-0 duration-300"
+                  />
+                ) : (
+                  <UserRound className="w-10 h-10 text-muted-foreground" />
+                )}
+              </div>
+              <div className="space-y-2 p-4">
+                <div className="text-base font-semibold leading-tight line-clamp-2 min-h-[2.5rem]">
+                  {a.artist_name}
                 </div>
-                <div className="min-w-0 flex-1">
-                  <div className="text-sm font-semibold truncate">{a.artist_name}</div>
-                  <div className="text-xs text-muted-foreground mt-0.5">
-                    {a.album_count} album{a.album_count === 1 ? '' : 's'}
-                  </div>
+                <div className="text-xs text-muted-foreground">
+                  {a.album_count} album{a.album_count === 1 ? '' : 's'}
                 </div>
               </div>
             </Card>

@@ -4,6 +4,7 @@ import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Badge } from '@/components/ui/badge';
+import { AuthenticatedImage } from '@/components/library/AuthenticatedImage';
 import { useToast } from '@/hooks/use-toast';
 import { cn } from '@/lib/utils';
 
@@ -229,7 +230,7 @@ export function SimilarArtists({ artistId, artistName }: SimilarArtistsProps) {
             >
               <div className="relative aspect-square w-full bg-muted overflow-hidden border-b border-border/60 flex items-center justify-center">
                 {artist.image_url && !isProbablyPlaceholderArtistImageUrl(artist.image_url) ? (
-                  <img
+                  <AuthenticatedImage
                     src={artist.image_url}
                     alt={artist.name}
                     className="w-full h-full object-cover animate-in fade-in-0 duration-300"

@@ -7,6 +7,7 @@ import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { AlbumBadgeGroups } from '@/components/library/AlbumBadgeGroups';
 import { AlbumArtwork } from '@/components/library/AlbumArtwork';
+import { AuthenticatedImage } from '@/components/library/AuthenticatedImage';
 import type { TrackInfo } from '@/components/library/AudioPlayer';
 import { usePlayback } from '@/contexts/PlaybackContext';
 import { useAlbumBadgesVisibility } from '@/hooks/use-album-badges';
@@ -428,7 +429,10 @@ export default function LibraryHomeFeed() {
       ) : null}
 
       {ARTIST_FEEDS.has(section) ? (
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3">
+        <div
+          className="grid gap-4"
+          style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(240px, 240px))' }}
+        >
           {artists.map((a) => (
             <button
               key={`hf-art-${section}-${a.artist_id}`}
@@ -436,20 +440,28 @@ export default function LibraryHomeFeed() {
               className="text-left"
               onClick={() => navigate(`/library/artist/${a.artist_id}${location.search || ''}`, { state: withBackLinkState(location) })}
             >
-              <Card className="border-border/60 bg-card hover:bg-accent/30 transition-colors p-4">
-                <div className="flex items-center gap-3">
-                  <div className="h-12 w-12 rounded-full bg-muted overflow-hidden shrink-0 flex items-center justify-center border border-border/60">
+              <Card className="pmda-flat-tile overflow-hidden transition-all duration-300 hover:-translate-y-1 hover:border-primary/35 hover:bg-accent/20">
+                <CardContent className="p-0">
+                  <div className="aspect-square w-full bg-muted overflow-hidden border-b border-border/60 flex items-center justify-center">
                     {a.thumb ? (
-                      <img src={a.thumb} alt={a.artist_name} className="w-full h-full object-cover" loading="lazy" decoding="async" />
+                      <AuthenticatedImage
+                        src={a.thumb}
+                        alt={a.artist_name}
+                        className="w-full h-full object-cover animate-in fade-in-0 duration-300"
+                        loading="lazy"
+                        decoding="async"
+                      />
                     ) : (
-                      <UserRound className="w-5 h-5 text-muted-foreground" />
+                      <UserRound className="w-10 h-10 text-muted-foreground" />
                     )}
                   </div>
-                  <div className="min-w-0 flex-1">
-                    <div className="text-sm font-semibold truncate">{a.artist_name}</div>
-                    <div className="text-xs text-muted-foreground mt-0.5">{a.album_count} albums</div>
+                  <div className="space-y-3 p-4">
+                    <div className="space-y-1">
+                      <div className="text-base font-semibold leading-tight line-clamp-2 min-h-[2.5rem]">{a.artist_name}</div>
+                      <div className="text-xs text-muted-foreground truncate">{a.album_count} albums</div>
+                    </div>
                   </div>
-                </div>
+                </CardContent>
               </Card>
             </button>
           ))}
@@ -468,7 +480,13 @@ export default function LibraryHomeFeed() {
               <div className="flex items-start gap-3">
                 <div className="w-12 h-12 rounded-lg bg-muted overflow-hidden shrink-0 flex items-center justify-center">
                   {rec.thumb ? (
-                    <img src={rec.thumb} alt={rec.album_title} className="w-full h-full object-cover" loading="lazy" decoding="async" />
+                    <AuthenticatedImage
+                      src={rec.thumb}
+                      alt={rec.album_title}
+                      className="w-full h-full object-cover"
+                      loading="lazy"
+                      decoding="async"
+                    />
                   ) : (
                     <Music className="w-5 h-5 text-muted-foreground" />
                   )}
