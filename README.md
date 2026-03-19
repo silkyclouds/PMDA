@@ -16,6 +16,7 @@
   <a href="https://hub.docker.com/r/meaning/pmda"><img src="https://img.shields.io/badge/🐳_Docker_Hub-meaning%2Fpmda-2496ED?style=for-the-badge" alt="Docker Hub"></a>
   <a href="docs/USER_GUIDE.md"><img src="https://img.shields.io/badge/📘_User_Guide-Open-1f9d8b?style=for-the-badge" alt="User Guide"></a>
   <a href="docs/ARCHITECTURE.md"><img src="https://img.shields.io/badge/🧱_Architecture-Read-404040?style=for-the-badge" alt="Architecture"></a>
+  <a href="https://discord.gg/2jkwnNhHHR"><img src="https://img.shields.io/badge/💬_Discord-Join_Us-5865F2?style=for-the-badge" alt="Discord"></a>
 </p>
 </div>
 
@@ -123,11 +124,11 @@ PMDA is designed for serious self-hosted music libraries:
 ## Documentation
 
 - [User guide](docs/USER_GUIDE.md)
-- [French user guide](docs/USER_GUIDE_FR.md)
 - [Architecture](docs/ARCHITECTURE.md)
-- [French architecture](docs/ARCHITECTURE_FR.md)
 - [Configuration](docs/CONFIGURATION.md)
-- [French configuration](docs/CONFIGURATION_FR.md)
+- [Unraid template](unraid/pmda.xml)
+- [Documentation hub](docs/README.md)
+- [Discord](https://discord.gg/2jkwnNhHHR)
 
 ## Docker Images
 

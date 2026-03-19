@@ -1,0 +1,35 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>PMDA</Name>
+  <Repository>meaning/pmda:latest</Repository>
+  <Registry>https://hub.docker.com/r/meaning/pmda</Registry>
+  <Network>bridge</Network>
+  <MyIP/>
+  <Shell>sh</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/silkyclouds/PMDA/issues</Support>
+  <Project>https://github.com/silkyclouds/PMDA</Project>
+  <Overview>PMDA scans music folders, matches albums, isolates duplicates and incomplete releases, publishes a fast PostgreSQL-backed library, and provides playback, recommendations, and export workflows.</Overview>
+  <Category>MediaApp:Music</Category>
+  <WebUI>http://[IP]:[PORT:5005]/</WebUI>
+  <TemplateURL>https://raw.githubusercontent.com/silkyclouds/PMDA/main/unraid/pmda.xml</TemplateURL>
+  <Icon>https://raw.githubusercontent.com/silkyclouds/PMDA/main/static/PMDA-p-mute-v1-transparent-512.png</Icon>
+  <ExtraParams/>
+  <PostArgs/>
+  <CPUset/>
+  <DonateText/>
+  <DonateLink/>
+  <Requires/>
+  <Config Name="WebUI Port" Target="5005" Default="5005" Mode="tcp" Description="Host port for the PMDA web UI." Type="Port" Display="always" Required="true" Mask="false">5005</Config>
+  <Config Name="Config Directory" Target="/config" Default="/mnt/user/appdata/pmda" Mode="rw" Description="Persistent PMDA data: PostgreSQL, Redis state, settings, auth state, and logs." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/pmda</Config>
+  <Config Name="Music Root" Target="/music" Default="/mnt/user/Music" Mode="rw" Description="Parent folder that contains the PMDA source folders. Configure the exact Standard and Incoming folders later in PMDA Settings." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/Music</Config>
+  <Config Name="Review Root" Target="/dupes" Default="/mnt/user/PMDA/review" Mode="rw" Description="Root folder used for duplicate and incomplete review targets." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/PMDA/review</Config>
+  <Config Name="Cache Directory" Target="/cache" Default="/mnt/cache/appdata/pmda-cache" Mode="rw" Description="SSD or NVMe cache for artwork and derived media. Strongly recommended." Type="Path" Display="always" Required="true" Mask="false">/mnt/cache/appdata/pmda-cache</Config>
+  <Config Name="Export Directory" Target="/export" Default="/mnt/user/PMDA/export" Mode="rw" Description="Optional clean export library root for hardlinks, symlinks, copies, or moves." Type="Path" Display="always" Required="false" Mask="false">/mnt/user/PMDA/export</Config>
+  <Config Name="Enable PMDA Auth" Target="PMDA_AUTH_ENABLED" Default="1" Mode="{3}" Description="Enable PMDA accounts and session-based access control." Type="Variable" Display="always" Required="true" Mask="false">1</Config>
+  <Config Name="Media Cache Root" Target="PMDA_MEDIA_CACHE_ROOT" Default="/cache" Mode="{3}" Description="Container path for PMDA artwork and media cache. Leave this set to /cache." Type="Variable" Display="advanced" Required="true" Mask="false">/cache</Config>
+  <Config Name="Trust Proxy Headers" Target="PMDA_AUTH_TRUST_PROXY_HEADERS" Default="false" Mode="{3}" Description="Enable when PMDA is behind Cloudflare Tunnel or another reverse proxy." Type="Variable" Display="advanced" Required="false" Mask="false">false</Config>
+  <Config Name="Secure Session Cookies" Target="PMDA_AUTH_SESSION_COOKIE_SECURE" Default="false" Mode="{3}" Description="Set to true when PMDA is served over HTTPS." Type="Variable" Display="advanced" Required="false" Mask="false">false</Config>
+  <Config Name="Allow Public Bootstrap" Target="PMDA_AUTH_ALLOW_PUBLIC_BOOTSTRAP" Default="false" Mode="{3}" Description="Leave false for normal deployments. Only enable temporarily on a trusted network if required for first-user setup." Type="Variable" Display="advanced" Required="false" Mask="false">false</Config>
+  <TailscaleStateDir/>
+</Container>

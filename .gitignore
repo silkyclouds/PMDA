@@ -7,6 +7,11 @@
 docs/
 *.md
 !README.md
+!docs/
+!docs/README.md
+!docs/USER_GUIDE.md
+!docs/ARCHITECTURE.md
+!docs/CONFIGURATION.md
 frontend/README.md
 
 # Python
