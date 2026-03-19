@@ -1,5 +1,6 @@
 import { Slider } from '@/components/ui/slider';
 import { cn } from '@/lib/utils';
+import { useIsMobile } from '@/hooks/use-mobile';
 
 interface GridSizeControlProps {
   value: number;
@@ -8,6 +9,10 @@ interface GridSizeControlProps {
 }
 
 export function GridSizeControl({ value, onChange, className }: GridSizeControlProps) {
+  const isMobile = useIsMobile();
+
+  if (isMobile) return null;
+
   return (
     <div className={cn('flex w-full min-w-0 items-center gap-3', className)}>
       <span className="text-xs text-muted-foreground shrink-0">Size</span>
