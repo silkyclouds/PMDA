@@ -201,10 +201,10 @@ export default function AdminUsersPage() {
 
   if (!auth.isAdmin) {
     return (
-      <div className="container py-8">
+      <div className="pmda-page-shell">
         <Card>
           <CardHeader>
-            <CardTitle>Users</CardTitle>
+            <CardTitle className="pmda-page-title">Users</CardTitle>
             <CardDescription>Admin access required.</CardDescription>
           </CardHeader>
         </Card>
@@ -213,17 +213,24 @@ export default function AdminUsersPage() {
   }
 
   return (
-    <div className="container space-y-6 py-6">
+    <div className="pmda-page-shell pmda-page-stack">
+      <div className="pmda-page-header">
+        <div>
+          <h1 className="pmda-page-title">Users</h1>
+          <p className="pmda-meta-text mt-1">Manage PMDA users, roles, download permission, AI access, and statistics visibility.</p>
+        </div>
+        <Button type="button" variant="outline" onClick={() => void loadUsers()} disabled={loading}>
+          {loading ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-2 h-4 w-4" />}
+          Refresh
+        </Button>
+      </div>
+
       <Card>
-        <CardHeader className="flex flex-row items-center justify-between gap-3">
+        <CardHeader>
           <div>
-            <CardTitle>User Management</CardTitle>
-            <CardDescription>Manage PMDA users, roles, download permission, and statistics visibility.</CardDescription>
+            <CardTitle className="pmda-section-title">User Management</CardTitle>
+            <CardDescription>Review accounts and permissions without leaving the page.</CardDescription>
           </div>
-          <Button type="button" variant="outline" onClick={() => void loadUsers()} disabled={loading}>
-            {loading ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-2 h-4 w-4" />}
-            Refresh
-          </Button>
         </CardHeader>
         <CardContent className="space-y-4">
           {loading ? (
@@ -236,7 +243,7 @@ export default function AdminUsersPage() {
               const isSelf = Number(auth.user?.id) === Number(u.id);
               const isDeleting = deletingId === u.id;
               return (
-                <div key={u.id} className="rounded-lg border p-4">
+                <div key={u.id} className="rounded-xl border border-border/60 bg-card/60 p-4">
                   <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
                     <p className="text-sm font-medium">#{u.id} · {u.username}</p>
                     <p className="text-xs text-muted-foreground">Last login: {formatLastLogin(u.last_login_at)}</p>
@@ -347,7 +354,7 @@ export default function AdminUsersPage() {
 
       <Card>
         <CardHeader>
-          <CardTitle>Create User</CardTitle>
+          <CardTitle className="pmda-section-title">Create User</CardTitle>
           <CardDescription>Add a new account and assign permissions.</CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">

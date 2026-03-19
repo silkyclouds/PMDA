@@ -124,14 +124,14 @@ export default function ListeningStatsPage() {
   }, [data?.hours]);
 
   return (
-    <div className="container py-6 space-y-6">
+    <div className="pmda-page-shell pmda-page-stack">
       <div className="flex flex-wrap items-end justify-between gap-3">
         <div className="space-y-1">
-          <h1 className="text-2xl font-bold flex items-center gap-2">
+          <h1 className="pmda-page-title flex items-center gap-2">
             <Headphones className="h-5 w-5 text-primary" />
             Listening Statistics
           </h1>
-          <p className="text-xs text-muted-foreground">Personal listening habits (single user).</p>
+          <p className="pmda-meta-text">Personal listening habits (single user).</p>
         </div>
         <StatisticsPageNav active="listening" />
       </div>
@@ -150,7 +150,7 @@ export default function ListeningStatsPage() {
             </Card>
           ) : null}
 
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+          <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
             <Card className="border-border/70">
               <CardHeader className="pb-2">
                 <CardTitle className="text-sm flex items-center gap-2">

@@ -273,14 +273,14 @@ export default function LibraryStatsPage() {
   }, [data?.quality?.lossless, data?.quality?.lossy]);
 
   return (
-    <div className="container py-6 space-y-6">
+    <div className="pmda-page-shell pmda-page-stack">
       <div className="flex flex-wrap items-end justify-between gap-3">
         <div className="space-y-1">
-          <h1 className="text-2xl font-bold flex items-center gap-2">
+          <h1 className="pmda-page-title flex items-center gap-2">
             <Database className="h-5 w-5 text-primary" />
             Library Statistics
           </h1>
-          <p className="text-xs text-muted-foreground">Distributions and growth from the indexed library (Files mode).</p>
+          <p className="pmda-meta-text">Distributions and growth from the indexed library (Files mode).</p>
         </div>
         <StatisticsPageNav active="library" />
       </div>
@@ -354,7 +354,7 @@ export default function LibraryStatsPage() {
         </CardContent>
       </Card>
 
-      <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+      <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-4">
         <Card className="border-border/70">
           <CardHeader className="pb-2">
             <CardTitle className="text-sm">With cover</CardTitle>

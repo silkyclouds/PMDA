@@ -1574,7 +1574,7 @@ export default function Statistics() {
             </div>
 
             <TabsContent value="overview" className="space-y-4">
-              <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4">
+              <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-6">
                 <StatCard
                   title="Scans"
                   icon={<Layers className="w-4 h-4 text-primary" />}
@@ -1640,7 +1640,7 @@ export default function Statistics() {
                   </div>
                 </CardContent>
               </Card>
-              <div className="grid grid-cols-1 xl:grid-cols-3 gap-4">
+              <div className="grid grid-cols-1 gap-4 xl:grid-cols-3">
                 <Card className="xl:col-span-1">
                   <CardHeader>
                     <CardTitle className="text-sm">Albums by Source Path</CardTitle>
@@ -1794,7 +1794,7 @@ export default function Statistics() {
                 </div>
               </div>
 
-              <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
+              <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
                 <StatCard
                   title="Total AI Calls"
                   icon={<Sparkles className="w-4 h-4 text-primary" />}
@@ -2052,7 +2052,7 @@ export default function Statistics() {
             </TabsContent>
 
             <TabsContent value="quality" className="space-y-4">
-              <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
+              <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
                 <StatCard
                   title="All Tags"
                   icon={<Tag className="w-4 h-4 text-primary" />}
@@ -2247,7 +2247,7 @@ export default function Statistics() {
             </TabsContent>
 
             <TabsContent value="operations" className="space-y-4">
-              <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4">
+              <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">
                 <StatCard
                   title="Total Duration"
                   icon={<Clock className="w-4 h-4 text-primary" />}
