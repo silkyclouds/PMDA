@@ -207,7 +207,7 @@ export function AppSidebar() {
 
   return (
     <Sidebar collapsible="icon" variant="sidebar">
-      <SidebarContent>
+      <SidebarContent className="pt-3 md:pt-4">
         <SidebarGroup>
           <SidebarGroupLabel>Browse</SidebarGroupLabel>
           <SidebarGroupContent>
