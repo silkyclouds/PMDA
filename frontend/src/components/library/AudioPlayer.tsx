@@ -328,7 +328,7 @@ export function AudioPlayer({
   const transitionTimerRef = useRef<number | null>(null);
   const transitionTargetTrackRef = useRef<TrackInfo | null>(null);
   const transitionTargetDeckRef = useRef<DeckIndex>(1);
-  const lastSeenTrackIdRef = useRef<number | null>(null);
+  const lastAutoOpenSessionKeyRef = useRef<string>('');
   const currentIndex = currentTrack ? tracks.findIndex((t) => t.track_id === currentTrack.track_id) : -1;
   const displayDuration = duration > 0 ? duration : (currentTrack?.duration ?? 0);
   const { resolvedTheme } = useTheme();
@@ -358,10 +358,24 @@ export function AudioPlayer({
   })();
 
   const deckRefs = useMemo(() => [deckARef, deckBRef] as const, []);
+  const isSimpleMobilePlayback = isMobile;
 
   useEffect(() => {
     savePlayerPrefs(prefs);
   }, [prefs]);
+
+  useEffect(() => {
+    const nextVolume = prefs.muted ? 0 : prefs.volume;
+    [deckARef.current, deckBRef.current].forEach((deck) => {
+      if (!deck) return;
+      deck.preload = 'auto';
+      deck.crossOrigin = 'anonymous';
+      deck.loop = false;
+      deck.setAttribute('playsinline', '');
+      deck.setAttribute('webkit-playsinline', 'true');
+      deck.volume = nextVolume;
+    });
+  }, [prefs.muted, prefs.volume]);
 
   const sendRecoEvent = useCallback((eventType: api.RecoEventType, track: TrackInfo | null, playedSeconds?: number) => {
     if (!track || !recommendationSessionId) return;
@@ -413,6 +427,7 @@ export function AudioPlayer({
   }, [postPlaybackEvent, sendRecoEvent]);
 
   const ensureAudioGraph = useCallback(async () => {
+    if (isSimpleMobilePlayback) return;
     if (audioContextRef.current) {
       if (audioContextRef.current.state === 'suspended') {
         await audioContextRef.current.resume().catch(() => {});
@@ -474,9 +489,10 @@ export function AudioPlayer({
       filter.gain.setValueAtTime(gain, now);
     });
     await ctx.resume().catch(() => {});
-  }, [prefs.eqEnabled, prefs.eqGains, prefs.muted, prefs.volume]);
+  }, [isSimpleMobilePlayback, prefs.eqEnabled, prefs.eqGains, prefs.muted, prefs.volume]);
 
   useEffect(() => {
+    if (isSimpleMobilePlayback) return;
     const ctx = audioContextRef.current;
     const master = masterGainRef.current;
     if (!ctx || !master) return;
@@ -484,9 +500,10 @@ export function AudioPlayer({
     master.gain.cancelScheduledValues(now);
     master.gain.setValueAtTime(master.gain.value, now);
     master.gain.linearRampToValueAtTime(prefs.muted ? 0 : prefs.volume, now + 0.04);
-  }, [prefs.muted, prefs.volume]);
+  }, [isSimpleMobilePlayback, prefs.muted, prefs.volume]);
 
   useEffect(() => {
+    if (isSimpleMobilePlayback) return;
     const ctx = audioContextRef.current;
     const filters = eqFiltersRef.current;
     if (!ctx || filters.length === 0) return;
@@ -496,7 +513,7 @@ export function AudioPlayer({
       filter.gain.cancelScheduledValues(now);
       filter.gain.setValueAtTime(gain, now);
     });
-  }, [prefs.eqEnabled, prefs.eqGains]);
+  }, [isSimpleMobilePlayback, prefs.eqEnabled, prefs.eqGains]);
 
   const getDeckTrack = useCallback((deckIndex: DeckIndex) => deckTracksRef.current[deckIndex], []);
 
@@ -565,6 +582,7 @@ export function AudioPlayer({
   }, [assignTrackToDeck, deckRefs, setDeckGain]);
 
   const preloadUpcomingTrack = useCallback(() => {
+    if (isSimpleMobilePlayback) return;
     const activeTrack = transitionActiveRef.current ? (transitionTargetTrackRef.current || activeTrackRef.current) : activeTrackRef.current;
     const nextTrack = getNextTrackFor(activeTrack);
     const preloadDeck = (activeDeckRef.current === 0 ? 1 : 0) as DeckIndex;
@@ -574,7 +592,7 @@ export function AudioPlayer({
     }
     if (getDeckTrack(preloadDeck)?.track_id === nextTrack.track_id) return;
     preloadDeckForTrack(preloadDeck, nextTrack);
-  }, [assignTrackToDeck, getDeckTrack, getNextTrackFor, preloadDeckForTrack]);
+  }, [assignTrackToDeck, getDeckTrack, getNextTrackFor, isSimpleMobilePlayback, preloadDeckForTrack]);
 
   const commitTransition = useCallback((pauseAfterCommit = false) => {
     if (!transitionActiveRef.current) return;
@@ -655,6 +673,44 @@ export function AudioPlayer({
 
   const syncToCurrentTrack = useCallback(async (track: TrackInfo | null) => {
     if (!track) return;
+    if (isSimpleMobilePlayback) {
+      clearTransitionTimer();
+      transitionActiveRef.current = false;
+      transitionTargetTrackRef.current = null;
+
+      if (activeTrackRef.current && activeTrackRef.current.track_id !== track.track_id) {
+        const played = Math.max(0, Math.floor(playedSecondsRef.current));
+        finalizeTrack(activeTrackRef.current, played, 'switch');
+      }
+
+      assignTrackToDeck(0, track);
+      assignTrackToDeck(1, null);
+      const targetEl = deckARef.current;
+      if (!targetEl) return;
+      try {
+        targetEl.currentTime = 0;
+      } catch {
+        // ignore
+      }
+      targetEl.volume = prefs.muted ? 0 : prefs.volume;
+      activeDeckRef.current = 0;
+      activeTrackRef.current = track;
+      finalizedTrackIdRef.current = null;
+      playedSecondsRef.current = 0;
+      setCurrentTime(0);
+      setDuration(track.duration || 0);
+      setBufferedEnd(0);
+      setIsPlaying(false);
+      sendPlayStart(track);
+      lastTrackLoadTimeRef.current = Date.now();
+      try {
+        await targetEl.play();
+        setIsPlaying(true);
+      } catch {
+        setIsPlaying(false);
+      }
+      return;
+    }
     const activeDeck = activeDeckRef.current;
     const inactiveDeck = (activeDeck === 0 ? 1 : 0) as DeckIndex;
     const activeDeckTrack = getDeckTrack(activeDeck);
@@ -720,7 +776,10 @@ export function AudioPlayer({
     ensureAudioGraph,
     finalizeTrack,
     getDeckTrack,
+    isSimpleMobilePlayback,
     preloadUpcomingTrack,
+    prefs.muted,
+    prefs.volume,
     sendPlayStart,
     setDeckGain,
     stopDeck,
@@ -736,13 +795,15 @@ export function AudioPlayer({
   }, [tracks, currentTrack?.track_id, preloadUpcomingTrack]);
 
   useEffect(() => {
-    const nextTrackId = Number(currentTrack?.track_id || 0) || null;
-    const prevTrackId = lastSeenTrackIdRef.current;
-    if (isMobile && nextTrackId && prevTrackId == null) {
+    if (!isMobile) return;
+    const firstTrackId = Number(tracks[0]?.track_id || 0) || 0;
+    const albumKey = Number(resolvedAlbumId || 0) > 0 ? String(resolvedAlbumId) : 'no-album';
+    const sessionKey = `${albumKey}:${tracks.length}:${firstTrackId}`;
+    if (firstTrackId > 0 && sessionKey !== lastAutoOpenSessionKeyRef.current) {
       setShowNowPlaying(true);
+      lastAutoOpenSessionKeyRef.current = sessionKey;
     }
-    lastSeenTrackIdRef.current = nextTrackId;
-  }, [currentTrack?.track_id, isMobile]);
+  }, [isMobile, resolvedAlbumId, tracks]);
 
   useEffect(() => {
     setCoverError(false);
@@ -813,6 +874,19 @@ export function AudioPlayer({
   const handleDeckTimeUpdate = useCallback((deckIndex: DeckIndex) => {
     const el = deckRefs[deckIndex].current;
     if (!el) return;
+    if (isSimpleMobilePlayback) {
+      if (deckIndex !== 0) return;
+      setCurrentTime(el.currentTime);
+      if (duration === 0 && !Number.isNaN(el.duration) && Number.isFinite(el.duration)) {
+        setDuration(el.duration);
+      }
+      if (el.buffered.length > 0) {
+        const end = el.buffered.end(el.buffered.length - 1);
+        setBufferedEnd(end);
+      }
+      playedSecondsRef.current = el.currentTime;
+      return;
+    }
     if (deckIndex === getVisibleDeckIndex()) {
       setCurrentTime(el.currentTime);
       if (duration === 0 && !Number.isNaN(el.duration) && Number.isFinite(el.duration)) {
@@ -823,6 +897,7 @@ export function AudioPlayer({
         : playedSecondsRef.current;
     }
     if (deckIndex !== activeDeckRef.current) return;
+    if (el.paused || !isPlaying) return;
     const nextTrack = getNextTrackFor(activeTrackRef.current);
     if (!nextTrack || transitionActiveRef.current || !Number.isFinite(el.duration) || el.duration <= 0) return;
     const transitionLead = prefs.crossfadeEnabled ? clamp(prefs.crossfadeSeconds, 1, 12) : GAPLESS_LEAD_SECONDS;
@@ -830,7 +905,7 @@ export function AudioPlayer({
     if (remaining <= transitionLead + 0.02) {
       void beginTransitionToNext(nextTrack, transitionLead);
     }
-  }, [beginTransitionToNext, currentTrack?.track_id, deckRefs, duration, getNextTrackFor, getVisibleDeckIndex, prefs.crossfadeEnabled, prefs.crossfadeSeconds]);
+  }, [beginTransitionToNext, currentTrack?.track_id, deckRefs, duration, getNextTrackFor, getVisibleDeckIndex, isPlaying, isSimpleMobilePlayback, prefs.crossfadeEnabled, prefs.crossfadeSeconds]);
 
   const handleDeckLoadedMetadata = useCallback((deckIndex: DeckIndex) => {
     const el = deckRefs[deckIndex].current;
@@ -888,6 +963,17 @@ export function AudioPlayer({
   }, [clearTransitionTimer, currentTrack?.track_id, deckRefs, onTrackSelect, setDeckGain]);
 
   const handleDeckEnded = useCallback((deckIndex: DeckIndex) => {
+    if (isSimpleMobilePlayback) {
+      if (deckIndex !== 0) return;
+      const nextTrackItem = getNextTrackFor(activeTrackRef.current);
+      if (nextTrackItem) {
+        onTrackSelect(nextTrackItem);
+        return;
+      }
+      finalizeTrack(activeTrackRef.current, Math.max(0, Math.floor(playedSecondsRef.current)), 'ended');
+      setIsPlaying(false);
+      return;
+    }
     if (transitionActiveRef.current) return;
     if (deckIndex !== activeDeckRef.current) return;
     const nextTrack = getNextTrackFor(activeTrackRef.current);
@@ -897,7 +983,7 @@ export function AudioPlayer({
     }
     finalizeTrack(activeTrackRef.current, Math.max(0, Math.floor(playedSecondsRef.current)), 'ended');
     setIsPlaying(false);
-  }, [beginTransitionToNext, finalizeTrack, getNextTrackFor]);
+  }, [beginTransitionToNext, finalizeTrack, getNextTrackFor, isSimpleMobilePlayback, onTrackSelect]);
 
   const toggleTrackLike = async () => {
     const track = currentTrack;
@@ -934,6 +1020,15 @@ export function AudioPlayer({
   }, [cancelTransition, stopDeck]);
 
   const handlePlayAll = useCallback(async () => {
+    if (isSimpleMobilePlayback) {
+      const el = deckARef.current;
+      if (!el) return;
+      el.volume = prefs.muted ? 0 : prefs.volume;
+      await el.play().then(() => setIsPlaying(true)).catch(() => {
+        setIsPlaying(false);
+      });
+      return;
+    }
     const visibleDeck = getVisibleDeckIndex();
     const visibleEl = deckRefs[visibleDeck].current;
     if (!visibleEl) return;
@@ -955,7 +1050,7 @@ export function AudioPlayer({
     await visibleEl.play().catch(() => {
       setIsPlaying(false);
     });
-  }, [deckRefs, ensureAudioGraph, getVisibleDeckIndex]);
+  }, [deckRefs, ensureAudioGraph, getVisibleDeckIndex, isSimpleMobilePlayback, prefs.muted, prefs.volume]);
 
   const togglePlayPause = useCallback(() => {
     if (isPlaying) {
@@ -1019,6 +1114,13 @@ export function AudioPlayer({
     clearTransitionTimer();
     onClose();
   }, [clearTransitionTimer, finalizeTrack, onClose, stopDeck]);
+
+  useEffect(() => {
+    if (!isSimpleMobilePlayback) return;
+    const activeEl = deckARef.current;
+    if (!activeEl) return;
+    activeEl.volume = prefs.muted ? 0 : prefs.volume;
+  }, [isSimpleMobilePlayback, prefs.muted, prefs.volume]);
 
   useEffect(() => {
     if (typeof navigator === 'undefined' || !('mediaSession' in navigator)) return;
@@ -1183,7 +1285,7 @@ export function AudioPlayer({
         onPause={() => handleDeckPause(1)}
       />
 
-      <div className="fixed bottom-0 left-0 right-0 z-50 border-t bg-zinc-900 text-white shadow-[0_-4px_20px_rgba(0,0,0,0.3)]">
+      <div className={cn('fixed bottom-0 left-0 right-0 z-50 border-t bg-zinc-900 text-white shadow-[0_-4px_20px_rgba(0,0,0,0.3)]', isMobile && showNowPlaying && 'hidden')}>
         <div
           className="relative h-1 w-full cursor-pointer bg-zinc-700 group"
           onClick={(e) => {
@@ -1198,7 +1300,7 @@ export function AudioPlayer({
           <div className="absolute inset-y-0 left-0 bg-amber-500 transition-all" style={{ width: `${displayDuration > 0 ? (currentTime / displayDuration) * 100 : 0}%` }} />
         </div>
 
-        {showFxPanel ? (
+        {showFxPanel && !isSimpleMobilePlayback ? (
           <div className="border-b border-zinc-800 px-4 py-4">
             {footerFxPanel}
           </div>
@@ -1274,16 +1376,18 @@ export function AudioPlayer({
             <span>{formatDuration(displayDuration)}</span>
           </div>
 
-          <div className="flex w-28 items-center gap-1">
+          <div className={cn('flex w-28 items-center gap-1', isMobile && 'hidden')}>
             <Button variant="ghost" size="icon" className="h-8 w-8 shrink-0 text-white hover:bg-zinc-700" onClick={toggleMute}>
               {prefs.muted || prefs.volume === 0 ? <VolumeX className="h-4 w-4" /> : <Volume2 className="h-4 w-4" />}
             </Button>
             <Slider value={[prefs.muted ? 0 : prefs.volume]} max={1} step={0.05} onValueChange={handleVolumeChange} className="w-full [&_[data-orientation=horizontal]]:bg-zinc-700" />
           </div>
 
-          <Button variant="ghost" size="icon" className={cn('h-8 w-8 text-white hover:bg-zinc-700', showFxPanel ? 'bg-zinc-800' : '')} onClick={() => setShowFxPanel((value) => !value)} title="Audio effects">
-            <SlidersHorizontal className="h-4 w-4" />
-          </Button>
+          {!isSimpleMobilePlayback ? (
+            <Button variant="ghost" size="icon" className={cn('h-8 w-8 text-white hover:bg-zinc-700', showFxPanel ? 'bg-zinc-800' : '')} onClick={() => setShowFxPanel((value) => !value)} title="Audio effects">
+              <SlidersHorizontal className="h-4 w-4" />
+            </Button>
+          ) : null}
           <Button variant="ghost" size="icon" className="h-8 w-8 text-white hover:bg-zinc-700" onClick={() => setShowList((s) => !s)} title="Track list">
             <List className="h-4 w-4" />
           </Button>
@@ -1334,8 +1438,8 @@ export function AudioPlayer({
       </div>
 
       <Dialog open={showNowPlaying} onOpenChange={setShowNowPlaying}>
-        <DialogContent className="h-[100dvh] w-[100dvw] max-w-none overflow-y-auto rounded-none border-0 p-0 !left-0 !top-0 !translate-x-0 !translate-y-0 [&>button]:hidden">
-          <div className={cn('relative min-h-full', isLightTheme ? 'text-foreground' : 'text-white')}>
+        <DialogContent className={cn('max-w-none overflow-y-auto overflow-x-hidden rounded-none border-0 p-0 [&>button]:hidden', isMobile ? 'z-[90] !left-0 !top-0 !h-[100dvh] !w-screen !max-w-screen !translate-x-0 !translate-y-0 overscroll-contain' : 'h-[100dvh] w-[100dvw]')}>
+          <div className={cn('relative min-h-full overflow-x-hidden', isLightTheme ? 'text-foreground' : 'text-white')}>
             <div className={cn('absolute inset-0', isLightTheme ? 'bg-slate-100' : 'bg-zinc-950')} />
             {(displayAlbumThumb && !coverError) ? (
               <img
@@ -1366,7 +1470,7 @@ export function AudioPlayer({
                       <ChevronLeft className="h-5 w-5" />
                     </Button>
                     <DialogHeader className="min-w-0 flex-1 space-y-0 text-center">
-                      <DialogTitle className={cn('truncate text-xl font-semibold', isLightTheme ? 'text-foreground' : 'text-white')}>Now Playing</DialogTitle>
+                      <DialogTitle className={cn('text-xl font-semibold', isLightTheme ? 'text-foreground' : 'text-white')}>Now Playing</DialogTitle>
                       <DialogDescription className="sr-only">
                         Full-screen player showing the current track and the queued track list.
                       </DialogDescription>
@@ -1393,8 +1497,8 @@ export function AudioPlayer({
                 )}
               </div>
 
-              <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
-                <div className={cn('flex flex-col items-center gap-6 p-6 md:p-10', isMobile ? 'pb-8 pt-5' : '')}>
+              <div className={cn('flex min-h-0 flex-1 flex-col', isMobile ? 'overflow-y-auto overflow-x-hidden' : 'overflow-hidden')}>
+                <div className={cn('flex flex-col items-center gap-6 p-6 md:p-10', isMobile ? 'pb-6 pt-5' : '')}>
                   <div className={cn('relative aspect-square overflow-hidden rounded-3xl border shadow-[0_20px_72px_rgba(0,0,0,0.28)]', isMobile ? 'w-[min(78vw,360px)] self-center' : 'w-[min(82vw,520px)]', isLightTheme ? 'border-border/60 bg-card' : 'border-white/10 bg-zinc-900 shadow-[0_30px_110px_rgba(0,0,0,0.65)]')}>
                     {(displayAlbumThumb && !coverError) ? (
                       <img src={displayAlbumThumb} alt="" className="absolute inset-0 h-full w-full animate-in object-cover fade-in-0 duration-300" />
@@ -1406,7 +1510,7 @@ export function AudioPlayer({
                     <div className={cn('absolute inset-0', isLightTheme ? 'bg-gradient-to-t from-black/30 via-black/5 to-transparent' : 'bg-gradient-to-t from-black/65 via-black/20 to-transparent')} />
                   </div>
 
-                  <div className={cn('space-y-1 text-center', isMobile ? 'w-full max-w-[92vw]' : 'max-w-[860px]')}>
+                  <div className={cn('space-y-1 text-center', isMobile ? 'w-full max-w-[92vw] overflow-hidden' : 'max-w-[860px]')}>
                     <div className={cn('truncate text-sm', isLightTheme ? 'text-muted-foreground' : 'text-white/70')}>{currentTrack?.artist ?? ''}</div>
                     <div className={cn('text-balance font-semibold tracking-tight', isMobile ? 'text-[2rem] leading-tight' : 'truncate text-3xl md:text-4xl', isLightTheme ? 'text-foreground' : 'text-white')}>
                       {currentTrack?.title ?? '—'}
@@ -1486,7 +1590,7 @@ export function AudioPlayer({
                     </Button>
                   </div>
 
-                  {showFxPanel ? (
+                  {showFxPanel && !isSimpleMobilePlayback ? (
                     <div className="w-full max-w-[980px]">
                       <PlaybackFxPanel
                         prefs={prefs}
@@ -1509,7 +1613,7 @@ export function AudioPlayer({
                       {currentIndex >= 0 ? `${currentIndex + 1}/${tracks.length}` : `${tracks.length}`}
                     </div>
                   </div>
-                  <ScrollArea className="min-h-0 flex-1">
+                  <ScrollArea className={cn('min-h-0 flex-1', isMobile ? 'max-h-none' : '')}>
                     <div className="space-y-1 px-4 pb-6 md:px-6">
                       {tracks.map((track) => (
                         <button
