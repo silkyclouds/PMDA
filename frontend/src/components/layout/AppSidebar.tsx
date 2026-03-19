@@ -16,6 +16,7 @@ import {
   SidebarGroup,
   SidebarGroupAction,
   SidebarGroupContent,
+  SidebarHeader,
   SidebarGroupLabel,
   SidebarMenu,
   SidebarMenuBadge,
@@ -23,6 +24,7 @@ import {
   SidebarMenuItem,
   SidebarRail,
   SidebarSeparator,
+  SidebarTrigger,
 } from '@/components/ui/sidebar';
 import { useIsMobile } from '@/hooks/use-mobile';
 
@@ -207,7 +209,12 @@ export function AppSidebar() {
 
   return (
     <Sidebar collapsible="icon" variant="sidebar">
-      <SidebarContent className="pt-3 md:pt-4">
+      <SidebarHeader className="pb-1 pt-2">
+        <div className="flex items-center justify-start group-data-[collapsible=icon]:justify-center">
+          <SidebarTrigger className="shrink-0" />
+        </div>
+      </SidebarHeader>
+      <SidebarContent className="pt-1">
         <SidebarGroup>
           <SidebarGroupLabel>Browse</SidebarGroupLabel>
           <SidebarGroupContent>
