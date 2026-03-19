@@ -377,8 +377,8 @@ export default function LibraryHome() {
   }
 
   return (
-    <div className="pmda-library-shell pb-6 flex flex-col gap-5 md:gap-6">
-      <section className="grid gap-4 xl:grid-cols-[1.45fr_0.9fr]">
+    <div className="pmda-library-shell pb-6 flex min-w-0 flex-col gap-5 md:gap-6">
+      <section className="grid min-w-0 gap-4 2xl:grid-cols-[minmax(0,1.35fr)_minmax(22rem,0.85fr)]">
         <Card className="overflow-hidden border-border/60 bg-[linear-gradient(135deg,rgba(27,29,36,0.98),rgba(17,19,25,0.96)),radial-gradient(circle_at_top_left,rgba(221,119,87,0.18),transparent_38%),radial-gradient(circle_at_78%_18%,rgba(235,184,120,0.14),transparent_28%)] text-white shadow-none">
           <CardContent className="p-6 md:p-8">
             <div className="flex flex-col gap-6">
@@ -427,10 +427,10 @@ export default function LibraryHome() {
             </div>
           </CardContent>
         </Card>
-        <div className="grid gap-4">
+        <div className="grid min-w-0 gap-4">
           <Card className="pmda-flat-surface overflow-hidden">
             <CardContent className="p-5">
-              <div className="flex items-start gap-4">
+              <div className="flex min-w-0 flex-col gap-4 sm:flex-row sm:items-start">
                 <div className="w-28 shrink-0">
                   <AspectRatio ratio={1} className="overflow-hidden border border-border/60 bg-muted">
                     <AlbumArtwork albumThumb={spotlightAlbum?.thumb || null} artistId={spotlightAlbum?.artist_id} alt={spotlightAlbum?.title || 'Spotlight album'} size={320} priority />
@@ -442,7 +442,7 @@ export default function LibraryHome() {
                     <>
                       <button
                         type="button"
-                        className="block text-left text-xl font-semibold tracking-tight hover:text-primary"
+                        className="block text-left text-lg font-semibold tracking-tight break-words hover:text-primary sm:text-xl"
                         onClick={() => navigate(`/library/album/${spotlightAlbum.album_id}${location.search || ''}`, { state: withBackLinkState(location) })}
                       >
                         {spotlightAlbum.title}
@@ -480,7 +480,7 @@ export default function LibraryHome() {
               </div>
             </CardContent>
           </Card>
-          <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-1">
+          <div className="grid gap-4 lg:grid-cols-2 2xl:grid-cols-1">
             <Card className="pmda-flat-surface">
               <CardContent className="flex items-start gap-3 p-5">
                 <div className="flex h-10 w-10 items-center justify-center border border-primary/20 bg-primary/10 text-primary">
@@ -509,8 +509,8 @@ export default function LibraryHome() {
         </div>
       </section>
 
-      <div className="flex flex-col md:flex-row md:items-center md:justify-end gap-3">
-        <GridSizeControl value={tileSize} onChange={setTileSize} className="w-full md:w-[280px]" />
+      <div className="flex min-w-0 flex-col gap-3 lg:flex-row lg:items-center lg:justify-end">
+        <GridSizeControl value={tileSize} onChange={setTileSize} className="w-full lg:w-[280px]" />
         <Button
           type="button"
           variant="outline"
@@ -791,7 +791,7 @@ export default function LibraryHome() {
           ) : recommendations.length === 0 ? (
             <p className="text-sm text-muted-foreground">{recoError ?? 'Start listening to personalize this feed.'}</p>
           ) : (
-            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+            <div className="grid grid-cols-1 gap-3 xl:grid-cols-2 2xl:grid-cols-3">
               {recommendations.map((rec) => (
                 <button
                   key={`rec-${rec.track_id}`}

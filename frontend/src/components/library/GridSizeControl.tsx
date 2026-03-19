@@ -9,9 +9,10 @@ interface GridSizeControlProps {
 
 export function GridSizeControl({ value, onChange, className }: GridSizeControlProps) {
   return (
-    <div className={cn('flex items-center gap-3 min-w-[220px]', className)}>
+    <div className={cn('flex w-full min-w-0 items-center gap-3', className)}>
       <span className="text-xs text-muted-foreground shrink-0">Size</span>
       <Slider
+        className="min-w-[120px] flex-1"
         value={[value]}
         min={150}
         max={340}
