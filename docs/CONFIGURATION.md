@@ -236,7 +236,7 @@ This keeps scans faster and reduces token cost.
 
 Official template shipped with the repo:
 
-- [unraid/pmda.xml](../unraid/pmda.xml)
+- [PMDA Unraid Community Apps template](https://github.com/silkyclouds/PMDA_unraid_xml/blob/main/pmda.xml)
 
 Recommended Unraid mappings:
 

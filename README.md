@@ -126,7 +126,7 @@ PMDA is designed for serious self-hosted music libraries:
 - [User guide](docs/USER_GUIDE.md)
 - [Architecture](docs/ARCHITECTURE.md)
 - [Configuration](docs/CONFIGURATION.md)
-- [Unraid template](unraid/pmda.xml)
+- [Unraid Community Apps template](https://github.com/silkyclouds/PMDA_unraid_xml/blob/main/pmda.xml)
 - [Documentation hub](docs/README.md)
 - [Discord](https://discord.gg/2jkwnNhHHR)
 
