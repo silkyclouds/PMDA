@@ -35,8 +35,10 @@ export function FolderBrowserInput({
 }: FolderBrowserInputProps) {
   const [open, setOpen] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [confirming, setConfirming] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [pathInput, setPathInput] = useState('');
+  const [candidatePath, setCandidatePath] = useState(normalizePath(value));
   const [state, setState] = useState<BrowseState>({
     currentPath: normalizePath(value),
     parentPath: null,
@@ -53,7 +55,13 @@ export function FolderBrowserInput({
     setError(null);
     try {
       const nextPath = normalizePath(pathToLoad ?? value);
-      const result = await api.getFilesystemDirectories(nextPath);
+      setCandidatePath(nextPath);
+      setPathInput(nextPath);
+      setState((prev) => ({
+        ...prev,
+        currentPath: nextPath,
+      }));
+      const result = await api.getFilesystemDirectories(nextPath, { timeoutMs: 45000 });
       setState({
         currentPath: result.path,
         parentPath: result.parent,
@@ -62,6 +70,7 @@ export function FolderBrowserInput({
         writable: Boolean(result.writable),
         truncated: Boolean(result.truncated),
       });
+      setCandidatePath(result.path);
       setPathInput(result.path);
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Unable to browse this folder');
@@ -73,9 +82,25 @@ export function FolderBrowserInput({
   useEffect(() => {
     if (!open) return;
     const initial = selectedPath || '/';
+    setCandidatePath(initial);
     setPathInput(initial);
     loadPath(initial);
   }, [open, selectedPath, loadPath]);
+
+  const confirmSelection = useCallback(async () => {
+    const nextPath = (pathInput || '').trim() ? normalizePath(pathInput) : normalizePath(candidatePath);
+    setConfirming(true);
+    setError(null);
+    try {
+      const result = await api.getFilesystemDirectories(nextPath, { timeoutMs: 20000, limit: 0 });
+      onChange(result.path);
+      setOpen(false);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Unable to use this folder');
+    } finally {
+      setConfirming(false);
+    }
+  }, [candidatePath, onChange, pathInput]);
 
   return (
     <>
@@ -124,7 +149,7 @@ export function FolderBrowserInput({
               <Button type="button" variant="outline" onClick={() => loadPath(pathInput)}>
                 Go
               </Button>
-              <Button type="button" variant="ghost" onClick={() => loadPath(state.currentPath)} disabled={loading}>
+              <Button type="button" variant="ghost" onClick={() => loadPath(candidatePath)} disabled={loading}>
                 {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
               </Button>
             </div>
@@ -141,8 +166,8 @@ export function FolderBrowserInput({
 
             <div className="rounded-md border border-border">
               <div className="flex items-center justify-between gap-2 px-3 py-2 border-b border-border">
-                <div className="text-xs text-muted-foreground truncate font-mono" title={state.currentPath}>
-                  {state.currentPath}
+                <div className="text-xs text-muted-foreground truncate font-mono" title={candidatePath}>
+                  {candidatePath}
                 </div>
                 <div className="flex items-center gap-2">
                   {state.parentPath && (
@@ -198,11 +223,10 @@ export function FolderBrowserInput({
             </Button>
             <Button
               type="button"
-              onClick={() => {
-                onChange(state.currentPath);
-                setOpen(false);
-              }}
+              onClick={confirmSelection}
+              disabled={confirming}
             >
+              {confirming ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
               Use this folder
             </Button>
           </DialogFooter>

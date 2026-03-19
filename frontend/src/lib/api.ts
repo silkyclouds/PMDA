@@ -3640,9 +3640,17 @@ export interface FilesystemDirectoryList {
 }
 
 /** Settings folder picker: list directories under a given absolute path. */
-export async function getFilesystemDirectories(path?: string): Promise<FilesystemDirectoryList> {
-  const query = path ? `?path=${encodeURIComponent(path)}` : '';
-  return fetchApi<FilesystemDirectoryList>(`/api/fs/list${query}`);
+export async function getFilesystemDirectories(
+  path?: string,
+  options?: { timeoutMs?: number; limit?: number },
+): Promise<FilesystemDirectoryList> {
+  const params = new URLSearchParams();
+  if (path) params.set('path', path);
+  if (typeof options?.limit === 'number') params.set('limit', String(options.limit));
+  const query = params.toString() ? `?${params.toString()}` : '';
+  return fetchApi<FilesystemDirectoryList>(`/api/fs/list${query}`, {
+    timeoutMs: options?.timeoutMs ?? 45000,
+  });
 }
 
 export async function testMusicBrainz(useMusicBrainz?: boolean): Promise<{ success: boolean; message: string }> {

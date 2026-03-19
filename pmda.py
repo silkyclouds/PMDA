@@ -50416,7 +50416,7 @@ def api_fs_list():
         path_raw = roots[0] if roots else "/"
     include_hidden = bool(_parse_bool(request.args.get("hidden") or False))
     try:
-        limit = max(20, min(1000, int(request.args.get("limit") or 300)))
+        limit = max(0, min(1000, int(request.args.get("limit") or 300)))
     except (TypeError, ValueError):
         limit = 300
 
@@ -50431,29 +50431,32 @@ def api_fs_list():
 
     directories = []
     truncated = False
-    try:
-        children = sorted(path_obj.iterdir(), key=lambda p: p.name.lower())
-    except PermissionError:
-        return jsonify({"error": "Permission denied", "path": str(path_obj)}), 403
-    except OSError as e:
-        return jsonify({"error": str(e), "path": str(path_obj)}), 500
-
-    for child in children:
+    if limit > 0:
         try:
-            if not child.is_dir():
-                continue
-            if not include_hidden and child.name.startswith("."):
-                continue
-            directories.append({
-                "name": child.name,
-                "path": str(child),
-                "writable": bool(os.access(child, os.W_OK)),
-            })
-            if len(directories) >= limit:
-                truncated = True
-                break
-        except OSError:
-            continue
+            # Avoid sorting the full directory listing first; on spun-down arrays,
+            # returning the first directories found is preferable to timing out.
+            with os.scandir(path_obj) as iterator:
+                for entry in iterator:
+                    try:
+                        name = entry.name
+                        if not include_hidden and name.startswith("."):
+                            continue
+                        if not entry.is_dir(follow_symlinks=False):
+                            continue
+                        directories.append({
+                            "name": name,
+                            "path": str(Path(path_obj, name)),
+                            "writable": bool(os.access(Path(path_obj, name), os.W_OK)),
+                        })
+                        if len(directories) >= limit:
+                            truncated = True
+                            break
+                    except OSError:
+                        continue
+        except PermissionError:
+            return jsonify({"error": "Permission denied", "path": str(path_obj)}), 403
+        except OSError as e:
+            return jsonify({"error": str(e), "path": str(path_obj)}), 500
 
     common_roots: list[str] = []
     for candidate in [
