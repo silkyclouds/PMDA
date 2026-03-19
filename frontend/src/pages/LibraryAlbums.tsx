@@ -6,12 +6,13 @@ import { AspectRatio } from '@/components/ui/aspect-ratio';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
-import { Slider } from '@/components/ui/slider';
 import { AlbumBadgeGroups } from '@/components/library/AlbumBadgeGroups';
 import { AlbumArtwork } from '@/components/library/AlbumArtwork';
+import { GridSizeControl } from '@/components/library/GridSizeControl';
 import { LibraryEmptyState } from '@/components/library/LibraryEmptyState';
 import { usePlayback } from '@/contexts/PlaybackContext';
 import { useAlbumBadgesVisibility } from '@/hooks/use-album-badges';
+import { getLibraryGridTemplateColumns, useLibraryTileSize } from '@/hooks/use-library-tile-size';
 import { useToast } from '@/hooks/use-toast';
 import { useLibraryQuery } from '@/hooks/useLibraryQuery';
 import { useIsMobile } from '@/hooks/use-mobile';
@@ -43,14 +44,7 @@ export default function LibraryAlbums() {
   const [albumLikes, setAlbumLikes] = useState<Record<number, boolean>>({});
 
   const [sort, setSort] = useState<SortMode>(() => (localStorage.getItem('pmda_library_sort') as SortMode) || 'recent');
-  const [coverSize, setCoverSize] = useState<number>(() => {
-    try {
-      const raw = Number(localStorage.getItem('pmda_library_cover_size') || 220);
-      return Number.isFinite(raw) ? Math.max(150, Math.min(320, raw)) : 220;
-    } catch {
-      return 220;
-    }
-  });
+  const { tileSize, setTileSize } = useLibraryTileSize();
 
   const [offset, setOffset] = useState(0);
   const limit = 96;
@@ -66,9 +60,8 @@ export default function LibraryAlbums() {
 
   const gridTemplateColumns = useMemo(() => {
     if (isMobile) return 'repeat(2, minmax(0, 1fr))';
-    const col = Math.max(140, Math.min(340, Math.floor(coverSize)));
-    return `repeat(auto-fill, minmax(${col}px, ${col}px))`;
-  }, [coverSize, isMobile]);
+    return getLibraryGridTemplateColumns(tileSize, isMobile);
+  }, [tileSize, isMobile]);
 
   const hydrateAlbumLikes = useCallback(async (ids: number[]) => {
     const unique = Array.from(new Set(ids.filter((x) => Number.isFinite(x) && x > 0)));
@@ -216,14 +209,14 @@ export default function LibraryAlbums() {
 
   if (libraryIsEmpty) {
     return (
-      <div className="container pb-6">
+      <div className="pmda-library-shell pb-6">
         <LibraryEmptyState />
       </div>
     );
   }
 
   return (
-    <div className="container pb-6 space-y-4">
+    <div className="pmda-library-shell pb-6 space-y-4">
       <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
         <div className="space-y-1">
           <div className="text-lg font-semibold">Albums</div>
@@ -257,24 +250,7 @@ export default function LibraryAlbums() {
             </SelectContent>
           </Select>
 
-          <div className="hidden md:flex items-center gap-2 w-[240px]">
-            <span className="text-xs text-muted-foreground w-12">Size</span>
-            <Slider
-              value={[coverSize]}
-              min={150}
-              max={320}
-              step={10}
-              onValueChange={(v) => {
-                const next = v[0];
-                setCoverSize(next);
-                try {
-                  localStorage.setItem('pmda_library_cover_size', String(next));
-                } catch {
-                  // ignore
-                }
-              }}
-            />
-          </div>
+          <GridSizeControl value={tileSize} onChange={setTileSize} className="w-full sm:w-[260px]" />
         </div>
       </div>
 

@@ -107,14 +107,14 @@ export default function LibraryGenres() {
 
   if (libraryIsEmpty) {
     return (
-      <div className="container pb-6">
+      <div className="pmda-library-shell pb-6">
         <LibraryEmptyState />
       </div>
     );
   }
 
   return (
-    <div className="container pb-6 space-y-4">
+    <div className="pmda-library-shell pb-6 space-y-4">
       <div className="flex items-end justify-between gap-3">
         <div className="space-y-1">
           <div className="text-lg font-semibold">Genres</div>

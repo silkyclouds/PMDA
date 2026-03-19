@@ -12,11 +12,14 @@ import { AlbumArtwork } from '@/components/library/AlbumArtwork';
 import { AuthenticatedImage } from '@/components/library/AuthenticatedImage';
 import { AlbumBadgeGroups } from '@/components/library/AlbumBadgeGroups';
 import { EntityDiscoverDialog } from '@/components/library/EntityDiscoverDialog';
+import { GridSizeControl } from '@/components/library/GridSizeControl';
 import { SocialActivityBadges } from '@/components/social/SocialActivityBadges';
 import { MatchDetailDialog } from '@/components/library/MatchDetailDialog';
 import { ProviderBadge } from '@/components/providers/ProviderBadge';
 import { ShareDialog } from '@/components/social/ShareDialog';
 import { useAlbumBadgesVisibility } from '@/hooks/use-album-badges';
+import { getLibraryGridTemplateColumns, getLibraryTileBasis, useLibraryTileSize } from '@/hooks/use-library-tile-size';
+import { useIsMobile } from '@/hooks/use-mobile';
 import { cn } from '@/lib/utils';
 import { badgeKindClass } from '@/lib/badgeStyles';
 import { resolveBackLink, withBackLinkState } from '@/lib/backNavigation';
@@ -150,11 +153,13 @@ function haversineKm(a: { lat: number; lon: number }, b: { lat: number; lon: num
 }
 
 export default function ArtistPage() {
+  const isMobile = useIsMobile();
   const navigate = useNavigate();
   const location = useLocation();
   const { startPlayback, setCurrentTrack } = usePlayback();
   const { canUseAI } = useAuth();
   const { showBadges, setShowBadges } = useAlbumBadgesVisibility();
+  const { tileSize, setTileSize } = useLibraryTileSize();
   const params = useParams<{ artistId: string }>();
   const artistId = Number(params.artistId);
   const { toast } = useToast();
@@ -665,6 +670,8 @@ export default function ArtistPage() {
     if (concertFilter.lat == null || concertFilter.lon == null) return null;
     return { lat: concertFilter.lat, lon: concertFilter.lon, radiusKm: concertFilter.radiusKm };
   }, [concertFilter?.enabled, concertFilter?.lat, concertFilter?.lon, concertFilter?.radiusKm]);
+  const albumTileBasis = useMemo(() => getLibraryTileBasis(tileSize, 185, 320), [tileSize]);
+  const similarArtistColumns = useMemo(() => getLibraryGridTemplateColumns(Math.max(tileSize, 220), isMobile, 190, 320), [tileSize, isMobile]);
 
   const concertList = useMemo(() => {
     if (!concertHome) return { events: concerts, hiddenNoCoords: 0 };
@@ -688,7 +695,7 @@ export default function ArtistPage() {
 
   if (loading) {
     return (
-      <div className="container py-8">
+      <div className="pmda-library-shell py-8">
         <div className="flex items-center justify-center py-24">
           <Loader2 className="w-10 h-10 animate-spin text-primary" />
         </div>
@@ -702,7 +709,7 @@ export default function ArtistPage() {
       label: 'Library',
     });
     return (
-      <div className="container py-8">
+      <div className="pmda-library-shell py-8">
         <Card>
           <CardContent className="p-8 space-y-4 text-center">
             <p className="text-muted-foreground">{error || 'Artist not found'}</p>
@@ -811,7 +818,7 @@ export default function ArtistPage() {
   };
 
   return (
-    <div className="container py-4 md:py-6 space-y-5 md:space-y-6">
+    <div className="pmda-library-shell py-4 md:py-6 space-y-5 md:space-y-6">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <Button variant="ghost" className="gap-2" onClick={() => navigate(effectiveBackLink.path)}>
             <ArrowLeft className="w-4 h-4" />
@@ -1250,20 +1257,23 @@ export default function ArtistPage() {
                   <Disc3 className="w-4 h-4 text-primary" />
                   <h2 className="text-lg font-semibold">{type === 'Single' ? 'Singles' : `${type}s`}</h2>
                 </div>
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  className="h-8 text-xs"
-                  onClick={() => setShowBadges(!showBadges)}
-                >
-                  {showBadges ? 'Hide badges' : 'Show badges'}
-                </Button>
+                <div className="flex flex-col sm:flex-row sm:items-center gap-3">
+                  <GridSizeControl value={tileSize} onChange={setTileSize} className="w-full sm:w-[260px]" />
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="h-8 text-xs"
+                    onClick={() => setShowBadges(!showBadges)}
+                  >
+                    {showBadges ? 'Hide badges' : 'Show badges'}
+                  </Button>
+                </div>
               </div>
               <Carousel opts={{ align: 'start', dragFree: true }} className="w-full">
                 <CarouselContent className="-ml-3">
                   {grouped[type].map((album) => (
-                    <CarouselItem key={album.album_id} className="pl-3 basis-[180px] sm:basis-[200px] md:basis-[220px]">
+                    <CarouselItem key={album.album_id} className="pl-3" style={{ flexBasis: `${albumTileBasis}px` }}>
                       <Card
                         className="pmda-flat-tile group h-full cursor-pointer transition-all duration-300 hover:-translate-y-1"
                         role="button"
@@ -1384,7 +1394,7 @@ export default function ArtistPage() {
               <CardContent className="p-5 text-sm text-muted-foreground">No similar artists available yet.</CardContent>
             </Card>
           ) : (
-            <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-4">
+            <div className="grid gap-4 justify-start" style={{ gridTemplateColumns: similarArtistColumns }}>
               {similar.map((artist) => (
 	                <Card
 	                  key={`${artist.artist_id || ''}-${artist.name}-${artist.mbid || ''}`}

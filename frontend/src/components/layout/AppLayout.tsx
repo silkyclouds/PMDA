@@ -9,7 +9,7 @@ import { UiBuildWatcher } from '@/components/UiBuildWatcher';
 export function AppLayout() {
   const location = useLocation();
   return (
-    <SidebarProvider defaultOpen>
+    <SidebarProvider defaultOpen={false}>
       <AppSidebar />
       <SidebarInset>
         <Header />

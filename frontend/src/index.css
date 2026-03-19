@@ -174,10 +174,18 @@
     --pmda-safe-top: env(safe-area-inset-top, 0px);
     --pmda-safe-left: env(safe-area-inset-left, 0px);
     --pmda-safe-right: env(safe-area-inset-right, 0px);
+    --pmda-page-gutter: clamp(1rem, 1.2vw + 0.75rem, 2rem);
   }
 }
 
 @layer components {
+  .pmda-library-shell {
+    width: 100%;
+    max-width: none;
+    padding-left: var(--pmda-page-gutter);
+    padding-right: var(--pmda-page-gutter);
+  }
+
   /* Stats badge */
   .stat-badge {
     @apply inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-card border border-border;

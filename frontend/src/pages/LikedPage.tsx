@@ -103,7 +103,7 @@ export default function LikedPage() {
   };
 
   return (
-    <div className="container py-6 space-y-6">
+    <div className="pmda-library-shell py-6 space-y-6">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="space-y-1">
           <h1 className="text-3xl font-bold tracking-tight">Liked</h1>

@@ -11,10 +11,12 @@ import { Carousel, CarouselContent, CarouselItem, CarouselNext, CarouselPrevious
 import { AlbumBadgeGroups } from '@/components/library/AlbumBadgeGroups';
 import { AlbumArtwork } from '@/components/library/AlbumArtwork';
 import { AuthenticatedImage } from '@/components/library/AuthenticatedImage';
+import { GridSizeControl } from '@/components/library/GridSizeControl';
 import { LibraryEmptyState } from '@/components/library/LibraryEmptyState';
 import { useAuth } from '@/contexts/AuthContext';
 import { usePlayback } from '@/contexts/PlaybackContext';
 import { useAlbumBadgesVisibility } from '@/hooks/use-album-badges';
+import { getLibraryTileBasis, useLibraryTileSize } from '@/hooks/use-library-tile-size';
 import { useToast } from '@/hooks/use-toast';
 import { withBackLinkState } from '@/lib/backNavigation';
 import * as api from '@/lib/api';
@@ -72,6 +74,7 @@ export default function LibraryHome() {
   const { toast } = useToast();
   const { startPlayback, setCurrentTrack, recommendationSessionId, session } = usePlayback();
   const { showBadges, setShowBadges } = useAlbumBadgesVisibility();
+  const { tileSize, setTileSize } = useLibraryTileSize();
 
   const [recoLoading, setRecoLoading] = useState(false);
   const [recoError, setRecoError] = useState<string | null>(null);
@@ -356,6 +359,8 @@ export default function LibraryHome() {
       .join(' ');
   }, [user?.username]);
   const greetingTitle = greetingName ? `Welcome back, ${greetingName}.` : 'Welcome back.';
+  const albumTileBasis = useMemo(() => getLibraryTileBasis(tileSize, 165, 320), [tileSize]);
+  const artistTileBasis = useMemo(() => getLibraryTileBasis(tileSize, 220, 360), [tileSize]);
 
   const sectionOrderStyle = useCallback((key: HomeSectionKey): { order: number; display?: string } => {
     const idx = visibleSectionOrder.indexOf(key);
@@ -365,14 +370,14 @@ export default function LibraryHome() {
 
   if (libraryIsEmpty) {
     return (
-      <div className="container pb-6">
+      <div className="pmda-library-shell pb-6">
         <LibraryEmptyState />
       </div>
     );
   }
 
   return (
-    <div className="container pb-6 flex flex-col gap-5 md:gap-6">
+    <div className="pmda-library-shell pb-6 flex flex-col gap-5 md:gap-6">
       <section className="grid gap-4 xl:grid-cols-[1.45fr_0.9fr]">
         <Card className="overflow-hidden border-border/60 bg-[linear-gradient(135deg,rgba(27,29,36,0.98),rgba(17,19,25,0.96)),radial-gradient(circle_at_top_left,rgba(221,119,87,0.18),transparent_38%),radial-gradient(circle_at_78%_18%,rgba(235,184,120,0.14),transparent_28%)] text-white shadow-none">
           <CardContent className="p-6 md:p-8">
@@ -504,7 +509,8 @@ export default function LibraryHome() {
         </div>
       </section>
 
-      <div className="flex items-center justify-end gap-2">
+      <div className="flex flex-col md:flex-row md:items-center md:justify-end gap-3">
+        <GridSizeControl value={tileSize} onChange={setTileSize} className="w-full md:w-[280px]" />
         <Button
           type="button"
           variant="outline"
@@ -659,7 +665,7 @@ export default function LibraryHome() {
                 <Carousel opts={{ align: 'start', dragFree: true }} effect="none" className="w-full pmda-fade-mask">
                   <CarouselContent className="-ml-3">
                     {sec.albums.map((a) => (
-                      <CarouselItem key={`disc-${sec.key}-${a.album_id}`} className="basis-[160px] sm:basis-[190px] md:basis-[220px] pl-3">
+                      <CarouselItem key={`disc-${sec.key}-${a.album_id}`} className="pl-3" style={{ flexBasis: `${albumTileBasis}px` }}>
                         <div className="group">
                           <Card className="pmda-flat-tile overflow-hidden transition-all duration-300 hover:-translate-y-1 hover:border-primary/35">
                             <AspectRatio
@@ -862,7 +868,7 @@ export default function LibraryHome() {
             <Carousel opts={{ align: 'start', dragFree: true }} effect="none" className="w-full pmda-fade-mask">
               <CarouselContent className="-ml-3">
                 {topArtists.map((a) => (
-                  <CarouselItem key={`ta-${a.artist_id}`} className="basis-[220px] sm:basis-[250px] md:basis-[270px] pl-3">
+                  <CarouselItem key={`ta-${a.artist_id}`} className="pl-3" style={{ flexBasis: `${artistTileBasis}px` }}>
                     <button type="button" onClick={() => navigate(`/library/artist/${a.artist_id}${location.search || ''}`, { state: withBackLinkState(location) })} className="w-full text-left group">
                       <Card className="pmda-flat-tile overflow-hidden transition-all duration-300 hover:-translate-y-1 hover:border-primary/35 hover:bg-accent/20">
                         <CardContent className="p-0">
@@ -943,7 +949,7 @@ export default function LibraryHome() {
             <Carousel opts={{ align: 'start', dragFree: true }} effect="none" className="w-full pmda-fade-mask">
               <CarouselContent className="-ml-3">
                 {recentArtists.map((a) => (
-                  <CarouselItem key={`ra-${a.artist_id}`} className="basis-[220px] sm:basis-[250px] md:basis-[270px] pl-3">
+                  <CarouselItem key={`ra-${a.artist_id}`} className="pl-3" style={{ flexBasis: `${artistTileBasis}px` }}>
                     <button type="button" onClick={() => navigate(`/library/artist/${a.artist_id}${location.search || ''}`, { state: withBackLinkState(location) })} className="w-full text-left group">
                       <Card className="pmda-flat-tile overflow-hidden transition-all duration-300 hover:-translate-y-1 hover:border-primary/35 hover:bg-accent/20">
                         <CardContent className="p-0">
@@ -1029,7 +1035,7 @@ export default function LibraryHome() {
             <Carousel opts={{ align: 'start', dragFree: true }} effect="none" className="w-full pmda-fade-mask">
               <CarouselContent className="-ml-3">
                 {recentlyPlayedAlbums.map((a) => (
-                  <CarouselItem key={`rplay-${a.album_id}`} className="basis-[160px] sm:basis-[190px] md:basis-[220px] pl-3">
+                  <CarouselItem key={`rplay-${a.album_id}`} className="pl-3" style={{ flexBasis: `${albumTileBasis}px` }}>
                     <div className="group">
                       <Card className="pmda-flat-tile overflow-hidden transition-all duration-300 hover:-translate-y-1 hover:border-primary/35">
                         <AspectRatio ratio={1} className="bg-muted">
@@ -1140,7 +1146,7 @@ export default function LibraryHome() {
             <Carousel opts={{ align: 'start', dragFree: true }} effect="none" className="w-full pmda-fade-mask">
               <CarouselContent className="-ml-3">
                 {recentAlbums.map((a) => (
-                  <CarouselItem key={`recent-${a.album_id}`} className="basis-[160px] sm:basis-[190px] md:basis-[220px] pl-3">
+                  <CarouselItem key={`recent-${a.album_id}`} className="pl-3" style={{ flexBasis: `${albumTileBasis}px` }}>
                     <div className="group">
                       <Card className="pmda-flat-tile overflow-hidden transition-all duration-300 hover:-translate-y-1 hover:border-primary/35">
                         <AspectRatio ratio={1} className="bg-muted">

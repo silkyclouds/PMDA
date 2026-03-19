@@ -8,9 +8,11 @@ import { Card, CardContent } from '@/components/ui/card';
 import { AlbumBadgeGroups } from '@/components/library/AlbumBadgeGroups';
 import { AlbumArtwork } from '@/components/library/AlbumArtwork';
 import { AuthenticatedImage } from '@/components/library/AuthenticatedImage';
+import { GridSizeControl } from '@/components/library/GridSizeControl';
 import type { TrackInfo } from '@/components/library/AudioPlayer';
 import { usePlayback } from '@/contexts/PlaybackContext';
 import { useAlbumBadgesVisibility } from '@/hooks/use-album-badges';
+import { getLibraryGridTemplateColumns, getLibraryTileBasis, useLibraryTileSize } from '@/hooks/use-library-tile-size';
 import { useToast } from '@/hooks/use-toast';
 import { useIsMobile } from '@/hooks/use-mobile';
 import { dedupeAlbumsForDisplay, mergeAlbumsForDisplay } from '@/lib/albumDisplayDedupe';
@@ -106,6 +108,7 @@ export default function LibraryHomeFeed() {
   const { toast } = useToast();
   const { startPlayback, setCurrentTrack, recommendationSessionId, session } = usePlayback();
   const { showBadges, setShowBadges } = useAlbumBadgesVisibility();
+  const { tileSize, setTileSize } = useLibraryTileSize();
 
   const [loading, setLoading] = useState(false);
   const [appending, setAppending] = useState(false);
@@ -128,20 +131,13 @@ export default function LibraryHomeFeed() {
     currentTrackIdRef.current = Number(session?.currentTrack?.track_id || 0) || null;
   }, [session?.currentTrack?.track_id]);
 
-  const coverSize = useMemo(() => {
-    try {
-      const raw = Number(localStorage.getItem('pmda_library_cover_size') || 220);
-      return Number.isFinite(raw) ? Math.max(150, Math.min(320, raw)) : 220;
-    } catch {
-      return 220;
-    }
-  }, []);
-
   const gridTemplateColumns = useMemo(() => {
-    if (isMobile) return 'repeat(2, minmax(0, 1fr))';
-    const col = Math.max(140, Math.min(340, Math.floor(coverSize)));
-    return `repeat(auto-fill, minmax(${col}px, ${col}px))`;
-  }, [coverSize, isMobile]);
+    return getLibraryGridTemplateColumns(tileSize, isMobile);
+  }, [tileSize, isMobile]);
+  const artistGridTemplateColumns = useMemo(() => {
+    return getLibraryGridTemplateColumns(tileSize, isMobile, 180, 340);
+  }, [tileSize, isMobile]);
+  const tileBasis = useMemo(() => getLibraryTileBasis(tileSize, 170, 320), [tileSize]);
   const backLink = useMemo(
     () => resolveBackLink(location, { path: `/library${location.search || ''}`, label: 'Home' }),
     [location],
@@ -323,7 +319,7 @@ export default function LibraryHomeFeed() {
   }, [loadMore]);
 
   return (
-    <div className="container py-4 md:py-6 space-y-5 md:space-y-6">
+    <div className="pmda-library-shell py-4 md:py-6 space-y-5 md:space-y-6">
       <div className="flex items-center justify-between gap-3">
         <Button variant="ghost" className="gap-2" onClick={() => navigate(backLink.path)}>
           <ArrowLeft className="w-4 h-4" />
@@ -336,21 +332,28 @@ export default function LibraryHomeFeed() {
 
       <Card className="border-border/70">
         <CardContent className="p-5">
-          <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
             <h1 className="text-2xl font-bold truncate">{FEED_TITLES[section]}</h1>
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              className="h-8 text-xs"
-              onClick={(e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                setShowBadges(!showBadges);
-              }}
-            >
-              {showBadges ? 'Hide badges' : 'Show badges'}
-            </Button>
+            <div className="flex flex-col sm:flex-row sm:items-center gap-3">
+              {(ALBUM_FEEDS.has(section) || ARTIST_FEEDS.has(section)) ? (
+                <GridSizeControl value={tileSize} onChange={setTileSize} className="w-full sm:w-[260px]" />
+              ) : null}
+              {ALBUM_FEEDS.has(section) ? (
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="h-8 text-xs"
+                  onClick={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    setShowBadges(!showBadges);
+                  }}
+                >
+                  {showBadges ? 'Hide badges' : 'Show badges'}
+                </Button>
+              ) : null}
+            </div>
           </div>
           {error ? (
             <div className="mt-2 text-sm text-destructive">{error}</div>
@@ -431,7 +434,7 @@ export default function LibraryHomeFeed() {
       {ARTIST_FEEDS.has(section) ? (
         <div
           className="grid gap-4"
-          style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(240px, 240px))' }}
+          style={{ gridTemplateColumns: artistGridTemplateColumns }}
         >
           {artists.map((a) => (
             <button
@@ -440,7 +443,7 @@ export default function LibraryHomeFeed() {
               className="text-left"
               onClick={() => navigate(`/library/artist/${a.artist_id}${location.search || ''}`, { state: withBackLinkState(location) })}
             >
-              <Card className="pmda-flat-tile overflow-hidden transition-all duration-300 hover:-translate-y-1 hover:border-primary/35 hover:bg-accent/20">
+                <Card className="pmda-flat-tile overflow-hidden transition-all duration-300 hover:-translate-y-1 hover:border-primary/35 hover:bg-accent/20" style={{ width: isMobile ? '100%' : `${tileBasis}px` }}>
                 <CardContent className="p-0">
                   <div className="aspect-square w-full bg-muted overflow-hidden border-b border-border/60 flex items-center justify-center">
                     {a.thumb ? (

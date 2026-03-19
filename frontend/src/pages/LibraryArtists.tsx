@@ -4,18 +4,23 @@ import { Loader2, UserRound } from 'lucide-react';
 
 import { Badge } from '@/components/ui/badge';
 import { AuthenticatedImage } from '@/components/library/AuthenticatedImage';
+import { GridSizeControl } from '@/components/library/GridSizeControl';
 import { Card } from '@/components/ui/card';
 import { LibraryEmptyState } from '@/components/library/LibraryEmptyState';
+import { getLibraryGridTemplateColumns, useLibraryTileSize } from '@/hooks/use-library-tile-size';
 import { useLibraryQuery } from '@/hooks/useLibraryQuery';
+import { useIsMobile } from '@/hooks/use-mobile';
 import { withBackLinkState } from '@/lib/backNavigation';
 import * as api from '@/lib/api';
 import type { LibraryOutletContext } from '@/pages/LibraryLayout';
 
 export default function LibraryArtists() {
+  const isMobile = useIsMobile();
   const navigate = useNavigate();
   const location = useLocation();
   const { includeUnmatched, libraryIsEmpty } = useOutletContext<LibraryOutletContext>();
   const { search, genre, label, year } = useLibraryQuery();
+  const { tileSize, setTileSize } = useLibraryTileSize();
 
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -28,6 +33,7 @@ export default function LibraryArtists() {
   const requestIdRef = useRef(0);
   const sentinelRef = useRef<HTMLDivElement | null>(null);
   const loadingMoreRef = useRef(false);
+  const gridTemplateColumns = getLibraryGridTemplateColumns(tileSize, isMobile, 160, 320);
 
   const fetchArtists = useCallback(async (opts: { reset: boolean; pageOffset: number }) => {
     const rid = ++requestIdRef.current;
@@ -108,26 +114,29 @@ export default function LibraryArtists() {
 
   if (libraryIsEmpty) {
     return (
-      <div className="container pb-6">
+      <div className="pmda-library-shell pb-6">
         <LibraryEmptyState />
       </div>
     );
   }
 
   return (
-    <div className="container pb-6 space-y-4">
-      <div className="flex items-end justify-between gap-3">
+    <div className="pmda-library-shell pb-6 space-y-4">
+      <div className="flex flex-col md:flex-row md:items-end md:justify-between gap-3">
         <div className="space-y-1">
           <div className="text-lg font-semibold">Artists</div>
           <div className="text-xs text-muted-foreground">
             {total > 0 ? `${artists.length.toLocaleString()} / ${total.toLocaleString()}` : ' '}
           </div>
         </div>
-        {error ? (
-          <Badge variant="outline" className="text-xs border-destructive/50 text-destructive">
-            {error}
-          </Badge>
-        ) : null}
+        <div className="flex flex-col sm:flex-row sm:items-center gap-3">
+          {error ? (
+            <Badge variant="outline" className="text-xs border-destructive/50 text-destructive">
+              {error}
+            </Badge>
+          ) : null}
+          <GridSizeControl value={tileSize} onChange={setTileSize} className="w-full sm:w-[260px]" />
+        </div>
       </div>
 
       {loading && artists.length === 0 ? (
@@ -136,7 +145,7 @@ export default function LibraryArtists() {
         </div>
       ) : null}
 
-      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-4">
+      <div className="grid gap-4 justify-start" style={{ gridTemplateColumns }}>
         {artists.map((a) => (
           <button
             key={`artist-${a.artist_id}`}

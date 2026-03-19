@@ -143,7 +143,7 @@ export function GlobalSearch({ className }: { className?: string }) {
   };
 
   return (
-    <div ref={rootRef} className={cn('relative w-full max-w-[28rem]', className)}>
+    <div ref={rootRef} className={cn('relative w-full', className)}>
       <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground pointer-events-none" />
       <Input
         value={query}

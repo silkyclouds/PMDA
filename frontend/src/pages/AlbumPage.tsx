@@ -539,7 +539,7 @@ export default function AlbumPage() {
 
   if (loading) {
     return (
-      <div className="container py-8">
+      <div className="pmda-library-shell py-8">
         <div className="flex items-center justify-center py-24">
           <Loader2 className="w-10 h-10 animate-spin text-primary" />
         </div>
@@ -553,7 +553,7 @@ export default function AlbumPage() {
       label: 'Library',
     });
     return (
-      <div className="container py-8">
+      <div className="pmda-library-shell py-8">
         <Card className="border-border/70">
           <CardContent className="p-8 space-y-4 text-center">
             <p className="text-muted-foreground">{error || 'Album not found'}</p>
@@ -583,7 +583,7 @@ export default function AlbumPage() {
   });
 
   return (
-    <div className="container py-4 md:py-6 space-y-5 md:space-y-6">
+    <div className="pmda-library-shell py-4 md:py-6 space-y-5 md:space-y-6">
       <div className="flex flex-wrap items-start justify-between gap-3">
             <Button variant="ghost" className="gap-2" onClick={() => navigate(effectiveBackLink.path)}>
           <ArrowLeft className="w-4 h-4" />

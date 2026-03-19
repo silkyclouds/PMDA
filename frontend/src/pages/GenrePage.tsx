@@ -6,11 +6,13 @@ import { AspectRatio } from '@/components/ui/aspect-ratio';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
+import { GridSizeControl } from '@/components/library/GridSizeControl';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { AlbumArtwork } from '@/components/library/AlbumArtwork';
 import { AlbumBadgeGroups } from '@/components/library/AlbumBadgeGroups';
 import { ShareDialog } from '@/components/social/ShareDialog';
 import { usePlayback } from '@/contexts/PlaybackContext';
+import { getLibraryGridTemplateColumns, useLibraryTileSize } from '@/hooks/use-library-tile-size';
 import { useToast } from '@/hooks/use-toast';
 import { useIsMobile } from '@/hooks/use-mobile';
 import { dedupeAlbumsForDisplay, mergeAlbumsForDisplay } from '@/lib/albumDisplayDedupe';
@@ -27,6 +29,7 @@ export default function GenrePage() {
   const { includeUnmatched } = useOutletContext<LibraryOutletContext>();
   const { startPlayback, setCurrentTrack } = usePlayback();
   const { toast } = useToast();
+  const { tileSize, setTileSize } = useLibraryTileSize();
   const params = useParams<{ genre: string }>();
   const genre = decodeURIComponent(String(params.genre || '')).trim();
 
@@ -50,20 +53,9 @@ export default function GenrePage() {
   const loadingMoreRef = useRef(false);
   const requestIdRef = useRef(0);
 
-  const [coverSize] = useState<number>(() => {
-    try {
-      const raw = Number(localStorage.getItem('pmda_library_cover_size') || 220);
-      return Number.isFinite(raw) ? Math.max(150, Math.min(320, raw)) : 220;
-    } catch {
-      return 220;
-    }
-  });
-
   const gridTemplateColumns = useMemo(() => {
-    if (isMobile) return 'repeat(2, minmax(0, 1fr))';
-    const col = Math.max(140, Math.min(340, Math.floor(coverSize)));
-    return `repeat(auto-fill, minmax(${col}px, ${col}px))`;
-  }, [coverSize, isMobile]);
+    return getLibraryGridTemplateColumns(tileSize, isMobile);
+  }, [tileSize, isMobile]);
 
   const handlePlayAlbum = useCallback(async (albumId: number, fallbackTitle: string, fallbackThumb?: string | null) => {
     try {
@@ -230,7 +222,7 @@ export default function GenrePage() {
   }, [genre, genreLiked, toast]);
 
   return (
-    <div className="container py-4 md:py-6 space-y-5 md:space-y-6">
+    <div className="pmda-library-shell py-4 md:py-6 space-y-5 md:space-y-6">
       <div className="flex items-center justify-between gap-3">
         <Button variant="ghost" className="gap-2" onClick={() => navigate(backLink.path)}>
           <ArrowLeft className="w-4 h-4" />
@@ -345,89 +337,94 @@ export default function GenrePage() {
           <CardContent className="p-8 text-sm text-muted-foreground">No albums found for this genre.</CardContent>
         </Card>
       ) : (
-        <div className="grid gap-4 justify-start" style={{ gridTemplateColumns }}>
-          {albums.map((a) => (
-            <div
-              key={`genre-alb-${a.album_id}`}
-              className="text-left group"
-              role="button"
-              tabIndex={0}
-              onClick={() => navigate(`/library/album/${a.album_id}${location.search || ''}`, { state: withBackLinkState(location) })}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' || e.key === ' ') {
-                  e.preventDefault();
-                  navigate(`/library/album/${a.album_id}${location.search || ''}`, { state: withBackLinkState(location) });
-                }
-              }}
-              title="Open album"
-            >
-              <div className="pmda-flat-tile relative overflow-hidden">
-                <AspectRatio ratio={1} className="bg-muted">
-                  <AlbumArtwork albumThumb={a.thumb} artistId={a.artist_id} alt={a.title} size={320} imageClassName="w-full h-full object-cover" />
-                  <div className="absolute inset-0 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity bg-black/25" />
-                  <div className="absolute inset-x-0 bottom-0 p-3 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity">
-                    <div className="flex items-center justify-between gap-2">
-                      <Button
-                        size="sm"
-                        className="h-9 gap-2"
-                        onClick={(e) => {
-                          e.preventDefault();
-                          e.stopPropagation();
-                          void handlePlayAlbum(a.album_id, a.title, a.thumb);
-                        }}
-                      >
-                        <Play className="h-4 w-4" />
-                        Play
-                      </Button>
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        className="h-9"
-                        onClick={(e) => {
-                          e.preventDefault();
-                          e.stopPropagation();
-                          navigate(`/library/artist/${a.artist_id}${location.search || ''}`, { state: withBackLinkState(location) });
-                        }}
-                        title="Open artist"
-                      >
-                        <UserRound className="h-4 w-4" />
-                      </Button>
+        <div className="space-y-4">
+          <div className="flex justify-end">
+            <GridSizeControl value={tileSize} onChange={setTileSize} className="w-full sm:w-[260px]" />
+          </div>
+          <div className="grid gap-4 justify-start" style={{ gridTemplateColumns }}>
+            {albums.map((a) => (
+              <div
+                key={`genre-alb-${a.album_id}`}
+                className="text-left group"
+                role="button"
+                tabIndex={0}
+                onClick={() => navigate(`/library/album/${a.album_id}${location.search || ''}`, { state: withBackLinkState(location) })}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    navigate(`/library/album/${a.album_id}${location.search || ''}`, { state: withBackLinkState(location) });
+                  }
+                }}
+                title="Open album"
+              >
+                <div className="pmda-flat-tile relative overflow-hidden">
+                  <AspectRatio ratio={1} className="bg-muted">
+                    <AlbumArtwork albumThumb={a.thumb} artistId={a.artist_id} alt={a.title} size={320} imageClassName="w-full h-full object-cover" />
+                    <div className="absolute inset-0 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity bg-black/25" />
+                    <div className="absolute inset-x-0 bottom-0 p-3 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity">
+                      <div className="flex items-center justify-between gap-2">
+                        <Button
+                          size="sm"
+                          className="h-9 gap-2"
+                          onClick={(e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            void handlePlayAlbum(a.album_id, a.title, a.thumb);
+                          }}
+                        >
+                          <Play className="h-4 w-4" />
+                          Play
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="h-9"
+                          onClick={(e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            navigate(`/library/artist/${a.artist_id}${location.search || ''}`, { state: withBackLinkState(location) });
+                          }}
+                          title="Open artist"
+                        >
+                          <UserRound className="h-4 w-4" />
+                        </Button>
+                      </div>
                     </div>
+                  </AspectRatio>
+                  <div className="p-3 space-y-1.5">
+                    <div className="text-sm font-semibold leading-snug line-clamp-3 min-h-[3.6rem]" title={a.title}>{a.title}</div>
+                    <button
+                      type="button"
+                      className="text-xs text-muted-foreground truncate hover:underline"
+                      onClick={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        navigate(`/library/artist/${a.artist_id}${location.search || ''}`, { state: withBackLinkState(location) });
+                      }}
+                      title="Open artist"
+                    >
+                      {a.artist_name}
+                    </button>
+                    <AlbumBadgeGroups
+                      show
+                      compact
+                      userRating={a.user_rating}
+                      publicRating={a.public_rating}
+                      publicRatingVotes={a.public_rating_votes}
+                      format={a.format}
+                      isLossless={a.is_lossless}
+                      year={a.year}
+                      trackCount={a.track_count}
+                      genres={a.genres || (a.genre ? [a.genre] : [])}
+                      label={a.label}
+                      onGenreClick={(genreName) => navigate(`/library/genre/${encodeURIComponent(genreName)}${location.search || ''}`, { state: withBackLinkState(location) })}
+                      onLabelClick={a.label ? () => navigate(`/library/label/${encodeURIComponent(a.label || '')}${location.search || ''}`, { state: withBackLinkState(location) }) : undefined}
+                    />
                   </div>
-                </AspectRatio>
-                <div className="p-3 space-y-1.5">
-                  <div className="text-sm font-semibold leading-snug line-clamp-3 min-h-[3.6rem]" title={a.title}>{a.title}</div>
-                  <button
-                    type="button"
-                    className="text-xs text-muted-foreground truncate hover:underline"
-                    onClick={(e) => {
-                      e.preventDefault();
-                      e.stopPropagation();
-                      navigate(`/library/artist/${a.artist_id}${location.search || ''}`, { state: withBackLinkState(location) });
-                    }}
-                    title="Open artist"
-                  >
-                    {a.artist_name}
-                  </button>
-                  <AlbumBadgeGroups
-                    show
-                    compact
-                    userRating={a.user_rating}
-                    publicRating={a.public_rating}
-                    publicRatingVotes={a.public_rating_votes}
-                    format={a.format}
-                    isLossless={a.is_lossless}
-                    year={a.year}
-                    trackCount={a.track_count}
-                    genres={a.genres || (a.genre ? [a.genre] : [])}
-                    label={a.label}
-                    onGenreClick={(genreName) => navigate(`/library/genre/${encodeURIComponent(genreName)}${location.search || ''}`, { state: withBackLinkState(location) })}
-                    onLabelClick={a.label ? () => navigate(`/library/label/${encodeURIComponent(a.label || '')}${location.search || ''}`, { state: withBackLinkState(location) }) : undefined}
-                  />
                 </div>
               </div>
-            </div>
-          ))}
+            ))}
+          </div>
         </div>
       )}
 

@@ -17,16 +17,13 @@ import {
   SidebarGroupAction,
   SidebarGroupContent,
   SidebarGroupLabel,
-  SidebarHeader,
   SidebarMenu,
   SidebarMenuBadge,
   SidebarMenuButton,
   SidebarMenuItem,
   SidebarRail,
   SidebarSeparator,
-  SidebarTrigger,
 } from '@/components/ui/sidebar';
-import { Logo } from '@/components/Logo';
 import { useIsMobile } from '@/hooks/use-mobile';
 
 function isPathActive(pathname: string, target: string): boolean {
@@ -210,19 +207,6 @@ export function AppSidebar() {
 
   return (
     <Sidebar collapsible="icon" variant="sidebar">
-      <SidebarHeader>
-        <div className="flex items-center gap-2 px-2 py-1.5 group-data-[collapsible=icon]:justify-center group-data-[collapsible=icon]:gap-0.5 group-data-[collapsible=icon]:px-0.5">
-          <SidebarTrigger className="h-8 w-8 rounded-lg group-data-[collapsible=icon]:h-6 group-data-[collapsible=icon]:w-6" />
-          <Logo variant="wordmark" size="xl" className="group-data-[collapsible=icon]:hidden" />
-          <Logo
-            showText={false}
-            variant="icon"
-            size="sm"
-            className="hidden group-data-[collapsible=icon]:inline-flex"
-          />
-        </div>
-      </SidebarHeader>
-
       <SidebarContent>
         <SidebarGroup>
           <SidebarGroupLabel>Browse</SidebarGroupLabel>
