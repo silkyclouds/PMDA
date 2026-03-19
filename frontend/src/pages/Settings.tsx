@@ -938,18 +938,7 @@ function SettingsPage() {
                 </CardDescription>
               </CardHeader>
               <CardContent className="space-y-5">
-                <div className="rounded-xl border border-cyan-500/20 bg-cyan-500/[0.05] p-4 md:p-5 space-y-3">
-                  <div className="space-y-1">
-                    <div className="flex items-center gap-2">
-                      <span className="inline-flex h-7 w-7 items-center justify-center rounded-full bg-cyan-500/15 text-cyan-200 text-xs font-semibold">1</span>
-                      <Label className="text-sm">What are your music source folders?</Label>
-                    </div>
-                    <p className="text-xs text-muted-foreground">
-                      Start here. Add every folder PMDA is allowed to scan. You can add one folder or many.
-                    </p>
-                  </div>
-                  <SourcesAutonomySettings />
-                </div>
+                <SourcesAutonomySettings />
 
                 <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
                   <div className="rounded-xl border border-orange-500/20 bg-orange-500/[0.04] p-4 md:p-5 space-y-2">
