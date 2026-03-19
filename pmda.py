@@ -8024,6 +8024,11 @@ def _files_source_roots_replace(roots_payload: list[dict], *, winner_source_root
     if not rows_clean:
         raise ValueError("At least one valid source root is required.")
 
+    library_rows = [r for r in rows_clean if str(r.get("role") or "") == "library"]
+    incoming_rows = [r for r in rows_clean if str(r.get("role") or "") == "incoming"]
+    if incoming_rows and not library_rows:
+        raise ValueError("At least one standard source folder is required when incoming folders are configured.")
+
     winner_path = ""
     if winner_source_root_id is not None:
         try:
@@ -8046,6 +8051,10 @@ def _files_source_roots_replace(roots_payload: list[dict], *, winner_source_root
     if not winner_path and previous_winner_path:
         if any(_normalize_root_path(r.get("path")) == previous_winner_path for r in rows_clean):
             winner_path = previous_winner_path
+    if winner_path:
+        winner_row = next((r for r in rows_clean if _normalize_root_path(r.get("path")) == winner_path), None)
+        if winner_row and str(winner_row.get("role") or "") == "incoming":
+            winner_path = ""
     if not winner_path:
         library_first = next((r for r in rows_clean if str(r.get("role") or "") == "library"), rows_clean[0])
         winner_path = _normalize_root_path(library_first.get("path"))

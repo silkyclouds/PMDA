@@ -34,7 +34,7 @@ export function SourcesAutonomySettings() {
   const [watcherStatus, setWatcherStatus] = useState<api.FilesWatcherStatus | null>(null);
 
   const [pendingPath, setPendingPath] = useState('');
-  const [pendingRole, setPendingRole] = useState<'library' | 'incoming'>('incoming');
+  const [pendingRole, setPendingRole] = useState<'library' | 'incoming'>('library');
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -90,11 +90,15 @@ export function SourcesAutonomySettings() {
     return normalizePath(String(byId?.path || ''));
   }, [roots, winnerId, winnerPath]);
 
+  const libraryDestinationRoots = useMemo(
+    () => roots.filter((row) => row.role === 'library' && normalizePath(String(row.path || ''))),
+    [roots],
+  );
+
   const updateRoot = useCallback((index: number, patch: Partial<FileSourceRoot>) => {
     setRoots((prev) => {
       const next: FileSourceRoot[] = prev.map((row, i) => {
         if (i === index) return { ...row, ...patch };
-        if (patch.role === 'incoming') return { ...row, role: 'library' as const };
         return row;
       });
       if (patch.role === 'incoming') {
@@ -141,12 +145,7 @@ export function SourcesAutonomySettings() {
           priority: nextPriority,
           is_winner_root: false,
         },
-      ].map((row, idx, all) => {
-        if (pendingRole === 'incoming' && idx !== all.length - 1 && row.role === 'incoming') {
-          return { ...row, role: 'library' as const };
-        }
-        return row;
-      });
+      ];
       if (!currentWinnerPath && pendingRole === 'library') {
         setWinnerPath(normalized);
         setWinnerId(null);
@@ -232,22 +231,22 @@ export function SourcesAutonomySettings() {
       <div className="rounded-lg border border-border bg-muted/20 p-4 space-y-2">
         <p className="text-sm font-medium">Configuration flow</p>
         <ol className="list-decimal pl-4 text-xs text-muted-foreground space-y-1">
-          <li>Add every folder PMDA is allowed to read from.</li>
-          <li>If you use an autosnatch/drop folder, mark that single folder as <span className="text-foreground">Incoming</span>.</li>
-          <li>Choose the <span className="text-foreground">Primary library</span> destination where validated winners will be placed.</li>
+          <li>Add every <span className="text-foreground">Standard source folder</span> PMDA is allowed to scan.</li>
+          <li>Optionally add one or more <span className="text-foreground">Incoming folders</span> if that is where new downloads land.</li>
+          <li>If you use incoming folders, choose which <span className="text-foreground">Standard source folder</span> receives processed albums.</li>
           <li>Save once, then optionally run an incoming scan immediately.</li>
         </ol>
       </div>
 
       <div className="grid grid-cols-1 gap-2 text-xs md:grid-cols-2">
         <div className="rounded-md border border-border bg-muted/30 px-3 py-2 text-muted-foreground">
-          Library roots: <span className="text-foreground font-medium">{libraryRootsCount}</span>
+          Standard source folders: <span className="text-foreground font-medium">{libraryRootsCount}</span>
         </div>
         <div className="rounded-md border border-border bg-muted/30 px-3 py-2 text-muted-foreground">
-          Incoming roots: <span className="text-foreground font-medium">{incomingRootsCount}</span>
+          Incoming folders: <span className="text-foreground font-medium">{incomingRootsCount}</span>
         </div>
         <div className="rounded-md border border-border bg-muted/30 px-3 py-2 text-muted-foreground md:col-span-2">
-          <div className="text-[11px] uppercase tracking-wide text-muted-foreground">Primary root</div>
+          <div className="text-[11px] uppercase tracking-wide text-muted-foreground">Processed incoming albums go to</div>
           <div className="mt-1 overflow-x-auto whitespace-nowrap font-mono text-xs text-foreground">
             {currentWinnerPath || 'not set'}
           </div>
@@ -262,10 +261,10 @@ export function SourcesAutonomySettings() {
               <Label className="text-sm">What are your music source folders?</Label>
             </div>
             <p className="text-xs text-muted-foreground">
-              Add every music folder PMDA must scan. You can add as many source folders as you want.
+              Add every folder PMDA must scan. You can add as many folders as you want and mark each one as either a standard source folder or an incoming folder.
             </p>
             <p className="text-[11px] text-muted-foreground">
-              PMDA reads from these folders, builds the library index, and compares new arrivals against what already exists.
+              Standard source folders are already part of your collection. Incoming folders are optional and are meant for new downloads or manual drops.
             </p>
           </div>
           <Button type="button" variant="outline" size="sm" onClick={load} className="gap-1.5">
@@ -296,8 +295,8 @@ export function SourcesAutonomySettings() {
                     >
                       <SelectTrigger><SelectValue /></SelectTrigger>
                       <SelectContent>
-                        <SelectItem value="library">Library (already in collection)</SelectItem>
-                        <SelectItem value="incoming">Incoming (new arrivals)</SelectItem>
+                        <SelectItem value="library">Standard source folder</SelectItem>
+                        <SelectItem value="incoming">Incoming folder (new arrivals)</SelectItem>
                       </SelectContent>
                     </Select>
                   </div>
@@ -315,7 +314,7 @@ export function SourcesAutonomySettings() {
                     }}
                     disabled={row.role === 'incoming'}
                   >
-                    {isWinner ? 'Primary' : 'Set primary'}
+                    {isWinner ? 'Processed here' : 'Set as destination'}
                   </Button>
                   <Button type="button" variant="ghost" size="icon" onClick={() => removeRoot(index)} className="shrink-0">
                     <Trash2 className="w-4 h-4" />
@@ -329,40 +328,83 @@ export function SourcesAutonomySettings() {
         <div className="rounded-lg border border-border/70 bg-background/30 p-3 space-y-3">
           <div className="space-y-1">
             <div className="flex items-center gap-2">
-              <span className="inline-flex h-7 w-7 items-center justify-center rounded-full bg-cyan-500/15 text-cyan-200 text-xs font-semibold">2</span>
-              <Label className="text-sm">Which folder is your incoming drop zone?</Label>
+              <Label className="text-sm">Add a folder</Label>
             </div>
             <p className="text-xs text-muted-foreground">
-              Incoming is optional. Use it for one watched folder where new albums arrive from autosnatch, downloads, or manual drops.
-            </p>
-            <p className="text-[11px] text-muted-foreground">
-              PMDA will monitor it, run the normal pipeline, compare with the indexed library, detect duplicates/incomplete albums, enrich metadata, then place validated winners into the primary library folder above.
+              Choose the folder type before adding it. Incoming is optional; use it only if fresh music lands in a separate drop zone.
             </p>
           </div>
           <div className="grid grid-cols-1 md:grid-cols-[1fr_220px_110px] gap-2">
           <FolderBrowserInput
             value={pendingPath}
             onChange={setPendingPath}
-            placeholder="/music/incoming"
+            placeholder="/music/library"
             selectLabel="Add source root"
           />
           <Select value={pendingRole} onValueChange={(value: 'library' | 'incoming') => setPendingRole(value)}>
             <SelectTrigger><SelectValue /></SelectTrigger>
             <SelectContent>
-              <SelectItem value="library">Regular source folder</SelectItem>
-              <SelectItem value="incoming">Incoming drop folder</SelectItem>
+              <SelectItem value="library">Standard source folder</SelectItem>
+              <SelectItem value="incoming">Incoming folder</SelectItem>
             </SelectContent>
           </Select>
           <Button type="button" variant="outline" onClick={addRoot} disabled={!normalizePath(pendingPath)} className="gap-1.5">
             <Plus className="w-4 h-4" />
-            Add root
+            Add folder
           </Button>
         </div>
-          {incomingRootsCount > 0 ? (
-            <p className="text-[11px] text-muted-foreground">
-              Only one incoming folder is kept in this simplified UI. If you mark another root as Incoming, the previous one becomes a regular source folder.
+        </div>
+
+        <div className="rounded-lg border border-border/70 bg-background/30 p-3 space-y-3">
+          <div className="space-y-1">
+            <Label className="text-sm">If you use incoming folders, where should processed albums end up?</Label>
+            <p className="text-xs text-muted-foreground">
+              Choose the standard source folder that should receive albums once PMDA has matched them, checked duplicates/incompletes, and validated metadata.
             </p>
-          ) : null}
+          </div>
+          <div className="grid grid-cols-1 gap-3 md:grid-cols-[minmax(0,1fr),220px]">
+            <Select
+              value={currentWinnerPath || '__none__'}
+              onValueChange={(value) => {
+                if (value === '__none__') {
+                  setWinnerPath('');
+                  setWinnerId(null);
+                  return;
+                }
+                const normalized = normalizePath(value);
+                const selected = libraryDestinationRoots.find((row) => normalizePath(String(row.path || '')) === normalized) ?? null;
+                setWinnerPath(normalized);
+                setWinnerId(Number(selected?.source_id || 0) > 0 ? Number(selected?.source_id || 0) : null);
+              }}
+              disabled={libraryDestinationRoots.length === 0}
+            >
+              <SelectTrigger>
+                <SelectValue placeholder="Select a standard source folder" />
+              </SelectTrigger>
+              <SelectContent>
+                {libraryDestinationRoots.map((row) => {
+                  const normalized = normalizePath(String(row.path || ''));
+                  return (
+                    <SelectItem key={`winner-root-${row.source_id || normalized}`} value={normalized}>
+                      {normalized}
+                    </SelectItem>
+                  );
+                })}
+              </SelectContent>
+            </Select>
+            <Select value={strategy} onValueChange={(value: 'move' | 'hardlink' | 'symlink' | 'copy') => setStrategy(value)}>
+              <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="move">Move</SelectItem>
+                <SelectItem value="hardlink">Hardlink</SelectItem>
+                <SelectItem value="symlink">Symlink</SelectItem>
+                <SelectItem value="copy">Copy</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+          <p className="text-[11px] text-muted-foreground">
+            Recommended for most users: <span className="text-foreground">Hardlink</span>. If you do not use incoming folders, this setting can stay prepared for later.
+          </p>
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
@@ -370,39 +412,19 @@ export function SourcesAutonomySettings() {
             {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
             Save folders
           </Button>
-          <Button type="button" variant="outline" onClick={runIncoming} disabled={runningIncoming} className="gap-2">
+          <Button
+            type="button"
+            variant="outline"
+            onClick={runIncoming}
+            disabled={runningIncoming || incomingRootsCount <= 0}
+            className="gap-2"
+          >
             {runningIncoming ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
             Run incoming scan now
           </Button>
-        </div>
-      </div>
-
-      <div className="space-y-3 rounded-xl border border-cyan-500/20 bg-cyan-500/[0.04] p-4">
-        <div className="flex items-center justify-between gap-3">
-          <div className="space-y-1">
-            <div className="flex items-center gap-2">
-              <span className="inline-flex h-7 w-7 items-center justify-center rounded-full bg-cyan-500/15 text-cyan-200 text-xs font-semibold">3</span>
-              <Label className="text-sm">Where should processed albums end up?</Label>
-            </div>
-            <p className="text-xs text-muted-foreground">
-              This is the main library destination for incoming albums once PMDA has matched, checked duplicates/incompletes, and validated metadata.
-            </p>
-            <div className="rounded-md border border-border/70 bg-background/40 px-3 py-2">
-              <div className="text-[11px] uppercase tracking-wide text-muted-foreground">Current primary folder</div>
-              <div className="mt-1 overflow-x-auto whitespace-nowrap font-mono text-xs text-foreground">
-                {currentWinnerPath || 'not set yet'}
-              </div>
-            </div>
-          </div>
-          <Select value={strategy} onValueChange={(value: 'move' | 'hardlink' | 'symlink' | 'copy') => setStrategy(value)}>
-            <SelectTrigger className="w-[220px]"><SelectValue /></SelectTrigger>
-            <SelectContent>
-              <SelectItem value="move">Move (single physical copy)</SelectItem>
-              <SelectItem value="hardlink">Hardlink (recommended, no extra space)</SelectItem>
-              <SelectItem value="symlink">Symlink (references original files)</SelectItem>
-              <SelectItem value="copy">Copy (duplicates files on disk)</SelectItem>
-            </SelectContent>
-          </Select>
+          {incomingRootsCount <= 0 ? (
+            <span className="text-[11px] text-muted-foreground">No incoming folders configured. This is optional.</span>
+          ) : null}
         </div>
       </div>
 

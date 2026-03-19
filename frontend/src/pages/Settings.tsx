@@ -934,7 +934,7 @@ function SettingsPage() {
                   Folders
                 </CardTitle>
                 <CardDescription>
-                  Configure scan roots, incoming/library roles, cache folders, and export destinations in one place.
+                  Configure standard source folders, optional incoming folders, cache folders, and export destinations in one place.
                 </CardDescription>
               </CardHeader>
               <CardContent className="space-y-5">
@@ -954,7 +954,7 @@ function SettingsPage() {
                 <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
                   <div className="rounded-xl border border-orange-500/20 bg-orange-500/[0.04] p-4 md:p-5 space-y-2">
                     <div className="flex items-center gap-2">
-                      <span className="inline-flex h-7 w-7 items-center justify-center rounded-full bg-orange-500/15 text-orange-200 text-xs font-semibold">4</span>
+                      <span className="inline-flex h-7 w-7 items-center justify-center rounded-full bg-orange-500/15 text-orange-200 text-xs font-semibold">2</span>
                       <Label className="text-sm">Where should duplicates go?</Label>
                     </div>
                     <p className="text-xs text-muted-foreground">
@@ -970,7 +970,7 @@ function SettingsPage() {
 
                   <div className="rounded-xl border border-amber-500/20 bg-amber-500/[0.04] p-4 md:p-5 space-y-2">
                     <div className="flex items-center gap-2">
-                      <span className="inline-flex h-7 w-7 items-center justify-center rounded-full bg-amber-500/15 text-amber-200 text-xs font-semibold">5</span>
+                      <span className="inline-flex h-7 w-7 items-center justify-center rounded-full bg-amber-500/15 text-amber-200 text-xs font-semibold">3</span>
                       <Label className="text-sm">Where should incomplete albums go?</Label>
                     </div>
                     <p className="text-xs text-muted-foreground">
@@ -988,7 +988,7 @@ function SettingsPage() {
                 <div className="rounded-xl border border-emerald-500/20 bg-emerald-500/[0.04] p-4 md:p-5 space-y-4">
                   <div className="space-y-1">
                     <div className="flex items-center gap-2">
-                      <span className="inline-flex h-7 w-7 items-center justify-center rounded-full bg-emerald-500/15 text-emerald-200 text-xs font-semibold">6</span>
+                      <span className="inline-flex h-7 w-7 items-center justify-center rounded-full bg-emerald-500/15 text-emerald-200 text-xs font-semibold">4</span>
                       <Label className="text-sm">Where should PMDA build the clean exported library?</Label>
                     </div>
                     <p className="text-xs text-muted-foreground">
@@ -1031,7 +1031,7 @@ function SettingsPage() {
                 <div className="rounded-xl border border-violet-500/20 bg-violet-500/[0.04] p-4 md:p-5 space-y-3">
                   <div className="space-y-1">
                     <div className="flex items-center gap-2">
-                      <span className="inline-flex h-7 w-7 items-center justify-center rounded-full bg-violet-500/15 text-violet-200 text-xs font-semibold">7</span>
+                      <span className="inline-flex h-7 w-7 items-center justify-center rounded-full bg-violet-500/15 text-violet-200 text-xs font-semibold">5</span>
                       <Label className="text-sm">Where should PMDA keep its artwork cache?</Label>
                     </div>
                     <p className="text-xs text-muted-foreground">
