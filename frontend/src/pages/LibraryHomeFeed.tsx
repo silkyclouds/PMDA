@@ -319,7 +319,7 @@ export default function LibraryHomeFeed() {
   }, [loadMore]);
 
   return (
-    <div className="pmda-library-shell py-4 md:py-6 space-y-5 md:space-y-6">
+    <div className="pmda-page-shell pmda-page-stack">
       <div className="flex items-center justify-between gap-3">
         <Button variant="ghost" className="gap-2" onClick={() => navigate(backLink.path)}>
           <ArrowLeft className="w-4 h-4" />
@@ -333,7 +333,7 @@ export default function LibraryHomeFeed() {
       <Card className="border-border/70">
         <CardContent className="p-5">
           <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
-            <h1 className="text-2xl font-bold truncate">{FEED_TITLES[section]}</h1>
+            <h1 className="pmda-page-title truncate">{FEED_TITLES[section]}</h1>
             <div className="flex flex-col sm:flex-row sm:items-center gap-3">
               {(ALBUM_FEEDS.has(section) || ARTIST_FEEDS.has(section)) ? (
                 <GridSizeControl value={tileSize} onChange={setTileSize} className="w-full sm:w-[260px]" />

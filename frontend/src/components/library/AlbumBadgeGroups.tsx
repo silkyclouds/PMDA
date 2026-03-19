@@ -59,9 +59,9 @@ export function AlbumBadgeGroups({
   const hasAlbumFacts = Boolean(String(format || '').trim()) || typeof isLossless === 'boolean' || Number(year || 0) > 0 || Number(trackCount || 0) > 0;
   const hasTaxonomy = cleanGenres.length > 0 || Boolean(cleanLabel);
   const headingClass = compact
-    ? 'text-[9px] font-medium uppercase tracking-[0.18em] text-muted-foreground/80'
-    : 'text-[10px] font-medium uppercase tracking-[0.2em] text-muted-foreground/85';
-  const badgeClass = compact ? 'text-[10px]' : 'text-[11px]';
+    ? 'text-[10px] font-medium uppercase tracking-[0.18em] text-muted-foreground/80'
+    : 'text-[11px] font-medium uppercase tracking-[0.2em] text-muted-foreground/85';
+  const badgeClass = 'text-[11px]';
 
   return (
     <div className="space-y-2">

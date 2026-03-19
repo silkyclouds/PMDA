@@ -80,10 +80,10 @@ export default function Scan() {
   }, [scanProgress?.scanning, queryClient]);
 
   return (
-    <main className="container py-6 space-y-6">
+    <main className="pmda-page-shell pmda-page-stack">
       <div>
-        <h1 className="text-display text-foreground">Library Scan</h1>
-        <p className="text-small text-muted-foreground mt-1">Run scans, then resolve duplicates and metadata in a clear workflow</p>
+        <h1 className="pmda-page-title">Library Scan</h1>
+        <p className="pmda-meta-text mt-1">Run scans, then resolve duplicates and metadata in a clear workflow</p>
       </div>
 
       <ScanProgress

@@ -212,7 +212,7 @@ export default function LabelPage() {
   }, [label, labelLiked, toast]);
 
   return (
-    <div className="pmda-library-shell py-4 md:py-6 space-y-5 md:space-y-6">
+    <div className="pmda-page-shell pmda-page-stack">
       <div className="flex items-center justify-between gap-3">
         <Button variant="ghost" className="gap-2" onClick={() => navigate(backLink.path)}>
           <ArrowLeft className="w-4 h-4" />
@@ -227,7 +227,7 @@ export default function LabelPage() {
         <CardContent className="p-5 space-y-4">
           <div className="flex items-start justify-between gap-4">
             <div className="min-w-0">
-              <h1 className="text-2xl font-bold leading-tight break-words">{label || 'Label'}</h1>
+              <h1 className="pmda-page-title break-words">{label || 'Label'}</h1>
               <p className="text-xs text-muted-foreground mt-1">
                 {(profile?.album_count || total || 0).toLocaleString()} release{(profile?.album_count || total || 0) !== 1 ? 's' : ''}
               </p>

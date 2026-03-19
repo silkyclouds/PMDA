@@ -118,11 +118,11 @@ export default function RecommendationsPage() {
   };
 
   return (
-    <div className="pmda-library-shell py-6 space-y-6">
-      <div className="flex flex-wrap items-start justify-between gap-3">
+    <div className="pmda-page-shell pmda-page-stack">
+      <div className="pmda-page-header">
         <div className="space-y-1">
-          <h1 className="text-3xl font-bold tracking-tight">Recommendations</h1>
-          <p className="text-sm text-muted-foreground">
+          <h1 className="pmda-page-title">Recommendations</h1>
+          <p className="pmda-meta-text">
             Albums, artists, labels and playlists shared between PMDA users.
           </p>
         </div>

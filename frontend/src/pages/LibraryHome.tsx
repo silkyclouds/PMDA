@@ -533,7 +533,7 @@ export default function LibraryHome() {
       {homeEditMode ? (
         <Card className="pmda-flat-surface animate-in fade-in-0 slide-in-from-bottom-2 duration-200">
           <CardHeader className="pb-2">
-            <CardTitle className="text-sm">Home Sections</CardTitle>
+            <CardTitle className="text-sm font-semibold tracking-tight">Home Sections</CardTitle>
             <CardDescription>Drag to reorder, uncheck to hide.</CardDescription>
           </CardHeader>
           <CardContent className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-2">
@@ -574,7 +574,7 @@ export default function LibraryHome() {
         <CardHeader className="pb-3">
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div className="space-y-1">
-              <CardTitle className="text-base flex items-center gap-2">
+              <CardTitle className="pmda-section-title flex items-center gap-2">
                 <Flame className="h-4 w-4 text-primary" />
                 Discover
               </CardTitle>
@@ -716,7 +716,7 @@ export default function LibraryHome() {
                                     {a.artist_name}
                                   </button>
                                 </div>
-                                <Badge variant="outline" className="text-[10px] shrink-0">
+                                <Badge variant="outline" className="text-[11px] shrink-0">
                                   {a.year ?? '—'}
                                 </Badge>
                               </div>
@@ -759,7 +759,7 @@ export default function LibraryHome() {
         <CardHeader className="pb-3">
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div className="space-y-1">
-              <CardTitle className="text-base flex items-center gap-2">
+              <CardTitle className="pmda-section-title flex items-center gap-2">
                 <Sparkles className="h-4 w-4 text-primary" />
                 For You
               </CardTitle>
@@ -817,7 +817,7 @@ export default function LibraryHome() {
                         {rec.artist_name} · {rec.album_title}
                       </p>
                       {Array.isArray(rec.reasons) && rec.reasons.length > 0 && (
-                        <p className="text-[10px] text-muted-foreground truncate mt-2">{rec.reasons.join(' · ')}</p>
+                        <p className="text-[11px] text-muted-foreground truncate mt-2">{rec.reasons.join(' · ')}</p>
                       )}
                     </div>
                     <Play className="w-4 h-4 text-muted-foreground group-hover:text-primary shrink-0 mt-0.5" />
@@ -836,7 +836,7 @@ export default function LibraryHome() {
         <CardHeader className="pb-3">
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div className="space-y-1">
-              <CardTitle className="text-base">Top Artists</CardTitle>
+              <CardTitle className="pmda-section-title">Top Artists</CardTitle>
               <CardDescription>Most played from your local listening stats.</CardDescription>
             </div>
             <div className="flex items-center gap-2 shrink-0">
@@ -917,7 +917,7 @@ export default function LibraryHome() {
         <CardHeader className="pb-3">
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div className="space-y-1">
-              <CardTitle className="text-base">Recently Added Artists</CardTitle>
+              <CardTitle className="pmda-section-title">Recently Added Artists</CardTitle>
               <CardDescription>Artists with the most recent imports.</CardDescription>
             </div>
             <div className="flex items-center gap-2 shrink-0">
@@ -997,7 +997,7 @@ export default function LibraryHome() {
         <CardHeader className="pb-3">
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div className="space-y-1">
-              <CardTitle className="text-base">Recently Played</CardTitle>
+              <CardTitle className="pmda-section-title">Recently Played</CardTitle>
               <CardDescription>What you played lately, across the whole library.</CardDescription>
             </div>
             <div className="flex items-center gap-2 shrink-0">
@@ -1073,7 +1073,7 @@ export default function LibraryHome() {
                                 {a.artist_name}
                               </button>
                             </div>
-                            <Badge variant="outline" className="text-[10px] shrink-0">
+                            <Badge variant="outline" className="text-[11px] shrink-0">
                               {a.year ?? '—'}
                             </Badge>
                           </div>
@@ -1114,7 +1114,7 @@ export default function LibraryHome() {
         <CardHeader className="pb-3">
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div className="space-y-1">
-              <CardTitle className="text-base">Recently Added</CardTitle>
+              <CardTitle className="pmda-section-title">Recently Added</CardTitle>
               <CardDescription>Fresh imports from your storage.</CardDescription>
             </div>
             <div className="flex items-center gap-2 shrink-0">
@@ -1184,7 +1184,7 @@ export default function LibraryHome() {
                                 {a.artist_name}
                               </button>
                             </div>
-                            <Badge variant="outline" className="text-[10px] shrink-0">
+                            <Badge variant="outline" className="text-[11px] shrink-0">
                               {a.year ?? '—'}
                             </Badge>
                           </div>

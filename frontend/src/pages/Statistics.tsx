@@ -429,14 +429,14 @@ function StatCard({
   return (
     <Card>
       <CardHeader className="pb-2">
-        <CardTitle className="text-caption font-medium flex items-center gap-1.5 text-muted-foreground uppercase tracking-wider">
+        <CardTitle className="text-xs font-medium flex items-center gap-1.5 text-muted-foreground uppercase tracking-wider">
           {icon}
           {title}
         </CardTitle>
       </CardHeader>
       <CardContent className="space-y-1">
-        <p className="text-display font-bold text-foreground tabular-nums">{value}</p>
-        {description && <p className="text-caption text-muted-foreground">{description}</p>}
+        <p className="text-3xl font-bold tracking-tight text-foreground tabular-nums">{value}</p>
+        {description && <p className="text-xs text-muted-foreground">{description}</p>}
         {delta}
       </CardContent>
     </Card>
@@ -1296,11 +1296,11 @@ export default function Statistics() {
   }
 
   return (
-    <div className="container mx-auto p-6 space-y-6">
+    <div className="pmda-page-shell pmda-page-stack">
         <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
           <div>
-            <h1 className="text-display text-foreground">Statistics</h1>
-            <p className="text-small text-muted-foreground mt-1">Single source of truth from completed scans</p>
+            <h1 className="pmda-page-title">Statistics</h1>
+            <p className="pmda-meta-text mt-1">Single source of truth from completed scans</p>
           </div>
           <StatisticsPageNav active="scan" />
         </div>
@@ -1711,7 +1711,7 @@ export default function Statistics() {
                 />
                 <Card>
                   <CardHeader className="pb-2">
-                    <CardTitle className="text-caption font-medium flex items-center gap-1.5 text-muted-foreground uppercase tracking-wider">
+                    <CardTitle className="text-xs font-medium flex items-center gap-1.5 text-muted-foreground uppercase tracking-wider">
                       <Database className="w-4 h-4 text-secondary" />
                       Fallback Providers
                     </CardTitle>

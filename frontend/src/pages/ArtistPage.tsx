@@ -695,7 +695,7 @@ export default function ArtistPage() {
 
   if (loading) {
     return (
-      <div className="pmda-library-shell py-8">
+      <div className="pmda-page-shell">
         <div className="flex items-center justify-center py-24">
           <Loader2 className="w-10 h-10 animate-spin text-primary" />
         </div>
@@ -709,7 +709,7 @@ export default function ArtistPage() {
       label: 'Library',
     });
     return (
-      <div className="pmda-library-shell py-8">
+      <div className="pmda-page-shell">
         <Card>
           <CardContent className="p-8 space-y-4 text-center">
             <p className="text-muted-foreground">{error || 'Artist not found'}</p>
@@ -818,7 +818,7 @@ export default function ArtistPage() {
   };
 
   return (
-    <div className="pmda-library-shell py-4 md:py-6 space-y-5 md:space-y-6">
+    <div className="pmda-page-shell pmda-page-stack">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <Button variant="ghost" className="gap-2" onClick={() => navigate(effectiveBackLink.path)}>
             <ArrowLeft className="w-4 h-4" />
@@ -852,8 +852,8 @@ export default function ArtistPage() {
             <div className="absolute inset-0 z-10 bg-gradient-to-r from-white/86 via-white/48 to-white/16 dark:from-background dark:via-background/92 dark:to-background/70" />
             <div className="absolute inset-0 z-10 bg-gradient-to-t from-background/76 via-transparent to-transparent" />
             <div className="relative z-20 flex min-h-[24rem] items-end p-6 md:min-h-[30rem] md:p-8">
-              <div className="grid grid-cols-1 md:grid-cols-[18rem,minmax(0,1fr)] xl:grid-cols-[20rem,minmax(0,1fr)] gap-8 md:gap-14 w-full items-center">
-                <div className="w-40 h-48 sm:w-48 sm:h-56 md:w-72 md:h-80 xl:w-80 xl:h-[28rem] overflow-hidden border border-white/12 bg-muted shrink-0 shadow-[0_24px_60px_rgba(0,0,0,0.5)]">
+              <div className="grid grid-cols-1 md:grid-cols-[19rem,minmax(0,1fr)] xl:grid-cols-[21rem,minmax(0,1fr)] gap-8 md:gap-14 w-full items-center">
+                <div className="w-44 h-52 sm:w-52 sm:h-60 md:w-[19rem] md:h-[22rem] xl:w-[21rem] xl:h-[26rem] overflow-hidden border border-white/12 bg-muted shrink-0 shadow-[0_24px_60px_rgba(0,0,0,0.5)]">
                   {heroImage ? (
                     <AuthenticatedImage
                       src={heroImage}
@@ -950,22 +950,6 @@ export default function ArtistPage() {
                         AI research
                       </Button>
                     ) : null}
-                    {displaySource ? (
-                      <ProviderBadge provider={displaySource} prefix="Source" className="text-[10px]" />
-                    ) : null}
-                    {artistUpdatedAt ? (
-                      <button
-                        type="button"
-                        className={cn(
-                          'inline-flex items-center rounded-full border px-2.5 py-1 text-[10px] leading-none transition-colors hover:brightness-110',
-                          badgeKindClass('muted')
-                        )}
-                        onClick={() => setMatchDialogOpen(true)}
-                        title="Open match detail"
-                      >
-                        Updated: {formatBadgeDateTime(artistUpdatedAt)}
-                      </button>
-                    ) : null}
                   </div>
                 </div>
               </div>
@@ -1012,6 +996,26 @@ export default function ArtistPage() {
                 No artist description available yet.
               </p>
             )}
+            {(displaySource || artistUpdatedAt) ? (
+              <div className="flex flex-wrap items-center gap-2 border-t border-border/50 pt-3">
+                {displaySource ? (
+                  <ProviderBadge provider={displaySource} prefix="Source" className="text-[11px]" />
+                ) : null}
+                {artistUpdatedAt ? (
+                  <button
+                    type="button"
+                    className={cn(
+                      'inline-flex items-center rounded-md border px-2.5 py-1 text-[11px] leading-none transition-colors hover:brightness-110',
+                      badgeKindClass('muted')
+                    )}
+                    onClick={() => setMatchDialogOpen(true)}
+                    title="Open match detail"
+                  >
+                    Updated: {formatBadgeDateTime(artistUpdatedAt)}
+                  </button>
+                ) : null}
+              </div>
+            ) : null}
           </CardContent>
         </Card>
 
@@ -1029,7 +1033,7 @@ export default function ArtistPage() {
                 >
                   <Calendar className="h-3.5 w-3.5" />
                   Concerts
-                  <Badge variant={concertList.events.length > 0 ? 'secondary' : 'outline'} className="h-5 px-1.5 text-[10px]">
+                  <Badge variant={concertList.events.length > 0 ? 'secondary' : 'outline'} className="h-5 px-1.5 text-[11px]">
                     {concertList.events.length}
                   </Badge>
                 </Button>
@@ -1186,11 +1190,11 @@ export default function ArtistPage() {
               <DialogTitle className="flex items-center gap-2">
                 <Calendar className="w-4 h-4 text-primary" />
                 Upcoming Concerts
-                <Badge variant="outline" className={`text-[10px] ${badgeKindClass('count')}`}>
+                <Badge variant="outline" className={`text-[11px] ${badgeKindClass('count')}`}>
                   {concertList.events.length}
                 </Badge>
                 {concertsMeta?.provider ? (
-                  <ProviderBadge provider={concertsMeta.provider} className="text-[10px]" />
+                  <ProviderBadge provider={concertsMeta.provider} className="text-[11px]" />
                 ) : null}
               </DialogTitle>
               <DialogDescription>
@@ -1255,7 +1259,7 @@ export default function ArtistPage() {
               <div className="flex items-center justify-between gap-3">
                 <div className="flex items-center gap-2">
                   <Disc3 className="w-4 h-4 text-primary" />
-                  <h2 className="text-lg font-semibold">{type === 'Single' ? 'Singles' : `${type}s`}</h2>
+                  <h2 className="pmda-section-title">{type === 'Single' ? 'Singles' : `${type}s`}</h2>
                 </div>
                 <div className="flex flex-col sm:flex-row sm:items-center gap-3">
                   <GridSizeControl value={tileSize} onChange={setTileSize} className="w-full sm:w-[260px]" />
@@ -1324,22 +1328,22 @@ export default function ArtistPage() {
                           {album.classical ? (
                             <div className="space-y-1">
                               {joinClassical(album.classical.work, 2) ? (
-                                <p className="text-[10px] font-medium text-foreground/85 line-clamp-2">
+                                <p className="text-[11px] font-medium text-foreground/85 line-clamp-2">
                                   {joinClassical(album.classical.work, 2)}
                                 </p>
                               ) : null}
                               {joinClassical(album.classical.composer, 2) ? (
-                                <p className="text-[10px] text-muted-foreground line-clamp-1">
+                                <p className="text-[11px] text-muted-foreground line-clamp-1">
                                   Composer: {joinClassical(album.classical.composer, 2)}
                                 </p>
                               ) : null}
                               {joinClassical(album.classical.conductor, 2) || joinClassical(album.classical.orchestra, 2) ? (
-                                <p className="text-[10px] text-muted-foreground line-clamp-2">
+                                <p className="text-[11px] text-muted-foreground line-clamp-2">
                                   {[joinClassical(album.classical.conductor, 2), joinClassical(album.classical.orchestra, 2)].filter(Boolean).join(' • ')}
                                 </p>
                               ) : null}
                               {joinClassical(album.classical.soloists, 2) ? (
-                                <p className="text-[10px] text-muted-foreground line-clamp-2">
+                                <p className="text-[11px] text-muted-foreground line-clamp-2">
                                   Soloists: {joinClassical(album.classical.soloists, 2)}
                                 </p>
                               ) : null}
@@ -1387,7 +1391,7 @@ export default function ArtistPage() {
         <section className="space-y-3">
           <div className="flex items-center gap-2">
             <Sparkles className="w-4 h-4 text-primary" />
-            <h2 className="text-lg font-semibold">Similar Artists</h2>
+            <h2 className="pmda-section-title">Similar Artists</h2>
           </div>
           {similar.length === 0 ? (
             <Card>
@@ -1425,7 +1429,7 @@ export default function ArtistPage() {
 	                  }}
 	                >
 	                  <CardContent className="p-0">
-	                    <div className="relative aspect-square w-full bg-muted overflow-hidden flex items-center justify-center border-b border-border/60">
+	                    <div className="relative aspect-[4/5] w-full bg-muted overflow-hidden flex items-center justify-center border-b border-border/60">
 	                      {artist.image_url && !isProbablyPlaceholderArtistImageUrl(artist.image_url) ? (
 	                        <AuthenticatedImage
                             src={artist.image_url}

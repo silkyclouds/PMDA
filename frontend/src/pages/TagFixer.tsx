@@ -80,11 +80,11 @@ export default function TagFixer() {
   }, [searchQuery, filterArtist, albums]);
 
   return (
-    <div className="container py-6">
-        <div className="flex items-center justify-between mb-6">
+    <div className="pmda-page-shell pmda-page-stack">
+        <div className="pmda-page-header">
           <div>
-            <h1 className="text-3xl font-bold">Tag Fixer</h1>
-            <p className="text-sm text-muted-foreground mt-1">
+            <h1 className="pmda-page-title">Tag Fixer</h1>
+            <p className="pmda-meta-text mt-1">
               Find and fix albums with missing MusicBrainz tags
             </p>
           </div>
@@ -99,7 +99,7 @@ export default function TagFixer() {
         </div>
 
         {albums.length > 0 && (
-          <div className="mb-4 flex items-center gap-4">
+          <div className="flex items-center gap-4">
             <div className="relative flex-1 max-w-sm">
               <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
               <Input

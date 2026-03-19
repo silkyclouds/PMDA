@@ -216,10 +216,10 @@ export default function LibraryAlbums() {
   }
 
   return (
-    <div className="pmda-library-shell pb-6 space-y-4">
+    <div className="pmda-page-shell pb-6 pmda-page-stack">
       <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
         <div className="space-y-1">
-          <div className="text-lg font-semibold">Albums</div>
+          <h1 className="pmda-page-title">Albums</h1>
           <div className="text-xs text-muted-foreground">
             {totalAlbums > 0 ? `${albums.length.toLocaleString()} / ${totalAlbums.toLocaleString()}` : ' '}
           </div>

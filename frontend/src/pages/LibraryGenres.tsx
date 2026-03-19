@@ -114,10 +114,10 @@ export default function LibraryGenres() {
   }
 
   return (
-    <div className="pmda-library-shell pb-6 space-y-4">
+    <div className="pmda-page-shell pb-6 pmda-page-stack">
       <div className="flex items-end justify-between gap-3">
         <div className="space-y-1">
-          <div className="text-lg font-semibold">Genres</div>
+          <h1 className="pmda-page-title">Genres</h1>
           <div className="text-xs text-muted-foreground">
             {total > 0 ? `${genres.length.toLocaleString()} / ${total.toLocaleString()}` : ' '}
           </div>

@@ -181,7 +181,7 @@ export default function PlaylistDetail() {
 
   if (loading) {
     return (
-      <div className="container py-10">
+      <div className="pmda-page-shell">
         <div className="flex items-center justify-center py-24">
           <Loader2 className="w-10 h-10 animate-spin text-primary" />
         </div>
@@ -191,7 +191,7 @@ export default function PlaylistDetail() {
 
   if (error || !detail) {
     return (
-      <div className="container py-10 space-y-4">
+      <div className="pmda-page-shell pmda-page-stack">
         <Card>
           <CardContent className="p-8 space-y-3 text-center">
             <div className="text-sm text-muted-foreground">{error || 'Playlist not found'}</div>
@@ -203,7 +203,7 @@ export default function PlaylistDetail() {
   }
 
   return (
-    <div className="container py-6 space-y-6">
+    <div className="pmda-page-shell pmda-page-stack">
       <div className="flex items-start justify-between gap-4">
         <div className="space-y-2">
           <Button variant="ghost" className="gap-2" onClick={() => navigate(backLink.path)}>
@@ -211,12 +211,12 @@ export default function PlaylistDetail() {
             {`Back to ${backLink.label}`}
           </Button>
           <div>
-            <h1 className="text-3xl font-bold tracking-tight">{detail.name}</h1>
-            <p className="text-sm text-muted-foreground">{detail.description || ' '}</p>
+            <h1 className="pmda-page-title">{detail.name}</h1>
+            <p className="pmda-meta-text">{detail.description || ' '}</p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
-            <Badge variant="outline" className="text-[10px]">{detail.items.length} tracks</Badge>
-            {savingOrder ? <Badge variant="outline" className="text-[10px]">Saving order…</Badge> : null}
+            <Badge variant="outline" className="text-[11px]">{detail.items.length} tracks</Badge>
+            {savingOrder ? <Badge variant="outline" className="text-[11px]">Saving order…</Badge> : null}
           </div>
         </div>
 

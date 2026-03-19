@@ -92,12 +92,12 @@ export default function Playlists() {
   }, [createDescription, createName, load, navigate, pendingSeed, toast]);
 
   return (
-    <div className="container py-6 space-y-6">
-      <div className="flex items-start justify-between gap-4">
+    <div className="pmda-page-shell pmda-page-stack">
+      <div className="pmda-page-header">
         <div className="space-y-1">
-          <h1 className="text-3xl font-bold tracking-tight">Playlists</h1>
-          <p className="text-sm text-muted-foreground">
-            Local playlists stored in PostgreSQL. Drag tracks from the Now Playing queue onto a playlist in the sidebar.
+          <h1 className="pmda-page-title">Playlists</h1>
+          <p className="pmda-meta-text">
+            Your personal playlists. Drag tracks from the player queue into the sidebar to build them quickly.
           </p>
         </div>
         <Dialog open={createOpen} onOpenChange={setCreateOpen}>

@@ -186,6 +186,34 @@
     padding-right: var(--pmda-page-gutter);
   }
 
+  .pmda-page-shell {
+    @apply pmda-library-shell py-5 md:py-6;
+  }
+
+  .pmda-page-stack {
+    @apply space-y-5 md:space-y-6;
+  }
+
+  .pmda-page-header {
+    @apply flex flex-col gap-3 md:flex-row md:items-start md:justify-between;
+  }
+
+  .pmda-page-title {
+    @apply text-2xl font-bold tracking-tight text-foreground;
+  }
+
+  .pmda-section-title {
+    @apply text-lg font-semibold tracking-tight text-foreground;
+  }
+
+  .pmda-meta-text {
+    @apply text-sm text-muted-foreground;
+  }
+
+  .pmda-caption-text {
+    @apply text-xs text-muted-foreground;
+  }
+
   /* Stats badge */
   .stat-badge {
     @apply inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-card border border-border;

@@ -837,10 +837,10 @@ function SettingsPage() {
 
   if (!auth.isAdmin) {
     return (
-      <div className="container mx-auto max-w-3xl p-6">
+      <div className="pmda-page-shell">
         <div className="mb-6">
-          <h1 className="text-3xl font-bold">Settings</h1>
-          <p className="mt-1 text-muted-foreground">
+          <h1 className="pmda-page-title">Settings</h1>
+          <p className="mt-1 pmda-meta-text">
             Personal profile preferences for sharing and identification inside PMDA.
           </p>
         </div>
@@ -850,11 +850,11 @@ function SettingsPage() {
   }
 
   return (
-    <div className="container mx-auto p-6 max-w-5xl">
+    <div className="pmda-page-shell">
         <div className="flex items-center justify-between mb-6">
           <div>
-            <h1 className="text-3xl font-bold">Settings</h1>
-            <p className="text-muted-foreground mt-1">
+            <h1 className="pmda-page-title">Settings</h1>
+            <p className="pmda-meta-text mt-1">
               Changes are saved automatically. No restart needed.
             </p>
           </div>

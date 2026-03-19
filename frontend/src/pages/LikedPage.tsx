@@ -103,11 +103,11 @@ export default function LikedPage() {
   };
 
   return (
-    <div className="pmda-library-shell py-6 space-y-6">
-      <div className="flex flex-wrap items-start justify-between gap-3">
+    <div className="pmda-page-shell pmda-page-stack">
+      <div className="pmda-page-header">
         <div className="space-y-1">
-          <h1 className="text-3xl font-bold tracking-tight">Liked</h1>
-          <p className="text-sm text-muted-foreground">
+          <h1 className="pmda-page-title">Liked</h1>
+          <p className="pmda-meta-text">
             Your own likes and PMDA suggestions derived from your ratings and favorites.
           </p>
         </div>
@@ -157,8 +157,8 @@ export default function LikedPage() {
           <section className="space-y-3">
             <div className="flex items-center gap-2">
               <Music2 className="h-4 w-4 text-primary" />
-              <h2 className="text-lg font-semibold">Liked tracks</h2>
-              <Badge variant="outline" className="text-[10px]">{tracks.length}</Badge>
+              <h2 className="pmda-section-title">Liked tracks</h2>
+              <Badge variant="outline" className="text-[11px]">{tracks.length}</Badge>
             </div>
             {tracks.length === 0 ? (
               <Card><CardContent className="p-6 text-sm text-muted-foreground">No liked tracks yet.</CardContent></Card>
@@ -202,8 +202,8 @@ export default function LikedPage() {
           <section className="space-y-3">
             <div className="flex items-center gap-2">
               <Heart className="h-4 w-4 text-primary" />
-              <h2 className="text-lg font-semibold">Liked albums</h2>
-              <Badge variant="outline" className="text-[10px]">{albums.length}</Badge>
+              <h2 className="pmda-section-title">Liked albums</h2>
+              <Badge variant="outline" className="text-[11px]">{albums.length}</Badge>
             </div>
             {albums.length === 0 ? (
               <Card><CardContent className="p-6 text-sm text-muted-foreground">No liked albums yet.</CardContent></Card>
@@ -260,7 +260,7 @@ export default function LikedPage() {
           </section>
 
           <section className="space-y-3">
-            <h2 className="text-lg font-semibold">Liked artists</h2>
+            <h2 className="pmda-section-title">Liked artists</h2>
             {artists.length === 0 ? (
               <Card><CardContent className="p-6 text-sm text-muted-foreground">No liked artists yet.</CardContent></Card>
             ) : (
@@ -292,7 +292,7 @@ export default function LikedPage() {
           </section>
 
           <section className="space-y-3">
-            <h2 className="text-lg font-semibold">Liked labels</h2>
+            <h2 className="pmda-section-title">Liked labels</h2>
             {labels.length === 0 ? (
               <Card><CardContent className="p-6 text-sm text-muted-foreground">No liked labels yet.</CardContent></Card>
             ) : (
@@ -315,7 +315,7 @@ export default function LikedPage() {
           </section>
 
           <section className="space-y-3">
-            <h2 className="text-lg font-semibold">Because you liked this</h2>
+            <h2 className="pmda-section-title">Because you liked this</h2>
             {suggestions.length === 0 ? (
               <Card><CardContent className="p-6 text-sm text-muted-foreground">PMDA has no suggestions yet.</CardContent></Card>
             ) : (

@@ -20,7 +20,7 @@ const formatClasses: Record<string, string> = {
 export function FormatBadge({ format, className, size = 'md' }: FormatBadgeProps) {
   const normalizedFormat = format.toLowerCase().replace('.', '');
   const formatClass = formatClasses[normalizedFormat] || '';
-  const sizeClass = size === 'sm' ? 'text-[10px] px-1.5 py-0' : '';
+  const sizeClass = size === 'sm' ? 'text-[11px] px-1.5 py-0' : '';
 
   return (
     <span className={cn('format-badge', formatClass, sizeClass, className)}>

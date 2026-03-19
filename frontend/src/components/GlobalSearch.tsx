@@ -158,7 +158,7 @@ export function GlobalSearch({ className }: { className?: string }) {
       ) : null}
 
       {open && (
-        <div className="absolute top-[calc(100%+0.35rem)] left-0 right-0 z-50 rounded-xl border border-border/70 bg-popover/95 backdrop-blur-xl shadow-2xl overflow-hidden">
+        <div className="absolute top-[calc(100%+0.35rem)] left-0 z-50 w-full max-w-[56rem] rounded-xl border border-border/70 bg-popover/95 backdrop-blur-xl shadow-2xl overflow-hidden">
           {items.length === 0 ? (
             <div className="px-3 py-2.5 text-sm text-muted-foreground">No results</div>
           ) : (
@@ -188,7 +188,7 @@ export function GlobalSearch({ className }: { className?: string }) {
                     <div className="min-w-0 flex-1">
                       <div className="flex items-center gap-2">
                         <span className="font-medium text-sm truncate">{item.title}</span>
-                        <span className="text-[10px] uppercase tracking-wider text-muted-foreground shrink-0">
+                        <span className="text-[11px] uppercase tracking-wider text-muted-foreground shrink-0">
                           {groupedLabel(item)}
                         </span>
                       </div>

@@ -174,11 +174,11 @@ export default function Tools() {
   };
 
   return (
-    <div className="container mx-auto p-6 max-w-6xl space-y-6">
-        <div className="flex items-center justify-between">
+    <div className="pmda-page-shell pmda-page-stack">
+        <div className="pmda-page-header">
           <div>
-            <h1 className="text-3xl font-bold">Tools</h1>
-            <p className="text-muted-foreground mt-1">
+            <h1 className="pmda-page-title">Tools</h1>
+            <p className="pmda-meta-text mt-1">
               Live view of fixed, deduped, and moved incomplete albums with restore actions.
             </p>
           </div>
@@ -198,7 +198,8 @@ export default function Tools() {
           <CardContent className="py-4 flex flex-wrap items-center gap-2">
             <Button
               size="sm"
-              className="gap-1.5 bg-amber-500/90 hover:bg-amber-500 text-black border border-amber-300/30"
+              variant="default"
+              className="gap-1.5"
               onClick={() => navigate(`/broken-albums${selectedRunQuery}`)}
               disabled={!hasIncompleteReview}
             >
@@ -206,7 +207,8 @@ export default function Tools() {
             </Button>
             <Button
               size="sm"
-              className="gap-1.5 bg-amber-500/90 hover:bg-amber-500 text-black border border-amber-300/30"
+              variant="outline"
+              className="gap-1.5"
               onClick={() => navigate(`/tools/duplicates${selectedRunQuery}`)}
               disabled={!hasDuplicateReview}
             >

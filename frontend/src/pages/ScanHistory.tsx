@@ -51,11 +51,11 @@ export default function ScanHistory() {
   return (
     <>
       <Header />
-      <div className="container mx-auto p-6 space-y-6">
+      <div className="pmda-page-shell pmda-page-stack">
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-3xl font-bold">History</h1>
-          <p className="text-muted-foreground mt-1">
+          <h1 className="pmda-page-title">History</h1>
+          <p className="pmda-meta-text mt-1">
             Scans, undupes, and restore moved albums
           </p>
         </div>
@@ -95,7 +95,7 @@ export default function ScanHistory() {
       </div>
 
       {/* List and Details */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+      <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
         <ScanHistoryList
           history={history}
           selectedScan={selectedScan}
@@ -111,7 +111,7 @@ export default function ScanHistory() {
           />
         )}
       </div>
-    </div>
+      </div>
     </>
   );
 }

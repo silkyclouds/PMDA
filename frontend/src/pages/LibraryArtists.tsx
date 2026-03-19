@@ -121,10 +121,10 @@ export default function LibraryArtists() {
   }
 
   return (
-    <div className="pmda-library-shell pb-6 space-y-4">
+    <div className="pmda-page-shell pb-6 pmda-page-stack">
       <div className="flex flex-col md:flex-row md:items-end md:justify-between gap-3">
         <div className="space-y-1">
-          <div className="text-lg font-semibold">Artists</div>
+          <h1 className="pmda-page-title">Artists</h1>
           <div className="text-xs text-muted-foreground">
             {total > 0 ? `${artists.length.toLocaleString()} / ${total.toLocaleString()}` : ' '}
           </div>
@@ -166,7 +166,7 @@ export default function LibraryArtists() {
                   <UserRound className="w-10 h-10 text-muted-foreground" />
                 )}
               </div>
-              <div className="space-y-2 p-4">
+              <div className="space-y-2 p-3.5">
                 <div className="text-base font-semibold leading-tight line-clamp-2 min-h-[2.5rem]">
                   {a.artist_name}
                 </div>

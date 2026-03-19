@@ -583,7 +583,7 @@ export default function AlbumPage() {
   });
 
   return (
-    <div className="pmda-library-shell py-4 md:py-6 space-y-5 md:space-y-6">
+    <div className="pmda-page-shell pmda-page-stack">
       <div className="flex flex-wrap items-start justify-between gap-3">
             <Button variant="ghost" className="gap-2" onClick={() => navigate(effectiveBackLink.path)}>
           <ArrowLeft className="w-4 h-4" />
@@ -656,7 +656,7 @@ export default function AlbumPage() {
             <button
               type="button"
               className={cn(
-                "inline-flex items-center border px-2.5 py-1 text-[10px] leading-none transition-colors hover:brightness-110",
+                "inline-flex items-center border px-2.5 py-1 text-[11px] leading-none transition-colors hover:brightness-110",
                 badgeKindClass('muted')
               )}
               onClick={() => setMatchDialogOpen(true)}
@@ -683,10 +683,10 @@ export default function AlbumPage() {
           <div className="absolute inset-0 z-10 bg-gradient-to-r from-white/86 via-white/48 to-white/16 dark:from-background dark:via-background/92 dark:to-background/70" />
           <div className="absolute inset-0 z-10 bg-gradient-to-t from-background/76 via-transparent to-transparent" />
           <div className="relative z-20 flex min-h-[22rem] items-end p-6 md:min-h-[28rem] md:p-8 xl:p-10">
-            <div className="grid w-full grid-cols-1 items-end gap-6 md:grid-cols-[18rem,1fr] xl:grid-cols-[20rem,1fr]">
+            <div className="grid w-full grid-cols-1 items-end gap-6 md:grid-cols-[19rem,1fr] xl:grid-cols-[21rem,1fr]">
               <button
                 type="button"
-                className="group relative h-52 w-52 overflow-hidden border border-white/12 bg-muted shadow-[0_28px_80px_-48px_rgba(0,0,0,0.9)] md:h-72 md:w-72 xl:h-80 xl:w-80"
+                className="group relative h-56 w-56 overflow-hidden border border-white/12 bg-muted shadow-[0_28px_80px_-48px_rgba(0,0,0,0.9)] md:h-[19rem] md:w-[19rem] xl:h-[21rem] xl:w-[21rem]"
                 onClick={() => setArtworkGalleryOpen(true)}
                 title="View artwork stack"
               >
@@ -740,21 +740,21 @@ export default function AlbumPage() {
 
                 <div className="mt-5 flex flex-wrap items-center gap-2">
                   {data.year ? (
-                    <Badge variant="outline" className={cn("gap-1.5 text-[10px]", badgeKindClass('year'))}>
+                    <Badge variant="outline" className={cn("gap-1.5 text-[11px]", badgeKindClass('year'))}>
                       <Calendar className="w-3 h-3" />
                       {data.year}
                     </Badge>
                   ) : null}
-                  <Badge variant="outline" className={cn("text-[10px]", badgeKindClass('count'))}>
+                  <Badge variant="outline" className={cn("text-[11px]", badgeKindClass('count'))}>
                     {data.track_count} tracks
                   </Badge>
-                  <Badge variant="outline" className={cn("text-[10px]", badgeKindClass('duration'))}>
+                  <Badge variant="outline" className={cn("text-[11px]", badgeKindClass('duration'))}>
                     {formatDuration(data.total_duration_sec || 0)}
                   </Badge>
                   {data.format ? <FormatBadge format={data.format} size="sm" /> : null}
                   <Badge
                     variant="outline"
-                    className={cn("text-[10px]", data.is_lossless ? badgeKindClass('lossless') : badgeKindClass('lossy'))}
+                    className={cn("text-[11px]", data.is_lossless ? badgeKindClass('lossless') : badgeKindClass('lossy'))}
                   >
                     {data.is_lossless ? 'Lossless' : 'Lossy'}
                   </Badge>
@@ -767,7 +767,7 @@ export default function AlbumPage() {
                         className="inline-flex"
                       />
                     ) : (
-                      <ProviderBadge provider={data.metadata_source} prefix="Source" className="text-[10px]" />
+                      <ProviderBadge provider={data.metadata_source} prefix="Source" className="text-[11px]" />
                     )
                   ) : null}
                   {data.bandcamp_album_url ? (
@@ -776,7 +776,7 @@ export default function AlbumPage() {
                 </div>
                 {genreBadges.length > 0 ? (
                   <div className="mt-4 space-y-1.5">
-                    <div className="text-[10px] font-medium uppercase tracking-[0.22em] text-slate-700 dark:text-white/68">
+                    <div className="text-[11px] font-medium uppercase tracking-[0.22em] text-slate-700 dark:text-white/68">
                       Genres
                     </div>
                     <div className="flex flex-wrap gap-1.5">
@@ -784,7 +784,7 @@ export default function AlbumPage() {
                         <Badge
                           key={`album-genre-${genre}`}
                           variant="outline"
-                          className={cn("text-[10px] cursor-pointer", badgeKindClass('genre'))}
+                          className={cn("text-[11px] cursor-pointer", badgeKindClass('genre'))}
                           onClick={() => navigate(`/library/genre/${encodeURIComponent(genre)}${location.search || ''}`, { state: withBackLinkState(location) })}
                         >
                           {genre}
@@ -797,37 +797,37 @@ export default function AlbumPage() {
                   <div className="mt-4 grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
                     {joinClassical(data.classical.composer, 3) ? (
                       <div className="border border-border/70 bg-white/45 px-3 py-3 dark:border-white/12 dark:bg-black/26">
-                        <div className="text-[10px] font-medium uppercase tracking-[0.2em] text-slate-700 dark:text-white/60">Composer</div>
+                        <div className="text-[11px] font-medium uppercase tracking-[0.2em] text-slate-700 dark:text-white/60">Composer</div>
                         <div className="mt-1 text-sm text-slate-900 line-clamp-2 dark:text-white">{joinClassical(data.classical.composer, 3)}</div>
                       </div>
                     ) : null}
                     {joinClassical(data.classical.work, 3) ? (
                       <div className="border border-border/70 bg-white/45 px-3 py-3 dark:border-white/12 dark:bg-black/26">
-                        <div className="text-[10px] font-medium uppercase tracking-[0.2em] text-slate-700 dark:text-white/60">Work</div>
+                        <div className="text-[11px] font-medium uppercase tracking-[0.2em] text-slate-700 dark:text-white/60">Work</div>
                         <div className="mt-1 text-sm text-slate-900 line-clamp-2 dark:text-white">{joinClassical(data.classical.work, 3)}</div>
                       </div>
                     ) : null}
                     {joinClassical(data.classical.conductor, 3) ? (
                       <div className="border border-border/70 bg-white/45 px-3 py-3 dark:border-white/12 dark:bg-black/26">
-                        <div className="text-[10px] font-medium uppercase tracking-[0.2em] text-slate-700 dark:text-white/60">Conductor</div>
+                        <div className="text-[11px] font-medium uppercase tracking-[0.2em] text-slate-700 dark:text-white/60">Conductor</div>
                         <div className="mt-1 text-sm text-slate-900 line-clamp-2 dark:text-white">{joinClassical(data.classical.conductor, 3)}</div>
                       </div>
                     ) : null}
                     {joinClassical(data.classical.orchestra, 3) ? (
                       <div className="border border-border/70 bg-white/45 px-3 py-3 dark:border-white/12 dark:bg-black/26">
-                        <div className="text-[10px] font-medium uppercase tracking-[0.2em] text-slate-700 dark:text-white/60">Orchestra</div>
+                        <div className="text-[11px] font-medium uppercase tracking-[0.2em] text-slate-700 dark:text-white/60">Orchestra</div>
                         <div className="mt-1 text-sm text-slate-900 line-clamp-2 dark:text-white">{joinClassical(data.classical.orchestra, 3)}</div>
                       </div>
                     ) : null}
                     {joinClassical(data.classical.soloists, 3) ? (
                       <div className="border border-border/70 bg-white/45 px-3 py-3 dark:border-white/12 dark:bg-black/26">
-                        <div className="text-[10px] font-medium uppercase tracking-[0.2em] text-slate-700 dark:text-white/60">Soloists</div>
+                        <div className="text-[11px] font-medium uppercase tracking-[0.2em] text-slate-700 dark:text-white/60">Soloists</div>
                         <div className="mt-1 text-sm text-slate-900 line-clamp-2 dark:text-white">{joinClassical(data.classical.soloists, 3)}</div>
                       </div>
                     ) : null}
                     {joinClassical(data.classical.catalog_numbers, 3) ? (
                       <div className="border border-border/70 bg-white/45 px-3 py-3 dark:border-white/12 dark:bg-black/26">
-                        <div className="text-[10px] font-medium uppercase tracking-[0.2em] text-slate-700 dark:text-white/60">Catalog</div>
+                        <div className="text-[11px] font-medium uppercase tracking-[0.2em] text-slate-700 dark:text-white/60">Catalog</div>
                         <div className="mt-1 text-sm text-slate-900 line-clamp-2 dark:text-white">{joinClassical(data.classical.catalog_numbers, 3)}</div>
                       </div>
                     ) : null}
@@ -860,41 +860,41 @@ export default function AlbumPage() {
               <div className="flex flex-wrap items-center gap-2">
                 <AlbumRatingStars value={ratings.public_rating} size={18} />
                 {ratings.public_rating_source && publicRatingSourceId !== 'unknown' ? (
-                  <ProviderBadge provider={ratings.public_rating_source} className="text-[10px]" />
+                  <ProviderBadge provider={ratings.public_rating_source} className="text-[11px]" />
                 ) : null}
                 {Number(ratings.public_rating_votes || 0) > 0 ? (
-                  <Badge variant="outline" className={cn('text-[10px]', badgeKindClass('count'))}>
+                  <Badge variant="outline" className={cn('text-[11px]', badgeKindClass('count'))}>
                     {formatCompactCount(ratings.public_rating_votes)} vote{Number(ratings.public_rating_votes || 0) > 1 ? 's' : ''}
                   </Badge>
                 ) : null}
               </div>
               <div className="flex flex-wrap items-center gap-1.5">
                 {Number(ratingSignals.discogs_have_count || 0) > 0 ? (
-                  <Badge variant="outline" className={cn('gap-1 text-[10px]', badgeKindClass('label'))}>
+                  <Badge variant="outline" className={cn('gap-1 text-[11px]', badgeKindClass('label'))}>
                     <Disc3 className="h-3 w-3" />
                     {formatCompactCount(ratingSignals.discogs_have_count)} owned
                   </Badge>
                 ) : null}
                 {Number(ratingSignals.discogs_want_count || 0) > 0 ? (
-                  <Badge variant="outline" className={cn('gap-1 text-[10px]', badgeKindClass('source'))}>
+                  <Badge variant="outline" className={cn('gap-1 text-[11px]', badgeKindClass('source'))}>
                     <Users className="h-3 w-3" />
                     {formatCompactCount(ratingSignals.discogs_want_count)} wanted
                   </Badge>
                 ) : null}
                 {Number(ratingSignals.bandcamp_supporter_count || 0) > 0 ? (
-                  <Badge variant="outline" className={cn('gap-1 text-[10px]', badgeKindClass('genre'))}>
+                  <Badge variant="outline" className={cn('gap-1 text-[11px]', badgeKindClass('genre'))}>
                     <Users className="h-3 w-3" />
                     {formatCompactCount(ratingSignals.bandcamp_supporter_count)} supporters
                   </Badge>
                 ) : null}
                 {Number(ratingSignals.lastfm_scrobbles || 0) > 0 ? (
-                  <Badge variant="outline" className={cn('gap-1 text-[10px]', badgeKindClass('duration'))}>
+                  <Badge variant="outline" className={cn('gap-1 text-[11px]', badgeKindClass('duration'))}>
                     <Users className="h-3 w-3" />
                     {formatCompactCount(ratingSignals.lastfm_scrobbles)} scrobbles
                   </Badge>
                 ) : null}
                 {Number(ratingSignals.lastfm_listeners || 0) > 0 ? (
-                  <Badge variant="outline" className={cn('gap-1 text-[10px]', badgeKindClass('count'))}>
+                  <Badge variant="outline" className={cn('gap-1 text-[11px]', badgeKindClass('count'))}>
                     <Users className="h-3 w-3" />
                     {formatCompactCount(ratingSignals.lastfm_listeners)} listeners
                   </Badge>
@@ -919,7 +919,7 @@ export default function AlbumPage() {
                 </CollapsibleContent>
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   {reviewSource ? (
-                    <ProviderBadge provider={reviewSource} prefix="Source" className="text-[10px]" />
+                    <ProviderBadge provider={reviewSource} prefix="Source" className="text-[11px]" />
                   ) : (
                     <span />
                   )}
@@ -943,7 +943,7 @@ export default function AlbumPage() {
         <CardContent className="p-5 space-y-3">
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div className="min-w-0">
-              <h2 className="text-lg font-semibold">Tracks</h2>
+              <h2 className="pmda-section-title">Tracks</h2>
               <p className="text-xs text-muted-foreground mt-1">
                 {trackRows.length > 0 ? `${trackRows.length} track${trackRows.length !== 1 ? 's' : ''}` : ' '}
               </p>
@@ -970,20 +970,20 @@ export default function AlbumPage() {
             <p className="text-sm text-muted-foreground">No tracks found for this album.</p>
           ) : (
             <div className="overflow-x-auto rounded-md border border-border/60">
-              <Table className="min-w-[920px]">
+              <Table className="min-w-[760px]">
                 <TableHeader>
                   <TableRow className="hover:bg-transparent">
-                    <TableHead className="h-10 w-[70px] text-center text-[10px] uppercase tracking-wide">
+                    <TableHead className="h-10 w-[70px] text-center text-[11px] uppercase tracking-wide">
                       <Play className="mx-auto h-3.5 w-3.5 text-emerald-400 fill-emerald-400" />
                     </TableHead>
-                    <TableHead className="h-10 w-[80px] text-[10px] uppercase tracking-wide">#</TableHead>
-                    <TableHead className="h-10 text-[10px] uppercase tracking-wide">Artist</TableHead>
-                    <TableHead className="h-10 min-w-[320px] text-[10px] uppercase tracking-wide">Track name</TableHead>
-                    <TableHead className="h-10 w-[90px] text-right text-[10px] uppercase tracking-wide">Duration</TableHead>
-                    <TableHead className="h-10 w-[78px] text-right text-[10px] uppercase tracking-wide">Queue</TableHead>
-                    <TableHead className="h-10 w-[90px] text-right text-[10px] uppercase tracking-wide">Detail</TableHead>
+                    <TableHead className="h-10 w-[80px] text-[11px] uppercase tracking-wide">#</TableHead>
+                    <TableHead className="hidden h-10 text-[11px] uppercase tracking-wide md:table-cell">Artist</TableHead>
+                    <TableHead className="h-10 min-w-[260px] text-[11px] uppercase tracking-wide">Track name</TableHead>
+                    <TableHead className="h-10 w-[90px] text-right text-[11px] uppercase tracking-wide">Duration</TableHead>
+                    <TableHead className="h-10 w-[78px] text-right text-[11px] uppercase tracking-wide">Queue</TableHead>
+                    <TableHead className="h-10 w-[90px] text-right text-[11px] uppercase tracking-wide">Detail</TableHead>
                     {isAdmin ? (
-                      <TableHead className="h-10 w-[92px] text-right text-[10px] uppercase tracking-wide">Playlist</TableHead>
+                      <TableHead className="h-10 w-[92px] text-right text-[11px] uppercase tracking-wide">Playlist</TableHead>
                     ) : null}
                   </TableRow>
                 </TableHeader>
@@ -1022,29 +1022,29 @@ export default function AlbumPage() {
                             </Button>
                           </TableCell>
                           <TableCell className="py-3 text-xs tabular-nums text-muted-foreground">{t.display_num}</TableCell>
-                          <TableCell className="py-3">
+                          <TableCell className="hidden py-3 md:table-cell">
                             <div className="max-w-[220px] truncate text-sm text-muted-foreground">{t.display_artist}</div>
                           </TableCell>
                           <TableCell className="py-3">
                             <div className="text-sm font-medium truncate">{t.display_title || 'Untitled'}</div>
                             <div className="flex items-center gap-1.5 flex-wrap mt-1">
                               {t.featured ? (
-                                <Badge variant="outline" className={cn("text-[10px]", badgeKindClass('genre'))}>
+                                <Badge variant="outline" className={cn("text-[11px]", badgeKindClass('genre'))}>
                                   feat. {t.featured}
                                 </Badge>
                               ) : null}
                               {t.format ? (
-                                <Badge variant="outline" className={cn("text-[10px]", badgeKindClass('track_meta'))}>
+                                <Badge variant="outline" className={cn("text-[11px]", badgeKindClass('track_meta'))}>
                                   {t.format.toUpperCase()}
                                 </Badge>
                               ) : null}
                               {t.sample_rate ? (
-                                <Badge variant="outline" className={cn("text-[10px]", badgeKindClass('track_meta'))}>
+                                <Badge variant="outline" className={cn("text-[11px]", badgeKindClass('track_meta'))}>
                                   {Math.round((t.sample_rate || 0) / 100) / 10}kHz
                                 </Badge>
                               ) : null}
                               {t.bit_depth ? (
-                                <Badge variant="outline" className={cn("text-[10px]", badgeKindClass('track_meta'))}>
+                                <Badge variant="outline" className={cn("text-[11px]", badgeKindClass('track_meta'))}>
                                   {t.bit_depth}bit
                                 </Badge>
                               ) : null}
