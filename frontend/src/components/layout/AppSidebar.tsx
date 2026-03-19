@@ -211,7 +211,7 @@ export function AppSidebar() {
     <Sidebar collapsible="icon" variant="sidebar">
       <SidebarHeader className="pb-1 pt-2">
         <div className="flex items-center justify-start group-data-[collapsible=icon]:justify-center">
-          <SidebarTrigger className="shrink-0" />
+          <SidebarTrigger className="shrink-0 group-data-[collapsible=icon]:-translate-x-px" />
         </div>
       </SidebarHeader>
       <SidebarContent className="pt-1">

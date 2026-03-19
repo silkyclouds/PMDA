@@ -374,7 +374,8 @@
   }
 
   .pmda-fade-mask {
-    mask-image: linear-gradient(to right, transparent, black 3%, black 97%, transparent);
+    mask-image: none;
+    -webkit-mask-image: none;
   }
 
   @keyframes pmdaPageEnter {
