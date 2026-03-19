@@ -11,6 +11,7 @@ interface FolderBrowserInputProps {
   onChange: (nextPath: string) => void;
   placeholder?: string;
   selectLabel?: string;
+  compact?: boolean;
 }
 
 interface BrowseState {
@@ -32,6 +33,7 @@ export function FolderBrowserInput({
   onChange,
   placeholder = '/music',
   selectLabel = 'Select folder',
+  compact = false,
 }: FolderBrowserInputProps) {
   const [open, setOpen] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -105,13 +107,15 @@ export function FolderBrowserInput({
   return (
     <>
       <div className="space-y-2 min-w-0">
-        <div className="rounded-md border border-border/70 bg-background/40 px-3 py-2">
-          <div className="text-[11px] uppercase tracking-wide text-muted-foreground">Current path</div>
-          <div className="mt-1 overflow-x-auto whitespace-nowrap font-mono text-xs text-foreground">
-            {selectedPath || placeholder}
+        {!compact ? (
+          <div className="rounded-md border border-border/70 bg-background/40 px-3 py-2">
+            <div className="text-[11px] uppercase tracking-wide text-muted-foreground">Current path</div>
+            <div className="mt-1 overflow-x-auto whitespace-nowrap font-mono text-xs text-foreground">
+              {selectedPath || placeholder}
+            </div>
           </div>
-        </div>
-        <div className="grid grid-cols-1 gap-2 sm:grid-cols-[minmax(0,1fr)_auto]">
+        ) : null}
+        <div className={`grid gap-2 ${compact ? 'grid-cols-[minmax(0,1fr)_auto]' : 'grid-cols-1 sm:grid-cols-[minmax(0,1fr)_auto]'}`}>
           <Input
             value={selectedPath}
             onChange={(e) => onChange(e.target.value)}

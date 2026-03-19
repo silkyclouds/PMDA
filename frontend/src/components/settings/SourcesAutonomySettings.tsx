@@ -33,9 +33,6 @@ export function SourcesAutonomySettings() {
   const [incomingStatus, setIncomingStatus] = useState<api.IncomingDeltaStatus | null>(null);
   const [watcherStatus, setWatcherStatus] = useState<api.FilesWatcherStatus | null>(null);
 
-  const [pendingPath, setPendingPath] = useState('');
-  const [pendingRole, setPendingRole] = useState<'library' | 'incoming'>('library');
-
   const load = useCallback(async () => {
     setLoading(true);
     try {
@@ -84,6 +81,11 @@ export function SourcesAutonomySettings() {
     [roots],
   );
 
+  const enabledIncomingRootsCount = useMemo(
+    () => roots.filter((row) => row.role === 'incoming' && row.enabled && normalizePath(String(row.path || ''))).length,
+    [roots],
+  );
+
   const currentWinnerPath = useMemo(() => {
     if (winnerPath) return winnerPath;
     const byId = roots.find((row) => Number(row.source_id || 0) > 0 && Number(row.source_id || 0) === Number(winnerId || 0));
@@ -91,29 +93,52 @@ export function SourcesAutonomySettings() {
   }, [roots, winnerId, winnerPath]);
 
   const libraryDestinationRoots = useMemo(
-    () => roots.filter((row) => row.role === 'library' && normalizePath(String(row.path || ''))),
+    () => roots.filter((row) => row.role === 'library' && row.enabled && normalizePath(String(row.path || ''))),
+    [roots],
+  );
+
+  const hasIncomingRoots = useMemo(
+    () => roots.some((row) => row.role === 'incoming' && row.enabled && normalizePath(String(row.path || ''))),
+    [roots],
+  );
+
+  const hasIncompleteRows = useMemo(
+    () => roots.some((row) => !normalizePath(String(row.path || ''))),
     [roots],
   );
 
   const updateRoot = useCallback((index: number, patch: Partial<FileSourceRoot>) => {
     setRoots((prev) => {
+      const currentRow = prev[index];
+      const currentPath = normalizePath(String(currentRow?.path || ''));
+      const wasWinner = Boolean(
+        (currentPath && currentPath === currentWinnerPath) ||
+        (winnerId != null && Number(currentRow?.source_id || 0) > 0 && Number(currentRow?.source_id || 0) === Number(winnerId))
+      );
       const next: FileSourceRoot[] = prev.map((row, i) => {
         if (i === index) return { ...row, ...patch };
         return row;
       });
-      if (patch.role === 'incoming') {
-        const targetPath = normalizePath(String(next[index]?.path || ''));
-        if (targetPath && targetPath === currentWinnerPath) {
-          const fallback = next.find((row, i) => i !== index && row.role === 'library' && row.enabled)
-            ?? next.find((row, i) => i !== index && row.role === 'library')
-            ?? null;
-          setWinnerPath(normalizePath(String(fallback?.path || '')));
-          setWinnerId(Number(fallback?.source_id || 0) > 0 ? Number(fallback?.source_id || 0) : null);
-        }
+      const nextRow = next[index];
+      const nextPath = normalizePath(String(nextRow?.path || ''));
+
+      if (wasWinner && patch.path !== undefined) {
+        setWinnerPath(nextPath);
+      }
+
+      if (
+        wasWinner &&
+        (nextRow?.role === 'incoming' || !nextRow?.enabled || !nextPath)
+      ) {
+        const fallback = next.find((row, i) => i !== index && row.role === 'library' && row.enabled && normalizePath(String(row.path || '')))
+          ?? next.find((row, i) => i !== index && row.role === 'library' && normalizePath(String(row.path || '')))
+          ?? null;
+        setWinnerPath(normalizePath(String(fallback?.path || '')));
+        setWinnerId(Number(fallback?.source_id || 0) > 0 ? Number(fallback?.source_id || 0) : null);
       }
       return next;
     });
-  }, [currentWinnerPath]);
+  }, [currentWinnerPath, winnerId]);
 
   const removeRoot = useCallback((index: number) => {
     setRoots((prev) => {
@@ -129,35 +154,49 @@ export function SourcesAutonomySettings() {
   }, [currentWinnerPath]);
 
   const addRoot = useCallback(() => {
-    const normalized = normalizePath(pendingPath);
-    if (!normalized) return;
     setRoots((prev) => {
-      if (prev.some((r) => normalizePath(r.path) === normalized)) {
-        return prev;
-      }
       const nextPriority = (prev.reduce((acc, row) => Math.max(acc, Number(row.priority || 0)), 0) || 0) + 10;
-      const nextRows: FileSourceRoot[] = [
+      return [
         ...prev,
         {
-          path: normalized,
-          role: pendingRole,
+          path: '',
+          role: 'library',
           enabled: true,
           priority: nextPriority,
           is_winner_root: false,
         },
       ];
-      if (!currentWinnerPath && pendingRole === 'library') {
-        setWinnerPath(normalized);
+    });
+  }, []);
+
+  useEffect(() => {
+    if (libraryDestinationRoots.length === 0) {
+      if (currentWinnerPath || winnerId != null) {
+        setWinnerPath('');
         setWinnerId(null);
       }
-      return nextRows;
+      return;
+    }
+    const hasSelectedWinner = libraryDestinationRoots.some((row) => {
+      const normalized = normalizePath(String(row.path || ''));
+      return (
+        (currentWinnerPath && normalized === currentWinnerPath) ||
+        (winnerId != null && Number(row.source_id || 0) > 0 && Number(row.source_id || 0) === Number(winnerId))
+      );
     });
-    setPendingPath('');
-  }, [currentWinnerPath, pendingPath, pendingRole]);
+    if (hasSelectedWinner) return;
+    const fallback = libraryDestinationRoots[0];
+    setWinnerPath(normalizePath(String(fallback?.path || '')));
+    setWinnerId(Number(fallback?.source_id || 0) > 0 ? Number(fallback?.source_id || 0) : null);
+  }, [libraryDestinationRoots, currentWinnerPath, winnerId]);
 
   const save = useCallback(async () => {
     if (roots.length === 0) {
       toast.error('Add at least one source root.');
+      return;
+    }
+    if (hasIncompleteRows) {
+      toast.error('Complete or remove empty folder rows before saving.');
       return;
     }
     setSaving(true);
@@ -199,7 +238,7 @@ export function SourcesAutonomySettings() {
     } finally {
       setSaving(false);
     }
-  }, [roots, winnerId, currentWinnerPath, strategy, load]);
+  }, [roots, winnerId, currentWinnerPath, strategy, load, hasIncompleteRows]);
 
   const runIncoming = useCallback(async () => {
     setRunningIncoming(true);
@@ -228,43 +267,12 @@ export function SourcesAutonomySettings() {
 
   return (
     <div className="space-y-5">
-      <div className="rounded-lg border border-border bg-muted/20 p-4 space-y-2">
-        <p className="text-sm font-medium">Configuration flow</p>
-        <ol className="list-decimal pl-4 text-xs text-muted-foreground space-y-1">
-          <li>Add every <span className="text-foreground">Standard source folder</span> PMDA is allowed to scan.</li>
-          <li>Optionally add one or more <span className="text-foreground">Incoming folders</span> if that is where new downloads land.</li>
-          <li>If you use incoming folders, choose which <span className="text-foreground">Standard source folder</span> receives processed albums.</li>
-          <li>Save once, then optionally run an incoming scan immediately.</li>
-        </ol>
-      </div>
-
-      <div className="grid grid-cols-1 gap-2 text-xs md:grid-cols-2">
-        <div className="rounded-md border border-border bg-muted/30 px-3 py-2 text-muted-foreground">
-          Standard source folders: <span className="text-foreground font-medium">{libraryRootsCount}</span>
-        </div>
-        <div className="rounded-md border border-border bg-muted/30 px-3 py-2 text-muted-foreground">
-          Incoming folders: <span className="text-foreground font-medium">{incomingRootsCount}</span>
-        </div>
-        <div className="rounded-md border border-border bg-muted/30 px-3 py-2 text-muted-foreground md:col-span-2">
-          <div className="text-[11px] uppercase tracking-wide text-muted-foreground">Processed incoming albums go to</div>
-          <div className="mt-1 overflow-x-auto whitespace-nowrap font-mono text-xs text-foreground">
-            {currentWinnerPath || 'not set'}
-          </div>
-        </div>
-      </div>
-
-      <div className="space-y-3 rounded-xl border border-cyan-500/20 bg-cyan-500/[0.04] p-4">
+      <div className="space-y-4 rounded-xl border border-cyan-500/20 bg-cyan-500/[0.04] p-4">
         <div className="flex items-center justify-between gap-3">
           <div className="space-y-1">
-            <div className="flex items-center gap-2">
-              <span className="inline-flex h-7 w-7 items-center justify-center rounded-full bg-cyan-500/15 text-cyan-200 text-xs font-semibold">1</span>
-              <Label className="text-sm">What are your music source folders?</Label>
-            </div>
+            <Label className="text-sm">Source folders</Label>
             <p className="text-xs text-muted-foreground">
-              Add every folder PMDA must scan. You can add as many folders as you want and mark each one as either a standard source folder or an incoming folder.
-            </p>
-            <p className="text-[11px] text-muted-foreground">
-              Standard source folders are already part of your collection. Incoming folders are optional and are meant for new downloads or manual drops.
+              Add every folder PMDA should scan. Use <span className="text-foreground">Incoming</span> only if new music lands in a separate drop zone.
             </p>
           </div>
           <Button type="button" variant="outline" size="sm" onClick={load} className="gap-1.5">
@@ -273,142 +281,139 @@ export function SourcesAutonomySettings() {
           </Button>
         </div>
 
-        <div className="space-y-2">
+        <div className="flex flex-wrap gap-2 text-[11px] text-muted-foreground">
+          <div className="rounded-md border border-border/70 bg-background/30 px-2.5 py-1">
+            Standard source: <span className="font-medium text-foreground">{libraryRootsCount}</span>
+          </div>
+          <div className="rounded-md border border-border/70 bg-background/30 px-2.5 py-1">
+            Incoming: <span className="font-medium text-foreground">{incomingRootsCount}</span>
+          </div>
+        </div>
+
+        <div className="overflow-hidden rounded-lg border border-border/70 bg-background/25">
+          <div className="hidden items-center gap-3 border-b border-border/60 px-3 py-2 text-[11px] uppercase tracking-wide text-muted-foreground lg:grid lg:grid-cols-[minmax(0,1.45fr)_230px_120px_44px]">
+            <div>Folder</div>
+            <div>Type</div>
+            <div>Enabled</div>
+            <div />
+          </div>
           {roots.length === 0 ? (
-            <div className="text-xs text-muted-foreground border rounded-md px-3 py-2">No source roots configured.</div>
+            <div className="px-3 py-4 text-sm text-muted-foreground">
+              No folders configured. Add your first music folder to get started.
+            </div>
           ) : roots.map((row, index) => {
-            const sid = Number(row.source_id || 0);
-            const isWinner = normalizePath(String(row.path || '')) === currentWinnerPath || (winnerId != null && sid > 0 && winnerId === sid);
             return (
-              <div key={`${row.source_id || 'new'}-${index}`} className="rounded-md border border-border bg-muted/20 p-3 space-y-3">
+              <div
+                key={`${row.source_id || 'new'}-${index}`}
+                className="grid gap-3 border-t border-border/60 px-3 py-3 first:border-t-0 lg:grid-cols-[minmax(0,1.45fr)_230px_120px_44px] lg:items-center"
+              >
                 <FolderBrowserInput
                   value={String(row.path || '')}
                   onChange={(nextPath) => updateRoot(index, { path: nextPath })}
                   placeholder="/music/library"
                   selectLabel="Select source root folder"
+                  compact
                 />
-                <div className="flex flex-wrap items-center gap-2">
-                  <div className="min-w-[240px] flex-1">
-                    <Select
-                      value={row.role === 'incoming' ? 'incoming' : 'library'}
-                      onValueChange={(value: 'library' | 'incoming') => updateRoot(index, { role: value })}
-                    >
-                      <SelectTrigger><SelectValue /></SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="library">Standard source folder</SelectItem>
-                        <SelectItem value="incoming">Incoming folder (new arrivals)</SelectItem>
-                      </SelectContent>
-                    </Select>
-                  </div>
-                  <div className="flex items-center justify-between rounded-md border border-border px-3 py-2 min-w-[140px]">
-                    <span className="text-xs text-muted-foreground">Enabled</span>
-                    <Switch checked={Boolean(row.enabled)} onCheckedChange={(checked) => updateRoot(index, { enabled: Boolean(checked) })} />
-                  </div>
-                  <Button
-                    type="button"
-                    variant={isWinner ? 'default' : 'outline'}
-                    size="sm"
-                    onClick={() => {
-                      setWinnerPath(normalizePath(String(row.path || '')));
-                      setWinnerId(sid > 0 ? sid : null);
-                    }}
-                    disabled={row.role === 'incoming'}
-                  >
-                    {isWinner ? 'Processed here' : 'Set as destination'}
-                  </Button>
-                  <Button type="button" variant="ghost" size="icon" onClick={() => removeRoot(index)} className="shrink-0">
-                    <Trash2 className="w-4 h-4" />
-                  </Button>
+                <Select
+                  value={row.role === 'incoming' ? 'incoming' : 'library'}
+                  onValueChange={(value: 'library' | 'incoming') => updateRoot(index, { role: value })}
+                >
+                  <SelectTrigger><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="library">Standard source</SelectItem>
+                    <SelectItem value="incoming">Incoming</SelectItem>
+                  </SelectContent>
+                </Select>
+                <div className="flex h-10 items-center justify-between rounded-md border border-border bg-background/40 px-3">
+                  <span className="text-xs text-muted-foreground">Enabled</span>
+                  <Switch checked={Boolean(row.enabled)} onCheckedChange={(checked) => updateRoot(index, { enabled: Boolean(checked) })} />
                 </div>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  onClick={() => removeRoot(index)}
+                  className="shrink-0"
+                  aria-label="Delete folder"
+                  title="Delete folder"
+                >
+                  <Trash2 className="w-4 h-4" />
+                </Button>
               </div>
             );
           })}
         </div>
 
-        <div className="rounded-lg border border-border/70 bg-background/30 p-3 space-y-3">
-          <div className="space-y-1">
-            <div className="flex items-center gap-2">
-              <Label className="text-sm">Add a folder</Label>
-            </div>
-            <p className="text-xs text-muted-foreground">
-              Choose the folder type before adding it. Incoming is optional; use it only if fresh music lands in a separate drop zone.
-            </p>
-          </div>
-          <div className="grid grid-cols-1 md:grid-cols-[1fr_220px_110px] gap-2">
-          <FolderBrowserInput
-            value={pendingPath}
-            onChange={setPendingPath}
-            placeholder="/music/library"
-            selectLabel="Add source root"
-          />
-          <Select value={pendingRole} onValueChange={(value: 'library' | 'incoming') => setPendingRole(value)}>
-            <SelectTrigger><SelectValue /></SelectTrigger>
-            <SelectContent>
-              <SelectItem value="library">Standard source folder</SelectItem>
-              <SelectItem value="incoming">Incoming folder</SelectItem>
-            </SelectContent>
-          </Select>
-          <Button type="button" variant="outline" onClick={addRoot} disabled={!normalizePath(pendingPath)} className="gap-1.5">
-            <Plus className="w-4 h-4" />
-            Add folder
-          </Button>
-        </div>
-        </div>
+        <Button type="button" variant="outline" size="sm" onClick={addRoot} className="gap-1.5">
+          <Plus className="w-4 h-4" />
+          + Add folder
+        </Button>
 
-        <div className="rounded-lg border border-border/70 bg-background/30 p-3 space-y-3">
-          <div className="space-y-1">
-            <Label className="text-sm">If you use incoming folders, where should processed albums end up?</Label>
-            <p className="text-xs text-muted-foreground">
-              Choose the standard source folder that should receive albums once PMDA has matched them, checked duplicates/incompletes, and validated metadata.
+        {hasIncomingRoots ? (
+          <div className="rounded-lg border border-border/70 bg-background/30 p-3 space-y-3">
+            <div className="space-y-1">
+              <Label className="text-sm">Processed incoming albums go to</Label>
+              <p className="text-xs text-muted-foreground">
+                Choose which enabled standard source folder should receive albums once PMDA has processed them.
+              </p>
+            </div>
+            <div className="grid grid-cols-1 gap-3 md:grid-cols-[minmax(0,1fr),220px]">
+              <Select
+                value={currentWinnerPath || '__none__'}
+                onValueChange={(value) => {
+                  if (value === '__none__') {
+                    setWinnerPath('');
+                    setWinnerId(null);
+                    return;
+                  }
+                  const normalized = normalizePath(value);
+                  const selected = libraryDestinationRoots.find((row) => normalizePath(String(row.path || '')) === normalized) ?? null;
+                  setWinnerPath(normalized);
+                  setWinnerId(Number(selected?.source_id || 0) > 0 ? Number(selected?.source_id || 0) : null);
+                }}
+                disabled={libraryDestinationRoots.length === 0}
+              >
+                <SelectTrigger>
+                  <SelectValue placeholder="Select a standard source folder" />
+                </SelectTrigger>
+                <SelectContent>
+                  {libraryDestinationRoots.map((row) => {
+                    const normalized = normalizePath(String(row.path || ''));
+                    return (
+                      <SelectItem key={`winner-root-${row.source_id || normalized}`} value={normalized}>
+                        {normalized}
+                      </SelectItem>
+                    );
+                  })}
+                </SelectContent>
+              </Select>
+              <Select value={strategy} onValueChange={(value: 'move' | 'hardlink' | 'symlink' | 'copy') => setStrategy(value)}>
+                <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="move">Move</SelectItem>
+                  <SelectItem value="hardlink">Hardlink</SelectItem>
+                  <SelectItem value="symlink">Symlink</SelectItem>
+                  <SelectItem value="copy">Copy</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <p className="text-[11px] text-muted-foreground">
+              Recommended for most users: <span className="text-foreground">Hardlink</span>. Files stay on disk once and PMDA keeps the processed library clean.
             </p>
           </div>
-          <div className="grid grid-cols-1 gap-3 md:grid-cols-[minmax(0,1fr),220px]">
-            <Select
-              value={currentWinnerPath || '__none__'}
-              onValueChange={(value) => {
-                if (value === '__none__') {
-                  setWinnerPath('');
-                  setWinnerId(null);
-                  return;
-                }
-                const normalized = normalizePath(value);
-                const selected = libraryDestinationRoots.find((row) => normalizePath(String(row.path || '')) === normalized) ?? null;
-                setWinnerPath(normalized);
-                setWinnerId(Number(selected?.source_id || 0) > 0 ? Number(selected?.source_id || 0) : null);
-              }}
-              disabled={libraryDestinationRoots.length === 0}
-            >
-              <SelectTrigger>
-                <SelectValue placeholder="Select a standard source folder" />
-              </SelectTrigger>
-              <SelectContent>
-                {libraryDestinationRoots.map((row) => {
-                  const normalized = normalizePath(String(row.path || ''));
-                  return (
-                    <SelectItem key={`winner-root-${row.source_id || normalized}`} value={normalized}>
-                      {normalized}
-                    </SelectItem>
-                  );
-                })}
-              </SelectContent>
-            </Select>
-            <Select value={strategy} onValueChange={(value: 'move' | 'hardlink' | 'symlink' | 'copy') => setStrategy(value)}>
-              <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
-              <SelectContent>
-                <SelectItem value="move">Move</SelectItem>
-                <SelectItem value="hardlink">Hardlink</SelectItem>
-                <SelectItem value="symlink">Symlink</SelectItem>
-                <SelectItem value="copy">Copy</SelectItem>
-              </SelectContent>
-            </Select>
-          </div>
+        ) : (
           <p className="text-[11px] text-muted-foreground">
-            Recommended for most users: <span className="text-foreground">Hardlink</span>. If you do not use incoming folders, this setting can stay prepared for later.
+            Incoming folders are optional. Add one only if new music lands in a separate drop zone.
           </p>
-        </div>
+        )}
 
         <div className="flex flex-wrap items-center gap-2">
-          <Button type="button" onClick={save} disabled={saving} className="gap-2">
+          <Button
+            type="button"
+            onClick={save}
+            disabled={saving || hasIncompleteRows || roots.length === 0 || (hasIncomingRoots && (libraryDestinationRoots.length === 0 || !currentWinnerPath))}
+            className="gap-2"
+          >
             {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
             Save folders
           </Button>
@@ -416,13 +421,15 @@ export function SourcesAutonomySettings() {
             type="button"
             variant="outline"
             onClick={runIncoming}
-            disabled={runningIncoming || incomingRootsCount <= 0}
+            disabled={runningIncoming || enabledIncomingRootsCount <= 0}
             className="gap-2"
           >
             {runningIncoming ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
             Run incoming scan now
           </Button>
-          {incomingRootsCount <= 0 ? (
+          {hasIncompleteRows ? (
+            <span className="text-[11px] text-muted-foreground">Complete or remove empty folder rows before saving.</span>
+          ) : enabledIncomingRootsCount <= 0 ? (
             <span className="text-[11px] text-muted-foreground">No incoming folders configured. This is optional.</span>
           ) : null}
         </div>
