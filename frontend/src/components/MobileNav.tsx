@@ -1,169 +1,315 @@
-import { useState } from 'react';
-import { useNavigate, useLocation } from 'react-router-dom';
-import { 
-  Menu, Scan, Library, 
-  BarChart2, Settings, Wrench
+import { useMemo, useState } from 'react';
+import { useLocation, useNavigate } from 'react-router-dom';
+import {
+  BarChart3,
+  Building2,
+  Disc3,
+  Heart,
+  House,
+  ListMusic,
+  LogOut,
+  MoreHorizontal,
+  Scan,
+  Settings2,
+  Share2,
+  Shield,
+  Tags,
+  Users,
+  Wrench,
+  type LucideIcon,
 } from 'lucide-react';
-import { Button } from '@/components/ui/button';
-import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetTrigger } from '@/components/ui/sheet';
-import { Badge } from '@/components/ui/badge';
-import { Logo } from '@/components/Logo';
-import { cn } from '@/lib/utils';
 
-interface NavItem {
+import { Logo } from '@/components/Logo';
+import { useAuth } from '@/contexts/AuthContext';
+import { cn } from '@/lib/utils';
+import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet';
+
+interface PrimaryNavItem {
   to: string;
-  icon: React.ElementType;
   label: string;
-  badge?: number;
-  badgeVariant?: 'default' | 'destructive' | 'warning';
+  icon: LucideIcon;
+  isActive: (pathname: string) => boolean;
 }
 
-// Simplified navigation - Tag Fixer and Incomplete Albums removed
-const navItems: NavItem[] = [
-  { to: '/', icon: Scan, label: 'Scan' },
-  { to: '/library', icon: Library, label: 'Library' },
-  { to: '/statistics', icon: BarChart2, label: 'Statistics' },
-  { to: '/tools', icon: Wrench, label: 'Tools' },
+interface SecondaryNavItem {
+  to?: string;
+  label: string;
+  icon: LucideIcon;
+  isActive?: (pathname: string) => boolean;
+  action?: 'logout';
+}
+
+const primaryItems: PrimaryNavItem[] = [
+  {
+    to: '/library',
+    label: 'Home',
+    icon: House,
+    isActive: (pathname) =>
+      pathname === '/library' || pathname === '/library/' || pathname === '/library/home' || pathname.startsWith('/library/home/'),
+  },
+  {
+    to: '/library/albums',
+    label: 'Albums',
+    icon: Disc3,
+    isActive: (pathname) => pathname.startsWith('/library/albums') || pathname.startsWith('/library/album/'),
+  },
+  {
+    to: '/library/artists',
+    label: 'Artists',
+    icon: Users,
+    isActive: (pathname) => pathname.startsWith('/library/artists') || pathname.startsWith('/library/artist/'),
+  },
+  {
+    to: '/library/playlists',
+    label: 'Playlists',
+    icon: ListMusic,
+    isActive: (pathname) => pathname.startsWith('/library/playlists'),
+  },
 ];
 
-interface MobileNavProps {
-  duplicateCount?: number;
-  onSettingsClick?: () => void;
-}
+function buildSecondaryItems(isAdmin: boolean, canViewStatistics: boolean): SecondaryNavItem[] {
+  const base: SecondaryNavItem[] = [
+    {
+      to: '/library/genres',
+      label: 'Genres',
+      icon: Tags,
+      isActive: (pathname) => pathname.startsWith('/library/genres') || pathname.startsWith('/library/genre/'),
+    },
+    {
+      to: '/library/labels',
+      label: 'Labels',
+      icon: Building2,
+      isActive: (pathname) => pathname.startsWith('/library/labels') || pathname.startsWith('/library/label/'),
+    },
+    {
+      to: '/library/liked',
+      label: 'Liked',
+      icon: Heart,
+      isActive: (pathname) => pathname.startsWith('/library/liked'),
+    },
+    {
+      to: '/library/recommendations',
+      label: 'Recommendations',
+      icon: Share2,
+      isActive: (pathname) => pathname.startsWith('/library/recommendations'),
+    },
+    {
+      to: '/settings',
+      label: 'Settings',
+      icon: Settings2,
+      isActive: (pathname) => pathname.startsWith('/settings'),
+    },
+  ];
 
-export function MobileNav({ duplicateCount, onSettingsClick }: MobileNavProps) {
-  const [open, setOpen] = useState(false);
-  const navigate = useNavigate();
-  const location = useLocation();
+  if (canViewStatistics) {
+    base.push({
+      to: '/statistics',
+      label: 'Statistics',
+      icon: BarChart3,
+      isActive: (pathname) => pathname.startsWith('/statistics'),
+    });
+  }
 
-  const handleNavigate = (to: string) => {
-    navigate(to);
-    setOpen(false);
-  };
+  if (isAdmin) {
+    base.push(
+      {
+        to: '/scan',
+        label: 'Scan',
+        icon: Scan,
+        isActive: (pathname) => pathname.startsWith('/scan'),
+      },
+      {
+        to: '/tools',
+        label: 'Tools',
+        icon: Wrench,
+        isActive: (pathname) => pathname.startsWith('/tools'),
+      },
+      {
+        to: '/admin/users',
+        label: 'Users',
+        icon: Shield,
+        isActive: (pathname) => pathname.startsWith('/admin/users'),
+      },
+    );
+  }
 
-  // Add badges to nav items
-  const itemsWithBadges = navItems.map(item => {
-    if (item.to === '/tools' && duplicateCount) {
-      return { ...item, badge: duplicateCount, badgeVariant: 'warning' as const };
-    }
-    return item;
+  base.push({
+    label: 'Logout',
+    icon: LogOut,
+    action: 'logout',
   });
 
+  return base;
+}
+
+function isMoreActive(pathname: string): boolean {
+  if (primaryItems.some((item) => item.isActive(pathname))) return false;
   return (
-    <Sheet open={open} onOpenChange={setOpen}>
-      <SheetTrigger asChild>
-        <Button variant="ghost" size="icon" className="lg:hidden">
-          <Menu className="h-5 w-5" />
-          <span className="sr-only">Toggle navigation menu</span>
-        </Button>
-      </SheetTrigger>
-      <SheetContent side="left" className="w-72 p-0">
-        <SheetHeader className="p-4 border-b border-border">
-          <SheetTitle className="flex items-center gap-2 text-left">
-            <Logo variant="wordmark" size="sm" className="pointer-events-none select-none" />
-          </SheetTitle>
-        </SheetHeader>
-        
-        <nav className="flex flex-col p-2">
-          {itemsWithBadges.map((item) => {
-            const Icon = item.icon;
-            const isActive = item.to === '/library'
-              ? location.pathname === '/library' || location.pathname.startsWith('/library/')
-              : location.pathname === item.to;
-            
-            return (
-              <button
-                key={item.to}
-                onClick={() => handleNavigate(item.to)}
-                className={cn(
-                  "flex items-center gap-3 px-3 py-2.5 rounded-lg text-small font-medium transition-colors",
-                  "hover:bg-accent hover:text-accent-foreground",
-                  isActive && "bg-accent text-accent-foreground"
-                )}
-              >
-                <Icon className="w-5 h-5" />
-                <span className="flex-1 text-left">{item.label}</span>
-                {item.badge && item.badge > 0 && (
-                  <Badge 
-                    variant={item.badgeVariant === 'warning' ? 'outline' : 'destructive'}
-                    className={cn(
-                      "text-caption",
-                      item.badgeVariant === 'warning' && "border-warning text-warning"
-                    )}
-                  >
-                    {item.badge}
-                  </Badge>
-                )}
-              </button>
-            );
-          })}
-          
-          <div className="h-px bg-border my-2" />
-          
-          <button
-            onClick={() => {
-              setOpen(false);
-              onSettingsClick?.();
-            }}
-            className="flex items-center gap-3 px-3 py-2.5 rounded-lg text-small font-medium transition-colors hover:bg-accent hover:text-accent-foreground"
-          >
-            <Settings className="w-5 h-5" />
-            <span>Settings</span>
-          </button>
-        </nav>
-      </SheetContent>
-    </Sheet>
+    pathname.startsWith('/statistics') ||
+    pathname.startsWith('/settings') ||
+    pathname.startsWith('/scan') ||
+    pathname.startsWith('/tools') ||
+    pathname.startsWith('/admin/users') ||
+    pathname.startsWith('/library/genres') ||
+    pathname.startsWith('/library/genre/') ||
+    pathname.startsWith('/library/labels') ||
+    pathname.startsWith('/library/label/') ||
+    pathname.startsWith('/library/liked') ||
+    pathname.startsWith('/library/recommendations')
   );
 }
 
-/** Bottom navigation for mobile - 5 key items */
-export function MobileBottomNav({ duplicateCount }: { duplicateCount?: number }) {
+export function MobileBottomNav({ playerOffsetPx = 0 }: { playerOffsetPx?: number }) {
+  const { isAdmin, canViewStatistics, logout } = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
+  const [open, setOpen] = useState(false);
 
-  const bottomItems: NavItem[] = [
-    { to: '/', icon: Scan, label: 'Scan' },
-    { to: '/library', icon: Library, label: 'Library' },
-    { to: '/tools', icon: Wrench, label: 'Tools', badge: duplicateCount, badgeVariant: 'warning' },
-    { to: '/statistics', icon: BarChart2, label: 'Stats' },
-  ];
+  const secondaryItems = useMemo(
+    () => buildSecondaryItems(isAdmin, canViewStatistics),
+    [canViewStatistics, isAdmin],
+  );
+
+  const handleNavigate = async (item: SecondaryNavItem | PrimaryNavItem) => {
+    if ('action' in item && item.action === 'logout') {
+      setOpen(false);
+      await logout();
+      navigate('/auth/login', { replace: true });
+      return;
+    }
+    if ('to' in item && item.to) {
+      setOpen(false);
+      navigate(item.to);
+    }
+  };
 
   return (
-    <nav className="fixed bottom-0 left-0 right-0 z-50 md:hidden border-t border-border bg-card/95 backdrop-blur supports-[backdrop-filter]:bg-card/80">
-      <div className="flex items-center justify-around py-2">
-        {bottomItems.map((item) => {
-          const Icon = item.icon;
-          const isActive = item.to === '/library'
-            ? location.pathname === '/library' || location.pathname.startsWith('/library/')
-            : location.pathname === item.to;
-          
-          return (
-            <button
-              key={item.to}
-              onClick={() => navigate(item.to)}
-              className={cn(
-                "relative flex flex-col items-center gap-1 px-3 py-1.5 rounded-lg transition-colors",
-                isActive ? "text-primary" : "text-muted-foreground hover:text-foreground"
-              )}
-            >
-              <div className="relative">
-                <Icon className="w-5 h-5" />
-                {item.badge && item.badge > 0 && (
-                  <span className={cn(
-                    "absolute -top-1.5 -right-1.5 min-w-[16px] h-4 px-1 rounded-full text-[10px] font-medium flex items-center justify-center",
-                    item.badgeVariant === 'warning' 
-                      ? "bg-warning text-warning-foreground"
-                      : "bg-destructive text-destructive-foreground"
-                  )}>
-                    {item.badge > 99 ? '99+' : item.badge}
-                  </span>
+    <>
+      <nav
+        className="fixed inset-x-0 z-40 border-t border-border/70 bg-card/95 backdrop-blur-xl md:hidden"
+        style={{ bottom: `${Math.max(0, playerOffsetPx)}px` }}
+      >
+        <div
+          className="grid grid-cols-5 items-center gap-1 px-2 pt-2"
+          style={{ paddingBottom: 'max(0.5rem, env(safe-area-inset-bottom))' }}
+        >
+          {primaryItems.map((item) => {
+            const Icon = item.icon;
+            const active = item.isActive(location.pathname);
+            return (
+              <button
+                key={item.to}
+                type="button"
+                onClick={() => navigate(item.to)}
+                className={cn(
+                  'flex min-w-0 flex-col items-center justify-center gap-1 rounded-xl px-2 py-2 transition-colors',
+                  active ? 'bg-primary/12 text-primary' : 'text-muted-foreground hover:bg-accent/60 hover:text-foreground',
                 )}
+              >
+                <Icon className="h-5 w-5 shrink-0" />
+                <span className="truncate text-[11px] font-medium">{item.label}</span>
+              </button>
+            );
+          })}
+
+          <button
+            type="button"
+            onClick={() => setOpen(true)}
+            className={cn(
+              'flex min-w-0 flex-col items-center justify-center gap-1 rounded-xl px-2 py-2 transition-colors',
+              isMoreActive(location.pathname) || open
+                ? 'bg-primary/12 text-primary'
+                : 'text-muted-foreground hover:bg-accent/60 hover:text-foreground',
+            )}
+          >
+            <MoreHorizontal className="h-5 w-5 shrink-0" />
+            <span className="truncate text-[11px] font-medium">More</span>
+          </button>
+        </div>
+      </nav>
+
+      <Sheet open={open} onOpenChange={setOpen}>
+        <SheetContent side="bottom" className="max-h-[82dvh] rounded-t-3xl border-border/70 bg-card/98 p-0 md:hidden">
+          <SheetHeader className="border-b border-border/60 px-5 py-4 text-left">
+            <SheetTitle className="flex items-center gap-3">
+              <Logo variant="wordmark" size="sm" className="pointer-events-none select-none" />
+            </SheetTitle>
+          </SheetHeader>
+
+          <div className="space-y-5 overflow-y-auto px-4 pb-[max(1rem,env(safe-area-inset-bottom))] pt-4">
+            <div className="space-y-2">
+              <div className="px-1 text-[11px] font-medium uppercase tracking-[0.24em] text-muted-foreground">Library</div>
+              <div className="grid grid-cols-2 gap-2">
+                {secondaryItems
+                  .filter((item) => item.to?.startsWith('/library/'))
+                  .map((item) => {
+                    const Icon = item.icon;
+                    const active = item.isActive?.(location.pathname);
+                    return (
+                      <button
+                        key={item.label}
+                        type="button"
+                        onClick={() => void handleNavigate(item)}
+                        className={cn(
+                          'flex items-center gap-3 rounded-xl border border-border/60 bg-background/70 px-3 py-3 text-left transition-colors',
+                          active ? 'border-primary/35 bg-primary/8 text-primary' : 'hover:bg-accent/40',
+                        )}
+                      >
+                        <Icon className="h-4 w-4 shrink-0" />
+                        <span className="min-w-0 truncate text-sm font-medium">{item.label}</span>
+                      </button>
+                    );
+                  })}
               </div>
-              <span className="text-[10px] font-medium">{item.label}</span>
-            </button>
-          );
-        })}
-      </div>
-    </nav>
+            </div>
+
+            <div className="space-y-2">
+              <div className="px-1 text-[11px] font-medium uppercase tracking-[0.24em] text-muted-foreground">System</div>
+              <div className="space-y-2">
+                {secondaryItems
+                  .filter((item) => !item.to?.startsWith('/library/') && item.action !== 'logout')
+                  .map((item) => {
+                    const Icon = item.icon;
+                    const active = item.isActive?.(location.pathname);
+                    return (
+                      <button
+                        key={item.label}
+                        type="button"
+                        onClick={() => void handleNavigate(item)}
+                        className={cn(
+                          'flex w-full items-center gap-3 rounded-xl border border-border/60 bg-background/70 px-3 py-3 text-left transition-colors',
+                          active ? 'border-primary/35 bg-primary/8 text-primary' : 'hover:bg-accent/40',
+                        )}
+                      >
+                        <Icon className="h-4 w-4 shrink-0" />
+                        <span className="min-w-0 truncate text-sm font-medium">{item.label}</span>
+                      </button>
+                    );
+                  })}
+              </div>
+            </div>
+
+            <div className="space-y-2">
+              {secondaryItems
+                .filter((item) => item.action === 'logout')
+                .map((item) => {
+                  const Icon = item.icon;
+                  return (
+                    <button
+                      key={item.label}
+                      type="button"
+                      onClick={() => void handleNavigate(item)}
+                      className="flex w-full items-center gap-3 rounded-xl border border-border/60 bg-background/70 px-3 py-3 text-left transition-colors hover:bg-accent/40"
+                    >
+                      <Icon className="h-4 w-4 shrink-0" />
+                      <span className="min-w-0 truncate text-sm font-medium">{item.label}</span>
+                    </button>
+                  );
+                })}
+            </div>
+          </div>
+        </SheetContent>
+      </Sheet>
+    </>
   );
 }

@@ -38,7 +38,9 @@ import { AudioPlayer } from "./components/library/AudioPlayer";
 import { ScanFinishedInvalidator } from "./components/ScanFinishedInvalidator";
 import { AssistantDock } from "./components/assistant/AssistantDock";
 import { AppLayout } from "./components/layout/AppLayout";
+import { MobileBottomNav } from "./components/MobileNav";
 import { useTaskEvents } from "./hooks/useTaskEvents";
+import { useIsMobile } from "./hooks/use-mobile";
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -74,6 +76,7 @@ function AuthLoadingScreen() {
 function AppRoutesWithPlayer() {
   const { session, setCurrentTrack, closePlayer, recommendationSessionId } = usePlayback();
   const auth = useAuth();
+  const isMobile = useIsMobile();
   useTaskEvents({ enabled: Boolean(auth.user?.is_admin), pollIntervalMs: 3000 });
 
   if (auth.isLoading) {
@@ -101,51 +104,62 @@ function AppRoutesWithPlayer() {
   const adminOnly = (element: JSX.Element) => (auth.isAdmin ? element : <Navigate to="/library" replace />);
   const statsAllowed = auth.isAdmin || auth.canViewStatistics;
   const statsOnly = (element: JSX.Element) => (statsAllowed ? element : <Navigate to="/library" replace />);
+  const mobilePlayerOffsetPx = isMobile && session ? 84 : 0;
+  const mobileNavOffsetPx = mobilePlayerOffsetPx;
+  const mobileContentPadding = isMobile
+    ? (session ? 'calc(9.5rem + env(safe-area-inset-bottom))' : 'calc(5rem + env(safe-area-inset-bottom))')
+    : undefined;
+  const assistantDockBottomOffset = isMobile
+    ? (session ? 176 : 92)
+    : (session ? 128 : 16);
 
   return (
     <>
       {auth.isAdmin ? <ScanFinishedInvalidator /> : null}
-      <Routes>
-        <Route element={<AppLayout />}>
-          <Route path="/" element={<Navigate to="/library" replace />} />
-          <Route path="/scan" element={adminOnly(<Scan />)} />
-          <Route path="/unduper" element={<Navigate to={auth.isAdmin ? "/tools/duplicates" : "/library"} replace />} />
-          <Route path="/history" element={<Navigate to={auth.isAdmin ? "/tools" : "/library"} replace />} />
-          <Route path="/statistics" element={statsOnly(<Statistics />)} />
-          <Route path="/statistics/listening" element={statsOnly(<ListeningStatsPage />)} />
-          <Route path="/statistics/library" element={statsOnly(<LibraryStatsPage />)} />
-          <Route path="/tools" element={adminOnly(<Tools />)} />
-          <Route path="/tools/duplicates" element={adminOnly(<Unduper />)} />
-          <Route path="/library" element={<LibraryLayout />}>
-            <Route index element={<LibraryHome />} />
-            <Route path="home" element={<LibraryHome />} />
-            <Route path="home/feed/:section" element={<LibraryHomeFeed />} />
-            <Route path="artists" element={<LibraryArtists />} />
-            <Route path="albums" element={<LibraryAlbums />} />
-            <Route path="genres" element={<LibraryGenres />} />
-            <Route path="labels" element={<LibraryLabels />} />
-            <Route path="liked" element={<LikedPage />} />
-            <Route path="recommendations" element={<RecommendationsPage />} />
-            <Route path="artist/:artistId" element={<ArtistPage />} />
-            <Route path="label/:label" element={<LabelPage />} />
-            <Route path="genre/:genre" element={<GenrePage />} />
-            <Route path="album/:albumId" element={<AlbumPage />} />
-            <Route path="playlists" element={<Playlists />} />
-            <Route path="playlists/:playlistId" element={<PlaylistDetail />} />
-            <Route path="browser" element={<Navigate to="/library" replace />} />
+      <div style={mobileContentPadding ? { paddingBottom: mobileContentPadding } : undefined}>
+        <Routes>
+          <Route element={<AppLayout />}>
+            <Route path="/" element={<Navigate to="/library" replace />} />
+            <Route path="/scan" element={adminOnly(<Scan />)} />
+            <Route path="/unduper" element={<Navigate to={auth.isAdmin ? "/tools/duplicates" : "/library"} replace />} />
+            <Route path="/history" element={<Navigate to={auth.isAdmin ? "/tools" : "/library"} replace />} />
+            <Route path="/statistics" element={statsOnly(<Statistics />)} />
+            <Route path="/statistics/listening" element={statsOnly(<ListeningStatsPage />)} />
+            <Route path="/statistics/library" element={statsOnly(<LibraryStatsPage />)} />
+            <Route path="/tools" element={adminOnly(<Tools />)} />
+            <Route path="/tools/duplicates" element={adminOnly(<Unduper />)} />
+            <Route path="/library" element={<LibraryLayout />}>
+              <Route index element={<LibraryHome />} />
+              <Route path="home" element={<LibraryHome />} />
+              <Route path="home/feed/:section" element={<LibraryHomeFeed />} />
+              <Route path="artists" element={<LibraryArtists />} />
+              <Route path="albums" element={<LibraryAlbums />} />
+              <Route path="genres" element={<LibraryGenres />} />
+              <Route path="labels" element={<LibraryLabels />} />
+              <Route path="liked" element={<LikedPage />} />
+              <Route path="recommendations" element={<RecommendationsPage />} />
+              <Route path="artist/:artistId" element={<ArtistPage />} />
+              <Route path="label/:label" element={<LabelPage />} />
+              <Route path="genre/:genre" element={<GenrePage />} />
+              <Route path="album/:albumId" element={<AlbumPage />} />
+              <Route path="playlists" element={<Playlists />} />
+              <Route path="playlists/:playlistId" element={<PlaylistDetail />} />
+              <Route path="browser" element={<Navigate to="/library" replace />} />
+            </Route>
+            <Route path="/playlists" element={<Navigate to="/library/playlists" replace />} />
+            <Route path="/playlists/:playlistId" element={<PlaylistLegacyRedirect />} />
+            <Route path="/tag-fixer" element={adminOnly(<TagFixer />)} />
+            <Route path="/broken-albums" element={adminOnly(<BrokenAlbumsList />)} />
+            <Route path="/settings" element={<Settings />} />
+            <Route path="/admin/users" element={adminOnly(<AdminUsersPage />)} />
+            <Route path="*" element={<NotFound />} />
           </Route>
-          <Route path="/playlists" element={<Navigate to="/library/playlists" replace />} />
-          <Route path="/playlists/:playlistId" element={<PlaylistLegacyRedirect />} />
-          <Route path="/tag-fixer" element={adminOnly(<TagFixer />)} />
-          <Route path="/broken-albums" element={adminOnly(<BrokenAlbumsList />)} />
-          <Route path="/settings" element={<Settings />} />
-          <Route path="/admin/users" element={adminOnly(<AdminUsersPage />)} />
-          <Route path="*" element={<NotFound />} />
-        </Route>
-        <Route path="/auth/login" element={<Navigate to="/library" replace />} />
-        <Route path="/auth/bootstrap" element={<Navigate to="/library" replace />} />
-      </Routes>
-      {auth.canUseAI ? <AssistantDock bottomOffsetPx={session ? 128 : 16} /> : null}
+          <Route path="/auth/login" element={<Navigate to="/library" replace />} />
+          <Route path="/auth/bootstrap" element={<Navigate to="/library" replace />} />
+        </Routes>
+      </div>
+      {isMobile ? <MobileBottomNav playerOffsetPx={mobileNavOffsetPx} /> : null}
+      {auth.canUseAI ? <AssistantDock bottomOffsetPx={assistantDockBottomOffset} /> : null}
       {session && (
         <AudioPlayer
           albumId={session.albumId}
