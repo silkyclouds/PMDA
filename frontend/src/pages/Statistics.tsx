@@ -42,7 +42,9 @@ import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { ProviderBadge } from '@/components/providers/ProviderBadge';
 import { StatisticsPageNav } from '@/components/statistics/StatisticsPageNav';
+import { PipelineTracePanel } from '@/components/statistics/PipelineTracePanel';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { useAuth } from '@/contexts/AuthContext';
 import * as api from '@/lib/api';
 import { toast } from 'sonner';
 
@@ -69,7 +71,7 @@ const AI_COST_ALBUM_LIMIT = 200;
 const AI_COST_SCAN_ROWS_LIMIT = 30;
 
 type PeriodKey = (typeof PERIODS)[number]['key'];
-type StatsTab = 'overview' | 'metadata' | 'quality' | 'operations' | 'duplicates' | 'incompletes' | 'ai' | 'benchmark';
+type StatsTab = 'overview' | 'metadata' | 'quality' | 'operations' | 'duplicates' | 'incompletes' | 'pipeline' | 'ai' | 'benchmark';
 
 interface ScanSnapshot {
   scanId: number;
@@ -442,6 +444,7 @@ function StatCard({
 }
 
 export default function Statistics() {
+  const { isAdmin } = useAuth();
   const [period, setPeriod] = useState<PeriodKey>('last');
   const [activeTab, setActiveTab] = useState<StatsTab>('overview');
   const [aiCostScope, setAiCostScope] = useState<'scan' | 'lifecycle'>('lifecycle');
@@ -1547,6 +1550,17 @@ export default function Statistics() {
                     Incompletes
                   </span>
                 </TabsTrigger>
+                {isAdmin ? (
+                  <TabsTrigger
+                    value="pipeline"
+                    className="h-11 justify-start rounded-lg border border-border/60 bg-card/70 px-3 text-left text-sm font-semibold text-foreground transition-colors hover:bg-accent/70 data-[state=active]:border-sky-400/60 data-[state=active]:bg-sky-500/20 data-[state=active]:text-sky-100 data-[state=active]:shadow-[0_0_0_1px_rgba(56,189,248,0.22)]"
+                  >
+                    <span className="flex items-center gap-2">
+                      <Server className="w-4 h-4" />
+                      Pipeline
+                    </span>
+                  </TabsTrigger>
+                ) : null}
                 <TabsTrigger
                   value="benchmark"
                   className="h-11 justify-start rounded-lg border border-border/60 bg-card/70 px-3 text-left text-sm font-semibold text-foreground transition-colors hover:bg-accent/70 data-[state=active]:border-pink-400/60 data-[state=active]:bg-pink-500/20 data-[state=active]:text-pink-100 data-[state=active]:shadow-[0_0_0_1px_rgba(244,114,182,0.22)]"
@@ -2733,6 +2747,15 @@ export default function Statistics() {
                 </Card>
               ) : null}
             </TabsContent>
+            {isAdmin ? (
+              <TabsContent value="pipeline" className="space-y-4">
+                <PipelineTracePanel
+                  history={history}
+                  liveScanId={scanProgress?.scan_id ?? null}
+                  liveScanActive={Boolean(scanProgress?.scanning || scanProgress?.post_processing)}
+                />
+              </TabsContent>
+            ) : null}
           </Tabs>
         )}
     </div>

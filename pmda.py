@@ -27,7 +27,9 @@ v0.7.5
 
 import base64
 import ast
+import csv
 import html
+import io
 import json
 import os
 import secrets
@@ -3439,6 +3441,13 @@ def _auth_user_can_use_ai(user: dict[str, Any] | None) -> bool:
     return bool(user.get("allow_ai_calls", True))
 
 
+def _require_admin_json() -> Optional[tuple[Response, int]]:
+    user = _current_user_or_empty()
+    if bool(user.get("is_admin")):
+        return None
+    return jsonify({"error": "Administrator only"}), 403
+
+
 def _auth_resolve_public_user_scope(
     requested_user_id: Any,
     *,
@@ -6432,6 +6441,82 @@ def init_state_db():
         if "strict_tracklist_score" not in se_cols:
             cur.execute("ALTER TABLE scan_editions ADD COLUMN strict_tracklist_score REAL NOT NULL DEFAULT 0.0")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_scan_editions_strict_match_verified ON scan_editions(scan_id, strict_match_verified)")
+    except sqlite3.OperationalError:
+        pass
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS scan_pipeline_trace (
+            scan_id INTEGER NOT NULL,
+            artist TEXT NOT NULL,
+            album_id INTEGER NOT NULL,
+            album_title TEXT,
+            folder TEXT NOT NULL DEFAULT '',
+            folder_name TEXT DEFAULT '',
+            fmt_text TEXT DEFAULT '',
+            metadata_source TEXT DEFAULT '',
+            strict_match_verified INTEGER NOT NULL DEFAULT 0,
+            strict_match_provider TEXT DEFAULT '',
+            strict_reject_reason TEXT DEFAULT '',
+            strict_tracklist_score REAL NOT NULL DEFAULT 0.0,
+            has_cover INTEGER DEFAULT 0,
+            is_broken INTEGER DEFAULT 0,
+            expected_track_count INTEGER,
+            actual_track_count INTEGER,
+            missing_indices TEXT,
+            missing_required_tags TEXT,
+            has_musicbrainz INTEGER DEFAULT 0,
+            has_discogs INTEGER DEFAULT 0,
+            has_lastfm INTEGER DEFAULT 0,
+            has_bandcamp INTEGER DEFAULT 0,
+            musicbrainz_release_id TEXT DEFAULT '',
+            discogs_release_id TEXT DEFAULT '',
+            lastfm_album_mbid TEXT DEFAULT '',
+            bandcamp_album_url TEXT DEFAULT '',
+            dupe_role TEXT DEFAULT 'none',
+            dupe_signal TEXT DEFAULT '',
+            dupe_peer_count INTEGER DEFAULT 0,
+            dupe_needs_ai INTEGER DEFAULT 0,
+            no_move INTEGER DEFAULT 0,
+            manual_review INTEGER DEFAULT 0,
+            same_folder INTEGER DEFAULT 0,
+            winner_album_id INTEGER,
+            winner_title TEXT DEFAULT '',
+            ai_used INTEGER DEFAULT 0,
+            ai_provider TEXT DEFAULT '',
+            ai_model TEXT DEFAULT '',
+            pipeline_status TEXT DEFAULT 'active',
+            move_reason TEXT DEFAULT '',
+            move_status TEXT DEFAULT 'none',
+            moved_to_path TEXT DEFAULT '',
+            decision_provider TEXT DEFAULT '',
+            decision_reason TEXT DEFAULT '',
+            decision_confidence REAL,
+            timeline_json TEXT NOT NULL DEFAULT '[]',
+            meta_summary_json TEXT NOT NULL DEFAULT '{}',
+            updated_at REAL NOT NULL,
+            PRIMARY KEY (scan_id, artist, album_id, folder),
+            FOREIGN KEY (scan_id) REFERENCES scan_history(scan_id)
+        )
+    """)
+    cur.execute("PRAGMA table_info(scan_pipeline_trace)")
+    trace_cols = [r[1] for r in cur.fetchall()]
+    for col_name, col_type in [
+        ("pipeline_status", "TEXT DEFAULT 'active'"),
+        ("move_reason", "TEXT DEFAULT ''"),
+        ("move_status", "TEXT DEFAULT 'none'"),
+        ("moved_to_path", "TEXT DEFAULT ''"),
+        ("decision_provider", "TEXT DEFAULT ''"),
+        ("decision_reason", "TEXT DEFAULT ''"),
+        ("decision_confidence", "REAL"),
+    ]:
+        if col_name not in trace_cols:
+            cur.execute(f"ALTER TABLE scan_pipeline_trace ADD COLUMN {col_name} {col_type}")
+    try:
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_scan_pipeline_trace_scan_updated ON scan_pipeline_trace(scan_id, updated_at DESC)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_scan_pipeline_trace_scan_artist ON scan_pipeline_trace(scan_id, artist)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_scan_pipeline_trace_scan_dupe ON scan_pipeline_trace(scan_id, dupe_role)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_scan_pipeline_trace_scan_broken ON scan_pipeline_trace(scan_id, is_broken)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_scan_pipeline_trace_scan_folder ON scan_pipeline_trace(scan_id, folder)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_scan_pipeline_trace_scan_status ON scan_pipeline_trace(scan_id, pipeline_status)")
     except sqlite3.OperationalError:
         pass
     # Persistent resume state for interrupted scans (artist-level status machine).
@@ -34126,6 +34211,562 @@ def save_scan_editions_artist_to_db(scan_id: int, artist_name: str, editions_lis
     return row_count
 
 
+def _scan_pipeline_trace_columns(cur: sqlite3.Cursor) -> set[str]:
+    try:
+        cur.execute("PRAGMA table_info(scan_pipeline_trace)")
+        return {str(r[1]) for r in cur.fetchall() if len(r) > 1}
+    except Exception:
+        return set()
+
+
+def _scan_pipeline_trace_move_lookup(scan_id: int) -> dict[int, dict[str, Any]]:
+    sid = int(scan_id or 0)
+    if sid <= 0:
+        return {}
+    con = sqlite3.connect(str(STATE_DB_FILE), timeout=30)
+    con.row_factory = sqlite3.Row
+    try:
+        cur = con.cursor()
+        cur.execute(
+            """
+            SELECT album_id,
+                   COALESCE(move_reason, '') AS move_reason,
+                   COALESCE(original_path, '') AS original_path,
+                   COALESCE(moved_to_path, '') AS moved_to_path,
+                   COALESCE(restored, 0) AS restored,
+                   COALESCE(decision_provider, '') AS decision_provider,
+                   COALESCE(decision_reason, '') AS decision_reason,
+                   decision_confidence
+            FROM scan_moves
+            WHERE scan_id = ?
+            ORDER BY moved_at DESC
+            """,
+            (sid,),
+        )
+        rows = cur.fetchall()
+    finally:
+        con.close()
+    out: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        try:
+            album_id = int(row["album_id"] or 0)
+        except Exception:
+            album_id = 0
+        if album_id <= 0 or album_id in out:
+            continue
+        status = _scan_move_status(
+            bool(row["restored"]),
+            str(row["original_path"] or ""),
+            str(row["moved_to_path"] or ""),
+        )
+        out[album_id] = {
+            "move_reason": str(row["move_reason"] or "").strip().lower(),
+            "move_status": status,
+            "moved_to_path": str(row["moved_to_path"] or "").strip(),
+            "decision_provider": str(row["decision_provider"] or "").strip(),
+            "decision_reason": str(row["decision_reason"] or "").strip(),
+            "decision_confidence": float(row["decision_confidence"]) if row["decision_confidence"] is not None else None,
+        }
+    return out
+
+
+def _scan_pipeline_trace_incomplete_lookup(scan_id: int) -> dict[int, dict[str, Any]]:
+    sid = int(scan_id or 0)
+    if sid <= 0:
+        return {}
+    con = sqlite3.connect(str(STATE_DB_FILE), timeout=30)
+    con.row_factory = sqlite3.Row
+    try:
+        cur = con.cursor()
+        cur.execute(
+            """
+            SELECT album_id,
+                   COALESCE(classification, '') AS classification,
+                   COALESCE(missing_in_plex, '[]') AS missing_in_plex,
+                   COALESCE(missing_on_disk, '[]') AS missing_on_disk,
+                   COALESCE(track_titles, '[]') AS track_titles,
+                   expected_track_count,
+                   actual_track_count
+            FROM incomplete_album_diagnostics
+            WHERE run_id = ?
+            """,
+            (sid,),
+        )
+        rows = cur.fetchall()
+    finally:
+        con.close()
+    out: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        try:
+            album_id = int(row["album_id"] or 0)
+        except Exception:
+            album_id = 0
+        if album_id <= 0:
+            continue
+        def _json_list(raw: Any) -> list[Any]:
+            try:
+                parsed = json.loads(str(raw or "[]"))
+                return parsed if isinstance(parsed, list) else []
+            except Exception:
+                return []
+        out[album_id] = {
+            "classification": str(row["classification"] or "").strip(),
+            "missing_in_plex": _json_list(row["missing_in_plex"]),
+            "missing_on_disk": _json_list(row["missing_on_disk"]),
+            "track_titles": _json_list(row["track_titles"]),
+            "expected_track_count": _parse_int_loose(row["expected_track_count"], 0),
+            "actual_track_count": _parse_int_loose(row["actual_track_count"], 0),
+        }
+    return out
+
+
+def _scan_pipeline_trace_duplicate_lookup(groups: list[dict] | None) -> dict[int, dict[str, Any]]:
+    out: dict[int, dict[str, Any]] = {}
+    for group in list(groups or []):
+        best = group.get("best") if isinstance(group.get("best"), dict) else None
+        losers = [e for e in list(group.get("losers") or []) if isinstance(e, dict)]
+        editions = [e for e in list(group.get("editions") or []) if isinstance(e, dict)]
+        peer_count = 0
+        if best or losers:
+            peer_count = (1 if best else 0) + len(losers)
+        elif editions:
+            peer_count = len(editions)
+        if peer_count <= 0:
+            continue
+        ai_used = False
+        ai_provider = ""
+        ai_model = ""
+        if best:
+            ai_used = bool(best.get("used_ai"))
+            ai_provider = str(best.get("ai_provider") or "").strip()
+            ai_model = str(best.get("ai_model") or "").strip()
+        if ai_used and (not ai_provider or not ai_model):
+            mod = sys.modules[__name__]
+            ai_provider = ai_provider or str(getattr(mod, "AI_PROVIDER", "") or "")
+            ai_model = ai_model or str(getattr(mod, "RESOLVED_MODEL", None) or getattr(mod, "OPENAI_MODEL", None) or "")
+        common = {
+            "dupe_signal": str(group.get("dupe_signal") or "").strip(),
+            "dupe_peer_count": int(peer_count),
+            "dupe_needs_ai": 1 if bool(group.get("needs_ai")) else 0,
+            "no_move": 1 if bool(group.get("no_move")) else 0,
+            "manual_review": 1 if bool(group.get("manual_review")) else 0,
+            "same_folder": 1 if bool(group.get("same_folder")) else 0,
+            "winner_album_id": int(best.get("album_id") or 0) if best else None,
+            "winner_title": str((best or {}).get("title_raw") or (best or {}).get("album_norm") or "").strip(),
+            "ai_used": 1 if ai_used else 0,
+            "ai_provider": ai_provider,
+            "ai_model": ai_model,
+        }
+        if best and losers:
+            try:
+                best_album_id = int(best.get("album_id") or 0)
+            except Exception:
+                best_album_id = 0
+            if best_album_id > 0:
+                out[best_album_id] = {**common, "dupe_role": "winner"}
+            for loser in losers:
+                try:
+                    loser_album_id = int(loser.get("album_id") or 0)
+                except Exception:
+                    loser_album_id = 0
+                if loser_album_id > 0:
+                    out[loser_album_id] = {**common, "dupe_role": "loser"}
+            continue
+        for edition in editions:
+            try:
+                album_id = int(edition.get("album_id") or 0)
+            except Exception:
+                album_id = 0
+            if album_id <= 0:
+                continue
+            out[album_id] = {**common, "dupe_role": "candidate"}
+    return out
+
+
+def _scan_pipeline_trace_status(
+    *,
+    move_reason: str,
+    move_status: str,
+    is_broken: bool,
+    dupe_role: str,
+    strict_match_verified: bool,
+    metadata_source: str,
+) -> str:
+    mr = str(move_reason or "").strip().lower()
+    ms = str(move_status or "").strip().lower()
+    role = str(dupe_role or "").strip().lower()
+    if mr == "dedupe" and ms == "moved":
+        return "moved_duplicate"
+    if mr == "incomplete" and ms == "moved":
+        return "moved_incomplete"
+    if mr == "dedupe" and ms == "restored":
+        return "restored_duplicate"
+    if mr == "incomplete" and ms == "restored":
+        return "restored_incomplete"
+    if bool(is_broken):
+        return "incomplete"
+    if role == "loser":
+        return "duplicate_loser"
+    if role == "winner":
+        return "duplicate_winner"
+    if role == "candidate":
+        return "duplicate_candidate"
+    if bool(strict_match_verified):
+        return "matched"
+    if str(metadata_source or "").strip():
+        return "provider_only"
+    return "unmatched"
+
+
+def _scan_pipeline_trace_timeline(
+    *,
+    metadata_source: str,
+    strict_match_verified: bool,
+    strict_match_provider: str,
+    strict_reject_reason: str,
+    has_cover: bool,
+    missing_required_tags: list[str],
+    is_broken: bool,
+    expected_track_count: int,
+    actual_track_count: int,
+    dupe_role: str,
+    dupe_signal: str,
+    move_reason: str,
+    move_status: str,
+    ai_used: bool,
+    ai_provider: str,
+) -> list[dict[str, str]]:
+    timeline: list[dict[str, str]] = [{"stage": "scan", "label": "Detected", "tone": "neutral"}]
+    provider_label = _normalize_identity_provider(strict_match_provider or metadata_source or "").strip() or "provider"
+    if strict_match_verified:
+        timeline.append({"stage": "match", "label": f"Strict via {provider_label}", "tone": "success"})
+    elif metadata_source:
+        timeline.append({"stage": "match", "label": f"Matched via {_normalize_identity_provider(metadata_source)}", "tone": "info"})
+    elif strict_reject_reason:
+        timeline.append({"stage": "match", "label": str(strict_reject_reason), "tone": "warning"})
+    else:
+        timeline.append({"stage": "match", "label": "Unmatched", "tone": "warning"})
+    timeline.append({"stage": "cover", "label": "Cover" if has_cover else "No cover", "tone": "success" if has_cover else "warning"})
+    if missing_required_tags:
+        timeline.append(
+            {
+                "stage": "tags",
+                "label": f"{len(missing_required_tags)} missing tag(s)",
+                "tone": "warning",
+            }
+        )
+    else:
+        timeline.append({"stage": "tags", "label": "Tags complete", "tone": "success"})
+    role = str(dupe_role or "").strip().lower()
+    if role == "winner":
+        label = "Duplicate winner"
+        if dupe_signal:
+            label = f"{label} · {dupe_signal}"
+        timeline.append({"stage": "dupe", "label": label, "tone": "info"})
+    elif role == "loser":
+        label = "Duplicate loser"
+        if dupe_signal:
+            label = f"{label} · {dupe_signal}"
+        timeline.append({"stage": "dupe", "label": label, "tone": "warning"})
+    elif role == "candidate":
+        timeline.append({"stage": "dupe", "label": "Duplicate candidate", "tone": "warning"})
+    if is_broken:
+        counts = ""
+        if expected_track_count or actual_track_count:
+            counts = f" {actual_track_count}/{expected_track_count}".strip()
+        timeline.append({"stage": "quality", "label": f"Incomplete {counts}".strip(), "tone": "warning"})
+    mr = str(move_reason or "").strip().lower()
+    ms = str(move_status or "").strip().lower()
+    if mr and mr != "none" and ms and ms != "none":
+        timeline.append({"stage": "move", "label": f"{ms.title()} {mr}", "tone": "success" if ms == "moved" else "info"})
+    if ai_used:
+        timeline.append({"stage": "ai", "label": f"AI {ai_provider or 'used'}", "tone": "info"})
+    return timeline
+
+
+def _scan_pipeline_trace_build_rows(
+    *,
+    scan_id: int,
+    artist_name: str,
+    editions_list: list[dict],
+    groups: list[dict] | None = None,
+    move_lookup: dict[int, dict[str, Any]] | None = None,
+    incomplete_lookup: dict[int, dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    dupe_lookup = _scan_pipeline_trace_duplicate_lookup(groups)
+    move_lookup = dict(move_lookup or {})
+    incomplete_lookup = dict(incomplete_lookup or {})
+    for edition in list(editions_list or []):
+        if not isinstance(edition, dict):
+            continue
+        try:
+            album_id = int(edition.get("album_id") or 0)
+        except Exception:
+            album_id = 0
+        if album_id <= 0:
+            continue
+        folder = str(edition.get("folder") or "").strip()
+        folder_name = ""
+        if folder:
+            try:
+                folder_name = (Path(folder).name or "").strip()
+            except Exception:
+                folder_name = ""
+        artist_resolved, title_resolved = _apply_resolved_identity_to_edition(
+            edition,
+            default_artist=str(artist_name or ""),
+            default_title=str(edition.get("title_raw") or edition.get("album_title") or ""),
+            folder_name=folder_name,
+        )
+        meta = dict(edition.get("meta", {}) or {})
+        if edition.get("primary_metadata_source"):
+            meta["primary_metadata_source"] = edition.get("primary_metadata_source")
+        try:
+            meta_json = json.dumps(meta, default=str)
+        except Exception:
+            meta_json = "{}"
+        has_cover = 0
+        if folder:
+            try:
+                folder_path = Path(folder)
+                cover_patterns = ["cover.*", "folder.*", "album.*", "artwork.*", "front.*"]
+                for pattern in cover_patterns:
+                    image_matches = [
+                        f for f in folder_path.glob(pattern)
+                        if f.suffix.lower() in [".jpg", ".jpeg", ".png", ".webp", ".gif"]
+                    ]
+                    if image_matches:
+                        has_cover = 1
+                        break
+            except Exception:
+                has_cover = 0
+        try:
+            missing_required_tags = _check_required_tags(meta, REQUIRED_TAGS, edition=edition)
+        except Exception:
+            missing_required_tags = []
+        missing_required_json = json.dumps(missing_required_tags, default=str) if missing_required_tags else None
+        discogs_release_id = str(edition.get("discogs_release_id") or meta.get("discogs_release_id") or "").strip()
+        lastfm_album_mbid = str(edition.get("lastfm_album_mbid") or meta.get("lastfm_album_mbid") or "").strip()
+        bandcamp_album_url = str(edition.get("bandcamp_album_url") or meta.get("bandcamp_album_url") or "").strip()
+        musicbrainz_release_id = str(
+            edition.get("musicbrainz_release_id")
+            or meta.get("musicbrainz_releaseid")
+            or meta.get("musicbrainz_release_id")
+            or meta.get("musicbrainz_albumid")
+            or ""
+        ).strip()
+        metadata_source = _normalize_identity_provider(
+            str(
+                edition.get("primary_metadata_source")
+                or edition.get("metadata_source")
+                or meta.get("primary_metadata_source")
+                or meta.get(PMDA_MATCH_PROVIDER_TAG)
+                or ""
+            )
+        )
+        strict_match_verified = 1 if bool(edition.get("strict_match_verified")) else 0
+        strict_match_provider = _normalize_identity_provider(str(edition.get("strict_match_provider") or ""))
+        strict_reject_reason = str(edition.get("strict_reject_reason") or "").strip()
+        strict_tracklist_score = float(edition.get("strict_tracklist_score") or 0.0)
+        dupe_info = dict(dupe_lookup.get(album_id) or {})
+        move_info = dict(move_lookup.get(album_id) or {})
+        incomplete_info = dict(incomplete_lookup.get(album_id) or {})
+        if incomplete_info:
+            expected_track_count = _parse_int_loose(
+                incomplete_info.get("expected_track_count"),
+                edition.get("expected_track_count"),
+            )
+            actual_track_count = _parse_int_loose(
+                incomplete_info.get("actual_track_count"),
+                edition.get("actual_track_count") or len(edition.get("tracks", [])),
+            )
+            missing_indices_value = incomplete_info.get("missing_on_disk") or edition.get("missing_indices") or []
+        else:
+            expected_track_count = _parse_int_loose(edition.get("expected_track_count"), 0)
+            actual_track_count = _parse_int_loose(edition.get("actual_track_count"), len(edition.get("tracks", [])))
+            missing_indices_value = edition.get("missing_indices") or []
+        try:
+            missing_indices_json = json.dumps(list(missing_indices_value or []), default=str)
+        except Exception:
+            missing_indices_json = "[]"
+        is_broken = 1 if bool(edition.get("is_broken")) or bool(incomplete_info) else 0
+        dupe_role = str(dupe_info.get("dupe_role") or "none").strip().lower() or "none"
+        dupe_signal = str(dupe_info.get("dupe_signal") or "").strip()
+        move_reason = str(move_info.get("move_reason") or "").strip().lower()
+        move_status = str(move_info.get("move_status") or "none").strip().lower() or "none"
+        ai_used = 1 if bool(dupe_info.get("ai_used")) else 0
+        ai_provider = str(dupe_info.get("ai_provider") or "").strip()
+        ai_model = str(dupe_info.get("ai_model") or "").strip()
+        pipeline_status = _scan_pipeline_trace_status(
+            move_reason=move_reason,
+            move_status=move_status,
+            is_broken=bool(is_broken),
+            dupe_role=dupe_role,
+            strict_match_verified=bool(strict_match_verified),
+            metadata_source=metadata_source,
+        )
+        timeline = _scan_pipeline_trace_timeline(
+            metadata_source=metadata_source,
+            strict_match_verified=bool(strict_match_verified),
+            strict_match_provider=strict_match_provider,
+            strict_reject_reason=strict_reject_reason,
+            has_cover=bool(has_cover),
+            missing_required_tags=list(missing_required_tags or []),
+            is_broken=bool(is_broken),
+            expected_track_count=expected_track_count,
+            actual_track_count=actual_track_count,
+            dupe_role=dupe_role,
+            dupe_signal=dupe_signal,
+            move_reason=move_reason,
+            move_status=move_status,
+            ai_used=bool(ai_used),
+            ai_provider=ai_provider,
+        )
+        meta_summary = {
+            "providers": {
+                "musicbrainz": bool(musicbrainz_release_id),
+                "discogs": bool(discogs_release_id),
+                "lastfm": bool(lastfm_album_mbid),
+                "bandcamp": bool(bandcamp_album_url),
+            },
+            "move": move_info or None,
+            "duplicate": dupe_info or None,
+            "incomplete": incomplete_info or None,
+            "metadata_source": metadata_source,
+        }
+        rows.append(
+            {
+                "scan_id": int(scan_id),
+                "artist": artist_resolved,
+                "album_id": album_id,
+                "album_title": title_resolved,
+                "folder": folder,
+                "folder_name": folder_name,
+                "fmt_text": get_primary_format(Path(folder)) if folder else "",
+                "metadata_source": metadata_source,
+                "strict_match_verified": strict_match_verified,
+                "strict_match_provider": strict_match_provider,
+                "strict_reject_reason": strict_reject_reason,
+                "strict_tracklist_score": strict_tracklist_score,
+                "has_cover": has_cover,
+                "is_broken": is_broken,
+                "expected_track_count": expected_track_count,
+                "actual_track_count": actual_track_count,
+                "missing_indices": missing_indices_json,
+                "missing_required_tags": missing_required_json,
+                "has_musicbrainz": 1 if musicbrainz_release_id else 0,
+                "has_discogs": 1 if discogs_release_id else 0,
+                "has_lastfm": 1 if lastfm_album_mbid else 0,
+                "has_bandcamp": 1 if bandcamp_album_url else 0,
+                "musicbrainz_release_id": musicbrainz_release_id,
+                "discogs_release_id": discogs_release_id,
+                "lastfm_album_mbid": lastfm_album_mbid,
+                "bandcamp_album_url": bandcamp_album_url,
+                "dupe_role": dupe_role,
+                "dupe_signal": dupe_signal,
+                "dupe_peer_count": int(dupe_info.get("dupe_peer_count") or 0),
+                "dupe_needs_ai": 1 if bool(dupe_info.get("dupe_needs_ai")) else 0,
+                "no_move": 1 if bool(dupe_info.get("no_move")) else 0,
+                "manual_review": 1 if bool(dupe_info.get("manual_review")) else 0,
+                "same_folder": 1 if bool(dupe_info.get("same_folder")) else 0,
+                "winner_album_id": _parse_int_loose(dupe_info.get("winner_album_id"), 0) or None,
+                "winner_title": str(dupe_info.get("winner_title") or "").strip(),
+                "ai_used": ai_used,
+                "ai_provider": ai_provider,
+                "ai_model": ai_model,
+                "pipeline_status": pipeline_status,
+                "move_reason": move_reason,
+                "move_status": move_status,
+                "moved_to_path": str(move_info.get("moved_to_path") or "").strip(),
+                "decision_provider": str(move_info.get("decision_provider") or "").strip(),
+                "decision_reason": str(move_info.get("decision_reason") or "").strip(),
+                "decision_confidence": move_info.get("decision_confidence"),
+                "timeline_json": json.dumps(timeline, ensure_ascii=False),
+                "meta_summary_json": json.dumps(meta_summary, ensure_ascii=False, default=str),
+                "updated_at": time.time(),
+            }
+        )
+    return rows
+
+
+def _scan_pipeline_trace_write_rows(
+    cur: sqlite3.Cursor,
+    rows: list[dict[str, Any]],
+) -> int:
+    cols_present = _scan_pipeline_trace_columns(cur)
+    written = 0
+    for row in rows:
+        ordered_keys = [key for key in row.keys() if key in cols_present]
+        placeholders = ", ".join("?" for _ in ordered_keys)
+        values = [row.get(key) for key in ordered_keys]
+        cur.execute(
+            f"""
+            INSERT OR REPLACE INTO scan_pipeline_trace ({", ".join(ordered_keys)})
+            VALUES ({placeholders})
+            """,
+            values,
+        )
+        written += 1
+    return written
+
+
+def save_scan_pipeline_trace_artist_to_db(
+    scan_id: int,
+    artist_name: str,
+    editions_list: List[dict],
+    groups: List[dict] | None = None,
+) -> int:
+    rows = _scan_pipeline_trace_build_rows(
+        scan_id=int(scan_id or 0),
+        artist_name=str(artist_name or ""),
+        editions_list=list(editions_list or []),
+        groups=list(groups or []),
+    )
+    con = sqlite3.connect(str(STATE_DB_FILE), timeout=30)
+    try:
+        cur = con.cursor()
+        cur.execute("DELETE FROM scan_pipeline_trace WHERE scan_id = ? AND artist = ?", (int(scan_id or 0), str(artist_name or "")))
+        written = _scan_pipeline_trace_write_rows(cur, rows)
+        con.commit()
+        return written
+    finally:
+        con.close()
+
+
+def save_scan_pipeline_trace_to_db(
+    scan_id: int,
+    all_editions_by_artist: Dict[str, List[dict]],
+    all_results: Dict[str, List[dict]] | None = None,
+) -> int:
+    sid = int(scan_id or 0)
+    if sid <= 0:
+        return 0
+    all_results = dict(all_results or {})
+    move_lookup = _scan_pipeline_trace_move_lookup(sid)
+    incomplete_lookup = _scan_pipeline_trace_incomplete_lookup(sid)
+    con = sqlite3.connect(str(STATE_DB_FILE), timeout=30)
+    try:
+        cur = con.cursor()
+        cur.execute("DELETE FROM scan_pipeline_trace WHERE scan_id = ?", (sid,))
+        total = 0
+        for artist_name, editions_list in (all_editions_by_artist or {}).items():
+            rows = _scan_pipeline_trace_build_rows(
+                scan_id=sid,
+                artist_name=str(artist_name or ""),
+                editions_list=list(editions_list or []),
+                groups=list(all_results.get(artist_name) or []),
+                move_lookup=move_lookup,
+                incomplete_lookup=incomplete_lookup,
+            )
+            total += _scan_pipeline_trace_write_rows(cur, rows)
+        con.commit()
+        logging.debug("save_scan_pipeline_trace_to_db: scan_id=%s rows=%s", sid, total)
+        return total
+    finally:
+        con.close()
+
+
 def update_scan_history_incremental(
     scan_id: int,
     artists_processed: int,
@@ -40243,6 +40884,7 @@ def background_scan():
         # Clear scan_editions for this scan_id so only the latest run's data is stored
         con = sqlite3.connect(str(STATE_DB_FILE))
         con.execute("DELETE FROM scan_editions WHERE scan_id = ?", (scan_id,))
+        con.execute("DELETE FROM scan_pipeline_trace WHERE scan_id = ?", (scan_id,))
         con.execute("DELETE FROM duplicates_loser")
         con.execute("DELETE FROM duplicates_best")
         con.commit()
@@ -40263,6 +40905,7 @@ def background_scan():
                 try:
                     save_scan_artist_to_db(aname, grps)
                     save_scan_editions_artist_to_db(sid, aname, eds)
+                    save_scan_pipeline_trace_artist_to_db(sid, aname, eds, grps)
                     logging.debug(
                         "Incremental persist: %s (%d groups, %d editions)",
                         aname, len(grps), len(eds),
@@ -41180,6 +41823,12 @@ def background_scan():
                 state["scan_player_sync_ok"] = bool(sync_result_ok)
                 state["scan_player_sync_message"] = sync_result_msg
                 state["scan_step_progress"] = state.get("scan_step_progress", 0) + 1
+        try:
+            _scan_id = state.get("scan_id")
+            if _scan_id and all_editions_by_artist is not None:
+                save_scan_pipeline_trace_to_db(int(_scan_id), all_editions_by_artist, all_results)
+        except Exception as e:
+            logging.warning("save_scan_pipeline_trace_to_db in finally failed: %s", e)
         end_time = time.time()
         scan_id = None
         detected_tracks_total = 0
@@ -51340,6 +51989,7 @@ def api_progress():
             ai_unpriced_calls_effective = int(last_scan_ai_unpriced_calls or 0)
     
     payload = {
+        "scan_id": int(state.get("scan_id") or 0) if state.get("scan_id") else None,
         "scanning": scanning,
         "scan_starting": scan_starting,
         "progress": progress,
@@ -51905,6 +52555,7 @@ def api_scan_history_clear():
     try:
         cur.execute("DELETE FROM ai_scan_cost_rollups")
         cur.execute("DELETE FROM ai_call_usage")
+        cur.execute("DELETE FROM scan_pipeline_trace")
         cur.execute("DELETE FROM scan_editions")
         cur.execute("DELETE FROM scan_history")
         con.commit()
@@ -70398,6 +71049,337 @@ def api_scan_history_detail(scan_id):
     else:
         out["summary_json"] = None
     return jsonify(out)
+
+
+def _scan_pipeline_trace_row_to_api(row: sqlite3.Row) -> dict[str, Any]:
+    def _json_list(raw: Any) -> list[Any]:
+        try:
+            parsed = json.loads(str(raw or "[]"))
+            return parsed if isinstance(parsed, list) else []
+        except Exception:
+            return []
+
+    def _json_obj(raw: Any) -> dict[str, Any]:
+        try:
+            parsed = json.loads(str(raw or "{}"))
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+
+    return {
+        "scan_id": int(row["scan_id"] or 0),
+        "artist": str(row["artist"] or ""),
+        "album_id": int(row["album_id"] or 0),
+        "album_title": str(row["album_title"] or ""),
+        "folder": str(row["folder"] or ""),
+        "folder_name": str(row["folder_name"] or ""),
+        "fmt_text": str(row["fmt_text"] or ""),
+        "metadata_source": str(row["metadata_source"] or ""),
+        "strict_match_verified": bool(row["strict_match_verified"]),
+        "strict_match_provider": str(row["strict_match_provider"] or ""),
+        "strict_reject_reason": str(row["strict_reject_reason"] or ""),
+        "strict_tracklist_score": float(row["strict_tracklist_score"] or 0.0),
+        "has_cover": bool(row["has_cover"]),
+        "is_broken": bool(row["is_broken"]),
+        "expected_track_count": _parse_int_loose(row["expected_track_count"], 0),
+        "actual_track_count": _parse_int_loose(row["actual_track_count"], 0),
+        "missing_indices": _json_list(row["missing_indices"]),
+        "missing_required_tags": _json_list(row["missing_required_tags"]),
+        "providers": {
+            "musicbrainz": bool(row["has_musicbrainz"]),
+            "discogs": bool(row["has_discogs"]),
+            "lastfm": bool(row["has_lastfm"]),
+            "bandcamp": bool(row["has_bandcamp"]),
+        },
+        "provider_refs": {
+            "musicbrainz_release_id": str(row["musicbrainz_release_id"] or ""),
+            "discogs_release_id": str(row["discogs_release_id"] or ""),
+            "lastfm_album_mbid": str(row["lastfm_album_mbid"] or ""),
+            "bandcamp_album_url": str(row["bandcamp_album_url"] or ""),
+        },
+        "dupe_role": str(row["dupe_role"] or "none"),
+        "dupe_signal": str(row["dupe_signal"] or ""),
+        "dupe_peer_count": _parse_int_loose(row["dupe_peer_count"], 0),
+        "dupe_needs_ai": bool(row["dupe_needs_ai"]),
+        "no_move": bool(row["no_move"]),
+        "manual_review": bool(row["manual_review"]),
+        "same_folder": bool(row["same_folder"]),
+        "winner_album_id": _parse_int_loose(row["winner_album_id"], 0) or None,
+        "winner_title": str(row["winner_title"] or ""),
+        "ai_used": bool(row["ai_used"]),
+        "ai_provider": str(row["ai_provider"] or ""),
+        "ai_model": str(row["ai_model"] or ""),
+        "pipeline_status": str(row["pipeline_status"] or "active"),
+        "move_reason": str(row["move_reason"] or ""),
+        "move_status": str(row["move_status"] or "none"),
+        "moved_to_path": str(row["moved_to_path"] or ""),
+        "decision_provider": str(row["decision_provider"] or ""),
+        "decision_reason": str(row["decision_reason"] or ""),
+        "decision_confidence": float(row["decision_confidence"]) if row["decision_confidence"] is not None else None,
+        "timeline": _json_list(row["timeline_json"]),
+        "meta_summary": _json_obj(row["meta_summary_json"]),
+        "updated_at": float(row["updated_at"] or 0.0),
+    }
+
+
+def _scan_pipeline_trace_filtered_query(
+    scan_id: int,
+    *,
+    q: str = "",
+    provider: str = "",
+    outcome: str = "",
+) -> tuple[str, list[Any]]:
+    where_parts = ["scan_id = ?"]
+    params: list[Any] = [int(scan_id)]
+    search = str(q or "").strip().lower()
+    if search:
+        needle = f"%{search}%"
+        where_parts.append(
+            "("
+            "LOWER(COALESCE(artist, '')) LIKE ? OR "
+            "LOWER(COALESCE(album_title, '')) LIKE ? OR "
+            "LOWER(COALESCE(folder_name, '')) LIKE ? OR "
+            "LOWER(COALESCE(folder, '')) LIKE ?"
+            ")"
+        )
+        params.extend([needle, needle, needle, needle])
+    provider_norm = str(provider or "").strip().lower()
+    if provider_norm in {"musicbrainz", "discogs", "lastfm", "bandcamp"}:
+        where_parts.append(f"COALESCE(has_{provider_norm}, 0) = 1")
+    elif provider_norm == "none":
+        where_parts.append(
+            "COALESCE(has_musicbrainz, 0) = 0 AND COALESCE(has_discogs, 0) = 0 "
+            "AND COALESCE(has_lastfm, 0) = 0 AND COALESCE(has_bandcamp, 0) = 0"
+        )
+    outcome_norm = str(outcome or "").strip().lower()
+    allowed_outcomes = {
+        "matched",
+        "provider_only",
+        "unmatched",
+        "duplicate_winner",
+        "duplicate_loser",
+        "duplicate_candidate",
+        "incomplete",
+        "moved_duplicate",
+        "moved_incomplete",
+        "restored_duplicate",
+        "restored_incomplete",
+    }
+    if outcome_norm in allowed_outcomes:
+        where_parts.append("LOWER(COALESCE(pipeline_status, 'active')) = ?")
+        params.append(outcome_norm)
+    return " AND ".join(where_parts), params
+
+
+@app.get("/api/scan-history/<int:scan_id>/pipeline-trace")
+def api_scan_history_pipeline_trace(scan_id: int):
+    admin_gate = _require_admin_json()
+    if admin_gate is not None:
+        return admin_gate
+    page = max(1, _parse_int_loose(request.args.get("page"), 1))
+    page_size = max(25, min(500, _parse_int_loose(request.args.get("page_size"), 100)))
+    q = str(request.args.get("q") or "").strip()
+    provider = str(request.args.get("provider") or "").strip()
+    outcome = str(request.args.get("outcome") or "").strip()
+    where_sql, params = _scan_pipeline_trace_filtered_query(scan_id, q=q, provider=provider, outcome=outcome)
+    offset = (page - 1) * page_size
+    con = sqlite3.connect(str(STATE_DB_FILE), timeout=30)
+    con.row_factory = sqlite3.Row
+    try:
+        cur = con.cursor()
+        cur.execute(f"SELECT COUNT(*) AS total FROM scan_pipeline_trace WHERE {where_sql}", tuple(params))
+        total = int((cur.fetchone() or {"total": 0})["total"] or 0)
+        cur.execute(
+            f"""
+            SELECT *
+            FROM scan_pipeline_trace
+            WHERE {where_sql}
+            ORDER BY updated_at DESC, artist COLLATE NOCASE ASC, album_title COLLATE NOCASE ASC
+            LIMIT ? OFFSET ?
+            """,
+            tuple(params + [page_size, offset]),
+        )
+        rows = cur.fetchall()
+        cur.execute(
+            f"""
+            SELECT
+                COUNT(*) AS total,
+                COALESCE(SUM(CASE WHEN COALESCE(strict_match_verified, 0) = 1 THEN 1 ELSE 0 END), 0) AS strict_matches,
+                COALESCE(SUM(CASE WHEN COALESCE(metadata_source, '') <> '' THEN 1 ELSE 0 END), 0) AS provider_matches,
+                COALESCE(SUM(CASE WHEN COALESCE(is_broken, 0) = 1 THEN 1 ELSE 0 END), 0) AS broken,
+                COALESCE(SUM(CASE WHEN LOWER(COALESCE(dupe_role, 'none')) = 'loser' THEN 1 ELSE 0 END), 0) AS duplicate_losers,
+                COALESCE(SUM(CASE WHEN LOWER(COALESCE(dupe_role, 'none')) = 'winner' THEN 1 ELSE 0 END), 0) AS duplicate_winners,
+                COALESCE(SUM(CASE WHEN LOWER(COALESCE(move_reason, '')) = 'dedupe' AND LOWER(COALESCE(move_status, '')) = 'moved' THEN 1 ELSE 0 END), 0) AS moved_duplicates,
+                COALESCE(SUM(CASE WHEN LOWER(COALESCE(move_reason, '')) = 'incomplete' AND LOWER(COALESCE(move_status, '')) = 'moved' THEN 1 ELSE 0 END), 0) AS moved_incompletes,
+                COALESCE(SUM(CASE WHEN COALESCE(ai_used, 0) = 1 THEN 1 ELSE 0 END), 0) AS ai_touched
+            FROM scan_pipeline_trace
+            WHERE {where_sql}
+            """,
+            tuple(params),
+        )
+        summary_row = cur.fetchone() or {}
+        cur.execute(
+            f"""
+            SELECT LOWER(COALESCE(pipeline_status, 'active')) AS pipeline_status, COUNT(*) AS count
+            FROM scan_pipeline_trace
+            WHERE {where_sql}
+            GROUP BY LOWER(COALESCE(pipeline_status, 'active'))
+            ORDER BY count DESC, pipeline_status ASC
+            """,
+            tuple(params),
+        )
+        status_counts = {str(r["pipeline_status"] or "active"): int(r["count"] or 0) for r in cur.fetchall()}
+        cur.execute(
+            f"""
+            SELECT LOWER(COALESCE(metadata_source, '')) AS provider, COUNT(*) AS count
+            FROM scan_pipeline_trace
+            WHERE {where_sql}
+            GROUP BY LOWER(COALESCE(metadata_source, ''))
+            ORDER BY count DESC, provider ASC
+            """,
+            tuple(params),
+        )
+        provider_counts = {str(r["provider"] or "none") or "none": int(r["count"] or 0) for r in cur.fetchall()}
+    finally:
+        con.close()
+    return jsonify(
+        {
+            "scan_id": int(scan_id),
+            "page": int(page),
+            "page_size": int(page_size),
+            "total": int(total),
+            "items": [_scan_pipeline_trace_row_to_api(row) for row in rows],
+            "summary": {
+                "total": int(summary_row["total"] or 0),
+                "strict_matches": int(summary_row["strict_matches"] or 0),
+                "provider_matches": int(summary_row["provider_matches"] or 0),
+                "broken": int(summary_row["broken"] or 0),
+                "duplicate_winners": int(summary_row["duplicate_winners"] or 0),
+                "duplicate_losers": int(summary_row["duplicate_losers"] or 0),
+                "moved_duplicates": int(summary_row["moved_duplicates"] or 0),
+                "moved_incompletes": int(summary_row["moved_incompletes"] or 0),
+                "ai_touched": int(summary_row["ai_touched"] or 0),
+                "status_counts": status_counts,
+                "provider_counts": provider_counts,
+            },
+        }
+    )
+
+
+@app.get("/api/scan-history/<int:scan_id>/pipeline-trace/export")
+def api_scan_history_pipeline_trace_export(scan_id: int):
+    admin_gate = _require_admin_json()
+    if admin_gate is not None:
+        return admin_gate
+    export_format = str(request.args.get("format") or "csv").strip().lower()
+    if export_format not in {"csv", "json"}:
+        return jsonify({"error": "Invalid export format"}), 400
+    q = str(request.args.get("q") or "").strip()
+    provider = str(request.args.get("provider") or "").strip()
+    outcome = str(request.args.get("outcome") or "").strip()
+    where_sql, params = _scan_pipeline_trace_filtered_query(scan_id, q=q, provider=provider, outcome=outcome)
+    con = sqlite3.connect(str(STATE_DB_FILE), timeout=30)
+    con.row_factory = sqlite3.Row
+    try:
+        cur = con.cursor()
+        cur.execute(
+            f"""
+            SELECT *
+            FROM scan_pipeline_trace
+            WHERE {where_sql}
+            ORDER BY updated_at DESC, artist COLLATE NOCASE ASC, album_title COLLATE NOCASE ASC
+            """,
+            tuple(params),
+        )
+        rows = [_scan_pipeline_trace_row_to_api(row) for row in cur.fetchall()]
+    finally:
+        con.close()
+    if export_format == "json":
+        return Response(
+            json.dumps({"scan_id": int(scan_id), "items": rows}, ensure_ascii=False, indent=2),
+            mimetype="application/json",
+            headers={
+                "Content-Disposition": f'attachment; filename="scan-{int(scan_id)}-pipeline-trace.json"',
+            },
+        )
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(
+        [
+            "artist",
+            "album_title",
+            "folder",
+            "pipeline_status",
+            "metadata_source",
+            "strict_match_verified",
+            "strict_match_provider",
+            "strict_reject_reason",
+            "strict_tracklist_score",
+            "has_musicbrainz",
+            "has_discogs",
+            "has_lastfm",
+            "has_bandcamp",
+            "dupe_role",
+            "dupe_signal",
+            "dupe_peer_count",
+            "is_broken",
+            "expected_track_count",
+            "actual_track_count",
+            "missing_indices",
+            "missing_required_tags",
+            "move_reason",
+            "move_status",
+            "moved_to_path",
+            "decision_provider",
+            "decision_reason",
+            "ai_used",
+            "ai_provider",
+            "ai_model",
+            "timeline",
+        ]
+    )
+    for row in rows:
+        writer.writerow(
+            [
+                row.get("artist"),
+                row.get("album_title"),
+                row.get("folder"),
+                row.get("pipeline_status"),
+                row.get("metadata_source"),
+                1 if row.get("strict_match_verified") else 0,
+                row.get("strict_match_provider"),
+                row.get("strict_reject_reason"),
+                row.get("strict_tracklist_score"),
+                1 if row.get("providers", {}).get("musicbrainz") else 0,
+                1 if row.get("providers", {}).get("discogs") else 0,
+                1 if row.get("providers", {}).get("lastfm") else 0,
+                1 if row.get("providers", {}).get("bandcamp") else 0,
+                row.get("dupe_role"),
+                row.get("dupe_signal"),
+                row.get("dupe_peer_count"),
+                1 if row.get("is_broken") else 0,
+                row.get("expected_track_count"),
+                row.get("actual_track_count"),
+                json.dumps(row.get("missing_indices") or [], ensure_ascii=False),
+                json.dumps(row.get("missing_required_tags") or [], ensure_ascii=False),
+                row.get("move_reason"),
+                row.get("move_status"),
+                row.get("moved_to_path"),
+                row.get("decision_provider"),
+                row.get("decision_reason"),
+                1 if row.get("ai_used") else 0,
+                row.get("ai_provider"),
+                row.get("ai_model"),
+                json.dumps(row.get("timeline") or [], ensure_ascii=False),
+            ]
+        )
+    return Response(
+        output.getvalue(),
+        mimetype="text/csv",
+        headers={
+            "Content-Disposition": f'attachment; filename="scan-{int(scan_id)}-pipeline-trace.csv"',
+        },
+    )
 
 
 @app.get("/api/scans/<int:scan_id>/ai-costs")

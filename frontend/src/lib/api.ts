@@ -155,6 +155,7 @@ export interface DuplicateCard {
 }
 
 export interface ScanProgress {
+  scan_id?: number | null;
   scanning: boolean;
   scan_starting?: boolean;
   progress: number;
@@ -1209,6 +1210,95 @@ export interface ScanMovesSummary {
   first_moved_at?: number | null;
   last_moved_at?: number | null;
   by_reason: Record<string, { total_moved: number; pending: number; restored: number; size_mb: number }>;
+}
+
+export type ScanPipelineOutcome =
+  | 'matched'
+  | 'provider_only'
+  | 'unmatched'
+  | 'duplicate_winner'
+  | 'duplicate_loser'
+  | 'duplicate_candidate'
+  | 'incomplete'
+  | 'moved_duplicate'
+  | 'moved_incomplete'
+  | 'restored_duplicate'
+  | 'restored_incomplete';
+
+export interface ScanPipelineTraceRow {
+  scan_id: number;
+  artist: string;
+  album_id: number;
+  album_title: string;
+  folder: string;
+  folder_name: string;
+  fmt_text?: string;
+  metadata_source?: string;
+  strict_match_verified: boolean;
+  strict_match_provider?: string;
+  strict_reject_reason?: string;
+  strict_tracklist_score?: number;
+  has_cover: boolean;
+  is_broken: boolean;
+  expected_track_count?: number;
+  actual_track_count?: number;
+  missing_indices: Array<number | string | unknown[]>;
+  missing_required_tags: string[];
+  providers: {
+    musicbrainz: boolean;
+    discogs: boolean;
+    lastfm: boolean;
+    bandcamp: boolean;
+  };
+  provider_refs: {
+    musicbrainz_release_id?: string;
+    discogs_release_id?: string;
+    lastfm_album_mbid?: string;
+    bandcamp_album_url?: string;
+  };
+  dupe_role: string;
+  dupe_signal?: string;
+  dupe_peer_count?: number;
+  dupe_needs_ai?: boolean;
+  no_move?: boolean;
+  manual_review?: boolean;
+  same_folder?: boolean;
+  winner_album_id?: number | null;
+  winner_title?: string;
+  ai_used?: boolean;
+  ai_provider?: string;
+  ai_model?: string;
+  pipeline_status: ScanPipelineOutcome | string;
+  move_reason?: string;
+  move_status?: string;
+  moved_to_path?: string;
+  decision_provider?: string;
+  decision_reason?: string;
+  decision_confidence?: number | null;
+  timeline: Array<{ stage: string; label: string; tone?: string }>;
+  meta_summary?: Record<string, unknown>;
+  updated_at: number;
+}
+
+export interface ScanPipelineTraceResponse {
+  scan_id: number;
+  page: number;
+  page_size: number;
+  total: number;
+  items: ScanPipelineTraceRow[];
+  summary: {
+    total: number;
+    strict_matches: number;
+    provider_matches: number;
+    broken: number;
+    duplicate_winners: number;
+    duplicate_losers: number;
+    moved_duplicates: number;
+    moved_incompletes: number;
+    ai_touched: number;
+    status_counts: Record<string, number>;
+    provider_counts: Record<string, number>;
+  };
 }
 
 type ApiError = Error & { response?: Response; body?: unknown };
@@ -3912,6 +4002,68 @@ export async function getScanMoves(
 
 export async function getScanMovesSummary(scanId: number): Promise<ScanMovesSummary> {
   return fetchApi<ScanMovesSummary>(`/api/scan-history/${scanId}/moves/summary`);
+}
+
+export async function getScanPipelineTrace(
+  scanId: number,
+  options?: {
+    page?: number;
+    pageSize?: number;
+    q?: string;
+    provider?: 'all' | 'musicbrainz' | 'discogs' | 'lastfm' | 'bandcamp' | 'none';
+    outcome?: 'all' | ScanPipelineOutcome;
+  },
+): Promise<ScanPipelineTraceResponse> {
+  const params = new URLSearchParams();
+  if (typeof options?.page === 'number' && Number.isFinite(options.page) && options.page > 0) {
+    params.set('page', String(Math.trunc(options.page)));
+  }
+  if (typeof options?.pageSize === 'number' && Number.isFinite(options.pageSize) && options.pageSize > 0) {
+    params.set('page_size', String(Math.trunc(options.pageSize)));
+  }
+  if (options?.q) params.set('q', options.q);
+  if (options?.provider && options.provider !== 'all') params.set('provider', options.provider);
+  if (options?.outcome && options.outcome !== 'all') params.set('outcome', options.outcome);
+  const qs = params.toString();
+  return fetchApi<ScanPipelineTraceResponse>(`/api/scan-history/${scanId}/pipeline-trace${qs ? `?${qs}` : ''}`, {
+    timeoutMs: 30000,
+  });
+}
+
+export async function downloadScanPipelineTrace(
+  scanId: number,
+  format: 'csv' | 'json',
+  options?: {
+    q?: string;
+    provider?: 'all' | 'musicbrainz' | 'discogs' | 'lastfm' | 'bandcamp' | 'none';
+    outcome?: 'all' | ScanPipelineOutcome;
+  },
+): Promise<void> {
+  const params = new URLSearchParams();
+  params.set('format', format);
+  if (options?.q) params.set('q', options.q);
+  if (options?.provider && options.provider !== 'all') params.set('provider', options.provider);
+  if (options?.outcome && options.outcome !== 'all') params.set('outcome', options.outcome);
+  const endpoint = `/api/scan-history/${scanId}/pipeline-trace/export?${params.toString()}`;
+  const response = await fetchWithAuth(endpoint, { method: 'GET' });
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({}));
+    const msg = (data as { error?: unknown }).error;
+    throw new Error(typeof msg === 'string' && msg.trim() ? msg : `Export failed (${response.status})`);
+  }
+  const blob = await response.blob();
+  const filename = parseContentDispositionFilename(response.headers.get('content-disposition')) || `scan-${scanId}-pipeline-trace.${format}`;
+  const objectUrl = window.URL.createObjectURL(blob);
+  try {
+    const anchor = document.createElement('a');
+    anchor.href = objectUrl;
+    anchor.download = filename;
+    document.body.appendChild(anchor);
+    anchor.click();
+    document.body.removeChild(anchor);
+  } finally {
+    window.URL.revokeObjectURL(objectUrl);
+  }
 }
 
 export interface ScanMoveDetailTrack {
