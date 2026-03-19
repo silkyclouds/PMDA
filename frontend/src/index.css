@@ -179,6 +179,15 @@
 }
 
 @layer components {
+  @keyframes pmda-mobile-marquee {
+    0% {
+      transform: translate3d(0, 0, 0);
+    }
+    100% {
+      transform: translate3d(-50%, 0, 0);
+    }
+  }
+
   .pmda-library-shell {
     width: 100%;
     max-width: none;
@@ -189,6 +198,18 @@
 
   .pmda-page-shell {
     @apply pmda-library-shell py-5 md:py-6;
+  }
+
+  .pmda-mobile-marquee {
+    width: max-content;
+    will-change: transform;
+    animation: pmda-mobile-marquee 14s linear infinite;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .pmda-mobile-marquee {
+      animation: none;
+    }
   }
 
   .pmda-page-stack {

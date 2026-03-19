@@ -309,6 +309,10 @@ export function AudioPlayer({
   const [coverError, setCoverError] = useState(false);
   const [trackLiked, setTrackLiked] = useState(false);
   const [albumMeta, setAlbumMeta] = useState<api.AlbumDetailResponse | null>(null);
+  const tracksSectionRef = useRef<HTMLDivElement | null>(null);
+  const mobileTitleViewportRef = useRef<HTMLDivElement | null>(null);
+  const mobileTitleTextRef = useRef<HTMLSpanElement | null>(null);
+  const [mobileTitleNeedsMarquee, setMobileTitleNeedsMarquee] = useState(false);
 
   const deckARef = useRef<HTMLAudioElement>(null);
   const deckBRef = useRef<HTMLAudioElement>(null);
@@ -359,6 +363,24 @@ export function AudioPlayer({
 
   const deckRefs = useMemo(() => [deckARef, deckBRef] as const, []);
   const isSimpleMobilePlayback = isMobile;
+  const primaryMobileBadges = useMemo(() => {
+    if (!albumMeta) return [] as React.ReactNode[];
+    const badges: React.ReactNode[] = [];
+    if (releaseYear) badges.push(<Badge key="year" variant="outline" className={cn('h-7 rounded-full px-3 text-xs', badgeKindClass('year'))}>{releaseYear}</Badge>);
+    if (albumMeta.total_duration_sec > 0) badges.push(<Badge key="duration" variant="outline" className={cn('h-7 rounded-full px-3 text-xs', badgeKindClass('duration'))}>{formatDuration(albumMeta.total_duration_sec)}</Badge>);
+    if (albumMeta.format) badges.push(<FormatBadge key="format" format={albumMeta.format} size="sm" className="h-7 rounded-full px-3 py-1 text-xs" />);
+    if (trackCountText) badges.push(<Badge key="count" variant="outline" className={cn('h-7 rounded-full px-3 text-xs', badgeKindClass('count'))}>{trackCountText}</Badge>);
+    return badges;
+  }, [albumMeta, releaseYear, trackCountText]);
+  const secondaryMobileMeta = useMemo(() => {
+    const parts: string[] = [];
+    if (albumMeta?.is_lossless) parts.push('Lossless');
+    if (!albumMeta?.is_lossless && albumMeta) parts.push('Lossy');
+    if (labelText) parts.push(labelText);
+    if (genres[0]) parts.push(genres[0]);
+    if (discCountText) parts.push(discCountText);
+    return parts.join(' · ');
+  }, [albumMeta, discCountText, genres, labelText]);
 
   useEffect(() => {
     savePlayerPrefs(prefs);
@@ -806,6 +828,25 @@ export function AudioPlayer({
   }, [isMobile, resolvedAlbumId, tracks]);
 
   useEffect(() => {
+    if (!isMobile || !showNowPlaying) {
+      setMobileTitleNeedsMarquee(false);
+      return;
+    }
+    const viewport = mobileTitleViewportRef.current;
+    const textNode = mobileTitleTextRef.current;
+    if (!viewport || !textNode) return;
+    const check = () => {
+      setMobileTitleNeedsMarquee(textNode.scrollWidth > viewport.clientWidth + 4);
+    };
+    check();
+    if (typeof ResizeObserver === 'undefined') return;
+    const observer = new ResizeObserver(check);
+    observer.observe(viewport);
+    observer.observe(textNode);
+    return () => observer.disconnect();
+  }, [currentTrack?.title, isMobile, showNowPlaying]);
+
+  useEffect(() => {
     setCoverError(false);
   }, [resolvedAlbumId, displayAlbumThumb]);
 
@@ -1114,6 +1155,10 @@ export function AudioPlayer({
     clearTransitionTimer();
     onClose();
   }, [clearTransitionTimer, finalizeTrack, onClose, stopDeck]);
+
+  const scrollToTracks = useCallback(() => {
+    tracksSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }, []);
 
   useEffect(() => {
     if (!isSimpleMobilePlayback) return;
@@ -1456,7 +1501,7 @@ export function AudioPlayer({
             </div>
 
             <div className="relative z-10 flex h-full flex-col">
-              <div className={cn('flex items-center justify-between gap-3 border-b px-4 py-3 backdrop-blur-sm md:px-6', isLightTheme ? 'border-border/70 bg-white/60' : 'border-white/10 bg-black/25')}>
+              <div className={cn('flex items-center justify-between gap-3 border-b px-4 backdrop-blur-sm md:px-6', isMobile ? 'py-2.5' : 'py-3', isLightTheme ? 'border-border/70 bg-white/60' : 'border-white/10 bg-black/25')}>
                 {isMobile ? (
                   <>
                     <Button
@@ -1470,7 +1515,7 @@ export function AudioPlayer({
                       <ChevronLeft className="h-5 w-5" />
                     </Button>
                     <DialogHeader className="min-w-0 flex-1 space-y-0 text-center">
-                      <DialogTitle className={cn('text-xl font-semibold', isLightTheme ? 'text-foreground' : 'text-white')}>Now Playing</DialogTitle>
+                      <DialogTitle className={cn(isMobile ? 'text-lg font-semibold' : 'text-xl font-semibold', isLightTheme ? 'text-foreground' : 'text-white')}>Now Playing</DialogTitle>
                       <DialogDescription className="sr-only">
                         Full-screen player showing the current track and the queued track list.
                       </DialogDescription>
@@ -1497,9 +1542,9 @@ export function AudioPlayer({
                 )}
               </div>
 
-              <div className={cn('flex min-h-0 flex-1 flex-col', isMobile ? 'overflow-y-auto overflow-x-hidden' : 'overflow-hidden')}>
-                <div className={cn('flex flex-col items-center gap-6 p-6 md:p-10', isMobile ? 'pb-6 pt-5' : '')}>
-                  <div className={cn('relative aspect-square overflow-hidden rounded-3xl border shadow-[0_20px_72px_rgba(0,0,0,0.28)]', isMobile ? 'w-[min(78vw,360px)] self-center' : 'w-[min(82vw,520px)]', isLightTheme ? 'border-border/60 bg-card' : 'border-white/10 bg-zinc-900 shadow-[0_30px_110px_rgba(0,0,0,0.65)]')}>
+              <div className={cn('flex min-h-0 flex-1 flex-col', isMobile ? 'overflow-y-auto overflow-x-hidden overscroll-contain' : 'overflow-hidden')}>
+                <div className={cn('flex flex-col items-center md:p-10', isMobile ? 'gap-4 px-5 pb-5 pt-3' : 'gap-6 p-6')}>
+                  <div className={cn('relative aspect-square overflow-hidden rounded-3xl border shadow-[0_20px_72px_rgba(0,0,0,0.28)]', isMobile ? 'w-[min(64vw,300px)] self-center' : 'w-[min(82vw,520px)]', isLightTheme ? 'border-border/60 bg-card' : 'border-white/10 bg-zinc-900 shadow-[0_30px_110px_rgba(0,0,0,0.65)]')}>
                     {(displayAlbumThumb && !coverError) ? (
                       <img src={displayAlbumThumb} alt="" className="absolute inset-0 h-full w-full animate-in object-cover fade-in-0 duration-300" />
                     ) : (
@@ -1511,26 +1556,41 @@ export function AudioPlayer({
                   </div>
 
                   <div className={cn('space-y-1 text-center', isMobile ? 'w-full max-w-[92vw] overflow-hidden' : 'max-w-[860px]')}>
-                    <div className={cn('truncate text-sm', isLightTheme ? 'text-muted-foreground' : 'text-white/70')}>{currentTrack?.artist ?? ''}</div>
-                    <div className={cn('text-balance font-semibold tracking-tight', isMobile ? 'text-[2rem] leading-tight' : 'truncate text-3xl md:text-4xl', isLightTheme ? 'text-foreground' : 'text-white')}>
-                      {currentTrack?.title ?? '—'}
-                    </div>
-                    <div className={cn(isMobile ? 'text-sm leading-6' : 'truncate text-sm', isLightTheme ? 'text-muted-foreground/90' : 'text-white/55')}>{displayAlbumTitle}</div>
-                    {albumMeta ? (
-                      <div className="mt-4 flex max-w-[920px] flex-col items-center gap-2">
-                        <div className={cn('text-[11px] uppercase tracking-[0.24em]', isLightTheme ? 'text-muted-foreground/80' : 'text-white/45')}>Album metadata</div>
-                        <div className="flex flex-wrap items-center justify-center gap-2">
-                          {releaseYear ? <Badge variant="outline" className={cn('h-7 rounded-full px-3 text-xs', badgeKindClass('year'))}>{releaseYear}</Badge> : null}
-                          {albumMeta.total_duration_sec > 0 ? <Badge variant="outline" className={cn('h-7 rounded-full px-3 text-xs', badgeKindClass('duration'))}>{formatDuration(albumMeta.total_duration_sec)}</Badge> : null}
-                          {albumMeta.format ? <FormatBadge format={albumMeta.format} size="sm" className="h-7 rounded-full px-3 py-1 text-xs" /> : null}
-                          <Badge variant="outline" className={cn('h-7 rounded-full px-3 text-xs', badgeKindClass(albumMeta.is_lossless ? 'lossless' : 'lossy'))}>
-                            {albumMeta.is_lossless ? 'Lossless' : 'Lossy'}
-                          </Badge>
-                          {trackCountText ? <Badge variant="outline" className={cn('h-7 rounded-full px-3 text-xs', badgeKindClass('count'))}>{trackCountText}</Badge> : null}
-                          {discCountText ? <Badge variant="outline" className={cn('h-7 rounded-full px-3 text-xs', badgeKindClass('count'))}>{discCountText}</Badge> : null}
-                          {labelText ? <Badge variant="outline" className={cn('h-7 rounded-full px-3 text-xs', badgeKindClass('label'))}>{`Label: ${labelText}`}</Badge> : null}
+                    <div className={cn(isMobile ? 'text-base' : 'truncate text-sm', isLightTheme ? 'text-muted-foreground' : 'text-white/70')}>{currentTrack?.artist ?? ''}</div>
+                    {isMobile ? (
+                      <div ref={mobileTitleViewportRef} className="overflow-hidden">
+                        <div className={cn('inline-flex min-w-full items-center justify-center whitespace-nowrap font-semibold tracking-tight', mobileTitleNeedsMarquee ? 'pmda-mobile-marquee' : '', isLightTheme ? 'text-foreground' : 'text-white')}>
+                          <span ref={mobileTitleTextRef} className="shrink-0 text-[1.9rem] leading-[1.1]">{currentTrack?.title ?? '—'}</span>
+                          {mobileTitleNeedsMarquee ? <span aria-hidden className="shrink-0 pl-10 text-[1.9rem] leading-[1.1]">{currentTrack?.title ?? '—'}</span> : null}
                         </div>
-                        {genres.length > 0 ? (
+                      </div>
+                    ) : (
+                      <div className={cn('text-balance font-semibold tracking-tight truncate text-3xl md:text-4xl', isLightTheme ? 'text-foreground' : 'text-white')}>
+                        {currentTrack?.title ?? '—'}
+                      </div>
+                    )}
+                    <div className={cn(isMobile ? 'text-sm leading-5 line-clamp-2' : 'truncate text-sm', isLightTheme ? 'text-muted-foreground/90' : 'text-white/55')}>{displayAlbumTitle}</div>
+                    {albumMeta ? (
+                      <div className={cn('mt-2 flex max-w-[920px] flex-col items-center', isMobile ? 'gap-1.5' : 'gap-2')}>
+                        {!isMobile ? <div className={cn('text-[11px] uppercase tracking-[0.24em]', isLightTheme ? 'text-muted-foreground/80' : 'text-white/45')}>Album metadata</div> : null}
+                        <div className="flex flex-wrap items-center justify-center gap-2">
+                          {isMobile ? primaryMobileBadges : (
+                            <>
+                              {releaseYear ? <Badge variant="outline" className={cn('h-7 rounded-full px-3 text-xs', badgeKindClass('year'))}>{releaseYear}</Badge> : null}
+                              {albumMeta.total_duration_sec > 0 ? <Badge variant="outline" className={cn('h-7 rounded-full px-3 text-xs', badgeKindClass('duration'))}>{formatDuration(albumMeta.total_duration_sec)}</Badge> : null}
+                              {albumMeta.format ? <FormatBadge format={albumMeta.format} size="sm" className="h-7 rounded-full px-3 py-1 text-xs" /> : null}
+                              <Badge variant="outline" className={cn('h-7 rounded-full px-3 text-xs', badgeKindClass(albumMeta.is_lossless ? 'lossless' : 'lossy'))}>
+                                {albumMeta.is_lossless ? 'Lossless' : 'Lossy'}
+                              </Badge>
+                              {trackCountText ? <Badge variant="outline" className={cn('h-7 rounded-full px-3 text-xs', badgeKindClass('count'))}>{trackCountText}</Badge> : null}
+                              {discCountText ? <Badge variant="outline" className={cn('h-7 rounded-full px-3 text-xs', badgeKindClass('count'))}>{discCountText}</Badge> : null}
+                              {labelText ? <Badge variant="outline" className={cn('h-7 rounded-full px-3 text-xs', badgeKindClass('label'))}>{`Label: ${labelText}`}</Badge> : null}
+                            </>
+                          )}
+                        </div>
+                        {isMobile ? (
+                          secondaryMobileMeta ? <div className={cn('max-w-[92vw] text-center text-xs leading-5', isLightTheme ? 'text-muted-foreground/90' : 'text-white/60')}>{secondaryMobileMeta}</div> : null
+                        ) : genres.length > 0 ? (
                           <div className="flex flex-wrap items-center justify-center gap-2">
                             {genres.map((genre) => (
                               <Badge key={genre} variant="outline" className={cn('h-7 rounded-full px-3 text-xs', badgeKindClass('genre'))}>
@@ -1543,7 +1603,7 @@ export function AudioPlayer({
                     ) : null}
                   </div>
 
-                  <div className="w-full max-w-[780px] space-y-2">
+                  <div className={cn('w-full max-w-[780px] space-y-2', isMobile ? 'pt-1' : '')}>
                     <Slider
                       value={[currentTime]}
                       max={Math.max(1, displayDuration)}
@@ -1557,7 +1617,7 @@ export function AudioPlayer({
                     </div>
                   </div>
 
-                  <div className="flex flex-wrap items-center justify-center gap-3">
+                  <div className={cn('flex flex-wrap items-center justify-center', isMobile ? 'gap-2.5' : 'gap-3')}>
                     <Button variant="ghost" size="icon" className={cn('h-11 w-11 rounded-full', isLightTheme ? 'text-foreground hover:bg-black/5' : 'text-white hover:bg-white/10')} onClick={prevTrack} disabled={currentIndex <= 0} title="Previous">
                       <SkipBack className="h-5 w-5" />
                     </Button>
@@ -1590,6 +1650,19 @@ export function AudioPlayer({
                     </Button>
                   </div>
 
+                  {isMobile ? (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      className={cn('mt-1 h-9 gap-2 rounded-full px-4', isLightTheme ? 'text-foreground hover:bg-black/5' : 'text-white hover:bg-white/10')}
+                      onClick={scrollToTracks}
+                    >
+                      <ChevronDown className="h-4 w-4" />
+                      Tracks
+                    </Button>
+                  ) : null}
+
                   {showFxPanel && !isSimpleMobilePlayback ? (
                     <div className="w-full max-w-[980px]">
                       <PlaybackFxPanel
@@ -1606,7 +1679,7 @@ export function AudioPlayer({
                   ) : null}
                 </div>
 
-                <div className={cn('flex min-h-0 flex-1 flex-col border-t', isLightTheme ? 'border-border/70 bg-white/55' : 'border-white/10 bg-black/25')}>
+                <div ref={tracksSectionRef} className={cn('flex min-h-0 flex-1 flex-col border-t', isLightTheme ? 'border-border/70 bg-white/55' : 'border-white/10 bg-black/25')}>
                   <div className="flex items-center justify-between gap-3 px-4 py-3 md:px-6">
                     <div className={cn('text-sm font-medium', isLightTheme ? 'text-foreground' : 'text-white/85')}>Tracks</div>
                     <div className={cn('text-xs tabular-nums', isLightTheme ? 'text-muted-foreground' : 'text-white/55')}>
