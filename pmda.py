@@ -53940,7 +53940,7 @@ def api_library_artists():
                         "roles": _safe_json_load(r[3] or "[]", fallback=[]),
                         "album_count": int(r[4] or 0),
                         "broken_albums_count": int(r[5] or 0),
-                        "artist_thumb": f"{base_url}/api/library/files/artist/{int(r[0])}/image?size=96" if bool(r[6]) else None,
+                        "artist_thumb": f"{base_url}/api/library/files/artist/{int(r[0])}/image?size=512" if bool(r[6]) else None,
                     }
                     for r in rows
                 ],
