@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import {
+  ChevronLeft,
   ChevronDown,
   Play,
   Pause,
@@ -30,6 +31,7 @@ import { FormatBadge } from '@/components/FormatBadge';
 import { badgeKindClass } from '@/lib/badgeStyles';
 import { useTheme } from 'next-themes';
 import { normalizePmdaAssetUrl } from '@/lib/api';
+import { useIsMobile } from '@/hooks/use-mobile';
 
 export interface TrackInfo {
   track_id: number;
@@ -295,6 +297,7 @@ export function AudioPlayer({
   onTrackSelect,
   onClose,
 }: AudioPlayerProps) {
+  const isMobile = useIsMobile();
   const [prefs, setPrefs] = useState<PlayerPrefs>(() => loadPlayerPrefs());
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
@@ -325,6 +328,7 @@ export function AudioPlayer({
   const transitionTimerRef = useRef<number | null>(null);
   const transitionTargetTrackRef = useRef<TrackInfo | null>(null);
   const transitionTargetDeckRef = useRef<DeckIndex>(1);
+  const lastSeenTrackIdRef = useRef<number | null>(null);
   const currentIndex = currentTrack ? tracks.findIndex((t) => t.track_id === currentTrack.track_id) : -1;
   const displayDuration = duration > 0 ? duration : (currentTrack?.duration ?? 0);
   const { resolvedTheme } = useTheme();
@@ -732,6 +736,15 @@ export function AudioPlayer({
   }, [tracks, currentTrack?.track_id, preloadUpcomingTrack]);
 
   useEffect(() => {
+    const nextTrackId = Number(currentTrack?.track_id || 0) || null;
+    const prevTrackId = lastSeenTrackIdRef.current;
+    if (isMobile && nextTrackId && prevTrackId == null) {
+      setShowNowPlaying(true);
+    }
+    lastSeenTrackIdRef.current = nextTrackId;
+  }, [currentTrack?.track_id, isMobile]);
+
+  useEffect(() => {
     setCoverError(false);
   }, [resolvedAlbumId, displayAlbumThumb]);
 
@@ -839,6 +852,41 @@ export function AudioPlayer({
     setIsPlaying(false);
   }, [getVisibleDeckIndex]);
 
+  const cancelTransition = useCallback(() => {
+    if (!transitionActiveRef.current) return;
+    clearTransitionTimer();
+    const oldDeck = activeDeckRef.current;
+    const nextDeck = transitionTargetDeckRef.current;
+    const oldEl = deckRefs[oldDeck].current;
+    const nextEl = deckRefs[nextDeck].current;
+    const oldTrack = activeTrackRef.current;
+    transitionActiveRef.current = false;
+    transitionTargetTrackRef.current = null;
+    if (nextEl) {
+      nextEl.pause();
+      try {
+        nextEl.currentTime = 0;
+      } catch {
+        // ignore
+      }
+    }
+    setDeckGain(nextDeck, 0, 0.02);
+    setDeckGain(oldDeck, 1, 0.02);
+    if (oldEl) {
+      setCurrentTime(oldEl.currentTime || 0);
+      if (Number.isFinite(oldEl.duration) && oldEl.duration > 0) {
+        setDuration(oldEl.duration);
+      }
+    } else {
+      setCurrentTime(0);
+      setDuration(oldTrack?.duration || 0);
+    }
+    setBufferedEnd(0);
+    if (oldTrack && currentTrack?.track_id !== oldTrack.track_id) {
+      onTrackSelect(oldTrack);
+    }
+  }, [clearTransitionTimer, currentTrack?.track_id, deckRefs, onTrackSelect, setDeckGain]);
+
   const handleDeckEnded = useCallback((deckIndex: DeckIndex) => {
     if (transitionActiveRef.current) return;
     if (deckIndex !== activeDeckRef.current) return;
@@ -878,12 +926,12 @@ export function AudioPlayer({
 
   const handlePauseAll = useCallback(() => {
     if (transitionActiveRef.current) {
-      commitTransition(true);
+      cancelTransition();
     }
     stopDeck(0, false);
     stopDeck(1, false);
     setIsPlaying(false);
-  }, [commitTransition, stopDeck]);
+  }, [cancelTransition, stopDeck]);
 
   const handlePlayAll = useCallback(async () => {
     const visibleDeck = getVisibleDeckIndex();
@@ -971,6 +1019,100 @@ export function AudioPlayer({
     clearTransitionTimer();
     onClose();
   }, [clearTransitionTimer, finalizeTrack, onClose, stopDeck]);
+
+  useEffect(() => {
+    if (typeof navigator === 'undefined' || !('mediaSession' in navigator)) return;
+    const mediaSession = navigator.mediaSession;
+    const artworkSrc = normalizePmdaAssetUrl(displayAlbumThumb);
+    try {
+      mediaSession.metadata = new MediaMetadata({
+        title: currentTrack?.title || displayAlbumTitle || 'PMDA',
+        artist: currentTrack?.artist || '',
+        album: displayAlbumTitle || '',
+        artwork: artworkSrc
+          ? [
+              { src: artworkSrc, sizes: '96x96' },
+              { src: artworkSrc, sizes: '192x192' },
+              { src: artworkSrc, sizes: '512x512' },
+            ]
+          : [],
+      });
+    } catch {
+      // ignore unsupported metadata surfaces
+    }
+    const safeSetActionHandler = (action: MediaSessionAction, handler: MediaSessionActionHandler | null) => {
+      try {
+        mediaSession.setActionHandler(action, handler);
+      } catch {
+        // ignore unsupported actions
+      }
+    };
+    safeSetActionHandler('play', () => { void handlePlayAll(); });
+    safeSetActionHandler('pause', handlePauseAll);
+    safeSetActionHandler('previoustrack', currentIndex > 0 ? prevTrack : null);
+    safeSetActionHandler('nexttrack', currentIndex >= 0 && currentIndex < tracks.length - 1 ? nextTrack : null);
+    safeSetActionHandler('seekbackward', () => handleSeek([Math.max(0, currentTime - 10)]));
+    safeSetActionHandler('seekforward', () => handleSeek([Math.min(Math.max(1, displayDuration), currentTime + 10)]));
+    safeSetActionHandler('seekto', (details) => {
+      const position = Number(details?.seekTime);
+      if (Number.isFinite(position)) {
+        handleSeek([Math.min(Math.max(0, position), Math.max(1, displayDuration))]);
+      }
+    });
+    return () => {
+      safeSetActionHandler('play', null);
+      safeSetActionHandler('pause', null);
+      safeSetActionHandler('previoustrack', null);
+      safeSetActionHandler('nexttrack', null);
+      safeSetActionHandler('seekbackward', null);
+      safeSetActionHandler('seekforward', null);
+      safeSetActionHandler('seekto', null);
+    };
+  }, [
+    currentIndex,
+    currentTime,
+    currentTrack?.artist,
+    currentTrack?.title,
+    displayAlbumThumb,
+    displayAlbumTitle,
+    displayDuration,
+    handlePauseAll,
+    handlePlayAll,
+    handleSeek,
+    nextTrack,
+    prevTrack,
+    tracks.length,
+  ]);
+
+  useEffect(() => {
+    if (typeof navigator === 'undefined' || !('mediaSession' in navigator)) return;
+    try {
+      navigator.mediaSession.playbackState = isPlaying ? 'playing' : 'paused';
+    } catch {
+      // ignore
+    }
+  }, [isPlaying]);
+
+  useEffect(() => {
+    if (typeof navigator === 'undefined' || !('mediaSession' in navigator)) return;
+    const mediaSession = navigator.mediaSession as MediaSession & {
+      setPositionState?: (state?: MediaPositionState) => void;
+    };
+    if (typeof mediaSession.setPositionState !== 'function') return;
+    try {
+      if (displayDuration > 0) {
+        mediaSession.setPositionState({
+          duration: displayDuration,
+          playbackRate: 1,
+          position: Math.min(currentTime, displayDuration),
+        });
+      } else {
+        mediaSession.setPositionState();
+      }
+    } catch {
+      // ignore
+    }
+  }, [currentTime, displayDuration]);
 
   const handleEqPresetChange = useCallback((preset: string) => {
     const nextPreset = EQ_PRESETS[preset] ? preset : 'flat';
@@ -1192,7 +1334,7 @@ export function AudioPlayer({
       </div>
 
       <Dialog open={showNowPlaying} onOpenChange={setShowNowPlaying}>
-        <DialogContent className="h-[100dvh] w-[100dvw] max-w-none overflow-y-auto rounded-none border-0 p-0">
+        <DialogContent className="h-[100dvh] w-[100dvw] max-w-none overflow-y-auto rounded-none border-0 p-0 !left-0 !top-0 !translate-x-0 !translate-y-0 [&>button]:hidden">
           <div className={cn('relative min-h-full', isLightTheme ? 'text-foreground' : 'text-white')}>
             <div className={cn('absolute inset-0', isLightTheme ? 'bg-slate-100' : 'bg-zinc-950')} />
             {(displayAlbumThumb && !coverError) ? (
@@ -1211,25 +1353,49 @@ export function AudioPlayer({
 
             <div className="relative z-10 flex h-full flex-col">
               <div className={cn('flex items-center justify-between gap-3 border-b px-4 py-3 backdrop-blur-sm md:px-6', isLightTheme ? 'border-border/70 bg-white/60' : 'border-white/10 bg-black/25')}>
-                <DialogHeader className="space-y-0">
-                  <DialogTitle className={cn(isLightTheme ? 'text-foreground' : 'text-white')}>Now Playing</DialogTitle>
-                  <DialogDescription className="sr-only">
-                    Full-screen player showing the current track and the queued track list.
-                  </DialogDescription>
-                </DialogHeader>
-                <div className="flex items-center gap-2">
-                  <Badge className={cn('hidden sm:inline-flex', isLightTheme ? 'border-border/60 bg-background/75 text-foreground' : 'border-white/10 bg-white/10 text-white')} variant="outline">
-                    {tracks.length} tracks
-                  </Badge>
-                  <Button type="button" variant="ghost" size="icon" className={cn('h-9 w-9', isLightTheme ? 'text-foreground hover:bg-black/5' : 'text-white hover:bg-white/10')} onClick={() => setShowNowPlaying(false)} title="Collapse">
-                    <ChevronDown className="h-5 w-5" />
-                  </Button>
-                </div>
+                {isMobile ? (
+                  <>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      className={cn('h-10 w-10 rounded-full', isLightTheme ? 'text-foreground hover:bg-black/5' : 'text-white hover:bg-white/10')}
+                      onClick={() => setShowNowPlaying(false)}
+                      title="Back to mini player"
+                    >
+                      <ChevronLeft className="h-5 w-5" />
+                    </Button>
+                    <DialogHeader className="min-w-0 flex-1 space-y-0 text-center">
+                      <DialogTitle className={cn('truncate text-xl font-semibold', isLightTheme ? 'text-foreground' : 'text-white')}>Now Playing</DialogTitle>
+                      <DialogDescription className="sr-only">
+                        Full-screen player showing the current track and the queued track list.
+                      </DialogDescription>
+                    </DialogHeader>
+                    <div className="w-10 shrink-0" />
+                  </>
+                ) : (
+                  <>
+                    <DialogHeader className="space-y-0">
+                      <DialogTitle className={cn(isLightTheme ? 'text-foreground' : 'text-white')}>Now Playing</DialogTitle>
+                      <DialogDescription className="sr-only">
+                        Full-screen player showing the current track and the queued track list.
+                      </DialogDescription>
+                    </DialogHeader>
+                    <div className="flex items-center gap-2">
+                      <Badge className={cn('hidden sm:inline-flex', isLightTheme ? 'border-border/60 bg-background/75 text-foreground' : 'border-white/10 bg-white/10 text-white')} variant="outline">
+                        {tracks.length} tracks
+                      </Badge>
+                      <Button type="button" variant="ghost" size="icon" className={cn('h-9 w-9', isLightTheme ? 'text-foreground hover:bg-black/5' : 'text-white hover:bg-white/10')} onClick={() => setShowNowPlaying(false)} title="Collapse">
+                        <ChevronDown className="h-5 w-5" />
+                      </Button>
+                    </div>
+                  </>
+                )}
               </div>
 
               <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
-                <div className="flex flex-col items-center gap-6 p-6 md:p-10">
-                  <div className={cn('relative aspect-square w-[min(82vw,520px)] overflow-hidden rounded-3xl border shadow-[0_20px_72px_rgba(0,0,0,0.28)]', isLightTheme ? 'border-border/60 bg-card' : 'border-white/10 bg-zinc-900 shadow-[0_30px_110px_rgba(0,0,0,0.65)]')}>
+                <div className={cn('flex flex-col items-center gap-6 p-6 md:p-10', isMobile ? 'pb-8 pt-5' : '')}>
+                  <div className={cn('relative aspect-square overflow-hidden rounded-3xl border shadow-[0_20px_72px_rgba(0,0,0,0.28)]', isMobile ? 'w-[min(78vw,360px)] self-center' : 'w-[min(82vw,520px)]', isLightTheme ? 'border-border/60 bg-card' : 'border-white/10 bg-zinc-900 shadow-[0_30px_110px_rgba(0,0,0,0.65)]')}>
                     {(displayAlbumThumb && !coverError) ? (
                       <img src={displayAlbumThumb} alt="" className="absolute inset-0 h-full w-full animate-in object-cover fade-in-0 duration-300" />
                     ) : (
@@ -1240,12 +1406,12 @@ export function AudioPlayer({
                     <div className={cn('absolute inset-0', isLightTheme ? 'bg-gradient-to-t from-black/30 via-black/5 to-transparent' : 'bg-gradient-to-t from-black/65 via-black/20 to-transparent')} />
                   </div>
 
-                  <div className="max-w-[860px] space-y-1 text-center">
+                  <div className={cn('space-y-1 text-center', isMobile ? 'w-full max-w-[92vw]' : 'max-w-[860px]')}>
                     <div className={cn('truncate text-sm', isLightTheme ? 'text-muted-foreground' : 'text-white/70')}>{currentTrack?.artist ?? ''}</div>
-                    <div className={cn('truncate text-3xl font-semibold tracking-tight md:text-4xl', isLightTheme ? 'text-foreground' : 'text-white')}>
+                    <div className={cn('text-balance font-semibold tracking-tight', isMobile ? 'text-[2rem] leading-tight' : 'truncate text-3xl md:text-4xl', isLightTheme ? 'text-foreground' : 'text-white')}>
                       {currentTrack?.title ?? '—'}
                     </div>
-                    <div className={cn('truncate text-sm', isLightTheme ? 'text-muted-foreground/90' : 'text-white/55')}>{displayAlbumTitle}</div>
+                    <div className={cn(isMobile ? 'text-sm leading-6' : 'truncate text-sm', isLightTheme ? 'text-muted-foreground/90' : 'text-white/55')}>{displayAlbumTitle}</div>
                     {albumMeta ? (
                       <div className="mt-4 flex max-w-[920px] flex-col items-center gap-2">
                         <div className={cn('text-[11px] uppercase tracking-[0.24em]', isLightTheme ? 'text-muted-foreground/80' : 'text-white/45')}>Album metadata</div>
