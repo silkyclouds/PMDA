@@ -63,6 +63,7 @@ export function ProviderIcon({ provider, className, size = 12 }: ProviderIconPro
     case 'audiodb':
     case 'fanart':
       return <ImageIcon aria-hidden="true" className={iconClass} size={size} />;
+    case 'searxng':
     case 'serper':
       return <Search aria-hidden="true" className={iconClass} size={size} />;
     case 'local':

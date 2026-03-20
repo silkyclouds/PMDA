@@ -147,7 +147,13 @@ export function normalizeConfigForUI(raw: Partial<PMDAConfig>): Partial<PMDAConf
   }
   if (out.AI_USAGE_LEVEL != null) {
     const level = String(out.AI_USAGE_LEVEL).trim().toLowerCase();
-    out.AI_USAGE_LEVEL = (['limited', 'medium', 'aggressive'].includes(level) ? level : 'medium') as PMDAConfig['AI_USAGE_LEVEL'];
+    out.AI_USAGE_LEVEL = (['limited', 'medium', 'aggressive', 'auto'].includes(level) ? level : 'auto') as PMDAConfig['AI_USAGE_LEVEL'];
+  }
+  if (out.WEB_SEARCH_PROVIDER != null) {
+    const provider = String(out.WEB_SEARCH_PROVIDER).trim().toLowerCase();
+    out.WEB_SEARCH_PROVIDER = (
+      ['auto', 'searxng', 'serper', 'ai_only', 'disabled'].includes(provider) ? provider : 'auto'
+    ) as PMDAConfig['WEB_SEARCH_PROVIDER'];
   }
   if (out.USE_AI_FOR_SOFT_MATCH_PROFILES !== undefined) {
     out.USE_AI_FOR_SOFT_MATCH_PROFILES = toBool(out.USE_AI_FOR_SOFT_MATCH_PROFILES);

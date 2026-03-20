@@ -8,6 +8,7 @@ export type ProviderId =
   | 'audiodb'
   | 'fanart'
   | 'bandsintown'
+  | 'searxng'
   | 'serper'
   | 'openai-api'
   | 'openai-codex'
@@ -28,6 +29,7 @@ export type ProviderIconKey =
   | 'audiodb'
   | 'fanart'
   | 'bandsintown'
+  | 'searxng'
   | 'serper'
   | 'openai'
   | 'anthropic'
@@ -108,6 +110,12 @@ const PROVIDER_META: Record<ProviderId, ProviderMeta> = {
     iconKey: 'bandsintown',
     aliases: [],
     externalBaseUrl: 'https://bandsintown.com',
+  },
+  searxng: {
+    id: 'searxng',
+    label: 'SearXNG',
+    iconKey: 'searxng',
+    aliases: ['searx', 'searx-ng', 'self-hosted-search'],
   },
   serper: {
     id: 'serper',
@@ -191,6 +199,7 @@ export function normalizeProviderId(raw: string | null | undefined): ProviderId 
   if (value.includes('fanart')) return 'fanart';
   if (value.includes('audiodb') || value.includes('theaudiodb')) return 'audiodb';
   if (value.includes('bandsintown')) return 'bandsintown';
+  if (value.includes('searxng') || value.includes('searx-ng') || value.includes('searx')) return 'searxng';
   if (value.includes('serper')) return 'serper';
   if (value.includes('ollama')) return 'ollama';
   if (value.includes('anthropic') || value.includes('claude')) return 'anthropic';

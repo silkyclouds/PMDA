@@ -154,6 +154,28 @@ export interface DuplicateCard {
   match_verified_by_ai?: boolean;
 }
 
+export interface ScanResumeSnapshot {
+  available: boolean;
+  run_id: string;
+  status: string;
+  scan_type: 'full' | 'changed_only';
+  created_at?: number | null;
+  updated_at?: number | null;
+  scan_id?: number | null;
+  total_artists: number;
+  total_albums: number;
+  done_artists: number;
+  done_albums: number;
+  remaining_artists: number;
+  remaining_albums: number;
+  pending_artists: number;
+  pending_albums: number;
+  running_artists: number;
+  running_albums: number;
+  failed_artists: number;
+  failed_albums: number;
+}
+
 export interface ScanProgress {
   scan_id?: number | null;
   scanning: boolean;
@@ -163,6 +185,8 @@ export interface ScanProgress {
   /** Progress including in-progress artist albums (so bar moves during scan) */
   effective_progress?: number;
   status: 'running' | 'paused' | 'stopped' | 'idle';
+  resume_available?: boolean;
+  resume_available_by_scan_type?: Partial<Record<'full' | 'changed_only', ScanResumeSnapshot>>;
   scan_type?: 'full' | 'changed_only' | 'incomplete_only';
   scan_resume_run_id?: string | null;
   /** Current scan phase: pre_scan | preparing_run_scope | format_analysis | identification_tags | ia_analysis | finalizing | moving_dupes | post_processing */
@@ -671,7 +695,7 @@ export interface PMDAConfig {
   // AI Provider
   AI_PROVIDER: 'openai' | 'openai-api' | 'openai-codex' | 'anthropic' | 'google' | 'ollama';
   /** Global AI usage profile across matching/dedupe/vision flow. */
-  AI_USAGE_LEVEL?: 'limited' | 'medium' | 'aggressive';
+  AI_USAGE_LEVEL?: 'limited' | 'medium' | 'aggressive' | 'auto';
   OPENAI_API_KEY: string;
   OPENAI_API_KEY_SET?: boolean;
   OPENAI_ENABLE_API_KEY_MODE?: boolean;
@@ -689,6 +713,7 @@ export interface PMDAConfig {
   ANTHROPIC_API_KEY: string;
   GOOGLE_API_KEY: string;
   OLLAMA_URL: string;
+  OLLAMA_MODEL?: string;
   /** Custom AI prompt for duplicate selection (advanced). Empty = use default. */
   AI_PROMPT?: string;
   
@@ -735,6 +760,8 @@ export interface PMDAConfig {
   USE_ACOUSTID_WHEN_TAGGED?: boolean;
   /** When no MB candidate or AI says NONE, use web search (Serper) + AI to suggest MBID. */
   USE_WEB_SEARCH_FOR_MB?: boolean;
+  /** Which web search backend PMDA should use before any paid fallback. */
+  WEB_SEARCH_PROVIDER?: 'auto' | 'searxng' | 'serper' | 'ai_only' | 'disabled';
   /** When Serper is unavailable (missing key/no credits), fallback to OpenAI native web search tool. */
   USE_AI_WEB_SEARCH_FALLBACK?: boolean;
   /** Hard cap for total AI calls per scan (0 = disable AI calls during scan). */
@@ -743,6 +770,9 @@ export interface PMDAConfig {
   AI_CALL_COOLDOWN_SEC?: number;
   /** Serper.dev API key for web search. */
   SERPER_API_KEY?: string;
+  /** Local/self-hosted SearXNG base URL. */
+  SEARXNG_URL?: string;
+  SEARXNG_URL_SET?: boolean;
   // Metadata Providers
   USE_DISCOGS: boolean;
   DISCOGS_USER_TOKEN: string;
@@ -3065,6 +3095,7 @@ export interface ScanPreflightResult {
   lastfm?: { ok: boolean; message: string };
   fanart?: { ok: boolean; message: string };
   bandcamp?: { ok: boolean; message: string };
+  searxng?: { ok: boolean; message: string };
   serper?: { ok: boolean; message: string };
   acoustid?: { ok: boolean; message: string };
   paths?: { music_rw: boolean; dupes_rw: boolean };
@@ -3943,6 +3974,34 @@ export async function getAIModels(
     }
     throw error instanceof Error ? error : new Error('Failed to fetch models');
   }
+}
+
+export interface OllamaPullStatus {
+  active: boolean;
+  status: string;
+  message: string;
+  model: string;
+  url: string;
+  completed: number;
+  total: number;
+  progress: number;
+  started_at?: number | null;
+  updated_at?: number | null;
+  finished_at?: number | null;
+  error?: string;
+  digest?: string;
+}
+
+export async function getOllamaPullStatus(): Promise<OllamaPullStatus> {
+  return fetchApi<OllamaPullStatus>('/api/ollama/pull/status');
+}
+
+export async function startOllamaPull(payload: { OLLAMA_URL: string; model: string }): Promise<OllamaPullStatus> {
+  return fetchApi<OllamaPullStatus>('/api/ollama/pull', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+    timeoutMs: 30000,
+  });
 }
 
 

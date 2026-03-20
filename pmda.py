@@ -2271,10 +2271,11 @@ merged = {
     "OPENAI_ENABLE_API_KEY_MODE": _get("OPENAI_ENABLE_API_KEY_MODE", default=True, cast=_parse_bool),
     "OPENAI_ENABLE_CODEX_OAUTH_MODE": _get("OPENAI_ENABLE_CODEX_OAUTH_MODE", default=True, cast=_parse_bool),
     "OPENAI_MODEL":   _get("OPENAI_MODEL",   default="gpt-4",                           cast=str),
-    "AI_USAGE_LEVEL": _get("AI_USAGE_LEVEL", default="medium",                          cast=str),
+    "AI_USAGE_LEVEL": _get("AI_USAGE_LEVEL", default="auto",                            cast=str),
     "ANTHROPIC_API_KEY": _get("ANTHROPIC_API_KEY", default="", cast=str),
     "GOOGLE_API_KEY": _get("GOOGLE_API_KEY", default="", cast=str),
     "OLLAMA_URL": _get("OLLAMA_URL", default="http://localhost:11434", cast=str),
+    "OLLAMA_MODEL": _get("OLLAMA_MODEL", default="qwen2.5:3b-instruct", cast=str),
     "DISCORD_WEBHOOK": _get("DISCORD_WEBHOOK", default="", cast=str),
     "USE_MUSICBRAINZ": _get("USE_MUSICBRAINZ", default=True, cast=_parse_bool),
     "MUSICBRAINZ_EMAIL": _get("MUSICBRAINZ_EMAIL", default="pmda@example.com", cast=str),
@@ -2406,8 +2407,9 @@ merged = {
     "ACOUSTID_API_KEY": _get("ACOUSTID_API_KEY", default="", cast=str),
     "USE_ACOUSTID_WHEN_TAGGED": _get("USE_ACOUSTID_WHEN_TAGGED", default="false", cast=_parse_bool),
     "USE_WEB_SEARCH_FOR_MB": _get("USE_WEB_SEARCH_FOR_MB", default=True, cast=_parse_bool),
+    "WEB_SEARCH_PROVIDER": _get("WEB_SEARCH_PROVIDER", default="auto", cast=str),
     # When enabled, PMDA can use OpenAI web search (preferred) and fallback to Serper when needed.
-    "USE_AI_WEB_SEARCH_FALLBACK": _get("USE_AI_WEB_SEARCH_FALLBACK", default=True, cast=_parse_bool),
+    "USE_AI_WEB_SEARCH_FALLBACK": _get("USE_AI_WEB_SEARCH_FALLBACK", default=False, cast=_parse_bool),
     "SCHEDULER_ALLOW_NON_SCAN_JOBS": _get("SCHEDULER_ALLOW_NON_SCAN_JOBS", default=SCHEDULER_ALLOW_NON_SCAN_JOBS, cast=_parse_bool),
     # PMDA no longer enforces hard AI call caps/cooldowns. Cost control is handled by batching,
     # caching and provider routing, not by blocking the pipeline mid-scan.
@@ -2432,6 +2434,7 @@ merged = {
         cast=lambda x: 0,
     ),
     "SERPER_API_KEY": _get("SERPER_API_KEY", default="", cast=str),
+    "SEARXNG_URL": _get("SEARXNG_URL", default="", cast=str),
     "CROSS_LIBRARY_DEDUPE": _get("CROSS_LIBRARY_DEDUPE", default="true", cast=_parse_bool),
     "CROSSCHECK_SAMPLES": _get("CROSSCHECK_SAMPLES", default=20, cast=lambda x: int(x) if x is not None and str(x).strip().isdigit() else 20),
     "LOG_FILE": _get("LOG_FILE", default="", cast=str) or str(CONFIG_DIR / "pmda.log"),
@@ -2567,7 +2570,7 @@ NAVIDROME_URL: str = str(merged.get("NAVIDROME_URL", "") or "").strip()
 NAVIDROME_USERNAME: str = str(merged.get("NAVIDROME_USERNAME", "") or "").strip()
 NAVIDROME_PASSWORD: str = str(merged.get("NAVIDROME_PASSWORD", "") or "").strip()
 NAVIDROME_API_KEY: str = str(merged.get("NAVIDROME_API_KEY", "") or "").strip()
-AI_USAGE_LEVEL: str = str(merged.get("AI_USAGE_LEVEL", "medium") or "medium").strip().lower()
+AI_USAGE_LEVEL: str = str(merged.get("AI_USAGE_LEVEL", "auto") or "auto").strip().lower()
 USE_AI_FOR_MB_MATCH: bool = bool(merged.get("USE_AI_FOR_MB_MATCH", True))
 USE_AI_FOR_MB_VERIFY: bool = bool(merged.get("USE_AI_FOR_MB_VERIFY", True))
 USE_AI_FOR_DEDUPE: bool = bool(merged.get("USE_AI_FOR_DEDUPE", True))
@@ -2586,7 +2589,8 @@ USE_ACOUSTID: bool = bool(merged.get("USE_ACOUSTID", True))
 ACOUSTID_API_KEY: str = str(merged.get("ACOUSTID_API_KEY", "") or "").strip()
 USE_ACOUSTID_WHEN_TAGGED: bool = bool(merged.get("USE_ACOUSTID_WHEN_TAGGED", False))
 USE_WEB_SEARCH_FOR_MB: bool = bool(merged.get("USE_WEB_SEARCH_FOR_MB", True))
-USE_AI_WEB_SEARCH_FALLBACK: bool = bool(merged.get("USE_AI_WEB_SEARCH_FALLBACK", True))
+WEB_SEARCH_PROVIDER: str = str(merged.get("WEB_SEARCH_PROVIDER", "auto") or "auto").strip().lower()
+USE_AI_WEB_SEARCH_FALLBACK: bool = bool(merged.get("USE_AI_WEB_SEARCH_FALLBACK", False))
 OPENAI_ENABLE_API_KEY_MODE: bool = bool(merged.get("OPENAI_ENABLE_API_KEY_MODE", True))
 OPENAI_ENABLE_CODEX_OAUTH_MODE: bool = bool(merged.get("OPENAI_ENABLE_CODEX_OAUTH_MODE", True))
 SCHEDULER_ALLOW_NON_SCAN_JOBS: bool = bool(merged.get("SCHEDULER_ALLOW_NON_SCAN_JOBS", SCHEDULER_ALLOW_NON_SCAN_JOBS))
@@ -2595,6 +2599,7 @@ AI_CALL_COOLDOWN_SEC: float = 0.0
 AI_GLOBAL_MAX_CALLS_PER_MINUTE: int = 0
 AI_GLOBAL_MAX_CALLS_PER_DAY: int = 0
 SERPER_API_KEY: str = str(merged.get("SERPER_API_KEY", "") or "").strip()
+SEARXNG_URL: str = str(merged.get("SEARXNG_URL", "") or "").strip().rstrip("/")
 AI_BATCH_SIZE: int = int(merged.get("AI_BATCH_SIZE", 10))
 FFPROBE_POOL_SIZE: int = int(merged.get("FFPROBE_POOL_SIZE", 8))
 REPROCESS_INCOMPLETE_ALBUMS: bool = bool(merged.get("REPROCESS_INCOMPLETE_ALBUMS", True))
@@ -2623,9 +2628,16 @@ LIVE_DEDUPE_MODE: str = str(merged.get("LIVE_DEDUPE_MODE", "safe") or "safe").st
 
 def _normalize_ai_usage_level(value: str | None) -> str:
     raw = str(value or "").strip().lower()
-    if raw in {"limited", "medium", "aggressive"}:
+    if raw in {"limited", "medium", "aggressive", "auto"}:
         return raw
-    return "medium"
+    return "auto"
+
+
+def _normalize_web_search_provider(value: str | None) -> str:
+    raw = str(value or "").strip().lower()
+    if raw in {"auto", "searxng", "serper", "ai_only", "disabled"}:
+        return raw
+    return "auto"
 
 
 def _ai_usage_level_overrides(level: str) -> dict[str, bool]:
@@ -2638,7 +2650,19 @@ def _ai_usage_level_overrides(level: str) -> dict[str, bool]:
             "USE_AI_VISION_FOR_COVER": False,
             "USE_AI_VISION_BEFORE_COVER_INJECT": False,
             "USE_WEB_SEARCH_FOR_MB": False,
+            "USE_AI_WEB_SEARCH_FALLBACK": False,
             "PROVIDER_IDENTITY_USE_AI": False,
+        }
+    if normalized == "auto":
+        return {
+            "USE_AI_FOR_MB_MATCH": False,
+            "USE_AI_FOR_MB_VERIFY": True,
+            "USE_AI_FOR_DEDUPE": True,
+            "USE_AI_VISION_FOR_COVER": False,
+            "USE_AI_VISION_BEFORE_COVER_INJECT": False,
+            "USE_WEB_SEARCH_FOR_MB": True,
+            "USE_AI_WEB_SEARCH_FALLBACK": False,
+            "PROVIDER_IDENTITY_USE_AI": True,
         }
     if normalized == "aggressive":
         return {
@@ -2648,6 +2672,7 @@ def _ai_usage_level_overrides(level: str) -> dict[str, bool]:
             "USE_AI_VISION_FOR_COVER": True,
             "USE_AI_VISION_BEFORE_COVER_INJECT": True,
             "USE_WEB_SEARCH_FOR_MB": True,
+            "USE_AI_WEB_SEARCH_FALLBACK": True,
             "PROVIDER_IDENTITY_USE_AI": True,
         }
     return {
@@ -2657,6 +2682,7 @@ def _ai_usage_level_overrides(level: str) -> dict[str, bool]:
         "USE_AI_VISION_FOR_COVER": False,
         "USE_AI_VISION_BEFORE_COVER_INJECT": False,
         "USE_WEB_SEARCH_FOR_MB": False,
+        "USE_AI_WEB_SEARCH_FALLBACK": False,
         "PROVIDER_IDENTITY_USE_AI": True,
     }
 
@@ -2671,7 +2697,7 @@ def _apply_ai_usage_level(level: str | None = None) -> str:
     global AI_USAGE_LEVEL
     global USE_AI_FOR_MB_MATCH, USE_AI_FOR_MB_VERIFY, USE_AI_FOR_DEDUPE
     global USE_AI_VISION_FOR_COVER, USE_AI_VISION_BEFORE_COVER_INJECT
-    global USE_WEB_SEARCH_FOR_MB, PROVIDER_IDENTITY_USE_AI
+    global USE_WEB_SEARCH_FOR_MB, USE_AI_WEB_SEARCH_FALLBACK, PROVIDER_IDENTITY_USE_AI
 
     normalized = _normalize_ai_usage_level(level if level is not None else AI_USAGE_LEVEL)
     AI_USAGE_LEVEL = normalized
@@ -2683,6 +2709,7 @@ def _apply_ai_usage_level(level: str | None = None) -> str:
     USE_AI_VISION_FOR_COVER = bool(overrides["USE_AI_VISION_FOR_COVER"])
     USE_AI_VISION_BEFORE_COVER_INJECT = bool(overrides["USE_AI_VISION_BEFORE_COVER_INJECT"])
     USE_WEB_SEARCH_FOR_MB = bool(overrides["USE_WEB_SEARCH_FOR_MB"])
+    USE_AI_WEB_SEARCH_FALLBACK = bool(overrides["USE_AI_WEB_SEARCH_FALLBACK"])
     PROVIDER_IDENTITY_USE_AI = bool(overrides["PROVIDER_IDENTITY_USE_AI"])
 
     merged["AI_USAGE_LEVEL"] = normalized
@@ -2692,6 +2719,7 @@ def _apply_ai_usage_level(level: str | None = None) -> str:
     merged["USE_AI_VISION_FOR_COVER"] = USE_AI_VISION_FOR_COVER
     merged["USE_AI_VISION_BEFORE_COVER_INJECT"] = USE_AI_VISION_BEFORE_COVER_INJECT
     merged["USE_WEB_SEARCH_FOR_MB"] = USE_WEB_SEARCH_FOR_MB
+    merged["USE_AI_WEB_SEARCH_FALLBACK"] = USE_AI_WEB_SEARCH_FALLBACK
     merged["PROVIDER_IDENTITY_USE_AI"] = PROVIDER_IDENTITY_USE_AI
     return normalized
 
@@ -2713,6 +2741,8 @@ def _apply_forced_runtime_defaults():
 
 
 _apply_forced_runtime_defaults()
+WEB_SEARCH_PROVIDER = _normalize_web_search_provider(WEB_SEARCH_PROVIDER)
+merged["WEB_SEARCH_PROVIDER"] = WEB_SEARCH_PROVIDER
 _apply_ai_usage_level(AI_USAGE_LEVEL)
 SKIP_MB_FOR_LIVE_ALBUMS: bool = bool(merged.get("SKIP_MB_FOR_LIVE_ALBUMS", True))
 TRACKLIST_MATCH_MIN: float = float(merged.get("TRACKLIST_MATCH_MIN", 0.8))
@@ -2820,6 +2850,7 @@ OPENAI_MODEL   = merged["OPENAI_MODEL"]
 ANTHROPIC_API_KEY = merged["ANTHROPIC_API_KEY"]
 GOOGLE_API_KEY = merged["GOOGLE_API_KEY"]
 OLLAMA_URL     = merged["OLLAMA_URL"]
+OLLAMA_MODEL   = merged["OLLAMA_MODEL"]
 DISCORD_WEBHOOK = merged["DISCORD_WEBHOOK"]
 
 #
@@ -2979,17 +3010,44 @@ def _reinit_ai_from_globals():
     ollama_url = None
     ai_provider_ready = False
 
+    api_key_mode_enabled = bool(getattr(mod, "OPENAI_ENABLE_API_KEY_MODE", OPENAI_ENABLE_API_KEY_MODE))
+    codex_mode_enabled = bool(getattr(mod, "OPENAI_ENABLE_CODEX_OAUTH_MODE", OPENAI_ENABLE_CODEX_OAUTH_MODE))
+
+    if api_key_mode_enabled and openai_key:
+        os.environ["OPENAI_API_KEY"] = openai_key
+        try:
+            openai_client = OpenAI(timeout=_openai_request_timeout_seconds())
+            logging.info("OpenAI client re-initialized (settings applied)")
+        except Exception as e:
+            logging.warning("OpenAI client re-init failed: %s", e)
+
+    if anthropic_key and anthropic:
+        try:
+            anthropic_client = anthropic.Anthropic(api_key=anthropic_key)
+            logging.info("Anthropic client re-initialized (settings applied)")
+        except Exception as e:
+            logging.warning("Anthropic client re-init failed: %s", e)
+
+    if google_key and genai:
+        try:
+            google_client = genai.Client(api_key=google_key)
+            google_client_configured = True
+            logging.info("Google Gemini client re-initialized (settings applied)")
+        except Exception as e:
+            logging.warning("Google client re-init failed: %s", e)
+
+    if ollama_u:
+        try:
+            r = requests.get(f"{ollama_u}/api/tags", timeout=5)
+            if r.status_code == 200:
+                ollama_url = ollama_u
+                logging.info("Ollama re-verified at %s (settings applied)", ollama_url)
+            else:
+                logging.warning("Ollama not accessible at %s (HTTP %d)", ollama_u, r.status_code)
+        except Exception as e:
+            logging.warning("Ollama re-check failed: %s", e)
+
     if provider in {"openai", "openai-api", "openai-codex"}:
-        api_key_mode_enabled = bool(getattr(mod, "OPENAI_ENABLE_API_KEY_MODE", OPENAI_ENABLE_API_KEY_MODE))
-        codex_mode_enabled = bool(getattr(mod, "OPENAI_ENABLE_CODEX_OAUTH_MODE", OPENAI_ENABLE_CODEX_OAUTH_MODE))
-        if api_key_mode_enabled and openai_key:
-            os.environ["OPENAI_API_KEY"] = openai_key
-            try:
-                openai_client = OpenAI(timeout=_openai_request_timeout_seconds())
-                ai_provider_ready = True
-                logging.info("OpenAI client re-initialized (settings applied)")
-            except Exception as e:
-                logging.warning("OpenAI client re-init failed: %s", e)
         if provider == "openai-codex":
             codex_ok, codex_reason = _openai_codex_token_health(_current_user_id_or_zero(), force_refresh=False)
             if codex_mode_enabled and codex_ok:
@@ -3062,42 +3120,30 @@ def _reinit_ai_from_globals():
         else:
             logging.info("No OPENAI_API_KEY; AI-driven selection disabled.")
     elif provider == "anthropic":
-        if anthropic_key and anthropic:
-            try:
-                anthropic_client = anthropic.Anthropic(api_key=anthropic_key)
-                ai_provider_ready = True
-                logging.info("Anthropic client re-initialized (settings applied)")
-            except Exception as e:
-                logging.warning("Anthropic client re-init failed: %s", e)
+        if anthropic_client:
+            ai_provider_ready = True
         else:
             logging.info("No ANTHROPIC_API_KEY; AI-driven selection disabled.")
     elif provider == "google":
-        if google_key and genai:
-            try:
-                google_client = genai.Client(api_key=google_key)
-                google_client_configured = True
-                ai_provider_ready = True
-                logging.info("Google Gemini client re-initialized (settings applied)")
-            except Exception as e:
-                logging.warning("Google client re-init failed: %s", e)
+        if google_client_configured and google_client:
+            ai_provider_ready = True
         else:
             logging.info("No GOOGLE_API_KEY; AI-driven selection disabled.")
     elif provider == "ollama":
-        if ollama_u:
-            ollama_url = ollama_u
-            try:
-                r = requests.get(f"{ollama_url}/api/tags", timeout=5)
-                if r.status_code == 200:
-                    ai_provider_ready = True
-                    logging.info("Ollama re-verified at %s (settings applied)", ollama_url)
-                else:
-                    logging.warning("Ollama not accessible at %s (HTTP %d)", ollama_url, r.status_code)
-            except Exception as e:
-                logging.warning("Ollama re-check failed: %s", e)
+        if ollama_url:
+            ai_provider_ready = True
         else:
             logging.info("No OLLAMA_URL; AI-driven selection disabled.")
     else:
         logging.warning("Unknown AI_PROVIDER: %s", provider)
+
+    if not ai_provider_ready and _local_first_scan_ai_enabled():
+        ai_provider_ready = True
+        AI_FUNCTIONAL_ERROR_MSG = None
+        logging.info("Local-first scan AI is ready via Ollama")
+
+    if not ai_provider_ready:
+        ai_provider_ready = bool(openai_client or anthropic_client or (google_client_configured and google_client) or ollama_url)
 
 
 def _reload_ai_config_and_reinit():
@@ -3109,6 +3155,7 @@ def _reload_ai_config_and_reinit():
     mod = sys.modules[__name__]
     ai_config_keys = (
         "AI_PROVIDER",
+        "AI_USAGE_LEVEL",
         "OPENAI_API_KEY",
         "OPENAI_MODEL",
         "OPENAI_ENABLE_API_KEY_MODE",
@@ -3116,6 +3163,10 @@ def _reload_ai_config_and_reinit():
         "ANTHROPIC_API_KEY",
         "GOOGLE_API_KEY",
         "OLLAMA_URL",
+        "OLLAMA_MODEL",
+        "WEB_SEARCH_PROVIDER",
+        "SEARXNG_URL",
+        "USE_AI_WEB_SEARCH_FALLBACK",
     )
     try:
         db_path = SETTINGS_DB_FILE
@@ -3564,6 +3615,50 @@ def _ai_context_from_analysis_type(analysis_type: str) -> str:
     return "batch"
 
 
+def _ollama_service_configured() -> bool:
+    return bool(str(getattr(sys.modules[__name__], "OLLAMA_URL", "") or "").strip())
+
+
+def _ollama_model_configured() -> str:
+    return str(getattr(sys.modules[__name__], "OLLAMA_MODEL", "") or "").strip() or "qwen2.5:3b-instruct"
+
+
+def _local_first_scan_ai_enabled() -> bool:
+    level = _normalize_ai_usage_level(getattr(sys.modules[__name__], "AI_USAGE_LEVEL", "auto"))
+    return level == "auto" and bool(ollama_url) and _ollama_service_configured()
+
+
+def _resolve_local_first_provider_for_runtime(context: str, requested_provider: str) -> str:
+    req_norm = _normalize_provider_id(str(requested_provider or "").strip().lower(), fallback="")
+    if req_norm and req_norm not in _OPENAI_PROVIDER_IDS:
+        return ""
+    if context != "batch":
+        return ""
+    if _local_first_scan_ai_enabled():
+        return "ollama"
+    return ""
+
+
+def _resolve_model_for_runtime(
+    provider_id: str,
+    requested_model: str,
+    *,
+    endpoint_kind: str = "text",
+) -> str:
+    pid = _normalize_provider_id(provider_id, fallback="openai-api")
+    requested = str(requested_model or "").strip()
+    if pid == "ollama":
+        configured = _ollama_model_configured()
+        if configured:
+            return configured
+        return requested or "qwen2.5:3b-instruct"
+    if pid == "openai-codex":
+        return requested or "codex"
+    if pid == "openai-api":
+        return requested or str(getattr(sys.modules[__name__], "OPENAI_MODEL", "") or "gpt-4o-mini")
+    return requested
+
+
 def _openai_codex_health_cache_invalidate(user_id: int | None = None) -> None:
     with _openai_codex_health_lock:
         if user_id is None:
@@ -3818,6 +3913,9 @@ def _resolve_provider_for_runtime(requested_provider: str, analysis_type: str, *
         return _normalize_provider_id(req, fallback=req)
     uid = _current_user_id_or_zero() if user_id is None else max(0, int(user_id or 0))
     context = _ai_context_from_analysis_type(analysis_type)
+    local_override = _resolve_local_first_provider_for_runtime(context, req)
+    if local_override:
+        return local_override
     prefs = _get_ai_provider_preferences(uid)
     api_ready = _openai_api_runtime_available()
     codex_ready = _openai_codex_runtime_available(uid, require_token=True)
@@ -4556,11 +4654,16 @@ def call_ai_provider(
     )
     provider_for_usage = str(provider_effective or provider or "").strip()
     provider_lower = provider_for_usage.lower()
+    model_for_usage = _resolve_model_for_runtime(
+        provider_for_usage,
+        str(model or ""),
+        endpoint_kind="text",
+    )
     auth_mode_for_usage = _provider_auth_mode(provider_for_usage)
     try:
         guard_allowed, guard_reason, guard_meta = _ai_guardrail_precheck_safe(
             provider=provider_for_usage,
-            model=str(model or ""),
+            model=model_for_usage,
             endpoint_kind="text",
             analysis_type=str(analysis_type or ""),
             requested_tokens=int(max_tokens or 0),
@@ -4591,19 +4694,19 @@ def call_ai_provider(
                     float(request_timeout_sec if request_timeout_sec is not None else _openai_request_timeout_seconds()),
                 )
                 try:
-                    if (model or "").strip().lower().startswith("gpt-5") and int(max_tokens or 0) < 128:
+                    if (model_for_usage or "").strip().lower().startswith("gpt-5") and int(max_tokens or 0) < 128:
                         max_tokens = 128
                 except Exception:
                     pass
                 try:
-                    is_gpt5 = (model or "").strip().lower().startswith("gpt-5")
+                    is_gpt5 = (model_for_usage or "").strip().lower().startswith("gpt-5")
                 except Exception:
                     is_gpt5 = False
                 use_responses_api = bool(auth_mode_for_usage == "oauth" or provider_lower == "openai-codex")
                 if use_responses_api:
                     try:
                         resp = client_to_use.responses.create(
-                            model=model,
+                            model=model_for_usage,
                             input=[
                                 {"role": ("developer" if is_gpt5 else "system"), "content": system_msg},
                                 {"role": "user", "content": user_msg},
@@ -4625,7 +4728,7 @@ def call_ai_provider(
                 param_style = getattr(sys.modules[__name__], "RESOLVED_PARAM_STYLE", "mct")
                 stop_ok = getattr(sys.modules[__name__], "RESOLVED_STOP_OK", True)
                 _kwargs = {
-                    "model": model,
+                    "model": model_for_usage,
                     "messages": [
                         {"role": ("developer" if is_gpt5 else "system"), "content": system_msg},
                         {"role": "user", "content": user_msg},
@@ -4716,7 +4819,7 @@ def call_ai_provider(
             if not anthropic_client:
                 raise ValueError("Anthropic client not initialized")
             resp = anthropic_client.messages.create(
-                model=model,
+                model=model_for_usage,
                 max_tokens=max_tokens,
                 system=system_msg,
                 messages=[{"role": "user", "content": user_msg}],
@@ -4729,7 +4832,7 @@ def call_ai_provider(
             if not google_client_configured or not google_client:
                 raise ValueError("Google client not configured")
             response = google_client.models.generate_content(
-                model=model,
+                model=model_for_usage,
                 contents=(user_msg or ""),
                 config=genai.types.GenerateContentConfig(
                     systemInstruction=(system_msg or ""),
@@ -4745,7 +4848,7 @@ def call_ai_provider(
             if not ollama_url:
                 raise ValueError("Ollama URL not configured")
             payload = {
-                "model": model,
+                "model": model_for_usage,
                 "messages": [
                     {"role": "system", "content": system_msg},
                     {"role": "user", "content": user_msg},
@@ -4773,7 +4876,7 @@ def call_ai_provider(
         if callable(recorder):
             recorder(
                 provider=provider_for_usage,
-                model=model,
+                model=model_for_usage,
                 endpoint_kind="text",
                 analysis_type=analysis_type,
                 started_at=started_at,
@@ -4814,6 +4917,11 @@ def call_ai_provider_vision(
     )
     provider_for_usage = str(provider_effective or provider or "").strip()
     provider_lower = provider_for_usage.lower()
+    model_for_usage = _resolve_model_for_runtime(
+        provider_for_usage,
+        str(model or ""),
+        endpoint_kind="vision",
+    )
     if provider_lower == "openai-codex":
         started_at = time.time()
         response_obj: Any = None
@@ -4826,7 +4934,7 @@ def call_ai_provider_vision(
         try:
             guard_allowed, guard_reason, guard_meta = _ai_guardrail_precheck_safe(
                 provider=provider_for_usage,
-                model=str(model or ""),
+                model=model_for_usage,
                 endpoint_kind="vision",
                 analysis_type=str(analysis_type or ""),
                 requested_tokens=int(max_tokens or 0),
@@ -4853,7 +4961,7 @@ def call_ai_provider_vision(
             if callable(recorder):
                 recorder(
                     provider=provider_for_usage,
-                    model=model,
+                    model=model_for_usage,
                     endpoint_kind="vision",
                     analysis_type=analysis_type,
                     started_at=started_at,
@@ -4872,7 +4980,7 @@ def call_ai_provider_vision(
     if provider_lower not in {"openai", "openai-api", "openai-codex"}:
         return call_ai_provider(
             provider_for_usage,
-            model,
+            model_for_usage,
             system_msg,
             user_msg,
             max_tokens=max_tokens,
@@ -4887,7 +4995,7 @@ def call_ai_provider_vision(
             logging.warning("OpenAI vision call downgraded to text provider due to runtime issue: %s", openai_runtime_reason)
         return call_ai_provider(
             "openai-api",
-            model,
+            model_for_usage,
             system_msg,
             user_msg,
             max_tokens=max_tokens,
@@ -4915,7 +5023,7 @@ def call_ai_provider_vision(
     param_style = getattr(sys.modules[__name__], "RESOLVED_PARAM_STYLE", "mct")
     stop_ok = getattr(sys.modules[__name__], "RESOLVED_STOP_OK", True)
     try:
-        is_gpt5 = (model or "").strip().lower().startswith("gpt-5")
+        is_gpt5 = (model_for_usage or "").strip().lower().startswith("gpt-5")
     except Exception:
         is_gpt5 = False
     # GPT-5 family models may spend very small budgets entirely on reasoning and return empty output.
@@ -4926,7 +5034,7 @@ def call_ai_provider_vision(
     except Exception:
         pass
     _kwargs = {
-        "model": model,
+        "model": model_for_usage,
         "messages": [
             {"role": ("developer" if is_gpt5 else "system"), "content": system_msg},
             {"role": "user", "content": content},
@@ -4943,7 +5051,7 @@ def call_ai_provider_vision(
     try:
         guard_allowed, guard_reason, guard_meta = _ai_guardrail_precheck_safe(
             provider=provider_for_usage,
-            model=str(model or ""),
+            model=model_for_usage,
             endpoint_kind="vision",
             analysis_type=str(analysis_type or ""),
             requested_tokens=int(max_tokens or 0),
@@ -5020,9 +5128,9 @@ def call_ai_provider_vision(
     finally:
         recorder = globals().get("record_ai_usage")
         if callable(recorder):
-            recorder(
-                provider=provider_for_usage,
-                model=model,
+                recorder(
+                    provider=provider_for_usage,
+                    model=model_for_usage,
                 endpoint_kind="vision",
                 analysis_type=analysis_type,
                 started_at=started_at,
@@ -18108,11 +18216,16 @@ def call_ai_provider_longform(
     )
     provider_for_usage = str(provider_effective or provider or "").strip()
     provider_lower = provider_for_usage.lower()
+    model_for_usage = _resolve_model_for_runtime(
+        provider_for_usage,
+        str(model or ""),
+        endpoint_kind="longform",
+    )
     auth_mode_for_usage = _provider_auth_mode(provider_for_usage)
     try:
         guard_allowed, guard_reason, guard_meta = _ai_guardrail_precheck(
             provider=provider_for_usage,
-            model=str(model or ""),
+            model=model_for_usage,
             endpoint_kind="longform",
             analysis_type=str(analysis_type or ""),
             requested_tokens=int(max_tokens or 0),
@@ -18143,7 +18256,7 @@ def call_ai_provider_longform(
                     float(request_timeout_sec if request_timeout_sec is not None else _openai_request_timeout_seconds()),
                 )
                 try:
-                    is_gpt5 = (model or "").strip().lower().startswith("gpt-5")
+                    is_gpt5 = (model_for_usage or "").strip().lower().startswith("gpt-5")
                 except Exception:
                     is_gpt5 = False
                 try:
@@ -18155,7 +18268,7 @@ def call_ai_provider_longform(
                 if use_responses_api:
                     try:
                         resp = client_to_use.responses.create(
-                            model=model,
+                            model=model_for_usage,
                             input=[
                                 {"role": ("developer" if is_gpt5 else "system"), "content": system_msg},
                                 {"role": "user", "content": user_msg},
@@ -18176,7 +18289,7 @@ def call_ai_provider_longform(
 
                 param_style = getattr(sys.modules[__name__], "RESOLVED_PARAM_STYLE", "mct")
                 _kwargs = {
-                    "model": model,
+                    "model": model_for_usage,
                     "messages": [
                         {"role": ("developer" if is_gpt5 else "system"), "content": system_msg},
                         {"role": "user", "content": user_msg},
@@ -18253,7 +18366,7 @@ def call_ai_provider_longform(
             if not anthropic_client:
                 raise ValueError("Anthropic client not initialized")
             resp = anthropic_client.messages.create(
-                model=model,
+                model=model_for_usage,
                 max_tokens=max_tokens,
                 system=system_msg,
                 messages=[{"role": "user", "content": user_msg}],
@@ -18266,7 +18379,7 @@ def call_ai_provider_longform(
             if not google_client_configured or not google_client:
                 raise ValueError("Google client not configured")
             response = google_client.models.generate_content(
-                model=model,
+                model=model_for_usage,
                 contents=(user_msg or ""),
                 config=genai.types.GenerateContentConfig(
                     systemInstruction=(system_msg or ""),
@@ -18281,7 +18394,7 @@ def call_ai_provider_longform(
             if not ollama_url:
                 raise ValueError("Ollama URL not configured")
             payload = {
-                "model": model,
+                "model": model_for_usage,
                 "messages": [
                     {"role": "system", "content": system_msg},
                     {"role": "user", "content": user_msg},
@@ -18308,7 +18421,7 @@ def call_ai_provider_longform(
         if callable(recorder):
             recorder(
                 provider=provider_for_usage,
-                model=model,
+                model=model_for_usage,
                 endpoint_kind="longform",
                 analysis_type=analysis_type,
                 started_at=started_at,
@@ -27877,7 +27990,9 @@ def _classical_identity_match_details(
         candidate_artist=candidate_artist,
         candidate_title=candidate_title,
     )
-    if not bool(local_ctx.get("is_classical") or provider_ctx.get("is_classical")):
+    local_is_classical = bool(local_ctx.get("is_classical"))
+    provider_is_classical = bool(provider_ctx.get("is_classical"))
+    if not local_is_classical:
         return (False, "classical_context_missing")
 
     local_title_norm = str(local_ctx.get("title_norm") or _normalize_identity_album_strict(local_title))
@@ -28383,8 +28498,7 @@ def _build_provider_identity_candidates(
             candidate_title=src_title,
         )
         classical_guard_applies = bool(
-            (resolved_local_context.get("is_classical") if isinstance(resolved_local_context, dict) else False)
-            or provider_context.get("is_classical")
+            resolved_local_context.get("is_classical") if isinstance(resolved_local_context, dict) else False
         )
         provider_titles = _provider_track_titles_for_strict(provider, payload)
         provider_track_count = len(provider_titles)
@@ -38566,6 +38680,93 @@ def _has_unfinished_resume_run(mode: str, scan_type: str) -> bool:
         return False
 
 
+def _get_resume_run_snapshot(mode: str, scan_type: str) -> dict[str, Any] | None:
+    """
+    Return the latest unfinished resume run for the current source signature with
+    counts describing what remains to process.
+    """
+    source_signature = _compute_scan_source_signature(mode, scan_type)
+    try:
+        con = sqlite3.connect(str(STATE_DB_FILE), timeout=15)
+        cur = con.cursor()
+        cur.execute(
+            """
+            SELECT run_id, status, created_at, updated_at, scan_id
+            FROM scan_resume_runs
+            WHERE source_signature = ? AND mode = ? AND scan_type = ?
+              AND COALESCE(status, '') != 'completed'
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+            (source_signature, mode, scan_type),
+        )
+        row = cur.fetchone()
+        if not row:
+            con.close()
+            return None
+        run_id = str(row[0] or "")
+        run_status = str(row[1] or "").strip().lower() or "pending"
+        created_at = float(row[2] or 0.0) if row[2] is not None else None
+        updated_at = float(row[3] or 0.0) if row[3] is not None else None
+        scan_id = int(row[4] or 0) if row[4] is not None else None
+        cur.execute(
+            """
+            SELECT
+              COUNT(*) AS total_artists,
+              COALESCE(SUM(album_count), 0) AS total_albums,
+              COALESCE(SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END), 0) AS done_artists,
+              COALESCE(SUM(CASE WHEN status = 'done' THEN album_count ELSE 0 END), 0) AS done_albums,
+              COALESCE(SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), 0) AS pending_artists,
+              COALESCE(SUM(CASE WHEN status = 'pending' THEN album_count ELSE 0 END), 0) AS pending_albums,
+              COALESCE(SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END), 0) AS running_artists,
+              COALESCE(SUM(CASE WHEN status = 'running' THEN album_count ELSE 0 END), 0) AS running_albums,
+              COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) AS failed_artists,
+              COALESCE(SUM(CASE WHEN status = 'failed' THEN album_count ELSE 0 END), 0) AS failed_albums
+            FROM scan_resume_artists
+            WHERE run_id = ?
+            """,
+            (run_id,),
+        )
+        counts = cur.fetchone() or (0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+        con.close()
+        total_artists = int(counts[0] or 0)
+        total_albums = int(counts[1] or 0)
+        done_artists = int(counts[2] or 0)
+        done_albums = int(counts[3] or 0)
+        pending_artists = int(counts[4] or 0)
+        pending_albums = int(counts[5] or 0)
+        running_artists = int(counts[6] or 0)
+        running_albums = int(counts[7] or 0)
+        failed_artists = int(counts[8] or 0)
+        failed_albums = int(counts[9] or 0)
+        remaining_artists = max(0, pending_artists + running_artists + failed_artists)
+        remaining_albums = max(0, pending_albums + running_albums + failed_albums)
+        return {
+            "available": bool(run_id and remaining_artists > 0),
+            "run_id": run_id,
+            "status": run_status,
+            "scan_type": scan_type,
+            "created_at": created_at,
+            "updated_at": updated_at,
+            "scan_id": scan_id,
+            "total_artists": total_artists,
+            "total_albums": total_albums,
+            "done_artists": done_artists,
+            "done_albums": done_albums,
+            "remaining_artists": remaining_artists,
+            "remaining_albums": remaining_albums,
+            "pending_artists": pending_artists,
+            "pending_albums": pending_albums,
+            "running_artists": running_artists,
+            "running_albums": running_albums,
+            "failed_artists": failed_artists,
+            "failed_albums": failed_albums,
+        }
+    except Exception:
+        logging.debug("Failed to read resume snapshot for scan_type=%s", scan_type, exc_info=True)
+        return None
+
+
 def _set_resume_artist_status(run_id: str | None, artist_name: str, status: str, error: str | None = None) -> None:
     """Update one artist status for a resume run."""
     if not run_id or not artist_name:
@@ -44426,6 +44627,26 @@ def _run_serper_preflight() -> tuple[bool, str]:
         return False, f"Serper unreachable: {e}"
 
 
+def _run_searxng_preflight() -> tuple[bool, str]:
+    """Check SearXNG reachability. Returns (ok, message)."""
+    base = (getattr(sys.modules[__name__], "SEARXNG_URL", "") or "").strip().rstrip("/")
+    if not base:
+        return False, "No SearXNG URL (local web search disabled)"
+    try:
+        resp = requests.get(
+            f"{base}/search",
+            params={"q": "test", "format": "json"},
+            timeout=8,
+            allow_redirects=True,
+            headers={"Accept": "application/json"},
+        )
+        if resp.status_code == 200:
+            return True, "SearXNG reachable"
+        return False, f"HTTP {resp.status_code}"
+    except Exception as e:
+        return False, f"SearXNG unreachable: {e}"
+
+
 def _serper_web_search(query: str, num: int = 5, *, allow_ai_fallback: bool = True) -> list[dict]:
     """Backward-compatible alias to the main Serper + AI-fallback web search helper."""
     return _web_search_serper(query, num=num, allow_ai_fallback=allow_ai_fallback)
@@ -44506,6 +44727,7 @@ def _run_provider_preflights_parallel() -> dict[str, tuple[bool, str]]:
         ("discogs", _run_discogs_preflight),
         ("lastfm", _run_lastfm_preflight),
         ("fanart", _run_fanart_preflight),
+        ("searxng", _run_searxng_preflight),
         ("serper", _run_serper_preflight),
         ("acoustid", _run_acoustid_preflight),
     ]
@@ -46485,7 +46707,7 @@ def _ai_web_search_budget_allows() -> tuple[bool, str]:
 
 
 def _ai_web_search_available(*, user_id: int | None = None) -> bool:
-    if not bool(getattr(sys.modules[__name__], "USE_AI_WEB_SEARCH_FALLBACK", True)):
+    if not bool(getattr(sys.modules[__name__], "USE_AI_WEB_SEARCH_FALLBACK", False)):
         return False
     ok, provider_effective, _auth_mode, _reason = _resolve_ai_runtime_availability(
         analysis_type="web_search",
@@ -46802,6 +47024,110 @@ def _openai_web_search_fallback(query: str, num: int = 10, *, reason: str = "") 
     return []
 
 
+def _web_search_ai_fallback_enabled(*, allow_ai_fallback: bool = True) -> bool:
+    if not allow_ai_fallback:
+        return False
+    if not bool(getattr(sys.modules[__name__], "USE_AI_WEB_SEARCH_FALLBACK", False)):
+        return False
+    usage_level = _normalize_ai_usage_level(str(getattr(sys.modules[__name__], "AI_USAGE_LEVEL", "auto") or "auto"))
+    return usage_level == "aggressive"
+
+
+def _web_search_provider_order() -> list[str]:
+    provider = _normalize_web_search_provider(str(getattr(sys.modules[__name__], "WEB_SEARCH_PROVIDER", "auto") or "auto"))
+    if provider == "disabled":
+        return []
+    if provider == "ai_only":
+        return []
+    if provider == "searxng":
+        return ["searxng"]
+    if provider == "serper":
+        return ["serper"]
+    order: list[str] = []
+    if str(getattr(sys.modules[__name__], "SEARXNG_URL", "") or "").strip():
+        order.append("searxng")
+    if str(getattr(sys.modules[__name__], "SERPER_API_KEY", "") or "").strip():
+        order.append("serper")
+    return order
+
+
+def _web_search_searxng(query: str, num: int = 10) -> tuple[str, list[dict]]:
+    q = str(query or "").strip()
+    if not q:
+        return ("miss", [])
+    base = str(getattr(sys.modules[__name__], "SEARXNG_URL", "") or "").strip().rstrip("/")
+    if not base:
+        return ("miss", [])
+    limit = max(1, min(20, int(num or 10)))
+    try:
+        resp = requests.get(
+            f"{base}/search",
+            params={"q": q, "format": "json", "language": "all", "safesearch": 0},
+            timeout=10,
+            allow_redirects=True,
+            headers={"Accept": "application/json"},
+        )
+        if resp.status_code != 200:
+            logging.debug("[SearXNG] HTTP %s for query=%r: %s", resp.status_code, q, resp.text[:200])
+            return ("error", [])
+        data = resp.json() if resp.content else {}
+        results = data.get("results") or []
+        out = _normalize_web_results(
+            [
+                {
+                    "title": item.get("title") if isinstance(item, dict) else "",
+                    "link": item.get("url") if isinstance(item, dict) else "",
+                    "snippet": item.get("content") if isinstance(item, dict) else "",
+                }
+                for item in results
+            ],
+            source="searxng",
+            max_items=limit,
+        )
+        return ("hit" if out else "miss", out[:limit])
+    except Exception as e:
+        logging.debug("[SearXNG] Request failed for query=%r: %s", q, e)
+        return ("error", [])
+
+
+def _web_search_serper_http(query: str, num: int = 10) -> tuple[str, list[dict]]:
+    q = str(query or "").strip()
+    if not q:
+        return ("miss", [])
+    key = getattr(sys.modules[__name__], "SERPER_API_KEY", "") or ""
+    if not key.strip():
+        return ("miss", [])
+    limit = max(1, min(20, int(num or 10)))
+    try:
+        resp = requests.post(
+            "https://google.serper.dev/search",
+            json={"q": q, "num": limit},
+            headers={"X-API-KEY": key, "Content-Type": "application/json"},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            logging.debug("[Serper] HTTP %s for query=%r: %s", resp.status_code, q, resp.text[:200])
+            return ("error", [])
+        data = resp.json()
+        organic = data.get("organic") or []
+        out = _normalize_web_results(
+            [
+                {
+                    "title": item.get("title") if isinstance(item, dict) else "",
+                    "link": item.get("link") if isinstance(item, dict) else "",
+                    "snippet": item.get("snippet") if isinstance(item, dict) else "",
+                }
+                for item in organic
+            ],
+            source="serper",
+            max_items=limit,
+        )
+        return ("hit" if out else "miss", out[:limit])
+    except Exception as e:
+        logging.debug("[Serper] Request failed for query=%r: %s", q, e)
+        return ("error", [])
+
+
 def _web_search_serper(query: str, num: int = 10, *, allow_ai_fallback: bool = True) -> List[dict]:
     """
     Run web search with Serper priority:
@@ -46826,83 +47152,30 @@ def _web_search_serper(query: str, num: int = 10, *, allow_ai_fallback: bool = T
         # Query already attempted during this run: avoid duplicate network calls.
         return []
 
-    ai_tried_primary = False
-    key = getattr(sys.modules[__name__], "SERPER_API_KEY", "") or ""
-    if not key.strip():
-        if not ai_tried_primary:
-            if allow_ai_fallback:
-                fallback_rows = _openai_web_search_fallback(q, num=limit, reason="serper_key_missing")
-                if fallback_rows:
-                    _ai_web_search_cache_set(q, limit, fallback_rows[:limit], status="hit")
-                    _ai_query_cache_set(scope, q, limit, fallback_rows[:limit], status="hit", source="openai_web_search")
-                    return fallback_rows[:limit]
-            _ai_web_search_cache_set(q, limit, [], status="miss")
-            _ai_query_cache_set(scope, q, limit, [], status="miss", source="none")
-            return []
-        return []
-    url = "https://google.serper.dev/search"
-    headers = {"X-API-KEY": key, "Content-Type": "application/json"}
-    body = {"q": q, "num": limit}
-    try:
-        resp = requests.post(url, json=body, headers=headers, timeout=10)
-        if resp.status_code != 200:
-            reason = f"serper_http_{resp.status_code}"
-            if resp.status_code in (401, 403, 429):
-                logging.warning(
-                    "[Serper] unavailable (%s) for query=%r – falling back to AI web search. %s",
-                    resp.status_code,
-                    q,
-                    resp.text[:200],
-                )
-            else:
-                logging.debug("[Serper] HTTP %s for query=%r: %s", resp.status_code, q, resp.text[:200])
-            if not ai_tried_primary and allow_ai_fallback:
-                fallback_rows = _openai_web_search_fallback(q, num=limit, reason=reason)
-                if fallback_rows:
-                    _ai_web_search_cache_set(q, limit, fallback_rows[:limit], status="hit")
-                    _ai_query_cache_set(scope, q, limit, fallback_rows[:limit], status="hit", source="openai_web_search")
-                    return fallback_rows[:limit]
-            _ai_web_search_cache_set(q, limit, [], status="error")
-            _ai_query_cache_set(scope, q, limit, [], status="error", source="serper")
-            return []
-        data = resp.json()
-        organic = data.get("organic") or []
-        out = _normalize_web_results(
-            [
-                {
-                    "title": item.get("title") if isinstance(item, dict) else "",
-                    "link": item.get("link") if isinstance(item, dict) else "",
-                    "snippet": item.get("snippet") if isinstance(item, dict) else "",
-                }
-                for item in organic
-            ],
-            source="serper",
-            max_items=limit,
-        )
-        if out:
-            _ai_web_search_cache_set(q, limit, out[:limit], status="hit")
-            _ai_query_cache_set(scope, q, limit, out[:limit], status="hit", source="serper")
-            return out[:limit]
-        if not ai_tried_primary and allow_ai_fallback:
-            fallback_rows = _openai_web_search_fallback(q, num=limit, reason="serper_empty")
-            if fallback_rows:
-                _ai_web_search_cache_set(q, limit, fallback_rows[:limit], status="hit")
-                _ai_query_cache_set(scope, q, limit, fallback_rows[:limit], status="hit", source="openai_web_search")
-                return fallback_rows[:limit]
-        _ai_web_search_cache_set(q, limit, [], status="miss")
-        _ai_query_cache_set(scope, q, limit, [], status="miss", source="serper")
-        return []
-    except Exception as e:
-        logging.debug("[Serper] Request failed for query=%r: %s", q, e)
-        if not ai_tried_primary and allow_ai_fallback:
-            fallback_rows = _openai_web_search_fallback(q, num=limit, reason="serper_exception")
-            if fallback_rows:
-                _ai_web_search_cache_set(q, limit, fallback_rows[:limit], status="hit")
-                _ai_query_cache_set(scope, q, limit, fallback_rows[:limit], status="hit", source="openai_web_search")
-                return fallback_rows[:limit]
-        _ai_web_search_cache_set(q, limit, [], status="error")
-        _ai_query_cache_set(scope, q, limit, [], status="error", source="serper")
-        return []
+    last_status = "miss"
+    last_source = "none"
+    for source in _web_search_provider_order():
+        if source == "searxng":
+            status, rows = _web_search_searxng(q, num=limit)
+        elif source == "serper":
+            status, rows = _web_search_serper_http(q, num=limit)
+        else:
+            continue
+        last_status = status
+        last_source = source
+        if rows:
+            _ai_web_search_cache_set(q, limit, rows[:limit], status="hit")
+            _ai_query_cache_set(scope, q, limit, rows[:limit], status="hit", source=source)
+            return rows[:limit]
+    if _web_search_ai_fallback_enabled(allow_ai_fallback=allow_ai_fallback):
+        fallback_rows = _openai_web_search_fallback(q, num=limit, reason=f"{last_source}_{last_status}")
+        if fallback_rows:
+            _ai_web_search_cache_set(q, limit, fallback_rows[:limit], status="hit")
+            _ai_query_cache_set(scope, q, limit, fallback_rows[:limit], status="hit", source="openai_web_search")
+            return fallback_rows[:limit]
+    _ai_web_search_cache_set(q, limit, [], status=last_status)
+    _ai_query_cache_set(scope, q, limit, [], status=last_status, source=last_source)
+    return []
 
 
 @app.get("/api/scan/preflight")
@@ -46950,6 +47223,8 @@ def scan_preflight():
 
     serper_ok, serper_msg = provider_checks.get("serper", (False, "No result"))
     serper = {"ok": serper_ok, "message": serper_msg}
+    searxng_ok, searxng_msg = provider_checks.get("searxng", (False, "No result"))
+    searxng = {"ok": searxng_ok, "message": searxng_msg}
     acoustid_ok, acoustid_msg = provider_checks.get("acoustid", (False, "No result"))
     acoustid = {"ok": acoustid_ok, "message": acoustid_msg}
     paths = _paths_rw_status()
@@ -46960,6 +47235,7 @@ def scan_preflight():
         lastfm=lastfm,
         fanart=fanart,
         bandcamp=bandcamp,
+        searxng=searxng,
         serper=serper,
         acoustid=acoustid,
         paths=paths,
@@ -46973,6 +47249,7 @@ def providers_preflight():
         discogs={"ok": checks["discogs"][0], "message": checks["discogs"][1]},
         lastfm={"ok": checks["lastfm"][0], "message": checks["lastfm"][1]},
         fanart={"ok": checks["fanart"][0], "message": checks["fanart"][1]},
+        searxng={"ok": checks["searxng"][0], "message": checks["searxng"][1]},
         serper={"ok": checks["serper"][0], "message": checks["serper"][1]},
         acoustid={"ok": checks["acoustid"][0], "message": checks["acoustid"][1]},
         checked_at=int(time.time()),
@@ -47296,15 +47573,36 @@ def pause_scan():
 
 @app.route("/scan/resume", methods=["POST"])
 def resume_scan():
+    _reload_ai_config_and_reinit()
     scan_is_paused.clear()
     # no state change needed; polling loop will continue
-    return jsonify({"status": "ok"})
+    return jsonify(
+        {
+            "status": "ok",
+            "ai_provider": str(AI_PROVIDER or ""),
+            "ai_model": str(getattr(sys.modules[__name__], "RESOLVED_MODEL", None) or OPENAI_MODEL or ""),
+        }
+    )
 
 
 @app.route("/scan/stop", methods=["POST"])
 def stop_scan():
+    snapshot_triggered = False
+    with lock:
+        mode = _get_library_mode()
+        can_snapshot = bool(mode == "files" and (state.get("files_editions_by_album_id") or {}))
+        resume_run_id = str(state.get("scan_resume_run_id") or "").strip() or None
+    if can_snapshot:
+        snapshot_triggered = _trigger_prescan_cache_snapshot_async(reason="manual_stop")
     scan_should_stop.set()
-    return jsonify({"status": "ok"})
+    return jsonify(
+        {
+            "status": "ok",
+            "snapshot_triggered": bool(snapshot_triggered),
+            "resume_preserved": bool(resume_run_id),
+            "resume_run_id": resume_run_id,
+        }
+    )
 
 
 @app.route("/api/scan/clear", methods=["POST"])
@@ -48595,6 +48893,176 @@ def api_ollama_models():
         return jsonify({"error": f"Failed to fetch models: {error_msg}"}), 500
 
 
+_OLLAMA_PULL_STATUS_LOCK = threading.Lock()
+_OLLAMA_PULL_STATUS: dict[str, Any] = {
+    "active": False,
+    "status": "idle",
+    "message": "",
+    "model": "",
+    "url": "",
+    "completed": 0,
+    "total": 0,
+    "progress": 0.0,
+    "started_at": None,
+    "updated_at": None,
+    "finished_at": None,
+    "error": "",
+    "digest": "",
+}
+
+
+def _ollama_pull_status_snapshot() -> dict[str, Any]:
+    with _OLLAMA_PULL_STATUS_LOCK:
+        return dict(_OLLAMA_PULL_STATUS)
+
+
+def _ollama_pull_status_update(**fields: Any) -> dict[str, Any]:
+    with _OLLAMA_PULL_STATUS_LOCK:
+        _OLLAMA_PULL_STATUS.update(fields)
+        _OLLAMA_PULL_STATUS["updated_at"] = time.time()
+        return dict(_OLLAMA_PULL_STATUS)
+
+
+def _ollama_model_exists(url: str, model_name: str) -> bool:
+    try:
+        response = requests.get(f"{url.rstrip('/')}/api/tags", timeout=10)
+        if response.status_code != 200:
+            return False
+        payload = response.json() if response.content else {}
+        models = payload.get("models") or []
+        target = str(model_name or "").strip().lower()
+        for item in models:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip().lower()
+            if name == target:
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def _run_ollama_pull_async(url: str, model_name: str) -> None:
+    started_at = time.time()
+    _ollama_pull_status_update(
+        active=True,
+        status="starting",
+        message=f"Pulling {model_name}…",
+        model=model_name,
+        url=url,
+        completed=0,
+        total=0,
+        progress=0.0,
+        started_at=started_at,
+        finished_at=None,
+        error="",
+        digest="",
+    )
+    try:
+        response = requests.post(
+            f"{url.rstrip('/')}/api/pull",
+            json={"name": model_name, "stream": True},
+            stream=True,
+            timeout=(10, 900),
+        )
+        if response.status_code != 200:
+            detail = response.text[:400] if response.text else f"HTTP {response.status_code}"
+            raise RuntimeError(f"Ollama pull failed: {detail}")
+        for raw_line in response.iter_lines(decode_unicode=True):
+            if not raw_line:
+                continue
+            try:
+                payload = json.loads(raw_line)
+            except Exception:
+                continue
+            status_text = str(payload.get("status") or "").strip() or "pulling"
+            completed = int(payload.get("completed") or 0)
+            total = int(payload.get("total") or 0)
+            digest = str(payload.get("digest") or "").strip()
+            progress = 0.0
+            if total > 0:
+                progress = max(0.0, min(100.0, (completed / total) * 100.0))
+            if payload.get("error"):
+                raise RuntimeError(str(payload.get("error")))
+            done = bool(payload.get("completed") and payload.get("total") and completed >= total)
+            _ollama_pull_status_update(
+                active=not done,
+                status="completed" if done else status_text,
+                message=status_text,
+                completed=completed,
+                total=total,
+                progress=progress,
+                digest=digest,
+                finished_at=time.time() if done else None,
+            )
+        if not _ollama_model_exists(url, model_name):
+            raise RuntimeError(f"Ollama did not report {model_name} after pull")
+        _ollama_pull_status_update(
+            active=False,
+            status="completed",
+            message=f"{model_name} is ready",
+            progress=100.0,
+            finished_at=time.time(),
+        )
+    except Exception as exc:
+        logging.error("Ollama pull failed for %s via %s: %s", model_name, url, exc)
+        _ollama_pull_status_update(
+            active=False,
+            status="error",
+            message=str(exc),
+            error=str(exc),
+            finished_at=time.time(),
+        )
+
+
+@app.get("/api/ollama/pull/status")
+def api_ollama_pull_status():
+    return jsonify(_ollama_pull_status_snapshot())
+
+
+@app.post("/api/ollama/pull")
+def api_ollama_pull():
+    data = request.get_json(silent=True) or {}
+    url = str(data.get("OLLAMA_URL") or "").strip() or OLLAMA_URL
+    model_name = str(data.get("model") or data.get("name") or "").strip()
+    if not url:
+        return jsonify({"error": "OLLAMA_URL is required"}), 400
+    url = url.rstrip("/")
+    if not model_name:
+        return jsonify({"error": "Model name is required"}), 400
+
+    current = _ollama_pull_status_snapshot()
+    if bool(current.get("active")):
+        if str(current.get("model") or "").strip().lower() == model_name.lower():
+            return jsonify(current), 202
+        return jsonify({"error": "Another Ollama pull is already running", "active": current}), 409
+
+    if _ollama_model_exists(url, model_name):
+        ready = _ollama_pull_status_update(
+            active=False,
+            status="completed",
+            message=f"{model_name} is already installed",
+            model=model_name,
+            url=url,
+            completed=0,
+            total=0,
+            progress=100.0,
+            started_at=time.time(),
+            finished_at=time.time(),
+            error="",
+        )
+        return jsonify(ready)
+
+    worker = threading.Thread(
+        target=_run_ollama_pull_async,
+        args=(url, model_name),
+        daemon=True,
+        name="ollama-model-pull",
+    )
+    worker.start()
+    return jsonify(_ollama_pull_status_snapshot()), 202
+
+
 @app.post("/api/ai/models")
 def api_ai_models():
     """Route to the appropriate AI provider's models endpoint based on AI_PROVIDER."""
@@ -49554,6 +50022,7 @@ def api_config_get():
     fanart_key_eff = get_setting("FANART_API_KEY", FANART_API_KEY)
     theaudiodb_key_eff = get_setting("THEAUDIODB_API_KEY", THEAUDIODB_API_KEY)
     serper_key_eff = get_setting("SERPER_API_KEY", SERPER_API_KEY)
+    searxng_url_eff = get_setting("SEARXNG_URL", SEARXNG_URL)
     acoustid_key_eff = get_setting("ACOUSTID_API_KEY", ACOUSTID_API_KEY)
     lidarr_key_eff = get_setting("LIDARR_API_KEY", merged.get("LIDARR_API_KEY", ""))
     autobrr_key_eff = get_setting("AUTOBRR_API_KEY", merged.get("AUTOBRR_API_KEY", ""))
@@ -49626,6 +50095,7 @@ def api_config_get():
         "GOOGLE_API_KEY": str(google_key_eff or ""),
         "GOOGLE_API_KEY_SET": _is_set(google_key_eff),
         "OLLAMA_URL": get_setting("OLLAMA_URL", OLLAMA_URL),
+        "OLLAMA_MODEL": get_setting("OLLAMA_MODEL", OLLAMA_MODEL),
         "USE_MUSICBRAINZ": True,
         "MUSICBRAINZ_EMAIL": get_setting("MUSICBRAINZ_EMAIL", MUSICBRAINZ_EMAIL),
         "MB_RETRY_NOT_FOUND": get_setting_bool("MB_RETRY_NOT_FOUND", MB_RETRY_NOT_FOUND),
@@ -49668,6 +50138,7 @@ def api_config_get():
         "OPENAI_VISION_MODEL": get_setting("OPENAI_VISION_MODEL", OPENAI_VISION_MODEL),
         "USE_AI_VISION_BEFORE_COVER_INJECT": bool(USE_AI_VISION_BEFORE_COVER_INJECT),
         "USE_WEB_SEARCH_FOR_MB": bool(USE_WEB_SEARCH_FOR_MB),
+        "WEB_SEARCH_PROVIDER": _normalize_web_search_provider(get_setting("WEB_SEARCH_PROVIDER", WEB_SEARCH_PROVIDER)),
         "USE_AI_WEB_SEARCH_FALLBACK": get_setting_bool("USE_AI_WEB_SEARCH_FALLBACK", USE_AI_WEB_SEARCH_FALLBACK),
         "SCHEDULER_ALLOW_NON_SCAN_JOBS": get_setting_bool("SCHEDULER_ALLOW_NON_SCAN_JOBS", SCHEDULER_ALLOW_NON_SCAN_JOBS),
         "AI_MAX_CALLS_PER_SCAN": 0,
@@ -49676,6 +50147,8 @@ def api_config_get():
         "AI_GLOBAL_MAX_CALLS_PER_DAY": 0,
         "SERPER_API_KEY": str(serper_key_eff or ""),
         "SERPER_API_KEY_SET": _is_set(serper_key_eff),
+        "SEARXNG_URL": str(searxng_url_eff or "").strip(),
+        "SEARXNG_URL_SET": _is_set(searxng_url_eff),
         "USE_ACOUSTID": True,
         "ACOUSTID_API_KEY": str(acoustid_key_eff or ""),
         "ACOUSTID_API_KEY_SET": _is_set(acoustid_key_eff),
@@ -50052,6 +50525,9 @@ def _apply_settings_in_memory(updates: dict):
     if "USE_WEB_SEARCH_FOR_MB" in updates:
         global USE_WEB_SEARCH_FOR_MB
         USE_WEB_SEARCH_FOR_MB = bool(_parse_bool(updates["USE_WEB_SEARCH_FOR_MB"]))
+    if "WEB_SEARCH_PROVIDER" in updates:
+        global WEB_SEARCH_PROVIDER
+        WEB_SEARCH_PROVIDER = _normalize_web_search_provider(updates["WEB_SEARCH_PROVIDER"])
     if "USE_AI_WEB_SEARCH_FALLBACK" in updates:
         global USE_AI_WEB_SEARCH_FALLBACK
         USE_AI_WEB_SEARCH_FALLBACK = bool(_parse_bool(updates["USE_AI_WEB_SEARCH_FALLBACK"]))
@@ -50072,7 +50548,7 @@ def _apply_settings_in_memory(updates: dict):
         AI_GLOBAL_MAX_CALLS_PER_DAY = 0
     if "AI_USAGE_LEVEL" in updates:
         global AI_USAGE_LEVEL
-        AI_USAGE_LEVEL = _normalize_ai_usage_level(str(updates.get("AI_USAGE_LEVEL") or "medium"))
+        AI_USAGE_LEVEL = _normalize_ai_usage_level(str(updates.get("AI_USAGE_LEVEL") or "auto"))
         _apply_ai_usage_level(AI_USAGE_LEVEL)
         logging.info("AI_USAGE_LEVEL updated in memory: %s", AI_USAGE_LEVEL)
     if "SERPER_API_KEY" in updates:
@@ -50080,6 +50556,9 @@ def _apply_settings_in_memory(updates: dict):
         v = str(updates.get("SERPER_API_KEY") or "").strip()
         if not _is_masked_secret_placeholder(v):
             SERPER_API_KEY = v
+    if "SEARXNG_URL" in updates:
+        global SEARXNG_URL
+        SEARXNG_URL = _normalize_http_base_url(str(updates.get("SEARXNG_URL") or ""))
     if "USE_ACOUSTID" in updates:
         global USE_ACOUSTID
         USE_ACOUSTID = bool(_parse_bool(updates["USE_ACOUSTID"]))
@@ -50547,6 +51026,8 @@ def _apply_settings_in_memory(updates: dict):
             mod.GOOGLE_API_KEY = v
     if "OLLAMA_URL" in updates:
         mod.OLLAMA_URL = str(updates["OLLAMA_URL"] or "").strip().rstrip("/")
+    if "OLLAMA_MODEL" in updates:
+        mod.OLLAMA_MODEL = str(updates["OLLAMA_MODEL"] or "").strip() or "qwen2.5:3b-instruct"
 
     if need_ai_reinit:
         _reinit_ai_from_globals()
@@ -50567,13 +51048,13 @@ def api_config_put():
         "DUPE_ROOT", "PMDA_CONFIG_DIR", "MUSIC_PARENT_PATH",
         "SCAN_THREADS", "LOG_LEVEL", "LOG_FILE", "AI_PROVIDER", "AI_USAGE_LEVEL", "OPENAI_API_KEY",
         "OPENAI_ENABLE_API_KEY_MODE", "OPENAI_ENABLE_CODEX_OAUTH_MODE", "OPENAI_MODEL",
-        "OPENAI_MODEL_FALLBACKS", "ANTHROPIC_API_KEY", "GOOGLE_API_KEY", "OLLAMA_URL",
+        "OPENAI_MODEL_FALLBACKS", "ANTHROPIC_API_KEY", "GOOGLE_API_KEY", "OLLAMA_URL", "OLLAMA_MODEL",
         "DISCORD_WEBHOOK", "USE_MUSICBRAINZ", "MUSICBRAINZ_EMAIL", "MB_RETRY_NOT_FOUND",
         "MB_SEARCH_ALBUM_TIMEOUT_SEC", "MB_CANDIDATE_FETCH_LIMIT", "MB_TRACKLIST_FETCH_LIMIT", "MB_FAST_FALLBACK_MODE",
         "PROVIDER_IDENTITY_STRICT", "PROVIDER_IDENTITY_USE_AI", "MATCH_COVER_OCR_MODE", "PROVIDER_IDENTITY_MIN_SCORE", "PROVIDER_IDENTITY_SCORE_MARGIN",
         "PROVIDER_CACHE_FOUND_TTL_SEC", "PROVIDER_CACHE_NOT_FOUND_TTL_SEC", "PROVIDER_CACHE_ERROR_TTL_SEC",
         "USE_AI_FOR_MB_MATCH", "USE_AI_FOR_MB_VERIFY", "USE_AI_FOR_DEDUPE", "USE_AI_FOR_SOFT_MATCH_PROFILES",
-        "USE_AI_VISION_FOR_COVER", "AI_CONFIDENCE_MIN", "OPENAI_VISION_MODEL", "USE_AI_VISION_BEFORE_COVER_INJECT", "USE_WEB_SEARCH_FOR_MB", "SERPER_API_KEY",
+        "USE_AI_VISION_FOR_COVER", "AI_CONFIDENCE_MIN", "OPENAI_VISION_MODEL", "USE_AI_VISION_BEFORE_COVER_INJECT", "USE_WEB_SEARCH_FOR_MB", "WEB_SEARCH_PROVIDER", "SERPER_API_KEY", "SEARXNG_URL",
         "USE_AI_WEB_SEARCH_FALLBACK", "AI_MAX_CALLS_PER_SCAN", "AI_CALL_COOLDOWN_SEC",
         "AI_GLOBAL_MAX_CALLS_PER_MINUTE", "AI_GLOBAL_MAX_CALLS_PER_DAY",
         "SCHEDULER_ALLOW_NON_SCAN_JOBS",
@@ -50653,6 +51134,8 @@ def api_config_put():
     ):
         if _k in updates:
             updates[_k] = bool(_parse_bool(updates[_k]))
+    if "WEB_SEARCH_PROVIDER" in updates:
+        updates["WEB_SEARCH_PROVIDER"] = _normalize_web_search_provider(updates["WEB_SEARCH_PROVIDER"])
     if "AI_MAX_CALLS_PER_SCAN" in updates:
         updates["AI_MAX_CALLS_PER_SCAN"] = 0
     if "AI_CALL_COOLDOWN_SEC" in updates:
@@ -50667,7 +51150,7 @@ def api_config_put():
         except (ValueError, TypeError):
             updates["TASK_NOTIFICATIONS_COOLDOWN_SEC"] = 20
     if "AI_USAGE_LEVEL" in updates:
-        normalized_level = _normalize_ai_usage_level(str(updates.get("AI_USAGE_LEVEL") or "medium"))
+        normalized_level = _normalize_ai_usage_level(str(updates.get("AI_USAGE_LEVEL") or "auto"))
         updates["AI_USAGE_LEVEL"] = normalized_level
         updates.update(_ai_usage_level_overrides(normalized_level))
     if "MATCH_COVER_OCR_MODE" in updates:
@@ -50676,6 +51159,8 @@ def api_config_put():
         updates["JELLYFIN_URL"] = _normalize_http_base_url(updates["JELLYFIN_URL"])
     if "NAVIDROME_URL" in updates:
         updates["NAVIDROME_URL"] = _normalize_http_base_url(updates["NAVIDROME_URL"])
+    if "SEARXNG_URL" in updates:
+        updates["SEARXNG_URL"] = _normalize_http_base_url(updates["SEARXNG_URL"])
     if "NAVIDROME_USERNAME" in updates:
         updates["NAVIDROME_USERNAME"] = str(updates["NAVIDROME_USERNAME"] or "").strip()
     if "REQUIRED_TAGS" in updates:
@@ -51763,6 +52248,7 @@ def api_progress():
                     if s and s != "done":
                         current_step = s
                         break
+        scan_id_current = _int_or_none(state.get("scan_id"))
         finalizing = state.get("scan_finalizing", False)
         deduping = state.get("deduping", False)
         dedupe_progress = state.get("dedupe_progress", 0)
@@ -51945,11 +52431,42 @@ def api_progress():
         except Exception as e:
             logging.debug("api_progress: could not load last_scan_summary: %s", e)
 
+    current_scan_ai_rollup = None
+    if scanning and scan_id_current:
+        try:
+            con = sqlite3.connect(str(STATE_DB_FILE), timeout=2)
+            con.row_factory = sqlite3.Row
+            cur = con.cursor()
+            cur.execute(
+                """
+                SELECT
+                    calls_total,
+                    total_tokens,
+                    cost_total_microusd,
+                    unpriced_calls,
+                    lifecycle_complete,
+                    updated_at
+                FROM ai_scan_cost_rollups
+                WHERE scan_id = ?
+                LIMIT 1
+                """,
+                (int(scan_id_current),),
+            )
+            current_scan_ai_rollup = cur.fetchone()
+            con.close()
+        except Exception as e:
+            logging.debug("api_progress: could not load current_scan_ai_rollup: %s", e)
+
     ai_used_count_effective = 0
     try:
         ai_used_count_effective = int(scan_ai_guard_calls_used or 0)
     except Exception:
         ai_used_count_effective = 0
+    if current_scan_ai_rollup is not None:
+        try:
+            ai_used_count_effective = max(ai_used_count_effective, int(current_scan_ai_rollup["calls_total"] or 0))
+        except Exception:
+            pass
     if ai_used_count_effective <= 0:
         try:
             ai_used_count_effective = int(ai_used_count or 0)
@@ -51971,6 +52488,19 @@ def api_progress():
     ai_tokens_total_effective = 0
     ai_cost_usd_total_effective = 0.0
     ai_unpriced_calls_effective = 0
+    if current_scan_ai_rollup is not None:
+        try:
+            ai_tokens_total_effective = int(current_scan_ai_rollup["total_tokens"] or 0)
+        except Exception:
+            ai_tokens_total_effective = 0
+        try:
+            ai_cost_usd_total_effective = float(_microusd_to_usd(int(current_scan_ai_rollup["cost_total_microusd"] or 0)))
+        except Exception:
+            ai_cost_usd_total_effective = 0.0
+        try:
+            ai_unpriced_calls_effective = int(current_scan_ai_rollup["unpriced_calls"] or 0)
+        except Exception:
+            ai_unpriced_calls_effective = 0
     if isinstance(last_scan_summary, dict) and not scanning:
         try:
             ai_tokens_total_effective = int(
@@ -51996,6 +52526,16 @@ def api_progress():
             )
         except Exception:
             ai_unpriced_calls_effective = int(last_scan_ai_unpriced_calls or 0)
+
+    resume_available_by_scan_type: dict[str, dict[str, Any]] = {}
+    resume_available = False
+    if not scanning:
+        current_mode = _get_library_mode()
+        for resume_scan_type in ("full", "changed_only"):
+            snap = _get_resume_run_snapshot(current_mode, resume_scan_type)
+            if isinstance(snap, dict) and snap.get("available"):
+                resume_available_by_scan_type[resume_scan_type] = snap
+                resume_available = True
     
     payload = {
         "scan_id": int(state.get("scan_id") or 0) if state.get("scan_id") else None,
@@ -52005,6 +52545,8 @@ def api_progress():
         "total": total,
         "effective_progress": effective_progress,
         "status": status,
+        "resume_available": resume_available,
+        "resume_available_by_scan_type": resume_available_by_scan_type,
         "phase": phase,
         "current_step": current_step,
         "ai_provider": ai_provider_display,
@@ -65055,7 +65597,7 @@ def _provider_versions_from_payload(provider: str, payload: dict | None) -> list
 
 
 def _review_lookup_query_plan(artist: str, album: str) -> tuple[str, list[str], int]:
-    usage_level = _normalize_ai_usage_level(str(getattr(sys.modules[__name__], "AI_USAGE_LEVEL", "medium") or "medium"))
+    usage_level = _normalize_ai_usage_level(str(getattr(sys.modules[__name__], "AI_USAGE_LEVEL", "auto") or "auto"))
     primary = f"\"{artist}\" \"{album}\" album review"
     expansions = [
         f"\"{artist}\" \"{album}\" review",
@@ -68646,15 +69188,19 @@ def api_library_album_review_generate(album_id: int):
                 user_id=_current_user_id_or_zero(),
             )
             ai_web_fallback_possible = bool(
-                bool(getattr(sys.modules[__name__], "USE_AI_WEB_SEARCH_FALLBACK", True))
+                bool(getattr(sys.modules[__name__], "USE_AI_WEB_SEARCH_FALLBACK", False))
                 and bool(ai_web_ok)
                 and str(_ai_web_provider or "").strip().lower() in {"openai", "openai-api", "openai-codex"}
+                and _web_search_ai_fallback_enabled()
             )
+            searxng_ok, searxng_msg = _run_searxng_preflight()
             serper_ok, serper_msg = _run_serper_preflight()
-            if not serper_ok and not ai_web_fallback_possible:
+            if not (searxng_ok or serper_ok) and not ai_web_fallback_possible:
                 detail_parts: list[str] = []
                 if str(ai_web_reason or "").strip():
                     detail_parts.append(f"openai_web={str(ai_web_reason).strip()}")
+                if str(searxng_msg or "").strip():
+                    detail_parts.append(f"searxng={str(searxng_msg).strip()}")
                 if str(serper_msg or "").strip():
                     detail_parts.append(f"serper={str(serper_msg).strip()}")
                 detail = " ; ".join(detail_parts) if detail_parts else "no web provider available"

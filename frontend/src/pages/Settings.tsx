@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback, type ComponentType } from 'react';
-import { Save, Loader2, Check, FolderOutput, RefreshCw, X, Database, Sparkles, ExternalLink, Copy, MapPin, ChevronDown, AlertTriangle, Trash2, SlidersHorizontal, Workflow } from 'lucide-react';
+import { Save, Loader2, Check, FolderOutput, RefreshCw, X, Database, Sparkles, ExternalLink, Copy, MapPin, ChevronDown, AlertTriangle, Trash2, SlidersHorizontal, Workflow, Download } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { toast } from 'sonner';
 import { IntegrationsSettings } from '@/components/settings/IntegrationsSettings';
@@ -148,6 +148,11 @@ const AI_USAGE_LEVELS: Array<{
   description: string;
 }> = [
   {
+    value: 'auto',
+    label: 'Auto',
+    description: 'Recommended. PMDA stays local-first, uses OCR/providers first, prefers self-hosted web search, and only escalates to paid AI when the case truly needs it.',
+  },
+  {
     value: 'limited',
     label: 'Limited',
     description: 'AI only for truly ambiguous cases; no vision, no web MBID search, no AI duplicate arbitration.',
@@ -268,6 +273,9 @@ function SettingsPage() {
   const [lastfmAuthBusy, setLastfmAuthBusy] = useState(false);
   const [providerPreferences, setProviderPreferences] = useState<api.AIProviderPreferencesResponse | null>(null);
   const [providerPreferencesBusy, setProviderPreferencesBusy] = useState(false);
+  const [ollamaPullStatus, setOllamaPullStatus] = useState<api.OllamaPullStatus | null>(null);
+  const [ollamaPullModel, setOllamaPullModel] = useState('');
+  const [ollamaPullBusy, setOllamaPullBusy] = useState(false);
   const [rebuildIndexLoading, setRebuildIndexLoading] = useState(false);
   const [advancedFoldersOpen, setAdvancedFoldersOpen] = useState(false);
   const [schedulerAdvancedOpen, setSchedulerAdvancedOpen] = useState(false);
@@ -335,13 +343,32 @@ function SettingsPage() {
     }
   }, [getApiErrorMessage]);
 
+  const refreshOllamaPullStatus = useCallback(async () => {
+    try {
+      const status = await api.getOllamaPullStatus();
+      setOllamaPullStatus(status);
+      return status;
+    } catch {
+      return null;
+    }
+  }, []);
+
   useEffect(() => {
     if (auth.isAdmin) {
       void loadConfig();
+      void refreshOllamaPullStatus();
       return;
     }
     setIsLoading(false);
-  }, [auth.isAdmin]);
+  }, [auth.isAdmin, refreshOllamaPullStatus]);
+
+  useEffect(() => {
+    if (!ollamaPullStatus?.active) return;
+    const t = setTimeout(() => {
+      void refreshOllamaPullStatus();
+    }, 1500);
+    return () => clearTimeout(t);
+  }, [ollamaPullStatus?.active, ollamaPullStatus?.updated_at, refreshOllamaPullStatus]);
 
   useEffect(() => {
     const pickActiveFromHash = () => {
@@ -611,6 +638,34 @@ function SettingsPage() {
     [getApiErrorMessage, loadConfig, providerPreferences],
   );
 
+  const startOllamaModelPull = useCallback(async () => {
+    const model = String(ollamaPullModel || '').trim();
+    const url = String(config.OLLAMA_URL || '').trim();
+    if (!url) {
+      toast.error('Configure an Ollama URL first.');
+      return;
+    }
+    if (!model) {
+      toast.error('Enter a model name to download.');
+      return;
+    }
+    setOllamaPullBusy(true);
+    try {
+      const status = await api.startOllamaPull({ OLLAMA_URL: url, model });
+      setOllamaPullStatus(status);
+      toast.success(status.active ? `Started downloading ${model}` : status.message || `${model} is ready`);
+      const nextModels = await api.getAIModels('ollama', { url }).catch(() => null);
+      if (Array.isArray(nextModels) && nextModels.length > 0) {
+        // keep UI in sync if the model was already installed
+        setOllamaPullModel((prev) => prev || model);
+      }
+    } catch (e) {
+      toast.error(getApiErrorMessage(e) || (e instanceof Error ? e.message : 'Failed to start Ollama model pull'));
+    } finally {
+      setOllamaPullBusy(false);
+    }
+  }, [config.OLLAMA_URL, getApiErrorMessage, ollamaPullModel]);
+
   useEffect(() => {
     if (!openaiOAuth || openaiOAuth.status !== 'pending') return;
     // Poll in the background while the user completes the flow in another tab.
@@ -656,11 +711,11 @@ function SettingsPage() {
   }, [flushSave]);
   const filesRoots = parsePathListValue(config.FILES_ROOTS);
   const selectedAiLevel = (() => {
-    const raw = String(config.AI_USAGE_LEVEL || 'medium').trim().toLowerCase();
-    return AI_USAGE_LEVELS.find((lvl) => lvl.value === raw)?.value || 'medium';
+    const raw = String(config.AI_USAGE_LEVEL || 'auto').trim().toLowerCase();
+    return AI_USAGE_LEVELS.find((lvl) => lvl.value === raw)?.value || 'auto';
   })();
   const selectedAiLevelIndex = Math.max(0, AI_USAGE_LEVELS.findIndex((lvl) => lvl.value === selectedAiLevel));
-  const selectedAiLevelMeta = AI_USAGE_LEVELS[selectedAiLevelIndex] || AI_USAGE_LEVELS[1];
+  const selectedAiLevelMeta = AI_USAGE_LEVELS[selectedAiLevelIndex] || AI_USAGE_LEVELS[0];
   const schedulerPaused = config.SCHEDULER_PAUSED !== false;
   const allowNonScanJobs = Boolean(config.SCHEDULER_ALLOW_NON_SCAN_JOBS ?? false);
   const postScanAsync = Boolean(config.PIPELINE_POST_SCAN_ASYNC ?? false);
@@ -673,7 +728,7 @@ function SettingsPage() {
   };
 
   const providerState = (
-    key: 'discogs' | 'lastfm' | 'fanart' | 'serper' | 'acoustid',
+    key: 'discogs' | 'lastfm' | 'fanart' | 'searxng' | 'serper' | 'acoustid',
     configured: boolean,
   ): ProviderState => {
     if (!configured) {
@@ -1721,16 +1776,139 @@ function SettingsPage() {
                     </div>
                     <Slider
                       min={0}
-                      max={2}
+                      max={AI_USAGE_LEVELS.length - 1}
                       step={1}
                       value={[selectedAiLevelIndex]}
                       onValueChange={(values) => {
-                        const idx = Math.max(0, Math.min(2, Number(values?.[0] ?? 1)));
-                        const level = AI_USAGE_LEVELS[idx]?.value ?? 'medium';
+                        const idx = Math.max(0, Math.min(AI_USAGE_LEVELS.length - 1, Number(values?.[0] ?? 0)));
+                        const level = AI_USAGE_LEVELS[idx]?.value ?? 'auto';
                         updateConfig({ AI_USAGE_LEVEL: level });
                       }}
                     />
                     <p className="text-xs text-muted-foreground">{selectedAiLevelMeta.description}</p>
+                  </div>
+                  <div className="rounded-lg border border-border/60 p-3 space-y-3">
+                    <div className="space-y-1">
+                      <Label>Web search backend</Label>
+                      <p className="text-xs text-muted-foreground">
+                        Local/self-hosted search first. Paid AI web search is only a fallback for the hardest cases.
+                      </p>
+                    </div>
+                    <div className="grid grid-cols-1 gap-3 md:grid-cols-[220px_minmax(0,1fr)]">
+                      <Select
+                        value={String(config.WEB_SEARCH_PROVIDER || 'auto')}
+                        onValueChange={(value: NonNullable<PMDAConfig['WEB_SEARCH_PROVIDER']>) => updateConfig({ WEB_SEARCH_PROVIDER: value })}
+                      >
+                        <SelectTrigger>
+                          <SelectValue placeholder="Choose backend" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="auto">Auto (SearXNG → Serper)</SelectItem>
+                          <SelectItem value="searxng">SearXNG only</SelectItem>
+                          <SelectItem value="serper">Serper only</SelectItem>
+                          <SelectItem value="ai_only">Paid AI only</SelectItem>
+                          <SelectItem value="disabled">Disabled</SelectItem>
+                        </SelectContent>
+                      </Select>
+                      <div className="flex items-center justify-between rounded-md border border-border/70 bg-background/40 px-3 py-2">
+                        <div className="space-y-0.5">
+                          <div className="text-sm font-medium">Allow paid AI web-search fallback</div>
+                          <p className="text-[11px] text-muted-foreground">
+                            Only useful in aggressive mode. Keep this off for bulk scans.
+                          </p>
+                        </div>
+                        <Switch
+                          checked={Boolean(config.USE_AI_WEB_SEARCH_FALLBACK)}
+                          onCheckedChange={(checked) => updateConfig({ USE_AI_WEB_SEARCH_FALLBACK: Boolean(checked) })}
+                        />
+                      </div>
+                    </div>
+                    <div className="rounded-md border border-border/60 bg-background/30 px-3 py-2 text-[11px] text-muted-foreground">
+                      Effective scan path: <span className="text-foreground">Tags/OCR/providers</span> → <span className="text-foreground">local web search</span> → <span className="text-foreground">local LLM / Ollama</span> → <span className="text-foreground">paid AI only if still unresolved</span>.
+                    </div>
+                  </div>
+                  <div className="rounded-lg border border-border/60 p-3 space-y-3">
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="space-y-1">
+                        <Label>Ollama model downloads</Label>
+                        <p className="text-xs text-muted-foreground">
+                          Pull local models directly from PMDA. No shell access needed.
+                        </p>
+                      </div>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        className="gap-2"
+                        onClick={() => void refreshOllamaPullStatus()}
+                      >
+                        <RefreshCw className="w-4 h-4" />
+                        Refresh
+                      </Button>
+                    </div>
+                    <div className="grid grid-cols-1 gap-3 md:grid-cols-[minmax(0,1fr)_minmax(220px,320px)]">
+                      <div className="space-y-2">
+                        <Label>Default local scan model</Label>
+                        <Input
+                          placeholder="qwen2.5:3b-instruct"
+                          value={String(config.OLLAMA_MODEL || '')}
+                          onChange={(e) => updateConfig({ OLLAMA_MODEL: e.target.value })}
+                        />
+                        <p className="text-[11px] text-muted-foreground">
+                          Used automatically for batch scan matching, dedupe arbitration and repair jobs in local-first mode.
+                        </p>
+                      </div>
+                      <div className="space-y-2">
+                        <Label>Ollama URL</Label>
+                        <Input
+                          placeholder="http://localhost:11434"
+                          value={String(config.OLLAMA_URL || '')}
+                          onChange={(e) => updateConfig({ OLLAMA_URL: e.target.value })}
+                        />
+                        <p className="text-[11px] text-muted-foreground">
+                          PMDA will prefer this local runtime during scans when AI usage is set to <span className="text-foreground">Auto</span>.
+                        </p>
+                      </div>
+                    </div>
+                    <div className="grid grid-cols-1 gap-3 md:grid-cols-[minmax(0,1fr)_auto]">
+                      <Input
+                        placeholder={String(config.OLLAMA_MODEL || 'qwen2.5:3b-instruct')}
+                        value={ollamaPullModel}
+                        onChange={(e) => setOllamaPullModel(e.target.value)}
+                      />
+                      <Button
+                        type="button"
+                        className="gap-2"
+                        onClick={() => void startOllamaModelPull()}
+                        disabled={ollamaPullBusy || Boolean(ollamaPullStatus?.active)}
+                      >
+                        {ollamaPullBusy || ollamaPullStatus?.active ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />}
+                        Download model
+                      </Button>
+                    </div>
+                    {ollamaPullStatus ? (
+                      <div className="space-y-2 rounded-md border border-border/60 bg-background/30 px-3 py-2">
+                        <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                          <span className="font-medium text-foreground">
+                            {ollamaPullStatus.model || 'No recent model pull'}
+                          </span>
+                          <Badge variant={ollamaPullStatus.status === 'error' ? 'destructive' : ollamaPullStatus.active ? 'secondary' : 'outline'}>
+                            {ollamaPullStatus.status}
+                          </Badge>
+                        </div>
+                        <p className="text-[11px] text-muted-foreground">{ollamaPullStatus.message || 'No model pull running.'}</p>
+                        <Progress value={Number(ollamaPullStatus.progress || 0)} />
+                        <div className="flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-muted-foreground">
+                          <span>URL: <span className="text-foreground">{ollamaPullStatus.url || String(config.OLLAMA_URL || 'not set')}</span></span>
+                          <span>Downloaded: <span className="text-foreground">{Number(ollamaPullStatus.completed || 0).toLocaleString()}</span></span>
+                          <span>Total: <span className="text-foreground">{Number(ollamaPullStatus.total || 0).toLocaleString()}</span></span>
+                        </div>
+                        {ollamaPullStatus.error ? <p className="text-xs text-destructive">{ollamaPullStatus.error}</p> : null}
+                      </div>
+                    ) : null}
+                    <p className="text-[11px] text-muted-foreground">
+                      Recommended local scan model: <span className="text-foreground">qwen2.5:3b-instruct</span>. Use a larger model only for repair/deep-enrichment runs.
+                    </p>
                   </div>
                   <div className="rounded-lg border border-border/60 p-3 space-y-2">
                     <div className="flex items-center justify-between gap-3">
@@ -1791,10 +1969,11 @@ function SettingsPage() {
                 </div>
 
                 <Tabs defaultValue="discogs" className="w-full">
-                  <TabsList className="grid h-auto w-full grid-cols-5">
+                  <TabsList className="grid h-auto w-full grid-cols-2 gap-2 md:grid-cols-3 xl:grid-cols-6">
                     <TabsTrigger value="discogs"><span className="inline-flex items-center gap-1.5"><ProviderIcon provider="discogs" />Discogs</span></TabsTrigger>
                     <TabsTrigger value="lastfm"><span className="inline-flex items-center gap-1.5"><ProviderIcon provider="lastfm" />Last.fm</span></TabsTrigger>
                     <TabsTrigger value="fanart"><span className="inline-flex items-center gap-1.5"><ProviderIcon provider="fanart" />Fanart</span></TabsTrigger>
+                    <TabsTrigger value="searxng"><span className="inline-flex items-center gap-1.5"><ProviderIcon provider="searxng" />SearXNG</span></TabsTrigger>
                     <TabsTrigger value="serper"><span className="inline-flex items-center gap-1.5"><ProviderIcon provider="serper" />Serper</span></TabsTrigger>
                     <TabsTrigger value="acoustid"><span className="inline-flex items-center gap-1.5"><ProviderIcon provider="acoustid" />AcoustID</span></TabsTrigger>
                   </TabsList>
@@ -1986,6 +2165,40 @@ function SettingsPage() {
                             value={String(config.FANART_API_KEY ?? '')}
                             onChange={(e) => updateConfig({ FANART_API_KEY: e.target.value })}
                           />
+                        </div>
+                      );
+                    })()}
+                  </TabsContent>
+
+                  <TabsContent value="searxng" className="mt-3">
+                    {(() => {
+                      const configured = Boolean(String(config.SEARXNG_URL || '').trim());
+                      const state = providerState('searxng', configured);
+                      return (
+                        <div className="space-y-3 rounded-lg border border-border p-3">
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <div className="space-y-1">
+                              <Label htmlFor="searxng-url">SearXNG base URL</Label>
+                              <p className="text-xs text-muted-foreground">
+                                Self-hosted search backend for cheap bulk scans. Example: <span className="text-foreground">http://searxng:8080</span>
+                              </p>
+                            </div>
+                            <div className="flex items-center gap-2">
+                              <Badge variant={state.variant}>{state.label}</Badge>
+                              <a href="https://docs.searxng.org/admin/installation-docker.html" target="_blank" rel="noreferrer" className="text-xs text-primary inline-flex items-center gap-1 hover:underline">
+                                Docker setup <ExternalLink className="w-3 h-3" />
+                              </a>
+                            </div>
+                          </div>
+                          <Input
+                            id="searxng-url"
+                            placeholder="http://searxng:8080"
+                            value={String(config.SEARXNG_URL ?? '')}
+                            onChange={(e) => updateConfig({ SEARXNG_URL: e.target.value })}
+                          />
+                          <div className="rounded-md border border-border/60 bg-background/30 px-3 py-2 text-[11px] text-muted-foreground">
+                            PMDA uses SearXNG as the first web-search layer in <span className="text-foreground">Auto</span> mode. If this is configured, bulk scans can avoid expensive LLM-native web search almost entirely.
+                          </div>
                         </div>
                       );
                     })()}

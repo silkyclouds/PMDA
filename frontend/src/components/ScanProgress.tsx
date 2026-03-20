@@ -194,6 +194,8 @@ export function ScanProgress({
     scan_player_sync_ok = null,
     scan_player_sync_message = null,
     scan_start_time = null,
+    resume_available = false,
+    resume_available_by_scan_type = {},
     bootstrap_required = false,
     autonomous_mode = false,
     has_completed_full_scan = false,
@@ -245,6 +247,21 @@ export function ScanProgress({
   }, [phase_progress]);
 
   const changedOnlyBlocked = Boolean(bootstrap_required);
+  const resumableSnapshot =
+    !scanning && (scanType === 'full' || scanType === 'changed_only')
+      ? (resume_available_by_scan_type?.[scanType] ?? null)
+      : null;
+  const resumableAvailable = Boolean(resumableSnapshot?.available || (resume_available && resumableSnapshot));
+  const startButtonLabel = resumableAvailable ? 'Resume scan' : 'Start scan';
+  const resumableSummary = resumableSnapshot
+    ? `${Number(resumableSnapshot.remaining_artists || 0).toLocaleString()} artists · ${Number(resumableSnapshot.remaining_albums || 0).toLocaleString()} albums remaining`
+    : '';
+  const pausedResumeSummary = (() => {
+    if (artists_total > 0 || total_albums > 0) {
+      return `${Number(artists_total || 0).toLocaleString()} artists · ${Number(total_albums || 0).toLocaleString()} albums still in scope.`;
+    }
+    return 'Remaining work stays queued in the resume state.';
+  })();
 
   // Stage badge: use backend phase (format_analysis | identification_tags | ia_analysis | finalizing | moving_dupes | post_processing)
   const effectiveStage = phase ?? (post_processing ? 'post_processing' : (finalizing ? 'finalizing' : (deduping ? 'moving_dupes' : 'format_analysis')));
@@ -502,7 +519,7 @@ export function ScanProgress({
               {!scanning && status !== 'running' && (
                 <Button onClick={() => onStart({ scan_type: scanType })} disabled={isStarting} className="gap-2">
                   {isStarting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
-                  Start scan
+                  {startButtonLabel}
                 </Button>
               )}
               {scanning && status === 'running' && (
@@ -568,6 +585,13 @@ export function ScanProgress({
               (default: {String(default_scan_type || 'full').replace('_', ' ')})
             </span>
           </div>
+          {resumableAvailable && (
+            <div className="rounded-md border border-primary/30 bg-primary/10 px-3 py-2 text-xs text-primary/90">
+              Interrupted <span className="font-medium text-foreground">{scanType === 'changed_only' ? 'changed-only' : 'full'}</span> scan available.
+              <span className="ml-1">{resumableSummary}.</span>
+              <span className="ml-1 text-muted-foreground">You can change AI settings before resuming.</span>
+            </div>
+          )}
 	          <div className="flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
 	            <span className="text-foreground font-medium">Mode:</span>
 	            <div className="flex items-center gap-1">
@@ -1207,7 +1231,7 @@ export function ScanProgress({
 	                  {!preflightResult.musicbrainz.ok && preflightResult.ai.ok && (
 	                    <Button size="sm" variant="secondary" className="w-full mt-1" onClick={() => { setPreflightVerifiedAtStart(false); onStart({ scan_type: scanType }); setPreflightResult(null); }} disabled={isStarting}>
 	                      {isStarting ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
-	                      Start scan anyway
+	                      {resumableAvailable ? 'Resume anyway' : 'Start scan anyway'}
 	                    </Button>
 	                  )}
                 </div>
@@ -1258,9 +1282,16 @@ export function ScanProgress({
                 }}
               >
                 {preflightLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
-                Start scan
+                {startButtonLabel}
               </Button>
             </div>
+            {resumableAvailable && (
+              <div className="rounded-lg border border-primary/30 bg-primary/10 px-3 py-2 text-xs text-primary/90">
+                Interrupted <span className="font-medium text-foreground">{scanType === 'changed_only' ? 'changed-only' : 'full'}</span> scan available.
+                <span className="ml-1">{resumableSummary}.</span>
+                <span className="ml-1 text-muted-foreground">You can change AI settings now; resume continues from the remaining work only.</span>
+              </div>
+            )}
           </div>
           </div>
           </> )}
@@ -1315,6 +1346,12 @@ export function ScanProgress({
           </div>
 
           <div className="p-4 space-y-4">
+            {status === 'paused' && (
+              <div className="rounded-lg border border-warning/30 bg-warning/10 px-3 py-2 text-xs text-warning-foreground dark:text-warning">
+                Scan paused. You can change AI settings now; resume reloads the current provider/model and continues from the remaining work only.
+                <span className="ml-1 text-muted-foreground">{pausedResumeSummary}</span>
+              </div>
+            )}
             {/* ─── Progress hero: bar + % + ETA ─────────────────────────────── */}
             <div className="space-y-2">
               <div className="flex items-end justify-between gap-4">
