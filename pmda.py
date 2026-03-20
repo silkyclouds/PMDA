@@ -27463,17 +27463,19 @@ def _classical_work_tokens_from_texts(texts: list[str]) -> set[str]:
             token = str(match or "").strip()
             if token:
                 out.add(f"{canonical_name} {token}")
+    explicit_signal = bool(out)
     split_patterns = re.compile(r"\s*(?:/|;|:|\||–|—)\s*")
-    for raw_text in texts or []:
-        raw = html.unescape(str(raw_text or "")).strip()
-        if not raw:
-            continue
-        raw = re.sub(r"[\(\[][^)\]]*[\)\]]", " ", raw)
-        for part in split_patterns.split(raw):
-            norm_part = _classical_norm_text(part)
-            if norm_part and len(norm_part) >= 4:
-                out.add(norm_part[:180])
-    if not out:
+    if explicit_signal:
+        for raw_text in texts or []:
+            raw = html.unescape(str(raw_text or "")).strip()
+            if not raw:
+                continue
+            raw = re.sub(r"[\(\[][^)\]]*[\)\]]", " ", raw)
+            for part in split_patterns.split(raw):
+                norm_part = _classical_norm_text(part)
+                if norm_part and len(norm_part) >= 4:
+                    out.add(norm_part[:180])
+    if not out and explicit_signal:
         title_line = _classical_norm_text(texts[0] if texts else "")
         if title_line:
             out.add(title_line[:180])
@@ -27641,7 +27643,6 @@ def _classical_identity_context(
     is_classical = bool(
         pre_is_classical
         or cover_ocr_ctx.get("work_tokens")
-        or label_tokens
     )
     return {
         "is_classical": bool(is_classical),
