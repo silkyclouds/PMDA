@@ -3706,6 +3706,18 @@ def _ollama_model_configured() -> str:
     return str(getattr(sys.modules[__name__], "OLLAMA_MODEL", "") or "").strip() or "qwen2.5:3b-instruct"
 
 
+def _ai_model_display_name(provider: str | None = None) -> str:
+    provider_name = str(provider or getattr(sys.modules[__name__], "AI_PROVIDER", "") or "").strip().lower()
+    mod = sys.modules[__name__]
+    if provider_name == "ollama":
+        return _ollama_model_configured()
+    if provider_name == "anthropic":
+        return str(getattr(mod, "ANTHROPIC_MODEL", "") or getattr(mod, "RESOLVED_MODEL", "") or "").strip()
+    if provider_name in {"google", "gemini"}:
+        return str(getattr(mod, "GOOGLE_MODEL", "") or getattr(mod, "RESOLVED_MODEL", "") or "").strip()
+    return str(getattr(mod, "RESOLVED_MODEL", None) or getattr(mod, "OPENAI_MODEL", "") or "").strip()
+
+
 def _scan_ai_policy_for_runtime() -> str:
     return _normalize_scan_ai_policy(getattr(sys.modules[__name__], "SCAN_AI_POLICY", "local_then_paid"))
 
@@ -48458,7 +48470,7 @@ def resume_scan():
                 "status": "ok",
                 "resume_run_id": current_resume_run_id,
                 "ai_provider": str(AI_PROVIDER or ""),
-                "ai_model": str(getattr(sys.modules[__name__], "RESOLVED_MODEL", None) or OPENAI_MODEL or ""),
+                "ai_model": _ai_model_display_name(AI_PROVIDER),
             }
         )
 
@@ -48506,7 +48518,7 @@ def resume_scan():
             "scan_type": chosen_scan_type,
             "resume_run_id": str(chosen_snapshot.get("run_id") or ""),
             "ai_provider": str(AI_PROVIDER or ""),
-            "ai_model": str(getattr(sys.modules[__name__], "RESOLVED_MODEL", None) or OPENAI_MODEL or ""),
+            "ai_model": _ai_model_display_name(AI_PROVIDER),
         }
     )
 
@@ -53519,7 +53531,7 @@ def api_progress():
     
     # AI provider/model for display (read outside lock)
     ai_provider_display = AI_PROVIDER or ""
-    ai_model_display = getattr(sys.modules[__name__], "RESOLVED_MODEL", None) or OPENAI_MODEL or ""
+    ai_model_display = _ai_model_display_name(ai_provider_display)
     
     # When not scanning, attach last completed scan summary for "Scan complete – Summary" UI
     last_scan_summary = None
