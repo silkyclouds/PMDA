@@ -174,6 +174,10 @@ export interface ScanResumeSnapshot {
   running_albums: number;
   failed_artists: number;
   failed_albums: number;
+  detected_artists_total?: number;
+  detected_albums_total?: number;
+  detected_tracks_total?: number;
+  plan_snapshot_ready?: boolean;
 }
 
 export interface ScanProgress {
@@ -352,6 +356,12 @@ export interface ScanProgress {
   scan_tracks_moved_incomplete?: number;
   /** Residual detected tracks not accounted in kept/moved buckets. */
   scan_tracks_unaccounted?: number;
+  /** Albums whose per-artist scan worker completed successfully during this run. */
+  scan_processed_albums_count?: number;
+  /** Albums already published into the live Files library during this run. */
+  scan_published_albums_count?: number;
+  /** Albums already passed through streamed post-processing during this run. */
+  scan_postprocessed_albums_count?: number;
   /** Player sync telemetry. */
   scan_player_sync_target?: string | null;
   scan_player_sync_ok?: boolean | null;

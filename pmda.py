@@ -3745,6 +3745,8 @@ def _provider_ready_for_runtime(provider_id: str, user_id: int | None = None) ->
 
 
 def _scan_paid_provider_fallback(user_id: int | None = None) -> str:
+    if _scan_ai_policy_for_runtime() == "local_only":
+        return ""
     chain = _scan_paid_provider_chain()
     uid = max(0, int(user_id or 0))
     for provider_id in chain:
@@ -3753,7 +3755,7 @@ def _scan_paid_provider_fallback(user_id: int | None = None) -> str:
     for provider_id in chain:
         if _provider_mode_enabled(provider_id):
             return provider_id
-    return "openai-api"
+    return ""
 
 
 def _local_first_scan_ai_enabled() -> bool:
@@ -6778,7 +6780,11 @@ def init_state_db():
             scan_type TEXT NOT NULL,
             source_signature TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'running',
-            scan_id INTEGER
+            scan_id INTEGER,
+            detected_artists_total INTEGER NOT NULL DEFAULT 0,
+            detected_albums_total INTEGER NOT NULL DEFAULT 0,
+            detected_tracks_total INTEGER NOT NULL DEFAULT 0,
+            plan_snapshot_ready INTEGER NOT NULL DEFAULT 0
         )
     """)
     cur.execute("""
@@ -6791,6 +6797,41 @@ def init_state_db():
             updated_at REAL NOT NULL,
             error TEXT,
             PRIMARY KEY (run_id, artist_name),
+            FOREIGN KEY (run_id) REFERENCES scan_resume_runs(run_id) ON DELETE CASCADE
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS scan_resume_files_plan (
+            run_id TEXT NOT NULL,
+            album_id INTEGER NOT NULL,
+            artist_name TEXT NOT NULL,
+            artist_order INTEGER NOT NULL DEFAULT 0,
+            album_order INTEGER NOT NULL DEFAULT 0,
+            album_title TEXT,
+            album_norm TEXT,
+            folder_path TEXT NOT NULL,
+            fingerprint TEXT,
+            file_count INTEGER NOT NULL DEFAULT 0,
+            source_id INTEGER,
+            has_cover INTEGER NOT NULL DEFAULT 0,
+            has_artist_image INTEGER NOT NULL DEFAULT 0,
+            has_mbid INTEGER NOT NULL DEFAULT 0,
+            has_identity INTEGER NOT NULL DEFAULT 0,
+            identity_provider TEXT,
+            strict_match_verified INTEGER NOT NULL DEFAULT 0,
+            strict_match_provider TEXT,
+            strict_reject_reason TEXT,
+            strict_tracklist_score REAL NOT NULL DEFAULT 0.0,
+            musicbrainz_id TEXT,
+            discogs_release_id TEXT,
+            lastfm_album_mbid TEXT,
+            bandcamp_album_url TEXT,
+            metadata_source TEXT,
+            missing_required_tags_json TEXT NOT NULL DEFAULT '[]',
+            skip_heavy_processing INTEGER NOT NULL DEFAULT 0,
+            lookup_artist_name TEXT,
+            lookup_album_title TEXT,
+            PRIMARY KEY (run_id, album_id),
             FOREIGN KEY (run_id) REFERENCES scan_resume_runs(run_id) ON DELETE CASCADE
         )
     """)
@@ -7255,9 +7296,21 @@ def init_state_db():
         """,
         (now_bootstrap,),
     )
+    cur.execute("PRAGMA table_info(scan_resume_runs)")
+    resume_run_cols = {r[1] for r in cur.fetchall()}
+    for col_name, col_type in [
+        ("detected_artists_total", "INTEGER NOT NULL DEFAULT 0"),
+        ("detected_albums_total", "INTEGER NOT NULL DEFAULT 0"),
+        ("detected_tracks_total", "INTEGER NOT NULL DEFAULT 0"),
+        ("plan_snapshot_ready", "INTEGER NOT NULL DEFAULT 0"),
+    ]:
+        if col_name not in resume_run_cols:
+            cur.execute(f"ALTER TABLE scan_resume_runs ADD COLUMN {col_name} {col_type}")
     try:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_scan_resume_runs_source ON scan_resume_runs(source_signature, updated_at DESC)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_scan_resume_artists_run_status ON scan_resume_artists(run_id, status)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_scan_resume_files_plan_run_artist ON scan_resume_files_plan(run_id, artist_order, album_order)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_scan_resume_files_plan_run_folder ON scan_resume_files_plan(run_id, folder_path)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_files_album_scan_cache_updated ON files_album_scan_cache(updated_at DESC)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_files_album_scan_cache_source_updated ON files_album_scan_cache(source_id, updated_at DESC)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_files_published_artist_norm ON files_library_published_albums(artist_norm)")
@@ -22507,6 +22560,9 @@ state = {
     "scan_artists_total": 0,          # Total d'artistes
     "scan_detected_artists_total": 0, # Artists detected from source before resume/incremental filtering
     "scan_detected_albums_total": 0,  # Albums detected from source before resume/incremental filtering
+    "scan_processed_albums_count": 0, # Albums whose artist scan worker completed
+    "scan_published_albums_count": 0, # Albums currently published to live files index for this scan
+    "scan_postprocessed_albums_count": 0, # Albums passed through streamed post-processing/fix
     "scan_resume_skipped_artists": 0, # Artists skipped by resume logic for current run
     "scan_resume_skipped_albums": 0,  # Albums skipped by resume logic for current run
     "scan_run_scope_preparing": False,  # True while resume/run-scope preparation is still computing
@@ -31403,6 +31459,20 @@ def scan_artist_duplicates(args):
                 fe = files_editions.get(aid)
                 if not fe:
                     continue
+                if bool(fe.get("_resume_stub")) or not fe.get("tracks") or not fe.get("ordered_paths"):
+                    hydrated = _hydrate_resume_files_edition(fe)
+                    if not hydrated:
+                        logging.info(
+                            "Files resume hydration skipped album_id=%s artist=%s folder=%s",
+                            aid,
+                            artist_name,
+                            str(fe.get("folder") or ""),
+                        )
+                        continue
+                    fe = hydrated
+                    with lock:
+                        latest_files_editions = state.get("files_editions_by_album_id") or {}
+                        latest_files_editions[aid] = hydrated
                 folder = fe.get("folder")
                 if not folder:
                     continue
@@ -38532,6 +38602,366 @@ def _compute_artist_signature(
     return h.hexdigest()
 
 
+def _persist_resume_files_plan(
+    run_id: str | None,
+    artists_merged: list[tuple[int, str, list[int]]],
+    files_editions_by_album_id: dict[int, dict] | None,
+    *,
+    detected_artists_total: int | None = None,
+    detected_albums_total: int | None = None,
+    detected_tracks_total: int | None = None,
+) -> int:
+    """Persist the remaining Files scan plan so stop/restart can resume without full rediscovery."""
+    if not run_id or not artists_merged or not files_editions_by_album_id:
+        return 0
+    rows: list[tuple[Any, ...]] = []
+    for artist_order, (_artist_id, artist_name, album_ids) in enumerate(artists_merged, start=1):
+        for album_order, aid in enumerate(album_ids, start=1):
+            fe = files_editions_by_album_id.get(aid) or {}
+            folder_raw = str(fe.get("folder") or "").strip()
+            if not folder_raw:
+                continue
+            try:
+                folder_live = path_for_fs_access(Path(folder_raw))
+                folder_path = str(folder_live.resolve())
+            except Exception:
+                folder_path = folder_raw
+            rows.append(
+                (
+                    str(run_id),
+                    int(aid),
+                    str(artist_name or "").strip() or "Unknown Artist",
+                    int(artist_order),
+                    int(album_order),
+                    str(fe.get("album_title") or fe.get("title_raw") or "").strip(),
+                    str(fe.get("album_norm") or "").strip(),
+                    folder_path,
+                    str(fe.get("fingerprint") or "").strip(),
+                    int(fe.get("file_count") or 0),
+                    _parse_int_loose(fe.get("source_id"), 0),
+                    1 if bool(fe.get("has_cover")) else 0,
+                    1 if bool(fe.get("has_artist_image")) else 0,
+                    1 if bool(fe.get("has_mbid")) else 0,
+                    1 if bool(fe.get("has_identity")) else 0,
+                    str(fe.get("identity_provider") or "").strip(),
+                    1 if bool(fe.get("strict_match_verified")) else 0,
+                    str(fe.get("strict_match_provider") or "").strip(),
+                    str(fe.get("strict_reject_reason") or "").strip(),
+                    float(fe.get("strict_tracklist_score") or 0.0),
+                    str(fe.get("musicbrainz_id") or "").strip(),
+                    str(fe.get("discogs_release_id") or "").strip(),
+                    str(fe.get("lastfm_album_mbid") or "").strip(),
+                    str(fe.get("bandcamp_album_url") or "").strip(),
+                    str(fe.get("metadata_source") or "").strip(),
+                    json.dumps(list(fe.get("missing_required_tags") or [])),
+                    1 if bool(fe.get("skip_heavy_processing")) else 0,
+                    str(fe.get("_lookup_artist_name") or "").strip(),
+                    str(fe.get("_lookup_album_title") or "").strip(),
+                )
+            )
+    if not rows:
+        return 0
+    now = time.time()
+    con = _state_connect(timeout=60)
+    cur = con.cursor()
+    cur.execute("DELETE FROM scan_resume_files_plan WHERE run_id = ?", (str(run_id),))
+    cur.executemany(
+        """
+        INSERT INTO scan_resume_files_plan (
+            run_id, album_id, artist_name, artist_order, album_order, album_title, album_norm,
+            folder_path, fingerprint, file_count, source_id, has_cover, has_artist_image, has_mbid,
+            has_identity, identity_provider, strict_match_verified, strict_match_provider,
+            strict_reject_reason, strict_tracklist_score, musicbrainz_id, discogs_release_id,
+            lastfm_album_mbid, bandcamp_album_url, metadata_source, missing_required_tags_json,
+            skip_heavy_processing, lookup_artist_name, lookup_album_title
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+    cur.execute(
+        """
+        UPDATE scan_resume_runs
+        SET updated_at = ?,
+            detected_artists_total = ?,
+            detected_albums_total = ?,
+            detected_tracks_total = ?,
+            plan_snapshot_ready = 1
+        WHERE run_id = ?
+        """,
+        (
+            now,
+            int(detected_artists_total if detected_artists_total is not None else len(artists_merged)),
+            int(detected_albums_total if detected_albums_total is not None else sum(len(ids) for _a, _n, ids in artists_merged)),
+            int(detected_tracks_total or 0),
+            str(run_id),
+        ),
+    )
+    con.commit()
+    con.close()
+    return len(rows)
+
+
+def _prune_resume_files_plan_artist(run_id: str | None, artist_name: str) -> None:
+    if not run_id or not artist_name:
+        return
+    try:
+        con = _state_connect(timeout=15)
+        cur = con.cursor()
+        cur.execute(
+            "DELETE FROM scan_resume_files_plan WHERE run_id = ? AND artist_name = ?",
+            (str(run_id), str(artist_name)),
+        )
+        cur.execute(
+            "UPDATE scan_resume_runs SET updated_at = ? WHERE run_id = ?",
+            (time.time(), str(run_id)),
+        )
+        con.commit()
+        con.close()
+    except Exception:
+        logging.debug("Failed to prune resume files plan for artist=%s run_id=%s", artist_name, run_id, exc_info=True)
+
+
+def _load_resume_files_plan(mode: str, scan_type: str) -> dict[str, Any] | None:
+    if mode != "files":
+        return None
+    source_signature = _compute_scan_source_signature(mode, scan_type)
+    try:
+        con = _state_connect(timeout=30)
+        con.row_factory = sqlite3.Row
+        cur = con.cursor()
+        cur.execute(
+            """
+            SELECT run_id, status, scan_id, detected_artists_total, detected_albums_total, detected_tracks_total
+            FROM scan_resume_runs
+            WHERE source_signature = ? AND mode = ? AND scan_type = ?
+              AND COALESCE(status, '') != 'completed'
+              AND COALESCE(plan_snapshot_ready, 0) = 1
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+            (source_signature, mode, scan_type),
+        )
+        run_row = cur.fetchone()
+        if not run_row:
+            con.close()
+            return None
+        run_id = str(run_row["run_id"] or "").strip()
+        cur.execute(
+            """
+            SELECT album_id, artist_name, album_title, album_norm, folder_path, fingerprint, file_count,
+                   source_id, has_cover, has_artist_image, has_mbid, has_identity, identity_provider,
+                   strict_match_verified, strict_match_provider, strict_reject_reason, strict_tracklist_score,
+                   musicbrainz_id, discogs_release_id, lastfm_album_mbid, bandcamp_album_url, metadata_source,
+                   missing_required_tags_json, skip_heavy_processing, lookup_artist_name, lookup_album_title
+            FROM scan_resume_files_plan
+            WHERE run_id = ?
+            ORDER BY artist_order, album_order
+            """,
+            (run_id,),
+        )
+        rows = cur.fetchall()
+        con.close()
+        if not rows:
+            return None
+        files_editions_by_album_id: dict[int, dict] = {}
+        artist_to_album_ids: dict[str, list[int]] = {}
+        for row in rows:
+            album_id = int(row["album_id"] or 0)
+            if album_id <= 0:
+                continue
+            artist_name = str(row["artist_name"] or "").strip() or "Unknown Artist"
+            folder_path = str(row["folder_path"] or "").strip()
+            if not folder_path:
+                continue
+            try:
+                folder_obj = path_for_fs_access(Path(folder_path))
+            except Exception:
+                folder_obj = Path(folder_path)
+            fingerprint = str(row["fingerprint"] or "").strip()
+            folder_key = _album_folder_cache_key(folder_obj)
+            try:
+                missing_required_tags = json.loads(row["missing_required_tags_json"] or "[]")
+                if not isinstance(missing_required_tags, list):
+                    missing_required_tags = []
+            except Exception:
+                missing_required_tags = []
+            files_editions_by_album_id[album_id] = {
+                "folder": folder_obj,
+                "artist": artist_name,
+                "artist_name": artist_name,
+                "title_raw": str(row["album_title"] or "").strip(),
+                "album_title": str(row["album_title"] or "").strip(),
+                "album_norm": str(row["album_norm"] or "").strip(),
+                "fingerprint": fingerprint,
+                "folder_key": folder_key,
+                "file_count": int(row["file_count"] or 0),
+                "source_id": _parse_int_loose(row["source_id"], 0) or None,
+                "has_cover": bool(row["has_cover"]),
+                "has_artist_image": bool(row["has_artist_image"]),
+                "has_mbid": bool(row["has_mbid"]),
+                "has_identity": bool(row["has_identity"]),
+                "identity_provider": str(row["identity_provider"] or "").strip(),
+                "strict_match_verified": bool(row["strict_match_verified"]),
+                "strict_match_provider": str(row["strict_match_provider"] or "").strip(),
+                "strict_reject_reason": str(row["strict_reject_reason"] or "").strip(),
+                "strict_tracklist_score": float(row["strict_tracklist_score"] or 0.0),
+                "musicbrainz_id": str(row["musicbrainz_id"] or "").strip(),
+                "discogs_release_id": str(row["discogs_release_id"] or "").strip(),
+                "lastfm_album_mbid": str(row["lastfm_album_mbid"] or "").strip(),
+                "bandcamp_album_url": str(row["bandcamp_album_url"] or "").strip(),
+                "metadata_source": str(row["metadata_source"] or "").strip(),
+                "missing_required_tags": missing_required_tags,
+                "skip_heavy_processing": bool(row["skip_heavy_processing"]),
+                "_lookup_artist_name": str(row["lookup_artist_name"] or "").strip(),
+                "_lookup_album_title": str(row["lookup_album_title"] or "").strip(),
+                "_resume_stub": True,
+                "resume_sig_part": f"{folder_key}|{fingerprint}",
+            }
+            artist_to_album_ids.setdefault(artist_name, []).append(album_id)
+        artists_merged = [(0, name, ids) for name, ids in artist_to_album_ids.items() if ids]
+        if not artists_merged:
+            return None
+        return {
+            "run_id": run_id,
+            "status": str(run_row["status"] or "").strip().lower() or "running",
+            "scan_id": _parse_int_loose(run_row["scan_id"], 0) or None,
+            "detected_artists_total": int(run_row["detected_artists_total"] or len(artists_merged)),
+            "detected_albums_total": int(run_row["detected_albums_total"] or sum(len(ids) for _a, _n, ids in artists_merged)),
+            "detected_tracks_total": int(run_row["detected_tracks_total"] or 0),
+            "artists_merged": artists_merged,
+            "total_albums": sum(len(ids) for _a, _n, ids in artists_merged),
+            "files_editions_by_album_id": files_editions_by_album_id,
+        }
+    except Exception:
+        logging.debug("Failed to restore resume files plan for scan_type=%s", scan_type, exc_info=True)
+        return None
+
+
+def _snapshot_current_resume_files_plan(reason: str = "") -> dict[str, Any]:
+    with lock:
+        run_id = str(state.get("scan_resume_run_id") or "").strip() or None
+        files_editions = dict(state.get("files_editions_by_album_id") or {})
+        detected_artists_total = int(state.get("scan_detected_artists_total") or 0)
+        detected_albums_total = int(state.get("scan_detected_albums_total") or 0)
+        detected_tracks_total = int(state.get("scan_tracks_detected_total") or 0)
+    if not run_id or not files_editions:
+        return {"ok": False, "rows": 0, "run_id": run_id}
+    artist_to_album_ids: dict[str, list[int]] = defaultdict(list)
+    for album_id, fe in files_editions.items():
+        artist_name = str((fe or {}).get("artist_name") or (fe or {}).get("artist") or "").strip() or "Unknown Artist"
+        try:
+            artist_to_album_ids[artist_name].append(int(album_id))
+        except Exception:
+            continue
+    artists_merged = [(0, artist_name, album_ids) for artist_name, album_ids in sorted(artist_to_album_ids.items(), key=lambda x: x[0].lower())]
+    rows = _persist_resume_files_plan(
+        run_id,
+        artists_merged,
+        files_editions,
+        detected_artists_total=detected_artists_total,
+        detected_albums_total=detected_albums_total,
+        detected_tracks_total=detected_tracks_total,
+    )
+    if rows:
+        logging.info("[Resume] persisted %d remaining Files album(s) for run_id=%s (%s)", rows, run_id, str(reason or "snapshot"))
+    return {"ok": bool(rows), "rows": int(rows), "run_id": run_id}
+
+
+def _hydrate_resume_files_edition(fe: dict[str, Any]) -> dict[str, Any] | None:
+    folder_raw = fe.get("folder")
+    if not folder_raw:
+        return None
+    try:
+        folder = path_for_fs_access(Path(folder_raw))
+    except Exception:
+        folder = Path(str(folder_raw))
+    ordered_paths = _files_collect_ordered_audio_paths(folder, fe.get("ordered_paths") or [])
+    if not ordered_paths:
+        return None
+    first_tags = extract_tags(ordered_paths[0]) or {}
+    artist_name = str(fe.get("artist_name") or fe.get("artist") or "").strip() or "Unknown Artist"
+    album_title_tag = str(fe.get("album_title") or fe.get("title_raw") or "").strip() or _sanitize_album_title_display(folder.name.replace("_", " "))
+    inferred_artist_name, inferred_album_title = ("", "")
+    try:
+        inferred_artist_name, inferred_album_title = _infer_artist_album_from_folder(folder, ordered_paths)
+    except Exception:
+        pass
+    if (artist_name or "").strip().lower() in {"unknown", "unknown artist", "various", "various artists"} and inferred_artist_name:
+        artist_name = inferred_artist_name
+    if not album_title_tag and inferred_album_title:
+        album_title_tag = inferred_album_title
+    album_title_tag = _sanitize_album_title_display(album_title_tag)
+    tracks: list[Track] = []
+    first_disc, first_trk = _parse_disc_track_loose(first_tags, fallback_disc=1, fallback_track=1)
+    first_title = str(first_tags.get("title") or first_tags.get("name") or "").strip()
+    for i, p in enumerate(ordered_paths):
+        disc, trk = _infer_disc_track_from_text(p.stem, i + 1)
+        title = re.sub(r"[_]+", " ", p.stem).strip() or f"Track {i + 1}"
+        if i == 0:
+            disc = first_disc or disc
+            trk = first_trk or trk
+            title = first_title or title
+        tracks.append(Track(title=(title or "").strip(), idx=max(1, int(trk or 1)), disc=max(1, int(disc or 1)), dur=0))
+    normalize_parenthetical = bool(_parse_bool(_get_config_from_db("NORMALIZE_PARENTHETICAL_FOR_DEDUPE") or "true"))
+    album_norm = norm_album_for_dedup(album_title_tag, normalize_parenthetical)
+    fingerprint = str(fe.get("fingerprint") or "").strip() or _compute_album_fingerprint(ordered_paths)
+    cached = {
+        "fingerprint": fingerprint,
+        "has_cover": bool(fe.get("has_cover")),
+        "has_artist_image": bool(fe.get("has_artist_image")),
+        "has_mbid": bool(fe.get("has_mbid")),
+        "has_identity": bool(fe.get("has_identity")),
+        "identity_provider": str(fe.get("identity_provider") or "").strip(),
+        "strict_match_verified": bool(fe.get("strict_match_verified")),
+        "strict_match_provider": str(fe.get("strict_match_provider") or "").strip(),
+        "strict_reject_reason": str(fe.get("strict_reject_reason") or "").strip(),
+        "strict_tracklist_score": float(fe.get("strict_tracklist_score") or 0.0),
+        "musicbrainz_id": str(fe.get("musicbrainz_id") or "").strip(),
+        "discogs_release_id": str(fe.get("discogs_release_id") or "").strip(),
+        "lastfm_album_mbid": str(fe.get("lastfm_album_mbid") or "").strip(),
+        "bandcamp_album_url": str(fe.get("bandcamp_album_url") or "").strip(),
+        "metadata_source": str(fe.get("metadata_source") or "").strip(),
+    }
+    identity_now = _extract_files_identity_fields(tags=first_tags, edition={}, cached=cached)
+    hydrated = dict(fe)
+    hydrated.update(
+        {
+            "folder": folder,
+            "artist": artist_name,
+            "artist_name": artist_name,
+            "title_raw": album_title_tag,
+            "album_title": album_title_tag,
+            "album_norm": album_norm,
+            "tracks": tracks,
+            "format": str(fe.get("format") or "").strip() or (ordered_paths[0].suffix.lower().lstrip(".") if ordered_paths else "").upper(),
+            "tags": first_tags,
+            "confidence_score": float(fe.get("confidence_score") or 0.8),
+            "file_count": int(fe.get("file_count") or len(ordered_paths)),
+            "ordered_paths": ordered_paths,
+            "fingerprint": fingerprint,
+            "folder_key": _album_folder_cache_key(folder),
+            "source_id": _parse_int_loose(fe.get("source_id"), 0) or None,
+            "missing_required_tags": _check_required_tags(first_tags, REQUIRED_TAGS, edition={"tracks": tracks}),
+            "has_cover": bool(album_folder_has_cover(folder)),
+            "has_artist_image": bool(_artist_folder_has_image(folder.parent if folder.parent else folder)),
+            "has_mbid": bool(identity_now["has_mbid"]),
+            "has_identity": bool(identity_now["has_identity"]),
+            "identity_provider": identity_now["identity_provider"],
+            "strict_match_verified": bool(identity_now.get("strict_match_verified")),
+            "strict_match_provider": identity_now.get("strict_match_provider") or "",
+            "strict_reject_reason": identity_now.get("strict_reject_reason") or "",
+            "strict_tracklist_score": float(identity_now.get("strict_tracklist_score") or 0.0),
+            "musicbrainz_id": identity_now["musicbrainz_id"],
+            "discogs_release_id": identity_now["discogs_release_id"],
+            "lastfm_album_mbid": identity_now["lastfm_album_mbid"],
+            "bandcamp_album_url": identity_now["bandcamp_album_url"],
+            "metadata_source": identity_now["metadata_source"],
+            "_resume_stub": False,
+        }
+    )
+    return hydrated
+
+
 def _prepare_resume_scan_artists(
     mode: str,
     scan_type: str,
@@ -38833,7 +39263,11 @@ def _get_resume_run_snapshot(mode: str, scan_type: str) -> dict[str, Any] | None
         cur = con.cursor()
         cur.execute(
             """
-            SELECT run_id, status, created_at, updated_at, scan_id
+            SELECT run_id, status, created_at, updated_at, scan_id,
+                   COALESCE(detected_artists_total, 0),
+                   COALESCE(detected_albums_total, 0),
+                   COALESCE(detected_tracks_total, 0),
+                   COALESCE(plan_snapshot_ready, 0)
             FROM scan_resume_runs
             WHERE source_signature = ? AND mode = ? AND scan_type = ?
               AND COALESCE(status, '') != 'completed'
@@ -38851,6 +39285,10 @@ def _get_resume_run_snapshot(mode: str, scan_type: str) -> dict[str, Any] | None
         created_at = float(row[2] or 0.0) if row[2] is not None else None
         updated_at = float(row[3] or 0.0) if row[3] is not None else None
         scan_id = int(row[4] or 0) if row[4] is not None else None
+        detected_artists_total = int(row[5] or 0)
+        detected_albums_total = int(row[6] or 0)
+        detected_tracks_total = int(row[7] or 0)
+        plan_snapshot_ready = bool(row[8])
         cur.execute(
             """
             SELECT
@@ -38883,6 +39321,20 @@ def _get_resume_run_snapshot(mode: str, scan_type: str) -> dict[str, Any] | None
         failed_albums = int(counts[9] or 0)
         remaining_artists = max(0, pending_artists + running_artists + failed_artists)
         remaining_albums = max(0, pending_albums + running_albums + failed_albums)
+        if plan_snapshot_ready and remaining_artists <= 0:
+            try:
+                con2 = sqlite3.connect(str(STATE_DB_FILE), timeout=15)
+                cur2 = con2.cursor()
+                cur2.execute(
+                    "SELECT COUNT(*), COALESCE(COUNT(DISTINCT artist_name), 0) FROM scan_resume_files_plan WHERE run_id = ?",
+                    (run_id,),
+                )
+                plan_counts = cur2.fetchone() or (0, 0)
+                con2.close()
+                remaining_albums = max(remaining_albums, int(plan_counts[0] or 0))
+                remaining_artists = max(remaining_artists, int(plan_counts[1] or 0))
+            except Exception:
+                logging.debug("Failed to count resume files plan rows for run_id=%s", run_id, exc_info=True)
         return {
             "available": bool(run_id and remaining_artists > 0),
             "run_id": run_id,
@@ -38903,6 +39355,10 @@ def _get_resume_run_snapshot(mode: str, scan_type: str) -> dict[str, Any] | None
             "running_albums": running_albums,
             "failed_artists": failed_artists,
             "failed_albums": failed_albums,
+            "detected_artists_total": detected_artists_total,
+            "detected_albums_total": detected_albums_total,
+            "detected_tracks_total": detected_tracks_total,
+            "plan_snapshot_ready": bool(plan_snapshot_ready),
         }
     except Exception:
         logging.debug("Failed to read resume snapshot for scan_type=%s", scan_type, exc_info=True)
@@ -40114,6 +40570,28 @@ def _build_scan_plan(scan_type: str = "full") -> tuple[list[tuple[int, str, list
         if not active_roots:
             raise RuntimeError("FILES_ROOTS is empty – configure at least one music root for files library mode.")
         log_scan("FILES mode source roots: %s", ", ".join(str(r) for r in active_roots))
+        restored_plan = _load_resume_files_plan("files", scan_type)
+        if restored_plan:
+            artists_merged = list(restored_plan.get("artists_merged") or [])
+            total_albums = int(restored_plan.get("total_albums") or 0)
+            files_editions_by_album_id = dict(restored_plan.get("files_editions_by_album_id") or {})
+            with lock:
+                state["files_editions_by_album_id"] = files_editions_by_album_id
+                state["scan_resume_run_id"] = str(restored_plan.get("run_id") or "").strip() or None
+                state["scan_detected_artists_total"] = int(restored_plan.get("detected_artists_total") or len(artists_merged))
+                state["scan_detected_albums_total"] = int(restored_plan.get("detected_albums_total") or total_albums)
+                state["scan_tracks_detected_total"] = int(restored_plan.get("detected_tracks_total") or 0)
+                state["scan_discovery_running"] = False
+                state["scan_discovery_stage"] = "ready"
+                state["scan_discovery_current_root"] = None
+                state["scan_discovery_updated_at"] = time.time()
+            log_scan(
+                "FILES mode restored resume plan %s: %d remaining artist(s), %d remaining album(s).",
+                str(restored_plan.get("run_id") or ""),
+                len(artists_merged),
+                total_albums,
+            )
+            return artists_merged, total_albums
         artists_merged, total_albums, files_editions_by_album_id = _build_files_editions(scan_type=scan_type)
         with lock:
             state["files_editions_by_album_id"] = files_editions_by_album_id
@@ -40825,6 +41303,9 @@ def background_scan():
         state["scan_run_scope_total"] = 0
         state["scan_run_scope_artists_included"] = 0
         state["scan_run_scope_albums_included"] = 0
+        state["scan_processed_albums_count"] = 0
+        state["scan_published_albums_count"] = 0
+        state["scan_postprocessed_albums_count"] = 0
         state["scan_run_scope_started_at"] = None
         state["scan_run_scope_updated_at"] = None
         state["scan_prescan_cache_snapshot_running"] = False
@@ -41030,6 +41511,9 @@ def background_scan():
             state["scan_run_scope_total"] = int(detected_artists_total or 0)
             state["scan_run_scope_artists_included"] = int(total_artists or 0)
             state["scan_run_scope_albums_included"] = int(total_albums or 0)
+            state["scan_processed_albums_count"] = 0
+            state["scan_published_albums_count"] = 0
+            state["scan_postprocessed_albums_count"] = 0
             state["scan_run_scope_started_at"] = state.get("scan_run_scope_started_at") or time.time()
             state["scan_run_scope_updated_at"] = time.time()
             state["scan_tracks_detected_total"] = int(detected_tracks_total or 0)
@@ -41129,6 +41613,21 @@ def background_scan():
             mb_ok, ai_ok = _run_preflight_checks()
             state["scan_mb_connection_ok"] = mb_ok
             state["scan_ai_connection_ok"] = ai_ok
+
+        if _get_library_mode() == "files" and resume_run_id:
+            try:
+                with lock:
+                    current_files_editions = dict(state.get("files_editions_by_album_id") or {})
+                _persist_resume_files_plan(
+                    resume_run_id,
+                    artists_merged,
+                    current_files_editions,
+                    detected_artists_total=int(detected_artists_total or 0),
+                    detected_albums_total=int(detected_albums_total or 0),
+                    detected_tracks_total=int(detected_tracks_total or 0),
+                )
+            except Exception:
+                logging.debug("Initial resume files plan persist failed for run_id=%s", resume_run_id, exc_info=True)
         
         # Reload AUTO_MOVE_DUPES from DB so scan uses current setting (UI may have toggled it)
         _reload_auto_move_from_db()
@@ -41505,6 +42004,7 @@ def background_scan():
                             post_done += 1
                             with lock:
                                 state["scan_post_done"] = post_done
+                                state["scan_postprocessed_albums_count"] = int(state.get("scan_postprocessed_albums_count") or 0) + 1
                                 state["scan_post_current_artist"] = artist_name
                                 state["scan_post_current_album"] = album_title
                                 if result.get("pmda_matched") or result.get("pmda_cover") or result.get("pmda_artist_image"):
@@ -41575,12 +42075,14 @@ def background_scan():
                     finally:
                         if _get_library_mode() == "files":
                             try:
-                                _publish_files_library_artist_from_items(
+                                published_now = _publish_files_library_artist_from_items(
                                     artist_name_for_batch,
                                     items,
                                     scan_id=scan_id,
                                     results_by_album_id=batch_results,
                                 )
+                                with lock:
+                                    state["scan_published_albums_count"] = int(state.get("scan_published_albums_count") or 0) + int(published_now or 0)
                             except Exception:
                                 logging.debug(
                                     "Files publication failed for artist %s in post worker",
@@ -41622,6 +42124,7 @@ def background_scan():
         import concurrent.futures
         future_to_albums: dict[concurrent.futures.Future, int] = {}
         future_to_artist: dict[concurrent.futures.Future, str] = {}
+        future_to_album_ids: dict[concurrent.futures.Future, list[int]] = {}
         with ThreadPoolExecutor(max_workers=SCAN_THREADS) as executor:
             for primary_id, artist_name, album_ids_list in artists_merged:
                 album_cnt = len(album_ids_list)
@@ -41638,6 +42141,7 @@ def background_scan():
                 futures.append(fut)
                 future_to_albums[fut] = album_cnt
                 future_to_artist[fut] = artist_name
+                future_to_album_ids[fut] = list(album_ids_list or [])
 
             artists_processed = 0
             for future in as_completed(futures):
@@ -41646,6 +42150,7 @@ def background_scan():
                     break
                 album_cnt = future_to_albums.get(future, 0)
                 artist_name = future_to_artist.get(future, "<unknown>")
+                artist_album_ids = list(future_to_album_ids.get(future, []) or [])
                 stats = {"ai_used": 0, "mb_used": 0}
                 artist_failed = False
                 artist_error = None
@@ -41675,6 +42180,8 @@ def background_scan():
                         state["scan_progress"] += album_cnt
                         state["scan_step_progress"] = state.get("scan_step_progress", 0) + album_cnt  # compare step: 1 per album
                         state["scan_artists_processed"] += 1
+                        if not artist_failed:
+                            state["scan_processed_albums_count"] = int(state.get("scan_processed_albums_count") or 0) + int(album_cnt or 0)
                         state["scan_ai_used_count"] += stats.get("ai_used", 0)
                         state["scan_mb_used_count"] += stats.get("mb_used", 0)
                         state["scan_audio_cache_hits"] += stats.get("audio_cache_hits", 0)
@@ -41762,17 +42269,26 @@ def background_scan():
                         "failed" if artist_failed else "done",
                         error=artist_error,
                     )
+                    if _get_library_mode() == "files" and not artist_failed:
+                        if artist_album_ids:
+                            with lock:
+                                files_editions_live = state.get("files_editions_by_album_id") or {}
+                                for _album_id_done in artist_album_ids:
+                                    files_editions_live.pop(_album_id_done, None)
+                        _prune_resume_files_plan_artist(resume_run_id, artist_name)
                     if scan_stream_post_by_artist and scan_post_queue is not None:
                         if publish_items:
                             scan_post_queue.put((artist_name, publish_items))
                     elif _get_library_mode() == "files" and publish_items:
                         try:
-                            _publish_files_library_artist_from_items(
+                            published_now = _publish_files_library_artist_from_items(
                                 artist_name,
                                 publish_items,
                                 scan_id=scan_id,
                                 results_by_album_id={},
                             )
+                            with lock:
+                                state["scan_published_albums_count"] = int(state.get("scan_published_albums_count") or 0) + int(published_now or 0)
                         except Exception:
                             logging.debug("Files publication failed for artist %s", artist_name, exc_info=True)
                         rebuild_reason = f"scan_artist_ready_{artist_name}"
@@ -46906,6 +47422,10 @@ def _openai_web_search_fallback(query: str, num: int = 10, *, reason: str = "") 
     Fallback web search using OpenAI native web-search tool when Serper is unavailable.
     Returns list of {"title","link","snippet","source"}.
     """
+    if _scan_ai_policy_for_runtime() == "local_only":
+        return []
+    if not _web_search_ai_fallback_enabled(allow_ai_fallback=True):
+        return []
     user_id = _current_user_id_or_zero()
     if not _ai_web_search_available(user_id=user_id):
         return []
@@ -47717,23 +48237,77 @@ def api_files_watcher_restart():
 def pause_scan():
     scan_is_paused.set()
     snapshot_triggered = False
+    snapshot_rows = 0
     with lock:
         state["scanning"] = True   # still scanning, just paused
         mode = _get_library_mode()
         can_snapshot = bool(mode == "files" and (state.get("files_editions_by_album_id") or {}))
+        resume_run_id = str(state.get("scan_resume_run_id") or "").strip() or None
     if can_snapshot:
-        snapshot_triggered = _trigger_prescan_cache_snapshot_async(reason="manual_pause")
-    return jsonify({"status": "ok", "snapshot_triggered": bool(snapshot_triggered)})
+        snap = _snapshot_current_resume_files_plan("manual_pause")
+        snapshot_triggered = bool(snap.get("ok"))
+        snapshot_rows = int(snap.get("rows") or 0)
+    _set_resume_run_status(resume_run_id, "paused")
+    return jsonify({"status": "ok", "snapshot_triggered": bool(snapshot_triggered), "snapshot_rows": snapshot_rows})
 
 
 @app.route("/scan/resume", methods=["POST"])
 def resume_scan():
     _reload_ai_config_and_reinit()
+    body = request.get_json(silent=True) or {}
+    requested_scan_type = str(body.get("scan_type") or "").strip().lower()
+    scan_should_stop.clear()
     scan_is_paused.clear()
-    # no state change needed; polling loop will continue
+    with lock:
+        scanning_now = bool(state.get("scanning") or state.get("scan_starting") or state.get("scan_finalizing"))
+        current_scan_type = str(state.get("scan_type") or "full").strip().lower() or "full"
+        run_improve_after = bool(state.get("run_improve_after", False))
+        current_resume_run_id = str(state.get("scan_resume_run_id") or "").strip() or None
+    if scanning_now:
+        _set_resume_run_status(current_resume_run_id, "running")
+        return jsonify(
+            {
+                "status": "ok",
+                "resume_run_id": current_resume_run_id,
+                "ai_provider": str(AI_PROVIDER or ""),
+                "ai_model": str(getattr(sys.modules[__name__], "RESOLVED_MODEL", None) or OPENAI_MODEL or ""),
+            }
+        )
+
+    current_mode = _get_library_mode()
+    candidate_scan_types: list[str] = []
+    for candidate in [requested_scan_type, current_scan_type, "full", "changed_only"]:
+        scan_type_norm = str(candidate or "").strip().lower()
+        if scan_type_norm in {"full", "changed_only"} and scan_type_norm not in candidate_scan_types:
+            candidate_scan_types.append(scan_type_norm)
+
+    chosen_snapshot = None
+    chosen_scan_type = None
+    for candidate in candidate_scan_types:
+        snap = _get_resume_run_snapshot(current_mode, candidate)
+        if isinstance(snap, dict) and snap.get("available"):
+            chosen_snapshot = snap
+            chosen_scan_type = candidate
+            break
+    if not chosen_snapshot or not chosen_scan_type:
+        return jsonify({"status": "blocked", "reason": "no_resume_available"}), 409
+
+    ok, meta = _try_begin_scan(
+        scan_type=chosen_scan_type,
+        source="interactive_resume",
+        run_improve_after=run_improve_after,
+        scheduler_run_id=None,
+    )
+    if not ok:
+        reason = str(meta.get("reason") or "resume_start_failed").strip() or "resume_start_failed"
+        http_status = 409 if reason == "scan_already_running" else 500
+        return jsonify({"status": "blocked", "reason": reason, "message": str(meta.get("message") or "")}), http_status
+    _set_resume_run_status(str(chosen_snapshot.get("run_id") or ""), "running")
     return jsonify(
         {
-            "status": "ok",
+            "status": "started",
+            "scan_type": chosen_scan_type,
+            "resume_run_id": str(chosen_snapshot.get("run_id") or ""),
             "ai_provider": str(AI_PROVIDER or ""),
             "ai_model": str(getattr(sys.modules[__name__], "RESOLVED_MODEL", None) or OPENAI_MODEL or ""),
         }
@@ -47743,17 +48317,22 @@ def resume_scan():
 @app.route("/scan/stop", methods=["POST"])
 def stop_scan():
     snapshot_triggered = False
+    snapshot_rows = 0
     with lock:
         mode = _get_library_mode()
         can_snapshot = bool(mode == "files" and (state.get("files_editions_by_album_id") or {}))
         resume_run_id = str(state.get("scan_resume_run_id") or "").strip() or None
     if can_snapshot:
-        snapshot_triggered = _trigger_prescan_cache_snapshot_async(reason="manual_stop")
+        snap = _snapshot_current_resume_files_plan("manual_stop")
+        snapshot_triggered = bool(snap.get("ok"))
+        snapshot_rows = int(snap.get("rows") or 0)
+    _set_resume_run_status(resume_run_id, "stopped")
     scan_should_stop.set()
     return jsonify(
         {
             "status": "ok",
             "snapshot_triggered": bool(snapshot_triggered),
+            "snapshot_rows": snapshot_rows,
             "resume_preserved": bool(resume_run_id),
             "resume_run_id": resume_run_id,
         }
@@ -52620,6 +53199,9 @@ def api_progress():
         scan_tracks_moved_dupes = int(state.get("scan_tracks_moved_dupes") or 0)
         scan_tracks_moved_incomplete = int(state.get("scan_tracks_moved_incomplete") or 0)
         scan_tracks_unaccounted = int(state.get("scan_tracks_unaccounted") or 0)
+        scan_processed_albums_count = int(state.get("scan_processed_albums_count") or 0)
+        scan_published_albums_count = int(state.get("scan_published_albums_count") or 0)
+        scan_postprocessed_albums_count = int(state.get("scan_postprocessed_albums_count") or 0)
         scan_player_sync_target = state.get("scan_player_sync_target")
         scan_player_sync_ok = state.get("scan_player_sync_ok")
         scan_player_sync_message = state.get("scan_player_sync_message")
@@ -53078,6 +53660,9 @@ def api_progress():
         "scan_tracks_moved_dupes": scan_tracks_moved_dupes,
         "scan_tracks_moved_incomplete": scan_tracks_moved_incomplete,
         "scan_tracks_unaccounted": scan_tracks_unaccounted,
+        "scan_processed_albums_count": scan_processed_albums_count,
+        "scan_published_albums_count": scan_published_albums_count,
+        "scan_postprocessed_albums_count": scan_postprocessed_albums_count,
         "scan_player_sync_target": scan_player_sync_target,
         "scan_player_sync_ok": scan_player_sync_ok,
         "scan_player_sync_message": scan_player_sync_message,

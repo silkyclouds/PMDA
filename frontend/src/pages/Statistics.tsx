@@ -256,12 +256,19 @@ function normalizeScan(entry: ScanHistoryEntry): ScanSnapshot {
 }
 
 function normalizeLiveScan(progress: ScanProgress, fallbackStartTime: number): ScanSnapshot {
-  const totalAlbums = Math.max(
+  const scopeAlbums = Math.max(
+    n(progress.scan_run_scope_albums_included),
     n(progress.total_albums),
-    n(progress.post_processing_total),
+    n(progress.detected_albums_total),
+  );
+  const processedAlbums = Math.max(
+    n(progress.scan_processed_albums_count),
+    n(progress.scan_published_albums_count),
+    n(progress.scan_postprocessed_albums_count),
     n(progress.mb_done_count),
     n(progress.format_done_count),
   );
+  const totalAlbums = scopeAlbums > 0 ? Math.min(processedAlbums, scopeAlbums) : processedAlbums;
   const withoutTags = n(progress.albums_without_complete_tags);
   const withoutCover = n(progress.albums_without_album_image);
   const withoutArtistImage = n(progress.albums_without_artist_image);
@@ -283,16 +290,16 @@ function normalizeLiveScan(progress: ScanProgress, fallbackStartTime: number): S
     albumsMoved: 0,
     durationSeconds,
     mode: 'live',
-    matchedAlbums,
+    matchedAlbums: Math.min(processedAlbums, matchedAlbums),
     albumsWithMbId,
     mbVerifiedByAi: 0,
     discogsMatches,
     lastfmMatches,
     bandcampMatches,
-    withTags: Math.max(0, totalAlbums - withoutTags),
-    withCover: Math.max(0, totalAlbums - withoutCover),
-    withArtistImage: Math.max(0, totalAlbums - withoutArtistImage),
-    fullyComplete: Math.max(0, totalAlbums - Math.max(withoutTags, withoutCover, withoutArtistImage)),
+    withTags: Math.max(0, processedAlbums - withoutTags),
+    withCover: Math.max(0, processedAlbums - withoutCover),
+    withArtistImage: Math.max(0, processedAlbums - withoutArtistImage),
+    fullyComplete: Math.max(0, processedAlbums - Math.max(withoutTags, withoutCover, withoutArtistImage)),
     withoutTags,
     withoutCover,
     withoutArtistImage,
