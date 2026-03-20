@@ -2272,6 +2272,9 @@ merged = {
     "OPENAI_ENABLE_CODEX_OAUTH_MODE": _get("OPENAI_ENABLE_CODEX_OAUTH_MODE", default=True, cast=_parse_bool),
     "OPENAI_MODEL":   _get("OPENAI_MODEL",   default="gpt-4",                           cast=str),
     "AI_USAGE_LEVEL": _get("AI_USAGE_LEVEL", default="auto",                            cast=str),
+    "SCAN_AI_POLICY": _get("SCAN_AI_POLICY", default="local_then_paid",                 cast=str),
+    "SCAN_PAID_PROVIDER_ORDER": _get("SCAN_PAID_PROVIDER_ORDER", default="openai-api,openai-codex,anthropic,google", cast=str),
+    "WEB_SEARCH_LOCAL_ORDER": _get("WEB_SEARCH_LOCAL_ORDER", default="searxng,serper", cast=str),
     "ANTHROPIC_API_KEY": _get("ANTHROPIC_API_KEY", default="", cast=str),
     "GOOGLE_API_KEY": _get("GOOGLE_API_KEY", default="", cast=str),
     "OLLAMA_URL": _get("OLLAMA_URL", default="http://localhost:11434", cast=str),
@@ -2571,6 +2574,12 @@ NAVIDROME_USERNAME: str = str(merged.get("NAVIDROME_USERNAME", "") or "").strip(
 NAVIDROME_PASSWORD: str = str(merged.get("NAVIDROME_PASSWORD", "") or "").strip()
 NAVIDROME_API_KEY: str = str(merged.get("NAVIDROME_API_KEY", "") or "").strip()
 AI_USAGE_LEVEL: str = str(merged.get("AI_USAGE_LEVEL", "auto") or "auto").strip().lower()
+SCAN_AI_POLICY: str = str(merged.get("SCAN_AI_POLICY", "local_then_paid") or "local_then_paid").strip().lower()
+SCAN_PAID_PROVIDER_ORDER: str = str(
+    merged.get("SCAN_PAID_PROVIDER_ORDER", "openai-api,openai-codex,anthropic,google")
+    or "openai-api,openai-codex,anthropic,google"
+).strip()
+WEB_SEARCH_LOCAL_ORDER: str = str(merged.get("WEB_SEARCH_LOCAL_ORDER", "searxng,serper") or "searxng,serper").strip()
 USE_AI_FOR_MB_MATCH: bool = bool(merged.get("USE_AI_FOR_MB_MATCH", True))
 USE_AI_FOR_MB_VERIFY: bool = bool(merged.get("USE_AI_FOR_MB_VERIFY", True))
 USE_AI_FOR_DEDUPE: bool = bool(merged.get("USE_AI_FOR_DEDUPE", True))
@@ -2638,6 +2647,62 @@ def _normalize_web_search_provider(value: str | None) -> str:
     if raw in {"auto", "searxng", "serper", "ai_only", "disabled"}:
         return raw
     return "auto"
+
+
+def _normalize_scan_ai_policy(value: str | None) -> str:
+    raw = str(value or "").strip().lower()
+    if raw in {"local_only", "local_then_paid", "paid_only"}:
+        return raw
+    return "local_then_paid"
+
+
+def _normalize_ordered_values(
+    value: Any,
+    *,
+    allowed: tuple[str, ...],
+    default: tuple[str, ...],
+) -> list[str]:
+    allowed_set = {str(item).strip().lower() for item in allowed}
+    queue: list[Any] = [value]
+    ordered: list[str] = []
+    seen: set[str] = set()
+    while queue:
+        item = queue.pop(0)
+        if item is None:
+            continue
+        if isinstance(item, (list, tuple, set)):
+            queue.extend(list(item))
+            continue
+        if isinstance(item, str):
+            raw = item.strip()
+            if not raw:
+                continue
+            if raw.startswith("["):
+                try:
+                    parsed = json.loads(raw)
+                    if parsed != item:
+                        queue.append(parsed)
+                        continue
+                except Exception:
+                    pass
+            if "," in raw:
+                parts = [p.strip() for p in raw.split(",") if str(p).strip()]
+                if len(parts) > 1:
+                    queue.extend(parts)
+                    continue
+            token = raw.strip().lower()
+        else:
+            token = str(item).strip().lower()
+        if not token or token in seen or token not in allowed_set:
+            continue
+        seen.add(token)
+        ordered.append(token)
+    for token in default:
+        norm = str(token).strip().lower()
+        if norm and norm in allowed_set and norm not in seen:
+            ordered.append(norm)
+            seen.add(norm)
+    return ordered
 
 
 def _ai_usage_level_overrides(level: str) -> dict[str, bool]:
@@ -2741,6 +2806,24 @@ def _apply_forced_runtime_defaults():
 
 
 _apply_forced_runtime_defaults()
+SCAN_AI_POLICY = _normalize_scan_ai_policy(SCAN_AI_POLICY)
+SCAN_PAID_PROVIDER_ORDER = ",".join(
+    _normalize_ordered_values(
+        SCAN_PAID_PROVIDER_ORDER,
+        allowed=("openai-api", "openai-codex", "anthropic", "google"),
+        default=("openai-api", "openai-codex", "anthropic", "google"),
+    )
+)
+WEB_SEARCH_LOCAL_ORDER = ",".join(
+    _normalize_ordered_values(
+        WEB_SEARCH_LOCAL_ORDER,
+        allowed=("searxng", "serper"),
+        default=("searxng", "serper"),
+    )
+)
+merged["SCAN_AI_POLICY"] = SCAN_AI_POLICY
+merged["SCAN_PAID_PROVIDER_ORDER"] = SCAN_PAID_PROVIDER_ORDER
+merged["WEB_SEARCH_LOCAL_ORDER"] = WEB_SEARCH_LOCAL_ORDER
 WEB_SEARCH_PROVIDER = _normalize_web_search_provider(WEB_SEARCH_PROVIDER)
 merged["WEB_SEARCH_PROVIDER"] = WEB_SEARCH_PROVIDER
 _apply_ai_usage_level(AI_USAGE_LEVEL)
@@ -3623,19 +3706,77 @@ def _ollama_model_configured() -> str:
     return str(getattr(sys.modules[__name__], "OLLAMA_MODEL", "") or "").strip() or "qwen2.5:3b-instruct"
 
 
+def _scan_ai_policy_for_runtime() -> str:
+    return _normalize_scan_ai_policy(getattr(sys.modules[__name__], "SCAN_AI_POLICY", "local_then_paid"))
+
+
+def _scan_paid_provider_chain() -> list[str]:
+    return _normalize_ordered_values(
+        getattr(sys.modules[__name__], "SCAN_PAID_PROVIDER_ORDER", ""),
+        allowed=("openai-api", "openai-codex", "anthropic", "google"),
+        default=("openai-api", "openai-codex", "anthropic", "google"),
+    )
+
+
+def _web_search_local_chain() -> list[str]:
+    return _normalize_ordered_values(
+        getattr(sys.modules[__name__], "WEB_SEARCH_LOCAL_ORDER", ""),
+        allowed=("searxng", "serper"),
+        default=("searxng", "serper"),
+    )
+
+
+def _provider_ready_for_runtime(provider_id: str, user_id: int | None = None) -> bool:
+    pid = _normalize_provider_id(provider_id, fallback="")
+    uid = max(0, int(user_id or 0))
+    if not pid:
+        return False
+    if pid == "openai-api":
+        return bool(_openai_api_runtime_available())
+    if pid == "openai-codex":
+        return bool(_openai_codex_runtime_available(uid, require_token=True))
+    if pid == "anthropic":
+        return bool(anthropic_client)
+    if pid == "google":
+        return bool(google_client_configured and google_client)
+    if pid == "ollama":
+        return bool(_ollama_service_configured())
+    return False
+
+
+def _scan_paid_provider_fallback(user_id: int | None = None) -> str:
+    chain = _scan_paid_provider_chain()
+    uid = max(0, int(user_id or 0))
+    for provider_id in chain:
+        if _provider_mode_enabled(provider_id) and _provider_ready_for_runtime(provider_id, uid):
+            return provider_id
+    for provider_id in chain:
+        if _provider_mode_enabled(provider_id):
+            return provider_id
+    return "openai-api"
+
+
 def _local_first_scan_ai_enabled() -> bool:
     level = _normalize_ai_usage_level(getattr(sys.modules[__name__], "AI_USAGE_LEVEL", "auto"))
     return level == "auto" and bool(ollama_url) and _ollama_service_configured()
 
 
-def _resolve_local_first_provider_for_runtime(context: str, requested_provider: str) -> str:
+def _resolve_local_first_provider_for_runtime(context: str, requested_provider: str, *, user_id: int | None = None) -> str:
     req_norm = _normalize_provider_id(str(requested_provider or "").strip().lower(), fallback="")
     if req_norm and req_norm not in _OPENAI_PROVIDER_IDS:
         return ""
     if context != "batch":
         return ""
-    if _local_first_scan_ai_enabled():
+    policy = _scan_ai_policy_for_runtime()
+    uid = max(0, int(user_id or 0))
+    if policy == "local_only":
         return "ollama"
+    if policy == "local_then_paid":
+        if _local_first_scan_ai_enabled():
+            return "ollama"
+        return _scan_paid_provider_fallback(uid)
+    if policy == "paid_only":
+        return _scan_paid_provider_fallback(uid)
     return ""
 
 
@@ -3913,7 +4054,7 @@ def _resolve_provider_for_runtime(requested_provider: str, analysis_type: str, *
         return _normalize_provider_id(req, fallback=req)
     uid = _current_user_id_or_zero() if user_id is None else max(0, int(user_id or 0))
     context = _ai_context_from_analysis_type(analysis_type)
-    local_override = _resolve_local_first_provider_for_runtime(context, req)
+    local_override = _resolve_local_first_provider_for_runtime(context, req, user_id=uid)
     if local_override:
         return local_override
     prefs = _get_ai_provider_preferences(uid)
@@ -47028,14 +47169,22 @@ def _openai_web_search_fallback(query: str, num: int = 10, *, reason: str = "") 
 def _web_search_ai_fallback_enabled(*, allow_ai_fallback: bool = True) -> bool:
     if not allow_ai_fallback:
         return False
-    if not bool(getattr(sys.modules[__name__], "USE_AI_WEB_SEARCH_FALLBACK", False)):
+    if _scan_ai_policy_for_runtime() == "local_only":
         return False
+    if not bool(getattr(sys.modules[__name__], "USE_AI_WEB_SEARCH_FALLBACK", False)):
+        provider = _normalize_web_search_provider(str(getattr(sys.modules[__name__], "WEB_SEARCH_PROVIDER", "auto") or "auto"))
+        if provider != "ai_only":
+            return False
+    if _scan_ai_policy_for_runtime() == "paid_only":
+        return True
     usage_level = _normalize_ai_usage_level(str(getattr(sys.modules[__name__], "AI_USAGE_LEVEL", "auto") or "auto"))
-    return usage_level == "aggressive"
+    provider = _normalize_web_search_provider(str(getattr(sys.modules[__name__], "WEB_SEARCH_PROVIDER", "auto") or "auto"))
+    return usage_level == "aggressive" or provider == "ai_only"
 
 
 def _web_search_provider_order() -> list[str]:
     provider = _normalize_web_search_provider(str(getattr(sys.modules[__name__], "WEB_SEARCH_PROVIDER", "auto") or "auto"))
+    policy = _scan_ai_policy_for_runtime()
     if provider == "disabled":
         return []
     if provider == "ai_only":
@@ -47043,12 +47192,17 @@ def _web_search_provider_order() -> list[str]:
     if provider == "searxng":
         return ["searxng"]
     if provider == "serper":
+        if policy == "local_only":
+            return []
         return ["serper"]
+    if policy == "paid_only":
+        return ["serper"] if str(getattr(sys.modules[__name__], "SERPER_API_KEY", "") or "").strip() else []
     order: list[str] = []
-    if str(getattr(sys.modules[__name__], "SEARXNG_URL", "") or "").strip():
-        order.append("searxng")
-    if str(getattr(sys.modules[__name__], "SERPER_API_KEY", "") or "").strip():
-        order.append("serper")
+    for source in _web_search_local_chain():
+        if source == "searxng" and str(getattr(sys.modules[__name__], "SEARXNG_URL", "") or "").strip():
+            order.append("searxng")
+        if source == "serper" and policy != "local_only" and str(getattr(sys.modules[__name__], "SERPER_API_KEY", "") or "").strip():
+            order.append("serper")
     return order
 
 
@@ -48894,6 +49048,178 @@ def api_ollama_models():
         return jsonify({"error": f"Failed to fetch models: {error_msg}"}), 500
 
 
+def _normalize_ollama_probe_url(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if not re.match(r"^https?://", raw, re.IGNORECASE):
+        raw = f"http://{raw}"
+    parsed = urlparse(raw)
+    scheme = parsed.scheme or "http"
+    host = parsed.hostname or ""
+    if not host:
+        return ""
+    port = parsed.port or 11434
+    return f"{scheme}://{host}:{port}"
+
+
+def _local_network_ipv4_candidates() -> list[str]:
+    found: list[str] = []
+    seen: set[str] = set()
+
+    def _add(ip_text: str) -> None:
+        raw = str(ip_text or "").strip()
+        if not raw:
+            return
+        try:
+            ip_obj = ipaddress.ip_address(raw)
+        except Exception:
+            return
+        if ip_obj.version != 4 or ip_obj.is_loopback or ip_obj.is_multicast:
+            return
+        if raw in seen:
+            return
+        seen.add(raw)
+        found.append(raw)
+
+    try:
+        with open("/proc/net/arp", "r", encoding="utf-8", errors="ignore") as handle:
+            for idx, line in enumerate(handle):
+                if idx == 0:
+                    continue
+                parts = [p for p in line.strip().split() if p]
+                if parts:
+                    _add(parts[0])
+    except Exception:
+        pass
+
+    try:
+        udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        udp.connect(("8.8.8.8", 80))
+        local_ip = str(udp.getsockname()[0] or "").strip()
+        udp.close()
+        _add(local_ip)
+        if local_ip.count(".") == 3:
+            prefix = ".".join(local_ip.split(".")[:3])
+            for suffix in (1, 2, 10, 20, 100, 254):
+                _add(f"{prefix}.{suffix}")
+    except Exception:
+        pass
+
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET, socket.SOCK_STREAM):
+            sockaddr = info[4] or ()
+            if sockaddr:
+                _add(str(sockaddr[0] or "").strip())
+    except Exception:
+        pass
+
+    return found
+
+
+def _ollama_probe(url: str) -> dict[str, Any]:
+    probe_url = _normalize_ollama_probe_url(url)
+    if not probe_url:
+        return {
+            "url": str(url or ""),
+            "ok": False,
+            "message": "Invalid URL",
+            "models": [],
+            "model_count": 0,
+        }
+    try:
+        response = requests.get(f"{probe_url}/api/tags", timeout=5)
+        if response.status_code != 200:
+            return {
+                "url": probe_url,
+                "ok": False,
+                "message": f"HTTP {response.status_code}",
+                "models": [],
+                "model_count": 0,
+            }
+        payload = response.json() if response.content else {}
+        models_raw = payload.get("models") or []
+        models = sorted(
+            [
+                str(item.get("name") or "").strip()
+                for item in models_raw
+                if isinstance(item, dict) and str(item.get("name") or "").strip()
+            ]
+        )
+        message = f"{len(models)} model(s) available" if models else "Connected, but no models are installed yet"
+        return {
+            "url": probe_url,
+            "ok": True,
+            "message": message,
+            "models": models,
+            "model_count": len(models),
+        }
+    except requests.exceptions.Timeout:
+        return {
+            "url": probe_url,
+            "ok": False,
+            "message": "Timed out",
+            "models": [],
+            "model_count": 0,
+        }
+    except requests.exceptions.ConnectionError:
+        return {
+            "url": probe_url,
+            "ok": False,
+            "message": "Connection failed",
+            "models": [],
+            "model_count": 0,
+        }
+    except Exception as exc:
+        return {
+            "url": probe_url,
+            "ok": False,
+            "message": str(exc or "Probe failed"),
+            "models": [],
+            "model_count": 0,
+        }
+
+
+@app.get("/api/ollama/discover")
+def api_ollama_discover():
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def _add(url: str) -> None:
+        normalized = _normalize_ollama_probe_url(url)
+        if not normalized or normalized in seen:
+            return
+        seen.add(normalized)
+        candidates.append(normalized)
+
+    configured = str(request.args.get("url") or "").strip() or str(getattr(sys.modules[__name__], "OLLAMA_URL", "") or "").strip()
+    if configured:
+        _add(configured)
+    for raw in (
+        "http://127.0.0.1:11434",
+        "http://localhost:11434",
+        "http://host.docker.internal:11434",
+        "http://ollama:11434",
+        "http://pmda-ollama:11434",
+    ):
+        _add(raw)
+    for ip_text in _local_network_ipv4_candidates():
+        _add(f"http://{ip_text}:11434")
+
+    results: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=min(8, max(1, len(candidates)))) as pool:
+        future_map = {pool.submit(_ollama_probe, url): url for url in candidates}
+        for future in as_completed(future_map):
+            try:
+                results.append(dict(future.result() or {}))
+            except Exception as exc:
+                url = future_map.get(future) or ""
+                results.append({"url": url, "ok": False, "message": str(exc or "Probe failed"), "models": [], "model_count": 0})
+
+    results.sort(key=lambda row: (not bool(row.get("ok")), -int(row.get("model_count") or 0), str(row.get("url") or "")))
+    return jsonify({"results": results})
+
+
 _OLLAMA_PULL_STATUS_LOCK = threading.Lock()
 _OLLAMA_PULL_STATUS: dict[str, Any] = {
     "active": False,
@@ -50073,6 +50399,21 @@ def api_config_get():
         "FORMAT_PREFERENCE": _parse_format_preference(get_setting("FORMAT_PREFERENCE", FORMAT_PREFERENCE)),
         "AI_PROVIDER": get_setting("AI_PROVIDER", AI_PROVIDER),
         "AI_USAGE_LEVEL": _normalize_ai_usage_level(get_setting("AI_USAGE_LEVEL", AI_USAGE_LEVEL)),
+        "SCAN_AI_POLICY": _normalize_scan_ai_policy(get_setting("SCAN_AI_POLICY", SCAN_AI_POLICY)),
+        "SCAN_PAID_PROVIDER_ORDER": ",".join(
+            _normalize_ordered_values(
+                get_setting("SCAN_PAID_PROVIDER_ORDER", SCAN_PAID_PROVIDER_ORDER),
+                allowed=("openai-api", "openai-codex", "anthropic", "google"),
+                default=("openai-api", "openai-codex", "anthropic", "google"),
+            )
+        ),
+        "WEB_SEARCH_LOCAL_ORDER": ",".join(
+            _normalize_ordered_values(
+                get_setting("WEB_SEARCH_LOCAL_ORDER", WEB_SEARCH_LOCAL_ORDER),
+                allowed=("searxng", "serper"),
+                default=("searxng", "serper"),
+            )
+        ),
         "OPENAI_API_KEY": str(openai_key_eff or ""),
         "OPENAI_API_KEY_SET": _is_set(openai_key_eff),
         "OPENAI_ENABLE_API_KEY_MODE": get_setting_bool("OPENAI_ENABLE_API_KEY_MODE", OPENAI_ENABLE_API_KEY_MODE),
@@ -50089,6 +50430,12 @@ def api_config_get():
         "OPENAI_PROVIDER_PREF_WEB_SEARCH": str(provider_prefs_eff.get("web_search_provider_id") or "openai-codex"),
         "OPENAI_PROVIDER_EFFECTIVE_INTERACTIVE": _normalize_provider_id(openai_effective_interactive, fallback="openai-api"),
         "OPENAI_PROVIDER_EFFECTIVE_BATCH": _normalize_provider_id(openai_effective_batch, fallback="openai-api"),
+        "SCAN_AI_EFFECTIVE_BATCH": _resolve_provider_for_runtime("openai", "scan_pipeline"),
+        "SCAN_AI_EFFECTIVE_WEB_SEARCH": (
+            "local"
+            if bool(_web_search_provider_order())
+            else ("paid_ai" if _web_search_ai_fallback_enabled(allow_ai_fallback=True) else "disabled")
+        ),
         "OPENAI_MODEL": get_setting("OPENAI_MODEL", OPENAI_MODEL),
         "OPENAI_MODEL_FALLBACKS": get_setting("OPENAI_MODEL_FALLBACKS", merged.get("OPENAI_MODEL_FALLBACKS", "")),
         "ANTHROPIC_API_KEY": str(anthropic_key_eff or ""),
@@ -50552,6 +50899,33 @@ def _apply_settings_in_memory(updates: dict):
         AI_USAGE_LEVEL = _normalize_ai_usage_level(str(updates.get("AI_USAGE_LEVEL") or "auto"))
         _apply_ai_usage_level(AI_USAGE_LEVEL)
         logging.info("AI_USAGE_LEVEL updated in memory: %s", AI_USAGE_LEVEL)
+    if "SCAN_AI_POLICY" in updates:
+        global SCAN_AI_POLICY
+        SCAN_AI_POLICY = _normalize_scan_ai_policy(str(updates.get("SCAN_AI_POLICY") or "local_then_paid"))
+        merged["SCAN_AI_POLICY"] = SCAN_AI_POLICY
+        logging.info("SCAN_AI_POLICY updated in memory: %s", SCAN_AI_POLICY)
+    if "SCAN_PAID_PROVIDER_ORDER" in updates:
+        global SCAN_PAID_PROVIDER_ORDER
+        SCAN_PAID_PROVIDER_ORDER = ",".join(
+            _normalize_ordered_values(
+                updates.get("SCAN_PAID_PROVIDER_ORDER"),
+                allowed=("openai-api", "openai-codex", "anthropic", "google"),
+                default=("openai-api", "openai-codex", "anthropic", "google"),
+            )
+        )
+        merged["SCAN_PAID_PROVIDER_ORDER"] = SCAN_PAID_PROVIDER_ORDER
+        logging.info("SCAN_PAID_PROVIDER_ORDER updated in memory: %s", SCAN_PAID_PROVIDER_ORDER)
+    if "WEB_SEARCH_LOCAL_ORDER" in updates:
+        global WEB_SEARCH_LOCAL_ORDER
+        WEB_SEARCH_LOCAL_ORDER = ",".join(
+            _normalize_ordered_values(
+                updates.get("WEB_SEARCH_LOCAL_ORDER"),
+                allowed=("searxng", "serper"),
+                default=("searxng", "serper"),
+            )
+        )
+        merged["WEB_SEARCH_LOCAL_ORDER"] = WEB_SEARCH_LOCAL_ORDER
+        logging.info("WEB_SEARCH_LOCAL_ORDER updated in memory: %s", WEB_SEARCH_LOCAL_ORDER)
     if "SERPER_API_KEY" in updates:
         global SERPER_API_KEY
         v = str(updates.get("SERPER_API_KEY") or "").strip()
@@ -51047,7 +51421,7 @@ def api_config_put():
     allowed = {
         "PLEX_HOST", "PLEX_TOKEN", "PLEX_BASE_PATH", "PLEX_DB_PATH", "SECTION_IDS", "PATH_MAP",
         "DUPE_ROOT", "PMDA_CONFIG_DIR", "MUSIC_PARENT_PATH",
-        "SCAN_THREADS", "LOG_LEVEL", "LOG_FILE", "AI_PROVIDER", "AI_USAGE_LEVEL", "OPENAI_API_KEY",
+        "SCAN_THREADS", "LOG_LEVEL", "LOG_FILE", "AI_PROVIDER", "AI_USAGE_LEVEL", "SCAN_AI_POLICY", "SCAN_PAID_PROVIDER_ORDER", "WEB_SEARCH_LOCAL_ORDER", "OPENAI_API_KEY",
         "OPENAI_ENABLE_API_KEY_MODE", "OPENAI_ENABLE_CODEX_OAUTH_MODE", "OPENAI_MODEL",
         "OPENAI_MODEL_FALLBACKS", "ANTHROPIC_API_KEY", "GOOGLE_API_KEY", "OLLAMA_URL", "OLLAMA_MODEL",
         "DISCORD_WEBHOOK", "USE_MUSICBRAINZ", "MUSICBRAINZ_EMAIL", "MB_RETRY_NOT_FOUND",
@@ -51154,6 +51528,24 @@ def api_config_put():
         normalized_level = _normalize_ai_usage_level(str(updates.get("AI_USAGE_LEVEL") or "auto"))
         updates["AI_USAGE_LEVEL"] = normalized_level
         updates.update(_ai_usage_level_overrides(normalized_level))
+    if "SCAN_AI_POLICY" in updates:
+        updates["SCAN_AI_POLICY"] = _normalize_scan_ai_policy(str(updates.get("SCAN_AI_POLICY") or "local_then_paid"))
+    if "SCAN_PAID_PROVIDER_ORDER" in updates:
+        updates["SCAN_PAID_PROVIDER_ORDER"] = ",".join(
+            _normalize_ordered_values(
+                updates.get("SCAN_PAID_PROVIDER_ORDER"),
+                allowed=("openai-api", "openai-codex", "anthropic", "google"),
+                default=("openai-api", "openai-codex", "anthropic", "google"),
+            )
+        )
+    if "WEB_SEARCH_LOCAL_ORDER" in updates:
+        updates["WEB_SEARCH_LOCAL_ORDER"] = ",".join(
+            _normalize_ordered_values(
+                updates.get("WEB_SEARCH_LOCAL_ORDER"),
+                allowed=("searxng", "serper"),
+                default=("searxng", "serper"),
+            )
+        )
     if "MATCH_COVER_OCR_MODE" in updates:
         updates["MATCH_COVER_OCR_MODE"] = _normalize_match_cover_ocr_mode(updates["MATCH_COVER_OCR_MODE"])
     if "JELLYFIN_URL" in updates:

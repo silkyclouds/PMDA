@@ -149,6 +149,12 @@ export function normalizeConfigForUI(raw: Partial<PMDAConfig>): Partial<PMDAConf
     const level = String(out.AI_USAGE_LEVEL).trim().toLowerCase();
     out.AI_USAGE_LEVEL = (['limited', 'medium', 'aggressive', 'auto'].includes(level) ? level : 'auto') as PMDAConfig['AI_USAGE_LEVEL'];
   }
+  if (out.SCAN_AI_POLICY != null) {
+    const policy = String(out.SCAN_AI_POLICY).trim().toLowerCase();
+    out.SCAN_AI_POLICY = (
+      ['local_only', 'local_then_paid', 'paid_only'].includes(policy) ? policy : 'local_then_paid'
+    ) as PMDAConfig['SCAN_AI_POLICY'];
+  }
   if (out.WEB_SEARCH_PROVIDER != null) {
     const provider = String(out.WEB_SEARCH_PROVIDER).trim().toLowerCase();
     out.WEB_SEARCH_PROVIDER = (

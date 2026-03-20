@@ -696,6 +696,16 @@ export interface PMDAConfig {
   AI_PROVIDER: 'openai' | 'openai-api' | 'openai-codex' | 'anthropic' | 'google' | 'ollama';
   /** Global AI usage profile across matching/dedupe/vision flow. */
   AI_USAGE_LEVEL?: 'limited' | 'medium' | 'aggressive' | 'auto';
+  /** Scan-time AI routing policy once providers/OCR are exhausted. */
+  SCAN_AI_POLICY?: 'local_only' | 'local_then_paid' | 'paid_only';
+  /** Ordered paid AI fallback chain for scan batch flows. */
+  SCAN_PAID_PROVIDER_ORDER?: string;
+  /** Ordered local/external web-search chain before any paid AI web search. */
+  WEB_SEARCH_LOCAL_ORDER?: string;
+  /** Effective batch AI provider after applying the scan policy. */
+  SCAN_AI_EFFECTIVE_BATCH?: string;
+  /** Effective web-search layer for the scan pipeline. */
+  SCAN_AI_EFFECTIVE_WEB_SEARCH?: string;
   OPENAI_API_KEY: string;
   OPENAI_API_KEY_SET?: boolean;
   OPENAI_ENABLE_API_KEY_MODE?: boolean;
@@ -3992,6 +4002,18 @@ export interface OllamaPullStatus {
   digest?: string;
 }
 
+export interface OllamaDiscoveryRow {
+  url: string;
+  ok: boolean;
+  message: string;
+  models: string[];
+  model_count: number;
+}
+
+export interface OllamaDiscoveryResponse {
+  results: OllamaDiscoveryRow[];
+}
+
 export async function getOllamaPullStatus(): Promise<OllamaPullStatus> {
   return fetchApi<OllamaPullStatus>('/api/ollama/pull/status');
 }
@@ -4001,6 +4023,13 @@ export async function startOllamaPull(payload: { OLLAMA_URL: string; model: stri
     method: 'POST',
     body: JSON.stringify(payload),
     timeoutMs: 30000,
+  });
+}
+
+export async function discoverOllama(url?: string): Promise<OllamaDiscoveryResponse> {
+  const qs = url?.trim() ? `?url=${encodeURIComponent(url.trim())}` : '';
+  return fetchApi<OllamaDiscoveryResponse>(`/api/ollama/discover${qs}`, {
+    timeoutMs: 45000,
   });
 }
 

@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback, type ComponentType } from 'react';
-import { Save, Loader2, Check, FolderOutput, RefreshCw, X, Database, Sparkles, ExternalLink, Copy, MapPin, ChevronDown, AlertTriangle, Trash2, SlidersHorizontal, Workflow, Download } from 'lucide-react';
+import { Save, Loader2, Check, FolderOutput, RefreshCw, X, Database, Sparkles, ExternalLink, Copy, MapPin, ChevronDown, AlertTriangle, Trash2, SlidersHorizontal, Workflow, Download, ArrowRight, ArrowUp, ArrowDown, Server, Globe, Cpu } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { toast } from 'sonner';
 import { IntegrationsSettings } from '@/components/settings/IntegrationsSettings';
@@ -179,6 +179,31 @@ const AI_PROVIDER_OPTIONS: Array<{ value: AIProviderId; label: string; provider:
   { value: 'ollama', label: 'Ollama (local)', provider: 'ollama' },
 ];
 
+const SCAN_AI_POLICY_OPTIONS: Array<{
+  value: NonNullable<PMDAConfig['SCAN_AI_POLICY']>;
+  label: string;
+  description: string;
+}> = [
+  {
+    value: 'local_only',
+    label: 'Local only',
+    description: 'Tags/OCR/providers first, then local web search + Ollama only. No paid AI fallback.',
+  },
+  {
+    value: 'local_then_paid',
+    label: 'Local + paid fallback',
+    description: 'Recommended. Local search and Ollama first, then the paid chain only when the local path still cannot settle the case.',
+  },
+  {
+    value: 'paid_only',
+    label: 'Paid only',
+    description: 'Skip Ollama and escalate directly to the paid fallback chain after providers/OCR.',
+  },
+];
+
+const LOCAL_WEB_PROVIDER_IDS = ['searxng', 'serper'] as const;
+const PAID_AI_PROVIDER_IDS = ['openai-api', 'openai-codex', 'anthropic', 'google'] as const;
+
 const DANGER_PRESETS: DangerPresetMeta[] = [
   {
     id: 'reset_all_keep_settings',
@@ -247,6 +272,76 @@ function parsePathListValue(value: unknown): string[] {
   return out;
 }
 
+function parseOrderedValues<T extends string>(value: unknown, allowed: readonly T[], fallback: readonly T[]): T[] {
+  const out: T[] = [];
+  const seen = new Set<string>();
+  const queue: unknown[] = [value];
+  const allowedSet = new Set<string>(allowed);
+
+  while (queue.length > 0) {
+    const item = queue.shift();
+    if (item == null) continue;
+    if (Array.isArray(item)) {
+      queue.push(...item);
+      continue;
+    }
+    if (typeof item === 'string') {
+      const s = item.trim();
+      if (!s) continue;
+      if (s.startsWith('[')) {
+        try {
+          const parsed = JSON.parse(s) as unknown;
+          if (parsed !== item) {
+            queue.push(parsed);
+            continue;
+          }
+        } catch {
+          // Fall through to CSV parsing.
+        }
+      }
+      if (s.includes(',')) {
+        const parts = s.split(',').map((p) => p.trim()).filter(Boolean);
+        if (parts.length > 1) {
+          queue.push(...parts);
+          continue;
+        }
+      }
+      const normalized = s.toLowerCase();
+      if (allowedSet.has(normalized) && !seen.has(normalized)) {
+        seen.add(normalized);
+        out.push(normalized as T);
+      }
+      continue;
+    }
+    const normalized = String(item).trim().toLowerCase();
+    if (allowedSet.has(normalized) && !seen.has(normalized)) {
+      seen.add(normalized);
+      out.push(normalized as T);
+    }
+  }
+
+  for (const item of fallback) {
+    if (!seen.has(item)) {
+      seen.add(item);
+      out.push(item);
+    }
+  }
+
+  return out;
+}
+
+function moveOrderedItem<T>(items: readonly T[], index: number, direction: -1 | 1): T[] {
+  const next = [...items];
+  const target = index + direction;
+  if (index < 0 || index >= next.length || target < 0 || target >= next.length) {
+    return next;
+  }
+  const current = next[index]!;
+  next[index] = next[target]!;
+  next[target] = current;
+  return next;
+}
+
 function SettingsPage() {
   const auth = useAuth();
   const [config, setConfig] = useState<Partial<PMDAConfig>>({});
@@ -276,6 +371,11 @@ function SettingsPage() {
   const [ollamaPullStatus, setOllamaPullStatus] = useState<api.OllamaPullStatus | null>(null);
   const [ollamaPullModel, setOllamaPullModel] = useState('');
   const [ollamaPullBusy, setOllamaPullBusy] = useState(false);
+  const [ollamaDiscoveryBusy, setOllamaDiscoveryBusy] = useState(false);
+  const [ollamaDiscoveryResults, setOllamaDiscoveryResults] = useState<api.OllamaDiscoveryRow[]>([]);
+  const [ollamaConnectionBusy, setOllamaConnectionBusy] = useState(false);
+  const [ollamaAvailableModels, setOllamaAvailableModels] = useState<string[]>([]);
+  const [ollamaConnectionMessage, setOllamaConnectionMessage] = useState<string | null>(null);
   const [rebuildIndexLoading, setRebuildIndexLoading] = useState(false);
   const [advancedFoldersOpen, setAdvancedFoldersOpen] = useState(false);
   const [schedulerAdvancedOpen, setSchedulerAdvancedOpen] = useState(false);
@@ -709,6 +809,67 @@ function SettingsPage() {
       flushSave();
     }, 350);
   }, [flushSave]);
+
+  const testOllamaConnection = useCallback(async (candidateUrl?: string, persist = false) => {
+    const url = String(candidateUrl || config.OLLAMA_URL || '').trim();
+    if (!url) {
+      toast.error('Configure an Ollama URL first.');
+      return;
+    }
+    setOllamaConnectionBusy(true);
+    try {
+      const models = await api.getAIModels('ollama', { url });
+      setOllamaAvailableModels(models);
+      const currentModel = String(config.OLLAMA_MODEL || '').trim();
+      const currentModelOk = !currentModel || models.includes(currentModel);
+      const msg = currentModel
+        ? currentModelOk
+          ? `Ollama is reachable and model ${currentModel} is available.`
+          : `Ollama is reachable, but ${currentModel} is not installed on this runtime.`
+        : 'Ollama is reachable and returned models.';
+      setOllamaConnectionMessage(msg);
+      if (persist && url !== String(config.OLLAMA_URL || '').trim()) {
+        updateConfig({ OLLAMA_URL: url });
+      }
+      toast.success(msg);
+    } catch (e) {
+      const message = getApiErrorMessage(e) || (e instanceof Error ? e.message : 'Failed to reach Ollama');
+      setOllamaAvailableModels([]);
+      setOllamaConnectionMessage(message);
+      toast.error(message);
+    } finally {
+      setOllamaConnectionBusy(false);
+    }
+  }, [config.OLLAMA_MODEL, config.OLLAMA_URL, getApiErrorMessage, updateConfig]);
+
+  const discoverOllamaHosts = useCallback(async () => {
+    setOllamaDiscoveryBusy(true);
+    try {
+      const res = await api.discoverOllama(String(config.OLLAMA_URL || '').trim() || undefined);
+      setOllamaDiscoveryResults(Array.isArray(res.results) ? res.results : []);
+      const okCount = (Array.isArray(res.results) ? res.results : []).filter((row) => row.ok).length;
+      toast.success(okCount > 0 ? `Found ${okCount} reachable Ollama endpoint${okCount > 1 ? 's' : ''}` : 'No reachable Ollama endpoints found');
+    } catch (e) {
+      toast.error(getApiErrorMessage(e) || (e instanceof Error ? e.message : 'Failed to discover Ollama on the local network'));
+    } finally {
+      setOllamaDiscoveryBusy(false);
+    }
+  }, [config.OLLAMA_URL, getApiErrorMessage]);
+
+  const moveLocalWebProvider = useCallback((providerId: (typeof LOCAL_WEB_PROVIDER_IDS)[number], direction: -1 | 1) => {
+    const current = parseOrderedValues(config.WEB_SEARCH_LOCAL_ORDER, LOCAL_WEB_PROVIDER_IDS, LOCAL_WEB_PROVIDER_IDS);
+    const index = current.indexOf(providerId);
+    const next = moveOrderedItem(current, index, direction);
+    updateConfig({ WEB_SEARCH_LOCAL_ORDER: next.join(',') });
+  }, [config.WEB_SEARCH_LOCAL_ORDER, updateConfig]);
+
+  const movePaidAiProvider = useCallback((providerId: (typeof PAID_AI_PROVIDER_IDS)[number], direction: -1 | 1) => {
+    const current = parseOrderedValues(config.SCAN_PAID_PROVIDER_ORDER, PAID_AI_PROVIDER_IDS, PAID_AI_PROVIDER_IDS);
+    const index = current.indexOf(providerId);
+    const next = moveOrderedItem(current, index, direction);
+    updateConfig({ SCAN_PAID_PROVIDER_ORDER: next.join(',') });
+  }, [config.SCAN_PAID_PROVIDER_ORDER, updateConfig]);
+
   const filesRoots = parsePathListValue(config.FILES_ROOTS);
   const selectedAiLevel = (() => {
     const raw = String(config.AI_USAGE_LEVEL || 'auto').trim().toLowerCase();
@@ -716,6 +877,31 @@ function SettingsPage() {
   })();
   const selectedAiLevelIndex = Math.max(0, AI_USAGE_LEVELS.findIndex((lvl) => lvl.value === selectedAiLevel));
   const selectedAiLevelMeta = AI_USAGE_LEVELS[selectedAiLevelIndex] || AI_USAGE_LEVELS[0];
+  const selectedScanAiPolicy = (() => {
+    const raw = String(config.SCAN_AI_POLICY || 'local_then_paid').trim().toLowerCase();
+    return SCAN_AI_POLICY_OPTIONS.find((option) => option.value === raw)?.value || 'local_then_paid';
+  })();
+  const selectedScanAiPolicyMeta =
+    SCAN_AI_POLICY_OPTIONS.find((option) => option.value === selectedScanAiPolicy) || SCAN_AI_POLICY_OPTIONS[1];
+  const localWebOrder = parseOrderedValues(config.WEB_SEARCH_LOCAL_ORDER, LOCAL_WEB_PROVIDER_IDS, LOCAL_WEB_PROVIDER_IDS);
+  const paidAiOrder = parseOrderedValues(config.SCAN_PAID_PROVIDER_ORDER, PAID_AI_PROVIDER_IDS, PAID_AI_PROVIDER_IDS);
+  const effectiveScanBatchProvider = String(config.SCAN_AI_EFFECTIVE_BATCH || '').trim();
+  const effectiveScanWebSearch = String(config.SCAN_AI_EFFECTIVE_WEB_SEARCH || '').trim();
+  const ollamaConfiguredUrl = String(config.OLLAMA_URL || '').trim();
+  const ollamaConfiguredModel = String(config.OLLAMA_MODEL || '').trim();
+  const ollamaConfigured = Boolean(ollamaConfiguredUrl && ollamaConfiguredModel);
+  const ollamaModelInstalled =
+    !ollamaConfiguredModel || ollamaAvailableModels.length === 0 || ollamaAvailableModels.includes(ollamaConfiguredModel);
+  const localWebProviderConfigured = {
+    searxng: Boolean(String(config.SEARXNG_URL || '').trim()),
+    serper: Boolean(String(config.SERPER_API_KEY || '').trim()),
+  };
+  const paidProviderConfigured = {
+    'openai-api': Boolean(openaiApiModeEnabled && String(config.OPENAI_API_KEY || '').trim()),
+    'openai-codex': Boolean(openaiCodexModeEnabled && openaiCodexStatus?.connected),
+    anthropic: Boolean(String(config.ANTHROPIC_API_KEY || '').trim()),
+    google: Boolean(String(config.GOOGLE_API_KEY || '').trim()),
+  } as const;
   const schedulerPaused = config.SCHEDULER_PAUSED !== false;
   const allowNonScanJobs = Boolean(config.SCHEDULER_ALLOW_NON_SCAN_JOBS ?? false);
   const postScanAsync = Boolean(config.PIPELINE_POST_SCAN_ASYNC ?? false);
@@ -1640,11 +1826,196 @@ function SettingsPage() {
                   ) : null}
                 </div>
 
-                <div className="rounded-lg border border-border p-4 space-y-3">
+                <div className="rounded-lg border border-border/60 p-4 space-y-4">
                   <div className="space-y-1">
-                    <Label>Provider routing by context</Label>
+                    <Label>Scan AI policy</Label>
                     <p className="text-xs text-muted-foreground">
-                      Select which provider PMDA uses by runtime context. Interactive will fallback automatically if Codex OAuth is unavailable.
+                      Choose whether batch scans stay fully local, use local-first with paid reinforcement, or skip local AI entirely.
+                    </p>
+                  </div>
+                  <div className="grid grid-cols-1 gap-3 xl:grid-cols-3">
+                    {SCAN_AI_POLICY_OPTIONS.map((option) => {
+                      const active = option.value === selectedScanAiPolicy;
+                      return (
+                        <button
+                          key={option.value}
+                          type="button"
+                          onClick={() => updateConfig({ SCAN_AI_POLICY: option.value })}
+                          className={`rounded-lg border p-3 text-left transition ${
+                            active
+                              ? 'border-primary bg-primary/10 shadow-[0_0_0_1px_rgba(45,212,191,0.18)]'
+                              : 'border-border/60 bg-background/30 hover:border-border'
+                          }`}
+                        >
+                          <div className="flex items-center justify-between gap-3">
+                            <div className="text-sm font-medium text-foreground">{option.label}</div>
+                            {active ? <Badge variant="default">Active</Badge> : <Badge variant="outline">Available</Badge>}
+                          </div>
+                          <p className="mt-2 text-xs text-muted-foreground">{option.description}</p>
+                        </button>
+                      );
+                    })}
+                  </div>
+
+                  <div className="grid grid-cols-1 gap-3 xl:grid-cols-[minmax(0,1.4fr)_auto_minmax(0,1fr)_auto_minmax(0,1fr)]">
+                    <div className="rounded-lg border border-border/60 bg-background/30 p-3">
+                      <div className="flex items-center gap-2 text-sm font-medium text-foreground">
+                        <Database className="h-4 w-4 text-cyan-400" />
+                        Deterministic core
+                      </div>
+                      <p className="mt-1 text-[11px] text-muted-foreground">
+                        Tags, file structure, OCR, AcousticID and metadata providers always run first.
+                      </p>
+                    </div>
+                    <div className="hidden xl:flex items-center justify-center text-muted-foreground">
+                      <ArrowRight className="h-4 w-4" />
+                    </div>
+                    <div className="rounded-lg border border-border/60 bg-background/30 p-3">
+                      <div className="flex items-center gap-2 text-sm font-medium text-foreground">
+                        <Globe className="h-4 w-4 text-emerald-400" />
+                        Local web search
+                      </div>
+                      <div className="mt-2 flex flex-wrap gap-1.5">
+                        {localWebOrder.map((providerId) => (
+                          <ProviderBadge key={providerId} provider={providerId} className="h-6 px-2 py-0 text-[11px]" />
+                        ))}
+                      </div>
+                      <p className="mt-2 text-[11px] text-muted-foreground">
+                        Effective web step: <span className="text-foreground">{effectiveScanWebSearch || 'none yet'}</span>
+                      </p>
+                    </div>
+                    <div className="hidden xl:flex items-center justify-center text-muted-foreground">
+                      <ArrowRight className="h-4 w-4" />
+                    </div>
+                    <div className="rounded-lg border border-border/60 bg-background/30 p-3">
+                      <div className="flex items-center gap-2 text-sm font-medium text-foreground">
+                        <Cpu className="h-4 w-4 text-violet-400" />
+                        AI arbitration
+                      </div>
+                      <div className="mt-2 flex flex-wrap gap-1.5">
+                        {selectedScanAiPolicy !== 'paid_only' ? (
+                          <ProviderBadge provider="ollama" className="h-6 px-2 py-0 text-[11px]" />
+                        ) : null}
+                        {selectedScanAiPolicy !== 'local_only'
+                          ? paidAiOrder.map((providerId) => (
+                              <ProviderBadge key={providerId} provider={providerId} className="h-6 px-2 py-0 text-[11px]" />
+                            ))
+                          : null}
+                      </div>
+                      <p className="mt-2 text-[11px] text-muted-foreground">
+                        Effective batch AI: <span className="text-foreground">{effectiveScanBatchProvider || 'deterministic only'}</span>
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 gap-3 xl:grid-cols-2">
+                    <div className="rounded-lg border border-border/60 bg-background/20 p-3 space-y-3">
+                      <div className="flex items-center justify-between gap-3">
+                        <div className="space-y-1">
+                          <Label>Local web search order</Label>
+                          <p className="text-[11px] text-muted-foreground">
+                            Self-hosted SearXNG first is recommended. Serper stays available as a cheap hosted fallback.
+                          </p>
+                        </div>
+                        <Badge variant="outline">{String(config.WEB_SEARCH_PROVIDER || 'auto')}</Badge>
+                      </div>
+                      <div className="space-y-2">
+                        {localWebOrder.map((providerId, index) => (
+                          <div key={providerId} className="flex items-center justify-between gap-3 rounded-md border border-border/60 bg-background/40 px-3 py-2">
+                            <div className="flex items-center gap-2">
+                              <ProviderBadge provider={providerId} className="h-6 px-2 py-0 text-[11px]" />
+                              <span className="text-[11px] text-muted-foreground">
+                                {providerId === 'searxng'
+                                  ? localWebProviderConfigured.searxng
+                                    ? 'Configured'
+                                    : 'Set SearXNG URL'
+                                  : localWebProviderConfigured.serper
+                                    ? 'Configured'
+                                    : 'Set Serper API key'}
+                              </span>
+                            </div>
+                            <div className="flex items-center gap-1">
+                              <Button
+                                type="button"
+                                size="icon"
+                                variant="ghost"
+                                className="h-7 w-7"
+                                onClick={() => moveLocalWebProvider(providerId, -1)}
+                                disabled={index === 0}
+                              >
+                                <ArrowUp className="h-3.5 w-3.5" />
+                              </Button>
+                              <Button
+                                type="button"
+                                size="icon"
+                                variant="ghost"
+                                className="h-7 w-7"
+                                onClick={() => moveLocalWebProvider(providerId, 1)}
+                                disabled={index === localWebOrder.length - 1}
+                              >
+                                <ArrowDown className="h-3.5 w-3.5" />
+                              </Button>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+
+                    <div className="rounded-lg border border-border/60 bg-background/20 p-3 space-y-3">
+                      <div className="flex items-center justify-between gap-3">
+                        <div className="space-y-1">
+                          <Label>Paid fallback order</Label>
+                          <p className="text-[11px] text-muted-foreground">
+                            Only used when the selected policy allows paid escalation.
+                          </p>
+                        </div>
+                        <Badge variant={selectedScanAiPolicy === 'local_only' ? 'outline' : 'secondary'}>
+                          {selectedScanAiPolicy === 'local_only' ? 'Disabled' : 'Active on fallback'}
+                        </Badge>
+                      </div>
+                      <div className="space-y-2">
+                        {paidAiOrder.map((providerId, index) => (
+                          <div key={providerId} className="flex items-center justify-between gap-3 rounded-md border border-border/60 bg-background/40 px-3 py-2">
+                            <div className="flex items-center gap-2">
+                              <ProviderBadge provider={providerId} className="h-6 px-2 py-0 text-[11px]" />
+                              <span className="text-[11px] text-muted-foreground">
+                                {paidProviderConfigured[providerId] ? 'Configured' : 'Credentials missing'}
+                              </span>
+                            </div>
+                            <div className="flex items-center gap-1">
+                              <Button
+                                type="button"
+                                size="icon"
+                                variant="ghost"
+                                className="h-7 w-7"
+                                onClick={() => movePaidAiProvider(providerId, -1)}
+                                disabled={index === 0 || selectedScanAiPolicy === 'local_only'}
+                              >
+                                <ArrowUp className="h-3.5 w-3.5" />
+                              </Button>
+                              <Button
+                                type="button"
+                                size="icon"
+                                variant="ghost"
+                                className="h-7 w-7"
+                                onClick={() => movePaidAiProvider(providerId, 1)}
+                                disabled={index === paidAiOrder.length - 1 || selectedScanAiPolicy === 'local_only'}
+                              >
+                                <ArrowDown className="h-3.5 w-3.5" />
+                              </Button>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="rounded-lg border border-border/60 p-4 space-y-3">
+                  <div className="space-y-1">
+                    <Label>Advanced provider routing overrides</Label>
+                    <p className="text-xs text-muted-foreground">
+                      These are runtime overrides for manual/interactive operations. Batch scans follow the scan policy above and only use these overrides if they escalate into a paid provider path.
                     </p>
                   </div>
                   <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
@@ -1771,7 +2142,7 @@ function SettingsPage() {
                 <div className="space-y-2">
                   <div className="mt-1 space-y-3 rounded-lg border border-border/60 bg-muted/30 p-3">
                     <div className="flex items-center justify-between gap-2">
-                      <Label>AI usage level</Label>
+                      <Label>Advanced AI depth override</Label>
                       <span className="text-xs font-medium text-muted-foreground">{selectedAiLevelMeta.label}</span>
                     </div>
                     <Slider
@@ -1785,13 +2156,15 @@ function SettingsPage() {
                         updateConfig({ AI_USAGE_LEVEL: level });
                       }}
                     />
-                    <p className="text-xs text-muted-foreground">{selectedAiLevelMeta.description}</p>
+                    <p className="text-xs text-muted-foreground">
+                      {selectedAiLevelMeta.description} Leave this on <span className="text-foreground">Auto</span> for normal scans. Raise it only for repair or deep-enrichment runs.
+                    </p>
                   </div>
                   <div className="rounded-lg border border-border/60 p-3 space-y-3">
                     <div className="space-y-1">
                       <Label>Web search backend</Label>
                       <p className="text-xs text-muted-foreground">
-                        Local/self-hosted search first. Paid AI web search is only a fallback for the hardest cases.
+                        SearXNG is the self-hosted/local-first option. Serper is a cheap hosted web backend. Paid AI web-search should stay exceptional.
                       </p>
                     </div>
                     <div className="grid grid-cols-1 gap-3 md:grid-cols-[220px_minmax(0,1fr)]">
@@ -1814,37 +2187,56 @@ function SettingsPage() {
                         <div className="space-y-0.5">
                           <div className="text-sm font-medium">Allow paid AI web-search fallback</div>
                           <p className="text-[11px] text-muted-foreground">
-                            Only useful in aggressive mode. Keep this off for bulk scans.
+                            Keep this off for bulk scans. It is ignored automatically in local-only mode.
                           </p>
                         </div>
                         <Switch
                           checked={Boolean(config.USE_AI_WEB_SEARCH_FALLBACK)}
                           onCheckedChange={(checked) => updateConfig({ USE_AI_WEB_SEARCH_FALLBACK: Boolean(checked) })}
+                          disabled={selectedScanAiPolicy === 'local_only'}
                         />
                       </div>
                     </div>
-                    <div className="rounded-md border border-border/60 bg-background/30 px-3 py-2 text-[11px] text-muted-foreground">
-                      Effective scan path: <span className="text-foreground">Tags/OCR/providers</span> → <span className="text-foreground">local web search</span> → <span className="text-foreground">local LLM / Ollama</span> → <span className="text-foreground">paid AI only if still unresolved</span>.
+                    <div className="grid grid-cols-1 gap-2 md:grid-cols-2">
+                      <div className="rounded-md border border-border/60 bg-background/30 px-3 py-2 text-[11px] text-muted-foreground">
+                        Effective scan web step: <span className="text-foreground">{effectiveScanWebSearch || 'deterministic only'}</span>
+                      </div>
+                      <div className="rounded-md border border-border/60 bg-background/30 px-3 py-2 text-[11px] text-muted-foreground">
+                        Local search order: <span className="text-foreground">{localWebOrder.join(' → ')}</span>
+                      </div>
                     </div>
                   </div>
                   <div className="rounded-lg border border-border/60 p-3 space-y-3">
                     <div className="flex items-center justify-between gap-3">
                       <div className="space-y-1">
-                        <Label>Ollama model downloads</Label>
+                        <Label>Ollama runtime</Label>
                         <p className="text-xs text-muted-foreground">
-                          Pull local models directly from PMDA. No shell access needed.
+                          Detect a local Ollama runtime on your LAN, verify it, then pull models directly from PMDA.
                         </p>
                       </div>
-                      <Button
-                        type="button"
-                        variant="outline"
-                        size="sm"
-                        className="gap-2"
-                        onClick={() => void refreshOllamaPullStatus()}
-                      >
-                        <RefreshCw className="w-4 h-4" />
-                        Refresh
-                      </Button>
+                      <div className="flex items-center gap-2">
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          className="gap-2"
+                          onClick={() => void discoverOllamaHosts()}
+                          disabled={ollamaDiscoveryBusy}
+                        >
+                          {ollamaDiscoveryBusy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Server className="w-4 h-4" />}
+                          Discover on LAN
+                        </Button>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          className="gap-2"
+                          onClick={() => void refreshOllamaPullStatus()}
+                        >
+                          <RefreshCw className="w-4 h-4" />
+                          Refresh
+                        </Button>
+                      </div>
                     </div>
                     <div className="grid grid-cols-1 gap-3 md:grid-cols-[minmax(0,1fr)_minmax(220px,320px)]">
                       <div className="space-y-2">
@@ -1866,10 +2258,75 @@ function SettingsPage() {
                           onChange={(e) => updateConfig({ OLLAMA_URL: e.target.value })}
                         />
                         <p className="text-[11px] text-muted-foreground">
-                          PMDA will prefer this local runtime during scans when AI usage is set to <span className="text-foreground">Auto</span>.
+                          PMDA will use this runtime first when the selected scan policy includes local AI.
                         </p>
                       </div>
                     </div>
+                    <div className="flex flex-wrap gap-2">
+                      <Button
+                        type="button"
+                        variant="outline"
+                        className="gap-2"
+                        onClick={() => void testOllamaConnection()}
+                        disabled={ollamaConnectionBusy}
+                      >
+                        {ollamaConnectionBusy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Check className="w-4 h-4" />}
+                        Test connection
+                      </Button>
+                      <Badge variant={ollamaConfigured ? 'secondary' : 'outline'}>
+                        {ollamaConfigured ? 'Configured' : 'URL/model missing'}
+                      </Badge>
+                      <Badge variant={ollamaModelInstalled ? 'outline' : 'destructive'}>
+                        {ollamaModelInstalled ? 'Configured model available or not checked yet' : 'Configured model missing on runtime'}
+                      </Badge>
+                    </div>
+                    {ollamaConnectionMessage ? (
+                      <div className="rounded-md border border-border/60 bg-background/30 px-3 py-2 text-[11px] text-muted-foreground">
+                        {ollamaConnectionMessage}
+                      </div>
+                    ) : null}
+                    {ollamaAvailableModels.length > 0 ? (
+                      <div className="rounded-md border border-border/60 bg-background/20 p-3 space-y-2">
+                        <div className="text-xs font-medium text-foreground">Detected models</div>
+                        <div className="flex flex-wrap gap-1.5">
+                          {ollamaAvailableModels.slice(0, 12).map((model) => (
+                            <Badge key={model} variant={model === ollamaConfiguredModel ? 'default' : 'outline'}>{model}</Badge>
+                          ))}
+                          {ollamaAvailableModels.length > 12 ? <Badge variant="outline">+{ollamaAvailableModels.length - 12} more</Badge> : null}
+                        </div>
+                      </div>
+                    ) : null}
+                    {ollamaDiscoveryResults.length > 0 ? (
+                      <div className="rounded-md border border-border/60 bg-background/20 p-3 space-y-2">
+                        <div className="text-xs font-medium text-foreground">Discovered endpoints</div>
+                        <div className="space-y-2">
+                          {ollamaDiscoveryResults.map((row) => (
+                            <div key={row.url} className="flex flex-col gap-2 rounded-md border border-border/60 bg-background/40 px-3 py-2 md:flex-row md:items-center md:justify-between">
+                              <div className="space-y-1">
+                                <div className="flex flex-wrap items-center gap-2">
+                                  <span className="text-sm text-foreground">{row.url}</span>
+                                  <Badge variant={row.ok ? 'default' : 'outline'}>{row.ok ? 'Reachable' : 'Unavailable'}</Badge>
+                                  {row.ok ? <Badge variant="outline">{row.model_count} model{row.model_count === 1 ? '' : 's'}</Badge> : null}
+                                </div>
+                                <p className="text-[11px] text-muted-foreground">{row.message}</p>
+                              </div>
+                              <Button
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                onClick={() => {
+                                  updateConfig({ OLLAMA_URL: row.url });
+                                  void testOllamaConnection(row.url, true);
+                                }}
+                                disabled={!row.ok}
+                              >
+                                Use this runtime
+                              </Button>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    ) : null}
                     <div className="grid grid-cols-1 gap-3 md:grid-cols-[minmax(0,1fr)_auto]">
                       <Input
                         placeholder={String(config.OLLAMA_MODEL || 'qwen2.5:3b-instruct')}
@@ -1907,7 +2364,7 @@ function SettingsPage() {
                       </div>
                     ) : null}
                     <p className="text-[11px] text-muted-foreground">
-                      Recommended local scan model: <span className="text-foreground">qwen2.5:3b-instruct</span>. Use a larger model only for repair/deep-enrichment runs.
+                      Recommended local scan model: <span className="text-foreground">qwen2.5:3b-instruct</span> for throughput, <span className="text-foreground">qwen2.5:14b-instruct</span> for harder repair runs.
                     </p>
                   </div>
                   <div className="rounded-lg border border-border/60 p-3 space-y-2">
