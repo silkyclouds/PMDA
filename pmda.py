@@ -39414,7 +39414,11 @@ def _load_resume_discovery_snapshot_by_run_id(run_id: str | None) -> dict[str, A
 
 def _snapshot_current_resume_discovery(reason: str = "") -> dict[str, Any]:
     with lock:
-        run_id = str(state.get("scan_resume_run_id") or "").strip() or None
+        run_id = (
+            str(state.get("scan_resume_run_id") or "").strip()
+            or str(state.get("scan_resume_requested_run_id") or "").strip()
+            or None
+        )
     runtime_snapshot = _copy_scan_discovery_runtime(run_id)
     result = _persist_resume_discovery_snapshot(run_id, runtime_snapshot)
     if result.get("ok"):
@@ -39456,7 +39460,11 @@ def _wait_for_discovery_runtime_update(
 def _snapshot_current_resume_state(reason: str = "") -> dict[str, Any]:
     with lock:
         mode = _get_library_mode()
-        run_id = str(state.get("scan_resume_run_id") or "").strip() or None
+        run_id = (
+            str(state.get("scan_resume_run_id") or "").strip()
+            or str(state.get("scan_resume_requested_run_id") or "").strip()
+            or None
+        )
         has_plan = bool(mode == "files" and (state.get("files_editions_by_album_id") or {}))
         discovery_running = bool(mode == "files" and state.get("scan_discovery_running"))
     if has_plan:
@@ -39624,7 +39632,11 @@ def _load_resume_files_plan(mode: str, scan_type: str) -> dict[str, Any] | None:
 
 def _snapshot_current_resume_files_plan(reason: str = "") -> dict[str, Any]:
     with lock:
-        run_id = str(state.get("scan_resume_run_id") or "").strip() or None
+        run_id = (
+            str(state.get("scan_resume_run_id") or "").strip()
+            or str(state.get("scan_resume_requested_run_id") or "").strip()
+            or None
+        )
         files_editions = dict(state.get("files_editions_by_album_id") or {})
         detected_artists_total = int(state.get("scan_detected_artists_total") or 0)
         detected_albums_total = int(state.get("scan_detected_albums_total") or 0)
@@ -42396,6 +42408,7 @@ def background_scan():
         requested_resume_run_id = str(state.get("scan_resume_requested_run_id") or "").strip() or None
         state["scan_starting"] = False
         state["scanning"] = True
+        state["scan_resume_run_id"] = requested_resume_run_id
         state["scan_type"] = scan_type
         state["scan_auto_trigger"] = scan_auto_trigger
         state["scan_scheduler_run_id"] = scan_scheduler_run_id
@@ -49363,7 +49376,11 @@ def pause_scan():
     with lock:
         state["scanning"] = True   # still scanning, just paused
         mode = _get_library_mode()
-        resume_run_id = str(state.get("scan_resume_run_id") or "").strip() or None
+        resume_run_id = (
+            str(state.get("scan_resume_run_id") or "").strip()
+            or str(state.get("scan_resume_requested_run_id") or "").strip()
+            or None
+        )
         discovery_running = bool(mode == "files" and state.get("scan_discovery_running"))
     previous_updated_at = None
     if discovery_running:
@@ -49473,7 +49490,11 @@ def stop_scan():
     snapshot_kind = "none"
     with lock:
         mode = _get_library_mode()
-        resume_run_id = str(state.get("scan_resume_run_id") or "").strip() or None
+        resume_run_id = (
+            str(state.get("scan_resume_run_id") or "").strip()
+            or str(state.get("scan_resume_requested_run_id") or "").strip()
+            or None
+        )
         discovery_running = bool(mode == "files" and state.get("scan_discovery_running"))
     previous_updated_at = None
     if discovery_running:
@@ -54240,7 +54261,10 @@ def api_progress():
         mb_done_count = state.get("scan_mb_done_count", 0)
         scan_steps_log = state.get("scan_steps_log") or []
         current_scan_type = (state.get("scan_type") or "full")
-        scan_resume_run_id = state.get("scan_resume_run_id")
+        scan_resume_run_id = (
+            state.get("scan_resume_run_id")
+            or state.get("scan_resume_requested_run_id")
+        )
         
         # Keep scan_progress for effective_progress / legacy; bar uses step progress
         active_artists_dict = state.get("scan_active_artists", {})
