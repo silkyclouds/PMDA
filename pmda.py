@@ -27,6 +27,7 @@ v0.7.5
 
 import base64
 import ast
+import copy
 import csv
 import html
 import io
