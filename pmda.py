@@ -2280,6 +2280,7 @@ merged = {
     "GOOGLE_API_KEY": _get("GOOGLE_API_KEY", default="", cast=str),
     "OLLAMA_URL": _get("OLLAMA_URL", default="http://localhost:11434", cast=str),
     "OLLAMA_MODEL": _get("OLLAMA_MODEL", default="qwen2.5:3b-instruct", cast=str),
+    "OLLAMA_COMPLEX_MODEL": _get("OLLAMA_COMPLEX_MODEL", default="qwen2.5:14b-instruct", cast=str),
     "DISCORD_WEBHOOK": _get("DISCORD_WEBHOOK", default="", cast=str),
     "USE_MUSICBRAINZ": _get("USE_MUSICBRAINZ", default=True, cast=_parse_bool),
     "MUSICBRAINZ_EMAIL": _get("MUSICBRAINZ_EMAIL", default="pmda@example.com", cast=str),
@@ -2935,6 +2936,7 @@ ANTHROPIC_API_KEY = merged["ANTHROPIC_API_KEY"]
 GOOGLE_API_KEY = merged["GOOGLE_API_KEY"]
 OLLAMA_URL     = merged["OLLAMA_URL"]
 OLLAMA_MODEL   = merged["OLLAMA_MODEL"]
+OLLAMA_COMPLEX_MODEL = merged["OLLAMA_COMPLEX_MODEL"]
 DISCORD_WEBHOOK = merged["DISCORD_WEBHOOK"]
 
 #
@@ -3248,6 +3250,7 @@ def _reload_ai_config_and_reinit():
         "GOOGLE_API_KEY",
         "OLLAMA_URL",
         "OLLAMA_MODEL",
+        "OLLAMA_COMPLEX_MODEL",
         "WEB_SEARCH_PROVIDER",
         "SEARXNG_URL",
         "USE_AI_WEB_SEARCH_FALLBACK",
@@ -3707,6 +3710,147 @@ def _ollama_model_configured() -> str:
     return str(getattr(sys.modules[__name__], "OLLAMA_MODEL", "") or "").strip() or "qwen2.5:3b-instruct"
 
 
+def _ollama_complex_model_configured() -> str:
+    return str(getattr(sys.modules[__name__], "OLLAMA_COMPLEX_MODEL", "") or "").strip() or "qwen2.5:14b-instruct"
+
+
+_OLLAMA_MODEL_CATALOG_CACHE_TTL_SEC = 60.0
+_OLLAMA_MODEL_CATALOG_CACHE_LOCK = threading.Lock()
+_OLLAMA_MODEL_CATALOG_CACHE: dict[str, Any] = {
+    "url": "",
+    "expires_at": 0.0,
+    "models": set(),
+}
+
+_OLLAMA_COMPLEX_ANALYSIS_TYPES = {
+    "acoustid_candidate_disambiguation",
+    "album_review_batch",
+    "album_review_generate",
+    "dedupe_choose_best",
+    "identity_inference_no_tags",
+    "mb_artist_index_choice",
+    "mb_candidate_tiebreak",
+    "mb_match_verify",
+    "mb_retry_disambiguation",
+    "provider_identity_verify",
+    "web_mbid_inference",
+}
+
+_OLLAMA_COMPLEXITY_HINTS = (
+    "ambiguous",
+    "arbitration",
+    "candidate",
+    "choose",
+    "disambiguation",
+    "fallback",
+    "none matched",
+    "provider candidates",
+    "same release",
+    "tie-break",
+)
+
+
+def _ollama_available_models_cached(force_refresh: bool = False) -> set[str]:
+    url = str(getattr(sys.modules[__name__], "OLLAMA_URL", "") or "").strip().rstrip("/")
+    if not url:
+        return set()
+    now = time.time()
+    with _OLLAMA_MODEL_CATALOG_CACHE_LOCK:
+        cached_url = str(_OLLAMA_MODEL_CATALOG_CACHE.get("url") or "")
+        expires_at = float(_OLLAMA_MODEL_CATALOG_CACHE.get("expires_at") or 0.0)
+        cached_models = _OLLAMA_MODEL_CATALOG_CACHE.get("models") or set()
+        if (
+            not force_refresh
+            and cached_url == url
+            and expires_at > now
+            and isinstance(cached_models, set)
+        ):
+            return set(cached_models)
+    models: set[str] = set()
+    try:
+        response = requests.get(f"{url}/api/tags", timeout=5)
+        if response.status_code == 200:
+            payload = response.json() if response.content else {}
+            for item in payload.get("models") or []:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name") or "").strip().lower()
+                if name:
+                    models.add(name)
+    except Exception:
+        models = set()
+    with _OLLAMA_MODEL_CATALOG_CACHE_LOCK:
+        _OLLAMA_MODEL_CATALOG_CACHE["url"] = url
+        _OLLAMA_MODEL_CATALOG_CACHE["expires_at"] = now + _OLLAMA_MODEL_CATALOG_CACHE_TTL_SEC
+        _OLLAMA_MODEL_CATALOG_CACHE["models"] = set(models)
+    return models
+
+
+def _ollama_model_available(model_name: str) -> bool:
+    target = str(model_name or "").strip().lower()
+    if not target:
+        return False
+    available = _ollama_available_models_cached()
+    if not available:
+        return False
+    return target in available
+
+
+def _ollama_route_for_analysis(
+    *,
+    requested_model: str,
+    analysis_type: str,
+    endpoint_kind: str,
+    system_msg: str,
+    user_msg: str,
+) -> tuple[str, dict[str, Any]]:
+    base_model = str(requested_model or "").strip() or _ollama_model_configured()
+    hard_model = _ollama_complex_model_configured()
+    analysis = str(analysis_type or "").strip().lower()
+    route_meta: dict[str, Any] = {
+        "route": "bulk",
+        "reason": "default",
+        "base_model": base_model,
+        "hard_model": hard_model,
+    }
+    if not hard_model or hard_model == base_model:
+        route_meta["reason"] = "single_model"
+        return base_model, route_meta
+
+    score = 0
+    reasons: list[str] = []
+    if endpoint_kind == "longform":
+        score += 3
+        reasons.append("longform")
+    if analysis in _OLLAMA_COMPLEX_ANALYSIS_TYPES:
+        score += 3
+        reasons.append(f"analysis:{analysis}")
+    user_text = str(user_msg or "")
+    system_text = str(system_msg or "")
+    combined = f"{system_text}\n{user_text}".strip()
+    if len(combined) >= 2400:
+        score += 1
+        reasons.append("prompt_size")
+    if combined.count("\n") >= 18:
+        score += 1
+        reasons.append("prompt_density")
+    lowered = combined.lower()
+    if any(token in lowered for token in _OLLAMA_COMPLEXITY_HINTS):
+        score += 1
+        reasons.append("ambiguity_hint")
+
+    if score < 3:
+        route_meta["reason"] = ",".join(reasons) if reasons else "not_complex"
+        return base_model, route_meta
+    if not _ollama_model_available(hard_model):
+        route_meta["reason"] = "hard_model_missing"
+        return base_model, route_meta
+
+    route_meta["route"] = "hard_case"
+    route_meta["reason"] = ",".join(reasons) if reasons else "complex"
+    return hard_model, route_meta
+
+
 def _ai_model_display_name(provider: str | None = None) -> str:
     provider_name = str(provider or getattr(sys.modules[__name__], "AI_PROVIDER", "") or "").strip().lower()
     mod = sys.modules[__name__]
@@ -3800,14 +3944,31 @@ def _resolve_model_for_runtime(
     requested_model: str,
     *,
     endpoint_kind: str = "text",
+    analysis_type: str = "",
+    system_msg: str = "",
+    user_msg: str = "",
 ) -> str:
     pid = _normalize_provider_id(provider_id, fallback="openai-api")
     requested = str(requested_model or "").strip()
     if pid == "ollama":
         configured = _ollama_model_configured()
-        if configured:
-            return configured
-        return requested or "qwen2.5:3b-instruct"
+        selected, route_meta = _ollama_route_for_analysis(
+            requested_model=configured or requested or "qwen2.5:3b-instruct",
+            analysis_type=analysis_type,
+            endpoint_kind=endpoint_kind,
+            system_msg=system_msg,
+            user_msg=user_msg,
+        )
+        if route_meta.get("route") == "hard_case":
+            logging.info(
+                "[Ollama Router] Escalating %s/%s from %s to %s (%s)",
+                str(analysis_type or "batch"),
+                endpoint_kind,
+                route_meta.get("base_model") or configured or requested or "qwen2.5:3b-instruct",
+                selected,
+                route_meta.get("reason") or "complex",
+            )
+        return selected or configured or requested or "qwen2.5:3b-instruct"
     if pid == "openai-codex":
         return requested or "codex"
     if pid == "openai-api":
@@ -4814,6 +4975,9 @@ def call_ai_provider(
         provider_for_usage,
         str(model or ""),
         endpoint_kind="text",
+        analysis_type=str(analysis_type or ""),
+        system_msg=system_msg,
+        user_msg=user_msg,
     )
     auth_mode_for_usage = _provider_auth_mode(provider_for_usage)
     try:
@@ -5077,6 +5241,9 @@ def call_ai_provider_vision(
         provider_for_usage,
         str(model or ""),
         endpoint_kind="vision",
+        analysis_type=str(analysis_type or ""),
+        system_msg=system_msg,
+        user_msg=user_msg,
     )
     if provider_lower == "openai-codex":
         started_at = time.time()
@@ -18601,6 +18768,9 @@ def call_ai_provider_longform(
         provider_for_usage,
         str(model or ""),
         endpoint_kind="longform",
+        analysis_type=str(analysis_type or ""),
+        system_msg=system_msg,
+        user_msg=user_msg,
     )
     auth_mode_for_usage = _provider_auth_mode(provider_for_usage)
     try:
@@ -52211,6 +52381,10 @@ def api_config_get():
         "GOOGLE_API_KEY_SET": _is_set(google_key_eff),
         "OLLAMA_URL": get_setting("OLLAMA_URL", OLLAMA_URL),
         "OLLAMA_MODEL": get_setting("OLLAMA_MODEL", OLLAMA_MODEL),
+        "OLLAMA_COMPLEX_MODEL": get_setting("OLLAMA_COMPLEX_MODEL", getattr(sys.modules[__name__], "OLLAMA_COMPLEX_MODEL", "qwen2.5:14b-instruct")),
+        "SCAN_AI_LOCAL_BULK_MODEL": _ollama_model_configured(),
+        "SCAN_AI_LOCAL_HARD_MODEL": _ollama_complex_model_configured(),
+        "SCAN_AI_LOCAL_HARD_AVAILABLE": _ollama_model_available(_ollama_complex_model_configured()),
         "USE_MUSICBRAINZ": True,
         "MUSICBRAINZ_EMAIL": get_setting("MUSICBRAINZ_EMAIL", MUSICBRAINZ_EMAIL),
         "MB_RETRY_NOT_FOUND": get_setting_bool("MB_RETRY_NOT_FOUND", MB_RETRY_NOT_FOUND),
@@ -53170,6 +53344,8 @@ def _apply_settings_in_memory(updates: dict):
         mod.OLLAMA_URL = str(updates["OLLAMA_URL"] or "").strip().rstrip("/")
     if "OLLAMA_MODEL" in updates:
         mod.OLLAMA_MODEL = str(updates["OLLAMA_MODEL"] or "").strip() or "qwen2.5:3b-instruct"
+    if "OLLAMA_COMPLEX_MODEL" in updates:
+        mod.OLLAMA_COMPLEX_MODEL = str(updates["OLLAMA_COMPLEX_MODEL"] or "").strip() or "qwen2.5:14b-instruct"
 
     if need_ai_reinit:
         _reinit_ai_from_globals()
@@ -53190,7 +53366,7 @@ def api_config_put():
         "DUPE_ROOT", "PMDA_CONFIG_DIR", "MUSIC_PARENT_PATH",
         "SCAN_THREADS", "LOG_LEVEL", "LOG_FILE", "AI_PROVIDER", "AI_USAGE_LEVEL", "SCAN_AI_POLICY", "SCAN_PAID_PROVIDER_ORDER", "WEB_SEARCH_LOCAL_ORDER", "OPENAI_API_KEY",
         "OPENAI_ENABLE_API_KEY_MODE", "OPENAI_ENABLE_CODEX_OAUTH_MODE", "OPENAI_MODEL",
-        "OPENAI_MODEL_FALLBACKS", "ANTHROPIC_API_KEY", "GOOGLE_API_KEY", "OLLAMA_URL", "OLLAMA_MODEL",
+        "OPENAI_MODEL_FALLBACKS", "ANTHROPIC_API_KEY", "GOOGLE_API_KEY", "OLLAMA_URL", "OLLAMA_MODEL", "OLLAMA_COMPLEX_MODEL",
         "DISCORD_WEBHOOK", "USE_MUSICBRAINZ", "MUSICBRAINZ_EMAIL", "MB_RETRY_NOT_FOUND",
         "MB_SEARCH_ALBUM_TIMEOUT_SEC", "MB_CANDIDATE_FETCH_LIMIT", "MB_TRACKLIST_FETCH_LIMIT", "MB_FAST_FALLBACK_MODE",
         "PROVIDER_IDENTITY_STRICT", "PROVIDER_IDENTITY_USE_AI", "MATCH_COVER_OCR_MODE", "PROVIDER_IDENTITY_MIN_SCORE", "PROVIDER_IDENTITY_SCORE_MARGIN",

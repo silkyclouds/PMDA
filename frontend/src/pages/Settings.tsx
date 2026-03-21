@@ -889,9 +889,12 @@ function SettingsPage() {
   const effectiveScanWebSearch = String(config.SCAN_AI_EFFECTIVE_WEB_SEARCH || '').trim();
   const ollamaConfiguredUrl = String(config.OLLAMA_URL || '').trim();
   const ollamaConfiguredModel = String(config.OLLAMA_MODEL || '').trim();
+  const ollamaConfiguredHardModel = String(config.OLLAMA_COMPLEX_MODEL || '').trim();
   const ollamaConfigured = Boolean(ollamaConfiguredUrl && ollamaConfiguredModel);
   const ollamaModelInstalled =
     !ollamaConfiguredModel || ollamaAvailableModels.length === 0 || ollamaAvailableModels.includes(ollamaConfiguredModel);
+  const ollamaHardModelInstalled =
+    !ollamaConfiguredHardModel || ollamaAvailableModels.length === 0 || ollamaAvailableModels.includes(ollamaConfiguredHardModel);
   const localWebProviderConfigured = {
     searxng: Boolean(String(config.SEARXNG_URL || '').trim()),
     serper: Boolean(String(config.SERPER_API_KEY || '').trim()),
@@ -2238,16 +2241,40 @@ function SettingsPage() {
                         </Button>
                       </div>
                     </div>
-                    <div className="grid grid-cols-1 gap-3 md:grid-cols-[minmax(0,1fr)_minmax(220px,320px)]">
+                    <div className="rounded-lg border border-border/60 bg-background/20 p-3 space-y-2">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <Cpu className="h-4 w-4 text-violet-400" />
+                        <div className="text-sm font-medium text-foreground">Automatic local model routing</div>
+                        <Badge variant="secondary">Auto</Badge>
+                      </div>
+                      <p className="text-[11px] text-muted-foreground">
+                        PMDA keeps the fast bulk scan on <span className="text-foreground">{String(config.SCAN_AI_LOCAL_BULK_MODEL || ollamaConfiguredModel || 'qwen2.5:3b-instruct')}</span>
+                        {' '}and only escalates ambiguous or long-form local AI work to{' '}
+                        <span className="text-foreground">{String(config.SCAN_AI_LOCAL_HARD_MODEL || ollamaConfiguredHardModel || 'qwen2.5:14b-instruct')}</span>
+                        {config.SCAN_AI_LOCAL_HARD_AVAILABLE === false ? ' when that model becomes available on the Ollama runtime.' : '.'}
+                      </p>
+                    </div>
+                    <div className="grid grid-cols-1 gap-3 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_minmax(220px,320px)]">
                       <div className="space-y-2">
-                        <Label>Default local scan model</Label>
+                        <Label>Bulk local model</Label>
                         <Input
                           placeholder="qwen2.5:3b-instruct"
                           value={String(config.OLLAMA_MODEL || '')}
                           onChange={(e) => updateConfig({ OLLAMA_MODEL: e.target.value })}
                         />
                         <p className="text-[11px] text-muted-foreground">
-                          Used automatically for batch scan matching, dedupe arbitration and repair jobs in local-first mode.
+                          Fast path for bulk scan matching, provider arbitration and dedupe in local-first mode.
+                        </p>
+                      </div>
+                      <div className="space-y-2">
+                        <Label>Hard-cases local model</Label>
+                        <Input
+                          placeholder="qwen2.5:14b-instruct"
+                          value={String(config.OLLAMA_COMPLEX_MODEL || '')}
+                          onChange={(e) => updateConfig({ OLLAMA_COMPLEX_MODEL: e.target.value })}
+                        />
+                        <p className="text-[11px] text-muted-foreground">
+                          Used automatically only for ambiguous disambiguation, tough arbitration and long-form local AI work.
                         </p>
                       </div>
                       <div className="space-y-2">
@@ -2277,7 +2304,10 @@ function SettingsPage() {
                         {ollamaConfigured ? 'Configured' : 'URL/model missing'}
                       </Badge>
                       <Badge variant={ollamaModelInstalled ? 'outline' : 'destructive'}>
-                        {ollamaModelInstalled ? 'Configured model available or not checked yet' : 'Configured model missing on runtime'}
+                        {ollamaModelInstalled ? 'Bulk model available or not checked yet' : 'Bulk model missing on runtime'}
+                      </Badge>
+                      <Badge variant={ollamaHardModelInstalled ? 'outline' : 'destructive'}>
+                        {ollamaHardModelInstalled ? 'Hard-cases model available or not checked yet' : 'Hard-cases model missing on runtime'}
                       </Badge>
                     </div>
                     {ollamaConnectionMessage ? (
@@ -2290,7 +2320,14 @@ function SettingsPage() {
                         <div className="text-xs font-medium text-foreground">Detected models</div>
                         <div className="flex flex-wrap gap-1.5">
                           {ollamaAvailableModels.slice(0, 12).map((model) => (
-                            <Badge key={model} variant={model === ollamaConfiguredModel ? 'default' : 'outline'}>{model}</Badge>
+                            <Badge
+                              key={model}
+                              variant={model === ollamaConfiguredModel || model === ollamaConfiguredHardModel ? 'default' : 'outline'}
+                            >
+                              {model}
+                              {model === ollamaConfiguredModel ? ' · bulk' : ''}
+                              {model === ollamaConfiguredHardModel ? ' · hard' : ''}
+                            </Badge>
                           ))}
                           {ollamaAvailableModels.length > 12 ? <Badge variant="outline">+{ollamaAvailableModels.length - 12} more</Badge> : null}
                         </div>

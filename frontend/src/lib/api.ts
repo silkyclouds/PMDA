@@ -734,6 +734,10 @@ export interface PMDAConfig {
   GOOGLE_API_KEY: string;
   OLLAMA_URL: string;
   OLLAMA_MODEL?: string;
+  OLLAMA_COMPLEX_MODEL?: string;
+  SCAN_AI_LOCAL_BULK_MODEL?: string;
+  SCAN_AI_LOCAL_HARD_MODEL?: string;
+  SCAN_AI_LOCAL_HARD_AVAILABLE?: boolean;
   /** Custom AI prompt for duplicate selection (advanced). Empty = use default. */
   AI_PROMPT?: string;
   
