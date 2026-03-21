@@ -3734,6 +3734,9 @@ _OLLAMA_COMPLEX_ANALYSIS_TYPES = {
     "mb_candidate_tiebreak",
     "mb_match_verify",
     "mb_retry_disambiguation",
+}
+
+_OLLAMA_AMBIGUOUS_ESCALATION_ANALYSIS_TYPES = {
     "provider_identity_verify",
     "web_mbid_inference",
 }
@@ -3741,10 +3744,8 @@ _OLLAMA_COMPLEX_ANALYSIS_TYPES = {
 _OLLAMA_COMPLEXITY_HINTS = (
     "ambiguous",
     "arbitration",
-    "candidate",
     "choose",
     "disambiguation",
-    "fallback",
     "none matched",
     "provider candidates",
     "same release",
@@ -3827,6 +3828,9 @@ def _ollama_route_for_analysis(
     if analysis in _OLLAMA_COMPLEX_ANALYSIS_TYPES:
         score += 3
         reasons.append(f"analysis:{analysis}")
+    elif analysis in _OLLAMA_AMBIGUOUS_ESCALATION_ANALYSIS_TYPES:
+        score += 1
+        reasons.append(f"analysis:{analysis}")
     user_text = str(user_msg or "")
     system_text = str(system_msg or "")
     combined = f"{system_text}\n{user_text}".strip()
@@ -3841,7 +3845,10 @@ def _ollama_route_for_analysis(
         score += 1
         reasons.append("ambiguity_hint")
 
-    if score < 3:
+    threshold = 3
+    if analysis in _OLLAMA_AMBIGUOUS_ESCALATION_ANALYSIS_TYPES:
+        threshold = 2
+    if score < threshold:
         route_meta["reason"] = ",".join(reasons) if reasons else "not_complex"
         return base_model, route_meta
     if not _ollama_model_available(hard_model):
@@ -5169,6 +5176,12 @@ def call_ai_provider(
         if provider_lower == "ollama":
             if not ollama_url:
                 raise ValueError("Ollama URL not configured")
+            ollama_timeout = 60
+            try:
+                if str(model_for_usage or "").strip().lower() == _ollama_complex_model_configured().lower():
+                    ollama_timeout = 180
+            except Exception:
+                ollama_timeout = 60
             payload = {
                 "model": model_for_usage,
                 "messages": [
@@ -5181,7 +5194,7 @@ def call_ai_provider(
                 },
                 "stream": False,
             }
-            response = requests.post(f"{ollama_url}/api/chat", json=payload, timeout=60)
+            response = requests.post(f"{ollama_url}/api/chat", json=payload, timeout=ollama_timeout)
             if response.status_code != 200:
                 raise Exception(f"Ollama API error: {response.status_code} - {response.text}")
             result = response.json()
@@ -26445,12 +26458,19 @@ def _classical_gap_anomaly_should_be_ignored(
     performance_values = _classical_collect_tag_values(tag_map, _CLASSICAL_PERFORMANCE_TAG_KEYS)
     work_values = _classical_collect_tag_values(tag_map, _CLASSICAL_WORK_TAG_KEYS)
     genre_values = _classical_collect_tag_values(tag_map, ("genre", "style"))
+    tag_override = _classical_tag_override(tag_map)
     looks_classical = _classical_has_explicit_signal(
         genre_values=genre_values,
         composer_values=composer_values,
         work_values=work_values,
         performer_values=performance_values,
     )
+    if tag_override is False and not (
+        _classical_genre_signal(genre_values)
+        or bool(_classical_release_catalog_tokens_from_texts(_classical_collect_tag_values(tag_map, _CLASSICAL_RELEASE_CATALOG_TAG_KEYS)))
+        or bool(_classical_collect_tag_values(tag_map, ("conductor", "orchestra", "ensemble", "choir", "chorus", "soloist", "soloists")))
+    ):
+        return False
     if not looks_classical:
         return False
     actual_total = max(0, int(actual_count or 0))
@@ -27697,6 +27717,16 @@ _CLASSICAL_CATALOG_RE = re.compile(
     flags=re.IGNORECASE,
 )
 _CLASSICAL_SPLIT_RE = re.compile(r"\s*(?:;|/|&|\band\b|\bwith\b|\bfeat\.?\b|\bfeaturing\b)\s*", flags=re.IGNORECASE)
+_CLASSICAL_GENERIC_VALUE_TOKENS = {
+    "0",
+    "false",
+    "na",
+    "n/a",
+    "none",
+    "null",
+    "off",
+    "unknown",
+}
 _CLASSICAL_RELEASE_CATALOG_PATTERNS = (
     re.compile(r"\b[A-Z]{1,6}\s*\d(?:[\s./-]?\d){2,}\b"),
     re.compile(r"\b\d{1,4}(?:[\s./-]\d{1,4}){1,4}\b"),
@@ -27791,10 +27821,35 @@ def _classical_split_values(value: Any) -> list[str]:
             if not cleaned:
                 continue
             key = _classical_norm_text(cleaned)
+            if not key or key in _CLASSICAL_GENERIC_VALUE_TOKENS:
+                continue
             if key and key not in seen:
                 out.append(cleaned)
                 seen.add(key)
     return out
+
+
+def _classical_tag_override(tags: dict | None) -> bool | None:
+    if not isinstance(tags, dict):
+        return None
+    lowered = {str(k or "").strip().lower(): v for k, v in tags.items()}
+    for raw_key in ("is_classical", "classical"):
+        for cand in {
+            raw_key,
+            raw_key.replace("_", ""),
+            raw_key.replace("_", " "),
+        }:
+            raw = lowered.get(cand)
+            if raw is None:
+                continue
+            txt = str(raw or "").strip().lower()
+            if not txt:
+                continue
+            if txt in {"1", "true", "yes", "y", "on"}:
+                return True
+            if txt in {"0", "false", "no", "n", "off"}:
+                return False
+    return None
 
 
 def _classical_collect_tag_values(tags: dict | None, keys: tuple[str, ...]) -> list[str]:
@@ -27882,7 +27937,7 @@ def _classical_has_explicit_signal(
     work_tokens = _classical_work_tokens_from_texts(([title] if str(title or "").strip() else []) + list(work_values or []) + list(track_titles or [])[:20])
     title_signal = _classical_title_signal(title, work_tokens=work_tokens, track_titles=track_titles)
     genre_signal = _classical_genre_signal(genre_values)
-    catalog_signal = bool(list(catalog_values or []))
+    catalog_signal = bool(_classical_release_catalog_tokens_from_texts(list(catalog_values or [])))
     performance_signal = bool(
         list(conductor_values or [])
         or list(orchestra_values or [])
@@ -27917,6 +27972,7 @@ def _classical_display_payload(
     performers_raw = _classical_display_values(_classical_collect_tag_values(tag_map, ("performer", "performers", "artist", "albumartist", "album_artist")), limit=8)
     catalog_numbers = _classical_display_values(_classical_collect_tag_values(tag_map, _CLASSICAL_RELEASE_CATALOG_TAG_KEYS), limit=6)
     genre_values = _classical_collect_tag_values(tag_map, ("genre", "style"))
+    tag_override = _classical_tag_override(tag_map)
     looks_classical = _classical_has_explicit_signal(
         title=fallback_title,
         genre_values=genre_values,
@@ -27929,6 +27985,18 @@ def _classical_display_payload(
         performer_values=performers_raw,
         catalog_values=catalog_numbers,
     )
+    if tag_override is False and not (
+        _classical_title_signal(
+            fallback_title,
+            work_tokens=_classical_work_tokens_from_texts(
+                ([fallback_title] if str(fallback_title or "").strip() else []) + list(work or [])
+            ),
+        )
+        or _classical_genre_signal(genre_values)
+        or bool(conductor or orchestra or ensemble or soloists)
+        or bool(_classical_release_catalog_tokens_from_texts(catalog_numbers))
+    ):
+        return None
     if not looks_classical:
         return None
     composer_norms = {_classical_norm_text(v) for v in composer}
@@ -28531,12 +28599,14 @@ def _classical_identity_context(
         artist_values.append(str(candidate_artist or local_artist or "").strip())
     base_artist_values = [v for v in artist_values if str(v or "").strip()]
     performance_tag_values = _classical_collect_tag_values(tags, _CLASSICAL_PERFORMANCE_TAG_KEYS)
+    classical_role_values = _classical_collect_tag_values(tags, ("conductor", "orchestra", "ensemble", "choir", "chorus", "soloist", "soloists"))
     artist_values.extend(performance_tag_values)
     composer_values = _classical_collect_tag_values(tags, _CLASSICAL_COMPOSER_TAG_KEYS)
     work_values = _classical_collect_tag_values(tags, _CLASSICAL_WORK_TAG_KEYS)
     label_values = _classical_collect_tag_values(tags, _CLASSICAL_LABEL_TAG_KEYS)
     catalog_values = _classical_collect_tag_values(tags, _CLASSICAL_RELEASE_CATALOG_TAG_KEYS)
     genre_values = _classical_collect_tag_values(tags, ("genre", "style"))
+    tag_override = _classical_tag_override(tags)
     meta_title_texts = [title_value] + work_values + track_titles[:20]
     work_tokens = _classical_work_tokens_from_texts(meta_title_texts)
     explicit_signal = _classical_has_explicit_signal(
@@ -28590,7 +28660,25 @@ def _classical_identity_context(
     catalog_tokens |= set(cover_ocr_ctx.get("catalog_tokens") or set())
     performance_tokens |= set(cover_ocr_ctx.get("performance_tokens") or set())
     performance_tokens -= composer_tokens
-    is_classical = bool(pre_is_classical or cover_ocr_ctx.get("work_tokens"))
+    ocr_classical_signal = bool(
+        cover_ocr_ctx.get("work_tokens")
+        and (
+            _classical_genre_signal(genre_values)
+            or bool(catalog_tokens)
+            or bool(classical_role_values)
+            or bool(pre_is_classical)
+        )
+    )
+    forced_non_classical = bool(
+        tag_override is False
+        and not (
+            pre_is_classical
+            or bool(catalog_tokens)
+            or bool(classical_role_values)
+            or _classical_genre_signal(genre_values)
+        )
+    )
+    is_classical = False if forced_non_classical else bool(pre_is_classical or ocr_classical_signal)
     return {
         "is_classical": bool(is_classical),
         "composer_tokens": composer_tokens,
