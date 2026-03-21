@@ -6796,7 +6796,10 @@ def init_state_db():
             detected_artists_total INTEGER NOT NULL DEFAULT 0,
             detected_albums_total INTEGER NOT NULL DEFAULT 0,
             detected_tracks_total INTEGER NOT NULL DEFAULT 0,
-            plan_snapshot_ready INTEGER NOT NULL DEFAULT 0
+            plan_snapshot_ready INTEGER NOT NULL DEFAULT 0,
+            discovery_snapshot_ready INTEGER NOT NULL DEFAULT 0,
+            discovery_stage TEXT NOT NULL DEFAULT '',
+            discovery_state_json TEXT NOT NULL DEFAULT '{}'
         )
     """)
     cur.execute("""
@@ -6844,6 +6847,15 @@ def init_state_db():
             lookup_artist_name TEXT,
             lookup_album_title TEXT,
             PRIMARY KEY (run_id, album_id),
+            FOREIGN KEY (run_id) REFERENCES scan_resume_runs(run_id) ON DELETE CASCADE
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS scan_resume_discovery_files (
+            run_id TEXT NOT NULL,
+            root_index INTEGER NOT NULL DEFAULT 0,
+            file_path TEXT NOT NULL,
+            PRIMARY KEY (run_id, file_path),
             FOREIGN KEY (run_id) REFERENCES scan_resume_runs(run_id) ON DELETE CASCADE
         )
     """)
@@ -7315,6 +7327,9 @@ def init_state_db():
         ("detected_albums_total", "INTEGER NOT NULL DEFAULT 0"),
         ("detected_tracks_total", "INTEGER NOT NULL DEFAULT 0"),
         ("plan_snapshot_ready", "INTEGER NOT NULL DEFAULT 0"),
+        ("discovery_snapshot_ready", "INTEGER NOT NULL DEFAULT 0"),
+        ("discovery_stage", "TEXT NOT NULL DEFAULT ''"),
+        ("discovery_state_json", "TEXT NOT NULL DEFAULT '{}'"),
     ]:
         if col_name not in resume_run_cols:
             cur.execute(f"ALTER TABLE scan_resume_runs ADD COLUMN {col_name} {col_type}")
@@ -7323,6 +7338,7 @@ def init_state_db():
         cur.execute("CREATE INDEX IF NOT EXISTS idx_scan_resume_artists_run_status ON scan_resume_artists(run_id, status)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_scan_resume_files_plan_run_artist ON scan_resume_files_plan(run_id, artist_order, album_order)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_scan_resume_files_plan_run_folder ON scan_resume_files_plan(run_id, folder_path)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_scan_resume_discovery_files_run_root ON scan_resume_discovery_files(run_id, root_index, file_path)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_files_album_scan_cache_updated ON files_album_scan_cache(updated_at DESC)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_files_album_scan_cache_source_updated ON files_album_scan_cache(source_id, updated_at DESC)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_files_published_artist_norm ON files_library_published_albums(artist_norm)")
@@ -7838,7 +7854,7 @@ def set_stat(key: str, value: int):
 
 def increment_stat(key: str, delta: int):
     """Atomically add *delta* to a stat counter. Creates the row if it does not exist (upsert)."""
-    con = sqlite3.connect(str(STATE_DB_FILE), timeout=30)
+    con = _state_connect(timeout=30)
     con.execute("PRAGMA busy_timeout=30000;")
     cur = con.cursor()
     try:
@@ -8519,12 +8535,130 @@ _scheduler_stop_event = threading.Event()
 _scheduler_paused = False
 _scheduler_running_keys: set[str] = set()
 _scheduler_running_meta: dict[str, dict[str, Any]] = {}
+_task_events_cache_lock = threading.Lock()
+_task_events_cache: dict[str, Any] = {"events": [], "max_id": 0, "ts": 0.0}
+_scan_discovery_runtime_lock = threading.Lock()
+_scan_discovery_runtime: dict[str, Any] | None = None
+
+
+def _configure_state_connection(
+    con: sqlite3.Connection,
+    *,
+    timeout: float = 30.0,
+    readonly: bool = False,
+) -> sqlite3.Connection:
+    busy_timeout_ms = max(1000, int(float(timeout or 0.0) * 1000.0))
+    try:
+        con.execute(f"PRAGMA busy_timeout={busy_timeout_ms};")
+    except Exception:
+        pass
+    if not readonly:
+        try:
+            con.execute("PRAGMA journal_mode=WAL;")
+        except Exception:
+            pass
+        try:
+            con.execute("PRAGMA synchronous=NORMAL;")
+        except Exception:
+            pass
+    try:
+        con.execute("PRAGMA temp_store=MEMORY;")
+    except Exception:
+        pass
+    con.row_factory = sqlite3.Row
+    return con
 
 
 def _state_connect(timeout: float = 30.0) -> sqlite3.Connection:
-    con = sqlite3.connect(str(STATE_DB_FILE), timeout=timeout)
-    con.row_factory = sqlite3.Row
-    return con
+    con = sqlite3.connect(str(STATE_DB_FILE), timeout=timeout, check_same_thread=False)
+    return _configure_state_connection(con, timeout=timeout, readonly=False)
+
+
+def _state_connect_readonly(timeout: float = 10.0) -> sqlite3.Connection:
+    try:
+        con = sqlite3.connect(
+            f"file:{STATE_DB_FILE}?mode=ro",
+            timeout=timeout,
+            uri=True,
+            check_same_thread=False,
+        )
+        return _configure_state_connection(con, timeout=timeout, readonly=True)
+    except Exception:
+        con = sqlite3.connect(str(STATE_DB_FILE), timeout=timeout, check_same_thread=False)
+        return _configure_state_connection(con, timeout=timeout, readonly=True)
+
+
+def _task_events_cache_merge(events: list[dict[str, Any]], max_id: int | None = None) -> None:
+    if not events and max_id is None:
+        return
+    with _task_events_cache_lock:
+        merged: dict[int, dict[str, Any]] = {
+            int(evt.get("event_id") or 0): dict(evt)
+            for evt in (_task_events_cache.get("events") or [])
+            if int(evt.get("event_id") or 0) > 0
+        }
+        for evt in events or []:
+            event_id = int((evt or {}).get("event_id") or 0)
+            if event_id <= 0:
+                continue
+            prev = dict(merged.get(event_id) or {})
+            next_evt = dict(evt)
+            for key in ("run_id", "job_type", "scope", "source"):
+                if not next_evt.get(key) and prev.get(key):
+                    next_evt[key] = prev.get(key)
+            if next_evt.get("ended_at") is None and prev.get("ended_at") is not None:
+                next_evt["ended_at"] = prev.get("ended_at")
+            if next_evt.get("duration_ms") is None and prev.get("duration_ms") is not None:
+                next_evt["duration_ms"] = prev.get("duration_ms")
+            merged[event_id] = next_evt
+        ordered = [merged[eid] for eid in sorted(merged.keys())]
+        if len(ordered) > 1000:
+            ordered = ordered[-1000:]
+        cache_max_id = int(_task_events_cache.get("max_id") or 0)
+        if max_id is None:
+            max_id = cache_max_id
+        if ordered:
+            max_id = max(int(max_id or 0), int(ordered[-1].get("event_id") or 0))
+        _task_events_cache["events"] = ordered
+        _task_events_cache["max_id"] = int(max_id or 0)
+        _task_events_cache["ts"] = time.time()
+
+
+def _task_events_cache_read(after_id: int = 0, limit: int = 100) -> tuple[list[dict[str, Any]], int, float]:
+    with _task_events_cache_lock:
+        events = [dict(evt) for evt in (_task_events_cache.get("events") or []) if int((evt or {}).get("event_id") or 0) > int(after_id or 0)]
+        max_id = int(_task_events_cache.get("max_id") or 0)
+        ts = float(_task_events_cache.get("ts") or 0.0)
+    if limit > 0:
+        events = events[:limit]
+    return events, max_id, ts
+
+
+def _set_scan_discovery_runtime(snapshot: dict[str, Any] | None) -> None:
+    global _scan_discovery_runtime
+    with _scan_discovery_runtime_lock:
+        _scan_discovery_runtime = snapshot
+
+
+def _clear_scan_discovery_runtime(run_id: str | None = None) -> None:
+    global _scan_discovery_runtime
+    with _scan_discovery_runtime_lock:
+        if run_id and isinstance(_scan_discovery_runtime, dict):
+            current_run_id = str(_scan_discovery_runtime.get("run_id") or "").strip()
+            if current_run_id and current_run_id != str(run_id).strip():
+                return
+        _scan_discovery_runtime = None
+
+
+def _copy_scan_discovery_runtime(run_id: str | None = None) -> dict[str, Any] | None:
+    with _scan_discovery_runtime_lock:
+        snap = _scan_discovery_runtime
+        if not isinstance(snap, dict):
+            return None
+        current_run_id = str(snap.get("run_id") or "").strip()
+        if run_id and current_run_id and current_run_id != str(run_id).strip():
+            return None
+        return copy.deepcopy(snap)
 
 
 def _json_dumps_safe(value: Any) -> str:
@@ -9730,6 +9864,26 @@ def _task_event_start(
     event_id = int(cur.lastrowid or 0)
     con.commit()
     con.close()
+    _task_events_cache_merge(
+        [
+            {
+                "event_id": event_id,
+                "run_id": str(run_id or ""),
+                "job_type": str(job_type or ""),
+                "scope": str(scope or "both"),
+                "status": "started",
+                "message": str(message or ""),
+                "metrics": {},
+                "summary": {},
+                "error": "",
+                "source": str(source or ""),
+                "started_at": float(started or 0.0),
+                "ended_at": None,
+                "duration_ms": None,
+            }
+        ],
+        max_id=event_id,
+    )
     return event_id
 
 
@@ -9772,6 +9926,26 @@ def _task_event_finish(
     )
     con.commit()
     con.close()
+    _task_events_cache_merge(
+        [
+            {
+                "event_id": int(event_id or 0),
+                "run_id": "",
+                "job_type": "",
+                "scope": "both",
+                "status": status_norm,
+                "message": str(message or ""),
+                "metrics": metrics or {},
+                "summary": summary or {},
+                "error": str(error or ""),
+                "source": "",
+                "started_at": float(started_at or 0.0),
+                "ended_at": float(ended or 0.0),
+                "duration_ms": int(duration_ms or 0),
+            }
+        ],
+        max_id=int(event_id or 0),
+    )
 
 
 def _scheduler_get_paused_from_db() -> bool:
@@ -24630,6 +24804,275 @@ def _iter_audio_files_under_roots(
             merged.append(path)
     return merged
 
+
+def _iter_audio_files_under_roots_checkpointed(
+    roots: list[str],
+    *,
+    run_id: str | None,
+    progress_cb=None,
+    progress_every: int = 250,
+    heartbeat_seconds: float = 10.0,
+    stop_event: threading.Event | None = None,
+    pause_event: threading.Event | None = None,
+    resume_snapshot: dict[str, Any] | None = None,
+    checkpoint_cb=None,
+) -> list[Path]:
+    roots_list = [str(r) for r in (roots or []) if r]
+    roots_total = len(roots_list)
+    if roots_total <= 0:
+        return []
+
+    progress_every = max(1, int(progress_every)) if progress_every else 0
+    heartbeat_seconds = float(heartbeat_seconds or 0.0)
+    progress_enabled = callable(progress_cb)
+    checkpoint_enabled = callable(checkpoint_cb)
+
+    results_by_idx: dict[int, list[Path]] = {}
+    shared_entries_scanned = 0
+    shared_files_found = 0
+    shared_roots_done = 0
+    resume_stage = str((resume_snapshot or {}).get("stage") or "").strip().lower()
+    current_resume_root_index = _parse_int_loose((resume_snapshot or {}).get("current_root_index"), None)
+    current_resume_stack = copy.deepcopy((resume_snapshot or {}).get("current_stack") or [])
+    current_resume_entries = int((resume_snapshot or {}).get("current_root_entries_scanned") or 0)
+    current_resume_audio_found = int((resume_snapshot or {}).get("current_root_audio_found") or 0)
+    current_resume_files = [Path(str(p)) for p in ((resume_snapshot or {}).get("current_root_files") or []) if p]
+
+    if isinstance(resume_snapshot, dict):
+        shared_entries_scanned = int(resume_snapshot.get("shared_entries_scanned") or resume_snapshot.get("entries_scanned") or 0)
+        shared_files_found = int(resume_snapshot.get("shared_files_found") or resume_snapshot.get("files_found") or 0)
+        shared_roots_done = int(resume_snapshot.get("shared_roots_done") or 0)
+        for key, paths in ((resume_snapshot.get("results_by_root") or {}).items() if isinstance(resume_snapshot.get("results_by_root"), dict) else []):
+            idx = _parse_int_loose(key, None)
+            if idx is None:
+                continue
+            results_by_idx[int(idx)] = [Path(str(p)) for p in (paths or []) if p]
+        if current_resume_root_index is not None and current_resume_files:
+            results_by_idx[int(current_resume_root_index)] = list(current_resume_files)
+
+    def _normalize_stack_frames(frames: list[Any]) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for frame in frames or []:
+            if isinstance(frame, dict):
+                dir_path = str(frame.get("dir") or "").strip()
+                pending = []
+                for item in (frame.get("pending") or []):
+                    if not isinstance(item, dict):
+                        continue
+                    pending.append(
+                        {
+                            "path": str(item.get("path") or "").strip(),
+                            "is_dir": bool(item.get("is_dir")),
+                            "is_audio": bool(item.get("is_audio")),
+                        }
+                    )
+                if dir_path:
+                    out.append({"dir": dir_path, "pending": pending})
+            else:
+                dir_path = str(frame or "").strip()
+                if dir_path:
+                    out.append({"dir": dir_path, "pending": None})
+        return out
+
+    def _publish_checkpoint(
+        *,
+        root_index: int | None,
+        root_path: str | None,
+        stack_frames: list[dict[str, Any]] | None,
+        root_entries_scanned: int,
+        root_audio_found: int,
+        current_root_files: list[Path] | None,
+        stage: str,
+        paused_ack: bool = False,
+    ) -> None:
+        if not checkpoint_enabled:
+            return
+        try:
+            checkpoint_cb(
+                {
+                    "run_id": str(run_id or "").strip(),
+                    "stage": str(stage or "filesystem"),
+                    "roots": list(roots_list),
+                    "roots_total": roots_total,
+                    "results_by_root": results_by_idx,
+                    "current_root_index": root_index,
+                    "current_root_path": str(root_path or "").strip() or None,
+                    "current_stack": _normalize_stack_frames(stack_frames or []),
+                    "current_root_entries_scanned": int(root_entries_scanned or 0),
+                    "current_root_audio_found": int(root_audio_found or 0),
+                    "current_root_files": list(current_root_files or []),
+                    "shared_entries_scanned": int(shared_entries_scanned or 0),
+                    "shared_files_found": int(shared_files_found or 0),
+                    "shared_roots_done": int(shared_roots_done or 0),
+                    "paused_ack": bool(paused_ack),
+                    "updated_at": time.time(),
+                }
+            )
+        except Exception:
+            pass
+
+    def _emit_progress(
+        *,
+        root: str,
+        root_entries_scanned: int,
+        delta_entries: int = 0,
+        delta_files: int = 0,
+        done_root: bool = False,
+    ) -> None:
+        nonlocal shared_entries_scanned, shared_files_found, shared_roots_done
+        if delta_entries:
+            shared_entries_scanned += max(0, int(delta_entries))
+        if delta_files:
+            shared_files_found += max(0, int(delta_files))
+        if done_root:
+            shared_roots_done += 1
+        if not progress_enabled:
+            return
+        payload = {
+            "root": root,
+            "roots_done": shared_roots_done,
+            "roots_total": roots_total,
+            "files_found": shared_files_found,
+            "entries_scanned": shared_entries_scanned,
+            "root_entries_scanned": max(0, int(root_entries_scanned)),
+            "done": shared_roots_done >= roots_total,
+        }
+        try:
+            progress_cb(payload)
+        except Exception:
+            pass
+
+    start_index = max(0, min(shared_roots_done, roots_total))
+    if resume_stage == "filesystem" and current_resume_root_index is not None:
+        start_index = max(0, min(int(current_resume_root_index), roots_total - 1))
+
+    for idx in range(start_index, roots_total):
+        root_path = roots_list[idx]
+        base = Path(root_path)
+        root_entries = 0
+        root_audio_found = 0
+        pending_entries = 0
+        pending_files = 0
+        last_heartbeat = time.monotonic()
+        local_out = list(results_by_idx.get(idx) or [])
+        stack_frames: list[dict[str, Any]] = [{"dir": str(base), "pending": None}]
+        if resume_stage == "filesystem" and current_resume_root_index == idx:
+            stack_frames = _normalize_stack_frames(current_resume_stack) or [{"dir": str(base), "pending": None}]
+            root_entries = int(current_resume_entries or 0)
+            root_audio_found = int(current_resume_audio_found or len(local_out))
+            if not local_out:
+                local_out = list(current_resume_files or [])
+
+        def _load_dir_entries(dir_path: str) -> list[dict[str, Any]]:
+            items: list[dict[str, Any]] = []
+            try:
+                with os.scandir(dir_path) as it:
+                    for entry in it:
+                        try:
+                            is_dir = bool(entry.is_dir(follow_symlinks=False))
+                            is_audio = bool(not is_dir and entry.is_file(follow_symlinks=False) and AUDIO_RE.search(entry.name))
+                            items.append(
+                                {
+                                    "path": str(entry.path),
+                                    "is_dir": is_dir,
+                                    "is_audio": is_audio,
+                                }
+                            )
+                        except (OSError, PermissionError):
+                            continue
+            except (FileNotFoundError, NotADirectoryError, PermissionError, OSError):
+                return []
+            return items
+
+        def _flush(*, done_root: bool = False, force: bool = False, paused_ack: bool = False) -> None:
+            nonlocal pending_entries, pending_files, last_heartbeat
+            if force or done_root or pending_entries > 0 or pending_files > 0:
+                _emit_progress(
+                    root=str(base),
+                    root_entries_scanned=root_entries,
+                    delta_entries=pending_entries,
+                    delta_files=pending_files,
+                    done_root=done_root,
+                )
+                pending_entries = 0
+                pending_files = 0
+                last_heartbeat = time.monotonic()
+            _publish_checkpoint(
+                root_index=idx,
+                root_path=str(base),
+                stack_frames=stack_frames,
+                root_entries_scanned=root_entries,
+                root_audio_found=root_audio_found,
+                current_root_files=local_out,
+                stage="filesystem",
+                paused_ack=paused_ack,
+            )
+
+        if not base.exists():
+            _flush(done_root=True, force=True)
+            results_by_idx[idx] = local_out
+            current_resume_root_index = None
+            current_resume_stack = []
+            continue
+
+        interrupted = False
+        while stack_frames:
+            if stop_event is not None and stop_event.is_set():
+                interrupted = True
+                break
+            if pause_event is not None and pause_event.is_set():
+                _flush(force=True, paused_ack=True)
+                while pause_event.is_set() and not (stop_event is not None and stop_event.is_set()):
+                    time.sleep(0.2)
+                if stop_event is not None and stop_event.is_set():
+                    interrupted = True
+                    break
+            frame = stack_frames.pop()
+            dir_path = str(frame.get("dir") or "").strip()
+            pending = frame.get("pending")
+            if pending is None:
+                pending = _load_dir_entries(dir_path)
+            if not pending:
+                continue
+            item = dict(pending.pop() or {})
+            if pending:
+                stack_frames.append({"dir": dir_path, "pending": pending})
+            root_entries += 1
+            pending_entries += 1
+            if bool(item.get("is_dir")):
+                stack_frames.append({"dir": str(item.get("path") or ""), "pending": None})
+            elif bool(item.get("is_audio")):
+                local_out.append(Path(str(item.get("path") or "")))
+                root_audio_found += 1
+                pending_files += 1
+                if progress_every > 0 and (root_audio_found % progress_every == 0):
+                    _flush()
+            if heartbeat_seconds > 0:
+                now = time.monotonic()
+                if (now - last_heartbeat) >= heartbeat_seconds:
+                    _flush()
+
+        results_by_idx[idx] = local_out
+        if interrupted:
+            _flush(force=True, paused_ack=bool(pause_event is not None and pause_event.is_set()))
+            break
+        _flush(done_root=True, force=True)
+        current_resume_root_index = None
+        current_resume_stack = []
+        current_resume_entries = 0
+        current_resume_audio_found = 0
+
+    merged: list[Path] = []
+    seen_paths: set[str] = set()
+    for idx in range(roots_total):
+        for path in results_by_idx.get(idx, []):
+            sp = str(path)
+            if sp in seen_paths:
+                continue
+            seen_paths.add(sp)
+            merged.append(path)
+    return merged
+
 # Global ffprobe pool for parallel processing
 _ffprobe_pool: Optional[ThreadPoolExecutor] = None
 
@@ -33997,7 +34440,7 @@ def scan_duplicates(
     
     # Store broken albums in database
     import json
-    con = sqlite3.connect(str(STATE_DB_FILE), timeout=30)
+    con = _state_connect(timeout=30)
     cur = con.cursor()
     for e in all_editions_for_stats:
         if e.get('is_broken', False):
@@ -34198,7 +34641,7 @@ def save_scan_editions_to_db(scan_id: int, all_editions_by_artist: Dict[str, Lis
     import json
     mode = _get_library_mode()
     cache_map = _load_files_album_scan_cache_map() if mode == "files" else {}
-    con = sqlite3.connect(str(STATE_DB_FILE), timeout=30)
+    con = _state_connect(timeout=30)
     cur = con.cursor()
     cur.execute("DELETE FROM scan_editions WHERE scan_id = ?", (scan_id,))
     row_count = 0
@@ -38734,6 +39177,298 @@ def _prune_resume_files_plan_artist(run_id: str | None, artist_name: str) -> Non
         logging.debug("Failed to prune resume files plan for artist=%s run_id=%s", artist_name, run_id, exc_info=True)
 
 
+def _ensure_resume_run_started(
+    mode: str,
+    scan_type: str,
+    *,
+    requested_run_id: str | None = None,
+) -> str | None:
+    if mode != "files":
+        return None
+    now = time.time()
+    run_id: str | None = None
+    source_signature = _compute_scan_source_signature(mode, scan_type)
+    requested_run_id = str(requested_run_id or "").strip() or None
+    try:
+        con = _state_connect(timeout=30)
+        cur = con.cursor()
+        row = None
+        if requested_run_id:
+            cur.execute(
+                """
+                SELECT run_id
+                FROM scan_resume_runs
+                WHERE run_id = ?
+                  AND mode = ? AND scan_type = ?
+                  AND COALESCE(status, '') != 'completed'
+                LIMIT 1
+                """,
+                (requested_run_id, mode, scan_type),
+            )
+            row = cur.fetchone()
+        if not row:
+            cur.execute(
+                """
+                SELECT run_id
+                FROM scan_resume_runs
+                WHERE source_signature = ? AND mode = ? AND scan_type = ?
+                  AND COALESCE(status, '') != 'completed'
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                (source_signature, mode, scan_type),
+            )
+            row = cur.fetchone()
+        if row:
+            run_id = str(row["run_id"] if isinstance(row, sqlite3.Row) else row[0] or "").strip() or None
+            if run_id:
+                cur.execute(
+                    """
+                    UPDATE scan_resume_runs
+                    SET status = 'running', updated_at = ?
+                    WHERE run_id = ?
+                    """,
+                    (now, run_id),
+                )
+        if not run_id:
+            run_id = uuid.uuid4().hex
+            cur.execute(
+                """
+                INSERT INTO scan_resume_runs
+                (run_id, created_at, updated_at, mode, scan_type, source_signature, status, scan_id)
+                VALUES (?, ?, ?, ?, ?, ?, 'running', NULL)
+                """,
+                (run_id, now, now, mode, scan_type, source_signature),
+            )
+        con.commit()
+        con.close()
+        return run_id
+    except Exception:
+        logging.debug("Failed to seed resume run for mode=%s scan_type=%s", mode, scan_type, exc_info=True)
+        return requested_run_id
+
+
+def _persist_resume_discovery_snapshot(
+    run_id: str | None,
+    snapshot: dict[str, Any] | None,
+) -> dict[str, Any]:
+    run_id = str(run_id or "").strip()
+    if not run_id or not isinstance(snapshot, dict):
+        return {"ok": False, "rows": 0, "run_id": run_id}
+    roots = [str(r) for r in (snapshot.get("roots") or []) if r]
+    stage = str(snapshot.get("stage") or "").strip() or "filesystem"
+    results_by_root_raw = snapshot.get("results_by_root") or {}
+    current_root_index = _parse_int_loose(snapshot.get("current_root_index"), 0)
+    current_root_files_raw = snapshot.get("current_root_files") or []
+    rows: list[tuple[str, int, str]] = []
+    seen_paths: set[str] = set()
+    for key, paths in (results_by_root_raw.items() if isinstance(results_by_root_raw, dict) else []):
+        root_index = _parse_int_loose(key, 0) or 0
+        for path in paths or []:
+            sp = str(path or "").strip()
+            if not sp or sp in seen_paths:
+                continue
+            seen_paths.add(sp)
+            rows.append((run_id, root_index, sp))
+    if current_root_index is not None:
+        for path in current_root_files_raw or []:
+            sp = str(path or "").strip()
+            if not sp or sp in seen_paths:
+                continue
+            seen_paths.add(sp)
+            rows.append((run_id, int(current_root_index), sp))
+    state_json = {
+        "stage": stage,
+        "roots": roots,
+        "current_root_index": _parse_int_loose(snapshot.get("current_root_index"), None),
+        "current_root_path": str(snapshot.get("current_root_path") or "").strip() or None,
+        "current_stack": copy.deepcopy(snapshot.get("current_stack") or []),
+        "current_root_entries_scanned": int(snapshot.get("current_root_entries_scanned") or 0),
+        "current_root_audio_found": int(snapshot.get("current_root_audio_found") or 0),
+        "shared_entries_scanned": int(snapshot.get("shared_entries_scanned") or 0),
+        "shared_files_found": int(snapshot.get("shared_files_found") or 0),
+        "shared_roots_done": int(snapshot.get("shared_roots_done") or 0),
+        "roots_total": int(snapshot.get("roots_total") or len(roots)),
+        "entries_scanned": int(snapshot.get("shared_entries_scanned") or 0),
+        "files_found": int(snapshot.get("shared_files_found") or 0),
+        "albums_found": int(snapshot.get("albums_found") or 0),
+        "artists_found": int(snapshot.get("artists_found") or 0),
+        "folders_found": int(snapshot.get("folders_found") or 0),
+        "folders_done": int(snapshot.get("folders_done") or 0),
+        "folders_total": int(snapshot.get("folders_total") or 0),
+        "updated_at": time.time(),
+    }
+    try:
+        con = _state_connect(timeout=60)
+        cur = con.cursor()
+        cur.execute("DELETE FROM scan_resume_discovery_files WHERE run_id = ?", (run_id,))
+        if rows:
+            cur.executemany(
+                """
+                INSERT OR REPLACE INTO scan_resume_discovery_files (run_id, root_index, file_path)
+                VALUES (?, ?, ?)
+                """,
+                rows,
+            )
+        cur.execute(
+            """
+            UPDATE scan_resume_runs
+            SET updated_at = ?,
+                detected_tracks_total = ?,
+                discovery_snapshot_ready = 1,
+                discovery_stage = ?,
+                discovery_state_json = ?
+            WHERE run_id = ?
+            """,
+            (
+                time.time(),
+                int(state_json.get("files_found") or 0),
+                stage,
+                _json_dumps_safe(state_json),
+                run_id,
+            ),
+        )
+        con.commit()
+        con.close()
+        return {"ok": True, "rows": len(rows), "run_id": run_id, "stage": stage}
+    except Exception:
+        logging.debug("Failed to persist discovery snapshot for run_id=%s", run_id, exc_info=True)
+        return {"ok": False, "rows": 0, "run_id": run_id}
+
+
+def _load_resume_discovery_snapshot_by_run_id(run_id: str | None) -> dict[str, Any] | None:
+    run_id = str(run_id or "").strip()
+    if not run_id:
+        return None
+    try:
+        con = _state_connect_readonly(timeout=20)
+        cur = con.cursor()
+        cur.execute(
+            """
+            SELECT discovery_stage, discovery_state_json
+            FROM scan_resume_runs
+            WHERE run_id = ?
+              AND COALESCE(status, '') != 'completed'
+              AND COALESCE(discovery_snapshot_ready, 0) = 1
+            LIMIT 1
+            """,
+            (run_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            con.close()
+            return None
+        try:
+            state_json = json.loads(row["discovery_state_json"] or "{}")
+            if not isinstance(state_json, dict):
+                state_json = {}
+        except Exception:
+            state_json = {}
+        cur.execute(
+            """
+            SELECT root_index, file_path
+            FROM scan_resume_discovery_files
+            WHERE run_id = ?
+            ORDER BY root_index ASC, file_path ASC
+            """,
+            (run_id,),
+        )
+        files_by_root: dict[int, list[str]] = defaultdict(list)
+        for file_row in cur.fetchall():
+            root_index = _parse_int_loose(file_row["root_index"] if isinstance(file_row, sqlite3.Row) else file_row[0], 0) or 0
+            file_path = str(file_row["file_path"] if isinstance(file_row, sqlite3.Row) else file_row[1] or "").strip()
+            if file_path:
+                files_by_root[root_index].append(file_path)
+        con.close()
+        current_root_index = _parse_int_loose(state_json.get("current_root_index"), None)
+        current_root_files = list(files_by_root.get(int(current_root_index), [])) if current_root_index is not None else []
+        return {
+            "run_id": run_id,
+            "stage": str(row["discovery_stage"] if isinstance(row, sqlite3.Row) else row[0] or "").strip() or str(state_json.get("stage") or "filesystem"),
+            "roots": [str(r) for r in (state_json.get("roots") or []) if r],
+            "current_root_index": current_root_index,
+            "current_root_path": str(state_json.get("current_root_path") or "").strip() or None,
+            "current_stack": copy.deepcopy(state_json.get("current_stack") or []),
+            "current_root_entries_scanned": int(state_json.get("current_root_entries_scanned") or 0),
+            "current_root_audio_found": int(state_json.get("current_root_audio_found") or len(current_root_files)),
+            "shared_entries_scanned": int(state_json.get("shared_entries_scanned") or 0),
+            "shared_files_found": int(state_json.get("shared_files_found") or 0),
+            "shared_roots_done": int(state_json.get("shared_roots_done") or 0),
+            "roots_total": int(state_json.get("roots_total") or 0),
+            "entries_scanned": int(state_json.get("entries_scanned") or 0),
+            "files_found": int(state_json.get("files_found") or 0),
+            "albums_found": int(state_json.get("albums_found") or 0),
+            "artists_found": int(state_json.get("artists_found") or 0),
+            "folders_found": int(state_json.get("folders_found") or 0),
+            "folders_done": int(state_json.get("folders_done") or 0),
+            "folders_total": int(state_json.get("folders_total") or 0),
+            "results_by_root": {int(idx): list(paths) for idx, paths in files_by_root.items()},
+            "current_root_files": current_root_files,
+            "updated_at": float(state_json.get("updated_at") or 0.0),
+        }
+    except Exception:
+        logging.debug("Failed to restore discovery snapshot for run_id=%s", run_id, exc_info=True)
+        return None
+
+
+def _snapshot_current_resume_discovery(reason: str = "") -> dict[str, Any]:
+    with lock:
+        run_id = str(state.get("scan_resume_run_id") or "").strip() or None
+    runtime_snapshot = _copy_scan_discovery_runtime(run_id)
+    result = _persist_resume_discovery_snapshot(run_id, runtime_snapshot)
+    if result.get("ok"):
+        logging.info(
+            "[Resume] persisted discovery snapshot (%s) for run_id=%s (%d file row(s))",
+            str(runtime_snapshot.get("stage") if isinstance(runtime_snapshot, dict) else "" or "filesystem"),
+            run_id,
+            int(result.get("rows") or 0),
+        )
+    return result
+
+
+def _wait_for_discovery_runtime_update(
+    run_id: str | None,
+    *,
+    previous_updated_at: float | None = None,
+    require_paused_ack: bool = False,
+    timeout_seconds: float = 3.0,
+) -> dict[str, Any] | None:
+    run_id = str(run_id or "").strip() or None
+    deadline = time.monotonic() + max(0.1, float(timeout_seconds or 0.0))
+    latest_snapshot: dict[str, Any] | None = None
+    while time.monotonic() < deadline:
+        latest_snapshot = _copy_scan_discovery_runtime(run_id)
+        if not isinstance(latest_snapshot, dict):
+            time.sleep(0.1)
+            continue
+        updated_at = float(latest_snapshot.get("updated_at") or 0.0)
+        if require_paused_ack and bool(latest_snapshot.get("paused_ack")):
+            return latest_snapshot
+        if previous_updated_at is None:
+            return latest_snapshot
+        if updated_at > float(previous_updated_at or 0.0):
+            return latest_snapshot
+        time.sleep(0.1)
+    return latest_snapshot
+
+
+def _snapshot_current_resume_state(reason: str = "") -> dict[str, Any]:
+    with lock:
+        mode = _get_library_mode()
+        run_id = str(state.get("scan_resume_run_id") or "").strip() or None
+        has_plan = bool(mode == "files" and (state.get("files_editions_by_album_id") or {}))
+        discovery_running = bool(mode == "files" and state.get("scan_discovery_running"))
+    if has_plan:
+        result = _snapshot_current_resume_files_plan(reason)
+        result["snapshot_kind"] = "plan"
+        return result
+    if discovery_running or isinstance(_copy_scan_discovery_runtime(run_id), dict):
+        result = _snapshot_current_resume_discovery(reason)
+        result["snapshot_kind"] = "discovery"
+        return result
+    return {"ok": False, "rows": 0, "run_id": run_id, "snapshot_kind": "none"}
+
+
 def _restore_resume_files_plan_from_run_row(
     con: sqlite3.Connection,
     run_row: sqlite3.Row | tuple | None,
@@ -39296,7 +40031,7 @@ def _has_unfinished_resume_run(mode: str, scan_type: str) -> bool:
     """
     source_signature = _compute_scan_source_signature(mode, scan_type)
     try:
-        con = sqlite3.connect(str(STATE_DB_FILE), timeout=15)
+        con = _state_connect_readonly(timeout=15)
         cur = con.cursor()
         cur.execute(
             """
@@ -39325,7 +40060,7 @@ def _get_resume_run_snapshot(mode: str, scan_type: str) -> dict[str, Any] | None
     """
     source_signature = _compute_scan_source_signature(mode, scan_type)
     try:
-        con = sqlite3.connect(str(STATE_DB_FILE), timeout=15)
+        con = _state_connect_readonly(timeout=15)
         cur = con.cursor()
         cur.execute(
             """
@@ -39333,7 +40068,10 @@ def _get_resume_run_snapshot(mode: str, scan_type: str) -> dict[str, Any] | None
                    COALESCE(detected_artists_total, 0),
                    COALESCE(detected_albums_total, 0),
                    COALESCE(detected_tracks_total, 0),
-                   COALESCE(plan_snapshot_ready, 0)
+                   COALESCE(plan_snapshot_ready, 0),
+                   COALESCE(discovery_snapshot_ready, 0),
+                   COALESCE(discovery_stage, ''),
+                   COALESCE(discovery_state_json, '{}')
             FROM scan_resume_runs
             WHERE source_signature = ? AND mode = ? AND scan_type = ?
               AND COALESCE(status, '') != 'completed'
@@ -39355,6 +40093,14 @@ def _get_resume_run_snapshot(mode: str, scan_type: str) -> dict[str, Any] | None
         detected_albums_total = int(row[6] or 0)
         detected_tracks_total = int(row[7] or 0)
         plan_snapshot_ready = bool(row[8])
+        discovery_snapshot_ready = bool(row[9])
+        discovery_stage = str(row[10] or "").strip()
+        try:
+            discovery_state = json.loads(row[11] or "{}")
+            if not isinstance(discovery_state, dict):
+                discovery_state = {}
+        except Exception:
+            discovery_state = {}
         cur.execute(
             """
             SELECT
@@ -39389,7 +40135,7 @@ def _get_resume_run_snapshot(mode: str, scan_type: str) -> dict[str, Any] | None
         remaining_albums = max(0, pending_albums + running_albums + failed_albums)
         if plan_snapshot_ready and remaining_artists <= 0:
             try:
-                con2 = sqlite3.connect(str(STATE_DB_FILE), timeout=15)
+                con2 = _state_connect_readonly(timeout=15)
                 cur2 = con2.cursor()
                 cur2.execute(
                     "SELECT COUNT(*), COALESCE(COUNT(DISTINCT artist_name), 0) FROM scan_resume_files_plan WHERE run_id = ?",
@@ -39401,8 +40147,32 @@ def _get_resume_run_snapshot(mode: str, scan_type: str) -> dict[str, Any] | None
                 remaining_artists = max(remaining_artists, int(plan_counts[1] or 0))
             except Exception:
                 logging.debug("Failed to count resume files plan rows for run_id=%s", run_id, exc_info=True)
+        if discovery_snapshot_ready and remaining_artists <= 0 and remaining_albums <= 0:
+            remaining_artists = max(remaining_artists, int(discovery_state.get("artists_found") or detected_artists_total or 0))
+            remaining_albums = max(
+                remaining_albums,
+                int(
+                    discovery_state.get("albums_found")
+                    or discovery_state.get("folders_found")
+                    or detected_albums_total
+                    or 0
+                ),
+            )
         return {
-            "available": bool(run_id and remaining_artists > 0),
+            "available": bool(
+                run_id
+                and (
+                    remaining_artists > 0
+                    or remaining_albums > 0
+                    or (
+                        discovery_snapshot_ready
+                        and bool(
+                            int(discovery_state.get("entries_scanned") or 0)
+                            or int(discovery_state.get("files_found") or 0)
+                        )
+                    )
+                )
+            ),
             "run_id": run_id,
             "status": run_status,
             "scan_type": scan_type,
@@ -39425,6 +40195,10 @@ def _get_resume_run_snapshot(mode: str, scan_type: str) -> dict[str, Any] | None
             "detected_albums_total": detected_albums_total,
             "detected_tracks_total": detected_tracks_total,
             "plan_snapshot_ready": bool(plan_snapshot_ready),
+            "discovery_snapshot_ready": bool(discovery_snapshot_ready),
+            "discovery_stage": discovery_stage,
+            "discovery_entries_scanned": int(discovery_state.get("entries_scanned") or 0),
+            "discovery_files_found": int(discovery_state.get("files_found") or 0),
         }
     except Exception:
         logging.debug("Failed to read resume snapshot for scan_type=%s", scan_type, exc_info=True)
@@ -39436,7 +40210,7 @@ def _get_resume_run_snapshot_by_run_id(run_id: str | None) -> dict[str, Any] | N
     if not run_id:
         return None
     try:
-        con = sqlite3.connect(str(STATE_DB_FILE), timeout=15)
+        con = _state_connect_readonly(timeout=15)
         cur = con.cursor()
         cur.execute(
             """
@@ -39445,6 +40219,9 @@ def _get_resume_run_snapshot_by_run_id(run_id: str | None) -> dict[str, Any] | N
                    COALESCE(detected_albums_total, 0),
                    COALESCE(detected_tracks_total, 0),
                    COALESCE(plan_snapshot_ready, 0),
+                   COALESCE(discovery_snapshot_ready, 0),
+                   COALESCE(discovery_stage, ''),
+                   COALESCE(discovery_state_json, '{}'),
                    mode,
                    scan_type
             FROM scan_resume_runs
@@ -39458,11 +40235,11 @@ def _get_resume_run_snapshot_by_run_id(run_id: str | None) -> dict[str, Any] | N
         con.close()
         if not row:
             return None
-        snap = _get_resume_run_snapshot(str(row[9] or "files"), str(row[10] or "full"))
+        snap = _get_resume_run_snapshot(str(row[12] or "files"), str(row[13] or "full"))
         if snap and str(snap.get("run_id") or "").strip() == run_id:
             return snap
         # Signature may have changed since the run was created; compute directly from run_id.
-        con = sqlite3.connect(str(STATE_DB_FILE), timeout=15)
+        con = _state_connect_readonly(timeout=15)
         cur = con.cursor()
         cur.execute(
             """
@@ -39493,12 +40270,37 @@ def _get_resume_run_snapshot_by_run_id(run_id: str | None) -> dict[str, Any] | N
             plan_counts = cur.fetchone() or (0, 0)
             remaining_albums = max(remaining_albums, int(plan_counts[0] or 0))
             remaining_artists = max(remaining_artists, int(plan_counts[1] or 0))
+        try:
+            discovery_state = json.loads(row[11] or "{}")
+            if not isinstance(discovery_state, dict):
+                discovery_state = {}
+        except Exception:
+            discovery_state = {}
+        if bool(row[9]) and remaining_artists <= 0 and remaining_albums <= 0:
+            remaining_artists = max(remaining_artists, int(discovery_state.get("artists_found") or row[5] or 0))
+            remaining_albums = max(
+                remaining_albums,
+                int(discovery_state.get("albums_found") or discovery_state.get("folders_found") or row[6] or 0),
+            )
         con.close()
         return {
-            "available": bool(run_id and remaining_artists > 0),
+            "available": bool(
+                run_id
+                and (
+                    remaining_artists > 0
+                    or remaining_albums > 0
+                    or (
+                        bool(row[9])
+                        and bool(
+                            int(discovery_state.get("entries_scanned") or 0)
+                            or int(discovery_state.get("files_found") or 0)
+                        )
+                    )
+                )
+            ),
             "run_id": run_id,
             "status": str(row[1] or "").strip().lower() or "pending",
-            "scan_type": str(row[10] or "full"),
+            "scan_type": str(row[13] or "full"),
             "created_at": float(row[2] or 0.0) if row[2] is not None else None,
             "updated_at": float(row[3] or 0.0) if row[3] is not None else None,
             "scan_id": int(row[4] or 0) if row[4] is not None else None,
@@ -39518,6 +40320,10 @@ def _get_resume_run_snapshot_by_run_id(run_id: str | None) -> dict[str, Any] | N
             "detected_albums_total": int(row[6] or 0),
             "detected_tracks_total": int(row[7] or 0),
             "plan_snapshot_ready": bool(row[8]),
+            "discovery_snapshot_ready": bool(row[9]),
+            "discovery_stage": str(row[10] or "").strip(),
+            "discovery_entries_scanned": int(discovery_state.get("entries_scanned") or 0),
+            "discovery_files_found": int(discovery_state.get("files_found") or 0),
             "signature_match": False,
         }
     except Exception:
@@ -39527,7 +40333,7 @@ def _get_resume_run_snapshot_by_run_id(run_id: str | None) -> dict[str, Any] | N
 
 def _get_latest_resume_run_snapshot_any_signature(mode: str, scan_type: str) -> dict[str, Any] | None:
     try:
-        con = sqlite3.connect(str(STATE_DB_FILE), timeout=15)
+        con = _state_connect_readonly(timeout=15)
         cur = con.cursor()
         cur.execute(
             """
@@ -39556,7 +40362,7 @@ def _set_resume_artist_status(run_id: str | None, artist_name: str, status: str,
         return
     now = time.time()
     try:
-        con = sqlite3.connect(str(STATE_DB_FILE), timeout=15)
+        con = _state_connect(timeout=15)
         cur = con.cursor()
         cur.execute(
             """
@@ -39582,7 +40388,7 @@ def _set_resume_run_status(run_id: str | None, status: str, scan_id: int | None 
         return
     now = time.time()
     try:
-        con = sqlite3.connect(str(STATE_DB_FILE), timeout=15)
+        con = _state_connect(timeout=15)
         cur = con.cursor()
         cur.execute(
             """
@@ -39626,6 +40432,20 @@ def _build_files_editions(
     roots = [Path(r) for r in (active_root_paths or FILES_ROOTS or []) if r]
     stop_event = scan_should_stop if respect_scan_controls else None
     pause_event = scan_is_paused if respect_scan_controls else None
+    with lock:
+        requested_resume_run_id = str(state.get("scan_resume_requested_run_id") or "").strip() or None
+        current_resume_run_id = str(state.get("scan_resume_run_id") or "").strip() or None
+    resume_run_id = current_resume_run_id or requested_resume_run_id
+    if respect_scan_controls and not resume_run_id:
+        resume_run_id = _ensure_resume_run_started("files", scan_type, requested_run_id=requested_resume_run_id)
+        if resume_run_id:
+            with lock:
+                state["scan_resume_run_id"] = resume_run_id
+    resume_discovery_snapshot = (
+        _load_resume_discovery_snapshot_by_run_id(resume_run_id)
+        if respect_scan_controls and resume_run_id
+        else None
+    )
 
     def _files_scan_stop_requested() -> bool:
         return bool(stop_event is not None and stop_event.is_set())
@@ -39638,6 +40458,7 @@ def _build_files_editions(
         return not _files_scan_stop_requested()
 
     if not roots:
+        _clear_scan_discovery_runtime(resume_run_id)
         with lock:
             state["scan_discovery_running"] = False
             state["scan_discovery_current_root"] = None
@@ -39693,8 +40514,18 @@ def _build_files_editions(
         with lock:
             for key, value in updates.items():
                 state[key] = value
+            discovery_files_found_now = int(state.get("scan_discovery_files_found") or 0)
+            discovery_albums_found_now = int(state.get("scan_discovery_albums_found") or 0)
+            discovery_artists_found_now = int(state.get("scan_discovery_artists_found") or 0)
+            discovery_total_now = int(state.get("scan_discovery_albums_total") or state.get("scan_discovery_folders_total") or 0)
+            state["scan_tracks_detected_total"] = max(int(state.get("scan_tracks_detected_total") or 0), discovery_files_found_now)
+            state["scan_detected_albums_total"] = max(int(state.get("scan_detected_albums_total") or 0), discovery_albums_found_now)
+            state["scan_detected_artists_total"] = max(int(state.get("scan_detected_artists_total") or 0), discovery_artists_found_now)
+            if discovery_total_now > 0:
+                state["scan_total_albums"] = max(int(state.get("scan_total_albums") or 0), discovery_total_now)
 
     def _cancel_discovery(reason: str = "cancelled") -> tuple[list[tuple[int, str, list[int]]], int, dict]:
+        _clear_scan_discovery_runtime(resume_run_id)
         _set_discovery_state(
             scan_discovery_running=False,
             scan_discovery_stage="cancelled",
@@ -39980,6 +40811,31 @@ def _build_files_editions(
         state["scan_discovery_started_at"] = discovery_started_at
         state["scan_discovery_updated_at"] = discovery_started_at
 
+    if isinstance(resume_discovery_snapshot, dict):
+        resume_stage = str(resume_discovery_snapshot.get("stage") or "").strip() or "filesystem"
+        _set_discovery_state(
+            scan_discovery_running=True,
+            scan_discovery_stage=resume_stage,
+            scan_discovery_current_root=resume_discovery_snapshot.get("current_root_path"),
+            scan_discovery_roots_done=int(resume_discovery_snapshot.get("shared_roots_done") or 0),
+            scan_discovery_roots_total=int(resume_discovery_snapshot.get("roots_total") or len(roots)),
+            scan_discovery_files_found=int(resume_discovery_snapshot.get("files_found") or 0),
+            scan_discovery_entries_scanned=int(resume_discovery_snapshot.get("entries_scanned") or 0),
+            scan_discovery_root_entries_scanned=int(resume_discovery_snapshot.get("current_root_entries_scanned") or 0),
+            scan_discovery_folders_found=int(resume_discovery_snapshot.get("folders_found") or 0),
+            scan_discovery_albums_found=int(resume_discovery_snapshot.get("albums_found") or 0),
+            scan_discovery_artists_found=int(resume_discovery_snapshot.get("artists_found") or 0),
+            scan_discovery_folders_done=int(resume_discovery_snapshot.get("folders_done") or 0),
+            scan_discovery_folders_total=int(resume_discovery_snapshot.get("folders_total") or 0),
+        )
+        log_scan(
+            "FILES discovery: resuming run_id=%s at stage=%s (visited=%d, audio=%d).",
+            resume_run_id,
+            resume_stage,
+            int(resume_discovery_snapshot.get("entries_scanned") or 0),
+            int(resume_discovery_snapshot.get("files_found") or 0),
+        )
+
     def _on_discovery_progress(payload: dict) -> None:
         try:
             _set_discovery_state(
@@ -40002,6 +40858,17 @@ def _build_files_editions(
             files_found=int(payload.get("files_found") or 0),
             entries_scanned=int(payload.get("entries_scanned") or 0),
         )
+
+    def _on_discovery_checkpoint(snapshot: dict[str, Any]) -> None:
+        if not isinstance(snapshot, dict):
+            return
+        with lock:
+            snapshot["albums_found"] = int(state.get("scan_discovery_albums_found") or 0)
+            snapshot["artists_found"] = int(state.get("scan_discovery_artists_found") or 0)
+            snapshot["folders_found"] = int(state.get("scan_discovery_folders_found") or 0)
+            snapshot["folders_done"] = int(state.get("scan_discovery_folders_done") or 0)
+            snapshot["folders_total"] = int(state.get("scan_discovery_folders_total") or 0)
+        _set_scan_discovery_runtime(snapshot)
 
     _emit_files_discovery_heartbeat("scanning filesystem", roots_done=0, roots_total=len(roots), force=True)
     by_folder: dict[Path, list[Path]] = defaultdict(list)
@@ -40060,19 +40927,71 @@ def _build_files_editions(
                 force=(idx == folders_total_pending),
             )
     else:
-        audio_files = _iter_audio_files_under_roots(
-            [str(r) for r in roots],
-            progress_cb=_on_discovery_progress,
-            progress_every=250,
-            heartbeat_seconds=5.0,
-            stop_event=stop_event,
-            pause_event=pause_event,
-        )
+        if isinstance(resume_discovery_snapshot, dict) and str(resume_discovery_snapshot.get("stage") or "").strip().lower() == "album_candidates":
+            seen_paths: set[str] = set()
+            audio_files = []
+            for root_idx in sorted((resume_discovery_snapshot.get("results_by_root") or {}).keys()):
+                for raw_path in (resume_discovery_snapshot.get("results_by_root") or {}).get(root_idx, []):
+                    sp = str(raw_path or "").strip()
+                    if not sp or sp in seen_paths:
+                        continue
+                    seen_paths.add(sp)
+                    audio_files.append(Path(sp))
+            _emit_files_discovery_heartbeat(
+                "resumed album candidates",
+                roots_done=len(roots),
+                roots_total=len(roots),
+                files_found=len(audio_files),
+                force=True,
+            )
+        else:
+            audio_files = _iter_audio_files_under_roots_checkpointed(
+                [str(r) for r in roots],
+                run_id=resume_run_id,
+                progress_cb=_on_discovery_progress,
+                progress_every=250,
+                heartbeat_seconds=5.0,
+                stop_event=stop_event,
+                pause_event=pause_event,
+                resume_snapshot=resume_discovery_snapshot,
+                checkpoint_cb=_on_discovery_checkpoint,
+            )
         if _files_scan_stop_requested():
             log_scan("FILES discovery cancelled during filesystem walk.")
             return _cancel_discovery()
         for p in audio_files:
             by_folder[p.parent].append(p)
+    with lock:
+        discovery_entries_scanned_live = int(state.get("scan_discovery_entries_scanned") or 0)
+        discovery_albums_found_live = int(state.get("scan_discovery_albums_found") or 0)
+        discovery_artists_found_live = int(state.get("scan_discovery_artists_found") or 0)
+        discovery_folders_done_live = int(state.get("scan_discovery_folders_done") or 0)
+        discovery_folders_total_live = int(state.get("scan_discovery_folders_total") or 0)
+    _set_scan_discovery_runtime(
+        {
+            "run_id": str(resume_run_id or "").strip(),
+            "stage": "album_candidates",
+            "roots": [str(r) for r in roots],
+            "roots_total": len(roots),
+            "results_by_root": {0: list(audio_files)},
+            "current_root_index": None,
+            "current_root_path": None,
+            "current_stack": [],
+            "current_root_entries_scanned": 0,
+            "current_root_audio_found": len(audio_files),
+            "current_root_files": [],
+            "shared_entries_scanned": discovery_entries_scanned_live,
+            "shared_files_found": len(audio_files),
+            "shared_roots_done": len(roots),
+            "albums_found": discovery_albums_found_live,
+            "artists_found": discovery_artists_found_live,
+            "folders_found": len(by_folder),
+            "folders_done": discovery_folders_done_live,
+            "folders_total": discovery_folders_total_live,
+            "paused_ack": False,
+            "updated_at": time.time(),
+        }
+    )
     _set_discovery_state(
         scan_discovery_running=True,
         scan_discovery_stage="album_candidates",
@@ -41600,12 +42519,14 @@ def background_scan():
                 if state["scan_run_scope_stage"] == "done":
                     state["scan_run_scope_preparing"] = False
 
+        with lock:
+            resume_run_id_current = str(state.get("scan_resume_run_id") or "").strip() or None
         resume_run_id, artists_merged, resume_skipped_artists, resume_skipped_albums = _prepare_resume_scan_artists(
             _get_library_mode(),
             scan_type,
             artists_merged,
             files_editions_by_album_id=files_editions_for_resume,
-            resume_run_id_override=requested_resume_run_id,
+            resume_run_id_override=(resume_run_id_current or requested_resume_run_id),
             progress_cb=_on_run_scope_progress,
             pause_event=scan_is_paused,
         )
@@ -48435,20 +49356,41 @@ def api_files_watcher_restart():
 
 @app.route("/scan/pause", methods=["POST"])
 def pause_scan():
-    scan_is_paused.set()
     snapshot_triggered = False
     snapshot_rows = 0
+    snapshot_kind = "none"
     with lock:
         state["scanning"] = True   # still scanning, just paused
         mode = _get_library_mode()
-        can_snapshot = bool(mode == "files" and (state.get("files_editions_by_album_id") or {}))
         resume_run_id = str(state.get("scan_resume_run_id") or "").strip() or None
-    if can_snapshot:
-        snap = _snapshot_current_resume_files_plan("manual_pause")
-        snapshot_triggered = bool(snap.get("ok"))
-        snapshot_rows = int(snap.get("rows") or 0)
+        discovery_running = bool(mode == "files" and state.get("scan_discovery_running"))
+    previous_updated_at = None
+    if discovery_running:
+        try:
+            previous_updated_at = float((_copy_scan_discovery_runtime(resume_run_id) or {}).get("updated_at") or 0.0)
+        except Exception:
+            previous_updated_at = None
+    scan_is_paused.set()
+    if discovery_running:
+        _wait_for_discovery_runtime_update(
+            resume_run_id,
+            previous_updated_at=previous_updated_at,
+            require_paused_ack=True,
+            timeout_seconds=3.0,
+        )
+    snap = _snapshot_current_resume_state("manual_pause")
+    snapshot_triggered = bool(snap.get("ok"))
+    snapshot_rows = int(snap.get("rows") or 0)
+    snapshot_kind = str(snap.get("snapshot_kind") or "none")
     _set_resume_run_status(resume_run_id, "paused")
-    return jsonify({"status": "ok", "snapshot_triggered": bool(snapshot_triggered), "snapshot_rows": snapshot_rows})
+    return jsonify(
+        {
+            "status": "ok",
+            "snapshot_triggered": bool(snapshot_triggered),
+            "snapshot_rows": snapshot_rows,
+            "snapshot_kind": snapshot_kind,
+        }
+    )
 
 
 @app.route("/scan/resume", methods=["POST"])
@@ -48527,21 +49469,36 @@ def resume_scan():
 def stop_scan():
     snapshot_triggered = False
     snapshot_rows = 0
+    snapshot_kind = "none"
     with lock:
         mode = _get_library_mode()
-        can_snapshot = bool(mode == "files" and (state.get("files_editions_by_album_id") or {}))
         resume_run_id = str(state.get("scan_resume_run_id") or "").strip() or None
-    if can_snapshot:
-        snap = _snapshot_current_resume_files_plan("manual_stop")
-        snapshot_triggered = bool(snap.get("ok"))
-        snapshot_rows = int(snap.get("rows") or 0)
-    _set_resume_run_status(resume_run_id, "stopped")
+        discovery_running = bool(mode == "files" and state.get("scan_discovery_running"))
+    previous_updated_at = None
+    if discovery_running:
+        try:
+            previous_updated_at = float((_copy_scan_discovery_runtime(resume_run_id) or {}).get("updated_at") or 0.0)
+        except Exception:
+            previous_updated_at = None
     scan_should_stop.set()
+    if discovery_running:
+        _wait_for_discovery_runtime_update(
+            resume_run_id,
+            previous_updated_at=previous_updated_at,
+            require_paused_ack=False,
+            timeout_seconds=3.0,
+        )
+    snap = _snapshot_current_resume_state("manual_stop")
+    snapshot_triggered = bool(snap.get("ok"))
+    snapshot_rows = int(snap.get("rows") or 0)
+    snapshot_kind = str(snap.get("snapshot_kind") or "none")
+    _set_resume_run_status(resume_run_id, "stopped")
     return jsonify(
         {
             "status": "ok",
             "snapshot_triggered": bool(snapshot_triggered),
             "snapshot_rows": snapshot_rows,
+            "snapshot_kind": snapshot_kind,
             "resume_preserved": bool(resume_run_id),
             "resume_run_id": resume_run_id,
         }
@@ -52564,59 +53521,74 @@ def api_task_events():
         limit = max(1, min(500, int(request.args.get("limit", 100) or 100)))
     except Exception:
         limit = 100
-    con = _state_connect(timeout=10)
-    cur = con.cursor()
-    cur.execute(
-        """
-        SELECT event_id, run_id, job_type, scope, status, message, metrics_json, summary_json, error,
-               source, started_at, ended_at, duration_ms
-        FROM task_events
-        WHERE event_id > ?
-        ORDER BY event_id ASC
-        LIMIT ?
-        """,
-        (after_id, limit),
-    )
-    rows = cur.fetchall()
-    cur.execute("SELECT MAX(event_id) AS max_id FROM task_events")
-    max_row = cur.fetchone()
-    con.close()
-    events = []
-    for row in rows:
-        metrics = {}
-        summary = {}
-        try:
-            metrics = json.loads(row["metrics_json"] or "{}")
-        except Exception:
+    try:
+        con = _state_connect_readonly(timeout=3)
+        cur = con.cursor()
+        cur.execute(
+            """
+            SELECT event_id, run_id, job_type, scope, status, message, metrics_json, summary_json, error,
+                   source, started_at, ended_at, duration_ms
+            FROM task_events
+            WHERE event_id > ?
+            ORDER BY event_id ASC
+            LIMIT ?
+            """,
+            (after_id, limit),
+        )
+        rows = cur.fetchall()
+        cur.execute("SELECT MAX(event_id) AS max_id FROM task_events")
+        max_row = cur.fetchone()
+        con.close()
+        events = []
+        for row in rows:
             metrics = {}
-        try:
-            summary = json.loads(row["summary_json"] or "{}")
-        except Exception:
             summary = {}
-        events.append(
+            try:
+                metrics = json.loads(row["metrics_json"] or "{}")
+            except Exception:
+                metrics = {}
+            try:
+                summary = json.loads(row["summary_json"] or "{}")
+            except Exception:
+                summary = {}
+            events.append(
+                {
+                    "event_id": int(row["event_id"] or 0),
+                    "run_id": row["run_id"],
+                    "job_type": str(row["job_type"] or ""),
+                    "scope": str(row["scope"] or "both"),
+                    "status": str(row["status"] or ""),
+                    "message": str(row["message"] or ""),
+                    "metrics": metrics,
+                    "summary": summary,
+                    "error": str(row["error"] or ""),
+                    "source": str(row["source"] or ""),
+                    "started_at": float(row["started_at"] or 0.0),
+                    "ended_at": float(row["ended_at"] or 0.0) if row["ended_at"] is not None else None,
+                    "duration_ms": int(row["duration_ms"] or 0) if row["duration_ms"] is not None else None,
+                }
+            )
+        last_id = int(max_row["max_id"] or 0) if max_row else 0
+        _task_events_cache_merge(events, max_id=last_id)
+        return jsonify(
             {
-                "event_id": int(row["event_id"] or 0),
-                "run_id": row["run_id"],
-                "job_type": str(row["job_type"] or ""),
-                "scope": str(row["scope"] or "both"),
-                "status": str(row["status"] or ""),
-                "message": str(row["message"] or ""),
-                "metrics": metrics,
-                "summary": summary,
-                "error": str(row["error"] or ""),
-                "source": str(row["source"] or ""),
-                "started_at": float(row["started_at"] or 0.0),
-                "ended_at": float(row["ended_at"] or 0.0) if row["ended_at"] is not None else None,
-                "duration_ms": int(row["duration_ms"] or 0) if row["duration_ms"] is not None else None,
+                "events": events,
+                "last_id": last_id,
+                "server_time": time.time(),
+                "stale": False,
             }
         )
-    return jsonify(
-        {
-            "events": events,
-            "last_id": int(max_row["max_id"] or 0) if max_row else 0,
-            "server_time": time.time(),
-        }
-    )
+    except sqlite3.OperationalError as exc:
+        logging.debug("api_task_events: returning cached response after SQLite lock: %s", exc)
+        events, last_id, _cached_ts = _task_events_cache_read(after_id=after_id, limit=limit)
+        return jsonify(
+            {
+                "events": events,
+                "last_id": int(last_id or 0),
+                "server_time": time.time(),
+                "stale": True,
+            }
+        )
 
 
 @app.get("/api/scheduler/rules")
@@ -53523,6 +54495,36 @@ def api_progress():
             phase = "format_analysis"
         else:
             phase = "format_analysis"
+        if run_scope_preparing and run_scope_total > 0:
+            progress = int(run_scope_done or 0)
+            total = int(run_scope_total or 0)
+            effective_progress = int(progress)
+            phase_progress = float(run_scope_percent or 0.0)
+            if run_scope_eta_seconds is not None:
+                eta_seconds = run_scope_eta_seconds
+        elif pre_scan_active:
+            if scan_discovery_stage == "filesystem":
+                progress = int(scan_discovery_roots_done or 0)
+                total = int(scan_discovery_roots_total or 0)
+                effective_progress = int(progress)
+                if total > 0:
+                    phase_progress = max(0.0, min(100.0, round((float(progress) / float(total)) * 100.0, 2)))
+                    if scan_discovery_started_at and progress > 0 and progress < total:
+                        try:
+                            discovery_elapsed = max(0.0, float(time.time() - float(scan_discovery_started_at)))
+                        except Exception:
+                            discovery_elapsed = 0.0
+                        if discovery_elapsed > 0:
+                            discovery_rate = progress / discovery_elapsed
+                            if discovery_rate > 0:
+                                eta_seconds = int(max(0, total - progress) / discovery_rate)
+                else:
+                    phase_progress = 0.0
+            else:
+                progress = int(preplan_done or 0)
+                total = int(preplan_total or 0)
+                effective_progress = int(progress)
+                phase_progress = float(preplan_percent or 0.0)
         if scan_profile_enrich_running and scan_profile_enrich_total > 0:
             phase_progress = scan_profile_enrich_percent
             if scan_profile_enrich_eta_seconds is not None:
@@ -53541,7 +54543,7 @@ def api_progress():
     last_scan_ai_unpriced_calls = 0
     if not scanning:
         try:
-            con = sqlite3.connect(str(STATE_DB_FILE), timeout=2)
+            con = _state_connect_readonly(timeout=2)
             cur = con.cursor()
             cur.execute(
                 """
@@ -53618,8 +54620,7 @@ def api_progress():
     current_scan_ai_rollup = None
     if scanning and scan_id_current:
         try:
-            con = sqlite3.connect(str(STATE_DB_FILE), timeout=2)
-            con.row_factory = sqlite3.Row
+            con = _state_connect_readonly(timeout=2)
             cur = con.cursor()
             cur.execute(
                 """
