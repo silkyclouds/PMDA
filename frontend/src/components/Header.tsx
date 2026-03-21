@@ -65,6 +65,7 @@ export function Header() {
   const { isAdmin } = useAuth();
   const location = useLocation();
   const [showSettings, setShowSettings] = useState(false);
+  const [welcomeMode, setWelcomeMode] = useState<'welcome' | 'bootstrap'>('welcome');
   const [isRebooting, setIsRebooting] = useState(false);
   const [rebootCountdown, setRebootCountdown] = useState(30);
   const [rebootProgress, setRebootProgress] = useState(0);
@@ -75,18 +76,26 @@ export function Header() {
   useEffect(() => {
     if (!isAdmin) {
       setShowSettings(false);
+      setWelcomeMode('welcome');
       setIsConfigured(true);
       setConfig(null);
       return;
     }
-    api.getConfig().then((data) => {
-      setConfig(data);
-      const configured = data.configured === true;
-      setIsConfigured(configured);
-      if (!configured && !hasWelcomeCookie()) {
-        setShowSettings(true);
-      }
-    }).catch(() => {});
+    Promise.all([api.getConfig(), api.getScanProgress()])
+      .then(([data, progress]) => {
+        setConfig(data);
+        const hasConfiguredRoots = Boolean(String(data.FILES_ROOTS || '').trim());
+        const configured = data.configured === true || hasConfiguredRoots;
+        const bootstrapPending = configured && Boolean(progress.bootstrap_required);
+        setIsConfigured(configured);
+        setWelcomeMode(bootstrapPending ? 'bootstrap' : 'welcome');
+        if ((bootstrapPending || !configured) && !hasWelcomeCookie()) {
+          setShowSettings(true);
+        } else {
+          setShowSettings(false);
+        }
+      })
+      .catch(() => {});
   }, [isAdmin]);
 
   const showGlobalSearch = location.pathname.startsWith('/library');
@@ -110,13 +119,14 @@ export function Header() {
       {isAdmin ? <GlobalStatusBar /> : null}
 
       {/* Welcome modal when not configured */}
-      {isAdmin && showSettings && !isConfigured && (
+      {isAdmin && showSettings && (
         <WelcomeModal
           onClose={() => {
             setWelcomeCookie();
             setShowSettings(false);
           }}
           config={config}
+          mode={welcomeMode}
         />
       )}
 
