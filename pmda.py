@@ -699,6 +699,8 @@ PMDA_REDIS_IDLE_CONSECUTIVE = max(1, int(os.getenv("PMDA_REDIS_IDLE_CONSECUTIVE"
 PMDA_REDIS_IDLE_WARN_COOLDOWN_SEC = max(10.0, float(os.getenv("PMDA_REDIS_IDLE_WARN_COOLDOWN_SEC", "180") or "180"))
 PMDA_OPENAI_CODEX_STATUS_TIMEOUT_SEC = max(5.0, float(os.getenv("PMDA_OPENAI_CODEX_STATUS_TIMEOUT_SEC", "30") or "30"))
 PMDA_FILES_LOCAL_CACHE_MAX_KEYS = int(max(1000, _parse_int(os.getenv("PMDA_FILES_LOCAL_CACHE_MAX_KEYS", "200000"), 200000) or 200000))
+PMDA_FILES_DIR_CACHE_MIN_SKIP_DEPTH = max(1, int(os.getenv("PMDA_FILES_DIR_CACHE_MIN_SKIP_DEPTH", "2") or "2"))
+PMDA_FILES_DIR_CACHE_MIN_ALBUMS = max(1, int(os.getenv("PMDA_FILES_DIR_CACHE_MIN_ALBUMS", "1") or "1"))
 PMDA_BENCHMARK_REPORTS_DIR = (
     os.getenv("PMDA_BENCHMARK_REPORTS_DIR", "/music/pmda_scan_benchmark/reports")
     or "/music/pmda_scan_benchmark/reports"
@@ -7033,6 +7035,7 @@ def init_state_db():
             folder_path TEXT PRIMARY KEY,
             source_id INTEGER,
             fingerprint TEXT NOT NULL,
+            ordered_paths_json TEXT NOT NULL DEFAULT '[]',
             artist_name TEXT,
             album_title TEXT,
             has_cover INTEGER NOT NULL DEFAULT 0,
@@ -7053,6 +7056,20 @@ def init_state_db():
             metadata_source TEXT,
             missing_required_tags TEXT NOT NULL DEFAULT '[]',
             last_scan_id INTEGER,
+            updated_at REAL NOT NULL
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS files_dir_scan_cache (
+            dir_path TEXT PRIMARY KEY,
+            source_id INTEGER,
+            root_path TEXT,
+            relative_depth INTEGER NOT NULL DEFAULT 0,
+            fingerprint TEXT NOT NULL,
+            subtree_audio_count INTEGER NOT NULL DEFAULT 0,
+            subtree_album_count INTEGER NOT NULL DEFAULT 0,
+            subtree_entry_estimate INTEGER NOT NULL DEFAULT 0,
+            album_folders_json TEXT NOT NULL DEFAULT '[]',
             updated_at REAL NOT NULL
         )
     """)
@@ -7406,6 +7423,7 @@ def init_state_db():
     files_cache_cols = {r[1] for r in cur.fetchall()}
     for col_name, col_type in [
         ("source_id", "INTEGER"),
+        ("ordered_paths_json", "TEXT NOT NULL DEFAULT '[]'"),
         ("musicbrainz_id", "TEXT"),
         ("has_identity", "INTEGER NOT NULL DEFAULT 0"),
         ("identity_provider", "TEXT"),
@@ -7421,6 +7439,21 @@ def init_state_db():
     ]:
         if col_name not in files_cache_cols:
             cur.execute(f"ALTER TABLE files_album_scan_cache ADD COLUMN {col_name} {col_type}")
+    cur.execute("PRAGMA table_info(files_dir_scan_cache)")
+    files_dir_cache_cols = {r[1] for r in cur.fetchall()}
+    for col_name, col_type in [
+        ("source_id", "INTEGER"),
+        ("root_path", "TEXT"),
+        ("relative_depth", "INTEGER NOT NULL DEFAULT 0"),
+        ("fingerprint", "TEXT NOT NULL DEFAULT ''"),
+        ("subtree_audio_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("subtree_album_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("subtree_entry_estimate", "INTEGER NOT NULL DEFAULT 0"),
+        ("album_folders_json", "TEXT NOT NULL DEFAULT '[]'"),
+        ("updated_at", "REAL NOT NULL DEFAULT 0"),
+    ]:
+        if col_name not in files_dir_cache_cols:
+            cur.execute(f"ALTER TABLE files_dir_scan_cache ADD COLUMN {col_name} {col_type}")
     # Backward-compatible schema evolution for files_library_published_albums.
     cur.execute("PRAGMA table_info(files_library_published_albums)")
     files_published_cols = {r[1] for r in cur.fetchall()}
@@ -7509,6 +7542,8 @@ def init_state_db():
         cur.execute("CREATE INDEX IF NOT EXISTS idx_scan_resume_discovery_files_run_root ON scan_resume_discovery_files(run_id, root_index, file_path)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_files_album_scan_cache_updated ON files_album_scan_cache(updated_at DESC)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_files_album_scan_cache_source_updated ON files_album_scan_cache(source_id, updated_at DESC)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_files_dir_scan_cache_root_depth ON files_dir_scan_cache(root_path, relative_depth)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_files_dir_scan_cache_updated ON files_dir_scan_cache(updated_at DESC)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_files_published_artist_norm ON files_library_published_albums(artist_norm)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_files_published_mb_rg ON files_library_published_albums(musicbrainz_release_group_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_files_published_artist_album ON files_library_published_albums(artist_norm, title_norm)")
@@ -24987,7 +25022,9 @@ def _iter_audio_files_under_roots_checkpointed(
     pause_event: threading.Event | None = None,
     resume_snapshot: dict[str, Any] | None = None,
     checkpoint_cb=None,
-) -> list[Path]:
+    dir_skip_lookup=None,
+    dir_skip_resolver=None,
+) -> tuple[list[Path], set[str]]:
     roots_list = [str(r) for r in (roots or []) if r]
     roots_total = len(roots_list)
     if roots_total <= 0:
@@ -24999,6 +25036,7 @@ def _iter_audio_files_under_roots_checkpointed(
     checkpoint_enabled = callable(checkpoint_cb)
 
     results_by_idx: dict[int, list[Path]] = {}
+    cached_album_folders: set[str] = set(str(p or "").strip() for p in ((resume_snapshot or {}).get("cached_album_folders") or []) if str(p or "").strip())
     shared_entries_scanned = 0
     shared_files_found = 0
     shared_roots_done = 0
@@ -25075,6 +25113,7 @@ def _iter_audio_files_under_roots_checkpointed(
                     "shared_entries_scanned": int(shared_entries_scanned or 0),
                     "shared_files_found": int(shared_files_found or 0),
                     "shared_roots_done": int(shared_roots_done or 0),
+                    "cached_album_folders": sorted(cached_album_folders),
                     "paused_ack": bool(paused_ack),
                     "updated_at": time.time(),
                 }
@@ -25211,7 +25250,36 @@ def _iter_audio_files_under_roots_checkpointed(
             root_entries += 1
             pending_entries += 1
             if bool(item.get("is_dir")):
-                stack_frames.append({"dir": str(item.get("path") or ""), "pending": None})
+                child_dir = str(item.get("path") or "").strip()
+                skipped_payload = None
+                if child_dir and callable(dir_skip_lookup) and callable(dir_skip_resolver):
+                    try:
+                        skip_meta = dir_skip_lookup(child_dir, str(base))
+                    except Exception:
+                        skip_meta = None
+                    if isinstance(skip_meta, dict) and skip_meta:
+                        try:
+                            skipped_payload = dir_skip_resolver(child_dir, skip_meta)
+                        except Exception:
+                            skipped_payload = None
+                if isinstance(skipped_payload, dict) and skipped_payload.get("file_paths"):
+                    file_paths = [Path(str(p)) for p in (skipped_payload.get("file_paths") or []) if str(p or "").strip()]
+                    local_out.extend(file_paths)
+                    added_files = int(skipped_payload.get("audio_count") or len(file_paths))
+                    added_entries = int(skipped_payload.get("entry_estimate") or 0)
+                    root_audio_found += max(0, added_files)
+                    pending_files += max(0, added_files)
+                    if added_entries > 0:
+                        root_entries += added_entries
+                        pending_entries += added_entries
+                    for folder_key in (skipped_payload.get("album_folders") or []):
+                        folder_clean = str(folder_key or "").strip()
+                        if folder_clean:
+                            cached_album_folders.add(folder_clean)
+                    if progress_every > 0 and (root_audio_found % progress_every == 0):
+                        _flush()
+                else:
+                    stack_frames.append({"dir": child_dir, "pending": None})
             elif bool(item.get("is_audio")):
                 local_out.append(Path(str(item.get("path") or "")))
                 root_audio_found += 1
@@ -25242,7 +25310,7 @@ def _iter_audio_files_under_roots_checkpointed(
                 continue
             seen_paths.add(sp)
             merged.append(path)
-    return merged
+    return merged, cached_album_folders
 
 # Global ffprobe pool for parallel processing
 _ffprobe_pool: Optional[ThreadPoolExecutor] = None
@@ -36715,11 +36783,74 @@ def _compute_album_fingerprint(paths: list[Path]) -> str:
     return h.hexdigest()
 
 
-def _load_files_album_scan_cache_map() -> dict[str, dict]:
+def _relative_depth_under_root(path_like: Path | str | None, root_like: Path | str | None) -> int | None:
+    try:
+        path_obj = path_for_fs_access(Path(path_like)) if path_like else None
+        root_obj = path_for_fs_access(Path(root_like)) if root_like else None
+    except Exception:
+        return None
+    if path_obj is None or root_obj is None:
+        return None
+    try:
+        rel = path_obj.resolve().relative_to(root_obj.resolve())
+    except Exception:
+        try:
+            rel = path_obj.relative_to(root_obj)
+        except Exception:
+            return None
+    parts = [part for part in rel.parts if part not in {"", "."}]
+    return len(parts)
+
+
+def _compute_dir_scan_fingerprint(dir_path: Path | str) -> tuple[str, int]:
+    """
+    Lightweight subtree gate based on immediate directory entries only.
+    This is intentionally cheap and optimized for append-only bucket layouts
+    such as Music_dump/month/day trees.
+    """
+    try:
+        dir_obj = path_for_fs_access(Path(dir_path))
+    except Exception:
+        dir_obj = Path(dir_path)
+    h = hashlib.blake2b(digest_size=20)
+    count = 0
+    items: list[tuple[str, bool, int, int]] = []
+    try:
+        with os.scandir(dir_obj) as it:
+            for entry in it:
+                try:
+                    is_dir = bool(entry.is_dir(follow_symlinks=False))
+                    is_file = bool(entry.is_file(follow_symlinks=False))
+                    if not is_dir and not is_file:
+                        continue
+                    st = entry.stat(follow_symlinks=False)
+                    size = int(st.st_size) if is_file else 0
+                    mtime_ns = int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)))
+                    items.append((entry.name, is_dir, size, mtime_ns))
+                except (OSError, PermissionError):
+                    continue
+    except (FileNotFoundError, NotADirectoryError, PermissionError, OSError):
+        return "", 0
+    for name, is_dir, size, mtime_ns in sorted(items, key=lambda x: x[0].lower()):
+        h.update(name.encode("utf-8", "replace"))
+        h.update(b"|d|" if is_dir else b"|f|")
+        h.update(str(size).encode("ascii"))
+        h.update(b"|")
+        h.update(str(mtime_ns).encode("ascii"))
+        h.update(b"\n")
+        count += 1
+    return h.hexdigest(), count
+
+
+def _load_files_album_scan_cache_map(
+    *,
+    folder_keys: list[str] | None = None,
+    include_ordered_paths: bool = False,
+) -> dict[str, dict]:
     """Load files album cache rows keyed by folder path."""
     out: dict[str, dict] = {}
     try:
-        con = sqlite3.connect(str(STATE_DB_FILE), timeout=20)
+        con = _state_connect_readonly(timeout=20)
         cur = con.cursor()
         cur.execute("PRAGMA table_info(files_album_scan_cache)")
         cols = {r[1] for r in cur.fetchall()}
@@ -36735,12 +36866,23 @@ def _load_files_album_scan_cache_map() -> dict[str, dict]:
         has_strict_provider_col = "strict_match_provider" in cols
         has_strict_reason_col = "strict_reject_reason" in cols
         has_strict_score_col = "strict_tracklist_score" in cols
+        has_ordered_paths_col = "ordered_paths_json" in cols
+
+        where_sql = ""
+        query_params: list[object] = []
+        if folder_keys:
+            cleaned_keys = [str(k or "").strip() for k in folder_keys if str(k or "").strip()]
+            if cleaned_keys:
+                placeholders = ",".join("?" for _ in cleaned_keys)
+                where_sql = f" WHERE folder_path IN ({placeholders})"
+                query_params.extend(cleaned_keys)
 
         cur.execute(
             f"""
             SELECT
                 folder_path,
                 fingerprint,
+                {'ordered_paths_json' if has_ordered_paths_col else "'[]'"} AS ordered_paths_json,
                 has_cover,
                 has_artist_image,
                 has_complete_tags,
@@ -36763,55 +36905,108 @@ def _load_files_album_scan_cache_map() -> dict[str, dict]:
                 album_title,
                 COALESCE(source_id, 0) AS source_id
             FROM files_album_scan_cache
-            """
+            {where_sql}
+            """,
+            tuple(query_params),
         )
         for row in cur.fetchall():
             folder_path = row[0] or ""
             if not folder_path:
                 continue
+            ordered_paths: list[str] = []
+            if include_ordered_paths:
+                try:
+                    ordered_paths = json.loads(row[2] or "[]")
+                    if not isinstance(ordered_paths, list):
+                        ordered_paths = []
+                except Exception:
+                    ordered_paths = []
             try:
-                missing_required = json.loads(row[18] or "[]")
+                missing_required = json.loads(row[19] or "[]")
                 if not isinstance(missing_required, list):
                     missing_required = []
             except Exception:
                 missing_required = []
-            identity_provider = _normalize_identity_provider(str(row[9] or ""))
-            metadata_source = _normalize_identity_provider(str(row[13] or ""))
-            strict_match_verified = bool(row[14])
-            strict_match_provider = _normalize_identity_provider(str(row[15] or ""))
-            strict_reject_reason = str(row[16] or "").strip()
+            identity_provider = _normalize_identity_provider(str(row[10] or ""))
+            metadata_source = _normalize_identity_provider(str(row[14] or ""))
+            strict_match_verified = bool(row[15])
+            strict_match_provider = _normalize_identity_provider(str(row[16] or ""))
+            strict_reject_reason = str(row[17] or "").strip()
             try:
-                strict_tracklist_score = float(row[17] or 0.0)
+                strict_tracklist_score = float(row[18] or 0.0)
             except Exception:
                 strict_tracklist_score = 0.0
             has_identity = bool(row[8]) or bool(strict_match_verified)
-            out[folder_path] = {
+            payload = {
                 "fingerprint": row[1] or "",
-                "has_cover": bool(row[2]),
-                "has_artist_image": bool(row[3]),
-                "has_complete_tags": bool(row[4]),
-                "has_mbid": bool(row[5]),
-                "musicbrainz_id": (row[6] or "").strip(),
-                "musicbrainz_release_id": (row[7] or "").strip(),
+                "has_cover": bool(row[3]),
+                "has_artist_image": bool(row[4]),
+                "has_complete_tags": bool(row[5]),
+                "has_mbid": bool(row[6]),
+                "musicbrainz_id": (row[7] or "").strip(),
+                "musicbrainz_release_id": (row[8] or "").strip(),
                 "has_identity": has_identity,
                 "identity_provider": strict_match_provider or identity_provider,
-                "discogs_release_id": (row[10] or "").strip(),
-                "lastfm_album_mbid": (row[11] or "").strip(),
-                "bandcamp_album_url": (row[12] or "").strip(),
+                "discogs_release_id": (row[11] or "").strip(),
+                "lastfm_album_mbid": (row[12] or "").strip(),
+                "bandcamp_album_url": (row[13] or "").strip(),
                 "metadata_source": metadata_source,
                 "strict_match_verified": strict_match_verified,
                 "strict_match_provider": strict_match_provider,
                 "strict_reject_reason": strict_reject_reason,
                 "strict_tracklist_score": strict_tracklist_score,
                 "missing_required_tags": missing_required,
-                "updated_at": float(row[19] or 0),
-                "artist_name": row[20] or "",
-                "album_title": row[21] or "",
-                "source_id": int(row[22] or 0) if len(row) > 22 else 0,
+                "updated_at": float(row[20] or 0),
+                "artist_name": row[21] or "",
+                "album_title": row[22] or "",
+                "source_id": int(row[23] or 0) if len(row) > 23 else 0,
             }
+            if include_ordered_paths:
+                payload["ordered_paths"] = [str(p) for p in ordered_paths if str(p or "").strip()]
+            out[folder_path] = payload
         con.close()
     except Exception:
         logging.debug("Failed to load files album scan cache", exc_info=True)
+    return out
+
+
+def _load_files_dir_scan_cache_map() -> dict[str, dict]:
+    out: dict[str, dict] = {}
+    try:
+        con = _state_connect_readonly(timeout=20)
+        cur = con.cursor()
+        cur.execute(
+            """
+            SELECT dir_path, COALESCE(source_id, 0) AS source_id, root_path, relative_depth,
+                   fingerprint, subtree_audio_count, subtree_album_count, subtree_entry_estimate,
+                   album_folders_json, updated_at
+            FROM files_dir_scan_cache
+            """
+        )
+        for row in cur.fetchall():
+            dir_path = str(row["dir_path"] or "").strip()
+            if not dir_path:
+                continue
+            try:
+                album_folders = json.loads(row["album_folders_json"] or "[]")
+                if not isinstance(album_folders, list):
+                    album_folders = []
+            except Exception:
+                album_folders = []
+            out[dir_path] = {
+                "source_id": int(row["source_id"] or 0),
+                "root_path": str(row["root_path"] or "").strip(),
+                "relative_depth": int(row["relative_depth"] or 0),
+                "fingerprint": str(row["fingerprint"] or "").strip(),
+                "subtree_audio_count": int(row["subtree_audio_count"] or 0),
+                "subtree_album_count": int(row["subtree_album_count"] or 0),
+                "subtree_entry_estimate": int(row["subtree_entry_estimate"] or 0),
+                "album_folders": [str(p) for p in album_folders if str(p or "").strip()],
+                "updated_at": float(row["updated_at"] or 0.0),
+            }
+        con.close()
+    except Exception:
+        logging.debug("Failed to load files dir scan cache", exc_info=True)
     return out
 
 
@@ -36820,21 +37015,22 @@ def _upsert_files_album_scan_cache_rows(rows: list[dict]) -> None:
     if not rows:
         return
     try:
-        con = sqlite3.connect(str(STATE_DB_FILE), timeout=30)
+        con = _state_connect(timeout=30)
         cur = con.cursor()
         cur.executemany(
             """
             INSERT INTO files_album_scan_cache
-            (folder_path, source_id, fingerprint, artist_name, album_title,
+            (folder_path, source_id, fingerprint, ordered_paths_json, artist_name, album_title,
              has_cover, has_artist_image, has_complete_tags, has_mbid, has_identity,
              identity_provider, strict_match_verified, strict_match_provider, strict_reject_reason, strict_tracklist_score,
              musicbrainz_id, musicbrainz_release_id, discogs_release_id, lastfm_album_mbid,
              bandcamp_album_url, metadata_source,
              missing_required_tags, last_scan_id, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(folder_path) DO UPDATE SET
               source_id=excluded.source_id,
               fingerprint=excluded.fingerprint,
+              ordered_paths_json=excluded.ordered_paths_json,
               artist_name=excluded.artist_name,
               album_title=excluded.album_title,
               has_cover=excluded.has_cover,
@@ -36862,6 +37058,7 @@ def _upsert_files_album_scan_cache_rows(rows: list[dict]) -> None:
                     r.get("folder_path") or "",
                     int(r.get("source_id") or 0) if int(r.get("source_id") or 0) > 0 else None,
                     r.get("fingerprint") or "",
+                    json.dumps([str(p) for p in (r.get("ordered_paths") or []) if str(p or "").strip()], ensure_ascii=False),
                     r.get("artist_name") or "",
                     r.get("album_title") or "",
                     1 if r.get("has_cover") else 0,
@@ -36892,6 +37089,53 @@ def _upsert_files_album_scan_cache_rows(rows: list[dict]) -> None:
         con.close()
     except Exception:
         logging.debug("Failed to upsert files album scan cache rows", exc_info=True)
+
+
+def _upsert_files_dir_scan_cache_rows(rows: list[dict]) -> None:
+    if not rows:
+        return
+    try:
+        con = _state_connect(timeout=30)
+        cur = con.cursor()
+        cur.executemany(
+            """
+            INSERT INTO files_dir_scan_cache
+            (dir_path, source_id, root_path, relative_depth, fingerprint,
+             subtree_audio_count, subtree_album_count, subtree_entry_estimate,
+             album_folders_json, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(dir_path) DO UPDATE SET
+              source_id=excluded.source_id,
+              root_path=excluded.root_path,
+              relative_depth=excluded.relative_depth,
+              fingerprint=excluded.fingerprint,
+              subtree_audio_count=excluded.subtree_audio_count,
+              subtree_album_count=excluded.subtree_album_count,
+              subtree_entry_estimate=excluded.subtree_entry_estimate,
+              album_folders_json=excluded.album_folders_json,
+              updated_at=excluded.updated_at
+            """,
+            [
+                (
+                    str(r.get("dir_path") or "").strip(),
+                    int(r.get("source_id") or 0) if int(r.get("source_id") or 0) > 0 else None,
+                    str(r.get("root_path") or "").strip() or None,
+                    int(r.get("relative_depth") or 0),
+                    str(r.get("fingerprint") or "").strip(),
+                    int(r.get("subtree_audio_count") or 0),
+                    int(r.get("subtree_album_count") or 0),
+                    int(r.get("subtree_entry_estimate") or 0),
+                    json.dumps([str(p) for p in (r.get("album_folders") or []) if str(p or "").strip()], ensure_ascii=False),
+                    float(r.get("updated_at") or time.time()),
+                )
+                for r in rows
+                if str(r.get("dir_path") or "").strip()
+            ],
+        )
+        con.commit()
+        con.close()
+    except Exception:
+        logging.debug("Failed to upsert files dir scan cache rows", exc_info=True)
 
 
 def _build_files_cache_row_from_prescan_item(item: dict, *, scan_id: int | None = None, now_ts: float | None = None) -> dict | None:
@@ -36926,6 +37170,7 @@ def _build_files_cache_row_from_prescan_item(item: dict, *, scan_id: int | None 
         "folder_path": folder_key,
         "source_id": source_id if source_id > 0 else None,
         "fingerprint": str(item.get("fingerprint") or "").strip(),
+        "ordered_paths": [str(p) for p in (item.get("ordered_paths") or []) if str(p or "").strip()],
         "artist_name": item.get("artist_name") or item.get("artist") or "",
         "album_title": item.get("album_title") or item.get("title_raw") or "",
         "has_cover": bool(item.get("has_cover")),
@@ -37012,6 +37257,127 @@ def _snapshot_files_album_scan_cache_from_prescan(
     return {"ok": True, "rows_upserted": rows_upserted, "reason": reason, "duration_sec": elapsed}
 
 
+def _snapshot_files_dir_scan_cache_from_prescan(
+    files_editions_by_album_id: dict[int, dict],
+    *,
+    roots: list[str] | None = None,
+    reason: str = "prescan",
+    batch_size: int = 500,
+) -> dict:
+    """
+    Persist subtree cache rows so later scans can skip unchanged day/month buckets
+    instead of re-walking every historical album folder.
+    """
+    started_at = time.time()
+    if not files_editions_by_album_id:
+        return {"ok": True, "rows_upserted": 0, "reason": reason, "duration_sec": 0.0}
+
+    root_paths = [path_for_fs_access(Path(r)) for r in (roots or _effective_files_roots(enabled_only=True)) if r]
+    if not root_paths:
+        return {"ok": True, "rows_upserted": 0, "reason": reason, "duration_sec": 0.0}
+
+    dir_to_album_folders: dict[str, set[str]] = defaultdict(set)
+    dir_to_audio_count: dict[str, int] = defaultdict(int)
+    dir_to_source_id: dict[str, int] = {}
+    dir_to_root_path: dict[str, str] = {}
+    dir_to_depth: dict[str, int] = {}
+
+    for item in files_editions_by_album_id.values():
+        folder_raw = item.get("folder")
+        if not folder_raw:
+            continue
+        try:
+            folder_path = path_for_fs_access(Path(folder_raw))
+            folder_key = _album_folder_cache_key(folder_path)
+        except Exception:
+            continue
+        if not folder_key:
+            continue
+        ordered_paths = [str(p) for p in (item.get("ordered_paths") or []) if str(p or "").strip()]
+        source_row = _source_row_for_path(folder_path, enabled_only=True)
+        source_id = _parse_int_loose(item.get("source_id"), 0) or int((source_row or {}).get("source_id") or 0)
+        root_path = None
+        root_raw = _normalize_root_path((source_row or {}).get("path"))
+        if root_raw:
+            root_path = path_for_fs_access(Path(root_raw))
+        else:
+            best_root = None
+            best_len = -1
+            for candidate_root in root_paths:
+                candidate_str = str(candidate_root)
+                if str(folder_path) == candidate_str or str(folder_path).startswith(candidate_str.rstrip("/") + "/"):
+                    if len(candidate_str) > best_len:
+                        best_root = candidate_root
+                        best_len = len(candidate_str)
+            root_path = best_root
+        if root_path is None:
+            continue
+        current = folder_path
+        while True:
+            depth = _relative_depth_under_root(current, root_path)
+            if depth is None or depth < PMDA_FILES_DIR_CACHE_MIN_SKIP_DEPTH:
+                break
+            dir_key = _album_folder_cache_key(current)
+            dir_to_album_folders[dir_key].add(folder_key)
+            dir_to_audio_count[dir_key] += len(ordered_paths)
+            if source_id > 0:
+                dir_to_source_id[dir_key] = source_id
+            dir_to_root_path[dir_key] = str(root_path)
+            dir_to_depth[dir_key] = int(depth)
+            parent = current.parent
+            if parent == current:
+                break
+            current = parent
+
+    if not dir_to_album_folders:
+        return {"ok": True, "rows_upserted": 0, "reason": reason, "duration_sec": round(time.time() - started_at, 2)}
+
+    rows_buffer: list[dict] = []
+    rows_upserted = 0
+    now_ts = time.time()
+    for dir_key, folder_keys in sorted(dir_to_album_folders.items()):
+        dir_path = path_for_fs_access(Path(dir_key))
+        if not dir_path.exists() or not dir_path.is_dir():
+            continue
+        fingerprint, _entry_count = _compute_dir_scan_fingerprint(dir_path)
+        if not fingerprint:
+            continue
+        folder_list = sorted(folder_keys)
+        if len(folder_list) < PMDA_FILES_DIR_CACHE_MIN_ALBUMS:
+            continue
+        rows_buffer.append(
+            {
+                "dir_path": dir_key,
+                "source_id": dir_to_source_id.get(dir_key) or None,
+                "root_path": dir_to_root_path.get(dir_key) or "",
+                "relative_depth": int(dir_to_depth.get(dir_key) or 0),
+                "fingerprint": fingerprint,
+                "subtree_audio_count": int(dir_to_audio_count.get(dir_key) or 0),
+                "subtree_album_count": len(folder_list),
+                "subtree_entry_estimate": int(dir_to_audio_count.get(dir_key) or 0) + len(folder_list),
+                "album_folders": folder_list,
+                "updated_at": now_ts,
+            }
+        )
+        if len(rows_buffer) >= max(100, int(batch_size or 500)):
+            _upsert_files_dir_scan_cache_rows(rows_buffer)
+            rows_upserted += len(rows_buffer)
+            rows_buffer = []
+    if rows_buffer:
+        _upsert_files_dir_scan_cache_rows(rows_buffer)
+        rows_upserted += len(rows_buffer)
+
+    elapsed = round(time.time() - started_at, 2)
+    logging.info(
+        "FILES dir-cache snapshot (%s): upserted %d row(s) from %d cached subtree(s) in %.2fs",
+        reason,
+        rows_upserted,
+        len(dir_to_album_folders),
+        elapsed,
+    )
+    return {"ok": True, "rows_upserted": rows_upserted, "reason": reason, "duration_sec": elapsed}
+
+
 def _trigger_prescan_cache_snapshot_async(*, reason: str = "prescan", scan_id: int | None = None) -> bool:
     """Start one async snapshot job from current files_editions_by_album_id (if available)."""
     if files_cache_snapshot_lock.locked():
@@ -37035,6 +37401,7 @@ def _trigger_prescan_cache_snapshot_async(*, reason: str = "prescan", scan_id: i
                     files_map_live = state.get("files_editions_by_album_id") or {}
                     if not isinstance(files_map_live, dict):
                         files_map_live = {}
+                    active_roots_live = list(_effective_files_roots(enabled_only=True))
                 result = _snapshot_files_album_scan_cache_from_prescan(
                     files_map_live,
                     scan_id=scan_id,
@@ -37044,6 +37411,13 @@ def _trigger_prescan_cache_snapshot_async(*, reason: str = "prescan", scan_id: i
                     respect_pause=False,
                 )
                 rows = int(result.get("rows_upserted") or 0)
+                dir_result = _snapshot_files_dir_scan_cache_from_prescan(
+                    files_map_live,
+                    roots=active_roots_live,
+                    reason=reason,
+                    batch_size=750,
+                )
+                rows += int(dir_result.get("rows_upserted") or 0)
         except Exception:
             logging.exception("FILES cache snapshot (%s) failed", reason)
         finally:
@@ -37315,6 +37689,7 @@ def _recalculate_files_album_scan_cache_quality(
                     "folder_path": folder_key,
                     "source_id": source_id_now if source_id_now > 0 else None,
                     "fingerprint": fingerprint,
+                    "ordered_paths": [str(p) for p in ordered_paths if str(p or "").strip()],
                     "artist_name": artist_name_now,
                     "album_title": _sanitize_album_title_display(album_title_now),
                     "has_cover": has_cover_now,
@@ -37517,6 +37892,7 @@ def _refresh_files_album_scan_cache_from_editions(editions: list[dict], scan_id:
                     "folder_path": folder_key,
                     "source_id": source_id if source_id > 0 else None,
                     "fingerprint": fingerprint,
+                    "ordered_paths": [str(p) for p in ordered_paths if str(p or "").strip()],
                     "artist_name": artist_resolved,
                     "album_title": title_resolved or folder.name,
                     "has_cover": has_cover,
@@ -39467,6 +39843,7 @@ def _persist_resume_discovery_snapshot(
         "folders_found": int(snapshot.get("folders_found") or 0),
         "folders_done": int(snapshot.get("folders_done") or 0),
         "folders_total": int(snapshot.get("folders_total") or 0),
+        "cached_album_folders": [str(p) for p in (snapshot.get("cached_album_folders") or []) if str(p or "").strip()],
         "updated_at": time.time(),
     }
     try:
@@ -39573,6 +39950,7 @@ def _load_resume_discovery_snapshot_by_run_id(run_id: str | None) -> dict[str, A
             "folders_found": int(state_json.get("folders_found") or 0),
             "folders_done": int(state_json.get("folders_done") or 0),
             "folders_total": int(state_json.get("folders_total") or 0),
+            "cached_album_folders": [str(p) for p in (state_json.get("cached_album_folders") or []) if str(p or "").strip()],
             "results_by_root": {int(idx): list(paths) for idx, paths in files_by_root.items()},
             "current_root_files": current_root_files,
             "updated_at": float(state_json.get("updated_at") or 0.0),
@@ -40665,6 +41043,60 @@ def _build_files_editions(
 
     skip_list = list(SKIP_FOLDERS or [])
     cache_map = _load_files_album_scan_cache_map()
+    dir_cache_map: dict[str, dict] = {}
+    cached_album_folders_from_discovery: set[str] = set(
+        str(p or "").strip()
+        for p in ((resume_discovery_snapshot or {}).get("cached_album_folders") or [])
+        if str(p or "").strip()
+    )
+    if not bool(_pipeline_bootstrap_status().get("bootstrap_required")):
+        dir_cache_map = _load_files_dir_scan_cache_map()
+    ordered_paths_cache: dict[str, list[str]] = {}
+    dir_cache_skip_hits = 0
+    dir_cache_skip_audio = 0
+
+    def _dir_skip_lookup(dir_path_raw: str, root_path_raw: str) -> dict[str, Any] | None:
+        if not dir_cache_map:
+            return None
+        dir_key = _album_folder_cache_key(dir_path_raw)
+        row = dir_cache_map.get(dir_key)
+        if not row:
+            return None
+        depth = _relative_depth_under_root(dir_path_raw, root_path_raw)
+        if depth is None or depth < PMDA_FILES_DIR_CACHE_MIN_SKIP_DEPTH:
+            return None
+        fingerprint_now, _entry_count = _compute_dir_scan_fingerprint(Path(dir_path_raw))
+        if not fingerprint_now or fingerprint_now != str(row.get("fingerprint") or "").strip():
+            return None
+        album_folders = [str(p) for p in (row.get("album_folders") or []) if str(p or "").strip()]
+        if len(album_folders) < PMDA_FILES_DIR_CACHE_MIN_ALBUMS:
+            return None
+        return row
+
+    def _dir_skip_resolver(dir_path_raw: str, row: dict[str, Any]) -> dict[str, Any] | None:
+        nonlocal dir_cache_skip_hits, dir_cache_skip_audio
+        folder_keys = [str(p) for p in (row.get("album_folders") or []) if str(p or "").strip()]
+        if not folder_keys:
+            return None
+        missing = [key for key in folder_keys if key not in ordered_paths_cache]
+        if missing:
+            payloads = _load_files_album_scan_cache_map(folder_keys=missing, include_ordered_paths=True)
+            for key, payload in payloads.items():
+                ordered_paths_cache[key] = [str(p) for p in (payload.get("ordered_paths") or []) if str(p or "").strip()]
+        file_paths: list[str] = []
+        for key in folder_keys:
+            ordered = ordered_paths_cache.get(key) or []
+            if not ordered:
+                return None
+            file_paths.extend(ordered)
+        dir_cache_skip_hits += 1
+        dir_cache_skip_audio += len(file_paths)
+        return {
+            "file_paths": file_paths,
+            "audio_count": int(row.get("subtree_audio_count") or len(file_paths)),
+            "entry_estimate": int(row.get("subtree_entry_estimate") or len(file_paths)),
+            "album_folders": folder_keys,
+        }
     changed_pending_folder_keys: list[str] = []
     changed_pending_deleted_folder_keys: list[str] = []
     if scan_type == "changed_only":
@@ -41113,6 +41545,11 @@ def _build_files_editions(
         if isinstance(resume_discovery_snapshot, dict) and str(resume_discovery_snapshot.get("stage") or "").strip().lower() == "album_candidates":
             seen_paths: set[str] = set()
             audio_files = []
+            cached_album_folders_from_discovery = {
+                str(p or "").strip()
+                for p in (resume_discovery_snapshot.get("cached_album_folders") or [])
+                if str(p or "").strip()
+            }
             for root_idx in sorted((resume_discovery_snapshot.get("results_by_root") or {}).keys()):
                 for raw_path in (resume_discovery_snapshot.get("results_by_root") or {}).get(root_idx, []):
                     sp = str(raw_path or "").strip()
@@ -41128,7 +41565,7 @@ def _build_files_editions(
                 force=True,
             )
         else:
-            audio_files = _iter_audio_files_under_roots_checkpointed(
+            audio_files, cached_album_folders_from_discovery = _iter_audio_files_under_roots_checkpointed(
                 [str(r) for r in roots],
                 run_id=resume_run_id,
                 progress_cb=_on_discovery_progress,
@@ -41138,6 +41575,8 @@ def _build_files_editions(
                 pause_event=pause_event,
                 resume_snapshot=resume_discovery_snapshot,
                 checkpoint_cb=_on_discovery_checkpoint,
+                dir_skip_lookup=_dir_skip_lookup,
+                dir_skip_resolver=_dir_skip_resolver,
             )
         if _files_scan_stop_requested():
             log_scan("FILES discovery cancelled during filesystem walk.")
@@ -41171,6 +41610,7 @@ def _build_files_editions(
             "folders_found": len(by_folder),
             "folders_done": discovery_folders_done_live,
             "folders_total": discovery_folders_total_live,
+            "cached_album_folders": sorted(cached_album_folders_from_discovery),
             "paused_ack": False,
             "updated_at": time.time(),
         }
@@ -41232,6 +41672,13 @@ def _build_files_editions(
         folders_total=len(by_folder),
         force=True,
     )
+    if cached_album_folders_from_discovery:
+        cache_map.update(
+            _load_files_album_scan_cache_map(
+                folder_keys=sorted(cached_album_folders_from_discovery),
+                include_ordered_paths=True,
+            )
+        )
 
     files_editions_by_album_id: dict[int, dict] = {}
     artist_to_album_ids: dict[str, list[int]] = defaultdict(list)
@@ -41277,12 +41724,13 @@ def _build_files_editions(
         # Cache-first fast path:
         # avoid expensive per-file mutagen reads when album fingerprint is unchanged and
         # last known quality/identity state is already healthy.
-        fingerprint = _compute_album_fingerprint(ordered_paths)
         folder_key = _album_folder_cache_key(folder_resolved)
-        source_id_current = int(_source_id_for_path(folder_resolved) or 0)
         cached = cache_map.get(folder_key) or {}
+        folder_from_cached_subtree = folder_key in cached_album_folders_from_discovery
+        if folder_from_cached_subtree and cached.get("ordered_paths"):
+            ordered_paths = [Path(str(p)) for p in (cached.get("ordered_paths") or []) if str(p or "").strip()]
+        source_id_current = int(cached.get("source_id") or _source_id_for_path(folder_resolved) or 0)
         cached_missing = cached.get("missing_required_tags") or []
-        unchanged = bool(cached and (cached.get("fingerprint") == fingerprint))
         cached_has_cover = bool(cached.get("has_cover"))
         cached_has_artist_image = bool(cached.get("has_artist_image"))
         cached_healthy = bool(
@@ -41293,14 +41741,23 @@ def _build_files_editions(
             and cached.get("has_identity")
             and not cached_missing
         )
-        has_cover_now = album_folder_has_cover(folder_resolved)
-        has_artist_image_now = _artist_folder_has_image(folder_resolved.parent if folder_resolved.parent else folder_resolved)
-        cached_fast_skip = bool(
-            unchanged
-            and cached_healthy
-            and has_cover_now
-            and has_artist_image_now
-        )
+        if folder_from_cached_subtree and cached:
+            fingerprint = str(cached.get("fingerprint") or "").strip()
+            unchanged = bool(fingerprint)
+            has_cover_now = cached_has_cover
+            has_artist_image_now = cached_has_artist_image
+            cached_fast_skip = bool(unchanged and cached_healthy and ordered_paths)
+        else:
+            fingerprint = _compute_album_fingerprint(ordered_paths)
+            unchanged = bool(cached and (cached.get("fingerprint") == fingerprint))
+            has_cover_now = album_folder_has_cover(folder_resolved)
+            has_artist_image_now = _artist_folder_has_image(folder_resolved.parent if folder_resolved.parent else folder_resolved)
+            cached_fast_skip = bool(
+                unchanged
+                and cached_healthy
+                and has_cover_now
+                and has_artist_image_now
+            )
         if cached_fast_skip and scan_type == "changed_only":
             skipped_unchanged_complete += 1
             continue
@@ -41590,13 +42047,14 @@ def _build_files_editions(
         force=True,
     )
     log_scan(
-        "FILES backend: discovered %d artist(s), %d album(s) from %d audio file(s)%s%s%s",
+        "FILES backend: discovered %d artist(s), %d album(s) from %d audio file(s)%s%s%s%s",
         len(artists_merged),
         total_albums,
         len(audio_files),
         f"; changed-only skipped {skipped_unchanged_complete} unchanged+healthy album(s)" if scan_type == "changed_only" else "",
         f"; cache-first fast-skip {fast_skip_full_cached} album(s)" if fast_skip_full_cached else "",
         f"; fast-skip candidates {fast_skip_marked}" if fast_skip_marked else "",
+        f"; dir-cache reused {dir_cache_skip_hits} subtree(s) / {dir_cache_skip_audio} audio file(s)" if dir_cache_skip_hits else "",
     )
     return artists_merged, total_albums, files_editions_by_album_id
 
