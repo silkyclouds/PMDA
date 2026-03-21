@@ -134,6 +134,19 @@ function joinClassical(values?: string[] | null, limit = 2): string | null {
   return items.slice(0, limit).join(' · ');
 }
 
+function hasClassicalIdentity(payload?: api.ClassicalIdentityPayload | null): boolean {
+  if (!payload) return false;
+  if (payload.is_classical === true) return true;
+  return Boolean(
+    (payload.work && payload.work.length)
+    || (payload.conductor && payload.conductor.length)
+    || (payload.orchestra && payload.orchestra.length)
+    || (payload.ensemble && payload.ensemble.length)
+    || (payload.soloists && payload.soloists.length)
+    || (payload.catalog_numbers && payload.catalog_numbers.length)
+  );
+}
+
 function toCoord(s?: string): number | null {
   const raw = (s || '').trim();
   if (!raw) return null;
@@ -1325,7 +1338,7 @@ export default function ArtistPage() {
                           <h3 className="min-h-[3.6rem] text-sm font-semibold leading-snug line-clamp-3" title={album.title}>
                             {album.title}
                           </h3>
-                          {album.classical ? (
+                          {hasClassicalIdentity(album.classical) ? (
                             <div className="space-y-1">
                               {joinClassical(album.classical.work, 2) ? (
                                 <p className="text-[11px] font-medium text-foreground/85 line-clamp-2">

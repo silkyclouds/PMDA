@@ -26445,12 +26445,11 @@ def _classical_gap_anomaly_should_be_ignored(
     performance_values = _classical_collect_tag_values(tag_map, _CLASSICAL_PERFORMANCE_TAG_KEYS)
     work_values = _classical_collect_tag_values(tag_map, _CLASSICAL_WORK_TAG_KEYS)
     genre_values = _classical_collect_tag_values(tag_map, ("genre", "style"))
-    genre_norms = {_classical_norm_text(value) for value in genre_values if _classical_norm_text(value)}
-    looks_classical = bool(
-        composer_values
-        or work_values
-        or performance_values
-        or (genre_norms and any(any(hint in g for hint in _CLASSICAL_GENRE_HINTS) for g in genre_norms))
+    looks_classical = _classical_has_explicit_signal(
+        genre_values=genre_values,
+        composer_values=composer_values,
+        work_values=work_values,
+        performer_values=performance_values,
     )
     if not looks_classical:
         return False
@@ -27848,6 +27847,60 @@ def _classical_display_values(values: list[str], *, limit: int = 6) -> list[str]
     return out
 
 
+def _classical_genre_signal(values: list[str] | tuple[str, ...] | None) -> bool:
+    genre_norms = {_classical_norm_text(v) for v in (values or []) if _classical_norm_text(v)}
+    return bool(genre_norms and any(any(hint in genre for hint in _CLASSICAL_GENRE_HINTS) for genre in genre_norms))
+
+
+def _classical_title_signal(title: str, *, work_tokens: set[str] | None = None, track_titles: list[str] | None = None) -> bool:
+    title_txt = str(title or "").strip()
+    if work_tokens:
+        return True
+    title_norm = _classical_norm_text(title_txt)
+    if any(keyword in title_norm for keyword in _CLASSICAL_WORK_KEYWORDS):
+        return True
+    if _CLASSICAL_CATALOG_RE.search(title_txt):
+        return True
+    joined_tracks = " ".join([str(item or "").strip() for item in (track_titles or [])[:12] if str(item or "").strip()])
+    return bool(joined_tracks and _CLASSICAL_CATALOG_RE.search(joined_tracks))
+
+
+def _classical_has_explicit_signal(
+    *,
+    title: str = "",
+    track_titles: list[str] | None = None,
+    genre_values: list[str] | tuple[str, ...] | None = None,
+    composer_values: list[str] | tuple[str, ...] | None = None,
+    work_values: list[str] | tuple[str, ...] | None = None,
+    conductor_values: list[str] | tuple[str, ...] | None = None,
+    orchestra_values: list[str] | tuple[str, ...] | None = None,
+    ensemble_values: list[str] | tuple[str, ...] | None = None,
+    soloist_values: list[str] | tuple[str, ...] | None = None,
+    performer_values: list[str] | tuple[str, ...] | None = None,
+    catalog_values: list[str] | tuple[str, ...] | None = None,
+) -> bool:
+    work_tokens = _classical_work_tokens_from_texts(([title] if str(title or "").strip() else []) + list(work_values or []) + list(track_titles or [])[:20])
+    title_signal = _classical_title_signal(title, work_tokens=work_tokens, track_titles=track_titles)
+    genre_signal = _classical_genre_signal(genre_values)
+    catalog_signal = bool(list(catalog_values or []))
+    performance_signal = bool(
+        list(conductor_values or [])
+        or list(orchestra_values or [])
+        or list(ensemble_values or [])
+        or list(soloist_values or [])
+    )
+    composer_signal = bool(list(composer_values or []))
+    performer_signal = bool(list(performer_values or []))
+    return bool(
+        title_signal
+        or genre_signal
+        or catalog_signal
+        or performance_signal
+        or (composer_signal and (title_signal or genre_signal or catalog_signal or performance_signal))
+        or (composer_signal and performer_signal and (title_signal or genre_signal or catalog_signal))
+    )
+
+
 def _classical_display_payload(
     tags: dict | None,
     *,
@@ -27864,20 +27917,17 @@ def _classical_display_payload(
     performers_raw = _classical_display_values(_classical_collect_tag_values(tag_map, ("performer", "performers", "artist", "albumartist", "album_artist")), limit=8)
     catalog_numbers = _classical_display_values(_classical_collect_tag_values(tag_map, _CLASSICAL_RELEASE_CATALOG_TAG_KEYS), limit=6)
     genre_values = _classical_collect_tag_values(tag_map, ("genre", "style"))
-    genre_norms = {_classical_norm_text(v) for v in genre_values if _classical_norm_text(v)}
-    work_tokens = _classical_work_tokens_from_texts(([fallback_title] if str(fallback_title or "").strip() else []) + work)
-    looks_classical = bool(
-        composer
-        or work
-        or conductor
-        or orchestra
-        or ensemble
-        or soloists
-        or catalog_numbers
-        or work_tokens
-        or (genre_norms and any(any(h in g for h in _CLASSICAL_GENRE_HINTS) for g in genre_norms))
-        or any(keyword in _classical_norm_text(fallback_title) for keyword in _CLASSICAL_WORK_KEYWORDS)
-        or bool(_CLASSICAL_CATALOG_RE.search(str(fallback_title or "")))
+    looks_classical = _classical_has_explicit_signal(
+        title=fallback_title,
+        genre_values=genre_values,
+        composer_values=composer,
+        work_values=work,
+        conductor_values=conductor,
+        orchestra_values=orchestra,
+        ensemble_values=ensemble,
+        soloist_values=soloists,
+        performer_values=performers_raw,
+        catalog_values=catalog_numbers,
     )
     if not looks_classical:
         return None
@@ -27896,9 +27946,18 @@ def _classical_display_payload(
     ]
     if not work and str(fallback_title or "").strip():
         work = _classical_display_values([fallback_title], limit=2)
-    if not composer and str(fallback_artist or "").strip() and not conductor and not orchestra and not ensemble:
+    fallback_artist_sig = _classical_person_alias_signature(fallback_artist)
+    if (
+        not composer
+        and str(fallback_artist or "").strip()
+        and not conductor
+        and not orchestra
+        and not ensemble
+        and bool(fallback_artist_sig)
+    ):
         composer = _classical_display_values([fallback_artist], limit=2)
     return {
+        "is_classical": True,
         "composer": composer,
         "work": work,
         "conductor": conductor,
@@ -27914,7 +27973,7 @@ def _files_collect_album_classical_payload(
     album: dict[str, Any],
     *,
     fallback_artist: str = "",
-) -> dict[str, list[str]] | None:
+) -> dict[str, Any] | None:
     merged: dict[str, list[str]] = {
         "composer": [],
         "work": [],
@@ -27974,7 +28033,11 @@ def _files_collect_album_classical_payload(
             for value in merged["composer"]
             if _classical_norm_text(value) != fallback_artist_norm
         ]
-    return merged if any_payload else None
+    if not any_payload:
+        return None
+    out: dict[str, Any] = dict(merged)
+    out["is_classical"] = True
+    return out
 
 
 _FILES_BROWSE_PRIMARY_ROLES = {"artist"}
@@ -28476,17 +28539,19 @@ def _classical_identity_context(
     genre_values = _classical_collect_tag_values(tags, ("genre", "style"))
     meta_title_texts = [title_value] + work_values + track_titles[:20]
     work_tokens = _classical_work_tokens_from_texts(meta_title_texts)
+    explicit_signal = _classical_has_explicit_signal(
+        title=title_value,
+        track_titles=track_titles,
+        genre_values=genre_values,
+        composer_values=composer_values,
+        work_values=work_values,
+        performer_values=performance_tag_values,
+        catalog_values=catalog_values,
+    )
     if not composer_values and base_artist_values:
-        genre_norms_probe = {_classical_norm_text(v) for v in genre_values if _classical_norm_text(v)}
-        looks_classical = bool(
-            work_tokens
-            or (genre_norms_probe and any(any(h in g for h in _CLASSICAL_GENRE_HINTS) for g in genre_norms_probe))
-            or any(keyword in _classical_norm_text(title_value) for keyword in _CLASSICAL_WORK_KEYWORDS)
-            or bool(_CLASSICAL_CATALOG_RE.search(title_value))
-            or bool(_CLASSICAL_CATALOG_RE.search(" ".join(track_titles[:12])))
-        )
-        if looks_classical and not performance_tag_values:
-            composer_values.extend(base_artist_values)
+        person_like_artists = [value for value in base_artist_values if _classical_person_alias_signature(value)]
+        if explicit_signal and not performance_tag_values and person_like_artists:
+            composer_values.extend(person_like_artists)
     composer_tokens = _classical_people_tokens(composer_values)
     performance_tokens = _classical_people_tokens(artist_values)
     performance_tokens -= composer_tokens
@@ -28503,14 +28568,7 @@ def _classical_identity_context(
         if year:
             break
     genre_norms = {_classical_norm_text(v) for v in genre_values if _classical_norm_text(v)}
-    pre_is_classical = bool(
-        composer_tokens
-        or work_tokens
-        or (genre_norms and any(any(h in g for h in _CLASSICAL_GENRE_HINTS) for g in genre_norms))
-        or any(keyword in _classical_norm_text(title_value) for keyword in _CLASSICAL_WORK_KEYWORDS)
-        or bool(_CLASSICAL_CATALOG_RE.search(title_value))
-        or bool(_CLASSICAL_CATALOG_RE.search(" ".join(track_titles[:12])))
-    )
+    pre_is_classical = bool(explicit_signal)
     provider_candidate_count = 0
     if isinstance(provider_payloads, dict):
         provider_candidate_count = sum(1 for value in provider_payloads.values() if isinstance(value, dict))
@@ -28532,10 +28590,7 @@ def _classical_identity_context(
     catalog_tokens |= set(cover_ocr_ctx.get("catalog_tokens") or set())
     performance_tokens |= set(cover_ocr_ctx.get("performance_tokens") or set())
     performance_tokens -= composer_tokens
-    is_classical = bool(
-        pre_is_classical
-        or cover_ocr_ctx.get("work_tokens")
-    )
+    is_classical = bool(pre_is_classical or cover_ocr_ctx.get("work_tokens"))
     return {
         "is_classical": bool(is_classical),
         "composer_tokens": composer_tokens,
@@ -28587,8 +28642,20 @@ def _provider_classical_context(
         tags["year"] = year_val
     explicit_composer = _classical_collect_tag_values(tags, _CLASSICAL_COMPOSER_TAG_KEYS)
     explicit_performance = _classical_collect_tag_values(tags, _CLASSICAL_PERFORMANCE_TAG_KEYS)
+    explicit_signal = _classical_has_explicit_signal(
+        title=candidate_title,
+        genre_values=_classical_collect_tag_values(tags, ("genre", "style")),
+        composer_values=explicit_composer,
+        work_values=_classical_collect_tag_values(tags, _CLASSICAL_WORK_TAG_KEYS),
+        conductor_values=_classical_collect_tag_values(tags, ("conductor",)),
+        orchestra_values=_classical_collect_tag_values(tags, ("orchestra",)),
+        ensemble_values=_classical_collect_tag_values(tags, ("ensemble", "choir", "chorus")),
+        soloist_values=_classical_collect_tag_values(tags, ("soloist", "soloists")),
+        performer_values=explicit_performance,
+        catalog_values=_classical_collect_tag_values(tags, _CLASSICAL_RELEASE_CATALOG_TAG_KEYS),
+    )
     candidate_artist_for_context: str | list[str] | tuple[str, ...] | None = candidate_artist
-    if candidate_artist_values and not explicit_composer:
+    if candidate_artist_values and not explicit_composer and explicit_signal:
         # Provider artist credit for classical releases is often the composer. Treat it as such
         # unless the payload already exposes a richer performance context.
         tags["composer"] = candidate_artist_values
@@ -29522,10 +29589,15 @@ def _provider_candidate_soft_identity_ok(
         return (False, f"confidence_below_min({confidence:.2f}<{float(min_confidence):.2f})")
 
     if has_provider_tracklist and has_local_tracklist:
-        if track_count_ratio < 0.55:
-            return (False, "track_count_mismatch")
         local_track_count = int(candidate.get("local_track_count") or 0)
         provider_track_count = int(candidate.get("provider_track_count") or 0)
+        track_count_delta = abs(local_track_count - provider_track_count)
+        if track_count_ratio < 0.55:
+            return (False, "track_count_mismatch")
+        if track_count_delta >= 4:
+            return (False, "track_count_mismatch")
+        if track_count_delta >= 2 and track_count_ratio < 0.86:
+            return (False, "track_count_mismatch")
         # When both sides expose a meaningful tracklist, reject obviously wrong
         # editions even if the counts are similar. Similar counts alone are not
         # enough when titles do not line up.
@@ -29533,6 +29605,8 @@ def _provider_candidate_soft_identity_ok(
             min(local_track_count, provider_track_count) >= 5
             and track_score < 0.55
         ):
+            return (False, "track_title_mismatch")
+        if track_count_delta >= 1 and min(local_track_count, provider_track_count) >= 8 and track_score < 0.68:
             return (False, "track_title_mismatch")
         if track_score < 0.40 and track_count_ratio < 0.80:
             return (False, "track_title_mismatch")
@@ -30953,6 +31027,34 @@ def search_mb_release_group_by_metadata(
                     raw_candidate_count,
                 )
                 candidates = []
+        if candidates and bool(search_local_context.get("is_classical")):
+            def _search_candidate_rank(item: dict) -> tuple[float, float, float]:
+                title_score = _provider_identity_text_score(
+                    title_raw or album_norm or "",
+                    str(item.get("title") or ""),
+                )
+                candidate_artists = _extract_mb_artist_names(item)
+                artist_score = max(
+                    (_provider_identity_text_score(artist, name) for name in candidate_artists),
+                    default=0.0,
+                )
+                year_score = 0.0
+                local_year = _mb_extract_year(search_local_context.get("year"))
+                candidate_year = _mb_extract_year(item.get("first-release-date"))
+                if local_year and candidate_year:
+                    try:
+                        diff = abs(int(local_year) - int(candidate_year))
+                    except Exception:
+                        diff = 99
+                    if diff == 0:
+                        year_score = 1.0
+                    elif diff <= 1:
+                        year_score = 0.75
+                    elif diff <= 5:
+                        year_score = 0.35
+                return (title_score, artist_score, year_score)
+
+            candidates = sorted(candidates, key=_search_candidate_rank, reverse=True)
 
         if candidates:
             letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -30978,7 +31080,28 @@ def search_mb_release_group_by_metadata(
                 candidate_fetch_limit,
             )
 
-        candidates_to_fetch = candidates[:candidate_fetch_limit] if candidate_fetch_limit > 0 else candidates
+        effective_candidate_fetch_limit = candidate_fetch_limit
+        effective_tracklist_fetch_limit = tracklist_fetch_limit
+        if bool(search_local_context.get("is_classical")):
+            classical_fetch_cap = 8
+            classical_tracklist_cap = 4
+            if effective_candidate_fetch_limit > 0:
+                effective_candidate_fetch_limit = min(effective_candidate_fetch_limit, classical_fetch_cap)
+            else:
+                effective_candidate_fetch_limit = min(len(candidates), classical_fetch_cap)
+            if effective_tracklist_fetch_limit > 0:
+                effective_tracklist_fetch_limit = min(effective_tracklist_fetch_limit, classical_tracklist_cap)
+            else:
+                effective_tracklist_fetch_limit = min(effective_candidate_fetch_limit, classical_tracklist_cap)
+            if len(candidates) > effective_candidate_fetch_limit:
+                logging.info(
+                    "[MusicBrainz] %s – %r: classical context detected; limiting detailed fetch to top %d/%d candidate(s)",
+                    artist,
+                    title_raw or album_norm or "?",
+                    effective_candidate_fetch_limit,
+                    len(candidates),
+                )
+        candidates_to_fetch = candidates[:effective_candidate_fetch_limit] if effective_candidate_fetch_limit > 0 else candidates
         for idx, rg in enumerate(candidates_to_fetch):
             if _mb_budget_exceeded():
                 logging.info(
@@ -31047,7 +31170,7 @@ def search_mb_release_group_by_metadata(
                 }
                 # Optionally fetch recording-level track titles for deterministic tracklist crosschecks
                 # (no LLM cost, but this endpoint is heavier; controlled by MB_TRACKLIST_FETCH_LIMIT).
-                if info.get('release-list') and tracks and (tracklist_fetch_limit <= 0 or idx < tracklist_fetch_limit):
+                if info.get('release-list') and tracks and (effective_tracklist_fetch_limit <= 0 or idx < effective_tracklist_fetch_limit):
                     first_release_id = info['release-list'][0].get('id')
                     if first_release_id:
                         try:
@@ -41682,6 +41805,16 @@ def _build_files_editions(
 
     files_editions_by_album_id: dict[int, dict] = {}
     artist_to_album_ids: dict[str, list[int]] = defaultdict(list)
+    artist_display_names: dict[str, str] = {}
+
+    def _append_artist_bucket(artist_name_raw: str, album_id: int, *, classical_hint: bool = False) -> None:
+        artist_name_clean = str(artist_name_raw or "").strip() or "Unknown Artist"
+        bucket_key = _files_artist_bucket_key(artist_name_clean, classical_hint=classical_hint) or artist_name_clean
+        artist_to_album_ids[bucket_key].append(int(album_id))
+        artist_display_names[bucket_key] = _choose_preferred_identity_display(
+            str(artist_display_names.get(bucket_key) or ""),
+            artist_name_clean,
+        )
     next_album_id = 1
     skipped_unchanged_complete = 0
     fast_skip_marked = 0
@@ -41820,7 +41953,7 @@ def _build_files_editions(
                 "metadata_source": identity_now["metadata_source"],
                 "skip_heavy_processing": True,
             }
-            artist_to_album_ids[artist_name].append(album_id)
+            _append_artist_bucket(artist_name, album_id)
             fast_skip_marked += 1
             fast_skip_full_cached += 1
             _set_discovery_state(
@@ -41925,6 +42058,13 @@ def _build_files_editions(
                     default_title=album_title_tag,
                     folder_name=folder.name,
                 )
+        classical_hint = bool(
+            _classical_display_payload(
+                first_tags,
+                fallback_title=album_title_tag,
+                fallback_artist=artist_name,
+            )
+        )
 
         # Dominant format and confidence
         exts = [p.suffix.lower().lstrip(".") for p in ordered_paths]
@@ -42007,7 +42147,7 @@ def _build_files_editions(
             "_lookup_album_title": discovery_identity_ctx.get("_lookup_album_title") or "",
             "_lookup_identity_hint": discovery_identity_ctx.get("_lookup_identity_hint") or {},
         }
-        artist_to_album_ids[artist_name].append(album_id)
+        _append_artist_bucket(artist_name, album_id, classical_hint=classical_hint)
         _set_discovery_state(
             scan_discovery_albums_found=next_album_id - 1,
             scan_discovery_artists_found=len(artist_to_album_ids),
@@ -42023,7 +42163,13 @@ def _build_files_editions(
         if fast_skip_heavy:
             fast_skip_marked += 1
     # Build artists_merged: (artist_id, artist_name, album_ids). For Files we use 0 as artist_id.
-    artists_merged = [(0, name, ids) for name, ids in sorted(artist_to_album_ids.items(), key=lambda x: x[0].lower())]
+    artists_merged = [
+        (0, str(artist_display_names.get(bucket_key) or bucket_key), album_ids)
+        for bucket_key, album_ids in sorted(
+            artist_to_album_ids.items(),
+            key=lambda item: str(artist_display_names.get(item[0]) or item[0]).lower(),
+        )
+    ]
     total_albums = next_album_id - 1
     _set_discovery_state(
         scan_discovery_running=False,
@@ -47630,6 +47776,20 @@ def _merge_album_public_metrics(*metrics_sources: dict[str, Any]) -> dict[str, A
 def _norm_artist_key(name: str) -> str:
     """Stable accent-insensitive key for artist-name lookups and cache joins."""
     return _normalize_identity_text_strict(name or "")
+
+
+def _files_artist_bucket_key(name: str, *, classical_hint: bool = False) -> str:
+    base_key = _norm_artist_key(name)
+    if not base_key:
+        return ""
+    if not classical_hint:
+        return base_key
+    sig = _classical_person_alias_signature(name)
+    surname = str(sig.get("surname") or "").strip()
+    initials = sorted({str(ch or "").strip()[:1] for ch in (sig.get("initials") or set()) if str(ch or "").strip()})
+    if surname and initials:
+        return f"classical-person:{surname}:{initials[0]}"
+    return base_key
 
 
 def _identity_display_quality_score(value: str) -> tuple[int, int, int, int, int]:
@@ -57092,8 +57252,8 @@ def api_library_discover():
                     alb.mb_identified,
                     ar.id AS artist_id,
                     ar.name AS artist_name,
-                    CASE WHEN alb.strict_match_verified THEN COALESCE(pr.short_description, '') ELSE '' END AS short_description,
-                    CASE WHEN alb.strict_match_verified THEN COALESCE(pr.source, '') ELSE '' END AS profile_source,
+                    COALESCE(pr.short_description, '') AS short_description,
+                    COALESCE(pr.source, '') AS profile_source,
                     pr.public_rating,
                     COALESCE(pr.public_rating_votes, 0) AS public_rating_votes,
                     COALESCE(pr.public_rating_source, '') AS public_rating_source,
@@ -57151,8 +57311,8 @@ def api_library_discover():
                     alb.mb_identified,
                     ar.id AS artist_id,
                     ar.name AS artist_name,
-                    CASE WHEN alb.strict_match_verified THEN COALESCE(pr.short_description, '') ELSE '' END AS short_description,
-                    CASE WHEN alb.strict_match_verified THEN COALESCE(pr.source, '') ELSE '' END AS profile_source,
+                    COALESCE(pr.short_description, '') AS short_description,
+                    COALESCE(pr.source, '') AS profile_source,
                     pr.public_rating,
                     COALESCE(pr.public_rating_votes, 0) AS public_rating_votes,
                     COALESCE(pr.public_rating_source, '') AS public_rating_source,
@@ -58881,8 +59041,8 @@ def api_library_albums():
                     alb.mb_identified,
                     ar.id AS artist_id,
                     ar.name AS artist_name,
-                    CASE WHEN alb.strict_match_verified THEN COALESCE(pr.short_description, '') ELSE '' END AS short_description,
-                    CASE WHEN alb.strict_match_verified THEN COALESCE(pr.source, '') ELSE '' END AS profile_source,
+                    COALESCE(pr.short_description, '') AS short_description,
+                    COALESCE(pr.source, '') AS profile_source,
                     pr.public_rating,
                     COALESCE(pr.public_rating_votes, 0) AS public_rating_votes,
                     COALESCE(pr.public_rating_source, '') AS public_rating_source,
@@ -59031,8 +59191,8 @@ def api_library_digest():
                     ar.id AS artist_id,
                     ar.name AS artist_name,
                     ar.name_norm AS artist_norm,
-                    CASE WHEN alb.strict_match_verified THEN COALESCE(pr.short_description, '') ELSE '' END AS short_description,
-                    CASE WHEN alb.strict_match_verified THEN COALESCE(pr.source, '') ELSE '' END AS profile_source
+                    COALESCE(pr.short_description, '') AS short_description,
+                    COALESCE(pr.source, '') AS profile_source
                 FROM files_albums alb
                 JOIN files_artists ar ON ar.id = alb.artist_id
                 LEFT JOIN files_album_profiles pr
@@ -59040,7 +59200,7 @@ def api_library_digest():
                       AND pr.title_norm = alb.title_norm
                 WHERE """ + album_match_sql + """
                 ORDER BY
-                    CASE WHEN alb.strict_match_verified AND COALESCE(pr.short_description, '') <> '' THEN 0 ELSE 1 END ASC,
+                    CASE WHEN COALESCE(pr.short_description, '') <> '' THEN 0 ELSE 1 END ASC,
                     COALESCE(pr.updated_at, alb.created_at) DESC,
                     alb.id DESC
                 LIMIT %s
@@ -61278,8 +61438,8 @@ def api_library_recently_played_albums():
                         alb.mb_identified,
                         ar.id AS artist_id,
                         ar.name AS artist_name,
-                        CASE WHEN alb.strict_match_verified THEN COALESCE(pr.short_description, '') ELSE '' END AS short_description,
-                        CASE WHEN alb.strict_match_verified THEN COALESCE(pr.source, '') ELSE '' END AS profile_source,
+                        COALESCE(pr.short_description, '') AS short_description,
+                        COALESCE(pr.source, '') AS profile_source,
                         ids.ord
                     FROM ids
                     JOIN files_albums alb ON alb.id = ids.album_id

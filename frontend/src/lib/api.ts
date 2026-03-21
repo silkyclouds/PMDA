@@ -2491,10 +2491,12 @@ export interface AlbumDetailReview {
 }
 
 export interface ClassicalIdentityPayload {
+  is_classical?: boolean;
   composer?: string[];
   work?: string[];
   conductor?: string[];
   orchestra?: string[];
+  ensemble?: string[];
   soloists?: string[];
   performers?: string[];
   catalog_numbers?: string[];

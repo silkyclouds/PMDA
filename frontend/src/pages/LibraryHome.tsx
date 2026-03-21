@@ -66,6 +66,19 @@ function joinClassical(values?: string[] | null, limit = 2): string {
     .join(' • ');
 }
 
+function hasClassicalIdentity(payload?: api.ClassicalIdentityPayload | null): boolean {
+  if (!payload) return false;
+  if (payload.is_classical === true) return true;
+  return Boolean(
+    (payload.work && payload.work.length)
+    || (payload.conductor && payload.conductor.length)
+    || (payload.orchestra && payload.orchestra.length)
+    || (payload.ensemble && payload.ensemble.length)
+    || (payload.soloists && payload.soloists.length)
+    || (payload.catalog_numbers && payload.catalog_numbers.length)
+  );
+}
+
 export default function LibraryHome() {
   const navigate = useNavigate();
   const location = useLocation();
@@ -454,7 +467,7 @@ export default function LibraryHome() {
                       >
                         {spotlightAlbum.artist_name}
                       </button>
-                      {spotlightAlbum.classical ? (
+                      {hasClassicalIdentity(spotlightAlbum.classical) ? (
                         <div className="space-y-1 text-xs leading-5 text-muted-foreground">
                           {joinClassical(spotlightAlbum.classical.work, 1) ? <div>{joinClassical(spotlightAlbum.classical.work, 1)}</div> : null}
                           {joinClassical(spotlightAlbum.classical.composer, 1) ? <div>Composer: {joinClassical(spotlightAlbum.classical.composer, 1)}</div> : null}

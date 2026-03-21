@@ -59,6 +59,19 @@ function wordCount(text: string): number {
   return m ? m.length : 0;
 }
 
+function hasClassicalIdentity(payload?: api.ClassicalIdentityPayload | null): boolean {
+  if (!payload) return false;
+  if (payload.is_classical === true) return true;
+  return Boolean(
+    (payload.work && payload.work.length)
+    || (payload.conductor && payload.conductor.length)
+    || (payload.orchestra && payload.orchestra.length)
+    || (payload.ensemble && payload.ensemble.length)
+    || (payload.soloists && payload.soloists.length)
+    || (payload.catalog_numbers && payload.catalog_numbers.length)
+  );
+}
+
 function normalizeArtistName(value: string): string {
   return (value || '').trim().toLowerCase().replace(/\s+/g, ' ');
 }
@@ -793,7 +806,7 @@ export default function AlbumPage() {
                     </div>
                   </div>
                 ) : null}
-                {data.classical ? (
+                {hasClassicalIdentity(data.classical) ? (
                   <div className="mt-4 grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
                     {joinClassical(data.classical.composer, 3) ? (
                       <div className="border border-border/70 bg-white/45 px-3 py-3 dark:border-white/12 dark:bg-black/26">
