@@ -17729,11 +17729,12 @@ def _run_files_profile_enrichment_job(
         try:
             role_hints: list[str] = []
             entity_kind = "artist"
+            artist_id = 0
             try:
                 with conn.cursor() as cur:
                     cur.execute(
                         """
-                        SELECT COALESCE(entity_kind, 'artist'), COALESCE(roles_json, '[]')
+                        SELECT id, COALESCE(entity_kind, 'artist'), COALESCE(roles_json, '[]')
                         FROM files_artists
                         WHERE name_norm = %s
                         LIMIT 1
@@ -17742,11 +17743,40 @@ def _run_files_profile_enrichment_job(
                     )
                     entity_row = cur.fetchone()
                 if entity_row:
-                    entity_kind = str(entity_row[0] or "artist").strip() or "artist"
-                    role_hints = _artist_role_hints_from_roles_json(entity_row[1] or "[]")
+                    artist_id = int(entity_row[0] or 0)
+                    entity_kind = str(entity_row[1] or "artist").strip() or "artist"
+                    role_hints = _artist_role_hints_from_roles_json(entity_row[2] or "[]")
             except Exception:
                 role_hints = []
                 entity_kind = "artist"
+                artist_id = 0
+            mb_identity: dict[str, Any] = {}
+            if artist_id > 0 and (
+                _artist_is_person_like(entity_kind=entity_kind, role_hints=role_hints)
+                or entity_kind in {"ensemble", "composer", "conductor"}
+                or bool(set(role_hints).intersection({"orchestra", "ensemble", "choir", "chorus"}))
+            ):
+                try:
+                    mb_identity = _musicbrainz_artist_identity_lookup(
+                        artist_name,
+                        entity_kind=entity_kind,
+                        role_hints=role_hints,
+                    )
+                    mb_aliases = list(mb_identity.get("aliases") or [])
+                    if mb_aliases:
+                        with conn.transaction():
+                            _files_upsert_artist_external_aliases(
+                                conn,
+                                artist_id=artist_id,
+                                artist_norm=artist_norm,
+                                artist_name=artist_name,
+                                aliases=mb_aliases,
+                                entity_kind=entity_kind,
+                                roles_json=role_hints,
+                                source="musicbrainz",
+                            )
+                except Exception:
+                    mb_identity = {}
             existing_profile = _files_get_artist_profile_cached(artist_name, artist_norm)
             existing_bio_text = ((existing_profile.get("bio") or existing_profile.get("short_bio") or "") if isinstance(existing_profile, dict) else "").strip()
             existing_source = str((existing_profile.get("source") if isinstance(existing_profile, dict) else "") or "").strip().lower()
@@ -17819,7 +17849,7 @@ def _run_files_profile_enrichment_job(
                 with conn.cursor() as cur:
                     cur.execute("SELECT id, has_image, COALESCE(image_path, '') FROM files_artists WHERE name_norm = %s", (artist_norm,))
                     arow = cur.fetchone()
-                artist_id = int(arow[0]) if arow else 0
+                artist_id = int(arow[0]) if arow else artist_id
                 local_has_image = bool(arow[1]) if arow else False
                 local_image_path = str((arow[2] if arow else "") or "").strip()
                 if local_has_image and local_image_path:
@@ -17880,6 +17910,8 @@ def _run_files_profile_enrichment_job(
                         lf_mbid = str((lastfm_info.get("mbid") if isinstance(lastfm_info, dict) else "") or "").strip()
                     except Exception:
                         lf_mbid = ""
+                    if not lf_mbid:
+                        lf_mbid = str((mb_identity.get("mbid") if isinstance(mb_identity, dict) else "") or "").strip()
                     if lf_mbid:
                         try:
                             fu = (_fetch_artist_image_fanart(lf_mbid) or "").strip()
@@ -28421,6 +28453,99 @@ def _artist_is_person_like(*, entity_kind: str = "", role_hints: list[str] | tup
     return bool(roles.intersection(_FILES_BROWSE_PERSON_ROLES))
 
 
+def _musicbrainz_artist_identity_lookup(
+    artist_name: str,
+    *,
+    entity_kind: str = "",
+    role_hints: list[str] | tuple[str, ...] | None = None,
+    limit: int = 8,
+) -> dict[str, Any]:
+    if not USE_MUSICBRAINZ:
+        return {}
+    query = " ".join(str(artist_name or "").split()).strip()
+    if not query:
+        return {}
+    person_like = _artist_is_person_like(entity_kind=entity_kind, role_hints=role_hints)
+    kind = str(entity_kind or "").strip().lower()
+    role_norms = {str(role or "").strip().lower() for role in (role_hints or []) if str(role or "").strip()}
+    try:
+        search = musicbrainzngs.search_artists(artist=query, limit=max(1, min(int(limit or 8), 10)))
+    except Exception:
+        return {}
+    artist_list = (search or {}).get("artist-list") or []
+    if not isinstance(artist_list, list) or not artist_list:
+        return {}
+    query_norm = _norm_artist_key(query)
+    query_signature = _classical_person_signature_key(query)
+    best: dict[str, Any] | None = None
+    best_score = 0.0
+    for cand in artist_list[: max(3, min(int(limit or 8), 10))]:
+        if not isinstance(cand, dict):
+            continue
+        cand_name = " ".join(str(cand.get("name") or "").split()).strip()
+        if not cand_name:
+            continue
+        cand_sort = " ".join(str(cand.get("sort-name") or "").split()).strip()
+        cand_type = str(cand.get("type") or "").strip().lower()
+        score = _provider_identity_text_score(query, cand_name)
+        if cand_sort:
+            score = max(score, _provider_identity_text_score(query, cand_sort))
+        if person_like and _classical_person_names_equivalent(query, cand_name):
+            score = max(score, 0.95)
+        if person_like and query_signature and _classical_person_signature_key(cand_name) == query_signature:
+            score = max(score, 0.94)
+        if query_norm and cand_sort and _norm_artist_key(cand_sort) == query_norm:
+            score = max(score, 0.93)
+        if person_like and cand_type == "person":
+            score += 0.03
+        elif not person_like and (kind == "ensemble" or "orchestra" in role_norms or "ensemble" in role_norms) and cand_type in {"group", "orchestra", "choir"}:
+            score += 0.03
+        if score < 0.74:
+            continue
+        if best is None or score > best_score:
+            best = cand
+            best_score = score
+    if not best:
+        return {}
+    artist_id = str(best.get("id") or "").strip()
+    if not artist_id:
+        return {}
+    out = {
+        "mbid": artist_id,
+        "name": " ".join(str(best.get("name") or "").split()).strip(),
+        "sort_name": " ".join(str(best.get("sort-name") or "").split()).strip(),
+        "aliases": [],
+    }
+    alias_values: list[str] = []
+    if out["name"]:
+        alias_values.append(out["name"])
+    if out["sort_name"]:
+        alias_values.append(out["sort_name"])
+    try:
+        full = musicbrainzngs.get_artist_by_id(artist_id, includes=["aliases"])
+    except Exception:
+        full = {}
+    artist_data = (full or {}).get("artist") or {}
+    alias_list = artist_data.get("alias-list") or []
+    if isinstance(alias_list, list):
+        for item in alias_list:
+            if not isinstance(item, dict):
+                continue
+            alias = " ".join(str(item.get("alias") or item.get("name") or "").split()).strip()
+            if alias:
+                alias_values.append(alias)
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for alias in alias_values:
+        alias_norm = _norm_artist_key(alias)
+        if not alias_norm or alias_norm in seen:
+            continue
+        seen.add(alias_norm)
+        deduped.append(alias)
+    out["aliases"] = deduped[:16]
+    return out
+
+
 def _files_artist_alias_rows_for_identity(
     *,
     artist_name: str,
@@ -28444,6 +28569,21 @@ def _files_artist_alias_rows_for_identity(
             clean = " ".join(str(value or "").split()).strip()
             if clean:
                 alias_values.append((clean, "alias_json"))
+    if person_like:
+        sig = _classical_person_alias_signature(name)
+        surname = str(sig.get("surname") or "").strip()
+        ordered_initials = [str(ch or "").strip().upper()[:1] for ch in (sig.get("ordered_initials") or []) if str(ch or "").strip()]
+        if surname and ordered_initials:
+            joined = " ".join(ordered_initials)
+            compact = "".join(ordered_initials)
+            dotted = ". ".join(ordered_initials) + "."
+            alias_values.extend(
+                [
+                    (f"{joined} {surname}".strip(), "generated_initials"),
+                    (f"{compact} {surname}".strip(), "generated_initials"),
+                    (f"{dotted} {surname}".strip(), "generated_initials"),
+                ]
+            )
     rows: list[dict[str, Any]] = []
     seen_norms: set[str] = set()
     for alias, source in alias_values:
@@ -28554,7 +28694,7 @@ def _files_backfill_artist_alias_table(conn) -> None:
         with conn.cursor() as cur:
             cur.execute("SELECT COALESCE(value, '') FROM files_index_meta WHERE key = 'artist_aliases_schema' LIMIT 1")
             row = cur.fetchone()
-            if row and str(row[0] or "").strip() == "v1":
+            if row and str(row[0] or "").strip() == "v2":
                 return
             cur.execute("SELECT name_norm FROM files_artists")
             norms = [str(value[0] or "").strip() for value in cur.fetchall() if str(value[0] or "").strip()]
@@ -28563,7 +28703,7 @@ def _files_backfill_artist_alias_table(conn) -> None:
                 cur.execute(
                     """
                     INSERT INTO files_index_meta(key, value, updated_at)
-                    VALUES ('artist_aliases_schema', 'v1', NOW())
+                    VALUES ('artist_aliases_schema', 'v2', NOW())
                     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
                     """
                 )
@@ -28574,7 +28714,7 @@ def _files_backfill_artist_alias_table(conn) -> None:
             cur.execute(
                 """
                 INSERT INTO files_index_meta(key, value, updated_at)
-                VALUES ('artist_aliases_schema', 'v1', NOW())
+                VALUES ('artist_aliases_schema', 'v2', NOW())
                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
                 """
             )
@@ -28625,6 +28765,70 @@ def _files_get_artist_alias_candidates(
         except Exception:
             logging.debug("Artist alias candidate fetch failed for %s", canonical_norm, exc_info=True)
     return out[: max(1, int(limit or 12))]
+
+
+def _files_upsert_artist_external_aliases(
+    conn,
+    *,
+    artist_id: int,
+    artist_norm: str,
+    artist_name: str,
+    aliases: list[str] | tuple[str, ...],
+    entity_kind: str = "",
+    roles_json: Any = None,
+    source: str = "musicbrainz",
+) -> None:
+    if conn is None or int(artist_id or 0) <= 0:
+        return
+    clean_aliases = [" ".join(str(value or "").split()).strip() for value in (aliases or [])]
+    clean_aliases = [value for value in clean_aliases if value]
+    if not clean_aliases:
+        return
+    alias_rows = _files_artist_alias_rows_for_identity(
+        artist_name=artist_name,
+        artist_norm=artist_norm,
+        entity_kind=entity_kind,
+        roles_json=roles_json,
+        aliases_json=clean_aliases,
+    )
+    if not alias_rows:
+        return
+    with conn.cursor() as cur:
+        for row in alias_rows:
+            cur.execute(
+                """
+                INSERT INTO files_artist_aliases (
+                    artist_id,
+                    artist_name_norm,
+                    alias,
+                    alias_norm,
+                    alias_signature,
+                    is_canonical,
+                    source,
+                    created_at,
+                    updated_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+                ON CONFLICT (artist_id, alias_norm)
+                DO UPDATE SET
+                    alias_signature = EXCLUDED.alias_signature,
+                    is_canonical = files_artist_aliases.is_canonical OR EXCLUDED.is_canonical,
+                    source = CASE
+                        WHEN files_artist_aliases.source = 'canonical' THEN files_artist_aliases.source
+                        ELSE EXCLUDED.source
+                    END,
+                    updated_at = NOW()
+                """,
+                (
+                    int(artist_id),
+                    artist_norm,
+                    str(row.get("alias") or "").strip(),
+                    str(row.get("alias_norm") or "").strip(),
+                    str(row.get("alias_signature") or "").strip(),
+                    bool(row.get("is_canonical")),
+                    source,
+                ),
+            )
 
 
 def _files_extract_browse_entities_for_album(
@@ -48808,6 +49012,14 @@ def _fetch_wikipedia_artist_bio(
                     "rapper",
                     "band",
                     "music group",
+                    "conductor",
+                    "maestro",
+                    "orchestra",
+                    "philharmonic",
+                    "symphony orchestra",
+                    "ensemble",
+                    "choir",
+                    "chorus",
                     # French variants (when using frwiki).
                     "musicien",
                     "groupe",
@@ -48817,6 +49029,11 @@ def _fetch_wikipedia_artist_bio(
                     "compositeur",
                     "producteur",
                     "rappeur",
+                    "chef d'orchestre",
+                    "orchestre",
+                    "ensemble",
+                    "choeur",
+                    "chœur",
                 )
                 if any(tok in desc_low for tok in hard_good):
                     return True
@@ -48828,8 +49045,10 @@ def _fetch_wikipedia_artist_bio(
             good = (
                 "musician", "band", "singer", "songwriter", "composer", "producer", "dj",
                 "album", "record", "label", "single", "track", "genre", "formed", "born",
+                "conductor", "maestro", "orchestra", "philharmonic", "symphony", "ensemble", "choir", "chorus",
                 # French variants
                 "musicien", "groupe", "chanteur", "chanteuse", "album", "label", "dj",
+                "chef d'orchestre", "orchestre", "ensemble", "choeur", "chœur",
             )
             bad = (
                 "pigment", "clay", "oxide", "mineral", "earth pigment", "paint", "soil",
