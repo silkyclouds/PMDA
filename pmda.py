@@ -58304,17 +58304,7 @@ def api_library_artists():
                                       AND {album_count_match_sql}
                                 ) AS album_count,
                                 a.broken_albums_count,
-                                (
-                                    a.has_image
-                                    OR COALESCE(ext.image_path, '') <> ''
-                                    OR EXISTS (
-                                        SELECT 1
-                                        FROM files_artist_album_links link_cov
-                                        JOIN files_albums alb_cov ON alb_cov.id = link_cov.album_id
-                                        WHERE link_cov.artist_id = a.id
-                                          AND COALESCE(alb_cov.has_cover, FALSE) = TRUE
-                                    )
-                                ) AS has_image,
+                                (""" + _artist_has_true_image_sql("a", "ext") + """) AS has_image,
                                 similarity(a.name, %s) AS score,
                                 CASE WHEN lower(a.name) LIKE lower(%s) || '%%' THEN 0 ELSE 1 END AS prefix_rank
                             FROM files_artists a
@@ -58341,17 +58331,7 @@ def api_library_artists():
                                       AND {album_count_match_sql}
                                 ) AS album_count,
                                 a.broken_albums_count,
-                                (
-                                    a.has_image
-                                    OR COALESCE(ext.image_path, '') <> ''
-                                    OR EXISTS (
-                                        SELECT 1
-                                        FROM files_artist_album_links link_cov
-                                        JOIN files_albums alb_cov ON alb_cov.id = link_cov.album_id
-                                        WHERE link_cov.artist_id = a.id
-                                          AND COALESCE(alb_cov.has_cover, FALSE) = TRUE
-                                    )
-                                ) AS has_image
+                                (""" + _artist_has_true_image_sql("a", "ext") + """) AS has_image
                             FROM files_artists a
                             LEFT JOIN files_external_artist_images ext ON ext.name_norm = a.name_norm
                             WHERE {" AND ".join(where_parts)}
@@ -58376,17 +58356,7 @@ def api_library_artists():
                                   AND {album_count_match_sql}
                             ) AS album_count,
                             a.broken_albums_count,
-                            (
-                                a.has_image
-                                OR COALESCE(ext.image_path, '') <> ''
-                                OR EXISTS (
-                                    SELECT 1
-                                    FROM files_artist_album_links link_cov
-                                    JOIN files_albums alb_cov ON alb_cov.id = link_cov.album_id
-                                    WHERE link_cov.artist_id = a.id
-                                      AND COALESCE(alb_cov.has_cover, FALSE) = TRUE
-                                )
-                            ) AS has_image
+                            (""" + _artist_has_true_image_sql("a", "ext") + """) AS has_image
                         FROM files_artists a
                         LEFT JOIN files_external_artist_images ext ON ext.name_norm = a.name_norm
                         WHERE {" AND ".join(where_parts)}
@@ -58559,17 +58529,7 @@ def api_library_artists_suggest():
                             WHERE link_cnt.artist_id = a.id
                         ) AS album_count,
                         a.broken_albums_count,
-                        (
-                            a.has_image
-                            OR COALESCE(ext.image_path, '') <> ''
-                            OR EXISTS (
-                                SELECT 1
-                                FROM files_artist_album_links link_cov
-                                JOIN files_albums alb_cov ON alb_cov.id = link_cov.album_id
-                                WHERE link_cov.artist_id = a.id
-                                  AND COALESCE(alb_cov.has_cover, FALSE) = TRUE
-                            )
-                        ) AS has_image,
+                        (""" + _artist_has_true_image_sql("a", "ext") + """) AS has_image,
                         similarity(a.name, %s) AS score,
                         CASE WHEN lower(a.name) LIKE lower(%s) || '%%' THEN 0 ELSE 1 END AS prefix_rank
                     FROM files_artists a
@@ -58595,17 +58555,7 @@ def api_library_artists_suggest():
                             WHERE link_cnt.artist_id = a.id
                         ) AS album_count,
                         a.broken_albums_count,
-                        (
-                            a.has_image
-                            OR COALESCE(ext.image_path, '') <> ''
-                            OR EXISTS (
-                                SELECT 1
-                                FROM files_artist_album_links link_cov
-                                JOIN files_albums alb_cov ON alb_cov.id = link_cov.album_id
-                                WHERE link_cov.artist_id = a.id
-                                  AND COALESCE(alb_cov.has_cover, FALSE) = TRUE
-                            )
-                        ) AS has_image
+                        (""" + _artist_has_true_image_sql("a", "ext") + """) AS has_image
                     FROM files_artists a
                     LEFT JOIN files_external_artist_images ext ON ext.name_norm = a.name_norm
                     WHERE (a.name ILIKE %s OR COALESCE(a.aliases_json, '[]') ILIKE %s)
@@ -58684,17 +58634,7 @@ def api_library_search_suggest():
                             WHERE link_cnt.artist_id = a.id
                               AND """ + artist_count_match_sql + """
                         ) AS album_count,
-                        (
-                            a.has_image
-                            OR COALESCE(ext.image_path, '') <> ''
-                            OR EXISTS (
-                                SELECT 1
-                                FROM files_artist_album_links link_cov
-                                JOIN files_albums alb_cov ON alb_cov.id = link_cov.album_id
-                                WHERE link_cov.artist_id = a.id
-                                  AND COALESCE(alb_cov.has_cover, FALSE) = TRUE
-                            )
-                        ) AS has_image,
+                        (""" + _artist_has_true_image_sql("a", "ext") + """) AS has_image,
                         similarity(a.name, %s) AS score,
                         CASE WHEN lower(a.name) LIKE lower(%s) || '%%' THEN 0 ELSE 1 END AS prefix_rank
                     FROM files_artists a
@@ -58727,17 +58667,7 @@ def api_library_search_suggest():
                             WHERE link_cnt.artist_id = a.id
                               AND """ + artist_count_match_sql + """
                         ) AS album_count,
-                        (
-                            a.has_image
-                            OR COALESCE(ext.image_path, '') <> ''
-                            OR EXISTS (
-                                SELECT 1
-                                FROM files_artist_album_links link_cov
-                                JOIN files_albums alb_cov ON alb_cov.id = link_cov.album_id
-                                WHERE link_cov.artist_id = a.id
-                                  AND COALESCE(alb_cov.has_cover, FALSE) = TRUE
-                            )
-                        ) AS has_image,
+                        (""" + _artist_has_true_image_sql("a", "ext") + """) AS has_image,
                         0.0 AS score,
                         1 AS prefix_rank
                     FROM files_artists a
@@ -60151,17 +60081,7 @@ def api_library_top_artists():
                             WHERE link_cnt.artist_id = ar.id
                               AND """ + album_count_sql + """
                         ) AS album_count,
-                        (
-                            ar.has_image
-                            OR COALESCE(ext.image_path, '') <> ''
-                            OR EXISTS (
-                                SELECT 1
-                                FROM files_artist_album_links link_cov
-                                JOIN files_albums alb_cov ON alb_cov.id = link_cov.album_id
-                                WHERE link_cov.artist_id = ar.id
-                                  AND COALESCE(alb_cov.has_cover, FALSE) = TRUE
-                            )
-                        ) AS has_image,
+                        (""" + _artist_has_true_image_sql("ar", "ext") + """) AS has_image,
                         COALESCE(SUM(CASE WHEN e.event_type IN ('play_complete', 'like') THEN 1 ELSE 0 END), 0) AS completion_count,
                         COALESCE(SUM(CASE WHEN e.event_type IN ('play_start', 'play_partial', 'play_complete', 'like') THEN 1 ELSE 0 END), 0) AS play_events
                     FROM files_reco_events e
@@ -60208,17 +60128,7 @@ def api_library_top_artists():
                             WHERE link_cnt.artist_id = ar.id
                               AND """ + album_count_sql + """
                         ) AS album_count,
-                        (
-                            ar.has_image
-                            OR COALESCE(ext.image_path, '') <> ''
-                            OR EXISTS (
-                                SELECT 1
-                                FROM files_artist_album_links link_cov
-                                JOIN files_albums alb_cov ON alb_cov.id = link_cov.album_id
-                                WHERE link_cov.artist_id = ar.id
-                                  AND COALESCE(alb_cov.has_cover, FALSE) = TRUE
-                            )
-                        ) AS has_image,
+                        (""" + _artist_has_true_image_sql("ar", "ext") + """) AS has_image,
                         COALESCE(SUM(st.completion_count), 0) AS completion_count,
                         COALESCE(SUM(st.play_count), 0) AS play_count
                     FROM files_reco_track_stats st
@@ -60288,17 +60198,7 @@ def api_library_recent_artists():
                 SELECT
                     ar.id,
                     ar.name,
-                    (
-                        ar.has_image
-                        OR COALESCE(ext.image_path, '') <> ''
-                        OR EXISTS (
-                            SELECT 1
-                            FROM files_artist_album_links link_cov
-                            JOIN files_albums alb_cov ON alb_cov.id = link_cov.album_id
-                            WHERE link_cov.artist_id = ar.id
-                              AND COALESCE(alb_cov.has_cover, FALSE) = TRUE
-                        )
-                    ) AS has_image,
+                    (""" + _artist_has_true_image_sql("ar", "ext") + """) AS has_image,
                     COUNT(DISTINCT aa.album_id)::BIGINT AS album_count,
                     EXTRACT(EPOCH FROM MAX(alb.created_at))::BIGINT AS last_added_at
                 FROM (SELECT DISTINCT artist_id, album_id FROM files_artist_album_links) aa
@@ -61281,7 +61181,7 @@ def api_library_genre_profile(genre: str):
                     ar.id,
                     ar.name,
                     COUNT(*)::BIGINT AS release_count,
-                    (ar.has_image OR COALESCE(ext.image_path, '') <> '') AS has_image
+                    (""" + _artist_has_true_image_sql("ar", "ext") + """) AS has_image
                 FROM matched_albums m
                 JOIN files_albums alb ON alb.id = m.album_id
                 JOIN files_artists ar ON ar.id = alb.artist_id
@@ -61381,7 +61281,7 @@ def api_library_label_profile(label: str):
                     ar.id,
                     ar.name,
                     COUNT(*)::BIGINT AS release_count,
-                    (ar.has_image OR COALESCE(ext.image_path, '') <> '') AS has_image
+                    (""" + _artist_has_true_image_sql("ar", "ext") + """) AS has_image
                 FROM files_albums alb
                 JOIN files_artists ar ON ar.id = alb.artist_id
                 LEFT JOIN files_external_artist_images ext ON ext.name_norm = ar.name_norm
@@ -63396,26 +63296,6 @@ def api_library_artist_detail(artist_id):
                     if ext_path and Path(ext_path).exists() and _is_media_cache_file(Path(ext_path), kind="artist"):
                         v = f"&v={ext_updated_epoch}" if ext_updated_epoch > 0 else ""
                         artist_thumb = f"{base_url}/api/library/external/artist-image/{quote(artist_norm, safe='')}?size=320{v}"
-                except Exception:
-                    pass
-            if not artist_thumb:
-                try:
-                    with conn.cursor() as cur:
-                        cur.execute(
-                            """
-                            SELECT alb.id
-                            FROM files_artist_album_links link
-                            JOIN files_albums alb ON alb.id = link.album_id
-                            WHERE link.artist_id = %s
-                              AND COALESCE(alb.has_cover, FALSE) = TRUE
-                            ORDER BY link.is_primary DESC, COALESCE(alb.year, 0) DESC, alb.updated_at DESC, alb.id DESC
-                            LIMIT 1
-                            """,
-                            (int(artist_id),),
-                        )
-                        crow = cur.fetchone()
-                    if crow and int(crow[0] or 0) > 0:
-                        artist_thumb = f"{base_url}/api/library/files/album/{int(crow[0])}/cover?size=320"
                 except Exception:
                     pass
             # Patch similar artists with local IDs + images (local first, then cached external).
@@ -66323,33 +66203,6 @@ def api_library_files_artist_image(artist_id):
                 str(ext_path),
             )
 
-    conn = _files_pg_connect()
-    if conn is not None:
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT COALESCE(alb.cover_path, '')
-                    FROM files_artist_album_links link
-                    JOIN files_albums alb ON alb.id = link.album_id
-                    WHERE link.artist_id = %s
-                      AND COALESCE(alb.has_cover, FALSE) = TRUE
-                    ORDER BY link.is_primary DESC, COALESCE(alb.year, 0) DESC, alb.updated_at DESC, alb.id DESC
-                    LIMIT 1
-                    """,
-                    (int(artist_id),),
-                )
-                crow = cur.fetchone()
-            cover_raw = str((crow[0] if crow else "") or "").strip()
-            if cover_raw:
-                cover_path = path_for_fs_access(Path(cover_raw))
-                if cover_path.exists() and cover_path.is_file():
-                    cached = _ensure_cached_image_for_path(cover_path, kind="album", max_px=size)
-                    to_send = cached or cover_path
-                    return _serve_image_file_cached(to_send, max_age=0, revalidate=True)
-        finally:
-            conn.close()
-
     if no_image_cached:
         return _transparent_png_response(max_age=3600)
     _files_cache_set_json(
@@ -67334,6 +67187,14 @@ def _is_probably_placeholder_artist_image_url(url: str) -> bool:
     return False
 
 
+def _artist_has_true_image_sql(artist_alias: str = "a", ext_alias: str = "ext") -> str:
+    """
+    Return SQL that is true only when we have a dedicated artist image.
+    Album covers must never count as artist portraits.
+    """
+    return f"({artist_alias}.has_image OR COALESCE({ext_alias}.image_path, '') <> '')"
+
+
 def _is_usable_artist_image_bytes(raw: bytes, *, min_dim: int = 220, min_bytes: int = 8192) -> bool:
     if not raw or len(raw) < min_bytes:
         return False
@@ -67675,52 +67536,158 @@ def _fetch_artist_image_audiodb(artist_name: str) -> Optional[str]:
         return None
 
 
-def _fetch_artist_image_web(artist_name: str, *, allow_ai_fallback: bool = True) -> Optional[str]:
+def _artist_image_search_queries(
+    artist_name: str,
+    *,
+    entity_kind: str = "",
+    role_hints: list[str] | tuple[str, ...] | None = None,
+) -> list[str]:
+    name = str(artist_name or "").strip()
+    if not name:
+        return []
+    kind = str(entity_kind or "").strip().lower()
+    role_norms = {
+        str(role or "").strip().lower()
+        for role in (role_hints or [])
+        if str(role or "").strip()
+    }
+    qualifiers: list[str] = []
+    if kind in {"composer"} or "composer" in role_norms:
+        qualifiers = ["composer portrait", "composer photo", "musician portrait"]
+    elif kind in {"conductor"} or "conductor" in role_norms:
+        qualifiers = ["conductor portrait", "conductor photo", "musician portrait"]
+    elif kind in {"orchestra"} or "orchestra" in role_norms:
+        qualifiers = ["orchestra official photo", "orchestra photo", "ensemble photo"]
+    elif kind in {"ensemble", "choir", "chorus"} or role_norms.intersection({"ensemble", "choir", "chorus"}):
+        qualifiers = ["ensemble official photo", "ensemble photo", "group photo"]
+    elif kind in {"band"} or "band" in role_norms:
+        qualifiers = ["band photo", "band promo photo", "group photo"]
+    else:
+        qualifiers = ["musician photo", "artist photo", "portrait"]
+    queries = [f"{name} {qualifier}" for qualifier in qualifiers]
+    queries.append(name)
+    out: list[str] = []
+    seen: set[str] = set()
+    for query in queries:
+        clean = re.sub(r"\s+", " ", str(query or "").strip())
+        key = clean.lower()
+        if clean and key not in seen:
+            seen.add(key)
+            out.append(clean)
+    return out
+
+
+def _artist_image_result_looks_relevant(
+    artist_name: str,
+    result: dict[str, Any] | None,
+    *,
+    entity_kind: str = "",
+    role_hints: list[str] | tuple[str, ...] | None = None,
+) -> bool:
+    if not isinstance(result, dict):
+        return False
+    title = str(result.get("title") or "").strip()
+    snippet = str(result.get("snippet") or "").strip()
+    link = str(result.get("link") or "").strip()
+    merged = f"{title} {snippet} {link}".lower()
+    if not _text_mentions_identity_phrase(str(artist_name or "").strip(), f"{title} {snippet}".strip()):
+        return False
+    reject_tokens = (
+        "discogs release",
+        "release page",
+        "album review",
+        "vinyl",
+        "cd ",
+        "bandcamp album",
+        "track listing",
+        "tracklist",
+        "cover art",
+        "album cover",
+        "recording cover",
+    )
+    if any(tok in merged for tok in reject_tokens):
+        return False
+    kind = str(entity_kind or "").strip().lower()
+    role_norms = {
+        str(role or "").strip().lower()
+        for role in (role_hints or [])
+        if str(role or "").strip()
+    }
+    if kind in {"orchestra"} or "orchestra" in role_norms:
+        return any(tok in merged for tok in ("orchestra", "philharmonic", "symphony", "ensemble"))
+    if kind in {"conductor"} or "conductor" in role_norms:
+        return any(tok in merged for tok in ("conductor", "maestro", "musician"))
+    if kind in {"composer"} or "composer" in role_norms:
+        return any(tok in merged for tok in ("composer", "musician", "portrait"))
+    if kind in {"ensemble", "choir", "chorus"} or role_norms.intersection({"ensemble", "choir", "chorus"}):
+        return any(tok in merged for tok in ("ensemble", "choir", "chorus", "group"))
+    return True
+
+
+def _fetch_artist_image_web(
+    artist_name: str,
+    *,
+    entity_kind: str = "",
+    role_hints: list[str] | tuple[str, ...] | None = None,
+    allow_ai_fallback: bool = True,
+) -> Optional[str]:
     """
     Fallback: try to find an artist image via web search (IA-first, Serper as backup) + OpenGraph image.
     Returns image URL or None.
     """
-    query = f"{artist_name} musician photo"
-    results = _serper_web_search(query, num=5, allow_ai_fallback=allow_ai_fallback)
-    if not results:
-        return None
-    for item in results:
-        link = item.get("link") or ""
-        if not link:
+    queries = _artist_image_search_queries(
+        artist_name,
+        entity_kind=entity_kind,
+        role_hints=role_hints,
+    )
+    for query in queries[:4]:
+        results = _serper_web_search(query, num=6, allow_ai_fallback=allow_ai_fallback)
+        if not results:
             continue
-        try:
-            resp = requests.get(link, timeout=8, allow_redirects=True)
-        except Exception as e:
-            logging.debug("[ArtistWebImage] Failed to fetch %s: %s", link, e)
-            continue
-        if resp.status_code != 200:
-            continue
-        ct = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
-        # Direct image URL
-        if ct.startswith("image/"):
-            return link
-        # HTML page – try og:image
-        if "text/html" in ct and resp.text:
+        for item in results:
+            if not _artist_image_result_looks_relevant(
+                artist_name,
+                item,
+                entity_kind=entity_kind,
+                role_hints=role_hints,
+            ):
+                continue
+            link = item.get("link") or ""
+            if not link:
+                continue
             try:
-                m = re.search(
-                    r'<meta\s+property=["\']og:image["\']\s+content=["\']([^"\']+)["\']',
-                    resp.text,
-                    re.IGNORECASE,
-                )
-                if not m:
+                resp = requests.get(link, timeout=8, allow_redirects=True)
+            except Exception as e:
+                logging.debug("[ArtistWebImage] Failed to fetch %s: %s", link, e)
+                continue
+            if resp.status_code != 200:
+                continue
+            ct = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
+            # Direct image URL
+            if ct.startswith("image/"):
+                return link
+            # HTML page – try og:image
+            if "text/html" in ct and resp.text:
+                try:
                     m = re.search(
-                        r'<meta\s+content=["\']([^"\']+)["\']\s+property=["\']og:image["\']',
+                        r'<meta\s+property=["\']og:image["\']\s+content=["\']([^"\']+)["\']',
                         resp.text,
                         re.IGNORECASE,
                     )
-                if not m:
+                    if not m:
+                        m = re.search(
+                            r'<meta\s+content=["\']([^"\']+)["\']\s+property=["\']og:image["\']',
+                            resp.text,
+                            re.IGNORECASE,
+                        )
+                    if not m:
+                        continue
+                    img_url = m.group(1).strip()
+                    if img_url:
+                        return img_url
+                except Exception as e:
+                    logging.debug("[ArtistWebImage] Failed to extract og:image from %s: %s", link, e)
                     continue
-                img_url = m.group(1).strip()
-                if img_url:
-                    return img_url
-            except Exception as e:
-                logging.debug("[ArtistWebImage] Failed to extract og:image from %s: %s", link, e)
-                continue
     return None
 
 

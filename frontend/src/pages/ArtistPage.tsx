@@ -136,15 +136,7 @@ function joinClassical(values?: string[] | null, limit = 2): string | null {
 
 function hasClassicalIdentity(payload?: api.ClassicalIdentityPayload | null): boolean {
   if (!payload) return false;
-  if (payload.is_classical === true) return true;
-  return Boolean(
-    (payload.work && payload.work.length)
-    || (payload.conductor && payload.conductor.length)
-    || (payload.orchestra && payload.orchestra.length)
-    || (payload.ensemble && payload.ensemble.length)
-    || (payload.soloists && payload.soloists.length)
-    || (payload.catalog_numbers && payload.catalog_numbers.length)
-  );
+  return payload.is_classical === true;
 }
 
 function toCoord(s?: string): number | null {
