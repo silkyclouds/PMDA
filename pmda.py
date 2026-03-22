@@ -11158,7 +11158,7 @@ def _scheduler_loop() -> None:
                                 source="schedule",
                                 reason=str(reason or "Skipped"),
                             )
-                            logging.info(
+                            logging.debug(
                                 "Scheduler skipped %s/%s run=%s (%s); next run scheduled normally.",
                                 job_type,
                                 scope,
@@ -12195,6 +12195,10 @@ def _files_pg_init_schema() -> bool:
                 _files_backfill_artist_alias_table(conn)
             except Exception:
                 logging.debug("Artist alias table backfill failed", exc_info=True)
+            try:
+                _files_purge_weak_classical_artist_images(conn)
+            except Exception:
+                logging.debug("Artist image policy backfill failed", exc_info=True)
         _FILES_PG_SCHEMA_READY = True
         return True
     except Exception as e:
@@ -12354,27 +12358,153 @@ def _files_backfill_artist_canonical_fields(conn) -> None:
         with conn.cursor() as cur:
             cur.execute("SELECT COALESCE(value, '') FROM files_index_meta WHERE key = 'artist_canonical_schema' LIMIT 1")
             row = cur.fetchone()
-            if row and str(row[0] or "").strip() == "v1":
+            if row and str(row[0] or "").strip() == "v4":
                 return
             cur.execute(
                 """
-                UPDATE files_artists
-                SET canonical_name = COALESCE(NULLIF(TRIM(canonical_name), ''), name),
-                    canonical_name_norm = COALESCE(NULLIF(TRIM(canonical_name_norm), ''), name_norm),
-                    updated_at = NOW()
-                WHERE COALESCE(NULLIF(TRIM(canonical_name), ''), '') = ''
-                   OR COALESCE(NULLIF(TRIM(canonical_name_norm), ''), '') = ''
+                SELECT id,
+                       COALESCE(name, ''),
+                       COALESCE(name_norm, ''),
+                       COALESCE(canonical_name, ''),
+                       COALESCE(canonical_name_norm, ''),
+                       COALESCE(entity_kind, 'artist'),
+                       COALESCE(roles_json, '[]'),
+                       COALESCE(aliases_json, '[]')
+                FROM files_artists
                 """
             )
+            rows = cur.fetchall()
+            updates: list[tuple[str, str, int]] = []
+            for artist_id, name, name_norm, canonical_name, canonical_name_norm, entity_kind, roles_json, aliases_json in rows:
+                current_name = " ".join(str(name or "").split()).strip()
+                current_norm = str(name_norm or "").strip()
+                current_canonical = " ".join(str(canonical_name or "").split()).strip()
+                current_canonical_norm = str(canonical_name_norm or "").strip()
+                roles = _artist_role_hints_from_roles_json(roles_json)
+                aliases = _safe_json_load(aliases_json or "[]", fallback=[])
+                merged_aliases = _files_merge_artist_alias_values([current_name, current_canonical], aliases)
+                if _artist_is_person_like(entity_kind=str(entity_kind or "artist"), role_hints=roles):
+                    preferred = current_name or current_canonical
+                    for candidate in [current_canonical, *merged_aliases]:
+                        preferred = _choose_preferred_person_identity_name(preferred, candidate)
+                    canonical = preferred or current_canonical or current_name
+                else:
+                    canonical = current_canonical or current_name
+                canonical = " ".join(str(canonical or "").split()).strip() or current_name
+                canonical_norm = _norm_artist_key(canonical) or current_norm
+                if canonical != current_canonical or canonical_norm != current_canonical_norm:
+                    updates.append((canonical, canonical_norm, int(artist_id or 0)))
+            if updates:
+                cur.executemany(
+                    """
+                    UPDATE files_artists
+                    SET canonical_name = %s,
+                        canonical_name_norm = %s,
+                        updated_at = NOW()
+                    WHERE id = %s
+                    """,
+                    updates,
+                )
             cur.execute(
                 """
                 INSERT INTO files_index_meta(key, value, updated_at)
-                VALUES ('artist_canonical_schema', 'v1', NOW())
+                VALUES ('artist_canonical_schema', 'v4', NOW())
                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
                 """
             )
     except Exception:
         logging.debug("Artist canonical field backfill failed", exc_info=True)
+
+
+def _files_purge_weak_classical_artist_images(conn) -> None:
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COALESCE(value, '') FROM files_index_meta WHERE key = 'artist_image_policy_schema' LIMIT 1")
+            row = cur.fetchone()
+            if row and str(row[0] or "").strip() == "v4":
+                return
+            try:
+                media_cache_root = path_for_fs_access(Path((MEDIA_CACHE_ROOT or "").strip() or str(CONFIG_DIR / "media_cache"))).resolve()
+            except Exception:
+                media_cache_root = Path((MEDIA_CACHE_ROOT or "").strip() or str(CONFIG_DIR / "media_cache"))
+            cur.execute(
+                """
+                SELECT
+                    a.name_norm,
+                    COALESCE(a.name, ''),
+                    COALESCE(a.canonical_name, ''),
+                    COALESCE(a.entity_kind, 'artist'),
+                    COALESCE(a.roles_json, '[]'),
+                    COALESCE(a.image_path, ''),
+                    COALESCE(ext.image_path, ''),
+                    COALESCE(ext.provider, ''),
+                    COALESCE(ext.image_url, '')
+                FROM files_artists a
+                JOIN files_external_artist_images ext ON ext.name_norm = a.name_norm
+                """
+            )
+            weak_rows = cur.fetchall()
+            for name_norm, artist_name, canonical_name, entity_kind, roles_json, artist_image_path, ext_image_path, provider, image_url in weak_rows:
+                key = str(name_norm or "").strip()
+                if not key:
+                    continue
+                display_name = " ".join(str(canonical_name or artist_name or "").split()).strip()
+                role_hints = _artist_role_hints_from_roles_json(roles_json)
+                ext_path = str(ext_image_path or "").strip()
+                art_path = str(artist_image_path or "").strip()
+                invalidate = _artist_external_image_requires_authoritative_refresh(
+                    provider=str(provider or "").strip().lower(),
+                    image_url=str(image_url or "").strip(),
+                    entity_kind=str(entity_kind or ""),
+                    role_hints=role_hints,
+                )
+                if (
+                    not invalidate
+                    and display_name
+                    and _artist_entity_is_classical_like(entity_kind=str(entity_kind or ""), role_hints=role_hints)
+                    and str(image_url or "").strip()
+                ):
+                    invalidate = not _artist_image_url_looks_relevant(
+                        str(image_url or "").strip(),
+                        artist_name=display_name,
+                        entity_kind=str(entity_kind or ""),
+                        role_hints=role_hints,
+                    )
+                if not invalidate and ext_path:
+                    try:
+                        invalidate = not _is_usable_artist_image_path(Path(ext_path))
+                    except Exception:
+                        invalidate = True
+                if not invalidate:
+                    continue
+                mirrored = bool(ext_path and art_path and _paths_refer_to_same_file(ext_path, art_path))
+                art_under_cache = False
+                if art_path:
+                    try:
+                        art_under_cache = path_for_fs_access(Path(art_path)).resolve().is_relative_to(media_cache_root)
+                    except Exception:
+                        art_under_cache = False
+                cur.execute("DELETE FROM files_external_artist_images WHERE name_norm = %s", (key,))
+                if mirrored or art_under_cache or not art_path:
+                    cur.execute(
+                        """
+                        UPDATE files_artists
+                        SET has_image = FALSE,
+                            image_path = NULL,
+                            updated_at = NOW()
+                        WHERE name_norm = %s
+                        """,
+                        (key,),
+                    )
+            cur.execute(
+                """
+                INSERT INTO files_index_meta(key, value, updated_at)
+                VALUES ('artist_image_policy_schema', 'v4', NOW())
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
+                """
+            )
+    except Exception:
+        logging.debug("Artist image policy backfill failed", exc_info=True)
 
 
 def _files_redis_client():
@@ -17261,6 +17391,8 @@ def _files_cache_external_artist_image(
     force_replace: bool = False,
     entity_kind: str = "",
     role_hints: list[str] | tuple[str, ...] | None = None,
+    page_title: str = "",
+    page_summary: str = "",
 ) -> Optional[str]:
     """
     Download + store an external artist image into the media cache and upsert the DB row.
@@ -17287,6 +17419,8 @@ def _files_cache_external_artist_image(
             artist_name=name,
             entity_kind=entity_kind,
             role_hints=role_hints,
+            page_title=page_title,
+            page_summary=page_summary,
         ):
             return None
     except Exception:
@@ -17333,6 +17467,8 @@ def _files_cache_external_artist_image(
             artist_name=name,
             entity_kind=entity_kind,
             role_hints=role_hints,
+            page_title=page_title,
+            page_summary=page_summary,
         ):
             return None
         if not _is_usable_artist_image_bytes(raw):
@@ -18062,6 +18198,10 @@ def _run_files_profile_enrichment_job(
                         entity_kind=entity_kind,
                         role_hints=role_hints,
                     )
+                    ensemble_like_entity = bool(
+                        str(entity_kind or "").strip().lower() in {"ensemble", "orchestra", "choir", "chorus"}
+                        or bool(set(role_hints).intersection({"orchestra", "ensemble", "choir", "chorus"}))
+                    )
                     # Lazy fetch sources only if we actually need an image.
                     if lastfm_info is None or wiki_info is None:
                         _seed_profile, seed_lastfm, seed_wiki, _seed_entities = _build_artist_profile_payload(
@@ -18073,6 +18213,29 @@ def _run_files_profile_enrichment_job(
                             lastfm_info = seed_lastfm or {}
                         if wiki_info is None:
                             wiki_info = seed_wiki or {}
+                    if artist_id > 0 and not mb_identity and isinstance(wiki_info, dict):
+                        wiki_title = _artist_image_page_identity_candidate(str(wiki_info.get("page_title") or "").strip())
+                        if wiki_title and _artist_image_alias_candidate_is_compatible(
+                            artist_name,
+                            wiki_title,
+                            entity_kind=entity_kind,
+                            role_hints=role_hints,
+                        ):
+                            try:
+                                with conn.transaction():
+                                    _files_upsert_artist_canonical_identity(
+                                        conn,
+                                        artist_id=artist_id,
+                                        artist_norm=artist_norm,
+                                        artist_name=artist_name,
+                                        canonical_name=wiki_title,
+                                        canonical_mbid="",
+                                        aliases=[artist_name],
+                                        entity_kind=entity_kind,
+                                        roles_json=role_hints,
+                                    )
+                            except Exception:
+                                logging.debug("Wikipedia canonical identity upsert failed for %s", artist_name, exc_info=True)
 
                     # Persist Wikipedia intro for assistant RAG even if it is too short for the "Original" UI slot.
                     try:
@@ -18095,7 +18258,21 @@ def _run_files_profile_enrichment_job(
 
                     # Try providers in order until one yields a usable cached image.
                     # Prefer Fanart.tv when available (often better artwork than Last.fm placeholders).
-                    candidates: list[tuple[str, str]] = []
+                    candidates: list[dict[str, str]] = []
+
+                    def _append_candidate(provider: str, url: str, *, title: str = "", summary: str = "") -> None:
+                        clean_url = str(url or "").strip()
+                        if not clean_url:
+                            return
+                        candidates.append(
+                            {
+                                "provider": str(provider or "").strip().lower() or "web",
+                                "url": clean_url,
+                                "title": str(title or "").strip(),
+                                "summary": str(summary or "").strip(),
+                            }
+                        )
+
                     try:
                         lf_mbid = str((lastfm_info.get("mbid") if isinstance(lastfm_info, dict) else "") or "").strip()
                     except Exception:
@@ -18107,7 +18284,7 @@ def _run_files_profile_enrichment_job(
                             for mb_url in get_artist_images_mb(lf_mbid)[:4]:
                                 resolved_mb_url = _resolve_remote_image_or_og_url(mb_url, timeout=8)
                                 if resolved_mb_url:
-                                    candidates.append(("musicbrainz", resolved_mb_url))
+                                    _append_candidate("musicbrainz", resolved_mb_url, title=str(mb_identity.get("name") or artist_name))
                         except Exception:
                             pass
                         try:
@@ -18115,13 +18292,13 @@ def _run_files_profile_enrichment_job(
                         except Exception:
                             fu = ""
                         if fu:
-                            candidates.append(("fanart", fu))
+                            _append_candidate("fanart", fu, title=str(mb_identity.get("name") or artist_name))
                     try:
                         img_url = (lastfm_info.get("image_url") or "").strip() if isinstance(lastfm_info, dict) else ""
                     except Exception:
                         img_url = ""
                     if img_url and not classical_like_entity:
-                        candidates.append(("lastfm", img_url))
+                        _append_candidate("lastfm", img_url, title=str(mb_identity.get("name") or artist_name), summary=str((lastfm_info or {}).get("bio") or ""))
                     try:
                         wiki_img_url = (wiki_info.get("image_url") or "").strip() if isinstance(wiki_info, dict) else ""
                     except Exception:
@@ -18147,13 +18324,15 @@ def _run_files_profile_enrichment_job(
                             limit=12,
                         )
                     for mb_url in [str(url or "").strip() for url in (mb_identity.get("urls") or []) if str(url or "").strip()][:8]:
+                        mb_page_title = str(mb_identity.get("name") or artist_name)
+                        mb_page_summary = "\n".join(str(alias or "").strip() for alias in (mb_identity.get("aliases") or []) if str(alias or "").strip())
                         resolved_mb_url = _resolve_authoritative_artist_image_url(
                             mb_url,
                             artist_name=artist_name,
                             entity_kind=entity_kind,
                             role_hints=role_hints,
-                            page_title=str(mb_identity.get("name") or artist_name),
-                            page_summary="\n".join(str(alias or "").strip() for alias in (mb_identity.get("aliases") or []) if str(alias or "").strip()),
+                            page_title=mb_page_title,
+                            page_summary=mb_page_summary,
                             timeout=8,
                         )
                         if resolved_mb_url and _artist_image_url_looks_relevant(
@@ -18161,10 +18340,10 @@ def _run_files_profile_enrichment_job(
                             artist_name=artist_name,
                             entity_kind=entity_kind,
                             role_hints=role_hints,
-                            page_title=str(mb_identity.get("name") or artist_name),
-                            page_summary="\n".join(str(alias or "").strip() for alias in (mb_identity.get("aliases") or []) if str(alias or "").strip()),
+                            page_title=mb_page_title,
+                            page_summary=mb_page_summary,
                         ):
-                            candidates.append(("musicbrainz_url", resolved_mb_url))
+                            _append_candidate("musicbrainz_url", resolved_mb_url, title=mb_page_title, summary=mb_page_summary)
                     if not wiki_img_url:
                         for lookup_name in artist_lookup_candidates:
                             wiki_seed = (
@@ -18173,12 +18352,14 @@ def _run_files_profile_enrichment_job(
                                     lang="en",
                                     entity_kind=entity_kind,
                                     role_hints=role_hints,
+                                    candidate_names=artist_lookup_candidates,
                                 )
                                 or _fetch_wikipedia_artist_bio(
                                     lookup_name,
                                     lang="fr",
                                     entity_kind=entity_kind,
                                     role_hints=role_hints,
+                                    candidate_names=artist_lookup_candidates,
                                 )
                                 or {}
                             )
@@ -18187,7 +18368,28 @@ def _run_files_profile_enrichment_job(
                                 wiki_info = wiki_seed
                                 break
                     if wiki_img_url:
-                        candidates.append(("wikipedia", wiki_img_url))
+                        _append_candidate(
+                            "wikipedia",
+                            wiki_img_url,
+                            title=str((wiki_info or {}).get("page_title") or artist_name),
+                            summary="\n".join(
+                                part
+                                for part in (
+                                    str((wiki_info or {}).get("page_description") or "").strip(),
+                                    str((wiki_info or {}).get("bio") or "").strip(),
+                                )
+                                if part
+                            ),
+                        )
+
+                    commons_url = _fetch_wikimedia_commons_artist_image(
+                        artist_name,
+                        entity_kind=entity_kind,
+                        role_hints=role_hints,
+                        candidate_names=artist_lookup_candidates,
+                    )
+                    if commons_url:
+                        _append_candidate("commons", commons_url, title=str(mb_identity.get("name") or artist_name))
 
                     def _first_non_empty_artist_image(fetcher) -> str:
                         for lookup_name in artist_lookup_candidates:
@@ -18201,29 +18403,42 @@ def _run_files_profile_enrichment_job(
 
                     au = _first_non_empty_artist_image(_fetch_artist_image_audiodb)
                     if au and not classical_like_entity:
-                        candidates.append(("audiodb", au))
+                        _append_candidate("audiodb", au, title=str(mb_identity.get("name") or artist_name))
                     du = _first_non_empty_artist_image(_fetch_artist_image_discogs)
                     if du and not classical_like_entity:
-                        candidates.append(("discogs", du))
+                        _append_candidate("discogs", du, title=str(mb_identity.get("name") or artist_name))
                     wu = _first_non_empty_artist_image(
                         lambda n: _fetch_artist_image_web(
                             n,
                             entity_kind=entity_kind,
                             role_hints=role_hints,
-                            allow_ai_fallback=True,
+                            candidate_names=artist_lookup_candidates,
+                            allow_ai_fallback=not classical_like_entity and not ensemble_like_entity,
                         )
                     )
                     if wu:
-                        candidates.append(("web", wu))
+                        effective_provider = "web"
+                        host = (urlparse(wu).netloc or "").strip().lower()
+                        if host == "commons.wikimedia.org" or host.endswith(".wikimedia.org"):
+                            effective_provider = "commons"
+                        elif host.endswith(".wikipedia.org"):
+                            effective_provider = "wikipedia"
+                        _append_candidate("web_authoritative" if effective_provider == "web" and classical_like_entity else effective_provider, wu, title=str(mb_identity.get("name") or artist_name))
 
-                    filtered_candidates: list[tuple[str, str]] = []
+                    filtered_candidates: list[dict[str, str]] = []
                     seen_candidate_urls: set[str] = set()
-                    preferred_order = ["wikipedia", "musicbrainz_url", "web", "musicbrainz", "fanart", "lastfm", "audiodb", "discogs"]
+                    preferred_order = (
+                        ["musicbrainz_url", "wikipedia", "web_authoritative", "commons", "web", "musicbrainz", "fanart", "lastfm", "audiodb", "discogs"]
+                        if ensemble_like_entity
+                        else ["musicbrainz_url", "wikipedia", "commons", "web_authoritative", "web", "musicbrainz", "fanart", "lastfm", "audiodb", "discogs"]
+                    )
                     for preferred_provider in preferred_order:
-                        for prov, url in candidates:
+                        for item in candidates:
+                            prov = str(item.get("provider") or "").strip().lower()
+                            url = str(item.get("url") or "").strip()
                             if prov != preferred_provider:
                                 continue
-                            clean_url = str(url or "").strip()
+                            clean_url = url
                             if not clean_url or clean_url in seen_candidate_urls:
                                 continue
                             if not _artist_image_provider_allowed_for_entity(
@@ -18233,9 +18448,11 @@ def _run_files_profile_enrichment_job(
                             ):
                                 continue
                             seen_candidate_urls.add(clean_url)
-                            filtered_candidates.append((prov, clean_url))
+                            filtered_candidates.append(item)
 
-                    for prov, url in filtered_candidates:
+                    for item in filtered_candidates:
+                        prov = str(item.get("provider") or "").strip().lower()
+                        url = str(item.get("url") or "").strip()
                         try:
                             with conn.transaction():
                                 outp = _files_cache_external_artist_image(
@@ -18244,9 +18461,11 @@ def _run_files_profile_enrichment_job(
                                     provider=prov,
                                     image_url=url,
                                     max_px=640,
-                                    force_replace=bool(authoritative_refresh and prov in {"musicbrainz", "wikipedia", "fanart"}),
+                                    force_replace=bool(authoritative_refresh and prov in {"musicbrainz", "musicbrainz_url", "wikipedia", "commons", "fanart"}),
                                     entity_kind=entity_kind,
                                     role_hints=role_hints,
+                                    page_title=str(item.get("title") or "").strip(),
+                                    page_summary=str(item.get("summary") or "").strip(),
                                 )
                             if outp:
                                 break
@@ -18351,6 +18570,13 @@ def _run_files_profile_enrichment_job(
                             w_img = ""
                         if w_img:
                             candidates_sim.append(("wikipedia", w_img))
+                        commons_img = _fetch_wikimedia_commons_artist_image(
+                            sname,
+                            entity_kind=entity_kind,
+                            role_hints=role_hints,
+                        )
+                        if commons_img:
+                            candidates_sim.append(("commons", commons_img))
                         try:
                             au = (_fetch_artist_image_audiodb(sname) or "").strip()
                         except Exception:
@@ -18367,7 +18593,13 @@ def _run_files_profile_enrichment_job(
                             # Similar-artist warming must never starve the core scan pipeline.
                             # Keep this strictly provider-driven; interactive/manual flows can still
                             # use AI-backed research on demand.
-                            wu = (_fetch_artist_image_web(sname, allow_ai_fallback=False) or "").strip()
+                            wu = (
+                                _fetch_artist_image_web(
+                                    sname,
+                                    allow_ai_fallback=False,
+                                )
+                                or ""
+                            ).strip()
                         except Exception:
                             wu = ""
                         if wu:
@@ -28706,6 +28938,117 @@ def _classical_person_generated_aliases(name: str) -> list[str]:
     return out
 
 
+def _artist_identity_primary_lookup_name(
+    artist_name: str,
+    *,
+    entity_kind: str = "",
+    role_hints: list[str] | tuple[str, ...] | None = None,
+    candidate_names: list[str] | tuple[str, ...] | None = None,
+) -> str:
+    primary = " ".join(str(artist_name or "").split()).strip()
+    if not primary:
+        return ""
+    explicit_candidates: list[str] = []
+    seen: set[str] = set()
+    for raw in candidate_names or []:
+        clean = " ".join(str(raw or "").split()).strip()
+        norm = _norm_artist_key(clean)
+        if not clean or not norm or norm in seen:
+            continue
+        if not _artist_image_alias_candidate_is_compatible(
+            primary,
+            clean,
+            entity_kind=entity_kind,
+            role_hints=role_hints,
+        ):
+            continue
+        seen.add(norm)
+        explicit_candidates.append(clean)
+    if not explicit_candidates:
+        return primary
+    if _artist_is_person_like(entity_kind=entity_kind, role_hints=role_hints) or str(entity_kind or "").strip().lower() in {"composer", "conductor"}:
+        ranked = sorted(
+            list(enumerate(explicit_candidates)),
+            key=lambda item: (
+                1 if "," in str(item[1] or "") else 0,
+                -_classical_person_alias_signature(str(item[1] or "")).get("token_count", 0),
+                -_identity_display_quality_score(str(item[1] or ""))[0],
+                item[0],
+            ),
+        )
+        best = " ".join(str((ranked[0][1] if ranked else primary) or "").split()).strip()
+        return best or primary
+    ranked = sorted(
+        explicit_candidates,
+        key=lambda value: (
+            1 if "," in str(value or "") else 0,
+            -_identity_display_quality_score(str(value or ""))[0],
+            -len(str(value or "")),
+        ),
+    )
+    best = " ".join(str(ranked[0] or "").split()).strip()
+    return best or primary
+
+
+def _artist_identity_lookup_names(
+    artist_name: str,
+    *,
+    entity_kind: str = "",
+    role_hints: list[str] | tuple[str, ...] | None = None,
+    candidate_names: list[str] | tuple[str, ...] | None = None,
+    limit: int = 12,
+) -> list[str]:
+    primary_lookup_name = _artist_identity_primary_lookup_name(
+        artist_name,
+        entity_kind=entity_kind,
+        role_hints=role_hints,
+        candidate_names=candidate_names,
+    )
+    lookup_names = _artist_image_lookup_candidates(
+        primary_lookup_name,
+        [artist_name, *(list(candidate_names or []))],
+        entity_kind=entity_kind,
+        role_hints=role_hints,
+        limit=max(1, int(limit or 12)),
+    ) or [primary_lookup_name or artist_name]
+    return lookup_names
+
+
+def _artist_profile_text_matches_any_identity(
+    artist_name: str,
+    text: str,
+    *,
+    entity_kind: str = "",
+    role_hints: list[str] | tuple[str, ...] | None = None,
+    candidate_names: list[str] | tuple[str, ...] | None = None,
+) -> bool:
+    txt = str(text or "").strip()
+    if not txt:
+        return False
+    for candidate in _artist_identity_lookup_names(
+        artist_name,
+        entity_kind=entity_kind,
+        role_hints=role_hints,
+        candidate_names=candidate_names,
+        limit=12,
+    ):
+        if _is_relevant_artist_profile_text(candidate, txt):
+            return True
+    return False
+
+
+def _artist_image_page_identity_candidate(value: str) -> str:
+    txt = " ".join(str(value or "").replace("_", " ").split()).strip()
+    if not txt:
+        return ""
+    txt = re.sub(r"^[Ff]ile:\s*", "", txt).strip()
+    txt = re.sub(r"\.(jpg|jpeg|png|webp|gif|tif|tiff|pdf|djvu|svg)$", "", txt, flags=re.IGNORECASE).strip()
+    txt = re.sub(r"\bby\s+[A-Z][A-Za-zÀ-ÿ'._-]+(?:\s+[A-Z][A-Za-zÀ-ÿ'._-]+){0,3}\s*$", "", txt).strip()
+    txt = re.sub(r"\bportrait\s+of\s+", "", txt, flags=re.IGNORECASE).strip()
+    txt = re.sub(r"\s*\([^)]*\)\s*$", "", txt).strip()
+    return " ".join(txt.split()).strip(" -–—")
+
+
 def _classical_person_alias_signature(name: str) -> dict[str, Any]:
     norm = _classical_norm_text(name)
     if not norm:
@@ -28770,6 +29113,36 @@ def _classical_person_names_equivalent(left: str, right: str) -> bool:
     return False
 
 
+def _choose_preferred_person_identity_name(current_value: str, candidate_value: str) -> str:
+    current_txt = " ".join(str(current_value or "").split()).strip()
+    candidate_txt = " ".join(str(candidate_value or "").split()).strip()
+    if not candidate_txt:
+        return current_txt
+    if not current_txt:
+        return candidate_txt
+    if not _classical_person_names_equivalent(current_txt, candidate_txt):
+        current_sig = _classical_person_alias_signature(current_txt)
+        candidate_sig = _classical_person_alias_signature(candidate_txt)
+        current_tokens = {tok for tok in re.findall(r"[a-z0-9]+", _classical_norm_text(current_txt)) if tok}
+        candidate_tokens = {tok for tok in re.findall(r"[a-z0-9]+", _classical_norm_text(candidate_txt)) if tok}
+        compatible = False
+        if current_sig and candidate_sig:
+            current_surname = str(current_sig.get("surname") or "").strip()
+            candidate_surname = str(candidate_sig.get("surname") or "").strip()
+            if current_surname and current_surname == candidate_surname:
+                compatible = True
+        elif current_tokens and candidate_tokens and (
+            current_tokens <= candidate_tokens
+            or candidate_tokens <= current_tokens
+        ):
+            compatible = True
+        if not compatible:
+            return current_txt
+    if _identity_display_quality_score(candidate_txt) > _identity_display_quality_score(current_txt):
+        return candidate_txt
+    return current_txt
+
+
 def _classical_person_signature_key(name: str) -> str:
     sig = _classical_person_alias_signature(name)
     surname = str(sig.get("surname") or "").strip()
@@ -28829,6 +29202,10 @@ def _musicbrainz_artist_identity_lookup(
     query_norm = _norm_artist_key(query)
     query_signature = _classical_person_signature_key(query)
     query_person_sig = _classical_person_alias_signature(query) if person_like else {}
+    query_surname = str(query_person_sig.get("surname") or "").strip()
+    query_initials = {str(ch or "").strip() for ch in (query_person_sig.get("initials") or set()) if str(ch or "").strip()}
+    query_long_givens = {str(tok or "").strip() for tok in (query_person_sig.get("long_givens") or set()) if str(tok or "").strip()}
+    query_initials_only = bool(person_like and query_signature and query_surname and query_initials and not query_long_givens)
 
     def _person_candidate_compatible(*names: str) -> bool:
         if not person_like or not query_person_sig:
@@ -28840,6 +29217,9 @@ def _musicbrainz_artist_identity_lookup(
         for raw_name in names:
             cand_sig = _classical_person_alias_signature(raw_name)
             if not cand_sig:
+                cand_norm = _norm_artist_key(raw_name)
+                if query_surname and cand_norm and query_surname in cand_norm:
+                    return True
                 continue
             saw_person_sig = True
             cand_surname = str(cand_sig.get("surname") or "").strip()
@@ -28853,7 +29233,7 @@ def _musicbrainz_artist_identity_lookup(
                 return True
             if query_surname and cand_surname and query_surname == cand_surname and (not query_initials or not cand_initials):
                 return True
-        return not saw_person_sig
+        return (not query_surname) and (not saw_person_sig)
 
     best: dict[str, Any] | None = None
     best_score = 0.0
@@ -28870,6 +29250,7 @@ def _musicbrainz_artist_identity_lookup(
         score = _provider_identity_text_score(query, cand_name)
         if cand_sort:
             score = max(score, _provider_identity_text_score(query, cand_sort))
+        cand_sig = _classical_person_alias_signature(cand_name) if person_like else {}
         if person_like and _classical_person_names_equivalent(query, cand_name):
             score = max(score, 0.95)
         if person_like and query_signature and _classical_person_signature_key(cand_name) == query_signature:
@@ -28877,7 +29258,18 @@ def _musicbrainz_artist_identity_lookup(
         if query_norm and cand_sort and _norm_artist_key(cand_sort) == query_norm:
             score = max(score, 0.93)
         if person_like and cand_type == "person":
-            score += 0.03
+            score += 0.05
+        elif person_like and cand_type:
+            score -= 0.03
+        if person_like and query_initials_only and cand_sig:
+            cand_surname = str(cand_sig.get("surname") or "").strip()
+            cand_long = {str(tok or "").strip() for tok in (cand_sig.get("long_givens") or set()) if str(tok or "").strip()}
+            cand_initials = {str(ch or "").strip() for ch in (cand_sig.get("initials") or set()) if str(ch or "").strip()}
+            if cand_surname and cand_surname == query_surname and cand_initials and query_initials <= cand_initials:
+                if cand_long:
+                    score += 0.12
+                elif _norm_artist_key(cand_name) == query_norm:
+                    score -= 0.08
         elif not person_like and (kind == "ensemble" or "orchestra" in role_norms or "ensemble" in role_norms) and cand_type in {"group", "orchestra", "choir"}:
             score += 0.03
         if score < 0.74:
@@ -28923,6 +29315,14 @@ def _musicbrainz_artist_identity_lookup(
             alias = " ".join(str(item.get("alias") or item.get("name") or "").split()).strip()
             if alias:
                 alias_values.append(alias)
+    if person_like and not _person_candidate_compatible(
+        full_name,
+        full_sort,
+        out.get("name") or "",
+        out.get("sort_name") or "",
+        *alias_values,
+    ):
+        return {}
     seen: set[str] = set()
     deduped: list[str] = []
     for alias in alias_values:
@@ -28982,7 +29382,15 @@ def _files_upsert_artist_canonical_identity(
     canonical = " ".join(str(canonical_name or "").split()).strip() or current_name
     if not canonical:
         return
-    display_name = _choose_preferred_identity_display(current_name, canonical)
+    role_hints = _artist_role_hints_from_roles_json(roles_json)
+    person_like = _artist_is_person_like(entity_kind=entity_kind, role_hints=role_hints)
+    if person_like:
+        canonical = _choose_preferred_person_identity_name(current_name, canonical)
+    display_name = (
+        _choose_preferred_person_identity_name(current_name, canonical)
+        if person_like
+        else _choose_preferred_identity_display(current_name, canonical)
+    )
     canonical_norm = _norm_artist_key(canonical) or _norm_artist_key(display_name) or str(artist_norm or "").strip()
     existing_aliases = []
     try:
@@ -29021,7 +29429,7 @@ def _files_upsert_artist_canonical_identity(
         artist_name=display_name,
         aliases=merged_aliases,
         entity_kind=entity_kind,
-        roles_json=roles_json,
+        roles_json=role_hints,
         source="musicbrainz",
     )
 
@@ -29030,17 +29438,23 @@ def _files_artist_alias_rows_for_identity(
     *,
     artist_name: str,
     artist_norm: str,
+    canonical_name: str = "",
     entity_kind: str = "",
     roles_json: Any = None,
     aliases_json: Any = None,
 ) -> list[dict[str, Any]]:
     name = " ".join(str(artist_name or "").split()).strip()
+    canonical_name_txt = " ".join(str(canonical_name or "").split()).strip()
     canonical_norm = str(artist_norm or "").strip() or _norm_artist_key(name)
-    if not name or not canonical_norm:
+    if not (name or canonical_name_txt) or not canonical_norm:
         return []
     role_hints = _artist_role_hints_from_roles_json(roles_json)
     person_like = _artist_is_person_like(entity_kind=entity_kind, role_hints=role_hints)
-    alias_values: list[tuple[str, str]] = [(name, "canonical")]
+    alias_values: list[tuple[str, str]] = []
+    if canonical_name_txt:
+        alias_values.append((canonical_name_txt, "canonical"))
+    if name:
+        alias_values.append((name, "name"))
     raw_aliases = aliases_json
     if isinstance(raw_aliases, str):
         raw_aliases = _safe_json_load(raw_aliases, fallback=[])
@@ -29091,7 +29505,7 @@ def _files_sync_artist_aliases(
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT id, name, name_norm, COALESCE(entity_kind, 'artist'), COALESCE(roles_json, '[]'), COALESCE(aliases_json, '[]')
+            SELECT id, name, name_norm, COALESCE(canonical_name, ''), COALESCE(entity_kind, 'artist'), COALESCE(roles_json, '[]'), COALESCE(aliases_json, '[]')
             FROM files_artists
             WHERE name_norm = ANY(%s)
             """,
@@ -29101,11 +29515,12 @@ def _files_sync_artist_aliases(
             str(name_norm or "").strip(): {
                 "artist_id": int(artist_id or 0),
                 "name": str(name or "").strip(),
+                "canonical_name": str(canonical_name or "").strip(),
                 "entity_kind": str(entity_kind or "artist").strip() or "artist",
                 "roles_json": roles_json or "[]",
                 "aliases_json": aliases_json or "[]",
             }
-            for artist_id, name, name_norm, entity_kind, roles_json, aliases_json in cur.fetchall()
+            for artist_id, name, name_norm, canonical_name, entity_kind, roles_json, aliases_json in cur.fetchall()
             if str(name_norm or "").strip() and int(artist_id or 0) > 0
         }
         artist_ids = [int(row["artist_id"]) for row in db_rows.values() if int(row.get("artist_id") or 0) > 0]
@@ -29118,12 +29533,14 @@ def _files_sync_artist_aliases(
                 continue
             payload = (artists_map or {}).get(norm) or {}
             artist_name = str(payload.get("name") or db_row.get("name") or "").strip()
+            canonical_name = str(payload.get("canonical_name") or "").strip() or str(db_row.get("canonical_name") or artist_name).strip()
             entity_kind = str(payload.get("entity_kind") or db_row.get("entity_kind") or "artist").strip() or "artist"
             roles_json = payload.get("roles_json") or db_row.get("roles_json") or "[]"
             aliases_json = payload.get("aliases_json") or db_row.get("aliases_json") or "[]"
             alias_rows = _files_artist_alias_rows_for_identity(
                 artist_name=artist_name,
                 artist_norm=norm,
+                canonical_name=canonical_name,
                 entity_kind=entity_kind,
                 roles_json=roles_json,
                 aliases_json=aliases_json,
@@ -29165,7 +29582,7 @@ def _files_backfill_artist_alias_table(conn) -> None:
         with conn.cursor() as cur:
             cur.execute("SELECT COALESCE(value, '') FROM files_index_meta WHERE key = 'artist_aliases_schema' LIMIT 1")
             row = cur.fetchone()
-            if row and str(row[0] or "").strip() == "v2":
+            if row and str(row[0] or "").strip() == "v3":
                 return
             cur.execute("SELECT name_norm FROM files_artists")
             norms = [str(value[0] or "").strip() for value in cur.fetchall() if str(value[0] or "").strip()]
@@ -29174,7 +29591,7 @@ def _files_backfill_artist_alias_table(conn) -> None:
                 cur.execute(
                     """
                     INSERT INTO files_index_meta(key, value, updated_at)
-                    VALUES ('artist_aliases_schema', 'v2', NOW())
+                    VALUES ('artist_aliases_schema', 'v3', NOW())
                     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
                     """
                 )
@@ -29185,7 +29602,7 @@ def _files_backfill_artist_alias_table(conn) -> None:
             cur.execute(
                 """
                 INSERT INTO files_index_meta(key, value, updated_at)
-                VALUES ('artist_aliases_schema', 'v2', NOW())
+                VALUES ('artist_aliases_schema', 'v3', NOW())
                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
                 """
             )
@@ -29258,6 +29675,7 @@ def _files_upsert_artist_external_aliases(
     alias_rows = _files_artist_alias_rows_for_identity(
         artist_name=artist_name,
         artist_norm=artist_norm,
+        canonical_name=artist_name,
         entity_kind=entity_kind,
         roles_json=roles_json,
         aliases_json=clean_aliases,
@@ -29402,7 +29820,7 @@ def _build_files_browse_artist_entities(
         if canonical_mbid:
             matched_norm = canonical_norm_by_mbid.get(canonical_mbid) or canonical_norm_hint or raw_norm
             current_name = canonical_name_by_norm.get(matched_norm, canonical_name_hint or raw_name)
-            preferred = _choose_preferred_identity_display(current_name, canonical_name_hint or raw_name)
+            preferred = _choose_preferred_person_identity_name(current_name, canonical_name_hint or raw_name)
             canonical_name_by_norm[matched_norm] = preferred
             canonical_norm_by_raw_norm[raw_norm] = matched_norm
             canonical_norm_by_mbid[canonical_mbid] = matched_norm
@@ -29411,7 +29829,7 @@ def _build_files_browse_artist_entities(
         for candidate_norm, candidate_name in canonical_name_by_norm.items():
             if _classical_person_names_equivalent(raw_name, candidate_name):
                 matched_norm = candidate_norm
-                preferred = _choose_preferred_identity_display(candidate_name, raw_name)
+                preferred = _choose_preferred_person_identity_name(candidate_name, raw_name)
                 if preferred != candidate_name:
                     canonical_name_by_norm[candidate_norm] = preferred
                 break
@@ -49395,6 +49813,20 @@ def _fetch_wikipedia_page_metadata(title: str, lang: str = "en", thumb_px: int =
         return {}
 
 
+def _wikipedia_title_from_fullurl(url: str) -> str:
+    raw = str(url or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urlparse(raw)
+        path = unquote(parsed.path or "")
+        if "/wiki/" in path:
+            return " ".join(path.split("/wiki/", 1)[1].replace("_", " ").split()).strip()
+    except Exception:
+        return ""
+    return ""
+
+
 def _fetch_wikipedia_pageimage(title: str, lang: str = "en", thumb_px: int = 640) -> str:
     """
     Return a Wikipedia lead thumbnail/original URL for a page title, or "" on failure.
@@ -49436,6 +49868,93 @@ def _fetch_wikipedia_pageimage(title: str, lang: str = "en", thumb_px: int = 640
     return ""
 
 
+def _fetch_wikimedia_commons_artist_image(
+    artist_name: str,
+    *,
+    entity_kind: str = "",
+    role_hints: list[str] | tuple[str, ...] | None = None,
+    candidate_names: list[str] | tuple[str, ...] | None = None,
+    limit: int = 8,
+) -> str:
+    primary_name = " ".join(str(artist_name or "").split()).strip()
+    if not primary_name:
+        return ""
+    primary_lookup_name = _artist_identity_primary_lookup_name(
+        primary_name,
+        entity_kind=entity_kind,
+        role_hints=role_hints,
+        candidate_names=candidate_names,
+    )
+    headers = {"User-Agent": "PMDA/0.7.5 (self-hosted music library; https://github.com/silkyclouds/PMDA)"}
+    lookup_names = _artist_image_lookup_candidates(
+        primary_lookup_name,
+        [primary_name, *(list(candidate_names or []))],
+        entity_kind=entity_kind,
+        role_hints=role_hints,
+        limit=12,
+    ) or [primary_lookup_name or primary_name]
+    for lookup_name in lookup_names[:6]:
+        queries = _artist_image_search_queries(
+            lookup_name,
+            entity_kind=entity_kind,
+            role_hints=role_hints,
+        )
+        for query in queries[:4]:
+            try:
+                resp = requests.get(
+                    "https://commons.wikimedia.org/w/api.php",
+                    params={
+                        "action": "query",
+                        "list": "search",
+                        "srsearch": query,
+                        "srnamespace": 6,
+                        "srlimit": max(3, min(int(limit or 8), 12)),
+                        "format": "json",
+                        "utf8": 1,
+                    },
+                    headers=headers,
+                    timeout=10,
+                )
+            except Exception:
+                continue
+            if resp.status_code != 200:
+                continue
+            data = resp.json() if resp.content else {}
+            results = ((data.get("query") or {}).get("search") or []) if isinstance(data, dict) else []
+            for item in results:
+                if not isinstance(item, dict):
+                    continue
+                title = str(item.get("title") or "").strip()
+                if not title.lower().startswith("file:"):
+                    continue
+                snippet = _strip_html_text(str(item.get("snippet") or "")).strip()
+                page_url = f"https://commons.wikimedia.org/wiki/{quote(title.replace(' ', '_'), safe=':/')}"
+                if not _artist_image_result_looks_relevant(
+                    lookup_name,
+                    {"title": title, "snippet": snippet, "link": page_url},
+                    entity_kind=entity_kind,
+                    role_hints=role_hints,
+                    candidate_names=lookup_names,
+                ):
+                    continue
+                file_name = title.split(":", 1)[1].strip()
+                if re.search(r"\.(pdf|djvu|svg)$", file_name, flags=re.IGNORECASE):
+                    continue
+                file_url = _commons_file_path_url(file_name)
+                if not file_url:
+                    continue
+                if _artist_image_url_looks_relevant(
+                    file_url,
+                    artist_name=lookup_name,
+                    entity_kind=entity_kind,
+                    role_hints=role_hints,
+                    page_title=title,
+                    page_summary=snippet,
+                ):
+                    return file_url
+    return ""
+
+
 def _resolve_authoritative_artist_image_url(
     target_url: str,
     *,
@@ -49466,6 +49985,21 @@ def _resolve_authoritative_artist_image_url(
                 entity_kind=entity_kind,
                 role_hints=role_hints,
                 page_title=page_title or title,
+                page_summary=page_summary,
+            ):
+                return img
+    if host == "commons.wikimedia.org" and "/wiki/" in path:
+        title = path.split("/wiki/", 1)[1].replace("_", " ").strip()
+        title_clean = _artist_image_page_identity_candidate(title)
+        if title.lower().startswith("file:"):
+            file_name = title.split(":", 1)[1].strip()
+            img = _commons_file_path_url(file_name)
+            if img and _artist_image_url_looks_relevant(
+                img,
+                artist_name=artist_name,
+                entity_kind=entity_kind,
+                role_hints=role_hints,
+                page_title=title_clean or title,
                 page_summary=page_summary,
             ):
                 return img
@@ -49596,6 +50130,7 @@ def _fetch_wikipedia_artist_bio(
     *,
     entity_kind: str = "",
     role_hints: list[str] | tuple[str, ...] | None = None,
+    candidate_names: list[str] | tuple[str, ...] | None = None,
 ) -> Optional[dict]:
     """
     Best-effort Wikipedia intro for an artist name.
@@ -49605,9 +50140,41 @@ def _fetch_wikipedia_artist_bio(
     l = (lang or "en").strip().lower() or "en"
     if not name:
         return None
+    lookup_names = _artist_identity_lookup_names(
+        name,
+        entity_kind=entity_kind,
+        role_hints=role_hints,
+        candidate_names=candidate_names,
+        limit=12,
+    )
+    primary_lookup_name = str(lookup_names[0] or name).strip()
+    ranked_lookup_names = sorted(
+        lookup_names,
+        key=lambda value: (
+            0 if _norm_artist_key(str(value or "")) == _norm_artist_key(primary_lookup_name) else 1,
+            -_identity_display_quality_score(str(value or ""))[0],
+            -_classical_person_alias_signature(str(value or "")).get("token_count", 0),
+            -len(str(value or "")),
+            str(value or "").lower(),
+        ),
+    )
     api_url = f"https://{l}.wikipedia.org/w/api.php"
     headers = {"User-Agent": "PMDA/0.7.5 (self-hosted music library; https://github.com/silkyclouds/PMDA)"}
     try:
+        def _title_is_identity_compatible(title: str) -> bool:
+            base_title = re.sub(r"\s*\([^)]*\)\s*$", "", str(title or "").strip()).strip()
+            if not base_title:
+                return False
+            for candidate in lookup_names:
+                if _artist_image_alias_candidate_is_compatible(
+                    candidate,
+                    base_title,
+                    entity_kind=entity_kind,
+                    role_hints=role_hints,
+                ):
+                    return True
+            return _provider_identity_text_score(name, base_title) >= 0.9
+
         def _looks_music_related(extract: str, description: str = "", title: str = "") -> bool:
             low = (extract or "").lower()
             if not low:
@@ -49697,12 +50264,56 @@ def _fetch_wikipedia_artist_bio(
                     score -= 2
             return score >= 1
 
+        def _bio_matches_identity(value: str) -> bool:
+            return _artist_profile_text_matches_any_identity(
+                name,
+                value,
+                entity_kind=entity_kind,
+                role_hints=role_hints,
+                candidate_names=ranked_lookup_names,
+            )
+
+        for exact_title in ranked_lookup_names[:8]:
+            extract, page_url, desc = _fetch_wikipedia_intro_extract(exact_title, lang=l)
+            if not extract:
+                continue
+            page_meta = _fetch_wikipedia_page_metadata(exact_title, lang=l, thumb_px=720)
+            canonical_title = _wikipedia_title_from_fullurl(str(page_meta.get("fullurl") or page_url)) or exact_title
+            if not _title_is_identity_compatible(canonical_title):
+                continue
+            if not _looks_music_related(extract, description=desc, title=canonical_title):
+                continue
+            if not _bio_matches_identity(f"{canonical_title}\n{extract}"):
+                continue
+            img_url = _fetch_wikipedia_pageimage(exact_title, lang=l, thumb_px=720) or ""
+            if img_url and not _artist_image_url_looks_relevant(
+                img_url,
+                artist_name=name,
+                entity_kind=entity_kind,
+                role_hints=role_hints,
+                page_title=canonical_title,
+                page_summary=f"{desc}\n{extract}",
+            ):
+                img_url = ""
+            short = _truncate_text(extract, max_chars=460)
+            return {
+                "bio": extract,
+                "short_bio": short,
+                "source": f"wikipedia:{l}",
+                "url": page_meta.get("fullurl") or page_url,
+                "lang": l,
+                "page_title": canonical_title,
+                "page_description": desc,
+                "image_url": img_url,
+            }
+
+        for lookup_name in ranked_lookup_names[:6]:
             # Use role-aware queries to avoid common false positives and to find the right entity kind.
-        for q in _artist_profile_search_queries(name, entity_kind=entity_kind, role_hints=role_hints):
-            resp = requests.get(
-                api_url,
-                params={
-                    "action": "query",
+            for q in _artist_profile_search_queries(lookup_name, entity_kind=entity_kind, role_hints=role_hints):
+                resp = requests.get(
+                    api_url,
+                    params={
+                        "action": "query",
                     "list": "search",
                     "srsearch": q,
                     "srlimit": 5,
@@ -49712,55 +50323,57 @@ def _fetch_wikipedia_artist_bio(
                 headers=headers,
                 timeout=10,
             )
-            if resp.status_code != 200:
-                continue
-            data = resp.json()
-            results = ((data.get("query") or {}).get("search") or []) if isinstance(data, dict) else []
-            if not isinstance(results, list) or not results:
-                continue
-            # Try a few candidates to dodge disambiguation pages and non-music pages.
-            for item in results[:5]:
-                if not isinstance(item, dict):
+                if resp.status_code != 200:
                     continue
-                title = (item.get("title") or "").strip()
-                if not title:
+                data = resp.json()
+                results = ((data.get("query") or {}).get("search") or []) if isinstance(data, dict) else []
+                if not isinstance(results, list) or not results:
                     continue
-                # Guard against unrelated pages returned by broad search terms:
-                # require minimal title affinity to the requested artist name.
-                title_base = re.sub(r"\s*\([^)]*\)\s*$", "", title).strip()
-                name_score = _provider_identity_text_score(name, title_base or title)
-                name_key = _norm_artist_key(name)
-                title_key = _norm_artist_key(title)
-                name_in_title = bool(name_key and title_key and name_key in title_key)
-                if name_score < 0.58 and not name_in_title:
-                    continue
-                extract, page_url, desc = _fetch_wikipedia_intro_extract(title, lang=l)
-                if not extract or not _looks_music_related(extract, description=desc, title=title):
-                    continue
-                # Reject broad/ambiguous pages that do not clearly mention the requested artist identity.
-                if not _is_relevant_artist_profile_text(name, f"{title}\n{extract}"):
-                    continue
-                img_url = _fetch_wikipedia_pageimage(title, lang=l, thumb_px=720) or ""
-                if img_url and not _artist_image_url_looks_relevant(
-                    img_url,
-                    artist_name=name,
-                    entity_kind=entity_kind,
-                    role_hints=role_hints,
-                    page_title=title,
-                    page_summary=f"{desc}\n{extract}",
-                ):
-                    img_url = ""
-                short = _truncate_text(extract, max_chars=460)
-                return {
-                    "bio": extract,
-                    "short_bio": short,
-                    "source": f"wikipedia:{l}",
-                    "url": page_url,
-                    "lang": l,
-                    "page_title": title,
-                    "page_description": desc,
-                    "image_url": img_url,
-                }
+                # Try a few candidates to dodge disambiguation pages and non-music pages.
+                for item in results[:5]:
+                    if not isinstance(item, dict):
+                        continue
+                    title = (item.get("title") or "").strip()
+                    if not title:
+                        continue
+                    title_base = re.sub(r"\s*\([^)]*\)\s*$", "", title).strip()
+                    name_score = max(
+                        _provider_identity_text_score(name, title_base or title),
+                        _provider_identity_text_score(lookup_name, title_base or title),
+                    )
+                    name_key = _norm_artist_key(lookup_name)
+                    title_key = _norm_artist_key(title)
+                    name_in_title = bool(name_key and title_key and name_key in title_key)
+                    if not _title_is_identity_compatible(title) and name_score < 0.58 and not name_in_title:
+                        continue
+                    if not _title_is_identity_compatible(title):
+                        continue
+                    extract, page_url, desc = _fetch_wikipedia_intro_extract(title, lang=l)
+                    if not extract or not _looks_music_related(extract, description=desc, title=title):
+                        continue
+                    if not _bio_matches_identity(f"{title}\n{extract}"):
+                        continue
+                    img_url = _fetch_wikipedia_pageimage(title, lang=l, thumb_px=720) or ""
+                    if img_url and not _artist_image_url_looks_relevant(
+                        img_url,
+                        artist_name=name,
+                        entity_kind=entity_kind,
+                        role_hints=role_hints,
+                        page_title=title,
+                        page_summary=f"{desc}\n{extract}",
+                    ):
+                        img_url = ""
+                    short = _truncate_text(extract, max_chars=460)
+                    return {
+                        "bio": extract,
+                        "short_bio": short,
+                        "source": f"wikipedia:{l}",
+                        "url": page_url,
+                        "lang": l,
+                        "page_title": title,
+                        "page_description": desc,
+                        "image_url": img_url,
+                    }
     except Exception:
         return None
     return None
@@ -49837,17 +50450,46 @@ def _build_single_artist_profile_payload(
     if not q:
         return ({"bio": "", "short_bio": "", "tags": [], "similar": [], "source": ""}, {}, {})
 
+    mb_identity: dict[str, Any] = {}
+    try:
+        if _artist_is_person_like(entity_kind=entity_kind, role_hints=role_hints) or str(entity_kind or "").strip().lower() in {"ensemble", "orchestra", "choir", "chorus", "conductor", "composer"}:
+            mb_identity = _musicbrainz_artist_identity_lookup(
+                q,
+                entity_kind=entity_kind,
+                role_hints=role_hints,
+            ) or {}
+    except Exception:
+        mb_identity = {}
+    wiki_candidate_names = _artist_image_lookup_candidates(
+        q,
+        [
+            str(mb_identity.get("name") or "").strip(),
+            str(mb_identity.get("sort_name") or "").strip(),
+            *[str(alias or "").strip() for alias in (mb_identity.get("aliases") or [])],
+        ],
+        entity_kind=entity_kind,
+        role_hints=role_hints,
+        limit=12,
+    )
     lastfm_info = _fetch_lastfm_artist_info(q) or {}
     wiki_info = (
-        _fetch_wikipedia_artist_bio(q, lang="en", entity_kind=entity_kind, role_hints=role_hints)
-        or _fetch_wikipedia_artist_bio(q, lang="fr", entity_kind=entity_kind, role_hints=role_hints)
+        _fetch_wikipedia_artist_bio(q, lang="en", entity_kind=entity_kind, role_hints=role_hints, candidate_names=wiki_candidate_names)
+        or _fetch_wikipedia_artist_bio(q, lang="fr", entity_kind=entity_kind, role_hints=role_hints, candidate_names=wiki_candidate_names)
         or {}
     )
 
     # Guard: reject artist bios that do not actually mention the requested artist identity.
     if isinstance(lastfm_info, dict):
         lf_bio = str(lastfm_info.get("bio") or lastfm_info.get("short_bio") or "").strip()
-        if lf_bio and (not _is_relevant_artist_profile_text(q, lf_bio)):
+        if lf_bio and (
+            not _artist_profile_text_matches_any_identity(
+                q,
+                lf_bio,
+                entity_kind=entity_kind,
+                role_hints=role_hints,
+                candidate_names=wiki_candidate_names,
+            )
+        ):
             lastfm_info = {
                 **lastfm_info,
                 "bio": "",
@@ -49855,7 +50497,15 @@ def _build_single_artist_profile_payload(
             }
     if isinstance(wiki_info, dict):
         wk_bio = str(wiki_info.get("bio") or wiki_info.get("short_bio") or "").strip()
-        if wk_bio and (not _is_relevant_artist_profile_text(q, wk_bio)):
+        if wk_bio and (
+            not _artist_profile_text_matches_any_identity(
+                q,
+                wk_bio,
+                entity_kind=entity_kind,
+                role_hints=role_hints,
+                candidate_names=wiki_candidate_names,
+            )
+        ):
             wiki_info = {}
 
     # Start with Last.fm tags/similar; replace the bio if Wikipedia is better.
@@ -68741,7 +69391,7 @@ def _is_suspicious_external_artist_image_url(url: str) -> bool:
 
 _ARTIST_CLASSICAL_ENTITY_KINDS = {"composer", "conductor", "orchestra", "ensemble", "choir", "chorus"}
 _ARTIST_CLASSICAL_ROLE_HINTS = {"composer", "conductor", "orchestra", "ensemble", "choir", "chorus"}
-_ARTIST_WEAK_CLASSICAL_IMAGE_PROVIDERS = {"web", "discogs", "lastfm", "musicbrainz_url", "fanart", "audiodb", "musicbrainz"}
+_ARTIST_WEAK_CLASSICAL_IMAGE_PROVIDERS = {"web", "discogs", "lastfm", "fanart", "audiodb", "musicbrainz"}
 
 
 def _artist_entity_is_classical_like(
@@ -68879,7 +69529,7 @@ def _artist_external_image_requires_authoritative_refresh_sql(
     )
     weak_classical_expr = (
         f"({classical_expr} AND ("
-        f"{provider_expr} IN ('web','discogs','lastfm','musicbrainz_url')"
+        f"{provider_expr} IN ('web','discogs','lastfm','fanart','audiodb','musicbrainz')"
         f" OR ({provider_expr} = 'wikipedia' AND {url_expr} <> '' AND {url_expr} NOT LIKE '%wikimedia.org%' AND {url_expr} NOT LIKE '%wikipedia.org%')"
         f" OR {suspicious_expr}"
         f"))"
@@ -69384,6 +70034,18 @@ _ARTIST_IMAGE_BUILDING_TOKENS = {
     "tower",
     "venue",
 }
+_ARTIST_IMAGE_EVENT_TOKENS = {
+    "concert",
+    "festival",
+    "gala",
+    "konzert",
+    "live",
+    "matinee",
+    "performance",
+    "rehearsal",
+    "session",
+    "tour",
+}
 
 
 def _artist_identity_distinctive_tokens(
@@ -69446,7 +70108,18 @@ def _artist_image_alias_candidate_is_compatible(
         return _provider_identity_text_score(primary, candidate) >= 0.78
     primary_tokens = _artist_identity_distinctive_tokens(primary, entity_kind=entity_kind, role_hints=role_hints)
     candidate_tokens = _artist_identity_distinctive_tokens(candidate, entity_kind=entity_kind, role_hints=role_hints)
-    if primary_tokens and candidate_tokens and primary_tokens.intersection(candidate_tokens):
+    overlap = primary_tokens.intersection(candidate_tokens)
+    ensemble_like = bool(
+        str(entity_kind or "").strip().lower() in {"orchestra", "ensemble", "choir", "chorus"}
+        or bool({str(role or "").strip().lower() for role in (role_hints or []) if str(role or "").strip()}.intersection({"orchestra", "ensemble", "choir", "chorus"}))
+    )
+    if ensemble_like:
+        if len(overlap) >= 2:
+            return True
+        if overlap and _provider_identity_text_score(primary, candidate) >= 0.86:
+            return True
+        return _provider_identity_text_score(primary, candidate) >= 0.9
+    if primary_tokens and candidate_tokens and overlap:
         return True
     return _provider_identity_text_score(primary, candidate) >= 0.8
 
@@ -69475,6 +70148,8 @@ def _artist_image_url_looks_relevant(
     basename = Path(decoded_path).stem
     basename_norm = _norm_artist_key(re.sub(r"[_-]+", " ", basename))
     basename_tokens = {tok for tok in re.findall(r"[a-z0-9]+", basename_norm) if tok}
+    page_title_clean = _artist_image_page_identity_candidate(page_title)
+    basename_candidate = _artist_image_page_identity_candidate(basename)
     distinctive_tokens = _artist_identity_distinctive_tokens(
         artist_name,
         entity_kind=entity_kind,
@@ -69493,9 +70168,15 @@ def _artist_image_url_looks_relevant(
     person_like = _artist_is_person_like(entity_kind=entity_kind, role_hints=role_hints) or kind in {"composer", "conductor"}
     ensemble_like = kind in {"orchestra", "ensemble", "choir", "chorus"} or roles.intersection({"orchestra", "ensemble", "choir", "chorus"})
     albumish_tokens = {"album", "cover", "soundtrack", "single", "release", "recording"}
+    event_like = bool(basename_tokens.intersection(_ARTIST_IMAGE_EVENT_TOKENS))
+    trusted_domains = ("fanart.tv", "theaudiodb.com", "last.fm", "discogs.com", "wikimedia.org", "wikipedia.org", "musicbrainz.org")
+    trusted_host = bool(
+        host
+        and any(host == domain or host.endswith(f".{domain}") for domain in trusted_domains)
+    )
     if basename_tokens.intersection(albumish_tokens):
         return False
-    if "logo" in basename_tokens or "signet" in basename_tokens:
+    if "logo" in basename_tokens or "signet" in basename_tokens or "svg" in basename_tokens:
         return False
     if host == "cf.allmusic.com" and "facebook_share" in target_url.lower():
         return False
@@ -69510,29 +70191,99 @@ def _artist_image_url_looks_relevant(
             return False
         if building_like and not overlap and not context_relevant:
             return False
-        if host and not any(
-            host == domain or host.endswith(f".{domain}")
-            for domain in ("fanart.tv", "theaudiodb.com", "last.fm", "discogs.com", "wikimedia.org", "wikipedia.org")
-        ):
+        if person_like:
+            if basename_candidate and _artist_image_alias_candidate_is_compatible(
+                artist_name,
+                basename_candidate,
+                entity_kind=entity_kind,
+                role_hints=role_hints,
+            ):
+                return True
+            if page_title_clean and _artist_image_alias_candidate_is_compatible(
+                artist_name,
+                page_title_clean,
+                entity_kind=entity_kind,
+                role_hints=role_hints,
+            ) and context_relevant:
+                return True
+            if trusted_host and overlap and context_relevant:
+                return True
+            return False
+        if ensemble_like:
+            if event_like or building_like:
+                return False
+            if basename_candidate and _artist_image_alias_candidate_is_compatible(
+                artist_name,
+                basename_candidate,
+                entity_kind=entity_kind,
+                role_hints=role_hints,
+            ):
+                return True
+            if page_title_clean and _artist_image_alias_candidate_is_compatible(
+                artist_name,
+                page_title_clean,
+                entity_kind=entity_kind,
+                role_hints=role_hints,
+            ) and context_relevant:
+                return True
+            if trusted_host and len(overlap) >= 2 and context_relevant:
+                return True
+            return False
+        if host and not trusted_host:
             if not overlap and not context_relevant:
                 return False
         return True
     if person_like:
-        surname = str((_classical_person_alias_signature(artist_name) or {}).get("surname") or "").strip()
-        if surname and surname in basename_tokens:
+        sig = _classical_person_alias_signature(artist_name) or {}
+        surname = str(sig.get("surname") or "").strip()
+        long_givens = {str(tok or "").strip() for tok in (sig.get("long_givens") or set()) if str(tok or "").strip()}
+        if page_title_clean and _artist_image_alias_candidate_is_compatible(
+            artist_name,
+            page_title_clean,
+                entity_kind=entity_kind,
+                role_hints=role_hints,
+            ):
             return True
-        if overlap:
+        page_title_sig = _classical_person_alias_signature(page_title_clean) if page_title_clean else {}
+        if page_title_sig and surname and str(page_title_sig.get("surname") or "").strip() == surname:
+            return False
+        if basename_candidate and _artist_image_alias_candidate_is_compatible(
+            artist_name,
+            basename_candidate,
+            entity_kind=entity_kind,
+            role_hints=role_hints,
+        ):
+            return True
+        basename_sig = _classical_person_alias_signature(basename_candidate) if basename_candidate else {}
+        if basename_sig and surname and str(basename_sig.get("surname") or "").strip() == surname:
+            return False
+        if surname and surname in basename_tokens and len(basename_tokens) <= 2 and long_givens and context_relevant and not page_title_clean:
+            return True
+        if overlap and context_relevant:
             return True
         if building_like:
             return False
-        return context_relevant
+        return False
     if ensemble_like:
+        if page_title_clean and _artist_image_alias_candidate_is_compatible(
+            artist_name,
+            page_title_clean,
+            entity_kind=entity_kind,
+            role_hints=role_hints,
+        ):
+            return True
+        if basename_candidate and _artist_image_alias_candidate_is_compatible(
+            artist_name,
+            basename_candidate,
+            entity_kind=entity_kind,
+            role_hints=role_hints,
+        ):
+            return True
         if building_like:
             return False
-        if len(overlap) >= 2:
-            return True
-        role_tokens = {"orchestra", "orchester", "philharmonic", "philharmonie", "filharmonie", "ensemble", "choir", "chorus", "symphony"}
-        if len(overlap) >= 1 and context_relevant and basename_tokens.intersection(role_tokens):
+        if event_like:
+            return False
+        if len(overlap) >= 2 and context_relevant:
             return True
         return False
     if overlap:
@@ -69548,6 +70299,7 @@ def _artist_image_result_looks_relevant(
     *,
     entity_kind: str = "",
     role_hints: list[str] | tuple[str, ...] | None = None,
+    candidate_names: list[str] | tuple[str, ...] | None = None,
 ) -> bool:
     if not isinstance(result, dict):
         return False
@@ -69556,7 +70308,13 @@ def _artist_image_result_looks_relevant(
     link = str(result.get("link") or "").strip()
     merged = f"{title} {snippet} {link}".lower()
     host = (urlparse(link).netloc or "").strip().lower()
-    if not _text_mentions_identity_phrase(str(artist_name or "").strip(), f"{title} {snippet}".strip()):
+    if not _artist_profile_text_matches_any_identity(
+        str(artist_name or "").strip(),
+        f"{title} {snippet}".strip(),
+        entity_kind=entity_kind,
+        role_hints=role_hints,
+        candidate_names=candidate_names,
+    ):
         return False
     reject_tokens = (
         "discogs release",
@@ -69573,6 +70331,8 @@ def _artist_image_result_looks_relevant(
     )
     if any(tok in merged for tok in reject_tokens):
         return False
+    if " logo" in f" {merged}" or ".svg" in merged or "/logo" in merged:
+        return False
     kind = str(entity_kind or "").strip().lower()
     role_norms = {
         str(role or "").strip().lower()
@@ -69583,12 +70343,29 @@ def _artist_image_result_looks_relevant(
     ensemble_like = kind in {"orchestra", "ensemble", "choir", "chorus"} or role_norms.intersection({"orchestra", "ensemble", "choir", "chorus"})
     trusted_domains = ("wikipedia.org", "wikimedia.org", "wikidata.org", "musicbrainz.org", "last.fm", "discogs.com", "theaudiodb.com")
     if ensemble_like:
-        if any(tok in merged for tok in ("skyline", "skyscraper", "empire state", "observation deck", "real estate")):
+        if any(tok in merged for tok in ("skyline", "skyscraper", "empire state", "observation deck", "real estate", "concert hall", "concertgebouw", "concert", "konzert", "festival")):
+            return False
+        if title and not _artist_image_alias_candidate_is_compatible(
+            artist_name,
+            re.sub(r"\s*\([^)]*\)\s*$", "", title).strip(),
+            entity_kind=entity_kind,
+            role_hints=role_hints,
+        ):
             return False
         if any(host == domain or host.endswith(f".{domain}") for domain in trusted_domains):
             return True
         return any(tok in merged for tok in ("orchestra", "philharmonic", "symphony", "ensemble", "choir", "chorus", "group"))
     if person_like:
+        title_base = re.sub(r"\s*\([^)]*\)\s*$", "", title).strip()
+        if title_base and not _artist_image_alias_candidate_is_compatible(
+            artist_name,
+            title_base,
+            entity_kind=entity_kind,
+            role_hints=role_hints,
+        ):
+            return False
+        if any(tok in merged for tok in ("statue", "monument", "sculpture", "stamp", "painting", "engraving", "book cover", "djvu", "pdf")):
+            return False
         if any(host == domain or host.endswith(f".{domain}") for domain in trusted_domains):
             return True
         return any(tok in merged for tok in ("composer", "conductor", "maestro", "musician", "pianist", "violinist", "portrait", "artist"))
@@ -69600,6 +70377,7 @@ def _fetch_artist_image_web(
     *,
     entity_kind: str = "",
     role_hints: list[str] | tuple[str, ...] | None = None,
+    candidate_names: list[str] | tuple[str, ...] | None = None,
     allow_ai_fallback: bool = True,
 ) -> Optional[str]:
     """
@@ -69612,105 +70390,106 @@ def _fetch_artist_image_web(
         for role in (role_hints or [])
         if str(role or "").strip()
     }
-    queries = _artist_image_search_queries(
+    lookup_names = _artist_identity_lookup_names(
         artist_name,
         entity_kind=entity_kind,
         role_hints=role_hints,
+        candidate_names=candidate_names,
+        limit=12,
     )
-    for query in queries[:4]:
-        results = _serper_web_search(query, num=6, allow_ai_fallback=allow_ai_fallback)
-        if not results:
-            continue
-        for item in results:
-            if not _artist_image_result_looks_relevant(
-                artist_name,
-                item,
-                entity_kind=entity_kind,
-                role_hints=role_hints,
-            ):
+    strict_identity = bool(
+        kind in {"composer", "conductor", "orchestra", "ensemble", "choir", "chorus"}
+        or role_norms.intersection({"composer", "conductor", "orchestra", "ensemble", "choir", "chorus"})
+    )
+    for lookup_name in lookup_names[:6]:
+        queries = _artist_image_search_queries(
+            lookup_name,
+            entity_kind=entity_kind,
+            role_hints=role_hints,
+        )
+        for query in queries[:4]:
+            results = _serper_web_search(query, num=6, allow_ai_fallback=allow_ai_fallback)
+            if not results:
                 continue
-            title = str(item.get("title") or "").strip()
-            snippet = str(item.get("snippet") or "").strip()
-            link = item.get("link") or ""
-            if not link:
-                continue
-            resolved_authoritative = _resolve_authoritative_artist_image_url(
-                str(link),
-                artist_name=artist_name,
-                entity_kind=entity_kind,
-                role_hints=role_hints,
-                page_title=title,
-                page_summary=snippet,
-                timeout=8,
-            )
-            if resolved_authoritative:
-                return resolved_authoritative
-            if kind in {"composer", "conductor", "orchestra", "ensemble", "choir", "chorus"} or role_norms.intersection({"composer", "conductor", "orchestra", "ensemble", "choir", "chorus"}):
-                host = (urlparse(str(link or "")).netloc or "").lower()
-                trusted_domains = (
-                    "wikipedia.org",
-                    "wikimedia.org",
-                    "musicbrainz.org",
-                    "last.fm",
-                    "discogs.com",
-                    "theaudiodb.com",
-                )
-                if host and not any(host == domain or host.endswith(f".{domain}") for domain in trusted_domains):
-                    merged = f"{title} {snippet} {link}".lower()
-                    if not any(tok in merged for tok in ("official", "biography", "biographie", "portrait", "conductor", "composer", "orchestra", "philharmonic", "ensemble", "choir", "chorus", "maestro")):
-                        continue
-            try:
-                resp = requests.get(link, timeout=8, allow_redirects=True)
-            except Exception as e:
-                logging.debug("[ArtistWebImage] Failed to fetch %s: %s", link, e)
-                continue
-            if resp.status_code != 200:
-                continue
-            ct = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
-            # Direct image URL
-            if ct.startswith("image/"):
-                if _artist_image_url_looks_relevant(
-                    link,
-                    artist_name=artist_name,
+            for item in results:
+                if not _artist_image_result_looks_relevant(
+                    lookup_name,
+                    item,
+                    entity_kind=entity_kind,
+                    role_hints=role_hints,
+                    candidate_names=lookup_names,
+                ):
+                    continue
+                title = str(item.get("title") or "").strip()
+                snippet = str(item.get("snippet") or "").strip()
+                link = item.get("link") or ""
+                if not link:
+                    continue
+                resolved_authoritative = _resolve_authoritative_artist_image_url(
+                    str(link),
+                    artist_name=lookup_name,
                     entity_kind=entity_kind,
                     role_hints=role_hints,
                     page_title=title,
                     page_summary=snippet,
-                ):
-                    return link
-                continue
-            # HTML page – try og:image
-            if "text/html" in ct and resp.text:
+                    timeout=8,
+                )
+                if resolved_authoritative:
+                    return resolved_authoritative
+                if strict_identity:
+                    continue
                 try:
-                    m = re.search(
-                        r'<meta\s+property=["\']og:image["\']\s+content=["\']([^"\']+)["\']',
-                        resp.text,
-                        re.IGNORECASE,
-                    )
-                    if not m:
+                    resp = requests.get(link, timeout=8, allow_redirects=True)
+                except Exception as e:
+                    logging.debug("[ArtistWebImage] Failed to fetch %s: %s", link, e)
+                    continue
+                if resp.status_code != 200:
+                    continue
+                ct = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
+                # Direct image URL
+                if ct.startswith("image/"):
+                    if _artist_image_url_looks_relevant(
+                        link,
+                        artist_name=lookup_name,
+                        entity_kind=entity_kind,
+                        role_hints=role_hints,
+                        page_title=title,
+                        page_summary=snippet,
+                    ):
+                        return link
+                    continue
+                # HTML page – try og:image
+                if "text/html" in ct and resp.text:
+                    try:
                         m = re.search(
-                            r'<meta\s+content=["\']([^"\']+)["\']\s+property=["\']og:image["\']',
+                            r'<meta\s+property=["\']og:image["\']\s+content=["\']([^"\']+)["\']',
                             resp.text,
                             re.IGNORECASE,
                         )
-                    if not m:
+                        if not m:
+                            m = re.search(
+                                r'<meta\s+content=["\']([^"\']+)["\']\s+property=["\']og:image["\']',
+                                resp.text,
+                                re.IGNORECASE,
+                            )
+                        if not m:
+                            continue
+                        img_url = m.group(1).strip()
+                        if img_url:
+                            resolved = _resolve_authoritative_artist_image_url(
+                                img_url,
+                                artist_name=lookup_name,
+                                entity_kind=entity_kind,
+                                role_hints=role_hints,
+                                page_title=title,
+                                page_summary=snippet,
+                                timeout=8,
+                            )
+                            if resolved:
+                                return resolved
+                    except Exception as e:
+                        logging.debug("[ArtistWebImage] Failed to extract og:image from %s: %s", link, e)
                         continue
-                    img_url = m.group(1).strip()
-                    if img_url:
-                        resolved = _resolve_authoritative_artist_image_url(
-                            img_url,
-                            artist_name=artist_name,
-                            entity_kind=entity_kind,
-                            role_hints=role_hints,
-                            page_title=title,
-                            page_summary=snippet,
-                            timeout=8,
-                        )
-                        if resolved:
-                            return resolved
-                except Exception as e:
-                    logging.debug("[ArtistWebImage] Failed to extract og:image from %s: %s", link, e)
-                    continue
     return None
 
 
@@ -69730,9 +70509,140 @@ def _fetch_and_save_artist_image(
     if _artist_folder_has_image(artist_folder):
         return None
     fanart_key = (getattr(sys.modules[__name__], "FANART_API_KEY", "") or "").strip()
+    identity_fields = dict(identity_fields or {})
+    entity_kind = str(identity_fields.get("entity_kind") or "").strip().lower()
+    role_hints = _artist_role_hints_from_roles_json(identity_fields.get("roles_json") or identity_fields.get("role_hints") or [])
+    candidate_names = [
+        value
+        for value in (identity_fields.get("artist_aliases") or [])
+        if str(value or "").strip()
+    ]
+    classical_like = _artist_entity_is_classical_like(entity_kind=entity_kind, role_hints=role_hints)
+    ensemble_like = bool(
+        entity_kind in {"ensemble", "orchestra", "choir", "chorus"}
+        or bool(set(role_hints).intersection({"orchestra", "ensemble", "choir", "chorus"}))
+    )
+    mb_identity: dict[str, Any] = {}
+    if classical_like:
+        try:
+            mb_identity = _musicbrainz_artist_identity_lookup(
+                artist_name,
+                entity_kind=entity_kind,
+                role_hints=role_hints,
+            ) or {}
+        except Exception:
+            mb_identity = {}
+        if mb_identity:
+            for key in ("name", "sort_name"):
+                alias_txt = " ".join(str(mb_identity.get(key) or "").split()).strip()
+                if alias_txt:
+                    candidate_names.append(alias_txt)
+            for alias in (mb_identity.get("aliases") or []):
+                alias_txt = " ".join(str(alias or "").split()).strip()
+                if alias_txt:
+                    candidate_names.append(alias_txt)
+
+    def _download_and_save(url: str, provider: str, *, page_title: str = "", page_summary: str = "") -> Optional[str]:
+        try:
+            if not _artist_image_url_looks_relevant(
+                url,
+                artist_name=artist_name,
+                entity_kind=entity_kind,
+                role_hints=role_hints,
+                page_title=page_title,
+                page_summary=page_summary,
+            ):
+                return None
+            resp = requests.get(url, timeout=10, allow_redirects=True)
+            if resp.status_code != 200 or not resp.content:
+                return None
+            ct = resp.headers.get("content-type", "").lower()
+            if "image/" not in ct:
+                return None
+            if not _is_usable_artist_image_bytes(resp.content):
+                return None
+            if not _is_artist_image_distinct_from_local_covers(artist_folder, resp.content):
+                logging.debug("Skipped %s artist image for '%s': too similar to local cover", provider, artist_name)
+                return None
+            ext = ".jpg"
+            if "png" in ct:
+                ext = ".png"
+            elif "webp" in ct:
+                ext = ".webp"
+            out = artist_folder / f"artist{ext}"
+            out.write_bytes(resp.content)
+            logging.info("Saved artist image from %s to %s", provider, out)
+            return provider
+        except Exception as e:
+            logging.warning("Artist image download (%s) failed: %s", provider, e)
+            return None
+
+    if classical_like:
+        mb_title = str(mb_identity.get("name") or artist_name).strip()
+        mb_summary = "\n".join(str(alias or "").strip() for alias in (mb_identity.get("aliases") or []) if str(alias or "").strip())
+        for mb_url in [str(url or "").strip() for url in (mb_identity.get("urls") or []) if str(url or "").strip()][:10]:
+            resolved_mb_url = _resolve_authoritative_artist_image_url(
+                mb_url,
+                artist_name=artist_name,
+                entity_kind=entity_kind,
+                role_hints=role_hints,
+                page_title=mb_title,
+                page_summary=mb_summary,
+            )
+            if resolved_mb_url:
+                saved = _download_and_save(resolved_mb_url, "musicbrainz_url", page_title=mb_title, page_summary=mb_summary)
+                if saved:
+                    return saved
+        try:
+            wiki_profile = _fetch_wikipedia_artist_bio(
+                artist_name,
+                entity_kind=entity_kind,
+                role_hints=role_hints,
+                candidate_names=candidate_names,
+            )
+        except Exception:
+            wiki_profile = {}
+        wiki_url = str((wiki_profile or {}).get("image_url") or "").strip()
+        if wiki_url:
+            saved = _download_and_save(
+                wiki_url,
+                "wikipedia",
+                page_title=str((wiki_profile or {}).get("page_title") or artist_name),
+                page_summary="\n".join(
+                    part
+                    for part in (
+                        str((wiki_profile or {}).get("page_description") or "").strip(),
+                        str((wiki_profile or {}).get("bio") or "").strip(),
+                    )
+                    if part
+                ),
+            )
+            if saved:
+                return saved
+        if ensemble_like:
+            web_url = _fetch_artist_image_web(
+                artist_name,
+                entity_kind=entity_kind,
+                role_hints=role_hints,
+                candidate_names=candidate_names,
+                allow_ai_fallback=False,
+            )
+            if web_url and not _is_probably_placeholder_artist_image_url(web_url):
+                saved = _download_and_save(web_url, "web_authoritative", page_title=str(mb_identity.get("name") or artist_name), page_summary=mb_summary)
+                if saved:
+                    return saved
+        commons_url = _fetch_wikimedia_commons_artist_image(
+            artist_name,
+            entity_kind=entity_kind,
+            role_hints=role_hints,
+            candidate_names=candidate_names,
+        )
+        if commons_url:
+            saved = _download_and_save(commons_url, "commons", page_title=str(mb_identity.get("name") or artist_name), page_summary=mb_summary)
+            if saved:
+                return saved
     if not USE_MUSICBRAINZ and not USE_LASTFM and not USE_DISCOGS and not fanart_key:
         return None
-    identity_fields = dict(identity_fields or {})
     mb_artist_for_fanart = _resolve_artist_mbid_for_fanart(
         artist_name=artist_name,
         artist_mbid=artist_mbid,
@@ -69750,74 +70660,35 @@ def _fetch_and_save_artist_image(
     if mb_artist_for_fanart:
         url = _fetch_artist_image_fanart(mb_artist_for_fanart)
         if url:
-            try:
-                resp = requests.get(url, timeout=10, allow_redirects=True)
-                if resp.status_code == 200 and resp.content and _is_usable_artist_image_bytes(resp.content):
-                    if not _is_artist_image_distinct_from_local_covers(artist_folder, resp.content):
-                        logging.debug("Skipped Fanart.tv artist image for '%s': too similar to local cover", artist_name)
-                    else:
-                        (artist_folder / "artist.jpg").write_bytes(resp.content)
-                        logging.info("Saved artist image from Fanart.tv to %s", artist_folder / "artist.jpg")
-                        return "fanart"
-            except Exception as e:
-                logging.warning("Artist image download (Fanart.tv) failed: %s", e)
+            saved = _download_and_save(url, "fanart")
+            if saved:
+                return saved
     # Last.fm
     if USE_LASTFM:
         url = _fetch_artist_image_lastfm(artist_name)
         if url and not _is_probably_placeholder_artist_image_url(url):
-            try:
-                resp = requests.get(url, timeout=10, allow_redirects=True)
-                if resp.status_code == 200 and resp.content and _is_usable_artist_image_bytes(resp.content):
-                    if not _is_artist_image_distinct_from_local_covers(artist_folder, resp.content):
-                        logging.debug("Skipped Last.fm artist image for '%s': too similar to local cover", artist_name)
-                    else:
-                        (artist_folder / "artist.jpg").write_bytes(resp.content)
-                        logging.info("Saved artist image from Last.fm to %s", artist_folder / "artist.jpg")
-                        return "lastfm"
-            except Exception as e:
-                logging.warning("Artist image download (Last.fm) failed: %s", e)
+            saved = _download_and_save(url, "lastfm")
+            if saved:
+                return saved
     # TheAudioDB (name-based) – optional.
     url = _fetch_artist_image_audiodb(artist_name)
     if url:
-        try:
-            resp = requests.get(url, timeout=10, allow_redirects=True)
-            if resp.status_code == 200 and resp.content and _is_usable_artist_image_bytes(resp.content):
-                if not _is_artist_image_distinct_from_local_covers(artist_folder, resp.content):
-                    logging.debug("Skipped TheAudioDB artist image for '%s': too similar to local cover", artist_name)
-                else:
-                    (artist_folder / "artist.jpg").write_bytes(resp.content)
-                    logging.info("Saved artist image from TheAudioDB to %s", artist_folder / "artist.jpg")
-                    return "audiodb"
-        except Exception as e:
-            logging.warning("Artist image download (TheAudioDB) failed: %s", e)
+        saved = _download_and_save(url, "audiodb")
+        if saved:
+            return saved
     # Discogs
     if USE_DISCOGS:
         url = _fetch_artist_image_discogs(artist_name)
         if url:
-            try:
-                resp = requests.get(url, timeout=10, allow_redirects=True)
-                if resp.status_code == 200 and resp.content and _is_usable_artist_image_bytes(resp.content):
-                    if not _is_artist_image_distinct_from_local_covers(artist_folder, resp.content):
-                        logging.debug("Skipped Discogs artist image for '%s': too similar to local cover", artist_name)
-                    else:
-                        (artist_folder / "artist.jpg").write_bytes(resp.content)
-                        logging.info("Saved artist image from Discogs to %s", artist_folder / "artist.jpg")
-                        return "discogs"
-            except Exception as e:
-                logging.warning("Artist image download (Discogs) failed: %s", e)
+            saved = _download_and_save(url, "discogs")
+            if saved:
+                return saved
     # Web search fallback (Serper + OpenGraph) when other providers did not yield an image
     web_url = _fetch_artist_image_web(artist_name)
     if web_url and not _is_probably_placeholder_artist_image_url(web_url):
-        try:
-            resp = requests.get(web_url, timeout=10, allow_redirects=True)
-            if resp.status_code == 200 and resp.content and _is_usable_artist_image_bytes(resp.content):
-                if not _is_artist_image_distinct_from_local_covers(artist_folder, resp.content):
-                    return None
-                (artist_folder / "artist.jpg").write_bytes(resp.content)
-                logging.info("Saved artist image from web search to %s", artist_folder / "artist.jpg")
-                return "web"
-        except Exception as e:
-            logging.warning("Artist image download (web search) failed: %s", e)
+        saved = _download_and_save(web_url, "web")
+        if saved:
+            return saved
     return None
 
 @app.get("/api/library/artist/<int:artist_id>/images")

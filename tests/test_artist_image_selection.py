@@ -1,0 +1,189 @@
+import unittest
+
+import pmda
+
+
+class ArtistImageSelectionTests(unittest.TestCase):
+    def test_classical_entities_reject_weak_external_sources(self):
+        self.assertTrue(
+            pmda._artist_external_image_requires_authoritative_refresh(
+                provider="web",
+                image_url="https://example.com/random-image.jpg",
+                entity_kind="composer",
+                role_hints=["composer"],
+            )
+        )
+        self.assertTrue(
+            pmda._artist_external_image_requires_authoritative_refresh(
+                provider="lastfm",
+                image_url="https://lastfm.freetls.fastly.net/i/u/300x300/random.jpg",
+                entity_kind="orchestra",
+                role_hints=["orchestra"],
+            )
+        )
+
+    def test_classical_entities_accept_authoritative_sources(self):
+        self.assertFalse(
+            pmda._artist_external_image_requires_authoritative_refresh(
+                provider="wikipedia",
+                image_url="https://upload.wikimedia.org/wikipedia/commons/1/12/Composer_portrait.jpg",
+                entity_kind="orchestra",
+                role_hints=["orchestra"],
+            )
+        )
+        self.assertFalse(
+            pmda._artist_external_image_requires_authoritative_refresh(
+                provider="musicbrainz_url",
+                image_url="https://i.scdn.co/image/ab6761610000e5eb1234567890abcdef12345678",
+                entity_kind="conductor",
+                role_hints=["conductor"],
+            )
+        )
+
+    def test_classical_entities_reject_fanart_and_audiodb(self):
+        self.assertTrue(
+            pmda._artist_external_image_requires_authoritative_refresh(
+                provider="fanart",
+                image_url="https://assets.fanart.tv/fanart/music/artist-thumb.jpg",
+                entity_kind="composer",
+                role_hints=["composer"],
+            )
+        )
+        self.assertTrue(
+            pmda._artist_external_image_requires_authoritative_refresh(
+                provider="audiodb",
+                image_url="https://www.theaudiodb.com/images/media/artist/thumb/example.jpg",
+                entity_kind="orchestra",
+                role_hints=["orchestra"],
+            )
+        )
+
+    def test_non_classical_entities_keep_non_placeholder_lastfm(self):
+        self.assertFalse(
+            pmda._artist_external_image_requires_authoritative_refresh(
+                provider="lastfm",
+                image_url="https://lastfm.freetls.fastly.net/i/u/300x300/real-band-photo.jpg",
+                entity_kind="artist",
+                role_hints=["band"],
+            )
+        )
+
+    def test_suspicious_or_placeholder_urls_are_never_accepted(self):
+        self.assertTrue(
+            pmda._artist_external_image_requires_authoritative_refresh(
+                provider="fanart",
+                image_url="https://coverartarchive.org/release/abc/front-250.jpg",
+                entity_kind="artist",
+                role_hints=[],
+            )
+        )
+
+    def test_choose_preferred_person_identity_name_keeps_specific_variant(self):
+        self.assertEqual(
+            pmda._choose_preferred_person_identity_name("Semyon", "Semyon Bychkov"),
+            "Semyon Bychkov",
+        )
+        self.assertEqual(
+            pmda._choose_preferred_person_identity_name("Peter Tchaikovsky", "Pyotr Ilyich Tchaikovsky"),
+            "Pyotr Ilyich Tchaikovsky",
+        )
+        self.assertTrue(
+            pmda._artist_external_image_requires_authoritative_refresh(
+                provider="wikipedia",
+                image_url="https://lastfm.freetls.fastly.net/i/u/300x300/2a96cbd8b46e442fc41c2b86b821562f.png",
+                entity_kind="artist",
+                role_hints=[],
+            )
+        )
+
+    def test_classical_person_image_rejects_wrong_same_surname_person(self):
+        self.assertFalse(
+            pmda._artist_image_url_looks_relevant(
+                "https://commons.wikimedia.org/wiki/Special:FilePath/Maria%20Barbara%20Bach%20%281684%E2%80%931720%29.jpg",
+                artist_name="Johann Sebastian Bach",
+                entity_kind="composer",
+                role_hints=["composer"],
+                page_title="File:Maria Barbara Bach (1684–1720).jpg",
+                page_summary="German singer and first wife of Johann Sebastian Bach.",
+            )
+        )
+
+    def test_classical_person_image_accepts_real_portrait_file(self):
+        self.assertTrue(
+            pmda._artist_image_url_looks_relevant(
+                "https://commons.wikimedia.org/wiki/Special:FilePath/Tchaikovsky%20by%20Reutlinger.jpg",
+                artist_name="Peter Tchaikovsky",
+                entity_kind="composer",
+                role_hints=["composer"],
+                page_title="File:Tchaikovsky by Reutlinger.jpg",
+                page_summary="Russian composer portrait.",
+            )
+        )
+
+    def test_ensemble_image_rejects_event_or_venue_file(self):
+        self.assertFalse(
+            pmda._artist_image_url_looks_relevant(
+                "https://commons.wikimedia.org/wiki/Special:FilePath/Berlin%20Philharmonie%20Ukraine-Konzert%20asv2022-07%20img2.jpg",
+                artist_name="Deutsches Symphonie-Orchester Berlin",
+                entity_kind="orchestra",
+                role_hints=["orchestra"],
+                page_title="File:Berlin Philharmonie Ukraine-Konzert asv2022-07 img2.jpg",
+                page_summary="Concert image from the Berlin Philharmonie.",
+            )
+        )
+
+    def test_artist_alias_rows_include_canonical_name_and_generated_person_aliases(self):
+        rows = pmda._files_artist_alias_rows_for_identity(
+            artist_name="Peter Tchaikovsky",
+            canonical_name="Pyotr Ilyich Tchaikovsky",
+            artist_norm=pmda._norm_artist_key("Pyotr Ilyich Tchaikovsky"),
+            entity_kind="composer",
+            roles_json=["composer"],
+            aliases_json=["P. I. Tchaikovsky"],
+        )
+        aliases = {row["alias"] for row in rows}
+        self.assertIn("Pyotr Ilyich Tchaikovsky", aliases)
+        self.assertIn("Peter Tchaikovsky", aliases)
+        self.assertTrue(any(alias in aliases for alias in ("P I Tchaikovsky", "P.I. Tchaikovsky", "P. I. Tchaikovsky")))
+
+    def test_primary_lookup_prefers_canonical_classical_name(self):
+        self.assertEqual(
+            pmda._artist_identity_primary_lookup_name(
+                "Peter Tchaikovsky",
+                entity_kind="composer",
+                role_hints=["composer"],
+                candidate_names=[
+                    "Pyotr Ilyich Tchaikovsky",
+                    "Tchaikovsky, Pyotr Ilyich",
+                    "Peter Tchaikovsky",
+                ],
+            ),
+            "Pyotr Ilyich Tchaikovsky",
+        )
+
+    def test_profile_text_matches_canonical_aliases(self):
+        self.assertTrue(
+            pmda._artist_profile_text_matches_any_identity(
+                "J.S. Bach",
+                "Johann Sebastian Bach was a German composer and musician of the late Baroque period.",
+                entity_kind="composer",
+                role_hints=["composer"],
+                candidate_names=["Johann Sebastian Bach", "Bach, Johann Sebastian"],
+            )
+        )
+
+    def test_classical_web_image_rejects_untrusted_context_only_match(self):
+        self.assertFalse(
+            pmda._artist_image_url_looks_relevant(
+                "https://example.com/images/bee.jpg",
+                artist_name="Peter Tchaikovsky",
+                entity_kind="composer",
+                role_hints=["composer"],
+                page_title="Pyotr Ilyich Tchaikovsky biography",
+                page_summary="Russian composer portrait and biography.",
+            )
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
