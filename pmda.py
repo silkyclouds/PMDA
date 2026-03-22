@@ -68514,6 +68514,8 @@ def _is_suspicious_external_artist_image_url(url: str) -> bool:
         "allmusic_facebook_share",
         "sharecard",
         "share-card",
+        "logo",
+        "signet",
         "%28album%29",
         "%28ep%29",
         "/album/",
@@ -68644,8 +68646,8 @@ def _artist_external_image_requires_authoritative_refresh_sql(
         f" OR {url_expr} LIKE '%allmusic_facebook_share%'"
         f" OR {url_expr} LIKE '%sharecard%'"
         f" OR {url_expr} LIKE '%share-card%'"
-        f" OR {url_expr} LIKE '%%%28album%%29%'"
-        f" OR {url_expr} LIKE '%%%28ep%%29%'"
+        f" OR {url_expr} LIKE '%logo%'"
+        f" OR {url_expr} LIKE '%signet%'"
         f" OR {url_expr} LIKE '%/album/%'"
         f" OR {url_expr} LIKE '%/release/%'"
         f" OR {url_expr} LIKE '%/cover/%'"
@@ -69219,6 +69221,8 @@ def _artist_image_url_looks_relevant(
     ensemble_like = kind in {"orchestra", "ensemble", "choir", "chorus"} or roles.intersection({"orchestra", "ensemble", "choir", "chorus"})
     albumish_tokens = {"album", "cover", "soundtrack", "single", "release", "recording"}
     if basename_tokens.intersection(albumish_tokens):
+        return False
+    if "logo" in basename_tokens or "signet" in basename_tokens:
         return False
     if host == "cf.allmusic.com" and "facebook_share" in target_url.lower():
         return False
