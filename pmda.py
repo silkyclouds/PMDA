@@ -68662,7 +68662,10 @@ def _artist_external_image_requires_authoritative_refresh_sql(
         f" OR {suspicious_expr}"
         f"))"
     )
-    return f"({placeholder_expr} OR {weak_classical_expr})"
+    sql = f"({placeholder_expr} OR {weak_classical_expr})"
+    # psycopg still parses % in SQL text for placeholders even inside LIKE literals.
+    # Doubling them keeps LIKE semantics intact while preventing placeholder parsing.
+    return sql.replace("%", "%%")
 
 
 def _artist_has_true_image_sql(artist_alias: str = "a", ext_alias: str = "ext") -> str:
