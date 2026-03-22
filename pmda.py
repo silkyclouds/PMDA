@@ -58288,6 +58288,7 @@ def api_library_artists():
                 total = int((cur.fetchone() or [0])[0] or 0)
 
                 album_count_match_sql = browse_album_match_sql
+                artist_has_image_sql = _artist_has_true_image_sql("a", "ext")
 
                 if search_query:
                     try:
@@ -58306,7 +58307,7 @@ def api_library_artists():
                                       AND {album_count_match_sql}
                                 ) AS album_count,
                                 a.broken_albums_count,
-                                (""" + _artist_has_true_image_sql("a", "ext") + """) AS has_image,
+                                ({artist_has_image_sql}) AS has_image,
                                 similarity(a.name, %s) AS score,
                                 CASE WHEN lower(a.name) LIKE lower(%s) || '%%' THEN 0 ELSE 1 END AS prefix_rank
                             FROM files_artists a
@@ -58333,7 +58334,7 @@ def api_library_artists():
                                       AND {album_count_match_sql}
                                 ) AS album_count,
                                 a.broken_albums_count,
-                                (""" + _artist_has_true_image_sql("a", "ext") + """) AS has_image
+                                ({artist_has_image_sql}) AS has_image
                             FROM files_artists a
                             LEFT JOIN files_external_artist_images ext ON ext.name_norm = a.name_norm
                             WHERE {where_sql}
@@ -58358,7 +58359,7 @@ def api_library_artists():
                                   AND {album_count_match_sql}
                             ) AS album_count,
                             a.broken_albums_count,
-                            (""" + _artist_has_true_image_sql("a", "ext") + """) AS has_image
+                            ({artist_has_image_sql}) AS has_image
                         FROM files_artists a
                         LEFT JOIN files_external_artist_images ext ON ext.name_norm = a.name_norm
                         WHERE {where_sql}
