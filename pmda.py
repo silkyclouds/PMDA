@@ -3729,7 +3729,6 @@ _OLLAMA_COMPLEX_ANALYSIS_TYPES = {
     "album_review_batch",
     "album_review_generate",
     "dedupe_choose_best",
-    "identity_inference_no_tags",
     "mb_artist_index_choice",
     "mb_candidate_tiebreak",
     "mb_match_verify",
@@ -3750,6 +3749,20 @@ _OLLAMA_COMPLEXITY_HINTS = (
     "provider candidates",
     "same release",
     "tie-break",
+)
+
+_PROVIDER_IDENTITY_AI_SKIP_REASON_PREFIXES = (
+    "track_count_mismatch",
+    "track_title_mismatch",
+    "classical_track_count_mismatch",
+    "classical_work_mismatch",
+    "classical_composer_mismatch",
+    "classical_performance_mismatch",
+    "classical_catalog_mismatch",
+    "classical_disc_count_mismatch",
+    "classical_duration_mismatch",
+    "classical_label_plus_performance_mismatch",
+    "classical_year_mismatch",
 )
 
 
@@ -18404,11 +18417,31 @@ def _run_files_profile_enrichment_job(
                     for title, norm in to_fetch[:120]:
                         if not bool(norm_match_flags.get(norm, False)):
                             continue
+                        state = album_state_by_norm.get(norm) or {}
+                        review_artist = str(artist_name or "").strip()
+                        review_title = str(title or "").strip()
+                        review_identity_provider = ""
+                        if state:
+                            try:
+                                review_artist, review_title, review_identity_provider = _resolve_album_review_identity_from_provider_hints(
+                                    review_artist,
+                                    review_title,
+                                    metadata_source=str(state.get("metadata_source") or "").strip(),
+                                    mbid=str(state.get("mbid") or "").strip(),
+                                    discogs_release_id=str(state.get("discogs_release_id") or "").strip(),
+                                    lastfm_album_mbid=str(state.get("lastfm_album_mbid") or "").strip(),
+                                    bandcamp_album_url=str(state.get("bandcamp_album_url") or "").strip(),
+                                )
+                            except Exception:
+                                review_artist = str(artist_name or "").strip()
+                                review_title = str(title or "").strip()
+                                review_identity_provider = ""
                         batch_requests.append(
                             {
-                                "album_title": title,
+                                "album_title": review_title or title,
                                 "title_norm": norm,
                                 "allow_short_title_fallback": bool(norm_strict_flags.get(norm, False)),
+                                "search_source": review_identity_provider or "",
                             }
                         )
                     if batch_requests:
@@ -18420,13 +18453,41 @@ def _run_files_profile_enrichment_job(
                         except Exception:
                             batch_web_profiles_by_norm = {}
                     for title, norm in to_fetch[:120]:
+                        state = album_state_by_norm.get(norm) or {}
+                        review_artist = str(artist_name or "").strip()
+                        review_title = str(title or "").strip()
+                        if state:
+                            try:
+                                review_artist, review_title, _review_identity_provider = _resolve_album_review_identity_from_provider_hints(
+                                    review_artist,
+                                    review_title,
+                                    metadata_source=str(state.get("metadata_source") or "").strip(),
+                                    mbid=str(state.get("mbid") or "").strip(),
+                                    discogs_release_id=str(state.get("discogs_release_id") or "").strip(),
+                                    lastfm_album_mbid=str(state.get("lastfm_album_mbid") or "").strip(),
+                                    bandcamp_album_url=str(state.get("bandcamp_album_url") or "").strip(),
+                                )
+                            except Exception:
+                                review_artist = str(artist_name or "").strip()
+                                review_title = str(title or "").strip()
                         profile = _fetch_best_album_profile(
-                            artist_name,
-                            title,
+                            review_artist,
+                            review_title,
                             allow_web_ai=bool(norm_match_flags.get(norm, False)),
                             allow_short_title_fallback=bool(norm_strict_flags.get(norm, False)),
                             precomputed_web_profile=batch_web_profiles_by_norm.get(norm),
                         ) or {}
+                        if (not _album_profile_has_payload(profile)) and state:
+                            profile = _fetch_album_profile_from_provider_fallback(
+                                review_artist,
+                                review_title,
+                                metadata_source=str(state.get("metadata_source") or "").strip(),
+                                mbid=str(state.get("mbid") or "").strip(),
+                                discogs_release_id=str(state.get("discogs_release_id") or "").strip(),
+                                lastfm_album_mbid=str(state.get("lastfm_album_mbid") or "").strip(),
+                                bandcamp_album_url=str(state.get("bandcamp_album_url") or "").strip(),
+                                allow_short_title_fallback=bool(norm_strict_flags.get(norm, False)),
+                            ) or {}
                         if not isinstance(profile, dict):
                             continue
                         if not _album_profile_has_payload(profile):
@@ -27963,6 +28024,15 @@ def _classical_display_payload(
     fallback_artist: str = "",
 ) -> dict[str, Any] | None:
     tag_map = tags if isinstance(tags, dict) else {}
+    preview_ctx = _classical_identity_context(
+        local_artist=str(fallback_artist or "").strip(),
+        local_title=str(fallback_title or "").strip(),
+        local_tracks=[],
+        local_tags=tag_map,
+        local_paths=None,
+    )
+    if not bool(preview_ctx.get("is_classical")):
+        return None
     composer = _classical_display_values(_classical_collect_tag_values(tag_map, _CLASSICAL_COMPOSER_TAG_KEYS))
     work = _classical_display_values(_classical_collect_tag_values(tag_map, _CLASSICAL_WORK_TAG_KEYS), limit=4)
     conductor = _classical_display_values(_classical_collect_tag_values(tag_map, ("conductor",)), limit=4)
@@ -29686,6 +29756,8 @@ def _provider_candidate_soft_identity_ok(
             return (False, "track_count_mismatch")
         if track_count_delta >= 2 and track_count_ratio < 0.86:
             return (False, "track_count_mismatch")
+        if track_count_delta >= 1 and min(local_track_count, provider_track_count) >= 10 and track_score < 0.78:
+            return (False, "track_count_mismatch")
         # When both sides expose a meaningful tracklist, reject obviously wrong
         # editions even if the counts are similar. Similar counts alone are not
         # enough when titles do not line up.
@@ -29708,6 +29780,32 @@ def _provider_candidate_soft_identity_ok(
             return (False, "provider_no_tracklist")
 
     return (True, "soft_identity_ok")
+
+
+def _provider_identity_ai_skip_reason(
+    candidates: list[dict],
+    *,
+    min_confidence: float,
+) -> str:
+    """
+    Skip AI arbitration when every viable candidate already fails on a
+    deterministic mismatch that an LLM cannot repair.
+    """
+    reasons: list[str] = []
+    for candidate in (candidates or [])[:6]:
+        ok, reason = _provider_candidate_soft_identity_ok(candidate, min_confidence=min_confidence)
+        if ok:
+            return ""
+        clean = str(reason or "").strip().lower()
+        if not clean:
+            return ""
+        reasons.append(clean)
+    if not reasons:
+        return ""
+    for reason in reasons:
+        if not any(reason.startswith(prefix) for prefix in _PROVIDER_IDENTITY_AI_SKIP_REASON_PREFIXES):
+            return ""
+    return ", ".join(sorted(set(reasons)))
 
 
 def _ai_choose_provider_identity_candidate(
@@ -29889,40 +29987,49 @@ def _arbitrate_provider_identity(
             close = [c for c in ai_pool if (top_conf - float(c.get("confidence") or 0.0)) <= window]
             if len(close) >= 2:
                 ai_pool = close
-        ai_choice, ai_conf = _ai_choose_provider_identity_candidate(
-            artist_name=artist_name,
-            album_title=album_title,
-            local_track_titles=local_track_titles,
-            candidates=ai_pool,
-        )
-        if ai_choice is not None:
-            ai_min = max(0.62, min_score - 0.08)
-            ai_ok, ai_reason = _provider_candidate_soft_identity_ok(ai_choice, min_confidence=ai_min)
-            if ai_ok:
-                logging.info(
-                    "[Providers Arbitration] %r – %r: accepted %s (AI tiebreak confidence=%s, heuristic=%.2f)",
-                    artist_name,
-                    album_title,
-                    ai_choice.get("provider"),
-                    ai_conf if ai_conf is not None else "n/a",
-                    float(ai_choice.get("confidence") or 0.0),
-                )
-                return {
-                    "provider": ai_choice.get("provider"),
-                    "payload": ai_choice.get("payload"),
-                    "provider_id": ai_choice.get("provider_id") or "",
-                    "confidence": float(ai_choice.get("confidence") or 0.0),
-                    "confidence_source": "ai",
-                    "title_score": float(ai_choice.get("title_score") or 0.0),
-                    "artist_score": float(ai_choice.get("artist_score") or 0.0),
-                    "track_score": float(ai_choice.get("track_score") or 0.0),
-                    "strict_match_verified": False,
-                    "strict_reject_reason": str(ai_choice.get("strict_reject_reason") or ""),
-                    "strict_tracklist_score": float(ai_choice.get("strict_tracklist_score") or 0.0),
-                    "soft_match_verified": True,
-                    "soft_match_provider": ai_choice.get("provider") or "",
-                    "soft_match_reason": f"ai_tiebreak:{ai_reason}",
-                }
+        ai_skip_reason = _provider_identity_ai_skip_reason(ai_pool, min_confidence=min_score)
+        if ai_skip_reason:
+            logging.info(
+                "[Providers Arbitration] %r – %r: skipping AI tiebreak (deterministic mismatches: %s)",
+                artist_name,
+                album_title,
+                ai_skip_reason,
+            )
+        else:
+            ai_choice, ai_conf = _ai_choose_provider_identity_candidate(
+                artist_name=artist_name,
+                album_title=album_title,
+                local_track_titles=local_track_titles,
+                candidates=ai_pool,
+            )
+            if ai_choice is not None:
+                ai_min = max(0.62, min_score - 0.08)
+                ai_ok, ai_reason = _provider_candidate_soft_identity_ok(ai_choice, min_confidence=ai_min)
+                if ai_ok:
+                    logging.info(
+                        "[Providers Arbitration] %r – %r: accepted %s (AI tiebreak confidence=%s, heuristic=%.2f)",
+                        artist_name,
+                        album_title,
+                        ai_choice.get("provider"),
+                        ai_conf if ai_conf is not None else "n/a",
+                        float(ai_choice.get("confidence") or 0.0),
+                    )
+                    return {
+                        "provider": ai_choice.get("provider"),
+                        "payload": ai_choice.get("payload"),
+                        "provider_id": ai_choice.get("provider_id") or "",
+                        "confidence": float(ai_choice.get("confidence") or 0.0),
+                        "confidence_source": "ai",
+                        "title_score": float(ai_choice.get("title_score") or 0.0),
+                        "artist_score": float(ai_choice.get("artist_score") or 0.0),
+                        "track_score": float(ai_choice.get("track_score") or 0.0),
+                        "strict_match_verified": False,
+                        "strict_reject_reason": str(ai_choice.get("strict_reject_reason") or ""),
+                        "strict_tracklist_score": float(ai_choice.get("strict_tracklist_score") or 0.0),
+                        "soft_match_verified": True,
+                        "soft_match_provider": ai_choice.get("provider") or "",
+                        "soft_match_reason": f"ai_tiebreak:{ai_reason}",
+                    }
 
     rejected = "; ".join(
         f"{c.get('provider')} -> strict={c.get('strict_reject_reason') or c.get('strict_reason') or 'strict failed'}"
@@ -30822,6 +30929,7 @@ def _infer_identity_from_local_context_ai(
     folder_path: Path | str | None,
     track_titles: list[str],
     file_paths: list[Path | str] | None = None,
+    local_tags: dict | None = None,
     missing_required_tags: list[str] | None = None,
 ) -> dict[str, Any]:
     """
@@ -30846,6 +30954,14 @@ def _infer_identity_from_local_context_ai(
     filename_hints = _filename_identity_hints(file_paths)
     filename_artist_hint = str(filename_hints.get("artist") or "").strip()
     filename_album_hint = str(filename_hints.get("album") or "").strip()
+    local_context = _classical_identity_context(
+        local_artist=local_artist_txt,
+        local_title=local_album_txt,
+        local_tracks=[{"title": value} for value in titles[:20]],
+        local_tags=local_tags if isinstance(local_tags, dict) else {},
+        local_paths=list(file_paths or []),
+    )
+    local_is_classical = bool(local_context.get("is_classical"))
     filename_album_conflict = bool(
         filename_album_hint
         and local_album_txt
@@ -30878,21 +30994,55 @@ def _infer_identity_from_local_context_ai(
 
     stable_filename_identity = bool(filename_artist_hint and filename_album_hint)
     if stable_filename_identity:
+        local_artist_norm = _normalize_identity_text_strict(local_artist_txt)
+        filename_artist_norm = _normalize_identity_text_strict(filename_artist_hint)
+        parent_norm = _normalize_identity_text_strict(parent_name)
+        artist_needs_help = bool(
+            ("artist" in missing)
+            or _identity_text_is_generic(local_artist_txt)
+            or not local_artist_txt
+        )
+        album_needs_help = bool(
+            ("album" in missing)
+            or _identity_text_is_generic(local_album_txt)
+            or not local_album_txt
+        )
         deterministic_reason_bits: list[str] = []
-        if filename_artist_conflict:
-            deterministic_reason_bits.append("artist_conflict")
-        if filename_album_conflict:
-            deterministic_reason_bits.append("album_conflict")
-        if ("artist" in missing) or _identity_text_is_generic(local_artist_txt) or not local_artist_txt:
+        if artist_needs_help:
             deterministic_reason_bits.append("artist_missing_or_generic")
-        if ("album" in missing) or _identity_text_is_generic(local_album_txt) or not local_album_txt:
+        if album_needs_help:
             deterministic_reason_bits.append("album_missing_or_generic")
         if deterministic_reason_bits:
             return {
-                "artist": filename_artist_hint,
-                "album": filename_album_hint,
+                "artist": filename_artist_hint if artist_needs_help else local_artist_txt,
+                "album": filename_album_hint if album_needs_help else local_album_txt,
                 "confidence": 96,
                 "reason": "stable filename pattern (" + ", ".join(deterministic_reason_bits) + ")",
+                "source": "filename_pattern",
+                "album_prefix_hint": album_prefix_hint or "",
+                "filename_artist_hint": filename_artist_hint,
+                "filename_album_hint": filename_album_hint,
+            }
+        artist_confirms_filename = bool(
+            filename_artist_norm
+            and (
+                (local_artist_norm and filename_artist_norm == local_artist_norm)
+                or (parent_norm and filename_artist_norm == parent_norm)
+            )
+        )
+        if (
+            not local_is_classical
+            and artist_confirms_filename
+            and filename_album_conflict
+            and not filename_artist_conflict
+            and local_album_txt
+            and not _identity_text_is_generic(local_album_txt)
+        ):
+            return {
+                "artist": filename_artist_hint,
+                "album": filename_album_hint,
+                "confidence": 94,
+                "reason": "stable filename pattern (album_conflict)",
                 "source": "filename_pattern",
                 "album_prefix_hint": album_prefix_hint or "",
                 "filename_artist_hint": filename_artist_hint,
@@ -31171,8 +31321,8 @@ def search_mb_release_group_by_metadata(
         effective_candidate_fetch_limit = candidate_fetch_limit
         effective_tracklist_fetch_limit = tracklist_fetch_limit
         if bool(search_local_context.get("is_classical")):
-            classical_fetch_cap = 8
-            classical_tracklist_cap = 4
+            classical_fetch_cap = 5
+            classical_tracklist_cap = 3
             if effective_candidate_fetch_limit > 0:
                 effective_candidate_fetch_limit = min(effective_candidate_fetch_limit, classical_fetch_cap)
             else:
@@ -33283,6 +33433,7 @@ def scan_duplicates(
                             folder_path=album_folder_arg,
                             track_titles=list(tracks_edition) if tracks_edition else list(tracks or []),
                             file_paths=list(e.get("ordered_paths") or []),
+                            local_tags=e.get("meta") if isinstance(e.get("meta"), dict) else {},
                             missing_required_tags=list(e.get("missing_required_tags") or []),
                         )
                         if isinstance(ai_identity_hint, dict) and ai_identity_hint:
@@ -42123,6 +42274,7 @@ def _build_files_editions(
             folder_path=folder,
             track_titles=[str(getattr(t, "title", "") or "") for t in tracks],
             file_paths=ordered_paths,
+            local_tags=first_tags if isinstance(first_tags, dict) else {},
             missing_required_tags=list(missing_required_now or []),
         )
         discovery_identity_ctx = {
