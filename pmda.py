@@ -17137,6 +17137,7 @@ def _files_cache_external_artist_image(
     provider: str,
     image_url: str,
     max_px: int = 640,
+    force_replace: bool = False,
 ) -> Optional[str]:
     """
     Download + store an external artist image into the media cache and upsert the DB row.
@@ -17157,7 +17158,7 @@ def _files_cache_external_artist_image(
 
     # Skip refresh if a recent cached image exists and the file is still present.
     existing = _files_get_external_artist_images(conn, [key]).get(key) or {}
-    if existing and not bool(existing.get("stale")):
+    if existing and not bool(existing.get("stale")) and not bool(force_replace):
         p = (existing.get("image_path") or "").strip()
         if p:
             try:
@@ -17861,13 +17862,28 @@ def _run_files_profile_enrichment_job(
 
                 # External cached image state (quality-aware) so we can decide whether a refresh is needed.
                 needs_image = not local_has_image
+                authoritative_refresh = False
                 if needs_image:
                     ext_row = _files_get_external_artist_images(conn, [artist_norm]).get(artist_norm) or {}
                     ext_path = str(ext_row.get("image_path") or "").strip()
+                    ext_provider = str(ext_row.get("provider") or "").strip().lower()
+                    ext_url = str(ext_row.get("image_url") or "").strip().lower()
+                    classical_like = bool(
+                        _artist_is_person_like(entity_kind=entity_kind, role_hints=role_hints)
+                        or entity_kind in {"ensemble", "composer", "conductor"}
+                        or bool(set(role_hints).intersection({"orchestra", "ensemble", "choir", "chorus"}))
+                    )
                     if ext_path and not bool(ext_row.get("stale")):
                         try:
                             if _is_usable_artist_image_path(Path(ext_path)):
-                                needs_image = False
+                                if classical_like and (
+                                    ext_provider in {"web", "discogs", "lastfm"}
+                                    or (ext_provider == "wikipedia" and "wikimedia.org" not in ext_url and "wikipedia.org" not in ext_url)
+                                ):
+                                    needs_image = True
+                                    authoritative_refresh = True
+                                else:
+                                    needs_image = False
                         except Exception:
                             needs_image = False
 
@@ -17913,6 +17929,13 @@ def _run_files_profile_enrichment_job(
                     if not lf_mbid:
                         lf_mbid = str((mb_identity.get("mbid") if isinstance(mb_identity, dict) else "") or "").strip()
                     if lf_mbid:
+                        try:
+                            for mb_url in get_artist_images_mb(lf_mbid)[:4]:
+                                resolved_mb_url = _resolve_remote_image_or_og_url(mb_url, timeout=8)
+                                if resolved_mb_url:
+                                    candidates.append(("musicbrainz", resolved_mb_url))
+                        except Exception:
+                            pass
                         try:
                             fu = (_fetch_artist_image_fanart(lf_mbid) or "").strip()
                         except Exception:
@@ -17997,6 +18020,7 @@ def _run_files_profile_enrichment_job(
                                     provider=prov,
                                     image_url=url,
                                     max_px=640,
+                                    force_replace=bool(authoritative_refresh and prov in {"musicbrainz", "wikipedia", "fanart"}),
                                 )
                             if outp:
                                 break
@@ -67819,14 +67843,49 @@ def get_artist_images_mb(artist_mbid: str) -> List[str]:
         url_relations = artist_data.get("url-relation-list", [])
         
         for url_rel in url_relations:
-            target = url_rel.get("target", "")
-            if "wikimedia" in target.lower() or "commons.wikimedia" in target.lower():
+            target = str(url_rel.get("target") or "").strip()
+            target_low = target.lower()
+            if (
+                "wikimedia" in target_low
+                or "commons.wikimedia" in target_low
+                or "wikipedia.org" in target_low
+            ):
                 image_urls.append(target)
         
         return image_urls
     except Exception as e:
         logging.error("Failed to get artist images for MBID %s: %s", artist_mbid, e)
         return []
+
+
+def _resolve_remote_image_or_og_url(target_url: str, *, timeout: int = 8) -> str:
+    url = str(target_url or "").strip()
+    if not url:
+        return ""
+    try:
+        resp = requests.get(url, timeout=max(3, min(int(timeout or 8), 20)), allow_redirects=True)
+    except Exception:
+        return ""
+    if resp.status_code != 200:
+        return ""
+    content_type = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
+    if content_type.startswith("image/"):
+        return url
+    if "text/html" not in content_type:
+        return ""
+    html = resp.text or ""
+    if not html:
+        return ""
+    for pattern in (
+        r'<meta\s+property=["\']og:image["\']\s+content=["\']([^"\']+)["\']',
+        r'<meta\s+content=["\']([^"\']+)["\']\s+property=["\']og:image["\']',
+    ):
+        match = re.search(pattern, html, re.IGNORECASE)
+        if match:
+            found = str(match.group(1) or "").strip()
+            if found:
+                return found
+    return ""
 
 
 def _artist_folder_has_image(artist_folder: Path) -> bool:
@@ -68298,6 +68357,8 @@ def _artist_image_result_looks_relevant(
         if str(role or "").strip()
     }
     if kind in {"orchestra"} or "orchestra" in role_norms:
+        if any(tok in merged for tok in ("skyline", "skyscraper", "empire state", "observation deck", "real estate")):
+            return False
         return any(tok in merged for tok in ("orchestra", "philharmonic", "symphony", "ensemble"))
     if kind in {"conductor"} or "conductor" in role_norms:
         return any(tok in merged for tok in ("conductor", "maestro", "musician"))
