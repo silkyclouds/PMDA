@@ -17245,6 +17245,8 @@ def _files_cache_external_artist_image(
     image_url: str,
     max_px: int = 640,
     force_replace: bool = False,
+    entity_kind: str = "",
+    role_hints: list[str] | tuple[str, ...] | None = None,
 ) -> Optional[str]:
     """
     Download + store an external artist image into the media cache and upsert the DB row.
@@ -17259,6 +17261,13 @@ def _files_cache_external_artist_image(
         return None
     try:
         if _is_probably_placeholder_artist_image_url(img_url):
+            return None
+        if not _artist_image_url_looks_relevant(
+            img_url,
+            artist_name=name,
+            entity_kind=entity_kind,
+            role_hints=role_hints,
+        ):
             return None
     except Exception:
         pass
@@ -17299,6 +17308,13 @@ def _files_cache_external_artist_image(
         return None
     raw, mime, url_used = dl
     try:
+        if not _artist_image_url_looks_relevant(
+            url_used,
+            artist_name=name,
+            entity_kind=entity_kind,
+            role_hints=role_hints,
+        ):
+            return None
         if not _is_usable_artist_image_bytes(raw):
             return None
     except Exception:
@@ -17977,33 +17993,42 @@ def _run_files_profile_enrichment_job(
                 artist_id = int(arow[0]) if arow else artist_id
                 local_has_image = bool(arow[1]) if arow else False
                 local_image_path = str((arow[2] if arow else "") or "").strip()
+                ext_row = _files_get_external_artist_images(conn, [artist_norm]).get(artist_norm) or {}
+                ext_path = str(ext_row.get("image_path") or "").strip()
+                ext_provider = str(ext_row.get("provider") or "").strip().lower()
+                ext_url = str(ext_row.get("image_url") or "").strip().lower()
                 if local_has_image and local_image_path:
                     try:
                         if not Path(local_image_path).exists():
                             local_has_image = False
                     except Exception:
                         pass
+                if (
+                    local_has_image
+                    and local_image_path
+                    and ext_path
+                    and _paths_refer_to_same_file(local_image_path, ext_path)
+                    and _artist_external_image_requires_authoritative_refresh(
+                        provider=ext_provider,
+                        image_url=ext_url,
+                        entity_kind=entity_kind,
+                        role_hints=role_hints,
+                    )
+                ):
+                    local_has_image = False
 
                 # External cached image state (quality-aware) so we can decide whether a refresh is needed.
                 needs_image = not local_has_image
                 authoritative_refresh = False
                 if needs_image:
-                    ext_row = _files_get_external_artist_images(conn, [artist_norm]).get(artist_norm) or {}
-                    ext_path = str(ext_row.get("image_path") or "").strip()
-                    ext_provider = str(ext_row.get("provider") or "").strip().lower()
-                    ext_url = str(ext_row.get("image_url") or "").strip().lower()
-                    classical_like = bool(
-                        _artist_is_person_like(entity_kind=entity_kind, role_hints=role_hints)
-                        or entity_kind in {"ensemble", "composer", "conductor"}
-                        or bool(set(role_hints).intersection({"orchestra", "ensemble", "choir", "chorus"}))
-                    )
                     if ext_path and not bool(ext_row.get("stale")):
                         try:
                             if _is_usable_artist_image_path(Path(ext_path)):
-                                if classical_like and (
-                                    ext_provider in {"web", "discogs", "lastfm"}
-                                    or (ext_provider == "wikipedia" and "wikimedia.org" not in ext_url and "wikipedia.org" not in ext_url)
-                                    or _is_suspicious_external_artist_image_url(ext_url)
+                                if _artist_external_image_requires_authoritative_refresh(
+                                    provider=ext_provider,
+                                    image_url=ext_url,
+                                    entity_kind=entity_kind,
+                                    role_hints=role_hints,
                                 ):
                                     needs_image = True
                                     authoritative_refresh = True
@@ -18169,6 +18194,8 @@ def _run_files_profile_enrichment_job(
                                     image_url=url,
                                     max_px=640,
                                     force_replace=bool(authoritative_refresh and prov in {"musicbrainz", "wikipedia", "fanart"}),
+                                    entity_kind=entity_kind,
+                                    role_hints=role_hints,
                                 )
                             if outp:
                                 break
@@ -18794,10 +18821,11 @@ def _enqueue_files_profile_enrichment(
     albums: list[tuple[str, str]],
     *,
     allow_soft_profiles: Optional[bool] = None,
+    force: bool = False,
 ) -> bool:
     if not artist_norm:
         return False
-    if not bool(getattr(sys.modules[__name__], "SCHEDULER_ALLOW_NON_SCAN_JOBS", SCHEDULER_ALLOW_NON_SCAN_JOBS)):
+    if (not force) and (not bool(getattr(sys.modules[__name__], "SCHEDULER_ALLOW_NON_SCAN_JOBS", SCHEDULER_ALLOW_NON_SCAN_JOBS))):
         with lock:
             scanning_now = bool(state.get("scanning") or state.get("scan_finalizing") or state.get("scan_starting"))
         if not scanning_now:
@@ -59338,6 +59366,10 @@ def api_library_artists():
                                 ) AS album_count,
                                 a.broken_albums_count,
                                 ({artist_has_image_sql}) AS has_image,
+                                GREATEST(
+                                    EXTRACT(EPOCH FROM COALESCE(a.updated_at, NOW())),
+                                    EXTRACT(EPOCH FROM COALESCE(ext.updated_at, a.updated_at, NOW()))
+                                )::bigint AS image_version,
                                 GREATEST(similarity(a.name, %s), similarity(COALESCE(a.canonical_name, ''), %s)) AS score,
                                 CASE
                                     WHEN lower(a.name) LIKE lower(%s) || '%%'
@@ -59369,6 +59401,11 @@ def api_library_artists():
                                 ) AS album_count,
                                 a.broken_albums_count,
                                 ({artist_has_image_sql}) AS has_image
+                                ,
+                                GREATEST(
+                                    EXTRACT(EPOCH FROM COALESCE(a.updated_at, NOW())),
+                                    EXTRACT(EPOCH FROM COALESCE(ext.updated_at, a.updated_at, NOW()))
+                                )::bigint AS image_version
                             FROM files_artists a
                             LEFT JOIN files_external_artist_images ext ON ext.name_norm = a.name_norm
                             WHERE {where_sql}
@@ -59394,6 +59431,11 @@ def api_library_artists():
                             ) AS album_count,
                             a.broken_albums_count,
                             ({artist_has_image_sql}) AS has_image
+                            ,
+                            GREATEST(
+                                EXTRACT(EPOCH FROM COALESCE(a.updated_at, NOW())),
+                                EXTRACT(EPOCH FROM COALESCE(ext.updated_at, a.updated_at, NOW()))
+                            )::bigint AS image_version
                         FROM files_artists a
                         LEFT JOIN files_external_artist_images ext ON ext.name_norm = a.name_norm
                         WHERE {where_sql}
@@ -59407,13 +59449,18 @@ def api_library_artists():
             payload = {
                 "artists": [
                     {
+                        "artist_thumb_version": int(r[7] or 0) if len(r) > 7 else 0,
                         "artist_id": int(r[0]),
                         "artist_name": r[1] or "",
                         "entity_kind": str(r[2] or "artist"),
                         "roles": _safe_json_load(r[3] or "[]", fallback=[]),
                         "album_count": int(r[4] or 0),
                         "broken_albums_count": int(r[5] or 0),
-                        "artist_thumb": f"{base_url}/api/library/files/artist/{int(r[0])}/image?size=512" if bool(r[6]) else None,
+                        "artist_thumb": (
+                            f"{base_url}/api/library/files/artist/{int(r[0])}/image?size=512&v={int(r[7] or 0)}"
+                            if bool(r[6])
+                            else None
+                        ),
                     }
                     for r in rows
                 ],
@@ -67226,35 +67273,113 @@ def api_library_files_artist_image(artist_id):
     lookup_key = f"artwork:artist:{int(artist_id)}"
     lookup = _files_cache_get_json(lookup_key)
     name_norm = ""
+    artist_name = ""
+    entity_kind = "artist"
+    roles_json = "[]"
     img_raw = ""
+    ext_raw = ""
+    ext_provider = ""
+    ext_image_url = ""
     no_image_cached = False
 
     if isinstance(lookup, dict):
         name_norm = str(lookup.get("name_norm") or "").strip()
+        artist_name = str(lookup.get("artist_name") or "").strip()
+        entity_kind = str(lookup.get("entity_kind") or "artist").strip() or "artist"
+        roles_json = str(lookup.get("roles_json") or "[]")
         img_raw = str(lookup.get("image_path") or "").strip()
+        ext_raw = str(lookup.get("ext_image_path") or "").strip()
+        ext_provider = str(lookup.get("ext_provider") or "").strip().lower()
+        ext_image_url = str(lookup.get("ext_image_url") or "").strip()
         no_image_cached = bool(lookup.get("no_image"))
-    else:
+    if (not name_norm) or (not artist_name) or ("ext_image_path" not in (lookup or {}) if isinstance(lookup, dict) else True):
         conn = _files_pg_connect()
         if conn is None:
             return jsonify({"error": "PostgreSQL unavailable"}), 503
         try:
             with conn.cursor() as cur:
-                cur.execute("SELECT name_norm, COALESCE(image_path, '') FROM files_artists WHERE id = %s", (artist_id,))
+                cur.execute(
+                    """
+                    SELECT
+                        a.name_norm,
+                        COALESCE(a.image_path, ''),
+                        COALESCE(a.name, ''),
+                        COALESCE(a.entity_kind, 'artist'),
+                        COALESCE(a.roles_json, '[]'),
+                        COALESCE(ext.image_path, ''),
+                        COALESCE(ext.provider, ''),
+                        COALESCE(ext.image_url, '')
+                    FROM files_artists a
+                    LEFT JOIN files_external_artist_images ext ON ext.name_norm = a.name_norm
+                    WHERE a.id = %s
+                    LIMIT 1
+                    """,
+                    (artist_id,),
+                )
                 row = cur.fetchone()
             if row:
                 name_norm = str(row[0] or "").strip()
-                img_raw = str(row[1] or "").strip()
+                img_raw = str(row[1] or "").strip() or img_raw
+                artist_name = str(row[2] or "").strip()
+                entity_kind = str(row[3] or "artist").strip() or "artist"
+                roles_json = str(row[4] or "[]")
+                ext_raw = str(row[5] or "").strip()
+                ext_provider = str(row[6] or "").strip().lower()
+                ext_image_url = str(row[7] or "").strip()
             _files_cache_set_json(
                 lookup_key,
                 {
                     "name_norm": name_norm,
                     "image_path": img_raw,
+                    "artist_name": artist_name,
+                    "entity_kind": entity_kind,
+                    "roles_json": roles_json,
+                    "ext_image_path": ext_raw,
+                    "ext_provider": ext_provider,
+                    "ext_image_url": ext_image_url,
                     "no_image": not bool(img_raw),
                 },
                 ttl=3600,
             )
         finally:
             conn.close()
+
+    role_hints = _artist_role_hints_from_roles_json(roles_json or "[]")
+    ext_requires_refresh = bool(
+        ext_raw
+        and _artist_external_image_requires_authoritative_refresh(
+            provider=ext_provider,
+            image_url=ext_image_url,
+            entity_kind=entity_kind,
+            role_hints=role_hints,
+        )
+    )
+    mirrored_weak_external = bool(
+        ext_requires_refresh
+        and img_raw
+        and ext_raw
+        and _paths_refer_to_same_file(img_raw, ext_raw)
+    )
+    if mirrored_weak_external:
+        img_raw = ""
+        no_image_cached = False
+        _files_cache_set_json(
+            lookup_key,
+            {
+                "name_norm": name_norm,
+                "image_path": "",
+                "artist_name": artist_name,
+                "entity_kind": entity_kind,
+                "roles_json": roles_json,
+                "ext_image_path": ext_raw,
+                "ext_provider": ext_provider,
+                "ext_image_url": ext_image_url,
+                "no_image": False,
+            },
+            ttl=60,
+        )
+        if artist_name and name_norm:
+            _enqueue_files_profile_enrichment(artist_name, name_norm, [], force=True)
 
     if img_raw:
         img_path = path_for_fs_access(Path(img_raw))
@@ -67271,26 +67396,60 @@ def api_library_files_artist_image(artist_id):
     if name_norm:
         ext_key = f"artwork:artist:ext:{name_norm}"
         ext_lookup = _files_cache_get_json(ext_key)
-        ext_raw = str((ext_lookup or {}).get("image_path") or "").strip() if isinstance(ext_lookup, dict) else ""
-        if not ext_raw:
+        if isinstance(ext_lookup, dict):
+            ext_raw = str(ext_lookup.get("image_path") or "").strip() or ext_raw
+            ext_provider = str(ext_lookup.get("provider") or "").strip().lower() or ext_provider
+            ext_image_url = str(ext_lookup.get("image_url") or "").strip() or ext_image_url
+        if not ext_raw or not ext_provider:
             conn = _files_pg_connect()
             if conn is None:
                 return jsonify({"error": "PostgreSQL unavailable"}), 503
             try:
                 with conn.cursor() as cur:
                     cur.execute(
-                        "SELECT COALESCE(image_path, '') FROM files_external_artist_images WHERE name_norm = %s",
+                        """
+                        SELECT COALESCE(image_path, ''), COALESCE(provider, ''), COALESCE(image_url, '')
+                        FROM files_external_artist_images
+                        WHERE name_norm = %s
+                        LIMIT 1
+                        """,
                         (name_norm,),
                     )
                     erow = cur.fetchone()
                 ext_raw = str((erow[0] if erow else "") or "").strip()
+                ext_provider = str((erow[1] if erow else "") or "").strip().lower()
+                ext_image_url = str((erow[2] if erow else "") or "").strip()
                 _files_cache_set_json(
                     ext_key,
-                    {"image_path": ext_raw, "no_image": not bool(ext_raw)},
+                    {
+                        "image_path": ext_raw,
+                        "provider": ext_provider,
+                        "image_url": ext_image_url,
+                        "no_image": not bool(ext_raw),
+                    },
                     ttl=3600,
                 )
             finally:
                 conn.close()
+        if ext_raw and _artist_external_image_requires_authoritative_refresh(
+            provider=ext_provider,
+            image_url=ext_image_url,
+            entity_kind=entity_kind,
+            role_hints=role_hints,
+        ):
+            _files_cache_set_json(
+                ext_key,
+                {
+                    "image_path": "",
+                    "provider": ext_provider,
+                    "image_url": ext_image_url,
+                    "no_image": False,
+                },
+                ttl=60,
+            )
+            if artist_name and name_norm:
+                _enqueue_files_profile_enrichment(artist_name, name_norm, [], force=True)
+            ext_raw = ""
         if ext_raw:
             ext_path = path_for_fs_access(Path(ext_raw))
             if ext_path.exists() and ext_path.is_file() and _is_media_cache_file(ext_path, kind="artist"):
@@ -67301,6 +67460,12 @@ def api_library_files_artist_image(artist_id):
                     {
                         "name_norm": name_norm,
                         "image_path": str(ext_path),
+                        "artist_name": artist_name,
+                        "entity_kind": entity_kind,
+                        "roles_json": roles_json,
+                        "ext_image_path": str(ext_path),
+                        "ext_provider": ext_provider,
+                        "ext_image_url": ext_image_url,
                         "no_image": False,
                     },
                     ttl=3600,
@@ -67319,6 +67484,12 @@ def api_library_files_artist_image(artist_id):
         {
             "name_norm": name_norm,
             "image_path": "",
+            "artist_name": artist_name,
+            "entity_kind": entity_kind,
+            "roles_json": roles_json,
+            "ext_image_path": ext_raw,
+            "ext_provider": ext_provider,
+            "ext_image_url": ext_image_url,
             "no_image": True,
         },
         ttl=900,
@@ -68335,12 +68506,161 @@ def _is_suspicious_external_artist_image_url(url: str) -> bool:
         "coverartarchive",
         "album-cover",
         "albumcover",
+        "album_art",
+        "cover-art",
+        "record-cover",
+        "recording-cover",
+        "facebook_share",
+        "allmusic_facebook_share",
+        "sharecard",
+        "share-card",
         "%28album%29",
         "%28ep%29",
         "/album/",
         "/release/",
+        "/cover/",
+        "/covers/",
+        ".svg",
     )
-    return any(tok in low for tok in suspicious_tokens)
+    if any(tok in low for tok in suspicious_tokens):
+        return True
+    if "i.scdn.co/image/" in low and "ab67616d" in low:
+        return True
+    return False
+
+
+_ARTIST_CLASSICAL_ENTITY_KINDS = {"composer", "conductor", "orchestra", "ensemble", "choir", "chorus"}
+_ARTIST_CLASSICAL_ROLE_HINTS = {"composer", "conductor", "orchestra", "ensemble", "choir", "chorus"}
+_ARTIST_WEAK_CLASSICAL_IMAGE_PROVIDERS = {"web", "discogs", "lastfm", "musicbrainz_url"}
+
+
+def _artist_entity_is_classical_like(
+    *,
+    entity_kind: str = "",
+    role_hints: list[str] | tuple[str, ...] | None = None,
+) -> bool:
+    kind = str(entity_kind or "").strip().lower()
+    roles = {
+        str(role or "").strip().lower()
+        for role in (role_hints or [])
+        if str(role or "").strip()
+    }
+    return bool(
+        _artist_is_person_like(entity_kind=entity_kind, role_hints=role_hints)
+        or kind in _ARTIST_CLASSICAL_ENTITY_KINDS
+        or bool(roles.intersection(_ARTIST_CLASSICAL_ROLE_HINTS))
+    )
+
+
+def _artist_external_image_requires_authoritative_refresh(
+    *,
+    provider: str = "",
+    image_url: str = "",
+    entity_kind: str = "",
+    role_hints: list[str] | tuple[str, ...] | None = None,
+) -> bool:
+    provider_low = str(provider or "").strip().lower()
+    url_low = str(image_url or "").strip().lower()
+    try:
+        if url_low and (
+            _is_probably_placeholder_artist_image_url(url_low)
+            or _is_suspicious_external_artist_image_url(url_low)
+        ):
+            return True
+    except Exception:
+        return True
+    if not _artist_entity_is_classical_like(entity_kind=entity_kind, role_hints=role_hints):
+        return False
+    if provider_low in _ARTIST_WEAK_CLASSICAL_IMAGE_PROVIDERS:
+        return True
+    if provider_low == "wikipedia" and url_low and "wikimedia.org" not in url_low and "wikipedia.org" not in url_low:
+        return True
+    return False
+
+
+def _paths_refer_to_same_file(left: str | Path | None, right: str | Path | None) -> bool:
+    left_raw = str(left or "").strip()
+    right_raw = str(right or "").strip()
+    if not left_raw or not right_raw:
+        return False
+    try:
+        left_path = path_for_fs_access(Path(left_raw))
+    except Exception:
+        left_path = Path(left_raw)
+    try:
+        right_path = path_for_fs_access(Path(right_raw))
+    except Exception:
+        right_path = Path(right_raw)
+    try:
+        return left_path.resolve() == right_path.resolve()
+    except Exception:
+        return str(left_path) == str(right_path)
+
+
+def _artist_external_image_requires_authoritative_refresh_sql(
+    artist_alias: str = "a",
+    ext_alias: str = "ext",
+) -> str:
+    kind_expr = f"LOWER(COALESCE({artist_alias}.entity_kind, 'artist'))"
+    roles_expr = f"LOWER(COALESCE({artist_alias}.roles_json::text, '[]'))"
+    provider_expr = f"LOWER(COALESCE({ext_alias}.provider, ''))"
+    url_expr = f"LOWER(COALESCE({ext_alias}.image_url, ''))"
+    classical_expr = (
+        f"({kind_expr} IN ('composer','conductor','orchestra','ensemble','choir','chorus')"
+        f" OR {roles_expr} LIKE '%composer%'"
+        f" OR {roles_expr} LIKE '%conductor%'"
+        f" OR {roles_expr} LIKE '%orchestra%'"
+        f" OR {roles_expr} LIKE '%ensemble%'"
+        f" OR {roles_expr} LIKE '%choir%'"
+        f" OR {roles_expr} LIKE '%chorus%')"
+    )
+    placeholder_expr = (
+        f"({url_expr} LIKE '%2a96cbd8b46e442fc41c2b86b821562f%'"
+        f" OR {url_expr} LIKE '%4128a6eb29f94943c9d206c08e625904%'"
+        f" OR {url_expr} LIKE '%c6f59c1e5e7240a4c0d427abd71f3dbb%'"
+        f" OR {url_expr} LIKE '%placeholder-artist%'"
+        f" OR {url_expr} LIKE '%/placeholders/%'"
+        f" OR {url_expr} LIKE '%default_avatar%'"
+        f" OR {url_expr} LIKE '%default-avatar%'"
+        f" OR {url_expr} LIKE '%noimage%'"
+        f" OR {url_expr} LIKE '%no-image%'"
+        f" OR {url_expr} LIKE '%blank.jpg%'"
+        f" OR {url_expr} LIKE '%spacer.gif%'"
+        f" OR {url_expr} LIKE '%transparent.png%'"
+        f" OR ({url_expr} LIKE '%default%' AND ({url_expr} LIKE '%last.fm%' OR {url_expr} LIKE '%lastfm%'))"
+        f" OR ({url_expr} LIKE '%static-images.merchbar.com%' AND {url_expr} LIKE '%/placeholders/%')"
+        f" OR {url_expr} LIKE '%s0.wp.com/i/blank.jpg%')"
+    )
+    suspicious_expr = (
+        f"({url_expr} LIKE '%soundtrack%'"
+        f" OR {url_expr} LIKE '%coverartarchive%'"
+        f" OR {url_expr} LIKE '%album-cover%'"
+        f" OR {url_expr} LIKE '%albumcover%'"
+        f" OR {url_expr} LIKE '%album_art%'"
+        f" OR {url_expr} LIKE '%cover-art%'"
+        f" OR {url_expr} LIKE '%record-cover%'"
+        f" OR {url_expr} LIKE '%recording-cover%'"
+        f" OR {url_expr} LIKE '%facebook_share%'"
+        f" OR {url_expr} LIKE '%allmusic_facebook_share%'"
+        f" OR {url_expr} LIKE '%sharecard%'"
+        f" OR {url_expr} LIKE '%share-card%'"
+        f" OR {url_expr} LIKE '%%%28album%%29%'"
+        f" OR {url_expr} LIKE '%%%28ep%%29%'"
+        f" OR {url_expr} LIKE '%/album/%'"
+        f" OR {url_expr} LIKE '%/release/%'"
+        f" OR {url_expr} LIKE '%/cover/%'"
+        f" OR {url_expr} LIKE '%/covers/%'"
+        f" OR {url_expr} LIKE '%.svg%'"
+        f" OR ({url_expr} LIKE '%i.scdn.co/image/%' AND {url_expr} LIKE '%ab67616d%'))"
+    )
+    weak_classical_expr = (
+        f"({classical_expr} AND ("
+        f"{provider_expr} IN ('web','discogs','lastfm','musicbrainz_url')"
+        f" OR ({provider_expr} = 'wikipedia' AND {url_expr} <> '' AND {url_expr} NOT LIKE '%wikimedia.org%' AND {url_expr} NOT LIKE '%wikipedia.org%')"
+        f" OR {suspicious_expr}"
+        f"))"
+    )
+    return f"({placeholder_expr} OR {weak_classical_expr})"
 
 
 def _artist_has_true_image_sql(artist_alias: str = "a", ext_alias: str = "ext") -> str:
@@ -68348,7 +68668,18 @@ def _artist_has_true_image_sql(artist_alias: str = "a", ext_alias: str = "ext") 
     Return SQL that is true only when we have a dedicated artist image.
     Album covers must never count as artist portraits.
     """
-    return f"({artist_alias}.has_image OR COALESCE({ext_alias}.image_path, '') <> '')"
+    weak_ext_expr = _artist_external_image_requires_authoritative_refresh_sql(artist_alias, ext_alias)
+    mirrored_ext_expr = (
+        f"(COALESCE({ext_alias}.image_path, '') <> ''"
+        f" AND COALESCE({artist_alias}.image_path, '') = COALESCE({ext_alias}.image_path, ''))"
+    )
+    return (
+        f"("
+        f"(({artist_alias}.has_image AND COALESCE({artist_alias}.image_path, '') <> '')"
+        f" AND NOT ({mirrored_ext_expr} AND {weak_ext_expr}))"
+        f" OR (COALESCE({ext_alias}.image_path, '') <> '' AND NOT {weak_ext_expr})"
+        f")"
+    )
 
 
 def _is_usable_artist_image_bytes(raw: bytes, *, min_dim: int = 220, min_bytes: int = 8192) -> bool:
@@ -68886,9 +69217,28 @@ def _artist_image_url_looks_relevant(
     roles = {str(role or "").strip().lower() for role in (role_hints or []) if str(role or "").strip()}
     person_like = _artist_is_person_like(entity_kind=entity_kind, role_hints=role_hints) or kind in {"composer", "conductor"}
     ensemble_like = kind in {"orchestra", "ensemble", "choir", "chorus"} or roles.intersection({"orchestra", "ensemble", "choir", "chorus"})
+    albumish_tokens = {"album", "cover", "soundtrack", "single", "release", "recording"}
+    if basename_tokens.intersection(albumish_tokens):
+        return False
+    if host == "cf.allmusic.com" and "facebook_share" in target_url.lower():
+        return False
+    if host == "i.scdn.co":
+        low_url = target_url.lower()
+        if "ab67616d" in low_url:
+            return False
+        if person_like and "ab676161" in low_url:
+            return True
     if not wiki_like:
+        if ensemble_like and building_like:
+            return False
         if building_like and not overlap and not context_relevant:
             return False
+        if host and not any(
+            host == domain or host.endswith(f".{domain}")
+            for domain in ("fanart.tv", "theaudiodb.com", "last.fm", "discogs.com", "wikimedia.org", "wikipedia.org")
+        ):
+            if not overlap and not context_relevant:
+                return False
         return True
     if person_like:
         surname = str((_classical_person_alias_signature(artist_name) or {}).get("surname") or "").strip()
@@ -68900,6 +69250,8 @@ def _artist_image_url_looks_relevant(
             return False
         return context_relevant
     if ensemble_like:
+        if building_like:
+            return False
         if len(overlap) >= 2:
             return True
         role_tokens = {"orchestra", "orchester", "philharmonic", "philharmonie", "filharmonie", "ensemble", "choir", "chorus", "symphony"}
@@ -68996,6 +69348,8 @@ def _fetch_artist_image_web(
                 role_hints=role_hints,
             ):
                 continue
+            title = str(item.get("title") or "").strip()
+            snippet = str(item.get("snippet") or "").strip()
             link = item.get("link") or ""
             if not link:
                 continue
@@ -69010,6 +69364,7 @@ def _fetch_artist_image_web(
                     "theaudiodb.com",
                 )
                 if host and not any(host == domain or host.endswith(f".{domain}") for domain in trusted_domains):
+                    merged = f"{title} {snippet} {link}".lower()
                     if not any(tok in merged for tok in ("official", "biography", "biographie", "portrait", "conductor", "composer", "orchestra", "philharmonic", "ensemble", "choir", "chorus", "maestro")):
                         continue
             try:
