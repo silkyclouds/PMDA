@@ -51,7 +51,7 @@ from collections import defaultdict, OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout, as_completed, wait
 from pathlib import Path
 from typing import NamedTuple, List, Dict, Optional, Tuple, Any
-from urllib.parse import quote, quote_plus, urlparse
+from urllib.parse import quote, quote_plus, unquote, urlparse
 
 import logging
 import re
@@ -18099,7 +18099,14 @@ def _run_files_profile_enrichment_job(
                         )
                     for mb_url in [str(url or "").strip() for url in (mb_identity.get("urls") or []) if str(url or "").strip()][:8]:
                         resolved_mb_url = _resolve_remote_image_or_og_url(mb_url, timeout=8)
-                        if resolved_mb_url:
+                        if resolved_mb_url and _artist_image_url_looks_relevant(
+                            resolved_mb_url,
+                            artist_name=artist_name,
+                            entity_kind=entity_kind,
+                            role_hints=role_hints,
+                            page_title=str(mb_identity.get("name") or artist_name),
+                            page_summary="\n".join(str(alias or "").strip() for alias in (mb_identity.get("aliases") or []) if str(alias or "").strip()),
+                        ):
                             candidates.append(("musicbrainz_url", resolved_mb_url))
                     if not wiki_img_url:
                         for lookup_name in artist_lookup_candidates:
@@ -28520,6 +28527,37 @@ def _files_browse_entity_kind_from_roles(roles: set[str]) -> str:
     return "mixed"
 
 
+def _classical_person_generated_aliases(name: str) -> list[str]:
+    clean = " ".join(str(name or "").split()).strip(" -–—")
+    if not clean:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def _push(value: str) -> None:
+        txt = " ".join(str(value or "").split()).strip(" -–—")
+        norm = _classical_norm_text(txt)
+        if not txt or not norm or norm in seen:
+            return
+        seen.add(norm)
+        out.append(txt)
+
+    if "," in clean:
+        _push(_classical_sort_name_to_display(clean))
+    sig = _classical_person_alias_signature(clean)
+    surname = str(sig.get("surname") or "").strip()
+    ordered_initials = [str(ch or "").strip().upper()[:1] for ch in (sig.get("ordered_initials") or []) if str(ch or "").strip()]
+    if surname and ordered_initials:
+        joined = " ".join(ordered_initials)
+        compact = "".join(ordered_initials)
+        dotted = ". ".join(ordered_initials) + "."
+        _push(f"{joined} {surname}".strip())
+        _push(f"{compact} {surname}".strip())
+        _push(f"{dotted} {surname}".strip())
+        _push(f"{'.'.join(ordered_initials)}. {surname}".strip())
+    return out
+
+
 def _classical_person_alias_signature(name: str) -> dict[str, Any]:
     norm = _classical_norm_text(name)
     if not norm:
@@ -28835,20 +28873,11 @@ def _files_artist_alias_rows_for_identity(
             if clean:
                 alias_values.append((clean, "alias_json"))
     if person_like:
-        sig = _classical_person_alias_signature(name)
-        surname = str(sig.get("surname") or "").strip()
-        ordered_initials = [str(ch or "").strip().upper()[:1] for ch in (sig.get("ordered_initials") or []) if str(ch or "").strip()]
-        if surname and ordered_initials:
-            joined = " ".join(ordered_initials)
-            compact = "".join(ordered_initials)
-            dotted = ". ".join(ordered_initials) + "."
-            alias_values.extend(
-                [
-                    (f"{joined} {surname}".strip(), "generated_initials"),
-                    (f"{compact} {surname}".strip(), "generated_initials"),
-                    (f"{dotted} {surname}".strip(), "generated_initials"),
-                ]
-            )
+        generated_rows: list[tuple[str, str]] = []
+        for alias, source in list(alias_values):
+            for generated in _classical_person_generated_aliases(alias):
+                generated_rows.append((generated, f"{source}:generated"))
+        alias_values.extend(generated_rows)
     rows: list[dict[str, Any]] = []
     seen_norms: set[str] = set()
     for alias, source in alias_values:
@@ -49476,6 +49505,15 @@ def _fetch_wikipedia_artist_bio(
                 if not _is_relevant_artist_profile_text(name, f"{title}\n{extract}"):
                     continue
                 img_url = _fetch_wikipedia_pageimage(title, lang=l, thumb_px=720) or ""
+                if img_url and not _artist_image_url_looks_relevant(
+                    img_url,
+                    artist_name=name,
+                    entity_kind=entity_kind,
+                    role_hints=role_hints,
+                    page_title=title,
+                    page_summary=f"{desc}\n{extract}",
+                ):
+                    img_url = ""
                 short = _truncate_text(extract, max_chars=460)
                 return {
                     "bio": extract,
@@ -49483,6 +49521,8 @@ def _fetch_wikipedia_artist_bio(
                     "source": f"wikipedia:{l}",
                     "url": page_url,
                     "lang": l,
+                    "page_title": title,
+                    "page_description": desc,
                     "image_url": img_url,
                 }
     except Exception:
@@ -68729,6 +68769,150 @@ def _artist_image_lookup_candidates(
     return out
 
 
+_ARTIST_IMAGE_GENERIC_ENSEMBLE_TOKENS = {
+    "band",
+    "choir",
+    "chorus",
+    "ensemble",
+    "group",
+    "music",
+    "musical",
+    "national",
+    "orchestra",
+    "orchester",
+    "orkester",
+    "philharmonic",
+    "philharmonie",
+    "radio",
+    "symphonic",
+    "symphonie",
+    "symphony",
+}
+_ARTIST_IMAGE_BUILDING_TOKENS = {
+    "auditorium",
+    "avenue",
+    "building",
+    "center",
+    "centre",
+    "city",
+    "downtown",
+    "estate",
+    "hall",
+    "house",
+    "hudson",
+    "manhattan",
+    "museum",
+    "opera",
+    "palace",
+    "paris",
+    "plaza",
+    "prague",
+    "real",
+    "realestate",
+    "rudolfinum",
+    "skyline",
+    "skyscraper",
+    "state",
+    "street",
+    "theater",
+    "theatre",
+    "tower",
+    "venue",
+}
+
+
+def _artist_identity_distinctive_tokens(
+    artist_name: str,
+    *,
+    entity_kind: str = "",
+    role_hints: list[str] | tuple[str, ...] | None = None,
+) -> set[str]:
+    norm = _norm_artist_key(artist_name)
+    tokens = {tok for tok in re.findall(r"[a-z0-9]+", norm) if tok}
+    if not tokens:
+        return set()
+    if _artist_is_person_like(entity_kind=entity_kind, role_hints=role_hints):
+        sig = _classical_person_alias_signature(artist_name)
+        surname = str(sig.get("surname") or "").strip()
+        long_givens = {str(tok or "").strip() for tok in (sig.get("long_givens") or set()) if str(tok or "").strip()}
+        out = {surname} if surname else set()
+        out.update({tok for tok in long_givens if len(tok) >= 4})
+        return {tok for tok in out if tok}
+    kind = str(entity_kind or "").strip().lower()
+    roles = {str(role or "").strip().lower() for role in (role_hints or []) if str(role or "").strip()}
+    if kind in {"orchestra", "ensemble", "choir", "chorus"} or roles.intersection({"orchestra", "ensemble", "choir", "chorus"}):
+        return {tok for tok in tokens if len(tok) >= 4 and tok not in _ARTIST_IMAGE_GENERIC_ENSEMBLE_TOKENS}
+    return {tok for tok in tokens if len(tok) >= 4}
+
+
+def _artist_image_url_looks_relevant(
+    url: str,
+    *,
+    artist_name: str,
+    entity_kind: str = "",
+    role_hints: list[str] | tuple[str, ...] | None = None,
+    page_title: str = "",
+    page_summary: str = "",
+) -> bool:
+    target_url = str(url or "").strip()
+    if not target_url:
+        return False
+    try:
+        if _is_probably_placeholder_artist_image_url(target_url) or _is_suspicious_external_artist_image_url(target_url):
+            return False
+    except Exception:
+        return False
+    parsed = urlparse(target_url)
+    host = (parsed.netloc or "").strip().lower()
+    wiki_like = any(host == domain or host.endswith(f".{domain}") for domain in ("wikipedia.org", "wikimedia.org"))
+    decoded_path = unquote(parsed.path or "")
+    basename = Path(decoded_path).stem
+    basename_norm = _norm_artist_key(re.sub(r"[_-]+", " ", basename))
+    basename_tokens = {tok for tok in re.findall(r"[a-z0-9]+", basename_norm) if tok}
+    distinctive_tokens = _artist_identity_distinctive_tokens(
+        artist_name,
+        entity_kind=entity_kind,
+        role_hints=role_hints,
+    )
+    overlap = distinctive_tokens.intersection(basename_tokens)
+    context_blob = "\n".join(
+        part.strip()
+        for part in (page_title, page_summary)
+        if str(part or "").strip()
+    )
+    context_relevant = _text_mentions_identity_phrase(str(artist_name or "").strip(), context_blob)
+    building_like = bool(basename_tokens.intersection(_ARTIST_IMAGE_BUILDING_TOKENS))
+    kind = str(entity_kind or "").strip().lower()
+    roles = {str(role or "").strip().lower() for role in (role_hints or []) if str(role or "").strip()}
+    person_like = _artist_is_person_like(entity_kind=entity_kind, role_hints=role_hints) or kind in {"composer", "conductor"}
+    ensemble_like = kind in {"orchestra", "ensemble", "choir", "chorus"} or roles.intersection({"orchestra", "ensemble", "choir", "chorus"})
+    if not wiki_like:
+        if building_like and not overlap and not context_relevant:
+            return False
+        return True
+    if person_like:
+        surname = str((_classical_person_alias_signature(artist_name) or {}).get("surname") or "").strip()
+        if surname and surname in basename_tokens:
+            return True
+        if overlap:
+            return True
+        if building_like:
+            return False
+        return context_relevant
+    if ensemble_like:
+        if len(overlap) >= 2:
+            return True
+        role_tokens = {"orchestra", "orchester", "philharmonic", "philharmonie", "filharmonie", "ensemble", "choir", "chorus", "symphony"}
+        if len(overlap) >= 1 and context_relevant and basename_tokens.intersection(role_tokens):
+            return True
+        return False
+    if overlap:
+        return True
+    if building_like and not context_relevant:
+        return False
+    return context_relevant
+
+
 def _artist_image_result_looks_relevant(
     artist_name: str,
     result: dict[str, Any] | None,
@@ -68838,7 +69022,16 @@ def _fetch_artist_image_web(
             ct = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
             # Direct image URL
             if ct.startswith("image/"):
-                return link
+                if _artist_image_url_looks_relevant(
+                    link,
+                    artist_name=artist_name,
+                    entity_kind=entity_kind,
+                    role_hints=role_hints,
+                    page_title=title,
+                    page_summary=snippet,
+                ):
+                    return link
+                continue
             # HTML page – try og:image
             if "text/html" in ct and resp.text:
                 try:
@@ -68856,7 +69049,14 @@ def _fetch_artist_image_web(
                     if not m:
                         continue
                     img_url = m.group(1).strip()
-                    if img_url:
+                    if img_url and _artist_image_url_looks_relevant(
+                        img_url,
+                        artist_name=artist_name,
+                        entity_kind=entity_kind,
+                        role_hints=role_hints,
+                        page_title=title,
+                        page_summary=snippet,
+                    ):
                         return img_url
                 except Exception as e:
                     logging.debug("[ArtistWebImage] Failed to extract og:image from %s: %s", link, e)
