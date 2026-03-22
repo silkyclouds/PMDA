@@ -17276,6 +17276,12 @@ def _files_cache_external_artist_image(
     try:
         if _is_probably_placeholder_artist_image_url(img_url):
             return None
+        if not _artist_image_provider_allowed_for_entity(
+            provider,
+            entity_kind=entity_kind,
+            role_hints=role_hints,
+        ):
+            return None
         if not _artist_image_url_looks_relevant(
             img_url,
             artist_name=name,
@@ -18052,6 +18058,10 @@ def _run_files_profile_enrichment_job(
                             needs_image = False
 
                 if needs_image:
+                    classical_like_entity = _artist_entity_is_classical_like(
+                        entity_kind=entity_kind,
+                        role_hints=role_hints,
+                    )
                     # Lazy fetch sources only if we actually need an image.
                     if lastfm_info is None or wiki_info is None:
                         _seed_profile, seed_lastfm, seed_wiki, _seed_entities = _build_artist_profile_payload(
@@ -18092,7 +18102,7 @@ def _run_files_profile_enrichment_job(
                         lf_mbid = ""
                     if not lf_mbid:
                         lf_mbid = str((mb_identity.get("mbid") if isinstance(mb_identity, dict) else "") or "").strip()
-                    if lf_mbid:
+                    if lf_mbid and not classical_like_entity:
                         try:
                             for mb_url in get_artist_images_mb(lf_mbid)[:4]:
                                 resolved_mb_url = _resolve_remote_image_or_og_url(mb_url, timeout=8)
@@ -18110,7 +18120,7 @@ def _run_files_profile_enrichment_job(
                         img_url = (lastfm_info.get("image_url") or "").strip() if isinstance(lastfm_info, dict) else ""
                     except Exception:
                         img_url = ""
-                    if img_url:
+                    if img_url and not classical_like_entity:
                         candidates.append(("lastfm", img_url))
                     try:
                         wiki_img_url = (wiki_info.get("image_url") or "").strip() if isinstance(wiki_info, dict) else ""
@@ -18190,10 +18200,10 @@ def _run_files_profile_enrichment_job(
                         return ""
 
                     au = _first_non_empty_artist_image(_fetch_artist_image_audiodb)
-                    if au:
+                    if au and not classical_like_entity:
                         candidates.append(("audiodb", au))
                     du = _first_non_empty_artist_image(_fetch_artist_image_discogs)
-                    if du:
+                    if du and not classical_like_entity:
                         candidates.append(("discogs", du))
                     wu = _first_non_empty_artist_image(
                         lambda n: _fetch_artist_image_web(
@@ -18206,7 +18216,26 @@ def _run_files_profile_enrichment_job(
                     if wu:
                         candidates.append(("web", wu))
 
-                    for prov, url in candidates:
+                    filtered_candidates: list[tuple[str, str]] = []
+                    seen_candidate_urls: set[str] = set()
+                    preferred_order = ["wikipedia", "musicbrainz_url", "web", "musicbrainz", "fanart", "lastfm", "audiodb", "discogs"]
+                    for preferred_provider in preferred_order:
+                        for prov, url in candidates:
+                            if prov != preferred_provider:
+                                continue
+                            clean_url = str(url or "").strip()
+                            if not clean_url or clean_url in seen_candidate_urls:
+                                continue
+                            if not _artist_image_provider_allowed_for_entity(
+                                prov,
+                                entity_kind=entity_kind,
+                                role_hints=role_hints,
+                            ):
+                                continue
+                            seen_candidate_urls.add(clean_url)
+                            filtered_candidates.append((prov, clean_url))
+
+                    for prov, url in filtered_candidates:
                         try:
                             with conn.transaction():
                                 outp = _files_cache_external_artist_image(
@@ -18914,6 +18943,25 @@ def _run_files_similar_images_warm_job(*, job_key: str, artist_norm: str, names:
                 key = _norm_artist_key(sname)
                 if not key:
                     continue
+                entity_kind = ""
+                role_hints: list[str] = []
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "SELECT COALESCE(entity_kind, ''), COALESCE(roles_json, '[]') FROM files_artists WHERE name_norm = %s",
+                            (key,),
+                        )
+                        erow = cur.fetchone()
+                    if erow:
+                        entity_kind = str(erow[0] or "").strip()
+                        role_hints = _artist_role_hints_from_roles_json(erow[1] or "[]")
+                except Exception:
+                    entity_kind = ""
+                    role_hints = []
+                classical_like_entity = _artist_entity_is_classical_like(
+                    entity_kind=entity_kind,
+                    role_hints=role_hints,
+                )
 
                 # Skip if local library already has a real on-disk artist image.
                 try:
@@ -18950,20 +18998,36 @@ def _run_files_similar_images_warm_job(*, job_key: str, artist_norm: str, names:
                         f_url = (_fetch_artist_image_fanart(lf_mbid) or "").strip()
                     except Exception:
                         f_url = ""
-                    if f_url:
-                        try:
-                            with conn.transaction():
-                                outp = _files_cache_external_artist_image(conn, artist_name=sname, provider="fanart", image_url=f_url, max_px=640)
-                            if outp:
-                                continue
-                        except Exception:
-                            pass
+                        if f_url and not classical_like_entity:
+                            try:
+                                with conn.transaction():
+                                    outp = _files_cache_external_artist_image(
+                                        conn,
+                                        artist_name=sname,
+                                        provider="fanart",
+                                        image_url=f_url,
+                                        max_px=640,
+                                        entity_kind=entity_kind,
+                                        role_hints=role_hints,
+                                    )
+                                if outp:
+                                    continue
+                            except Exception:
+                                pass
 
                 # 1b) Last.fm image (fallback).
-                if img_url and not _is_probably_placeholder_artist_image_url(img_url):
+                if img_url and not _is_probably_placeholder_artist_image_url(img_url) and not classical_like_entity:
                     try:
                         with conn.transaction():
-                            outp = _files_cache_external_artist_image(conn, artist_name=sname, provider="lastfm", image_url=img_url, max_px=640)
+                            outp = _files_cache_external_artist_image(
+                                conn,
+                                artist_name=sname,
+                                provider="lastfm",
+                                image_url=img_url,
+                                max_px=640,
+                                entity_kind=entity_kind,
+                                role_hints=role_hints,
+                            )
                         if outp:
                             continue
                     except Exception:
@@ -18976,6 +19040,8 @@ def _run_files_similar_images_warm_job(*, job_key: str, artist_norm: str, names:
                         (sname, "en"),
                         (f"{sname} musician", "en"),
                         (f"{sname} band", "en"),
+                        (f"{sname} orchestra", "en"),
+                        (f"{sname} conductor", "en"),
                         (sname, "fr"),
                     ):
                         w = _fetch_wikipedia_artist_bio(query, lang=lang) or {}
@@ -18990,7 +19056,15 @@ def _run_files_similar_images_warm_job(*, job_key: str, artist_norm: str, names:
                 if wiki_img:
                     try:
                         with conn.transaction():
-                            outp = _files_cache_external_artist_image(conn, artist_name=sname, provider="wikipedia", image_url=wiki_img, max_px=640)
+                            outp = _files_cache_external_artist_image(
+                                conn,
+                                artist_name=sname,
+                                provider="wikipedia",
+                                image_url=wiki_img,
+                                max_px=640,
+                                entity_kind=entity_kind,
+                                role_hints=role_hints,
+                            )
                         if outp:
                             continue
                     except Exception:
@@ -19001,10 +19075,18 @@ def _run_files_similar_images_warm_job(*, job_key: str, artist_norm: str, names:
                     aurl = (_fetch_artist_image_audiodb(sname) or "").strip()
                 except Exception:
                     aurl = ""
-                if aurl:
+                if aurl and not classical_like_entity:
                     try:
                         with conn.transaction():
-                            outp = _files_cache_external_artist_image(conn, artist_name=sname, provider="audiodb", image_url=aurl, max_px=640)
+                            outp = _files_cache_external_artist_image(
+                                conn,
+                                artist_name=sname,
+                                provider="audiodb",
+                                image_url=aurl,
+                                max_px=640,
+                                entity_kind=entity_kind,
+                                role_hints=role_hints,
+                            )
                         if outp:
                             continue
                     except Exception:
@@ -19015,10 +19097,18 @@ def _run_files_similar_images_warm_job(*, job_key: str, artist_norm: str, names:
                     durl = (_fetch_artist_image_discogs(sname) or "").strip()
                 except Exception:
                     durl = ""
-                if durl:
+                if durl and not classical_like_entity:
                     try:
                         with conn.transaction():
-                            outp = _files_cache_external_artist_image(conn, artist_name=sname, provider="discogs", image_url=durl, max_px=640)
+                            outp = _files_cache_external_artist_image(
+                                conn,
+                                artist_name=sname,
+                                provider="discogs",
+                                image_url=durl,
+                                max_px=640,
+                                entity_kind=entity_kind,
+                                role_hints=role_hints,
+                            )
                         if outp:
                             continue
                     except Exception:
@@ -19032,7 +19122,15 @@ def _run_files_similar_images_warm_job(*, job_key: str, artist_norm: str, names:
                 if wurl:
                     try:
                         with conn.transaction():
-                            outp = _files_cache_external_artist_image(conn, artist_name=sname, provider="web", image_url=wurl, max_px=640)
+                            outp = _files_cache_external_artist_image(
+                                conn,
+                                artist_name=sname,
+                                provider="web",
+                                image_url=wurl,
+                                max_px=640,
+                                entity_kind=entity_kind,
+                                role_hints=role_hints,
+                            )
                         if outp:
                             continue
                     except Exception:
@@ -68643,7 +68741,7 @@ def _is_suspicious_external_artist_image_url(url: str) -> bool:
 
 _ARTIST_CLASSICAL_ENTITY_KINDS = {"composer", "conductor", "orchestra", "ensemble", "choir", "chorus"}
 _ARTIST_CLASSICAL_ROLE_HINTS = {"composer", "conductor", "orchestra", "ensemble", "choir", "chorus"}
-_ARTIST_WEAK_CLASSICAL_IMAGE_PROVIDERS = {"web", "discogs", "lastfm", "musicbrainz_url"}
+_ARTIST_WEAK_CLASSICAL_IMAGE_PROVIDERS = {"web", "discogs", "lastfm", "musicbrainz_url", "fanart", "audiodb", "musicbrainz"}
 
 
 def _artist_entity_is_classical_like(
@@ -68688,6 +68786,20 @@ def _artist_external_image_requires_authoritative_refresh(
     if provider_low == "wikipedia" and url_low and "wikimedia.org" not in url_low and "wikipedia.org" not in url_low:
         return True
     return False
+
+
+def _artist_image_provider_allowed_for_entity(
+    provider: str,
+    *,
+    entity_kind: str = "",
+    role_hints: list[str] | tuple[str, ...] | None = None,
+) -> bool:
+    provider_low = str(provider or "").strip().lower()
+    if not provider_low:
+        return False
+    if not _artist_entity_is_classical_like(entity_kind=entity_kind, role_hints=role_hints):
+        return True
+    return provider_low not in _ARTIST_WEAK_CLASSICAL_IMAGE_PROVIDERS
 
 
 def _paths_refer_to_same_file(left: str | Path | None, right: str | Path | None) -> bool:
@@ -69155,13 +69267,13 @@ def _artist_image_search_queries(
     }
     qualifiers: list[str] = []
     if kind in {"composer"} or "composer" in role_norms:
-        qualifiers = ["composer portrait", "composer photo", "musician portrait", "wikipedia"]
+        qualifiers = ["composer portrait", "composer photo", "composer official portrait", "musician portrait", "wikipedia"]
     elif kind in {"conductor"} or "conductor" in role_norms:
-        qualifiers = ["conductor portrait", "conductor photo", "musician portrait", "wikipedia"]
+        qualifiers = ["conductor portrait", "conductor photo", "conductor official portrait", "official biography photo", "wikipedia"]
     elif kind in {"orchestra"} or "orchestra" in role_norms:
-        qualifiers = ["orchestra official photo", "orchestra photo", "symphony orchestra photo", "wikipedia"]
+        qualifiers = ["orchestra official photo", "official orchestra photo", "official website photo", "symphony orchestra photo", "wikipedia"]
     elif kind in {"ensemble", "choir", "chorus"} or role_norms.intersection({"ensemble", "choir", "chorus"}):
-        qualifiers = ["ensemble official photo", "ensemble photo", "group photo", "wikipedia"]
+        qualifiers = ["ensemble official photo", "official ensemble photo", "official website photo", "group photo", "wikipedia"]
     elif kind in {"band"} or "band" in role_norms:
         qualifiers = ["band photo", "band promo photo", "group photo"]
     else:
