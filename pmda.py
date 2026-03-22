@@ -48831,13 +48831,15 @@ def _fetch_wikipedia_pageimage(title: str, lang: str = "en", thumb_px: int = 640
     api_url = f"https://{l}.wikipedia.org/w/api.php"
     headers = {"User-Agent": "PMDA/0.7.5 (self-hosted music library; https://github.com/silkyclouds/PMDA)"}
     try:
+        page_url = ""
         resp = requests.get(
             api_url,
             params={
                 "action": "query",
-                "prop": "pageimages",
-                "piprop": "thumbnail",
+                "prop": "pageimages|info",
+                "piprop": "thumbnail|original",
                 "pithumbsize": thumb_px,
+                "inprop": "url",
                 "titles": t,
                 "redirects": 1,
                 "format": "json",
@@ -48853,11 +48855,38 @@ def _fetch_wikipedia_pageimage(title: str, lang: str = "en", thumb_px: int = 640
         for _pid, page in (pages or {}).items():
             if not isinstance(page, dict):
                 continue
+            page_url = str(page.get("fullurl") or "").strip() or page_url
+            original = page.get("original") or {}
+            if isinstance(original, dict):
+                src = (original.get("source") or "").strip()
+                if src:
+                    return src
             thumb = page.get("thumbnail") or {}
             if isinstance(thumb, dict):
                 src = (thumb.get("source") or "").strip()
                 if src:
                     return src
+        if page_url:
+            try:
+                html_resp = requests.get(page_url, headers=headers, timeout=10, allow_redirects=True)
+                if html_resp.status_code == 200 and "text/html" in (html_resp.headers.get("content-type") or "").lower():
+                    match = re.search(
+                        r'<meta\s+property=["\']og:image["\']\s+content=["\']([^"\']+)["\']',
+                        html_resp.text,
+                        re.IGNORECASE,
+                    )
+                    if not match:
+                        match = re.search(
+                            r'<meta\s+content=["\']([^"\']+)["\']\s+property=["\']og:image["\']',
+                            html_resp.text,
+                            re.IGNORECASE,
+                        )
+                    if match:
+                        src = match.group(1).strip()
+                        if src:
+                            return src
+            except Exception:
+                pass
         return ""
     except Exception:
         return ""
