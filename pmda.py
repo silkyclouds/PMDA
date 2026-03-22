@@ -8764,6 +8764,7 @@ _scheduler_stop_event = threading.Event()
 _scheduler_paused = False
 _scheduler_running_keys: set[str] = set()
 _scheduler_running_meta: dict[str, dict[str, Any]] = {}
+_scheduler_bootstrap_skip_notice_until: dict[int, float] = {}
 _task_events_cache_lock = threading.Lock()
 _task_events_cache: dict[str, Any] = {"events": [], "max_id": 0, "ts": 0.0}
 _scan_discovery_runtime_lock = threading.Lock()
@@ -11098,17 +11099,19 @@ def _scheduler_loop() -> None:
                     continue
                 if job_type == "scan_changed" and bool(_pipeline_bootstrap_status().get("bootstrap_required")):
                     next_normal = _scheduler_compute_next_run(rule, now_ts=now)
-                    skipped_run = _scheduler_record_skipped_job(
-                        rule_id=int(rule["rule_id"]),
-                        job_type=job_type,
-                        scope=scope,
-                        source="schedule",
-                        reason="Initial full scan required before changed-only schedule.",
-                    )
                     _scheduler_rule_update_runtime(
                         int(rule["rule_id"]),
                         next_run_ts=next_normal,
                     )
+                    rule_id = int(rule["rule_id"] or 0)
+                    notice_until = float(_scheduler_bootstrap_skip_notice_until.get(rule_id, 0.0) or 0.0)
+                    if now >= notice_until:
+                        logging.debug(
+                            "Scheduler deferred %s/%s: initial full scan still required before changed-only schedule.",
+                            job_type,
+                            scope,
+                        )
+                        _scheduler_bootstrap_skip_notice_until[rule_id] = now + 1800.0
                     continue
                 next_run_raw = rule["next_run_ts"]
                 next_run_ts = float(next_run_raw) if next_run_raw is not None else 0.0
@@ -11129,28 +11132,39 @@ def _scheduler_loop() -> None:
                     reason_norm = str(reason or "").strip().lower()
                     skip_to_next = bool(
                         job_type in {"scan_changed", "scan_full"}
-                        and reason_norm in {"same job/scope already running", "scan already running"}
+                        and reason_norm in {"same job/scope already running", "scan already running", "bootstrap_required"}
                     )
                     if skip_to_next:
-                        skipped_run = _scheduler_record_skipped_job(
-                            rule_id=int(rule["rule_id"]),
-                            job_type=job_type,
-                            scope=scope,
-                            source="schedule",
-                            reason=str(reason or "Skipped"),
-                        )
                         next_normal = _scheduler_compute_next_run(rule, now_ts=now)
                         _scheduler_rule_update_runtime(
                             int(rule["rule_id"]),
                             next_run_ts=next_normal,
                         )
-                        logging.info(
-                            "Scheduler skipped %s/%s run=%s (%s); next run scheduled normally.",
-                            job_type,
-                            scope,
-                            skipped_run,
-                            reason,
-                        )
+                        if reason_norm == "bootstrap_required":
+                            rule_id = int(rule["rule_id"] or 0)
+                            notice_until = float(_scheduler_bootstrap_skip_notice_until.get(rule_id, 0.0) or 0.0)
+                            if now >= notice_until:
+                                logging.debug(
+                                    "Scheduler deferred %s/%s: bootstrap_required.",
+                                    job_type,
+                                    scope,
+                                )
+                                _scheduler_bootstrap_skip_notice_until[rule_id] = now + 1800.0
+                        else:
+                            skipped_run = _scheduler_record_skipped_job(
+                                rule_id=int(rule["rule_id"]),
+                                job_type=job_type,
+                                scope=scope,
+                                source="schedule",
+                                reason=str(reason or "Skipped"),
+                            )
+                            logging.info(
+                                "Scheduler skipped %s/%s run=%s (%s); next run scheduled normally.",
+                                job_type,
+                                scope,
+                                skipped_run,
+                                reason,
+                            )
                     else:
                         _scheduler_rule_update_runtime(
                             int(rule["rule_id"]),
@@ -18123,7 +18137,15 @@ def _run_files_profile_enrichment_job(
                             limit=12,
                         )
                     for mb_url in [str(url or "").strip() for url in (mb_identity.get("urls") or []) if str(url or "").strip()][:8]:
-                        resolved_mb_url = _resolve_remote_image_or_og_url(mb_url, timeout=8)
+                        resolved_mb_url = _resolve_authoritative_artist_image_url(
+                            mb_url,
+                            artist_name=artist_name,
+                            entity_kind=entity_kind,
+                            role_hints=role_hints,
+                            page_title=str(mb_identity.get("name") or artist_name),
+                            page_summary="\n".join(str(alias or "").strip() for alias in (mb_identity.get("aliases") or []) if str(alias or "").strip()),
+                            timeout=8,
+                        )
                         if resolved_mb_url and _artist_image_url_looks_relevant(
                             resolved_mb_url,
                             artist_name=artist_name,
@@ -49316,6 +49338,65 @@ def _fetch_wikipedia_pageimage(title: str, lang: str = "en", thumb_px: int = 640
     return ""
 
 
+def _resolve_authoritative_artist_image_url(
+    target_url: str,
+    *,
+    artist_name: str,
+    entity_kind: str = "",
+    role_hints: list[str] | tuple[str, ...] | None = None,
+    page_title: str = "",
+    page_summary: str = "",
+    timeout: int = 8,
+) -> str:
+    url = str(target_url or "").strip()
+    if not url:
+        return ""
+    parsed = urlparse(url)
+    host = (parsed.netloc or "").strip().lower()
+    path = unquote(parsed.path or "")
+    wiki_lang = ""
+    if host.endswith(".wikipedia.org"):
+        wiki_lang = host.split(".")[0]
+        title = ""
+        if "/wiki/" in path:
+            title = path.split("/wiki/", 1)[1].replace("_", " ").strip()
+        if title:
+            img = _fetch_wikipedia_pageimage(title, lang=wiki_lang or "en", thumb_px=960)
+            if img and _artist_image_url_looks_relevant(
+                img,
+                artist_name=artist_name,
+                entity_kind=entity_kind,
+                role_hints=role_hints,
+                page_title=page_title or title,
+                page_summary=page_summary,
+            ):
+                return img
+    if host.endswith(".wikidata.org") or host == "wikidata.org":
+        parts = [part for part in path.split("/") if part]
+        qid = parts[-1] if parts else ""
+        img = _fetch_wikidata_media_url(qid, preferred_props=("P18",))
+        if img and _artist_image_url_looks_relevant(
+            img,
+            artist_name=artist_name,
+            entity_kind=entity_kind,
+            role_hints=role_hints,
+            page_title=page_title,
+            page_summary=page_summary,
+        ):
+            return img
+    resolved = _resolve_remote_image_or_og_url(url, timeout=timeout)
+    if resolved and _artist_image_url_looks_relevant(
+        resolved,
+        artist_name=artist_name,
+        entity_kind=entity_kind,
+        role_hints=role_hints,
+        page_title=page_title,
+        page_summary=page_summary,
+    ):
+        return resolved
+    return ""
+
+
 def _fetch_wikipedia_intro_extract(title: str, lang: str = "en") -> tuple[str, str, str]:
     """
     Return (extract, page_url, description) for a Wikipedia page title, or ("","","") on failure.
@@ -49387,17 +49468,17 @@ def _artist_profile_search_queries(
     roles = {str(role or "").strip().lower() for role in (role_hints or []) if str(role or "").strip()}
     qualifiers: list[str]
     if kind in {"composer"} or "composer" in roles:
-        qualifiers = ["composer", "classical composer", "musician"]
+        qualifiers = ["composer", "classical composer", "composer portrait", "musician", "wikipedia"]
     elif kind in {"conductor"} or "conductor" in roles:
-        qualifiers = ["conductor", "maestro", "musician"]
+        qualifiers = ["conductor", "maestro", "conductor portrait", "musician", "wikipedia"]
     elif kind in {"orchestra"} or "orchestra" in roles:
-        qualifiers = ["orchestra", "philharmonic", "symphony orchestra"]
+        qualifiers = ["orchestra", "philharmonic orchestra", "symphony orchestra", "official photo", "wikipedia"]
     elif kind in {"ensemble", "choir", "chorus"} or roles.intersection({"ensemble", "choir", "chorus"}):
-        qualifiers = ["ensemble", "choir", "chorus", "music ensemble"]
+        qualifiers = ["ensemble", "music ensemble", "official photo", "choir", "chorus", "wikipedia"]
     elif kind in {"performer"} or roles.intersection({"soloist", "performer"}):
-        qualifiers = ["musician", "performer", "soloist"]
+        qualifiers = ["musician", "performer", "soloist", "portrait", "wikipedia"]
     else:
-        qualifiers = ["musician", "band", "artist"]
+        qualifiers = ["musician", "band", "artist", "portrait"]
     queries = [f"{name} {qualifier}" for qualifier in qualifiers]
     queries.append(name)
     out: list[str] = []
@@ -69123,11 +69204,18 @@ def _artist_image_lookup_candidates(
         norm = _norm_artist_key(clean)
         if not clean or not norm or norm in seen:
             continue
-        seen.add(norm)
         if norm != primary_norm and classical_like:
             token_count = len([tok for tok in re.findall(r"[a-z0-9]+", norm) if tok])
             if len(norm) < 6 or token_count < 2:
                 continue
+            if not _artist_image_alias_candidate_is_compatible(
+                primary,
+                clean,
+                entity_kind=entity_kind,
+                role_hints=role_hints,
+            ):
+                continue
+        seen.add(norm)
         out.append(clean)
         if len(out) >= max(2, int(limit or 12)):
             break
@@ -69208,6 +69296,47 @@ def _artist_identity_distinctive_tokens(
     if kind in {"orchestra", "ensemble", "choir", "chorus"} or roles.intersection({"orchestra", "ensemble", "choir", "chorus"}):
         return {tok for tok in tokens if len(tok) >= 4 and tok not in _ARTIST_IMAGE_GENERIC_ENSEMBLE_TOKENS}
     return {tok for tok in tokens if len(tok) >= 4}
+
+
+def _artist_image_alias_candidate_is_compatible(
+    artist_name: str,
+    candidate_name: str,
+    *,
+    entity_kind: str = "",
+    role_hints: list[str] | tuple[str, ...] | None = None,
+) -> bool:
+    primary = " ".join(str(artist_name or "").split()).strip()
+    candidate = " ".join(str(candidate_name or "").split()).strip()
+    if not primary or not candidate:
+        return False
+    primary_norm = _norm_artist_key(primary)
+    candidate_norm = _norm_artist_key(candidate)
+    if not primary_norm or not candidate_norm:
+        return False
+    if primary_norm == candidate_norm:
+        return True
+    if _artist_is_person_like(entity_kind=entity_kind, role_hints=role_hints):
+        if _classical_person_names_equivalent(primary, candidate):
+            return True
+        primary_sig = _classical_person_alias_signature(primary)
+        candidate_sig = _classical_person_alias_signature(candidate)
+        if primary_sig and candidate_sig:
+            if str(primary_sig.get("surname") or "").strip() != str(candidate_sig.get("surname") or "").strip():
+                return False
+            primary_long = {str(tok or "").strip() for tok in (primary_sig.get("long_givens") or set()) if str(tok or "").strip()}
+            candidate_long = {str(tok or "").strip() for tok in (candidate_sig.get("long_givens") or set()) if str(tok or "").strip()}
+            if primary_long and candidate_long and primary_long.intersection(candidate_long):
+                return True
+            primary_initials = {str(tok or "").strip() for tok in (primary_sig.get("initials") or set()) if str(tok or "").strip()}
+            candidate_initials = {str(tok or "").strip() for tok in (candidate_sig.get("initials") or set()) if str(tok or "").strip()}
+            if primary_initials and candidate_initials and primary_initials.intersection(candidate_initials):
+                return True
+        return _provider_identity_text_score(primary, candidate) >= 0.78
+    primary_tokens = _artist_identity_distinctive_tokens(primary, entity_kind=entity_kind, role_hints=role_hints)
+    candidate_tokens = _artist_identity_distinctive_tokens(candidate, entity_kind=entity_kind, role_hints=role_hints)
+    if primary_tokens and candidate_tokens and primary_tokens.intersection(candidate_tokens):
+        return True
+    return _provider_identity_text_score(primary, candidate) >= 0.8
 
 
 def _artist_image_url_looks_relevant(
@@ -69314,6 +69443,7 @@ def _artist_image_result_looks_relevant(
     snippet = str(result.get("snippet") or "").strip()
     link = str(result.get("link") or "").strip()
     merged = f"{title} {snippet} {link}".lower()
+    host = (urlparse(link).netloc or "").strip().lower()
     if not _text_mentions_identity_phrase(str(artist_name or "").strip(), f"{title} {snippet}".strip()):
         return False
     reject_tokens = (
@@ -69337,16 +69467,19 @@ def _artist_image_result_looks_relevant(
         for role in (role_hints or [])
         if str(role or "").strip()
     }
-    if kind in {"orchestra"} or "orchestra" in role_norms:
+    person_like = _artist_is_person_like(entity_kind=entity_kind, role_hints=role_hints) or kind in {"composer", "conductor"}
+    ensemble_like = kind in {"orchestra", "ensemble", "choir", "chorus"} or role_norms.intersection({"orchestra", "ensemble", "choir", "chorus"})
+    trusted_domains = ("wikipedia.org", "wikimedia.org", "wikidata.org", "musicbrainz.org", "last.fm", "discogs.com", "theaudiodb.com")
+    if ensemble_like:
         if any(tok in merged for tok in ("skyline", "skyscraper", "empire state", "observation deck", "real estate")):
             return False
-        return any(tok in merged for tok in ("orchestra", "philharmonic", "symphony", "ensemble"))
-    if kind in {"conductor"} or "conductor" in role_norms:
-        return any(tok in merged for tok in ("conductor", "maestro", "musician"))
-    if kind in {"composer"} or "composer" in role_norms:
-        return any(tok in merged for tok in ("composer", "musician", "portrait"))
-    if kind in {"ensemble", "choir", "chorus"} or role_norms.intersection({"ensemble", "choir", "chorus"}):
-        return any(tok in merged for tok in ("ensemble", "choir", "chorus", "group"))
+        if any(host == domain or host.endswith(f".{domain}") for domain in trusted_domains):
+            return True
+        return any(tok in merged for tok in ("orchestra", "philharmonic", "symphony", "ensemble", "choir", "chorus", "group"))
+    if person_like:
+        if any(host == domain or host.endswith(f".{domain}") for domain in trusted_domains):
+            return True
+        return any(tok in merged for tok in ("composer", "conductor", "maestro", "musician", "pianist", "violinist", "portrait", "artist"))
     return True
 
 
@@ -69389,6 +69522,17 @@ def _fetch_artist_image_web(
             link = item.get("link") or ""
             if not link:
                 continue
+            resolved_authoritative = _resolve_authoritative_artist_image_url(
+                str(link),
+                artist_name=artist_name,
+                entity_kind=entity_kind,
+                role_hints=role_hints,
+                page_title=title,
+                page_summary=snippet,
+                timeout=8,
+            )
+            if resolved_authoritative:
+                return resolved_authoritative
             if kind in {"composer", "conductor", "orchestra", "ensemble", "choir", "chorus"} or role_norms.intersection({"composer", "conductor", "orchestra", "ensemble", "choir", "chorus"}):
                 host = (urlparse(str(link or "")).netloc or "").lower()
                 trusted_domains = (
@@ -69440,15 +69584,18 @@ def _fetch_artist_image_web(
                     if not m:
                         continue
                     img_url = m.group(1).strip()
-                    if img_url and _artist_image_url_looks_relevant(
-                        img_url,
-                        artist_name=artist_name,
-                        entity_kind=entity_kind,
-                        role_hints=role_hints,
-                        page_title=title,
-                        page_summary=snippet,
-                    ):
-                        return img_url
+                    if img_url:
+                        resolved = _resolve_authoritative_artist_image_url(
+                            img_url,
+                            artist_name=artist_name,
+                            entity_kind=entity_kind,
+                            role_hints=role_hints,
+                            page_title=title,
+                            page_summary=snippet,
+                            timeout=8,
+                        )
+                        if resolved:
+                            return resolved
                 except Exception as e:
                     logging.debug("[ArtistWebImage] Failed to extract og:image from %s: %s", link, e)
                     continue
