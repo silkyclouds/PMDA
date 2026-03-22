@@ -11109,12 +11109,6 @@ def _scheduler_loop() -> None:
                         int(rule["rule_id"]),
                         next_run_ts=next_normal,
                     )
-                    logging.debug(
-                        "Scheduler skipped %s/%s run=%s (bootstrap_required); next run scheduled normally.",
-                        job_type,
-                        scope,
-                        skipped_run,
-                    )
                     continue
                 next_run_raw = rule["next_run_ts"]
                 next_run_ts = float(next_run_raw) if next_run_raw is not None else 0.0
@@ -11575,6 +11569,9 @@ def _files_pg_init_schema() -> bool:
                     id BIGSERIAL PRIMARY KEY,
                     name TEXT NOT NULL,
                     name_norm TEXT NOT NULL UNIQUE,
+                    canonical_name TEXT,
+                    canonical_name_norm TEXT,
+                    canonical_mbid TEXT,
                     entity_kind TEXT NOT NULL DEFAULT 'artist',
                     roles_json TEXT NOT NULL DEFAULT '[]',
                     aliases_json TEXT NOT NULL DEFAULT '[]',
@@ -11588,6 +11585,9 @@ def _files_pg_init_schema() -> bool:
                 )
             """)
             for col_name, col_sql in [
+                ("canonical_name", "TEXT"),
+                ("canonical_name_norm", "TEXT"),
+                ("canonical_mbid", "TEXT"),
                 ("entity_kind", "TEXT NOT NULL DEFAULT 'artist'"),
                 ("roles_json", "TEXT NOT NULL DEFAULT '[]'"),
                 ("aliases_json", "TEXT NOT NULL DEFAULT '[]'"),
@@ -11596,6 +11596,8 @@ def _files_pg_init_schema() -> bool:
                     cur.execute(f"ALTER TABLE files_artists ADD COLUMN IF NOT EXISTS {col_name} {col_sql}")
                 except Exception:
                     pass
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_files_artists_canonical_name_norm ON files_artists(canonical_name_norm)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_files_artists_canonical_mbid ON files_artists(canonical_mbid)")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS files_albums (
                     id BIGSERIAL PRIMARY KEY,
@@ -12159,6 +12161,7 @@ def _files_pg_init_schema() -> bool:
             cur.execute("CREATE INDEX IF NOT EXISTS idx_assistant_entity_facts_updated_at ON assistant_entity_facts(updated_at DESC)")
             try:
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_files_artists_name_trgm ON files_artists USING gin (name gin_trgm_ops)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_files_artists_canonical_name_trgm ON files_artists USING gin (canonical_name gin_trgm_ops)")
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_files_artist_aliases_alias_trgm ON files_artist_aliases USING gin (alias gin_trgm_ops)")
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_files_albums_title_trgm ON files_albums USING gin (title gin_trgm_ops)")
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_files_tracks_title_trgm ON files_tracks USING gin (title gin_trgm_ops)")
@@ -12170,6 +12173,10 @@ def _files_pg_init_schema() -> bool:
                 _files_migrate_external_artist_images_norm_keys(cur)
             except Exception:
                 pass
+            try:
+                _files_backfill_artist_canonical_fields(conn)
+            except Exception:
+                logging.debug("Artist canonical field backfill failed", exc_info=True)
             try:
                 _files_backfill_artist_alias_table(conn)
             except Exception:
@@ -12326,6 +12333,34 @@ def _files_migrate_external_artist_images_norm_keys(cur) -> None:
         pass
     if migrated:
         logging.info("Migrated %d external artist image cache keys to strict normalization", migrated)
+
+
+def _files_backfill_artist_canonical_fields(conn) -> None:
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COALESCE(value, '') FROM files_index_meta WHERE key = 'artist_canonical_schema' LIMIT 1")
+            row = cur.fetchone()
+            if row and str(row[0] or "").strip() == "v1":
+                return
+            cur.execute(
+                """
+                UPDATE files_artists
+                SET canonical_name = COALESCE(NULLIF(TRIM(canonical_name), ''), name),
+                    canonical_name_norm = COALESCE(NULLIF(TRIM(canonical_name_norm), ''), name_norm),
+                    updated_at = NOW()
+                WHERE COALESCE(NULLIF(TRIM(canonical_name), ''), '') = ''
+                   OR COALESCE(NULLIF(TRIM(canonical_name_norm), ''), '') = ''
+                """
+            )
+            cur.execute(
+                """
+                INSERT INTO files_index_meta(key, value, updated_at)
+                VALUES ('artist_canonical_schema', 'v1', NOW())
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
+                """
+            )
+    except Exception:
+        logging.debug("Artist canonical field backfill failed", exc_info=True)
 
 
 def _files_redis_client():
@@ -14267,6 +14302,8 @@ def _ensure_media_cache_dirs() -> None:
 
 def _image_ext_from_mime(mime: str) -> str:
     m = (mime or "").lower()
+    if "svg" in m:
+        return ".svg"
     if "png" in m:
         return ".png"
     if "webp" in m:
@@ -14331,19 +14368,21 @@ def _ensure_cached_image_from_bytes(
         ).hexdigest()
     except Exception:
         return None
+    raw_ext = _image_ext_from_mime(mime)
+    raw_target = _media_cache_path_for_key(digest, kind, raw_ext)
     target = _media_cache_path_for_key(digest, kind, ".webp")
     if target.exists() and target.is_file():
         return target
+    if raw_target.exists() and raw_target.is_file():
+        return raw_target
     try:
         from io import BytesIO
         from PIL import Image
     except ImportError:
-        ext = _image_ext_from_mime(mime)
-        target = _media_cache_path_for_key(digest, kind, ext)
         try:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(raw)
-            return target
+            raw_target.parent.mkdir(parents=True, exist_ok=True)
+            raw_target.write_bytes(raw)
+            return raw_target
         except Exception:
             return None
     try:
@@ -14356,7 +14395,12 @@ def _ensure_cached_image_from_bytes(
         return target
     except Exception as e:
         logging.debug("Embedded media cache generation failed: %s", e)
-        return None
+        try:
+            raw_target.parent.mkdir(parents=True, exist_ok=True)
+            raw_target.write_bytes(raw)
+            return raw_target
+        except Exception:
+            return None
 
 
 def _existing_file_path(raw: str) -> Optional[Path]:
@@ -15231,6 +15275,9 @@ def _rebuild_files_library_index_for_artist(
                         (
                             data["name"],
                             norm,
+                            str(data.get("canonical_name") or data["name"]),
+                            str(data.get("canonical_name_norm") or norm),
+                            str(data.get("canonical_mbid") or ""),
                             str(data.get("entity_kind") or "artist"),
                             str(data.get("roles_json") or "[]"),
                             str(data.get("aliases_json") or "[]"),
@@ -15242,10 +15289,16 @@ def _rebuild_files_library_index_for_artist(
                     if artist_rows:
                         cur.executemany(
                             """
-                            INSERT INTO files_artists (name, name_norm, entity_kind, roles_json, aliases_json, has_image, image_path, created_at, updated_at)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+                            INSERT INTO files_artists (name, name_norm, canonical_name, canonical_name_norm, canonical_mbid, entity_kind, roles_json, aliases_json, has_image, image_path, created_at, updated_at)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
                             ON CONFLICT (name_norm) DO UPDATE SET
                                 name = EXCLUDED.name,
+                                canonical_name = EXCLUDED.canonical_name,
+                                canonical_name_norm = EXCLUDED.canonical_name_norm,
+                                canonical_mbid = CASE
+                                    WHEN EXCLUDED.canonical_mbid IS NULL OR EXCLUDED.canonical_mbid = '' THEN files_artists.canonical_mbid
+                                    ELSE EXCLUDED.canonical_mbid
+                                END,
                                 entity_kind = EXCLUDED.entity_kind,
                                 roles_json = EXCLUDED.roles_json,
                                 aliases_json = EXCLUDED.aliases_json,
@@ -15845,6 +15898,9 @@ def _rebuild_files_library_index(reason: str = "manual", wait_if_running: bool =
                         (
                             data["name"],
                             norm,
+                            str(data.get("canonical_name") or data["name"]),
+                            str(data.get("canonical_name_norm") or norm),
+                            str(data.get("canonical_mbid") or ""),
                             str(data.get("entity_kind") or "artist"),
                             str(data.get("roles_json") or "[]"),
                             str(data.get("aliases_json") or "[]"),
@@ -15856,8 +15912,8 @@ def _rebuild_files_library_index(reason: str = "manual", wait_if_running: bool =
                     if artist_rows:
                         cur.executemany(
                             """
-                            INSERT INTO files_artists (name, name_norm, entity_kind, roles_json, aliases_json, has_image, image_path, created_at, updated_at)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+                            INSERT INTO files_artists (name, name_norm, canonical_name, canonical_name_norm, canonical_mbid, entity_kind, roles_json, aliases_json, has_image, image_path, created_at, updated_at)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
                             """,
                             artist_rows,
                         )
@@ -16509,10 +16565,16 @@ def _files_backfill_artist_browse_entities_from_existing_index() -> dict[str, in
                 for artist_norm, data in artists_map.items():
                     cur.execute(
                         """
-                        INSERT INTO files_artists (name, name_norm, entity_kind, roles_json, aliases_json, has_image, image_path, created_at, updated_at)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+                        INSERT INTO files_artists (name, name_norm, canonical_name, canonical_name_norm, canonical_mbid, entity_kind, roles_json, aliases_json, has_image, image_path, created_at, updated_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
                         ON CONFLICT (name_norm) DO UPDATE
                         SET name = EXCLUDED.name,
+                            canonical_name = EXCLUDED.canonical_name,
+                            canonical_name_norm = EXCLUDED.canonical_name_norm,
+                            canonical_mbid = CASE
+                                WHEN COALESCE(NULLIF(TRIM(EXCLUDED.canonical_mbid), ''), '') <> '' THEN EXCLUDED.canonical_mbid
+                                ELSE files_artists.canonical_mbid
+                            END,
                             entity_kind = EXCLUDED.entity_kind,
                             roles_json = EXCLUDED.roles_json,
                             aliases_json = EXCLUDED.aliases_json,
@@ -16526,6 +16588,9 @@ def _files_backfill_artist_browse_entities_from_existing_index() -> dict[str, in
                         (
                             str(data.get("name") or artist_norm).strip(),
                             artist_norm,
+                            str(data.get("canonical_name") or data.get("name") or artist_norm).strip(),
+                            str(data.get("canonical_name_norm") or artist_norm).strip(),
+                            str(data.get("canonical_mbid") or "").strip() or None,
                             str(data.get("entity_kind") or "artist").strip() or "artist",
                             str(data.get("roles_json") or "[]"),
                             str(data.get("aliases_json") or "[]"),
@@ -17008,6 +17073,8 @@ def _files_get_external_artist_images(conn, name_norms: list[str]) -> dict[str, 
             img_path = (image_path or "").strip() or None
             img_url = (image_url or "").strip() or None
             stale = _is_external_artist_image_stale(updated_at)
+            invalidate_path = False
+            invalidate_url = False
 
             # Never serve known placeholder images (e.g. Last.fm "music note" missing-avatar).
             try:
@@ -17015,6 +17082,17 @@ def _files_get_external_artist_images(conn, name_norms: list[str]) -> dict[str, 
                     img_path = None
                     img_url = None
                     stale = True
+                    invalidate_path = True
+                    invalidate_url = True
+            except Exception:
+                pass
+            try:
+                if img_url and _is_suspicious_external_artist_image_url(img_url):
+                    img_path = None
+                    img_url = None
+                    stale = True
+                    invalidate_path = True
+                    invalidate_url = True
             except Exception:
                 pass
 
@@ -17025,17 +17103,46 @@ def _files_get_external_artist_images(conn, name_norms: list[str]) -> dict[str, 
                     if not p.exists():
                         img_path = None
                         stale = True
+                        invalidate_path = True
                     else:
                         # Tiny files are almost always placeholders (e.g. blank avatars); treat as stale.
                         try:
                             if int(p.stat().st_size or 0) < 8192:
                                 img_path = None
                                 stale = True
+                                invalidate_path = True
                         except Exception:
                             pass
                 except Exception:
                     img_path = None
                     stale = True
+                    invalidate_path = True
+            if invalidate_path or invalidate_url:
+                try:
+                    with conn.cursor() as cur:
+                        if invalidate_url:
+                            cur.execute(
+                                """
+                                UPDATE files_external_artist_images
+                                SET image_path = NULL,
+                                    image_url = NULL,
+                                    updated_at = NOW()
+                                WHERE name_norm = %s
+                                """,
+                                (key,),
+                            )
+                        else:
+                            cur.execute(
+                                """
+                                UPDATE files_external_artist_images
+                                SET image_path = NULL,
+                                    updated_at = NOW()
+                                WHERE name_norm = %s
+                                """,
+                                (key,),
+                            )
+                except Exception:
+                    pass
             out[key] = {
                 "artist_name": artist_name or "",
                 "provider": provider or "",
@@ -17408,23 +17515,35 @@ def _files_refresh_artist_media_map_from_db(artists_map: dict[str, dict[str, Any
     if conn is None:
         return artists_map
     try:
-        artist_rows: dict[str, tuple[str, bool, str]] = {}
+        artist_rows: dict[str, dict[str, Any]] = {}
         ext_rows: dict[str, str] = {}
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT name_norm, COALESCE(name, ''), has_image, COALESCE(image_path, '')
+                SELECT
+                    name_norm,
+                    COALESCE(name, ''),
+                    has_image,
+                    COALESCE(image_path, ''),
+                    COALESCE(canonical_name, ''),
+                    COALESCE(canonical_name_norm, ''),
+                    COALESCE(canonical_mbid, ''),
+                    COALESCE(aliases_json, '[]')
                 FROM files_artists
                 WHERE name_norm = ANY(%s)
                 """,
                 (norms,),
             )
-            for name_norm, name, has_image, image_path in cur.fetchall():
-                artist_rows[str(name_norm or "").strip()] = (
-                    str(name or "").strip(),
-                    bool(has_image),
-                    str(image_path or "").strip(),
-                )
+            for name_norm, name, has_image, image_path, canonical_name, canonical_name_norm, canonical_mbid, aliases_json in cur.fetchall():
+                artist_rows[str(name_norm or "").strip()] = {
+                    "name": str(name or "").strip(),
+                    "has_image": bool(has_image),
+                    "image_path": str(image_path or "").strip(),
+                    "canonical_name": str(canonical_name or "").strip(),
+                    "canonical_name_norm": str(canonical_name_norm or "").strip(),
+                    "canonical_mbid": str(canonical_mbid or "").strip(),
+                    "aliases_json": aliases_json or "[]",
+                }
             cur.execute(
                 """
                 SELECT name_norm, COALESCE(image_path, '')
@@ -17441,9 +17560,13 @@ def _files_refresh_artist_media_map_from_db(artists_map: dict[str, dict[str, Any
             current = dict(payload or {})
             row = artist_rows.get(key)
             if row:
-                current["name"] = _choose_preferred_identity_display(str(current.get("name") or ""), row[0])
-                current["has_image"] = bool(row[1])
-                current["image_path"] = row[2]
+                current["name"] = _choose_preferred_identity_display(str(current.get("name") or ""), str(row.get("name") or ""))
+                current["has_image"] = bool(row.get("has_image"))
+                current["image_path"] = str(row.get("image_path") or "").strip()
+                current["canonical_name"] = str(row.get("canonical_name") or "").strip() or current.get("name") or ""
+                current["canonical_name_norm"] = str(row.get("canonical_name_norm") or "").strip() or key
+                current["canonical_mbid"] = str(row.get("canonical_mbid") or "").strip()
+                current["aliases_json"] = row.get("aliases_json") or current.get("aliases_json") or "[]"
             if (not current.get("has_image")) and ext_rows.get(key):
                 current["has_image"] = True
                 current["image_path"] = ext_rows.get(key) or ""
@@ -17764,17 +17887,18 @@ def _run_files_profile_enrichment_job(
                         role_hints=role_hints,
                     )
                     mb_aliases = list(mb_identity.get("aliases") or [])
-                    if mb_aliases:
+                    if mb_identity:
                         with conn.transaction():
-                            _files_upsert_artist_external_aliases(
+                            _files_upsert_artist_canonical_identity(
                                 conn,
                                 artist_id=artist_id,
                                 artist_norm=artist_norm,
                                 artist_name=artist_name,
+                                canonical_name=str(mb_identity.get("name") or artist_name),
+                                canonical_mbid=str(mb_identity.get("mbid") or ""),
                                 aliases=mb_aliases,
                                 entity_kind=entity_kind,
                                 roles_json=role_hints,
-                                source="musicbrainz",
                             )
                 except Exception:
                     mb_identity = {}
@@ -17879,6 +18003,7 @@ def _run_files_profile_enrichment_job(
                                 if classical_like and (
                                     ext_provider in {"web", "discogs", "lastfm"}
                                     or (ext_provider == "wikipedia" and "wikimedia.org" not in ext_url and "wikipedia.org" not in ext_url)
+                                    or _is_suspicious_external_artist_image_url(ext_url)
                                 ):
                                     needs_image = True
                                     authoritative_refresh = True
@@ -17952,14 +18077,30 @@ def _run_files_profile_enrichment_job(
                         wiki_img_url = (wiki_info.get("image_url") or "").strip() if isinstance(wiki_info, dict) else ""
                     except Exception:
                         wiki_img_url = ""
-                    artist_lookup_candidates = _files_get_artist_alias_candidates(
-                        conn,
-                        artist_norm=artist_norm,
-                        artist_name=artist_name,
+                    artist_lookup_candidates = _artist_image_lookup_candidates(
+                        artist_name,
+                        _files_get_artist_alias_candidates(
+                            conn,
+                            artist_norm=artist_norm,
+                            artist_name=artist_name,
+                            limit=12,
+                        ),
+                        entity_kind=entity_kind,
+                        role_hints=role_hints,
                         limit=12,
                     )
                     if not artist_lookup_candidates:
-                        artist_lookup_candidates = [artist_name, *composite_entities]
+                        artist_lookup_candidates = _artist_image_lookup_candidates(
+                            artist_name,
+                            [artist_name, *composite_entities],
+                            entity_kind=entity_kind,
+                            role_hints=role_hints,
+                            limit=12,
+                        )
+                    for mb_url in [str(url or "").strip() for url in (mb_identity.get("urls") or []) if str(url or "").strip()][:8]:
+                        resolved_mb_url = _resolve_remote_image_or_og_url(mb_url, timeout=8)
+                        if resolved_mb_url:
+                            candidates.append(("musicbrainz_url", resolved_mb_url))
                     if not wiki_img_url:
                         for lookup_name in artist_lookup_candidates:
                             wiki_seed = (
@@ -28539,6 +28680,7 @@ def _musicbrainz_artist_identity_lookup(
         "name": " ".join(str(best.get("name") or "").split()).strip(),
         "sort_name": " ".join(str(best.get("sort-name") or "").split()).strip(),
         "aliases": [],
+        "urls": [],
     }
     alias_values: list[str] = []
     if out["name"]:
@@ -28546,10 +28688,18 @@ def _musicbrainz_artist_identity_lookup(
     if out["sort_name"]:
         alias_values.append(out["sort_name"])
     try:
-        full = musicbrainzngs.get_artist_by_id(artist_id, includes=["aliases"])
+        full = musicbrainzngs.get_artist_by_id(artist_id, includes=["aliases", "url-rels"])
     except Exception:
         full = {}
     artist_data = (full or {}).get("artist") or {}
+    full_name = " ".join(str(artist_data.get("name") or "").split()).strip()
+    full_sort = " ".join(str(artist_data.get("sort-name") or "").split()).strip()
+    if full_name:
+        out["name"] = full_name
+        alias_values.append(full_name)
+    if full_sort:
+        out["sort_name"] = full_sort
+        alias_values.append(full_sort)
     alias_list = artist_data.get("alias-list") or []
     if isinstance(alias_list, list):
         for item in alias_list:
@@ -28567,7 +28717,98 @@ def _musicbrainz_artist_identity_lookup(
         seen.add(alias_norm)
         deduped.append(alias)
     out["aliases"] = deduped[:16]
+    url_values: list[str] = []
+    url_relations = artist_data.get("url-relation-list") or []
+    if isinstance(url_relations, list):
+        for relation in url_relations:
+            if not isinstance(relation, dict):
+                continue
+            target = str(relation.get("target") or "").strip()
+            if target:
+                url_values.append(target)
+    out["urls"] = _dedupe_keep_order(url_values)[:12]
     return out
+
+
+def _files_merge_artist_alias_values(*sources: Any) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for source in sources:
+        raw = source
+        if isinstance(raw, str):
+            raw = _safe_json_load(raw, fallback=[raw])
+        if not isinstance(raw, (list, tuple, set)):
+            raw = [raw]
+        for value in raw:
+            clean = " ".join(str(value or "").split()).strip()
+            norm = _norm_artist_key(clean)
+            if not clean or not norm or norm in seen:
+                continue
+            seen.add(norm)
+            out.append(clean)
+    return out
+
+
+def _files_upsert_artist_canonical_identity(
+    conn,
+    *,
+    artist_id: int,
+    artist_norm: str,
+    artist_name: str,
+    canonical_name: str,
+    canonical_mbid: str = "",
+    aliases: list[str] | tuple[str, ...] | None = None,
+    entity_kind: str = "",
+    roles_json: Any = None,
+) -> None:
+    if conn is None or int(artist_id or 0) <= 0:
+        return
+    current_name = " ".join(str(artist_name or "").split()).strip()
+    canonical = " ".join(str(canonical_name or "").split()).strip() or current_name
+    if not canonical:
+        return
+    display_name = _choose_preferred_identity_display(current_name, canonical)
+    canonical_norm = _norm_artist_key(canonical) or _norm_artist_key(display_name) or str(artist_norm or "").strip()
+    existing_aliases = []
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COALESCE(aliases_json, '[]') FROM files_artists WHERE id = %s LIMIT 1", (int(artist_id),))
+            row = cur.fetchone()
+        existing_aliases = _safe_json_load((row[0] if row else "[]") or "[]", fallback=[])
+    except Exception:
+        existing_aliases = []
+    merged_aliases = _files_merge_artist_alias_values(existing_aliases, [current_name, canonical], aliases or [])
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE files_artists
+            SET name = %s,
+                canonical_name = %s,
+                canonical_name_norm = %s,
+                canonical_mbid = COALESCE(NULLIF(%s, ''), canonical_mbid),
+                aliases_json = %s,
+                updated_at = NOW()
+            WHERE id = %s
+            """,
+            (
+                display_name,
+                canonical,
+                canonical_norm,
+                str(canonical_mbid or "").strip(),
+                json.dumps(merged_aliases, ensure_ascii=False),
+                int(artist_id),
+            ),
+        )
+    _files_upsert_artist_external_aliases(
+        conn,
+        artist_id=int(artist_id),
+        artist_norm=str(artist_norm or "").strip(),
+        artist_name=display_name,
+        aliases=merged_aliases,
+        entity_kind=entity_kind,
+        roles_json=roles_json,
+        source="musicbrainz",
+    )
 
 
 def _files_artist_alias_rows_for_identity(
@@ -28878,6 +29119,7 @@ def _files_extract_browse_entities_for_album(
         if key in seen:
             return
         seen.add(key)
+        artist_row = artists_map.get(norm) or {}
         entities.append(
             {
                 "name": clean,
@@ -28886,6 +29128,9 @@ def _files_extract_browse_entities_for_album(
                 "is_primary": bool(is_primary),
                 "has_image": bool(has_image),
                 "image_path": str(image_path or "").strip(),
+                "canonical_name": str(artist_row.get("canonical_name") or artist_row.get("name") or clean).strip(),
+                "canonical_norm": str(artist_row.get("canonical_name_norm") or norm).strip(),
+                "canonical_mbid": str(artist_row.get("canonical_mbid") or "").strip(),
             }
         )
 
@@ -28939,10 +29184,22 @@ def _build_files_browse_artist_entities(
     )
     canonical_norm_by_raw_norm: dict[str, str] = {}
     canonical_name_by_norm: dict[str, str] = {}
+    canonical_norm_by_mbid: dict[str, str] = {}
     for entry in person_alias_targets:
         raw_name = str(entry.get("name") or "").strip()
         raw_norm = str(entry.get("norm") or "").strip()
+        canonical_mbid = str(entry.get("canonical_mbid") or "").strip()
+        canonical_name_hint = str(entry.get("canonical_name") or raw_name).strip()
+        canonical_norm_hint = str(entry.get("canonical_norm") or raw_norm).strip()
         if not raw_norm:
+            continue
+        if canonical_mbid:
+            matched_norm = canonical_norm_by_mbid.get(canonical_mbid) or canonical_norm_hint or raw_norm
+            current_name = canonical_name_by_norm.get(matched_norm, canonical_name_hint or raw_name)
+            preferred = _choose_preferred_identity_display(current_name, canonical_name_hint or raw_name)
+            canonical_name_by_norm[matched_norm] = preferred
+            canonical_norm_by_raw_norm[raw_norm] = matched_norm
+            canonical_norm_by_mbid[canonical_mbid] = matched_norm
             continue
         matched_norm = None
         for candidate_norm, candidate_name in canonical_name_by_norm.items():
@@ -48842,25 +49099,64 @@ def _fetch_lastfm_artist_info(artist_name: str) -> Optional[dict]:
         return None
 
 
-def _fetch_wikipedia_pageimage(title: str, lang: str = "en", thumb_px: int = 640) -> str:
-    """
-    Return a Wikipedia lead thumbnail URL for a page title, or "" on failure.
-    Uses MediaWiki `pageimages` (no API key required).
-    """
+def _commons_file_path_url(filename: str) -> str:
+    clean = str(filename or "").strip()
+    if not clean:
+        return ""
+    return f"https://commons.wikimedia.org/wiki/Special:FilePath/{quote(clean, safe='')}"
+
+
+def _fetch_wikidata_media_url(entity_id: str, preferred_props: tuple[str, ...] = ("P18", "P154")) -> str:
+    qid = str(entity_id or "").strip()
+    if not qid:
+        return ""
+    headers = {"User-Agent": "PMDA/0.7.5 (self-hosted music library; https://github.com/silkyclouds/PMDA)"}
+    try:
+        resp = requests.get(
+            "https://www.wikidata.org/w/api.php",
+            params={
+                "action": "wbgetentities",
+                "ids": qid,
+                "props": "claims",
+                "format": "json",
+            },
+            headers=headers,
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            return ""
+        data = resp.json() if resp.content else {}
+        entity = (((data or {}).get("entities") or {}).get(qid) or {}) if isinstance(data, dict) else {}
+        claims = entity.get("claims") or {}
+        for prop in preferred_props:
+            claim_list = claims.get(prop) or []
+            if not isinstance(claim_list, list):
+                continue
+            for claim in claim_list:
+                if not isinstance(claim, dict):
+                    continue
+                datavalue = (((claim.get("mainsnak") or {}).get("datavalue") or {}).get("value"))
+                if isinstance(datavalue, str) and datavalue.strip():
+                    return _commons_file_path_url(datavalue.strip())
+        return ""
+    except Exception:
+        return ""
+
+
+def _fetch_wikipedia_page_metadata(title: str, lang: str = "en", thumb_px: int = 640) -> dict[str, str]:
     t = (title or "").strip()
     l = (lang or "en").strip().lower() or "en"
     thumb_px = max(64, min(1600, int(thumb_px or 640)))
     if not t:
-        return ""
+        return {}
     api_url = f"https://{l}.wikipedia.org/w/api.php"
     headers = {"User-Agent": "PMDA/0.7.5 (self-hosted music library; https://github.com/silkyclouds/PMDA)"}
     try:
-        page_url = ""
         resp = requests.get(
             api_url,
             params={
                 "action": "query",
-                "prop": "pageimages|info",
+                "prop": "pageimages|pageprops|info",
                 "piprop": "thumbnail|original",
                 "pithumbsize": thumb_px,
                 "inprop": "url",
@@ -48873,47 +49169,65 @@ def _fetch_wikipedia_pageimage(title: str, lang: str = "en", thumb_px: int = 640
             timeout=10,
         )
         if resp.status_code != 200:
-            return ""
+            return {}
         data = resp.json()
         pages = ((data.get("query") or {}).get("pages") or {}) if isinstance(data, dict) else {}
         for _pid, page in (pages or {}).items():
             if not isinstance(page, dict):
                 continue
-            page_url = str(page.get("fullurl") or "").strip() or page_url
             original = page.get("original") or {}
-            if isinstance(original, dict):
-                src = (original.get("source") or "").strip()
-                if src:
-                    return src
             thumb = page.get("thumbnail") or {}
-            if isinstance(thumb, dict):
-                src = (thumb.get("source") or "").strip()
-                if src:
-                    return src
-        if page_url:
-            try:
-                html_resp = requests.get(page_url, headers=headers, timeout=10, allow_redirects=True)
-                if html_resp.status_code == 200 and "text/html" in (html_resp.headers.get("content-type") or "").lower():
+            pageprops = page.get("pageprops") or {}
+            return {
+                "fullurl": str(page.get("fullurl") or "").strip(),
+                "original": str((original.get("source") if isinstance(original, dict) else "") or "").strip(),
+                "thumbnail": str((thumb.get("source") if isinstance(thumb, dict) else "") or "").strip(),
+                "wikibase_item": str((pageprops.get("wikibase_item") if isinstance(pageprops, dict) else "") or "").strip(),
+            }
+        return {}
+    except Exception:
+        return {}
+
+
+def _fetch_wikipedia_pageimage(title: str, lang: str = "en", thumb_px: int = 640) -> str:
+    """
+    Return a Wikipedia lead thumbnail/original URL for a page title, or "" on failure.
+    Falls back to Wikidata media claims and finally article-level og:image.
+    """
+    meta = _fetch_wikipedia_page_metadata(title, lang=lang, thumb_px=thumb_px)
+    if not meta:
+        return ""
+    for key in ("original", "thumbnail"):
+        src = str(meta.get(key) or "").strip()
+        if src:
+            return src
+    wikidata_url = _fetch_wikidata_media_url(str(meta.get("wikibase_item") or "").strip())
+    if wikidata_url:
+        return wikidata_url
+    page_url = str(meta.get("fullurl") or "").strip()
+    if page_url:
+        headers = {"User-Agent": "PMDA/0.7.5 (self-hosted music library; https://github.com/silkyclouds/PMDA)"}
+        try:
+            html_resp = requests.get(page_url, headers=headers, timeout=10, allow_redirects=True)
+            if html_resp.status_code == 200 and "text/html" in (html_resp.headers.get("content-type") or "").lower():
+                match = re.search(
+                    r'<meta\s+property=["\']og:image["\']\s+content=["\']([^"\']+)["\']',
+                    html_resp.text,
+                    re.IGNORECASE,
+                )
+                if not match:
                     match = re.search(
-                        r'<meta\s+property=["\']og:image["\']\s+content=["\']([^"\']+)["\']',
+                        r'<meta\s+content=["\']([^"\']+)["\']\s+property=["\']og:image["\']',
                         html_resp.text,
                         re.IGNORECASE,
                     )
-                    if not match:
-                        match = re.search(
-                            r'<meta\s+content=["\']([^"\']+)["\']\s+property=["\']og:image["\']',
-                            html_resp.text,
-                            re.IGNORECASE,
-                        )
-                    if match:
-                        src = match.group(1).strip()
-                        if src:
-                            return src
-            except Exception:
-                pass
-        return ""
-    except Exception:
-        return ""
+                if match:
+                    src = match.group(1).strip()
+                    if src:
+                        return src
+        except Exception:
+            pass
+    return ""
 
 
 def _fetch_wikipedia_intro_extract(title: str, lang: str = "en") -> tuple[str, str, str]:
@@ -58857,6 +59171,8 @@ def api_library_artists():
                         f"""
                         (
                             a.name ILIKE %s
+                            OR COALESCE(a.canonical_name, '') ILIKE %s
+                            OR (%s <> '' AND COALESCE(a.canonical_name_norm, '') = %s)
                             OR EXISTS (
                                 SELECT 1
                                 FROM files_artist_aliases alias
@@ -58886,7 +59202,7 @@ def api_library_artists():
                         )
                         """
                     )
-                    params.extend([like, like, search_norm, search_norm, search_signature, search_signature, like, like])
+                    params.extend([like, like, search_norm, search_norm, like, search_norm, search_norm, search_signature, search_signature, like, like])
 
                 if year and int(year) > 0:
                     where_parts.append(
@@ -58982,15 +59298,19 @@ def api_library_artists():
                                 ) AS album_count,
                                 a.broken_albums_count,
                                 ({artist_has_image_sql}) AS has_image,
-                                similarity(a.name, %s) AS score,
-                                CASE WHEN lower(a.name) LIKE lower(%s) || '%%' THEN 0 ELSE 1 END AS prefix_rank
+                                GREATEST(similarity(a.name, %s), similarity(COALESCE(a.canonical_name, ''), %s)) AS score,
+                                CASE
+                                    WHEN lower(a.name) LIKE lower(%s) || '%%'
+                                      OR lower(COALESCE(a.canonical_name, '')) LIKE lower(%s) || '%%'
+                                    THEN 0 ELSE 1
+                                END AS prefix_rank
                             FROM files_artists a
                             LEFT JOIN files_external_artist_images ext ON ext.name_norm = a.name_norm
                             WHERE {where_sql}
                             ORDER BY prefix_rank ASC, score DESC, album_count DESC, a.name ASC
                             LIMIT %s OFFSET %s
                             """,
-                            [search_query, search_query, *params, int(limit), int(offset)],
+                            [search_query, search_query, search_query, search_query, *params, int(limit), int(offset)],
                         )
                     except Exception:
                         cur.execute(
@@ -59209,12 +59529,18 @@ def api_library_artists_suggest():
                         ) AS album_count,
                         a.broken_albums_count,
                         (""" + _artist_has_true_image_sql("a", "ext") + """) AS has_image,
-                        similarity(a.name, %s) AS score,
-                        CASE WHEN lower(a.name) LIKE lower(%s) || '%%' THEN 0 ELSE 1 END AS prefix_rank
+                        GREATEST(similarity(a.name, %s), similarity(COALESCE(a.canonical_name, ''), %s)) AS score,
+                        CASE
+                            WHEN lower(a.name) LIKE lower(%s) || '%%'
+                              OR lower(COALESCE(a.canonical_name, '')) LIKE lower(%s) || '%%'
+                            THEN 0 ELSE 1
+                        END AS prefix_rank
                     FROM files_artists a
                     LEFT JOIN files_external_artist_images ext ON ext.name_norm = a.name_norm
                     WHERE (
                         a.name ILIKE %s
+                        OR COALESCE(a.canonical_name, '') ILIKE %s
+                        OR (%s <> '' AND COALESCE(a.canonical_name_norm, '') = %s)
                         OR COALESCE(a.aliases_json, '[]') ILIKE %s
                         OR EXISTS (
                             SELECT 1
@@ -59227,10 +59553,10 @@ def api_library_artists_suggest():
                               )
                         )
                     )
-                    ORDER BY prefix_rank ASC, score DESC, a.album_count DESC, a.name ASC
+                    ORDER BY prefix_rank ASC, score DESC, album_count DESC, a.name ASC
                     LIMIT %s
                     """,
-                    (query, query, like, like, like, query_norm, query_norm, query_signature, query_signature, limit),
+                    (query, query, query, query, like, like, query_norm, query_norm, like, query_norm, query_norm, query_signature, query_signature, limit),
                 )
             except Exception:
                 cur.execute(
@@ -59252,6 +59578,8 @@ def api_library_artists_suggest():
                     LEFT JOIN files_external_artist_images ext ON ext.name_norm = a.name_norm
                     WHERE (
                         a.name ILIKE %s
+                        OR COALESCE(a.canonical_name, '') ILIKE %s
+                        OR (%s <> '' AND COALESCE(a.canonical_name_norm, '') = %s)
                         OR COALESCE(a.aliases_json, '[]') ILIKE %s
                         OR EXISTS (
                             SELECT 1
@@ -59264,10 +59592,10 @@ def api_library_artists_suggest():
                               )
                         )
                     )
-                    ORDER BY a.album_count DESC, a.name ASC
+                    ORDER BY album_count DESC, a.name ASC
                     LIMIT %s
                     """,
-                    (like, like, like, query_norm, query_norm, query_signature, query_signature, limit),
+                    (like, like, query_norm, query_norm, like, like, query_norm, query_norm, query_signature, query_signature, limit),
                 )
             rows = cur.fetchall()
         base_url = request.url_root.rstrip("/")
@@ -59318,6 +59646,8 @@ def api_library_search_suggest():
         return jsonify({"query": query, "items": [], "error": "PostgreSQL unavailable"}), 503
 
     like = f"%{query}%"
+    query_norm = _norm_artist_key(query)
+    query_signature = _classical_person_signature_key(query)
     per_kind = max(8, min(120, limit * 4))
     base_url = request.url_root.rstrip("/")
     merged: list[dict] = []
@@ -59340,11 +59670,30 @@ def api_library_search_suggest():
                               AND """ + artist_count_match_sql + """
                         ) AS album_count,
                         (""" + _artist_has_true_image_sql("a", "ext") + """) AS has_image,
-                        similarity(a.name, %s) AS score,
-                        CASE WHEN lower(a.name) LIKE lower(%s) || '%%' THEN 0 ELSE 1 END AS prefix_rank
+                        GREATEST(similarity(a.name, %s), similarity(COALESCE(a.canonical_name, ''), %s)) AS score,
+                        CASE
+                            WHEN lower(a.name) LIKE lower(%s) || '%%'
+                              OR lower(COALESCE(a.canonical_name, '')) LIKE lower(%s) || '%%'
+                            THEN 0 ELSE 1
+                        END AS prefix_rank
                     FROM files_artists a
                     LEFT JOIN files_external_artist_images ext ON ext.name_norm = a.name_norm
-                    WHERE (a.name ILIKE %s OR COALESCE(a.aliases_json, '[]') ILIKE %s)
+                    WHERE (
+                        a.name ILIKE %s
+                        OR COALESCE(a.canonical_name, '') ILIKE %s
+                        OR (%s <> '' AND COALESCE(a.canonical_name_norm, '') = %s)
+                        OR COALESCE(a.aliases_json, '[]') ILIKE %s
+                        OR EXISTS (
+                            SELECT 1
+                            FROM files_artist_aliases alias
+                            WHERE alias.artist_id = a.id
+                              AND (
+                                  alias.alias ILIKE %s
+                                  OR (%s <> '' AND alias.alias_norm = %s)
+                                  OR (%s <> '' AND alias.alias_signature = %s)
+                              )
+                        )
+                    )
                       AND EXISTS (
                         SELECT 1
                         FROM files_artist_album_links link2
@@ -59352,10 +59701,10 @@ def api_library_search_suggest():
                         WHERE link2.artist_id = a.id
                           AND """ + artist_match_sql + """
                       )
-                    ORDER BY prefix_rank ASC, score DESC, a.album_count DESC, a.name ASC
+                    ORDER BY prefix_rank ASC, score DESC, album_count DESC, a.name ASC
                     LIMIT %s
                     """,
-                    (query, query, like, like, per_kind),
+                    (query, query, query, query, like, like, query_norm, query_norm, like, like, query_norm, query_norm, query_signature, query_signature, per_kind),
                 )
             except Exception:
                 cur.execute(
@@ -59377,7 +59726,22 @@ def api_library_search_suggest():
                         1 AS prefix_rank
                     FROM files_artists a
                     LEFT JOIN files_external_artist_images ext ON ext.name_norm = a.name_norm
-                    WHERE (a.name ILIKE %s OR COALESCE(a.aliases_json, '[]') ILIKE %s)
+                    WHERE (
+                        a.name ILIKE %s
+                        OR COALESCE(a.canonical_name, '') ILIKE %s
+                        OR (%s <> '' AND COALESCE(a.canonical_name_norm, '') = %s)
+                        OR COALESCE(a.aliases_json, '[]') ILIKE %s
+                        OR EXISTS (
+                            SELECT 1
+                            FROM files_artist_aliases alias
+                            WHERE alias.artist_id = a.id
+                              AND (
+                                  alias.alias ILIKE %s
+                                  OR (%s <> '' AND alias.alias_norm = %s)
+                                  OR (%s <> '' AND alias.alias_signature = %s)
+                              )
+                        )
+                    )
                       AND EXISTS (
                         SELECT 1
                         FROM files_artist_album_links link2
@@ -59385,10 +59749,10 @@ def api_library_search_suggest():
                         WHERE link2.artist_id = a.id
                           AND """ + artist_match_sql + """
                       )
-                    ORDER BY a.album_count DESC, a.name ASC
+                    ORDER BY album_count DESC, a.name ASC
                     LIMIT %s
                     """,
-                    (like, like, per_kind),
+                    (like, like, query_norm, query_norm, like, like, query_norm, query_norm, query_signature, query_signature, per_kind),
                 )
             for row in cur.fetchall():
                 artist_id = int(row[0] or 0)
@@ -66938,13 +67302,8 @@ def api_library_external_artist_image(name_norm: str):
     if conn is None:
         return jsonify({"error": "PostgreSQL unavailable"}), 503
     try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT COALESCE(image_path, '') FROM files_external_artist_images WHERE name_norm = %s",
-                (key,),
-            )
-            row = cur.fetchone()
-        img_raw = (row[0] or "").strip() if row else ""
+        ext_row = _files_get_external_artist_images(conn, [key]).get(key) or {}
+        img_raw = str(ext_row.get("image_path") or "").strip()
         if not img_raw:
             return jsonify({"error": "External artist image not found"}), 404
         p = Path(img_raw)
@@ -67927,6 +68286,23 @@ def _is_probably_placeholder_artist_image_url(url: str) -> bool:
     return False
 
 
+def _is_suspicious_external_artist_image_url(url: str) -> bool:
+    low = (url or "").strip().lower()
+    if not low:
+        return False
+    suspicious_tokens = (
+        "soundtrack",
+        "coverartarchive",
+        "album-cover",
+        "albumcover",
+        "%28album%29",
+        "%28ep%29",
+        "/album/",
+        "/release/",
+    )
+    return any(tok in low for tok in suspicious_tokens)
+
+
 def _artist_has_true_image_sql(artist_alias: str = "a", ext_alias: str = "ext") -> str:
     """
     Return SQL that is true only when we have a dedicated artist image.
@@ -68320,6 +68696,39 @@ def _artist_image_search_queries(
     return out
 
 
+def _artist_image_lookup_candidates(
+    artist_name: str,
+    candidates: list[str] | tuple[str, ...],
+    *,
+    entity_kind: str = "",
+    role_hints: list[str] | tuple[str, ...] | None = None,
+    limit: int = 12,
+) -> list[str]:
+    primary = " ".join(str(artist_name or "").split()).strip()
+    primary_norm = _norm_artist_key(primary)
+    classical_like = bool(
+        _artist_is_person_like(entity_kind=entity_kind, role_hints=role_hints)
+        or str(entity_kind or "").strip().lower() in {"ensemble", "conductor", "composer", "orchestra", "choir", "chorus"}
+        or bool({str(role or "").strip().lower() for role in (role_hints or []) if str(role or "").strip()}.intersection({"orchestra", "ensemble", "choir", "chorus"}))
+    )
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in [primary, *(candidates or [])]:
+        clean = " ".join(str(raw or "").split()).strip()
+        norm = _norm_artist_key(clean)
+        if not clean or not norm or norm in seen:
+            continue
+        seen.add(norm)
+        if norm != primary_norm and classical_like:
+            token_count = len([tok for tok in re.findall(r"[a-z0-9]+", norm) if tok])
+            if len(norm) < 6 or token_count < 2:
+                continue
+        out.append(clean)
+        if len(out) >= max(2, int(limit or 12)):
+            break
+    return out
+
+
 def _artist_image_result_looks_relevant(
     artist_name: str,
     result: dict[str, Any] | None,
@@ -68417,7 +68826,8 @@ def _fetch_artist_image_web(
                     "theaudiodb.com",
                 )
                 if host and not any(host == domain or host.endswith(f".{domain}") for domain in trusted_domains):
-                    continue
+                    if not any(tok in merged for tok in ("official", "biography", "biographie", "portrait", "conductor", "composer", "orchestra", "philharmonic", "ensemble", "choir", "chorus", "maestro")):
+                        continue
             try:
                 resp = requests.get(link, timeout=8, allow_redirects=True)
             except Exception as e:
