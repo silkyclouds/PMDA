@@ -290,6 +290,16 @@ export function SourcesAutonomySettings() {
           </div>
         </div>
 
+        <div className="rounded-lg border border-border/70 bg-background/20 p-3">
+          <div className="text-sm font-medium text-foreground">Recommended operating mode</div>
+          <p className="mt-1 text-xs text-muted-foreground">
+            Use <span className="text-foreground">Incoming</span> as the drop zone for new music, let PMDA process and place the winner into a <span className="text-foreground">Standard source</span>, then let PMDA export the clean serving tree into your library folder for Plex, Navidrome or Jellyfin.
+          </p>
+          <p className="mt-2 text-[11px] text-muted-foreground">
+            This is optional. You can also skip incoming entirely and scan standard source folders directly.
+          </p>
+        </div>
+
         <div className="overflow-hidden rounded-lg border border-border/70 bg-background/25">
           <div className="hidden items-center gap-3 border-b border-border/60 px-3 py-2 text-[11px] uppercase tracking-wide text-muted-foreground lg:grid lg:grid-cols-[minmax(0,1.45fr)_230px_120px_44px]">
             <div>Folder</div>
@@ -354,7 +364,7 @@ export function SourcesAutonomySettings() {
             <div className="space-y-1">
               <Label className="text-sm">Processed incoming albums go to</Label>
               <p className="text-xs text-muted-foreground">
-                Choose which enabled standard source folder should receive albums once PMDA has processed them.
+                Choose which enabled standard source folder should receive albums once PMDA has processed them. PMDA will export the clean serving tree separately through the library export folder.
               </p>
             </div>
             <div className="grid grid-cols-1 gap-3 md:grid-cols-[minmax(0,1fr),220px]">

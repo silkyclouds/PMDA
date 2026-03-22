@@ -2269,13 +2269,13 @@ merged = {
     "PATH_MAP":       _parse_path_map(_get("PATH_MAP", default={})),
     "DUPE_ROOT":      _get("DUPE_ROOT", default="/dupes", cast=str),
     "LOG_LEVEL":      _get("LOG_LEVEL",      default="INFO").upper(),
-    "AI_PROVIDER": _get("AI_PROVIDER", default="openai", cast=str),
+    "AI_PROVIDER": _get("AI_PROVIDER", default="ollama", cast=str),
     "OPENAI_API_KEY": _get("OPENAI_API_KEY", default="",                                cast=str),
     "OPENAI_ENABLE_API_KEY_MODE": _get("OPENAI_ENABLE_API_KEY_MODE", default=True, cast=_parse_bool),
     "OPENAI_ENABLE_CODEX_OAUTH_MODE": _get("OPENAI_ENABLE_CODEX_OAUTH_MODE", default=True, cast=_parse_bool),
     "OPENAI_MODEL":   _get("OPENAI_MODEL",   default="gpt-4",                           cast=str),
     "AI_USAGE_LEVEL": _get("AI_USAGE_LEVEL", default="auto",                            cast=str),
-    "SCAN_AI_POLICY": _get("SCAN_AI_POLICY", default="local_then_paid",                 cast=str),
+    "SCAN_AI_POLICY": _get("SCAN_AI_POLICY", default="local_only",                      cast=str),
     "SCAN_PAID_PROVIDER_ORDER": _get("SCAN_PAID_PROVIDER_ORDER", default="openai-api,openai-codex,anthropic,google", cast=str),
     "WEB_SEARCH_LOCAL_ORDER": _get("WEB_SEARCH_LOCAL_ORDER", default="searxng,serper", cast=str),
     "ANTHROPIC_API_KEY": _get("ANTHROPIC_API_KEY", default="", cast=str),
@@ -2578,7 +2578,7 @@ NAVIDROME_USERNAME: str = str(merged.get("NAVIDROME_USERNAME", "") or "").strip(
 NAVIDROME_PASSWORD: str = str(merged.get("NAVIDROME_PASSWORD", "") or "").strip()
 NAVIDROME_API_KEY: str = str(merged.get("NAVIDROME_API_KEY", "") or "").strip()
 AI_USAGE_LEVEL: str = str(merged.get("AI_USAGE_LEVEL", "auto") or "auto").strip().lower()
-SCAN_AI_POLICY: str = str(merged.get("SCAN_AI_POLICY", "local_then_paid") or "local_then_paid").strip().lower()
+SCAN_AI_POLICY: str = str(merged.get("SCAN_AI_POLICY", "local_only") or "local_only").strip().lower()
 SCAN_PAID_PROVIDER_ORDER: str = str(
     merged.get("SCAN_PAID_PROVIDER_ORDER", "openai-api,openai-codex,anthropic,google")
     or "openai-api,openai-codex,anthropic,google"
@@ -3886,7 +3886,7 @@ def _ai_model_display_name(provider: str | None = None) -> str:
 
 
 def _scan_ai_policy_for_runtime() -> str:
-    return _normalize_scan_ai_policy(getattr(sys.modules[__name__], "SCAN_AI_POLICY", "local_then_paid"))
+    return _normalize_scan_ai_policy(getattr(sys.modules[__name__], "SCAN_AI_POLICY", "local_only"))
 
 
 def _scan_paid_provider_chain() -> list[str]:
@@ -4345,7 +4345,7 @@ def _resolve_ai_runtime_availability(
 
 def _assistant_runtime_status(*, user_id: int | None = None) -> dict[str, Any]:
     uid = _current_user_id_or_zero() if user_id is None else max(0, int(user_id or 0))
-    requested_provider = str(getattr(sys.modules[__name__], "AI_PROVIDER", "openai") or "openai").strip() or "openai"
+    requested_provider = str(getattr(sys.modules[__name__], "AI_PROVIDER", "ollama") or "ollama").strip() or "ollama"
     ai_ready, provider_effective, auth_mode, ai_error = _resolve_ai_runtime_availability(
         analysis_type="assistant_chat",
         requested_provider=requested_provider,
@@ -53712,7 +53712,7 @@ def _apply_settings_in_memory(updates: dict):
         logging.info("AI_USAGE_LEVEL updated in memory: %s", AI_USAGE_LEVEL)
     if "SCAN_AI_POLICY" in updates:
         global SCAN_AI_POLICY
-        SCAN_AI_POLICY = _normalize_scan_ai_policy(str(updates.get("SCAN_AI_POLICY") or "local_then_paid"))
+        SCAN_AI_POLICY = _normalize_scan_ai_policy(str(updates.get("SCAN_AI_POLICY") or "local_only"))
         merged["SCAN_AI_POLICY"] = SCAN_AI_POLICY
         logging.info("SCAN_AI_POLICY updated in memory: %s", SCAN_AI_POLICY)
     if "SCAN_PAID_PROVIDER_ORDER" in updates:
@@ -54342,7 +54342,7 @@ def api_config_put():
         updates["AI_USAGE_LEVEL"] = normalized_level
         updates.update(_ai_usage_level_overrides(normalized_level))
     if "SCAN_AI_POLICY" in updates:
-        updates["SCAN_AI_POLICY"] = _normalize_scan_ai_policy(str(updates.get("SCAN_AI_POLICY") or "local_then_paid"))
+        updates["SCAN_AI_POLICY"] = _normalize_scan_ai_policy(str(updates.get("SCAN_AI_POLICY") or "local_only"))
     if "SCAN_PAID_PROVIDER_ORDER" in updates:
         updates["SCAN_PAID_PROVIDER_ORDER"] = ",".join(
             _normalize_ordered_values(

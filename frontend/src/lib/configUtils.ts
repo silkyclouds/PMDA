@@ -152,7 +152,7 @@ export function normalizeConfigForUI(raw: Partial<PMDAConfig>): Partial<PMDAConf
   if (out.SCAN_AI_POLICY != null) {
     const policy = String(out.SCAN_AI_POLICY).trim().toLowerCase();
     out.SCAN_AI_POLICY = (
-      ['local_only', 'local_then_paid', 'paid_only'].includes(policy) ? policy : 'local_then_paid'
+      ['local_only', 'local_then_paid', 'paid_only'].includes(policy) ? policy : 'local_only'
     ) as PMDAConfig['SCAN_AI_POLICY'];
   }
   if (out.WEB_SEARCH_PROVIDER != null) {

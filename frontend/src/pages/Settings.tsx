@@ -187,12 +187,12 @@ const SCAN_AI_POLICY_OPTIONS: Array<{
   {
     value: 'local_only',
     label: 'Local only',
-    description: 'Tags/OCR/providers first, then local web search + Ollama only. No paid AI fallback.',
+    description: 'Recommended default. Tags/OCR/providers first, then local web search + Ollama only. PMDA stays free to run unless you explicitly enable paid reinforcement.',
   },
   {
     value: 'local_then_paid',
     label: 'Local + paid fallback',
-    description: 'Recommended. Local search and Ollama first, then the paid chain only when the local path still cannot settle the case.',
+    description: 'Optional reinforcement mode. Local search and Ollama run first, then the paid chain only when the local path still cannot settle the case.',
   },
   {
     value: 'paid_only',
@@ -878,11 +878,11 @@ function SettingsPage() {
   const selectedAiLevelIndex = Math.max(0, AI_USAGE_LEVELS.findIndex((lvl) => lvl.value === selectedAiLevel));
   const selectedAiLevelMeta = AI_USAGE_LEVELS[selectedAiLevelIndex] || AI_USAGE_LEVELS[0];
   const selectedScanAiPolicy = (() => {
-    const raw = String(config.SCAN_AI_POLICY || 'local_then_paid').trim().toLowerCase();
-    return SCAN_AI_POLICY_OPTIONS.find((option) => option.value === raw)?.value || 'local_then_paid';
+    const raw = String(config.SCAN_AI_POLICY || 'local_only').trim().toLowerCase();
+    return SCAN_AI_POLICY_OPTIONS.find((option) => option.value === raw)?.value || 'local_only';
   })();
   const selectedScanAiPolicyMeta =
-    SCAN_AI_POLICY_OPTIONS.find((option) => option.value === selectedScanAiPolicy) || SCAN_AI_POLICY_OPTIONS[1];
+    SCAN_AI_POLICY_OPTIONS.find((option) => option.value === selectedScanAiPolicy) || SCAN_AI_POLICY_OPTIONS[0];
   const localWebOrder = parseOrderedValues(config.WEB_SEARCH_LOCAL_ORDER, LOCAL_WEB_PROVIDER_IDS, LOCAL_WEB_PROVIDER_IDS);
   const paidAiOrder = parseOrderedValues(config.SCAN_PAID_PROVIDER_ORDER, PAID_AI_PROVIDER_IDS, PAID_AI_PROVIDER_IDS);
   const effectiveScanBatchProvider = String(config.SCAN_AI_EFFECTIVE_BATCH || '').trim();
@@ -1225,7 +1225,7 @@ function SettingsPage() {
                       <Label className="text-sm">Where should PMDA build the clean exported library?</Label>
                     </div>
                     <p className="text-xs text-muted-foreground">
-                      This folder is the clean library PMDA generates automatically. It is required because PMDA keeps your processed output predictable and ready for players.
+                      This folder is the clean library PMDA generates automatically. Point Plex, Navidrome or Jellyfin here rather than at your raw source or incoming folders.
                     </p>
                     <p className="text-[11px] text-muted-foreground">
                       If the folder does not exist yet, PMDA will create it when the export pipeline runs.
@@ -1599,7 +1599,7 @@ function SettingsPage() {
                   AI
                 </CardTitle>
                 <CardDescription>
-                  Configure OpenAI API key for batch workloads and OpenAI Codex OAuth for interactive workflows.
+                  PMDA is optimized to run locally by default with Ollama plus self-hosted web search. Paid AI is optional and only needed if you want external reinforcement.
                 </CardDescription>
               </CardHeader>
               <CardContent className="space-y-4">

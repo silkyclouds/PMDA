@@ -31,7 +31,7 @@ export function AISettings({ config, updateConfig, errors }: AISettingsProps) {
   const [showAdvanced, setShowAdvanced] = useState(false);
   const credentialsRef = useRef<string>('');
 
-  const provider = (config.AI_PROVIDER || 'openai') as 'openai' | 'anthropic' | 'google' | 'ollama';
+  const provider = (config.AI_PROVIDER || 'ollama') as 'openai' | 'anthropic' | 'google' | 'ollama';
 
   // Auto-fetch models when credentials are present
   useEffect(() => {
