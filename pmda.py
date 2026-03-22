@@ -28708,6 +28708,33 @@ def _musicbrainz_artist_identity_lookup(
         return {}
     query_norm = _norm_artist_key(query)
     query_signature = _classical_person_signature_key(query)
+    query_person_sig = _classical_person_alias_signature(query) if person_like else {}
+
+    def _person_candidate_compatible(*names: str) -> bool:
+        if not person_like or not query_person_sig:
+            return True
+        query_surname = str(query_person_sig.get("surname") or "").strip()
+        query_initials = {str(ch or "").strip() for ch in (query_person_sig.get("initials") or set()) if str(ch or "").strip()}
+        query_long = {str(tok or "").strip() for tok in (query_person_sig.get("long_givens") or set()) if str(tok or "").strip()}
+        saw_person_sig = False
+        for raw_name in names:
+            cand_sig = _classical_person_alias_signature(raw_name)
+            if not cand_sig:
+                continue
+            saw_person_sig = True
+            cand_surname = str(cand_sig.get("surname") or "").strip()
+            if query_surname and cand_surname and cand_surname != query_surname:
+                continue
+            cand_initials = {str(ch or "").strip() for ch in (cand_sig.get("initials") or set()) if str(ch or "").strip()}
+            cand_long = {str(tok or "").strip() for tok in (cand_sig.get("long_givens") or set()) if str(tok or "").strip()}
+            if query_long and cand_long and query_long.intersection(cand_long):
+                return True
+            if query_initials and cand_initials and query_initials.intersection(cand_initials):
+                return True
+            if query_surname and cand_surname and query_surname == cand_surname and (not query_initials or not cand_initials):
+                return True
+        return not saw_person_sig
+
     best: dict[str, Any] | None = None
     best_score = 0.0
     for cand in artist_list[: max(3, min(int(limit or 8), 10))]:
@@ -28718,6 +28745,8 @@ def _musicbrainz_artist_identity_lookup(
             continue
         cand_sort = " ".join(str(cand.get("sort-name") or "").split()).strip()
         cand_type = str(cand.get("type") or "").strip().lower()
+        if person_like and not _person_candidate_compatible(cand_name, cand_sort):
+            continue
         score = _provider_identity_text_score(query, cand_name)
         if cand_sort:
             score = max(score, _provider_identity_text_score(query, cand_sort))
