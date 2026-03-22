@@ -28010,11 +28010,23 @@ def _classical_has_explicit_signal(
     return bool(
         title_signal
         or genre_signal
-        or catalog_signal
         or performance_signal
-        or (composer_signal and (title_signal or genre_signal or catalog_signal or performance_signal))
-        or (composer_signal and performer_signal and (title_signal or genre_signal or catalog_signal))
+        or (catalog_signal and (title_signal or genre_signal or performance_signal))
+        or (composer_signal and (title_signal or genre_signal or performance_signal))
+        or (composer_signal and performer_signal and (title_signal or genre_signal))
     )
+
+
+def _should_run_profile_enrichment_inline(albums_count: int) -> bool:
+    try:
+        total = max(0, int(albums_count or 0))
+    except Exception:
+        total = 0
+    if not bool(getattr(sys.modules[__name__], "SCHEDULER_ALLOW_NON_SCAN_JOBS", SCHEDULER_ALLOW_NON_SCAN_JOBS)):
+        return True
+    if total <= 0:
+        return False
+    return total <= 64
 
 
 def _classical_display_payload(
@@ -45510,7 +45522,7 @@ def background_scan():
                 _run_improve_all_albums_global(best_albums)
                 if _get_library_mode() == "files":
                     _refresh_files_album_scan_cache_from_editions(best_albums, scan_id=scan_id)
-                    if not bool(getattr(sys.modules[__name__], "SCHEDULER_ALLOW_NON_SCAN_JOBS", SCHEDULER_ALLOW_NON_SCAN_JOBS)):
+                    if _should_run_profile_enrichment_inline(len(best_albums)):
                         try:
                             enrich_metrics = _run_scan_profile_enrichment_inline(
                                 best_albums,
@@ -45537,24 +45549,24 @@ def background_scan():
         if (
             scan_status == "completed"
             and _get_library_mode() == "files"
-            and not bool(getattr(sys.modules[__name__], "SCHEDULER_ALLOW_NON_SCAN_JOBS", SCHEDULER_ALLOW_NON_SCAN_JOBS))
             and bool((run_improve_after_requested or pipeline_flags_requested.get("match_fix")))
             and not bool(profile_enrich_inline_done)
         ):
             try:
                 targets = _scan_collect_profile_enrich_targets(_int_or_none(scan_id))
-                enrich_metrics = _run_scan_profile_enrichment_inline(
-                    targets,
-                    reason=f"scan_{int(scan_id or 0)}_fallback",
-                )
-                logging.info(
-                    "Pipeline step profile-enrich-inline (fallback): artists=%d done=%d failed=%d albums=%d",
-                    int(enrich_metrics.get("artists_total") or 0),
-                    int(enrich_metrics.get("artists_done") or 0),
-                    int(enrich_metrics.get("artists_failed") or 0),
-                    int(enrich_metrics.get("albums_targeted") or 0),
-                )
-                _refresh_scan_history_from_published(scan_id)
+                if _should_run_profile_enrichment_inline(len(targets)) and targets:
+                    enrich_metrics = _run_scan_profile_enrichment_inline(
+                        targets,
+                        reason=f"scan_{int(scan_id or 0)}_fallback",
+                    )
+                    logging.info(
+                        "Pipeline step profile-enrich-inline (fallback): artists=%d done=%d failed=%d albums=%d",
+                        int(enrich_metrics.get("artists_total") or 0),
+                        int(enrich_metrics.get("artists_done") or 0),
+                        int(enrich_metrics.get("artists_failed") or 0),
+                        int(enrich_metrics.get("albums_targeted") or 0),
+                    )
+                    _refresh_scan_history_from_published(scan_id)
             except Exception:
                 logging.exception("Scan inline profile enrichment fallback failed")
         if scan_stream_post_by_artist and scan_status == "completed":
