@@ -58275,11 +58275,13 @@ def api_library_artists():
                         params.append(norms)
                         params.append(norms)
 
+                where_sql = " AND ".join(where_parts)
+
                 cur.execute(
                     f"""
                     SELECT COUNT(*)
                     FROM files_artists a
-                    WHERE {" AND ".join(where_parts)}
+                    WHERE {where_sql}
                     """,
                     params,
                 )
@@ -58309,7 +58311,7 @@ def api_library_artists():
                                 CASE WHEN lower(a.name) LIKE lower(%s) || '%%' THEN 0 ELSE 1 END AS prefix_rank
                             FROM files_artists a
                             LEFT JOIN files_external_artist_images ext ON ext.name_norm = a.name_norm
-                            WHERE {" AND ".join(where_parts)}
+                            WHERE {where_sql}
                             ORDER BY prefix_rank ASC, score DESC, album_count DESC, a.name ASC
                             LIMIT %s OFFSET %s
                             """,
@@ -58334,7 +58336,7 @@ def api_library_artists():
                                 (""" + _artist_has_true_image_sql("a", "ext") + """) AS has_image
                             FROM files_artists a
                             LEFT JOIN files_external_artist_images ext ON ext.name_norm = a.name_norm
-                            WHERE {" AND ".join(where_parts)}
+                            WHERE {where_sql}
                             ORDER BY album_count DESC, a.name ASC
                             LIMIT %s OFFSET %s
                             """,
@@ -58359,7 +58361,7 @@ def api_library_artists():
                             (""" + _artist_has_true_image_sql("a", "ext") + """) AS has_image
                         FROM files_artists a
                         LEFT JOIN files_external_artist_images ext ON ext.name_norm = a.name_norm
-                        WHERE {" AND ".join(where_parts)}
+                        WHERE {where_sql}
                         ORDER BY album_count DESC, a.name ASC
                         LIMIT %s OFFSET %s
                         """,
