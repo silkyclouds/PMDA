@@ -16122,12 +16122,22 @@ def _rebuild_files_library_index_for_artist(
         _files_index_set_state(phase="artist_enrichment")
         if scan_critical_rebuild:
             primary_norm = _norm_artist_key(artist_name) or norm_album(artist_name or "")
-            _files_enrich_artists_blocking(
-                artists_map,
-                target_artist_norms={primary_norm} if primary_norm else None,
-                max_artists=1,
-                total_budget_sec=_FILES_SCAN_INLINE_ARTIST_ENRICH_BUDGET_SEC,
-            )
+            payload = artists_map.get(primary_norm) if primary_norm else None
+            target_name = str((payload or {}).get("name") or artist_name or "").strip()
+            if primary_norm and target_name:
+                spawned = _spawn_files_profile_enrichment_job(
+                    artist_name=target_name,
+                    artist_norm=primary_norm,
+                    albums=[],
+                    allow_soft_profiles=True,
+                    force=True,
+                )
+                logging.info(
+                    "[Scan Pipeline] deferred artist enrichment to background artist=%r reason=%s spawned=%s",
+                    target_name,
+                    reason,
+                    bool(spawned),
+                )
         else:
             _files_enrich_artists_blocking(artists_map)
         artists_map = _files_refresh_artist_media_map_from_db(artists_map)
@@ -18602,6 +18612,7 @@ def _files_try_artist_image_refresh(
 
 
 _FILES_SCAN_INLINE_ARTIST_ENRICH_BUDGET_SEC = 8.0
+_FILES_SCAN_WEB_MBID_AI_TIMEOUT_SEC = 20.0
 
 
 def _files_enrich_artists_blocking(
@@ -33898,7 +33909,10 @@ def search_mb_release_group_by_metadata(
                         user_msg=prompt,
                         max_tokens=70,
                         analysis_type="web_mbid_inference",
-                        timeout_sec=AI_SCAN_HARD_TIMEOUT_SEC,
+                        timeout_sec=min(
+                            float(AI_SCAN_HARD_TIMEOUT_SEC or 120.0),
+                            _FILES_SCAN_WEB_MBID_AI_TIMEOUT_SEC if _scan_pipeline_active() else 45.0,
+                        ),
                         log_prefix="[MusicBrainz Web+AI]",
                     )
                     reply_clean, ai_confidence = parse_ai_confidence((reply or "").strip())
