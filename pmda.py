@@ -8330,6 +8330,28 @@ def _ensure_files_source_roots_seeded() -> None:
 
 
 def _pipeline_bootstrap_status() -> dict[str, Any]:
+    def _sqlite_ts_to_float(value: Any) -> float | None:
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            try:
+                return float(value)
+            except Exception:
+                return None
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+        try:
+            return float(raw)
+        except Exception:
+            pass
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S.%f"):
+            try:
+                return datetime.strptime(raw, fmt).timestamp()
+            except Exception:
+                continue
+        return None
+
     try:
         con = sqlite3.connect(str(STATE_DB_FILE), timeout=15)
         con.row_factory = sqlite3.Row
@@ -8358,8 +8380,8 @@ def _pipeline_bootstrap_status() -> dict[str, Any]:
         "bootstrap_required": bool(row["bootstrap_required"]),
         "autonomous_mode": bool(row["autonomous_mode"]),
         "first_full_scan_id": int(row["first_full_scan_id"]) if row["first_full_scan_id"] is not None else None,
-        "first_full_completed_at": float(row["first_full_completed_at"]) if row["first_full_completed_at"] is not None else None,
-        "updated_at": float(row["updated_at"]) if row["updated_at"] is not None else None,
+        "first_full_completed_at": _sqlite_ts_to_float(row["first_full_completed_at"]),
+        "updated_at": _sqlite_ts_to_float(row["updated_at"]),
     }
 
 
