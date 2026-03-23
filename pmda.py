@@ -11409,7 +11409,7 @@ def _scheduler_loop() -> None:
             for rule in rules:
                 if not int(rule["enabled"] or 0):
                     continue
-                if bool(int(rule.get("post_scan_chain") or 0)):
+                if bool(int(rule["post_scan_chain"] or 0)):
                     # Chain rules are templates for async post-scan jobs, not periodic schedule jobs.
                     continue
                 job_type = _normalize_task_job_type(rule["job_type"])
