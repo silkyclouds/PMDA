@@ -60597,6 +60597,21 @@ def api_library_artists():
         cached = _files_cache_get_json(cache_key)
         if cached is not None:
             return jsonify(cached)
+        with lock:
+            scan_busy = bool(
+                state.get("scanning")
+                or state.get("scan_starting")
+                or state.get("scan_finalizing")
+                or state.get("scan_post_processing")
+            )
+        if files_index_lock.locked():
+            cached = _files_cache_get_json(cache_key)
+            if cached is not None:
+                payload = dict(cached)
+                payload["stale"] = True
+                return jsonify(payload)
+            if scan_busy:
+                return jsonify({"artists": [], "total": 0, "limit": int(limit), "offset": int(offset), "stale": True})
         ok, err = _ensure_files_index_ready()
         if not ok:
             return jsonify({"error": err or "Files index unavailable"}), 503
@@ -61670,6 +61685,21 @@ def api_library_albums():
     cached = _files_cache_get_json(cache_key)
     if cached is not None:
         return jsonify(cached)
+    with lock:
+        scan_busy = bool(
+            state.get("scanning")
+            or state.get("scan_starting")
+            or state.get("scan_finalizing")
+            or state.get("scan_post_processing")
+        )
+    if files_index_lock.locked():
+        cached = _files_cache_get_json(cache_key)
+        if cached is not None:
+            payload = dict(cached)
+            payload["stale"] = True
+            return jsonify(payload)
+        if scan_busy:
+            return jsonify({"albums": [], "total": 0, "limit": int(limit), "offset": int(offset), "stale": True})
 
     ok, err = _ensure_files_index_ready()
     if not ok:
