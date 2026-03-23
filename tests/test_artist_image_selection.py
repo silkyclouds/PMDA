@@ -41,6 +41,16 @@ class ArtistImageSelectionTests(unittest.TestCase):
             )
         )
 
+    def test_classical_ensemble_musicbrainz_spotify_avatar_requires_refresh(self):
+        self.assertTrue(
+            pmda._artist_external_image_requires_authoritative_refresh(
+                provider="musicbrainz_url",
+                image_url="https://i.scdn.co/image/ab6761610000e5ebaac46a30dc91a8148051a633",
+                entity_kind="orchestra",
+                role_hints=["orchestra"],
+            )
+        )
+
     def test_classical_entities_reject_fanart_and_audiodb(self):
         self.assertTrue(
             pmda._artist_external_image_requires_authoritative_refresh(
@@ -133,6 +143,16 @@ class ArtistImageSelectionTests(unittest.TestCase):
             )
         )
 
+    def test_ensemble_image_rejects_spotify_logo_avatar(self):
+        self.assertFalse(
+            pmda._artist_image_url_looks_relevant(
+                "https://i.scdn.co/image/ab6761610000e5eb65ffed8eba27a6d130accb2d",
+                artist_name="Deutsches Symphonie-Orchester Berlin",
+                entity_kind="orchestra",
+                role_hints=["orchestra"],
+            )
+        )
+
     def test_artist_alias_rows_include_canonical_name_and_generated_person_aliases(self):
         rows = pmda._files_artist_alias_rows_for_identity(
             artist_name="Peter Tchaikovsky",
@@ -197,6 +217,21 @@ class ArtistImageSelectionTests(unittest.TestCase):
                 entity_kind="composer",
                 role_hints=["composer"],
                 candidate_names=["Pyotr Ilyich Tchaikovsky", "Peter Tchaikovsky"],
+            )
+        )
+
+    def test_ensemble_search_result_rejects_logo_page(self):
+        self.assertFalse(
+            pmda._artist_image_result_looks_relevant(
+                "Česká filharmonie",
+                {
+                    "title": "Česká filharmonie visual identity logo",
+                    "snippet": "Official logo and brand identity assets for the orchestra.",
+                    "link": "https://example.com/ceska-filharmonie-logo",
+                },
+                entity_kind="orchestra",
+                role_hints=["orchestra"],
+                candidate_names=["Ceska filharmonie", "Czech Philharmonic"],
             )
         )
 
