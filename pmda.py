@@ -12358,7 +12358,7 @@ def _files_backfill_artist_canonical_fields(conn) -> None:
         with conn.cursor() as cur:
             cur.execute("SELECT COALESCE(value, '') FROM files_index_meta WHERE key = 'artist_canonical_schema' LIMIT 1")
             row = cur.fetchone()
-            if row and str(row[0] or "").strip() == "v4":
+            if row and str(row[0] or "").strip() == "v5":
                 return
             cur.execute(
                 """
@@ -12408,7 +12408,7 @@ def _files_backfill_artist_canonical_fields(conn) -> None:
             cur.execute(
                 """
                 INSERT INTO files_index_meta(key, value, updated_at)
-                VALUES ('artist_canonical_schema', 'v4', NOW())
+                VALUES ('artist_canonical_schema', 'v5', NOW())
                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
                 """
             )
@@ -12421,7 +12421,7 @@ def _files_purge_weak_classical_artist_images(conn) -> None:
         with conn.cursor() as cur:
             cur.execute("SELECT COALESCE(value, '') FROM files_index_meta WHERE key = 'artist_image_policy_schema' LIMIT 1")
             row = cur.fetchone()
-            if row and str(row[0] or "").strip() == "v4":
+            if row and str(row[0] or "").strip() == "v5":
                 return
             try:
                 media_cache_root = path_for_fs_access(Path((MEDIA_CACHE_ROOT or "").strip() or str(CONFIG_DIR / "media_cache"))).resolve()
@@ -12458,12 +12458,7 @@ def _files_purge_weak_classical_artist_images(conn) -> None:
                     entity_kind=str(entity_kind or ""),
                     role_hints=role_hints,
                 )
-                if (
-                    not invalidate
-                    and display_name
-                    and _artist_entity_is_classical_like(entity_kind=str(entity_kind or ""), role_hints=role_hints)
-                    and str(image_url or "").strip()
-                ):
+                if not invalidate and display_name and str(image_url or "").strip():
                     invalidate = not _artist_image_url_looks_relevant(
                         str(image_url or "").strip(),
                         artist_name=display_name,
@@ -12499,7 +12494,7 @@ def _files_purge_weak_classical_artist_images(conn) -> None:
             cur.execute(
                 """
                 INSERT INTO files_index_meta(key, value, updated_at)
-                VALUES ('artist_image_policy_schema', 'v4', NOW())
+                VALUES ('artist_image_policy_schema', 'v5', NOW())
                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
                 """
             )
@@ -28998,15 +28993,46 @@ def _artist_identity_lookup_names(
     candidate_names: list[str] | tuple[str, ...] | None = None,
     limit: int = 12,
 ) -> list[str]:
+    augmented_candidates: list[str] = []
+    seen_augmented: set[str] = set()
+
+    def _push_candidate(value: str) -> None:
+        clean = " ".join(str(value or "").split()).strip()
+        norm = _norm_artist_key(clean)
+        if not clean or not norm or norm in seen_augmented:
+            return
+        seen_augmented.add(norm)
+        augmented_candidates.append(clean)
+
+    _push_candidate(artist_name)
+    for raw in candidate_names or []:
+        _push_candidate(str(raw or ""))
+
+    classical_like = _artist_entity_is_classical_like(entity_kind=entity_kind, role_hints=role_hints)
+    if classical_like:
+        try:
+            mb_identity = _musicbrainz_artist_identity_lookup(
+                artist_name,
+                entity_kind=entity_kind,
+                role_hints=role_hints,
+            ) or {}
+        except Exception:
+            mb_identity = {}
+        if isinstance(mb_identity, dict):
+            _push_candidate(str(mb_identity.get("name") or ""))
+            _push_candidate(str(mb_identity.get("sort_name") or ""))
+            for alias in (mb_identity.get("aliases") or []):
+                _push_candidate(str(alias or ""))
+
     primary_lookup_name = _artist_identity_primary_lookup_name(
         artist_name,
         entity_kind=entity_kind,
         role_hints=role_hints,
-        candidate_names=candidate_names,
+        candidate_names=augmented_candidates,
     )
     lookup_names = _artist_image_lookup_candidates(
         primary_lookup_name,
-        [artist_name, *(list(candidate_names or []))],
+        augmented_candidates,
         entity_kind=entity_kind,
         role_hints=role_hints,
         limit=max(1, int(limit or 12)),
@@ -29582,7 +29608,7 @@ def _files_backfill_artist_alias_table(conn) -> None:
         with conn.cursor() as cur:
             cur.execute("SELECT COALESCE(value, '') FROM files_index_meta WHERE key = 'artist_aliases_schema' LIMIT 1")
             row = cur.fetchone()
-            if row and str(row[0] or "").strip() == "v3":
+            if row and str(row[0] or "").strip() == "v4":
                 return
             cur.execute("SELECT name_norm FROM files_artists")
             norms = [str(value[0] or "").strip() for value in cur.fetchall() if str(value[0] or "").strip()]
@@ -29591,7 +29617,7 @@ def _files_backfill_artist_alias_table(conn) -> None:
                 cur.execute(
                     """
                     INSERT INTO files_index_meta(key, value, updated_at)
-                    VALUES ('artist_aliases_schema', 'v3', NOW())
+                    VALUES ('artist_aliases_schema', 'v4', NOW())
                     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
                     """
                 )
@@ -29602,7 +29628,7 @@ def _files_backfill_artist_alias_table(conn) -> None:
             cur.execute(
                 """
                 INSERT INTO files_index_meta(key, value, updated_at)
-                VALUES ('artist_aliases_schema', 'v3', NOW())
+                VALUES ('artist_aliases_schema', 'v4', NOW())
                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
                 """
             )
@@ -68241,15 +68267,36 @@ def api_library_files_artist_image(artist_id):
 
     if img_raw:
         img_path = path_for_fs_access(Path(img_raw))
-        if img_path.exists() and img_path.is_file() and _is_media_cache_file(img_path, kind="artist"):
+        if ext_requires_refresh and _is_media_cache_file(img_path, kind="artist"):
+            img_raw = ""
+            no_image_cached = False
+            _files_cache_set_json(
+                lookup_key,
+                {
+                    "name_norm": name_norm,
+                    "image_path": "",
+                    "artist_name": artist_name,
+                    "entity_kind": entity_kind,
+                    "roles_json": roles_json,
+                    "ext_image_path": ext_raw,
+                    "ext_provider": ext_provider,
+                    "ext_image_url": ext_image_url,
+                    "no_image": False,
+                },
+                ttl=60,
+            )
+            if artist_name and name_norm:
+                _enqueue_files_profile_enrichment(artist_name, name_norm, [], force=True)
+        elif img_path.exists() and img_path.is_file() and _is_media_cache_file(img_path, kind="artist"):
             cached = _ensure_cached_image_for_path(img_path, kind="artist", max_px=size)
             to_send = cached or img_path
             return _serve_image_file_cached(to_send, max_age=0, revalidate=True)
-        logging.debug(
-            "cache_miss_no_runtime_fallback: artist_id=%s image_path=%s",
-            int(artist_id),
-            str(img_path),
-        )
+        else:
+            logging.debug(
+                "cache_miss_no_runtime_fallback: artist_id=%s image_path=%s",
+                int(artist_id),
+                str(img_path),
+            )
 
     if name_norm:
         ext_key = f"artwork:artist:ext:{name_norm}"
@@ -68337,6 +68384,8 @@ def api_library_files_artist_image(artist_id):
 
     if no_image_cached:
         return _transparent_png_response(max_age=3600)
+    if artist_name and name_norm:
+        _enqueue_files_profile_enrichment(artist_name, name_norm, [], force=True)
     _files_cache_set_json(
         lookup_key,
         {

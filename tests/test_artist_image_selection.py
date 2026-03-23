@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 
 import pmda
 
@@ -183,6 +184,40 @@ class ArtistImageSelectionTests(unittest.TestCase):
                 page_summary="Russian composer portrait and biography.",
             )
         )
+
+    def test_classical_search_result_rejects_wasp_false_positive(self):
+        self.assertFalse(
+            pmda._artist_image_result_looks_relevant(
+                "Peter Tchaikovsky",
+                {
+                    "title": "Tchaikovsky wasp",
+                    "snippet": "Species page for a parasitoid wasp named after Tchaikovsky.",
+                    "link": "https://example.com/tchaikovsky-wasp",
+                },
+                entity_kind="composer",
+                role_hints=["composer"],
+                candidate_names=["Pyotr Ilyich Tchaikovsky", "Peter Tchaikovsky"],
+            )
+        )
+
+    def test_lookup_names_use_musicbrainz_identity_for_transliterated_queries(self):
+        with mock.patch.object(
+            pmda,
+            "_musicbrainz_artist_identity_lookup",
+            return_value={
+                "name": "Johann Sebastian Bach",
+                "sort_name": "Bach, Johann Sebastian",
+                "aliases": ["Jean-Sébastien Bach", "J. S. Bach"],
+            },
+        ):
+            names = pmda._artist_identity_lookup_names(
+                "Jean-Sebastien Bach",
+                entity_kind="composer",
+                role_hints=["composer"],
+                candidate_names=[],
+            )
+        self.assertIn("Johann Sebastian Bach", names)
+        self.assertTrue(any(value in names for value in ("Jean-Sébastien Bach", "Jean-Sebastien Bach")))
 
 
 if __name__ == "__main__":
