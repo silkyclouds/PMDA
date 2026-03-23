@@ -4985,6 +4985,7 @@ def call_ai_provider(
     response_obj: Any = None
     error_msg = ""
     status = "failed"
+    result_text = ""
     guard_allowed = True
     guard_reason = ""
     guard_meta: dict[str, Any] = {}
@@ -5003,6 +5004,15 @@ def call_ai_provider(
         user_msg=user_msg,
     )
     auth_mode_for_usage = _provider_auth_mode(provider_for_usage)
+    ai_ctx_for_log = _ai_infer_runtime_context()
+    logging.info(
+        "[AI Trace] start endpoint=text analysis=%s provider=%s model=%s context=%s prompt=%r",
+        str(analysis_type or "other").strip() or "other",
+        provider_for_usage,
+        model_for_usage,
+        _ai_trace_context_summary(ai_ctx_for_log),
+        _log_preview_text(user_msg, 220),
+    )
     try:
         guard_allowed, guard_reason, guard_meta = _ai_guardrail_precheck_safe(
             provider=provider_for_usage,
@@ -5023,7 +5033,8 @@ def call_ai_provider(
             )
             auth_mode_for_usage = "oauth"
             status = "completed"
-            return out
+            result_text = str(out or "")
+            return result_text
         if provider_lower in {"openai", "openai-api", "openai-codex"}:
             try:
                 client_to_use, auth_mode_for_usage, openai_runtime_reason = _resolve_openai_client_for_runtime(
@@ -5061,7 +5072,8 @@ def call_ai_provider(
                         out = _extract_text_from_openai_response(resp)
                         if out:
                             status = "completed"
-                            return out
+                            result_text = str(out or "")
+                            return result_text
                         raise RuntimeError("OpenAI responses call returned empty output")
                     except Exception as e:
                         if auth_mode_for_usage == "oauth":
@@ -5099,7 +5111,8 @@ def call_ai_provider(
                         out = _openai_chat_text(resp2)
                         response_obj = resp2
                     status = "completed"
-                    return out
+                    result_text = str(out or "")
+                    return result_text
                 except Exception as e:
                     err_msg = str(e).lower()
                     if "reasoning_effort" in err_msg and ("unsupported_parameter" in err_msg or "400" in err_msg):
@@ -5107,7 +5120,8 @@ def call_ai_provider(
                         resp = client_to_use.chat.completions.create(**_kwargs)
                         response_obj = resp
                         status = "completed"
-                        return _openai_chat_text(resp)
+                        result_text = _openai_chat_text(resp)
+                        return result_text
                     if "unsupported_parameter" not in err_msg and "400" not in err_msg:
                         raise
                     if "max_tokens" in err_msg and "max_completion_tokens" in err_msg:
@@ -5116,14 +5130,16 @@ def call_ai_provider(
                         resp = client_to_use.chat.completions.create(**_kwargs)
                         response_obj = resp
                         status = "completed"
-                        return _openai_chat_text(resp)
+                        result_text = _openai_chat_text(resp)
+                        return result_text
                     if "max_completion_tokens" in err_msg and ("max_tokens" in err_msg or "use" in err_msg):
                         _kwargs.pop("max_completion_tokens", None)
                         _kwargs["max_tokens"] = max_tokens
                         resp = client_to_use.chat.completions.create(**_kwargs)
                         response_obj = resp
                         status = "completed"
-                        return _openai_chat_text(resp)
+                        result_text = _openai_chat_text(resp)
+                        return result_text
                     if "stop" in err_msg or "unsupported" in err_msg:
                         _kwargs.pop("stop", None)
                         try:
@@ -5133,7 +5149,8 @@ def call_ai_provider(
                         resp = client_to_use.chat.completions.create(**_kwargs)
                         response_obj = resp
                         status = "completed"
-                        return _openai_chat_text(resp)
+                        result_text = _openai_chat_text(resp)
+                        return result_text
                     raise
             except Exception as e:
                 if provider_lower in {"openai", "openai-api"} and _openai_error_allows_codex_fallback(e):
@@ -5155,7 +5172,8 @@ def call_ai_provider(
                         auth_mode_for_usage = "oauth"
                         status = "completed"
                         error_msg = ""
-                        return out
+                        result_text = str(out or "")
+                        return result_text
                 raise
 
         if provider_lower == "anthropic":
@@ -5169,7 +5187,8 @@ def call_ai_provider(
             )
             response_obj = resp
             status = "completed"
-            return (resp.content[0].text or "").strip()
+            result_text = (resp.content[0].text or "").strip()
+            return result_text
 
         if provider_lower == "google":
             if not google_client_configured or not google_client:
@@ -5185,7 +5204,8 @@ def call_ai_provider(
             )
             response_obj = response
             status = "completed"
-            return (getattr(response, "text", "") or "").strip()
+            result_text = (getattr(response, "text", "") or "").strip()
+            return result_text
 
         if provider_lower == "ollama":
             if not ollama_url:
@@ -5214,13 +5234,35 @@ def call_ai_provider(
             result = response.json()
             response_obj = result
             status = "completed"
-            return (result.get("message", {}) or {}).get("content", "").strip()
+            result_text = (result.get("message", {}) or {}).get("content", "").strip()
+            return result_text
 
         raise ValueError(f"Unknown AI provider: {provider}")
     except Exception as e:
         error_msg = str(e)
         raise
     finally:
+        elapsed = max(0.0, time.time() - started_at)
+        if status == "completed":
+            logging.info(
+                "[AI Trace] done endpoint=text analysis=%s provider=%s model=%s elapsed=%.2fs context=%s reply=%r",
+                str(analysis_type or "other").strip() or "other",
+                provider_for_usage,
+                model_for_usage,
+                elapsed,
+                _ai_trace_context_summary(ai_ctx_for_log),
+                _log_preview_text(result_text, 220),
+            )
+        else:
+            logging.warning(
+                "[AI Trace] failed endpoint=text analysis=%s provider=%s model=%s elapsed=%.2fs context=%s error=%s",
+                str(analysis_type or "other").strip() or "other",
+                provider_for_usage,
+                model_for_usage,
+                elapsed,
+                _ai_trace_context_summary(ai_ctx_for_log),
+                _log_preview_text(error_msg, 220),
+            )
         recorder = globals().get("record_ai_usage")
         if callable(recorder):
             recorder(
@@ -8965,6 +9007,54 @@ def _normalize_ai_analysis_type(value: str | None) -> str:
     return "other"
 
 
+def _log_preview_text(value: Any, max_chars: int = 180) -> str:
+    text = re.sub(r"\s+", " ", str(value or "").strip())
+    if not text:
+        return ""
+    if len(text) <= max(16, int(max_chars or 0)):
+        return text
+    return text[: max(15, int(max_chars or 0) - 1)] + "…"
+
+
+def _ai_trace_context_summary(ctx: dict[str, Any] | None = None) -> str:
+    info = dict(ctx or _ai_infer_runtime_context() or {})
+    artist = str(info.get("album_artist") or "").strip()
+    title = str(info.get("album_title") or "").strip()
+    album_id = _int_or_none(info.get("album_id"))
+    phase = str(info.get("phase") or "").strip() or "manual"
+    parts = [f"phase={phase}"]
+    if album_id:
+        parts.append(f"album_id={int(album_id)}")
+    if artist:
+        parts.append(f"artist={artist!r}")
+    if title:
+        parts.append(f"title={title!r}")
+    return ", ".join(parts)
+
+
+def _web_results_log_summary(rows: list[dict[str, Any]], *, max_items: int = 3) -> str:
+    out: list[str] = []
+    for row in list(rows or [])[: max(1, int(max_items or 0))]:
+        if not isinstance(row, dict):
+            continue
+        title = _log_preview_text(row.get("title") or "", 64)
+        link = str(row.get("link") or "").strip()
+        host = ""
+        try:
+            host = urlparse(link).netloc.lower()
+            if host.startswith("www."):
+                host = host[4:]
+        except Exception:
+            host = ""
+        if title and host:
+            out.append(f"{title} @ {host}")
+        elif title:
+            out.append(title)
+        elif host:
+            out.append(host)
+    return " | ".join(out)
+
+
 def _ai_usage_context_get() -> dict[str, Any]:
     ctx = getattr(_ai_usage_local, "ctx", None)
     if isinstance(ctx, dict):
@@ -10363,26 +10453,36 @@ def _scheduler_insert_default_rules_if_empty() -> None:
         con.close()
         return
     defaults = [
-        # Changed-only scan every 20 minutes.
-        ("scan_changed", 1, "interval", 20, "", "", "new", 0, 10, 1),
+        # Changed-only scans are useful, but surprise background scans are confusing for most users.
+        # Keep the stock rule present so it is easy to enable later from Settings, but default it to OFF.
+        ("scan_changed", 0, "interval", 20, "", "", "new", 0, 10, 1),
         # Full scan every Sunday at 02:00 local.
         ("scan_full", 1, "weekly", None, "6", "02:00", "full", 0, 20, 1),
+        # Post-scan chain templates. These are *not* periodic schedule jobs; the scheduler loop
+        # ignores rules flagged `post_scan_chain=1` and they are used only as queue templates
+        # after a successful scan. This keeps the default pipeline fast and predictable while
+        # still enabling background enrichment/export by default.
+        ("enrich_batch", 1, "interval", 30, "", "", "both", 1, 30, 1),
+        ("dedupe", 1, "interval", 30, "", "", "both", 1, 35, 1),
+        ("incomplete_move", 1, "interval", 30, "", "", "both", 1, 45, 1),
+        ("export", 1, "interval", 30, "", "", "both", 1, 50, 1),
+        ("player_sync", 1, "interval", 30, "", "", "both", 1, 60, 1),
     ]
     if bool(getattr(sys.modules[__name__], "SCHEDULER_ALLOW_NON_SCAN_JOBS", SCHEDULER_ALLOW_NON_SCAN_JOBS)):
         defaults.extend(
             [
                 # Enrich in the background (continuous batches).
-                ("enrich_batch", 1, "interval", 30, "", "", "both", 1, 30, 1),
+                ("enrich_batch", 1, "interval", 30, "", "", "both", 0, 30, 1),
                 # Dedupe: chain for new changes + nightly full sweep.
                 ("dedupe", 1, "interval", 24 * 60, "", "", "full", 0, 40, 1),
-                ("dedupe", 1, "interval", 30, "", "", "new", 1, 35, 1),
+                ("dedupe", 1, "interval", 30, "", "", "new", 0, 35, 1),
                 # Incomplete move on new changes.
-                ("incomplete_move", 1, "interval", 30, "", "", "new", 1, 45, 1),
+                ("incomplete_move", 1, "interval", 30, "", "", "new", 0, 45, 1),
                 # Export and sync in batches + chain after full scans.
                 ("export", 1, "interval", 30, "", "", "new", 0, 50, 1),
-                ("export", 1, "interval", 30, "", "", "full", 1, 50, 1),
+                ("export", 1, "interval", 30, "", "", "full", 0, 50, 1),
                 ("player_sync", 1, "interval", 30, "", "", "new", 0, 60, 1),
-                ("player_sync", 1, "interval", 30, "", "", "full", 1, 60, 1),
+                ("player_sync", 1, "interval", 30, "", "", "full", 0, 60, 1),
             ]
         )
     for job_type, enabled, trigger_type, interval_min, days_of_week, time_local, scope, post_scan_chain, priority, max_concurrency in defaults:
@@ -10409,6 +10509,151 @@ def _scheduler_insert_default_rules_if_empty() -> None:
         )
     con.commit()
     con.close()
+
+
+def _scheduler_migrate_legacy_scan_changed_default() -> None:
+    """
+    Older builds created an enabled stock `scan_changed` rule every 20 minutes.
+    That surprised users because scans could restart without explicit action.
+    Migrate that legacy stock rule to disabled once, while preserving any non-stock custom rules.
+    """
+    marker_key = "SCHEDULER_LEGACY_SCAN_CHANGED_DEFAULT_MIGRATED"
+    try:
+        if str(_get_config_from_db(marker_key, "") or "").strip() == "1":
+            return
+    except Exception:
+        pass
+    con = _state_connect(timeout=10)
+    changed = 0
+    try:
+        cur = con.cursor()
+        cur.execute(
+            """
+            SELECT rule_id, enabled
+            FROM scheduler_rules
+            WHERE job_type = 'scan_changed'
+              AND trigger_type = 'interval'
+              AND COALESCE(interval_min, 0) = 20
+              AND COALESCE(days_of_week, '') = ''
+              AND COALESCE(time_local, '') = ''
+              AND COALESCE(scope, 'both') = 'new'
+              AND COALESCE(post_scan_chain, 0) = 0
+              AND COALESCE(priority, 0) = 10
+              AND COALESCE(max_concurrency, 1) = 1
+            """
+        )
+        rows = cur.fetchall()
+        now = time.time()
+        for row in rows:
+            rule_id = int((row["rule_id"] if isinstance(row, sqlite3.Row) else row[0]) or 0)
+            enabled = int((row["enabled"] if isinstance(row, sqlite3.Row) else row[1]) or 0)
+            if rule_id <= 0 or enabled <= 0:
+                continue
+            cur.execute(
+                "UPDATE scheduler_rules SET enabled = 0, updated_at = ? WHERE rule_id = ?",
+                (now, rule_id),
+            )
+            changed += 1
+        con.commit()
+    finally:
+        con.close()
+    if changed > 0:
+        logging.info(
+            "Scheduler migration: disabled %d legacy auto scan_changed rule(s); users can re-enable them manually in Settings.",
+            changed,
+        )
+    try:
+        _settings_db_set_value(marker_key, "1")
+    except Exception:
+        pass
+
+
+def _scheduler_ensure_post_scan_chain_defaults() -> None:
+    """
+    Ensure chain-only scheduler templates exist even when periodic non-scan jobs are disabled.
+    This lets the default pipeline finish scans quickly and continue enrichment/export in the
+    background without enabling surprise scheduled jobs.
+    """
+    defaults = [
+        ("enrich_batch", "both", 30, 1),
+        ("dedupe", "both", 35, 1),
+        ("incomplete_move", "both", 45, 1),
+        ("export", "both", 50, 1),
+        ("player_sync", "both", 60, 1),
+    ]
+    now = time.time()
+    con = _state_connect(timeout=10)
+    inserted = 0
+    try:
+        cur = con.cursor()
+        for job_type, scope, priority, max_concurrency in defaults:
+            cur.execute(
+                """
+                SELECT rule_id
+                FROM scheduler_rules
+                WHERE enabled = 1
+                  AND post_scan_chain = 1
+                  AND job_type = ?
+                  AND COALESCE(scope, 'both') = ?
+                LIMIT 1
+                """,
+                (job_type, scope),
+            )
+            if cur.fetchone():
+                continue
+            cur.execute(
+                """
+                INSERT INTO scheduler_rules
+                (job_type, enabled, trigger_type, interval_min, days_of_week, time_local, scope, post_scan_chain, priority, max_concurrency, next_run_ts, last_run_ts, created_at, updated_at)
+                VALUES (?, 1, 'interval', 30, '', '', ?, 1, ?, ?, NULL, NULL, ?, ?)
+                """,
+                (job_type, scope, int(priority), int(max_concurrency), now, now),
+            )
+            inserted += 1
+        con.commit()
+    finally:
+        con.close()
+    if inserted > 0:
+        logging.info(
+            "Scheduler defaults: inserted %d post-scan chain template rule(s) for async pipeline jobs.",
+            inserted,
+        )
+
+
+def _pipeline_migrate_legacy_post_scan_async_default() -> None:
+    """
+    Older installs could persist PIPELINE_POST_SCAN_ASYNC=False from the slow synchronous
+    pipeline default. Migrate that legacy default once so scans finish fast by default.
+    Users can still disable it manually afterwards.
+    """
+    marker_key = "PIPELINE_POST_SCAN_ASYNC_DEFAULT_MIGRATED"
+    try:
+        if str(_get_config_from_db(marker_key, "") or "").strip() == "1":
+            return
+    except Exception:
+        pass
+    raw_value = _get_config_from_db("PIPELINE_POST_SCAN_ASYNC", None)
+    changed = False
+    if raw_value is not None and not bool(_parse_bool(raw_value)):
+        try:
+            _settings_db_set_value("PIPELINE_POST_SCAN_ASYNC", "true")
+            changed = True
+        except Exception:
+            changed = False
+    try:
+        _settings_db_set_value(marker_key, "1")
+    except Exception:
+        pass
+    if changed:
+        try:
+            global PIPELINE_POST_SCAN_ASYNC
+            PIPELINE_POST_SCAN_ASYNC = True
+            sys.modules[__name__].merged["PIPELINE_POST_SCAN_ASYNC"] = True
+        except Exception:
+            pass
+        logging.info(
+            "Settings migration: enabled PIPELINE_POST_SCAN_ASYNC by default for legacy installs; users can disable it manually in Settings."
+        )
 
 
 def _scheduler_job_insert(
@@ -10897,6 +11142,14 @@ def _scheduler_worker(
                 "origin_scan_id": _int_or_none(origin_scan_id),
                 "started_at": started,
             }
+        logging.info(
+            "[Scheduler] start run=%s job=%s scope=%s source=%s origin_scan_id=%s",
+            run_id,
+            job_type,
+            scope,
+            source,
+            _int_or_none(origin_scan_id),
+        )
         _scheduler_job_update(run_id, status="running", started_at=started, message=f"{job_type} started")
         event_id = _task_event_start(
             run_id=run_id,
@@ -10908,6 +11161,16 @@ def _scheduler_worker(
         ok, msg, metrics = _scheduler_execute_job(job_type, scope, source, run_id=run_id)
         ended = time.time()
         if ok:
+            logging.info(
+                "[Scheduler] done run=%s job=%s scope=%s source=%s elapsed=%.2fs message=%s metrics=%s",
+                run_id,
+                job_type,
+                scope,
+                source,
+                max(0.0, ended - started),
+                _log_preview_text(msg, 160),
+                _log_preview_text(json.dumps(metrics or {}, ensure_ascii=True), 220),
+            )
             _scheduler_job_update(
                 run_id,
                 status="completed",
@@ -10925,6 +11188,16 @@ def _scheduler_worker(
                     summary=metrics,
                 )
         else:
+            logging.warning(
+                "[Scheduler] failed run=%s job=%s scope=%s source=%s elapsed=%.2fs message=%s metrics=%s",
+                run_id,
+                job_type,
+                scope,
+                source,
+                max(0.0, ended - started),
+                _log_preview_text(msg, 160),
+                _log_preview_text(json.dumps(metrics or {}, ensure_ascii=True), 220),
+            )
             _scheduler_job_update(
                 run_id,
                 status="failed",
@@ -11119,6 +11392,9 @@ def _scheduler_loop() -> None:
             for rule in rules:
                 if not int(rule["enabled"] or 0):
                     continue
+                if bool(int(rule.get("post_scan_chain") or 0)):
+                    # Chain rules are templates for async post-scan jobs, not periodic schedule jobs.
+                    continue
                 job_type = _normalize_task_job_type(rule["job_type"])
                 scope = _normalize_task_scope(rule["scope"], default="both")
                 if not job_type:
@@ -11193,6 +11469,9 @@ def _scheduler_loop() -> None:
 def _start_scheduler_if_needed() -> None:
     global _scheduler_thread, _scheduler_paused
     _scheduler_insert_default_rules_if_empty()
+    _scheduler_migrate_legacy_scan_changed_default()
+    _scheduler_ensure_post_scan_chain_defaults()
+    _pipeline_migrate_legacy_post_scan_async_default()
     _scheduler_paused = _scheduler_get_paused_from_db()
     with _scheduler_lock:
         if _scheduler_thread is not None and _scheduler_thread.is_alive():
@@ -11376,6 +11655,9 @@ migrate_settings_from_state_db()
 _ensure_files_source_roots_seeded()
 _pipeline_bootstrap_refresh_from_history()
 _scheduler_insert_default_rules_if_empty()
+_scheduler_migrate_legacy_scan_changed_default()
+_scheduler_ensure_post_scan_chain_defaults()
+_pipeline_migrate_legacy_post_scan_async_default()
 _scheduler_paused = _scheduler_get_paused_from_db()
 
 # ───────────────────────────────── CACHE DB SETUP ──────────────────────────────────
@@ -18233,9 +18515,21 @@ def _files_try_artist_image_refresh(
                     page_summary=str(item.get("summary") or "").strip(),
                 )
             if outp:
+                logging.info(
+                    "[Artist Image] %s (%s): accepted %s",
+                    artist_name,
+                    entity_kind,
+                    str(item.get("provider") or "").strip(),
+                )
                 return True
         except Exception:
             continue
+    logging.info(
+        "[Artist Image] %s (%s): no verified candidate%s",
+        artist_name,
+        entity_kind,
+        " [fast-mode]" if bool(fast_mode) else "",
+    )
     return False
 
 
@@ -18404,7 +18698,19 @@ def _run_files_profile_enrichment_job(
     allow_soft_profiles: Optional[bool] = None,
     fast_mode: bool = False,
 ) -> None:
+    started_at = time.time()
+    artist_profile_refreshed = False
+    artist_image_refreshed = False
+    album_profiles_saved = 0
+    album_profiles_targeted = 0
     try:
+        logging.info(
+            "[Profile Enrich] start artist=%r fast_mode=%s skip_album_profiles=%s albums=%d",
+            artist_name,
+            bool(fast_mode),
+            bool(skip_album_profiles),
+            len(albums or []),
+        )
         conn = _files_pg_connect()
         if conn is None:
             return
@@ -18524,20 +18830,23 @@ def _run_files_profile_enrichment_job(
                 # Persist profile.
                 with conn.transaction():
                     _files_upsert_artist_profile(conn, artist_norm, artist_name, artist_profile)
+                artist_profile_refreshed = True
 
             # Cache fast, identity-safe artist images during the critical scan path.
             try:
-                _files_try_artist_image_refresh(
-                    conn,
-                    artist_name=artist_name,
-                    artist_norm=artist_norm,
-                    entity_kind=entity_kind,
-                    role_hints=role_hints,
-                    lastfm_info=lastfm_info,
-                    wiki_info=wiki_info,
-                    mb_identity=mb_identity,
-                    fast_mode=fast_mode,
-                )
+                artist_image_refreshed = bool(
+                    _files_try_artist_image_refresh(
+                        conn,
+                        artist_name=artist_name,
+                        artist_norm=artist_norm,
+                        entity_kind=entity_kind,
+                        role_hints=role_hints,
+                        lastfm_info=lastfm_info,
+                        wiki_info=wiki_info,
+                        mb_identity=mb_identity,
+                        fast_mode=fast_mode,
+                    )
+                ) or artist_image_refreshed
             except Exception:
                 logging.debug("Fast artist image refresh failed for %s", artist_name, exc_info=True)
 
@@ -18588,18 +18897,6 @@ def _run_files_profile_enrichment_job(
                     if expected_id:
                         exact_provider_ids[provider_name] = expected_id
 
-                exact_cover_provider_lock = ""
-                metadata_provider_norm = _normalize_identity_provider(str(metadata_source or ""))
-                if metadata_provider_norm in exact_provider_ids:
-                    exact_cover_provider_lock = metadata_provider_norm
-                elif metadata_provider_norm == "musicbrainz" and str(mbid or "").strip():
-                    exact_cover_provider_lock = "musicbrainz"
-                else:
-                    for provider_name in provider_chain:
-                        if provider_name in exact_provider_ids:
-                            exact_cover_provider_lock = provider_name
-                            break
-
                 cover_candidates_default = [
                     str(metadata_source or "").strip(),
                     "bandcamp",
@@ -18614,12 +18911,27 @@ def _run_files_profile_enrichment_job(
                     if provider_norm and provider_norm not in provider_chain:
                         provider_chain.append(provider_norm)
 
+                exact_cover_provider_lock = ""
+                metadata_provider_norm = _normalize_identity_provider(str(metadata_source or ""))
+                if metadata_provider_norm in exact_provider_ids:
+                    exact_cover_provider_lock = metadata_provider_norm
+                elif metadata_provider_norm == "musicbrainz" and str(mbid or "").strip():
+                    exact_cover_provider_lock = "musicbrainz"
+                else:
+                    for provider_name in provider_chain:
+                        if provider_name in exact_provider_ids:
+                            exact_cover_provider_lock = provider_name
+                            break
+
                 if exact_cover_provider_lock:
                     provider_chain = [exact_cover_provider_lock]
                 elif exact_provider_ids:
                     provider_chain = [provider_name for provider_name in ("musicbrainz", "discogs", "bandcamp", "lastfm") if provider_name in provider_chain]
 
-                current_cover_provider_norm = _normalize_identity_provider(current_cover_provider)
+                if current_cover_provider:
+                    current_cover_provider_norm = _normalize_identity_provider(current_cover_provider)
+                else:
+                    current_cover_provider_norm = ""
                 if current_cover_provider_norm and current_cover_provider_norm not in {"local", "unknown"} and cover_raw:
                     if exact_cover_provider_lock:
                         if current_cover_provider_norm == exact_cover_provider_lock:
@@ -19010,12 +19322,23 @@ def _run_files_profile_enrichment_job(
                             continue
                         with conn.transaction():
                             _files_upsert_album_profile(conn, artist_norm, norm, title, profile)
+                        album_profiles_saved += 1
+                    album_profiles_targeted = max(album_profiles_targeted, len(to_fetch))
         finally:
             conn.close()
         _files_cache_invalidate_all()
     except Exception as e:
         logging.debug("Artist profile enrichment failed for %s: %s", artist_name, e)
     finally:
+        logging.info(
+            "[Profile Enrich] done artist=%r elapsed=%.2fs artist_profile=%s artist_image=%s album_profiles=%d/%d",
+            artist_name,
+            max(0.0, time.time() - started_at),
+            artist_profile_refreshed,
+            artist_image_refreshed,
+            int(album_profiles_saved or 0),
+            int(album_profiles_targeted or 0),
+        )
         with _files_profile_jobs_lock:
             _files_profile_jobs_active.discard(job_key)
 
@@ -19479,6 +19802,7 @@ def call_ai_provider_longform(
     response_obj: Any = None
     status = "failed"
     error_msg = ""
+    result_text = ""
     guard_allowed = True
     guard_reason = ""
     guard_meta: dict[str, Any] = {}
@@ -19497,6 +19821,15 @@ def call_ai_provider_longform(
         user_msg=user_msg,
     )
     auth_mode_for_usage = _provider_auth_mode(provider_for_usage)
+    ai_ctx_for_log = _ai_infer_runtime_context()
+    logging.info(
+        "[AI Trace] start endpoint=longform analysis=%s provider=%s model=%s context=%s prompt=%r",
+        str(analysis_type or "other").strip() or "other",
+        provider_for_usage,
+        model_for_usage,
+        _ai_trace_context_summary(ai_ctx_for_log),
+        _log_preview_text(user_msg, 220),
+    )
     try:
         guard_allowed, guard_reason, guard_meta = _ai_guardrail_precheck(
             provider=provider_for_usage,
@@ -19517,7 +19850,8 @@ def call_ai_provider_longform(
             )
             auth_mode_for_usage = "oauth"
             status = "completed"
-            return out
+            result_text = str(out or "")
+            return result_text
         if provider_lower in {"openai", "openai-api", "openai-codex"}:
             try:
                 client_to_use, auth_mode_for_usage, openai_runtime_reason = _resolve_openai_client_for_runtime(
@@ -19555,7 +19889,8 @@ def call_ai_provider_longform(
                         out = _extract_text_from_openai_response(resp)
                         if out:
                             status = "completed"
-                            return out
+                            result_text = str(out or "")
+                            return result_text
                         raise RuntimeError("OpenAI responses call returned empty output")
                     except Exception as e:
                         if auth_mode_for_usage == "oauth":
@@ -19589,7 +19924,8 @@ def call_ai_provider_longform(
                         out = _openai_chat_text(resp2)
                         response_obj = resp2
                     status = "completed"
-                    return out
+                    result_text = str(out or "")
+                    return result_text
                 except Exception as e:
                     err_msg = str(e).lower()
                     if "reasoning_effort" in err_msg and ("unsupported_parameter" in err_msg or "400" in err_msg):
@@ -19597,7 +19933,8 @@ def call_ai_provider_longform(
                         resp = client_to_use.chat.completions.create(**_kwargs)
                         response_obj = resp
                         status = "completed"
-                        return _openai_chat_text(resp)
+                        result_text = _openai_chat_text(resp)
+                        return result_text
                     if "unsupported_parameter" in err_msg or "400" in err_msg:
                         if "max_completion_tokens" in err_msg and ("max_tokens" in err_msg or "use" in err_msg):
                             _kwargs.pop("max_completion_tokens", None)
@@ -19605,7 +19942,8 @@ def call_ai_provider_longform(
                             resp = client_to_use.chat.completions.create(**_kwargs)
                             response_obj = resp
                             status = "completed"
-                            return _openai_chat_text(resp)
+                            result_text = _openai_chat_text(resp)
+                            return result_text
                         if "max_tokens" in err_msg and "max_completion_tokens" in err_msg:
                             _kwargs.pop("max_tokens", None)
                             _kwargs["max_completion_tokens"] = max_tokens
@@ -19634,7 +19972,8 @@ def call_ai_provider_longform(
                         auth_mode_for_usage = "oauth"
                         status = "completed"
                         error_msg = ""
-                        return out
+                        result_text = str(out or "")
+                        return result_text
                 raise
 
         if provider_lower == "anthropic":
@@ -19648,7 +19987,8 @@ def call_ai_provider_longform(
             )
             response_obj = resp
             status = "completed"
-            return resp.content[0].text.strip()
+            result_text = resp.content[0].text.strip()
+            return result_text
 
         if provider_lower == "google":
             if not google_client_configured or not google_client:
@@ -19663,7 +20003,8 @@ def call_ai_provider_longform(
             )
             response_obj = response
             status = "completed"
-            return (getattr(response, "text", "") or "").strip()
+            result_text = (getattr(response, "text", "") or "").strip()
+            return result_text
 
         if provider_lower == "ollama":
             if not ollama_url:
@@ -19685,13 +20026,35 @@ def call_ai_provider_longform(
             result = response.json()
             response_obj = result
             status = "completed"
-            return (result.get("message", {}) or {}).get("content", "").strip()
+            result_text = (result.get("message", {}) or {}).get("content", "").strip()
+            return result_text
 
         raise ValueError(f"Unknown AI provider: {provider}")
     except Exception as e:
         error_msg = str(e)
         raise
     finally:
+        elapsed = max(0.0, time.time() - started_at)
+        if status == "completed":
+            logging.info(
+                "[AI Trace] done endpoint=longform analysis=%s provider=%s model=%s elapsed=%.2fs context=%s reply=%r",
+                str(analysis_type or "other").strip() or "other",
+                provider_for_usage,
+                model_for_usage,
+                elapsed,
+                _ai_trace_context_summary(ai_ctx_for_log),
+                _log_preview_text(result_text, 220),
+            )
+        else:
+            logging.warning(
+                "[AI Trace] failed endpoint=longform analysis=%s provider=%s model=%s elapsed=%.2fs context=%s error=%s",
+                str(analysis_type or "other").strip() or "other",
+                provider_for_usage,
+                model_for_usage,
+                elapsed,
+                _ai_trace_context_summary(ai_ctx_for_log),
+                _log_preview_text(error_msg, 220),
+            )
         recorder = globals().get("record_ai_usage")
         if callable(recorder):
             recorder(
@@ -45251,6 +45614,14 @@ def background_scan():
     scan_task_job_type = "scan_changed" if scan_type == "changed_only" else "scan_full"
     scan_task_scope = "new" if scan_type == "changed_only" else "full"
     scan_task_source = scan_auto_trigger
+    logging.info(
+        "[Scan Pipeline] start type=%s source=%s async=%s requested=%s inline=%s",
+        scan_type,
+        scan_task_source,
+        bool(pipeline_async_enabled),
+        json.dumps(pipeline_flags_requested, sort_keys=True),
+        json.dumps(pipeline_flags, sort_keys=True),
+    )
     if scan_task_source in SCHEDULER_MANAGED_SCAN_SOURCES and scan_scheduler_run_id:
         scan_task_run_id = str(scan_scheduler_run_id)
     else:
@@ -47477,6 +47848,12 @@ def background_scan():
                     enabled_chain_jobs.add("export")
                 if bool(pipeline_flags_requested.get("player_sync")):
                     enabled_chain_jobs.add("player_sync")
+                logging.info(
+                    "[Scan Pipeline] queueing post-scan chain scan_id=%s include_enrich=%s jobs=%s",
+                    _int_or_none(scan_id),
+                    include_enrich,
+                    ",".join(sorted(enabled_chain_jobs)) or "-",
+                )
                 _scheduler_chain_post_scan(
                     scan_type,
                     origin_scan_id=_int_or_none(scan_id),
@@ -47523,7 +47900,7 @@ def background_scan():
                     else ("Scan cancelled" if task_status == "skipped" else "Scan failed")
                 )
             if task_status == "completed" and pipeline_async_enabled:
-                scan_task_message = f"{scan_task_message}. Post-scan jobs queued."
+                scan_task_message = f"{scan_task_message}. Library ready; background enrichment jobs queued."
             if task_status != "completed" and not scan_task_error:
                 scan_task_error = scan_task_message
             try:
@@ -52431,15 +52808,35 @@ def _web_search_serper(query: str, num: int = 10, *, allow_ai_fallback: bool = T
         last_status = status
         last_source = source
         if rows:
+            logging.info(
+                "[WEB] query=%r provider=%s results=%d top=%s",
+                q,
+                source,
+                len(rows),
+                _web_results_log_summary(rows),
+            )
             _ai_web_search_cache_set(q, limit, rows[:limit], status="hit")
             _ai_query_cache_set(scope, q, limit, rows[:limit], status="hit", source=source)
             return rows[:limit]
     if _web_search_ai_fallback_enabled(allow_ai_fallback=allow_ai_fallback):
         fallback_rows = _openai_web_search_fallback(q, num=limit, reason=f"{last_source}_{last_status}")
         if fallback_rows:
+            logging.info(
+                "[WEB] query=%r provider=%s results=%d top=%s",
+                q,
+                "openai_web_search",
+                len(fallback_rows),
+                _web_results_log_summary(fallback_rows),
+            )
             _ai_web_search_cache_set(q, limit, fallback_rows[:limit], status="hit")
             _ai_query_cache_set(scope, q, limit, fallback_rows[:limit], status="hit", source="openai_web_search")
             return fallback_rows[:limit]
+    logging.info(
+        "[WEB] query=%r results=0 providers=%s last_status=%s",
+        q,
+        ",".join(_web_search_provider_order()) or "none",
+        last_status,
+    )
     _ai_web_search_cache_set(q, limit, [], status=last_status)
     _ai_query_cache_set(scope, q, limit, [], status=last_status, source=last_source)
     return []
@@ -58201,6 +58598,30 @@ def api_progress():
         except Exception:
             ai_unpriced_calls_effective = int(last_scan_ai_unpriced_calls or 0)
 
+    background_jobs: list[dict[str, Any]] = []
+    try:
+        with _scheduler_lock:
+            for meta in _scheduler_running_meta.values():
+                if not isinstance(meta, dict):
+                    continue
+                background_jobs.append(
+                    {
+                        "run_id": str(meta.get("run_id") or "").strip(),
+                        "job_type": _normalize_task_job_type(meta.get("job_type")),
+                        "scope": _normalize_task_scope(meta.get("scope"), default="both"),
+                        "source": str(meta.get("source") or "").strip().lower(),
+                        "origin_scan_id": _int_or_none(meta.get("origin_scan_id")),
+                        "started_at": meta.get("started_at"),
+                    }
+                )
+    except Exception:
+        background_jobs = []
+    background_jobs.sort(key=lambda item: float(item.get("started_at") or 0.0))
+    background_enrichment_running = any(
+        str(item.get("job_type") or "") in {"enrich_batch", "dedupe", "incomplete_move", "export", "player_sync"}
+        for item in background_jobs
+    )
+
     resume_available_by_scan_type: dict[str, dict[str, Any]] = {}
     resume_available = False
     if not scanning:
@@ -58221,6 +58642,8 @@ def api_progress():
         "total": total,
         "effective_progress": effective_progress,
         "status": status,
+        "background_enrichment_running": background_enrichment_running,
+        "background_jobs": background_jobs,
         "resume_available": resume_available,
         "resume_available_by_scan_type": resume_available_by_scan_type,
         "phase": phase,
