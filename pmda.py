@@ -14697,22 +14697,30 @@ def _promote_files_media_paths_to_cache(artists_map: dict[str, dict], albums_pay
     return covers_promoted, artists_promoted
 
 
-def _precache_files_media_assets(artists_map: dict[str, dict], albums_payload: list[dict]) -> tuple[int, int]:
+def _precache_files_media_assets(
+    artists_map: dict[str, dict],
+    albums_payload: list[dict],
+    *,
+    include_album_covers: bool = True,
+    include_artist_images: bool = True,
+) -> tuple[int, int]:
     _ensure_media_cache_dirs()
     cover_paths: list[Path] = []
     artist_paths: list[Path] = []
-    for album in albums_payload:
-        raw = str(album.get("cover_path") or "").strip()
-        if raw:
-            p = path_for_fs_access(Path(raw))
-            if p.exists() and p.is_file():
-                cover_paths.append(p)
-    for data in artists_map.values():
-        raw = str((data or {}).get("image_path") or "").strip()
-        if raw:
-            p = path_for_fs_access(Path(raw))
-            if p.exists() and p.is_file():
-                artist_paths.append(p)
+    if include_album_covers:
+        for album in albums_payload:
+            raw = str(album.get("cover_path") or "").strip()
+            if raw:
+                p = path_for_fs_access(Path(raw))
+                if p.exists() and p.is_file():
+                    cover_paths.append(p)
+    if include_artist_images:
+        for data in artists_map.values():
+            raw = str((data or {}).get("image_path") or "").strip()
+            if raw:
+                p = path_for_fs_access(Path(raw))
+                if p.exists() and p.is_file():
+                    artist_paths.append(p)
     cover_paths = list(dict.fromkeys(cover_paths))
     artist_paths = list(dict.fromkeys(artist_paths))
 
@@ -15365,6 +15373,7 @@ def _rebuild_files_library_index_for_artist(
         return {"ok": False, "running": True, "error": "Files index rebuild already running"}
     try:
         started_at = time.time()
+        scan_critical_rebuild = _scan_pipeline_active() or str(reason or "").strip().startswith("scan_artist_ready_")
         _files_index_set_state(
             running=True,
             started_at=started_at,
@@ -15761,10 +15770,24 @@ def _rebuild_files_library_index_for_artist(
             conn.close()
 
         _files_index_set_state(phase="artist_enrichment")
-        _files_enrich_artists_blocking(artists_map)
+        if scan_critical_rebuild:
+            primary_norm = _norm_artist_key(artist_name) or norm_album(artist_name or "")
+            _files_enrich_artists_blocking(
+                artists_map,
+                target_artist_norms={primary_norm} if primary_norm else None,
+                max_artists=1,
+                total_budget_sec=_FILES_SCAN_INLINE_ARTIST_ENRICH_BUDGET_SEC,
+            )
+        else:
+            _files_enrich_artists_blocking(artists_map)
         artists_map = _files_refresh_artist_media_map_from_db(artists_map)
         _files_index_set_state(phase="media_cache")
-        covers_cached, artists_cached = _precache_files_media_assets(artists_map, albums_payload)
+        covers_cached, artists_cached = _precache_files_media_assets(
+            artists_map,
+            albums_payload,
+            include_album_covers=True,
+            include_artist_images=not scan_critical_rebuild,
+        )
         _files_cache_invalidate_all()
         artists_count, albums_count, tracks_count = _files_index_read_counts()
         _tracks_count, embeddings_count = _files_index_read_track_and_embedding_counts()
@@ -18216,10 +18239,31 @@ def _files_try_artist_image_refresh(
     return False
 
 
-def _files_enrich_artists_blocking(artists_map: dict[str, dict[str, Any]]) -> None:
+_FILES_SCAN_INLINE_ARTIST_ENRICH_BUDGET_SEC = 8.0
+
+
+def _files_enrich_artists_blocking(
+    artists_map: dict[str, dict[str, Any]],
+    *,
+    target_artist_norms: Optional[set[str]] = None,
+    max_artists: int | None = None,
+    total_budget_sec: float | None = None,
+) -> None:
     if not artists_map:
         return
-    for artist_norm, payload in artists_map.items():
+    target_norms = {str(v or "").strip() for v in (target_artist_norms or set()) if str(v or "").strip()}
+    started_at = time.time()
+    processed = 0
+    items = list(artists_map.items())
+    if target_norms:
+        items.sort(key=lambda item: (0 if item[0] in target_norms else 1, item[0]))
+    for artist_norm, payload in items:
+        if target_norms and artist_norm not in target_norms:
+            continue
+        if max_artists is not None and processed >= max_artists:
+            break
+        if total_budget_sec is not None and (time.time() - started_at) >= float(total_budget_sec):
+            break
         name = str((payload or {}).get("name") or "").strip()
         if not artist_norm or not name:
             continue
@@ -18268,6 +18312,7 @@ def _files_enrich_artists_blocking(artists_map: dict[str, dict[str, Any]]) -> No
                         entity_kind=entity_kind,
                         roles_json=roles_json,
                     )
+                processed += 1
             finally:
                 conn.close()
         except Exception:
@@ -63186,6 +63231,16 @@ def api_library_genres():
         cached = _files_cache_get_json(cache_key)
         if cached is not None:
             return jsonify(cached)
+    with lock:
+        scan_busy = bool(state.get("scanning") or state.get("scan_starting") or state.get("scan_finalizing") or state.get("scan_post_processing"))
+    if files_index_lock.locked():
+        cached = _files_cache_get_json(cache_key)
+        if cached is not None:
+            payload = dict(cached)
+            payload["stale"] = True
+            return jsonify(payload)
+        if scan_busy:
+            return jsonify({"genres": [], "total": 0, "limit": int(limit), "offset": int(offset), "stale": True})
 
     album_filters = ["1=1", album_match_sql]
     album_params: list = []
@@ -63339,6 +63394,16 @@ def api_library_labels():
         cached = _files_cache_get_json(cache_key)
         if cached is not None:
             return jsonify(cached)
+    with lock:
+        scan_busy = bool(state.get("scanning") or state.get("scan_starting") or state.get("scan_finalizing") or state.get("scan_post_processing"))
+    if files_index_lock.locked():
+        cached = _files_cache_get_json(cache_key)
+        if cached is not None:
+            payload = dict(cached)
+            payload["stale"] = True
+            return jsonify(payload)
+        if scan_busy:
+            return jsonify({"labels": [], "total": 0, "limit": int(limit), "offset": int(offset), "stale": True})
 
     album_filters = ["1=1", album_match_sql]
     album_params: list = []
