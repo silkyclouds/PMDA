@@ -91,6 +91,7 @@ interface ArtistProfileResponse {
 }
 
 const albumTypeOrder = ['Album', 'EP', 'Single', 'Compilation', 'Anthology'];
+const classicalCatalogGroupKey = '__classical_works__';
 
 function wordCount(text: string): number {
   const t = (text || '').trim();
@@ -137,6 +138,11 @@ function joinClassical(values?: string[] | null, limit = 2): string | null {
 function hasClassicalIdentity(payload?: api.ClassicalIdentityPayload | null): boolean {
   if (!payload) return false;
   return payload.is_classical === true;
+}
+
+function pluralizeCatalogLabel(count: number, singular: string, plural?: string): string {
+  const resolvedPlural = plural || `${singular}s`;
+  return `${count.toLocaleString()} ${count === 1 ? singular : resolvedPlural}`;
 }
 
 function toCoord(s?: string): number | null {
@@ -647,21 +653,38 @@ export default function ArtistPage() {
     };
   }, [appendIncludeUnmatched, details]);
 
+  const classicalAlbumCount = useMemo(() => {
+    return (details?.albums || []).reduce((count, album) => count + (hasClassicalIdentity(album.classical) ? 1 : 0), 0);
+  }, [details?.albums]);
+
+  const isPureClassicalCatalog = useMemo(() => {
+    const total = details?.albums?.length || 0;
+    return total > 0 && classicalAlbumCount === total;
+  }, [classicalAlbumCount, details?.albums?.length]);
+
+  const catalogCountLabel = useMemo(() => {
+    return isPureClassicalCatalog
+      ? pluralizeCatalogLabel(details?.total_albums || 0, 'work')
+      : pluralizeCatalogLabel(details?.total_albums || 0, 'album');
+  }, [details?.total_albums, isPureClassicalCatalog]);
+
   const grouped = useMemo(() => {
     const src = details?.albums ?? [];
     const map: Record<string, AlbumInfo[]> = {};
     for (const album of src) {
-      const t = album.type || 'Album';
+      const t = isPureClassicalCatalog ? classicalCatalogGroupKey : (album.type || 'Album');
       if (!map[t]) map[t] = [];
       map[t].push(album);
     }
     return map;
-  }, [details?.albums]);
+  }, [details?.albums, isPureClassicalCatalog]);
 
   const sortedTypes = useMemo(() => {
     return Object.keys(grouped).sort((a, b) => {
-      const ai = albumTypeOrder.indexOf(a);
-      const bi = albumTypeOrder.indexOf(b);
+      const normalizedA = a === classicalCatalogGroupKey ? 'Album' : a;
+      const normalizedB = b === classicalCatalogGroupKey ? 'Album' : b;
+      const ai = albumTypeOrder.indexOf(normalizedA);
+      const bi = albumTypeOrder.indexOf(normalizedB);
       if (ai === -1 && bi === -1) return a.localeCompare(b);
       if (ai === -1) return 1;
       if (bi === -1) return -1;
@@ -876,7 +899,7 @@ export default function ArtistPage() {
                     {details.artist_name}
                   </h1>
                   <p className="mt-1.5 text-base text-slate-800 dark:text-white/82">
-                    {details.total_albums.toLocaleString()} album{details.total_albums !== 1 ? 's' : ''}
+                    {catalogCountLabel}
                   </p>
                   {tags.length > 0 && (
                     <div className="flex flex-wrap gap-1.5 mt-3">
@@ -903,7 +926,7 @@ export default function ArtistPage() {
                       entityType="artist"
                       entityId={details.artist_id}
                       entityLabel={details.artist_name}
-                      entitySubtitle={`${details.total_albums} album${details.total_albums !== 1 ? 's' : ''}`}
+                      entitySubtitle={catalogCountLabel}
                       trigger={(
                         <Button type="button" size="sm" variant="outline" className="h-8 gap-2">
                           <Users className="h-3.5 w-3.5" />
@@ -1259,24 +1282,28 @@ export default function ArtistPage() {
         </Dialog>
 
         <div className="space-y-6">
+          {sortedTypes.length > 0 ? (
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-end">
+              <GridSizeControl value={tileSize} onChange={setTileSize} className="w-full sm:w-[260px]" />
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="h-8 text-xs sm:self-auto"
+                onClick={() => setShowBadges(!showBadges)}
+              >
+                {showBadges ? 'Hide badges' : 'Show badges'}
+              </Button>
+            </div>
+          ) : null}
           {sortedTypes.map((type) => (
             <section key={type} className="space-y-3">
-              <div className="flex items-center justify-between gap-3">
+              <div className="flex items-center gap-3">
                 <div className="flex items-center gap-2">
                   <Disc3 className="w-4 h-4 text-primary" />
-                  <h2 className="pmda-section-title">{type === 'Single' ? 'Singles' : `${type}s`}</h2>
-                </div>
-                <div className="flex flex-col sm:flex-row sm:items-center gap-3">
-                  <GridSizeControl value={tileSize} onChange={setTileSize} className="w-full sm:w-[260px]" />
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    className="h-8 text-xs"
-                    onClick={() => setShowBadges(!showBadges)}
-                  >
-                    {showBadges ? 'Hide badges' : 'Show badges'}
-                  </Button>
+                  <h2 className="pmda-section-title">
+                    {type === classicalCatalogGroupKey ? 'Works' : (type === 'Single' ? 'Singles' : `${type}s`)}
+                  </h2>
                 </div>
               </div>
               <Carousel opts={{ align: 'start', dragFree: true }} className="w-full">

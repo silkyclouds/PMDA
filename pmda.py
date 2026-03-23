@@ -10780,6 +10780,8 @@ def _scheduler_run_dedupe() -> tuple[bool, str, dict]:
 
 
 def _scheduler_run_incomplete_move() -> tuple[bool, str, dict]:
+    if _get_library_mode() == "files":
+        return True, "Incomplete-move scheduler skipped in Files mode (handled by the scan pipeline)", {"moved": 0, "run_id": None}
     _run_incomplete_albums_scan()
     with lock:
         inc = dict(state.get("incomplete_scan") or {})
@@ -59009,6 +59011,19 @@ def api_broken_albums():
 
 def _run_incomplete_albums_scan():
     """Background job: scan library for incomplete (broken) albums only; double-check Plex vs disk; write to incomplete_album_diagnostics."""
+    if _get_library_mode() == "files":
+        with lock:
+            state["incomplete_scan"] = {
+                "running": False,
+                "run_id": None,
+                "progress": 0,
+                "total": 0,
+                "current_artist": "",
+                "current_album": "",
+                "count": 0,
+                "error": "Legacy incomplete scan is disabled in Files mode; incomplete detection is handled by the scan pipeline.",
+            }
+        return
     global SECTION_IDS, PATH_MAP
     _reload_section_ids_from_db()
     _reload_path_map_from_db()
@@ -59202,6 +59217,8 @@ def _run_incomplete_albums_scan():
 @app.post("/api/incomplete-albums/scan")
 def api_incomplete_albums_scan_start():
     """Start the incomplete-albums-only scan (Plex + disk cross-check)."""
+    if _get_library_mode() == "files":
+        return jsonify({"error": "Manual incomplete scan is disabled in Files mode; PMDA handles incompletes during the scan pipeline.", "started": False}), 400
     if not PLEX_CONFIGURED:
         return jsonify({"error": "Plex not configured"}), 503
     with lock:
@@ -63787,6 +63804,7 @@ def api_library_genre_profile(genre: str):
                 JOIN files_artists ar ON ar.id = alb.artist_id
                 LEFT JOIN files_external_artist_images ext ON ext.name_norm = ar.name_norm
                 GROUP BY ar.id, ar.name, ar.has_image, ext.image_path
+                       , ar.image_path, ar.entity_kind, ar.roles_json, ext.image_url, ext.provider
                 ORDER BY release_count DESC, ar.name ASC
                 LIMIT %s
                 """,
@@ -63890,6 +63908,7 @@ def api_library_label_profile(label: str):
                 + album_match_sql
                 + """
                 GROUP BY ar.id, ar.name, ar.has_image, ext.image_path
+                       , ar.image_path, ar.entity_kind, ar.roles_json, ext.image_url, ext.provider
                 ORDER BY release_count DESC, ar.name ASC
                 LIMIT %s
                 """,
