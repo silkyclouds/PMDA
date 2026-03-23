@@ -49789,19 +49789,56 @@ def _fetch_lastfm_album_info(artist_name: str, album_title: str, mbid: Optional[
     api_key = (getattr(sys.modules[__name__], "LASTFM_API_KEY", "") or "").strip()
     if not api_key:
         return None
+    api_root = "https://ws.audioscrobbler.com/2.0/"
+
+    def _lastfm_get_json(params: dict) -> Optional[dict]:
+        last_error: Exception | None = None
+        for attempt in range(2):
+            try:
+                resp = requests.get(api_root, params=params, timeout=(5, 15))
+                if resp.status_code == 429:
+                    retry_after = 2.0
+                    try:
+                        retry_after = max(1.0, float(resp.headers.get("Retry-After") or 2.0))
+                    except Exception:
+                        retry_after = 2.0
+                    if attempt == 0:
+                        time.sleep(min(retry_after, 6.0))
+                        continue
+                if resp.status_code != 200:
+                    return None
+                return resp.json()
+            except requests.exceptions.RequestException as e:
+                last_error = e
+                if attempt == 0:
+                    time.sleep(0.75)
+                    continue
+        # Stdlib fallback can succeed when requests/urllib3 trips over transient socket routing issues.
+        try:
+            from urllib.parse import urlencode
+            from urllib.request import urlopen
+
+            url = f"{api_root}?{urlencode(params)}"
+            with urlopen(url, timeout=15) as resp:
+                raw = resp.read()
+            if not raw:
+                return None
+            return json.loads(raw.decode("utf-8", errors="replace"))
+        except Exception as e:
+            if last_error is not None:
+                raise last_error
+            raise e
     try:
         params = {"method": "album.getInfo", "artist": artist_name, "album": album_title, "api_key": api_key, "format": "json"}
         if mbid:
             params["mbid"] = mbid
-        resp = requests.get("https://ws.audioscrobbler.com/2.0/", params=params, timeout=10)
-        if resp.status_code != 200:
+        data = _lastfm_get_json(params)
+        if not data:
             return None
-        data = resp.json()
         if data.get("error") and data.get("error") != 0:
             search_params = {"method": "album.search", "album": f"{artist_name} {album_title}".strip(), "api_key": api_key, "format": "json"}
-            search_resp = requests.get("https://ws.audioscrobbler.com/2.0/", params=search_params, timeout=10)
-            if search_resp.status_code == 200:
-                search_data = search_resp.json()
+            search_data = _lastfm_get_json(search_params)
+            if search_data:
                 matches = (search_data.get("results") or {}).get("albummatches") or {}
                 album_list = matches.get("album") or []
                 if isinstance(album_list, dict):
@@ -49811,9 +49848,9 @@ def _fetch_lastfm_album_info(artist_name: str, album_title: str, mbid: Optional[
                     search_artist = (first.get("artist") or "").strip() or artist_name
                     search_album = (first.get("name") or "").strip() or album_title
                     params2 = {"method": "album.getInfo", "artist": search_artist, "album": search_album, "api_key": api_key, "format": "json"}
-                    resp2 = requests.get("https://ws.audioscrobbler.com/2.0/", params=params2, timeout=10)
-                    if resp2.status_code == 200:
-                        data = resp2.json()
+                    data2 = _lastfm_get_json(params2)
+                    if data2:
+                        data = data2
                         if not (data.get("error") and data.get("error") != 0):
                             album_title = search_album
                             artist_name = search_artist
