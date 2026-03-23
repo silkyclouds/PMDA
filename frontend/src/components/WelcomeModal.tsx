@@ -1,9 +1,10 @@
 import { useNavigate } from 'react-router-dom';
+import { useQuery } from '@tanstack/react-query';
 import { Play, Settings, X, CheckCircle2, XCircle } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Logo } from '@/components/Logo';
 import { cn } from '@/lib/utils';
-import type { ConfigResponse } from '@/lib/api';
+import { getScanProgress, type ConfigResponse } from '@/lib/api';
 
 interface WelcomeModalProps {
   onClose: () => void;
@@ -16,6 +17,32 @@ export function WelcomeModal({ onClose, config, mode = 'welcome' }: WelcomeModal
   const mounts = config?.container_mounts;
   const hasConfiguredRoots = Boolean(String(config?.FILES_ROOTS || '').trim());
   const isBootstrapMode = mode === 'bootstrap' || hasConfiguredRoots;
+  const { data: scanProgress } = useQuery({
+    queryKey: ['welcome-modal-scan-progress'],
+    queryFn: getScanProgress,
+    enabled: isBootstrapMode,
+    refetchInterval: isBootstrapMode ? 2000 : false,
+    staleTime: 1000,
+    retry: 1,
+  });
+
+  const initialFullScanAlreadyStarted = Boolean(
+    scanProgress && (
+      scanProgress.scanning ||
+      scanProgress.scan_starting ||
+      scanProgress.resume_available ||
+      scanProgress.scan_resume_run_id ||
+      (scanProgress.scan_start_time != null) ||
+      (scanProgress.artists_total ?? 0) > 0 ||
+      (scanProgress.detected_albums_total ?? 0) > 0 ||
+      (scanProgress.scan_run_scope_total ?? 0) > 0 ||
+      scanProgress.last_scan_summary
+    )
+  );
+
+  if (isBootstrapMode && initialFullScanAlreadyStarted) {
+    return null;
+  }
 
   const goToSettings = () => {
     navigate('/settings');
