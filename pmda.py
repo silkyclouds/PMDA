@@ -29927,7 +29927,7 @@ def _files_merge_duplicate_person_artists(conn) -> None:
                         SELECT ctid,
                                ROW_NUMBER() OVER (
                                    PARTITION BY artist_id, album_id, role, is_primary
-                                   ORDER BY id
+                                   ORDER BY ctid
                                ) AS rn
                         FROM files_artist_album_links
                         WHERE artist_id = %s
