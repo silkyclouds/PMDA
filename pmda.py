@@ -11127,15 +11127,6 @@ def _scheduler_loop() -> None:
                         int(rule["rule_id"]),
                         next_run_ts=next_normal,
                     )
-                    rule_id = int(rule["rule_id"] or 0)
-                    notice_until = float(_scheduler_bootstrap_skip_notice_until.get(rule_id, 0.0) or 0.0)
-                    if now >= notice_until:
-                        logging.debug(
-                            "Scheduler deferred %s/%s: initial full scan still required before changed-only schedule.",
-                            job_type,
-                            scope,
-                        )
-                        _scheduler_bootstrap_skip_notice_until[rule_id] = now + 21600.0
                     continue
                 next_run_raw = rule["next_run_ts"]
                 next_run_ts = float(next_run_raw) if next_run_raw is not None else 0.0
@@ -11165,15 +11156,7 @@ def _scheduler_loop() -> None:
                             next_run_ts=next_normal,
                         )
                         if "bootstrap_required" in reason_norm:
-                            rule_id = int(rule["rule_id"] or 0)
-                            notice_until = float(_scheduler_bootstrap_skip_notice_until.get(rule_id, 0.0) or 0.0)
-                            if now >= notice_until:
-                                logging.debug(
-                                    "Scheduler deferred %s/%s: bootstrap_required.",
-                                    job_type,
-                                    scope,
-                                )
-                                _scheduler_bootstrap_skip_notice_until[rule_id] = now + 21600.0
+                            pass
                         else:
                             skipped_run = _scheduler_record_skipped_job(
                                 rule_id=int(rule["rule_id"]),
@@ -12390,7 +12373,7 @@ def _files_backfill_artist_canonical_fields(conn) -> None:
         with conn.cursor() as cur:
             cur.execute("SELECT COALESCE(value, '') FROM files_index_meta WHERE key = 'artist_canonical_schema' LIMIT 1")
             row = cur.fetchone()
-            if row and str(row[0] or "").strip() == "v6":
+            if row and str(row[0] or "").strip() == "v7":
                 return
             cur.execute(
                 """
@@ -12453,7 +12436,7 @@ def _files_purge_weak_classical_artist_images(conn) -> None:
         with conn.cursor() as cur:
             cur.execute("SELECT COALESCE(value, '') FROM files_index_meta WHERE key = 'artist_image_policy_schema' LIMIT 1")
             row = cur.fetchone()
-            if row and str(row[0] or "").strip() == "v8":
+            if row and str(row[0] or "").strip() == "v9":
                 return
             try:
                 media_cache_root = path_for_fs_access(Path((MEDIA_CACHE_ROOT or "").strip() or str(CONFIG_DIR / "media_cache"))).resolve()
@@ -12507,6 +12490,23 @@ def _files_purge_weak_classical_artist_images(conn) -> None:
                     except Exception:
                         invalidate = True
                 if not invalidate:
+                    reference_folder = _files_artist_reference_folder(
+                        conn,
+                        artist_norm=key,
+                        artist_name=display_name,
+                    )
+                    try:
+                        ref_path = Path(ext_path) if ext_path else Path(art_path) if art_path else None
+                    except Exception:
+                        ref_path = None
+                    if reference_folder and ref_path and ref_path.is_file():
+                        try:
+                            candidate_raw = ref_path.read_bytes()
+                        except Exception:
+                            candidate_raw = b""
+                        if candidate_raw and not _is_artist_image_distinct_from_local_covers(reference_folder, candidate_raw):
+                            invalidate = True
+                if not invalidate:
                     continue
                 mirrored = bool(ext_path and art_path and _paths_refer_to_same_file(ext_path, art_path))
                 art_under_cache = False
@@ -12540,7 +12540,7 @@ def _files_purge_weak_classical_artist_images(conn) -> None:
             cur.execute(
                 """
                 INSERT INTO files_index_meta(key, value, updated_at)
-                VALUES ('artist_image_policy_schema', 'v8', NOW())
+                VALUES ('artist_image_policy_schema', 'v9', NOW())
                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
                 """
             )
@@ -17428,6 +17428,51 @@ def _files_upsert_external_artist_image(
             pass
 
 
+def _files_artist_reference_folder(
+    conn,
+    *,
+    artist_norm: str,
+    artist_name: str = "",
+) -> Optional[Path]:
+    key = str(artist_norm or "").strip() or _norm_artist_key(artist_name)
+    if not key or conn is None:
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT COALESCE(alb.folder_path, '')
+                FROM files_artists a
+                JOIN files_artist_album_links link ON link.artist_id = a.id
+                JOIN files_albums alb ON alb.id = link.album_id
+                WHERE a.name_norm = %s
+                  AND COALESCE(alb.folder_path, '') <> ''
+                ORDER BY link.is_primary DESC, alb.year DESC NULLS LAST, alb.id ASC
+                LIMIT 1
+                """,
+                (key,),
+            )
+            row = cur.fetchone()
+    except Exception:
+        return None
+    folder_raw = str((row[0] if row else "") or "").strip()
+    if not folder_raw:
+        return None
+    try:
+        album_folder = path_for_fs_access(Path(folder_raw))
+    except Exception:
+        album_folder = Path(folder_raw)
+    if not album_folder.exists() or not album_folder.is_dir():
+        return None
+    try:
+        artist_folder = _files_guess_artist_folder(album_folder, artist_name or Path(folder_raw).parent.name)
+    except Exception:
+        artist_folder = album_folder.parent if album_folder.parent else None
+    if artist_folder and artist_folder.exists() and artist_folder.is_dir():
+        return artist_folder
+    return None
+
+
 def _files_cache_external_artist_image(
     conn,
     *,
@@ -17519,6 +17564,13 @@ def _files_cache_external_artist_image(
         ):
             return None
         if not _is_usable_artist_image_bytes(raw):
+            return None
+        reference_folder = _files_artist_reference_folder(
+            conn,
+            artist_norm=key,
+            artist_name=name,
+        )
+        if reference_folder and not _is_artist_image_distinct_from_local_covers(reference_folder, raw):
             return None
     except Exception:
         # Keep permissive behavior if inspection fails unexpectedly.
@@ -19236,6 +19288,7 @@ def _run_files_similar_images_warm_job(*, job_key: str, artist_norm: str, names:
                     continue
                 entity_kind = ""
                 role_hints: list[str] = []
+                lookup_names: list[str] = []
                 try:
                     with conn.cursor() as cur:
                         cur.execute(
@@ -19249,6 +19302,23 @@ def _run_files_similar_images_warm_job(*, job_key: str, artist_norm: str, names:
                 except Exception:
                     entity_kind = ""
                     role_hints = []
+                try:
+                    lookup_names = _artist_image_lookup_candidates(
+                        sname,
+                        _files_get_artist_alias_candidates(
+                            conn,
+                            artist_norm=key,
+                            artist_name=sname,
+                            limit=12,
+                        ),
+                        entity_kind=entity_kind,
+                        role_hints=role_hints,
+                        limit=12,
+                    )
+                except Exception:
+                    lookup_names = [sname]
+                if not lookup_names:
+                    lookup_names = [sname]
                 classical_like_entity = _artist_entity_is_classical_like(
                     entity_kind=entity_kind,
                     role_hints=role_hints,
@@ -19327,14 +19397,13 @@ def _run_files_similar_images_warm_job(*, job_key: str, artist_norm: str, names:
                 # 2) Wikipedia lead image as fallback (no API key).
                 try:
                     wiki_img = ""
-                    for query in (
-                        sname,
-                        f"{sname} musician",
-                        f"{sname} band",
-                        f"{sname} orchestra",
-                        f"{sname} conductor",
-                    ):
-                        w = _fetch_wikipedia_artist_bio_best(query) or {}
+                    for query in lookup_names[:8]:
+                        w = _fetch_wikipedia_artist_bio_best(
+                            query,
+                            entity_kind=entity_kind,
+                            role_hints=role_hints,
+                            candidate_names=lookup_names,
+                        ) or {}
                         if not isinstance(w, dict):
                             continue
                         w_img = str(w.get("image_url") or "").strip()
@@ -19406,7 +19475,16 @@ def _run_files_similar_images_warm_job(*, job_key: str, artist_norm: str, names:
 
                 # 5) Web search fallback (Serper -> og:image). Last resort.
                 try:
-                    wurl = (_fetch_artist_image_web(sname, allow_ai_fallback=False) or "").strip()
+                    wurl = (
+                        _fetch_artist_image_web(
+                            sname,
+                            entity_kind=entity_kind,
+                            role_hints=role_hints,
+                            candidate_names=lookup_names,
+                            allow_ai_fallback=False,
+                        )
+                        or ""
+                    ).strip()
                 except Exception:
                     wurl = ""
                 if wurl:
@@ -29771,7 +29849,7 @@ def _files_backfill_artist_alias_table(conn) -> None:
         with conn.cursor() as cur:
             cur.execute("SELECT COALESCE(value, '') FROM files_index_meta WHERE key = 'artist_aliases_schema' LIMIT 1")
             row = cur.fetchone()
-            if row and str(row[0] or "").strip() == "v6":
+            if row and str(row[0] or "").strip() == "v7":
                 return
             cur.execute("SELECT name_norm FROM files_artists")
             norms = [str(value[0] or "").strip() for value in cur.fetchall() if str(value[0] or "").strip()]
@@ -29780,7 +29858,7 @@ def _files_backfill_artist_alias_table(conn) -> None:
                 cur.execute(
                     """
                     INSERT INTO files_index_meta(key, value, updated_at)
-                    VALUES ('artist_aliases_schema', 'v6', NOW())
+                    VALUES ('artist_aliases_schema', 'v7', NOW())
                     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
                     """
                 )
@@ -29791,7 +29869,7 @@ def _files_backfill_artist_alias_table(conn) -> None:
             cur.execute(
                 """
                 INSERT INTO files_index_meta(key, value, updated_at)
-                VALUES ('artist_aliases_schema', 'v6', NOW())
+                VALUES ('artist_aliases_schema', 'v7', NOW())
                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
                 """
             )
@@ -29816,7 +29894,7 @@ def _files_merge_duplicate_person_artists(conn) -> None:
         with conn.cursor() as cur:
             cur.execute("SELECT COALESCE(value, '') FROM files_index_meta WHERE key = 'artist_person_merge_schema' LIMIT 1")
             row = cur.fetchone()
-            if row and str(row[0] or "").strip() == "v2":
+            if row and str(row[0] or "").strip() == "v3":
                 return
             cur.execute(
                 """
@@ -29908,7 +29986,7 @@ def _files_merge_duplicate_person_artists(conn) -> None:
                 cur.execute(
                     """
                     INSERT INTO files_index_meta(key, value, updated_at)
-                    VALUES ('artist_person_merge_schema', 'v2', NOW())
+                    VALUES ('artist_person_merge_schema', 'v3', NOW())
                     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
                     """
                 )
@@ -29962,7 +30040,7 @@ def _files_merge_duplicate_person_artists(conn) -> None:
                 cur.execute(
                     """
                     INSERT INTO files_index_meta(key, value, updated_at)
-                    VALUES ('artist_person_merge_schema', 'v2', NOW())
+                    VALUES ('artist_person_merge_schema', 'v3', NOW())
                     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
                     """
                 )
@@ -30095,7 +30173,7 @@ def _files_merge_duplicate_person_artists(conn) -> None:
             cur.execute(
                 """
                 INSERT INTO files_index_meta(key, value, updated_at)
-                VALUES ('artist_person_merge_schema', 'v2', NOW())
+                VALUES ('artist_person_merge_schema', 'v3', NOW())
                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
                 """
             )
@@ -70763,12 +70841,31 @@ def _artist_image_url_looks_relevant(
     classical_like = _artist_entity_is_classical_like(entity_kind=entity_kind, role_hints=role_hints)
     albumish_tokens = {"album", "cover", "soundtrack", "single", "release", "recording"}
     event_like = bool(basename_tokens.intersection(_ARTIST_IMAGE_EVENT_TOKENS))
+    taxonomy_like = bool(
+        basename_tokens.intersection(
+            {
+                "wasp",
+                "bee",
+                "hornet",
+                "moth",
+                "beetle",
+                "insect",
+                "species",
+                "genus",
+                "spider",
+                "fly",
+                "bug",
+            }
+        )
+    )
     trusted_domains = ("fanart.tv", "theaudiodb.com", "last.fm", "discogs.com", "wikimedia.org", "wikipedia.org", "musicbrainz.org")
     trusted_host = bool(
         host
         and any(host == domain or host.endswith(f".{domain}") for domain in trusted_domains)
     )
     if basename_tokens.intersection(albumish_tokens):
+        return False
+    if taxonomy_like:
         return False
     if "logo" in basename_tokens or "signet" in basename_tokens or "svg" in basename_tokens:
         return False
@@ -70813,8 +70910,6 @@ def _artist_image_url_looks_relevant(
                 and any(term in person_context for term in musician_terms)
             ):
                 return True
-            if trusted_host and overlap and context_relevant:
-                return True
             return False
         if ensemble_like:
             if event_like or building_like:
@@ -70826,17 +70921,12 @@ def _artist_image_url_looks_relevant(
                 role_hints=role_hints,
             ):
                 return True
-            if trusted_host and len(overlap) >= 2 and context_relevant:
-                return True
             return False
         if host and not trusted_host:
             if not overlap and not context_relevant:
                 return False
         return True
     if person_like:
-        sig = _classical_person_alias_signature(artist_name) or {}
-        surname = str(sig.get("surname") or "").strip()
-        long_givens = {str(tok or "").strip() for tok in (sig.get("long_givens") or set()) if str(tok or "").strip()}
         if page_title_clean and _artist_image_alias_candidate_is_compatible(
             artist_name,
             page_title_clean,
@@ -70844,9 +70934,6 @@ def _artist_image_url_looks_relevant(
                 role_hints=role_hints,
             ):
             return True
-        page_title_sig = _classical_person_alias_signature(page_title_clean) if page_title_clean else {}
-        if page_title_sig and surname and str(page_title_sig.get("surname") or "").strip() == surname:
-            return False
         if basename_candidate and _artist_image_alias_candidate_is_compatible(
             artist_name,
             basename_candidate,
@@ -70854,15 +70941,6 @@ def _artist_image_url_looks_relevant(
             role_hints=role_hints,
         ):
             return True
-        basename_sig = _classical_person_alias_signature(basename_candidate) if basename_candidate else {}
-        if basename_sig and surname and str(basename_sig.get("surname") or "").strip() == surname:
-            return False
-        if surname and surname in basename_tokens and len(basename_tokens) <= 2 and long_givens and context_relevant and not page_title_clean:
-            return True
-        if overlap and context_relevant:
-            return True
-        if building_like:
-            return False
         return False
     if ensemble_like:
         if page_title_clean and _artist_image_alias_candidate_is_compatible(
@@ -70878,12 +70956,6 @@ def _artist_image_url_looks_relevant(
             entity_kind=entity_kind,
             role_hints=role_hints,
         ):
-            return True
-        if building_like:
-            return False
-        if event_like:
-            return False
-        if len(overlap) >= 2 and context_relevant:
             return True
         return False
     if overlap:
