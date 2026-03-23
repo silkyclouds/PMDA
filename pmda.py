@@ -2457,7 +2457,7 @@ merged = {
     # Extra artist image providers (optional)
     "FANART_API_KEY": _get("FANART_API_KEY", default="", cast=str),
     "THEAUDIODB_API_KEY": _get("THEAUDIODB_API_KEY", default="", cast=str),
-    "USE_BANDCAMP": _get("USE_BANDCAMP", default=True, cast=_parse_bool),
+    "USE_BANDCAMP": _get("USE_BANDCAMP", default=False, cast=_parse_bool),
     # Artist / metadata modes
     "ARTIST_CREDIT_MODE": _get("ARTIST_CREDIT_MODE", default="picard_like_default", cast=str),
     "LIVE_DEDUPE_MODE": _get("LIVE_DEDUPE_MODE", default="safe", cast=str),
@@ -2635,7 +2635,7 @@ LASTFM_API_KEY: str = str(merged.get("LASTFM_API_KEY", "") or "")
 LASTFM_API_SECRET: str = str(merged.get("LASTFM_API_SECRET", "") or "")
 FANART_API_KEY: str = str(merged.get("FANART_API_KEY", "") or "")
 THEAUDIODB_API_KEY: str = str(merged.get("THEAUDIODB_API_KEY", "") or "")
-USE_BANDCAMP: bool = bool(merged.get("USE_BANDCAMP", True))
+USE_BANDCAMP: bool = bool(merged.get("USE_BANDCAMP", False))
 ARTIST_CREDIT_MODE: str = str(merged.get("ARTIST_CREDIT_MODE", "picard_like_default") or "picard_like_default").strip().lower()
 LIVE_DEDUPE_MODE: str = str(merged.get("LIVE_DEDUPE_MODE", "safe") or "safe").strip().lower()
 
@@ -17978,6 +17978,244 @@ def _files_ensure_local_artist_profile(conn, *, artist_id: int, artist_name: str
         _files_upsert_artist_profile(conn, artist_norm, artist_name, fallback)
 
 
+_FILES_SIMILAR_IMAGES_WARM_ENABLED = False
+
+
+def _scan_pipeline_active() -> bool:
+    try:
+        with lock:
+            return bool(
+                state.get("scanning")
+                or state.get("scan_starting")
+                or state.get("scan_finalizing")
+                or state.get("scan_post_processing")
+                or state.get("scan_profile_enrich_running")
+            )
+    except Exception:
+        return False
+
+
+def _files_try_artist_image_refresh(
+    conn,
+    *,
+    artist_name: str,
+    artist_norm: str,
+    entity_kind: str,
+    role_hints: list[str] | tuple[str, ...] | None,
+    lastfm_info: dict | None = None,
+    wiki_info: dict | None = None,
+    mb_identity: dict | None = None,
+    fast_mode: bool = False,
+) -> bool:
+    role_hints = list(role_hints or [])
+    entity_kind = str(entity_kind or "").strip() or "artist"
+    artist_name = str(artist_name or "").strip()
+    artist_norm = str(artist_norm or "").strip()
+    if not artist_name or not artist_norm:
+        return False
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT has_image, COALESCE(image_path, '') FROM files_artists WHERE name_norm = %s LIMIT 1",
+                (artist_norm,),
+            )
+            local_row = cur.fetchone()
+    except Exception:
+        local_row = None
+    local_has_image = bool(local_row[0]) if local_row else False
+    local_image_path = str((local_row[1] if local_row else "") or "").strip()
+    if local_has_image and local_image_path:
+        try:
+            if Path(local_image_path).exists():
+                return True
+        except Exception:
+            pass
+
+    ext_row = _files_get_external_artist_images(conn, [artist_norm]).get(artist_norm) or {}
+    ext_path = str(ext_row.get("image_path") or "").strip()
+    ext_provider = str(ext_row.get("provider") or "").strip().lower()
+    ext_url = str(ext_row.get("image_url") or "").strip()
+    if ext_path and not bool(ext_row.get("stale")):
+        try:
+            if _is_usable_artist_image_path(Path(ext_path)) and not _artist_external_image_requires_authoritative_refresh(
+                provider=ext_provider,
+                image_url=ext_url,
+                entity_kind=entity_kind,
+                role_hints=role_hints,
+            ):
+                return True
+        except Exception:
+            pass
+
+    lastfm_info = dict(lastfm_info or {})
+    wiki_info = dict(wiki_info or {})
+    mb_identity = dict(mb_identity or {})
+    if not lastfm_info and not wiki_info:
+        try:
+            _profile, seed_lastfm, seed_wiki, _entities = _build_artist_profile_payload(
+                artist_name,
+                entity_kind=entity_kind,
+                role_hints=role_hints,
+            )
+            lastfm_info = dict(seed_lastfm or {})
+            wiki_info = dict(seed_wiki or {})
+        except Exception:
+            lastfm_info = {}
+            wiki_info = {}
+
+    classical_like_entity = _artist_entity_is_classical_like(
+        entity_kind=entity_kind,
+        role_hints=role_hints,
+    )
+    ensemble_like_entity = bool(
+        str(entity_kind or "").strip().lower() in {"ensemble", "orchestra", "choir", "chorus"}
+        or bool(set(role_hints).intersection({"orchestra", "ensemble", "choir", "chorus"}))
+    )
+    artist_lookup_candidates = _artist_image_lookup_candidates(
+        artist_name,
+        _files_get_artist_alias_candidates(
+            conn,
+            artist_norm=artist_norm,
+            artist_name=artist_name,
+            limit=8,
+        ),
+        entity_kind=entity_kind,
+        role_hints=role_hints,
+        limit=8,
+    )
+    if not artist_lookup_candidates:
+        artist_lookup_candidates = [artist_name]
+
+    candidates: list[dict[str, str]] = []
+    seen_urls: set[str] = set()
+
+    def _append_candidate(provider: str, url: str, *, title: str = "", summary: str = "") -> None:
+        clean_url = str(url or "").strip()
+        prov = str(provider or "").strip().lower()
+        if not clean_url or not prov or clean_url in seen_urls:
+            return
+        if not _artist_image_provider_allowed_for_entity(
+            prov,
+            entity_kind=entity_kind,
+            role_hints=role_hints,
+        ):
+            return
+        seen_urls.add(clean_url)
+        candidates.append(
+            {
+                "provider": prov,
+                "url": clean_url,
+                "title": str(title or "").strip(),
+                "summary": str(summary or "").strip(),
+            }
+        )
+
+    lf_mbid = str(lastfm_info.get("mbid") or mb_identity.get("mbid") or "").strip()
+    if lf_mbid and not classical_like_entity:
+        try:
+            fanart_url = (_fetch_artist_image_fanart(lf_mbid) or "").strip()
+        except Exception:
+            fanart_url = ""
+        if fanart_url:
+            _append_candidate("fanart", fanart_url, title=str(mb_identity.get("name") or artist_name))
+
+    if not classical_like_entity:
+        lf_img = str(lastfm_info.get("image_url") or "").strip()
+        if lf_img and not _is_probably_placeholder_artist_image_url(lf_img):
+            _append_candidate(
+                "lastfm",
+                lf_img,
+                title=str(mb_identity.get("name") or artist_name),
+                summary=str(lastfm_info.get("bio") or lastfm_info.get("short_bio") or "").strip(),
+            )
+
+    wiki_img_url = str(wiki_info.get("image_url") or "").strip()
+    if not wiki_img_url:
+        for lookup_name in artist_lookup_candidates[:4]:
+            wiki_seed = _fetch_wikipedia_artist_bio_best(
+                lookup_name,
+                entity_kind=entity_kind,
+                role_hints=role_hints,
+                candidate_names=artist_lookup_candidates,
+            )
+            wiki_img_url = str((wiki_seed.get("image_url") if isinstance(wiki_seed, dict) else "") or "").strip()
+            if wiki_img_url:
+                wiki_info = dict(wiki_seed or {})
+                break
+    if wiki_img_url:
+        _append_candidate(
+            "wikipedia",
+            wiki_img_url,
+            title=str(wiki_info.get("page_title") or artist_name),
+            summary="\n".join(
+                part
+                for part in (
+                    str(wiki_info.get("page_description") or "").strip(),
+                    str(wiki_info.get("bio") or "").strip(),
+                )
+                if part
+            ),
+        )
+
+    if not wiki_img_url or not fast_mode:
+        try:
+            commons_url = _fetch_wikimedia_commons_artist_image(
+                artist_name,
+                entity_kind=entity_kind,
+                role_hints=role_hints,
+                candidate_names=artist_lookup_candidates,
+            )
+        except Exception:
+            commons_url = ""
+        if commons_url:
+            _append_candidate("commons", commons_url, title=str(mb_identity.get("name") or artist_name))
+
+    if not fast_mode and not classical_like_entity:
+        for fetch_provider, fetcher in (
+            ("audiodb", _fetch_artist_image_audiodb),
+            ("discogs", _fetch_artist_image_discogs),
+        ):
+            for lookup_name in artist_lookup_candidates[:4]:
+                try:
+                    fetched = (fetcher(lookup_name) or "").strip()
+                except Exception:
+                    fetched = ""
+                if fetched:
+                    _append_candidate(fetch_provider, fetched, title=str(mb_identity.get("name") or artist_name))
+                    break
+
+    preferred_order = (
+        ["wikipedia", "commons", "fanart", "lastfm", "audiodb", "discogs"]
+        if ensemble_like_entity or classical_like_entity
+        else ["fanart", "lastfm", "wikipedia", "commons", "audiodb", "discogs"]
+    )
+    ordered_candidates: list[dict[str, str]] = []
+    for provider in preferred_order:
+        ordered_candidates.extend([item for item in candidates if str(item.get("provider") or "").strip().lower() == provider])
+
+    for item in ordered_candidates:
+        try:
+            with conn.transaction():
+                outp = _files_cache_external_artist_image(
+                    conn,
+                    artist_name=artist_name,
+                    provider=str(item.get("provider") or "").strip(),
+                    image_url=str(item.get("url") or "").strip(),
+                    max_px=640,
+                    force_replace=bool(item.get("provider") in {"wikipedia", "commons", "fanart"}),
+                    entity_kind=entity_kind,
+                    role_hints=role_hints,
+                    page_title=str(item.get("title") or "").strip(),
+                    page_summary=str(item.get("summary") or "").strip(),
+                )
+            if outp:
+                return True
+        except Exception:
+            continue
+    return False
+
+
 def _files_enrich_artists_blocking(artists_map: dict[str, dict[str, Any]]) -> None:
     if not artists_map:
         return
@@ -18019,6 +18257,7 @@ def _files_enrich_artists_blocking(artists_map: dict[str, dict[str, Any]]) -> No
                         artist_norm=artist_norm,
                         albums=[],
                         skip_album_profiles=True,
+                        fast_mode=True,
                     )
                 if artist_id > 0:
                     _files_ensure_local_artist_profile(
@@ -18118,12 +18357,14 @@ def _run_files_profile_enrichment_job(
     albums: list[tuple[str, str]],
     skip_album_profiles: bool = False,
     allow_soft_profiles: Optional[bool] = None,
+    fast_mode: bool = False,
 ) -> None:
     try:
         conn = _files_pg_connect()
         if conn is None:
             return
         try:
+            fast_mode = bool(fast_mode)
             role_hints: list[str] = []
             entity_kind = "artist"
             artist_id = 0
@@ -18201,7 +18442,7 @@ def _run_files_profile_enrichment_job(
                 )
 
                 # Similar artists fallback via MusicBrainz (names only; images handled separately).
-                if (not (artist_profile.get("similar") or [])) and USE_MUSICBRAINZ:
+                if (not fast_mode) and (not (artist_profile.get("similar") or [])) and USE_MUSICBRAINZ:
                     mbid = ""
                     mb_queries = [artist_name, *composite_entities]
                     seen_mb_queries: set[str] = set()
@@ -18239,499 +18480,21 @@ def _run_files_profile_enrichment_job(
                 with conn.transaction():
                     _files_upsert_artist_profile(conn, artist_norm, artist_name, artist_profile)
 
-            # Cache external artist images (main + similar) so the UI never shows empty placeholders.
-            # This is best-effort; failures should not break enrichment. Importantly, this should run
-            # even when the bio/tags profile does not need a refresh (images can be missing/low quality).
+            # Cache fast, identity-safe artist images during the critical scan path.
             try:
-                # Local artist image presence.
-                with conn.cursor() as cur:
-                    cur.execute("SELECT id, has_image, COALESCE(image_path, '') FROM files_artists WHERE name_norm = %s", (artist_norm,))
-                    arow = cur.fetchone()
-                artist_id = int(arow[0]) if arow else artist_id
-                local_has_image = bool(arow[1]) if arow else False
-                local_image_path = str((arow[2] if arow else "") or "").strip()
-                ext_row = _files_get_external_artist_images(conn, [artist_norm]).get(artist_norm) or {}
-                ext_path = str(ext_row.get("image_path") or "").strip()
-                ext_provider = str(ext_row.get("provider") or "").strip().lower()
-                ext_url = str(ext_row.get("image_url") or "").strip().lower()
-                if local_has_image and local_image_path:
-                    try:
-                        if not Path(local_image_path).exists():
-                            local_has_image = False
-                    except Exception:
-                        pass
-                if (
-                    local_has_image
-                    and local_image_path
-                    and ext_path
-                    and _paths_refer_to_same_file(local_image_path, ext_path)
-                    and (
-                        _artist_external_image_requires_authoritative_refresh(
-                            provider=ext_provider,
-                            image_url=ext_url,
-                            entity_kind=entity_kind,
-                            role_hints=role_hints,
-                        )
-                        or (
-                            bool(ext_url)
-                            and not _artist_image_url_looks_relevant(
-                                ext_url,
-                                artist_name=artist_name,
-                                entity_kind=entity_kind,
-                                role_hints=role_hints,
-                            )
-                        )
-                    )
-                ):
-                    local_has_image = False
-
-                # External cached image state (quality-aware) so we can decide whether a refresh is needed.
-                needs_image = not local_has_image
-                authoritative_refresh = False
-                if needs_image:
-                    if ext_path and not bool(ext_row.get("stale")):
-                        try:
-                            if _is_usable_artist_image_path(Path(ext_path)):
-                                if (
-                                    _artist_external_image_requires_authoritative_refresh(
-                                        provider=ext_provider,
-                                        image_url=ext_url,
-                                        entity_kind=entity_kind,
-                                        role_hints=role_hints,
-                                    )
-                                    or (
-                                        bool(ext_url)
-                                        and not _artist_image_url_looks_relevant(
-                                            ext_url,
-                                            artist_name=artist_name,
-                                            entity_kind=entity_kind,
-                                            role_hints=role_hints,
-                                        )
-                                    )
-                                ):
-                                    needs_image = True
-                                    authoritative_refresh = True
-                                else:
-                                    needs_image = False
-                        except Exception:
-                            needs_image = False
-
-                if needs_image:
-                    classical_like_entity = _artist_entity_is_classical_like(
-                        entity_kind=entity_kind,
-                        role_hints=role_hints,
-                    )
-                    ensemble_like_entity = bool(
-                        str(entity_kind or "").strip().lower() in {"ensemble", "orchestra", "choir", "chorus"}
-                        or bool(set(role_hints).intersection({"orchestra", "ensemble", "choir", "chorus"}))
-                    )
-                    # Lazy fetch sources only if we actually need an image.
-                    if lastfm_info is None or wiki_info is None:
-                        _seed_profile, seed_lastfm, seed_wiki, _seed_entities = _build_artist_profile_payload(
-                            artist_name,
-                            entity_kind=entity_kind,
-                            role_hints=role_hints,
-                        )
-                        if lastfm_info is None:
-                            lastfm_info = seed_lastfm or {}
-                        if wiki_info is None:
-                            wiki_info = seed_wiki or {}
-                    if artist_id > 0 and not mb_identity and isinstance(wiki_info, dict):
-                        wiki_title = _artist_image_page_identity_candidate(str(wiki_info.get("page_title") or "").strip())
-                        if wiki_title and _artist_image_alias_candidate_is_compatible(
-                            artist_name,
-                            wiki_title,
-                            entity_kind=entity_kind,
-                            role_hints=role_hints,
-                        ):
-                            try:
-                                with conn.transaction():
-                                    _files_upsert_artist_canonical_identity(
-                                        conn,
-                                        artist_id=artist_id,
-                                        artist_norm=artist_norm,
-                                        artist_name=artist_name,
-                                        canonical_name=wiki_title,
-                                        canonical_mbid="",
-                                        aliases=[artist_name],
-                                        entity_kind=entity_kind,
-                                        roles_json=role_hints,
-                                    )
-                            except Exception:
-                                logging.debug("Wikipedia canonical identity upsert failed for %s", artist_name, exc_info=True)
-
-                    # Persist Wikipedia intro for assistant RAG even if it is too short for the "Original" UI slot.
-                    try:
-                        if artist_id > 0 and isinstance(wiki_info, dict):
-                            wtxt = (wiki_info.get("bio") or "").strip()
-                            if wtxt:
-                                _assistant_upsert_doc(
-                                    conn,
-                                    entity_type="artist",
-                                    entity_id=int(artist_id),
-                                    doc_type="artist_external_wikipedia_intro",
-                                    source=str(wiki_info.get("source") or "wikipedia"),
-                                    title=str(artist_name),
-                                    url=str(wiki_info.get("url") or ""),
-                                    lang=str(wiki_info.get("lang") or ""),
-                                    content=wtxt,
-                                )
-                    except Exception:
-                        pass
-
-                    # Try providers in order until one yields a usable cached image.
-                    # Prefer Fanart.tv when available (often better artwork than Last.fm placeholders).
-                    candidates: list[dict[str, str]] = []
-
-                    def _append_candidate(provider: str, url: str, *, title: str = "", summary: str = "") -> None:
-                        clean_url = str(url or "").strip()
-                        if not clean_url:
-                            return
-                        candidates.append(
-                            {
-                                "provider": str(provider or "").strip().lower() or "web",
-                                "url": clean_url,
-                                "title": str(title or "").strip(),
-                                "summary": str(summary or "").strip(),
-                            }
-                        )
-
-                    try:
-                        lf_mbid = str((lastfm_info.get("mbid") if isinstance(lastfm_info, dict) else "") or "").strip()
-                    except Exception:
-                        lf_mbid = ""
-                    if not lf_mbid:
-                        lf_mbid = str((mb_identity.get("mbid") if isinstance(mb_identity, dict) else "") or "").strip()
-                    if lf_mbid and not classical_like_entity:
-                        try:
-                            for mb_url in get_artist_images_mb(lf_mbid)[:4]:
-                                resolved_mb_url = _resolve_remote_image_or_og_url(mb_url, timeout=8)
-                                if resolved_mb_url:
-                                    _append_candidate("musicbrainz", resolved_mb_url, title=str(mb_identity.get("name") or artist_name))
-                        except Exception:
-                            pass
-                        try:
-                            fu = (_fetch_artist_image_fanart(lf_mbid) or "").strip()
-                        except Exception:
-                            fu = ""
-                        if fu:
-                            _append_candidate("fanart", fu, title=str(mb_identity.get("name") or artist_name))
-                    try:
-                        img_url = (lastfm_info.get("image_url") or "").strip() if isinstance(lastfm_info, dict) else ""
-                    except Exception:
-                        img_url = ""
-                    if img_url and not classical_like_entity:
-                        _append_candidate("lastfm", img_url, title=str(mb_identity.get("name") or artist_name), summary=str((lastfm_info or {}).get("bio") or ""))
-                    try:
-                        wiki_img_url = (wiki_info.get("image_url") or "").strip() if isinstance(wiki_info, dict) else ""
-                    except Exception:
-                        wiki_img_url = ""
-                    artist_lookup_candidates = _artist_image_lookup_candidates(
-                        artist_name,
-                        _files_get_artist_alias_candidates(
-                            conn,
-                            artist_norm=artist_norm,
-                            artist_name=artist_name,
-                            limit=12,
-                        ),
-                        entity_kind=entity_kind,
-                        role_hints=role_hints,
-                        limit=12,
-                    )
-                    if not artist_lookup_candidates:
-                        artist_lookup_candidates = _artist_image_lookup_candidates(
-                            artist_name,
-                            [artist_name, *composite_entities],
-                            entity_kind=entity_kind,
-                            role_hints=role_hints,
-                            limit=12,
-                        )
-                    if not ensemble_like_entity:
-                        for mb_url in [str(url or "").strip() for url in (mb_identity.get("urls") or []) if str(url or "").strip()][:8]:
-                            mb_page_title = str(mb_identity.get("name") or artist_name)
-                            mb_page_summary = "\n".join(str(alias or "").strip() for alias in (mb_identity.get("aliases") or []) if str(alias or "").strip())
-                            resolved_mb_url = _resolve_authoritative_artist_image_url(
-                                mb_url,
-                                artist_name=artist_name,
-                                entity_kind=entity_kind,
-                                role_hints=role_hints,
-                                page_title=mb_page_title,
-                                page_summary=mb_page_summary,
-                                timeout=8,
-                            )
-                            if resolved_mb_url and _artist_image_url_looks_relevant(
-                                resolved_mb_url,
-                                artist_name=artist_name,
-                                entity_kind=entity_kind,
-                                role_hints=role_hints,
-                                page_title=mb_page_title,
-                                page_summary=mb_page_summary,
-                            ):
-                                _append_candidate("musicbrainz_url", resolved_mb_url, title=mb_page_title, summary=mb_page_summary)
-                    if not wiki_img_url:
-                        for lookup_name in artist_lookup_candidates:
-                            wiki_seed = _fetch_wikipedia_artist_bio_best(
-                                lookup_name,
-                                entity_kind=entity_kind,
-                                role_hints=role_hints,
-                                candidate_names=artist_lookup_candidates,
-                            )
-                            wiki_img_url = str((wiki_seed.get("image_url") if isinstance(wiki_seed, dict) else "") or "").strip()
-                            if wiki_img_url:
-                                wiki_info = wiki_seed
-                                break
-                    if wiki_img_url:
-                        _append_candidate(
-                            "wikipedia",
-                            wiki_img_url,
-                            title=str((wiki_info or {}).get("page_title") or artist_name),
-                            summary="\n".join(
-                                part
-                                for part in (
-                                    str((wiki_info or {}).get("page_description") or "").strip(),
-                                    str((wiki_info or {}).get("bio") or "").strip(),
-                                )
-                                if part
-                            ),
-                        )
-
-                    commons_url = _fetch_wikimedia_commons_artist_image(
-                        artist_name,
-                        entity_kind=entity_kind,
-                        role_hints=role_hints,
-                        candidate_names=artist_lookup_candidates,
-                    )
-                    if commons_url:
-                        _append_candidate("commons", commons_url, title=str(mb_identity.get("name") or artist_name))
-
-                    def _first_non_empty_artist_image(fetcher) -> str:
-                        for lookup_name in artist_lookup_candidates:
-                            try:
-                                found = (fetcher(lookup_name) or "").strip()
-                            except Exception:
-                                found = ""
-                            if found:
-                                return found
-                        return ""
-
-                    au = _first_non_empty_artist_image(_fetch_artist_image_audiodb)
-                    if au and not classical_like_entity:
-                        _append_candidate("audiodb", au, title=str(mb_identity.get("name") or artist_name))
-                    du = _first_non_empty_artist_image(_fetch_artist_image_discogs)
-                    if du and not classical_like_entity:
-                        _append_candidate("discogs", du, title=str(mb_identity.get("name") or artist_name))
-                    wu = _first_non_empty_artist_image(
-                        lambda n: _fetch_artist_image_web(
-                            n,
-                            entity_kind=entity_kind,
-                            role_hints=role_hints,
-                            candidate_names=artist_lookup_candidates,
-                            allow_ai_fallback=not classical_like_entity and not ensemble_like_entity,
-                        )
-                    )
-                    if wu:
-                        effective_provider = "web"
-                        host = (urlparse(wu).netloc or "").strip().lower()
-                        if host == "commons.wikimedia.org" or host.endswith(".wikimedia.org"):
-                            effective_provider = "commons"
-                        elif host.endswith(".wikipedia.org"):
-                            effective_provider = "wikipedia"
-                        _append_candidate("web_authoritative" if effective_provider == "web" and classical_like_entity else effective_provider, wu, title=str(mb_identity.get("name") or artist_name))
-
-                    filtered_candidates: list[dict[str, str]] = []
-                    seen_candidate_urls: set[str] = set()
-                    preferred_order = (
-                        ["musicbrainz_url", "wikipedia", "web_authoritative", "commons", "web", "musicbrainz", "fanart", "lastfm", "audiodb", "discogs"]
-                        if ensemble_like_entity
-                        else ["musicbrainz_url", "wikipedia", "commons", "web_authoritative", "web", "musicbrainz", "fanart", "lastfm", "audiodb", "discogs"]
-                    )
-                    for preferred_provider in preferred_order:
-                        for item in candidates:
-                            prov = str(item.get("provider") or "").strip().lower()
-                            url = str(item.get("url") or "").strip()
-                            if prov != preferred_provider:
-                                continue
-                            clean_url = url
-                            if not clean_url or clean_url in seen_candidate_urls:
-                                continue
-                            if not _artist_image_provider_allowed_for_entity(
-                                prov,
-                                entity_kind=entity_kind,
-                                role_hints=role_hints,
-                            ):
-                                continue
-                            seen_candidate_urls.add(clean_url)
-                            filtered_candidates.append(item)
-
-                    for item in filtered_candidates:
-                        prov = str(item.get("provider") or "").strip().lower()
-                        url = str(item.get("url") or "").strip()
-                        try:
-                            with conn.transaction():
-                                outp = _files_cache_external_artist_image(
-                                    conn,
-                                    artist_name=artist_name,
-                                    provider=prov,
-                                    image_url=url,
-                                    max_px=640,
-                                    force_replace=bool(authoritative_refresh and prov in {"musicbrainz", "musicbrainz_url", "wikipedia", "commons", "fanart"}),
-                                    entity_kind=entity_kind,
-                                    role_hints=role_hints,
-                                    page_title=str(item.get("title") or "").strip(),
-                                    page_summary=str(item.get("summary") or "").strip(),
-                                )
-                            if outp:
-                                break
-                        except Exception:
-                            continue
-
-                # Similar artists: warm top N images (use refreshed profile if present, else existing cached profile).
-                profile_for_similar = artist_profile if isinstance(artist_profile, dict) else existing_profile if isinstance(existing_profile, dict) else {}
-                sim_list = []
-                if isinstance(profile_for_similar, dict):
-                    sim_list = profile_for_similar.get("similar") or profile_for_similar.get("similar_artists") or []
-                if isinstance(sim_list, list) and sim_list:
-                    # Preload local/external image presence to avoid unnecessary network calls.
-                    sim_norms: list[str] = []
-                    for sim in sim_list[:12]:
-                        if not isinstance(sim, dict):
-                            continue
-                        sname = (sim.get("name") or "").strip()
-                        if not sname:
-                            continue
-                        sim_norms.append(_norm_artist_key(sname))
-                    sim_norms = list(dict.fromkeys([n for n in sim_norms if n]))
-                    local_sim_map: dict[str, dict] = {}
-                    if sim_norms:
-                        try:
-                            with conn.cursor() as cur:
-                                cur.execute(
-                                    """
-                                    SELECT name_norm, has_image
-                                    FROM files_artists
-                                    WHERE name_norm = ANY(%s)
-                                    """,
-                                    (sim_norms,),
-                                )
-                                for nn, has_img in cur.fetchall():
-                                    key = str(nn or "").strip()
-                                    if key:
-                                        local_sim_map[key] = {"has_image": bool(has_img)}
-                        except Exception:
-                            local_sim_map = {}
-                    ext_sim_map = _files_get_external_artist_images(conn, sim_norms) if sim_norms else {}
-
-                    warmed = 0
-                    for sim in sim_list[:12]:
-                        if not isinstance(sim, dict):
-                            continue
-                        sname = (sim.get("name") or "").strip()
-                        surl = (sim.get("image_url") or "").strip()
-                        if not sname:
-                            continue
-
-                        # Fast path: provider already gave an image URL (but still validate/cache).
-                        if surl and not _is_probably_placeholder_artist_image_url(surl):
-                            try:
-                                with conn.transaction():
-                                    outp = _files_cache_external_artist_image(conn, artist_name=sname, provider="lastfm", image_url=surl, max_px=640)
-                                if outp:
-                                    continue
-                            except Exception:
-                                pass
-
-                        # Otherwise: best-effort warm a small number of missing/poor images so UI doesn't show placeholders.
-                        if warmed >= 8:
-                            continue
-                        key = _norm_artist_key(sname)
-                        if not key:
-                            continue
-                        if local_sim_map.get(key, {}).get("has_image"):
-                            continue
-                        ext_row = ext_sim_map.get(key) or {}
-                        ext_path = str(ext_row.get("image_path") or "").strip()
-                        if ext_path and not bool(ext_row.get("stale")):
-                            try:
-                                if _is_usable_artist_image_path(Path(ext_path)):
-                                    continue
-                            except Exception:
-                                continue
-
-                        # Try providers in order until one succeeds.
-                        candidates_sim: list[tuple[str, str]] = []
-                        try:
-                            lf = _fetch_lastfm_artist_info(sname) or {}
-                            lf_img = (lf.get("image_url") or "").strip()
-                            lf_mbid = str(lf.get("mbid") or "").strip()
-                        except Exception:
-                            lf = {}
-                            lf_img = ""
-                            lf_mbid = ""
-                        if lf_mbid:
-                            try:
-                                fu = (_fetch_artist_image_fanart(lf_mbid) or "").strip()
-                            except Exception:
-                                fu = ""
-                            if fu:
-                                candidates_sim.append(("fanart", fu))
-                        if lf_img:
-                            candidates_sim.append(("lastfm", lf_img))
-                        try:
-                            w = _fetch_wikipedia_artist_bio_best(sname)
-                            w_img = (w.get("image_url") or "").strip() if isinstance(w, dict) else ""
-                        except Exception:
-                            w_img = ""
-                        if w_img:
-                            candidates_sim.append(("wikipedia", w_img))
-                        commons_img = _fetch_wikimedia_commons_artist_image(
-                            sname,
-                            entity_kind=entity_kind,
-                            role_hints=role_hints,
-                        )
-                        if commons_img:
-                            candidates_sim.append(("commons", commons_img))
-                        try:
-                            au = (_fetch_artist_image_audiodb(sname) or "").strip()
-                        except Exception:
-                            au = ""
-                        if au:
-                            candidates_sim.append(("audiodb", au))
-                        try:
-                            du = (_fetch_artist_image_discogs(sname) or "").strip()
-                        except Exception:
-                            du = ""
-                        if du:
-                            candidates_sim.append(("discogs", du))
-                        try:
-                            # Similar-artist warming must never starve the core scan pipeline.
-                            # Keep this strictly provider-driven; interactive/manual flows can still
-                            # use AI-backed research on demand.
-                            wu = (
-                                _fetch_artist_image_web(
-                                    sname,
-                                    allow_ai_fallback=False,
-                                )
-                                or ""
-                            ).strip()
-                        except Exception:
-                            wu = ""
-                        if wu:
-                            candidates_sim.append(("web", wu))
-
-                        success = False
-                        for prov, url in candidates_sim:
-                            try:
-                                with conn.transaction():
-                                    outp = _files_cache_external_artist_image(conn, artist_name=sname, provider=prov, image_url=url, max_px=640)
-                                if outp:
-                                    success = True
-                                    break
-                            except Exception:
-                                continue
-                        if success:
-                            warmed += 1
+                _files_try_artist_image_refresh(
+                    conn,
+                    artist_name=artist_name,
+                    artist_norm=artist_norm,
+                    entity_kind=entity_kind,
+                    role_hints=role_hints,
+                    lastfm_info=lastfm_info,
+                    wiki_info=wiki_info,
+                    mb_identity=mb_identity,
+                    fast_mode=fast_mode,
+                )
             except Exception:
-                pass
+                logging.debug("Fast artist image refresh failed for %s", artist_name, exc_info=True)
 
             def _cover_provider_from_primary_tags(primary_tags_json: Any) -> str:
                 tags_blob = primary_tags_json
@@ -19120,45 +18883,46 @@ def _run_files_profile_enrichment_job(
                         if norm not in existing or _is_profile_stale(existing.get(norm)):
                             to_fetch.append((title, norm))
                     batch_web_profiles_by_norm: dict[str, dict[str, str]] = {}
-                    batch_requests: list[dict[str, Any]] = []
-                    for title, norm in to_fetch[:120]:
-                        if not bool(norm_match_flags.get(norm, False)):
-                            continue
-                        state = album_state_by_norm.get(norm) or {}
-                        review_artist = str(artist_name or "").strip()
-                        review_title = str(title or "").strip()
-                        review_identity_provider = ""
-                        if state:
+                    if not fast_mode:
+                        batch_requests: list[dict[str, Any]] = []
+                        for title, norm in to_fetch[:120]:
+                            if not bool(norm_match_flags.get(norm, False)):
+                                continue
+                            state = album_state_by_norm.get(norm) or {}
+                            review_artist = str(artist_name or "").strip()
+                            review_title = str(title or "").strip()
+                            review_identity_provider = ""
+                            if state:
+                                try:
+                                    review_artist, review_title, review_identity_provider = _resolve_album_review_identity_from_provider_hints(
+                                        review_artist,
+                                        review_title,
+                                        metadata_source=str(state.get("metadata_source") or "").strip(),
+                                        mbid=str(state.get("mbid") or "").strip(),
+                                        discogs_release_id=str(state.get("discogs_release_id") or "").strip(),
+                                        lastfm_album_mbid=str(state.get("lastfm_album_mbid") or "").strip(),
+                                        bandcamp_album_url=str(state.get("bandcamp_album_url") or "").strip(),
+                                    )
+                                except Exception:
+                                    review_artist = str(artist_name or "").strip()
+                                    review_title = str(title or "").strip()
+                                    review_identity_provider = ""
+                            batch_requests.append(
+                                {
+                                    "album_title": review_title or title,
+                                    "title_norm": norm,
+                                    "allow_short_title_fallback": bool(norm_strict_flags.get(norm, False)),
+                                    "search_source": review_identity_provider or "",
+                                }
+                            )
+                        if batch_requests:
                             try:
-                                review_artist, review_title, review_identity_provider = _resolve_album_review_identity_from_provider_hints(
-                                    review_artist,
-                                    review_title,
-                                    metadata_source=str(state.get("metadata_source") or "").strip(),
-                                    mbid=str(state.get("mbid") or "").strip(),
-                                    discogs_release_id=str(state.get("discogs_release_id") or "").strip(),
-                                    lastfm_album_mbid=str(state.get("lastfm_album_mbid") or "").strip(),
-                                    bandcamp_album_url=str(state.get("bandcamp_album_url") or "").strip(),
+                                batch_web_profiles_by_norm = _fetch_album_review_web_ai_batch(
+                                    artist_name=artist_name,
+                                    requests_payload=batch_requests,
                                 )
                             except Exception:
-                                review_artist = str(artist_name or "").strip()
-                                review_title = str(title or "").strip()
-                                review_identity_provider = ""
-                        batch_requests.append(
-                            {
-                                "album_title": review_title or title,
-                                "title_norm": norm,
-                                "allow_short_title_fallback": bool(norm_strict_flags.get(norm, False)),
-                                "search_source": review_identity_provider or "",
-                            }
-                        )
-                    if batch_requests:
-                        try:
-                            batch_web_profiles_by_norm = _fetch_album_review_web_ai_batch(
-                                artist_name=artist_name,
-                                requests_payload=batch_requests,
-                            )
-                        except Exception:
-                            batch_web_profiles_by_norm = {}
+                                batch_web_profiles_by_norm = {}
                     for title, norm in to_fetch[:120]:
                         state = album_state_by_norm.get(norm) or {}
                         review_artist = str(artist_name or "").strip()
@@ -19180,7 +18944,7 @@ def _run_files_profile_enrichment_job(
                         profile = _fetch_best_album_profile(
                             review_artist,
                             review_title,
-                            allow_web_ai=bool(norm_match_flags.get(norm, False)),
+                            allow_web_ai=(not fast_mode) and bool(norm_match_flags.get(norm, False)),
                             allow_short_title_fallback=bool(norm_strict_flags.get(norm, False)),
                             precomputed_web_profile=batch_web_profiles_by_norm.get(norm),
                         ) or {}
@@ -19521,6 +19285,10 @@ def _run_files_similar_images_warm_job(*, job_key: str, artist_norm: str, names:
 
 
 def _enqueue_files_similar_images_warm(artist_norm: str, names: list[str]) -> bool:
+    if not bool(_FILES_SIMILAR_IMAGES_WARM_ENABLED):
+        return False
+    if _scan_pipeline_active():
+        return False
     key = str(artist_norm or "").strip()
     if not key:
         return False
@@ -28824,11 +28592,9 @@ def _should_run_profile_enrichment_inline(albums_count: int) -> bool:
         total = max(0, int(albums_count or 0))
     except Exception:
         total = 0
-    if not bool(getattr(sys.modules[__name__], "SCHEDULER_ALLOW_NON_SCAN_JOBS", SCHEDULER_ALLOW_NON_SCAN_JOBS)):
-        return True
     if total <= 0:
         return False
-    return total <= 64
+    return total <= 24
 
 
 def _classical_display_payload(
@@ -55964,7 +55730,7 @@ def api_config_get():
         "FANART_API_KEY_SET": _is_set(fanart_key_eff),
         "THEAUDIODB_API_KEY": str(theaudiodb_key_eff or ""),
         "THEAUDIODB_API_KEY_SET": _is_set(theaudiodb_key_eff),
-        "USE_BANDCAMP": True,
+        "USE_BANDCAMP": False,
         "JELLYFIN_URL": get_setting("JELLYFIN_URL", JELLYFIN_URL),
         "JELLYFIN_API_KEY": str(jellyfin_key_eff or ""),
         "JELLYFIN_API_KEY_SET": _is_set(jellyfin_key_eff),
@@ -67089,7 +66855,7 @@ def _concerts_fetch_upcoming_events(artist_name: str, preferred_provider: str = 
     Strategy:
     - `songkick`: Songkick only
     - `bandsintown`: Bandsintown only (unless temporarily blocked)
-    - `auto`: Songkick first, Bandsintown only if Songkick has no events and Bandsintown is available
+    - `auto`: Songkick only. Bandsintown is no longer part of the default path.
     """
     provider = str(preferred_provider or "auto").strip().lower() or "auto"
     name = (artist_name or "").strip()
@@ -67104,17 +66870,7 @@ def _concerts_fetch_upcoming_events(artist_name: str, preferred_provider: str = 
         source_url = f"https://www.bandsintown.com/a/{quote(name, safe='')}" if name else None
         return ("bandsintown", events, source_url)
     events, source_url = _songkick_fetch_upcoming_events(name)
-    if events:
-        return ("songkick", events, source_url)
-    blocked, _, _ = _bandsintown_block_state()
-    if blocked:
-        return ("songkick", [], source_url)
-    app_id = str(_get_config_from_db("BANDSINTOWN_APP_ID", "") or "").strip() or "pmda"
-    events = _bandsintown_fetch_upcoming_events(name, app_id)
-    if events:
-        source_url = f"https://www.bandsintown.com/a/{quote(name, safe='')}" if name else source_url
-        return ("bandsintown", events, source_url)
-    return ("songkick", [], source_url)
+    return ("songkick", events, source_url)
 
 
 # --- Geo helpers (concert map) ------------------------------------------------
@@ -77502,6 +77258,7 @@ def _run_scan_profile_enrichment_inline(best_albums_list: list[dict], *, reason:
                     albums=albums,
                     skip_album_profiles=False,
                     allow_soft_profiles=True,
+                    fast_mode=True,
                 )
                 artists_done += 1
             except Exception:
