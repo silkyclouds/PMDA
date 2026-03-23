@@ -16125,7 +16125,7 @@ def _rebuild_files_library_index_for_artist(
             payload = artists_map.get(primary_norm) if primary_norm else None
             target_name = str((payload or {}).get("name") or artist_name or "").strip()
             if primary_norm and target_name:
-                spawned = _spawn_files_profile_enrichment_job(
+                spawned = _enqueue_files_profile_enrichment(
                     artist_name=target_name,
                     artist_norm=primary_norm,
                     albums=[],
