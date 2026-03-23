@@ -2460,6 +2460,7 @@ merged = {
     "USE_BANDCAMP": _get("USE_BANDCAMP", default=False, cast=_parse_bool),
     # Artist / metadata modes
     "ARTIST_CREDIT_MODE": _get("ARTIST_CREDIT_MODE", default="picard_like_default", cast=str),
+    "CLASSICAL_NAME_PREFERENCE": _get("CLASSICAL_NAME_PREFERENCE", default="original", cast=str),
     "LIVE_DEDUPE_MODE": _get("LIVE_DEDUPE_MODE", default="safe", cast=str),
     "SKIP_MB_FOR_LIVE_ALBUMS": _get("SKIP_MB_FOR_LIVE_ALBUMS", default="true", cast=_parse_bool),
     "TRACKLIST_MATCH_MIN": _get("TRACKLIST_MATCH_MIN", default="0.9", cast=lambda x: float(x) if x is not None and str(x).replace(".", "", 1).replace("-", "", 1).isdigit() else 0.9),
@@ -2637,6 +2638,9 @@ FANART_API_KEY: str = str(merged.get("FANART_API_KEY", "") or "")
 THEAUDIODB_API_KEY: str = str(merged.get("THEAUDIODB_API_KEY", "") or "")
 USE_BANDCAMP: bool = bool(merged.get("USE_BANDCAMP", False))
 ARTIST_CREDIT_MODE: str = str(merged.get("ARTIST_CREDIT_MODE", "picard_like_default") or "picard_like_default").strip().lower()
+CLASSICAL_NAME_PREFERENCE: str = str(merged.get("CLASSICAL_NAME_PREFERENCE", "original") or "original").strip().lower()
+if CLASSICAL_NAME_PREFERENCE not in {"original", "english"}:
+    CLASSICAL_NAME_PREFERENCE = "original"
 LIVE_DEDUPE_MODE: str = str(merged.get("LIVE_DEDUPE_MODE", "safe") or "safe").strip().lower()
 
 
@@ -2659,6 +2663,11 @@ def _normalize_scan_ai_policy(value: str | None) -> str:
     if raw in {"local_only", "local_then_paid", "paid_only"}:
         return raw
     return "local_then_paid"
+
+
+def _normalize_classical_name_preference(value: str | None) -> str:
+    raw = str(value or "").strip().lower()
+    return raw if raw in {"original", "english"} else "original"
 
 
 def _normalize_ordered_values(
@@ -11015,17 +11024,44 @@ def _scheduler_build_improve_candidates() -> list[dict]:
 
 def _scheduler_run_enrich_batch() -> tuple[bool, str, dict]:
     albums = _scheduler_build_improve_candidates()
-    if not albums:
-        return True, "No albums to enrich", {"albums": 0}
     before = time.time()
-    _run_improve_all_albums_global(albums)
-    with lock:
-        improve_state = dict(state.get("improve_all") or {})
-    result = improve_state.get("result") if isinstance(improve_state.get("result"), dict) else {}
-    err = str(improve_state.get("error") or "").strip()
-    if err:
-        return False, err, {"albums": len(albums), "duration_s": round(time.time() - before, 2), "result": result or {}}
-    return True, "Enrichment batch finished", {"albums": len(albums), "duration_s": round(time.time() - before, 2), "result": result or {}}
+    result: dict[str, Any] = {}
+    if albums:
+        _run_improve_all_albums_global(albums)
+        with lock:
+            improve_state = dict(state.get("improve_all") or {})
+        result = improve_state.get("result") if isinstance(improve_state.get("result"), dict) else {}
+        err = str(improve_state.get("error") or "").strip()
+        if err:
+            return False, err, {"albums": len(albums), "duration_s": round(time.time() - before, 2), "result": result or {}}
+    else:
+        logging.info("[Scan Pipeline] enrich_batch: no album-level improve candidates; continuing with profile backfill only")
+
+    profile_metrics: dict[str, Any] = {}
+    if _get_library_mode() == "files":
+        logging.info("[Scan Pipeline] enrich_batch: starting background profile backfill")
+        _run_files_profile_backfill(reason="scheduler_enrich_batch", sleep_sec=0.05)
+        with _files_profile_backfill_lock:
+            profile_state = dict(_files_profile_backfill_state or {})
+        profile_metrics = {
+            "artists_total": int(profile_state.get("total") or 0),
+            "artists_done": int(profile_state.get("current") or 0),
+            "errors": int(profile_state.get("errors") or 0),
+            "finished_at": profile_state.get("finished_at"),
+        }
+        logging.info(
+            "[Scan Pipeline] enrich_batch: profile backfill finished artists=%d/%d errors=%d",
+            int(profile_metrics.get("artists_done") or 0),
+            int(profile_metrics.get("artists_total") or 0),
+            int(profile_metrics.get("errors") or 0),
+        )
+
+    return True, "Enrichment batch finished", {
+        "albums": len(albums),
+        "duration_s": round(time.time() - before, 2),
+        "result": result or {},
+        "profiles": profile_metrics,
+    }
 
 
 def _scheduler_run_dedupe() -> tuple[bool, str, dict]:
@@ -12674,7 +12710,7 @@ def _files_backfill_artist_canonical_fields(conn) -> None:
         with conn.cursor() as cur:
             cur.execute("SELECT COALESCE(value, '') FROM files_index_meta WHERE key = 'artist_canonical_schema' LIMIT 1")
             row = cur.fetchone()
-            if row and str(row[0] or "").strip() == "v7":
+            if row and str(row[0] or "").strip() == "v8":
                 return
             cur.execute(
                 """
@@ -12690,7 +12726,8 @@ def _files_backfill_artist_canonical_fields(conn) -> None:
                 """
             )
             rows = cur.fetchall()
-            updates: list[tuple[str, str, int]] = []
+            updates: list[tuple[str, str, str, int]] = []
+            touched_norms: list[str] = []
             for artist_id, name, name_norm, canonical_name, canonical_name_norm, entity_kind, roles_json, aliases_json in rows:
                 current_name = " ".join(str(name or "").split()).strip()
                 current_norm = str(name_norm or "").strip()
@@ -12700,31 +12737,45 @@ def _files_backfill_artist_canonical_fields(conn) -> None:
                 aliases = _safe_json_load(aliases_json or "[]", fallback=[])
                 merged_aliases = _files_merge_artist_alias_values([current_name, current_canonical], aliases)
                 if _artist_is_person_like(entity_kind=str(entity_kind or "artist"), role_hints=roles):
-                    preferred = current_name or current_canonical
-                    for candidate in [current_canonical, *merged_aliases]:
-                        preferred = _choose_preferred_person_identity_name(preferred, candidate)
+                    preferred = _select_classical_person_display_name(
+                        current_name=current_name,
+                        primary_name=current_canonical or current_name,
+                        aliases=merged_aliases,
+                    )
+                    display_name = preferred or current_name or current_canonical
                     canonical = preferred or current_canonical or current_name
                 else:
+                    display_name = current_name
                     canonical = current_canonical or current_name
                 canonical = " ".join(str(canonical or "").split()).strip() or current_name
+                display_name = " ".join(str(display_name or canonical or current_name).split()).strip() or current_name
                 canonical_norm = _norm_artist_key(canonical) or current_norm
-                if canonical != current_canonical or canonical_norm != current_canonical_norm:
-                    updates.append((canonical, canonical_norm, int(artist_id or 0)))
+                if (
+                    display_name != current_name
+                    or canonical != current_canonical
+                    or canonical_norm != current_canonical_norm
+                ):
+                    updates.append((display_name, canonical, canonical_norm, int(artist_id or 0)))
+                    if current_norm:
+                        touched_norms.append(current_norm)
             if updates:
                 cur.executemany(
                     """
                     UPDATE files_artists
-                    SET canonical_name = %s,
+                    SET name = %s,
+                        canonical_name = %s,
                         canonical_name_norm = %s,
                         updated_at = NOW()
                     WHERE id = %s
                     """,
                     updates,
                 )
+            if touched_norms:
+                _files_sync_artist_aliases(conn, artist_norms=[norm for norm in dict.fromkeys(touched_norms) if norm])
             cur.execute(
                 """
                 INSERT INTO files_index_meta(key, value, updated_at)
-                VALUES ('artist_canonical_schema', 'v6', NOW())
+                VALUES ('artist_canonical_schema', 'v8', NOW())
                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
                 """
             )
@@ -19707,7 +19758,8 @@ _files_profile_backfill_state: dict = {
 
 def _run_files_profile_backfill(*, reason: str = "manual", sleep_sec: float = 0.15) -> None:
     """
-    Background job: progressively enrich all artists (bios/tags/similar) and cache external artist images.
+    Background job: progressively enrich all artists with canonical bios/images and
+    album reviews after the main scan has already published the library.
     This is intentionally throttled to avoid provider rate limits.
     """
     sleep_sec = max(0.0, min(2.0, float(sleep_sec or 0.0)))
@@ -19725,8 +19777,33 @@ def _run_files_profile_backfill(*, reason: str = "manual", sleep_sec: float = 0.
                     """
                 )
                 artists = [(int(r[0] or 0), str(r[1] or "").strip(), str(r[2] or "").strip()) for r in cur.fetchall()]
+                cur.execute(
+                    """
+                    SELECT
+                        link.artist_id,
+                        COALESCE(alb.title, ''),
+                        COALESCE(alb.title_norm, '')
+                    FROM files_artist_album_links link
+                    JOIN files_albums alb ON alb.id = link.album_id
+                    ORDER BY link.artist_id ASC, alb.title ASC
+                    """
+                )
+                album_rows = cur.fetchall()
         finally:
             conn.close()
+
+        albums_by_artist_id: dict[int, list[tuple[str, str]]] = defaultdict(list)
+        seen_pairs_by_artist_id: dict[int, set[str]] = defaultdict(set)
+        for artist_id, album_title, album_norm in album_rows:
+            aid = int(artist_id or 0)
+            title_txt = str(album_title or "").strip()
+            norm_txt = str(album_norm or "").strip()
+            if aid <= 0 or not title_txt or not norm_txt:
+                continue
+            if norm_txt in seen_pairs_by_artist_id[aid]:
+                continue
+            seen_pairs_by_artist_id[aid].add(norm_txt)
+            albums_by_artist_id[aid].append((title_txt, norm_txt))
 
         with _files_profile_backfill_lock:
             _files_profile_backfill_state["running"] = True
@@ -19738,7 +19815,7 @@ def _run_files_profile_backfill(*, reason: str = "manual", sleep_sec: float = 0.
             _files_profile_backfill_state["current_artist"] = ""
             _files_profile_backfill_state["errors"] = 0
 
-        for idx, (_aid, artist_name, artist_norm) in enumerate(artists, start=1):
+        for idx, (artist_id, artist_name, artist_norm) in enumerate(artists, start=1):
             if not artist_norm or not artist_name:
                 continue
             with _files_profile_backfill_lock:
@@ -19756,8 +19833,10 @@ def _run_files_profile_backfill(*, reason: str = "manual", sleep_sec: float = 0.
                     job_key=artist_norm,
                     artist_name=artist_name,
                     artist_norm=artist_norm,
-                    albums=[],
-                    skip_album_profiles=True,
+                    albums=list(albums_by_artist_id.get(int(artist_id or 0)) or []),
+                    skip_album_profiles=False,
+                    allow_soft_profiles=True,
+                    fast_mode=False,
                 )
             except Exception:
                 with _files_profile_backfill_lock:
@@ -29539,6 +29618,100 @@ def _classical_person_names_equivalent(left: str, right: str) -> bool:
     return False
 
 
+_CLASSICAL_PERSON_ENGLISH_GIVEN_NAMES = {
+    "alexander", "andrew", "anthony", "arthur", "charles", "claude", "edward", "george",
+    "gregory", "henry", "ivan", "jack", "jacob", "james", "jean", "jerome", "john",
+    "joseph", "jules", "lawrence", "leo", "leonard", "louis", "mark", "michael",
+    "nicholas", "peter", "paul", "philip", "richard", "robert", "samuel", "stephen",
+    "thomas", "victor", "william",
+}
+
+
+def _classical_person_name_looks_english(value: str) -> bool:
+    tokens = {
+        tok for tok in re.findall(r"[a-z0-9]+", _classical_norm_text(value))
+        if tok
+    }
+    return bool(tokens.intersection(_CLASSICAL_PERSON_ENGLISH_GIVEN_NAMES))
+
+
+def _classical_person_display_preference_score(
+    value: str,
+    *,
+    preference: str | None = None,
+    primary: bool = False,
+    current: bool = False,
+) -> tuple[int, int, int, int, int, int, int, int]:
+    txt = " ".join(str(value or "").split()).strip()
+    if not txt:
+        return (-1, -1, -1, -1, -1, -1, -1, -1)
+    pref = _normalize_classical_name_preference(
+        preference if preference is not None else globals().get("CLASSICAL_NAME_PREFERENCE", CLASSICAL_NAME_PREFERENCE)
+    )
+    quality = _identity_display_quality_score(txt)
+    ascii_only = 1 if all(ord(ch) < 128 for ch in txt) else 0
+    looks_english = 1 if _classical_person_name_looks_english(txt) else 0
+    if pref == "english":
+        return (
+            ascii_only,
+            looks_english,
+            1 if current else 0,
+            1 if primary and ascii_only else 0,
+            quality[0],
+            quality[2],
+            quality[3],
+            quality[4],
+        )
+    return (
+        1 if primary else 0,
+        quality[1],
+        0 if looks_english else 1,
+        quality[0],
+        quality[2],
+        quality[3],
+        quality[4],
+        1 if current else 0,
+    )
+
+
+def _select_classical_person_display_name(
+    *,
+    current_name: str = "",
+    primary_name: str = "",
+    aliases: list[str] | tuple[str, ...] | None = None,
+    preference: str | None = None,
+) -> str:
+    current_txt = " ".join(str(current_name or "").split()).strip()
+    primary_txt = " ".join(str(primary_name or "").split()).strip()
+    alias_values = [str(value or "").strip() for value in (aliases or []) if str(value or "").strip()]
+    base_name = primary_txt or current_txt
+    candidates = _files_merge_artist_alias_values([primary_txt, current_txt], alias_values)
+    if not candidates:
+        return primary_txt or current_txt
+    filtered: list[str] = []
+    if base_name:
+        for candidate in candidates:
+            if _classical_person_names_equivalent(base_name, candidate):
+                filtered.append(candidate)
+    pool = filtered or candidates
+    primary_norm = _norm_artist_key(primary_txt)
+    current_norm = _norm_artist_key(current_txt)
+    best = ""
+    best_score: tuple[int, int, int, int, int, int, int, int] | None = None
+    for candidate in pool:
+        candidate_norm = _norm_artist_key(candidate)
+        score = _classical_person_display_preference_score(
+            candidate,
+            preference=preference,
+            primary=bool(primary_norm and candidate_norm == primary_norm),
+            current=bool(current_norm and candidate_norm == current_norm),
+        )
+        if best_score is None or score > best_score:
+            best = candidate
+            best_score = score
+    return best or primary_txt or current_txt
+
+
 def _choose_preferred_person_identity_name(current_value: str, candidate_value: str) -> str:
     current_txt = " ".join(str(current_value or "").split()).strip()
     candidate_txt = " ".join(str(candidate_value or "").split()).strip()
@@ -29564,9 +29737,11 @@ def _choose_preferred_person_identity_name(current_value: str, candidate_value: 
             compatible = True
         if not compatible:
             return current_txt
-    if _identity_display_quality_score(candidate_txt) > _identity_display_quality_score(current_txt):
-        return candidate_txt
-    return current_txt
+    return _select_classical_person_display_name(
+        current_name=current_txt,
+        primary_name=candidate_txt,
+        aliases=[current_txt, candidate_txt],
+    )
 
 
 def _classical_person_signature_key(name: str) -> str:
@@ -29840,6 +30015,12 @@ def _files_upsert_artist_canonical_identity(
     except Exception:
         existing_aliases = []
     merged_aliases = _files_merge_artist_alias_values(existing_aliases, [current_name, canonical], aliases or [])
+    if person_like:
+        canonical = _select_classical_person_display_name(
+            current_name=current_name,
+            primary_name=canonical,
+            aliases=merged_aliases,
+        ) or canonical
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -30087,7 +30268,7 @@ def _files_merge_duplicate_person_artists(conn) -> None:
         with conn.cursor() as cur:
             cur.execute("SELECT COALESCE(value, '') FROM files_index_meta WHERE key = 'artist_person_merge_schema' LIMIT 1")
             row = cur.fetchone()
-            if row and str(row[0] or "").strip() == "v3":
+            if row and str(row[0] or "").strip() == "v4":
                 return
             cur.execute(
                 """
@@ -30179,7 +30360,7 @@ def _files_merge_duplicate_person_artists(conn) -> None:
                 cur.execute(
                     """
                     INSERT INTO files_index_meta(key, value, updated_at)
-                    VALUES ('artist_person_merge_schema', 'v3', NOW())
+                    VALUES ('artist_person_merge_schema', 'v4', NOW())
                     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
                     """
                 )
@@ -30233,7 +30414,7 @@ def _files_merge_duplicate_person_artists(conn) -> None:
                 cur.execute(
                     """
                     INSERT INTO files_index_meta(key, value, updated_at)
-                    VALUES ('artist_person_merge_schema', 'v3', NOW())
+                    VALUES ('artist_person_merge_schema', 'v4', NOW())
                     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
                     """
                 )
@@ -30280,6 +30461,11 @@ def _files_merge_duplicate_person_artists(conn) -> None:
                     promoted_image_path = row_image_path
                     promoted_has_image = bool(row.get("has_image")) or _existing_file_path(row_image_path)
             merged_aliases = _files_merge_artist_alias_values(all_aliases, [chosen_name])
+            chosen_name = _select_classical_person_display_name(
+                current_name=str(winner.get("name") or "").strip(),
+                primary_name=chosen_name,
+                aliases=merged_aliases,
+            ) or chosen_name
             merged_roles = sorted({value.lower() for value in all_roles if value}, key=lambda role: (_FILES_BROWSE_ROLE_PRIORITY.get(role, 99), role))
             merged_entity_kind = _files_best_person_entity_kind(all_entity_kinds, merged_roles)
             winner_norm = str(winner.get("name_norm") or "").strip()
@@ -30366,7 +30552,7 @@ def _files_merge_duplicate_person_artists(conn) -> None:
             cur.execute(
                 """
                 INSERT INTO files_index_meta(key, value, updated_at)
-                VALUES ('artist_person_merge_schema', 'v3', NOW())
+                VALUES ('artist_person_merge_schema', 'v4', NOW())
                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
                 """
             )
@@ -32911,9 +33097,7 @@ def _resolve_edition_display_identity(
         and hint_source == "filename_pattern"
         and hint_confidence >= 90
         and (
-            "artist_conflict" in hint_reason
-            or "album_conflict" in hint_reason
-            or "artist_missing_or_generic" in hint_reason
+            "artist_missing_or_generic" in hint_reason
             or "album_missing_or_generic" in hint_reason
         )
     )
@@ -33184,8 +33368,6 @@ def _infer_identity_from_local_context_ai(
         or ("artist" in missing)
         or ("album" in missing)
         or bool(album_prefix_hint)
-        or filename_album_conflict
-        or filename_artist_conflict
         or (
             bool(filename_album_hint)
             and (_identity_text_is_generic(local_album_txt) or not local_album_txt)
@@ -33244,16 +33426,12 @@ def _infer_identity_from_local_context_ai(
             and local_album_txt
             and not _identity_text_is_generic(local_album_txt)
         ):
-            return {
-                "artist": filename_artist_hint,
-                "album": filename_album_hint,
-                "confidence": 94,
-                "reason": "stable filename pattern (album_conflict)",
-                "source": "filename_pattern",
-                "album_prefix_hint": album_prefix_hint or "",
-                "filename_artist_hint": filename_artist_hint,
-                "filename_album_hint": filename_album_hint,
-            }
+            logging.info(
+                "[Identity] ignoring filename album conflict override artist=%r local_album=%r filename_album=%r",
+                local_artist_txt,
+                local_album_txt,
+                filename_album_hint,
+            )
     if not bool(getattr(sys.modules[__name__], "ai_provider_ready", False)):
         return {}
 
@@ -47596,7 +47774,6 @@ def background_scan():
         with lock:
             state["scan_finalizing"] = False
             run_improve_after = state.pop("run_improve_after", False)
-        profile_enrich_inline_done = False
         # Magic / run-improve-after: run improve-all only for a completed scan.
         should_request_improve = bool((not pipeline_async_enabled) and (run_improve_after or pipeline_flags.get("match_fix")))
         if should_request_improve and scan_status != "completed":
@@ -47738,53 +47915,11 @@ def background_scan():
                 _run_improve_all_albums_global(best_albums)
                 if _get_library_mode() == "files":
                     _refresh_files_album_scan_cache_from_editions(best_albums, scan_id=scan_id)
-                    if _should_run_profile_enrichment_inline(len(best_albums)):
-                        try:
-                            enrich_metrics = _run_scan_profile_enrichment_inline(
-                                best_albums,
-                                reason=f"scan_{int(scan_id or 0)}",
-                            )
-                            logging.info(
-                                "Pipeline step profile-enrich-inline: artists=%d done=%d failed=%d albums=%d",
-                                int(enrich_metrics.get("artists_total") or 0),
-                                int(enrich_metrics.get("artists_done") or 0),
-                                int(enrich_metrics.get("artists_failed") or 0),
-                                int(enrich_metrics.get("albums_targeted") or 0),
-                            )
-                            profile_enrich_inline_done = True
-                            _refresh_scan_history_from_published(scan_id)
-                        except Exception:
-                            logging.exception("Scan inline profile enrichment failed")
             else:
                 if MAGIC_MODE:
                     logging.info("Magic mode: dedupe done; no albums to improve from current scan.")
                 else:
                     logging.info("Run improve after scan: no albums to improve from current scan.")
-        # Files mode, scheduler-off: always execute profile enrichment inside scan, even when
-        # post-processing was streamed by artist (no global improve-all block).
-        if (
-            scan_status == "completed"
-            and _get_library_mode() == "files"
-            and bool((run_improve_after_requested or pipeline_flags_requested.get("match_fix")))
-            and not bool(profile_enrich_inline_done)
-        ):
-            try:
-                targets = _scan_collect_profile_enrich_targets(_int_or_none(scan_id))
-                if _should_run_profile_enrichment_inline(len(targets)) and targets:
-                    enrich_metrics = _run_scan_profile_enrichment_inline(
-                        targets,
-                        reason=f"scan_{int(scan_id or 0)}_fallback",
-                    )
-                    logging.info(
-                        "Pipeline step profile-enrich-inline (fallback): artists=%d done=%d failed=%d albums=%d",
-                        int(enrich_metrics.get("artists_total") or 0),
-                        int(enrich_metrics.get("artists_done") or 0),
-                        int(enrich_metrics.get("artists_failed") or 0),
-                        int(enrich_metrics.get("albums_targeted") or 0),
-                    )
-                    _refresh_scan_history_from_published(scan_id)
-            except Exception:
-                logging.exception("Scan inline profile enrichment fallback failed")
         trigger_auto_export_after_scan = False
         if scan_stream_post_by_artist and scan_status == "completed":
             try:
@@ -56182,7 +56317,8 @@ def api_config_get():
         "TASK_NOTIFY_EXPORT": get_setting_bool("TASK_NOTIFY_EXPORT", TASK_NOTIFY_EXPORT),
         "TASK_NOTIFY_PLAYER_SYNC": get_setting_bool("TASK_NOTIFY_PLAYER_SYNC", TASK_NOTIFY_PLAYER_SYNC),
         "SCHEDULER_PAUSED": bool(_scheduler_paused),
-        "ARTIST_CREDIT_MODE": "picard_like_default",
+        "ARTIST_CREDIT_MODE": get_setting("ARTIST_CREDIT_MODE", ARTIST_CREDIT_MODE),
+        "CLASSICAL_NAME_PREFERENCE": get_setting("CLASSICAL_NAME_PREFERENCE", CLASSICAL_NAME_PREFERENCE),
         "LIVE_DEDUPE_MODE": get_setting("LIVE_DEDUPE_MODE", LIVE_DEDUPE_MODE),
         "SCAN_DISABLE_CACHE": get_setting_bool("SCAN_DISABLE_CACHE", SCAN_DISABLE_CACHE),
         "DISABLE_PATH_CROSSCHECK": get_setting_bool("DISABLE_PATH_CROSSCHECK", DISABLE_PATH_CROSSCHECK),
@@ -56591,6 +56727,11 @@ def _apply_settings_in_memory(updates: dict):
         global ARTIST_CREDIT_MODE
         ARTIST_CREDIT_MODE = str(updates.get("ARTIST_CREDIT_MODE") or "album_artist_strict").strip().lower()
         logging.info("ARTIST_CREDIT_MODE updated in memory: %s", ARTIST_CREDIT_MODE)
+    if "CLASSICAL_NAME_PREFERENCE" in updates:
+        global CLASSICAL_NAME_PREFERENCE
+        CLASSICAL_NAME_PREFERENCE = _normalize_classical_name_preference(updates.get("CLASSICAL_NAME_PREFERENCE"))
+        merged["CLASSICAL_NAME_PREFERENCE"] = CLASSICAL_NAME_PREFERENCE
+        logging.info("CLASSICAL_NAME_PREFERENCE updated in memory: %s", CLASSICAL_NAME_PREFERENCE)
     if "LIVE_DEDUPE_MODE" in updates:
         global LIVE_DEDUPE_MODE
         LIVE_DEDUPE_MODE = str(updates.get("LIVE_DEDUPE_MODE") or "safe").strip().lower()
@@ -57084,7 +57225,7 @@ def api_config_put():
         "PIPELINE_POST_SCAN_ASYNC",
         "TASK_NOTIFICATIONS_ENABLED", "TASK_NOTIFICATIONS_SUCCESS", "TASK_NOTIFICATIONS_FAILURE", "TASK_NOTIFICATIONS_SILENT_INTERACTIVE_SCAN", "TASK_NOTIFICATIONS_COOLDOWN_SEC",
         "TASK_NOTIFY_SCAN_CHANGED", "TASK_NOTIFY_SCAN_FULL", "TASK_NOTIFY_ENRICH_BATCH", "TASK_NOTIFY_DEDUPE", "TASK_NOTIFY_INCOMPLETE_MOVE", "TASK_NOTIFY_EXPORT", "TASK_NOTIFY_PLAYER_SYNC",
-        "ARTIST_CREDIT_MODE", "LIVE_DEDUPE_MODE",
+        "ARTIST_CREDIT_MODE", "CLASSICAL_NAME_PREFERENCE", "LIVE_DEDUPE_MODE",
         "LIDARR_URL", "LIDARR_API_KEY", "AUTOBRR_URL", "AUTOBRR_API_KEY", "AUTO_FIX_BROKEN_ALBUMS",
         "BROKEN_ALBUM_CONSECUTIVE_THRESHOLD", "BROKEN_ALBUM_PERCENTAGE_THRESHOLD", "REQUIRED_TAGS",
         "USE_DISCOGS", "DISCOGS_USER_TOKEN", "USE_LASTFM", "LASTFM_API_KEY", "LASTFM_API_SECRET",
@@ -57172,6 +57313,8 @@ def api_config_put():
         normalized_level = _normalize_ai_usage_level(str(updates.get("AI_USAGE_LEVEL") or "auto"))
         updates["AI_USAGE_LEVEL"] = normalized_level
         updates.update(_ai_usage_level_overrides(normalized_level))
+    if "CLASSICAL_NAME_PREFERENCE" in updates:
+        updates["CLASSICAL_NAME_PREFERENCE"] = _normalize_classical_name_preference(updates.get("CLASSICAL_NAME_PREFERENCE"))
     if "SCAN_AI_POLICY" in updates:
         updates["SCAN_AI_POLICY"] = _normalize_scan_ai_policy(str(updates.get("SCAN_AI_POLICY") or "local_only"))
     if "SCAN_PAID_PROVIDER_ORDER" in updates:
@@ -58634,9 +58777,24 @@ def api_progress():
     except Exception:
         background_jobs = []
     background_jobs.sort(key=lambda item: float(item.get("started_at") or 0.0))
+    with _files_profile_backfill_lock:
+        profile_backfill_state = dict(_files_profile_backfill_state or {})
+    try:
+        with _files_profile_jobs_lock:
+            profile_jobs_active = int(len(_files_profile_jobs_active))
+    except Exception:
+        profile_jobs_active = 0
     background_enrichment_running = any(
         str(item.get("job_type") or "") in {"enrich_batch", "dedupe", "incomplete_move", "export", "player_sync"}
         for item in background_jobs
+    ) or bool(profile_backfill_state.get("running")) or bool(profile_jobs_active > 0)
+    library_ready = bool(
+        not bool(bootstrap_status.get("bootstrap_required"))
+        and (
+            bool(has_completed_full_scan)
+            or int(scan_published_albums_count or 0) > 0
+            or (isinstance(last_scan_summary, dict) and int(last_scan_summary.get("albums_scanned") or 0) > 0)
+        )
     )
 
     resume_available_by_scan_type: dict[str, dict[str, Any]] = {}
@@ -58659,8 +58817,10 @@ def api_progress():
         "total": total,
         "effective_progress": effective_progress,
         "status": status,
+        "library_ready": library_ready,
         "background_enrichment_running": background_enrichment_running,
         "background_jobs": background_jobs,
+        "profile_backfill": profile_backfill_state,
         "resume_available": resume_available,
         "resume_available_by_scan_type": resume_available_by_scan_type,
         "phase": phase,

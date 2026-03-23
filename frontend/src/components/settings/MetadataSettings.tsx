@@ -467,6 +467,38 @@ export function MetadataSettings({ config, updateConfig, errors }: MetadataSetti
             </Select>
           </div>
 
+          <div className="space-y-3 pt-2 border-t border-border">
+            <div className="space-y-1.5">
+              <div className="flex items-center gap-1.5">
+                <Label htmlFor="classical-name-preference" className="text-sm font-medium">
+                  Classical display names
+                </Label>
+                <FieldTooltip content="Choose whether PMDA prefers the original/canonical composer or conductor name, or an English/transliterated variant when multiple equivalent aliases exist." />
+              </div>
+              <p className="text-xs text-muted-foreground">
+                This controls which equivalent classical name PMDA prefers in the library, for example original/canonical versus English/transliterated variants.
+              </p>
+            </div>
+            <Select
+              value={config.CLASSICAL_NAME_PREFERENCE ?? 'original'}
+              onValueChange={(value) =>
+                updateConfig({ CLASSICAL_NAME_PREFERENCE: value as PMDAConfig['CLASSICAL_NAME_PREFERENCE'] })
+              }
+            >
+              <SelectTrigger id="classical-name-preference" className="w-full sm:w-80">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="original">
+                  Original or canonical name (recommended)
+                </SelectItem>
+                <SelectItem value="english">
+                  English or transliterated name
+                </SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+
         {/* AcousticID Section - always visible, independent of MusicBrainz */}
         <div className="space-y-4 p-4 rounded-lg border border-border">
           <div className="flex items-center justify-between">

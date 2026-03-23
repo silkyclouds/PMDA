@@ -184,6 +184,26 @@ export interface ScanProgress {
   scan_id?: number | null;
   scanning: boolean;
   scan_starting?: boolean;
+  library_ready?: boolean;
+  background_enrichment_running?: boolean;
+  background_jobs?: Array<{
+    run_id: string;
+    job_type: string;
+    scope: string;
+    source: string;
+    origin_scan_id?: number | null;
+    started_at?: number | null;
+  }>;
+  profile_backfill?: {
+    running?: boolean;
+    reason?: string;
+    started_at?: number | null;
+    finished_at?: number | null;
+    current?: number;
+    total?: number;
+    current_artist?: string;
+    errors?: number;
+  } | null;
   progress: number;
   total: number;
   /** Progress including in-progress artist albums (so bar moves during scan) */
@@ -746,6 +766,8 @@ export interface PMDAConfig {
   MUSICBRAINZ_EMAIL: string;
   /** How to apply MusicBrainz artist credits to tags and grouping. */
   ARTIST_CREDIT_MODE?: 'album_artist_strict' | 'musicbrainz_full_credit' | 'picard_like_default';
+  /** Which display name to prefer for classical people: original/default or english/transliterated. */
+  CLASSICAL_NAME_PREFERENCE?: 'original' | 'english';
   /** Re-query MusicBrainz for albums previously cached as "not found" on each scan */
   MB_RETRY_NOT_FOUND?: boolean;
   /** Advanced: ignore MusicBrainz cache and stored MBIDs, forcing a full lookup every scan (slower; for testing). */

@@ -108,6 +108,10 @@ export function ScanProgress({
 
   const {
     scanning,
+    library_ready = false,
+    background_enrichment_running = false,
+    background_jobs = [],
+    profile_backfill = null,
     progress: current,
     total,
     effective_progress,
@@ -483,26 +487,56 @@ export function ScanProgress({
     return 'fix';
   }, [canDedupe, dupesAlreadyAllMoved, improveAllRunning]);
 
+  const profileBackfillRunning = Boolean(profile_backfill?.running);
+  const profileBackfillDone = Math.max(0, Number(profile_backfill?.current ?? 0));
+  const profileBackfillTotal = Math.max(0, Number(profile_backfill?.total ?? 0));
+  const profileBackfillArtist = String(profile_backfill?.current_artist ?? '').trim();
+  const backgroundJobSummary = useMemo(() => {
+    const names = Array.isArray(background_jobs)
+      ? background_jobs
+          .map((job) => String(job?.job_type ?? '').trim())
+          .filter(Boolean)
+      : [];
+    if (!names.length) return '';
+    const unique = Array.from(new Set(names));
+    return unique.join(' · ');
+  }, [background_jobs]);
+  const libraryStatusTitle = library_ready
+    ? (background_enrichment_running ? 'Library ready' : 'Library ready')
+    : 'Idle';
+  const libraryStatusBody = library_ready && background_enrichment_running
+    ? (
+        profileBackfillRunning && profileBackfillTotal > 0
+          ? `Background enrichment running · ${profileBackfillDone}/${profileBackfillTotal} artists`
+          : 'Background enrichment running'
+      )
+    : (library_ready ? 'Background enrichment finished' : 'Ready to scan');
+
   if (isCompact) {
     const statusLabel = scanning
       ? (runScopePreparing
         ? `Scanning · preparing_run_scope · ${runScopeStageLabel}`
         : (preScanActive ? `Scanning · pre-scan · ${preScanStageLabel}` : (phase ? `Scanning · ${phase}` : 'Scanning')))
-      : 'Idle';
+      : libraryStatusTitle;
     const progressLabel = scanning
       ? (runScopePreparing && runScopeProgressTotal > 0
         ? `Preparing run scope · ${runScopeStageLabel} · ${displayProgress}/${displayTotal}`
         : preScanActive && preScanProgressTotal > 0
         ? `Pre-scan ${preScanStageLabel} · ${displayProgress}/${displayTotal}`
         : `${displayProgress}/${displayTotal} artist(s)`)
-      : 'Ready to scan';
+      : libraryStatusBody;
     return (
       <div className={cn("rounded-xl bg-card border border-border overflow-hidden", className)}>
         <div className="p-6 space-y-4">
           <div className="flex flex-wrap items-start justify-between gap-4">
-            <div className="space-y-1">
+          <div className="space-y-1">
               <h2 className="text-lg font-semibold text-foreground">Scan status</h2>
               <p className="text-sm text-muted-foreground">{statusLabel}</p>
+              {!scanning && background_enrichment_running && (
+                <p className="text-xs text-muted-foreground">
+                  {backgroundJobSummary || 'Post-scan enrichment'}{profileBackfillArtist ? ` · ${profileBackfillArtist}` : ''}
+                </p>
+              )}
               {currentArtist && scanning && (
                 <p className="text-xs text-muted-foreground">Artist: <span className="font-medium text-foreground">{currentArtist}</span></p>
               )}
@@ -634,6 +668,38 @@ export function ScanProgress({
             </div>
           ) : (
             <>
+          {library_ready && (
+            <div
+              className={cn(
+                "rounded-xl border p-4",
+                background_enrichment_running
+                  ? "border-primary/30 bg-primary/10"
+                  : "border-emerald-500/30 bg-emerald-500/10"
+              )}
+            >
+              <div className="flex items-start justify-between gap-3">
+                <div className="space-y-1">
+                  <p className="text-sm font-semibold text-foreground">
+                    {background_enrichment_running ? 'Library ready' : 'Library ready'}
+                  </p>
+                  <p className="text-xs text-muted-foreground">
+                    {background_enrichment_running
+                      ? (
+                          profileBackfillRunning && profileBackfillTotal > 0
+                            ? `Background enrichment running · ${profileBackfillDone}/${profileBackfillTotal} artists`
+                            : 'Background enrichment running'
+                        )
+                      : 'Background enrichment finished'}
+                  </p>
+                  {(profileBackfillArtist || backgroundJobSummary) && (
+                    <p className="text-xs text-muted-foreground">
+                      {[backgroundJobSummary, profileBackfillArtist].filter(Boolean).join(' · ')}
+                    </p>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
           {/* Last scan summary – 3-tier hierarchy */}
           {last_scan_summary && (
             <div className="space-y-6">

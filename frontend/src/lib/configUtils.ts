@@ -161,6 +161,12 @@ export function normalizeConfigForUI(raw: Partial<PMDAConfig>): Partial<PMDAConf
       ['auto', 'searxng', 'serper', 'ai_only', 'disabled'].includes(provider) ? provider : 'auto'
     ) as PMDAConfig['WEB_SEARCH_PROVIDER'];
   }
+  if (out.CLASSICAL_NAME_PREFERENCE != null) {
+    const value = String(out.CLASSICAL_NAME_PREFERENCE).trim().toLowerCase();
+    out.CLASSICAL_NAME_PREFERENCE = (
+      ['original', 'english'].includes(value) ? value : 'original'
+    ) as PMDAConfig['CLASSICAL_NAME_PREFERENCE'];
+  }
   if (out.USE_AI_FOR_SOFT_MATCH_PROFILES !== undefined) {
     out.USE_AI_FOR_SOFT_MATCH_PROFILES = toBool(out.USE_AI_FOR_SOFT_MATCH_PROFILES);
   }
