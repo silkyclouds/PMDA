@@ -51288,6 +51288,7 @@ def _download_best_cover_image(
     cover_candidates: Optional[List[str]] = None,
     headers: Optional[dict] = None,
     timeout: int = 12,
+    max_download_bytes: int = 32 * 1024 * 1024,
 ) -> Optional[Tuple[bytes, str, str]]:
     """
     Download the best (largest byte size) image among available candidates.
@@ -51321,12 +51322,22 @@ def _download_best_cover_image(
             resp = requests.get(u, headers=req_headers, timeout=timeout, allow_redirects=True)
             if resp.status_code != 200:
                 continue
+            try:
+                content_length = int(resp.headers.get("content-length") or "0")
+            except Exception:
+                content_length = 0
+            if int(max_download_bytes or 0) > 0 and content_length > int(max_download_bytes):
+                logging.debug("[Cover] skipped oversized candidate=%s bytes=%s", u, content_length)
+                continue
             mime = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
             if not mime.startswith("image/"):
                 continue
             content = resp.content or b""
             size = len(content)
             if size <= 0:
+                continue
+            if int(max_download_bytes or 0) > 0 and size > int(max_download_bytes):
+                logging.debug("[Cover] skipped oversized payload=%s bytes=%s", u, size)
                 continue
             if best is None or size > best[3]:
                 best = (content, mime or "image/jpeg", u, size)
@@ -62679,6 +62690,7 @@ def api_library_top_artists():
                     WHERE e.created_at >= (NOW() - (%s || ' days')::INTERVAL)
                       AND """ + album_match_sql + """
                     GROUP BY ar.id, ar.has_image, ext.image_path
+                             , ar.image_path, ar.entity_kind, ar.roles_json, ext.image_url, ext.provider
                     ORDER BY completion_count DESC, play_events DESC, album_count DESC, ar.name ASC
                     LIMIT %s OFFSET %s
                     """,
@@ -62725,6 +62737,7 @@ def api_library_top_artists():
                     LEFT JOIN files_external_artist_images ext ON ext.name_norm = ar.name_norm
                     WHERE """ + album_match_sql + """
                     GROUP BY ar.id, ar.has_image, ext.image_path
+                             , ar.image_path, ar.entity_kind, ar.roles_json, ext.image_url, ext.provider
                     ORDER BY completion_count DESC, play_count DESC, album_count DESC, ar.name ASC
                     LIMIT %s OFFSET %s
                     """,
@@ -62795,6 +62808,7 @@ def api_library_recent_artists():
                 + album_match_sql
                 + """
                 GROUP BY ar.id, ar.name, ar.has_image, ext.image_path
+                         , ar.image_path, ar.entity_kind, ar.roles_json, ext.image_url, ext.provider
                 ORDER BY MAX(alb.created_at) DESC, ar.name ASC
                 LIMIT %s OFFSET %s
                 """,
