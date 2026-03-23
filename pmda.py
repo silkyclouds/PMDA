@@ -44513,6 +44513,26 @@ def _run_export_library() -> None:
             state["export_progress"]["error"] = str(e)
 
 
+def _trigger_export_library_async(reason: str = "manual") -> bool:
+    """Queue a Files export-library rebuild without blocking the caller."""
+    if _get_library_mode() != "files":
+        return False
+    with lock:
+        prog = state.get("export_progress") or {}
+        if prog.get("running"):
+            return False
+    reason_norm = re.sub(r"[^a-z0-9]+", "-", str(reason or "manual").strip().lower()).strip("-") or "manual"
+
+    def _runner() -> None:
+        try:
+            _run_export_library()
+        except Exception:
+            logging.exception("Async export library failed (%s)", reason_norm)
+
+    threading.Thread(target=_runner, daemon=True, name=f"files-export-{reason_norm}").start()
+    return True
+
+
 def _build_scan_plan(scan_type: str = "full") -> tuple[list[tuple[int, str, list[int]]], int]:
     """
     Build the list of artists/albums to scan and return (artists_merged, total_albums).
@@ -47383,15 +47403,12 @@ def background_scan():
                     _refresh_scan_history_from_published(scan_id)
             except Exception:
                 logging.exception("Scan inline profile enrichment fallback failed")
+        trigger_auto_export_after_scan = False
         if scan_stream_post_by_artist and scan_status == "completed":
             try:
                 if _get_library_mode() == "files" and getattr(sys.modules[__name__], "AUTO_EXPORT_LIBRARY", False):
-                    logging.info("Auto-export: rebuilding Files library after streamed post-processing.")
-                    with lock:
-                        state["scan_post_processing"] = True
-                        state["scan_post_current_artist"] = "Library"
-                        state["scan_post_current_album"] = "Export rebuild"
-                    _run_export_library()
+                    logging.info("Auto-export queued after streamed post-processing.")
+                    trigger_auto_export_after_scan = True
             except Exception as e:
                 logging.exception("Auto-export library after streamed post-processing failed: %s", e)
         if scan_status == "completed" and _get_library_mode() == "files":
@@ -47449,6 +47466,15 @@ def background_scan():
                     scan_id,
                     exc_info=True,
                 )
+        if trigger_auto_export_after_scan:
+            try:
+                started = _trigger_export_library_async(reason=f"scan_{int(_parse_int_loose(scan_id, 0) or 0)}_auto_export")
+                if started:
+                    logging.info("Auto-export started in background after scan completion.")
+                else:
+                    logging.info("Auto-export already running; background trigger skipped.")
+            except Exception:
+                logging.exception("Failed to queue auto-export after scan completion")
         if pipeline_async_enabled and scan_status == "completed":
             try:
                 include_enrich = bool(run_improve_after_requested or pipeline_flags_requested.get("match_fix"))
@@ -56960,8 +56986,9 @@ def api_files_export_rebuild():
         prog = state.get("export_progress") or {}
         if prog.get("running"):
             return jsonify({"status": "already_running", "message": "Export already in progress"}), 409
-    thread = threading.Thread(target=_run_export_library, daemon=True)
-    thread.start()
+    started = _trigger_export_library_async(reason="api_export_rebuild")
+    if not started:
+        return jsonify({"status": "already_running", "message": "Export already in progress"}), 409
     return jsonify({"status": "started"})
 
 
@@ -77205,8 +77232,11 @@ def _run_improve_all_albums_global(best_albums_list: List[dict]):
         # Auto-export: rebuild Files export library after Magic when enabled
         try:
             if _get_library_mode() == "files" and getattr(sys.modules[__name__], "AUTO_EXPORT_LIBRARY", False):
-                logging.info("Auto-export: rebuilding Files library after Magic run (AUTO_EXPORT_LIBRARY=True).")
-                _run_export_library()
+                started = _trigger_export_library_async(reason="magic_auto_export")
+                if started:
+                    logging.info("Auto-export queued after Magic run (AUTO_EXPORT_LIBRARY=True).")
+                else:
+                    logging.info("Auto-export already running after Magic run; queue skipped.")
         except Exception as e:
             logging.exception("Auto-export library after Magic failed: %s", e)
         if _get_library_mode() == "files":
