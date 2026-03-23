@@ -47408,16 +47408,10 @@ def background_scan():
         if scan_status == "completed" and _get_library_mode() == "files":
             try:
                 _refresh_scan_history_from_published(scan_id)
-                sync_result = _rebuild_files_library_index(
-                    reason=f"scan_{int(_parse_int_loose(scan_id, 0) or 0)}_final_sync",
-                    wait_if_running=True,
+                logging.info(
+                    "Final files index sync deferred to async rebuild for scan_id=%s",
+                    scan_id,
                 )
-                if not bool(sync_result.get("ok")):
-                    logging.debug(
-                        "Final files index sync returned non-ok for scan_id=%s: %s",
-                        scan_id,
-                        sync_result.get("error") or sync_result,
-                    )
             except Exception:
                 logging.debug("Final published scan refresh failed for scan_id=%s", scan_id, exc_info=True)
         with lock:
