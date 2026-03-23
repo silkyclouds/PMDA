@@ -46645,20 +46645,14 @@ def background_scan():
         # Pipeline step: export library (Files mode only).
         if pipeline_flags.get("export"):
             if _get_library_mode() == "files":
-                logging.info("Pipeline step export: rebuilding Files export library...")
                 try:
-                    with lock:
-                        state["scan_post_processing"] = True
-                        state["scan_post_current_artist"] = "Library"
-                        state["scan_post_current_album"] = "Export rebuild"
-                    _run_export_library()
+                    started = _trigger_export_library_async(reason=f"scan_{int(_parse_int_loose(scan_id, 0) or 0)}_pipeline_export")
+                    if started:
+                        logging.info("Pipeline step export: queued Files export library rebuild in background.")
+                    else:
+                        logging.info("Pipeline step export: export already running; background queue skipped.")
                 except Exception:
-                    logging.exception("Pipeline step export failed")
-                finally:
-                    with lock:
-                        state["scan_post_processing"] = False
-                        state["scan_post_current_artist"] = None
-                        state["scan_post_current_album"] = None
+                    logging.exception("Pipeline step export queue failed")
             else:
                 logging.info("Pipeline step export skipped: not in Files mode")
             with lock:
