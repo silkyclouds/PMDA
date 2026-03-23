@@ -51423,7 +51423,46 @@ def _fetch_bandcamp_album_info(artist_name: str, album_title: str) -> Optional[d
         if wait > 0:
             time.sleep(wait)
         _last_bandcamp_request = time.time()
-    headers = {"User-Agent": "PMDA/1.0 (metadata fallback; https://github.com/silkyclouds/PMDA)"}
+    headers = {
+        "User-Agent": "PMDA/1.0 (metadata fallback; https://github.com/silkyclouds/PMDA)",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    def _bandcamp_http_get(url: str, *, context: str, allow_redirects: bool = True) -> Optional[requests.Response]:
+        last_error: Exception | None = None
+        timeout = (6, 25)
+        for attempt in range(2):
+            try:
+                resp = requests.get(
+                    url,
+                    headers=headers,
+                    timeout=timeout,
+                    allow_redirects=allow_redirects,
+                )
+                if resp.status_code == 429:
+                    retry_after = 3.0
+                    try:
+                        retry_after = max(1.0, float(resp.headers.get("Retry-After") or 3.0))
+                    except Exception:
+                        retry_after = 3.0
+                    if attempt == 0:
+                        time.sleep(min(retry_after, 8.0))
+                        continue
+                return resp
+            except requests.exceptions.Timeout as e:
+                last_error = e
+                if attempt == 0:
+                    time.sleep(1.5)
+                    continue
+            except requests.exceptions.RequestException as e:
+                last_error = e
+                if attempt == 0:
+                    time.sleep(1.0)
+                    continue
+                break
+        if last_error is not None:
+            raise last_error
+        return None
 
     def _split_bandcamp_keywords(value: str) -> list[str]:
         raw = (value or "").strip()
@@ -51439,7 +51478,9 @@ def _fetch_bandcamp_album_info(artist_name: str, album_title: str) -> Optional[d
         return parts
 
     def _parse_album_page(album_url: str) -> Optional[dict]:
-        album_resp = requests.get(album_url, headers=headers, timeout=15)
+        album_resp = _bandcamp_http_get(album_url, context="album_page")
+        if album_resp is None:
+            return None
         if album_resp.status_code != 200:
             return None
         page = album_resp.text
@@ -51626,26 +51667,26 @@ def _fetch_bandcamp_album_info(artist_name: str, album_title: str) -> Optional[d
 
     try:
         q = quote_plus(f"{artist_name} {album_title}".strip())
-        search_url = f"https://bandcamp.com/search?q={q}"
-        resp = requests.get(search_url, headers=headers, timeout=15)
-        if resp.status_code != 200:
-            return None
-        search_page = resp.text
+        search_url = f"https://bandcamp.com/search?q={q}&item_type=a"
+        search_page = ""
+        try:
+            resp = _bandcamp_http_get(search_url, context="search")
+            if resp is not None and resp.status_code == 200:
+                search_page = resp.text
+        except Exception as e:
+            logging.debug("[Bandcamp] direct search failed for %r / %r: %s", artist_name, album_title, e)
 
         artist_norm_compact = _normalize_identity_text_strict(artist_name).replace(" ", "")
         album_norm_compact = _normalize_identity_album_strict(album_title).replace(" ", "")
 
         candidates: List[Tuple[float, str]] = []
-        matches = re.findall(
-            r'href="(https?://[^"]*bandcamp\.com/album/([^"?#]+))',
-            search_page,
-            flags=re.IGNORECASE,
-        )
-        for idx, (full_url, slug) in enumerate(matches):
-            url = full_url.split("?")[0].split("#")[0].strip()
-            if not url:
-                continue
-            score = 0.0
+        def _score_bandcamp_candidate(url: str, idx: int = 0, *, base_score: float = 0.0) -> float:
+            score = float(base_score)
+            slug = ""
+            try:
+                slug = re.sub(r"^https?://", "", url).split("/album/", 1)[1].split("?", 1)[0].split("#", 1)[0]
+            except Exception:
+                slug = ""
             slug_norm = _normalize_identity_album_strict(slug).replace(" ", "")
             if album_norm_compact and slug_norm:
                 if album_norm_compact == slug_norm:
@@ -51661,9 +51702,36 @@ def _fetch_bandcamp_album_info(artist_name: str, album_title: str) -> Optional[d
                     score += 1.5
                 elif artist_norm_compact in host_artist_norm or host_artist_norm in artist_norm_compact:
                     score += 0.75
-
             score += max(0.0, 0.25 - (idx * 0.01))
-            candidates.append((score, url))
+            return score
+
+        if search_page:
+            matches = re.findall(
+                r'href="(https?://[^"]*bandcamp\.com/album/([^"?#]+))',
+                search_page,
+                flags=re.IGNORECASE,
+            )
+            for idx, (full_url, _slug) in enumerate(matches):
+                url = full_url.split("?")[0].split("#")[0].strip()
+                if not url:
+                    continue
+                candidates.append((_score_bandcamp_candidate(url, idx), url))
+
+        if not candidates:
+            query = f'site:bandcamp.com/album "{artist_name}" "{album_title}"'
+            search_state, web_results = _web_search_searxng(query, num=8)
+            if search_state == "hit" and web_results:
+                logging.info(
+                    "[Bandcamp] direct search unavailable for %r / %r; using SearXNG fallback (%d result(s))",
+                    artist_name,
+                    album_title,
+                    len(web_results),
+                )
+                for idx, item in enumerate(web_results):
+                    url = str((item or {}).get("link") or "").split("?", 1)[0].split("#", 1)[0].strip()
+                    if not url or "bandcamp.com/album/" not in url.lower():
+                        continue
+                    candidates.append((_score_bandcamp_candidate(url, idx, base_score=0.5), url))
 
         if not candidates:
             return None
