@@ -10627,12 +10627,29 @@ def _pipeline_migrate_legacy_post_scan_async_default() -> None:
     Users can still disable it manually afterwards.
     """
     marker_key = "PIPELINE_POST_SCAN_ASYNC_DEFAULT_MIGRATED"
+    raw_value = None
+    marker_value = ""
     try:
-        if str(_get_config_from_db(marker_key, "") or "").strip() == "1":
-            return
+        init_settings_db()
+        con = sqlite3.connect(str(SETTINGS_DB_FILE), timeout=5)
+        cur = con.cursor()
+        cur.execute(
+            "SELECT key, value FROM settings WHERE key IN (?, ?)",
+            (marker_key, "PIPELINE_POST_SCAN_ASYNC"),
+        )
+        for row in cur.fetchall():
+            key = str(row[0] or "").strip()
+            value = row[1]
+            if key == marker_key:
+                marker_value = str(value or "").strip()
+            elif key == "PIPELINE_POST_SCAN_ASYNC":
+                raw_value = value
+        con.close()
     except Exception:
-        pass
-    raw_value = _get_config_from_db("PIPELINE_POST_SCAN_ASYNC", None)
+        marker_value = ""
+        raw_value = raw_value
+    if marker_value == "1":
+        return
     changed = False
     if raw_value is not None and not bool(_parse_bool(raw_value)):
         try:
