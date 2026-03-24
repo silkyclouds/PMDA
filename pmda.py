@@ -29966,6 +29966,32 @@ def _artist_is_person_like(*, entity_kind: str = "", role_hints: list[str] | tup
     return bool(roles.intersection(_FILES_BROWSE_PERSON_ROLES))
 
 
+def _library_artist_display_name(
+    *,
+    current_name: str,
+    canonical_name: str = "",
+    entity_kind: str = "",
+    roles_json: Any = None,
+    aliases_json: Any = None,
+) -> str:
+    current_txt = " ".join(str(current_name or "").split()).strip()
+    canonical_txt = " ".join(str(canonical_name or "").split()).strip()
+    role_hints = _artist_role_hints_from_roles_json(roles_json)
+    aliases = _safe_json_load(aliases_json or "[]", fallback=[])
+    alias_values = [str(value or "").strip() for value in aliases if str(value or "").strip()]
+    if _artist_is_person_like(entity_kind=entity_kind, role_hints=role_hints):
+        return (
+            _select_classical_person_display_name(
+                current_name=current_txt,
+                primary_name=canonical_txt or current_txt,
+                aliases=alias_values,
+            )
+            or canonical_txt
+            or current_txt
+        )
+    return _choose_preferred_identity_display(current_txt, canonical_txt or current_txt) or canonical_txt or current_txt
+
+
 @lru_cache(maxsize=2048)
 def _musicbrainz_artist_identity_lookup_cached(
     artist_name: str,
@@ -32488,6 +32514,47 @@ def _provider_candidate_near_perfect_identity(candidate: dict) -> bool:
         and float(candidate.get("track_count_ratio") or 0.0) >= 0.96
         and float(candidate.get("confidence") or 0.0) >= 0.90
     )
+
+
+_STRICT_REJECT_BLOCKS_SOFT_IDENTITY = {
+    "artist_mismatch",
+    "album_mismatch",
+    "track_count_mismatch",
+    "track_title_mismatch",
+    "classical_work_mismatch",
+    "classical_composer_mismatch",
+    "classical_performance_mismatch",
+    "classical_track_count_mismatch",
+}
+
+
+def _edition_soft_identity_survives_strict_reject(edition: dict | None) -> bool:
+    e = edition if isinstance(edition, dict) else {}
+    strict_reject = _strict_reject_code(
+        str(e.get("strict_reject_reason") or e.get("_match_reject_reason") or "")
+    )
+    if strict_reject in _STRICT_REJECT_BLOCKS_SOFT_IDENTITY:
+        return False
+    soft_provider = _normalize_identity_provider(
+        str(
+            e.get("identity_provider")
+            or e.get("primary_metadata_source")
+            or e.get("metadata_source")
+            or ""
+        )
+    )
+    explicit_soft = bool(
+        e.get("provider_identity_soft_match")
+        or e.get("soft_match_verified")
+    )
+    provider_soft_id = bool(
+        str(e.get("discogs_release_id") or "").strip()
+        or str(e.get("lastfm_album_mbid") or "").strip()
+        or str(e.get("bandcamp_album_url") or "").strip()
+    )
+    if soft_provider == "musicbrainz" and not explicit_soft and not provider_soft_id:
+        return False
+    return bool(explicit_soft or provider_soft_id)
 
 
 def _ai_choose_provider_identity_candidate(
@@ -36779,14 +36846,7 @@ def scan_duplicates(
                         or ""
                     )
                 )
-                has_soft_identity = bool(
-                    e.get("has_identity")
-                    or e.get("provider_identity_soft_match")
-                    or e.get("musicbrainz_id")
-                    or e.get("discogs_release_id")
-                    or e.get("lastfm_album_mbid")
-                    or e.get("bandcamp_album_url")
-                )
+                has_soft_identity = _edition_soft_identity_survives_strict_reject(e)
                 if has_soft_identity:
                     e["has_identity"] = True
                     if soft_provider:
@@ -56470,10 +56530,22 @@ def _files_library_browse_counts(
             cur.execute(
                 f"""
                 SELECT
-                    COUNT(*)::BIGINT AS album_count,
-                    COUNT(DISTINCT alb.artist_id)::BIGINT AS artist_count
-                FROM files_albums alb
-                WHERE {matched_where}
+                    (
+                        SELECT COUNT(*)::BIGINT
+                        FROM files_albums alb
+                        WHERE {matched_where}
+                    ) AS album_count,
+                    (
+                        SELECT COUNT(*)::BIGINT
+                        FROM files_artists a
+                        WHERE EXISTS (
+                            SELECT 1
+                            FROM files_artist_album_links link
+                            JOIN files_albums alb ON alb.id = link.album_id
+                            WHERE link.artist_id = a.id
+                              AND {matched_where}
+                        )
+                    ) AS artist_count
                 """
             )
             row = cur.fetchone() or (0, 0)
@@ -58731,12 +58803,12 @@ def api_progress():
         phase_rate = None
         phase_progress = 0.0
         threads_in_use = SCAN_THREADS
-        if scanning and state.get("scan_start_time") and total > 0:
+        if scanning and state.get("scan_start_time"):
             current_time = time.time()
             start_time = state["scan_start_time"]
             elapsed_time = current_time - start_time
             elapsed_seconds = int(max(0.0, elapsed_time))
-            if elapsed_time > 0 and progress > 0:
+            if total > 0 and elapsed_time > 0 and progress > 0:
                 speed = progress / elapsed_time
                 phase_rate = float(speed)
                 remaining_steps = total - progress
@@ -59243,6 +59315,13 @@ def api_progress():
         if browse_visible_albums_count is not None
         else int(scan_published_albums_count or 0)
     )
+    total_artists = int(artists_total or 0)
+    scan_runtime_sec_effective = elapsed_seconds
+    if scan_runtime_sec_effective is None and isinstance(last_scan_summary, dict):
+        try:
+            scan_runtime_sec_effective = int(last_scan_summary.get("duration_seconds") or 0)
+        except Exception:
+            scan_runtime_sec_effective = None
     library_ready = bool(
         int(visible_published_albums_count or 0) > 0
         or int(browse_visible_artists_count or 0) > 0
@@ -59449,7 +59528,7 @@ def api_progress():
         "library_visible_artists_count": browse_visible_artists_count,
         "library_include_unmatched_default": bool(include_unmatched_default),
         "elapsed_seconds": elapsed_seconds,
-        "scan_runtime_sec": elapsed_seconds,
+        "scan_runtime_sec": scan_runtime_sec_effective,
         "phase_rate": phase_rate,
         "phase_progress": phase_progress,
     }
@@ -61678,10 +61757,14 @@ def api_library_artists():
         genre = (request.args.get("genre") or "").strip()
         label = (request.args.get("label") or "").strip()
         year = _parse_int_loose(request.args.get("year"), 0)
-        browse_album_match_sql = "1=1"
+        include_unmatched = _library_include_unmatched_effective()
+        browse_album_match_sql = _library_albums_match_where(include_unmatched, "alb")
         limit = max(1, min(500, _parse_int_loose(request.args.get("limit"), 100)))
         offset = max(0, _parse_int_loose(request.args.get("offset"), 0))
-        cache_key = f"library:artists:{search_query.lower()}:{genre.lower()}:{label.lower()}:{int(year or 0)}:{limit}:{offset}:browseall"
+        cache_key = (
+            f"library:artists:{search_query.lower()}:{genre.lower()}:{label.lower()}:"
+            f"{int(year or 0)}:{limit}:{offset}:{_library_cache_unmatched_suffix(include_unmatched)}"
+        )
         cached = _files_cache_get_json(cache_key)
         if cached is not None:
             return jsonify(cached)
@@ -61847,8 +61930,10 @@ def api_library_artists():
                             SELECT
                                 a.id,
                                 a.name,
+                                COALESCE(a.canonical_name, '') AS canonical_name,
                                 COALESCE(a.entity_kind, 'artist') AS entity_kind,
                                 COALESCE(a.roles_json, '[]') AS roles_json,
+                                COALESCE(a.aliases_json, '[]') AS aliases_json,
                                 (
                                     SELECT COUNT(DISTINCT link_cnt.album_id)
                                     FROM files_artist_album_links link_cnt
@@ -61882,8 +61967,10 @@ def api_library_artists():
                             SELECT
                                 a.id,
                                 a.name,
+                                COALESCE(a.canonical_name, '') AS canonical_name,
                                 COALESCE(a.entity_kind, 'artist') AS entity_kind,
                                 COALESCE(a.roles_json, '[]') AS roles_json,
+                                COALESCE(a.aliases_json, '[]') AS aliases_json,
                                 (
                                     SELECT COUNT(DISTINCT link_cnt.album_id)
                                     FROM files_artist_album_links link_cnt
@@ -61912,8 +61999,10 @@ def api_library_artists():
                         SELECT
                             a.id,
                             a.name,
+                            COALESCE(a.canonical_name, '') AS canonical_name,
                             COALESCE(a.entity_kind, 'artist') AS entity_kind,
                             COALESCE(a.roles_json, '[]') AS roles_json,
+                            COALESCE(a.aliases_json, '[]') AS aliases_json,
                             (
                                 SELECT COUNT(DISTINCT link_cnt.album_id)
                                 FROM files_artist_album_links link_cnt
@@ -61941,16 +62030,22 @@ def api_library_artists():
             payload = {
                 "artists": [
                     {
-                        "artist_thumb_version": int(r[7] or 0) if len(r) > 7 else 0,
+                        "artist_thumb_version": int(r[9] or 0) if len(r) > 9 else 0,
                         "artist_id": int(r[0]),
-                        "artist_name": r[1] or "",
-                        "entity_kind": str(r[2] or "artist"),
-                        "roles": _safe_json_load(r[3] or "[]", fallback=[]),
-                        "album_count": int(r[4] or 0),
-                        "broken_albums_count": int(r[5] or 0),
+                        "artist_name": _library_artist_display_name(
+                            current_name=str(r[1] or ""),
+                            canonical_name=str(r[2] or ""),
+                            entity_kind=str(r[3] or "artist"),
+                            roles_json=r[4] or "[]",
+                            aliases_json=r[5] or "[]",
+                        ),
+                        "entity_kind": str(r[3] or "artist"),
+                        "roles": _safe_json_load(r[4] or "[]", fallback=[]),
+                        "album_count": int(r[6] or 0),
+                        "broken_albums_count": int(r[7] or 0),
                         "artist_thumb": (
-                            f"{base_url}/api/library/files/artist/{int(r[0])}/image?size=512&v={int(r[7] or 0)}"
-                            if bool(r[6])
+                            f"{base_url}/api/library/files/artist/{int(r[0])}/image?size=512&v={int(r[9] or 0)}"
+                            if bool(r[8])
                             else None
                         ),
                     }

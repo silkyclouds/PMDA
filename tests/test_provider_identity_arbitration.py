@@ -218,6 +218,17 @@ class ProviderIdentityArbitrationTests(unittest.TestCase):
             )
         )
 
+    def test_musicbrainz_only_soft_identity_does_not_survive_artist_mismatch(self):
+        edition = {
+            "identity_provider": "musicbrainz",
+            "primary_metadata_source": "musicbrainz",
+            "metadata_source": "musicbrainz",
+            "musicbrainz_id": "fake-mbid",
+            "strict_reject_reason": "artist_mismatch",
+            "provider_identity_soft_match": False,
+        }
+        self.assertFalse(pmda._edition_soft_identity_survives_strict_reject(edition))
+
     def test_extract_identity_fields_uses_provider_ids_without_strict_flag(self):
         identity = pmda._extract_files_identity_fields(
             edition={"discogs_release_id": "42", "metadata_source": "discogs"},
