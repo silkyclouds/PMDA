@@ -107,6 +107,32 @@ class ArtistImageSelectionTests(unittest.TestCase):
             )
         )
 
+    def test_classical_display_preference_uses_original_variant_over_english_primary(self):
+        aliases = [
+            "Peter Tchaikovsky",
+            "Pyotr Ilyich Tchaikovsky",
+            "Petr Ilyich Tchaikovsky",
+            "Piotr Ilyich Tchaikovsky",
+        ]
+        self.assertEqual(
+            pmda._select_classical_person_display_name(
+                current_name="Peter Tchaikovsky",
+                primary_name="Peter Tchaikovsky",
+                aliases=aliases,
+                preference="original",
+            ),
+            "Pyotr Ilyich Tchaikovsky",
+        )
+        self.assertEqual(
+            pmda._select_classical_person_display_name(
+                current_name="Peter Tchaikovsky",
+                primary_name="Peter Tchaikovsky",
+                aliases=aliases,
+                preference="english",
+            ),
+            "Peter Tchaikovsky",
+        )
+
     def test_classical_name_equivalence_handles_transliteration_but_not_suffix_variants(self):
         self.assertTrue(
             pmda._classical_person_names_equivalent(

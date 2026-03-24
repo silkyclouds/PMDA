@@ -29851,13 +29851,13 @@ def _classical_person_display_preference_score(
             quality[4],
         )
     return (
-        1 if primary else 0,
-        quality[1],
         0 if looks_english else 1,
+        quality[1],
         quality[0],
+        quality[4],
+        1 if primary else 0,
         quality[2],
         quality[3],
-        quality[4],
         1 if current else 0,
     )
 
@@ -59262,6 +59262,13 @@ def api_progress():
         and int(scan_processed_albums_count or 0) >= int(total_albums or 0)
     ):
         phase = "background_enrichment"
+    elif (
+        scanning
+        and library_ready
+        and int(artists_processed or 0) >= int(total_artists or 0)
+        and int(scan_processed_albums_count or 0) >= int(total_albums or 0)
+    ):
+        phase = "finalizing"
 
     resume_available_by_scan_type: dict[str, dict[str, Any]] = {}
     resume_available = False
