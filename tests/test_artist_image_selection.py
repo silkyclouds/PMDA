@@ -294,6 +294,75 @@ class ArtistImageSelectionTests(unittest.TestCase):
         self.assertIn("Johann Sebastian Bach", names)
         self.assertTrue(any(value in names for value in ("Jean-Sébastien Bach", "Jean-Sebastien Bach")))
 
+    def test_verified_filename_pattern_hint_promotes_display_identity(self):
+        artist, album = pmda._resolve_edition_display_identity(
+            {
+                "artist": "Sigur Rós",
+                "title_raw": "Takk...",
+                "_lookup_artist_name": "Slowdive",
+                "_lookup_album_title": "Souvlaki",
+                "_lookup_identity_hint": {
+                    "artist": "Slowdive",
+                    "album": "Souvlaki",
+                    "confidence": 96,
+                    "reason": "stable filename pattern (artist_missing_or_generic, album_missing_or_generic)",
+                    "source": "filename_pattern",
+                },
+                "strict_match_verified": True,
+                "strict_match_provider": "discogs",
+                "discogs_release_id": "42",
+            },
+            default_artist="Sigur Rós",
+            default_title="Takk...",
+        )
+        self.assertEqual((artist, album), ("Slowdive", "Souvlaki"))
+
+    def test_files_remap_resolved_artist_norms_merges_classical_alias_payloads(self):
+        pyotr_norm = pmda._norm_artist_key("Pyotr Ilyich Tchaikovsky")
+        peter_norm = pmda._norm_artist_key("Peter Tchaikovsky")
+        albums_payload = [
+            {"folder_path": "/music/a", "artist_norm": peter_norm},
+            {"folder_path": "/music/b", "artist_norm": pyotr_norm},
+        ]
+        artists_map = {
+            peter_norm: {
+                "name": "Peter Tchaikovsky",
+                "canonical_name": "Peter Tchaikovsky",
+                "canonical_name_norm": peter_norm,
+                "entity_kind": "composer",
+                "roles_json": '["composer"]',
+                "aliases_json": '["Peter Tchaikovsky"]',
+                "has_image": False,
+                "image_path": "",
+            },
+            pyotr_norm: {
+                "name": "Pyotr Ilyich Tchaikovsky",
+                "canonical_name": "Pyotr Ilyich Tchaikovsky",
+                "canonical_name_norm": pyotr_norm,
+                "entity_kind": "composer",
+                "roles_json": '["composer"]',
+                "aliases_json": '["Pyotr Ilyich Tchaikovsky"]',
+                "has_image": False,
+                "image_path": "",
+            },
+        }
+        remapped_artists, remapped_links = pmda._files_remap_resolved_artist_norms(
+            artists_map,
+            resolved_norm_map={
+                peter_norm: pyotr_norm,
+                pyotr_norm: pyotr_norm,
+            },
+            albums_payload=albums_payload,
+            album_links_by_folder={
+                "/music/a": [{"artist_norm": peter_norm, "role": "composer", "is_primary": True}],
+                "/music/b": [{"artist_norm": pyotr_norm, "role": "composer", "is_primary": True}],
+            },
+        )
+        self.assertEqual(list(remapped_artists.keys()), [pyotr_norm])
+        self.assertEqual(remapped_artists[pyotr_norm]["name"], "Pyotr Ilyich Tchaikovsky")
+        self.assertEqual(albums_payload[0]["artist_norm"], pyotr_norm)
+        self.assertEqual(remapped_links["/music/a"][0]["artist_norm"], pyotr_norm)
+
     def test_browse_entities_keep_original_classical_display_name_after_merge(self):
         original_pref = pmda.CLASSICAL_NAME_PREFERENCE
         try:

@@ -205,6 +205,8 @@ export function ScanProgress({
     has_completed_full_scan = false,
     default_scan_type = 'full',
     scan_published_albums_count = 0,
+    library_visible_albums_count = null,
+    library_visible_artists_count = null,
     elapsed_seconds = null,
     scan_runtime_sec = null,
     phase_rate = null,
@@ -505,16 +507,18 @@ export function ScanProgress({
     return unique.join(' · ');
   }, [background_jobs]);
   const libraryUsable = Boolean(library_ready || Number(scan_published_albums_count || 0) > 0);
+  const visibleAlbums = library_visible_albums_count != null ? Math.max(0, Number(library_visible_albums_count || 0)) : Math.max(0, Number(scan_published_albums_count || 0));
+  const visibleArtists = library_visible_artists_count != null ? Math.max(0, Number(library_visible_artists_count || 0)) : 0;
   const libraryStatusTitle = libraryUsable
     ? (background_enrichment_running ? 'Library ready' : 'Library ready')
     : 'Idle';
   const libraryStatusBody = libraryUsable && background_enrichment_running
     ? (
         profileBackfillRunning && profileBackfillTotal > 0
-          ? `Background enrichment running · ${profileBackfillDone}/${profileBackfillTotal} artists`
-          : 'Background enrichment running'
+          ? `Visible now: ${visibleAlbums} album(s), ${visibleArtists} artist(s) · background enrichment ${profileBackfillDone}/${profileBackfillTotal} artists`
+          : `Visible now: ${visibleAlbums} album(s), ${visibleArtists} artist(s) · background enrichment running`
       )
-    : (libraryUsable ? 'Background enrichment finished' : 'Ready to scan');
+    : (libraryUsable ? `Visible now: ${visibleAlbums} album(s), ${visibleArtists} artist(s) · background enrichment finished` : 'Ready to scan');
 
   if (isCompact) {
     const statusLabel = scanning

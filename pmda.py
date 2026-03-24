@@ -15977,9 +15977,23 @@ def _rebuild_files_library_index_for_artist(
                             artist_rows,
                         )
                     _files_sync_artist_aliases(conn, artists_map=artists_map)
-                    _files_merge_duplicate_person_artists(conn)
-                    artists_map = _files_refresh_artist_media_map_from_db(artists_map)
+                    _files_merge_duplicate_person_artists(conn, force=True)
+                    artists_map, album_links_by_folder, resolved_artist_norm_map = _files_apply_canonical_artist_resolution(
+                        conn,
+                        artists_map,
+                        albums_payload=albums_payload,
+                        album_links_by_folder=album_links_by_folder,
+                    )
                     _files_promote_artist_alias_cache(conn, artists_map)
+                    for album in albums_payload:
+                        folder_key = str(album.get("folder_path") or "").strip()
+                        primary_link = next(
+                            (link for link in (album_links_by_folder.get(folder_key) or []) if bool(link.get("is_primary"))),
+                            None,
+                        )
+                        artist_norm = str((primary_link or {}).get("artist_norm") or "").strip()
+                        if artist_norm:
+                            album["artist_norm"] = artist_norm
                     artist_norms = [norm for norm in artists_map.keys()]
                     cur.execute(
                         "SELECT id, name_norm FROM files_artists WHERE name_norm = ANY(%s)",
@@ -16241,6 +16255,7 @@ def _rebuild_files_library_index_for_artist(
         _files_index_set_state(phase="artist_enrichment")
         if scan_critical_rebuild:
             primary_norm = _norm_artist_key(artist_name) or norm_album(artist_name or "")
+            primary_norm = str(resolved_artist_norm_map.get(primary_norm, primary_norm)).strip() or primary_norm
             payload = artists_map.get(primary_norm) if primary_norm else None
             target_name = str((payload or {}).get("name") or artist_name or "").strip()
             if primary_norm and target_name:
@@ -16611,9 +16626,23 @@ def _rebuild_files_library_index(reason: str = "manual", wait_if_running: bool =
                             artist_rows,
                         )
                     _files_sync_artist_aliases(conn, artists_map=artists_map)
-                    _files_merge_duplicate_person_artists(conn)
-                    artists_map = _files_refresh_artist_media_map_from_db(artists_map)
+                    _files_merge_duplicate_person_artists(conn, force=True)
+                    artists_map, album_links_by_folder, _resolved_artist_norm_map = _files_apply_canonical_artist_resolution(
+                        conn,
+                        artists_map,
+                        albums_payload=albums_payload,
+                        album_links_by_folder=album_links_by_folder,
+                    )
                     _files_promote_artist_alias_cache(conn, artists_map)
+                    for album in albums_payload:
+                        folder_key = str(album.get("folder_path") or "").strip()
+                        primary_link = next(
+                            (link for link in (album_links_by_folder.get(folder_key) or []) if bool(link.get("is_primary"))),
+                            None,
+                        )
+                        artist_norm = str((primary_link or {}).get("artist_norm") or "").strip()
+                        if artist_norm:
+                            album["artist_norm"] = artist_norm
                     cur.execute("SELECT id, name_norm FROM files_artists")
                     artist_id_by_norm = {str(r[1]): int(r[0]) for r in cur.fetchall()}
 
@@ -17294,8 +17323,22 @@ def _files_backfill_artist_browse_entities_from_existing_index() -> dict[str, in
                         ),
                     )
                 _files_sync_artist_aliases(conn, artists_map=artists_map)
-                _files_merge_duplicate_person_artists(conn)
-                artists_map = _files_refresh_artist_media_map_from_db(artists_map)
+                _files_merge_duplicate_person_artists(conn, force=True)
+                artists_map, album_links_by_folder, _resolved_artist_norm_map = _files_apply_canonical_artist_resolution(
+                    conn,
+                    artists_map,
+                    albums_payload=albums_payload,
+                    album_links_by_folder=album_links_by_folder,
+                )
+                for album in albums_payload:
+                    folder_key = str(album.get("folder_path") or "").strip()
+                    primary_link = next(
+                        (link for link in (album_links_by_folder.get(folder_key) or []) if bool(link.get("is_primary"))),
+                        None,
+                    )
+                    artist_norm = str((primary_link or {}).get("artist_norm") or "").strip()
+                    if artist_norm:
+                        album["artist_norm"] = artist_norm
 
                 cur.execute(
                     "SELECT id, name_norm FROM files_artists WHERE name_norm = ANY(%s)",
@@ -18282,14 +18325,11 @@ def _files_promote_artist_alias_cache(conn, artists_map: dict[str, dict[str, Any
                         break
 
 
-def _files_refresh_artist_media_map_from_db(artists_map: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    if not artists_map:
-        return {}
+def _files_refresh_artist_media_map_from_conn(conn, artists_map: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    if conn is None or not artists_map:
+        return artists_map or {}
     norms = [str(norm or "").strip() for norm in artists_map.keys() if str(norm or "").strip()]
     if not norms:
-        return artists_map
-    conn = _files_pg_connect()
-    if conn is None:
         return artists_map
     try:
         artist_rows: dict[str, dict[str, Any]] = {}
@@ -18351,8 +18391,212 @@ def _files_refresh_artist_media_map_from_db(artists_map: dict[str, dict[str, Any
         return refreshed
     except Exception:
         return artists_map
+
+
+def _files_refresh_artist_media_map_from_db(artists_map: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    if not artists_map:
+        return {}
+    conn = _files_pg_connect()
+    if conn is None:
+        return artists_map
+    try:
+        return _files_refresh_artist_media_map_from_conn(conn, artists_map)
     finally:
         conn.close()
+
+
+def _files_resolve_artist_norm_map(
+    conn,
+    norms: list[str] | tuple[str, ...] | set[str] | None,
+) -> dict[str, str]:
+    requested = [str(norm or "").strip() for norm in (norms or []) if str(norm or "").strip()]
+    requested = list(dict.fromkeys(requested))
+    if conn is None or not requested:
+        return {norm: norm for norm in requested}
+    resolved: dict[str, str] = {}
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT name_norm FROM files_artists WHERE name_norm = ANY(%s)",
+                (requested,),
+            )
+            for (name_norm,) in cur.fetchall():
+                key = str(name_norm or "").strip()
+                if key:
+                    resolved[key] = key
+            missing = [norm for norm in requested if norm not in resolved]
+            if missing:
+                cur.execute(
+                    """
+                    SELECT alias_norm, artist_name_norm
+                    FROM files_artist_aliases
+                    WHERE alias_norm = ANY(%s)
+                    ORDER BY is_canonical DESC, source ASC, artist_name_norm ASC
+                    """,
+                    (missing,),
+                )
+                for alias_norm, artist_name_norm in cur.fetchall():
+                    alias_key = str(alias_norm or "").strip()
+                    target_norm = str(artist_name_norm or "").strip()
+                    if alias_key and target_norm and alias_key not in resolved:
+                        resolved[alias_key] = target_norm
+    except Exception:
+        logging.debug("Artist norm alias resolution failed", exc_info=True)
+    for norm in requested:
+        resolved.setdefault(norm, norm)
+    return resolved
+
+
+def _files_remap_resolved_artist_norms(
+    artists_map: dict[str, dict[str, Any]],
+    *,
+    resolved_norm_map: dict[str, str] | None = None,
+    albums_payload: list[dict[str, Any]] | None = None,
+    album_links_by_folder: dict[str, list[dict[str, Any]]] | None = None,
+) -> tuple[dict[str, dict[str, Any]], dict[str, list[dict[str, Any]]]]:
+    mapping = {
+        str(key or "").strip(): str(value or "").strip()
+        for key, value in dict(resolved_norm_map or {}).items()
+        if str(key or "").strip() and str(value or "").strip()
+    }
+    if not artists_map:
+        return {}, dict(album_links_by_folder or {})
+    if not mapping:
+        mapping = {
+            str(norm or "").strip(): str(norm or "").strip()
+            for norm in artists_map.keys()
+            if str(norm or "").strip()
+        }
+
+    def _merge_artist_payload(base: dict[str, Any], incoming: dict[str, Any], target_norm: str) -> dict[str, Any]:
+        merged = dict(base or {})
+        current = dict(incoming or {})
+        base_roles = _artist_role_hints_from_roles_json(merged.get("roles_json") or "[]")
+        current_roles = _artist_role_hints_from_roles_json(current.get("roles_json") or "[]")
+        merged_roles = sorted(
+            {str(role or "").strip().lower() for role in [*base_roles, *current_roles] if str(role or "").strip()},
+            key=lambda role: (_FILES_BROWSE_ROLE_PRIORITY.get(role, 99), role),
+        )
+        existing_entity_kind = str(merged.get("entity_kind") or "artist").strip() or "artist"
+        incoming_entity_kind = str(current.get("entity_kind") or "artist").strip() or "artist"
+        person_like = _artist_is_person_like(entity_kind=existing_entity_kind, role_hints=merged_roles) or _artist_is_person_like(entity_kind=incoming_entity_kind, role_hints=merged_roles)
+        merged["entity_kind"] = (
+            _files_best_person_entity_kind([existing_entity_kind, incoming_entity_kind], merged_roles)
+            if person_like
+            else (existing_entity_kind or incoming_entity_kind or "artist")
+        )
+        merged["roles_json"] = json.dumps(merged_roles, ensure_ascii=False)
+        merged_name = str(merged.get("name") or "").strip()
+        incoming_name = str(current.get("name") or "").strip()
+        merged_canonical = str(merged.get("canonical_name") or merged_name).strip()
+        incoming_canonical = str(current.get("canonical_name") or incoming_name).strip()
+        if person_like:
+            preferred_name = _choose_preferred_person_identity_name(merged_name, incoming_name)
+            preferred_canonical = _choose_preferred_person_identity_name(merged_canonical or preferred_name, incoming_canonical or incoming_name)
+            alias_values = _files_merge_artist_alias_values(
+                merged.get("aliases_json") or "[]",
+                current.get("aliases_json") or "[]",
+                [merged_name, incoming_name, preferred_canonical],
+            )
+            alias_values = _collapse_classical_person_aliases(alias_values)
+            display_name = _select_classical_person_display_name(
+                current_name=preferred_name,
+                primary_name=preferred_canonical,
+                aliases=alias_values,
+            ) or preferred_canonical or preferred_name
+            merged["name"] = display_name
+            merged["canonical_name"] = preferred_canonical or display_name
+            merged["aliases_json"] = json.dumps(alias_values[:12], ensure_ascii=False)
+        else:
+            merged["name"] = _choose_preferred_identity_display(merged_name, incoming_name) or incoming_name or merged_name
+            merged["canonical_name"] = _choose_preferred_identity_display(merged_canonical, incoming_canonical) or incoming_canonical or merged_canonical or merged["name"]
+            alias_values = _files_merge_artist_alias_values(
+                merged.get("aliases_json") or "[]",
+                current.get("aliases_json") or "[]",
+                [merged_name, incoming_name, merged.get("canonical_name") or ""],
+            )
+            merged["aliases_json"] = json.dumps(alias_values[:12], ensure_ascii=False)
+        merged["canonical_name_norm"] = str(current.get("canonical_name_norm") or merged.get("canonical_name_norm") or target_norm).strip() or target_norm
+        merged["canonical_mbid"] = str(merged.get("canonical_mbid") or current.get("canonical_mbid") or "").strip()
+        if bool(current.get("has_image")) and str(current.get("image_path") or "").strip():
+            if not (bool(merged.get("has_image")) and str(merged.get("image_path") or "").strip()):
+                merged["has_image"] = True
+                merged["image_path"] = str(current.get("image_path") or "").strip()
+        return merged
+
+    remapped_artists: dict[str, dict[str, Any]] = {}
+    for old_norm, payload in artists_map.items():
+        source_norm = str(old_norm or "").strip()
+        target_norm = mapping.get(source_norm, source_norm)
+        if not target_norm:
+            continue
+        current_payload = dict(payload or {})
+        current_payload["canonical_name_norm"] = str(current_payload.get("canonical_name_norm") or target_norm).strip() or target_norm
+        existing_payload = remapped_artists.get(target_norm)
+        if existing_payload is None:
+            remapped_artists[target_norm] = current_payload
+        else:
+            remapped_artists[target_norm] = _merge_artist_payload(existing_payload, current_payload, target_norm)
+
+    remapped_links: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for folder_path, links in dict(album_links_by_folder or {}).items():
+        seen_links: set[tuple[str, str, bool]] = set()
+        for link in links or []:
+            raw_norm = str((link or {}).get("artist_norm") or "").strip()
+            resolved_norm = mapping.get(raw_norm, raw_norm)
+            role = str((link or {}).get("role") or "").strip().lower() or "artist"
+            is_primary = bool((link or {}).get("is_primary"))
+            key = (resolved_norm, role, is_primary)
+            if not resolved_norm or key in seen_links:
+                continue
+            seen_links.add(key)
+            remapped_links[str(folder_path or "").strip()].append(
+                {
+                    "artist_norm": resolved_norm,
+                    "role": role,
+                    "is_primary": is_primary,
+                }
+            )
+
+    for album in albums_payload or []:
+        raw_norm = str((album or {}).get("artist_norm") or "").strip()
+        if not raw_norm:
+            continue
+        album["artist_norm"] = mapping.get(raw_norm, raw_norm)
+
+    return remapped_artists, dict(remapped_links)
+
+
+def _files_apply_canonical_artist_resolution(
+    conn,
+    artists_map: dict[str, dict[str, Any]],
+    *,
+    albums_payload: list[dict[str, Any]] | None = None,
+    album_links_by_folder: dict[str, list[dict[str, Any]]] | None = None,
+) -> tuple[dict[str, dict[str, Any]], dict[str, list[dict[str, Any]]], dict[str, str]]:
+    norms: set[str] = {
+        str(norm or "").strip()
+        for norm in (artists_map or {}).keys()
+        if str(norm or "").strip()
+    }
+    for album in albums_payload or []:
+        artist_norm = str((album or {}).get("artist_norm") or "").strip()
+        if artist_norm:
+            norms.add(artist_norm)
+    for links in dict(album_links_by_folder or {}).values():
+        for link in links or []:
+            artist_norm = str((link or {}).get("artist_norm") or "").strip()
+            if artist_norm:
+                norms.add(artist_norm)
+    resolved_norm_map = _files_resolve_artist_norm_map(conn, norms)
+    remapped_artists, remapped_links = _files_remap_resolved_artist_norms(
+        artists_map or {},
+        resolved_norm_map=resolved_norm_map,
+        albums_payload=albums_payload,
+        album_links_by_folder=album_links_by_folder,
+    )
+    refreshed_artists = _files_refresh_artist_media_map_from_conn(conn, remapped_artists)
+    return refreshed_artists, remapped_links, resolved_norm_map
 
 
 def _files_build_local_artist_profile(
@@ -33596,18 +33840,26 @@ def _resolve_edition_display_identity(
             or "album_missing_or_generic" in hint_reason
         )
     )
+    verified_hint_override = bool(
+        hinted_artist
+        and hinted_album
+        and hint_source == "filename_pattern"
+        and hint_confidence >= 90
+        and _edition_has_verified_provider_identity(e)
+    )
     if hint_source == "ai_local_context" and not _edition_has_verified_provider_identity(e):
         hinted_artist = ""
         hinted_album = ""
-    if force_hint_override:
+    if force_hint_override or verified_hint_override:
         logging.info(
-            "[Identity] forcing filename-pattern override artist=%r -> %r album=%r -> %r reason=%s confidence=%s",
+            "[Identity] forcing filename-pattern override artist=%r -> %r album=%r -> %r reason=%s confidence=%s verified=%s",
             current_artist,
             hinted_artist,
             current_title,
             hinted_album,
             hint_reason or "",
             hint_confidence,
+            bool(verified_hint_override),
         )
         artist_resolved = hinted_artist
         album_resolved = hinted_album

@@ -77,6 +77,44 @@ class ScanProgressStateTests(unittest.TestCase):
             pmda._pipeline_bootstrap_status = orig_bootstrap
             pmda._files_library_browse_counts = orig_counts
 
+    def test_api_progress_background_enrichment_uses_visible_browse_counts(self):
+        orig_bootstrap = pmda._pipeline_bootstrap_status
+        orig_counts = pmda._files_library_browse_counts
+        with pmda._files_profile_jobs_lock:
+            orig_profile_jobs_active = set(pmda._files_profile_jobs_active)
+            pmda._files_profile_jobs_active.clear()
+            pmda._files_profile_jobs_active.add("artist:pyotr")
+        try:
+            pmda._pipeline_bootstrap_status = lambda: {"bootstrap_required": False}
+            pmda._files_library_browse_counts = lambda *args, **kwargs: (4, 3)
+            with pmda.lock:
+                pmda.state["scanning"] = True
+                pmda.state["scan_starting"] = False
+                pmda.state["scan_start_time"] = time.time() - 22
+                pmda.state["scan_artists_processed"] = 6
+                pmda.state["scan_artists_total"] = 6
+                pmda.state["scan_total_albums"] = 12
+                pmda.state["scan_processed_albums_count"] = 12
+                pmda.state["scan_published_albums_count"] = 9
+                pmda.state["scan_pipeline_async"] = True
+                pmda.state["scan_active_artists"] = {}
+                pmda.state["scan_steps_log"] = []
+            resp = self.client.get("/api/progress")
+            self.assertEqual(resp.status_code, 200)
+            payload = resp.get_json() or {}
+            self.assertTrue(bool(payload.get("library_ready")))
+            self.assertTrue(bool(payload.get("background_enrichment_running")))
+            self.assertEqual(payload.get("phase"), "background_enrichment")
+            self.assertEqual(int(payload.get("scan_published_albums_count") or 0), 4)
+            self.assertEqual(int(payload.get("library_visible_albums_count") or 0), 4)
+            self.assertGreaterEqual(int(payload.get("scan_runtime_sec") or 0), 1)
+        finally:
+            with pmda._files_profile_jobs_lock:
+                pmda._files_profile_jobs_active.clear()
+                pmda._files_profile_jobs_active.update(orig_profile_jobs_active)
+            pmda._pipeline_bootstrap_status = orig_bootstrap
+            pmda._files_library_browse_counts = orig_counts
+
 
 
     def test_collapse_classical_person_aliases_prefers_best_display_for_equivalent_aliases(self):

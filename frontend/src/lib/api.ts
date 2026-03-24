@@ -213,8 +213,8 @@ export interface ScanProgress {
   resume_available_by_scan_type?: Partial<Record<'full' | 'changed_only', ScanResumeSnapshot>>;
   scan_type?: 'full' | 'changed_only' | 'incomplete_only';
   scan_resume_run_id?: string | null;
-  /** Current scan phase: pre_scan | preparing_run_scope | format_analysis | identification_tags | ia_analysis | finalizing | moving_dupes | post_processing */
-  phase?: 'pre_scan' | 'preparing_run_scope' | 'format_analysis' | 'identification_tags' | 'ia_analysis' | 'finalizing' | 'moving_dupes' | 'post_processing' | null;
+  /** Current scan phase: pre_scan | preparing_run_scope | format_analysis | identification_tags | ia_analysis | finalizing | moving_dupes | post_processing | background_enrichment */
+  phase?: 'pre_scan' | 'preparing_run_scope' | 'format_analysis' | 'identification_tags' | 'ia_analysis' | 'finalizing' | 'moving_dupes' | 'post_processing' | 'background_enrichment' | null;
   /** Micro-step for live indicators: analyzing_format | fetching_mb_id | searching_mb | comparing_versions | detecting_best | done */
   current_step?: string | null;
   /** Total albums in this scan (for N/M display in findings) */
