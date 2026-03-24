@@ -18743,6 +18743,7 @@ def _files_try_artist_image_refresh(
 
 _FILES_SCAN_INLINE_ARTIST_ENRICH_BUDGET_SEC = 8.0
 _FILES_SCAN_WEB_MBID_AI_TIMEOUT_SEC = 20.0
+_FILES_SCAN_PROVIDER_IDENTITY_AI_TIMEOUT_SEC = 18.0
 
 
 def _files_enrich_artists_blocking(
@@ -30535,6 +30536,7 @@ def _files_merge_duplicate_person_artists(conn, *, force: bool = False) -> None:
             parent[rroot] = lroot
 
     buckets: dict[str, list[int]] = defaultdict(list)
+    surname_buckets: dict[str, list[int]] = defaultdict(list)
     for row in person_rows:
         artist_id = int(row["id"])
         mbid = str(row.get("canonical_mbid") or "").strip()
@@ -30542,6 +30544,11 @@ def _files_merge_duplicate_person_artists(conn, *, force: bool = False) -> None:
             buckets[f"mbid:{mbid}"].append(artist_id)
         for alias_norm in sorted(row.get("alias_norms") or []):
             buckets[f"alias:{alias_norm}"].append(artist_id)
+        signature_source = str(row.get("canonical_name") or row.get("name") or "").strip()
+        sig = _classical_person_alias_signature(signature_source)
+        surname = str(sig.get("surname") or "").strip()
+        if surname:
+            surname_buckets[surname].append(artist_id)
 
     for ids in buckets.values():
         if len(ids) < 2:
@@ -30549,6 +30556,30 @@ def _files_merge_duplicate_person_artists(conn, *, force: bool = False) -> None:
         anchor = int(ids[0])
         for candidate in ids[1:]:
             _union(anchor, int(candidate))
+
+    for ids in surname_buckets.values():
+        unique_ids = sorted({int(value) for value in ids if int(value or 0) > 0})
+        if len(unique_ids) < 2:
+            continue
+        for idx, left_id in enumerate(unique_ids):
+            left_row = rows_by_id.get(left_id) or {}
+            left_names = [
+                str(left_row.get("canonical_name") or left_row.get("name") or "").strip(),
+                *[str(value or "").strip() for value in (left_row.get("aliases") or []) if str(value or "").strip()],
+            ]
+            for right_id in unique_ids[idx + 1 :]:
+                right_row = rows_by_id.get(right_id) or {}
+                right_names = [
+                    str(right_row.get("canonical_name") or right_row.get("name") or "").strip(),
+                    *[str(value or "").strip() for value in (right_row.get("aliases") or []) if str(value or "").strip()],
+                ]
+                if any(
+                    _classical_person_names_equivalent(left_name, right_name)
+                    for left_name in left_names
+                    for right_name in right_names
+                    if left_name and right_name
+                ):
+                    _union(left_id, right_id)
 
     clusters: dict[int, list[dict[str, Any]]] = defaultdict(list)
     for row in person_rows:
@@ -32371,6 +32402,20 @@ def _provider_identity_ai_skip_reason(
     return ", ".join(sorted(set(reasons)))
 
 
+def _provider_candidate_near_perfect_identity(candidate: dict) -> bool:
+    if not isinstance(candidate, dict):
+        return False
+    if not bool(candidate.get("has_provider_tracklist")) or not bool(candidate.get("has_local_tracklist")):
+        return False
+    return bool(
+        float(candidate.get("title_score") or 0.0) >= 0.995
+        and float(candidate.get("artist_score") or 0.0) >= 0.995
+        and float(candidate.get("track_score") or 0.0) >= 0.96
+        and float(candidate.get("track_count_ratio") or 0.0) >= 0.96
+        and float(candidate.get("confidence") or 0.0) >= 0.90
+    )
+
+
 def _ai_choose_provider_identity_candidate(
     artist_name: str,
     album_title: str,
@@ -32417,7 +32462,10 @@ def _ai_choose_provider_identity_candidate(
             user_msg=prompt,
             max_tokens=30,
             analysis_type="provider_identity_verify",
-            timeout_sec=AI_SCAN_HARD_TIMEOUT_SEC,
+            timeout_sec=min(
+                float(AI_SCAN_HARD_TIMEOUT_SEC or 120.0),
+                _FILES_SCAN_PROVIDER_IDENTITY_AI_TIMEOUT_SEC if _scan_pipeline_active() else 45.0,
+            ),
             log_prefix="[Providers Arbitration]",
         )
         reply_clean, ai_confidence = parse_ai_confidence((reply or "").strip())
@@ -32512,16 +32560,24 @@ def _arbitrate_provider_identity(
     top = ranked[0]
     top_ok, top_reason = _provider_candidate_soft_identity_ok(top, min_confidence=min_score)
     runner = ranked[1] if len(ranked) > 1 else None
+    runner_ok = False
+    runner_reason = ""
+    if runner is not None:
+        runner_ok, runner_reason = _provider_candidate_soft_identity_ok(runner, min_confidence=min_score)
     ambiguous = bool(
-        runner is not None
+        top_ok
+        and runner is not None
+        and runner_ok
         and abs(float(top.get("confidence") or 0.0) - float(runner.get("confidence") or 0.0)) <= score_margin
     )
-    if top_ok and not ambiguous:
+    top_near_perfect = _provider_candidate_near_perfect_identity(top)
+    if top_ok and (not ambiguous or top_near_perfect):
         logging.info(
-            "[Providers Arbitration] %r – %r: accepted %s (soft-safe confidence=%.2f)",
+            "[Providers Arbitration] %r – %r: accepted %s (%s confidence=%.2f)",
             artist_name,
             album_title,
             top.get("provider"),
+            "soft-safe near-perfect" if top_near_perfect and ambiguous else "soft-safe",
             float(top.get("confidence") or 0.0),
         )
         return {

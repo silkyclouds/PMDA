@@ -73,6 +73,66 @@ class ProviderIdentityArbitrationTests(unittest.TestCase):
         )
         self.assertIsNone(result)
 
+    def test_arbitration_accepts_near_perfect_top_candidate_without_ai(self):
+        candidates = [
+            {
+                "provider": "discogs",
+                "payload": {"title": "Takk…", "artist_name": "Sigur Rós"},
+                "provider_id": "discogs-1",
+                "title_score": 1.0,
+                "artist_score": 1.0,
+                "ocr_title_score": 0.0,
+                "ocr_artist_score": 0.0,
+                "track_score": 1.0,
+                "confidence": 0.97,
+                "title": "Takk…",
+                "artist": "Sigur Rós",
+                "strict_match_verified": False,
+                "strict_reject_reason": "",
+                "strict_tracklist_score": 0.95,
+                "has_provider_tracklist": True,
+                "has_local_tracklist": True,
+                "provider_track_count": 11,
+                "local_track_count": 11,
+                "track_count_ratio": 1.0,
+                "classical_guard_applies": False,
+                "classical_guard_ok": True,
+            },
+            {
+                "provider": "lastfm",
+                "payload": {"title": "Takk…", "artist": "Sigur Rós"},
+                "provider_id": "lastfm-1",
+                "title_score": 0.99,
+                "artist_score": 0.99,
+                "ocr_title_score": 0.0,
+                "ocr_artist_score": 0.0,
+                "track_score": 0.96,
+                "confidence": 0.95,
+                "title": "Takk…",
+                "artist": "Sigur Rós",
+                "strict_match_verified": False,
+                "strict_reject_reason": "",
+                "strict_tracklist_score": 0.90,
+                "has_provider_tracklist": True,
+                "has_local_tracklist": True,
+                "provider_track_count": 11,
+                "local_track_count": 11,
+                "track_count_ratio": 1.0,
+                "classical_guard_applies": False,
+                "classical_guard_ok": True,
+            },
+        ]
+        with unittest.mock.patch.object(pmda, "_build_provider_identity_candidates", return_value=candidates):
+            result = pmda._arbitrate_provider_identity(
+                artist_name="Sigur Rós",
+                album_title="Takk…",
+                local_track_titles=["track"] * 11,
+                provider_payloads={},
+            )
+        self.assertIsNotNone(result)
+        self.assertEqual(result.get("provider"), "discogs")
+        self.assertEqual(result.get("confidence_source"), "heuristic")
+
     def test_unverified_ai_lookup_hint_does_not_override_display_identity(self):
         edition = {
             "artist": "Sigur Rós",

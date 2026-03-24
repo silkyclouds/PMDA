@@ -107,6 +107,20 @@ class ArtistImageSelectionTests(unittest.TestCase):
             )
         )
 
+    def test_classical_name_equivalence_handles_transliteration_but_not_suffix_variants(self):
+        self.assertTrue(
+            pmda._classical_person_names_equivalent(
+                "Peter Tchaikovsky",
+                "Pyotr Ilyich Tchaikovsky",
+            )
+        )
+        self.assertFalse(
+            pmda._classical_person_names_equivalent(
+                "Johann Strauss I",
+                "Johann Strauss II",
+            )
+        )
+
     def test_classical_person_image_rejects_wrong_same_surname_person(self):
         self.assertFalse(
             pmda._artist_image_url_looks_relevant(
