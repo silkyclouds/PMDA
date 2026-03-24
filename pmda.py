@@ -61759,6 +61759,8 @@ def api_library_artists():
         year = _parse_int_loose(request.args.get("year"), 0)
         include_unmatched = _library_include_unmatched_effective()
         browse_album_match_sql = _library_albums_match_where(include_unmatched, "alb")
+        search_album_match_sql = _library_albums_match_where(include_unmatched, "alb2")
+        album_count_match_sql = _library_albums_match_where(include_unmatched, "alb_cnt")
         limit = max(1, min(500, _parse_int_loose(request.args.get("limit"), 100)))
         offset = max(0, _parse_int_loose(request.args.get("offset"), 0))
         cache_key = (
@@ -61809,7 +61811,7 @@ def api_library_artists():
                     like = f"%{search_query}%"
                     search_norm = _norm_artist_key(search_query)
                     search_signature = _classical_person_signature_key(search_query)
-                    search_album_match = browse_album_match_sql
+                    search_album_match = search_album_match_sql
                     where_parts.append(
                         f"""
                         (
@@ -61920,7 +61922,6 @@ def api_library_artists():
                 )
                 total = int((cur.fetchone() or [0])[0] or 0)
 
-                album_count_match_sql = browse_album_match_sql
                 artist_has_image_sql = _artist_has_true_image_sql("a", "ext")
 
                 if search_query:

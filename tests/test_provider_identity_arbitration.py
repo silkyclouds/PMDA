@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 
 import pmda
 
@@ -144,7 +145,7 @@ class ProviderIdentityArbitrationTests(unittest.TestCase):
                 "classical_guard_ok": True,
             },
         ]
-        with unittest.mock.patch.object(pmda, "_build_provider_identity_candidates", return_value=candidates):
+        with mock.patch.object(pmda, "_build_provider_identity_candidates", return_value=candidates):
             result = pmda._arbitrate_provider_identity(
                 artist_name="Sigur Rós",
                 album_title="Takk…",
