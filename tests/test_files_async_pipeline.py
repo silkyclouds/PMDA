@@ -1,4 +1,6 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import pmda
 
@@ -91,6 +93,41 @@ class FilesAsyncPipelineTests(unittest.TestCase):
             pmda.threading.Thread = orig_thread
             with pmda._files_profile_jobs_lock:
                 pmda._files_profile_jobs_active.discard("sigur ros")
+
+    def test_maintenance_reset_state_db_reseeds_scheduler_defaults(self):
+        with TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "state.db"
+            db_path.write_text("placeholder", encoding="utf-8")
+            calls = {"defaults": 0, "legacy": 0, "chain": 0, "async_default": 0}
+            orig_state_db = pmda.STATE_DB_FILE
+            orig_insert = pmda._scheduler_insert_default_rules_if_empty
+            orig_legacy = pmda._scheduler_migrate_legacy_scan_changed_default
+            orig_chain = pmda._scheduler_ensure_post_scan_chain_defaults
+            orig_async = pmda._pipeline_migrate_legacy_post_scan_async_default
+            try:
+                pmda.STATE_DB_FILE = db_path
+                pmda._scheduler_insert_default_rules_if_empty = lambda: calls.__setitem__("defaults", calls["defaults"] + 1)
+                pmda._scheduler_migrate_legacy_scan_changed_default = lambda: calls.__setitem__("legacy", calls["legacy"] + 1)
+                pmda._scheduler_ensure_post_scan_chain_defaults = lambda: calls.__setitem__("chain", calls["chain"] + 1)
+                pmda._pipeline_migrate_legacy_post_scan_async_default = lambda: calls.__setitem__("async_default", calls["async_default"] + 1)
+
+                def _fake_reinit():
+                    db_path.write_text("reinitialized", encoding="utf-8")
+
+                result = pmda._maintenance_reset_sqlite_db(db_path, _fake_reinit)
+
+                self.assertTrue(result["ok"])
+                self.assertTrue(result["reinitialized"])
+                self.assertEqual(calls["defaults"], 1)
+                self.assertEqual(calls["legacy"], 1)
+                self.assertEqual(calls["chain"], 1)
+                self.assertEqual(calls["async_default"], 1)
+            finally:
+                pmda.STATE_DB_FILE = orig_state_db
+                pmda._scheduler_insert_default_rules_if_empty = orig_insert
+                pmda._scheduler_migrate_legacy_scan_changed_default = orig_legacy
+                pmda._scheduler_ensure_post_scan_chain_defaults = orig_chain
+                pmda._pipeline_migrate_legacy_post_scan_async_default = orig_async
 
 
 if __name__ == "__main__":

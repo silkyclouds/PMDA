@@ -39554,6 +39554,9 @@ def _refresh_scan_history_from_published(scan_id: int | None) -> None:
         )
         con.commit()
         con.close()
+        with lock:
+            if int(state.get("scan_id") or 0) == sid:
+                state["scan_published_albums_count"] = int(len(rows))
     except Exception:
         logging.debug("Failed to refresh scan_history from published rows for scan_id=%s", scan_id, exc_info=True)
 
@@ -54438,6 +54441,13 @@ def _maintenance_reset_sqlite_db(db_path: Path, reinit_fn) -> dict[str, Any]:
     try:
         reinit_fn()
         reinitialized = True
+        if db_path == STATE_DB_FILE:
+            # A live state.db reset happens after module startup, so scheduler defaults
+            # must be reseeded explicitly or post-scan chain jobs vanish until restart.
+            _scheduler_insert_default_rules_if_empty()
+            _scheduler_migrate_legacy_scan_changed_default()
+            _scheduler_ensure_post_scan_chain_defaults()
+            _pipeline_migrate_legacy_post_scan_async_default()
     except Exception as e:
         errors.append(f"reinit failed: {e}")
     return {
