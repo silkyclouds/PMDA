@@ -29695,7 +29695,9 @@ def _files_collect_album_classical_payload(
 
 
 _FILES_BROWSE_PRIMARY_ROLES = {"artist"}
-_FILES_BROWSE_PERSON_ROLES = {"artist", "composer", "conductor", "soloist", "performer"}
+# Generic "artist" roles must not flow through the classical-person alias/merge path.
+# That path is only for actual people (composer/conductor/soloist/performer).
+_FILES_BROWSE_PERSON_ROLES = {"composer", "conductor", "soloist", "performer"}
 _FILES_BROWSE_ENSEMBLE_ROLES = {"orchestra", "ensemble"}
 _FILES_BROWSE_ROLE_PRIORITY = {
     "artist": 0,
@@ -30262,7 +30264,7 @@ def _artist_role_hints_from_roles_json(roles_json: Any) -> list[str]:
 def _artist_is_person_like(*, entity_kind: str = "", role_hints: list[str] | tuple[str, ...] | None = None) -> bool:
     kind = str(entity_kind or "").strip().lower()
     roles = {str(role or "").strip().lower() for role in (role_hints or []) if str(role or "").strip()}
-    if kind in {"composer", "conductor", "performer"}:
+    if kind in {"person", "composer", "conductor", "performer", "soloist"}:
         return True
     return bool(roles.intersection(_FILES_BROWSE_PERSON_ROLES))
 
@@ -30738,6 +30740,17 @@ def _files_sync_artist_aliases(
                     updated_at
                 )
                 VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+                ON CONFLICT (artist_id, alias_norm)
+                DO UPDATE SET
+                    alias = EXCLUDED.alias,
+                    artist_name_norm = EXCLUDED.artist_name_norm,
+                    alias_signature = EXCLUDED.alias_signature,
+                    is_canonical = files_artist_aliases.is_canonical OR EXCLUDED.is_canonical,
+                    source = CASE
+                        WHEN files_artist_aliases.source = 'canonical' THEN files_artist_aliases.source
+                        ELSE EXCLUDED.source
+                    END,
+                    updated_at = NOW()
                 """,
                 insert_rows,
             )
