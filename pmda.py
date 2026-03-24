@@ -11025,19 +11025,23 @@ def _scheduler_build_improve_candidates() -> list[dict]:
 
 
 def _scheduler_run_enrich_batch() -> tuple[bool, str, dict]:
-    albums = _scheduler_build_improve_candidates()
     before = time.time()
     result: dict[str, Any] = {}
-    if albums:
-        _run_improve_all_albums_global(albums)
-        with lock:
-            improve_state = dict(state.get("improve_all") or {})
-        result = improve_state.get("result") if isinstance(improve_state.get("result"), dict) else {}
-        err = str(improve_state.get("error") or "").strip()
-        if err:
-            return False, err, {"albums": len(albums), "duration_s": round(time.time() - before, 2), "result": result or {}}
+    albums: list[dict] = []
+    if _get_library_mode() == "files":
+        logging.info("[Scan Pipeline] enrich_batch: Files mode skips legacy improve-all; running background profile/review backfill only")
     else:
-        logging.info("[Scan Pipeline] enrich_batch: no album-level improve candidates; continuing with profile backfill only")
+        albums = _scheduler_build_improve_candidates()
+        if albums:
+            _run_improve_all_albums_global(albums)
+            with lock:
+                improve_state = dict(state.get("improve_all") or {})
+            result = improve_state.get("result") if isinstance(improve_state.get("result"), dict) else {}
+            err = str(improve_state.get("error") or "").strip()
+            if err:
+                return False, err, {"albums": len(albums), "duration_s": round(time.time() - before, 2), "result": result or {}}
+        else:
+            logging.info("[Scan Pipeline] enrich_batch: no album-level improve candidates; continuing with profile backfill only")
 
     profile_metrics: dict[str, Any] = {}
     if _get_library_mode() == "files":
@@ -11894,12 +11898,18 @@ def _files_pg_connect_kwargs() -> dict:
 
 _FILES_PG_MAX_CONNS = max(2, int(os.getenv("FILES_PG_MAX_CONNS", "8") or 8))
 _FILES_PG_ACQUIRE_TIMEOUT_SEC = max(0.5, float(os.getenv("FILES_PG_ACQUIRE_TIMEOUT_SEC", "8") or 8))
+_FILES_PG_UI_RESERVED_CONNS = max(
+    0,
+    min(_FILES_PG_MAX_CONNS - 1, int(os.getenv("FILES_PG_UI_RESERVED_CONNS", "2") or 2)),
+)
+_FILES_PG_BG_MAX_CONNS = max(1, _FILES_PG_MAX_CONNS - _FILES_PG_UI_RESERVED_CONNS)
 _FILES_PG_CONN_GATE = threading.BoundedSemaphore(_FILES_PG_MAX_CONNS)
+_FILES_PG_BG_CONN_GATE = threading.BoundedSemaphore(_FILES_PG_BG_MAX_CONNS)
 _FILES_PG_CONN_STATE_LOCK = threading.Lock()
 _FILES_PG_CONN_ACTIVE = 0
 
 
-def _files_pg_release_connection(conn) -> None:
+def _files_pg_release_connection(conn, release_bg_gate: bool = False) -> None:
     global _FILES_PG_CONN_ACTIVE
     try:
         conn.close()
@@ -11912,14 +11922,19 @@ def _files_pg_release_connection(conn) -> None:
             _FILES_PG_CONN_GATE.release()
         except Exception:
             pass
+        if release_bg_gate:
+            try:
+                _FILES_PG_BG_CONN_GATE.release()
+            except Exception:
+                pass
 
 
 class _FilesPgConnectionProxy:
     __slots__ = ("_conn", "_finalizer", "_closed", "__weakref__")
 
-    def __init__(self, conn) -> None:
+    def __init__(self, conn, *, release_bg_gate: bool = False) -> None:
         self._conn = conn
-        self._finalizer = weakref.finalize(self, _files_pg_release_connection, conn)
+        self._finalizer = weakref.finalize(self, _files_pg_release_connection, conn, release_bg_gate)
         self._closed = False
 
     def close(self) -> None:
@@ -11939,14 +11954,28 @@ class _FilesPgConnectionProxy:
         return False
 
 
-def _files_pg_connect(*, autocommit: bool = True):
+def _files_pg_connect(*, autocommit: bool = True, acquire_timeout_sec: float | None = None):
     global _FILES_PG_LAST_ERROR, _FILES_PG_LAST_OK_TS, _FILES_PG_CONN_ACTIVE
     if psycopg is None:
         _FILES_PG_LAST_ERROR = "psycopg_not_installed"
         return None
     acquired = False
+    acquired_bg = False
+    acquire_timeout = max(0.2, float(acquire_timeout_sec if acquire_timeout_sec is not None else _FILES_PG_ACQUIRE_TIMEOUT_SEC))
+    request_ctx = bool(has_request_context())
     try:
-        acquired = _FILES_PG_CONN_GATE.acquire(timeout=_FILES_PG_ACQUIRE_TIMEOUT_SEC)
+        if (not request_ctx) and _FILES_PG_UI_RESERVED_CONNS > 0:
+            acquired_bg = _FILES_PG_BG_CONN_GATE.acquire(timeout=acquire_timeout)
+            if not acquired_bg:
+                _FILES_PG_LAST_ERROR = "background_pool_reserved"
+                logging.debug(
+                    "Files PG background connection deferred: reserved %d slot(s) for requests (%d active / max %d)",
+                    int(_FILES_PG_UI_RESERVED_CONNS),
+                    int(_FILES_PG_CONN_ACTIVE),
+                    int(_FILES_PG_MAX_CONNS),
+                )
+                return None
+        acquired = _FILES_PG_CONN_GATE.acquire(timeout=acquire_timeout)
         if not acquired:
             _FILES_PG_LAST_ERROR = "pool_timeout"
             logging.warning(
@@ -11960,11 +11989,16 @@ def _files_pg_connect(*, autocommit: bool = True):
             _FILES_PG_CONN_ACTIVE += 1
         _FILES_PG_LAST_OK_TS = time.time()
         _FILES_PG_LAST_ERROR = ""
-        return _FilesPgConnectionProxy(conn)
+        return _FilesPgConnectionProxy(conn, release_bg_gate=acquired_bg)
     except Exception as e:
         if acquired:
             try:
                 _FILES_PG_CONN_GATE.release()
+            except Exception:
+                pass
+        if acquired_bg:
+            try:
+                _FILES_PG_BG_CONN_GATE.release()
             except Exception:
                 pass
         err_kind = e.__class__.__name__
@@ -16215,6 +16249,8 @@ def _rebuild_files_library_index_for_artist(
                     artist_norm=primary_norm,
                     albums=[],
                     allow_soft_profiles=True,
+                    skip_album_profiles=True,
+                    fast_mode=True,
                     force=True,
                 )
                 logging.info(
@@ -19565,6 +19601,8 @@ def _enqueue_files_profile_enrichment(
     albums: list[tuple[str, str]],
     *,
     allow_soft_profiles: Optional[bool] = None,
+    skip_album_profiles: bool = False,
+    fast_mode: bool = False,
     force: bool = False,
 ) -> bool:
     if not artist_norm:
@@ -19587,6 +19625,8 @@ def _enqueue_files_profile_enrichment(
             "artist_norm": artist_norm,
             "albums": albums,
             "allow_soft_profiles": allow_soft_profiles,
+            "skip_album_profiles": bool(skip_album_profiles),
+            "fast_mode": bool(fast_mode),
         },
         daemon=True,
         name=f"profile-enrich-{artist_norm[:24]}",
@@ -48311,9 +48351,10 @@ def background_scan():
                 enabled_chain_jobs: set[str] = set()
                 if include_enrich:
                     enabled_chain_jobs.add("enrich_batch")
-                if bool(pipeline_flags_requested.get("incomplete_move")):
+                files_mode = _get_library_mode() == "files"
+                if (not files_mode) and bool(pipeline_flags_requested.get("incomplete_move")):
                     enabled_chain_jobs.add("incomplete_move")
-                if bool(pipeline_flags_requested.get("dedupe")):
+                if (not files_mode) and bool(pipeline_flags_requested.get("dedupe")):
                     enabled_chain_jobs.add("dedupe")
                 if bool(pipeline_flags_requested.get("export")):
                     enabled_chain_jobs.add("export")
@@ -60323,8 +60364,13 @@ def api_library_stats():
             )
         if not _files_pg_init_schema():
             return jsonify({"error": "PostgreSQL unavailable"}), 503
-        conn = _files_pg_connect()
+        conn = _files_pg_connect(acquire_timeout_sec=0.75)
         if conn is None:
+            cached = _files_cache_get_json(cache_key)
+            if cached is not None:
+                payload = dict(cached)
+                payload["stale"] = True
+                return jsonify(payload)
             return jsonify({"error": "PostgreSQL unavailable"}), 503
         try:
             with conn.cursor() as cur:
@@ -61408,9 +61454,14 @@ def api_library_normalize_album_names():
         ok, err = _ensure_files_index_ready()
         if not ok:
             return jsonify({"error": err or "Files index unavailable"}), 503
-        conn = _files_pg_connect()
+        conn = _files_pg_connect(acquire_timeout_sec=0.75)
         if conn is None:
-            return jsonify({"error": "PostgreSQL unavailable"}), 503
+            cached = _files_cache_get_json(cache_key)
+            if cached is not None:
+                payload = dict(cached)
+                payload["stale"] = True
+                return jsonify(payload)
+            return jsonify({"artists": [], "total": 0, "limit": int(limit), "offset": int(offset), "error": "PostgreSQL unavailable", "stale": True}), 503
         try:
             with conn.cursor() as cur:
                 if album_ids:
@@ -62623,9 +62674,14 @@ def api_library_albums():
     ok, err = _ensure_files_index_ready()
     if not ok:
         return jsonify({"albums": [], "total": 0, "limit": limit, "offset": offset, "error": err or "Files index unavailable"}), 503
-    conn = _files_pg_connect()
+    conn = _files_pg_connect(acquire_timeout_sec=0.75)
     if conn is None:
-        return jsonify({"albums": [], "total": 0, "limit": limit, "offset": offset, "error": "PostgreSQL unavailable"}), 503
+        cached = _files_cache_get_json(cache_key)
+        if cached is not None:
+            payload = dict(cached)
+            payload["stale"] = True
+            return jsonify(payload)
+        return jsonify({"albums": [], "total": 0, "limit": limit, "offset": offset, "error": "PostgreSQL unavailable", "stale": True}), 503
 
     try:
         where_parts = ["1=1", album_match_sql]
