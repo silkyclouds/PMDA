@@ -57,6 +57,85 @@ class ProviderIdentityArbitrationTests(unittest.TestCase):
         )
         self.assertIsNone(result)
 
+    def test_arbitration_rejects_weak_no_tracklist_lastfm_candidate(self):
+        payloads = {
+            "lastfm": {
+                "title": "Takk...",
+                "artist": "Slowdive",
+                "mbid": "fake-lastfm-id",
+            }
+        }
+        result = pmda._arbitrate_provider_identity(
+            artist_name="Slowdive",
+            album_title="Souvlaki",
+            local_track_titles=["Alison", "Machine Gun", "40 Days", "Sing"],
+            provider_payloads=payloads,
+        )
+        self.assertIsNone(result)
+
+    def test_unverified_ai_lookup_hint_does_not_override_display_identity(self):
+        edition = {
+            "artist": "Sigur Rós",
+            "title_raw": "Takk...",
+            "_lookup_artist_name": "Slowdive",
+            "_lookup_album_title": "Souvlaki",
+            "_lookup_identity_hint": {
+                "artist": "Slowdive",
+                "album": "Souvlaki",
+                "confidence": 92,
+                "reason": "track titles point there",
+                "source": "ai_local_context",
+            },
+        }
+        artist, album = pmda._resolve_edition_display_identity(edition)
+        self.assertEqual(artist, "Sigur Rós")
+        self.assertEqual(album, "Takk...")
+
+    def test_filename_pattern_hint_is_safe_for_provider_lookup(self):
+        edition = {
+            "artist": "Unknown Artist",
+            "title_raw": "Unknown Album",
+            "_lookup_artist_name": "Slowdive",
+            "_lookup_album_title": "Souvlaki",
+            "_lookup_identity_hint": {
+                "artist": "Slowdive",
+                "album": "Souvlaki",
+                "confidence": 96,
+                "reason": "stable filename pattern (artist_missing_or_generic, album_missing_or_generic)",
+                "source": "filename_pattern",
+            },
+            "missing_required_tags": ["artist", "album"],
+        }
+        self.assertTrue(
+            pmda._identity_hint_safe_for_provider_lookup(
+                edition,
+                default_artist="Unknown Artist",
+                default_title="Unknown Album",
+            )
+        )
+
+    def test_ai_lookup_hint_not_used_for_provider_lookup_when_local_identity_specific(self):
+        edition = {
+            "artist": "Sigur Rós",
+            "title_raw": "Takk...",
+            "_lookup_artist_name": "Slowdive",
+            "_lookup_album_title": "Souvlaki",
+            "_lookup_identity_hint": {
+                "artist": "Slowdive",
+                "album": "Souvlaki",
+                "confidence": 92,
+                "reason": "track titles point there",
+                "source": "ai_local_context",
+            },
+        }
+        self.assertFalse(
+            pmda._identity_hint_safe_for_provider_lookup(
+                edition,
+                default_artist="Sigur Rós",
+                default_title="Takk...",
+            )
+        )
+
     def test_extract_identity_fields_uses_provider_ids_without_strict_flag(self):
         identity = pmda._extract_files_identity_fields(
             edition={"discogs_release_id": "42", "metadata_source": "discogs"},

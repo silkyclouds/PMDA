@@ -18584,6 +18584,33 @@ def _files_try_artist_image_refresh(
                 summary=str(lastfm_info.get("bio") or lastfm_info.get("short_bio") or "").strip(),
             )
 
+    if classical_like_entity and not ensemble_like_entity:
+        mb_title = str(mb_identity.get("name") or artist_name).strip()
+        mb_summary = "\n".join(
+            str(alias or "").strip()
+            for alias in (mb_identity.get("aliases") or [])
+            if str(alias or "").strip()
+        )
+        for mb_url in [str(url or "").strip() for url in (mb_identity.get("urls") or []) if str(url or "").strip()][:8]:
+            try:
+                resolved_mb_url = _resolve_authoritative_artist_image_url(
+                    mb_url,
+                    artist_name=artist_name,
+                    entity_kind=entity_kind,
+                    role_hints=role_hints,
+                    page_title=mb_title,
+                    page_summary=mb_summary,
+                )
+            except Exception:
+                resolved_mb_url = ""
+            if resolved_mb_url:
+                _append_candidate(
+                    "musicbrainz_url",
+                    resolved_mb_url,
+                    title=mb_title,
+                    summary=mb_summary,
+                )
+
     wiki_img_url = str(wiki_info.get("image_url") or "").strip()
     if not wiki_img_url:
         for lookup_name in artist_lookup_candidates[:4]:
@@ -18641,8 +18668,12 @@ def _files_try_artist_image_refresh(
 
     preferred_order = (
         ["wikipedia", "commons", "fanart", "lastfm", "audiodb", "discogs"]
-        if ensemble_like_entity or classical_like_entity
-        else ["fanart", "lastfm", "wikipedia", "commons", "audiodb", "discogs"]
+        if ensemble_like_entity
+        else (
+            ["musicbrainz_url", "wikipedia", "commons", "fanart", "lastfm", "audiodb", "discogs"]
+            if classical_like_entity
+            else ["fanart", "lastfm", "wikipedia", "commons", "audiodb", "discogs"]
+        )
     )
     ordered_candidates: list[dict[str, str]] = []
     for provider in preferred_order:
@@ -18915,6 +18946,8 @@ def _run_files_profile_enrichment_job(
                                 entity_kind=entity_kind,
                                 roles_json=role_hints,
                             )
+                        _files_sync_artist_aliases(conn, artist_norms=[artist_norm])
+                        _files_merge_duplicate_person_artists(conn, force=True)
                 except Exception:
                     mb_identity = {}
             existing_profile = _files_get_artist_profile_cached(artist_name, artist_norm)
@@ -30345,12 +30378,12 @@ def _files_best_person_entity_kind(entity_kinds: list[str], role_values: list[st
     return "artist"
 
 
-def _files_merge_duplicate_person_artists(conn) -> None:
+def _files_merge_duplicate_person_artists(conn, *, force: bool = False) -> None:
     try:
         with conn.cursor() as cur:
             cur.execute("SELECT COALESCE(value, '') FROM files_index_meta WHERE key = 'artist_person_merge_schema' LIMIT 1")
             row = cur.fetchone()
-            if row and str(row[0] or "").strip() == "v4":
+            if (not force) and row and str(row[0] or "").strip() == "v5":
                 return
             cur.execute(
                 """
@@ -30442,7 +30475,7 @@ def _files_merge_duplicate_person_artists(conn) -> None:
                 cur.execute(
                     """
                     INSERT INTO files_index_meta(key, value, updated_at)
-                    VALUES ('artist_person_merge_schema', 'v4', NOW())
+                    VALUES ('artist_person_merge_schema', 'v5', NOW())
                     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
                     """
                 )
@@ -30496,7 +30529,7 @@ def _files_merge_duplicate_person_artists(conn) -> None:
                 cur.execute(
                     """
                     INSERT INTO files_index_meta(key, value, updated_at)
-                    VALUES ('artist_person_merge_schema', 'v4', NOW())
+                    VALUES ('artist_person_merge_schema', 'v5', NOW())
                     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
                     """
                 )
@@ -30634,7 +30667,7 @@ def _files_merge_duplicate_person_artists(conn) -> None:
             cur.execute(
                 """
                 INSERT INTO files_index_meta(key, value, updated_at)
-                VALUES ('artist_person_merge_schema', 'v4', NOW())
+                VALUES ('artist_person_merge_schema', 'v5', NOW())
                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
                 """
             )
@@ -32207,9 +32240,14 @@ def _provider_candidate_soft_identity_ok(
     ocr_artist_score = float(candidate.get("ocr_artist_score") or 0.0)
     track_score = float(candidate.get("track_score") or 0.0)
     confidence = float(candidate.get("confidence") or 0.0)
+    provider = _normalize_identity_provider(str(candidate.get("provider") or ""))
     has_provider_tracklist = bool(candidate.get("has_provider_tracklist"))
     has_local_tracklist = bool(candidate.get("has_local_tracklist"))
     track_count_ratio = float(candidate.get("track_count_ratio") or 0.0)
+    local_track_count = int(candidate.get("local_track_count") or 0)
+    strict_reject = _strict_reject_code(
+        str(candidate.get("strict_reject_reason") or candidate.get("strict_reason") or "")
+    )
     if bool(candidate.get("classical_guard_applies")) and not bool(candidate.get("classical_guard_ok")):
         return (False, str(candidate.get("classical_guard_reason") or "classical_context_insufficient"))
 
@@ -32245,12 +32283,31 @@ def _provider_candidate_soft_identity_ok(
         if track_score < 0.40 and track_count_ratio < 0.80:
             return (False, "track_title_mismatch")
     else:
-        # No provider tracklist: keep it possible, but require stronger artist/title confidence.
+        # No provider tracklist: only allow near-exact identity. This keeps sparse
+        # providers from "winning" on title/artist fuzz alone.
+        if strict_reject in {
+            "artist_mismatch",
+            "album_mismatch",
+            "classical_work_mismatch",
+            "classical_composer_mismatch",
+            "classical_performance_mismatch",
+        }:
+            return (False, strict_reject)
+        title_gate = max(title_score, ocr_title_score)
+        artist_gate = max(artist_score, ocr_artist_score)
         if (not has_provider_tracklist) and (
-            max(title_score, ocr_title_score) < 0.86
-            or max(artist_score, ocr_artist_score) < 0.82
-            or confidence < max(float(min_confidence), 0.82)
+            title_gate < 0.94
+            or artist_gate < 0.88
+            or confidence < max(float(min_confidence), 0.86)
         ):
+            return (False, "provider_no_tracklist")
+        if local_track_count >= 5 and (
+            title_gate < 0.97
+            or artist_gate < 0.92
+            or confidence < max(float(min_confidence), 0.90)
+        ):
+            return (False, "provider_no_tracklist")
+        if provider == "lastfm" and local_track_count >= 3 and confidence < max(float(min_confidence), 0.92):
             return (False, "provider_no_tracklist")
 
     return (True, "soft_identity_ok")
@@ -33106,6 +33163,66 @@ def _edition_missing_required_tags_set(edition: dict | None) -> set[str]:
     return out
 
 
+def _edition_has_verified_provider_identity(edition: dict | None) -> bool:
+    e = edition if isinstance(edition, dict) else {}
+    provider = _normalize_identity_provider(
+        str(
+            e.get("identity_provider")
+            or e.get("metadata_source")
+            or e.get("primary_metadata_source")
+            or ""
+        )
+    )
+    return bool(
+        e.get("strict_match_verified")
+        or e.get("soft_match_verified")
+        or e.get("provider_identity_soft_match")
+        or str(e.get("musicbrainz_id") or "").strip()
+        or str(e.get("discogs_release_id") or "").strip()
+        or str(e.get("lastfm_album_mbid") or "").strip()
+        or str(e.get("bandcamp_album_url") or "").strip()
+        or provider in {"musicbrainz", "discogs", "lastfm", "bandcamp"}
+    )
+
+
+def _identity_hint_safe_for_provider_lookup(
+    edition: dict | None,
+    *,
+    default_artist: str = "",
+    default_title: str = "",
+) -> bool:
+    e = edition if isinstance(edition, dict) else {}
+    hint = e.get("_lookup_identity_hint") if isinstance(e.get("_lookup_identity_hint"), dict) else {}
+    hint_source = str(hint.get("source") or "").strip().lower()
+    try:
+        hint_confidence = int(float(hint.get("confidence") or 0))
+    except Exception:
+        hint_confidence = 0
+    if hint_source == "filename_pattern":
+        return hint_confidence >= 90
+    if hint_source != "ai_local_context":
+        return False
+    missing_required = _edition_missing_required_tags_set(e)
+    current_artist = str(
+        e.get("artist")
+        or e.get("artist_name")
+        or default_artist
+        or ""
+    ).strip()
+    current_title = str(
+        e.get("title_raw")
+        or e.get("album_title")
+        or default_title
+        or ""
+    ).strip()
+    return bool(
+        "artist" in missing_required
+        or "album" in missing_required
+        or _identity_text_is_generic(current_artist)
+        or _identity_text_is_generic(current_title)
+    )
+
+
 def _prefer_identity_hint_value(
     *,
     current_value: str,
@@ -33183,6 +33300,9 @@ def _resolve_edition_display_identity(
             or "album_missing_or_generic" in hint_reason
         )
     )
+    if hint_source == "ai_local_context" and not _edition_has_verified_provider_identity(e):
+        hinted_artist = ""
+        hinted_album = ""
     if force_hint_override:
         logging.info(
             "[Identity] forcing filename-pattern override artist=%r -> %r album=%r -> %r reason=%s confidence=%s",
@@ -36157,8 +36277,21 @@ def scan_duplicates(
             # Fallback when MusicBrainz found nothing: try Discogs, Bandcamp, then Last.fm for metadata
             # (and optionally MB ID from Last.fm as the last resort).
             title_raw_local = e.get("title_raw") or e.get("plex_title") or album_norm
-            lookup_artist_for_provider = str(e.get("_lookup_artist_name") or artist or "").strip() or str(artist or "").strip()
-            title_raw = str(e.get("_lookup_album_title") or title_raw_local or "").strip() or str(title_raw_local or "")
+            use_hint_for_provider_lookup = _identity_hint_safe_for_provider_lookup(
+                e,
+                default_artist=str(artist or "").strip(),
+                default_title=str(title_raw_local or "").strip(),
+            )
+            lookup_artist_for_provider = (
+                str(e.get("_lookup_artist_name") or artist or "").strip()
+                if use_hint_for_provider_lookup
+                else str(artist or "").strip()
+            ) or str(artist or "").strip()
+            title_raw = (
+                str(e.get("_lookup_album_title") or title_raw_local or "").strip()
+                if use_hint_for_provider_lookup
+                else str(title_raw_local or "").strip()
+            ) or str(title_raw_local or "")
             if (lookup_artist_for_provider != str(artist or "").strip()) or (title_raw != str(title_raw_local or "").strip()):
                 logging.info(
                     "[Providers Lookup] local=%r - %r | using hint=%r - %r",
@@ -36433,8 +36566,21 @@ def scan_duplicates(
                                     pass
                                 except Exception:
                                     pass
-            strict_ref_artist = str(e.get("_lookup_artist_name") or artist or "").strip() or str(artist or "").strip()
-            strict_ref_title = str(e.get("_lookup_album_title") or title_raw or "").strip() or str(title_raw or "")
+            use_hint_for_strict_validation = _identity_hint_safe_for_provider_lookup(
+                e,
+                default_artist=str(artist or "").strip(),
+                default_title=str(title_raw or "").strip(),
+            )
+            strict_ref_artist = (
+                str(e.get("_lookup_artist_name") or artist or "").strip()
+                if use_hint_for_strict_validation
+                else str(artist or "").strip()
+            ) or str(artist or "").strip()
+            strict_ref_title = (
+                str(e.get("_lookup_album_title") or title_raw or "").strip()
+                if use_hint_for_strict_validation
+                else str(title_raw or "").strip()
+            ) or str(title_raw or "")
             strict_verdict = _strict_validate_edition_match(
                 artist_name=strict_ref_artist,
                 album_title=strict_ref_title,
@@ -70743,8 +70889,16 @@ def _artist_external_image_requires_authoritative_refresh(
     )
     if provider_low in _ARTIST_WEAK_CLASSICAL_IMAGE_PROVIDERS:
         return True
-    if provider_low in {"musicbrainz_url", "web_authoritative"} and url_low and "wikimedia.org" not in url_low and "wikipedia.org" not in url_low:
+    if provider_low == "web_authoritative" and url_low and "wikimedia.org" not in url_low and "wikipedia.org" not in url_low:
         return True
+    if provider_low == "musicbrainz_url":
+        # MusicBrainz URL relations are an authoritative identity source for person-like
+        # classical entities once the final image URL has passed relevance checks.
+        # Keep ensemble-like entities stricter because Spotify/CDN avatars often collapse
+        # to venue/concert-hall imagery or generic logos for orchestras/choirs.
+        if ensemble_like and url_low and "i.scdn.co/image/" in url_low:
+            return True
+        return False
     if ensemble_like and url_low and "i.scdn.co/image/" in url_low:
         return True
     if provider_low == "wikipedia" and url_low and "wikimedia.org" not in url_low and "wikipedia.org" not in url_low:
