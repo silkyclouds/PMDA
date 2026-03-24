@@ -41407,7 +41407,7 @@ def _refresh_files_album_scan_cache_from_editions(editions: list[dict], scan_id:
     """
     if not editions:
         return
-    candidates: list[dict] = []
+    rows: list[dict] = []
     now = time.time()
     pg_conn = None
     try:

@@ -33,6 +33,39 @@ class FilesAsyncPipelineTests(unittest.TestCase):
             finally:
                 pmda.STATE_DB_FILE = orig_state_db
 
+    def test_refresh_files_album_scan_cache_from_editions_upserts_rows(self):
+        with TemporaryDirectory() as tmpdir:
+            album_dir = Path(tmpdir) / "Artist" / "Album"
+            album_dir.mkdir(parents=True, exist_ok=True)
+            audio_path = album_dir / "01 - Track.mp3"
+            audio_path.write_bytes(b"fake-mp3")
+            captured = {}
+            orig_pg = pmda._files_pg_connect
+            orig_extract = pmda.extract_tags
+            orig_upsert = pmda._upsert_files_album_scan_cache_rows
+            try:
+                pmda._files_pg_connect = lambda *args, **kwargs: None
+                pmda.extract_tags = lambda _path: {}
+                pmda._upsert_files_album_scan_cache_rows = lambda rows: captured.setdefault("rows", list(rows))
+                pmda._refresh_files_album_scan_cache_from_editions(
+                    [
+                        {
+                            "folder": str(album_dir),
+                            "artist": "Artist",
+                            "title_raw": "Album",
+                            "tracks": [{"title": "Track", "idx": 1}],
+                        }
+                    ],
+                    scan_id=99,
+                )
+                self.assertEqual(len(captured.get("rows") or []), 1)
+                self.assertEqual(captured["rows"][0]["artist_name"], "Artist")
+                self.assertEqual(captured["rows"][0]["album_title"], "Album")
+            finally:
+                pmda._files_pg_connect = orig_pg
+                pmda.extract_tags = orig_extract
+                pmda._upsert_files_album_scan_cache_rows = orig_upsert
+
     def test_pipeline_inline_flags_keep_dedupe_and_incomplete_in_files_async_mode(self):
         requested = {
             "match_fix": True,
