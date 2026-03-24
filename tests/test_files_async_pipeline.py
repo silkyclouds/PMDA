@@ -6,6 +6,22 @@ import pmda
 
 
 class FilesAsyncPipelineTests(unittest.TestCase):
+    def test_pipeline_inline_flags_keep_dedupe_and_incomplete_in_files_async_mode(self):
+        requested = {
+            "match_fix": True,
+            "dedupe": True,
+            "incomplete_move": True,
+            "export": True,
+            "player_sync": True,
+            "sync_target": "none",
+        }
+        inline = pmda._pipeline_inline_flags(requested, pipeline_async_enabled=True)
+        self.assertFalse(bool(inline.get("match_fix")))
+        self.assertTrue(bool(inline.get("dedupe")))
+        self.assertTrue(bool(inline.get("incomplete_move")))
+        self.assertFalse(bool(inline.get("export")))
+        self.assertFalse(bool(inline.get("player_sync")))
+
     def test_scheduler_enrich_batch_skips_legacy_magic_in_files_mode(self):
         orig_get_library_mode = pmda._get_library_mode
         orig_build_candidates = pmda._scheduler_build_improve_candidates

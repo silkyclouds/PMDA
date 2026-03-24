@@ -8204,7 +8204,7 @@ def _normalize_root_path(raw_path: str | Path | None) -> str:
 
 
 def _files_source_roots_fetch(*, enabled_only: bool = False) -> list[dict]:
-    candidates: list[dict] = []
+    rows: list[dict] = []
     try:
         con = sqlite3.connect(str(STATE_DB_FILE), timeout=15)
         con.row_factory = sqlite3.Row
@@ -41407,7 +41407,7 @@ def _refresh_files_album_scan_cache_from_editions(editions: list[dict], scan_id:
     """
     if not editions:
         return
-    rows: list[dict] = []
+    candidates: list[dict] = []
     now = time.time()
     pg_conn = None
     try:
@@ -42690,7 +42690,7 @@ def _publish_files_library_artist_from_items(
     """
     if not items:
         return 0
-    rows: list[dict] = []
+    candidates: list[dict] = []
     now = time.time()
     results_by_album_id = results_by_album_id or {}
     pg_conn = None
@@ -46250,6 +46250,25 @@ def _pipeline_flags_for_scan(scan_type: str, run_improve_after_requested: bool) 
     }
 
 
+def _pipeline_inline_flags(
+    pipeline_flags_requested: dict[str, bool | str] | None,
+    *,
+    pipeline_async_enabled: bool,
+) -> dict[str, bool | str]:
+    flags = dict(pipeline_flags_requested or {})
+    if pipeline_async_enabled:
+        # Files scans must still finish the "truth" part of the pipeline inline:
+        #   - broken/incomplete quarantine
+        #   - dedupe moves
+        # Only enrichment/export/player sync are deferred.
+        flags.update(
+            match_fix=False,
+            export=False,
+            player_sync=False,
+        )
+    return flags
+
+
 def _auto_move_incomplete_albums_for_scan(
     scan_id: int | None,
     editions_by_artist: dict[str, list[dict]] | None,
@@ -46825,15 +46844,10 @@ def background_scan():
         scan_type = "full"
     pipeline_flags_requested = _pipeline_flags_for_scan(scan_type, run_improve_after_requested)
     pipeline_async_enabled = bool(PIPELINE_POST_SCAN_ASYNC and scan_type in {"full", "changed_only"})
-    pipeline_flags = dict(pipeline_flags_requested)
-    if pipeline_async_enabled:
-        pipeline_flags.update(
-            match_fix=False,
-            dedupe=False,
-            incomplete_move=False,
-            export=False,
-            player_sync=False,
-        )
+    pipeline_flags = _pipeline_inline_flags(
+        pipeline_flags_requested,
+        pipeline_async_enabled=bool(pipeline_async_enabled),
+    )
     scan_task_job_type = "scan_changed" if scan_type == "changed_only" else "scan_full"
     scan_task_scope = "new" if scan_type == "changed_only" else "full"
     scan_task_source = scan_auto_trigger
@@ -47220,15 +47234,10 @@ def background_scan():
         # Reload AUTO_MOVE_DUPES from DB so scan uses current setting (UI may have toggled it)
         _reload_auto_move_from_db()
         pipeline_flags_requested = _pipeline_flags_for_scan(scan_type, run_improve_after_requested)
-        pipeline_flags = dict(pipeline_flags_requested)
-        if pipeline_async_enabled:
-            pipeline_flags.update(
-                match_fix=False,
-                dedupe=False,
-                incomplete_move=False,
-                export=False,
-                player_sync=False,
-            )
+        pipeline_flags = _pipeline_inline_flags(
+            pipeline_flags_requested,
+            pipeline_async_enabled=bool(pipeline_async_enabled),
+        )
         # Files changed-only scans can legitimately produce 0 albums to process (e.g. watcher noise,
         # or a folder that is unchanged+healthy and gets fast-skipped). In that case, skip expensive
         # pipeline steps (export rebuild, player sync, etc.) so the auto background scan stays fast.
