@@ -8219,7 +8219,7 @@ def _files_source_roots_fetch(*, enabled_only: bool = False) -> list[dict]:
         query += " ORDER BY priority ASC, source_id ASC"
         cur.execute(query, params)
         for row in cur.fetchall():
-            candidates.append(
+            rows.append(
                 {
                     "source_id": int(row["source_id"] or 0),
                     "path": str(row["path"] or ""),
@@ -8234,7 +8234,7 @@ def _files_source_roots_fetch(*, enabled_only: bool = False) -> list[dict]:
         con.close()
     except Exception:
         logging.debug("Failed to fetch files_source_roots", exc_info=True)
-    return candidates
+    return rows
 
 
 def _effective_files_source_rows(*, enabled_only: bool = True) -> list[dict]:
