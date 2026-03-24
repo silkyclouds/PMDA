@@ -77,6 +77,14 @@ class ScanProgressStateTests(unittest.TestCase):
             pmda._pipeline_bootstrap_status = orig_bootstrap
             pmda._files_library_browse_counts = orig_counts
 
+
+
+    def test_collapse_classical_person_aliases_prefers_best_display_for_equivalent_aliases(self):
+        merged = pmda._collapse_classical_person_aliases(
+            ["piotr ilyitch tchaikovsky", "Pyotr Ilyich Tchaikovsky"],
+        )
+        self.assertEqual(merged, ["Pyotr Ilyich Tchaikovsky"])
+
     def test_library_artist_display_name_prefers_original_classical_alias(self):
         orig_pref = pmda.CLASSICAL_NAME_PREFERENCE
         try:
@@ -98,6 +106,18 @@ class ScanProgressStateTests(unittest.TestCase):
                 aliases_json='["Peter Tchaikovsky", "Pyotr Ilyich Tchaikovsky"]',
             )
             self.assertEqual(display_en, "Peter Tchaikovsky")
+        finally:
+            pmda.CLASSICAL_NAME_PREFERENCE = orig_pref
+
+    def test_choose_preferred_person_identity_name_upgrades_lowercase_transliteration(self):
+        orig_pref = pmda.CLASSICAL_NAME_PREFERENCE
+        try:
+            pmda.CLASSICAL_NAME_PREFERENCE = "original"
+            chosen = pmda._choose_preferred_person_identity_name(
+                "piotr ilyitch tchaikovsky",
+                "Pyotr Ilyich Tchaikovsky",
+            )
+            self.assertEqual(chosen, "Pyotr Ilyich Tchaikovsky")
         finally:
             pmda.CLASSICAL_NAME_PREFERENCE = orig_pref
 

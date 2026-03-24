@@ -29823,6 +29823,20 @@ def _classical_person_name_looks_english(value: str) -> bool:
     return bool(tokens.intersection(_CLASSICAL_PERSON_ENGLISH_GIVEN_NAMES))
 
 
+def _identity_case_quality_score(value: str) -> tuple[int, int, int]:
+    txt = " ".join(str(value or "").split()).strip()
+    if not txt:
+        return (-1, -1, -1)
+    alpha_tokens = re.findall(r"[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ'’.-]*", txt)
+    title_case = 1 if alpha_tokens and all(
+        token[:1].isupper() and any(ch.islower() for ch in token[1:])
+        for token in alpha_tokens
+    ) else 0
+    mixed_case = 1 if any(ch.islower() for ch in txt) and any(ch.isupper() for ch in txt) else 0
+    all_lower = 1 if txt == txt.lower() else 0
+    return (title_case, mixed_case, 0 if all_lower else 1)
+
+
 def _classical_person_display_preference_score(
     value: str,
     *,
@@ -29837,29 +29851,72 @@ def _classical_person_display_preference_score(
         preference if preference is not None else globals().get("CLASSICAL_NAME_PREFERENCE", CLASSICAL_NAME_PREFERENCE)
     )
     quality = _identity_display_quality_score(txt)
+    case_quality = _identity_case_quality_score(txt)
     ascii_only = 1 if all(ord(ch) < 128 for ch in txt) else 0
     looks_english = 1 if _classical_person_name_looks_english(txt) else 0
     if pref == "english":
         return (
             ascii_only,
             looks_english,
+            case_quality[0],
+            case_quality[1],
+            case_quality[2],
             1 if current else 0,
             1 if primary and ascii_only else 0,
             quality[0],
             quality[2],
-            quality[3],
             quality[4],
         )
     return (
         0 if looks_english else 1,
+        case_quality[0],
+        case_quality[1],
+        case_quality[2],
         quality[1],
         quality[0],
-        quality[4],
         1 if primary else 0,
         quality[2],
-        quality[3],
+        quality[4],
         1 if current else 0,
     )
+
+
+def _collapse_classical_person_aliases(
+    values: list[str] | tuple[str, ...] | None,
+    *,
+    preference: str | None = None,
+) -> list[str]:
+    collapsed: list[str] = []
+    best_scores: list[tuple[Any, ...]] = []
+    for raw in values or []:
+        clean = " ".join(str(raw or "").split()).strip()
+        if not clean:
+            continue
+        norm = _norm_artist_key(clean)
+        if not norm:
+            continue
+        score = _classical_person_display_preference_score(clean, preference=preference)
+        replaced = False
+        for idx, existing in enumerate(collapsed):
+            if not _classical_person_names_equivalent(existing, clean):
+                continue
+            replaced = True
+            if score > best_scores[idx]:
+                collapsed[idx] = clean
+                best_scores[idx] = score
+            break
+        if not replaced:
+            collapsed.append(clean)
+            best_scores.append(score)
+    out: list[str] = []
+    seen: set[str] = set()
+    for clean in collapsed:
+        norm = _norm_artist_key(clean)
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        out.append(clean)
+    return out
 
 
 def _select_classical_person_display_name(
@@ -29881,11 +29938,11 @@ def _select_classical_person_display_name(
         for candidate in candidates:
             if _classical_person_names_equivalent(base_name, candidate):
                 filtered.append(candidate)
-    pool = filtered or candidates
+    pool = _collapse_classical_person_aliases(filtered or candidates, preference=preference)
     primary_norm = _norm_artist_key(primary_txt)
     current_norm = _norm_artist_key(current_txt)
     best = ""
-    best_score: tuple[int, int, int, int, int, int, int, int] | None = None
+    best_score: tuple[int, ...] | None = None
     for candidate in pool:
         candidate_norm = _norm_artist_key(candidate)
         score = _classical_person_display_preference_score(
@@ -30174,8 +30231,8 @@ def _musicbrainz_artist_identity_lookup(
 
 
 def _files_merge_artist_alias_values(*sources: Any) -> list[str]:
-    out: list[str] = []
-    seen: set[str] = set()
+    best_by_norm: dict[str, str] = {}
+    order: list[str] = []
     for source in sources:
         raw = source
         if isinstance(raw, str):
@@ -30185,11 +30242,16 @@ def _files_merge_artist_alias_values(*sources: Any) -> list[str]:
         for value in raw:
             clean = " ".join(str(value or "").split()).strip()
             norm = _norm_artist_key(clean)
-            if not clean or not norm or norm in seen:
+            if not clean or not norm:
                 continue
-            seen.add(norm)
-            out.append(clean)
-    return out
+            current = best_by_norm.get(norm)
+            if current is None:
+                best_by_norm[norm] = clean
+                order.append(norm)
+                continue
+            if _identity_display_quality_score(clean) > _identity_display_quality_score(current):
+                best_by_norm[norm] = clean
+    return [best_by_norm[norm] for norm in order if norm in best_by_norm]
 
 
 def _files_upsert_artist_canonical_identity(
@@ -30224,6 +30286,7 @@ def _files_upsert_artist_canonical_identity(
         existing_aliases = []
     merged_aliases = _files_merge_artist_alias_values(existing_aliases, [current_name, canonical], aliases or [])
     if person_like:
+        merged_aliases = _collapse_classical_person_aliases(merged_aliases)
         canonical = _select_classical_person_display_name(
             current_name=current_name,
             primary_name=canonical,
@@ -30486,7 +30549,7 @@ def _files_merge_duplicate_person_artists(conn, *, force: bool = False) -> None:
         with conn.cursor() as cur:
             cur.execute("SELECT COALESCE(value, '') FROM files_index_meta WHERE key = 'artist_person_merge_schema' LIMIT 1")
             row = cur.fetchone()
-            if (not force) and row and str(row[0] or "").strip() == "v5":
+            if (not force) and row and str(row[0] or "").strip() == "v6":
                 return
             cur.execute(
                 """
@@ -30547,6 +30610,8 @@ def _files_merge_duplicate_person_artists(conn, *, force: bool = False) -> None:
             aliases_json or [],
             alias_values_by_id.get(aid, []),
         )
+        if person_like:
+            merged_aliases = _collapse_classical_person_aliases(merged_aliases)
         alias_norms = {
             _norm_artist_key(value)
             for value in merged_aliases
@@ -30578,7 +30643,7 @@ def _files_merge_duplicate_person_artists(conn, *, force: bool = False) -> None:
                 cur.execute(
                     """
                     INSERT INTO files_index_meta(key, value, updated_at)
-                    VALUES ('artist_person_merge_schema', 'v5', NOW())
+                    VALUES ('artist_person_merge_schema', 'v6', NOW())
                     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
                     """
                 )
@@ -30662,7 +30727,7 @@ def _files_merge_duplicate_person_artists(conn, *, force: bool = False) -> None:
                 cur.execute(
                     """
                     INSERT INTO files_index_meta(key, value, updated_at)
-                    VALUES ('artist_person_merge_schema', 'v5', NOW())
+                    VALUES ('artist_person_merge_schema', 'v6', NOW())
                     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
                     """
                 )
@@ -30709,6 +30774,7 @@ def _files_merge_duplicate_person_artists(conn, *, force: bool = False) -> None:
                     promoted_image_path = row_image_path
                     promoted_has_image = bool(row.get("has_image")) or _existing_file_path(row_image_path)
             merged_aliases = _files_merge_artist_alias_values(all_aliases, [chosen_name])
+            merged_aliases = _collapse_classical_person_aliases(merged_aliases)
             chosen_name = _select_classical_person_display_name(
                 current_name=str(winner.get("name") or "").strip(),
                 primary_name=chosen_name,
@@ -30800,7 +30866,7 @@ def _files_merge_duplicate_person_artists(conn, *, force: bool = False) -> None:
             cur.execute(
                 """
                 INSERT INTO files_index_meta(key, value, updated_at)
-                VALUES ('artist_person_merge_schema', 'v5', NOW())
+                VALUES ('artist_person_merge_schema', 'v6', NOW())
                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
                 """
             )
@@ -31127,6 +31193,7 @@ def _build_files_browse_artist_entities(
             if _norm_artist_key(value) != canonical_norm
         ]
         if _artist_is_person_like(entity_kind=str(bucket.get("entity_kind") or ""), role_hints=role_values):
+            alias_values = _collapse_classical_person_aliases(alias_values)
             bucket["name"] = _select_classical_person_display_name(
                 current_name=str(bucket.get("name") or "").strip(),
                 primary_name=str(bucket.get("canonical_name_hint") or bucket.get("name") or "").strip(),
@@ -61763,9 +61830,22 @@ def api_library_artists():
         album_count_match_sql = _library_albums_match_where(include_unmatched, "alb_cnt")
         limit = max(1, min(500, _parse_int_loose(request.args.get("limit"), 100)))
         offset = max(0, _parse_int_loose(request.args.get("offset"), 0))
+        with lock:
+            live_cache_generation = (
+                f"{int(state.get('scan_published_albums_count') or 0)}:"
+                f"{int(state.get('scan_processed_albums_count') or 0)}:"
+                f"{int(state.get('scan_artists_processed') or 0)}"
+                if bool(
+                    state.get("scanning")
+                    or state.get("scan_starting")
+                    or state.get("scan_finalizing")
+                    or state.get("scan_post_processing")
+                )
+                else "idle"
+            )
         cache_key = (
             f"library:artists:{search_query.lower()}:{genre.lower()}:{label.lower()}:"
-            f"{int(year or 0)}:{limit}:{offset}:{_library_cache_unmatched_suffix(include_unmatched)}"
+            f"{int(year or 0)}:{limit}:{offset}:{_library_cache_unmatched_suffix(include_unmatched)}:{live_cache_generation}"
         )
         cached = _files_cache_get_json(cache_key)
         if cached is not None:
@@ -62864,8 +62944,21 @@ def api_library_albums():
     user_id = _current_user_id_or_zero()
     limit = max(1, min(240, _parse_int_loose(request.args.get("limit"), 80)))
     offset = max(0, _parse_int_loose(request.args.get("offset"), 0))
+    with lock:
+        live_cache_generation = (
+            f"{int(state.get('scan_published_albums_count') or 0)}:"
+            f"{int(state.get('scan_processed_albums_count') or 0)}:"
+            f"{int(state.get('scan_artists_processed') or 0)}"
+            if bool(
+                state.get("scanning")
+                or state.get("scan_starting")
+                or state.get("scan_finalizing")
+                or state.get("scan_post_processing")
+            )
+            else "idle"
+        )
 
-    cache_key = f"library:albums:u{user_id}:{search_query.lower()}:{genre.lower()}:{label.lower()}:{int(year or 0)}:{sort}:{limit}:{offset}:{_library_cache_unmatched_suffix(include_unmatched)}"
+    cache_key = f"library:albums:u{user_id}:{search_query.lower()}:{genre.lower()}:{label.lower()}:{int(year or 0)}:{sort}:{limit}:{offset}:{_library_cache_unmatched_suffix(include_unmatched)}:{live_cache_generation}"
     cached = _files_cache_get_json(cache_key)
     if cached is not None:
         return jsonify(cached)
@@ -62962,7 +63055,7 @@ def api_library_albums():
                 f"""
                 SELECT COUNT(*)
                 FROM files_albums alb
-                JOIN files_artists ar ON ar.id = alb.artist_id
+                LEFT JOIN files_artists ar ON ar.id = alb.artist_id
                 WHERE {" AND ".join(where_parts)}
                 """,
                 params,
@@ -62996,9 +63089,9 @@ def api_library_albums():
                     COALESCE(pr.heat_label, '') AS heat_label,
                     COALESCE(ur.rating, 0) AS user_rating
                 FROM files_albums alb
-                JOIN files_artists ar ON ar.id = alb.artist_id
+                LEFT JOIN files_artists ar ON ar.id = alb.artist_id
                 LEFT JOIN files_album_profiles pr
-                       ON pr.artist_norm = ar.name_norm
+                       ON pr.artist_norm = COALESCE(ar.name_norm, '')
                       AND pr.title_norm = alb.title_norm
                 LEFT JOIN files_user_album_ratings ur
                        ON ur.album_id = alb.id
