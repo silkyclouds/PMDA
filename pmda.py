@@ -46,6 +46,7 @@ import subprocess
 import threading
 import time
 import atexit
+import weakref
 from datetime import datetime, timedelta, time as dt_time
 from collections import defaultdict, OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout, as_completed, wait
@@ -11886,23 +11887,93 @@ def _files_pg_connect_kwargs() -> dict:
         "user": PMDA_PG_USER,
         "password": PMDA_PG_PASSWORD,
         "connect_timeout": 5,
+        "application_name": "pmda-files",
     }
 
 
+_FILES_PG_MAX_CONNS = max(2, int(os.getenv("FILES_PG_MAX_CONNS", "8") or 8))
+_FILES_PG_ACQUIRE_TIMEOUT_SEC = max(0.5, float(os.getenv("FILES_PG_ACQUIRE_TIMEOUT_SEC", "8") or 8))
+_FILES_PG_CONN_GATE = threading.BoundedSemaphore(_FILES_PG_MAX_CONNS)
+_FILES_PG_CONN_STATE_LOCK = threading.Lock()
+_FILES_PG_CONN_ACTIVE = 0
+
+
+def _files_pg_release_connection(conn) -> None:
+    global _FILES_PG_CONN_ACTIVE
+    try:
+        conn.close()
+    except Exception:
+        pass
+    finally:
+        with _FILES_PG_CONN_STATE_LOCK:
+            _FILES_PG_CONN_ACTIVE = max(0, int(_FILES_PG_CONN_ACTIVE) - 1)
+        try:
+            _FILES_PG_CONN_GATE.release()
+        except Exception:
+            pass
+
+
+class _FilesPgConnectionProxy:
+    __slots__ = ("_conn", "_finalizer", "_closed", "__weakref__")
+
+    def __init__(self, conn) -> None:
+        self._conn = conn
+        self._finalizer = weakref.finalize(self, _files_pg_release_connection, conn)
+        self._closed = False
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._finalizer()
+
+    def __getattr__(self, name: str):
+        return getattr(self._conn, name)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        self.close()
+        return False
+
+
 def _files_pg_connect(*, autocommit: bool = True):
-    global _FILES_PG_LAST_ERROR, _FILES_PG_LAST_OK_TS
+    global _FILES_PG_LAST_ERROR, _FILES_PG_LAST_OK_TS, _FILES_PG_CONN_ACTIVE
     if psycopg is None:
         _FILES_PG_LAST_ERROR = "psycopg_not_installed"
         return None
+    acquired = False
     try:
+        acquired = _FILES_PG_CONN_GATE.acquire(timeout=_FILES_PG_ACQUIRE_TIMEOUT_SEC)
+        if not acquired:
+            _FILES_PG_LAST_ERROR = "pool_timeout"
+            logging.warning(
+                "Files PG connection delayed: app pool exhausted (%d active / max %d)",
+                int(_FILES_PG_CONN_ACTIVE),
+                int(_FILES_PG_MAX_CONNS),
+            )
+            return None
         conn = psycopg.connect(**_files_pg_connect_kwargs(), autocommit=autocommit)
+        with _FILES_PG_CONN_STATE_LOCK:
+            _FILES_PG_CONN_ACTIVE += 1
         _FILES_PG_LAST_OK_TS = time.time()
         _FILES_PG_LAST_ERROR = ""
-        return conn
+        return _FilesPgConnectionProxy(conn)
     except Exception as e:
+        if acquired:
+            try:
+                _FILES_PG_CONN_GATE.release()
+            except Exception:
+                pass
         err_kind = e.__class__.__name__
         _FILES_PG_LAST_ERROR = err_kind
-        logging.warning("Files PG connection failed (%s)", err_kind)
+        logging.warning(
+            "Files PG connection failed (%s, active=%d/%d)",
+            err_kind,
+            int(_FILES_PG_CONN_ACTIVE),
+            int(_FILES_PG_MAX_CONNS),
+        )
         return None
 
 
