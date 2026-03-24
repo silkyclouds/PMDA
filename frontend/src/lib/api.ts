@@ -380,6 +380,8 @@ export interface ScanProgress {
   scan_processed_albums_count?: number;
   /** Albums already published into the live Files library during this run. */
   scan_published_albums_count?: number;
+  /** Raw rows written to the publication table before browse/index filtering settles. */
+  scan_published_album_rows_count?: number;
   /** Albums already passed through streamed post-processing during this run. */
   scan_postprocessed_albums_count?: number;
   /** Player sync telemetry. */
@@ -393,8 +395,11 @@ export interface ScanProgress {
   default_scan_type?: 'full' | 'changed_only' | 'incomplete_only' | string;
   /** Live timing metrics. */
   elapsed_seconds?: number | null;
+  scan_runtime_sec?: number | null;
   phase_rate?: number | null;
   phase_progress?: number | null;
+  library_visible_albums_count?: number | null;
+  library_visible_artists_count?: number | null;
 }
 
 export interface CacheControlMetrics {

@@ -73,6 +73,28 @@ class ProviderIdentityArbitrationTests(unittest.TestCase):
         )
         self.assertIsNone(result)
 
+    def test_arbitration_rejects_exact_title_artist_no_tracklist_for_full_album(self):
+        payloads = {
+            "lastfm": {
+                "title": "Takk...",
+                "artist": "Slowdive",
+                "mbid": "fake-lastfm-id",
+            }
+        }
+        result = pmda._arbitrate_provider_identity(
+            artist_name="Slowdive",
+            album_title="Takk...",
+            local_track_titles=[
+                "Alison",
+                "Machine Gun",
+                "40 Days",
+                "Sing",
+                "Here She Comes",
+            ],
+            provider_payloads=payloads,
+        )
+        self.assertIsNone(result)
+
     def test_arbitration_accepts_near_perfect_top_candidate_without_ai(self):
         candidates = [
             {

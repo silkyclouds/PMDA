@@ -204,7 +204,9 @@ export function ScanProgress({
     autonomous_mode = false,
     has_completed_full_scan = false,
     default_scan_type = 'full',
+    scan_published_albums_count = 0,
     elapsed_seconds = null,
+    scan_runtime_sec = null,
     phase_rate = null,
     phase_progress = null,
   } = safeProgress;
@@ -221,12 +223,13 @@ export function ScanProgress({
 
   const elapsedSeconds = useMemo(() => {
     if (!scanning) return null;
-    if (elapsed_seconds != null && Number.isFinite(elapsed_seconds) && Number(elapsed_seconds) >= 0) {
-      return Math.max(0, Math.floor(Number(elapsed_seconds)));
+    const runtimeValue = scan_runtime_sec ?? elapsed_seconds;
+    if (runtimeValue != null && Number.isFinite(runtimeValue) && Number(runtimeValue) >= 0) {
+      return Math.max(0, Math.floor(Number(runtimeValue)));
     }
     if (effectiveScanStart == null) return null;
     return Math.max(0, Math.floor(Date.now() / 1000 - effectiveScanStart));
-  }, [scanning, elapsed_seconds, effectiveScanStart, current, scan_discovery_entries_scanned, scan_discovery_files_found, artists_processed, post_processing_done]);
+  }, [scanning, scan_runtime_sec, elapsed_seconds, effectiveScanStart, current, scan_discovery_entries_scanned, scan_discovery_files_found, artists_processed, post_processing_done]);
 
   const etaSecondsValue = useMemo(() => {
     if (eta_seconds == null || !Number.isFinite(eta_seconds) || eta_seconds <= 0) return null;
@@ -501,22 +504,25 @@ export function ScanProgress({
     const unique = Array.from(new Set(names));
     return unique.join(' · ');
   }, [background_jobs]);
-  const libraryStatusTitle = library_ready
+  const libraryUsable = Boolean(library_ready || Number(scan_published_albums_count || 0) > 0);
+  const libraryStatusTitle = libraryUsable
     ? (background_enrichment_running ? 'Library ready' : 'Library ready')
     : 'Idle';
-  const libraryStatusBody = library_ready && background_enrichment_running
+  const libraryStatusBody = libraryUsable && background_enrichment_running
     ? (
         profileBackfillRunning && profileBackfillTotal > 0
           ? `Background enrichment running · ${profileBackfillDone}/${profileBackfillTotal} artists`
           : 'Background enrichment running'
       )
-    : (library_ready ? 'Background enrichment finished' : 'Ready to scan');
+    : (libraryUsable ? 'Background enrichment finished' : 'Ready to scan');
 
   if (isCompact) {
     const statusLabel = scanning
-      ? (runScopePreparing
+      ? (libraryUsable
+        ? (background_enrichment_running ? 'Library ready · background enrichment' : 'Library ready · finalizing')
+        : (runScopePreparing
         ? `Scanning · preparing_run_scope · ${runScopeStageLabel}`
-        : (preScanActive ? `Scanning · pre-scan · ${preScanStageLabel}` : (phase ? `Scanning · ${phase}` : 'Scanning')))
+        : (preScanActive ? `Scanning · pre-scan · ${preScanStageLabel}` : (phase ? `Scanning · ${phase}` : 'Scanning'))))
       : libraryStatusTitle;
     const progressLabel = scanning
       ? (runScopePreparing && runScopeProgressTotal > 0
@@ -668,7 +674,7 @@ export function ScanProgress({
             </div>
           ) : (
             <>
-          {library_ready && (
+          {libraryUsable && (
             <div
               className={cn(
                 "rounded-xl border p-4",

@@ -30188,12 +30188,6 @@ def _files_upsert_artist_canonical_identity(
     person_like = _artist_is_person_like(entity_kind=entity_kind, role_hints=role_hints)
     if person_like:
         canonical = _choose_preferred_person_identity_name(current_name, canonical)
-    display_name = (
-        _choose_preferred_person_identity_name(current_name, canonical)
-        if person_like
-        else _choose_preferred_identity_display(current_name, canonical)
-    )
-    canonical_norm = _norm_artist_key(canonical) or _norm_artist_key(display_name) or str(artist_norm or "").strip()
     existing_aliases = []
     try:
         with conn.cursor() as cur:
@@ -30209,6 +30203,16 @@ def _files_upsert_artist_canonical_identity(
             primary_name=canonical,
             aliases=merged_aliases,
         ) or canonical
+    display_name = (
+        _select_classical_person_display_name(
+            current_name=current_name,
+            primary_name=canonical,
+            aliases=merged_aliases,
+        )
+        if person_like
+        else _choose_preferred_identity_display(current_name, canonical)
+    )
+    canonical_norm = _norm_artist_key(canonical) or _norm_artist_key(display_name) or str(artist_norm or "").strip()
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -31039,6 +31043,7 @@ def _build_files_browse_artist_entities(
             canonical_norm,
             {
                 "name": canonical_name,
+                "canonical_name_hint": canonical_name,
                 "has_image": False,
                 "image_path": "",
                 "roles": set(),
@@ -31048,7 +31053,18 @@ def _build_files_browse_artist_entities(
                 "broken_count": 0,
             },
         )
-        bucket["name"] = _choose_preferred_identity_display(str(bucket.get("name") or ""), canonical_name)
+        if role in _FILES_BROWSE_PERSON_ROLES:
+            bucket["name"] = _choose_preferred_person_identity_name(str(bucket.get("name") or ""), canonical_name)
+            bucket["canonical_name_hint"] = _choose_preferred_person_identity_name(
+                str(bucket.get("canonical_name_hint") or ""),
+                canonical_name,
+            )
+        else:
+            bucket["name"] = _choose_preferred_identity_display(str(bucket.get("name") or ""), canonical_name)
+            bucket["canonical_name_hint"] = _choose_preferred_identity_display(
+                str(bucket.get("canonical_name_hint") or ""),
+                canonical_name,
+            )
         bucket["roles"].add(role)
         bucket["aliases"].add(str(entry.get("name") or "").strip())
         bucket["aliases"].add(canonical_name)
@@ -31067,9 +31083,13 @@ def _build_files_browse_artist_entities(
             )
 
     for canonical_norm, bucket in entity_map.items():
-        bucket["entity_kind"] = _files_browse_entity_kind_from_roles(set(bucket.get("roles") or set()))
+        role_values = sorted(
+            set(bucket.get("roles") or set()),
+            key=lambda role: (_FILES_BROWSE_ROLE_PRIORITY.get(role, 99), role),
+        )
+        bucket["entity_kind"] = _files_browse_entity_kind_from_roles(set(role_values))
         bucket["roles_json"] = json.dumps(
-            sorted(set(bucket.get("roles") or set()), key=lambda role: (_FILES_BROWSE_ROLE_PRIORITY.get(role, 99), role)),
+            role_values,
             ensure_ascii=False,
         )
         alias_values = [
@@ -31080,7 +31100,19 @@ def _build_files_browse_artist_entities(
             )
             if _norm_artist_key(value) != canonical_norm
         ]
+        if _artist_is_person_like(entity_kind=str(bucket.get("entity_kind") or ""), role_hints=role_values):
+            bucket["name"] = _select_classical_person_display_name(
+                current_name=str(bucket.get("name") or "").strip(),
+                primary_name=str(bucket.get("canonical_name_hint") or bucket.get("name") or "").strip(),
+                aliases=alias_values,
+            ) or str(bucket.get("name") or "").strip()
+        else:
+            bucket["name"] = _choose_preferred_identity_display(
+                str(bucket.get("name") or "").strip(),
+                str(bucket.get("canonical_name_hint") or bucket.get("name") or "").strip(),
+            )
         bucket["aliases_json"] = json.dumps(alias_values[:12], ensure_ascii=False)
+        bucket.pop("canonical_name_hint", None)
     return entity_map, dict(album_links_by_folder)
 
 
@@ -32396,6 +32428,8 @@ def _provider_candidate_soft_identity_ok(
             "classical_performance_mismatch",
         }:
             return (False, strict_reject)
+        if local_track_count >= 4:
+            return (False, "provider_no_tracklist_full_album")
         title_gate = max(title_score, ocr_title_score)
         artist_gate = max(artist_score, ocr_artist_score)
         if (not has_provider_tracklist) and (
@@ -56414,6 +56448,46 @@ def _library_cache_unmatched_suffix(include_unmatched: bool) -> str:
     return "all" if include_unmatched else "matched"
 
 
+def _files_library_browse_counts(
+    include_unmatched: bool,
+    *,
+    acquire_timeout_sec: float = 0.20,
+) -> tuple[int | None, int | None]:
+    """
+    Read browse-visible album/artist counts from the live Files index using the
+    exact same matched/unmatched gate as the browse endpoints.
+    """
+    if _get_library_mode() != "files":
+        return (None, None)
+    if not _files_pg_init_schema():
+        return (None, None)
+    conn = _files_pg_connect(acquire_timeout_sec=acquire_timeout_sec)
+    if conn is None:
+        return (None, None)
+    try:
+        matched_where = _library_albums_match_where(include_unmatched, "alb")
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT
+                    COUNT(*)::BIGINT AS album_count,
+                    COUNT(DISTINCT alb.artist_id)::BIGINT AS artist_count
+                FROM files_albums alb
+                WHERE {matched_where}
+                """
+            )
+            row = cur.fetchone() or (0, 0)
+        return (int(row[0] or 0), int(row[1] or 0))
+    except Exception:
+        logging.debug("Failed to read Files browse counts", exc_info=True)
+        return (None, None)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 @app.get("/api/config")
 def api_config_get():
     """Return current effective configuration for the Web UI.
@@ -59023,6 +59097,22 @@ def api_progress():
         except Exception as e:
             logging.debug("api_progress: could not load last_scan_summary: %s", e)
 
+    include_unmatched_default = False
+    browse_visible_albums_count = None
+    browse_visible_artists_count = None
+    if _get_library_mode() == "files":
+        try:
+            include_unmatched_default = _library_include_unmatched_effective()
+        except Exception:
+            include_unmatched_default = bool(getattr(sys.modules[__name__], "LIBRARY_INCLUDE_UNMATCHED", True))
+        try:
+            browse_visible_albums_count, browse_visible_artists_count = _files_library_browse_counts(
+                bool(include_unmatched_default),
+                acquire_timeout_sec=0.20,
+            )
+        except Exception:
+            browse_visible_albums_count, browse_visible_artists_count = (None, None)
+
     current_scan_ai_rollup = None
     if scanning and scan_id_current:
         try:
@@ -59148,14 +59238,30 @@ def api_progress():
         str(item.get("job_type") or "") in {"enrich_batch", "dedupe", "incomplete_move", "export", "player_sync"}
         for item in background_jobs
     ) or bool(profile_backfill_state.get("running")) or bool(profile_jobs_active > 0)
+    visible_published_albums_count = (
+        int(browse_visible_albums_count or 0)
+        if browse_visible_albums_count is not None
+        else int(scan_published_albums_count or 0)
+    )
     library_ready = bool(
-        not bool(bootstrap_status.get("bootstrap_required"))
-        and (
-            bool(has_completed_full_scan)
-            or int(scan_published_albums_count or 0) > 0
-            or (isinstance(last_scan_summary, dict) and int(last_scan_summary.get("albums_scanned") or 0) > 0)
+        int(visible_published_albums_count or 0) > 0
+        or int(browse_visible_artists_count or 0) > 0
+        or (
+            (not scanning)
+            and bool(has_completed_full_scan)
+            and (
+                int(scan_published_albums_count or 0) > 0
+                or (isinstance(last_scan_summary, dict) and int(last_scan_summary.get("albums_scanned") or 0) > 0)
+            )
         )
     )
+    if (
+        scanning
+        and library_ready
+        and background_enrichment_running
+        and int(scan_processed_albums_count or 0) >= int(total_albums or 0)
+    ):
+        phase = "background_enrichment"
 
     resume_available_by_scan_type: dict[str, dict[str, Any]] = {}
     resume_available = False
@@ -59322,7 +59428,8 @@ def api_progress():
         "scan_tracks_moved_incomplete": scan_tracks_moved_incomplete,
         "scan_tracks_unaccounted": scan_tracks_unaccounted,
         "scan_processed_albums_count": scan_processed_albums_count,
-        "scan_published_albums_count": scan_published_albums_count,
+        "scan_published_albums_count": visible_published_albums_count,
+        "scan_published_album_rows_count": scan_published_albums_count,
         "scan_postprocessed_albums_count": scan_postprocessed_albums_count,
         "scan_player_sync_target": scan_player_sync_target,
         "scan_player_sync_ok": scan_player_sync_ok,
@@ -59331,7 +59438,11 @@ def api_progress():
         "autonomous_mode": _scan_autonomous_mode_effective(),
         "has_completed_full_scan": bool(has_completed_full_scan),
         "default_scan_type": str(default_scan_type or "full"),
+        "library_visible_albums_count": browse_visible_albums_count,
+        "library_visible_artists_count": browse_visible_artists_count,
+        "library_include_unmatched_default": bool(include_unmatched_default),
         "elapsed_seconds": elapsed_seconds,
+        "scan_runtime_sec": elapsed_seconds,
         "phase_rate": phase_rate,
         "phase_progress": phase_progress,
     }

@@ -268,6 +268,59 @@ class ArtistImageSelectionTests(unittest.TestCase):
         self.assertIn("Johann Sebastian Bach", names)
         self.assertTrue(any(value in names for value in ("Jean-Sébastien Bach", "Jean-Sebastien Bach")))
 
+    def test_browse_entities_keep_original_classical_display_name_after_merge(self):
+        original_pref = pmda.CLASSICAL_NAME_PREFERENCE
+        try:
+            pmda.CLASSICAL_NAME_PREFERENCE = "original"
+            artists_map = {
+                pmda._norm_artist_key("Pyotr Ilyich Tchaikovsky"): {
+                    "name": "Pyotr Ilyich Tchaikovsky",
+                    "canonical_name": "Pyotr Ilyich Tchaikovsky",
+                    "canonical_name_norm": pmda._norm_artist_key("Pyotr Ilyich Tchaikovsky"),
+                    "canonical_mbid": "mbid-1",
+                },
+                pmda._norm_artist_key("Peter Tchaikovsky"): {
+                    "name": "Peter Tchaikovsky",
+                    "canonical_name": "Pyotr Ilyich Tchaikovsky",
+                    "canonical_name_norm": pmda._norm_artist_key("Pyotr Ilyich Tchaikovsky"),
+                    "canonical_mbid": "mbid-1",
+                },
+            }
+            fake_entities = [
+                [
+                    {
+                        "name": "Peter Tchaikovsky",
+                        "norm": pmda._norm_artist_key("Peter Tchaikovsky"),
+                        "role": "composer",
+                        "is_primary": False,
+                        "has_image": False,
+                        "image_path": "",
+                        "canonical_name": "Pyotr Ilyich Tchaikovsky",
+                        "canonical_norm": pmda._norm_artist_key("Pyotr Ilyich Tchaikovsky"),
+                        "canonical_mbid": "mbid-1",
+                    }
+                ],
+                [
+                    {
+                        "name": "Pyotr Ilyich Tchaikovsky",
+                        "norm": pmda._norm_artist_key("Pyotr Ilyich Tchaikovsky"),
+                        "role": "composer",
+                        "is_primary": False,
+                        "has_image": False,
+                        "image_path": "",
+                        "canonical_name": "Pyotr Ilyich Tchaikovsky",
+                        "canonical_norm": pmda._norm_artist_key("Pyotr Ilyich Tchaikovsky"),
+                        "canonical_mbid": "mbid-1",
+                    }
+                ],
+            ]
+            with mock.patch.object(pmda, "_files_extract_browse_entities_for_album", side_effect=fake_entities):
+                entity_map, _links = pmda._build_files_browse_artist_entities(artists_map, [{}, {}])
+            merged = entity_map.get(pmda._norm_artist_key("Pyotr Ilyich Tchaikovsky")) or {}
+            self.assertEqual(merged.get("name"), "Pyotr Ilyich Tchaikovsky")
+        finally:
+            pmda.CLASSICAL_NAME_PREFERENCE = original_pref
+
 
 if __name__ == "__main__":
     unittest.main()
