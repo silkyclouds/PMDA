@@ -190,6 +190,8 @@ export default function ArtistPage() {
   const { toast } = useToast();
   const autoAiRequestedRef = useRef(false);
   const similarRefreshAttemptsRef = useRef(0);
+  const autoMissingDataRefreshArtistIdRef = useRef<number | null>(null);
+  const similarWarmupArtistIdRef = useRef<number | null>(null);
 
   const [loading, setLoading] = useState(true);
   const [details, setDetails] = useState<ArtistDetailResponse | null>(null);
@@ -226,6 +228,12 @@ export default function ArtistPage() {
     const txt = String(value ?? '').trim();
     return txt || 'unknown error';
   }, []);
+
+  useEffect(() => {
+    autoMissingDataRefreshArtistIdRef.current = null;
+    similarWarmupArtistIdRef.current = null;
+    similarRefreshAttemptsRef.current = 0;
+  }, [artistId]);
 
   const fetchArtist = useCallback(async (refresh = false) => {
     if (!Number.isFinite(artistId) || artistId <= 0) {
@@ -612,11 +620,13 @@ export default function ArtistPage() {
 
   useEffect(() => {
     if (!details || loading) return;
+    if (autoMissingDataRefreshArtistIdRef.current === details.artist_id) return;
     const heroMissing = !Boolean(details.artist_has_image && details.artist_thumb);
     const bioMissing = !String(profile?.bio || profile?.short_bio || '').trim();
     const similarMissing = fallbackSimilar.length > 0 && fallbackSimilar.some((artist) => !artist.image_url || isProbablyPlaceholderArtistImageUrl(artist.image_url));
     if (!heroMissing && !bioMissing && !similarMissing) return;
 
+    autoMissingDataRefreshArtistIdRef.current = details.artist_id;
     let cancelled = false;
     const timers: Array<ReturnType<typeof setTimeout>> = [];
     const delays = [1600, 4800, 11000];
@@ -636,6 +646,9 @@ export default function ArtistPage() {
 
   useEffect(() => {
     if (!details) return;
+    if (similarWarmupArtistIdRef.current === details.artist_id) return;
+
+    similarWarmupArtistIdRef.current = details.artist_id;
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
     similarRefreshAttemptsRef.current = 0;

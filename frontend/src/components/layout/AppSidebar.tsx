@@ -215,10 +215,7 @@ export function AppSidebar() {
           <span className="shrink-0 group-data-[collapsible=icon]:hidden">
             <Logo variant="wordmark" size="sm" />
           </span>
-          <span className="shrink-0 hidden group-data-[collapsible=icon]:block">
-            <Logo variant="icon" size="sm" />
-          </span>
-          <SidebarTrigger className="shrink-0 ml-auto group-data-[collapsible=icon]:ml-0" />
+          <SidebarTrigger className="shrink-0 ml-auto group-data-[collapsible=icon]:ml-0 group-data-[collapsible=icon]:mx-auto" />
         </div>
       </SidebarHeader>
       <SidebarContent className="pt-1">

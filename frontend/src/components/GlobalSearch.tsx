@@ -146,21 +146,21 @@ export function GlobalSearch({ className }: { className?: string }) {
 
   return (
     <div ref={rootRef} className={cn('relative w-full', className)}>
-      <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground pointer-events-none" />
+      <Search className="pointer-events-none absolute left-3.5 top-1/2 h-4.5 w-4.5 -translate-y-1/2 text-primary/80 transition-colors" />
       <Input
         value={query}
         onChange={(e) => setQuery(e.target.value)}
         onFocus={() => setOpen(items.length > 0)}
         onKeyDown={onKeyDown}
-        placeholder="Search artist, album, track, genre..."
-        className="h-10 md:h-11 pl-9 pr-9 rounded-xl bg-background/85 border-border/70 text-sm"
+        placeholder="Search artists, albums, tracks or genres..."
+        className="h-11 md:h-12 rounded-2xl border-border/80 bg-card/95 pl-11 pr-10 text-sm shadow-[0_0_0_1px_hsl(var(--border)/0.35),0_14px_34px_hsl(var(--foreground)/0.08)] placeholder:text-muted-foreground/85 focus-visible:border-primary/60 focus-visible:ring-4 focus-visible:ring-primary/15"
       />
       {loading ? (
         <Loader2 className="w-4 h-4 absolute right-3 top-1/2 -translate-y-1/2 animate-spin text-muted-foreground" />
       ) : null}
 
       {open && (
-        <div className="absolute top-[calc(100%+0.35rem)] left-0 z-50 w-full max-w-[56rem] rounded-xl border border-border/60 bg-popover/95 backdrop-blur-xl shadow-2xl overflow-hidden">
+        <div className="absolute left-0 top-[calc(100%+0.45rem)] z-50 w-full max-w-[56rem] overflow-hidden rounded-2xl border border-border/70 bg-popover/95 backdrop-blur-xl shadow-[0_22px_60px_hsl(var(--foreground)/0.18)]">
           {items.length === 0 ? (
             <div className="px-3 py-3 text-sm text-muted-foreground">No results found</div>
           ) : (
