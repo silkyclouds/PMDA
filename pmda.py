@@ -65531,6 +65531,63 @@ def api_library_label_profile(label: str):
             )
         genres = [{"genre": str(r[0] or "").strip(), "count": int(r[1] or 0)} for r in genre_rows if str(r[0] or "").strip()]
 
+        def _looks_label_music_related(extract: str, description: str = "", title: str = "") -> bool:
+            text = " ".join(
+                part.strip().lower()
+                for part in (str(title or ""), str(description or ""), str(extract or ""))
+                if str(part or "").strip()
+            )
+            if not text:
+                return False
+            hard_bad = (
+                "cryptanalysis",
+                "admiralty",
+                "zimmermann telegram",
+                "world war",
+                "military alliance",
+                "german foreign office",
+                "u-boats",
+                "destroyer",
+                "cruiser",
+                "warship",
+                "battle",
+                "naval intelligence",
+                "telegraph traffic",
+                "diplomatic communication",
+                "ministry",
+                "government",
+            )
+            if any(token in text for token in hard_bad):
+                return False
+            strong_good = (
+                "record label",
+                "independent record label",
+                "music label",
+                "independent label",
+                "netlabel",
+                "record company",
+                "music company",
+                "label founded",
+                "discogs",
+                "electronic music label",
+                "jazz label",
+                "classical label",
+            )
+            if any(token in text for token in strong_good):
+                return True
+            softer_good = (
+                "releases by",
+                "albums by",
+                "founded in",
+                "founded by",
+                "catalog",
+                "artists including",
+                "distributed by",
+                "imprint",
+            )
+            good_score = sum(1 for token in softer_good if token in text)
+            return good_score >= 2
+
         # Optional metadata enrichments (best-effort): Wikipedia + Discogs label graph.
         wiki_extract = ""
         wiki_url = ""
@@ -65540,7 +65597,7 @@ def api_library_label_profile(label: str):
                 ex, url, desc = _fetch_wikipedia_intro_extract(cand, lang="en")
             except Exception:
                 ex, url, desc = "", "", ""
-            if ex:
+            if ex and _looks_label_music_related(ex, description=desc, title=cand):
                 wiki_extract, wiki_url, wiki_desc = ex, url, desc
                 break
 
@@ -65548,6 +65605,8 @@ def api_library_label_profile(label: str):
         sub_labels: list[str] = []
         discogs_profile = ""
         discogs_url = ""
+        logo_url = ""
+        logo_provider = ""
         try:
             if USE_DISCOGS:
                 d = _discogs_client()
@@ -65593,6 +65652,16 @@ def api_library_label_profile(label: str):
                                         if uu:
                                             discogs_url = uu
                                             break
+                                images = ldata.get("images") or []
+                                if isinstance(images, list):
+                                    for image in images:
+                                        if not isinstance(image, dict):
+                                            continue
+                                        candidate_url = str(image.get("uri150") or image.get("uri") or "").strip()
+                                        if candidate_url:
+                                            logo_url = candidate_url
+                                            logo_provider = "discogs"
+                                            break
         except DiscogsRateLimited:
             pass
         except Exception:
@@ -65604,10 +65673,16 @@ def api_library_label_profile(label: str):
             if m:
                 owner = m.group(1).strip()
 
+        description_text = ""
+        if discogs_profile:
+            description_text = discogs_profile
+        elif wiki_extract and _looks_label_music_related(wiki_extract, description=wiki_desc, title=raw_label):
+            description_text = wiki_extract
+
         payload = {
             "label": raw_label,
             "album_count": int(album_count),
-            "description": wiki_extract or "",
+            "description": description_text or "",
             "wiki_url": wiki_url or "",
             "wiki_description": wiki_desc or "",
             "owner": owner or "",
@@ -65616,6 +65691,8 @@ def api_library_label_profile(label: str):
             "genres": genres,
             "discogs_profile": discogs_profile or "",
             "discogs_url": discogs_url or "",
+            "logo_url": logo_url or "",
+            "logo_provider": logo_provider or "",
         }
         _files_cache_set_json(cache_key, payload, ttl=60 * 60 * 12)
         return jsonify(payload)

@@ -55,6 +55,7 @@ export default function LabelPage() {
   const sentinelRef = useRef<HTMLDivElement | null>(null);
   const loadingMoreRef = useRef(false);
   const requestIdRef = useRef(0);
+  const profileWarmupLabelRef = useRef<string | null>(null);
 
   const gridTemplateColumns = useMemo(() => {
     return getLibraryGridTemplateColumns(tileSize, isMobile);
@@ -136,6 +137,7 @@ export default function LabelPage() {
       setError('Invalid label');
       return;
     }
+    profileWarmupLabelRef.current = null;
     setAlbums([]);
     setOffset(0);
     setTotal(0);
@@ -148,7 +150,9 @@ export default function LabelPage() {
   useEffect(() => {
     if (!label) return;
     if (!profile) return;
+    if (profileWarmupLabelRef.current === label.toLowerCase()) return;
     if (profile.logo_url && profile.description) return;
+    profileWarmupLabelRef.current = label.toLowerCase();
     let cancelled = false;
     const timers: Array<ReturnType<typeof setTimeout>> = [];
     const delays = [1800, 5200, 12000];
