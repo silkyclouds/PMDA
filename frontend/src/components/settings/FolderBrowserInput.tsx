@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { ArrowUp, ChevronRight, FolderOpen, Loader2, RefreshCw } from 'lucide-react';
+import { ArrowUp, FolderOpen, Loader2, RefreshCw } from 'lucide-react';
 import * as api from '@/lib/api';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -12,6 +12,9 @@ interface FolderBrowserInputProps {
   placeholder?: string;
   selectLabel?: string;
   compact?: boolean;
+  browseRoot?: string;
+  lockToBrowseRoot?: boolean;
+  allowManualEntry?: boolean;
 }
 
 interface BrowseState {
@@ -28,21 +31,37 @@ function normalizePath(pathValue: string | undefined | null): string {
   return p || '/';
 }
 
+function isPathWithinRoot(pathValue: string, rootValue: string): boolean {
+  const path = normalizePath(pathValue);
+  const root = normalizePath(rootValue);
+  if (root === '/') return true;
+  return path === root || path.startsWith(`${root}/`);
+}
+
 export function FolderBrowserInput({
   value,
   onChange,
   placeholder = '/music',
   selectLabel = 'Select folder',
   compact = false,
+  browseRoot,
+  lockToBrowseRoot = false,
+  allowManualEntry = true,
 }: FolderBrowserInputProps) {
+  const normalizedBrowseRoot = browseRoot ? normalizePath(browseRoot) : '';
+  const clampPathToRoot = useCallback((pathValue: string | undefined | null) => {
+    const normalized = normalizePath(pathValue);
+    if (!lockToBrowseRoot || !normalizedBrowseRoot) return normalized;
+    return isPathWithinRoot(normalized, normalizedBrowseRoot) ? normalized : normalizedBrowseRoot;
+  }, [lockToBrowseRoot, normalizedBrowseRoot]);
   const [open, setOpen] = useState(false);
   const [loading, setLoading] = useState(false);
   const [confirming, setConfirming] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [pathInput, setPathInput] = useState('');
-  const [candidatePath, setCandidatePath] = useState(normalizePath(value));
+  const [candidatePath, setCandidatePath] = useState(clampPathToRoot(value || normalizedBrowseRoot || placeholder));
   const [state, setState] = useState<BrowseState>({
-    currentPath: normalizePath(value),
+    currentPath: clampPathToRoot(value || normalizedBrowseRoot || placeholder),
     parentPath: null,
     roots: [],
     directories: [],
@@ -50,15 +69,20 @@ export function FolderBrowserInput({
     truncated: false,
   });
 
-  const selectedPath = useMemo(() => normalizePath(value), [value]);
+  const selectedPath = useMemo(() => {
+    const raw = String(value || '').trim();
+    return raw ? clampPathToRoot(raw) : '';
+  }, [clampPathToRoot, value]);
 
-  const loadPath = useCallback(async (pathToLoad?: string) => {
+  const loadPath = useCallback(async (pathToLoad?: string, options?: { selectLoadedPath?: boolean }) => {
     setLoading(true);
     setError(null);
+    const nextPath = clampPathToRoot(pathToLoad ?? value ?? normalizedBrowseRoot);
     try {
-      const nextPath = normalizePath(pathToLoad ?? value);
-      setCandidatePath(nextPath);
-      setPathInput(nextPath);
+      if (options?.selectLoadedPath !== false) {
+        setCandidatePath(nextPath);
+        setPathInput(nextPath);
+      }
       setState((prev) => ({
         ...prev,
         currentPath: nextPath,
@@ -67,30 +91,57 @@ export function FolderBrowserInput({
       setState({
         currentPath: result.path,
         parentPath: result.parent,
-        roots: Array.isArray(result.roots) ? result.roots : [],
-        directories: Array.isArray(result.directories) ? result.directories : [],
+        roots: lockToBrowseRoot && normalizedBrowseRoot ? [normalizedBrowseRoot] : (Array.isArray(result.roots) ? result.roots : []),
+        directories: Array.isArray(result.directories)
+          ? result.directories.filter((dir) => !lockToBrowseRoot || !normalizedBrowseRoot || isPathWithinRoot(dir.path, normalizedBrowseRoot))
+          : [],
         writable: Boolean(result.writable),
         truncated: Boolean(result.truncated),
       });
-      setCandidatePath(result.path);
-      setPathInput(result.path);
+      if (options?.selectLoadedPath !== false) {
+        setCandidatePath(result.path);
+        setPathInput(result.path);
+      }
     } catch (e) {
+      if (lockToBrowseRoot && normalizedBrowseRoot && nextPath !== normalizedBrowseRoot) {
+        try {
+          const fallback = await api.getFilesystemDirectories(normalizedBrowseRoot, { timeoutMs: 45000 });
+          setState({
+            currentPath: fallback.path,
+            parentPath: fallback.parent,
+            roots: [normalizedBrowseRoot],
+            directories: Array.isArray(fallback.directories)
+              ? fallback.directories.filter((dir) => isPathWithinRoot(dir.path, normalizedBrowseRoot))
+              : [],
+            writable: Boolean(fallback.writable),
+            truncated: Boolean(fallback.truncated),
+          });
+          setCandidatePath(fallback.path);
+          setPathInput(fallback.path);
+          setError(`Folder not found. Browsing reset to ${normalizedBrowseRoot}.`);
+          return;
+        } catch {
+          // fall through to generic error below
+        }
+      }
       setError(e instanceof Error ? e.message : 'Unable to browse this folder');
     } finally {
       setLoading(false);
     }
-  }, [value]);
+  }, [clampPathToRoot, lockToBrowseRoot, normalizedBrowseRoot, value]);
 
   useEffect(() => {
     if (!open) return;
-    const initial = selectedPath || '/';
+    const initial = lockToBrowseRoot && normalizedBrowseRoot
+      ? normalizedBrowseRoot
+      : clampPathToRoot(selectedPath || normalizedBrowseRoot || '/');
     setCandidatePath(initial);
     setPathInput(initial);
-    loadPath(initial);
-  }, [open, selectedPath, loadPath]);
+    loadPath(initial, { selectLoadedPath: true });
+  }, [clampPathToRoot, loadPath, lockToBrowseRoot, normalizedBrowseRoot, open, selectedPath]);
 
   const confirmSelection = useCallback(async () => {
-    const nextPath = (pathInput || '').trim() ? normalizePath(pathInput) : normalizePath(candidatePath);
+    const nextPath = (pathInput || '').trim() ? clampPathToRoot(pathInput) : clampPathToRoot(candidatePath);
     setConfirming(true);
     setError(null);
     try {
@@ -102,7 +153,26 @@ export function FolderBrowserInput({
     } finally {
       setConfirming(false);
     }
-  }, [candidatePath, onChange, pathInput]);
+  }, [candidatePath, clampPathToRoot, onChange, pathInput]);
+
+  const confirmSpecificPath = useCallback(async (pathValue: string) => {
+    const nextPath = clampPathToRoot(pathValue);
+    setConfirming(true);
+    setError(null);
+    try {
+      const result = await api.getFilesystemDirectories(nextPath, { timeoutMs: 20000, limit: 0 });
+      onChange(result.path);
+      setCandidatePath(result.path);
+      setPathInput(result.path);
+      setOpen(false);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Unable to use this folder');
+    } finally {
+      setConfirming(false);
+    }
+  }, [clampPathToRoot, onChange]);
+
+  const displayedValue = selectedPath || ((lockToBrowseRoot && normalizedBrowseRoot) ? normalizedBrowseRoot : '');
 
   return (
     <>
@@ -117,10 +187,15 @@ export function FolderBrowserInput({
         ) : null}
         <div className={`grid gap-2 ${compact ? 'grid-cols-[minmax(0,1fr)_auto]' : 'grid-cols-1 sm:grid-cols-[minmax(0,1fr)_auto]'}`}>
           <Input
-            value={selectedPath}
-            onChange={(e) => onChange(e.target.value)}
+            value={displayedValue}
+            onChange={(e) => {
+              if (!allowManualEntry) return;
+              onChange(e.target.value);
+            }}
             placeholder={placeholder}
-            className="font-mono min-w-0"
+            className={`font-mono min-w-0 ${!allowManualEntry ? 'cursor-pointer' : ''}`}
+            readOnly={!allowManualEntry}
+            onClick={!allowManualEntry ? () => setOpen(true) : undefined}
           />
           <Button type="button" variant="outline" className="gap-2 shrink-0" onClick={() => setOpen(true)}>
             <FolderOpen className="w-4 h-4" />
@@ -133,30 +208,53 @@ export function FolderBrowserInput({
         <DialogContent className="sm:max-w-3xl">
           <DialogHeader>
             <DialogTitle>{selectLabel}</DialogTitle>
-            <DialogDescription>Select a folder from the container filesystem.</DialogDescription>
+            <DialogDescription>
+              {lockToBrowseRoot && normalizedBrowseRoot
+                ? `Select an existing folder under ${normalizedBrowseRoot}.`
+                : 'Select a folder from the container filesystem.'}
+            </DialogDescription>
           </DialogHeader>
 
           <div className="space-y-3">
-            <div className="flex gap-2">
-              <Input
-                value={pathInput}
-                onChange={(e) => setPathInput(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter') {
-                    e.preventDefault();
-                    loadPath(pathInput);
-                  }
-                }}
-                placeholder="/"
-                className="font-mono"
-              />
-              <Button type="button" variant="outline" onClick={() => loadPath(pathInput)}>
-                Go
-              </Button>
-              <Button type="button" variant="ghost" onClick={() => loadPath(candidatePath)} disabled={loading}>
-                {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
-              </Button>
-            </div>
+            {allowManualEntry ? (
+              <div className="flex gap-2">
+                <Input
+                  value={pathInput}
+                  onChange={(e) => setPathInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault();
+                      loadPath(pathInput);
+                    }
+                  }}
+                  placeholder={normalizedBrowseRoot || '/'}
+                  className="font-mono"
+                />
+                <Button type="button" variant="outline" onClick={() => loadPath(pathInput)}>
+                  Go
+                </Button>
+                <Button type="button" variant="ghost" onClick={() => loadPath(candidatePath)} disabled={loading}>
+                  {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
+                </Button>
+              </div>
+            ) : (
+              <div className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-border/70 bg-background/40 px-3 py-2 text-xs text-muted-foreground">
+                <div>
+                  Browsing is locked under <span className="font-mono text-foreground">{normalizedBrowseRoot || '/'}</span>.
+                </div>
+                <div className="flex items-center gap-2">
+                  {normalizedBrowseRoot && state.currentPath !== normalizedBrowseRoot ? (
+                    <Button type="button" variant="outline" size="sm" onClick={() => loadPath(normalizedBrowseRoot)}>
+                      Back to root
+                    </Button>
+                  ) : null}
+                  <Button type="button" variant="ghost" size="sm" onClick={() => loadPath(state.currentPath, { selectLoadedPath: false })} disabled={loading}>
+                    {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
+                    Refresh
+                  </Button>
+                </div>
+              </div>
+            )}
 
             {state.roots.length > 0 && (
               <div className="flex flex-wrap gap-2">
@@ -170,16 +268,20 @@ export function FolderBrowserInput({
 
             <div className="rounded-md border border-border">
               <div className="flex items-center justify-between gap-2 px-3 py-2 border-b border-border">
-                <div className="text-xs text-muted-foreground truncate font-mono" title={candidatePath}>
-                  {candidatePath}
+                <div className="min-w-0 flex-1">
+                  <div className="text-[11px] uppercase tracking-wide text-muted-foreground">Selected folder</div>
+                  <Input value={candidatePath} readOnly className="mt-1 font-mono text-xs" />
                 </div>
                 <div className="flex items-center gap-2">
                   {state.parentPath && (
-                    <Button type="button" variant="ghost" size="icon" onClick={() => loadPath(state.parentPath)}>
+                    <Button type="button" variant="ghost" size="icon" onClick={() => loadPath(state.parentPath, { selectLoadedPath: false })}>
                       <ArrowUp className="w-4 h-4" />
                     </Button>
                   )}
                 </div>
+              </div>
+              <div className="border-b border-border px-3 py-2 text-[11px] text-muted-foreground">
+                Browsing inside <span className="font-mono text-foreground">{state.currentPath}</span>
               </div>
 
               <ScrollArea className="h-64">
@@ -196,17 +298,35 @@ export function FolderBrowserInput({
                   {!loading && !error && state.directories.length === 0 && (
                     <div className="text-sm text-muted-foreground px-2 py-2">No subfolders found.</div>
                   )}
-                  {!loading && !error && state.directories.map((dir) => (
-                    <button
-                      key={dir.path}
-                      type="button"
-                      className="w-full flex items-center justify-between gap-2 rounded px-2 py-1.5 hover:bg-muted text-left"
-                      onClick={() => loadPath(dir.path)}
-                    >
-                      <span className="truncate font-mono text-sm">{dir.name}</span>
-                      <ChevronRight className="w-4 h-4 text-muted-foreground shrink-0" />
-                    </button>
-                  ))}
+                  {!loading && !error && state.directories.map((dir) => {
+                    const selected = candidatePath === dir.path;
+                    return (
+                      <div
+                        key={dir.path}
+                        className={`flex items-center gap-2 rounded px-2 py-1 ${selected ? 'bg-primary/10 ring-1 ring-primary/30' : ''}`}
+                      >
+                        <button
+                          type="button"
+                          className="min-w-0 flex-1 rounded px-2 py-2 text-left hover:bg-muted"
+                          onClick={() => loadPath(dir.path, { selectLoadedPath: true })}
+                          title={`Open ${dir.path}`}
+                        >
+                          <span className="block truncate font-mono text-sm text-foreground">{dir.name}</span>
+                          <span className="block text-[11px] text-muted-foreground">{dir.path}</span>
+                        </button>
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant={selected ? 'default' : 'outline'}
+                          className="shrink-0"
+                          onClick={() => void confirmSpecificPath(dir.path)}
+                          disabled={confirming}
+                        >
+                          Select
+                        </Button>
+                      </div>
+                    );
+                  })}
                 </div>
               </ScrollArea>
             </div>
@@ -216,6 +336,9 @@ export function FolderBrowserInput({
                 Folder list truncated. Narrow down by navigating to a deeper path.
               </p>
             )}
+            <p className="text-xs text-muted-foreground">
+              Click a folder to open it. Use <span className="font-medium text-foreground">Select</span> to choose it immediately.
+            </p>
             <p className="text-xs text-muted-foreground">
               Current folder is {state.writable ? 'writable' : 'read-only'} for PMDA.
             </p>
@@ -231,7 +354,7 @@ export function FolderBrowserInput({
               disabled={confirming}
             >
               {confirming ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
-              Use this folder
+              {candidatePath ? `Use ${candidatePath}` : 'Use this folder'}
             </Button>
           </DialogFooter>
         </DialogContent>

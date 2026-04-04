@@ -7,6 +7,7 @@ import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { AlbumBadgeGroups } from '@/components/library/AlbumBadgeGroups';
 import { AlbumArtwork } from '@/components/library/AlbumArtwork';
+import { AlbumMatchSources } from '@/components/library/AlbumMatchSources';
 import { AuthenticatedImage } from '@/components/library/AuthenticatedImage';
 import { GridSizeControl } from '@/components/library/GridSizeControl';
 import type { TrackInfo } from '@/components/library/AudioPlayer';
@@ -103,7 +104,7 @@ export default function LibraryHomeFeed() {
   const location = useLocation();
   const { section: rawSection } = useParams<{ section: string }>();
   const section = asFeedSection(String(rawSection || ''));
-  const { includeUnmatched } = useOutletContext<LibraryOutletContext>();
+  const { includeUnmatched, scope } = useOutletContext<LibraryOutletContext>();
   const isMobile = useIsMobile();
   const { toast } = useToast();
   const { startPlayback, setCurrentTrack, recommendationSessionId, session } = usePlayback();
@@ -199,7 +200,7 @@ export default function LibraryHomeFeed() {
       }
 
       if (section === 'recently_added') {
-        const res = await api.getLibraryAlbums({ sort: 'recent', limit: pageSize, offset: pageOffset, includeUnmatched });
+        const res = await api.getLibraryAlbums({ sort: 'recent', limit: pageSize, offset: pageOffset, includeUnmatched, scope });
         if (rid !== requestIdRef.current) return;
         const listRaw = Array.isArray(res.albums) ? res.albums : [];
         const list = dedupeAlbumsForDisplay(listRaw);
@@ -208,7 +209,7 @@ export default function LibraryHomeFeed() {
         setTotal(typeof res.total === 'number' ? res.total : 0);
         setHasMore(pageOffset + listRaw.length < Number(res.total || 0));
       } else if (section === 'recently_played') {
-        const res = await api.getLibraryRecentlyPlayedAlbumsWithOptions(365, pageSize, false, { includeUnmatched, offset: pageOffset });
+        const res = await api.getLibraryRecentlyPlayedAlbumsWithOptions(365, pageSize, false, { includeUnmatched, offset: pageOffset, scope });
         if (rid !== requestIdRef.current) return;
         const listRaw = Array.isArray(res.albums) ? res.albums : [];
         const list = dedupeAlbumsForDisplay(listRaw);
@@ -218,7 +219,7 @@ export default function LibraryHomeFeed() {
         setTotal(nextTotal);
         setHasMore(pageOffset + listRaw.length < nextTotal);
       } else if (section === 'discover') {
-        const res = await api.getLibraryDiscoverWithOptions(90, 36, !opts.reset, { includeUnmatched });
+        const res = await api.getLibraryDiscoverWithOptions(90, 36, !opts.reset, { includeUnmatched, scope });
         if (rid !== requestIdRef.current) return;
         const chunk = dedupeAlbumsForDisplay((res.sections || []).flatMap((s) => (Array.isArray(s.albums) ? s.albums : [])));
         setAlbums((prev) => {
@@ -231,7 +232,7 @@ export default function LibraryHomeFeed() {
         });
         setTotal(null);
       } else if (section === 'top_artists') {
-        const res = await api.getTopArtists(pageSize, 0, { includeUnmatched, offset: pageOffset });
+        const res = await api.getTopArtists(pageSize, 0, { includeUnmatched, offset: pageOffset, scope });
         if (rid !== requestIdRef.current) return;
         const listRaw = Array.isArray(res.artists) ? res.artists : [];
         const list = dedupeArtistsById(listRaw);
@@ -241,7 +242,7 @@ export default function LibraryHomeFeed() {
         setTotal(nextTotal);
         setHasMore(pageOffset + listRaw.length < nextTotal);
       } else if (section === 'recent_artists') {
-        const res = await api.getRecentlyAddedArtists(pageSize, pageOffset, { includeUnmatched });
+        const res = await api.getRecentlyAddedArtists(pageSize, pageOffset, { includeUnmatched, scope });
         if (rid !== requestIdRef.current) return;
         const listRaw = Array.isArray(res.artists) ? res.artists : [];
         const list = dedupeArtistsById(listRaw);
@@ -277,7 +278,7 @@ export default function LibraryHomeFeed() {
         setAppending(false);
       }
     }
-  }, [includeUnmatched, pageSize, recommendationSessionId, section]);
+  }, [includeUnmatched, pageSize, recommendationSessionId, scope, section]);
 
   useEffect(() => {
     setAlbums([]);
@@ -388,11 +389,11 @@ export default function LibraryHomeFeed() {
                         e.stopPropagation();
                         void handlePlayAlbum(a.album_id, a.title, a.thumb);
                       }}
-                      className="absolute inset-0 flex items-center justify-center opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity bg-black/30"
+                      className="absolute inset-0 flex items-center justify-center opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity bg-foreground/30"
                       title="Play"
                     >
-                      <div className="h-10 w-10 rounded-full bg-white/20 backdrop-blur-sm border border-white/20 flex items-center justify-center">
-                        <Play className="h-5 w-5 text-white fill-white" />
+                      <div className="h-10 w-10 rounded-full bg-background/20 backdrop-blur-sm border border-background/20 flex items-center justify-center">
+                        <Play className="h-5 w-5 text-background fill-background" />
                       </div>
                     </button>
                   </AspectRatio>
@@ -410,6 +411,7 @@ export default function LibraryHomeFeed() {
                     >
                       {a.artist_name}
                     </button>
+                    <AlbumMatchSources album={a} className="pt-0.5" />
                     <AlbumBadgeGroups
                       show={showBadges}
                       compact
@@ -418,6 +420,8 @@ export default function LibraryHomeFeed() {
                       publicRatingVotes={a.public_rating_votes}
                       format={a.format}
                       isLossless={a.is_lossless}
+                      sampleRate={a.sample_rate}
+                      bitDepth={a.bit_depth}
                       year={a.year}
                       trackCount={a.track_count}
                       genres={a.genres || (a.genre ? [a.genre] : [])}

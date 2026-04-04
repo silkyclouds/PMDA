@@ -103,7 +103,7 @@ function EditionPanel({
   const grouped = useMemo(() => groupTracksByDisc(edition.tracks || []), [edition.tracks]);
   const accentClass =
     accent === 'winner'
-      ? 'border-emerald-500/30 bg-emerald-500/5'
+      ? 'border-success/30 bg-success/5'
       : 'border-border/70 bg-muted/20';
 
   return (
@@ -343,7 +343,7 @@ export function ScanMoveReviewDialog({
                       <div className="space-y-2">
                         {rationaleItems.map((item, index) => (
                           <div key={`rationale-${index}`} className="flex items-start gap-2 text-sm">
-                            <CheckCircle2 className="w-4 h-4 mt-0.5 text-emerald-400 shrink-0" />
+                            <CheckCircle2 className="w-4 h-4 mt-0.5 text-success shrink-0" />
                             <span>{item}</span>
                           </div>
                         ))}

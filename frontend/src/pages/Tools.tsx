@@ -332,7 +332,7 @@ export default function Tools() {
                   <div className="flex items-center gap-2">
                     <Button
                       size="sm"
-                      className="gap-1.5 bg-amber-500/90 hover:bg-amber-500 text-black border border-amber-300/30"
+                      className="gap-1.5 bg-warning hover:bg-warning/90 text-warning-foreground border border-warning/30"
                       onClick={() => navigate(`/broken-albums${selectedRunQuery}`)}
                       disabled={!hasIncompleteReview}
                     >
@@ -367,7 +367,7 @@ export default function Tools() {
                 <div className="flex items-center gap-2">
                   <Button
                     size="sm"
-                    className="gap-1.5 bg-amber-500/90 hover:bg-amber-500 text-black border border-amber-300/30"
+                    className="gap-1.5 bg-warning hover:bg-warning/90 text-warning-foreground border border-warning/30"
                     onClick={() => navigate(`/tools/duplicates${selectedRunQuery}`)}
                     disabled={!hasDuplicateReview}
                   >

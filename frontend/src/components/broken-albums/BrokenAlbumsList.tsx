@@ -15,11 +15,17 @@ function fmtMissingIndices(raw: unknown): string {
   if (!Array.isArray(raw)) return '';
   const chunks: string[] = [];
   for (const row of raw) {
-    if (!Array.isArray(row) || row.length < 2) continue;
-    const start = Number(row[0]);
-    const end = Number(row[1]);
-    if (!Number.isFinite(start) || !Number.isFinite(end)) continue;
-    chunks.push(`${start}-${end}`);
+    if (Array.isArray(row)) {
+      if (row.length < 2) continue;
+      const start = Number(row[0]);
+      const end = Number(row[1]);
+      if (!Number.isFinite(start) || !Number.isFinite(end)) continue;
+      chunks.push(start === end ? `${start}` : `${start}-${end}`);
+      continue;
+    }
+    const single = Number(row);
+    if (!Number.isFinite(single)) continue;
+    chunks.push(`${single}`);
   }
   return chunks.join(', ');
 }
@@ -299,9 +305,7 @@ export function BrokenAlbumsList() {
                         {album.missing_indices.length > 0 ? (
                           <div>
                             <span className="text-muted-foreground">Missing gaps:</span>{' '}
-                            <span className="font-medium">
-                              {album.missing_indices.map(([start, end]) => `${start}-${end}`).join(', ')}
-                            </span>
+                            <span className="font-medium">{fmtMissingIndices(album.missing_indices)}</span>
                           </div>
                         ) : null}
                       </div>

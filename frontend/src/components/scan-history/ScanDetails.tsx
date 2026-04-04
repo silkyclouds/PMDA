@@ -247,7 +247,7 @@ export function ScanDetails({ scanId, onRestore }: ScanDetailsProps) {
             <div className="grid grid-cols-2 gap-3 text-sm">
               {(scan.duplicate_groups_count ?? 0) > 0 && (
                 <div className="flex items-center gap-2">
-                  <Package className="w-4 h-4 text-orange-500" />
+                  <Package className="w-4 h-4 text-warning" />
                   <div className="flex-1">
                     <div className="text-muted-foreground">Duplicate Groups</div>
                     <div className="font-medium">{(scan.duplicate_groups_count ?? 0).toLocaleString()}</div>
@@ -256,7 +256,7 @@ export function ScanDetails({ scanId, onRestore }: ScanDetailsProps) {
               )}
               {(scan.total_duplicates_count ?? 0) > 0 && (
                 <div className="flex items-center gap-2">
-                  <Music className="w-4 h-4 text-red-500" />
+                  <Music className="w-4 h-4 text-destructive" />
                   <div className="flex-1">
                     <div className="text-muted-foreground">Total Duplicates</div>
                     <div className="font-medium">{(scan.total_duplicates_count ?? 0).toLocaleString()}</div>
@@ -265,25 +265,25 @@ export function ScanDetails({ scanId, onRestore }: ScanDetailsProps) {
               )}
               {(scan.broken_albums_count ?? 0) > 0 && (
                 <div className="flex items-center gap-2">
-                  <AlertTriangle className="w-4 h-4 text-red-500" />
+                  <AlertTriangle className="w-4 h-4 text-destructive" />
                   <div className="flex-1">
                     <div className="text-muted-foreground">Incomplete albums</div>
-                    <div className="font-medium text-red-600 dark:text-red-400">{(scan.broken_albums_count ?? 0).toLocaleString()}</div>
+                    <div className="font-medium text-destructive">{(scan.broken_albums_count ?? 0).toLocaleString()}</div>
                   </div>
                 </div>
               )}
               {(scan.missing_albums_count ?? 0) > 0 && (
                 <div className="flex items-center gap-2">
-                  <Music className="w-4 h-4 text-yellow-500" />
+                  <Music className="w-4 h-4 text-warning" />
                   <div className="flex-1">
                     <div className="text-muted-foreground">Missing Albums</div>
-                    <div className="font-medium text-yellow-600 dark:text-yellow-400">{(scan.missing_albums_count ?? 0).toLocaleString()}</div>
+                    <div className="font-medium text-warning">{(scan.missing_albums_count ?? 0).toLocaleString()}</div>
                   </div>
                 </div>
               )}
               {(scan.albums_without_mb_id ?? 0) > 0 && (
                 <div className="flex items-center gap-2">
-                  <Database className="w-4 h-4 text-blue-500" />
+                  <Database className="w-4 h-4 text-info" />
                   <div className="flex-1">
                     <div className="text-muted-foreground">Without MB ID</div>
                     <div className="font-medium">{(scan.albums_without_mb_id ?? 0).toLocaleString()}</div>
@@ -292,7 +292,7 @@ export function ScanDetails({ scanId, onRestore }: ScanDetailsProps) {
               )}
               {(scan.albums_without_artist_mb_id ?? 0) > 0 && (
                 <div className="flex items-center gap-2">
-                  <Database className="w-4 h-4 text-blue-500" />
+                  <Database className="w-4 h-4 text-info" />
                   <div className="flex-1">
                     <div className="text-muted-foreground">Without Artist MB ID</div>
                     <div className="font-medium">{(scan.albums_without_artist_mb_id ?? 0).toLocaleString()}</div>
@@ -301,7 +301,7 @@ export function ScanDetails({ scanId, onRestore }: ScanDetailsProps) {
               )}
               {(scan.albums_without_complete_tags ?? 0) > 0 && (
                 <div className="flex items-center gap-2">
-                  <Tag className="w-4 h-4 text-purple-500" />
+                  <Tag className="w-4 h-4 text-primary" />
                   <div className="flex-1">
                     <div className="text-muted-foreground">Incomplete Tags</div>
                     <div className="font-medium">{(scan.albums_without_complete_tags ?? 0).toLocaleString()}</div>
@@ -310,7 +310,7 @@ export function ScanDetails({ scanId, onRestore }: ScanDetailsProps) {
               )}
               {(scan.albums_without_album_image ?? 0) > 0 && (
                 <div className="flex items-center gap-2">
-                  <Image className="w-4 h-4 text-gray-500" />
+                  <Image className="w-4 h-4 text-muted-foreground" />
                   <div className="flex-1">
                     <div className="text-muted-foreground">Without Album Image</div>
                     <div className="font-medium">{(scan.albums_without_album_image ?? 0).toLocaleString()}</div>
@@ -319,7 +319,7 @@ export function ScanDetails({ scanId, onRestore }: ScanDetailsProps) {
               )}
               {(scan.albums_without_artist_image ?? 0) > 0 && (
                 <div className="flex items-center gap-2">
-                  <Image className="w-4 h-4 text-gray-500" />
+                  <Image className="w-4 h-4 text-muted-foreground" />
                   <div className="flex-1">
                     <div className="text-muted-foreground">Without Artist Image</div>
                     <div className="font-medium">{(scan.albums_without_artist_image ?? 0).toLocaleString()}</div>
@@ -405,7 +405,7 @@ export function ScanDetails({ scanId, onRestore }: ScanDetailsProps) {
               {albumsScanned > 0 && (
                 <div className="rounded-lg border border-border bg-muted/40 p-3 space-y-1.5">
                   <div className="flex items-center gap-2">
-                    <Sparkles className="w-4 h-4 text-emerald-500" />
+                    <Sparkles className="w-4 h-4 text-success" />
                     <span className="font-medium text-foreground text-sm">PMDA album health</span>
                   </div>
                   <ul className="text-xs text-muted-foreground space-y-0.5">
@@ -444,7 +444,7 @@ export function ScanDetails({ scanId, onRestore }: ScanDetailsProps) {
               {hasProviderSummary && (
                 <div className="rounded-lg border border-border bg-muted/40 p-3 space-y-1.5">
                   <div className="flex items-center gap-2">
-                    <Database className="w-4 h-4 text-blue-500" />
+                    <Database className="w-4 h-4 text-info" />
                     <span className="font-medium text-foreground text-sm">Metadata sources</span>
                   </div>
                   <ul className="text-xs text-muted-foreground space-y-0.5">
@@ -491,7 +491,7 @@ export function ScanDetails({ scanId, onRestore }: ScanDetailsProps) {
               {duplicateSummaryAvailable && (
                 <div className="rounded-lg border border-border bg-muted/40 p-3 space-y-1.5">
                   <div className="flex items-center gap-2">
-                    <Package className="w-4 h-4 text-orange-500" />
+                    <Package className="w-4 h-4 text-warning" />
                     <span className="font-medium text-foreground text-sm">Duplicate decisions</span>
                   </div>
                   <ul className="text-xs text-muted-foreground space-y-0.5">
@@ -523,7 +523,7 @@ export function ScanDetails({ scanId, onRestore }: ScanDetailsProps) {
               {(summary.cover_from_mb ?? 0) + (summary.cover_from_discogs ?? 0) + (summary.cover_from_lastfm ?? 0) + (summary.cover_from_bandcamp ?? 0) > 0 && (
                 <div className="rounded-lg border border-border bg-muted/40 p-3 space-y-1.5">
                   <div className="flex items-center gap-2">
-                    <Image className="w-4 h-4 text-teal-500" />
+                    <Image className="w-4 h-4 text-info" />
                     <span className="font-medium text-foreground text-sm">Covers fetched</span>
                   </div>
                   <ul className="text-xs text-muted-foreground space-y-0.5">
@@ -600,14 +600,14 @@ export function ScanDetails({ scanId, onRestore }: ScanDetailsProps) {
               ))}
             </ul>
             {Array.isArray(summary.ai_errors) && summary.ai_errors.length > 0 && (
-              <div className="mt-3 rounded-md border border-amber-300/70 bg-amber-50 dark:bg-amber-950/30 p-3">
+              <div className="mt-3 rounded-md border border-warning/40 bg-warning/10 p-3">
                 <div className="flex items-center gap-2 mb-1.5">
-                  <Sparkles className="w-4 h-4 text-amber-500" />
-                  <p className="text-xs font-semibold text-amber-700 dark:text-amber-300">
+                  <Sparkles className="w-4 h-4 text-warning" />
+                  <p className="text-xs font-semibold text-warning">
                     AI diagnostics
                   </p>
                 </div>
-                <ul className="space-y-0.5 text-[11px] text-amber-800 dark:text-amber-200">
+                <ul className="space-y-0.5 text-[11px] text-warning">
                   {summary.ai_errors.slice(0, 3).map((err, idx) => (
                     <li key={idx} className="leading-snug">
                       {err.group ? <span className="font-medium">{err.group}:</span> : null}{' '}

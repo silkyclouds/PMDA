@@ -9,6 +9,7 @@ import { useToast } from '@/hooks/use-toast';
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
 import { Button } from '@/components/ui/button';
 import { ThemeToggle } from '@/components/ThemeToggle';
+import { Logo } from '@/components/Logo';
 import {
   Sidebar,
   SidebarContent,
@@ -210,8 +211,14 @@ export function AppSidebar() {
   return (
     <Sidebar collapsible="icon" variant="sidebar">
       <SidebarHeader className="pb-1 pt-2">
-        <div className="flex items-center justify-start group-data-[collapsible=icon]:justify-center">
-          <SidebarTrigger className="shrink-0 group-data-[collapsible=icon]:-translate-x-px" />
+        <div className="flex items-center gap-2 px-1 group-data-[collapsible=icon]:justify-center group-data-[collapsible=icon]:px-0">
+          <span className="shrink-0 group-data-[collapsible=icon]:hidden">
+            <Logo variant="wordmark" size="sm" />
+          </span>
+          <span className="shrink-0 hidden group-data-[collapsible=icon]:block">
+            <Logo variant="icon" size="sm" />
+          </span>
+          <SidebarTrigger className="shrink-0 ml-auto group-data-[collapsible=icon]:ml-0" />
         </div>
       </SidebarHeader>
       <SidebarContent className="pt-1">

@@ -186,15 +186,15 @@ export function MetadataSettings({ config, updateConfig, errors }: MetadataSetti
                 {mbTestResult && (
                   <div className={`p-2 rounded-lg flex items-start gap-2 ${
                     mbTestResult.success 
-                      ? 'bg-green-500/10 border border-green-500/20' 
-                      : 'bg-red-500/10 border border-red-500/20'
+                      ? 'bg-success/10 border border-success/20' 
+                      : 'bg-destructive/10 border border-destructive/20'
                   }`}>
                     {mbTestResult.success ? (
-                      <CheckCircle2 className="w-4 h-4 text-green-500 mt-0.5 shrink-0" />
+                      <CheckCircle2 className="w-4 h-4 text-success mt-0.5 shrink-0" />
                     ) : (
-                      <XCircle className="w-4 h-4 text-red-500 mt-0.5 shrink-0" />
+                      <XCircle className="w-4 h-4 text-destructive mt-0.5 shrink-0" />
                     )}
-                    <p className={`text-xs ${mbTestResult.success ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}`}>
+                    <p className={`text-xs ${mbTestResult.success ? 'text-success' : 'text-destructive'}`}>
                       {mbTestResult.message}
                     </p>
                   </div>
@@ -391,8 +391,8 @@ export function MetadataSettings({ config, updateConfig, errors }: MetadataSetti
                       }}
                     />
                   </div>
-                  <div className="p-3 rounded-lg bg-blue-500/5 border border-blue-500/20 space-y-2">
-                    <p className="text-sm font-medium text-blue-600 dark:text-blue-400">Contact Email (Optional)</p>
+                  <div className="p-3 rounded-lg bg-info/5 border border-info/20 space-y-2">
+                    <p className="text-sm font-medium text-info">Contact Email (Optional)</p>
                     <p className="text-xs text-muted-foreground">
                       Your email address will be included in the User-Agent header sent to MusicBrainz. 
                       This helps MusicBrainz contact you if needed. Rate limit: 1 request per second (standard for all users).
@@ -704,7 +704,7 @@ export function MetadataSettings({ config, updateConfig, errors }: MetadataSetti
               </p>
             </div>
             <Switch
-              checked={config.USE_BANDCAMP ?? false}
+              checked={config.USE_BANDCAMP ?? true}
               onCheckedChange={(checked) => updateConfig({ USE_BANDCAMP: checked })}
             />
           </div>

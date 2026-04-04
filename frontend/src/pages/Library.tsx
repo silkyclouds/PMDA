@@ -12,10 +12,12 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { Carousel, CarouselContent, CarouselItem, CarouselNext, CarouselPrevious } from '@/components/ui/carousel';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
 import { ProviderBadge } from '@/components/providers/ProviderBadge';
+import { AlbumMatchSources } from '@/components/library/AlbumMatchSources';
 import { cn } from '@/lib/utils';
 import { usePlayback } from '@/contexts/PlaybackContext';
 import { useToast } from '@/hooks/use-toast';
 import * as api from '@/lib/api';
+import { formatAudioSpec } from '@/lib/audioFormat';
 import type { TrackInfo } from '@/components/library/AudioPlayer';
 import { FormatBadge } from '@/components/FormatBadge';
 
@@ -521,7 +523,7 @@ export default function Library() {
       <div className="relative overflow-hidden rounded-3xl border border-border/60 bg-gradient-to-br from-card via-card to-accent/20 p-6 md:p-8">
           <div className="absolute inset-0 pointer-events-none opacity-80">
             <div className="absolute -top-20 -right-24 h-64 w-64 rounded-full bg-primary/10 blur-3xl" />
-            <div className="absolute -bottom-24 -left-24 h-64 w-64 rounded-full bg-amber-500/10 blur-3xl" />
+            <div className="absolute -bottom-24 -left-24 h-64 w-64 rounded-full bg-secondary/10 blur-3xl" />
           </div>
           <div className="relative flex flex-col gap-4">
             <div className="flex items-start justify-between gap-4">
@@ -846,13 +848,13 @@ export default function Library() {
                                   type="button"
                                   onClick={() => void handlePlayAlbum(a.album_id, a.title, a.thumb)}
                                   className={cn(
-                                    'absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity',
-                                    'bg-black/35',
+                                     'absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity',
+                                    'bg-foreground/30',
                                   )}
                                   title="Play"
                                 >
-                                  <div className="h-12 w-12 rounded-full bg-white/15 backdrop-blur-sm border border-white/20 flex items-center justify-center">
-                                    <Play className="h-5 w-5 text-white fill-white" />
+                                  <div className="h-12 w-12 rounded-full bg-background/15 backdrop-blur-sm border border-background/20 flex items-center justify-center">
+                                    <Play className="h-5 w-5 text-background fill-background" />
                                   </div>
                                 </button>
                               </AspectRatio>
@@ -877,6 +879,7 @@ export default function Library() {
                                     >
                                       {a.artist_name}
                                     </button>
+                                    <AlbumMatchSources album={a} className="pt-0.5" />
                                   </div>
                                   <Badge variant="outline" className="text-[10px] shrink-0">
                                     {a.year ?? '—'}
@@ -884,9 +887,15 @@ export default function Library() {
                                 </div>
                                 <div className="flex items-center justify-between gap-2">
                                   {a.format ? <FormatBadge format={a.format} size="sm" /> : <span />}
-                                  {a.is_lossless ? (
-                                    <Badge variant="secondary" className="text-[10px]">Lossless</Badge>
-                                  ) : null}
+                                  {(() => {
+                                    const audioBadgeText = formatAudioSpec(a.bit_depth, a.sample_rate) || (a.is_lossless ? '' : 'Lossy');
+                                    if (!audioBadgeText) return null;
+                                    return (
+                                      <Badge variant={a.is_lossless ? 'secondary' : 'outline'} className="text-[10px]">
+                                        {audioBadgeText}
+                                      </Badge>
+                                    );
+                                  })()}
                                 </div>
                               </CardContent>
                             </Card>
@@ -1087,12 +1096,12 @@ export default function Library() {
                               onClick={() => void handlePlayAlbum(a.album_id, a.title, a.thumb)}
                               className={cn(
                                 'absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity',
-                                'bg-black/35',
+                                'bg-foreground/30',
                               )}
                               title="Play"
                             >
-                              <div className="h-12 w-12 rounded-full bg-white/15 backdrop-blur-sm border border-white/20 flex items-center justify-center">
-                                <Play className="h-5 w-5 text-white fill-white" />
+                              <div className="h-12 w-12 rounded-full bg-background/15 backdrop-blur-sm border border-background/20 flex items-center justify-center">
+                                <Play className="h-5 w-5 text-background fill-background" />
                               </div>
                             </button>
                           </AspectRatio>
@@ -1117,6 +1126,7 @@ export default function Library() {
                                 >
                                   {a.artist_name}
                                 </button>
+                                <AlbumMatchSources album={a} className="pt-0.5" />
                               </div>
                               <Badge variant="outline" className="text-[10px] shrink-0">
                                 {a.year ?? '—'}
@@ -1198,12 +1208,12 @@ export default function Library() {
                               onClick={() => void handlePlayAlbum(a.album_id, a.title, a.thumb)}
                               className={cn(
                                 'absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity',
-                                'bg-black/35',
+                                'bg-foreground/30',
                               )}
                               title="Play"
                             >
-                              <div className="h-12 w-12 rounded-full bg-white/15 backdrop-blur-sm border border-white/20 flex items-center justify-center">
-                                <Play className="h-5 w-5 text-white fill-white" />
+                              <div className="h-12 w-12 rounded-full bg-background/15 backdrop-blur-sm border border-background/20 flex items-center justify-center">
+                                <Play className="h-5 w-5 text-background fill-background" />
                               </div>
                             </button>
                           </AspectRatio>
@@ -1228,6 +1238,7 @@ export default function Library() {
                                 >
                                   {a.artist_name}
                                 </button>
+                                <AlbumMatchSources album={a} className="pt-0.5" />
                               </div>
                               <Badge variant="outline" className="text-[10px] shrink-0">
                                 {a.year ?? '—'}
@@ -1316,7 +1327,7 @@ export default function Library() {
                                   </div>
                                 )}
                               </AspectRatio>
-                              <div className="absolute inset-0 opacity-0 hover:opacity-100 transition-opacity bg-black/35" />
+                              <div className="absolute inset-0 opacity-0 hover:opacity-100 transition-opacity bg-foreground/30" />
                               <div className="absolute top-2 right-2 flex items-center gap-2">
                                 <Button
                                   type="button"
@@ -1344,6 +1355,7 @@ export default function Library() {
                                   <button type="button" className="text-xs text-muted-foreground truncate hover:underline" onClick={() => navigate(`/library/artist/${a.artist_id}`)}>
                                     {a.artist_name}
                                   </button>
+                                  <AlbumMatchSources album={a} className="pt-0.5" />
                                 </div>
                                 <div className="flex items-center justify-end flex-wrap gap-2 shrink-0">
                                   <Badge variant="outline" className="text-[10px]">{a.year ?? '—'}</Badge>
@@ -1436,7 +1448,7 @@ export default function Library() {
                         <Music className="w-10 h-10 text-muted-foreground" />
                       </div>
                     )}
-                    <div className="absolute inset-0 opacity-0 group-hover:opacity-100 transition-opacity bg-black/35" />
+                    <div className="absolute inset-0 opacity-0 group-hover:opacity-100 transition-opacity bg-foreground/30" />
                     <div className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity">
                       <Button
                         type="button"
@@ -1475,12 +1487,19 @@ export default function Library() {
                       <button type="button" className="text-xs text-muted-foreground truncate hover:underline" onClick={() => navigate(`/library/artist/${a.artist_id}`)}>
                         {a.artist_name}
                       </button>
+                      <AlbumMatchSources album={a} className="pt-0.5" />
                     </div>
                     <div className="flex flex-wrap items-center gap-1.5">
                       {a.format ? <FormatBadge format={a.format} size="sm" /> : null}
-                      <Badge variant={a.is_lossless ? 'secondary' : 'outline'} className="text-[10px]">
-                        {a.is_lossless ? 'Lossless' : 'Lossy'}
-                      </Badge>
+                      {(() => {
+                        const audioBadgeText = formatAudioSpec(a.bit_depth, a.sample_rate) || (a.is_lossless ? '' : 'Lossy');
+                        if (!audioBadgeText) return null;
+                        return (
+                          <Badge variant={a.is_lossless ? 'secondary' : 'outline'} className="text-[10px]">
+                            {audioBadgeText}
+                          </Badge>
+                        );
+                      })()}
                       <Badge variant="outline" className="text-[10px]">
                         {a.year ?? '—'}
                       </Badge>

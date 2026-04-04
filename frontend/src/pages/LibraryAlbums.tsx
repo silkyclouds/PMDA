@@ -8,6 +8,7 @@ import { Card } from '@/components/ui/card';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { AlbumBadgeGroups } from '@/components/library/AlbumBadgeGroups';
 import { AlbumArtwork } from '@/components/library/AlbumArtwork';
+import { AlbumMatchSources } from '@/components/library/AlbumMatchSources';
 import { GridSizeControl } from '@/components/library/GridSizeControl';
 import { LibraryEmptyState } from '@/components/library/LibraryEmptyState';
 import { usePlayback } from '@/contexts/PlaybackContext';
@@ -29,17 +30,18 @@ export default function LibraryAlbums() {
   const isMobile = useIsMobile();
   const navigate = useNavigate();
   const location = useLocation();
-  const { includeUnmatched, libraryIsEmpty } = useOutletContext<LibraryOutletContext>();
+  const { includeUnmatched, scope, libraryIsEmpty, emptyState, setScope } = useOutletContext<LibraryOutletContext>();
   const { toast } = useToast();
   const { startPlayback, setCurrentTrack } = usePlayback();
   const { showBadges, setShowBadges } = useAlbumBadgesVisibility();
-  const { search, genre, label, year } = useLibraryQuery();
+  const { search, genre, label, year, patch } = useLibraryQuery();
 
   const [albumLoading, setAlbumLoading] = useState(false);
   const [albumError, setAlbumError] = useState<string | null>(null);
   const [albums, setAlbums] = useState<api.LibraryAlbumItem[]>([]);
   const [totalAlbums, setTotalAlbums] = useState(0);
   const [appending, setAppending] = useState(false);
+  const [genres, setGenres] = useState<api.LibraryFacetItem[]>([]);
 
   const [albumLikes, setAlbumLikes] = useState<Record<number, boolean>>({});
 
@@ -110,6 +112,7 @@ export default function LibraryAlbums() {
         label: label || undefined,
         year: year ?? undefined,
         includeUnmatched,
+        scope,
       });
       if (rid !== requestIdRef.current) return;
       const listRaw = Array.isArray(data.albums) ? data.albums : [];
@@ -132,7 +135,7 @@ export default function LibraryAlbums() {
     } finally {
       if (rid === requestIdRef.current) setAlbumLoading(false);
     }
-  }, [genre, hydrateAlbumLikes, includeUnmatched, label, limit, search, sort, year]);
+  }, [genre, hydrateAlbumLikes, includeUnmatched, label, limit, scope, search, sort, year]);
 
   useEffect(() => {
     try {
@@ -141,6 +144,28 @@ export default function LibraryAlbums() {
       // ignore
     }
   }, [sort]);
+
+  useEffect(() => {
+    let cancelled = false;
+    api.getLibraryGenres({
+      label: label || undefined,
+      year: year ?? undefined,
+      includeUnmatched,
+      scope,
+      limit: 120,
+    })
+      .then((res) => {
+        if (cancelled) return;
+        setGenres(Array.isArray(res.genres) ? res.genres : []);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setGenres([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [includeUnmatched, label, scope, year]);
 
   useEffect(() => {
     if (libraryIsEmpty) {
@@ -210,7 +235,12 @@ export default function LibraryAlbums() {
   if (libraryIsEmpty) {
     return (
       <div className="pmda-library-shell pb-6">
-        <LibraryEmptyState />
+        <LibraryEmptyState
+          title={emptyState.title}
+          description={emptyState.description}
+          actionLabel={emptyState.actionLabel ?? undefined}
+          onAction={emptyState.actionScope ? () => setScope(emptyState.actionScope as api.LibraryBrowseScope) : undefined}
+        />
       </div>
     );
   }
@@ -250,6 +280,29 @@ export default function LibraryAlbums() {
             </SelectContent>
           </Select>
 
+          <Select
+            value={genre || '__all__'}
+            onValueChange={(value) => patch({ genre: value === '__all__' ? '' : value }, { replace: true })}
+          >
+            <SelectTrigger className="w-full sm:w-[220px] h-10 bg-background/80">
+              <SelectValue placeholder="All genres" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="__all__">All genres</SelectItem>
+              {genres.map((item) => (
+                <SelectItem key={`album-genre-${item.value}`} value={item.value}>
+                  {item.value} ({item.count})
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+
+          {genre ? (
+            <Button type="button" variant="ghost" size="sm" className="h-10 px-3" onClick={() => patch({ genre: '' }, { replace: true })}>
+              Clear genre
+            </Button>
+          ) : null}
+
           <GridSizeControl value={tileSize} onChange={setTileSize} className="w-full sm:w-[260px]" />
         </div>
       </div>
@@ -281,7 +334,7 @@ export default function LibraryAlbums() {
                 }}
               >
                 <AlbumArtwork albumThumb={a.thumb} artistId={a.artist_id} alt={a.title} size={512} priority={idx < 24} />
-                <div className="absolute inset-0 opacity-0 group-hover:opacity-100 transition-opacity bg-black/35" />
+                <div className="absolute inset-0 opacity-0 group-hover:opacity-100 transition-opacity bg-foreground/30" />
                 <div className="absolute top-2 right-2 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity">
                   <Button
                     type="button"
@@ -325,6 +378,7 @@ export default function LibraryAlbums() {
                   >
                     {a.artist_name}
                   </button>
+                  <AlbumMatchSources album={a} className="pt-0.5" />
                 </div>
 
                 <AlbumBadgeGroups
@@ -335,6 +389,8 @@ export default function LibraryAlbums() {
                   publicRatingVotes={a.public_rating_votes}
                   format={a.format}
                   isLossless={a.is_lossless}
+                  sampleRate={a.sample_rate}
+                  bitDepth={a.bit_depth}
                   year={a.year}
                   trackCount={a.track_count}
                   genres={a.genres || (a.genre ? [a.genre] : [])}

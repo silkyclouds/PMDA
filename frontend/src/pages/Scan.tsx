@@ -80,12 +80,7 @@ export default function Scan() {
   }, [scanProgress?.scanning, queryClient]);
 
   return (
-    <main className="pmda-page-shell pmda-page-stack">
-      <div>
-        <h1 className="pmda-page-title">Library Scan</h1>
-        <p className="pmda-meta-text mt-1">Run scans, then resolve duplicates and metadata in a clear workflow</p>
-      </div>
-
+    <main className="scan-page pmda-page-shell" data-scan-layout="expanded-v2">
       <ScanProgress
         progress={enhancedProgress}
         currentDuplicateCount={currentDuplicateCount}

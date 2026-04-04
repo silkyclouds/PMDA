@@ -145,7 +145,7 @@ function IssueBadges({ album, className }: { album: AlbumInfo; className?: strin
   return (
     <div className={cn('flex flex-wrap items-center gap-1', className)}>
       {noCover && (
-        <Badge className="text-xs bg-slate-500/20 text-slate-700 dark:bg-slate-500/30 dark:text-slate-300 border-slate-500/30">
+        <Badge className="text-xs bg-muted text-muted-foreground border-border/60">
           No cover
         </Badge>
       )}
@@ -176,12 +176,12 @@ function IssueBadges({ album, className }: { album: AlbumInfo; className?: strin
           ) : null}
         </>
       ) : album.mb_identified === false && (
-        <Badge className="text-xs bg-amber-500/20 text-amber-700 dark:bg-amber-500/30 dark:text-amber-300 border-amber-500/30">
+        <Badge className="text-xs bg-warning/20 text-warning-foreground border-warning/30">
           No MBID
         </Badge>
       )}
       {album.in_duplicate_group && (
-        <Badge className="text-xs border-blue-500/50 text-blue-700 dark:text-blue-300 bg-transparent">
+        <Badge className="text-xs border-info/50 text-info bg-transparent">
           Duplicate
         </Badge>
       )}
@@ -730,7 +730,7 @@ export default function LibraryBrowser() {
               {totalArtists > 0 ? `${totalArtists.toLocaleString()} artist${totalArtists !== 1 ? 's' : ''}` : 'Browse your music library by artist'}
             </p>
             {scanRunning && (
-              <p className="text-xs text-emerald-500 mt-1">
+              <p className="text-xs text-success mt-1">
                 Live refresh enabled while scan is running.
               </p>
             )}
@@ -1409,7 +1409,7 @@ export default function LibraryBrowser() {
                   const isCurrent = improveAllProgress?.current_provider === name;
                   return (
                     <span key={name} className="flex items-center gap-1.5 text-xs">
-                      {status === 'ok' && <Check className="h-4 w-4 text-green-600" aria-hidden />}
+                      {status === 'ok' && <Check className="h-4 w-4 text-success" aria-hidden />}
                       {status === 'fail' && <X className="h-4 w-4 text-destructive" aria-hidden />}
                       {status === 'pending' && !isCurrent && <Circle className="h-3.5 w-3.5 text-muted-foreground" aria-hidden />}
                       {isCurrent && <Loader2 className="h-4 w-4 animate-spin text-primary" aria-hidden />}
@@ -1434,7 +1434,7 @@ export default function LibraryBrowser() {
                   <ul className="space-y-0.5 text-xs">
                     {improveAllProgress.current_steps.map((step, i) => (
                       <li key={i} className="flex items-center gap-2">
-                        {step.success === true && <Check className="h-3.5 w-3.5 text-green-600 shrink-0" />}
+                        {step.success === true && <Check className="h-3.5 w-3.5 text-success shrink-0" />}
                         {step.success === false && <X className="h-3.5 w-3.5 text-destructive shrink-0" />}
                         {step.success === null && <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground shrink-0" />}
                         <span>{step.label}</span>
@@ -1455,7 +1455,7 @@ export default function LibraryBrowser() {
                             <ul className="mt-0.5 pl-4 space-y-0.5 text-muted-foreground">
                               {entry.steps?.map((step, i) => (
                                 <li key={i} className="flex items-center gap-2">
-                                  {step.success === true && <Check className="h-3 w-3 text-green-600 shrink-0" />}
+                                  {step.success === true && <Check className="h-3 w-3 text-success shrink-0" />}
                                   {step.success === false && <X className="h-3 w-3 text-destructive shrink-0" />}
                                   <span>{step.label}</span>
                                 </li>
@@ -1509,7 +1509,7 @@ export default function LibraryBrowser() {
                             <ul className="mt-0.5 pl-4 space-y-0.5 text-muted-foreground">
                               {entry.steps?.map((step, i) => (
                                 <li key={i} className="flex items-center gap-2">
-                                  {step.success === true && <Check className="h-3 w-3 text-green-600 shrink-0" />}
+                                  {step.success === true && <Check className="h-3 w-3 text-success shrink-0" />}
                                   {step.success === false && <X className="h-3 w-3 text-destructive shrink-0" />}
                                   <span>{step.label}</span>
                                 </li>

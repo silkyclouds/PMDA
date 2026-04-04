@@ -423,7 +423,7 @@ export function SchedulerSettings({ config, updateConfig }: SchedulerSettingsPro
                   <p className="text-xs text-muted-foreground">Watcher status unavailable.</p>
                 )}
                 {watcherDegraded ? (
-                  <div className="flex items-center gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
+                  <div className="flex items-center gap-2 rounded-md border border-warning/40 bg-warning/10 px-3 py-2 text-xs text-warning">
                     <AlertTriangle className="h-4 w-4" />
                     Watcher degraded: changed-only uses discovery fallback.
                   </div>

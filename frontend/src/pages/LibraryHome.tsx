@@ -10,6 +10,7 @@ import { AspectRatio } from '@/components/ui/aspect-ratio';
 import { Carousel, CarouselContent, CarouselItem, CarouselNext, CarouselPrevious } from '@/components/ui/carousel';
 import { AlbumBadgeGroups } from '@/components/library/AlbumBadgeGroups';
 import { AlbumArtwork } from '@/components/library/AlbumArtwork';
+import { AlbumMatchSources } from '@/components/library/AlbumMatchSources';
 import { AuthenticatedImage } from '@/components/library/AuthenticatedImage';
 import { GridSizeControl } from '@/components/library/GridSizeControl';
 import { LibraryEmptyState } from '@/components/library/LibraryEmptyState';
@@ -82,7 +83,7 @@ function hasClassicalIdentity(payload?: api.ClassicalIdentityPayload | null): bo
 export default function LibraryHome() {
   const navigate = useNavigate();
   const location = useLocation();
-  const { includeUnmatched, libraryIsEmpty } = useOutletContext<LibraryOutletContext>();
+  const { includeUnmatched, scope, libraryIsEmpty, emptyState, setScope } = useOutletContext<LibraryOutletContext>();
   const { user } = useAuth();
   const { toast } = useToast();
   const { startPlayback, setCurrentTrack, recommendationSessionId, session } = usePlayback();
@@ -151,32 +152,32 @@ export default function LibraryHome() {
   const loadTopArtists = useCallback(async () => {
     try {
       setTopArtistsLoading(true);
-      const res = await api.getTopArtists(18, 0, { includeUnmatched });
+      const res = await api.getTopArtists(18, 0, { includeUnmatched, scope });
       setTopArtists(Array.isArray(res.artists) ? res.artists : []);
     } catch {
       setTopArtists([]);
     } finally {
       setTopArtistsLoading(false);
     }
-  }, [includeUnmatched]);
+  }, [includeUnmatched, scope]);
 
   const loadRecentArtists = useCallback(async () => {
     try {
       setRecentArtistsLoading(true);
-      const res = await api.getRecentlyAddedArtists(18, 0, { includeUnmatched });
+      const res = await api.getRecentlyAddedArtists(18, 0, { includeUnmatched, scope });
       setRecentArtists(Array.isArray(res.artists) ? res.artists : []);
     } catch {
       setRecentArtists([]);
     } finally {
       setRecentArtistsLoading(false);
     }
-  }, [includeUnmatched]);
+  }, [includeUnmatched, scope]);
 
   const loadDiscover = useCallback(async (opts?: { refresh?: boolean }) => {
     try {
       setDiscoverLoading(true);
       setDiscoverError(null);
-      const res = await api.getLibraryDiscoverWithOptions(90, 18, Boolean(opts?.refresh), { includeUnmatched });
+      const res = await api.getLibraryDiscoverWithOptions(90, 18, Boolean(opts?.refresh), { includeUnmatched, scope });
       setDiscover(res);
     } catch (e) {
       setDiscover(null);
@@ -184,25 +185,25 @@ export default function LibraryHome() {
     } finally {
       setDiscoverLoading(false);
     }
-  }, [includeUnmatched]);
+  }, [includeUnmatched, scope]);
 
   const loadRecent = useCallback(async () => {
     try {
       setRecentLoading(true);
-      const data = await api.getLibraryAlbums({ sort: 'recent', limit: 18, offset: 0, includeUnmatched });
+      const data = await api.getLibraryAlbums({ sort: 'recent', limit: 18, offset: 0, includeUnmatched, scope });
       setRecentAlbums(Array.isArray(data.albums) ? data.albums : []);
     } catch {
       setRecentAlbums([]);
     } finally {
       setRecentLoading(false);
     }
-  }, [includeUnmatched]);
+  }, [includeUnmatched, scope]);
 
   const loadRecentlyPlayed = useCallback(async (opts?: { refresh?: boolean }) => {
     try {
       setRecentlyPlayedLoading(true);
       setRecentlyPlayedError(null);
-      const data = await api.getLibraryRecentlyPlayedAlbumsWithOptions(90, 18, Boolean(opts?.refresh), { includeUnmatched });
+      const data = await api.getLibraryRecentlyPlayedAlbumsWithOptions(90, 18, Boolean(opts?.refresh), { includeUnmatched, scope });
       setRecentlyPlayedAlbums(Array.isArray(data.albums) ? data.albums : []);
     } catch (e) {
       setRecentlyPlayedAlbums([]);
@@ -210,7 +211,7 @@ export default function LibraryHome() {
     } finally {
       setRecentlyPlayedLoading(false);
     }
-  }, [includeUnmatched]);
+  }, [includeUnmatched, scope]);
 
   useEffect(() => {
     if (libraryIsEmpty) {
@@ -384,7 +385,12 @@ export default function LibraryHome() {
   if (libraryIsEmpty) {
     return (
       <div className="pmda-library-shell pb-6">
-        <LibraryEmptyState />
+        <LibraryEmptyState
+          title={emptyState.title}
+          description={emptyState.description}
+          actionLabel={emptyState.actionLabel ?? undefined}
+          onAction={emptyState.actionScope ? () => setScope(emptyState.actionScope as api.LibraryBrowseScope) : undefined}
+        />
       </div>
     );
   }
@@ -392,48 +398,48 @@ export default function LibraryHome() {
   return (
     <div className="pmda-library-shell pb-6 flex min-w-0 flex-col gap-5 md:gap-6">
       <section className="grid min-w-0 gap-4 2xl:grid-cols-[minmax(0,1.35fr)_minmax(22rem,0.85fr)]">
-        <Card className="overflow-hidden border-border/60 bg-[linear-gradient(135deg,rgba(27,29,36,0.98),rgba(17,19,25,0.96)),radial-gradient(circle_at_top_left,rgba(221,119,87,0.18),transparent_38%),radial-gradient(circle_at_78%_18%,rgba(235,184,120,0.14),transparent_28%)] text-white shadow-none">
+        <Card className="overflow-hidden border-border/60 bg-[linear-gradient(135deg,hsl(var(--card)),hsl(var(--background))),radial-gradient(circle_at_top_left,hsl(var(--primary)/0.12),transparent_38%),radial-gradient(circle_at_78%_18%,hsl(var(--secondary)/0.10),transparent_28%)] shadow-none">
           <CardContent className="p-6 md:p-8">
             <div className="flex flex-col gap-6">
               <div className="space-y-3">
-                <div className="inline-flex items-center gap-2 border border-white/12 bg-white/6 px-3 py-1 text-[11px] font-medium uppercase tracking-[0.28em] text-white/78">
-                  <Sparkles className="h-3.5 w-3.5 text-emerald-300" />
+                <div className="inline-flex items-center gap-2 border border-border/30 bg-muted/30 px-3 py-1 text-[11px] font-medium uppercase tracking-[0.28em] text-muted-foreground">
+                  <Sparkles className="h-3.5 w-3.5 text-primary" />
                   Listening Notes
                 </div>
                 <div className="max-w-2xl space-y-3">
-                  <h1 className="max-w-xl text-3xl font-semibold tracking-tight text-white sm:text-[3rem]">
+                  <h1 className="max-w-xl text-3xl font-semibold tracking-tight text-foreground sm:text-[3rem]">
                     {greetingTitle}
                   </h1>
-                  <p className="max-w-xl text-sm leading-6 text-white/72 sm:text-[15px]">
+                  <p className="max-w-xl text-sm leading-6 text-muted-foreground sm:text-[15px]">
                     Here&apos;s what deserves a closer listen today.
                   </p>
                 </div>
               </div>
               <div className="grid gap-3 sm:grid-cols-3">
-                <div className="border border-white/10 bg-black/16 p-4 backdrop-blur-sm">
-                  <div className="text-[11px] uppercase tracking-[0.22em] text-white/48">Discovery queue</div>
-                  <div className="mt-2 text-3xl font-semibold text-white">{discoverAlbumCount}</div>
-                  <p className="mt-1 text-xs leading-5 text-white/60">Albums surfaced from your listening history and neighboring records.</p>
+                <div className="border border-border/40 bg-muted/40 p-4 backdrop-blur-sm">
+                  <div className="text-[11px] uppercase tracking-[0.22em] text-muted-foreground">Discovery queue</div>
+                  <div className="mt-2 text-3xl font-semibold">{discoverAlbumCount}</div>
+                  <p className="mt-1 text-xs leading-5 text-muted-foreground">Albums surfaced from your listening history and neighboring records.</p>
                 </div>
-                <div className="border border-white/10 bg-black/16 p-4 backdrop-blur-sm">
-                  <div className="text-[11px] uppercase tracking-[0.22em] text-white/48">For you</div>
-                  <div className="mt-2 text-3xl font-semibold text-white">{recommendations.length}</div>
-                  <p className="mt-1 text-xs leading-5 text-white/60">Track recommendations shaped by what you actually finish and replay.</p>
+                <div className="border border-border/40 bg-muted/40 p-4 backdrop-blur-sm">
+                  <div className="text-[11px] uppercase tracking-[0.22em] text-muted-foreground">For you</div>
+                  <div className="mt-2 text-3xl font-semibold">{recommendations.length}</div>
+                  <p className="mt-1 text-xs leading-5 text-muted-foreground">Track recommendations shaped by what you actually finish and replay.</p>
                 </div>
-                <div className="border border-white/10 bg-black/16 p-4 backdrop-blur-sm">
-                  <div className="text-[11px] uppercase tracking-[0.22em] text-white/48">Recent motion</div>
-                  <div className="mt-2 text-3xl font-semibold text-white">{recentlyPlayedAlbums.length || recentAlbums.length}</div>
-                  <p className="mt-1 text-xs leading-5 text-white/60">Recently played and recently added records ready for the next session.</p>
+                <div className="border border-border/40 bg-muted/40 p-4 backdrop-blur-sm">
+                  <div className="text-[11px] uppercase tracking-[0.22em] text-muted-foreground">Recent motion</div>
+                  <div className="mt-2 text-3xl font-semibold">{recentlyPlayedAlbums.length || recentAlbums.length}</div>
+                  <p className="mt-1 text-xs leading-5 text-muted-foreground">Recently played and recently added records ready for the next session.</p>
                 </div>
               </div>
               <div className="flex flex-wrap gap-2">
-                <Button type="button" className="h-10 bg-white text-slate-950 hover:bg-white/90" onClick={() => openSectionPage('discover')}>
+                <Button type="button" className="h-10" onClick={() => openSectionPage('discover')}>
                   Open discovery
                 </Button>
-                <Button type="button" variant="secondary" className="h-10 border border-white/12 bg-white/10 text-white hover:bg-white/16" onClick={() => navigate(`/library/recommendations${location.search || ''}`, { state: withBackLinkState(location) })}>
+                <Button type="button" variant="secondary" className="h-10" onClick={() => navigate(`/library/recommendations${location.search || ''}`, { state: withBackLinkState(location) })}>
                   Recommendations
                 </Button>
-                <Button type="button" variant="secondary" className="h-10 border border-white/12 bg-white/10 text-white hover:bg-white/16" onClick={() => navigate(`/library/liked${location.search || ''}`, { state: withBackLinkState(location) })}>
+                <Button type="button" variant="outline" className="h-10" onClick={() => navigate(`/library/liked${location.search || ''}`, { state: withBackLinkState(location) })}>
                   Liked
                 </Button>
               </div>
@@ -699,11 +705,11 @@ export default function LibraryHome() {
                               <button
                                 type="button"
                                 onClick={() => void handlePlayAlbum(a.album_id, a.title, a.thumb)}
-                                className="absolute inset-0 flex items-center justify-center opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity bg-black/35"
+                                className="absolute inset-0 flex items-center justify-center opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity bg-foreground/30"
                                 title="Play"
                               >
-                                <div className="h-10 w-10 sm:h-12 sm:w-12 border border-white/20 bg-white/15 backdrop-blur-sm flex items-center justify-center">
-                                  <Play className="h-5 w-5 text-white fill-white" />
+                                <div className="h-10 w-10 sm:h-12 sm:w-12 border border-background/20 bg-background/15 backdrop-blur-sm flex items-center justify-center">
+                                  <Play className="h-5 w-5 text-background fill-background" />
                                 </div>
                               </button>
                             </AspectRatio>
@@ -728,6 +734,7 @@ export default function LibraryHome() {
                                   >
                                     {a.artist_name}
                                   </button>
+                                  <AlbumMatchSources album={a} className="pt-0.5" />
                                 </div>
                                 <Badge variant="outline" className="text-[11px] shrink-0">
                                   {a.year ?? '—'}
@@ -741,6 +748,8 @@ export default function LibraryHome() {
                                 publicRatingVotes={a.public_rating_votes}
                                 format={a.format}
                                 isLossless={a.is_lossless}
+                                sampleRate={a.sample_rate}
+                                bitDepth={a.bit_depth}
                                 year={a.year}
                                 trackCount={a.track_count}
                                 genres={a.genres || (a.genre ? [a.genre] : [])}
@@ -1056,11 +1065,11 @@ export default function LibraryHome() {
                           <button
                             type="button"
                             onClick={() => void handlePlayAlbum(a.album_id, a.title, a.thumb)}
-                            className="absolute inset-0 flex items-center justify-center opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity bg-black/35"
+                             className="absolute inset-0 flex items-center justify-center opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity bg-foreground/30"
                             title="Play"
                           >
-                            <div className="h-10 w-10 sm:h-12 sm:w-12 border border-white/20 bg-white/15 backdrop-blur-sm flex items-center justify-center">
-                              <Play className="h-5 w-5 text-white fill-white" />
+                            <div className="h-10 w-10 sm:h-12 sm:w-12 border border-background/20 bg-background/15 backdrop-blur-sm flex items-center justify-center">
+                              <Play className="h-5 w-5 text-background fill-background" />
                             </div>
                           </button>
                         </AspectRatio>
@@ -1085,6 +1094,7 @@ export default function LibraryHome() {
                               >
                                 {a.artist_name}
                               </button>
+                              <AlbumMatchSources album={a} className="pt-0.5" />
                             </div>
                             <Badge variant="outline" className="text-[11px] shrink-0">
                               {a.year ?? '—'}
@@ -1098,6 +1108,8 @@ export default function LibraryHome() {
                             publicRatingVotes={a.public_rating_votes}
                             format={a.format}
                             isLossless={a.is_lossless}
+                            sampleRate={a.sample_rate}
+                            bitDepth={a.bit_depth}
                             year={a.year}
                             trackCount={a.track_count}
                             genres={a.genres || (a.genre ? [a.genre] : [])}
@@ -1167,11 +1179,11 @@ export default function LibraryHome() {
                           <button
                             type="button"
                             onClick={() => void handlePlayAlbum(a.album_id, a.title, a.thumb)}
-                            className="absolute inset-0 flex items-center justify-center opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity bg-black/35"
+                            className="absolute inset-0 flex items-center justify-center opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity bg-foreground/30"
                             title="Play"
                           >
-                            <div className="h-10 w-10 sm:h-12 sm:w-12 border border-white/20 bg-white/15 backdrop-blur-sm flex items-center justify-center">
-                              <Play className="h-5 w-5 text-white fill-white" />
+                            <div className="h-10 w-10 sm:h-12 sm:w-12 border border-background/20 bg-background/15 backdrop-blur-sm flex items-center justify-center">
+                              <Play className="h-5 w-5 text-background fill-background" />
                             </div>
                           </button>
                         </AspectRatio>
@@ -1196,6 +1208,7 @@ export default function LibraryHome() {
                               >
                                 {a.artist_name}
                               </button>
+                              <AlbumMatchSources album={a} className="pt-0.5" />
                             </div>
                             <Badge variant="outline" className="text-[11px] shrink-0">
                               {a.year ?? '—'}
@@ -1209,6 +1222,8 @@ export default function LibraryHome() {
                             publicRatingVotes={a.public_rating_votes}
                             format={a.format}
                             isLossless={a.is_lossless}
+                            sampleRate={a.sample_rate}
+                            bitDepth={a.bit_depth}
                             year={a.year}
                             trackCount={a.track_count}
                             genres={a.genres || (a.genre ? [a.genre] : [])}

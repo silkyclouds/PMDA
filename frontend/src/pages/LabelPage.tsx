@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useLocation, useNavigate, useOutletContext, useParams } from 'react-router-dom';
-import { ArrowLeft, Heart, Loader2, Play, Share2, UserRound } from 'lucide-react';
+import { ArrowLeft, Building2, Heart, Loader2, Play, Share2, UserRound } from 'lucide-react';
 
 import { AspectRatio } from '@/components/ui/aspect-ratio';
 import { Badge } from '@/components/ui/badge';
@@ -12,6 +12,8 @@ import { SocialActivityBadges } from '@/components/social/SocialActivityBadges';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { AlbumArtwork } from '@/components/library/AlbumArtwork';
 import { AlbumBadgeGroups } from '@/components/library/AlbumBadgeGroups';
+import { AlbumMatchSources } from '@/components/library/AlbumMatchSources';
+import { AuthenticatedImage } from '@/components/library/AuthenticatedImage';
 import { ShareDialog } from '@/components/social/ShareDialog';
 import { usePlayback } from '@/contexts/PlaybackContext';
 import { getLibraryGridTemplateColumns, useLibraryTileSize } from '@/hooks/use-library-tile-size';
@@ -29,7 +31,7 @@ export default function LabelPage() {
   const isMobile = useIsMobile();
   const navigate = useNavigate();
   const location = useLocation();
-  const { includeUnmatched } = useOutletContext<LibraryOutletContext>();
+  const { includeUnmatched, scope } = useOutletContext<LibraryOutletContext>();
   const { startPlayback, setCurrentTrack } = usePlayback();
   const { canUseAI } = useAuth();
   const { toast } = useToast();
@@ -80,18 +82,18 @@ export default function LabelPage() {
     }
   }, [setCurrentTrack, startPlayback, toast]);
 
-  const loadProfile = useCallback(async () => {
+  const loadProfile = useCallback(async (refresh = false) => {
     if (!label) return;
     try {
       setProfileLoading(true);
-      const res = await api.getLabelProfile(label, { includeUnmatched, limit_artists: 24, limit_genres: 24 });
+      const res = await api.getLabelProfile(label, { includeUnmatched, limit_artists: 24, limit_genres: 24, refresh, scope });
       setProfile(res);
     } catch {
       setProfile(null);
     } finally {
       setProfileLoading(false);
     }
-  }, [includeUnmatched, label]);
+  }, [includeUnmatched, label, scope]);
 
   const loadAlbumsPage = useCallback(async (opts: { reset: boolean; pageOffset: number }) => {
     const rid = ++requestIdRef.current;
@@ -103,7 +105,7 @@ export default function LabelPage() {
       } else {
         setAppending(true);
       }
-      const res = await api.getLibraryAlbums({ label, sort: 'year_desc', limit, offset: pageOffset, includeUnmatched });
+      const res = await api.getLibraryAlbums({ label, sort: 'year_desc', limit, offset: pageOffset, includeUnmatched, scope });
       if (rid !== requestIdRef.current) return;
       const listRaw = Array.isArray(res.albums) ? res.albums : [];
       const list = dedupeAlbumsForDisplay(listRaw);
@@ -127,7 +129,7 @@ export default function LabelPage() {
         setAppending(false);
       }
     }
-  }, [includeUnmatched, label, limit]);
+  }, [includeUnmatched, label, limit, scope]);
 
   useEffect(() => {
     if (!label) {
@@ -142,6 +144,25 @@ export default function LabelPage() {
     void loadProfile();
     void loadAlbumsPage({ reset: true, pageOffset: 0 });
   }, [label, includeUnmatched, loadAlbumsPage, loadProfile]);
+
+  useEffect(() => {
+    if (!label) return;
+    if (!profile) return;
+    if (profile.logo_url && profile.description) return;
+    let cancelled = false;
+    const timers: Array<ReturnType<typeof setTimeout>> = [];
+    const delays = [1800, 5200, 12000];
+    for (const delay of delays) {
+      const timer = setTimeout(() => {
+        if (!cancelled) void loadProfile(true);
+      }, delay);
+      timers.push(timer);
+    }
+    return () => {
+      cancelled = true;
+      for (const timer of timers) clearTimeout(timer);
+    };
+  }, [label, loadProfile, profile]);
 
   useEffect(() => {
     let cancelled = false;
@@ -226,11 +247,30 @@ export default function LabelPage() {
       <Card className="pmda-flat-surface overflow-hidden">
         <CardContent className="p-5 space-y-4">
           <div className="flex items-start justify-between gap-4">
-            <div className="min-w-0">
-              <h1 className="pmda-page-title break-words">{label || 'Label'}</h1>
-              <p className="text-xs text-muted-foreground mt-1">
-                {(profile?.album_count || total || 0).toLocaleString()} release{(profile?.album_count || total || 0) !== 1 ? 's' : ''}
-              </p>
+            <div className="min-w-0 flex items-start gap-4">
+              {profile?.logo_url ? (
+                <div className="w-64 md:w-80 lg:w-96 shrink-0">
+                  <AspectRatio ratio={1}>
+                    <AuthenticatedImage
+                      src={profile.logo_url}
+                      alt={`${label || 'Label'} logo`}
+                      className="h-full w-full rounded-md border border-border/60 object-contain bg-muted p-4"
+                      fallback={<Building2 className="h-10 w-10 text-muted-foreground" />}
+                    />
+                  </AspectRatio>
+                </div>
+              ) : null}
+              <div className="min-w-0">
+                <h1 className="pmda-page-title break-words">{label || 'Label'}</h1>
+                <p className="text-xs text-muted-foreground mt-1">
+                  {(profile?.album_count || total || 0).toLocaleString()} release{(profile?.album_count || total || 0) !== 1 ? 's' : ''}
+                </p>
+                {profile?.logo_provider ? (
+                  <p className="mt-1 text-[11px] uppercase tracking-[0.24em] text-muted-foreground/70">
+                    Logo from {profile.logo_provider}
+                  </p>
+                ) : null}
+              </div>
             </div>
             {error ? (
               <Badge variant="outline" className="text-xs border-destructive/50 text-destructive">
@@ -369,7 +409,7 @@ export default function LabelPage() {
                 <div className="pmda-flat-tile relative overflow-hidden">
                   <AspectRatio ratio={1} className="bg-muted">
                     <AlbumArtwork albumThumb={a.thumb} artistId={a.artist_id} alt={a.title} size={320} imageClassName="w-full h-full object-cover" />
-                    <div className="absolute inset-0 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity bg-black/25" />
+                    <div className="absolute inset-0 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity bg-foreground/25" />
                     <div className="absolute inset-x-0 bottom-0 p-3 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity">
                       <div className="flex items-center justify-between gap-2">
                         <Button
@@ -413,6 +453,7 @@ export default function LabelPage() {
                     >
                       {a.artist_name}
                     </button>
+                    <AlbumMatchSources album={a} className="pt-0.5" />
                     <AlbumBadgeGroups
                       show
                       compact
@@ -421,6 +462,8 @@ export default function LabelPage() {
                       publicRatingVotes={a.public_rating_votes}
                       format={a.format}
                       isLossless={a.is_lossless}
+                      sampleRate={a.sample_rate}
+                      bitDepth={a.bit_depth}
                       year={a.year}
                       trackCount={a.track_count}
                       genres={a.genres || (a.genre ? [a.genre] : [])}

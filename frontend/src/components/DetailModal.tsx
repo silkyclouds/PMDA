@@ -82,10 +82,10 @@ export function DetailModal({ artist, albumId, onClose, onDedupe, no_move, best_
       {/* Content */}
       <div className="modal-content">
         {/* Header */}
-        <div className="sticky top-0 z-10 flex items-center justify-between gap-4 p-4 border-b border-border bg-card">
+        <div className="sticky top-0 z-10 flex items-center justify-between gap-4 p-4 md:p-5 border-b border-border/60 bg-card/95 backdrop-blur-sm">
           <div className="flex-1 min-w-0">
             <div className="flex items-center gap-3 flex-wrap">
-            <h2 className="text-lg font-semibold text-foreground truncate">
+              <h2 className="text-base md:text-lg font-semibold text-foreground truncate">
                 {(details?.artist || artist) + ' – ' + (details?.album || best_title || 'Loading...')}
               </h2>
               {details?.editions && (
@@ -111,7 +111,7 @@ export function DetailModal({ artist, albumId, onClose, onDedupe, no_move, best_
         </div>
 
         {/* Body — full width, no horizontal overflow */}
-        <div className="p-4 md:p-6 space-y-6 w-full min-w-0 overflow-x-hidden">
+        <div className="p-4 md:p-6 space-y-5 w-full min-w-0 overflow-x-hidden">
           {no_move && (
             <div className="p-4 rounded-lg bg-warning/5 border border-warning/20 text-warning-foreground">
               <p className="font-medium text-foreground mb-1">Manual review recommended</p>
@@ -174,7 +174,7 @@ export function DetailModal({ artist, albumId, onClose, onDedupe, no_move, best_
                 <h3 className="text-sm font-medium text-foreground">
                   Choose Edition to Keep ({details.editions.length} available)
                 </h3>
-                <div className="flex flex-nowrap gap-4 w-full min-w-0">
+                <div className="flex flex-col md:flex-row flex-nowrap gap-4 w-full min-w-0">
                   <RadioGroup
                     value={selectedEdition}
                     onValueChange={setSelectedEdition}
@@ -233,7 +233,7 @@ export function DetailModal({ artist, albumId, onClose, onDedupe, no_move, best_
         </div>
 
         {/* Footer */}
-        <div className="sticky bottom-0 flex items-center justify-between gap-3 p-4 border-t border-border bg-card">
+        <div className="sticky bottom-0 flex flex-col sm:flex-row items-center justify-between gap-3 p-4 md:p-5 border-t border-border/60 bg-card/95 backdrop-blur-sm">
           <p className="text-xs text-muted-foreground">
             {!no_move && selectedEdition !== '0' && (
               <span className="text-warning">⚠ You've overridden the AI recommendation</span>

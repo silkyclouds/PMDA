@@ -7,6 +7,7 @@ import { useAuth } from '@/contexts/AuthContext';
 import { AlbumArtwork } from '@/components/library/AlbumArtwork';
 import { AuthenticatedImage } from '@/components/library/AuthenticatedImage';
 import { AlbumBadgeGroups } from '@/components/library/AlbumBadgeGroups';
+import { AlbumMatchSources } from '@/components/library/AlbumMatchSources';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
@@ -233,6 +234,7 @@ export default function LikedPage() {
                         >
                           {album.artist_name}
                         </button>
+                        <AlbumMatchSources album={album} className="pt-0.5" />
                         {!showBadges && album.year ? (
                           <div className="text-[11px] text-muted-foreground">{album.year}</div>
                         ) : null}
@@ -245,6 +247,8 @@ export default function LikedPage() {
                         publicRatingVotes={album.public_rating_votes}
                         format={album.format}
                         isLossless={album.is_lossless}
+                        sampleRate={album.sample_rate}
+                        bitDepth={album.bit_depth}
                         year={album.year}
                         trackCount={album.track_count}
                         genres={album.genres || (album.genre ? [album.genre] : [])}
@@ -335,6 +339,7 @@ export default function LikedPage() {
                       <div className="space-y-1">
                         <div className="truncate text-sm font-semibold">{album.title}</div>
                         <div className="truncate text-xs text-muted-foreground">{album.artist_name}</div>
+                        <AlbumMatchSources album={album} className="pt-0.5" />
                         {!showBadges && album.year ? (
                           <div className="text-[11px] text-muted-foreground">{album.year}</div>
                         ) : null}
@@ -347,6 +352,8 @@ export default function LikedPage() {
                         publicRatingVotes={album.public_rating_votes}
                         format={album.format}
                         isLossless={album.is_lossless}
+                        sampleRate={album.sample_rate}
+                        bitDepth={album.bit_depth}
                         year={album.year}
                         trackCount={album.track_count}
                         genres={album.genres || (album.genre ? [album.genre] : [])}

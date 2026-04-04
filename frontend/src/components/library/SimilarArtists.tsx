@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { Users, Plus, Loader2, Music } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
@@ -52,6 +52,7 @@ export function SimilarArtists({ artistId, artistName }: SimilarArtistsProps) {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [adding, setAdding] = useState(false);
   const { toast } = useToast();
+  const refreshAttemptsRef = useRef(0);
 
   const artistKey = (a: SimilarArtist): string => {
     const mbid = (a.mbid || '').trim();
@@ -90,9 +91,37 @@ export function SimilarArtists({ artistId, artistName }: SimilarArtistsProps) {
 
   useEffect(() => {
     if (artistId) {
+      refreshAttemptsRef.current = 0;
       loadSimilarArtists();
     }
   }, [artistId]);
+
+  useEffect(() => {
+    if (similarArtists.length === 0) return;
+    const missing = similarArtists.filter((artist) => !artist.image_url || isProbablyPlaceholderArtistImageUrl(artist.image_url));
+    if (missing.length === 0) return;
+    if (refreshAttemptsRef.current >= 3) return;
+    let cancelled = false;
+    const attemptNo = refreshAttemptsRef.current;
+    const timer = setTimeout(async () => {
+      if (cancelled) return;
+      refreshAttemptsRef.current += 1;
+      try {
+        const response = await fetch(`/api/library/artist/${artistId}/similar?refresh=1`);
+        if (!response.ok || cancelled) return;
+        const data = await response.json();
+        if (cancelled) return;
+        setSimilarArtists(Array.isArray(data.similar_artists) ? data.similar_artists : []);
+        setSource(String(data.source || ''));
+      } catch {
+        // Best-effort only.
+      }
+    }, 1800 + attemptNo * 2400);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [artistId, similarArtists]);
 
   const handleToggle = (key: string) => {
     setSelected(prev => {
@@ -235,9 +264,14 @@ export function SimilarArtists({ artistId, artistName }: SimilarArtistsProps) {
                     alt={artist.name}
                     className="w-full h-full object-cover animate-in fade-in-0 duration-300"
                     loading="lazy"
+                    fallback={(
+                      <div className="w-full h-full flex items-center justify-center bg-gradient-to-br from-warning/30 via-muted/10 to-success/30 text-lg font-semibold text-foreground/80">
+                        {initialsFromName(artist.name)}
+                      </div>
+                    )}
                   />
                 ) : (
-                  <div className="w-full h-full flex items-center justify-center bg-gradient-to-br from-amber-500/30 via-slate-500/10 to-emerald-500/30 text-lg font-semibold text-foreground/80">
+                  <div className="w-full h-full flex items-center justify-center bg-gradient-to-br from-warning/30 via-muted/10 to-success/30 text-lg font-semibold text-foreground/80">
                     {initialsFromName(artist.name)}
                   </div>
                 )}

@@ -34,7 +34,7 @@ export function AlbumRatingStars({
               style={{ width: size, height: size }}
             >
               <Star
-                className="absolute inset-0 text-slate-500 fill-slate-300/20 dark:text-white/45 dark:fill-white/10"
+                className="absolute inset-0 text-muted-foreground fill-muted/20"
                 style={{ width: size, height: size }}
                 strokeWidth={1.8}
               />
@@ -43,7 +43,7 @@ export function AlbumRatingStars({
                 style={{ width: `${fillPct * 100}%` }}
               >
                 <Star
-                  className="text-amber-400 fill-amber-400"
+                  className="text-warning fill-warning"
                   style={{ width: size, height: size }}
                   strokeWidth={1.8}
                 />

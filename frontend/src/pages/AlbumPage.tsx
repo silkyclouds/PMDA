@@ -19,6 +19,7 @@ import { ProviderBadge } from '@/components/providers/ProviderBadge';
 import { ProviderLink } from '@/components/providers/ProviderLink';
 import { ShareDialog } from '@/components/social/ShareDialog';
 import * as api from '@/lib/api';
+import { formatAudioSpec } from '@/lib/audioFormat';
 import { badgeKindClass } from '@/lib/badgeStyles';
 import { resolveBackLink, withBackLinkState } from '@/lib/backNavigation';
 import { formatBadgeDateTime } from '@/lib/dateFormat';
@@ -230,6 +231,7 @@ export default function AlbumPage() {
   const [error, setError] = useState<string | null>(null);
   const [data, setData] = useState<api.AlbumDetailResponse | null>(null);
   const [reviewExpanded, setReviewExpanded] = useState(false);
+  const [supporterCommentsExpanded, setSupporterCommentsExpanded] = useState(false);
   const [playlistsLoading, setPlaylistsLoading] = useState(false);
   const [playlists, setPlaylists] = useState<api.PlaylistSummary[]>([]);
   const [addingTrackId, setAddingTrackId] = useState<number | null>(null);
@@ -243,6 +245,7 @@ export default function AlbumPage() {
   const [savingUserRating, setSavingUserRating] = useState(false);
   const [albumLiked, setAlbumLiked] = useState(false);
   const durationRefreshAttemptsRef = useRef(0);
+  const metadataRefreshAttemptsRef = useRef(0);
 
   const load = useCallback(async () => {
     if (!Number.isFinite(albumId) || albumId <= 0) {
@@ -269,6 +272,7 @@ export default function AlbumPage() {
 
   useEffect(() => {
     durationRefreshAttemptsRef.current = 0;
+    metadataRefreshAttemptsRef.current = 0;
     setExpandedTrackId(null);
     setTrackDetailsError(null);
     setTrackDetailsById({});
@@ -306,7 +310,7 @@ export default function AlbumPage() {
       if (cancelled) return;
       durationRefreshAttemptsRef.current += 1;
       try {
-        const refreshed = await api.getAlbumDetail(albumId);
+        const refreshed = await api.getAlbumDetail(albumId, { refresh: true });
         if (!cancelled) setData(refreshed);
       } catch {
         // Best-effort refresh only.
@@ -315,6 +319,34 @@ export default function AlbumPage() {
 
     const attemptNo = Math.max(0, durationRefreshAttemptsRef.current);
     timer = setTimeout(run, 900 + attemptNo * 1300);
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [albumId, data, loading]);
+
+  useEffect(() => {
+    if (!Number.isFinite(albumId) || albumId <= 0) return;
+    if (!data || loading) return;
+    const reviewMissing = !String(data.review?.description || data.review?.short_description || '').trim();
+    const coverMissing = !Boolean(data.has_cover);
+    if (!reviewMissing && !coverMissing) return;
+    if (metadataRefreshAttemptsRef.current >= 3) return;
+
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const run = async () => {
+      if (cancelled) return;
+      metadataRefreshAttemptsRef.current += 1;
+      try {
+        const refreshed = await api.getAlbumDetail(albumId, { refresh: true });
+        if (!cancelled) setData(refreshed);
+      } catch {
+        // Best-effort only.
+      }
+    };
+    const attemptNo = Math.max(0, metadataRefreshAttemptsRef.current);
+    timer = setTimeout(run, 1800 + attemptNo * 2400);
     return () => {
       cancelled = true;
       if (timer) clearTimeout(timer);
@@ -577,6 +609,19 @@ export default function AlbumPage() {
   const genreBadges = parseGenreBadges(data.genre || '');
   const ratings = data.ratings || {};
   const ratingSignals = ratings.signals || {};
+  const bandcampSupporterComments = Array.isArray(ratingSignals.bandcamp_supporter_comments)
+    ? ratingSignals.bandcamp_supporter_comments.filter((item) => Boolean((item?.text || '').trim()))
+    : [];
+  const hasPublicPulse = Boolean(
+    Number(ratings.public_rating || 0) > 0 ||
+    Number(ratings.public_rating_votes || 0) > 0 ||
+    Number(ratingSignals.discogs_have_count || 0) > 0 ||
+    Number(ratingSignals.discogs_want_count || 0) > 0 ||
+    Number(ratingSignals.bandcamp_supporter_count || 0) > 0 ||
+    Number(ratingSignals.lastfm_scrobbles || 0) > 0 ||
+    Number(ratingSignals.lastfm_listeners || 0) > 0 ||
+    bandcampSupporterComments.length > 0
+  );
   const publicRatingSourceId = normalizeProviderId(ratings.public_rating_source || '');
   const albumUpdatedAt =
     Number(data.updated_at || 0) > 0
@@ -685,13 +730,13 @@ export default function AlbumPage() {
             <div className="absolute inset-0 bg-gradient-to-br from-muted via-muted/70 to-accent/20" />
           )}
           <div className="absolute inset-0 z-10 bg-background/34 backdrop-blur-xl" />
-          <div className="absolute inset-0 z-10 bg-gradient-to-r from-white/86 via-white/48 to-white/16 dark:from-background dark:via-background/92 dark:to-background/70" />
+          <div className="absolute inset-0 z-10 bg-gradient-to-r from-background/86 via-background/48 to-background/16" />
           <div className="absolute inset-0 z-10 bg-gradient-to-t from-background/76 via-transparent to-transparent" />
           <div className="relative z-20 flex min-h-[22rem] items-end p-6 md:min-h-[28rem] md:p-8 xl:p-10">
             <div className="grid w-full grid-cols-1 items-end gap-6 md:grid-cols-[19rem,1fr] xl:grid-cols-[21rem,1fr]">
               <button
                 type="button"
-                className="group relative h-56 w-56 overflow-hidden border border-white/12 bg-muted shadow-[0_28px_80px_-48px_rgba(0,0,0,0.9)] md:h-[19rem] md:w-[19rem] xl:h-[21rem] xl:w-[21rem]"
+                className="group relative h-56 w-56 overflow-hidden border border-border/20 bg-muted shadow-[0_28px_80px_-48px_rgba(0,0,0,0.9)] md:h-[19rem] md:w-[19rem] xl:h-[21rem] xl:w-[21rem]"
                 onClick={() => setArtworkGalleryOpen(true)}
                 title="View artwork stack"
               >
@@ -707,8 +752,8 @@ export default function AlbumPage() {
                       <Music className="h-8 w-8 text-muted-foreground" />
                     </div>
                   )}
-                  <div className="absolute inset-0 flex items-center justify-center bg-black/0 opacity-0 transition-all duration-200 group-hover:bg-black/36 group-hover:opacity-100">
-                    <span className="inline-flex items-center border border-white/20 bg-black/35 px-3 py-2 text-[11px] font-medium uppercase tracking-[0.24em] text-white backdrop-blur-sm">
+                  <div className="absolute inset-0 flex items-center justify-center bg-foreground/0 opacity-0 transition-all duration-200 group-hover:bg-foreground/30 group-hover:opacity-100">
+                    <span className="inline-flex items-center border border-background/20 bg-foreground/40 px-3 py-2 text-[11px] font-medium uppercase tracking-[0.24em] text-background backdrop-blur-sm">
                       View sleeves
                     </span>
                   </div>
@@ -727,16 +772,16 @@ export default function AlbumPage() {
                   </Button>
                 </div>
               </button>
-              <div className="min-w-0 border border-border/70 bg-white/52 px-5 py-5 backdrop-blur-md dark:border-white/10 dark:bg-background/58">
+              <div className="min-w-0 border border-border/70 bg-card/80 px-5 py-5 backdrop-blur-md">
                 <h1 className={cn(
-                  'max-w-[18ch] pr-2 pt-1 font-bold tracking-tight text-slate-950 [text-wrap:balance] drop-shadow-[0_1px_4px_rgba(255,255,255,0.55)] break-words dark:text-white dark:drop-shadow-[0_2px_10px_rgba(0,0,0,0.7)]',
+                  'max-w-[18ch] pr-2 pt-1 font-bold tracking-tight text-foreground [text-wrap:balance] break-words',
                   albumHeroTitleClass(data.title)
                 )}>
                   {data.title}
                 </h1>
                 <button
                   type="button"
-                  className="mt-2 truncate text-sm text-slate-800 hover:underline dark:text-white/82"
+                  className="mt-2 truncate text-sm text-muted-foreground hover:underline"
                   onClick={() => navigate(`/library/artist/${data.artist_id}${location.search || ''}`, { state: withBackLinkState(location) })}
                   title="Open artist"
                 >
@@ -757,12 +802,18 @@ export default function AlbumPage() {
                     {formatDuration(data.total_duration_sec || 0)}
                   </Badge>
                   {data.format ? <FormatBadge format={data.format} size="sm" /> : null}
-                  <Badge
-                    variant="outline"
-                    className={cn("text-[11px]", data.is_lossless ? badgeKindClass('lossless') : badgeKindClass('lossy'))}
-                  >
-                    {data.is_lossless ? 'Lossless' : 'Lossy'}
-                  </Badge>
+                  {(() => {
+                    const audioBadgeText = formatAudioSpec(data.bit_depth, data.sample_rate) || (data.is_lossless ? '' : 'Lossy');
+                    if (!audioBadgeText) return null;
+                    return (
+                      <Badge
+                        variant="outline"
+                        className={cn("text-[11px]", data.is_lossless ? badgeKindClass('lossless') : badgeKindClass('lossy'))}
+                      >
+                        {audioBadgeText}
+                      </Badge>
+                    );
+                  })()}
                   {data.metadata_source ? (
                     data.metadata_source_url ? (
                       <ProviderLink
@@ -775,13 +826,13 @@ export default function AlbumPage() {
                       <ProviderBadge provider={data.metadata_source} prefix="Source" className="text-[11px]" />
                     )
                   ) : null}
-                  {data.bandcamp_album_url ? (
+                  {data.bandcamp_album_url && String(data.metadata_source || '').trim().toLowerCase() !== 'bandcamp' ? (
                     <ProviderLink provider="bandcamp" href={data.bandcamp_album_url} className="inline-flex" />
                   ) : null}
                 </div>
                 {genreBadges.length > 0 ? (
                   <div className="mt-4 space-y-1.5">
-                    <div className="text-[11px] font-medium uppercase tracking-[0.22em] text-slate-700 dark:text-white/68">
+                    <div className="text-[11px] font-medium uppercase tracking-[0.22em] text-muted-foreground">
                       Genres
                     </div>
                     <div className="flex flex-wrap gap-1.5">
@@ -801,39 +852,39 @@ export default function AlbumPage() {
                 {hasClassicalIdentity(data.classical) ? (
                   <div className="mt-4 grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
                     {joinClassical(data.classical.composer, 3) ? (
-                      <div className="border border-border/70 bg-white/45 px-3 py-3 dark:border-white/12 dark:bg-black/26">
-                        <div className="text-[11px] font-medium uppercase tracking-[0.2em] text-slate-700 dark:text-white/60">Composer</div>
-                        <div className="mt-1 text-sm text-slate-900 line-clamp-2 dark:text-white">{joinClassical(data.classical.composer, 3)}</div>
+                      <div className="border border-border/70 bg-card/60 px-3 py-3 backdrop-blur-sm">
+                        <div className="text-[11px] font-medium uppercase tracking-[0.2em] text-muted-foreground">Composer</div>
+                        <div className="mt-1 text-sm text-foreground line-clamp-2">{joinClassical(data.classical.composer, 3)}</div>
                       </div>
                     ) : null}
                     {joinClassical(data.classical.work, 3) ? (
-                      <div className="border border-border/70 bg-white/45 px-3 py-3 dark:border-white/12 dark:bg-black/26">
-                        <div className="text-[11px] font-medium uppercase tracking-[0.2em] text-slate-700 dark:text-white/60">Work</div>
-                        <div className="mt-1 text-sm text-slate-900 line-clamp-2 dark:text-white">{joinClassical(data.classical.work, 3)}</div>
+                      <div className="border border-border/70 bg-card/60 px-3 py-3 backdrop-blur-sm">
+                        <div className="text-[11px] font-medium uppercase tracking-[0.2em] text-muted-foreground">Work</div>
+                        <div className="mt-1 text-sm text-foreground line-clamp-2">{joinClassical(data.classical.work, 3)}</div>
                       </div>
                     ) : null}
                     {joinClassical(data.classical.conductor, 3) ? (
-                      <div className="border border-border/70 bg-white/45 px-3 py-3 dark:border-white/12 dark:bg-black/26">
-                        <div className="text-[11px] font-medium uppercase tracking-[0.2em] text-slate-700 dark:text-white/60">Conductor</div>
-                        <div className="mt-1 text-sm text-slate-900 line-clamp-2 dark:text-white">{joinClassical(data.classical.conductor, 3)}</div>
+                      <div className="border border-border/70 bg-card/60 px-3 py-3 backdrop-blur-sm">
+                        <div className="text-[11px] font-medium uppercase tracking-[0.2em] text-muted-foreground">Conductor</div>
+                        <div className="mt-1 text-sm text-foreground line-clamp-2">{joinClassical(data.classical.conductor, 3)}</div>
                       </div>
                     ) : null}
                     {joinClassical(data.classical.orchestra, 3) ? (
-                      <div className="border border-border/70 bg-white/45 px-3 py-3 dark:border-white/12 dark:bg-black/26">
-                        <div className="text-[11px] font-medium uppercase tracking-[0.2em] text-slate-700 dark:text-white/60">Orchestra</div>
-                        <div className="mt-1 text-sm text-slate-900 line-clamp-2 dark:text-white">{joinClassical(data.classical.orchestra, 3)}</div>
+                      <div className="border border-border/70 bg-card/60 px-3 py-3 backdrop-blur-sm">
+                        <div className="text-[11px] font-medium uppercase tracking-[0.2em] text-muted-foreground">Orchestra</div>
+                        <div className="mt-1 text-sm text-foreground line-clamp-2">{joinClassical(data.classical.orchestra, 3)}</div>
                       </div>
                     ) : null}
                     {joinClassical(data.classical.soloists, 3) ? (
-                      <div className="border border-border/70 bg-white/45 px-3 py-3 dark:border-white/12 dark:bg-black/26">
-                        <div className="text-[11px] font-medium uppercase tracking-[0.2em] text-slate-700 dark:text-white/60">Soloists</div>
-                        <div className="mt-1 text-sm text-slate-900 line-clamp-2 dark:text-white">{joinClassical(data.classical.soloists, 3)}</div>
+                      <div className="border border-border/70 bg-card/60 px-3 py-3 backdrop-blur-sm">
+                        <div className="text-[11px] font-medium uppercase tracking-[0.2em] text-muted-foreground">Soloists</div>
+                        <div className="mt-1 text-sm text-foreground line-clamp-2">{joinClassical(data.classical.soloists, 3)}</div>
                       </div>
                     ) : null}
                     {joinClassical(data.classical.catalog_numbers, 3) ? (
-                      <div className="border border-border/70 bg-white/45 px-3 py-3 dark:border-white/12 dark:bg-black/26">
-                        <div className="text-[11px] font-medium uppercase tracking-[0.2em] text-slate-700 dark:text-white/60">Catalog</div>
-                        <div className="mt-1 text-sm text-slate-900 line-clamp-2 dark:text-white">{joinClassical(data.classical.catalog_numbers, 3)}</div>
+                      <div className="border border-border/70 bg-card/60 px-3 py-3 backdrop-blur-sm">
+                        <div className="text-[11px] font-medium uppercase tracking-[0.2em] text-muted-foreground">Catalog</div>
+                        <div className="mt-1 text-sm text-foreground line-clamp-2">{joinClassical(data.classical.catalog_numbers, 3)}</div>
                       </div>
                     ) : null}
                   </div>
@@ -843,7 +894,7 @@ export default function AlbumPage() {
           </div>
         </div>
         <CardContent className="pt-4 pb-5 space-y-4">
-          <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,1fr),minmax(0,1fr)] gap-4">
+          <div className={cn('grid grid-cols-1 gap-4', hasPublicPulse ? 'xl:grid-cols-[minmax(0,1fr),minmax(0,1fr)]' : '')}>
             <div className="border border-border/60 bg-background/35 p-4 space-y-2">
               <div className="text-[11px] font-semibold uppercase tracking-[0.22em] text-muted-foreground">Your rating</div>
               <div className="flex items-center gap-3">
@@ -860,10 +911,12 @@ export default function AlbumPage() {
               </p>
             </div>
 
+            {hasPublicPulse ? (
             <div className="border border-border/60 bg-background/35 p-4 space-y-3">
               <div className="text-[11px] font-semibold uppercase tracking-[0.22em] text-muted-foreground">Public pulse</div>
+              {(Number(ratings.public_rating || 0) > 0 || Number(ratings.public_rating_votes || 0) > 0) ? (
               <div className="flex flex-wrap items-center gap-2">
-                <AlbumRatingStars value={ratings.public_rating} size={18} />
+                {Number(ratings.public_rating || 0) > 0 ? <AlbumRatingStars value={ratings.public_rating} size={18} /> : null}
                 {ratings.public_rating_source && publicRatingSourceId !== 'unknown' ? (
                   <ProviderBadge provider={ratings.public_rating_source} className="text-[11px]" />
                 ) : null}
@@ -873,6 +926,7 @@ export default function AlbumPage() {
                   </Badge>
                 ) : null}
               </div>
+              ) : null}
               <div className="flex flex-wrap items-center gap-1.5">
                 {Number(ratingSignals.discogs_have_count || 0) > 0 ? (
                   <Badge variant="outline" className={cn('gap-1 text-[11px]', badgeKindClass('label'))}>
@@ -905,42 +959,67 @@ export default function AlbumPage() {
                   </Badge>
                 ) : null}
               </div>
+              {bandcampSupporterComments.length > 0 ? (
+                <div className="space-y-2">
+                  <div className="text-[11px] font-semibold uppercase tracking-[0.22em] text-muted-foreground">Supported by</div>
+                  <Collapsible open={supporterCommentsExpanded} onOpenChange={setSupporterCommentsExpanded}>
+                    <div className="space-y-2">
+                      {(supporterCommentsExpanded ? bandcampSupporterComments : bandcampSupporterComments.slice(0, 1)).map((comment, index) => (
+                        <div key={`${comment.author || 'fan'}-${index}`} className="rounded-md border border-border/60 bg-background/40 px-3 py-2">
+                          <p className="text-sm leading-relaxed text-muted-foreground whitespace-pre-wrap">{(comment.text || '').trim()}</p>
+                          {comment.author ? (
+                            <p className="mt-2 text-[11px] font-medium uppercase tracking-[0.18em] text-muted-foreground">{comment.author}</p>
+                          ) : null}
+                        </div>
+                      ))}
+                    </div>
+                    {bandcampSupporterComments.length > 1 ? (
+                      <div className="flex justify-end">
+                        <CollapsibleTrigger asChild>
+                          <Button type="button" variant="ghost" size="sm" className="px-0">
+                            {supporterCommentsExpanded ? 'Show fewer comments' : `Show ${bandcampSupporterComments.length - 1} more`}
+                          </Button>
+                        </CollapsibleTrigger>
+                      </div>
+                    ) : null}
+                  </Collapsible>
+                </div>
+              ) : null}
               <SocialActivityBadges
                 entityType="album"
                 entityId={data.album_id}
                 compact
               />
             </div>
+            ) : null}
           </div>
+          {reviewText ? (
           <div className="space-y-2">
             <div className="text-xs font-medium text-muted-foreground">Review</div>
-            {reviewText ? (
-              <Collapsible open={reviewExpanded} onOpenChange={setReviewExpanded}>
-                {!reviewExpanded ? (
-                  <p className="text-sm leading-relaxed text-muted-foreground whitespace-pre-wrap line-clamp-5">{reviewText}</p>
+            <Collapsible open={reviewExpanded} onOpenChange={setReviewExpanded}>
+              {!reviewExpanded ? (
+                <p className="text-sm leading-relaxed text-muted-foreground whitespace-pre-wrap line-clamp-5">{reviewText}</p>
+              ) : null}
+              <CollapsibleContent>
+                <p className="text-sm leading-relaxed text-muted-foreground whitespace-pre-wrap">{reviewText}</p>
+              </CollapsibleContent>
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                {reviewSource ? (
+                  <ProviderBadge provider={reviewSource} prefix="Source" className="text-[11px]" />
+                ) : (
+                  <span />
+                )}
+                {showReviewToggle ? (
+                  <CollapsibleTrigger asChild>
+                    <Button type="button" variant="ghost" size="sm" className="px-0">
+                      {reviewExpanded ? 'Show less' : 'Show more'}
+                    </Button>
+                  </CollapsibleTrigger>
                 ) : null}
-                <CollapsibleContent>
-                  <p className="text-sm leading-relaxed text-muted-foreground whitespace-pre-wrap">{reviewText}</p>
-                </CollapsibleContent>
-                <div className="flex flex-wrap items-center justify-between gap-3">
-                  {reviewSource ? (
-                    <ProviderBadge provider={reviewSource} prefix="Source" className="text-[11px]" />
-                  ) : (
-                    <span />
-                  )}
-                  {showReviewToggle ? (
-                    <CollapsibleTrigger asChild>
-                      <Button type="button" variant="ghost" size="sm" className="px-0">
-                        {reviewExpanded ? 'Show less' : 'Show more'}
-                      </Button>
-                    </CollapsibleTrigger>
-                  ) : null}
-                </div>
-              </Collapsible>
-            ) : (
-              <p className="text-sm text-muted-foreground">No review snippet available for this album yet.</p>
-            )}
+              </div>
+            </Collapsible>
           </div>
+          ) : null}
         </CardContent>
       </Card>
 
@@ -979,7 +1058,7 @@ export default function AlbumPage() {
                 <TableHeader>
                   <TableRow className="hover:bg-transparent">
                     <TableHead className="h-10 w-[70px] text-center text-[11px] uppercase tracking-wide">
-                      <Play className="mx-auto h-3.5 w-3.5 text-emerald-400 fill-emerald-400" />
+                      <Play className="mx-auto h-3.5 w-3.5 text-primary fill-primary" />
                     </TableHead>
                     <TableHead className="h-10 w-[80px] text-[11px] uppercase tracking-wide">#</TableHead>
                     <TableHead className="hidden h-10 text-[11px] uppercase tracking-wide md:table-cell">Artist</TableHead>
@@ -1018,7 +1097,7 @@ export default function AlbumPage() {
                               type="button"
                               size="icon"
                               variant="ghost"
-                              className="h-8 w-8 rounded-full text-emerald-400 hover:bg-emerald-500/10 hover:text-emerald-300"
+                              className="h-8 w-8 rounded-full text-primary hover:bg-primary/10 hover:text-primary"
                               onClick={() => handlePlayTrack(t.track_id)}
                               title="Play track"
                               disabled={!canStream}
@@ -1158,7 +1237,7 @@ export default function AlbumPage() {
                                   <p className="text-xs text-destructive">Tag inspector: {detail.tags_error}</p>
                                 ) : null}
                                 <div className="space-y-2">
-                                  <div className="text-xs font-medium">All file tags ({detailTagEntries.length})</div>
+                                  <div className="text-xs font-medium">All tags ({detailTagEntries.length})</div>
                                   {detailTagEntries.length === 0 ? (
                                     <p className="text-xs text-muted-foreground">
                                       {trackDetailsLoading ? 'Loading tags…' : 'No tag data available for this track.'}

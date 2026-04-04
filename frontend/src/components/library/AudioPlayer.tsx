@@ -28,6 +28,7 @@ import * as api from '@/lib/api';
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Badge } from '@/components/ui/badge';
 import { FormatBadge } from '@/components/FormatBadge';
+import { formatAudioSpec } from '@/lib/audioFormat';
 import { badgeKindClass } from '@/lib/badgeStyles';
 import { useTheme } from 'next-themes';
 import { normalizePmdaAssetUrl } from '@/lib/api';
@@ -181,24 +182,20 @@ function PlaybackFxPanel({
       className={cn(
         'space-y-5 rounded-2xl border p-4 backdrop-blur-sm',
         compact
-          ? isLightTheme
-            ? 'border-border/70 bg-background/90'
-            : 'border-white/10 bg-zinc-900/95'
-          : isLightTheme
-            ? 'border-border/70 bg-white/80'
-            : 'border-white/10 bg-black/30'
+          ? 'border-border/60 bg-card/90'
+          : 'border-border/60 bg-card/80'
       )}
     >
       <div className="grid gap-4 lg:grid-cols-[1.05fr_1.45fr]">
         <div className="space-y-4">
           <div className="space-y-1.5">
-            <div className={cn('text-[11px] uppercase tracking-[0.22em]', isLightTheme ? 'text-muted-foreground/80' : 'text-white/45')}>
+            <div className="text-[11px] uppercase tracking-[0.22em] text-muted-foreground">
               Playback
             </div>
             <div className="flex items-center justify-between gap-3 rounded-xl border border-border/40 px-3 py-3">
               <div className="space-y-1">
                 <div className="text-sm font-medium">Gapless playback</div>
-                <div className={cn('text-xs', isLightTheme ? 'text-muted-foreground' : 'text-white/60')}>
+                <div className="text-xs text-muted-foreground">
                   Always on. PMDA preloads the next track for seamless transitions.
                 </div>
               </div>
@@ -208,7 +205,7 @@ function PlaybackFxPanel({
               <div className="flex items-center justify-between gap-3">
                 <div className="space-y-1">
                   <div className="text-sm font-medium">Crossfade</div>
-                  <div className={cn('text-xs', isLightTheme ? 'text-muted-foreground' : 'text-white/60')}>
+                  <div className="text-xs text-muted-foreground">
                     Blend the outgoing and incoming tracks instead of a hard hand-off.
                   </div>
                 </div>
@@ -216,7 +213,7 @@ function PlaybackFxPanel({
               </div>
               <div className="mt-3 space-y-2">
                 <div className="flex items-center justify-between gap-3">
-                  <span className={cn('text-xs uppercase tracking-[0.18em]', isLightTheme ? 'text-muted-foreground/80' : 'text-white/45')}>
+                  <span className="text-xs uppercase tracking-[0.18em] text-muted-foreground">
                     Fade length
                   </span>
                   <span className="text-sm tabular-nums">{prefs.crossfadeSeconds.toFixed(0)}s</span>
@@ -237,10 +234,10 @@ function PlaybackFxPanel({
         <div className="space-y-4">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div className="space-y-1">
-              <div className={cn('text-[11px] uppercase tracking-[0.22em]', isLightTheme ? 'text-muted-foreground/80' : 'text-white/45')}>
+              <div className="text-[11px] uppercase tracking-[0.22em] text-muted-foreground">
                 Equalizer
               </div>
-              <div className={cn('text-xs', isLightTheme ? 'text-muted-foreground' : 'text-white/60')}>
+              <div className="text-xs text-muted-foreground">
                 Ten-band EQ tuned for music playback. Flat stays transparent when disabled.
               </div>
             </div>
@@ -374,7 +371,8 @@ export function AudioPlayer({
   }, [albumMeta, releaseYear, trackCountText]);
   const secondaryMobileMeta = useMemo(() => {
     const parts: string[] = [];
-    if (albumMeta?.is_lossless) parts.push('Lossless');
+    const audioSpec = formatAudioSpec(albumMeta?.bit_depth, albumMeta?.sample_rate);
+    if (audioSpec) parts.push(audioSpec);
     if (!albumMeta?.is_lossless && albumMeta) parts.push('Lossy');
     if (labelText) parts.push(labelText);
     if (genres[0]) parts.push(genres[0]);
@@ -652,18 +650,26 @@ export function AudioPlayer({
       nextEl?.pause();
       setIsPlaying(false);
     } else {
-      setIsPlaying(Boolean(nextEl && !nextEl.paused));
+      if (nextEl) {
+        nextEl.muted = false;
+        nextEl.volume = 1;
+        setDeckGain(nextDeck, 1, 0.02);
+        if (nextEl.paused) {
+          void nextEl.play().catch(() => {});
+        }
+      }
+      setIsPlaying(Boolean(nextEl && !nextEl.paused) || Boolean(nextEl));
     }
-  }, [clearTransitionTimer, deckRefs, finalizeTrack]);
+  }, [clearTransitionTimer, deckRefs, finalizeTrack, setDeckGain]);
 
   const beginTransitionToNext = useCallback(async (nextTrack: TrackInfo, fadeSeconds: number) => {
-    if (transitionActiveRef.current) return;
+    if (transitionActiveRef.current) return false;
     await ensureAudioGraph();
     const oldDeck = activeDeckRef.current;
     const nextDeck = (oldDeck === 0 ? 1 : 0) as DeckIndex;
     const oldEl = deckRefs[oldDeck].current;
     const nextEl = deckRefs[nextDeck].current;
-    if (!oldEl || !nextEl) return;
+    if (!oldEl || !nextEl) return false;
     preloadDeckForTrack(nextDeck, nextTrack);
     try {
       nextEl.currentTime = 0;
@@ -681,7 +687,7 @@ export function AudioPlayer({
     } catch {
       transitionActiveRef.current = false;
       transitionTargetTrackRef.current = null;
-      return;
+      return false;
     }
     const effectiveFade = Math.max(0.04, fadeSeconds);
     setDeckGain(nextDeck, 1, effectiveFade);
@@ -691,7 +697,67 @@ export function AudioPlayer({
       commitTransition(false);
       preloadUpcomingTrack();
     }, Math.ceil(effectiveFade * 1000) + 40);
+    return true;
   }, [commitTransition, deckRefs, ensureAudioGraph, onTrackSelect, preloadDeckForTrack, preloadUpcomingTrack, sendPlayStart, setDeckGain]);
+
+  const startTrackOnDeck = useCallback(async (
+    targetDeck: DeckIndex,
+    track: TrackInfo,
+    options?: { announceSelection?: boolean; stopOtherDeck?: boolean },
+  ) => {
+    const targetEl = deckRefs[targetDeck].current;
+    if (!targetEl) return false;
+    const otherDeck = (targetDeck === 0 ? 1 : 0) as DeckIndex;
+    await ensureAudioGraph();
+    if (options?.stopOtherDeck !== false) {
+      stopDeck(otherDeck, true);
+      setDeckGain(otherDeck, 0, 0.04);
+    }
+    if (getDeckTrack(targetDeck)?.track_id !== track.track_id) {
+      assignTrackToDeck(targetDeck, track);
+    }
+    targetEl.preload = 'auto';
+    targetEl.muted = false;
+    targetEl.volume = 1;
+    try {
+      targetEl.currentTime = 0;
+    } catch {
+      // ignore
+    }
+    setDeckGain(targetDeck, 1, 0.04);
+    activeDeckRef.current = targetDeck;
+    activeTrackRef.current = track;
+    finalizedTrackIdRef.current = null;
+    playedSecondsRef.current = 0;
+    setCurrentTime(0);
+    setDuration(track.duration || 0);
+    setBufferedEnd(0);
+    setIsPlaying(false);
+    sendPlayStart(track);
+    lastTrackLoadTimeRef.current = Date.now();
+    try {
+      await targetEl.play();
+      if (options?.announceSelection) {
+        onTrackSelect(track);
+      }
+      setIsPlaying(true);
+      preloadUpcomingTrack();
+      return true;
+    } catch {
+      setIsPlaying(false);
+      return false;
+    }
+  }, [
+    assignTrackToDeck,
+    deckRefs,
+    ensureAudioGraph,
+    getDeckTrack,
+    onTrackSelect,
+    preloadUpcomingTrack,
+    sendPlayStart,
+    setDeckGain,
+    stopDeck,
+  ]);
 
   const syncToCurrentTrack = useCallback(async (track: TrackInfo | null) => {
     if (!track) return;
@@ -766,31 +832,7 @@ export function AudioPlayer({
     if (getDeckTrack(targetDeck)?.track_id !== track.track_id) {
       assignTrackToDeck(targetDeck, track);
     }
-    const targetEl = deckRefs[targetDeck].current;
-    if (!targetEl) return;
-    targetEl.preload = 'auto';
-    try {
-      targetEl.currentTime = 0;
-    } catch {
-      // ignore
-    }
-    setDeckGain(targetDeck, 1, 0.04);
-    activeDeckRef.current = targetDeck;
-      activeTrackRef.current = track;
-    finalizedTrackIdRef.current = null;
-    playedSecondsRef.current = 0;
-    setCurrentTime(0);
-    setDuration(track.duration || 0);
-    setBufferedEnd(0);
-    setIsPlaying(false);
-    sendPlayStart(track);
-    lastTrackLoadTimeRef.current = Date.now();
-    try {
-      await targetEl.play();
-    } catch {
-      setIsPlaying(false);
-    }
-    preloadUpcomingTrack();
+    await startTrackOnDeck(targetDeck, track, { announceSelection: false, stopOtherDeck: oldDeck !== targetDeck });
   }, [
     assignTrackToDeck,
     clearTransitionTimer,
@@ -802,8 +844,8 @@ export function AudioPlayer({
     preloadUpcomingTrack,
     prefs.muted,
     prefs.volume,
-    sendPlayStart,
     setDeckGain,
+    startTrackOnDeck,
     stopDeck,
   ]);
 
@@ -1004,27 +1046,41 @@ export function AudioPlayer({
   }, [clearTransitionTimer, currentTrack?.track_id, deckRefs, onTrackSelect, setDeckGain]);
 
   const handleDeckEnded = useCallback((deckIndex: DeckIndex) => {
-    if (isSimpleMobilePlayback) {
-      if (deckIndex !== 0) return;
-      const nextTrackItem = getNextTrackFor(activeTrackRef.current);
-      if (nextTrackItem) {
-        onTrackSelect(nextTrackItem);
+    void (async () => {
+      if (isSimpleMobilePlayback) {
+        if (deckIndex !== 0) return;
+        const nextTrackItem = getNextTrackFor(activeTrackRef.current);
+        if (nextTrackItem) {
+          const started = await startTrackOnDeck(0, nextTrackItem, { announceSelection: true, stopOtherDeck: true });
+          if (!started) {
+            onTrackSelect(nextTrackItem);
+            setIsPlaying(false);
+          }
+          return;
+        }
+        finalizeTrack(activeTrackRef.current, Math.max(0, Math.floor(playedSecondsRef.current)), 'ended');
+        setIsPlaying(false);
+        return;
+      }
+      if (transitionActiveRef.current) return;
+      if (deckIndex !== activeDeckRef.current) return;
+      const nextTrack = getNextTrackFor(activeTrackRef.current);
+      if (nextTrack) {
+        const transitioned = await beginTransitionToNext(nextTrack, GAPLESS_LEAD_SECONDS);
+        if (transitioned) return;
+        // If gapless handoff cannot start, force a normal deck switch immediately.
+        finalizeTrack(activeTrackRef.current, Math.max(0, Math.floor(playedSecondsRef.current)), 'ended');
+        const forcedDeck = (activeDeckRef.current === 0 ? 1 : 0) as DeckIndex;
+        const started = await startTrackOnDeck(forcedDeck, nextTrack, { announceSelection: true, stopOtherDeck: true });
+        if (!started) {
+          setIsPlaying(false);
+        }
         return;
       }
       finalizeTrack(activeTrackRef.current, Math.max(0, Math.floor(playedSecondsRef.current)), 'ended');
       setIsPlaying(false);
-      return;
-    }
-    if (transitionActiveRef.current) return;
-    if (deckIndex !== activeDeckRef.current) return;
-    const nextTrack = getNextTrackFor(activeTrackRef.current);
-    if (nextTrack) {
-      void beginTransitionToNext(nextTrack, GAPLESS_LEAD_SECONDS);
-      return;
-    }
-    finalizeTrack(activeTrackRef.current, Math.max(0, Math.floor(playedSecondsRef.current)), 'ended');
-    setIsPlaying(false);
-  }, [beginTransitionToNext, finalizeTrack, getNextTrackFor, isSimpleMobilePlayback, onTrackSelect]);
+    })();
+  }, [beginTransitionToNext, finalizeTrack, getNextTrackFor, isSimpleMobilePlayback, onTrackSelect, startTrackOnDeck]);
 
   const toggleTrackLike = async () => {
     const track = currentTrack;
@@ -1088,9 +1144,19 @@ export function AudioPlayer({
       setIsPlaying(true);
       return;
     }
+    const hiddenDeck = (visibleDeck === 0 ? 1 : 0) as DeckIndex;
+    visibleEl.muted = false;
+    visibleEl.volume = 1;
+    if (!transitionActiveRef.current) {
+      setDeckGain(hiddenDeck, 0, 0.02);
+    }
+    setDeckGain(visibleDeck, 1, 0.02);
     await visibleEl.play().catch(() => {
       setIsPlaying(false);
     });
+    if (!visibleEl.paused) {
+      setIsPlaying(true);
+    }
   }, [deckRefs, ensureAudioGraph, getVisibleDeckIndex, isSimpleMobilePlayback, prefs.muted, prefs.volume]);
 
   const togglePlayPause = useCallback(() => {
@@ -1330,9 +1396,10 @@ export function AudioPlayer({
         onPause={() => handleDeckPause(1)}
       />
 
-      <div className={cn('fixed bottom-0 left-0 right-0 z-50 border-t bg-zinc-900 text-white shadow-[0_-4px_20px_rgba(0,0,0,0.3)]', isMobile && showNowPlaying && 'hidden')}>
+      <div className={cn('fixed bottom-0 left-0 right-0 z-50 border-t pmda-player-bar shadow-[0_-4px_20px_rgba(0,0,0,0.3)]', isMobile && showNowPlaying && 'hidden')}>
         <div
-          className="relative h-1 w-full cursor-pointer bg-zinc-700 group"
+          className="relative h-1 w-full cursor-pointer group"
+          style={{ background: 'hsl(var(--player-surface))' }}
           onClick={(e) => {
             if (displayDuration <= 0) return;
             const rect = e.currentTarget.getBoundingClientRect();
@@ -1341,12 +1408,12 @@ export function AudioPlayer({
             handleSeek([t]);
           }}
         >
-          <div className="absolute inset-y-0 left-0 bg-zinc-500 transition-all" style={{ width: `${displayDuration > 0 ? (bufferedEnd / displayDuration) * 100 : 0}%` }} />
-          <div className="absolute inset-y-0 left-0 bg-amber-500 transition-all" style={{ width: `${displayDuration > 0 ? (currentTime / displayDuration) * 100 : 0}%` }} />
+          <div className="absolute inset-y-0 left-0 transition-all" style={{ width: `${displayDuration > 0 ? (bufferedEnd / displayDuration) * 100 : 0}%`, background: 'hsl(var(--player-text-muted) / 0.3)' }} />
+          <div className="absolute inset-y-0 left-0 bg-primary transition-all" style={{ width: `${displayDuration > 0 ? (currentTime / displayDuration) * 100 : 0}%` }} />
         </div>
 
         {showFxPanel && !isSimpleMobilePlayback ? (
-          <div className="border-b border-zinc-800 px-4 py-4">
+          <div className="border-b px-4 py-4" style={{ borderColor: 'hsl(var(--player-border))' }}>
             {footerFxPanel}
           </div>
         ) : null}
@@ -1355,7 +1422,8 @@ export function AudioPlayer({
           <div className="flex min-w-0 flex-1 items-center gap-3">
             <button
               type="button"
-              className="h-14 w-14 shrink-0 overflow-hidden rounded bg-zinc-800 focus:outline-none focus:ring-2 focus:ring-amber-500/60"
+              className="h-14 w-14 shrink-0 overflow-hidden rounded focus:outline-none focus:ring-2 focus:ring-primary/60"
+              style={{ background: 'hsl(var(--player-surface))' }}
               onClick={() => setShowNowPlaying(true)}
               title="Open Now Playing"
               draggable
@@ -1372,30 +1440,30 @@ export function AudioPlayer({
               {(displayAlbumThumb && !coverError) ? (
                 <img src={displayAlbumThumb} alt="" className="h-full w-full object-cover" onError={() => setCoverError(true)} />
               ) : (
-                <div className="flex h-full w-full items-center justify-center">
-                  <Music className="h-7 w-7 text-zinc-500" />
+                <div className="flex h-full w-full items-center justify-center" style={{ color: 'hsl(var(--player-text-muted))' }}>
+                  <Music className="h-7 w-7" />
                 </div>
               )}
             </button>
             <button
               type="button"
-              className="min-w-0 flex-1 rounded text-left focus:outline-none focus:ring-2 focus:ring-amber-500/60"
+              className="min-w-0 flex-1 rounded text-left focus:outline-none focus:ring-2 focus:ring-primary/60"
               onClick={() => setShowNowPlaying(true)}
               title="Open Now Playing"
             >
-              <p className="truncate text-sm font-medium text-white">{currentTrack?.title ?? '—'}</p>
-              <p className="truncate text-xs text-zinc-400">{currentTrack?.artist} · {displayAlbumTitle}</p>
+              <p className="truncate text-sm font-medium">{currentTrack?.title ?? '—'}</p>
+              <p className="truncate text-xs" style={{ color: 'hsl(var(--player-text-muted))' }}>{currentTrack?.artist} · {displayAlbumTitle}</p>
             </button>
           </div>
 
           <div className="flex items-center gap-2">
-            <Button variant="ghost" size="icon" className="h-9 w-9 text-white hover:bg-zinc-700" onClick={prevTrack} disabled={currentIndex <= 0}>
+            <Button variant="ghost" size="icon" className="h-9 w-9 hover:bg-accent/40" onClick={prevTrack} disabled={currentIndex <= 0}>
               <SkipBack className="h-5 w-5" />
             </Button>
-            <Button variant="ghost" size="icon" className="h-10 w-10 text-white hover:bg-zinc-700" onClick={togglePlayPause}>
+            <Button variant="ghost" size="icon" className="h-10 w-10 hover:bg-accent/40" onClick={togglePlayPause}>
               {isPlaying ? <Pause className="h-6 w-6 fill-current" /> : <Play className="h-6 w-6 fill-current" />}
             </Button>
-            <Button variant="ghost" size="icon" className="h-9 w-9 text-white hover:bg-zinc-700" onClick={nextTrack} disabled={currentIndex < 0 || currentIndex >= tracks.length - 1}>
+            <Button variant="ghost" size="icon" className="h-9 w-9 hover:bg-accent/40" onClick={nextTrack} disabled={currentIndex < 0 || currentIndex >= tracks.length - 1}>
               <SkipForward className="h-5 w-5" />
             </Button>
           </div>
@@ -1404,48 +1472,48 @@ export function AudioPlayer({
             <Button
               variant="ghost"
               size="icon"
-              className={cn('h-8 w-8 text-white hover:bg-zinc-700', trackLiked ? 'text-emerald-300' : '')}
+              className={cn('h-8 w-8 hover:bg-accent/40', trackLiked ? 'text-primary' : '')}
               onClick={() => void toggleTrackLike()}
               title={trackLiked ? 'Liked' : 'Like'}
             >
               <ThumbsUp className={cn('h-4 w-4', trackLiked ? 'fill-current' : '')} />
             </Button>
-            <Button variant="ghost" size="icon" className="h-8 w-8 text-white hover:bg-zinc-700" onClick={() => void dislikeTrack()} title="Dislike">
+            <Button variant="ghost" size="icon" className="h-8 w-8 hover:bg-accent/40" onClick={() => void dislikeTrack()} title="Dislike">
               <ThumbsDown className="h-4 w-4" />
             </Button>
           </div>
 
-          <div className="min-w-[100px] justify-center text-xs tabular-nums text-zinc-400 flex items-center gap-1">
+          <div className={cn('min-w-[100px] justify-center text-xs tabular-nums flex items-center gap-1', isMobile && 'hidden sm:flex')} style={{ color: 'hsl(var(--player-text-muted))' }}>
             <span>{formatDuration(currentTime)}</span>
             <span>/</span>
             <span>{formatDuration(displayDuration)}</span>
           </div>
 
           <div className={cn('flex w-28 items-center gap-1', isMobile && 'hidden')}>
-            <Button variant="ghost" size="icon" className="h-8 w-8 shrink-0 text-white hover:bg-zinc-700" onClick={toggleMute}>
+            <Button variant="ghost" size="icon" className="h-8 w-8 shrink-0 hover:bg-accent/40" onClick={toggleMute}>
               {prefs.muted || prefs.volume === 0 ? <VolumeX className="h-4 w-4" /> : <Volume2 className="h-4 w-4" />}
             </Button>
-            <Slider value={[prefs.muted ? 0 : prefs.volume]} max={1} step={0.05} onValueChange={handleVolumeChange} className="w-full [&_[data-orientation=horizontal]]:bg-zinc-700" />
+            <Slider value={[prefs.muted ? 0 : prefs.volume]} max={1} step={0.05} onValueChange={handleVolumeChange} className="w-full" />
           </div>
 
           {!isSimpleMobilePlayback ? (
-            <Button variant="ghost" size="icon" className={cn('h-8 w-8 text-white hover:bg-zinc-700', showFxPanel ? 'bg-zinc-800' : '')} onClick={() => setShowFxPanel((value) => !value)} title="Audio effects">
+            <Button variant="ghost" size="icon" className={cn('h-8 w-8 hover:bg-accent/40', showFxPanel ? 'bg-accent/40' : '')} onClick={() => setShowFxPanel((value) => !value)} title="Audio effects">
               <SlidersHorizontal className="h-4 w-4" />
             </Button>
           ) : null}
-          <Button variant="ghost" size="icon" className="h-8 w-8 text-white hover:bg-zinc-700" onClick={() => setShowList((s) => !s)} title="Track list">
+          <Button variant="ghost" size="icon" className="h-8 w-8 hover:bg-accent/40" onClick={() => setShowList((s) => !s)} title="Track list">
             <List className="h-4 w-4" />
           </Button>
-          <Button variant="ghost" size="icon" className="h-8 w-8 text-white hover:bg-zinc-700" onClick={() => setShowNowPlaying(true)} title="Now Playing">
+          <Button variant="ghost" size="icon" className="h-8 w-8 hover:bg-accent/40" onClick={() => setShowNowPlaying(true)} title="Now Playing">
             <Maximize2 className="h-4 w-4" />
           </Button>
-          <Button variant="ghost" size="icon" className="h-8 w-8 text-white hover:bg-zinc-700" onClick={handleClosePlayer} title="Close">
+          <Button variant="ghost" size="icon" className="h-8 w-8 hover:bg-accent/40" onClick={handleClosePlayer} title="Close">
             <X className="h-4 w-4" />
           </Button>
         </div>
 
         {showList ? (
-          <div className="border-t border-zinc-700 bg-zinc-800/50">
+          <div className="border-t" style={{ borderColor: 'hsl(var(--player-border))', background: 'hsl(var(--player-surface) / 0.5)' }}>
             <ScrollArea className="h-[min(60vh,560px)]">
               <div className="space-y-0.5 px-4 py-3 pr-4">
                 {tracks.map((track) => (
@@ -1466,14 +1534,14 @@ export function AudioPlayer({
                       }
                     }}
                     className={cn(
-                      'flex w-full cursor-grab items-center gap-2 rounded px-2 py-1.5 text-left text-sm transition-colors active:cursor-grabbing hover:bg-zinc-700',
-                      currentTrack?.track_id === track.track_id && 'bg-zinc-700 font-medium text-white'
+                      'flex w-full cursor-grab items-center gap-2 rounded px-2 py-1.5 text-left text-sm transition-colors active:cursor-grabbing hover:bg-accent/40',
+                      currentTrack?.track_id === track.track_id && 'bg-accent/40 font-medium'
                     )}
                   >
-                    <GripVertical className="h-4 w-4 text-zinc-600" />
-                    <span className="w-6 shrink-0 text-zinc-400">{track.index}</span>
-                    <span className="min-w-0 flex-1 truncate text-zinc-200">{track.title}</span>
-                    <span className="shrink-0 text-xs tabular-nums text-zinc-500">{formatDuration(track.duration)}</span>
+                    <GripVertical className="h-4 w-4" style={{ color: 'hsl(var(--player-text-muted) / 0.5)' }} />
+                    <span className="w-6 shrink-0" style={{ color: 'hsl(var(--player-text-muted))' }}>{track.index}</span>
+                    <span className="min-w-0 flex-1 truncate">{track.title}</span>
+                    <span className="shrink-0 text-xs tabular-nums" style={{ color: 'hsl(var(--player-text-muted) / 0.7)' }}>{formatDuration(track.duration)}</span>
                   </button>
                 ))}
               </div>
@@ -1484,38 +1552,34 @@ export function AudioPlayer({
 
       <Dialog open={showNowPlaying} onOpenChange={setShowNowPlaying}>
         <DialogContent className={cn('max-w-none overflow-y-auto overflow-x-hidden rounded-none border-0 p-0 [&>button]:hidden', isMobile ? 'z-[90] !left-0 !top-0 !h-[100dvh] !w-screen !max-w-screen !translate-x-0 !translate-y-0 overscroll-contain' : 'h-[100dvh] w-[100dvw]')}>
-          <div className={cn('relative min-h-full overflow-x-hidden', isLightTheme ? 'text-foreground' : 'text-white')}>
-            <div className={cn('absolute inset-0', isLightTheme ? 'bg-slate-100' : 'bg-zinc-950')} />
+          <div className="relative min-h-full overflow-x-hidden text-foreground">
+            <div className={cn('absolute inset-0', isLightTheme ? 'bg-background' : 'bg-background')} />
             {(displayAlbumThumb && !coverError) ? (
               <img
                 src={displayAlbumThumb}
                 alt=""
-                className={cn('absolute inset-0 h-full w-full scale-110 object-cover blur-3xl', isLightTheme ? 'opacity-15' : 'opacity-25')}
+                className={cn('absolute inset-0 h-full w-full scale-110 object-cover blur-3xl', isLightTheme ? 'opacity-10' : 'opacity-20')}
                 onError={() => setCoverError(true)}
               />
             ) : null}
-            <div className={cn('absolute inset-0', isLightTheme ? 'bg-gradient-to-b from-white/55 via-white/88 to-white' : 'bg-gradient-to-b from-black/25 via-black/70 to-black')} />
-            <div className="pointer-events-none absolute inset-0 opacity-50">
-              <div className="absolute -right-20 -top-24 h-80 w-80 rounded-full bg-amber-500/10 blur-3xl" />
-              <div className="absolute -bottom-28 -left-24 h-80 w-80 rounded-full bg-sky-500/10 blur-3xl" />
-            </div>
+            <div className={cn('absolute inset-0', isLightTheme ? 'bg-gradient-to-b from-background/50 via-background/85 to-background' : 'bg-gradient-to-b from-background/20 via-background/65 to-background')} />
 
             <div className="relative z-10 flex h-full flex-col">
-              <div className={cn('flex items-center justify-between gap-3 border-b px-4 backdrop-blur-sm md:px-6', isMobile ? 'py-2.5' : 'py-3', isLightTheme ? 'border-border/70 bg-white/60' : 'border-white/10 bg-black/25')}>
+              <div className={cn('flex items-center justify-between gap-3 border-b px-4 backdrop-blur-sm md:px-6', isMobile ? 'py-2.5' : 'py-3', 'border-border/60 bg-card/60')}>
                 {isMobile ? (
                   <>
                     <Button
                       type="button"
                       variant="ghost"
                       size="icon"
-                      className={cn('h-10 w-10 rounded-full', isLightTheme ? 'text-foreground hover:bg-black/5' : 'text-white hover:bg-white/10')}
+                      className="h-10 w-10 rounded-full"
                       onClick={() => setShowNowPlaying(false)}
                       title="Back to mini player"
                     >
                       <ChevronLeft className="h-5 w-5" />
                     </Button>
                     <DialogHeader className="min-w-0 flex-1 space-y-0 text-center">
-                      <DialogTitle className={cn(isMobile ? 'text-lg font-semibold' : 'text-xl font-semibold', isLightTheme ? 'text-foreground' : 'text-white')}>Now Playing</DialogTitle>
+                      <DialogTitle className={cn(isMobile ? 'text-lg font-semibold' : 'text-xl font-semibold')}>Now Playing</DialogTitle>
                       <DialogDescription className="sr-only">
                         Full-screen player showing the current track and the queued track list.
                       </DialogDescription>
@@ -1525,16 +1589,16 @@ export function AudioPlayer({
                 ) : (
                   <>
                     <DialogHeader className="space-y-0">
-                      <DialogTitle className={cn(isLightTheme ? 'text-foreground' : 'text-white')}>Now Playing</DialogTitle>
+                      <DialogTitle>Now Playing</DialogTitle>
                       <DialogDescription className="sr-only">
                         Full-screen player showing the current track and the queued track list.
                       </DialogDescription>
                     </DialogHeader>
                     <div className="flex items-center gap-2">
-                      <Badge className={cn('hidden sm:inline-flex', isLightTheme ? 'border-border/60 bg-background/75 text-foreground' : 'border-white/10 bg-white/10 text-white')} variant="outline">
+                      <Badge className="hidden sm:inline-flex" variant="outline">
                         {tracks.length} tracks
                       </Badge>
-                      <Button type="button" variant="ghost" size="icon" className={cn('h-9 w-9', isLightTheme ? 'text-foreground hover:bg-black/5' : 'text-white hover:bg-white/10')} onClick={() => setShowNowPlaying(false)} title="Collapse">
+                      <Button type="button" variant="ghost" size="icon" className="h-9 w-9" onClick={() => setShowNowPlaying(false)} title="Collapse">
                         <ChevronDown className="h-5 w-5" />
                       </Button>
                     </div>
@@ -1544,44 +1608,50 @@ export function AudioPlayer({
 
               <div className={cn('flex min-h-0 flex-1 flex-col', isMobile ? 'overflow-y-auto overflow-x-hidden overscroll-contain' : 'overflow-hidden')}>
                 <div className={cn('flex flex-col items-center md:p-10', isMobile ? 'gap-4 px-5 pb-5 pt-3' : 'gap-6 p-6')}>
-                  <div className={cn('relative aspect-square overflow-hidden rounded-3xl border shadow-[0_20px_72px_rgba(0,0,0,0.28)]', isMobile ? 'w-[min(64vw,300px)] self-center' : 'w-[min(82vw,520px)]', isLightTheme ? 'border-border/60 bg-card' : 'border-white/10 bg-zinc-900 shadow-[0_30px_110px_rgba(0,0,0,0.65)]')}>
+                  <div className={cn('relative aspect-square overflow-hidden rounded-3xl border shadow-[0_20px_72px_rgba(0,0,0,0.28)]', isMobile ? 'w-[min(64vw,300px)] self-center' : 'w-[min(82vw,520px)]', 'border-border/60 bg-card')}>
                     {(displayAlbumThumb && !coverError) ? (
                       <img src={displayAlbumThumb} alt="" className="absolute inset-0 h-full w-full animate-in object-cover fade-in-0 duration-300" />
                     ) : (
                       <div className="absolute inset-0 flex items-center justify-center">
-                        <Music className={cn('h-20 w-20', isLightTheme ? 'text-muted-foreground/70' : 'text-zinc-600')} />
+                        <Music className="h-20 w-20 text-muted-foreground/70" />
                       </div>
                     )}
-                    <div className={cn('absolute inset-0', isLightTheme ? 'bg-gradient-to-t from-black/30 via-black/5 to-transparent' : 'bg-gradient-to-t from-black/65 via-black/20 to-transparent')} />
+                    <div className="absolute inset-0 bg-gradient-to-t from-foreground/30 via-foreground/8 to-transparent" />
                   </div>
 
                   <div className={cn('space-y-1 text-center', isMobile ? 'w-full max-w-[92vw] overflow-hidden' : 'max-w-[860px]')}>
-                    <div className={cn(isMobile ? 'text-base' : 'truncate text-sm', isLightTheme ? 'text-muted-foreground' : 'text-white/70')}>{currentTrack?.artist ?? ''}</div>
+                    <div className={cn(isMobile ? 'text-base' : 'truncate text-sm', 'text-muted-foreground')}>{currentTrack?.artist ?? ''}</div>
                     {isMobile ? (
                       <div ref={mobileTitleViewportRef} className="overflow-hidden">
-                        <div className={cn('inline-flex min-w-full items-center justify-center whitespace-nowrap font-semibold tracking-tight', mobileTitleNeedsMarquee ? 'pmda-mobile-marquee' : '', isLightTheme ? 'text-foreground' : 'text-white')}>
+                        <div className={cn('inline-flex min-w-full items-center justify-center whitespace-nowrap font-semibold tracking-tight', mobileTitleNeedsMarquee ? 'pmda-mobile-marquee' : '')}>
                           <span ref={mobileTitleTextRef} className="shrink-0 text-[1.9rem] leading-[1.1]">{currentTrack?.title ?? '—'}</span>
                           {mobileTitleNeedsMarquee ? <span aria-hidden className="shrink-0 pl-10 text-[1.9rem] leading-[1.1]">{currentTrack?.title ?? '—'}</span> : null}
                         </div>
                       </div>
                     ) : (
-                      <div className={cn('text-balance font-semibold tracking-tight truncate text-3xl md:text-4xl', isLightTheme ? 'text-foreground' : 'text-white')}>
+                      <div className="text-balance font-semibold tracking-tight truncate text-3xl md:text-4xl">
                         {currentTrack?.title ?? '—'}
                       </div>
                     )}
-                    <div className={cn(isMobile ? 'text-sm leading-5 line-clamp-2' : 'truncate text-sm', isLightTheme ? 'text-muted-foreground/90' : 'text-white/55')}>{displayAlbumTitle}</div>
+                    <div className={cn(isMobile ? 'text-sm leading-5 line-clamp-2' : 'truncate text-sm', 'text-muted-foreground')}>{displayAlbumTitle}</div>
                     {albumMeta ? (
                       <div className={cn('mt-2 flex max-w-[920px] flex-col items-center', isMobile ? 'gap-1.5' : 'gap-2')}>
-                        {!isMobile ? <div className={cn('text-[11px] uppercase tracking-[0.24em]', isLightTheme ? 'text-muted-foreground/80' : 'text-white/45')}>Album metadata</div> : null}
+                        {!isMobile ? <div className="text-[11px] uppercase tracking-[0.24em] text-muted-foreground">Album metadata</div> : null}
                         <div className="flex flex-wrap items-center justify-center gap-2">
                           {isMobile ? primaryMobileBadges : (
                             <>
                               {releaseYear ? <Badge variant="outline" className={cn('h-7 rounded-full px-3 text-xs', badgeKindClass('year'))}>{releaseYear}</Badge> : null}
                               {albumMeta.total_duration_sec > 0 ? <Badge variant="outline" className={cn('h-7 rounded-full px-3 text-xs', badgeKindClass('duration'))}>{formatDuration(albumMeta.total_duration_sec)}</Badge> : null}
                               {albumMeta.format ? <FormatBadge format={albumMeta.format} size="sm" className="h-7 rounded-full px-3 py-1 text-xs" /> : null}
-                              <Badge variant="outline" className={cn('h-7 rounded-full px-3 text-xs', badgeKindClass(albumMeta.is_lossless ? 'lossless' : 'lossy'))}>
-                                {albumMeta.is_lossless ? 'Lossless' : 'Lossy'}
-                              </Badge>
+                              {(() => {
+                                const audioBadgeText = formatAudioSpec(albumMeta.bit_depth, albumMeta.sample_rate) || (albumMeta.is_lossless ? '' : 'Lossy');
+                                if (!audioBadgeText) return null;
+                                return (
+                                  <Badge variant="outline" className={cn('h-7 rounded-full px-3 text-xs', badgeKindClass(albumMeta.is_lossless ? 'lossless' : 'lossy'))}>
+                                    {audioBadgeText}
+                                  </Badge>
+                                );
+                              })()}
                               {trackCountText ? <Badge variant="outline" className={cn('h-7 rounded-full px-3 text-xs', badgeKindClass('count'))}>{trackCountText}</Badge> : null}
                               {discCountText ? <Badge variant="outline" className={cn('h-7 rounded-full px-3 text-xs', badgeKindClass('count'))}>{discCountText}</Badge> : null}
                               {labelText ? <Badge variant="outline" className={cn('h-7 rounded-full px-3 text-xs', badgeKindClass('label'))}>{`Label: ${labelText}`}</Badge> : null}
@@ -1589,7 +1659,7 @@ export function AudioPlayer({
                           )}
                         </div>
                         {isMobile ? (
-                          secondaryMobileMeta ? <div className={cn('max-w-[92vw] text-center text-xs leading-5', isLightTheme ? 'text-muted-foreground/90' : 'text-white/60')}>{secondaryMobileMeta}</div> : null
+                          secondaryMobileMeta ? <div className="max-w-[92vw] text-center text-xs leading-5 text-muted-foreground/80">{secondaryMobileMeta}</div> : null
                         ) : genres.length > 0 ? (
                           <div className="flex flex-wrap items-center justify-center gap-2">
                             {genres.map((genre) => (
@@ -1609,43 +1679,43 @@ export function AudioPlayer({
                       max={Math.max(1, displayDuration)}
                       step={1}
                       onValueChange={handleSeek}
-                      className={cn('w-full', isLightTheme ? '[&_[data-orientation=horizontal]]:bg-black/10' : '[&_[data-orientation=horizontal]]:bg-white/15')}
+                      className="w-full [&_[data-orientation=horizontal]]:bg-muted"
                     />
-                    <div className={cn('flex items-center justify-between text-xs tabular-nums', isLightTheme ? 'text-muted-foreground' : 'text-white/60')}>
+                    <div className="flex items-center justify-between text-xs tabular-nums text-muted-foreground">
                       <span>{formatDuration(currentTime)}</span>
                       <span>{formatDuration(displayDuration)}</span>
                     </div>
                   </div>
 
                   <div className={cn('flex flex-wrap items-center justify-center', isMobile ? 'gap-2.5' : 'gap-3')}>
-                    <Button variant="ghost" size="icon" className={cn('h-11 w-11 rounded-full', isLightTheme ? 'text-foreground hover:bg-black/5' : 'text-white hover:bg-white/10')} onClick={prevTrack} disabled={currentIndex <= 0} title="Previous">
+                    <Button variant="ghost" size="icon" className="h-11 w-11 rounded-full" onClick={prevTrack} disabled={currentIndex <= 0} title="Previous">
                       <SkipBack className="h-5 w-5" />
                     </Button>
                     <Button
                       variant="secondary"
                       size="icon"
-                      className={cn('h-16 w-16 rounded-full border', isLightTheme ? 'border-border/60 bg-background/80 text-foreground hover:bg-background' : 'border-white/20 bg-white/15 text-white hover:bg-white/20')}
+                      className="h-16 w-16 rounded-full border border-border/60"
                       onClick={togglePlayPause}
                       title={isPlaying ? 'Pause' : 'Play'}
                     >
                       {isPlaying ? <Pause className="h-8 w-8 fill-current" /> : <Play className="h-8 w-8 fill-current" />}
                     </Button>
-                    <Button variant="ghost" size="icon" className={cn('h-11 w-11 rounded-full', isLightTheme ? 'text-foreground hover:bg-black/5' : 'text-white hover:bg-white/10')} onClick={nextTrack} disabled={currentIndex < 0 || currentIndex >= tracks.length - 1} title="Next">
+                    <Button variant="ghost" size="icon" className="h-11 w-11 rounded-full" onClick={nextTrack} disabled={currentIndex < 0 || currentIndex >= tracks.length - 1} title="Next">
                       <SkipForward className="h-5 w-5" />
                     </Button>
                     <Button
                       variant="ghost"
                       size="icon"
-                      className={cn('h-10 w-10 rounded-full', isLightTheme ? 'text-foreground hover:bg-black/5' : 'text-white hover:bg-white/10', trackLiked ? 'text-emerald-300' : '')}
+                      className={cn('h-10 w-10 rounded-full', trackLiked ? 'text-primary' : '')}
                       onClick={() => void toggleTrackLike()}
                       title={trackLiked ? 'Liked' : 'Like'}
                     >
                       <ThumbsUp className={cn('h-5 w-5', trackLiked ? 'fill-current' : '')} />
                     </Button>
-                    <Button variant="ghost" size="icon" className={cn('h-10 w-10 rounded-full', isLightTheme ? 'text-foreground hover:bg-black/5' : 'text-white hover:bg-white/10')} onClick={() => void dislikeTrack()} title="Dislike">
+                    <Button variant="ghost" size="icon" className="h-10 w-10 rounded-full" onClick={() => void dislikeTrack()} title="Dislike">
                       <ThumbsDown className="h-5 w-5" />
                     </Button>
-                    <Button variant="ghost" size="icon" className={cn('h-10 w-10 rounded-full', isLightTheme ? 'text-foreground hover:bg-black/5' : 'text-white hover:bg-white/10', showFxPanel ? (isLightTheme ? 'bg-black/5' : 'bg-white/10') : '')} onClick={() => setShowFxPanel((value) => !value)} title="Audio effects">
+                    <Button variant="ghost" size="icon" className={cn('h-10 w-10 rounded-full', showFxPanel ? 'bg-accent' : '')} onClick={() => setShowFxPanel((value) => !value)} title="Audio effects">
                       <SlidersHorizontal className="h-5 w-5" />
                     </Button>
                   </div>
@@ -1655,7 +1725,7 @@ export function AudioPlayer({
                       type="button"
                       variant="ghost"
                       size="sm"
-                      className={cn('mt-1 h-9 gap-2 rounded-full px-4', isLightTheme ? 'text-foreground hover:bg-black/5' : 'text-white hover:bg-white/10')}
+                      className="mt-1 h-9 gap-2 rounded-full px-4"
                       onClick={scrollToTracks}
                     >
                       <ChevronDown className="h-4 w-4" />
@@ -1679,10 +1749,10 @@ export function AudioPlayer({
                   ) : null}
                 </div>
 
-                <div ref={tracksSectionRef} className={cn('flex min-h-0 flex-1 flex-col border-t', isLightTheme ? 'border-border/70 bg-white/55' : 'border-white/10 bg-black/25')}>
+                <div ref={tracksSectionRef} className="flex min-h-0 flex-1 flex-col border-t border-border/60 bg-card/50">
                   <div className="flex items-center justify-between gap-3 px-4 py-3 md:px-6">
-                    <div className={cn('text-sm font-medium', isLightTheme ? 'text-foreground' : 'text-white/85')}>Tracks</div>
-                    <div className={cn('text-xs tabular-nums', isLightTheme ? 'text-muted-foreground' : 'text-white/55')}>
+                    <div className="text-sm font-medium">Tracks</div>
+                    <div className="text-xs tabular-nums text-muted-foreground">
                       {currentIndex >= 0 ? `${currentIndex + 1}/${tracks.length}` : `${tracks.length}`}
                     </div>
                   </div>
@@ -1706,15 +1776,14 @@ export function AudioPlayer({
                             }
                           }}
                           className={cn(
-                            'flex w-full cursor-grab items-center gap-3 rounded-xl px-3 py-2 text-left text-sm transition-colors active:cursor-grabbing',
-                            isLightTheme ? 'hover:bg-black/5' : 'hover:bg-white/10',
-                            currentTrack?.track_id === track.track_id && (isLightTheme ? 'bg-black/10 text-foreground' : 'bg-white/10 text-white')
+                            'flex w-full cursor-grab items-center gap-3 rounded-xl px-3 py-2 text-left text-sm transition-colors active:cursor-grabbing hover:bg-accent/50',
+                            currentTrack?.track_id === track.track_id && 'bg-accent font-medium'
                           )}
                         >
-                          <GripVertical className={cn('h-4 w-4 shrink-0', isLightTheme ? 'text-muted-foreground/50' : 'text-white/25')} />
-                          <span className={cn('w-10 shrink-0 tabular-nums', isLightTheme ? 'text-muted-foreground/80' : 'text-white/45')}>{track.index}</span>
-                          <span className={cn('min-w-0 flex-1 truncate', isLightTheme ? 'text-foreground/95' : 'text-white/90')}>{track.title}</span>
-                          <span className={cn('shrink-0 text-xs tabular-nums', isLightTheme ? 'text-muted-foreground/80' : 'text-white/45')}>{formatDuration(track.duration)}</span>
+                          <GripVertical className="h-4 w-4 shrink-0 text-muted-foreground/50" />
+                          <span className="w-10 shrink-0 tabular-nums text-muted-foreground">{track.index}</span>
+                          <span className="min-w-0 flex-1 truncate">{track.title}</span>
+                          <span className="shrink-0 text-xs tabular-nums text-muted-foreground">{formatDuration(track.duration)}</span>
                         </button>
                       ))}
                     </div>

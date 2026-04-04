@@ -3,6 +3,7 @@ import { useLocation, useNavigate } from 'react-router-dom';
 import { Disc3, Loader2, Music2, Search, Tags, UserRound, Users } from 'lucide-react';
 import { Input } from '@/components/ui/input';
 import { AuthenticatedImage } from '@/components/library/AuthenticatedImage';
+import { useLibraryQuery } from '@/hooks/useLibraryQuery';
 import { withBackLinkState } from '@/lib/backNavigation';
 import { cn } from '@/lib/utils';
 import type { LibrarySearchSuggestionItem } from '@/lib/api';
@@ -17,6 +18,7 @@ export function GlobalSearch({ className }: { className?: string }) {
   const [open, setOpen] = useState(false);
   const [loading, setLoading] = useState(false);
   const [activeIndex, setActiveIndex] = useState(0);
+  const { scope } = useLibraryQuery();
 
   const trimmed = query.trim();
   const includeUnmatched = true;
@@ -31,7 +33,7 @@ export function GlobalSearch({ className }: { className?: string }) {
     const id = setTimeout(async () => {
       setLoading(true);
       try {
-        const res = await api.getLibrarySearchSuggestWithOptions(trimmed, 12, { includeUnmatched });
+        const res = await api.getLibrarySearchSuggestWithOptions(trimmed, 12, { includeUnmatched, scope });
         if (cancelled) return;
         setItems(Array.isArray(res.items) ? res.items : []);
         setOpen(true);
@@ -49,7 +51,7 @@ export function GlobalSearch({ className }: { className?: string }) {
       cancelled = true;
       clearTimeout(id);
     };
-  }, [includeUnmatched, trimmed]);
+  }, [includeUnmatched, scope, trimmed]);
 
   useEffect(() => {
     const onPointerDown = (evt: MouseEvent) => {
@@ -150,19 +152,19 @@ export function GlobalSearch({ className }: { className?: string }) {
         onChange={(e) => setQuery(e.target.value)}
         onFocus={() => setOpen(items.length > 0)}
         onKeyDown={onKeyDown}
-        placeholder="Search artist, composer, orchestra, album, track, genre..."
-        className="h-11 pl-9 pr-9 rounded-xl bg-background/85 border-border/70"
+        placeholder="Search artist, album, track, genre..."
+        className="h-10 md:h-11 pl-9 pr-9 rounded-xl bg-background/85 border-border/70 text-sm"
       />
       {loading ? (
         <Loader2 className="w-4 h-4 absolute right-3 top-1/2 -translate-y-1/2 animate-spin text-muted-foreground" />
       ) : null}
 
       {open && (
-        <div className="absolute top-[calc(100%+0.35rem)] left-0 z-50 w-full max-w-[56rem] rounded-xl border border-border/70 bg-popover/95 backdrop-blur-xl shadow-2xl overflow-hidden">
+        <div className="absolute top-[calc(100%+0.35rem)] left-0 z-50 w-full max-w-[56rem] rounded-xl border border-border/60 bg-popover/95 backdrop-blur-xl shadow-2xl overflow-hidden">
           {items.length === 0 ? (
-            <div className="px-3 py-2.5 text-sm text-muted-foreground">No results</div>
+            <div className="px-3 py-3 text-sm text-muted-foreground">No results found</div>
           ) : (
-            <div className="max-h-[min(26rem,62vh)] overflow-y-auto">
+            <div className="max-h-[min(22rem,55vh)] md:max-h-[min(26rem,62vh)] overflow-y-auto">
               {items.map((item, idx) => (
                 <button
                   key={`${item.type}:${item.artist_id ?? ''}:${item.album_id ?? ''}:${item.track_id ?? ''}:${item.title}:${idx}`}
@@ -170,12 +172,12 @@ export function GlobalSearch({ className }: { className?: string }) {
                   onMouseEnter={() => setActiveIndex(idx)}
                   onClick={() => goToItem(item)}
                     className={cn(
-                      'w-full px-3 py-2.5 text-left border-b border-border/50 last:border-b-0 hover:bg-accent/70 transition-colors',
-                      idx === activeIndex && 'bg-accent'
+                      'w-full px-3 py-2 text-left border-b border-border/40 last:border-b-0 hover:bg-accent/60 transition-colors',
+                      idx === activeIndex && 'bg-accent/80'
                     )}
                 >
                   <div className="flex items-center gap-3 min-w-0">
-                    <div className="relative w-9 h-9 rounded-md bg-muted overflow-hidden shrink-0 flex items-center justify-center">
+                    <div className="relative w-8 h-8 md:w-9 md:h-9 rounded-md bg-muted overflow-hidden shrink-0 flex items-center justify-center">
                       <div className="absolute inset-0 flex items-center justify-center">{iconFor(item.type)}</div>
                       {item.thumb ? (
                         <AuthenticatedImage

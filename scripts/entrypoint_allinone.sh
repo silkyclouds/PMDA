@@ -242,14 +242,14 @@ fi
 
 su -s /bin/sh postgres -c "pg_ctl -D '${PMDA_PGDATA}' -w start"
 
-if ! su -s /bin/sh postgres -c "psql -tAc \"SELECT 1 FROM pg_roles WHERE rolname='${PMDA_PG_USER}'\"" | grep -q 1; then
-  su -s /bin/sh postgres -c "psql -v ON_ERROR_STOP=1 -c \"CREATE ROLE \\\"${PMDA_PG_USER}\\\" LOGIN PASSWORD '${PMDA_PG_PASSWORD}'\""
+if ! su -s /bin/sh postgres -c "psql -p \"${PMDA_PG_PORT}\" -tAc \"SELECT 1 FROM pg_roles WHERE rolname='${PMDA_PG_USER}'\"" | grep -q 1; then
+  su -s /bin/sh postgres -c "psql -p \"${PMDA_PG_PORT}\" -v ON_ERROR_STOP=1 -c \"CREATE ROLE \\\"${PMDA_PG_USER}\\\" LOGIN PASSWORD '${PMDA_PG_PASSWORD}'\""
 else
-  su -s /bin/sh postgres -c "psql -v ON_ERROR_STOP=1 -c \"ALTER ROLE \\\"${PMDA_PG_USER}\\\" LOGIN PASSWORD '${PMDA_PG_PASSWORD}'\""
+  su -s /bin/sh postgres -c "psql -p \"${PMDA_PG_PORT}\" -v ON_ERROR_STOP=1 -c \"ALTER ROLE \\\"${PMDA_PG_USER}\\\" LOGIN PASSWORD '${PMDA_PG_PASSWORD}'\""
 fi
 
-if ! su -s /bin/sh postgres -c "psql -tAc \"SELECT 1 FROM pg_database WHERE datname='${PMDA_PG_DB}'\"" | grep -q 1; then
-  su -s /bin/sh postgres -c "createdb -O \"${PMDA_PG_USER}\" \"${PMDA_PG_DB}\""
+if ! su -s /bin/sh postgres -c "psql -p \"${PMDA_PG_PORT}\" -tAc \"SELECT 1 FROM pg_database WHERE datname='${PMDA_PG_DB}'\"" | grep -q 1; then
+  su -s /bin/sh postgres -c "createdb -p \"${PMDA_PG_PORT}\" -O \"${PMDA_PG_USER}\" \"${PMDA_PG_DB}\""
 fi
 
 build_redis_args

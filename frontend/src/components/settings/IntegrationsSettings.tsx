@@ -310,15 +310,15 @@ export function IntegrationsSettings({ config, updateConfig }: IntegrationsSetti
         {playerResult && (
           <div className={`p-3 rounded-lg flex items-start gap-2 ${
             playerResult.success
-              ? 'bg-green-500/10 border border-green-500/20'
-              : 'bg-red-500/10 border border-red-500/20'
+              ? 'bg-success/10 border border-success/20'
+              : 'bg-destructive/10 border border-destructive/20'
           }`}>
             {playerResult.success ? (
-              <CheckCircle2 className="w-4 h-4 text-green-500 mt-0.5 shrink-0" />
+              <CheckCircle2 className="w-4 h-4 text-success mt-0.5 shrink-0" />
             ) : (
-              <XCircle className="w-4 h-4 text-red-500 mt-0.5 shrink-0" />
+              <XCircle className="w-4 h-4 text-destructive mt-0.5 shrink-0" />
             )}
-            <p className={`text-xs ${playerResult.success ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}`}>
+            <p className={`text-xs ${playerResult.success ? 'text-success' : 'text-destructive'}`}>
               {playerResult.message}
             </p>
           </div>

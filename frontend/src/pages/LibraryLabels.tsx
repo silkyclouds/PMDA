@@ -3,6 +3,7 @@ import { useLocation, useNavigate, useOutletContext } from 'react-router-dom';
 import { Building2, Loader2 } from 'lucide-react';
 
 import { Badge } from '@/components/ui/badge';
+import { AuthenticatedImage } from '@/components/library/AuthenticatedImage';
 import { Card } from '@/components/ui/card';
 import { LibraryEmptyState } from '@/components/library/LibraryEmptyState';
 import { useLibraryQuery } from '@/hooks/useLibraryQuery';
@@ -14,7 +15,7 @@ import type { LibraryOutletContext } from '@/pages/LibraryLayout';
 export default function LibraryLabels() {
   const navigate = useNavigate();
   const location = useLocation();
-  const { includeUnmatched, libraryIsEmpty } = useOutletContext<LibraryOutletContext>();
+  const { includeUnmatched, scope, libraryIsEmpty, emptyState, setScope } = useOutletContext<LibraryOutletContext>();
   const { search, genre, year } = useLibraryQuery();
 
   const [loading, setLoading] = useState(false);
@@ -28,6 +29,7 @@ export default function LibraryLabels() {
   const requestIdRef = useRef(0);
   const sentinelRef = useRef<HTMLDivElement | null>(null);
   const loadingMoreRef = useRef(false);
+  const logoRefreshAttemptsRef = useRef(0);
 
   const fetchLabels = useCallback(async (opts: { reset: boolean; pageOffset: number }) => {
     const rid = ++requestIdRef.current;
@@ -41,8 +43,10 @@ export default function LibraryLabels() {
         genre: genre || undefined,
         year: year ?? undefined,
         includeUnmatched,
+        scope,
         limit,
         offset: opts.pageOffset,
+        refresh: false,
       });
       if (rid !== requestIdRef.current) return;
       const list = Array.isArray(res.labels) ? res.labels : [];
@@ -60,7 +64,7 @@ export default function LibraryLabels() {
     } finally {
       if (rid === requestIdRef.current) setLoading(false);
     }
-  }, [genre, includeUnmatched, limit, search, year]);
+  }, [genre, includeUnmatched, limit, scope, search, year]);
 
   useEffect(() => {
     if (libraryIsEmpty) {
@@ -71,8 +75,46 @@ export default function LibraryLabels() {
       return;
     }
     setOffset(0);
+    logoRefreshAttemptsRef.current = 0;
     void fetchLabels({ reset: true, pageOffset: 0 });
   }, [search, genre, year, includeUnmatched, fetchLabels, libraryIsEmpty]);
+
+  useEffect(() => {
+    if (labels.length === 0) return;
+    const missing = labels.filter((labelItem) => !String(labelItem.thumb || '').trim());
+    if (missing.length === 0) return;
+    if (logoRefreshAttemptsRef.current >= 3) return;
+
+    let cancelled = false;
+    const attemptNo = logoRefreshAttemptsRef.current;
+    const timer = setTimeout(async () => {
+      if (cancelled) return;
+      logoRefreshAttemptsRef.current += 1;
+      try {
+        const res = await api.getLibraryLabels({
+          search: search.trim() || undefined,
+          genre: genre || undefined,
+          year: year ?? undefined,
+          includeUnmatched,
+          scope,
+          limit,
+          offset: 0,
+          refresh: true,
+        });
+        if (cancelled) return;
+        const list = Array.isArray(res.labels) ? res.labels : [];
+        setLabels(list);
+        setTotal(typeof res.total === 'number' ? res.total : 0);
+        setOffset(list.length);
+      } catch {
+        // Best-effort only.
+      }
+    }, 1800 + attemptNo * 2600);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [genre, includeUnmatched, labels, limit, scope, search, year]);
 
   const canLoadMore = labels.length < total && !loading;
   const loadMore = useCallback(async () => {
@@ -108,7 +150,12 @@ export default function LibraryLabels() {
   if (libraryIsEmpty) {
     return (
       <div className="pmda-library-shell pb-6">
-        <LibraryEmptyState />
+        <LibraryEmptyState
+          title={emptyState.title}
+          description={emptyState.description}
+          actionLabel={emptyState.actionLabel ?? undefined}
+          onAction={emptyState.actionScope ? () => setScope(emptyState.actionScope as api.LibraryBrowseScope) : undefined}
+        />
       </div>
     );
   }
@@ -148,11 +195,16 @@ export default function LibraryLabels() {
               >
                 <div className="flex items-center justify-between gap-3">
                   <div className="min-w-0 flex items-center gap-2">
-                    <div className="h-7 w-7 rounded-md overflow-hidden border border-border/60 bg-muted shrink-0 flex items-center justify-center">
+                    <div className="h-20 w-20 rounded-md overflow-hidden border border-border/60 bg-muted shrink-0 flex items-center justify-center">
                       {l.thumb ? (
-                        <img src={l.thumb} alt={l.value} className="h-full w-full object-cover" loading="lazy" decoding="async" />
+                        <AuthenticatedImage
+                          src={l.thumb}
+                          alt={l.value}
+                          className="h-full w-full object-contain bg-muted p-2"
+                          fallback={<Building2 className="h-6 w-6 text-muted-foreground shrink-0" />}
+                        />
                       ) : (
-                        <Building2 className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
+                        <Building2 className="h-6 w-6 text-muted-foreground shrink-0" />
                       )}
                     </div>
                     <div className="font-medium text-sm truncate">{l.value}</div>

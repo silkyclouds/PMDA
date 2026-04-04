@@ -267,7 +267,7 @@ export function SourcesAutonomySettings() {
 
   return (
     <div className="space-y-5">
-      <div className="space-y-4 rounded-xl border border-cyan-500/20 bg-cyan-500/[0.04] p-4">
+      <div className="space-y-4 rounded-xl border border-info/20 bg-info/[0.04] p-4">
         <div className="flex items-center justify-between gap-3">
           <div className="space-y-1">
             <Label className="text-sm">Source folders</Label>

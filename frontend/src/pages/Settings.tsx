@@ -6,6 +6,10 @@ import { IntegrationsSettings } from '@/components/settings/IntegrationsSettings
 import { ProfileSharingSettings } from '@/components/settings/ProfileSharingSettings';
 import { SchedulerSettings } from '@/components/settings/SchedulerSettings';
 import { SourcesAutonomySettings } from '@/components/settings/SourcesAutonomySettings';
+import { LibraryWorkflowSettings } from '@/components/settings/LibraryWorkflowSettings';
+import { OnboardingWizard } from '@/components/settings/OnboardingWizard';
+import { GuidedOnboardingDialog } from '@/components/settings/GuidedOnboardingDialog';
+import { ScalingSettings } from '@/components/settings/ScalingSettings';
 import { ProviderBadge } from '@/components/providers/ProviderBadge';
 import { ProviderIcon } from '@/components/providers/ProviderIcon';
 import { useAuth } from '@/contexts/AuthContext';
@@ -55,67 +59,94 @@ type SettingsSection = {
 
 const SETTINGS_SECTIONS: SettingsSection[] = [
   {
+    id: 'settings-onboarding',
+    label: 'Onboarding',
+    icon: Sparkles,
+    navClass: 'pmda-settings-nav-item',
+    navActiveClass: '',
+    cardClass: 'border-border/60',
+    iconClass: 'pmda-settings-section-icon',
+  },
+  {
+    id: 'settings-library-workflow',
+    label: 'Library workflow',
+    icon: Workflow,
+    navClass: 'pmda-settings-nav-item',
+    navActiveClass: '',
+    cardClass: 'border-border/60',
+    iconClass: 'pmda-settings-section-icon',
+  },
+  {
     id: 'settings-files-export',
     label: 'Folders',
     icon: FolderOutput,
-    navClass: 'border-cyan-300/60 bg-cyan-500/10 text-cyan-800 hover:bg-cyan-500/20 dark:border-cyan-500/30 dark:text-cyan-100',
-    navActiveClass: 'ring-1 ring-cyan-400/40 bg-cyan-500/20 dark:bg-cyan-500/25',
-    cardClass: 'border-cyan-500/20 bg-cyan-500/[0.04]',
-    iconClass: 'bg-cyan-500/20 text-cyan-700 dark:text-cyan-200',
+    navClass: 'pmda-settings-nav-item',
+    navActiveClass: '',
+    cardClass: 'border-border/60',
+    iconClass: 'pmda-settings-section-icon',
   },
   {
     id: 'settings-scan-behavior',
     label: 'Scan behavior',
     icon: SlidersHorizontal,
-    navClass: 'border-indigo-300/60 bg-indigo-500/10 text-indigo-800 hover:bg-indigo-500/20 dark:border-indigo-500/30 dark:text-indigo-100',
-    navActiveClass: 'ring-1 ring-indigo-400/40 bg-indigo-500/20 dark:bg-indigo-500/25',
-    cardClass: 'border-indigo-500/20 bg-indigo-500/[0.04]',
-    iconClass: 'bg-indigo-500/20 text-indigo-700 dark:text-indigo-200',
+    navClass: 'pmda-settings-nav-item',
+    navActiveClass: '',
+    cardClass: 'border-border/60',
+    iconClass: 'pmda-settings-section-icon',
+  },
+  {
+    id: 'settings-scaling',
+    label: 'Scaling',
+    icon: Server,
+    navClass: 'pmda-settings-nav-item',
+    navActiveClass: '',
+    cardClass: 'border-border/60',
+    iconClass: 'pmda-settings-section-icon',
   },
   {
     id: 'settings-pipeline',
     label: 'Pipeline',
     icon: Sparkles,
-    navClass: 'border-violet-300/60 bg-violet-500/10 text-violet-800 hover:bg-violet-500/20 dark:border-violet-500/30 dark:text-violet-100',
-    navActiveClass: 'ring-1 ring-violet-400/40 bg-violet-500/20 dark:bg-violet-500/25',
-    cardClass: 'border-violet-500/20 bg-violet-500/[0.04]',
-    iconClass: 'bg-violet-500/20 text-violet-700 dark:text-violet-200',
+    navClass: 'pmda-settings-nav-item',
+    navActiveClass: '',
+    cardClass: 'border-border/60',
+    iconClass: 'pmda-settings-section-icon',
   },
   {
     id: 'settings-ai',
     label: 'AI',
     icon: Sparkles,
-    navClass: 'border-fuchsia-300/60 bg-fuchsia-500/10 text-fuchsia-800 hover:bg-fuchsia-500/20 dark:border-fuchsia-500/30 dark:text-fuchsia-100',
-    navActiveClass: 'ring-1 ring-fuchsia-400/40 bg-fuchsia-500/20 dark:bg-fuchsia-500/25',
-    cardClass: 'border-fuchsia-500/20 bg-fuchsia-500/[0.04]',
-    iconClass: 'bg-fuchsia-500/20 text-fuchsia-700 dark:text-fuchsia-200',
+    navClass: 'pmda-settings-nav-item',
+    navActiveClass: '',
+    cardClass: 'border-border/60',
+    iconClass: 'pmda-settings-section-icon',
   },
   {
     id: 'settings-providers',
     label: 'Metadata providers',
     icon: Database,
-    navClass: 'border-sky-300/60 bg-sky-500/10 text-sky-800 hover:bg-sky-500/20 dark:border-sky-500/30 dark:text-sky-100',
-    navActiveClass: 'ring-1 ring-sky-400/40 bg-sky-500/20 dark:bg-sky-500/25',
-    cardClass: 'border-sky-500/20 bg-sky-500/[0.04]',
-    iconClass: 'bg-sky-500/20 text-sky-700 dark:text-sky-200',
+    navClass: 'pmda-settings-nav-item',
+    navActiveClass: '',
+    cardClass: 'border-border/60',
+    iconClass: 'pmda-settings-section-icon',
   },
   {
     id: 'settings-concerts',
     label: 'Concerts',
     icon: MapPin,
-    navClass: 'border-amber-300/60 bg-amber-500/10 text-amber-800 hover:bg-amber-500/20 dark:border-amber-500/30 dark:text-amber-100',
-    navActiveClass: 'ring-1 ring-amber-400/40 bg-amber-500/20 dark:bg-amber-500/25',
-    cardClass: 'border-amber-500/20 bg-amber-500/[0.04]',
-    iconClass: 'bg-amber-500/20 text-amber-700 dark:text-amber-200',
+    navClass: 'pmda-settings-nav-item',
+    navActiveClass: '',
+    cardClass: 'border-border/60',
+    iconClass: 'pmda-settings-section-icon',
   },
   {
     id: 'settings-danger-zone',
     label: 'Danger zone',
     icon: AlertTriangle,
-    navClass: 'border-rose-300/60 bg-rose-500/10 text-rose-800 hover:bg-rose-500/20 dark:border-rose-500/30 dark:text-rose-100',
-    navActiveClass: 'ring-1 ring-rose-400/40 bg-rose-500/20 dark:bg-rose-500/25',
+    navClass: 'pmda-settings-nav-item',
+    navActiveClass: '',
     cardClass: 'border-destructive/30 bg-destructive/[0.04]',
-    iconClass: 'bg-destructive/20 text-destructive',
+    iconClass: 'pmda-settings-section-icon',
   },
 ];
 
@@ -201,7 +232,7 @@ const SCAN_AI_POLICY_OPTIONS: Array<{
   },
 ];
 
-const LOCAL_WEB_PROVIDER_IDS = ['searxng', 'serper'] as const;
+const LOCAL_WEB_PROVIDER_IDS = ['serper'] as const;
 const PAID_AI_PROVIDER_IDS = ['openai-api', 'openai-codex', 'anthropic', 'google'] as const;
 
 const DANGER_PRESETS: DangerPresetMeta[] = [
@@ -348,7 +379,7 @@ function SettingsPage() {
   const [isLoading, setIsLoading] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
   const [errors, setErrors] = useState<Record<string, string>>({});
-  const [activeSettingsSection, setActiveSettingsSection] = useState<string>('settings-files-export');
+  const [activeSettingsSection, setActiveSettingsSection] = useState<string>('settings-onboarding');
   const [openaiOAuth, setOpenaiOAuth] = useState<{
     sessionId: string;
     verificationUrl: string;
@@ -378,6 +409,7 @@ function SettingsPage() {
   const [ollamaConnectionMessage, setOllamaConnectionMessage] = useState<string | null>(null);
   const [rebuildIndexLoading, setRebuildIndexLoading] = useState(false);
   const [advancedFoldersOpen, setAdvancedFoldersOpen] = useState(false);
+  const [showGuidedOnboarding, setShowGuidedOnboarding] = useState(false);
   const [schedulerAdvancedOpen, setSchedulerAdvancedOpen] = useState(false);
   const [providersChecking, setProvidersChecking] = useState(false);
   const [providersPreflight, setProvidersPreflight] = useState<api.ScanPreflightResult | null>(null);
@@ -393,6 +425,7 @@ function SettingsPage() {
   const openaiCodexModeEnabled = config.OPENAI_ENABLE_CODEX_OAUTH_MODE !== false;
   const codexProfileConnected = Boolean(openaiCodexStatus?.profile_connected || openaiCodexStatus?.connected);
   const codexReady = Boolean(openaiCodexStatus?.connected);
+  const configConfigured = (config as api.ConfigResponse).configured === true || Boolean(String(config.FILES_ROOTS || '').trim());
 
   const getApiErrorMessage = (e: unknown): string | null => {
     const bodyMsg = (e as { body?: { message?: unknown } } | null)?.body?.message;
@@ -896,7 +929,6 @@ function SettingsPage() {
   const ollamaHardModelInstalled =
     !ollamaConfiguredHardModel || ollamaAvailableModels.length === 0 || ollamaAvailableModels.includes(ollamaConfiguredHardModel);
   const localWebProviderConfigured = {
-    searxng: Boolean(String(config.SEARXNG_URL || '').trim()),
     serper: Boolean(String(config.SERPER_API_KEY || '').trim()),
   };
   const paidProviderConfigured = {
@@ -917,7 +949,7 @@ function SettingsPage() {
   };
 
   const providerState = (
-    key: 'discogs' | 'lastfm' | 'fanart' | 'searxng' | 'serper' | 'acoustid',
+    key: 'discogs' | 'lastfm' | 'fanart' | 'serper' | 'acoustid',
     configured: boolean,
   ): ProviderState => {
     if (!configured) {
@@ -1104,7 +1136,7 @@ function SettingsPage() {
           </div>
           <div className="flex items-center gap-2">
             {lastSaved === true && (
-              <span className="text-sm font-medium text-green-600 dark:text-green-400 flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-green-500/10">
+              <span className="text-sm font-medium text-success flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-success/10">
                 <Check className="w-4 h-4" /> Saved
               </span>
             )}
@@ -1133,12 +1165,13 @@ function SettingsPage() {
         {/* Mobile: horizontal scroll nav */}
         <nav className="md:hidden mb-4 -mx-6 px-6 overflow-x-auto pb-3 border-b border-border" aria-label="Settings sections">
           <div className="flex gap-2 min-w-max">
-            {SETTINGS_SECTIONS.map(({ id, label, icon: Icon, navClass, navActiveClass }) => (
+            {SETTINGS_SECTIONS.map(({ id, label, icon: Icon }) => (
               <a
                 key={id}
                 href={`#${id}`}
                 onClick={() => setActiveSettingsSection(id)}
-                className={`shrink-0 flex items-center gap-1.5 py-2 px-3 rounded-lg border text-sm transition-colors whitespace-nowrap ${navClass} ${activeSettingsSection === id ? navActiveClass : ''}`}
+                data-active={activeSettingsSection === id}
+                className="pmda-settings-nav-item shrink-0 whitespace-nowrap"
               >
                 <Icon className="w-3.5 h-3.5" />
                 {label}
@@ -1152,12 +1185,13 @@ function SettingsPage() {
           <nav className="hidden md:block shrink-0 w-56 top-24 self-start sticky rounded-xl border border-border bg-card/50 p-3 shadow-sm" aria-label="Settings sections">
             <p className="text-xs font-medium text-muted-foreground uppercase tracking-wider mb-3">Settings map</p>
             <ul className="space-y-1.5">
-              {SETTINGS_SECTIONS.map(({ id, label, icon: Icon, navClass, navActiveClass }) => (
+              {SETTINGS_SECTIONS.map(({ id, label, icon: Icon }) => (
                 <li key={id}>
                   <a
                     href={`#${id}`}
                     onClick={() => setActiveSettingsSection(id)}
-                    className={`flex items-center gap-2 py-2 px-2.5 rounded-lg border text-sm transition-colors ${navClass} ${activeSettingsSection === id ? navActiveClass : ''}`}
+                    data-active={activeSettingsSection === id}
+                    className="pmda-settings-nav-item"
                   >
                     <Icon className="w-4 h-4" />
                     <span>{label}</span>
@@ -1169,6 +1203,21 @@ function SettingsPage() {
 
           <div className="min-w-0 flex-1 space-y-6">
             <ProfileSharingSettings compact />
+            <OnboardingWizard
+              config={config}
+              updateConfig={updateConfig}
+              configured={configConfigured}
+              onOpenGuidedSetup={() => setShowGuidedOnboarding(true)}
+            />
+            <GuidedOnboardingDialog open={showGuidedOnboarding} onOpenChange={setShowGuidedOnboarding} />
+            <LibraryWorkflowSettings
+              config={config}
+              updateConfig={updateConfig}
+              onSwitchToCustom={() => {
+                setAdvancedFoldersOpen(true);
+                setActiveSettingsSection('settings-files-export');
+              }}
+            />
             <Card id="settings-files-export" className={`scroll-mt-24 ${getSettingsSection('settings-files-export').cardClass}`}>
               <CardHeader>
                 <CardTitle className="flex items-center gap-2">
@@ -1178,93 +1227,128 @@ function SettingsPage() {
                   Folders
                 </CardTitle>
                 <CardDescription>
-                  Configure standard source folders, optional incoming folders, cache folders, and export destinations in one place.
+                  Low-level source, export and cache controls. In guided workflow modes, use this section only if you intentionally want to switch to raw configuration.
                 </CardDescription>
               </CardHeader>
               <CardContent className="space-y-5">
-                <SourcesAutonomySettings />
+                {config.LIBRARY_WORKFLOW_MODE === 'custom' ? (
+                  <>
+                    <SourcesAutonomySettings />
 
-                <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
-                  <div className="rounded-xl border border-orange-500/20 bg-orange-500/[0.04] p-4 md:p-5 space-y-2">
-                    <div className="flex items-center gap-2">
-                      <span className="inline-flex h-7 w-7 items-center justify-center rounded-full bg-orange-500/15 text-orange-200 text-xs font-semibold">2</span>
-                      <Label className="text-sm">Where should duplicates go?</Label>
+                    <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
+                      <div className="rounded-xl border border-warning/20 bg-warning/[0.04] p-4 md:p-5 space-y-2">
+                        <div className="flex items-center gap-2">
+                          <span className="inline-flex h-7 w-7 items-center justify-center rounded-full bg-warning/15 text-warning text-xs font-semibold">2</span>
+                          <Label className="text-sm">Where should duplicates go?</Label>
+                        </div>
+                        <p className="text-xs text-muted-foreground">
+                          When PMDA decides an album is a duplicate loser, it moves it here so you can review and restore it later if needed.
+                        </p>
+                        <FolderBrowserInput
+                          value={config.DUPE_ROOT ?? '/dupes'}
+                          onChange={(path) => updateConfig({ DUPE_ROOT: path || '/dupes' })}
+                          placeholder="/dupes"
+                          selectLabel="Select duplicates destination folder"
+                        />
+                      </div>
+
+                      <div className="rounded-xl border border-warning/20 bg-warning/[0.04] p-4 md:p-5 space-y-2">
+                        <div className="flex items-center gap-2">
+                          <span className="inline-flex h-7 w-7 items-center justify-center rounded-full bg-warning/15 text-warning text-xs font-semibold">3</span>
+                          <Label className="text-sm">Where should incomplete albums go?</Label>
+                        </div>
+                        <p className="text-xs text-muted-foreground">
+                          If PMDA detects missing tracks, it quarantines the album here instead of mixing it into your clean library.
+                        </p>
+                        <FolderBrowserInput
+                          value={config.INCOMPLETE_ALBUMS_TARGET_DIR ?? '/dupes/incomplete_albums'}
+                          onChange={(path) => updateConfig({ INCOMPLETE_ALBUMS_TARGET_DIR: path || '/dupes/incomplete_albums' })}
+                          placeholder="/dupes/incomplete_albums"
+                          selectLabel="Select incomplete albums destination folder"
+                        />
+                      </div>
                     </div>
-                    <p className="text-xs text-muted-foreground">
-                      When PMDA decides an album is a duplicate loser, it moves it here so you can review and restore it later if needed.
-                    </p>
-                    <FolderBrowserInput
-                      value={config.DUPE_ROOT ?? '/dupes'}
-                      onChange={(path) => updateConfig({ DUPE_ROOT: path || '/dupes' })}
-                      placeholder="/dupes"
-                      selectLabel="Select duplicates destination folder"
-                    />
-                  </div>
 
-                  <div className="rounded-xl border border-amber-500/20 bg-amber-500/[0.04] p-4 md:p-5 space-y-2">
-                    <div className="flex items-center gap-2">
-                      <span className="inline-flex h-7 w-7 items-center justify-center rounded-full bg-amber-500/15 text-amber-200 text-xs font-semibold">3</span>
-                      <Label className="text-sm">Where should incomplete albums go?</Label>
+                    <div className="rounded-xl border border-success/20 bg-success/[0.04] p-4 md:p-5 space-y-4">
+                      <div className="space-y-1">
+                        <div className="flex items-center gap-2">
+                          <span className="inline-flex h-7 w-7 items-center justify-center rounded-full bg-success/15 text-success text-xs font-semibold">4</span>
+                          <Label className="text-sm">Where should PMDA build the clean exported library?</Label>
+                        </div>
+                        <p className="text-xs text-muted-foreground">
+                          This folder is the clean library PMDA generates automatically. Point Plex, Navidrome or Jellyfin here rather than at your raw source or incoming folders.
+                        </p>
+                        <p className="text-[11px] text-muted-foreground">
+                          If the folder does not exist yet, PMDA will create it when the export pipeline runs.
+                        </p>
+                      </div>
+                      <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,1fr),320px] gap-3 items-start">
+                        <FolderBrowserInput
+                          value={config.EXPORT_ROOT ?? '/music/library'}
+                          onChange={(path) => updateConfig({ EXPORT_ROOT: path || '/music/library' })}
+                          placeholder="/music/library"
+                          selectLabel="Select library export destination folder"
+                        />
+                        <div className="space-y-2">
+                          <Label>Export method</Label>
+                          <Select
+                            value={(config.EXPORT_LINK_STRATEGY as 'hardlink' | 'symlink' | 'copy' | 'move' | undefined) ?? 'hardlink'}
+                            onValueChange={(value: 'hardlink' | 'symlink' | 'copy' | 'move') => updateConfig({ EXPORT_LINK_STRATEGY: value })}
+                          >
+                            <SelectTrigger className="w-full">
+                              <SelectValue placeholder="Select strategy" />
+                            </SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value="hardlink">Hardlink: fastest, no extra space</SelectItem>
+                              <SelectItem value="symlink">Symlink: references original files</SelectItem>
+                              <SelectItem value="copy">Copy: safest but duplicates files</SelectItem>
+                              <SelectItem value="move">Move: relocates files physically</SelectItem>
+                            </SelectContent>
+                          </Select>
+                          <p className="text-[11px] text-muted-foreground">
+                            Recommended for most users: <span className="text-foreground">Hardlink</span>.
+                          </p>
+                        </div>
+                      </div>
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                        <div className="flex items-center justify-between rounded-lg border border-border/40 bg-muted/30 px-3 py-2.5">
+                          <div className="space-y-0.5 pr-4">
+                            <div className="text-sm font-medium">Include album format in folder name</div>
+                            <div className="text-[11px] text-muted-foreground">
+                              Example: <span className="text-foreground">Desert Solitaire (Flac)</span>
+                            </div>
+                          </div>
+                          <Switch
+                            checked={Boolean(config.EXPORT_INCLUDE_ALBUM_FORMAT_IN_FOLDER)}
+                            onCheckedChange={(checked) => updateConfig({ EXPORT_INCLUDE_ALBUM_FORMAT_IN_FOLDER: checked })}
+                          />
+                        </div>
+                        <div className="flex items-center justify-between rounded-lg border border-border/40 bg-muted/30 px-3 py-2.5">
+                          <div className="space-y-0.5 pr-4">
+                            <div className="text-sm font-medium">Include album type in folder name</div>
+                            <div className="text-[11px] text-muted-foreground">
+                              Example: <span className="text-foreground">Desert Solitaire (Flac,  Album)</span>
+                            </div>
+                          </div>
+                          <Switch
+                            checked={Boolean(config.EXPORT_INCLUDE_ALBUM_TYPE_IN_FOLDER)}
+                            onCheckedChange={(checked) => updateConfig({ EXPORT_INCLUDE_ALBUM_TYPE_IN_FOLDER: checked })}
+                          />
+                        </div>
+                      </div>
                     </div>
-                    <p className="text-xs text-muted-foreground">
-                      If PMDA detects missing tracks, it quarantines the album here instead of mixing it into your clean library.
-                    </p>
-                    <FolderBrowserInput
-                      value={config.INCOMPLETE_ALBUMS_TARGET_DIR ?? '/dupes/incomplete_albums'}
-                      onChange={(path) => updateConfig({ INCOMPLETE_ALBUMS_TARGET_DIR: path || '/dupes/incomplete_albums' })}
-                      placeholder="/dupes/incomplete_albums"
-                      selectLabel="Select incomplete albums destination folder"
-                    />
+                  </>
+                ) : (
+                  <div className="rounded-xl border border-dashed border-border/70 bg-muted/20 p-4 text-sm text-muted-foreground">
+                    Guided workflow mode is active. PMDA now treats Library / Inbox / Dupes as product concepts and translates them into the raw source/export settings automatically.
+                    Use <span className="text-foreground">Switch to Custom / Advanced</span> in the Library workflow card if you want to edit source roots and export controls directly.
                   </div>
-                </div>
+                )}
 
-                <div className="rounded-xl border border-emerald-500/20 bg-emerald-500/[0.04] p-4 md:p-5 space-y-4">
+                <div className="rounded-xl border border-primary/20 bg-primary/[0.04] p-4 md:p-5 space-y-3">
                   <div className="space-y-1">
                     <div className="flex items-center gap-2">
-                      <span className="inline-flex h-7 w-7 items-center justify-center rounded-full bg-emerald-500/15 text-emerald-200 text-xs font-semibold">4</span>
-                      <Label className="text-sm">Where should PMDA build the clean exported library?</Label>
-                    </div>
-                    <p className="text-xs text-muted-foreground">
-                      This folder is the clean library PMDA generates automatically. Point Plex, Navidrome or Jellyfin here rather than at your raw source or incoming folders.
-                    </p>
-                    <p className="text-[11px] text-muted-foreground">
-                      If the folder does not exist yet, PMDA will create it when the export pipeline runs.
-                    </p>
-                  </div>
-                  <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,1fr),320px] gap-3 items-start">
-                    <FolderBrowserInput
-                      value={config.EXPORT_ROOT ?? '/music/library'}
-                      onChange={(path) => updateConfig({ EXPORT_ROOT: path || '/music/library' })}
-                      placeholder="/music/library"
-                      selectLabel="Select library export destination folder"
-                    />
-                    <div className="space-y-2">
-                      <Label>Export method</Label>
-                      <Select
-                        value={(config.EXPORT_LINK_STRATEGY as 'hardlink' | 'symlink' | 'copy' | 'move' | undefined) ?? 'hardlink'}
-                        onValueChange={(value: 'hardlink' | 'symlink' | 'copy' | 'move') => updateConfig({ EXPORT_LINK_STRATEGY: value })}
-                      >
-                        <SelectTrigger className="w-full">
-                          <SelectValue placeholder="Select strategy" />
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="hardlink">Hardlink: fastest, no extra space</SelectItem>
-                          <SelectItem value="symlink">Symlink: references original files</SelectItem>
-                          <SelectItem value="copy">Copy: safest but duplicates files</SelectItem>
-                          <SelectItem value="move">Move: relocates files physically</SelectItem>
-                        </SelectContent>
-                      </Select>
-                      <p className="text-[11px] text-muted-foreground">
-                        Recommended for most users: <span className="text-foreground">Hardlink</span>.
-                      </p>
-                    </div>
-                  </div>
-                </div>
-
-                <div className="rounded-xl border border-violet-500/20 bg-violet-500/[0.04] p-4 md:p-5 space-y-3">
-                  <div className="space-y-1">
-                    <div className="flex items-center gap-2">
-                      <span className="inline-flex h-7 w-7 items-center justify-center rounded-full bg-violet-500/15 text-violet-200 text-xs font-semibold">5</span>
+                      <span className="inline-flex h-7 w-7 items-center justify-center rounded-full bg-primary/15 text-primary text-xs font-semibold">5</span>
                       <Label className="text-sm">Where should PMDA keep its artwork cache?</Label>
                     </div>
                     <p className="text-xs text-muted-foreground">
@@ -1475,7 +1559,7 @@ function SettingsPage() {
                   Scan behavior
                 </CardTitle>
                 <CardDescription>
-                  Recommended mode is scan-first: PMDA runs pipeline inside the scan and avoids random background jobs.
+                  These switches decide when PMDA may start scans, whether the full pipeline stays attached to the scan, and whether provider-only hole-filling may continue after the scan for things like artist images, label logos, bios, similar artists, and album descriptions.
                 </CardDescription>
               </CardHeader>
               <CardContent className="space-y-4">
@@ -1484,7 +1568,7 @@ function SettingsPage() {
                     <div className="space-y-1">
                       <Label>Scan-first mode (recommended)</Label>
                       <p className="text-xs text-muted-foreground">
-                        Disable scheduler jobs and run pipeline during manual scans only.
+                        Best for predictable runs. PMDA only scans when you launch it manually, and the scan keeps ownership of the main pipeline: match, tags, covers, dedupe, incomplete moves, export, and provider metadata collection.
                       </p>
                     </div>
                     <Switch
@@ -1513,7 +1597,7 @@ function SettingsPage() {
                     <div className="space-y-1">
                       <Label>Allow scheduled scans</Label>
                       <p className="text-xs text-muted-foreground">
-                        If disabled, PMDA will only scan when you launch a scan manually.
+                        Lets PMDA start the same full scan pipeline automatically on schedule. This only controls scan launch timing; it does not change what the scan itself collects.
                       </p>
                     </div>
                     <Switch
@@ -1525,7 +1609,7 @@ function SettingsPage() {
                     <div className="space-y-1">
                       <Label>Allow non-scan background jobs</Label>
                       <p className="text-xs text-muted-foreground">
-                        Allows scheduler to run enrichment/dedupe/export outside scan runs.
+                        Lets PMDA keep filling remaining holes even when no scan is running. This is for provider-only follow-up like artist images, label logos, bios, similar artists, and album descriptions that may arrive after a page is opened or after a scan has already published the library.
                       </p>
                     </div>
                     <Switch
@@ -1537,7 +1621,7 @@ function SettingsPage() {
                     <div className="space-y-1">
                       <Label>Post-scan chain in async queue</Label>
                       <p className="text-xs text-muted-foreground">
-                        Disabled = run all pipeline steps in the same scan run for predictable behavior.
+                        Enabled = PMDA may declare the scan finished first and let the remaining tail finish in background. Disabled = the scan only reaches 100% after those trailing pipeline steps are done too.
                       </p>
                     </div>
                     <Switch
@@ -1570,6 +1654,13 @@ function SettingsPage() {
                 </Collapsible>
               </CardContent>
             </Card>
+
+            <Separator />
+
+            <ScalingSettings
+              config={config}
+              updateConfig={updateConfig}
+            />
 
             <Separator />
 
@@ -1713,7 +1804,7 @@ function SettingsPage() {
                     </Button>
                   </div>
                   {!openaiCodexModeEnabled ? (
-                    <p className="text-xs text-amber-600">ChatGPT OAuth mode is disabled. Interactive OAuth routing is inactive.</p>
+                    <p className="text-xs text-warning">ChatGPT OAuth mode is disabled. Interactive OAuth routing is inactive.</p>
                   ) : null}
                   {openaiOAuth && (
                     <div className="space-y-2 pt-2 border-t border-border/60">
@@ -1825,7 +1916,7 @@ function SettingsPage() {
                     )}
                   </div>
                   {!openaiApiModeEnabled ? (
-                    <p className="text-xs text-amber-600">API key mode is disabled. Batch/web-search routing to `openai-api` is inactive.</p>
+                    <p className="text-xs text-warning">API key mode is disabled. Batch/web-search routing to `openai-api` is inactive.</p>
                   ) : null}
                 </div>
 
@@ -1863,7 +1954,7 @@ function SettingsPage() {
                   <div className="grid grid-cols-1 gap-3 xl:grid-cols-[minmax(0,1.4fr)_auto_minmax(0,1fr)_auto_minmax(0,1fr)]">
                     <div className="rounded-lg border border-border/60 bg-background/30 p-3">
                       <div className="flex items-center gap-2 text-sm font-medium text-foreground">
-                        <Database className="h-4 w-4 text-cyan-400" />
+                        <Database className="h-4 w-4 text-info" />
                         Deterministic core
                       </div>
                       <p className="mt-1 text-[11px] text-muted-foreground">
@@ -1875,7 +1966,7 @@ function SettingsPage() {
                     </div>
                     <div className="rounded-lg border border-border/60 bg-background/30 p-3">
                       <div className="flex items-center gap-2 text-sm font-medium text-foreground">
-                        <Globe className="h-4 w-4 text-emerald-400" />
+                        <Globe className="h-4 w-4 text-success" />
                         Local web search
                       </div>
                       <div className="mt-2 flex flex-wrap gap-1.5">
@@ -1892,7 +1983,7 @@ function SettingsPage() {
                     </div>
                     <div className="rounded-lg border border-border/60 bg-background/30 p-3">
                       <div className="flex items-center gap-2 text-sm font-medium text-foreground">
-                        <Cpu className="h-4 w-4 text-violet-400" />
+                        <Cpu className="h-4 w-4 text-primary" />
                         AI arbitration
                       </div>
                       <div className="mt-2 flex flex-wrap gap-1.5">
@@ -1917,7 +2008,7 @@ function SettingsPage() {
                         <div className="space-y-1">
                           <Label>Local web search order</Label>
                           <p className="text-[11px] text-muted-foreground">
-                            Self-hosted SearXNG first is recommended. Serper stays available as a cheap hosted fallback.
+                            Serper is the hosted search layer before local Ollama web search fallback. Keep paid AI web-search exceptional.
                           </p>
                         </div>
                         <Badge variant="outline">{String(config.WEB_SEARCH_PROVIDER || 'auto')}</Badge>
@@ -1928,13 +2019,7 @@ function SettingsPage() {
                             <div className="flex items-center gap-2">
                               <ProviderBadge provider={providerId} className="h-6 px-2 py-0 text-[11px]" />
                               <span className="text-[11px] text-muted-foreground">
-                                {providerId === 'searxng'
-                                  ? localWebProviderConfigured.searxng
-                                    ? 'Configured'
-                                    : 'Set SearXNG URL'
-                                  : localWebProviderConfigured.serper
-                                    ? 'Configured'
-                                    : 'Set Serper API key'}
+                                {localWebProviderConfigured.serper ? 'Configured' : 'Set Serper API key'}
                               </span>
                             </div>
                             <div className="flex items-center gap-1">
@@ -2167,7 +2252,7 @@ function SettingsPage() {
                     <div className="space-y-1">
                       <Label>Web search backend</Label>
                       <p className="text-xs text-muted-foreground">
-                        SearXNG is the self-hosted/local-first option. Serper is a cheap hosted web backend. Paid AI web-search should stay exceptional.
+                        Serper is the hosted search backend. Ollama web search is the local AI fallback. Paid AI web-search should stay exceptional.
                       </p>
                     </div>
                     <div className="grid grid-cols-1 gap-3 md:grid-cols-[220px_minmax(0,1fr)]">
@@ -2179,9 +2264,9 @@ function SettingsPage() {
                           <SelectValue placeholder="Choose backend" />
                         </SelectTrigger>
                         <SelectContent>
-                          <SelectItem value="auto">Auto (SearXNG → Serper)</SelectItem>
-                          <SelectItem value="searxng">SearXNG only</SelectItem>
+                          <SelectItem value="auto">Auto (Serper → Ollama)</SelectItem>
                           <SelectItem value="serper">Serper only</SelectItem>
+                          <SelectItem value="ollama">Ollama only</SelectItem>
                           <SelectItem value="ai_only">Paid AI only</SelectItem>
                           <SelectItem value="disabled">Disabled</SelectItem>
                         </SelectContent>
@@ -2205,7 +2290,7 @@ function SettingsPage() {
                         Effective scan web step: <span className="text-foreground">{effectiveScanWebSearch || 'deterministic only'}</span>
                       </div>
                       <div className="rounded-md border border-border/60 bg-background/30 px-3 py-2 text-[11px] text-muted-foreground">
-                        Local search order: <span className="text-foreground">{localWebOrder.join(' → ')}</span>
+                        Provider search order: <span className="text-foreground">{localWebOrder.join(' → ') || 'none'}</span>
                       </div>
                     </div>
                   </div>
@@ -2243,14 +2328,14 @@ function SettingsPage() {
                     </div>
                     <div className="rounded-lg border border-border/60 bg-background/20 p-3 space-y-2">
                       <div className="flex flex-wrap items-center gap-2">
-                        <Cpu className="h-4 w-4 text-violet-400" />
+                        <Cpu className="h-4 w-4 text-primary" />
                         <div className="text-sm font-medium text-foreground">Automatic local model routing</div>
                         <Badge variant="secondary">Auto</Badge>
                       </div>
                       <p className="text-[11px] text-muted-foreground">
-                        PMDA keeps the fast bulk scan on <span className="text-foreground">{String(config.SCAN_AI_LOCAL_BULK_MODEL || ollamaConfiguredModel || 'qwen2.5:3b-instruct')}</span>
+                        PMDA keeps the fast bulk scan on <span className="text-foreground">{String(config.SCAN_AI_LOCAL_BULK_MODEL || ollamaConfiguredModel || 'qwen3:4b')}</span>
                         {' '}and only escalates ambiguous or long-form local AI work to{' '}
-                        <span className="text-foreground">{String(config.SCAN_AI_LOCAL_HARD_MODEL || ollamaConfiguredHardModel || 'qwen2.5:14b-instruct')}</span>
+                        <span className="text-foreground">{String(config.SCAN_AI_LOCAL_HARD_MODEL || ollamaConfiguredHardModel || 'qwen3:14b')}</span>
                         {config.SCAN_AI_LOCAL_HARD_AVAILABLE === false ? ' when that model becomes available on the Ollama runtime.' : '.'}
                       </p>
                     </div>
@@ -2258,7 +2343,7 @@ function SettingsPage() {
                       <div className="space-y-2">
                         <Label>Bulk local model</Label>
                         <Input
-                          placeholder="qwen2.5:3b-instruct"
+                          placeholder="qwen3:4b"
                           value={String(config.OLLAMA_MODEL || '')}
                           onChange={(e) => updateConfig({ OLLAMA_MODEL: e.target.value })}
                         />
@@ -2269,7 +2354,7 @@ function SettingsPage() {
                       <div className="space-y-2">
                         <Label>Hard-cases local model</Label>
                         <Input
-                          placeholder="qwen2.5:14b-instruct"
+                          placeholder="qwen3:14b"
                           value={String(config.OLLAMA_COMPLEX_MODEL || '')}
                           onChange={(e) => updateConfig({ OLLAMA_COMPLEX_MODEL: e.target.value })}
                         />
@@ -2366,7 +2451,7 @@ function SettingsPage() {
                     ) : null}
                     <div className="grid grid-cols-1 gap-3 md:grid-cols-[minmax(0,1fr)_auto]">
                       <Input
-                        placeholder={String(config.OLLAMA_MODEL || 'qwen2.5:3b-instruct')}
+                        placeholder={String(config.OLLAMA_MODEL || 'qwen3:4b')}
                         value={ollamaPullModel}
                         onChange={(e) => setOllamaPullModel(e.target.value)}
                       />
@@ -2401,15 +2486,15 @@ function SettingsPage() {
                       </div>
                     ) : null}
                     <p className="text-[11px] text-muted-foreground">
-                      Recommended local scan model: <span className="text-foreground">qwen2.5:3b-instruct</span> for throughput, <span className="text-foreground">qwen2.5:14b-instruct</span> for harder repair runs.
+                      Recommended local scan model: <span className="text-foreground">qwen3:4b</span> for throughput, <span className="text-foreground">qwen3:14b</span> for harder repair runs.
                     </p>
                   </div>
                   <div className="rounded-lg border border-border/60 p-3 space-y-2">
                     <div className="flex items-center justify-between gap-3">
                       <div className="space-y-1">
-                        <Label>Auto-generate soft-match album reviews</Label>
+                        <Label>Auto-fetch soft-match album profiles</Label>
                         <p className="text-xs text-muted-foreground">
-                          When enabled, PMDA can generate album descriptions for SOFT_MATCH albums (web + AI relevance checks).
+                          When enabled, PMDA can fetch provider album metadata for SOFT_MATCH albums such as Last.fm descriptions and community pulse signals.
                         </p>
                       </div>
                       <Switch
@@ -2418,7 +2503,7 @@ function SettingsPage() {
                       />
                     </div>
                     <p className="text-[11px] text-muted-foreground">
-                      Manual generation from album match detail remains available even when this is disabled.
+                      Web+AI review generation is no longer automatic during scans. This only affects provider profile fetches for soft matches.
                     </p>
                   </div>
                 </div>
@@ -2463,11 +2548,10 @@ function SettingsPage() {
                 </div>
 
                 <Tabs defaultValue="discogs" className="w-full">
-                  <TabsList className="grid h-auto w-full grid-cols-2 gap-2 md:grid-cols-3 xl:grid-cols-6">
+                  <TabsList className="grid h-auto w-full grid-cols-2 gap-2 md:grid-cols-3 xl:grid-cols-5">
                     <TabsTrigger value="discogs"><span className="inline-flex items-center gap-1.5"><ProviderIcon provider="discogs" />Discogs</span></TabsTrigger>
                     <TabsTrigger value="lastfm"><span className="inline-flex items-center gap-1.5"><ProviderIcon provider="lastfm" />Last.fm</span></TabsTrigger>
                     <TabsTrigger value="fanart"><span className="inline-flex items-center gap-1.5"><ProviderIcon provider="fanart" />Fanart</span></TabsTrigger>
-                    <TabsTrigger value="searxng"><span className="inline-flex items-center gap-1.5"><ProviderIcon provider="searxng" />SearXNG</span></TabsTrigger>
                     <TabsTrigger value="serper"><span className="inline-flex items-center gap-1.5"><ProviderIcon provider="serper" />Serper</span></TabsTrigger>
                     <TabsTrigger value="acoustid"><span className="inline-flex items-center gap-1.5"><ProviderIcon provider="acoustid" />AcoustID</span></TabsTrigger>
                   </TabsList>
@@ -2545,7 +2629,7 @@ function SettingsPage() {
                                 Connect a Last.fm user session to scrobble finished tracks and optionally update now playing. After you authorize PMDA on Last.fm, the connection completes automatically.
                               </p>
                               {lastfmAuthStatus?.message ? (
-                                <p className={`text-xs ${scrobbleReconnectRequired ? 'text-amber-500' : 'text-muted-foreground'}`}>
+                                <p className={`text-xs ${scrobbleReconnectRequired ? 'text-warning' : 'text-muted-foreground'}`}>
                                   {lastfmAuthStatus.message}
                                 </p>
                               ) : null}
@@ -2659,40 +2743,6 @@ function SettingsPage() {
                             value={String(config.FANART_API_KEY ?? '')}
                             onChange={(e) => updateConfig({ FANART_API_KEY: e.target.value })}
                           />
-                        </div>
-                      );
-                    })()}
-                  </TabsContent>
-
-                  <TabsContent value="searxng" className="mt-3">
-                    {(() => {
-                      const configured = Boolean(String(config.SEARXNG_URL || '').trim());
-                      const state = providerState('searxng', configured);
-                      return (
-                        <div className="space-y-3 rounded-lg border border-border p-3">
-                          <div className="flex flex-wrap items-center justify-between gap-2">
-                            <div className="space-y-1">
-                              <Label htmlFor="searxng-url">SearXNG base URL</Label>
-                              <p className="text-xs text-muted-foreground">
-                                Self-hosted search backend for cheap bulk scans. Example: <span className="text-foreground">http://searxng:8080</span>
-                              </p>
-                            </div>
-                            <div className="flex items-center gap-2">
-                              <Badge variant={state.variant}>{state.label}</Badge>
-                              <a href="https://docs.searxng.org/admin/installation-docker.html" target="_blank" rel="noreferrer" className="text-xs text-primary inline-flex items-center gap-1 hover:underline">
-                                Docker setup <ExternalLink className="w-3 h-3" />
-                              </a>
-                            </div>
-                          </div>
-                          <Input
-                            id="searxng-url"
-                            placeholder="http://searxng:8080"
-                            value={String(config.SEARXNG_URL ?? '')}
-                            onChange={(e) => updateConfig({ SEARXNG_URL: e.target.value })}
-                          />
-                          <div className="rounded-md border border-border/60 bg-background/30 px-3 py-2 text-[11px] text-muted-foreground">
-                            PMDA uses SearXNG as the first web-search layer in <span className="text-foreground">Auto</span> mode. If this is configured, bulk scans can avoid expensive LLM-native web search almost entirely.
-                          </div>
                         </div>
                       );
                     })()}
@@ -2967,7 +3017,7 @@ function SettingsPage() {
 
         {isRestarting && (
           <>
-            <div className="fixed inset-0 z-[10000] bg-black/80 backdrop-blur-md" />
+            <div className="fixed inset-0 z-[10000] bg-foreground/80 backdrop-blur-md" />
             <div className="fixed left-1/2 top-1/2 z-[10001] w-full max-w-md -translate-x-1/2 -translate-y-1/2 rounded-2xl border border-border bg-card p-6 shadow-2xl">
               <div className="flex flex-col items-center gap-4 text-center">
                 <div className="rounded-full bg-primary/10 p-4">

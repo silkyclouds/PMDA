@@ -11,6 +11,7 @@ const JOB_LABELS: Record<TaskJobType, string> = {
   incomplete_move: 'Incomplete move',
   export: 'Export',
   player_sync: 'Player sync',
+  managed_musicbrainz_update: 'MusicBrainz maintenance',
 };
 
 function asBool(value: unknown, fallback: boolean): boolean {
