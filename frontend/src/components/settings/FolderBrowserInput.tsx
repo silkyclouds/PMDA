@@ -205,19 +205,21 @@ export function FolderBrowserInput({
       </div>
 
       <Dialog open={open} onOpenChange={setOpen}>
-        <DialogContent className="sm:max-w-3xl">
+        <DialogContent className="flex max-h-[85vh] w-[min(96vw,56rem)] max-w-[min(96vw,56rem)] flex-col overflow-hidden p-0">
           <DialogHeader>
-            <DialogTitle>{selectLabel}</DialogTitle>
-            <DialogDescription>
+            <div className="px-6 pt-6">
+              <DialogTitle>{selectLabel}</DialogTitle>
+            </div>
+            <DialogDescription className="px-6">
               {lockToBrowseRoot && normalizedBrowseRoot
                 ? `Select an existing folder under ${normalizedBrowseRoot}.`
                 : 'Select a folder from the container filesystem.'}
             </DialogDescription>
           </DialogHeader>
 
-          <div className="space-y-3">
+          <div className="flex min-h-0 flex-1 flex-col space-y-3 overflow-hidden px-6">
             {allowManualEntry ? (
-              <div className="flex gap-2">
+              <div className="flex flex-col gap-2 sm:flex-row">
                 <Input
                   value={pathInput}
                   onChange={(e) => setPathInput(e.target.value)}
@@ -228,7 +230,7 @@ export function FolderBrowserInput({
                     }
                   }}
                   placeholder={normalizedBrowseRoot || '/'}
-                  className="font-mono"
+                  className="min-w-0 font-mono"
                 />
                 <Button type="button" variant="outline" onClick={() => loadPath(pathInput)}>
                   Go
@@ -266,11 +268,11 @@ export function FolderBrowserInput({
               </div>
             )}
 
-            <div className="rounded-md border border-border">
-              <div className="flex items-center justify-between gap-2 px-3 py-2 border-b border-border">
+            <div className="min-h-0 overflow-hidden rounded-md border border-border">
+              <div className="flex flex-col gap-2 border-b border-border px-3 py-2 sm:flex-row sm:items-center sm:justify-between">
                 <div className="min-w-0 flex-1">
                   <div className="text-[11px] uppercase tracking-wide text-muted-foreground">Selected folder</div>
-                  <Input value={candidatePath} readOnly className="mt-1 font-mono text-xs" />
+                  <Input value={candidatePath} readOnly className="mt-1 min-w-0 font-mono text-xs" />
                 </div>
                 <div className="flex items-center gap-2">
                   {state.parentPath && (
@@ -284,7 +286,7 @@ export function FolderBrowserInput({
                 Browsing inside <span className="font-mono text-foreground">{state.currentPath}</span>
               </div>
 
-              <ScrollArea className="h-64">
+              <ScrollArea className="h-[min(44vh,22rem)]">
                 <div className="p-1">
                   {loading && (
                     <div className="flex items-center gap-2 text-sm text-muted-foreground px-2 py-2">
@@ -303,16 +305,16 @@ export function FolderBrowserInput({
                     return (
                       <div
                         key={dir.path}
-                        className={`flex items-center gap-2 rounded px-2 py-1 ${selected ? 'bg-primary/10 ring-1 ring-primary/30' : ''}`}
+                        className={`flex min-w-0 items-center gap-2 rounded px-2 py-1 ${selected ? 'bg-primary/10 ring-1 ring-primary/30' : ''}`}
                       >
                         <button
                           type="button"
-                          className="min-w-0 flex-1 rounded px-2 py-2 text-left hover:bg-muted"
+                          className="min-w-0 flex-1 overflow-hidden rounded px-2 py-2 text-left hover:bg-muted"
                           onClick={() => loadPath(dir.path, { selectLoadedPath: true })}
                           title={`Open ${dir.path}`}
                         >
                           <span className="block truncate font-mono text-sm text-foreground">{dir.name}</span>
-                          <span className="block text-[11px] text-muted-foreground">{dir.path}</span>
+                          <span className="block truncate text-[11px] text-muted-foreground">{dir.path}</span>
                         </button>
                         <Button
                           type="button"
@@ -344,7 +346,7 @@ export function FolderBrowserInput({
             </p>
           </div>
 
-          <DialogFooter>
+          <DialogFooter className="shrink-0 border-t border-border px-6 py-4 sm:justify-between">
             <Button type="button" variant="outline" onClick={() => setOpen(false)}>
               Cancel
             </Button>
@@ -352,9 +354,10 @@ export function FolderBrowserInput({
               type="button"
               onClick={confirmSelection}
               disabled={confirming}
+              className="max-w-full"
             >
               {confirming ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
-              {candidatePath ? `Use ${candidatePath}` : 'Use this folder'}
+              <span className="truncate">{candidatePath ? `Use ${candidatePath}` : 'Use this folder'}</span>
             </Button>
           </DialogFooter>
         </DialogContent>
