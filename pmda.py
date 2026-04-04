@@ -65408,10 +65408,79 @@ def api_library_label_profile(label: str):
     include_unmatched = _library_include_unmatched_effective()
     album_match_sql = _library_albums_match_where(include_unmatched, "alb")
 
+    def _looks_label_music_related(extract: str, description: str = "", title: str = "") -> bool:
+        text = " ".join(
+            part.strip().lower()
+            for part in (str(title or ""), str(description or ""), str(extract or ""))
+            if str(part or "").strip()
+        )
+        if not text:
+            return False
+        hard_bad = (
+            "cryptanalysis",
+            "admiralty",
+            "zimmermann telegram",
+            "world war",
+            "military alliance",
+            "german foreign office",
+            "u-boats",
+            "destroyer",
+            "cruiser",
+            "warship",
+            "battle",
+            "naval intelligence",
+            "telegraph traffic",
+            "diplomatic communication",
+            "ministry",
+            "government",
+        )
+        if any(token in text for token in hard_bad):
+            return False
+        strong_good = (
+            "record label",
+            "independent record label",
+            "music label",
+            "independent label",
+            "netlabel",
+            "record company",
+            "music company",
+            "label founded",
+            "discogs",
+            "electronic music label",
+            "jazz label",
+            "classical label",
+        )
+        if any(token in text for token in strong_good):
+            return True
+        softer_good = (
+            "releases by",
+            "albums by",
+            "founded in",
+            "founded by",
+            "catalog",
+            "artists including",
+            "distributed by",
+            "imprint",
+        )
+        good_score = sum(1 for token in softer_good if token in text)
+        return good_score >= 2
+
+    def _label_profile_cache_is_usable(cached: Any) -> bool:
+        if not isinstance(cached, dict):
+            return False
+        discogs_profile = str(cached.get("discogs_profile") or "").strip()
+        description = str(cached.get("description") or "").strip()
+        wiki_description = str(cached.get("wiki_description") or "").strip()
+        if discogs_profile:
+            return True
+        if description and not _looks_label_music_related(description, description=wiki_description, title=raw_label):
+            return False
+        return True
+
     cache_key = f"library:label:profile:{raw_label.lower()}:{limit_artists}:{limit_genres}:{_library_cache_unmatched_suffix(include_unmatched)}"
     if not refresh:
         cached = _files_cache_get_json(cache_key)
-        if cached is not None:
+        if cached is not None and _label_profile_cache_is_usable(cached):
             return jsonify(cached)
 
     conn = _files_pg_connect()
@@ -65530,63 +65599,6 @@ def api_library_label_profile(label: str):
                 }
             )
         genres = [{"genre": str(r[0] or "").strip(), "count": int(r[1] or 0)} for r in genre_rows if str(r[0] or "").strip()]
-
-        def _looks_label_music_related(extract: str, description: str = "", title: str = "") -> bool:
-            text = " ".join(
-                part.strip().lower()
-                for part in (str(title or ""), str(description or ""), str(extract or ""))
-                if str(part or "").strip()
-            )
-            if not text:
-                return False
-            hard_bad = (
-                "cryptanalysis",
-                "admiralty",
-                "zimmermann telegram",
-                "world war",
-                "military alliance",
-                "german foreign office",
-                "u-boats",
-                "destroyer",
-                "cruiser",
-                "warship",
-                "battle",
-                "naval intelligence",
-                "telegraph traffic",
-                "diplomatic communication",
-                "ministry",
-                "government",
-            )
-            if any(token in text for token in hard_bad):
-                return False
-            strong_good = (
-                "record label",
-                "independent record label",
-                "music label",
-                "independent label",
-                "netlabel",
-                "record company",
-                "music company",
-                "label founded",
-                "discogs",
-                "electronic music label",
-                "jazz label",
-                "classical label",
-            )
-            if any(token in text for token in strong_good):
-                return True
-            softer_good = (
-                "releases by",
-                "albums by",
-                "founded in",
-                "founded by",
-                "catalog",
-                "artists including",
-                "distributed by",
-                "imprint",
-            )
-            good_score = sum(1 for token in softer_good if token in text)
-            return good_score >= 2
 
         # Optional metadata enrichments (best-effort): Wikipedia + Discogs label graph.
         wiki_extract = ""

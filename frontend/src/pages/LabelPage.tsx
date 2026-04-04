@@ -310,12 +310,12 @@ export default function LabelPage() {
             ) : null}
           </div>
 
-          {profileLoading ? (
+          {profile?.description ? (
+            <div className="text-sm text-muted-foreground leading-relaxed">{profile.description}</div>
+          ) : profileLoading ? (
             <div className="flex items-center gap-2 text-sm text-muted-foreground">
               <Loader2 className="w-4 h-4 animate-spin" /> Loading label profile…
             </div>
-          ) : profile?.description ? (
-            <div className="text-sm text-muted-foreground leading-relaxed">{profile.description}</div>
           ) : null}
 
           <div className="flex flex-wrap items-center gap-2">
