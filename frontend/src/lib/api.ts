@@ -2189,6 +2189,9 @@ export interface LibraryAlbumItem {
   public_rating_source?: string | null;
   heat_score?: number | null;
   classical?: ClassicalIdentityPayload | null;
+  is_box_set?: boolean;
+  box_set_disc_count?: number | null;
+  box_set_member_album_ids?: number[] | null;
 }
 
 export interface LibraryAlbumsResponse {
@@ -3083,6 +3086,9 @@ export interface AlbumDetailResponse {
   metadata_source_url?: string | null;
   artist_id: number;
   artist_name: string;
+  is_box_set?: boolean;
+  box_set_disc_count?: number | null;
+  box_set_member_album_ids?: number[] | null;
   classical?: ClassicalIdentityPayload | null;
   review?: AlbumDetailReview;
   ratings?: {

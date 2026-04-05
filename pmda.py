@@ -36,6 +36,7 @@ import os
 import secrets
 import shutil
 import uuid
+import itertools
 import ipaddress
 import tempfile
 import filecmp
@@ -49,7 +50,7 @@ import atexit
 import weakref
 from contextlib import contextmanager
 from datetime import datetime, timedelta, time as dt_time
-from collections import defaultdict, OrderedDict, deque
+from collections import Counter, defaultdict, OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout, as_completed, wait
 from functools import lru_cache
 from pathlib import Path
@@ -11885,6 +11886,7 @@ _ARTIST_IMAGE_NAMES = (
 
 
 def _files_pg_connect_kwargs() -> dict:
+    idle_ms = int(max(15000.0, float(_FILES_PG_IDLE_REAP_SEC or 90.0) * 1000.0))
     return {
         "host": PMDA_PG_HOST,
         "port": PMDA_PG_PORT,
@@ -11893,28 +11895,82 @@ def _files_pg_connect_kwargs() -> dict:
         "password": PMDA_PG_PASSWORD,
         "connect_timeout": 5,
         "application_name": "pmda-files",
+        "options": f"-c idle_session_timeout={idle_ms} -c idle_in_transaction_session_timeout={idle_ms}",
     }
 
 
-_FILES_PG_MAX_CONNS = max(2, int(os.getenv("FILES_PG_MAX_CONNS", "8") or 8))
+_FILES_PG_MAX_CONNS = max(4, int(os.getenv("FILES_PG_MAX_CONNS", "16") or 16))
 _FILES_PG_ACQUIRE_TIMEOUT_SEC = max(0.5, float(os.getenv("FILES_PG_ACQUIRE_TIMEOUT_SEC", "8") or 8))
 _FILES_PG_UI_RESERVED_CONNS = max(
     0,
-    min(_FILES_PG_MAX_CONNS - 1, int(os.getenv("FILES_PG_UI_RESERVED_CONNS", "2") or 2)),
+    min(_FILES_PG_MAX_CONNS - 1, int(os.getenv("FILES_PG_UI_RESERVED_CONNS", "4") or 4)),
 )
 _FILES_PG_BG_MAX_CONNS = max(1, _FILES_PG_MAX_CONNS - _FILES_PG_UI_RESERVED_CONNS)
 _FILES_PG_CONN_GATE = threading.BoundedSemaphore(_FILES_PG_MAX_CONNS)
 _FILES_PG_BG_CONN_GATE = threading.BoundedSemaphore(_FILES_PG_BG_MAX_CONNS)
 _FILES_PG_CONN_STATE_LOCK = threading.Lock()
 _FILES_PG_CONN_ACTIVE = 0
+_FILES_PG_IDLE_REAP_SEC = max(15.0, float(os.getenv("FILES_PG_IDLE_REAP_SEC", "90") or 90))
+_FILES_PG_CONN_REGISTRY_LOCK = threading.Lock()
+_FILES_PG_CONN_REGISTRY: dict[int, dict[str, Any]] = {}
+_FILES_PG_CONN_TOKEN_SEQ = itertools.count(1)
 
 
-def _files_pg_release_connection(conn, release_bg_gate: bool = False) -> None:
-    global _FILES_PG_CONN_ACTIVE
+def _files_pg_conn_is_idle(conn) -> bool:
     try:
-        conn.close()
+        info = getattr(conn, "info", None)
+        status = getattr(info, "transaction_status", None)
+        if status is None:
+            return True
+        pq_mod = getattr(psycopg, "pq", None) if psycopg is not None else None
+        idle_marker = getattr(getattr(pq_mod, "TransactionStatus", None), "IDLE", None)
+        if idle_marker is not None:
+            return status == idle_marker
+        status_name = str(getattr(status, "name", "") or status).strip().upper()
+        return status_name in {"IDLE", "0"}
     except Exception:
-        pass
+        return True
+
+
+def _files_pg_register_connection(conn, *, release_bg_gate: bool = False) -> int:
+    token = int(next(_FILES_PG_CONN_TOKEN_SEQ))
+    now = time.monotonic()
+    with _FILES_PG_CONN_REGISTRY_LOCK:
+        _FILES_PG_CONN_REGISTRY[token] = {
+            "conn": conn,
+            "release_bg_gate": bool(release_bg_gate),
+            "created_at": now,
+            "last_touch": now,
+            "thread": str(threading.current_thread().name or ""),
+        }
+    return token
+
+
+def _files_pg_touch_connection(token: int) -> None:
+    if int(token or 0) <= 0:
+        return
+    with _FILES_PG_CONN_REGISTRY_LOCK:
+        entry = _FILES_PG_CONN_REGISTRY.get(int(token))
+        if entry is not None:
+            entry["last_touch"] = time.monotonic()
+
+
+def _files_pg_release_connection_by_token(token: int, *, close_conn: bool = True) -> None:
+    global _FILES_PG_CONN_ACTIVE
+    if int(token or 0) <= 0:
+        return
+    with _FILES_PG_CONN_REGISTRY_LOCK:
+        entry = _FILES_PG_CONN_REGISTRY.pop(int(token), None)
+    if not entry:
+        return
+    conn = entry.get("conn")
+    release_bg_gate = bool(entry.get("release_bg_gate"))
+    try:
+        if close_conn and conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
     finally:
         with _FILES_PG_CONN_STATE_LOCK:
             _FILES_PG_CONN_ACTIVE = max(0, int(_FILES_PG_CONN_ACTIVE) - 1)
@@ -11929,13 +11985,112 @@ def _files_pg_release_connection(conn, release_bg_gate: bool = False) -> None:
                 pass
 
 
+def _files_pg_reap_stale_connections(
+    *,
+    idle_timeout_sec: float | None = None,
+    closed_only: bool = False,
+    log_reason: str = "",
+) -> int:
+    timeout = max(5.0, float(idle_timeout_sec or _FILES_PG_IDLE_REAP_SEC or 90.0))
+    now = time.monotonic()
+    stale_tokens: list[int] = []
+    with _FILES_PG_CONN_REGISTRY_LOCK:
+        for token, entry in list(_FILES_PG_CONN_REGISTRY.items()):
+            conn = entry.get("conn")
+            try:
+                conn_closed = bool(getattr(conn, "closed", False))
+            except Exception:
+                conn_closed = True
+            if conn_closed:
+                stale_tokens.append(int(token))
+                continue
+            if closed_only:
+                continue
+            last_touch = float(entry.get("last_touch") or entry.get("created_at") or now)
+            if (now - last_touch) < timeout:
+                continue
+            if _files_pg_conn_is_idle(conn):
+                stale_tokens.append(int(token))
+    for token in stale_tokens:
+        _files_pg_release_connection_by_token(token, close_conn=True)
+    if stale_tokens and log_reason:
+        logging.warning(
+            "Files PG: reaped %d stale connection(s) during %s",
+            len(stale_tokens),
+            log_reason,
+        )
+    return len(stale_tokens)
+
+
+class _FilesPgCursorProxy:
+    __slots__ = ("_cursor", "_touch")
+
+    def __init__(self, cursor, touch_cb) -> None:
+        self._cursor = cursor
+        self._touch = touch_cb
+
+    def __enter__(self):
+        self._touch()
+        self._cursor.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self._touch()
+        return self._cursor.__exit__(exc_type, exc, tb)
+
+    def __getattr__(self, name: str):
+        attr = getattr(self._cursor, name)
+        if callable(attr) and name in {
+            "execute",
+            "executemany",
+            "fetchone",
+            "fetchmany",
+            "fetchall",
+            "copy",
+            "stream",
+            "close",
+        }:
+            def _wrapped(*args, **kwargs):
+                self._touch()
+                result = attr(*args, **kwargs)
+                self._touch()
+                return result
+            return _wrapped
+        return attr
+
+
+class _FilesPgTransactionProxy:
+    __slots__ = ("_tx", "_touch")
+
+    def __init__(self, tx, touch_cb) -> None:
+        self._tx = tx
+        self._touch = touch_cb
+
+    def __enter__(self):
+        self._touch()
+        return self._tx.__enter__()
+
+    def __exit__(self, exc_type, exc, tb):
+        self._touch()
+        return self._tx.__exit__(exc_type, exc, tb)
+
+
 class _FilesPgConnectionProxy:
-    __slots__ = ("_conn", "_finalizer", "_closed", "__weakref__")
+    __slots__ = ("_conn", "_token", "_finalizer", "_closed", "__weakref__")
 
     def __init__(self, conn, *, release_bg_gate: bool = False) -> None:
         self._conn = conn
-        self._finalizer = weakref.finalize(self, _files_pg_release_connection, conn, release_bg_gate)
+        self._token = _files_pg_register_connection(conn, release_bg_gate=release_bg_gate)
+        self._finalizer = weakref.finalize(
+            self,
+            _files_pg_release_connection_by_token,
+            self._token,
+            close_conn=True,
+        )
         self._closed = False
+
+    def _touch(self) -> None:
+        _files_pg_touch_connection(self._token)
 
     def close(self) -> None:
         if self._closed:
@@ -11943,10 +12098,27 @@ class _FilesPgConnectionProxy:
         self._closed = True
         self._finalizer()
 
+    def cursor(self, *args, **kwargs):
+        self._touch()
+        return _FilesPgCursorProxy(self._conn.cursor(*args, **kwargs), self._touch)
+
+    def transaction(self, *args, **kwargs):
+        self._touch()
+        return _FilesPgTransactionProxy(self._conn.transaction(*args, **kwargs), self._touch)
+
     def __getattr__(self, name: str):
-        return getattr(self._conn, name)
+        attr = getattr(self._conn, name)
+        if callable(attr) and name in {"execute", "commit", "rollback"}:
+            def _wrapped(*args, **kwargs):
+                self._touch()
+                result = attr(*args, **kwargs)
+                self._touch()
+                return result
+            return _wrapped
+        return attr
 
     def __enter__(self):
+        self._touch()
         return self
 
     def __exit__(self, exc_type, exc, tb) -> bool:
@@ -11964,8 +12136,12 @@ def _files_pg_connect(*, autocommit: bool = True, acquire_timeout_sec: float | N
     acquire_timeout = max(0.2, float(acquire_timeout_sec if acquire_timeout_sec is not None else _FILES_PG_ACQUIRE_TIMEOUT_SEC))
     request_ctx = bool(has_request_context())
     try:
+        _files_pg_reap_stale_connections(closed_only=False, log_reason="pre-acquire")
         if (not request_ctx) and _FILES_PG_UI_RESERVED_CONNS > 0:
             acquired_bg = _FILES_PG_BG_CONN_GATE.acquire(timeout=acquire_timeout)
+            if not acquired_bg:
+                _files_pg_reap_stale_connections(closed_only=False, log_reason="bg-pool-timeout")
+                acquired_bg = _FILES_PG_BG_CONN_GATE.acquire(timeout=min(1.0, acquire_timeout))
             if not acquired_bg:
                 _FILES_PG_LAST_ERROR = "background_pool_reserved"
                 logging.debug(
@@ -11976,6 +12152,9 @@ def _files_pg_connect(*, autocommit: bool = True, acquire_timeout_sec: float | N
                 )
                 return None
         acquired = _FILES_PG_CONN_GATE.acquire(timeout=acquire_timeout)
+        if not acquired:
+            _files_pg_reap_stale_connections(closed_only=False, log_reason="pool-timeout")
+            acquired = _FILES_PG_CONN_GATE.acquire(timeout=min(1.0, acquire_timeout))
         if not acquired:
             _FILES_PG_LAST_ERROR = "pool_timeout"
             logging.warning(
@@ -12010,6 +12189,35 @@ def _files_pg_connect(*, autocommit: bool = True, acquire_timeout_sec: float | N
             int(_FILES_PG_MAX_CONNS),
         )
         return None
+
+
+def _files_pg_error_text(exc: Any) -> str:
+    try:
+        return " ".join(str(exc or "").split()).strip().lower()
+    except Exception:
+        return ""
+
+
+def _files_pg_is_connection_dropped_error(exc: Any) -> bool:
+    if exc is None:
+        return False
+    cls_name = str(getattr(exc.__class__, "__name__", "") or "").strip().lower()
+    text = _files_pg_error_text(exc)
+    markers = (
+        "server closed the connection unexpectedly",
+        "terminating connection due to",
+        "consuming input failed",
+        "connection is closed",
+        "connection already closed",
+        "broken pipe",
+        "connection reset by peer",
+        "admin shutdown",
+    )
+    if any(marker in text for marker in markers):
+        return True
+    return cls_name in {"operationalerror", "interfaceerror"} and (
+        "connection" in text or "server" in text or "input failed" in text
+    )
 
 
 @contextmanager
@@ -60127,11 +60335,164 @@ def api_progress():
     return jsonify(payload)
 
 
+_ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
+_LOG_TAIL_FORMAT_RE = re.compile(
+    r"^(?P<timestamp>\d{2}:\d{2}:\d{2})\s+│\s+(?P<level>[A-Z]+)\s+│\s+(?P<thread>[^│]+?)\s+│\s+(?P<message>.*)$"
+)
+_LEADING_TAG_RE = re.compile(r"^\[(?P<tag>[^\]]+)\]\s*(?P<rest>.*)$")
+_CANDIDATE_LINE_RE = re.compile(r"^[A-Z]\)\s+")
+
+_LOG_TAIL_SOURCE_MAP = {
+    "MB": ("MusicBrainz", "provider", "musicbrainz"),
+    "MUSICBRAINZ": ("MusicBrainz", "provider", "musicbrainz"),
+    "DISCOGS": ("Discogs", "provider", "discogs"),
+    "LAST.FM": ("Last.fm", "provider", "lastfm"),
+    "LASTFM": ("Last.fm", "provider", "lastfm"),
+    "BANDCAMP": ("Bandcamp", "provider", "bandcamp"),
+    "ACOUSTID": ("AcoustID", "provider", "acoustid"),
+    "AI": ("AI", "ai", "ai"),
+    "AI TRACE": ("AI Trace", "ai", "ai_trace"),
+    "OLLAMA ROUTER": ("AI Router", "ai", "ai_router"),
+    "PROVIDERS ARBITRATION": ("Providers", "provider", "providers"),
+    "SCAN": ("Scan", "scan", "scan"),
+    "PATH": ("Filesystem", "scan", "filesystem"),
+    "LIVE": ("Live", "scan", "live"),
+    "CFG": ("Config", "scan", "config"),
+    "TAG": ("Tags", "scan", "tags"),
+    "ART": ("Artwork", "scan", "artwork"),
+    "COV": ("Artwork", "scan", "artwork"),
+}
+
+
+def _strip_ansi(value: str) -> str:
+    return _ANSI_ESCAPE_RE.sub("", str(value or ""))
+
+
+def _log_tail_thread_info(label: str) -> tuple[str, str, int]:
+    display = str(label or "").strip()
+    key = re.sub(r"[^a-z0-9]+", "_", display.lower()).strip("_") or "general"
+    slot = int(hashlib.sha1(key.encode("utf-8")).hexdigest()[:8], 16) % 12
+    return display, key, slot
+
+
+def _log_tail_infer_level(message: str, explicit_level: str = "") -> str:
+    level = str(explicit_level or "").strip().upper()
+    if level:
+        return level
+    upper = str(message or "").upper()
+    if " TRACEBACK" in f" {upper}" or " EXCEPTION" in f" {upper}" or " ERROR" in f" {upper}" or " FAILED" in f" {upper}":
+        return "ERROR"
+    if " WARNING" in f" {upper}" or " DEGRADED" in f" {upper}" or " OFFLINE" in f" {upper}":
+        return "WARNING"
+    if " DEBUG" in f" {upper}":
+        return "DEBUG"
+    return ""
+
+
+def _log_tail_infer_kind(message: str, base_kind: str = "info", explicit_level: str = "") -> tuple[str, str]:
+    text = str(message or "").strip()
+    upper = text.upper()
+    level = str(explicit_level or "").strip().upper()
+    if "[NO MATCH]" in upper:
+        return "miss", "×"
+    if "[SOFT MATCH]" in upper:
+        return "soft", "~"
+    if "[MATCH]" in upper or " TRUSTED VIA " in f" {upper}" or " ACCEPTED " in f" {upper}":
+        return "match", "✓"
+    if level == "ERROR" or " TRACEBACK" in f" {upper}" or " EXCEPTION" in f" {upper}" or " FAILED" in f" {upper}":
+        return "error", "×"
+    if level == "WARNING" or " WARNING" in f" {upper}" or " DEGRADED" in f" {upper}" or " OFFLINE" in f" {upper}":
+        return "warning", "!"
+    if " REJECTED " in f" {upper}" or upper.startswith("REJECTED "):
+        return "miss", "×"
+    return (base_kind or "info"), ""
+
+
+def _log_tail_parse_entry(raw: str, previous: dict | None = None) -> dict[str, Any]:
+    clean = _strip_ansi(raw).rstrip("\n")
+    stripped = clean.strip()
+    timestamp = ""
+    level = ""
+    thread = ""
+    thread_key = ""
+    thread_slot = 0
+    base_kind = "info"
+    message = stripped
+
+    formatted = _LOG_TAIL_FORMAT_RE.match(stripped)
+    if formatted:
+        timestamp = str(formatted.group("timestamp") or "").strip()
+        level = str(formatted.group("level") or "").strip().upper()
+        thread, thread_key, thread_slot = _log_tail_thread_info(str(formatted.group("thread") or "").strip())
+        message = str(formatted.group("message") or "").strip()
+        base_kind = "info"
+
+    if not thread and previous and (clean.startswith("  ") or clean.startswith("\t") or _CANDIDATE_LINE_RE.match(stripped)):
+        thread = str(previous.get("thread") or "")
+        thread_key = str(previous.get("thread_key") or "")
+        thread_slot = int(previous.get("thread_slot") or 0)
+        base_kind = str(previous.get("kind") or "info")
+
+    tag_match = _LEADING_TAG_RE.match(message)
+    if tag_match:
+        tag = str(tag_match.group("tag") or "").strip()
+        rest = str(tag_match.group("rest") or "").strip()
+        tag_key = tag.upper()
+        if tag_key.startswith("ARTIST "):
+            thread, thread_key, thread_slot = _log_tail_thread_info("Artist")
+            base_kind = "scan"
+            artist_name = tag[7:].strip()
+            message = f"{artist_name}: {rest}" if rest else artist_name
+        else:
+            source = _LOG_TAIL_SOURCE_MAP.get(tag_key)
+            if source:
+                thread, base_kind, key = source
+                thread, thread_key, thread_slot = _log_tail_thread_info(thread)
+                if key:
+                    thread_key = key
+                    thread_slot = int(hashlib.sha1(key.encode("utf-8")).hexdigest()[:8], 16) % 12
+            else:
+                thread, thread_key, thread_slot = _log_tail_thread_info(tag)
+            message = rest or message
+
+    if message.startswith(("✅", "❌", "~")):
+        message = message[1:].strip()
+
+    if not thread and stripped.startswith("Processing artist:"):
+        thread, thread_key, thread_slot = _log_tail_thread_info("Scan")
+        base_kind = "scan"
+        message = stripped
+
+    level = _log_tail_infer_level(message, explicit_level=level)
+    kind, marker = _log_tail_infer_kind(message, base_kind=base_kind, explicit_level=level)
+
+    return {
+        "raw": clean,
+        "timestamp": timestamp,
+        "level": level,
+        "thread": thread,
+        "thread_key": thread_key,
+        "thread_slot": thread_slot,
+        "message": message or clean,
+        "kind": kind,
+        "marker": marker,
+    }
+
+
+def _tail_log_entries(lines: list[str]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    previous: dict[str, Any] | None = None
+    for raw in lines:
+        entry = _log_tail_parse_entry(raw, previous=previous)
+        out.append(entry)
+        previous = entry
+    return out
+
+
 def _tail_log_lines(path: Path, lines: int = 200, max_bytes: int = 512 * 1024) -> list[str]:
     """Return last `lines` lines from `path`, stripping ANSI escape codes for Web UI."""
     if lines <= 0:
         return []
-    ansi_re = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
     try:
         with path.open("rb") as fh:
             fh.seek(0, os.SEEK_END)
@@ -60149,7 +60510,7 @@ def _tail_log_lines(path: Path, lines: int = 200, max_bytes: int = 512 * 1024) -
     out = text.splitlines()
     if len(out) > lines:
         out = out[-lines:]
-    return [ansi_re.sub("", ln) for ln in out]
+    return [_strip_ansi(ln) for ln in out]
 
 
 @app.get("/api/logs/tail")
@@ -60161,9 +60522,11 @@ def api_logs_tail():
         lines = 180
     lines = max(20, min(lines, 1200))
     log_path = Path(str(LOG_FILE or "")).expanduser()
+    log_lines = _tail_log_lines(log_path, lines=lines)
     return jsonify(
         path=str(log_path),
-        lines=_tail_log_lines(log_path, lines=lines),
+        lines=log_lines,
+        entries=_tail_log_entries(log_lines),
     )
 
 
@@ -63452,6 +63815,324 @@ def api_library_search_suggest():
         conn.close()
 
 
+_BOX_SET_DISC_LEAF_RE = re.compile(
+    r"^(?:cd|disc|disk|vol(?:ume)?|part)\s*[-_ ]*\d+$|^\d{1,2}$",
+    re.IGNORECASE,
+)
+_BOX_SET_FORMAT_LEAF_RE = re.compile(
+    r"^(?:flac|mp3|aac|alac|wav|aiff|ogg|opus|m4a|lossless|lossy|hi[- ]?res|24[- ]?bit|16[- ]?bit|vinyl(?: rip)?|web|cd rip)$",
+    re.IGNORECASE,
+)
+
+
+def _files_box_set_normalize_path(value: Any) -> str:
+    raw = str(value or "").strip().replace("\\", "/")
+    if not raw:
+        return ""
+    if len(raw) > 1:
+        raw = raw.rstrip("/")
+    return raw
+
+
+def _files_box_set_parent_path(value: Any) -> str:
+    raw = _files_box_set_normalize_path(value)
+    if not raw or "/" not in raw:
+        return ""
+    return raw.rsplit("/", 1)[0]
+
+
+def _files_box_set_leaf_name(value: Any) -> str:
+    raw = _files_box_set_normalize_path(value)
+    if not raw:
+        return ""
+    return raw.rsplit("/", 1)[-1].strip()
+
+
+def _files_box_set_identity_key(row: Mapping[str, Any] | None) -> str:
+    payload = row or {}
+    for key in (
+        "musicbrainz_release_group_id",
+        "discogs_release_id",
+        "lastfm_album_mbid",
+        "bandcamp_album_url",
+    ):
+        value = str(payload.get(key) or "").strip()
+        if value:
+            return f"{key}:{value.lower()}"
+    title_norm = str(payload.get("title_norm") or "").strip()
+    if title_norm:
+        return f"title:{title_norm.lower()}"
+    title_raw = _normalize_identity_text_strict(str(payload.get("title") or ""))
+    return f"title:{title_raw}" if title_raw else ""
+
+
+def _files_box_set_group_key(row: Mapping[str, Any] | None) -> str:
+    payload = row or {}
+    parent_path = _files_box_set_parent_path(payload.get("folder_path"))
+    identity = _files_box_set_identity_key(payload)
+    if not parent_path or not identity:
+        return ""
+    return f"{parent_path.lower()}|{identity}"
+
+
+def _files_box_set_group_is_valid(rows: Sequence[Mapping[str, Any]]) -> bool:
+    if len(rows or []) <= 1:
+        return False
+    folders = {_files_box_set_normalize_path(row.get("folder_path")) for row in (rows or []) if _files_box_set_normalize_path(row.get("folder_path"))}
+    if len(folders) <= 1:
+        return False
+    parent_paths = {_files_box_set_parent_path(folder) for folder in folders}
+    if len(parent_paths) != 1:
+        return False
+    leaf_names = [_files_box_set_leaf_name(folder) for folder in folders]
+    if leaf_names and all(_BOX_SET_FORMAT_LEAF_RE.match(name or "") for name in leaf_names):
+        return False
+    return True
+
+
+def _files_box_set_member_sort_key(row: Mapping[str, Any]) -> tuple[int, int, str, int]:
+    leaf = _files_box_set_leaf_name(row.get("folder_path"))
+    explicit_disc_no = 0
+    match = re.search(r"(\d{1,2})", leaf or "")
+    if match:
+        try:
+            explicit_disc_no = int(match.group(1) or 0)
+        except Exception:
+            explicit_disc_no = 0
+    discish = 0 if _BOX_SET_DISC_LEAF_RE.match(leaf or "") else 1
+    return (
+        discish,
+        explicit_disc_no if explicit_disc_no > 0 else 9999,
+        (leaf or "").lower(),
+        int(row.get("album_id") or row.get("id") or 0),
+    )
+
+
+def _files_box_set_display_artist(rows: Sequence[Mapping[str, Any]]) -> tuple[str, int]:
+    candidates: list[tuple[str, int]] = []
+    for row in (rows or []):
+        name = str(row.get("artist_name") or "").strip()
+        artist_id = int(row.get("artist_id") or 0)
+        if name:
+            candidates.append((name, artist_id))
+    if not candidates:
+        return ("", 0)
+    unique_names = []
+    seen_names: set[str] = set()
+    for name, artist_id in candidates:
+        norm = _norm_artist_key(name)
+        if not norm or norm in seen_names:
+            continue
+        seen_names.add(norm)
+        unique_names.append((name, artist_id, norm))
+    if len(unique_names) == 1:
+        return (unique_names[0][0], unique_names[0][1])
+    for name, artist_id, norm in sorted(unique_names, key=lambda item: (len(item[0]), item[0].lower())):
+        if norm and all(norm in other_norm for _other_name, _other_id, other_norm in unique_names):
+            return (name, artist_id)
+    counts = Counter(norm for _name, _artist_id, norm in unique_names)
+    best_name, best_id, _best_norm = sorted(
+        unique_names,
+        key=lambda item: (-counts.get(item[2], 0), len(item[0]), item[0].lower()),
+    )[0]
+    return (best_name, best_id)
+
+
+def _collapse_files_album_browse_rows(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    ordered_rows = [dict(row) for row in (rows or [])]
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in ordered_rows:
+        group_key = _files_box_set_group_key(row)
+        grouped.setdefault(group_key or f"album:{int(row.get('album_id') or row.get('id') or 0)}", []).append(row)
+
+    valid_group_keys = {
+        key
+        for key, members in grouped.items()
+        if key.startswith("/") or "|" in key
+        if _files_box_set_group_is_valid(members)
+    }
+
+    emitted: set[str] = set()
+    collapsed: list[dict[str, Any]] = []
+    for row in ordered_rows:
+        album_id = int(row.get("album_id") or row.get("id") or 0)
+        group_key = _files_box_set_group_key(row)
+        if group_key and group_key in valid_group_keys:
+            if group_key in emitted:
+                continue
+            emitted.add(group_key)
+            members = list(grouped.get(group_key) or [])
+            display_artist_name, display_artist_id = _files_box_set_display_artist(members)
+            representative = next((member for member in members if bool(member.get("has_cover"))), members[0])
+            collapsed_row = dict(representative)
+            collapsed_row["album_id"] = int(representative.get("album_id") or representative.get("id") or album_id)
+            collapsed_row["artist_name"] = display_artist_name or str(representative.get("artist_name") or "")
+            collapsed_row["artist_id"] = int(display_artist_id or representative.get("artist_id") or 0)
+            collapsed_row["track_count"] = sum(int(member.get("track_count") or 0) for member in members)
+            collapsed_row["is_box_set"] = True
+            collapsed_row["box_set_disc_count"] = len(members)
+            collapsed_row["box_set_member_album_ids"] = [
+                int(member.get("album_id") or member.get("id") or 0)
+                for member in sorted(members, key=_files_box_set_member_sort_key)
+                if int(member.get("album_id") or member.get("id") or 0) > 0
+            ]
+            collapsed_row["box_set_root_path"] = _files_box_set_parent_path(representative.get("folder_path"))
+            collapsed.append(collapsed_row)
+            continue
+        if album_id <= 0:
+            continue
+        row_copy = dict(row)
+        row_copy["album_id"] = album_id
+        row_copy["is_box_set"] = False
+        row_copy["box_set_disc_count"] = None
+        row_copy["box_set_member_album_ids"] = [album_id]
+        row_copy["box_set_root_path"] = None
+        collapsed.append(row_copy)
+    return collapsed
+
+
+def _files_box_set_context(conn, album_id: int) -> dict[str, Any] | None:
+    album_id = int(album_id or 0)
+    if album_id <= 0:
+        return None
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                alb.id AS album_id,
+                COALESCE(alb.title, '') AS title,
+                COALESCE(alb.title_norm, '') AS title_norm,
+                COALESCE(alb.folder_path, '') AS folder_path,
+                COALESCE(alb.has_cover, FALSE) AS has_cover,
+                COALESCE(alb.cover_path, '') AS cover_path,
+                COALESCE(alb.musicbrainz_release_group_id, '') AS musicbrainz_release_group_id,
+                COALESCE(alb.discogs_release_id, '') AS discogs_release_id,
+                COALESCE(alb.lastfm_album_mbid, '') AS lastfm_album_mbid,
+                COALESCE(alb.bandcamp_album_url, '') AS bandcamp_album_url,
+                art.id AS artist_id,
+                COALESCE(art.name, '') AS artist_name
+            FROM files_albums alb
+            LEFT JOIN files_artists art ON art.id = alb.artist_id
+            WHERE alb.id = %s
+            LIMIT 1
+            """,
+            (album_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        seed = {
+            "album_id": int(row[0] or 0),
+            "title": str(row[1] or "").strip(),
+            "title_norm": str(row[2] or "").strip(),
+            "folder_path": str(row[3] or "").strip(),
+            "has_cover": bool(row[4]),
+            "cover_path": str(row[5] or "").strip(),
+            "musicbrainz_release_group_id": str(row[6] or "").strip(),
+            "discogs_release_id": str(row[7] or "").strip(),
+            "lastfm_album_mbid": str(row[8] or "").strip(),
+            "bandcamp_album_url": str(row[9] or "").strip(),
+            "artist_id": int(row[10] or 0),
+            "artist_name": str(row[11] or "").strip(),
+        }
+        group_key = _files_box_set_group_key(seed)
+        parent_path = _files_box_set_parent_path(seed.get("folder_path"))
+        if not group_key or not parent_path:
+            return None
+        cur.execute(
+            """
+            SELECT
+                alb.id AS album_id,
+                COALESCE(alb.title, '') AS title,
+                COALESCE(alb.title_norm, '') AS title_norm,
+                COALESCE(alb.folder_path, '') AS folder_path,
+                COALESCE(alb.has_cover, FALSE) AS has_cover,
+                COALESCE(alb.cover_path, '') AS cover_path,
+                COALESCE(alb.musicbrainz_release_group_id, '') AS musicbrainz_release_group_id,
+                COALESCE(alb.discogs_release_id, '') AS discogs_release_id,
+                COALESCE(alb.lastfm_album_mbid, '') AS lastfm_album_mbid,
+                COALESCE(alb.bandcamp_album_url, '') AS bandcamp_album_url,
+                art.id AS artist_id,
+                COALESCE(art.name, '') AS artist_name
+            FROM files_albums alb
+            LEFT JOIN files_artists art ON art.id = alb.artist_id
+            WHERE alb.folder_path LIKE %s
+            """,
+            (f"{parent_path}/%",),
+        )
+        members: list[dict[str, Any]] = []
+        for member_row in cur.fetchall():
+            member = {
+                "album_id": int(member_row[0] or 0),
+                "title": str(member_row[1] or "").strip(),
+                "title_norm": str(member_row[2] or "").strip(),
+                "folder_path": str(member_row[3] or "").strip(),
+                "has_cover": bool(member_row[4]),
+                "cover_path": str(member_row[5] or "").strip(),
+                "musicbrainz_release_group_id": str(member_row[6] or "").strip(),
+                "discogs_release_id": str(member_row[7] or "").strip(),
+                "lastfm_album_mbid": str(member_row[8] or "").strip(),
+                "bandcamp_album_url": str(member_row[9] or "").strip(),
+                "artist_id": int(member_row[10] or 0),
+                "artist_name": str(member_row[11] or "").strip(),
+            }
+            if _files_box_set_parent_path(member.get("folder_path")) != parent_path:
+                continue
+            if _files_box_set_group_key(member) != group_key:
+                continue
+            members.append(member)
+    if not _files_box_set_group_is_valid(members):
+        return None
+    ordered_members = sorted(members, key=_files_box_set_member_sort_key)
+    canonical = ordered_members[0]
+    cover_member = next((member for member in ordered_members if bool(member.get("has_cover"))), canonical)
+    display_artist_name, display_artist_id = _files_box_set_display_artist(ordered_members)
+    return {
+        "canonical_album_id": int(canonical.get("album_id") or album_id),
+        "cover_album_id": int(cover_member.get("album_id") or canonical.get("album_id") or album_id),
+        "member_album_ids": [int(member.get("album_id") or 0) for member in ordered_members if int(member.get("album_id") or 0) > 0],
+        "member_rows": ordered_members,
+        "title": str(canonical.get("title") or seed.get("title") or "").strip(),
+        "artist_name": display_artist_name or str(canonical.get("artist_name") or ""),
+        "artist_id": int(display_artist_id or canonical.get("artist_id") or 0),
+        "root_path": parent_path,
+    }
+
+
+def _files_box_set_reindex_tracks(
+    track_rows: Sequence[Mapping[str, Any]],
+    member_album_ids: Sequence[int],
+) -> tuple[list[dict[str, Any]], int]:
+    rows_by_album: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for row in (track_rows or []):
+        rows_by_album[int(row.get("album_id") or 0)].append(dict(row))
+    out: list[dict[str, Any]] = []
+    disc_offset = 0
+    total_disc_count = 0
+    for album_id in [int(value or 0) for value in (member_album_ids or []) if int(value or 0) > 0]:
+        album_tracks = sorted(
+            rows_by_album.get(album_id) or [],
+            key=lambda item: (
+                int(item.get("disc_num") or 1),
+                int(item.get("track_num") or 0),
+                int(item.get("track_id") or item.get("id") or 0),
+            ),
+        )
+        if not album_tracks:
+            continue
+        max_local_disc = max(int(item.get("disc_num") or 1) for item in album_tracks)
+        max_local_disc = max(1, int(max_local_disc or 1))
+        for item in album_tracks:
+            local_disc = max(1, int(item.get("disc_num") or 1))
+            global_disc = disc_offset + local_disc
+            item["disc_num"] = global_disc
+            item["disc_label"] = f"Disc {global_disc}"
+            out.append(item)
+        disc_offset += max_local_disc
+        total_disc_count = max(total_disc_count, disc_offset)
+    return (out, int(total_disc_count or 0))
+
+
 @app.get("/api/library/albums")
 def api_library_albums():
     """List albums (Files mode). Used for Roon-like album grid and carousels."""
@@ -63482,7 +64163,7 @@ def api_library_albums():
             else "idle"
         )
 
-    cache_key = f"library:albums:u{user_id}:{search_query.lower()}:{genre.lower()}:{label.lower()}:{int(year or 0)}:{sort}:{limit}:{offset}:{_library_cache_unmatched_suffix(include_unmatched)}:{live_cache_generation}"
+    cache_key = f"library:albums:v2:u{user_id}:{search_query.lower()}:{genre.lower()}:{label.lower()}:{int(year or 0)}:{sort}:{limit}:{offset}:{_library_cache_unmatched_suffix(include_unmatched)}:{live_cache_generation}"
     cached = _files_cache_get_json(cache_key)
     if cached is not None:
         return jsonify(cached)
@@ -63577,41 +64258,20 @@ def api_library_albums():
         with conn.cursor() as cur:
             cur.execute(
                 f"""
-                SELECT COUNT(*)
-                FROM files_albums alb
-                LEFT JOIN files_artists ar ON ar.id = alb.artist_id
-                WHERE {" AND ".join(where_parts)}
-                """,
-                params,
-            )
-            total = int((cur.fetchone() or [0])[0] or 0)
-
-            cur.execute(
-                f"""
                 SELECT
-                    alb.id,
+                    alb.id AS album_id,
                     alb.title,
+                    COALESCE(alb.title_norm, '') AS title_norm,
                     COALESCE(alb.year, 0) AS year,
-                    COALESCE(alb.genre, '') AS genre,
-                    COALESCE(alb.label, '') AS label,
-                    COALESCE(alb.tags_json, '[]') AS tags_json,
-                    alb.track_count,
-                    COALESCE(alb.format, '') AS format,
-                    alb.is_lossless,
-                    alb.has_cover,
-                    COALESCE(alb.cover_path, '') AS cover_path,
                     COALESCE(alb.folder_path, '') AS folder_path,
-                    alb.mb_identified,
+                    COALESCE(alb.track_count, 0) AS track_count,
+                    COALESCE(alb.has_cover, FALSE) AS has_cover,
+                    COALESCE(alb.musicbrainz_release_group_id, '') AS musicbrainz_release_group_id,
+                    COALESCE(alb.discogs_release_id, '') AS discogs_release_id,
+                    COALESCE(alb.lastfm_album_mbid, '') AS lastfm_album_mbid,
+                    COALESCE(alb.bandcamp_album_url, '') AS bandcamp_album_url,
                     ar.id AS artist_id,
-                    ar.name AS artist_name,
-                    COALESCE(pr.short_description, '') AS short_description,
-                    COALESCE(pr.source, '') AS profile_source,
-                    pr.public_rating,
-                    COALESCE(pr.public_rating_votes, 0) AS public_rating_votes,
-                    COALESCE(pr.public_rating_source, '') AS public_rating_source,
-                    pr.heat_score,
-                    COALESCE(pr.heat_label, '') AS heat_label,
-                    COALESCE(ur.rating, 0) AS user_rating
+                    COALESCE(ar.name, '') AS artist_name
                 FROM files_albums alb
                 LEFT JOIN files_artists ar ON ar.id = alb.artist_id
                 LEFT JOIN files_album_profiles pr
@@ -63622,17 +64282,94 @@ def api_library_albums():
                       AND ur.user_id = %s
                 WHERE {" AND ".join(where_parts)}
                 {order_sql}
-                LIMIT %s OFFSET %s
                 """,
-                [int(user_id), *params, int(limit), int(offset)],
+                [int(user_id), *params],
             )
-            rows = cur.fetchall()
+            raw_rows = [
+                {
+                    "album_id": int(row[0] or 0),
+                    "title": str(row[1] or "").strip(),
+                    "title_norm": str(row[2] or "").strip(),
+                    "year": int(row[3] or 0) or None,
+                    "folder_path": str(row[4] or "").strip(),
+                    "track_count": int(row[5] or 0),
+                    "has_cover": bool(row[6]),
+                    "musicbrainz_release_group_id": str(row[7] or "").strip(),
+                    "discogs_release_id": str(row[8] or "").strip(),
+                    "lastfm_album_mbid": str(row[9] or "").strip(),
+                    "bandcamp_album_url": str(row[10] or "").strip(),
+                    "artist_id": int(row[11] or 0),
+                    "artist_name": str(row[12] or "").strip(),
+                }
+                for row in cur.fetchall()
+            ]
+
+            grouped_rows = _collapse_files_album_browse_rows(raw_rows)
+            total = len(grouped_rows)
+            page_rows = grouped_rows[int(offset): int(offset + limit)]
+            page_album_ids = [
+                int(row.get("album_id") or 0)
+                for row in page_rows
+                if int(row.get("album_id") or 0) > 0
+            ]
+
+            detailed_rows: list[tuple[Any, ...]] = []
+            if page_album_ids:
+                cur.execute(
+                    """
+                    SELECT
+                        alb.id,
+                        alb.title,
+                        COALESCE(alb.year, 0) AS year,
+                        COALESCE(alb.genre, '') AS genre,
+                        COALESCE(alb.label, '') AS label,
+                        COALESCE(alb.tags_json, '[]') AS tags_json,
+                        alb.track_count,
+                        COALESCE(alb.format, '') AS format,
+                        alb.is_lossless,
+                        alb.has_cover,
+                        COALESCE(alb.cover_path, '') AS cover_path,
+                        COALESCE(alb.folder_path, '') AS folder_path,
+                        alb.mb_identified,
+                        ar.id AS artist_id,
+                        ar.name AS artist_name,
+                        COALESCE(pr.short_description, '') AS short_description,
+                        COALESCE(pr.source, '') AS profile_source,
+                        pr.public_rating,
+                        COALESCE(pr.public_rating_votes, 0) AS public_rating_votes,
+                        COALESCE(pr.public_rating_source, '') AS public_rating_source,
+                        pr.heat_score,
+                        COALESCE(pr.heat_label, '') AS heat_label,
+                        COALESCE(ur.rating, 0) AS user_rating
+                    FROM files_albums alb
+                    LEFT JOIN files_artists ar ON ar.id = alb.artist_id
+                    LEFT JOIN files_album_profiles pr
+                           ON pr.artist_norm = COALESCE(ar.name_norm, '')
+                          AND pr.title_norm = alb.title_norm
+                    LEFT JOIN files_user_album_ratings ur
+                           ON ur.album_id = alb.id
+                          AND ur.user_id = %s
+                    WHERE alb.id = ANY(%s)
+                    """,
+                    (int(user_id), page_album_ids),
+                )
+                detailed_rows = cur.fetchall()
 
         base_url = request.url_root.rstrip("/")
+        detail_by_id = {
+            int(row[0] or 0): row
+            for row in detailed_rows
+            if int(row[0] or 0) > 0
+        }
         albums = []
-        for album_id, title, year, genre, label, tags_json, track_count, fmt, is_lossless, has_cover, cover_path_raw, folder_path_raw, mb_identified, artist_id, artist_name, short_desc, profile_source, public_rating, public_rating_votes, public_rating_source, heat_score, heat_label, user_rating in rows:
+        for page_row in page_rows:
+            aid = int(page_row.get("album_id") or 0)
+            row = detail_by_id.get(aid)
+            if not row:
+                continue
+            album_id, title, year, genre, label, tags_json, track_count, fmt, is_lossless, has_cover, cover_path_raw, folder_path_raw, mb_identified, artist_id, artist_name, short_desc, profile_source, public_rating, public_rating_votes, public_rating_source, heat_score, heat_label, user_rating = row
             aid = int(album_id or 0)
-            arid = int(artist_id or 0)
+            arid = int(page_row.get("artist_id") or artist_id or 0)
             has_cover_effective = bool(has_cover)
             if not has_cover_effective:
                 try:
@@ -63682,14 +64419,14 @@ def api_library_albums():
                     "genre": (genre or "").strip() or None,
                     "genres": genres_list,
                     "label": (label or "").strip() or None,
-                    "track_count": int(track_count or 0),
+                    "track_count": int(page_row.get("track_count") or track_count or 0),
                     "format": (fmt or "").strip() or None,
                     "is_lossless": bool(is_lossless),
                     "mb_identified": bool(mb_identified),
                     "has_cover": has_cover_effective,
                     "thumb": thumb,
                     "artist_id": arid,
-                    "artist_name": artist_name or "",
+                    "artist_name": str(page_row.get("artist_name") or artist_name or ""),
                     "short_description": short_desc_clean or None,
                     "profile_source": (profile_source or "").strip() or None,
                     "public_rating": float(public_rating) if public_rating is not None else None,
@@ -63698,6 +64435,9 @@ def api_library_albums():
                     "heat_score": float(heat_score) if heat_score is not None else None,
                     "heat_label": None,
                     "user_rating": int(user_rating or 0) if int(user_rating or 0) > 0 else None,
+                    "is_box_set": bool(page_row.get("is_box_set")),
+                    "box_set_disc_count": int(page_row.get("box_set_disc_count") or 0) if bool(page_row.get("is_box_set")) else None,
+                    "box_set_member_album_ids": list(page_row.get("box_set_member_album_ids") or [aid]),
                 }
             )
 
@@ -69542,6 +70282,13 @@ def api_library_album_tracks(album_id):
         if conn is None:
             return jsonify({"error": "PostgreSQL unavailable"}), 503
         try:
+            group_ctx = _files_box_set_context(conn, album_id)
+            playback_album_id = int(group_ctx.get("canonical_album_id") or album_id) if group_ctx else int(album_id or 0)
+            cover_album_id = int(group_ctx.get("cover_album_id") or playback_album_id) if group_ctx else int(album_id or 0)
+            member_album_ids = list(group_ctx.get("member_album_ids") or [playback_album_id]) if group_ctx else [int(album_id or 0)]
+            album_title = ""
+            artist_name = ""
+            has_cover = False
             with conn.cursor() as cur:
                 cur.execute(
                     """
@@ -69550,43 +70297,57 @@ def api_library_album_tracks(album_id):
                     JOIN files_artists art ON art.id = alb.artist_id
                     WHERE alb.id = %s
                     """,
-                    (album_id,),
+                    (playback_album_id,),
                 )
                 album_row = cur.fetchone()
                 if not album_row:
                     return jsonify({"error": "Album not found"}), 404
-                album_title = album_row[0] or ""
-                artist_name = album_row[1] or ""
+                album_title = str(group_ctx.get("title") or album_row[0] or "").strip() if group_ctx else (album_row[0] or "")
+                artist_name = str(group_ctx.get("artist_name") or album_row[1] or "").strip() if group_ctx else (album_row[1] or "")
                 has_cover = bool(album_row[2])
                 cur.execute(
                     """
-                    SELECT id, title, duration_sec, track_num, file_path
+                    SELECT album_id, id, title, disc_num, track_num, duration_sec, file_path
                     FROM files_tracks
-                    WHERE album_id = %s
-                    ORDER BY disc_num ASC, track_num ASC, id ASC
+                    WHERE album_id = ANY(%s)
+                    ORDER BY album_id ASC, disc_num ASC, track_num ASC, id ASC
                     """,
-                    (album_id,),
+                    (member_album_ids,),
                 )
-                rows = cur.fetchall()
+                rows = [
+                    {
+                        "album_id": int(row[0] or 0),
+                        "track_id": int(row[1] or 0),
+                        "title": str(row[2] or "").strip(),
+                        "disc_num": int(row[3] or 0) or 1,
+                        "track_num": int(row[4] or 0) or 0,
+                        "duration_sec": int(row[5] or 0),
+                        "file_path": str(row[6] or "").strip(),
+                    }
+                    for row in cur.fetchall()
+                ]
+            if group_ctx:
+                rows, _group_disc_count = _files_box_set_reindex_tracks(rows, member_album_ids)
             _schedule_album_detail_enrichment(
-                int(album_id),
-                rows=[(int(r[0] or 0), int(r[2] or 0), str(r[4] or "")) for r in rows],
+                int(playback_album_id),
+                rows=[(int(r.get("track_id") or 0), int(r.get("duration_sec") or 0), str(r.get("file_path") or "")) for r in rows],
                 has_cover=bool(has_cover),
                 cover_path_raw="",
             )
             tracks = [
                 {
-                    "track_id": int(r[0]),
-                    "title": r[1] or "",
+                    "track_id": int(r.get("track_id") or 0),
+                    "title": r.get("title") or "",
                     "artist": artist_name,
                     "album": album_title,
-                    "duration": int(r[2] or 0),
-                    "index": int(r[3] or 0),
-                    "file_url": _browser_api_url(f"/api/library/track/{int(r[0])}/stream"),
+                    "duration": int(r.get("duration_sec") or 0),
+                    "index": int(r.get("track_num") or 0),
+                    "disc_num": int(r.get("disc_num") or 1),
+                    "file_url": _browser_api_url(f"/api/library/track/{int(r.get('track_id') or 0)}/stream"),
                 }
                 for r in rows
             ]
-            album_thumb = _browser_api_url(f"/api/library/files/album/{album_id}/cover?size=320")
+            album_thumb = _browser_api_url(f"/api/library/files/album/{cover_album_id}/cover?size=320")
             return jsonify({"tracks": tracks, "album_thumb": album_thumb})
         finally:
             conn.close()
@@ -69832,7 +70593,7 @@ def api_library_album_detail(album_id: int):
         return jsonify({"error": "Invalid album id"}), 400
     user_id = _current_user_id_or_zero()
 
-    cache_key = f"library:album:v4:u{user_id}:{album_id}"
+    cache_key = f"library:album:v5:u{user_id}:{album_id}"
     cached = _files_cache_get_json(cache_key)
     if cached is not None:
         return jsonify(cached)
@@ -69841,6 +70602,10 @@ def api_library_album_detail(album_id: int):
     if conn is None:
         return jsonify({"error": "PostgreSQL unavailable"}), 503
     try:
+        group_ctx = _files_box_set_context(conn, album_id)
+        detail_album_id = int(group_ctx.get("canonical_album_id") or album_id) if group_ctx else int(album_id)
+        cover_album_id = int(group_ctx.get("cover_album_id") or detail_album_id) if group_ctx else int(album_id)
+        member_album_ids = list(group_ctx.get("member_album_ids") or [detail_album_id]) if group_ctx else [int(album_id)]
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -69874,7 +70639,7 @@ def api_library_album_detail(album_id: int):
                 JOIN files_artists art ON art.id = alb.artist_id
                 WHERE alb.id = %s
                 """,
-                (album_id,),
+                (detail_album_id,),
             )
             row = cur.fetchone()
             if not row:
@@ -69982,7 +70747,7 @@ def api_library_album_detail(album_id: int):
                         WHERE user_id = %s AND album_id = %s
                         LIMIT 1
                         """,
-                        (int(user_id), int(album_id)),
+                        (int(user_id), int(detail_album_id)),
                     )
                     rrow = cur.fetchone()
                     if rrow:
@@ -70000,6 +70765,7 @@ def api_library_album_detail(album_id: int):
             cur.execute(
                 """
                 SELECT
+                    album_id,
                     id,
                     COALESCE(title, '') AS title,
                     COALESCE(disc_num, 0) AS disc_num,
@@ -70012,16 +70778,16 @@ def api_library_album_detail(album_id: int):
                     COALESCE(file_size_bytes, 0) AS file_size_bytes,
                     COALESCE(file_path, '') AS file_path
                 FROM files_tracks
-                WHERE album_id = %s
-                ORDER BY disc_num ASC, track_num ASC, id ASC
+                WHERE album_id = ANY(%s)
+                ORDER BY album_id ASC, disc_num ASC, track_num ASC, id ASC
                 """,
-                (album_id,),
+                (member_album_ids,),
             )
             track_rows = cur.fetchall()
 
         # Keep endpoint responsive: missing durations are repaired asynchronously.
 
-        has_cover_effective = bool(has_cover)
+        has_cover_effective = bool(has_cover) or (bool(group_ctx) and cover_album_id > 0 and cover_album_id != detail_album_id)
         cover_path_effective = str(cover_path_raw or "").strip()
         if cover_path_effective:
             try:
@@ -70032,9 +70798,30 @@ def api_library_album_detail(album_id: int):
                 pass
 
         # Keep this endpoint fast: background enrichment handles missing durations/embedded cover.
-        enrich_rows = [(int(r[0] or 0), int(r[4] or 0), str(r[10] or "")) for r in track_rows]
+        raw_track_rows = [
+            {
+                "album_id": int(r[0] or 0),
+                "track_id": int(r[1] or 0),
+                "title": str(r[2] or "").strip(),
+                "disc_num": int(r[3] or 0) or 1,
+                "track_num": int(r[4] or 0) or 1,
+                "duration_sec": int(r[5] or 0),
+                "format": str(r[6] or "").strip(),
+                "bitrate": int(r[7] or 0),
+                "sample_rate": int(r[8] or 0),
+                "bit_depth": int(r[9] or 0),
+                "file_size_bytes": int(r[10] or 0),
+                "file_path": str(r[11] or "").strip(),
+            }
+            for r in track_rows
+        ]
+        if group_ctx:
+            raw_track_rows, box_set_disc_count = _files_box_set_reindex_tracks(raw_track_rows, member_album_ids)
+        else:
+            box_set_disc_count = max((int(track.get("disc_num") or 1) for track in raw_track_rows), default=1)
+        enrich_rows = [(int(r.get("track_id") or 0), int(r.get("duration_sec") or 0), str(r.get("file_path") or "")) for r in raw_track_rows]
         _schedule_album_detail_enrichment(
-            int(album_id),
+            int(detail_album_id),
             rows=enrich_rows,
             has_cover=bool(has_cover_effective),
             cover_path_raw=cover_path_effective,
@@ -70072,12 +70859,12 @@ def api_library_album_detail(album_id: int):
         edition_payload.setdefault("lastfm_album_mbid", str(lastfm_album_mbid or "").strip())
         edition_payload.setdefault("bandcamp_album_url", str(bandcamp_album_url or "").strip())
         edition_payload.setdefault("metadata_source", str(metadata_source or "").strip())
-        for idx, r in enumerate(track_rows, start=1):
-            tid = int(r[0] or 0)
-            raw_title = str(r[1] or "").strip()
-            disc_num = int(r[2] or 0) or 1
-            track_num = int(r[3] or 0) or idx
-            file_path = str(r[10] or "").strip()
+        for idx, r in enumerate(raw_track_rows, start=1):
+            tid = int(r.get("track_id") or 0)
+            raw_title = str(r.get("title") or "").strip()
+            disc_num = int(r.get("disc_num") or 0) or 1
+            track_num = int(r.get("track_num") or 0) or idx
+            file_path = str(r.get("file_path") or "").strip()
             display = _track_display_fields_from_sources(
                 raw_title=raw_title,
                 file_path=file_path,
@@ -70087,13 +70874,13 @@ def api_library_album_detail(album_id: int):
             title = str(display.get("display_title") or raw_title or f"Track {idx}").strip()
             disc_num = int(display.get("display_disc_num") or disc_num or 1)
             track_num = int(display.get("display_track_num") or track_num or idx)
-            disc_label = str(display.get("display_disc_label") or "").strip()
-            dur = int(r[4] or 0)
-            t_fmt = (r[5] or "").strip()
-            bitrate = int(r[6] or 0)
-            sample_rate = int(r[7] or 0)
-            bit_depth = int(r[8] or 0)
-            size_bytes = int(r[9] or 0)
+            disc_label = (f"Disc {disc_num}" if group_ctx else str(display.get("display_disc_label") or "").strip())
+            dur = int(r.get("duration_sec") or 0)
+            t_fmt = str(r.get("format") or "").strip()
+            bitrate = int(r.get("bitrate") or 0)
+            sample_rate = int(r.get("sample_rate") or 0)
+            bit_depth = int(r.get("bit_depth") or 0)
+            size_bytes = int(r.get("file_size_bytes") or 0)
 
             feat = ""
             try:
@@ -70142,7 +70929,7 @@ def api_library_album_detail(album_id: int):
             total_duration_sec = sum(int(t.get("duration_sec") or 0) for t in tracks)
 
         # Always expose the cover endpoint; it can still resolve folder/embedded art lazily.
-        cover_url = _browser_api_url(f"/api/library/files/album/{album_id}/cover?size=640")
+        cover_url = _browser_api_url(f"/api/library/files/album/{cover_album_id}/cover?size=640")
         metadata_source_norm = _normalize_identity_provider(str(metadata_source or ""))
         metadata_ref = ""
         if metadata_source_norm == "musicbrainz":
@@ -70166,7 +70953,7 @@ def api_library_album_detail(album_id: int):
         )
 
         payload = {
-            "album_id": int(album_id),
+            "album_id": int(detail_album_id),
             "title": (album_title or "").strip(),
             "year": int(year or 0) if int(year or 0) > 0 else None,
             "created_at": int(album_created_at or 0) or None,
@@ -70176,15 +70963,18 @@ def api_library_album_detail(album_id: int):
             "label": (label or "").strip(),
             "format": (fmt or "").strip(),
             "is_lossless": bool(is_lossless),
-            "track_count": int(track_count or 0),
+            "track_count": int(len(tracks) or int(track_count or 0)),
             "total_duration_sec": int(total_duration_sec or 0),
             "has_cover": bool(has_cover_effective),
             "cover_url": cover_url,
             "bandcamp_album_url": (bandcamp_album_url or "").strip() or None,
             "metadata_source": (metadata_source_norm or "").strip() or None,
             "metadata_source_url": metadata_source_url,
-            "artist_id": int(artist_id or 0),
-            "artist_name": (artist_name or "").strip(),
+            "artist_id": int(group_ctx.get("artist_id") or artist_id or 0) if group_ctx else int(artist_id or 0),
+            "artist_name": str(group_ctx.get("artist_name") or artist_name or "").strip() if group_ctx else (artist_name or "").strip(),
+            "is_box_set": bool(group_ctx),
+            "box_set_disc_count": int(box_set_disc_count or 0) if group_ctx else None,
+            "box_set_member_album_ids": list(member_album_ids if group_ctx else [detail_album_id]),
             "classical": classical_payload,
             "review": {
                 "description": str(prof.get("description") or "").strip(),
@@ -70249,6 +71039,8 @@ def api_library_album_download(album_id: int):
     if conn is None:
         return jsonify({"error": "PostgreSQL unavailable"}), 503
     try:
+        group_ctx = _files_box_set_context(conn, album_id)
+        download_album_id = int(group_ctx.get("canonical_album_id") or album_id) if group_ctx else int(album_id)
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -70261,7 +71053,7 @@ def api_library_album_download(album_id: int):
                 WHERE alb.id = %s
                 LIMIT 1
                 """,
-                (album_id,),
+                (download_album_id,),
             )
             row = cur.fetchone()
     finally:
@@ -70270,15 +71062,16 @@ def api_library_album_download(album_id: int):
     if not row or not str(row[0] or "").strip():
         return jsonify({"error": "Album not found"}), 404
 
-    folder_path = path_for_fs_access(Path(str(row[0] or "").strip()))
+    folder_path_raw = str(group_ctx.get("root_path") or row[0] or "").strip() if group_ctx else str(row[0] or "").strip()
+    folder_path = path_for_fs_access(Path(folder_path_raw))
     if not folder_path.exists() or not folder_path.is_dir():
         return jsonify({"error": "Album folder not found"}), 404
 
-    artist_name = _sanitize_path_component(str(row[2] or "").strip() or f"artist-{album_id}")
-    album_title = _sanitize_path_component(str(row[1] or "").strip() or f"album-{album_id}")
-    archive_label = f"{artist_name} - {album_title}".strip(" -") or f"album-{album_id}"
+    artist_name = _sanitize_path_component(str(group_ctx.get("artist_name") or row[2] or "").strip() or f"artist-{download_album_id}")
+    album_title = _sanitize_path_component(str(group_ctx.get("title") or row[1] or "").strip() or f"album-{download_album_id}")
+    archive_label = f"{artist_name} - {album_title}".strip(" -") or f"album-{download_album_id}"
 
-    tmp_dir = tempfile.mkdtemp(prefix=f"pmda-album-{album_id}-")
+    tmp_dir = tempfile.mkdtemp(prefix=f"pmda-album-{download_album_id}-")
     archive_base = os.path.join(tmp_dir, archive_label)
     archive_path = shutil.make_archive(archive_base, "zip", root_dir=str(folder_path))
 
@@ -73517,6 +74310,9 @@ def api_library_album_tracks_detail(album_id: int):
     if conn is None:
         return jsonify({"error": "PostgreSQL unavailable"}), 503
     try:
+        group_ctx = _files_box_set_context(conn, album_id)
+        detail_album_id = int(group_ctx.get("canonical_album_id") or album_id) if group_ctx else int(album_id)
+        member_album_ids = list(group_ctx.get("member_album_ids") or [detail_album_id]) if group_ctx else [int(album_id)]
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -73526,17 +74322,18 @@ def api_library_album_tracks_detail(album_id: int):
                 WHERE alb.id = %s
                 LIMIT 1
                 """,
-                (album_id,),
+                (detail_album_id,),
             )
             album_row = cur.fetchone()
             if not album_row:
                 return jsonify({"error": "Album not found"}), 404
-            album_title = str(album_row[0] or "").strip()
-            artist_name = str(album_row[1] or "").strip()
+            album_title = str(group_ctx.get("title") or album_row[0] or "").strip() if group_ctx else str(album_row[0] or "").strip()
+            artist_name = str(group_ctx.get("artist_name") or album_row[1] or "").strip() if group_ctx else str(album_row[1] or "").strip()
 
             cur.execute(
                 """
                 SELECT
+                    album_id,
                     id,
                     COALESCE(title, '') AS title,
                     COALESCE(disc_num, 0) AS disc_num,
@@ -73549,27 +74346,47 @@ def api_library_album_tracks_detail(album_id: int):
                     COALESCE(file_size_bytes, 0) AS file_size_bytes,
                     COALESCE(file_path, '') AS file_path
                 FROM files_tracks
-                WHERE album_id = %s
-                ORDER BY disc_num ASC, track_num ASC, id ASC
+                WHERE album_id = ANY(%s)
+                ORDER BY album_id ASC, disc_num ASC, track_num ASC, id ASC
                 """,
-                (album_id,),
+                (member_album_ids,),
             )
             rows = cur.fetchall()
+        raw_rows = [
+            {
+                "album_id": int(row[0] or 0),
+                "track_id": int(row[1] or 0),
+                "title": str(row[2] or "").strip(),
+                "disc_num": int(row[3] or 0) or 1,
+                "track_num": int(row[4] or 0) or 0,
+                "duration_sec": int(row[5] or 0),
+                "format": str(row[6] or "").strip(),
+                "bitrate": int(row[7] or 0),
+                "sample_rate": int(row[8] or 0),
+                "bit_depth": int(row[9] or 0),
+                "file_size_bytes": int(row[10] or 0),
+                "file_path": str(row[11] or "").strip(),
+            }
+            for row in rows
+        ]
+        if group_ctx:
+            raw_rows, _disc_count = _files_box_set_reindex_tracks(raw_rows, member_album_ids)
 
-        def _extract_one_track(row: tuple[Any, ...]) -> dict[str, Any]:
-            tid = int(row[0] or 0)
-            file_path_raw = str(row[10] or "").strip()
+        def _extract_one_track(row: Mapping[str, Any]) -> dict[str, Any]:
+            tid = int(row.get("track_id") or 0)
+            file_path_raw = str(row.get("file_path") or "").strip()
             out: dict[str, Any] = {
                 "track_id": tid,
-                "title": str(row[1] or "").strip(),
-                "disc_num": int(row[2] or 0),
-                "track_num": int(row[3] or 0),
-                "duration_sec": int(row[4] or 0),
-                "format": str(row[5] or "").strip(),
-                "bitrate": int(row[6] or 0),
-                "sample_rate": int(row[7] or 0),
-                "bit_depth": int(row[8] or 0),
-                "file_size_bytes": int(row[9] or 0),
+                "title": str(row.get("title") or "").strip(),
+                "disc_num": int(row.get("disc_num") or 0),
+                "disc_label": f"Disc {int(row.get('disc_num') or 1)}" if group_ctx else None,
+                "track_num": int(row.get("track_num") or 0),
+                "duration_sec": int(row.get("duration_sec") or 0),
+                "format": str(row.get("format") or "").strip(),
+                "bitrate": int(row.get("bitrate") or 0),
+                "sample_rate": int(row.get("sample_rate") or 0),
+                "bit_depth": int(row.get("bit_depth") or 0),
+                "file_size_bytes": int(row.get("file_size_bytes") or 0),
                 "file_path": file_path_raw,
                 "tags": {},
                 "tags_error": None,
@@ -73600,26 +74417,27 @@ def api_library_album_tracks_detail(album_id: int):
             return out
 
         details: list[dict[str, Any]] = []
-        if include_tags and len(rows) >= 6:
-            workers = max(2, min(8, int(len(rows))))
+        if include_tags and len(raw_rows) >= 6:
+            workers = max(2, min(8, int(len(raw_rows))))
             with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="track-detail") as pool:
-                fut_to_idx = {pool.submit(_extract_one_track, row): idx for idx, row in enumerate(rows)}
-                ordered: list[dict[str, Any] | None] = [None] * len(rows)
+                fut_to_idx = {pool.submit(_extract_one_track, row): idx for idx, row in enumerate(raw_rows)}
+                ordered: list[dict[str, Any] | None] = [None] * len(raw_rows)
                 for fut in as_completed(fut_to_idx):
                     idx = int(fut_to_idx.get(fut) or 0)
                     try:
                         ordered[idx] = fut.result()
                     except Exception:
-                        ordered[idx] = _extract_one_track(rows[idx])
+                        ordered[idx] = _extract_one_track(raw_rows[idx])
                 details = [d for d in ordered if isinstance(d, dict)]
         else:
-            details = [_extract_one_track(r) for r in rows]
+            details = [_extract_one_track(r) for r in raw_rows]
 
         return jsonify(
             {
-                "album_id": int(album_id),
+                "album_id": int(detail_album_id),
                 "artist_name": artist_name,
                 "album_title": album_title,
+                "is_box_set": bool(group_ctx),
                 "tracks": details,
             }
         )

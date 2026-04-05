@@ -393,6 +393,7 @@ export default function LibraryAlbums() {
                   bitDepth={a.bit_depth}
                   year={a.year}
                   trackCount={a.track_count}
+                  boxSetDiscCount={a.box_set_disc_count}
                   genres={a.genres || (a.genre ? [a.genre] : [])}
                   label={a.label}
                   onGenreClick={(genreName) => navigate(`/library/genre/${encodeURIComponent(genreName)}${location.search || ''}`, { state: withBackLinkState(location) })}

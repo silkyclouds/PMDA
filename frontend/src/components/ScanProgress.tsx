@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useMemo } from 'react';
 import { Link } from 'react-router-dom';
-import { Play, Pause, Square, RefreshCw, Loader2, ChevronDown, ChevronUp, Sparkles, Database, Music, Cpu, Zap, AlertTriangle, Image, Tag, Package, Trash2, Clock, FolderInput, Terminal, Download, BarChart3, Activity, TimerReset, Gauge, ChevronRight, Info } from 'lucide-react';
+import { Play, Pause, Square, RefreshCw, Loader2, ChevronDown, ChevronUp, Sparkles, Database, Music, Cpu, Zap, AlertTriangle, Image, Tag, Package, Trash2, Clock, FolderInput, Terminal, Download, BarChart3, Activity, TimerReset, Gauge, ChevronRight, Info, CheckCircle2 } from 'lucide-react';
 import { useQuery } from '@tanstack/react-query';
 import { Button } from '@/components/ui/button';
 import { Checkbox } from '@/components/ui/checkbox';
@@ -13,9 +13,10 @@ import { BackendLogPanel } from '@/components/BackendLogPanel';
 import { MiniSparkline } from '@/components/scan/MiniSparkline';
 import { StatusDot } from '@/components/scan/StatusDot';
 import { cn } from '@/lib/utils';
-import type { LogTailEntry, ProviderGatewayStatsBucket, ScanProgress as ScanProgressType } from '@/lib/api';
-import { buildScanPipelineSteps } from '@/lib/scanPipeline';
+import type { ConfigResponse, LogTailEntry, PMDAConfig, ProviderGatewayStatsBucket, ScanProgress as ScanProgressType } from '@/lib/api';
+import { buildScanPipelineSteps, type ScanPipelineStep, type ScanPipelineStepKey } from '@/lib/scanPipeline';
 import {
+  getConfig,
   getScanPreflight,
   type ScanPreflightResult,
   dedupeAll,
@@ -161,6 +162,228 @@ function activityBadgeClass(type: 'matched' | 'skipped' | 'flagged' | 'exported'
   }
 }
 
+function firstConfiguredPath(value: unknown): string {
+  if (Array.isArray(value)) {
+    return value.map((entry) => String(entry || '').trim()).find(Boolean) || '';
+  }
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  if (raw.startsWith('[')) {
+    try {
+      return firstConfiguredPath(JSON.parse(raw) as unknown);
+    } catch {
+      return raw;
+    }
+  }
+  return raw.split(',').map((part) => part.trim()).find(Boolean) || '';
+}
+
+function compactPath(value: string | null | undefined, maxLen = 34): string {
+  const raw = String(value || '').trim();
+  if (!raw) return '—';
+  if (raw.length <= maxLen) return raw;
+  const parts = raw.split('/').filter(Boolean);
+  if (parts.length <= 2) return raw;
+  return `…/${parts.slice(-2).join('/')}`;
+}
+
+function resolveWorkflowTopology(config?: Partial<PMDAConfig> | null) {
+  const workflowMode = String(config?.LIBRARY_WORKFLOW_MODE || '').trim().toLowerCase();
+  const source = workflowMode === 'managed'
+    ? firstConfiguredPath(config?.LIBRARY_INTAKE_ROOTS || config?.FILES_ROOTS || config?.MUSIC_PARENT_PATH)
+    : firstConfiguredPath(config?.FILES_ROOTS || config?.LIBRARY_SOURCE_ROOTS || config?.LIBRARY_INTAKE_ROOTS || config?.MUSIC_PARENT_PATH);
+  const winners = firstConfiguredPath(config?.EXPORT_ROOT || config?.LIBRARY_SERVING_ROOT);
+  const dupes = firstConfiguredPath(config?.DUPE_ROOT || config?.LIBRARY_DUPES_ROOT);
+  const incompletes = firstConfiguredPath(config?.INCOMPLETE_ALBUMS_TARGET_DIR || config?.LIBRARY_INCOMPLETE_ROOT);
+  const library = firstConfiguredPath(config?.LIBRARY_SERVING_ROOT || config?.EXPORT_ROOT || config?.MUSIC_PARENT_PATH);
+  const exportStrategy = String(config?.EXPORT_LINK_STRATEGY || config?.LIBRARY_MATERIALIZATION_MODE || 'hardlink').trim() || 'hardlink';
+
+  return {
+    source: source || 'Source root',
+    winners: winners || 'Clean winners',
+    dupes: dupes || 'Duplicates',
+    incompletes: incompletes || 'Incomplete quarantine',
+    library: library || 'Visible library',
+    exportStrategy,
+  };
+}
+
+function pipelineStepIcon(stepKey: ScanPipelineStepKey) {
+  switch (stepKey) {
+    case 'pre_scan':
+    case 'run_scope':
+      return <FolderInput className="h-4 w-4" />;
+    case 'format_analysis':
+      return <Music className="h-4 w-4" />;
+    case 'identification_tags':
+      return <Tag className="h-4 w-4" />;
+    case 'ia_analysis':
+      return <Sparkles className="h-4 w-4" />;
+    case 'incomplete_move':
+      return <AlertTriangle className="h-4 w-4" />;
+    case 'moving_dupes':
+      return <Trash2 className="h-4 w-4" />;
+    case 'export':
+      return <Package className="h-4 w-4" />;
+    case 'post_processing':
+      return <RefreshCw className="h-4 w-4" />;
+    case 'finalizing':
+      return <CheckCircle2 className="h-4 w-4" />;
+    default:
+      return <Activity className="h-4 w-4" />;
+  }
+}
+
+type ScanAlertTone = 'success' | 'info' | 'warning' | 'error';
+
+interface ScanAlertItem {
+  key: string;
+  tone: ScanAlertTone;
+  title: string;
+  body: string;
+  href?: string;
+  hrefLabel?: string;
+}
+
+function alertToneClasses(tone: ScanAlertTone) {
+  switch (tone) {
+    case 'success':
+      return 'border-success/25 bg-success/8 text-success';
+    case 'warning':
+      return 'border-warning/25 bg-warning/8 text-warning';
+    case 'error':
+      return 'border-destructive/25 bg-destructive/8 text-destructive';
+    case 'info':
+    default:
+      return 'border-info/25 bg-info/8 text-info';
+  }
+}
+
+function ScanAlertRail({ alerts }: { alerts: ScanAlertItem[] }) {
+  if (!alerts.length) return null;
+  return (
+    <section className="grid gap-3 xl:grid-cols-2">
+      {alerts.map((alert) => (
+        <div key={alert.key} className={cn('rounded-xl border px-4 py-3', alertToneClasses(alert.tone))}>
+          <div className="flex items-start justify-between gap-3">
+            <div className="min-w-0">
+              <div className="text-[11px] font-semibold uppercase tracking-[0.18em]">{alert.title}</div>
+              <p className="mt-1 text-sm leading-6 text-foreground/88">{alert.body}</p>
+            </div>
+            {alert.href && alert.hrefLabel ? (
+              <Link to={alert.href} className="shrink-0 text-[11px] font-semibold uppercase tracking-[0.12em] text-foreground hover:text-primary">
+                {alert.hrefLabel}
+              </Link>
+            ) : null}
+          </div>
+        </div>
+      ))}
+    </section>
+  );
+}
+
+function CompactPipelineRail({
+  steps,
+}: {
+  steps: ScanPipelineStep[];
+}) {
+  return (
+    <section className="rounded-[1.5rem] border border-border/60 bg-card/95 px-4 pb-4 pt-6 md:px-5 md:pb-5 md:pt-6">
+      <div className="grid gap-3 md:grid-cols-2 2xl:grid-cols-none 2xl:grid-flow-col 2xl:auto-cols-fr">
+        {steps.map((step, index) => {
+          const isDone = step.state === 'done';
+          const isActive = step.state === 'active';
+          return (
+            <div key={step.key} className="relative min-w-0">
+              {index < steps.length - 1 ? (
+                <div className="absolute left-[calc(100%-0.25rem)] top-6 hidden h-px w-[calc(100%+1rem)] bg-border/70 2xl:block">
+                  <div
+                    className={cn('h-full transition-all duration-500', isDone ? 'w-full bg-primary' : isActive ? 'w-1/2 bg-primary/65' : 'w-0 bg-transparent')}
+                  />
+                </div>
+              ) : null}
+              <div
+                className={cn(
+                  'h-full rounded-2xl border px-3 py-3 backdrop-blur-sm transition-colors',
+                  isDone
+                    ? 'border-primary/25 bg-primary/8 text-primary'
+                    : isActive
+                      ? 'border-primary/45 bg-background/75 text-foreground shadow-[0_0_0_1px_hsl(var(--primary)/0.18)]'
+                      : 'border-border/60 bg-background/55 text-muted-foreground'
+                )}
+              >
+                <div className="flex items-start gap-3">
+                  <div
+                    className={cn(
+                      'flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl border',
+                      isDone
+                        ? 'border-primary/30 bg-primary text-primary-foreground'
+                        : isActive
+                          ? 'border-primary/35 bg-primary/12 text-primary'
+                          : 'border-border/60 bg-background/85 text-muted-foreground'
+                    )}
+                  >
+                    {pipelineStepIcon(step.key)}
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <div className="text-[11px] font-semibold uppercase tracking-[0.2em] text-muted-foreground">Step {step.index}</div>
+                    <div className={cn('mt-1 text-sm font-semibold', isActive ? 'text-foreground' : isDone ? 'text-primary' : 'text-foreground/88')}>
+                      {step.label}
+                    </div>
+                    <p className="mt-1 text-xs leading-5 text-muted-foreground">{step.description}</p>
+                  </div>
+                </div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
+function WorkflowTopologyCard({
+  config,
+  libraryStatusBody,
+}: {
+  config?: ConfigResponse | null;
+  libraryStatusBody: string;
+}) {
+  const topology = resolveWorkflowTopology(config);
+  const nodes = [
+    { key: 'source', label: 'Source', path: topology.source, helper: 'What PMDA reads first', icon: <FolderInput className="h-3.5 w-3.5" />, classes: 'border-info/25 bg-info/8 text-info' },
+    { key: 'verify', label: 'Match & verify', path: 'Strict identity checks', helper: 'Tags, formats, providers, AI only when needed', icon: <Cpu className="h-3.5 w-3.5" />, classes: 'border-border/60 bg-background/65 text-foreground' },
+    { key: 'winners', label: 'Winners', path: topology.winners, helper: `${topology.exportStrategy} into the clean library target`, icon: <Package className="h-3.5 w-3.5" />, classes: 'border-primary/25 bg-primary/8 text-primary' },
+    { key: 'dupes', label: 'Dupes', path: topology.dupes, helper: 'Loser editions queued for review', icon: <Trash2 className="h-3.5 w-3.5" />, classes: 'border-warning/25 bg-warning/8 text-warning' },
+    { key: 'incomplete', label: 'Incompletes', path: topology.incompletes, helper: 'Broken or missing-track albums', icon: <AlertTriangle className="h-3.5 w-3.5" />, classes: 'border-destructive/25 bg-destructive/8 text-destructive' },
+    { key: 'library', label: 'Visible library', path: topology.library, helper: 'What Library, Artist, and Album pages show', icon: <BarChart3 className="h-3.5 w-3.5" />, classes: 'border-success/25 bg-success/8 text-success' },
+  ] as const;
+
+  return (
+    <section className="rounded-[1.5rem] border border-border/60 bg-card/95 p-4 md:p-5">
+      <div className="flex flex-col gap-1 md:flex-row md:items-end md:justify-between">
+        <div>
+          <div className="text-[11px] font-semibold uppercase tracking-[0.3em] text-info">Topology</div>
+          <h3 className="mt-2 text-xl font-black tracking-tight text-foreground">From raw intake to published library</h3>
+        </div>
+        <div className="text-xs text-muted-foreground">{libraryStatusBody}</div>
+      </div>
+      <div className="mt-5 grid gap-3 md:grid-cols-2 2xl:grid-cols-6">
+        {nodes.map((node) => (
+          <div key={node.key} className="relative min-w-0 rounded-2xl border border-border/50 bg-background/55 px-3 py-3">
+            <div className={cn('inline-flex h-9 w-9 items-center justify-center rounded-xl border', node.classes)}>
+              {node.icon}
+            </div>
+            <div className="mt-3 text-[11px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">{node.label}</div>
+            <div className="mt-1 break-all font-mono text-sm text-foreground">{compactPath(node.path, 38)}</div>
+            <p className="mt-2 text-xs leading-5 text-muted-foreground">{node.helper}</p>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
 interface ScanStatCellProps {
   icon: React.ReactNode;
   label: string;
@@ -172,9 +395,9 @@ interface ScanStatCellProps {
 
 function ScanStatCell({ icon, label, value, tone = 'neutral', description, sparkline }: ScanStatCellProps) {
   return (
-    <div className="rounded-xl border border-[hsl(var(--scan-border))] bg-[hsl(var(--scan-surface))] px-3 py-3 sm:px-4">
-      <div className="flex items-center gap-2 text-[11px] font-medium uppercase tracking-[0.16em] text-[hsl(var(--scan-text-secondary))]">
-        <span className="text-[hsl(var(--scan-text-tertiary))]">{icon}</span>
+    <div className="rounded-xl border border-border/60 bg-card/95 px-3 py-3 sm:px-4">
+      <div className="flex items-center gap-2 text-[11px] font-medium uppercase tracking-[0.16em] text-muted-foreground">
+        <span className="text-muted-foreground/80">{icon}</span>
         <span className="truncate">{label}</span>
       </div>
       <div className={cn('mt-2 text-2xl font-bold tabular-nums tracking-tight', metricValueClass(tone))}>{value}</div>
@@ -185,7 +408,7 @@ function ScanStatCell({ icon, label, value, tone = 'neutral', description, spark
           color={tone === 'throughput' ? 'hsl(var(--success))' : tone === 'time' ? 'hsl(var(--info))' : 'hsl(var(--muted-foreground))'}
         />
       ) : null}
-      {description ? <div className="mt-2 text-xs leading-5 text-[hsl(var(--scan-text-secondary))]">{description}</div> : null}
+      {description ? <div className="mt-2 text-xs leading-5 text-muted-foreground">{description}</div> : null}
     </div>
   );
 }
@@ -207,7 +430,7 @@ function SystemHealthTable({ rows }: { rows: SystemHealthRow[] }) {
     <div className="overflow-x-auto">
       <table className="min-w-[620px] w-full text-sm">
         <thead>
-          <tr className="border-b border-[hsl(var(--scan-border-subtle))] text-[11px] uppercase tracking-[0.14em] text-[hsl(var(--scan-text-tertiary))]">
+          <tr className="border-b border-border/50 text-[11px] uppercase tracking-[0.14em] text-muted-foreground">
             <th className="px-4 py-3 text-left font-semibold">Provider</th>
             <th className="px-2 py-3 text-center font-semibold">Status</th>
             <th className="px-3 py-3 text-right font-semibold">Lookups</th>
@@ -219,12 +442,12 @@ function SystemHealthTable({ rows }: { rows: SystemHealthRow[] }) {
         <tbody>
           {rows.map((row) => {
             const hitRateValue = row.hitRate != null && Number.isFinite(row.hitRate) ? Math.max(0, Math.min(100, Number(row.hitRate))) : null;
-            const hitTone = hitRateValue == null ? 'bg-[hsl(var(--scan-border))]' : hitRateValue >= 80 ? 'bg-success' : hitRateValue >= 50 ? 'bg-warning' : 'bg-destructive';
+            const hitTone = hitRateValue == null ? 'bg-border' : hitRateValue >= 80 ? 'bg-success' : hitRateValue >= 50 ? 'bg-warning' : 'bg-destructive';
             return (
-              <tr key={row.key} className="border-b border-[hsl(var(--scan-border-subtle))] text-[13px] text-[hsl(var(--scan-text-secondary))] last:border-b-0 hover:bg-[hsl(var(--scan-surface-raised))]">
+              <tr key={row.key} className="border-b border-border/50 text-[13px] text-muted-foreground last:border-b-0 hover:bg-accent/35">
                 <td className="px-4 py-3">
                   <div className="flex items-center gap-2 text-[13px] text-foreground">
-                    {row.provider ? <ProviderIcon provider={row.provider} className="text-[hsl(var(--scan-text-secondary))]" size={14} /> : row.icon}
+                    {row.provider ? <ProviderIcon provider={row.provider} className="text-muted-foreground" size={14} /> : row.icon}
                     <span>{row.label}</span>
                   </div>
                 </td>
@@ -239,18 +462,18 @@ function SystemHealthTable({ rows }: { rows: SystemHealthRow[] }) {
                 <td className="px-3 py-3 text-right tabular-nums">{row.lookups || '—'}</td>
                 <td className="px-3 py-3">
                   {hitRateValue == null ? (
-                    <span className="text-[hsl(var(--scan-text-tertiary))]">—</span>
+                    <span className="text-muted-foreground/80">—</span>
                   ) : (
                     <div className="flex items-center gap-2">
-                      <div className="h-1.5 w-14 overflow-hidden rounded-full bg-[hsl(var(--scan-border))]">
+                      <div className="h-1.5 w-14 overflow-hidden rounded-full bg-border">
                         <div className={cn('h-full rounded-full', hitTone)} style={{ width: `${hitRateValue}%` }} />
                       </div>
-                      <span className="tabular-nums text-[11px] text-[hsl(var(--scan-text-secondary))]">{hitRateValue.toFixed(0)}%</span>
+                      <span className="tabular-nums text-[11px] text-muted-foreground">{hitRateValue.toFixed(0)}%</span>
                     </div>
                   )}
                 </td>
                 <td className="px-3 py-3 text-right tabular-nums">{row.latency || '—'}</td>
-                <td className="px-3 py-3 text-[11px] text-[hsl(var(--scan-text-tertiary))]" title={row.notes}>{row.notes || '—'}</td>
+                <td className="px-3 py-3 text-[11px] text-muted-foreground/80" title={row.notes}>{row.notes || '—'}</td>
               </tr>
             );
           })}
@@ -478,6 +701,13 @@ export function ScanProgress({
     queryFn: () => getScalingRuntime(),
     refetchInterval: scanning ? 5000 : 15000,
     staleTime: 2000,
+    retry: 1,
+  });
+  const { data: workflowConfig } = useQuery<ConfigResponse | null>({
+    queryKey: ['scan-workflow-config'],
+    queryFn: () => getConfig(),
+    staleTime: 60000,
+    refetchInterval: scanning ? 30000 : false,
     retry: 1,
   });
 
@@ -990,6 +1220,97 @@ export function ScanProgress({
           : undefined,
       },
     ];
+    const completedSummary = !scanning && status !== 'running' && Boolean(last_scan_summary);
+    const compactPipelineSteps = completedSummary
+      ? presentation.pipeline.steps.map((step) => ({ ...step, state: 'done' as const }))
+      : presentation.pipeline.steps;
+    const degradedProviders = Object.entries(providerStats)
+      .filter(([, bucket]) => Number(bucket?.rate_limited_count || 0) > 0)
+      .map(([provider]) => provider);
+    const scanAlerts: ScanAlertItem[] = [];
+    if (completedSummary) {
+      scanAlerts.push({
+        key: 'completed',
+        tone: (last_scan_summary?.ai_errors?.length ?? 0) > 0 ? 'warning' : 'success',
+        title: (last_scan_summary?.ai_errors?.length ?? 0) > 0 ? 'Completed with warnings' : 'Scan completed',
+        body: `Processed ${(last_scan_summary?.albums_scanned ?? 0).toLocaleString()} albums across ${(last_scan_summary?.artists_total ?? 0).toLocaleString()} artists.`,
+        href: '/statistics',
+        hrefLabel: 'Statistics',
+      });
+    }
+    if (!scanning && scanType === 'changed_only') {
+      scanAlerts.push({
+        key: 'changed-only',
+        tone: 'info',
+        title: 'Changed-only mode',
+        body: 'PMDA will restrict the next run to changed or resumed work instead of crawling the whole source again.',
+      });
+    }
+    if (status === 'paused') {
+      scanAlerts.push({
+        key: 'paused',
+        tone: 'warning',
+        title: 'Scan paused',
+        body: 'Processing is frozen. Resume keeps the remaining work set and reloads the current provider/model configuration.',
+      });
+    }
+    const incompleteAlertCount = completedSummary
+      ? Number(last_scan_summary?.broken_albums_count || 0)
+      : presentation.incompleteAlbumsSoFar;
+    if (incompleteAlertCount > 0) {
+      scanAlerts.push({
+        key: 'incompletes',
+        tone: 'warning',
+        title: 'Incomplete albums need review',
+        body: `${incompleteAlertCount.toLocaleString()} album(s) were quarantined or flagged as incomplete.`,
+        href: '/broken-albums',
+        hrefLabel: 'Review',
+      });
+    }
+    if (actualDuplicateCount > 0) {
+      scanAlerts.push({
+        key: 'duplicates',
+        tone: 'warning',
+        title: 'Duplicate review queue active',
+        body: `${actualDuplicateCount.toLocaleString()} duplicate group(s) are waiting for operator review or restore decisions.`,
+        href: '/tools',
+        hrefLabel: 'Tools',
+      });
+    }
+    if (degradedProviders.length > 0) {
+      scanAlerts.push({
+        key: 'providers',
+        tone: 'warning',
+        title: 'Provider gateway degraded',
+        body: `${degradedProviders.join(', ')} reported rate limiting during this run. PMDA continues, but throughput and hit-rate quality may fluctuate.`,
+      });
+    }
+    if ((last_scan_summary?.ai_errors?.length ?? 0) > 0) {
+      scanAlerts.push({
+        key: 'ai-errors',
+        tone: 'error',
+        title: 'AI verification errors recorded',
+        body: `${last_scan_summary?.ai_errors?.length ?? 0} ambiguous group(s) finished with AI-side errors. Review the summary before trusting the final result.`,
+        href: '/statistics',
+        hrefLabel: 'Inspect',
+      });
+    }
+    if (background_enrichment_running) {
+      scanAlerts.push({
+        key: 'background',
+        tone: 'info',
+        title: 'Background enrichment running',
+        body: libraryStatusBody,
+      });
+    }
+    if (scanning && presentation.etaConfidence === 'low') {
+      scanAlerts.push({
+        key: 'eta',
+        tone: 'warning',
+        title: 'ETA is provisional',
+        body: 'PMDA is still in an early or unstable phase. The time estimate will settle once enough album throughput has been measured.',
+      });
+    }
 
     if (!scanning && status !== 'running') {
       if (waitingForProgress) {
@@ -1004,84 +1325,167 @@ export function ScanProgress({
         );
       }
       return (
-        <div className={cn("rounded-xl bg-card border border-border overflow-hidden", className)}>
-          <div className="p-6 space-y-5">
-            <div className="flex flex-wrap items-start justify-between gap-4">
-              <div className="space-y-1">
-                <h2 className="text-lg font-semibold text-foreground">Library scan</h2>
-                <p className="text-sm text-muted-foreground">
-                  Configure the next scan run, resume an interrupted one, or inspect the last completed summary.
-                </p>
-              </div>
-              <div className="flex flex-wrap gap-2">
-                {(
+        <div className={cn("scan-page overflow-hidden rounded-2xl border border-border/60 bg-card/95 text-foreground", className)}>
+          <div className="space-y-5 p-4 md:p-5 xl:p-6">
+            <section className="rounded-[1.75rem] border border-border/60 bg-card/95 px-5 py-5 md:px-6 md:py-6">
+              <div className="flex flex-col gap-5 xl:flex-row xl:items-start xl:justify-between">
+                <div className="max-w-3xl space-y-3">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className={cn(
+                      "inline-flex items-center gap-2 rounded-full px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.22em]",
+                      completedSummary ? "bg-success/10 text-success" : "bg-info/10 text-info"
+                    )}>
+                      <StatusDot state={completedSummary ? 'success' : 'idle'} />
+                      {completedSummary ? 'Complete' : 'Ready'}
+                    </span>
+                    <span className="inline-flex items-center rounded-full bg-background/80 px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.22em] text-muted-foreground">
+                      {completedSummary ? 'Last run summary' : `Default ${String(default_scan_type || 'full').replace('_', ' ')}`}
+                    </span>
+                    <span className="inline-flex items-center rounded-full bg-primary/10 px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.22em] text-primary">
+                      Visible library {visibleAlbums.toLocaleString()}
+                    </span>
+                  </div>
+                  <div className="space-y-2">
+                    <h2 className="text-3xl font-black tracking-tight text-foreground md:text-4xl">
+                      {completedSummary ? 'Scan completed' : 'Operator scan workspace'}
+                    </h2>
+                    <p className="max-w-2xl text-sm leading-6 text-muted-foreground md:text-base">
+                      {completedSummary
+                        ? 'The last run is settled. Review the resulting quality issues, duplicates, and publication outcome before launching the next pipeline.'
+                        : 'Launch the next PMDA scan with the real folder topology in view so the source, winners, dupes, incompletes, and visible library are never ambiguous.'}
+                    </p>
+                  </div>
+                </div>
+                <div className="flex flex-wrap gap-2">
                   <Button onClick={() => onStart({ scan_type: scanType })} disabled={isStarting} className="gap-2">
                     {isStarting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
-                    {startButtonLabel}
+                    {completedSummary ? 'Start new scan' : startButtonLabel}
                   </Button>
-                )}
-                <Link
-                  to="/statistics"
-                  className="inline-flex h-10 items-center gap-1.5 rounded-md border border-border px-3 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-                >
-                  <BarChart3 className="h-3.5 w-3.5" />
-                  Open advanced statistics
-                </Link>
+                  <Link
+                    to="/statistics"
+                    className="inline-flex h-10 items-center gap-1.5 rounded-md border border-border/70 px-3 text-xs text-muted-foreground transition-colors hover:bg-accent/60 hover:text-foreground"
+                  >
+                    <BarChart3 className="h-3.5 w-3.5" />
+                    Advanced statistics
+                  </Link>
+                  {completedSummary ? (
+                    <Link
+                      to="/library"
+                      className="inline-flex h-10 items-center gap-1.5 rounded-md border border-border/70 px-3 text-xs text-muted-foreground transition-colors hover:bg-accent/60 hover:text-foreground"
+                    >
+                      <Package className="h-3.5 w-3.5" />
+                      Open library
+                    </Link>
+                  ) : null}
+                </div>
               </div>
-            </div>
 
-            <div className={cn(
-              "rounded-md border px-3 py-2 text-xs",
-              bootstrap_required
-                ? "border-warning/40 bg-warning/10 text-warning"
-                : autonomous_mode && has_completed_full_scan
-                  ? "border-success/30 bg-success/10 text-success"
-                  : "border-border bg-muted/40 text-muted-foreground"
-            )}>
-              {bootstrap_required
-                ? "Initial full scan required before changed-only runs."
-                : autonomous_mode && has_completed_full_scan
-                  ? "Bootstrap complete. Default scan switched to changed only."
-                  : "Choose scan mode manually."}
-              <span className="ml-1 text-muted-foreground">
-                (default: {String(default_scan_type || 'full').replace('_', ' ')})
-              </span>
-            </div>
-
-            {resumableAvailable && (
-              <div className="rounded-md border border-primary/30 bg-primary/10 px-3 py-2 text-xs text-primary/90">
-                Interrupted <span className="font-medium text-foreground">{scanType === 'changed_only' ? 'changed-only' : 'full'}</span> scan available.
-                <span className="ml-1">{resumableSummary}.</span>
-                <span className="ml-1 text-muted-foreground">You can change AI settings before resuming.</span>
+              <div className="mt-4 flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
+                <span className="text-foreground font-medium">Mode:</span>
+                <div className="flex items-center gap-1">
+                  <Button
+                    variant={scanType === 'full' ? 'default' : 'outline'}
+                    size="sm"
+                    onClick={() => setScanType('full')}
+                  >
+                    Full
+                  </Button>
+                  <Button
+                    variant={scanType === 'changed_only' ? 'default' : 'outline'}
+                    size="sm"
+                    onClick={() => setScanType('changed_only')}
+                    disabled={changedOnlyBlocked}
+                  >
+                    Changed only
+                  </Button>
+                </div>
               </div>
+
+              <div className={cn(
+                "mt-4 rounded-xl border px-4 py-3 text-sm",
+                bootstrap_required
+                  ? "border-warning/35 bg-warning/10 text-warning"
+                  : autonomous_mode && has_completed_full_scan
+                    ? "border-success/30 bg-success/10 text-success"
+                    : "border-border/60 bg-background/55 text-muted-foreground"
+              )}>
+                {bootstrap_required
+                  ? "Initial full scan required before changed-only runs."
+                  : autonomous_mode && has_completed_full_scan
+                    ? "Bootstrap complete. Default scan switched to changed only."
+                    : "Choose scan mode manually."}
+                <span className="ml-1 text-muted-foreground">
+                  (default: {String(default_scan_type || 'full').replace('_', ' ')})
+                </span>
+              </div>
+
+              {resumableAvailable ? (
+                <div className="mt-3 rounded-xl border border-primary/30 bg-primary/10 px-4 py-3 text-sm text-primary/90">
+                  Interrupted <span className="font-medium text-foreground">{scanType === 'changed_only' ? 'changed-only' : 'full'}</span> scan available.
+                  <span className="ml-1">{resumableSummary}.</span>
+                  <span className="ml-1 text-muted-foreground">You can change AI settings before resuming.</span>
+                </div>
+              ) : null}
+            </section>
+
+            <CompactPipelineRail
+              steps={compactPipelineSteps}
+            />
+
+            <ScanAlertRail alerts={scanAlerts} />
+
+            <WorkflowTopologyCard config={workflowConfig} libraryStatusBody={libraryStatusBody} />
+
+            {completedSummary && last_scan_summary ? (
+              <>
+                <section className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+                  <ScanStatCell icon={<Music className="h-3.5 w-3.5" />} label="Albums processed" value={(last_scan_summary.albums_scanned ?? 0).toLocaleString()} tone="content" />
+                  <ScanStatCell icon={<FolderInput className="h-3.5 w-3.5" />} label="Artists processed" value={(last_scan_summary.artists_total ?? 0).toLocaleString()} tone="content" />
+                  <ScanStatCell icon={<Package className="h-3.5 w-3.5" />} label="Duplicates found" value={(last_scan_summary.duplicate_groups_count ?? 0).toLocaleString()} tone={(last_scan_summary.duplicate_groups_count ?? 0) > 0 ? 'issue' : 'output'} />
+                  <ScanStatCell icon={<AlertTriangle className="h-3.5 w-3.5" />} label="Incomplete" value={(last_scan_summary.broken_albums_count ?? 0).toLocaleString()} tone={(last_scan_summary.broken_albums_count ?? 0) > 0 ? 'issue' : 'neutral'} />
+                </section>
+
+                <section className="grid gap-4 xl:grid-cols-[minmax(0,1.15fr)_minmax(320px,0.85fr)]">
+                  <div className="rounded-[1.5rem] border border-border/60 bg-card/95 p-4 md:p-5">
+                    <div className="text-[11px] font-semibold uppercase tracking-[0.28em] text-info">Outcome</div>
+                    <h3 className="mt-2 text-xl font-black tracking-tight text-foreground">What the last run produced</h3>
+                    <p className="mt-2 max-w-2xl text-sm leading-6 text-muted-foreground">
+                      PMDA scanned {(last_scan_summary.albums_scanned ?? 0).toLocaleString()} albums, kept the clean winners visible in the library, isolated duplicate losers, and surfaced incomplete sets for review instead of letting them pollute the published result.
+                    </p>
+                    <div className="mt-4 grid gap-3 sm:grid-cols-2">
+                      <CompactMetricCard label="Duration" value={formatDuration(last_scan_summary.duration_seconds)} hint="Measured runtime for the completed pipeline." />
+                      <CompactMetricCard label="MusicBrainz matches" value={last_scan_summary.mb_match ? `${last_scan_summary.mb_match.matched}/${last_scan_summary.mb_match.total}` : `${last_scan_summary.albums_with_mb_id ?? 0}`} hint="Deterministic MB matching resolved during the run." />
+                      <CompactMetricCard label="AI-resolved groups" value={(last_scan_summary.ai_groups_count ?? 0).toLocaleString()} hint="Only ambiguous groups escalated to AI." />
+                      <CompactMetricCard label="Dupes moved" value={(last_scan_summary.dupes_moved_this_scan ?? 0).toLocaleString()} hint="Duplicate loser editions moved away from the clean serving root." />
+                    </div>
+                  </div>
+
+                  <div className="rounded-[1.5rem] border border-border/60 bg-card/95 p-4 md:p-5">
+                    <div className="text-[11px] font-semibold uppercase tracking-[0.28em] text-info">Next actions</div>
+                    <div className="mt-3 grid gap-3">
+                      <Link to="/library" className="rounded-xl border border-border/60 bg-background/55 px-4 py-3 text-sm font-medium text-foreground transition-colors hover:border-primary/35 hover:bg-accent/20">
+                        Open the published library
+                      </Link>
+                      <Link to="/tools" className="rounded-xl border border-border/60 bg-background/55 px-4 py-3 text-sm font-medium text-foreground transition-colors hover:border-primary/35 hover:bg-accent/20">
+                        Review duplicate moves and scan history
+                      </Link>
+                      <Link to="/broken-albums" className="rounded-xl border border-border/60 bg-background/55 px-4 py-3 text-sm font-medium text-foreground transition-colors hover:border-primary/35 hover:bg-accent/20">
+                        Review incomplete albums
+                      </Link>
+                      <Link to="/statistics" className="rounded-xl border border-border/60 bg-background/55 px-4 py-3 text-sm font-medium text-foreground transition-colors hover:border-primary/35 hover:bg-accent/20">
+                        Inspect advanced statistics
+                      </Link>
+                    </div>
+                  </div>
+                </section>
+              </>
+            ) : (
+              <section className="grid gap-3 md:grid-cols-3">
+                <CompactMetricCard label="Library status" value={libraryStatusTitle} hint={libraryStatusBody} />
+                <CompactMetricCard label="Visible albums" value={visibleAlbums.toLocaleString()} hint="Published into the live PMDA library view." />
+                <CompactMetricCard label="Visible artists" value={visibleArtists.toLocaleString()} hint="Artists currently exposed in the live library view." />
+              </section>
             )}
-
-            <div className="flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
-              <span className="text-foreground font-medium">Mode:</span>
-              <div className="flex items-center gap-1">
-                <Button
-                  variant={scanType === 'full' ? 'default' : 'outline'}
-                  size="sm"
-                  onClick={() => setScanType('full')}
-                >
-                  Full
-                </Button>
-                <Button
-                  variant={scanType === 'changed_only' ? 'default' : 'outline'}
-                  size="sm"
-                  onClick={() => setScanType('changed_only')}
-                  disabled={changedOnlyBlocked}
-                >
-                  Changed only
-                </Button>
-              </div>
-            </div>
-
-            <div className="grid gap-3 md:grid-cols-3">
-              <CompactMetricCard label="Library status" value={libraryStatusTitle} hint={libraryStatusBody} />
-              <CompactMetricCard label="Visible albums" value={visibleAlbums.toLocaleString()} hint="Published into the live PMDA library view." />
-              <CompactMetricCard label="Visible artists" value={visibleArtists.toLocaleString()} hint="Artists currently exposed in the live library view." />
-            </div>
           </div>
         </div>
       );
@@ -1194,22 +1598,25 @@ export function ScanProgress({
     ];
 
     return (
-      <div className={cn("scan-page rounded-2xl border border-[hsl(var(--scan-border))] bg-[hsl(var(--scan-bg))] text-[hsl(var(--scan-text-primary))] overflow-hidden", className)}>
+      <div className={cn("scan-page overflow-hidden rounded-2xl border border-border/60 bg-card/95 text-foreground", className)}>
         <div className="space-y-5 p-4 md:p-5 xl:p-6">
-          <section className="rounded-xl border border-[hsl(var(--scan-border))] bg-[hsl(var(--scan-surface))] px-4 py-4 md:px-5 lg:sticky lg:top-[74px] lg:z-20">
+          <section className="rounded-[1.5rem] border border-border/60 bg-card/95 px-4 py-4 shadow-none md:px-5">
             <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
               <div className="min-w-0 flex-1 space-y-2">
                 <div className="flex flex-wrap items-center gap-2">
-                  <span className="inline-flex items-center gap-2 rounded-full bg-success/10 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.08em] text-success">
+                  <span className={cn(
+                    "inline-flex items-center gap-2 rounded-full px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.16em]",
+                    status === 'paused' ? 'bg-warning/10 text-warning' : 'bg-success/10 text-success'
+                  )}>
                     <StatusDot state={status === 'paused' ? 'paused' : status === 'running' ? 'running' : 'idle'} />
                     {status}
                   </span>
-                  <span className="inline-flex items-center rounded-full bg-info/10 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.08em] text-info">
+                  <span className="inline-flex items-center rounded-full bg-info/10 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-info">
                     Step {presentation.pipeline.currentIndex}/{presentation.pipeline.total}
                   </span>
                   <span
                     className={cn(
-                      'inline-flex items-center rounded-full px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.08em]',
+                      'inline-flex items-center rounded-full px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.16em]',
                     presentation.etaConfidence === 'high'
                         ? 'bg-success/10 text-success'
                         : presentation.etaConfidence === 'medium'
@@ -1220,22 +1627,24 @@ export function ScanProgress({
                     ETA {presentation.etaConfidence}
                   </span>
                 </div>
-                <div className="min-w-0">
-                  <h2 className="truncate text-lg font-semibold leading-7 text-[hsl(var(--scan-text-primary))] md:text-xl">{presentation.currentStageLabel}</h2>
+                <div className="min-w-0 space-y-1">
+                  <div className="text-[11px] font-semibold uppercase tracking-[0.28em] text-info">The pipeline</div>
+                  <h2 className="truncate text-2xl font-black leading-tight tracking-tight text-foreground md:text-3xl">{presentation.currentStageLabel}</h2>
+                  <div className="text-xs font-medium uppercase tracking-[0.2em] text-muted-foreground">{presentation.pipelineHeadline}</div>
                   {currentArtist ? (
-                    <p className="mt-1 truncate text-sm text-[hsl(var(--scan-text-secondary))]">Artist: {currentArtist}</p>
+                    <p className="truncate text-sm text-muted-foreground">Artist focus: {currentArtist}</p>
                   ) : null}
                 </div>
               </div>
               <div className="flex flex-wrap items-center gap-2">
                 {scanning && status === 'running' ? (
-                  <Button variant="outline" onClick={onPause} disabled={isPausing} className="gap-2 border-[hsl(var(--scan-border))] bg-transparent text-[hsl(var(--scan-text-primary))] hover:bg-[hsl(var(--scan-surface-raised))]">
+                  <Button variant="outline" onClick={onPause} disabled={isPausing} className="gap-2 border-border/70 bg-transparent text-foreground hover:bg-accent/60">
                     {isPausing ? <Loader2 className="h-4 w-4 animate-spin" /> : <Pause className="h-4 w-4" />}
                     Pause
                   </Button>
                 ) : null}
                 {status === 'paused' ? (
-                  <Button onClick={onResume} disabled={isResuming} className="gap-2 bg-[hsl(var(--scan-accent))] text-[hsl(var(--scan-text-primary))] hover:bg-[hsl(var(--scan-accent))]/90">
+                  <Button onClick={onResume} disabled={isResuming} className="gap-2 bg-primary text-primary-foreground hover:bg-primary/90">
                     {isResuming ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
                     Resume
                   </Button>
@@ -1248,7 +1657,7 @@ export function ScanProgress({
                 ) : null}
                 <Link
                   to="/statistics"
-                  className="inline-flex h-10 items-center gap-1.5 rounded-md border border-[hsl(var(--scan-border))] px-3 text-xs text-[hsl(var(--scan-text-secondary))] transition-colors hover:bg-[hsl(var(--scan-surface-raised))] hover:text-[hsl(var(--scan-text-primary))]"
+                  className="inline-flex h-10 items-center gap-1.5 rounded-md border border-border/70 px-3 text-xs text-muted-foreground transition-colors hover:bg-accent/60 hover:text-foreground"
                 >
                   <BarChart3 className="h-3.5 w-3.5" />
                   Advanced statistics
@@ -1257,63 +1666,41 @@ export function ScanProgress({
             </div>
           </section>
 
-          <section className="rounded-xl border-l-[3px] border-[hsl(var(--scan-border))] border-l-[hsl(var(--scan-accent))] bg-[linear-gradient(90deg,rgba(59,130,246,0.08),rgba(59,130,246,0.03))] px-4 py-3 text-sm text-[hsl(var(--scan-text-secondary))]">
+          <ScanAlertRail alerts={scanAlerts} />
+
+          <CompactPipelineRail
+            steps={presentation.pipeline.steps}
+          />
+
+          <section className="rounded-xl border border-primary/20 bg-primary/6 px-4 py-3 text-sm text-muted-foreground">
             {presentation.humanExplanation}
           </section>
 
-          <section className="rounded-xl border border-[hsl(var(--scan-border))] bg-[hsl(var(--scan-surface))] p-4 md:p-5">
-            <div className="space-y-3">
-              <div className="flex flex-wrap items-center gap-1.5">
-                {presentation.pipeline.steps.map((step) => (
-                  <Tooltip key={step.key}>
-                    <TooltipTrigger asChild>
-                      <button
-                        type="button"
-                        className={cn(
-                          'flex h-8 min-w-8 flex-1 items-center justify-center rounded-md border text-[11px] font-semibold tabular-nums transition-colors',
-                          step.state === 'done'
-                            ? 'border-success/25 bg-success/15 text-success'
-                            : step.state === 'active'
-                              ? 'border-info/40 bg-info/15 text-foreground'
-                              : 'border-[hsl(var(--scan-border))] bg-[hsl(var(--scan-bg))] text-[hsl(var(--scan-text-tertiary))]',
-                        )}
-                      >
-                        {step.index}
-                      </button>
-                    </TooltipTrigger>
-                    <TooltipContent sideOffset={8}>{step.label}</TooltipContent>
-                  </Tooltip>
-                ))}
-              </div>
-              <div className="text-sm font-medium text-[hsl(var(--scan-text-primary))]">
-                Step {presentation.pipeline.currentIndex} — {presentation.pipeline.currentLabel}
-              </div>
-            </div>
-          </section>
+          <WorkflowTopologyCard config={workflowConfig} libraryStatusBody={libraryStatusBody} />
 
           <section className="grid gap-4 xl:grid-cols-[minmax(0,1.4fr)_minmax(320px,0.7fr)]">
-            <div className="rounded-xl border border-[hsl(var(--scan-border))] bg-[hsl(var(--scan-surface))] p-4 md:p-5">
+            <div className="rounded-xl border border-border/60 bg-card/95 p-4 md:p-5">
               <div className="space-y-4">
                 <div className="space-y-2">
                   <div className="flex items-center justify-between gap-3 text-sm">
-                    <span className="font-medium text-[hsl(var(--scan-text-primary))]">Pipeline progress</span>
-                    <span className="tabular-nums text-[hsl(var(--scan-text-secondary))]">{pipelinePercent.toFixed(1)}%</span>
+                    <span className="font-medium text-foreground">Pipeline progress</span>
+                    <span className="tabular-nums text-muted-foreground">{pipelinePercent.toFixed(1)}%</span>
                   </div>
-                  <div className="h-2 rounded-full bg-[hsl(var(--scan-border))] overflow-hidden">
-                    <div className="h-full rounded-full bg-[hsl(var(--scan-accent))] transition-all duration-700 ease-out" style={{ width: `${pipelinePercent}%` }} />
+                  <div className="h-2 overflow-hidden rounded-full bg-border">
+                    <div className="h-full rounded-full bg-primary transition-all duration-700 ease-out" style={{ width: `${pipelinePercent}%` }} />
                   </div>
-                  <div className="text-xs text-[hsl(var(--scan-text-secondary))]">{presentation.pipelineProgressLabel}</div>
+                  <div className="text-xs text-muted-foreground">{presentation.pipelineProgressLabel}</div>
                 </div>
 
                 <div className="space-y-2">
                   <div className="flex items-center justify-between gap-3 text-sm">
-                    <span className="font-medium text-[hsl(var(--scan-text-primary))]">Current stage progress</span>
-                    <span className="tabular-nums text-[hsl(var(--scan-text-secondary))]">{presentation.currentStagePercentLabel}</span>
+                    <span className="font-medium text-foreground">Current stage progress</span>
+                    <span className="tabular-nums text-muted-foreground">{presentation.currentStagePercentLabel}</span>
                   </div>
-                  <div className="h-2 rounded-full bg-[hsl(var(--scan-border))] overflow-hidden">
-                    <div className="h-full rounded-full bg-[hsl(var(--scan-accent))]/80 transition-all duration-700 ease-out" style={{ width: `${stagePercentCompact}%` }} />
+                  <div className="h-2 overflow-hidden rounded-full bg-border">
+                    <div className="h-full rounded-full bg-primary/75 transition-all duration-700 ease-out" style={{ width: `${stagePercentCompact}%` }} />
                   </div>
-                  <div className="text-xs text-[hsl(var(--scan-text-secondary))]">{presentation.stageHeroLabel}</div>
+                  <div className="text-xs text-muted-foreground">{presentation.stageHeroLabel}</div>
                 </div>
               </div>
             </div>
@@ -1344,7 +1731,7 @@ export function ScanProgress({
             </div>
           </section>
 
-          <section className="grid grid-cols-2 gap-2 rounded-xl border border-[hsl(var(--scan-border))] bg-[hsl(var(--scan-border))] p-px sm:grid-cols-3 xl:grid-cols-9">
+          <section className="grid grid-cols-2 gap-2 rounded-xl border border-border/60 bg-background/35 p-2 sm:grid-cols-3 xl:grid-cols-9">
             <ScanStatCell icon={<Music className="h-3.5 w-3.5" />} label="Albums processed" value={presentation.albumsProcessed.toLocaleString()} tone="content" />
             <ScanStatCell icon={<FolderInput className="h-3.5 w-3.5" />} label="Artists processed" value={presentation.artistsProcessed.toLocaleString()} tone="content" />
             <ScanStatCell icon={<Activity className="h-3.5 w-3.5" />} label="Active artists" value={presentation.activeArtistsCount.toLocaleString()} tone="content" />
@@ -1358,41 +1745,41 @@ export function ScanProgress({
 
           <section className="grid gap-5 xl:grid-cols-[minmax(0,1.2fr)_minmax(360px,0.95fr)]">
             <div className="space-y-4">
-              <div className="rounded-xl border border-[hsl(var(--scan-border))] bg-[hsl(var(--scan-surface))] p-4 md:p-5">
-                <div className="flex items-center gap-2 text-[11px] font-medium uppercase tracking-[0.16em] text-[hsl(var(--scan-text-secondary))]">
+              <div className="rounded-xl border border-border/60 bg-card/95 p-4 md:p-5">
+                <div className="flex items-center gap-2 text-[11px] font-medium uppercase tracking-[0.16em] text-muted-foreground">
                   {currentFocusMode === 'album' ? <Music className="h-3.5 w-3.5" /> : currentFocusMode === 'artist' ? <Activity className="h-3.5 w-3.5" /> : <Cpu className="h-3.5 w-3.5" />}
                   Current focus
                 </div>
-                <div className="mt-3 rounded-lg border border-[hsl(var(--scan-accent)/0.2)] bg-[hsl(var(--scan-accent)/0.08)] px-4 py-4">
-                  <div className="truncate text-base font-semibold text-[hsl(var(--scan-text-primary))]">{currentFocusTitle}</div>
-                  <div className="mt-1 text-sm text-[hsl(var(--scan-text-secondary))]">{currentFocusSubtitle || 'Waiting for next task…'}</div>
+                <div className="mt-3 rounded-lg border border-primary/20 bg-primary/8 px-4 py-4">
+                  <div className="truncate text-base font-semibold text-foreground">{currentFocusTitle}</div>
+                  <div className="mt-1 text-sm text-muted-foreground">{currentFocusSubtitle || 'Waiting for next task…'}</div>
                   {currentFocusDetail ? (
-                    <div className="mt-3 rounded-md border border-[hsl(var(--scan-border))] bg-[hsl(var(--scan-bg))] px-3 py-2 text-xs text-[hsl(var(--scan-text-secondary))]">
+                    <div className="mt-3 rounded-md border border-border/60 bg-background/65 px-3 py-2 text-xs text-muted-foreground">
                       {currentFocusDetail}
                     </div>
                   ) : null}
                 </div>
               </div>
 
-              <div className="rounded-xl border border-[hsl(var(--scan-border))] bg-[hsl(var(--scan-surface))] p-4 md:p-5">
+              <div className="rounded-xl border border-border/60 bg-card/95 p-4 md:p-5">
                 <div className="flex items-center justify-between gap-3">
-                  <div className="text-[11px] font-medium uppercase tracking-[0.16em] text-[hsl(var(--scan-text-secondary))]">Recent activity</div>
-                  <div className="text-[11px] text-[hsl(var(--scan-text-tertiary))]">Last {Math.min(18, recentActivity.length)} entries</div>
+                  <div className="text-[11px] font-medium uppercase tracking-[0.16em] text-muted-foreground">Recent activity</div>
+                  <div className="text-[11px] text-muted-foreground/80">Last {Math.min(18, recentActivity.length)} entries</div>
                 </div>
                 <div className="mt-3 max-h-[360px] overflow-y-auto">
                   {recentActivity.length === 0 ? (
-                    <div className="flex min-h-[120px] items-center justify-center text-sm text-[hsl(var(--scan-text-tertiary))]">No activity yet</div>
+                    <div className="flex min-h-[120px] items-center justify-center text-sm text-muted-foreground/80">No activity yet</div>
                   ) : (
                     <ul className="space-y-2">
                       {recentActivity.map((line, idx) => {
                         const type = inferActivityType(line);
                         return (
-                          <li key={`${idx}-${line.slice(0, 24)}`} className="flex items-start gap-3 rounded-md px-2 py-1.5 hover:bg-[hsl(var(--scan-surface-raised))]">
-                            <span className="min-w-[56px] pt-0.5 text-[11px] tabular-nums text-[hsl(var(--scan-text-tertiary))]">recent</span>
+                          <li key={`${idx}-${line.slice(0, 24)}`} className="flex items-start gap-3 rounded-md px-2 py-1.5 hover:bg-accent/35">
+                            <span className="min-w-[56px] pt-0.5 text-[11px] tabular-nums text-muted-foreground/80">recent</span>
                             <span className={cn('inline-flex shrink-0 rounded-full border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.08em]', activityBadgeClass(type))}>
                               {type}
                             </span>
-                            <span className="min-w-0 truncate text-[13px] text-[hsl(var(--scan-text-secondary))]" title={line}>{line}</span>
+                            <span className="min-w-0 truncate text-[13px] text-muted-foreground" title={line}>{line}</span>
                           </li>
                         );
                       })}
@@ -1402,22 +1789,22 @@ export function ScanProgress({
               </div>
 
               <Collapsible open={compactLogsOpen} onOpenChange={setCompactLogsOpen}>
-                <div className="rounded-xl border border-[hsl(var(--scan-border))] bg-[hsl(var(--scan-surface))]">
+                <div className="rounded-xl border border-border/60 bg-card/95">
                   <div className="flex items-center justify-between gap-3 px-4 py-3">
-                    <div className="text-[11px] font-medium uppercase tracking-[0.16em] text-[hsl(var(--scan-text-secondary))]">Backend logs</div>
+                    <div className="text-[11px] font-medium uppercase tracking-[0.16em] text-muted-foreground">Backend logs</div>
                     <div className="flex items-center gap-2">
                       <Button
                         type="button"
                         variant="ghost"
                         size="sm"
-                        className="h-8 px-2 text-[11px] text-[hsl(var(--scan-text-secondary))] hover:text-[hsl(var(--scan-text-primary))]"
+                        className="h-8 px-2 text-[11px] text-muted-foreground hover:text-foreground"
                         onClick={() => { window.location.href = '/api/logs/download?lines=50000'; }}
                       >
                         <Download className="mr-1 h-3.5 w-3.5" />
                         Download
                       </Button>
                       <CollapsibleTrigger asChild>
-                        <Button type="button" variant="ghost" size="icon" className="h-8 w-8 text-[hsl(var(--scan-text-secondary))] hover:text-[hsl(var(--scan-text-primary))]">
+                        <Button type="button" variant="ghost" size="icon" className="h-8 w-8 text-muted-foreground hover:text-foreground">
                           {compactLogsOpen ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
                         </Button>
                       </CollapsibleTrigger>
@@ -1439,22 +1826,22 @@ export function ScanProgress({
             </div>
 
             <div className="space-y-4">
-              <div className="rounded-xl border border-[hsl(var(--scan-border))] bg-[hsl(var(--scan-surface))]">
-                <div className="border-b border-[hsl(var(--scan-border-subtle))] px-4 py-3">
-                  <div className="text-[11px] font-medium uppercase tracking-[0.16em] text-[hsl(var(--scan-text-secondary))]">System health</div>
+              <div className="rounded-xl border border-border/60 bg-card/95">
+                <div className="border-b border-border/50 px-4 py-3">
+                  <div className="text-[11px] font-medium uppercase tracking-[0.16em] text-muted-foreground">System health</div>
                 </div>
                 <SystemHealthTable rows={systemHealthRows} />
               </div>
 
               <Collapsible open={compactPipelineOpen} onOpenChange={setCompactPipelineOpen}>
-                <div className="rounded-xl border border-[hsl(var(--scan-border))] bg-[hsl(var(--scan-surface))]">
+                <div className="rounded-xl border border-border/60 bg-card/95">
                   <div className="flex items-center justify-between gap-3 px-4 py-3">
                     <div className="flex items-center gap-2">
-                      <div className="text-sm font-medium text-[hsl(var(--scan-text-primary))]">Scan pipeline</div>
+                      <div className="text-sm font-medium text-foreground">Scan pipeline</div>
                       {pipelineTooltip ? (
                         <Tooltip>
                           <TooltipTrigger asChild>
-                            <button type="button" className="text-[hsl(var(--scan-text-tertiary))] hover:text-[hsl(var(--scan-text-primary))]">
+                            <button type="button" className="text-muted-foreground/80 hover:text-foreground">
                               <Info className="h-3.5 w-3.5" />
                             </button>
                           </TooltipTrigger>
@@ -1465,7 +1852,7 @@ export function ScanProgress({
                       ) : null}
                     </div>
                     <CollapsibleTrigger asChild>
-                      <button type="button" className="inline-flex items-center gap-2 text-sm text-[hsl(var(--scan-text-secondary))] hover:text-[hsl(var(--scan-text-primary))]">
+                      <button type="button" className="inline-flex items-center gap-2 text-sm text-muted-foreground hover:text-foreground">
                         <span>Step {presentation.pipeline.currentIndex} of {presentation.pipeline.total} active</span>
                         {compactPipelineOpen ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
                       </button>
@@ -1478,7 +1865,7 @@ export function ScanProgress({
                           key={step.key}
                           className={cn(
                             'flex items-start gap-3 rounded-lg px-3 py-3',
-                            step.state === 'active' ? 'bg-info/8' : step.state === 'done' ? 'bg-success/8' : 'bg-transparent',
+                            step.state === 'active' ? 'bg-primary/8' : step.state === 'done' ? 'bg-success/8' : 'bg-transparent',
                           )}
                         >
                           <StatusDot
@@ -1488,7 +1875,7 @@ export function ScanProgress({
                           />
                           <div className="min-w-0 flex-1">
                             <div className="flex flex-wrap items-center justify-between gap-2">
-                              <div className={cn('text-sm', step.state === 'active' ? 'font-semibold text-[hsl(var(--scan-text-primary))]' : 'font-medium text-[hsl(var(--scan-text-secondary))]')}>
+                              <div className={cn('text-sm', step.state === 'active' ? 'font-semibold text-foreground' : 'font-medium text-muted-foreground')}>
                                 {step.index}. {step.label}
                               </div>
                               <span className={cn(
@@ -1496,13 +1883,13 @@ export function ScanProgress({
                                 step.state === 'done'
                                   ? 'bg-success/10 text-success'
                                   : step.state === 'active'
-                                    ? 'bg-info/10 text-info'
-                                    : 'bg-[hsl(var(--scan-border))] text-[hsl(var(--scan-text-tertiary))]',
+                                    ? 'bg-primary/10 text-primary'
+                                    : 'bg-border text-muted-foreground',
                               )}>
                                 {step.state}
                               </span>
                             </div>
-                            <div className="mt-1 text-xs leading-5 text-[hsl(var(--scan-text-secondary))]">{step.description}</div>
+                            <div className="mt-1 text-xs leading-5 text-muted-foreground">{step.description}</div>
                           </div>
                         </div>
                       ))}

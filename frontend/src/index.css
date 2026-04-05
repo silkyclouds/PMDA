@@ -217,20 +217,14 @@
   }
 
   .scan-page {
-    --scan-bg: 220 30% 4%;
-    --scan-surface: 222 25% 9%;
-    --scan-surface-raised: 222 20% 13%;
-    --scan-border: 222 18% 16%;
-    --scan-border-subtle: 222 15% 12%;
-    --scan-accent: 217 91% 60%;
-    --scan-success: 160 84% 39%;
-    --scan-warning: 38 92% 50%;
-    --scan-error: 0 84% 60%;
-    --scan-purple: 263 85% 67%;
-    --scan-cyan: 188 95% 43%;
-    --scan-text-primary: 0 0% 100%;
-    --scan-text-secondary: 215 20% 69%;
-    --scan-text-tertiary: 215 16% 47%;
+    position: relative;
+    isolation: isolate;
+    background-image:
+      radial-gradient(circle at top right, hsl(var(--primary) / 0.08), transparent 34rem),
+      radial-gradient(circle at bottom left, hsl(var(--info) / 0.06), transparent 28rem),
+      url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='180' height='180' viewBox='0 0 180 180'%3E%3Cg fill='%23ffffff' fill-opacity='0.022'%3E%3Ccircle cx='12' cy='20' r='1'/%3E%3Ccircle cx='48' cy='84' r='1'/%3E%3Ccircle cx='92' cy='24' r='1'/%3E%3Ccircle cx='136' cy='112' r='1'/%3E%3Ccircle cx='164' cy='44' r='1'/%3E%3Ccircle cx='26' cy='146' r='1'/%3E%3Ccircle cx='84' cy='158' r='1'/%3E%3Ccircle cx='128' cy='172' r='1'/%3E%3Ccircle cx='156' cy='142' r='1'/%3E%3C/g%3E%3C/svg%3E");
+    background-repeat: no-repeat, no-repeat, repeat;
+    background-size: auto, auto, 180px 180px;
   }
 
   .pmda-page-header {

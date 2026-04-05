@@ -795,6 +795,16 @@ export default function AlbumPage() {
                       {data.year}
                     </Badge>
                   ) : null}
+                  {data.is_box_set ? (
+                    <Badge variant="outline" className={cn("text-[11px]", badgeKindClass('source'))}>
+                      Box set
+                    </Badge>
+                  ) : null}
+                  {Number(data.box_set_disc_count || 0) > 1 ? (
+                    <Badge variant="outline" className={cn("text-[11px]", badgeKindClass('count'))}>
+                      {data.box_set_disc_count} discs
+                    </Badge>
+                  ) : null}
                   <Badge variant="outline" className={cn("text-[11px]", badgeKindClass('count'))}>
                     {data.track_count} tracks
                   </Badge>
