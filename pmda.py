@@ -41,6 +41,7 @@ import ipaddress
 import tempfile
 import filecmp
 import errno
+import zlib
 from decimal import Decimal, ROUND_HALF_UP
 import sqlite3
 import subprocess
@@ -95,12 +96,30 @@ except ImportError:
 ANSI_RESET   = "\033[0m"
 ANSI_BOLD    = "\033[1m"
 ANSI_DIM     = "\033[2m"
+ANSI_BLACK   = "\033[30m"
+ANSI_WHITE   = "\033[97m"
 ANSI_GREEN   = "\033[92m"
 ANSI_YELLOW  = "\033[93m"
 ANSI_CYAN    = "\033[96m"
 ANSI_RED     = "\033[91m"
 ANSI_MAGENTA = "\033[95m"
 ANSI_BLUE    = "\033[94m"
+ANSI_BG_BLUE = "\033[104m"
+ANSI_BG_CYAN = "\033[106m"
+ANSI_BG_GREEN = "\033[102m"
+ANSI_BG_YELLOW = "\033[103m"
+ANSI_BG_RED = "\033[101m"
+ANSI_BG_MAGENTA = "\033[105m"
+ANSI_BG_WHITE = "\033[107m"
+ANSI_BG_BLACK = "\033[40m"
+
+
+def _ansi_256_fg(code: int) -> str:
+    return f"\033[38;5;{max(0, min(255, int(code)))}m"
+
+
+def _ansi_256_bg(code: int) -> str:
+    return f"\033[48;5;{max(0, min(255, int(code)))}m"
 
 def log_header(title: str) -> None:
     """Print a bold cyan header like `----- TITLE -----`."""
@@ -271,75 +290,314 @@ logging.basicConfig(
 PMDA_LOG_VERBOSE = bool(os.getenv("PMDA_LOG_VERBOSE"))
 
 
-class ColourFormatter(logging.Formatter):
-    """Add rich ANSI colours to logs so scanning the console is actually pleasant."""
+def _humanize_log_thread_name(thread_name: str) -> str:
+    raw = str(thread_name or "").strip() or "thread"
+    lowered = raw.lower()
 
-    LEVEL_COLOURS = {
-        logging.DEBUG: ANSI_CYAN,
-        logging.INFO: ANSI_GREEN,
-        logging.WARNING: ANSI_YELLOW,
-        logging.ERROR: ANSI_RED,
-        logging.CRITICAL: ANSI_RED + ANSI_BOLD,
+    def _suffix_num(label: str) -> str:
+        m = re.search(r"_(\d+)$", raw)
+        if not m:
+            return label
+        try:
+            return f"{label} {int(m.group(1)) + 1}"
+        except Exception:
+            return label
+
+    if raw == "MainThread":
+        return "startup"
+    if raw.startswith("scan-"):
+        return raw.replace("scan-", "scan:", 1)
+    if raw.startswith("pmda-ai-bounded"):
+        return _suffix_num("ai worker")
+    if raw.startswith("pmda-call-bounded"):
+        return _suffix_num("task worker")
+    if raw.startswith("pmda-provider-fallback"):
+        return _suffix_num("provider fallback")
+    if raw.startswith("pmda-files-discovery"):
+        return _suffix_num("files discovery")
+    if raw.startswith("pmda-preflight"):
+        return _suffix_num("preflight")
+    if raw == "files-index-rebuild":
+        return "index rebuild"
+    if raw == "files-watcher-manager":
+        return "watcher"
+    if "process_request_thread" in lowered:
+        return "http"
+    if raw.startswith("ThreadPoolExecutor-"):
+        return _suffix_num("worker")
+    if raw.startswith("Thread-"):
+        return "background"
+    return raw.replace("_", " ")
+
+
+_LOG_TAG_RE = re.compile(r"^\[(?P<tag>[^\]]+)\]\s*")
+_THREAD_PILL_WIDTH = 18
+_DOMAIN_PILL_WIDTH = 11
+
+
+def _pad_log_label(value: str, width: int) -> str:
+    text = str(value or "").strip()
+    if len(text) > width:
+        if width <= 1:
+            return text[:width]
+        return text[: width - 1] + "…"
+    return text.ljust(width)
+
+
+def _styled_log_pill(text: str, *, fg: str, bg: str, width: int) -> str:
+    label = _pad_log_label(text, width)
+    if os.getenv("NO_COLOR"):
+        return f"[{label}]"
+    return f"{ANSI_BOLD}{fg}{bg}[{label}]{ANSI_RESET}"
+
+
+def _log_level_badge(levelno: int) -> str:
+    if levelno >= logging.CRITICAL:
+        return _styled_log_pill("CRIT", fg=ANSI_WHITE, bg=ANSI_BG_RED, width=5)
+    if levelno >= logging.ERROR:
+        return _styled_log_pill("ERROR", fg=ANSI_WHITE, bg=ANSI_BG_RED, width=5)
+    if levelno >= logging.WARNING:
+        return _styled_log_pill("WARN", fg=ANSI_BLACK, bg=ANSI_BG_YELLOW, width=5)
+    if levelno <= logging.DEBUG:
+        return _styled_log_pill("DEBUG", fg=ANSI_BLACK, bg=ANSI_BG_CYAN, width=5)
+    return _styled_log_pill("INFO", fg=ANSI_BLACK, bg=ANSI_BG_GREEN, width=5)
+
+
+def _log_thread_pill(thread_label: str) -> str:
+    raw = str(thread_label or "").strip() or "thread"
+    worker_palette: list[tuple[str, str]] = [
+        (_ansi_256_fg(16), _ansi_256_bg(51)),
+        (_ansi_256_fg(16), _ansi_256_bg(226)),
+        (_ansi_256_fg(231), _ansi_256_bg(196)),
+        (_ansi_256_fg(231), _ansi_256_bg(27)),
+        (_ansi_256_fg(16), _ansi_256_bg(46)),
+        (_ansi_256_fg(231), _ansi_256_bg(129)),
+        (_ansi_256_fg(16), _ansi_256_bg(208)),
+        (_ansi_256_fg(231), _ansi_256_bg(161)),
+        (_ansi_256_fg(16), _ansi_256_bg(118)),
+        (_ansi_256_fg(231), _ansi_256_bg(20)),
+        (_ansi_256_fg(16), _ansi_256_bg(87)),
+        (_ansi_256_fg(231), _ansi_256_bg(166)),
+    ]
+    generic_palette: list[tuple[str, str]] = [
+        (_ansi_256_fg(16), _ansi_256_bg(45)),
+        (_ansi_256_fg(231), _ansi_256_bg(57)),
+        (_ansi_256_fg(16), _ansi_256_bg(150)),
+        (_ansi_256_fg(231), _ansi_256_bg(88)),
+        (_ansi_256_fg(16), _ansi_256_bg(220)),
+        (_ansi_256_fg(231), _ansi_256_bg(25)),
+        (_ansi_256_fg(16), _ansi_256_bg(111)),
+        (_ansi_256_fg(231), _ansi_256_bg(90)),
+    ]
+    m = re.search(r"(\d+)$", raw)
+    if raw.startswith("worker ") and m:
+        try:
+            slot = (int(m.group(1)) - 1) % len(worker_palette)
+        except Exception:
+            slot = zlib.crc32(raw.encode("utf-8", errors="ignore")) % len(worker_palette)
+        fg, bg = worker_palette[slot]
+    else:
+        if m:
+            try:
+                slot = (int(m.group(1)) - 1) % len(generic_palette)
+            except Exception:
+                slot = zlib.crc32(raw.encode("utf-8", errors="ignore")) % len(generic_palette)
+        else:
+            slot = zlib.crc32(raw.encode("utf-8", errors="ignore")) % len(generic_palette)
+        fg, bg = generic_palette[slot]
+    if raw in {"startup", "http"}:
+        fg, bg = (ANSI_BLACK, ANSI_BG_WHITE)
+    elif raw in {"scan:full", "scan:quick", "scan:interactive"}:
+        fg, bg = (ANSI_BLACK, ANSI_BG_GREEN)
+    return _styled_log_pill(raw, fg=fg, bg=bg, width=_THREAD_PILL_WIDTH)
+
+
+def _parse_log_tag_body(levelno: int, message: str) -> tuple[str, str]:
+    raw = str(message or "").strip()
+    tag = ""
+    body = raw
+    tag_match = _LOG_TAG_RE.match(raw)
+    if tag_match:
+        tag = str(tag_match.group("tag") or "").strip()
+        body = raw[tag_match.end():].strip()
+    elif raw.startswith("Processing artist:"):
+        tag = "ARTIST"
+        body = raw[len("Processing artist:"):].strip()
+    elif levelno >= logging.ERROR:
+        tag = "ERROR"
+    elif levelno >= logging.WARNING:
+        tag = "WARN"
+    else:
+        tag = "LOG"
+    return tag, body
+
+
+def _parse_album_profile_progress(body_lower: str) -> tuple[int, int] | None:
+    m = re.search(r"album_profiles=(\d+)\s*/\s*(\d+)", body_lower)
+    if not m:
+        return None
+    try:
+        return int(m.group(1)), int(m.group(2))
+    except Exception:
+        return None
+
+
+def _log_state_from_domain_body(levelno: int, domain_norm: str, body: str) -> str:
+    lowered = str(body or "").strip().lower()
+    if domain_norm == "match":
+        return "success"
+    if domain_norm == "miss":
+        return "failure"
+    if domain_norm == "soft":
+        return "partial"
+    if levelno >= logging.ERROR:
+        return "failure"
+    if levelno >= logging.WARNING:
+        return "warning"
+    if lowered.startswith("config "):
+        return "info"
+
+    if lowered.startswith("done artist='"):
+        progress = _parse_album_profile_progress(lowered)
+        profile_true = "artist_profile=true" in lowered
+        image_true = "artist_image=true" in lowered
+        profile_false = "artist_profile=false" in lowered
+        image_false = "artist_image=false" in lowered
+        if progress:
+            done_count, total_count = progress
+        else:
+            done_count, total_count = (0, 0)
+        if image_true or profile_true or (total_count > 0 and done_count > 0):
+            return "success"
+        if profile_false and image_false and (total_count == 0 or done_count == 0):
+            return "failure"
+        return "partial"
+
+    failure_phrases = (
+        "no verified candidate",
+        "could not verify",
+        "no usable ",
+        "no provider candidates survived",
+        "no matches for folder",
+        "no release-groups",
+        "failed:",
+        " failed ",
+        "exception on ",
+        "traceback",
+        "timed out after",
+        "timed out.",
+        "error=",
+        "artist_image=false artist_profile=false",
+        "image unavailable",
+        "missing cover",
+    )
+    if any(phrase in lowered for phrase in failure_phrases):
+        return "failure"
+
+    skip_phrases = (
+        "skipping ",
+        "skip ",
+        "allow soft ",
+        "fallback sources ready",
+        "deferred artist enrichment",
+        "classical context detected",
+        "reaped ",
+        "still waiting on:",
+        "suppressing further",
+    )
+    if any(phrase in lowered for phrase in skip_phrases):
+        return "skip"
+
+    progress_phrases = (
+        "start artist=",
+        "processing artist:",
+        "prefiltered ",
+        "candidate(s) from search",
+        "file(s) fingerprinted",
+        "from lookup",
+        "starting full scan",
+        "scan pipeline",
+        "building album candidates",
+        "loading profile",
+        "waiting on",
+        "trying provider",
+        "searching ",
+    )
+    if any(phrase in lowered for phrase in progress_phrases):
+        return "progress"
+
+    success_phrases = (
+        "strict matched",
+        "trusted via",
+        "verified match",
+        "profile ready",
+        "image ready",
+        "library index upserted",
+        "upserted ",
+        "completed successfully",
+        "done ",
+    )
+    if any(phrase in lowered for phrase in success_phrases):
+        return "success"
+
+    return "info"
+
+
+def _format_log_domain(domain_label: str, state: str) -> tuple[str, str]:
+    palette: dict[str, tuple[str, str]] = {
+        "success": (ANSI_BLACK, ANSI_BG_GREEN),
+        "failure": (ANSI_WHITE, ANSI_BG_RED),
+        "warning": (ANSI_BLACK, ANSI_BG_YELLOW),
+        "partial": (ANSI_WHITE, ANSI_BG_MAGENTA),
+        "progress": (ANSI_BLACK, ANSI_BG_CYAN),
+        "skip": (ANSI_BLACK, ANSI_BG_WHITE),
+        "info": (ANSI_WHITE, ANSI_BG_BLACK),
     }
+    return palette.get(state, (ANSI_WHITE, ANSI_BG_BLACK))
 
+
+def _log_state_marker(state: str) -> tuple[str, str, str]:
+    markers: dict[str, tuple[str, str, str]] = {
+        "success": ("✓", ANSI_BLACK, ANSI_BG_GREEN),
+        "failure": ("×", ANSI_WHITE, ANSI_BG_RED),
+        "warning": ("!", ANSI_BLACK, ANSI_BG_YELLOW),
+        "partial": ("≈", ANSI_WHITE, ANSI_BG_MAGENTA),
+        "progress": ("…", ANSI_BLACK, ANSI_BG_CYAN),
+        "skip": ("»", ANSI_BLACK, ANSI_BG_WHITE),
+        "info": ("·", ANSI_WHITE, ANSI_BG_BLACK),
+    }
+    return markers.get(state, ("·", ANSI_WHITE, ANSI_BG_BLACK))
+
+
+class ColourFormatter(logging.Formatter):
     def format(self, record):
-        if not os.getenv("NO_COLOR"):
-            # Colour the level name
-            colour_code = self.LEVEL_COLOURS.get(record.levelno)
-            if colour_code:
-                record.levelname = f"{colour_code}{record.levelname}{ANSI_RESET}"
+        levelname = record.levelname
+        thread_name = record.threadName
+        try:
+            message = record.getMessage()
+        except Exception:
+            message = str(record.msg)
 
-            # Colour thread names so concurrent workers are easier to follow
-            thread = record.threadName
-            try:
-                if "background_scan" in thread:
-                    thread_colour = ANSI_GREEN
-                elif "process_request_thread" in thread:
-                    thread_colour = ANSI_CYAN
-                elif "ThreadPoolExecutor" in thread:
-                    # Stable colour per executor thread
-                    palette = [ANSI_BLUE, ANSI_MAGENTA, ANSI_YELLOW, ANSI_GREEN, ANSI_CYAN]
-                    idx = abs(hash(thread)) % len(palette)
-                    thread_colour = palette[idx]
-                else:
-                    thread_colour = ANSI_DIM
-                record.threadName = f"{thread_colour}{thread}{ANSI_RESET}"
-            except Exception:
-                record.threadName = f"{ANSI_DIM}{thread}{ANSI_RESET}"
-
-            # Colour‑code domains by [TAG] prefix
-            msg = record.getMessage()
-            coloured_msg = msg
-            try:
-                if msg.startswith("[MB]"):
-                    coloured_msg = colour(msg, ANSI_CYAN)
-                elif msg.startswith("[AI]"):
-                    coloured_msg = colour(msg, ANSI_MAGENTA)
-                elif msg.startswith("[DUPES]"):
-                    coloured_msg = colour(msg, ANSI_BLUE)
-                elif msg.startswith("[LIVE]"):
-                    coloured_msg = colour(msg, ANSI_YELLOW)
-                elif msg.startswith("[PATH]"):
-                    coloured_msg = colour(msg, ANSI_GREEN)
-                elif msg.startswith("[SCAN]"):
-                    coloured_msg = colour(msg, ANSI_GREEN + ANSI_BOLD)
-                elif msg.startswith("[CFG]"):
-                    coloured_msg = colour(msg, ANSI_MAGENTA)
-                elif msg.startswith("[COV]"):
-                    coloured_msg = colour(msg, ANSI_GREEN)
-                elif msg.startswith("[ART]"):
-                    coloured_msg = colour(msg, ANSI_BLUE)
-                elif msg.startswith("[TAG]"):
-                    coloured_msg = colour(msg, ANSI_CYAN)
-                # Override the formatted message and clear args so logging
-                # does not attempt %-interpolation a second time.
-                record.msg = coloured_msg
-                record.args = ()
-            except Exception:
-                # If anything goes wrong while colourising, fall back to plain message
-                record.msg = msg
-
-        return super().format(record)
+        thread_display = _humanize_log_thread_name(record.threadName)
+        tag, body = _parse_log_tag_body(record.levelno, message)
+        state = _log_state_from_domain_body(record.levelno, tag.lower(), body)
+        try:
+            record.levelname = _log_level_badge(record.levelno)
+            record.threadName = _log_thread_pill(thread_display)
+            domain_label = tag.upper() if tag else "LOG"
+            fg, bg = _format_log_domain(domain_label, state)
+            marker, marker_fg, marker_bg = _log_state_marker(state)
+            domain_pill = _styled_log_pill(domain_label, fg=fg, bg=bg, width=_DOMAIN_PILL_WIDTH)
+            marker_pill = _styled_log_pill(marker, fg=marker_fg, bg=marker_bg, width=3)
+            if body:
+                record.msg = f"{domain_pill} {marker_pill} {body}"
+            else:
+                record.msg = f"{domain_pill} {marker_pill}"
+            record.args = ()
+            return super().format(record)
+        finally:
+            record.levelname = levelname
+            record.threadName = thread_name
 
 
 _root_logger = logging.getLogger()
