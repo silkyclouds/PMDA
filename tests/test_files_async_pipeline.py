@@ -1,4 +1,5 @@
 import unittest
+import sqlite3
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -6,6 +7,81 @@ import pmda
 
 
 class FilesAsyncPipelineTests(unittest.TestCase):
+    def test_files_source_roots_fetch_returns_rows(self):
+        with TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "state.db"
+            orig_state_db = pmda.STATE_DB_FILE
+            try:
+                pmda.STATE_DB_FILE = db_path
+                pmda.init_state_db()
+                con = sqlite3.connect(str(db_path))
+                cur = con.cursor()
+                cur.execute(
+                    """
+                    INSERT INTO files_source_roots
+                    (source_id, path, role, enabled, priority, is_winner_root, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (7, "/music/test", "library", 1, 10, 0, 1.0, 2.0),
+                )
+                con.commit()
+                con.close()
+                rows = pmda._files_source_roots_fetch(enabled_only=True)
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0]["source_id"], 7)
+                self.assertEqual(rows[0]["path"], "/music/test")
+            finally:
+                pmda.STATE_DB_FILE = orig_state_db
+
+    def test_refresh_files_album_scan_cache_from_editions_upserts_rows(self):
+        with TemporaryDirectory() as tmpdir:
+            album_dir = Path(tmpdir) / "Artist" / "Album"
+            album_dir.mkdir(parents=True, exist_ok=True)
+            audio_path = album_dir / "01 - Track.mp3"
+            audio_path.write_bytes(b"fake-mp3")
+            captured = {}
+            orig_pg = pmda._files_pg_connect
+            orig_extract = pmda.extract_tags
+            orig_upsert = pmda._upsert_files_album_scan_cache_rows
+            try:
+                pmda._files_pg_connect = lambda *args, **kwargs: None
+                pmda.extract_tags = lambda _path: {}
+                pmda._upsert_files_album_scan_cache_rows = lambda rows: captured.setdefault("rows", list(rows))
+                pmda._refresh_files_album_scan_cache_from_editions(
+                    [
+                        {
+                            "folder": str(album_dir),
+                            "artist": "Artist",
+                            "title_raw": "Album",
+                            "tracks": [{"title": "Track", "idx": 1}],
+                        }
+                    ],
+                    scan_id=99,
+                )
+                self.assertEqual(len(captured.get("rows") or []), 1)
+                self.assertEqual(captured["rows"][0]["artist_name"], "Artist")
+                self.assertEqual(captured["rows"][0]["album_title"], "Album")
+            finally:
+                pmda._files_pg_connect = orig_pg
+                pmda.extract_tags = orig_extract
+                pmda._upsert_files_album_scan_cache_rows = orig_upsert
+
+    def test_pipeline_inline_flags_keep_dedupe_and_incomplete_in_files_async_mode(self):
+        requested = {
+            "match_fix": True,
+            "dedupe": True,
+            "incomplete_move": True,
+            "export": True,
+            "player_sync": True,
+            "sync_target": "none",
+        }
+        inline = pmda._pipeline_inline_flags(requested, pipeline_async_enabled=True)
+        self.assertFalse(bool(inline.get("match_fix")))
+        self.assertTrue(bool(inline.get("dedupe")))
+        self.assertTrue(bool(inline.get("incomplete_move")))
+        self.assertFalse(bool(inline.get("export")))
+        self.assertFalse(bool(inline.get("player_sync")))
+
     def test_scheduler_enrich_batch_skips_legacy_magic_in_files_mode(self):
         orig_get_library_mode = pmda._get_library_mode
         orig_build_candidates = pmda._scheduler_build_improve_candidates

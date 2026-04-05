@@ -19614,11 +19614,6 @@ def _run_files_profile_enrichment_job(
         if not bool(skip_album_profiles):
             album_pairs = [(str(title or ""), str(norm or "")) for title, norm in albums if str(norm or "").strip()]
             if album_pairs:
-                soft_profiles_allowed = (
-                    bool(getattr(sys.modules[__name__], "USE_AI_FOR_SOFT_MATCH_PROFILES", False))
-                    if allow_soft_profiles is None
-                    else bool(allow_soft_profiles)
-                )
                 norm_match_flags: dict[str, bool] = {}
                 norm_strict_flags: dict[str, bool] = {}
                 album_state_by_norm: dict[str, dict[str, Any]] = {}
@@ -19674,8 +19669,16 @@ def _run_files_profile_enrichment_job(
                                     or str(lastfm_album_mbid or "").strip()
                                     or str(bandcamp_album_url or "").strip()
                                 )
-                                can_fetch = bool(strict_ok or (soft_profiles_allowed and has_identity_hint))
+                                can_fetch = bool(strict_ok)
                                 if not can_fetch:
+                                    if has_identity_hint:
+                                        logging.info(
+                                            "[Profile Enrich] skip soft album profile artist=%s album=%s provider=%s strict=%s",
+                                            str(artist_name or "").strip() or "Unknown Artist",
+                                            str(album_title_db or "").strip() or "Unknown Album",
+                                            str(metadata_source or "").strip() or "unknown",
+                                            bool(strict_ok),
+                                        )
                                     continue
                                 norm_match_flags[norm_key] = True
                                 if strict_ok:
@@ -20267,7 +20270,7 @@ def _run_files_profile_backfill(*, reason: str = "manual", sleep_sec: float = 0.
                     artist_norm=artist_norm,
                     albums=list(albums_by_artist_id.get(int(artist_id or 0)) or []),
                     skip_album_profiles=False,
-                    allow_soft_profiles=True,
+                    allow_soft_profiles=False,
                     fast_mode=False,
                 )
             except Exception:
@@ -32467,6 +32470,8 @@ def _strict_provider_match_100(
         "strict_reject_reason": "strict_reject",
         "strict_tracklist_score": 0.0,
         "provider_id": "",
+        "strict_artist_name": "",
+        "strict_album_title": "",
     }
     if p not in {"musicbrainz", "discogs", "bandcamp", "lastfm"}:
         out["strict_reject_reason"] = "provider_missing"
@@ -32525,6 +32530,8 @@ def _strict_provider_match_100(
     out["strict_match_provider"] = p
     out["strict_reject_reason"] = ""
     out["strict_tracklist_score"] = 1.0
+    out["strict_artist_name"] = _provider_payload_artist(p, payload)
+    out["strict_album_title"] = _provider_payload_title(p, payload)
     return out
 
 
@@ -33856,14 +33863,24 @@ def _resolve_edition_display_identity(
     verified_hint_override = bool(
         hinted_artist
         and hinted_album
-        and hint_source == "filename_pattern"
+        and hint_source in {"filename_pattern", "ai_local_context"}
         and hint_confidence >= 90
         and _edition_has_verified_provider_identity(e)
+    )
+    verified_artist = str(e.get("_verified_artist_name") or "").strip()
+    verified_album = str(e.get("_verified_album_title") or "").strip()
+    verified_provider_override = bool(
+        bool(e.get("strict_match_verified"))
+        and verified_artist
+        and verified_album
     )
     if hint_source == "ai_local_context" and not _edition_has_verified_provider_identity(e):
         hinted_artist = ""
         hinted_album = ""
-    if force_hint_override or verified_hint_override:
+    if verified_provider_override:
+        artist_resolved = verified_artist
+        album_resolved = verified_album
+    elif force_hint_override or verified_hint_override:
         logging.info(
             "[Identity] forcing filename-pattern override artist=%r -> %r album=%r -> %r reason=%s confidence=%s verified=%s",
             current_artist,
@@ -37153,6 +37170,12 @@ def scan_duplicates(
             e["strict_tracklist_score"] = float(strict_verdict.get("strict_tracklist_score") or 0.0)
             if e.get("strict_match_verified"):
                 strict_provider = str(e.get("strict_match_provider") or "").strip()
+                verified_artist_name = str(strict_verdict.get("strict_artist_name") or "").strip()
+                verified_album_title = str(strict_verdict.get("strict_album_title") or "").strip()
+                if verified_artist_name:
+                    e["_verified_artist_name"] = verified_artist_name
+                if verified_album_title:
+                    e["_verified_album_title"] = _sanitize_album_title_display(verified_album_title)
                 if strict_provider:
                     e["primary_metadata_source"] = strict_provider
                     e["metadata_source"] = strict_provider
@@ -38008,6 +38031,33 @@ def scan_duplicates(
         if len(ed_list) < 2:
             continue
         _append_group(ed_list, fuzzy=False, signal="audio_fp", evidence=[f"AUDIO_SIG:{sig[:12]}"])
+
+    # Phase 3.75: strict canonical identity grouping.
+    remaining = [e for e in editions if e.get("album_id") not in used_ids]
+    strict_identity_groups: dict[str, list[dict]] = defaultdict(list)
+    for e in remaining:
+        strict_key = _strict_album_identity_key_for_edition(
+            e,
+            default_artist=str(artist or "").strip(),
+            default_title=str(e.get("title_raw") or e.get("album_norm") or "").strip(),
+        )
+        if strict_key:
+            strict_identity_groups[strict_key].append(e)
+    for strict_key, ed_list in strict_identity_groups.items():
+        if len(ed_list) < 2:
+            continue
+        candidate_groups = _dupe_split_editions_by_similarity(
+            ed_list,
+            min_jaccard=0.82,
+            min_ratio=0.75,
+            allow_audio_fp=True,
+        )
+        if not candidate_groups and _group_has_exact_provider_trackcount_signal(ed_list):
+            candidate_groups = [ed_list]
+        for candidate in candidate_groups:
+            if len(candidate) < 2:
+                continue
+            _append_group(candidate, fuzzy=False, signal="strict_identity", evidence=[f"STRICT_IDENTITY:{strict_key}"])
 
     # Phase 1/3: loose title grouping + similarity-based splitting.
     remaining = [e for e in editions if e.get("album_id") not in used_ids]
@@ -39684,8 +39734,9 @@ def _remove_dedupe_group_from_db(artist: str, best_album_id: int, loser_album_id
         con = sqlite3.connect(str(STATE_DB_FILE))
         cur = con.cursor()
         cur.execute("DELETE FROM duplicates_best WHERE artist = ? AND album_id = ?", (artist, best_album_id))
-        for aid in loser_album_ids:
-            cur.execute("DELETE FROM duplicates_loser WHERE artist = ? AND album_id = ?", (artist, aid))
+        # duplicates_loser.album_id is the winner/group key; loser_album_id stores the real loser edition id.
+        # Remove the whole loser set for this winner group in one shot.
+        cur.execute("DELETE FROM duplicates_loser WHERE artist = ? AND album_id = ?", (artist, best_album_id))
         con.commit()
         con.close()
     except Exception as e:
@@ -42137,6 +42188,7 @@ def _authoritative_primary_tags_for_publication(
     discogs_release_id: str,
     lastfm_album_mbid: str,
     bandcamp_album_url: str,
+    strict_match_verified: bool = False,
     cover_provider: str = "",
 ) -> dict:
     out = dict(tags or {})
@@ -42163,8 +42215,12 @@ def _authoritative_primary_tags_for_publication(
     provider_txt = _normalize_identity_provider(str(metadata_source or ""))
     if provider_txt:
         out["primary_metadata_source"] = provider_txt
-        out[PMDA_MATCH_PROVIDER_TAG] = provider_txt
-        out["pmda_matched"] = "true"
+        if bool(strict_match_verified):
+            out[PMDA_MATCH_PROVIDER_TAG] = provider_txt
+            out["pmda_matched"] = "true"
+        else:
+            out.pop(PMDA_MATCH_PROVIDER_TAG, None)
+            out.pop("pmda_matched", None)
     if musicbrainz_release_group_id:
         out["musicbrainz_releasegroupid"] = musicbrainz_release_group_id
         out["musicbrainz_release_group_id"] = musicbrainz_release_group_id
@@ -42260,6 +42316,8 @@ def _authoritative_publication_cover(
 ) -> tuple[str, bool, str]:
     local_cover = _first_cover_path(folder)
     local_cover_ok = bool(local_cover and local_cover.is_file())
+    if not bool(strict_match_verified):
+        return (str(local_cover) if local_cover_ok else "", bool(local_cover_ok), "local" if local_cover_ok else "")
     trusted_identity = _has_trusted_album_identity(
         musicbrainz_id=musicbrainz_release_group_id or musicbrainz_release_id,
         discogs_release_id=discogs_release_id,
@@ -42440,6 +42498,185 @@ def _filter_existing_files_album_items(
     return filtered, skipped
 
 
+def _normalize_bandcamp_album_ref(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urlparse(raw)
+        path = re.sub(r"/+", "/", str(parsed.path or "/")).rstrip("/")
+        return urlunparse((parsed.scheme.lower(), parsed.netloc.lower(), path, "", "", ""))
+    except Exception:
+        return raw.rstrip("/").lower()
+
+
+def _strict_album_identity_key(
+    *,
+    artist_name: str,
+    album_title: str,
+    strict_match_verified: bool,
+    musicbrainz_release_group_id: str = "",
+    musicbrainz_release_id: str = "",
+    discogs_release_id: str = "",
+    lastfm_album_mbid: str = "",
+    bandcamp_album_url: str = "",
+) -> str:
+    if not bool(strict_match_verified):
+        return ""
+    artist_norm = _norm_artist_key(str(artist_name or "").strip())
+    title_norm = norm_album_for_dedup(str(album_title or "").strip(), normalize_parenthetical=True)
+    # Publication and duplicate resolution need one canonical "same album" key even when
+    # strict matches were proven through different providers. If we prioritize provider ids
+    # first, the same album can survive multiple times in browse just because one edition
+    # strict-matched via Discogs and another via Last.fm. Canonical artist/title must win.
+    if artist_norm and title_norm:
+        return f"strict-title:{artist_norm}:{title_norm}"
+    if str(musicbrainz_release_group_id or "").strip():
+        return f"mb-rg:{str(musicbrainz_release_group_id or '').strip()}"
+    if str(musicbrainz_release_id or "").strip():
+        return f"mb-rel:{str(musicbrainz_release_id or '').strip()}"
+    if str(discogs_release_id or "").strip():
+        return f"discogs:{str(discogs_release_id or '').strip()}"
+    if str(lastfm_album_mbid or "").strip():
+        return f"lastfm:{str(lastfm_album_mbid or '').strip()}"
+    bandcamp_ref = _normalize_bandcamp_album_ref(str(bandcamp_album_url or ""))
+    if bandcamp_ref:
+        return f"bandcamp:{bandcamp_ref}"
+    return ""
+
+
+def _strict_album_identity_key_for_edition(
+    edition: dict | None,
+    *,
+    default_artist: str = "",
+    default_title: str = "",
+) -> str:
+    e = edition if isinstance(edition, dict) else {}
+    folder_name = ""
+    try:
+        folder_name = Path(str(e.get("folder") or "")).name
+    except Exception:
+        folder_name = ""
+    artist_name, album_title = _resolve_edition_display_identity(
+        e,
+        default_artist=str(default_artist or "").strip(),
+        default_title=str(default_title or "").strip(),
+        folder_name=folder_name,
+    )
+    return _strict_album_identity_key(
+        artist_name=artist_name,
+        album_title=album_title,
+        strict_match_verified=bool(e.get("strict_match_verified")),
+        musicbrainz_release_group_id=_dupe_get_mb_release_group_id(e),
+        musicbrainz_release_id=_dupe_get_mb_release_id(e),
+        discogs_release_id=_dupe_get_discogs_id(e),
+        lastfm_album_mbid=_dupe_get_lastfm_mbid(e),
+        bandcamp_album_url=_dupe_get_bandcamp_url(e),
+    )
+
+
+def _files_publication_candidate_score(candidate: dict) -> tuple:
+    item = candidate.get("item") if isinstance(candidate.get("item"), dict) else {}
+    row = candidate.get("row") if isinstance(candidate.get("row"), dict) else {}
+    folder_name = ""
+    try:
+        folder_name = Path(str(row.get("folder_path") or item.get("folder") or "")).name.lower()
+    except Exception:
+        folder_name = str(row.get("folder_path") or item.get("folder") or "").lower()
+    noisy_tokens = ("no tags", "no cover", "gaps", "incomplete", "broken", "[dupe]", " dupe", "(dupe)")
+    variant_clean = 1 if not any(tok in folder_name for tok in noisy_tokens) else 0
+    missing_required = list(item.get("pre_missing_required_tags") or [])
+    format_value = str(row.get("format") or "").strip().lower()
+    return (
+        1 if bool(row.get("strict_match_verified")) else 0,
+        1 if bool(row.get("has_cover")) else 0,
+        1 if bool(item.get("pre_has_cover")) else 0,
+        1 if bool(item.get("pre_has_artist_image")) else 0,
+        variant_clean,
+        -int(len(missing_required)),
+        int(score_format(format_value) or 0),
+        int(item.get("bd") or 0),
+        int(item.get("sr") or 0),
+        int(item.get("br") or 0),
+        float(row.get("strict_tracklist_score") or 0.0),
+        int(row.get("track_count") or 0),
+        int(row.get("total_duration_sec") or 0),
+        -len(str(row.get("folder_path") or "")),
+    )
+
+
+def _collapse_files_publication_candidates(
+    artist_name: str,
+    candidates: list[dict],
+) -> tuple[list[dict], set[str]]:
+    if not candidates:
+        return [], set()
+    grouped: dict[str, list[dict]] = defaultdict(list)
+    passthrough: list[dict] = []
+    hidden_folder_paths: set[str] = set()
+    for candidate in candidates:
+        row = candidate.get("row") if isinstance(candidate.get("row"), dict) else {}
+        key = _strict_album_identity_key(
+            artist_name=str(row.get("artist_name") or ""),
+            album_title=str(row.get("album_title") or ""),
+            strict_match_verified=bool(row.get("strict_match_verified")),
+            musicbrainz_release_group_id=str(row.get("musicbrainz_release_group_id") or ""),
+            musicbrainz_release_id=str(row.get("musicbrainz_release_id") or ""),
+            discogs_release_id=str(row.get("discogs_release_id") or ""),
+            lastfm_album_mbid=str(row.get("lastfm_album_mbid") or ""),
+            bandcamp_album_url=str(row.get("bandcamp_album_url") or ""),
+        )
+        if key:
+            grouped[key].append(candidate)
+        else:
+            passthrough.append(candidate)
+    out_candidates: list[dict] = list(passthrough)
+    for key, group in grouped.items():
+        if len(group) == 1:
+            out_candidates.append(group[0])
+            continue
+        winner = max(group, key=_files_publication_candidate_score)
+        out_candidates.append(winner)
+        loser_paths = sorted(
+            {
+                str((cand.get("row") or {}).get("folder_path") or "").strip()
+                for cand in group
+                if cand is not winner and str((cand.get("row") or {}).get("folder_path") or "").strip()
+            }
+        )
+        hidden_folder_paths.update(loser_paths)
+        logging.info(
+            "[Scan Pipeline] publication collapse artist=%s key=%s winner=%s losers=%s",
+            artist_name,
+            key,
+            str((winner.get("row") or {}).get("folder_path") or "").strip(),
+            loser_paths,
+        )
+    rows = [dict(candidate.get("row") or {}) for candidate in out_candidates if isinstance(candidate.get("row"), dict)]
+    return rows, hidden_folder_paths
+
+
+def _delete_files_library_published_rows(folder_paths: list[str] | set[str] | tuple[str, ...]) -> int:
+    paths = sorted({str(value or "").strip() for value in (folder_paths or []) if str(value or "").strip()})
+    if not paths:
+        return 0
+    try:
+        con = sqlite3.connect(str(STATE_DB_FILE), timeout=30)
+        cur = con.cursor()
+        placeholders = ",".join(["?"] * len(paths))
+        cur.execute(
+            f"DELETE FROM files_library_published_albums WHERE folder_path IN ({placeholders})",
+            paths,
+        )
+        deleted = int(cur.rowcount or 0)
+        con.commit()
+        con.close()
+        return deleted
+    except Exception:
+        logging.debug("Failed to delete stale files_library_published_albums rows", exc_info=True)
+        return 0
+
+
 def _publish_files_library_artist_from_items(
     artist_name: str,
     items: list[dict],
@@ -42453,7 +42690,7 @@ def _publish_files_library_artist_from_items(
     """
     if not items:
         return 0
-    rows: list[dict] = []
+    candidates: list[dict] = []
     now = time.time()
     results_by_album_id = results_by_album_id or {}
     pg_conn = None
@@ -42687,11 +42924,11 @@ def _publish_files_library_artist_from_items(
                     discogs_release_id=discogs_release_id,
                     lastfm_album_mbid=lastfm_album_mbid,
                     bandcamp_album_url=bandcamp_album_url,
+                    strict_match_verified=bool(strict_match_verified),
                     cover_provider=cover_provider,
                 )
                 source_id = int(_source_id_for_path(folder) or 0)
-                rows.append(
-                    {
+                row_payload = {
                         "folder_path": _album_folder_cache_key(folder),
                         "scan_id": scan_id,
                         "source_id": source_id if source_id > 0 else None,
@@ -42733,7 +42970,7 @@ def _publish_files_library_artist_from_items(
                         "fingerprint": (item.get("fingerprint") or "").strip(),
                         "updated_at": now,
                     }
-                )
+                candidates.append({"item": dict(item or {}), "row": row_payload})
             except Exception as e:
                 logging.warning(
                     "Files publication skipped album artist=%s album=%s folder=%s: %s",
@@ -42750,6 +42987,9 @@ def _publish_files_library_artist_from_items(
                 pg_conn.close()
         except Exception:
             pass
+    rows, hidden_folder_paths = _collapse_files_publication_candidates(artist_name, candidates)
+    if hidden_folder_paths:
+        _delete_files_library_published_rows(hidden_folder_paths)
     _apply_genre_defaults_to_albums_payload(rows)
     inserted = _upsert_files_library_published_rows(rows)
     if inserted:
@@ -46010,6 +46250,25 @@ def _pipeline_flags_for_scan(scan_type: str, run_improve_after_requested: bool) 
     }
 
 
+def _pipeline_inline_flags(
+    pipeline_flags_requested: dict[str, bool | str] | None,
+    *,
+    pipeline_async_enabled: bool,
+) -> dict[str, bool | str]:
+    flags = dict(pipeline_flags_requested or {})
+    if pipeline_async_enabled:
+        # Files scans must still finish the "truth" part of the pipeline inline:
+        #   - broken/incomplete quarantine
+        #   - dedupe moves
+        # Only enrichment/export/player sync are deferred.
+        flags.update(
+            match_fix=False,
+            export=False,
+            player_sync=False,
+        )
+    return flags
+
+
 def _auto_move_incomplete_albums_for_scan(
     scan_id: int | None,
     editions_by_artist: dict[str, list[dict]] | None,
@@ -46585,15 +46844,10 @@ def background_scan():
         scan_type = "full"
     pipeline_flags_requested = _pipeline_flags_for_scan(scan_type, run_improve_after_requested)
     pipeline_async_enabled = bool(PIPELINE_POST_SCAN_ASYNC and scan_type in {"full", "changed_only"})
-    pipeline_flags = dict(pipeline_flags_requested)
-    if pipeline_async_enabled:
-        pipeline_flags.update(
-            match_fix=False,
-            dedupe=False,
-            incomplete_move=False,
-            export=False,
-            player_sync=False,
-        )
+    pipeline_flags = _pipeline_inline_flags(
+        pipeline_flags_requested,
+        pipeline_async_enabled=bool(pipeline_async_enabled),
+    )
     scan_task_job_type = "scan_changed" if scan_type == "changed_only" else "scan_full"
     scan_task_scope = "new" if scan_type == "changed_only" else "full"
     scan_task_source = scan_auto_trigger
@@ -46980,15 +47234,10 @@ def background_scan():
         # Reload AUTO_MOVE_DUPES from DB so scan uses current setting (UI may have toggled it)
         _reload_auto_move_from_db()
         pipeline_flags_requested = _pipeline_flags_for_scan(scan_type, run_improve_after_requested)
-        pipeline_flags = dict(pipeline_flags_requested)
-        if pipeline_async_enabled:
-            pipeline_flags.update(
-                match_fix=False,
-                dedupe=False,
-                incomplete_move=False,
-                export=False,
-                player_sync=False,
-            )
+        pipeline_flags = _pipeline_inline_flags(
+            pipeline_flags_requested,
+            pipeline_async_enabled=bool(pipeline_async_enabled),
+        )
         # Files changed-only scans can legitimately produce 0 albums to process (e.g. watcher noise,
         # or a folder that is unchanged+healthy and gets fast-skipped). In that case, skip expensive
         # pipeline steps (export rebuild, player sync, etc.) so the auto background scan stays fast.
@@ -67709,7 +67958,10 @@ def api_library_artist_detail(artist_id):
                 }
             cur.execute("SELECT album_id FROM duplicates_best WHERE artist = ?", (artist_name,))
             dup_album_ids_from_scan.update(r[0] for r in cur.fetchall())
-            cur.execute("SELECT album_id FROM duplicates_loser WHERE artist = ?", (artist_name,))
+            cur.execute("PRAGMA table_info(duplicates_loser)")
+            loser_cols = {str(r[1] or "").strip() for r in cur.fetchall() if len(r) > 1}
+            loser_id_col = "loser_album_id" if "loser_album_id" in loser_cols else "album_id"
+            cur.execute(f"SELECT {loser_id_col} FROM duplicates_loser WHERE artist = ?", (artist_name,))
             dup_album_ids_from_scan.update(r[0] for r in cur.fetchall())
         except Exception as e:
             logging.debug("scan_editions query for Library artist failed: %s", e)
@@ -69667,10 +69919,7 @@ def api_library_album_detail(album_id: int):
                 or str(lastfm_album_mbid or "").strip()
                 or str(bandcamp_album_url or "").strip()
             )
-            allow_profile_for_album = bool(
-                bool(strict_match_verified)
-                or (bool(getattr(sys.modules[__name__], "USE_AI_FOR_SOFT_MATCH_PROFILES", False)) and has_identity_hint)
-            )
+            allow_profile_for_album = bool(strict_match_verified)
             prof = {}
             if allow_profile_for_album and artist_norm and title_norm:
                 try:
@@ -79024,7 +79273,7 @@ def _run_scan_profile_enrichment_inline(best_albums_list: list[dict], *, reason:
                     artist_norm=artist_norm,
                     albums=albums,
                     skip_album_profiles=False,
-                    allow_soft_profiles=True,
+                    allow_soft_profiles=False,
                     fast_mode=True,
                 )
                 artists_done += 1
@@ -79068,9 +79317,22 @@ def _scan_collect_profile_enrich_targets(scan_id: int | None) -> list[dict]:
     if sid <= 0:
         return []
     rows: list[dict] = []
+    duplicate_loser_album_ids: set[int] = set()
     try:
         con = sqlite3.connect(str(STATE_DB_FILE))
         cur = con.cursor()
+        try:
+            cur.execute("PRAGMA table_info(duplicates_loser)")
+            loser_cols = {str(r[1] or "").strip() for r in cur.fetchall() if len(r) > 1}
+            loser_id_col = "loser_album_id" if "loser_album_id" in loser_cols else "album_id"
+            cur.execute(f"SELECT COALESCE({loser_id_col}, 0) FROM duplicates_loser")
+            duplicate_loser_album_ids = {
+                int(_parse_int_loose(r[0], 0) or 0)
+                for r in cur.fetchall()
+                if int(_parse_int_loose(r[0], 0) or 0) > 0
+            }
+        except Exception:
+            duplicate_loser_album_ids = set()
         cur.execute(
             """
             SELECT artist, album_id, title_raw, folder,
@@ -79117,6 +79379,9 @@ def _scan_collect_profile_enrich_targets(scan_id: int | None) -> list[dict]:
             missing_indices,
         ) in cur.fetchall():
             artist_name = str(artist or "").strip()
+            parsed_album_id = int(_parse_int_loose(album_id, 0) or 0)
+            if parsed_album_id > 0 and parsed_album_id in duplicate_loser_album_ids:
+                continue
             album_title = str(title_raw or "").strip()
             if not artist_name or not album_title:
                 continue
@@ -79127,7 +79392,7 @@ def _scan_collect_profile_enrich_targets(scan_id: int | None) -> list[dict]:
             rows.append(
                 {
                     "artist": artist_name,
-                    "album_id": int(_parse_int_loose(album_id, 0) or 0),
+                    "album_id": parsed_album_id,
                     "album_title": album_title,
                     "title_raw": album_title,
                     "folder": str(folder or "").strip(),
