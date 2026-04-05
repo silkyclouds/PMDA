@@ -8,7 +8,6 @@ import { SchedulerSettings } from '@/components/settings/SchedulerSettings';
 import { SourcesAutonomySettings } from '@/components/settings/SourcesAutonomySettings';
 import { LibraryWorkflowSettings } from '@/components/settings/LibraryWorkflowSettings';
 import { OnboardingWizard } from '@/components/settings/OnboardingWizard';
-import { GuidedOnboardingDialog } from '@/components/settings/GuidedOnboardingDialog';
 import { SettingsControlPlane } from '@/components/settings/SettingsControlPlane';
 import { ScalingSettings } from '@/components/settings/ScalingSettings';
 import { ProviderBadge } from '@/components/providers/ProviderBadge';
@@ -410,7 +409,6 @@ function SettingsPage() {
   const [ollamaConnectionMessage, setOllamaConnectionMessage] = useState<string | null>(null);
   const [rebuildIndexLoading, setRebuildIndexLoading] = useState(false);
   const [advancedFoldersOpen, setAdvancedFoldersOpen] = useState(false);
-  const [showGuidedOnboarding, setShowGuidedOnboarding] = useState(false);
   const [schedulerAdvancedOpen, setSchedulerAdvancedOpen] = useState(false);
   const [providersChecking, setProvidersChecking] = useState(false);
   const [providersPreflight, setProvidersPreflight] = useState<api.ScanPreflightResult | null>(null);
@@ -462,6 +460,10 @@ function SettingsPage() {
       return false;
     }
   };
+
+  const openGuidedOnboarding = useCallback(() => {
+    window.dispatchEvent(new CustomEvent('pmda:open-guided-onboarding'));
+  }, []);
 
   const refreshProviderStatus = useCallback(async () => {
     setProvidersChecking(true);
@@ -1178,7 +1180,7 @@ function SettingsPage() {
             providersChecking={providersChecking}
             providersPreflightAt={providersPreflightAt}
             onRefreshProviders={() => void refreshProviderStatus()}
-            onOpenGuidedSetup={() => setShowGuidedOnboarding(true)}
+            onOpenGuidedSetup={openGuidedOnboarding}
             onOpenSection={openSettingsSection}
             updateConfig={updateConfig}
           />
@@ -1235,9 +1237,8 @@ function SettingsPage() {
               config={config}
               updateConfig={updateConfig}
               configured={configConfigured}
-              onOpenGuidedSetup={() => setShowGuidedOnboarding(true)}
+              onOpenGuidedSetup={openGuidedOnboarding}
             />
-            <GuidedOnboardingDialog open={showGuidedOnboarding} onOpenChange={setShowGuidedOnboarding} />
             <LibraryWorkflowSettings
               config={config}
               updateConfig={updateConfig}

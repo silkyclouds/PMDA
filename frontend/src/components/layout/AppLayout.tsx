@@ -8,11 +8,13 @@ import { AppSidebar } from '@/components/layout/AppSidebar';
 import { SocialNotificationsBridge } from '@/components/social/SocialNotificationsBridge';
 import { UiBuildWatcher } from '@/components/UiBuildWatcher';
 import { WelcomeModal } from '@/components/WelcomeModal';
+import { GuidedOnboardingDialog } from '@/components/settings/GuidedOnboardingDialog';
 import { Progress } from '@/components/ui/progress';
 import * as api from '@/lib/api';
 import { useAuth } from '@/contexts/AuthContext';
 
 const WELCOME_COOKIE = 'pmda_welcome_dismissed';
+const GUIDED_ONBOARDING_STORAGE_KEY = 'pmda_guided_onboarding_open';
 
 function hasWelcomeCookie(): boolean {
   try {
@@ -25,6 +27,26 @@ function hasWelcomeCookie(): boolean {
 function setWelcomeCookie(): void {
   try {
     document.cookie = `${WELCOME_COOKIE}=1; Max-Age=31536000; Path=/; SameSite=Lax`;
+  } catch {
+    // ignore
+  }
+}
+
+function hasGuidedOnboardingFlag(): boolean {
+  try {
+    return window.localStorage.getItem(GUIDED_ONBOARDING_STORAGE_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
+function setGuidedOnboardingFlag(open: boolean): void {
+  try {
+    if (open) {
+      window.localStorage.setItem(GUIDED_ONBOARDING_STORAGE_KEY, '1');
+    } else {
+      window.localStorage.removeItem(GUIDED_ONBOARDING_STORAGE_KEY);
+    }
   } catch {
     // ignore
   }
@@ -68,6 +90,7 @@ export function AppLayout() {
   const { isAdmin } = useAuth();
 
   const [showSettings, setShowSettings] = useState(false);
+  const [showGuidedOnboarding, setShowGuidedOnboarding] = useState(false);
   const [welcomeMode, setWelcomeMode] = useState<'welcome' | 'bootstrap'>('welcome');
   const [isRebooting, setIsRebooting] = useState(false);
   const [rebootCountdown, setRebootCountdown] = useState(30);
@@ -77,8 +100,10 @@ export function AppLayout() {
   useEffect(() => {
     if (!isAdmin) {
       setShowSettings(false);
+      setShowGuidedOnboarding(false);
       setWelcomeMode('welcome');
       setConfig(null);
+      setGuidedOnboardingFlag(false);
       return;
     }
     Promise.all([api.getConfig(), api.getScanProgress()])
@@ -97,6 +122,24 @@ export function AppLayout() {
         }
       })
       .catch(() => {});
+  }, [isAdmin]);
+
+  useEffect(() => {
+    if (!isAdmin) return;
+    setShowGuidedOnboarding(hasGuidedOnboardingFlag());
+  }, [isAdmin]);
+
+  useEffect(() => {
+    if (!isAdmin) return;
+    const handleOpenGuidedOnboarding = () => {
+      setShowSettings(false);
+      setShowGuidedOnboarding(true);
+      setGuidedOnboardingFlag(true);
+    };
+    window.addEventListener('pmda:open-guided-onboarding', handleOpenGuidedOnboarding);
+    return () => {
+      window.removeEventListener('pmda:open-guided-onboarding', handleOpenGuidedOnboarding);
+    };
   }, [isAdmin]);
 
   return (
@@ -122,6 +165,20 @@ export function AppLayout() {
           }}
           config={config}
           mode={welcomeMode}
+          onOpenGuidedOnboarding={() => {
+            setShowGuidedOnboarding(true);
+            setGuidedOnboardingFlag(true);
+          }}
+        />
+      )}
+
+      {isAdmin && (
+        <GuidedOnboardingDialog
+          open={showGuidedOnboarding}
+          onOpenChange={(open) => {
+            setShowGuidedOnboarding(open);
+            setGuidedOnboardingFlag(open);
+          }}
         />
       )}
 

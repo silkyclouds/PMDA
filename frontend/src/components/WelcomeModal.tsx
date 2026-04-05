@@ -1,10 +1,8 @@
-import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
 import { Play, Settings, X, CheckCircle2, XCircle } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Logo } from '@/components/Logo';
-import { GuidedOnboardingDialog } from '@/components/settings/GuidedOnboardingDialog';
 import { cn } from '@/lib/utils';
 import { getScanProgress, type ConfigResponse } from '@/lib/api';
 
@@ -12,11 +10,11 @@ interface WelcomeModalProps {
   onClose: () => void;
   config?: ConfigResponse | null;
   mode?: 'welcome' | 'bootstrap';
+  onOpenGuidedOnboarding?: () => void;
 }
 
-export function WelcomeModal({ onClose, config, mode = 'welcome' }: WelcomeModalProps) {
+export function WelcomeModal({ onClose, config, mode = 'welcome', onOpenGuidedOnboarding }: WelcomeModalProps) {
   const navigate = useNavigate();
-  const [showOnboarding, setShowOnboarding] = useState(false);
   const mounts = config?.container_mounts;
   const hasConfiguredRoots = Boolean(String(config?.FILES_ROOTS || '').trim());
   const isBootstrapMode = mode === 'bootstrap' || hasConfiguredRoots;
@@ -47,20 +45,13 @@ export function WelcomeModal({ onClose, config, mode = 'welcome' }: WelcomeModal
     return null;
   }
 
-  if (showOnboarding) {
-    return (
-      <GuidedOnboardingDialog
-        open={showOnboarding}
-        onOpenChange={(open) => {
-          setShowOnboarding(open);
-          if (!open) onClose();
-        }}
-      />
-    );
-  }
-
   const goToScan = () => {
     navigate('/scan');
+    onClose();
+  };
+
+  const openGuidedOnboarding = () => {
+    onOpenGuidedOnboarding?.();
     onClose();
   };
 
@@ -154,7 +145,7 @@ export function WelcomeModal({ onClose, config, mode = 'welcome' }: WelcomeModal
           )}
 
           <div className="flex flex-col gap-2 sm:flex-row">
-            <Button onClick={() => setShowOnboarding(true)} className="flex-1 gap-2">
+            <Button onClick={openGuidedOnboarding} className="flex-1 gap-2">
               <Settings className="w-4 h-4" />
               Open guided onboarding
             </Button>
