@@ -57720,6 +57720,20 @@ def api_config_get():
             pass
     
     files_roots_effective = _parse_files_roots(get_setting("FILES_ROOTS", ",".join(FILES_ROOTS) if isinstance(FILES_ROOTS, list) else (FILES_ROOTS or "")))
+    workflow_mode_eff = str(get_setting("LIBRARY_WORKFLOW_MODE", "managed") or "managed").strip().lower()
+    if workflow_mode_eff not in {"managed", "mirror", "inplace", "custom"}:
+        workflow_mode_eff = "managed"
+    intake_roots_eff = _parse_files_roots(
+        get_setting("LIBRARY_INTAKE_ROOTS", ",".join(files_roots_effective) if workflow_mode_eff == "managed" else "")
+    )
+    source_roots_eff = _parse_files_roots(
+        get_setting("LIBRARY_SOURCE_ROOTS", ",".join(files_roots_effective) if workflow_mode_eff in {"mirror", "inplace", "custom"} else "")
+    )
+    serving_root_eff = str(get_setting("LIBRARY_SERVING_ROOT", get_setting("EXPORT_ROOT", EXPORT_ROOT)) or "").strip()
+    dupes_root_eff = str(get_setting("LIBRARY_DUPES_ROOT", get_setting("DUPE_ROOT", str(DUPE_ROOT))) or "").strip() or "/dupes"
+    incomplete_root_eff = str(
+        get_setting("LIBRARY_INCOMPLETE_ROOT", get_setting("INCOMPLETE_ALBUMS_TARGET_DIR", "/dupes/incomplete_albums")) or ""
+    ).strip() or "/dupes/incomplete_albums"
     configured = has_settings or bool(files_roots_effective)
 
     def _is_set(val) -> bool:
@@ -57973,8 +57987,27 @@ def api_config_get():
         "INCOMPLETE_ALBUMS_TARGET_DIR": get_setting("INCOMPLETE_ALBUMS_TARGET_DIR", "/dupes/incomplete_albums"),
         # Library backend and file-library settings
         "LIBRARY_MODE": "files",
+        "LIBRARY_WORKFLOW_MODE": workflow_mode_eff,
+        "LIBRARY_INTAKE_ROOTS": ", ".join(intake_roots_eff),
+        "LIBRARY_SOURCE_ROOTS": ", ".join(source_roots_eff),
+        "LIBRARY_SERVING_ROOT": serving_root_eff,
+        "LIBRARY_DUPES_ROOT": dupes_root_eff,
+        "LIBRARY_INCOMPLETE_ROOT": incomplete_root_eff,
+        "LIBRARY_HAS_INTAKE": bool(intake_roots_eff),
         "LIBRARY_INCLUDE_UNMATCHED": get_setting_bool("LIBRARY_INCLUDE_UNMATCHED", LIBRARY_INCLUDE_UNMATCHED),
         "FILES_ROOTS": ", ".join(files_roots_effective),
+        "LIBRARY_MATERIALIZATION_MODE": str(
+            get_setting("LIBRARY_MATERIALIZATION_MODE", get_setting("EXPORT_LINK_STRATEGY", EXPORT_LINK_STRATEGY))
+            or EXPORT_LINK_STRATEGY
+        ).strip().lower(),
+        "LIBRARY_INCLUDE_FORMAT_IN_FOLDER": get_setting_bool(
+            "LIBRARY_INCLUDE_FORMAT_IN_FOLDER",
+            get_setting_bool("EXPORT_INCLUDE_ALBUM_FORMAT_IN_FOLDER", EXPORT_INCLUDE_ALBUM_FORMAT_IN_FOLDER),
+        ),
+        "LIBRARY_INCLUDE_TYPE_IN_FOLDER": get_setting_bool(
+            "LIBRARY_INCLUDE_TYPE_IN_FOLDER",
+            get_setting_bool("EXPORT_INCLUDE_ALBUM_TYPE_IN_FOLDER", EXPORT_INCLUDE_ALBUM_TYPE_IN_FOLDER),
+        ),
         "LIBRARY_WINNER_PLACEMENT_STRATEGY": str(
             get_setting("LIBRARY_WINNER_PLACEMENT_STRATEGY", LIBRARY_WINNER_PLACEMENT_STRATEGY or "move")
             or "move"
@@ -58858,7 +58891,11 @@ def api_config_put():
         # Concert discovery (UI filtering)
         "CONCERTS_FILTER_ENABLED", "CONCERTS_HOME_LAT", "CONCERTS_HOME_LON", "CONCERTS_RADIUS_KM",
         # Library backend & file-library settings
-        "LIBRARY_MODE", "LIBRARY_INCLUDE_UNMATCHED", "FILES_ROOTS", "WINNER_SOURCE_ROOT_ID", "LIBRARY_WINNER_PLACEMENT_STRATEGY", "EXPORT_ROOT", "EXPORT_NAMING_TEMPLATE", "EXPORT_LINK_STRATEGY", "MEDIA_CACHE_ROOT", "AUTO_EXPORT_LIBRARY",
+        "LIBRARY_MODE", "LIBRARY_WORKFLOW_MODE", "LIBRARY_INTAKE_ROOTS", "LIBRARY_SOURCE_ROOTS",
+        "LIBRARY_SERVING_ROOT", "LIBRARY_DUPES_ROOT", "LIBRARY_INCOMPLETE_ROOT",
+        "LIBRARY_MATERIALIZATION_MODE", "LIBRARY_INCLUDE_FORMAT_IN_FOLDER", "LIBRARY_INCLUDE_TYPE_IN_FOLDER",
+        "LIBRARY_VISIBLE_SCOPES", "LIBRARY_INCLUDE_UNMATCHED", "FILES_ROOTS", "WINNER_SOURCE_ROOT_ID",
+        "LIBRARY_WINNER_PLACEMENT_STRATEGY", "EXPORT_ROOT", "EXPORT_NAMING_TEMPLATE", "EXPORT_LINK_STRATEGY", "MEDIA_CACHE_ROOT", "AUTO_EXPORT_LIBRARY",
     }
     # Only process keys that are in the request AND in the allowed list
     # This preserves existing values in SQLite for keys not in the request
@@ -59069,8 +59106,75 @@ def api_config_put():
     # Force files-only mode regardless of incoming value.
     if "LIBRARY_MODE" in updates:
         updates["LIBRARY_MODE"] = "files"
+    if "LIBRARY_WORKFLOW_MODE" in updates:
+        workflow_mode = str(updates["LIBRARY_WORKFLOW_MODE"] or "managed").strip().lower()
+        updates["LIBRARY_WORKFLOW_MODE"] = workflow_mode if workflow_mode in {"managed", "mirror", "inplace", "custom"} else "managed"
+    if "LIBRARY_INTAKE_ROOTS" in updates:
+        updates["LIBRARY_INTAKE_ROOTS"] = _parse_files_roots(updates["LIBRARY_INTAKE_ROOTS"])
+    if "LIBRARY_SOURCE_ROOTS" in updates:
+        updates["LIBRARY_SOURCE_ROOTS"] = _parse_files_roots(updates["LIBRARY_SOURCE_ROOTS"])
+    if "LIBRARY_SERVING_ROOT" in updates:
+        updates["LIBRARY_SERVING_ROOT"] = str(updates["LIBRARY_SERVING_ROOT"] or "").strip()
+    if "LIBRARY_DUPES_ROOT" in updates:
+        updates["LIBRARY_DUPES_ROOT"] = str(updates["LIBRARY_DUPES_ROOT"] or "").strip() or "/dupes"
+    if "LIBRARY_INCOMPLETE_ROOT" in updates:
+        updates["LIBRARY_INCOMPLETE_ROOT"] = str(updates["LIBRARY_INCOMPLETE_ROOT"] or "").strip() or "/dupes/incomplete_albums"
+    if "LIBRARY_MATERIALIZATION_MODE" in updates:
+        strategy = str(updates["LIBRARY_MATERIALIZATION_MODE"] or "hardlink").strip().lower()
+        updates["LIBRARY_MATERIALIZATION_MODE"] = strategy if strategy in {"hardlink", "symlink", "copy", "move"} else "hardlink"
+    if "LIBRARY_VISIBLE_SCOPES" in updates:
+        raw_scopes = updates["LIBRARY_VISIBLE_SCOPES"]
+        if isinstance(raw_scopes, list):
+            scope_items = [str(item or "").strip().lower() for item in raw_scopes]
+        else:
+            scope_items = [part.strip().lower() for part in str(raw_scopes or "").split(",")]
+        updates["LIBRARY_VISIBLE_SCOPES"] = [item for item in scope_items if item in {"library", "inbox", "dupes", "all"}]
+    for _k in ("LIBRARY_INCLUDE_FORMAT_IN_FOLDER", "LIBRARY_INCLUDE_TYPE_IN_FOLDER"):
+        if _k in updates:
+            updates[_k] = bool(_parse_bool(updates[_k]))
     if "LIBRARY_INCLUDE_UNMATCHED" in updates:
         updates["LIBRARY_INCLUDE_UNMATCHED"] = bool(_parse_bool(updates["LIBRARY_INCLUDE_UNMATCHED"]))
+    if "LIBRARY_SERVING_ROOT" in updates and "EXPORT_ROOT" not in updates:
+        updates["EXPORT_ROOT"] = str(updates["LIBRARY_SERVING_ROOT"] or "").strip()
+    if "LIBRARY_DUPES_ROOT" in updates and "DUPE_ROOT" not in updates:
+        updates["DUPE_ROOT"] = str(updates["LIBRARY_DUPES_ROOT"] or "").strip() or "/dupes"
+    if "LIBRARY_INCOMPLETE_ROOT" in updates and "INCOMPLETE_ALBUMS_TARGET_DIR" not in updates:
+        updates["INCOMPLETE_ALBUMS_TARGET_DIR"] = str(updates["LIBRARY_INCOMPLETE_ROOT"] or "").strip() or "/dupes/incomplete_albums"
+    if "LIBRARY_MATERIALIZATION_MODE" in updates and "EXPORT_LINK_STRATEGY" not in updates:
+        updates["EXPORT_LINK_STRATEGY"] = str(updates["LIBRARY_MATERIALIZATION_MODE"] or "hardlink").strip().lower()
+    if "LIBRARY_INCLUDE_FORMAT_IN_FOLDER" in updates and "EXPORT_INCLUDE_ALBUM_FORMAT_IN_FOLDER" not in updates:
+        updates["EXPORT_INCLUDE_ALBUM_FORMAT_IN_FOLDER"] = bool(updates["LIBRARY_INCLUDE_FORMAT_IN_FOLDER"])
+    if "LIBRARY_INCLUDE_TYPE_IN_FOLDER" in updates and "EXPORT_INCLUDE_ALBUM_TYPE_IN_FOLDER" not in updates:
+        updates["EXPORT_INCLUDE_ALBUM_TYPE_IN_FOLDER"] = bool(updates["LIBRARY_INCLUDE_TYPE_IN_FOLDER"])
+    if "FILES_ROOTS" not in updates and any(
+        key in updates
+        for key in ("LIBRARY_WORKFLOW_MODE", "LIBRARY_INTAKE_ROOTS", "LIBRARY_SOURCE_ROOTS")
+    ):
+        current_workflow_mode = str(
+            updates.get("LIBRARY_WORKFLOW_MODE")
+            or _get_config_from_db("LIBRARY_WORKFLOW_MODE")
+            or "managed"
+        ).strip().lower()
+        intake_roots = updates.get("LIBRARY_INTAKE_ROOTS")
+        if intake_roots is None:
+            intake_roots = _parse_files_roots(_get_config_from_db("LIBRARY_INTAKE_ROOTS") or "")
+        source_roots = updates.get("LIBRARY_SOURCE_ROOTS")
+        if source_roots is None:
+            source_roots = _parse_files_roots(_get_config_from_db("LIBRARY_SOURCE_ROOTS") or "")
+        if current_workflow_mode == "managed":
+            updates["FILES_ROOTS"] = list(intake_roots or [])
+        elif current_workflow_mode == "mirror":
+            updates["FILES_ROOTS"] = list(source_roots or [])
+        elif current_workflow_mode == "inplace":
+            seen_roots = set()
+            merged_roots = []
+            for root in list(source_roots or []) + list(intake_roots or []):
+                normalized = str(root or "").strip()
+                if not normalized or normalized in seen_roots:
+                    continue
+                seen_roots.add(normalized)
+                merged_roots.append(normalized)
+            updates["FILES_ROOTS"] = merged_roots
     
     # Serialize complex types for SQLite storage. Never overwrite real secrets with UI masks.
     masked_secrets = set(MASKED_SECRET_KEYS)
@@ -59091,7 +59195,7 @@ def api_config_put():
         elif k == "SKIP_FOLDERS" and isinstance(v, list):
             # Store as comma-separated string; load uses _parse_skip_folders (accepts JSON or CSV)
             updates_for_db[k] = ",".join(str(p).strip() for p in v if str(p).strip()) if v else ""
-        elif k == "FILES_ROOTS" and isinstance(v, list):
+        elif k in {"FILES_ROOTS", "LIBRARY_INTAKE_ROOTS", "LIBRARY_SOURCE_ROOTS"} and isinstance(v, list):
             # Store as comma-separated string to avoid double-encoded JSON values.
             updates_for_db[k] = ",".join(str(p).strip() for p in v if str(p).strip()) if v else ""
         elif isinstance(v, (dict, list)):
