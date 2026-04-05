@@ -1276,16 +1276,31 @@ export function OnboardingWizard({
                           ? 'All local services are ready'
                           : localStackHasStarted
                             ? 'Local stack creation progress'
-                            : 'Nothing is running yet'}
+                            : 'Nothing has started yet'}
                       </span>
                       <span>{localRuntimeReady ? '100%' : `${localStackProgress}%`}</span>
                     </div>
                     <Progress value={Math.max(0, Math.min(100, localStackProgress))} className="h-2 bg-white/10" />
                   </div>
 
-                  {localStackHasStarted ? (
-                    <div className="rounded-2xl border border-white/10 bg-black/10 p-4">
-                      <div className="text-sm font-semibold text-white">What PMDA is doing now</div>
+                  <div className="rounded-2xl border border-white/10 bg-black/10 p-4">
+                    <div className="flex items-center justify-between gap-3">
+                      <div>
+                        <div className="text-sm font-semibold text-white">Runtime status</div>
+                        <p className="mt-1 text-xs text-slate-400">
+                          {localStackHasStarted
+                            ? 'PMDA is now checking or creating the local services below.'
+                            : 'These are the only local services PMDA still needs before the local metadata stack is ready.'}
+                        </p>
+                      </div>
+                      {!localRuntimeReady ? (
+                        <Badge variant="outline" className="border-white/15 bg-white/5 text-slate-200">
+                          {localStackHasStarted ? 'Provisioning' : 'Idle'}
+                        </Badge>
+                      ) : null}
+                    </div>
+
+                    {localStackHasStarted ? (
                       <div className="mt-3 space-y-3">
                         {localStackActivityRows.map((row) => (
                           <div key={row.key} className="flex items-start justify-between gap-3 rounded-2xl border border-white/10 bg-white/[0.02] px-3 py-3">
@@ -1299,56 +1314,13 @@ export function OnboardingWizard({
                           </div>
                         ))}
                       </div>
-                    </div>
-                  ) : (
-                    <div className="rounded-2xl border border-white/10 bg-black/10 p-4">
-                      <div className="text-sm font-semibold text-white">Current state</div>
-                      <div className="mt-2 text-xs leading-5 text-slate-400">
-                        PMDA is idle here. Nothing is being downloaded or created yet.
-                      </div>
-                      <div className="mt-3 grid gap-2 md:grid-cols-3">
-                        <div className="rounded-2xl border border-white/10 bg-white/[0.02] px-3 py-3">
-                          <div className="flex items-center justify-between gap-2">
-                            <div className="text-sm font-medium text-white">Docker access</div>
-                            <Badge variant={managedPreflightReady ? 'default' : 'outline'}>
-                              {managedPreflightReady ? 'Ready' : statusLoading ? 'Checking' : 'Unknown'}
-                            </Badge>
-                          </div>
-                          <p className="mt-2 text-xs leading-5 text-slate-400">
-                            {managedPreflightReady ? 'PMDA can talk to the Docker runtime.' : statusLoading ? 'PMDA is still checking Docker.' : (managedStatus?.preflight.message || 'PMDA has not confirmed Docker yet.')}
-                          </p>
-                        </div>
-                        <div className="rounded-2xl border border-white/10 bg-white/[0.02] px-3 py-3">
-                          <div className="flex items-center justify-between gap-2">
-                            <div className="text-sm font-medium text-white">MusicBrainz mirror</div>
-                            <Badge variant={managedMbCandidate ? 'secondary' : 'outline'}>
-                              {managedMbCandidate ? 'Detected' : 'Not started'}
-                            </Badge>
-                          </div>
-                          <p className="mt-2 text-xs leading-5 text-slate-400">
-                            {managedMbCandidate ? 'PMDA detected an existing local MusicBrainz service it can adopt.' : 'PMDA has not started creating the local MusicBrainz mirror yet.'}
-                          </p>
-                        </div>
-                        <div className="rounded-2xl border border-white/10 bg-white/[0.02] px-3 py-3">
-                          <div className="flex items-center justify-between gap-2">
-                            <div className="text-sm font-medium text-white">Ollama + models</div>
-                            <Badge variant={managedOllamaCandidate ? 'secondary' : 'outline'}>
-                              {managedOllamaCandidate ? 'Detected' : 'Not started'}
-                            </Badge>
-                          </div>
-                          <p className="mt-2 text-xs leading-5 text-slate-400">
-                            {managedOllamaCandidate ? 'PMDA detected an existing Ollama runtime it can adopt.' : `PMDA has not started installing ${ollamaModel} and ${ollamaHardModel} yet.`}
-                          </p>
-                        </div>
-                      </div>
-                    </div>
-                  )}
+                    ) : null}
 
-                  <div className="grid gap-3 md:grid-cols-3">
+                    <div className="mt-3 grid gap-3 md:grid-cols-3">
                     {localStackChecklist.map((item) => {
                       const itemBadge = item.done ? null : item.progress > 0 ? `${item.progress}%` : (item.detail.toLowerCase().includes('detected') ? 'Detected' : 'Not started');
                       return (
-                      <div key={item.key} className="rounded-2xl border border-white/10 bg-black/10 p-3">
+                      <div key={item.key} className="rounded-2xl border border-white/10 bg-white/[0.02] p-3">
                         <div className="flex items-center justify-between gap-2">
                           <div className="text-sm font-medium text-white">{item.label}</div>
                           {item.done ? (
@@ -1360,9 +1332,14 @@ export function OnboardingWizard({
                           )}
                         </div>
                         <p className="mt-2 text-xs leading-5 text-slate-400">{item.detail}</p>
-                        <Progress value={Math.max(0, Math.min(100, item.progress))} className="mt-3 h-1.5 bg-white/10" />
+                        {item.progress > 0 || item.done ? (
+                          <Progress value={Math.max(0, Math.min(100, item.progress))} className="mt-3 h-1.5 bg-white/10" />
+                        ) : (
+                          <div className="mt-3 text-[11px] uppercase tracking-[0.14em] text-slate-500">Starts after you click create local stack</div>
+                        )}
                       </div>
                     );})}
+                    </div>
                   </div>
 
                   {localStackServices.length > 0 ? (
