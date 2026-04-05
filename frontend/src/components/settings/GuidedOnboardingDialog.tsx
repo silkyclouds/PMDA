@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Loader2 } from 'lucide-react';
 import { toast } from 'sonner';
 
@@ -24,6 +24,9 @@ export function GuidedOnboardingDialog({ open, onOpenChange }: Props) {
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [dirty, setDirty] = useState(false);
+  const configRef = useRef<Partial<PMDAConfig>>({});
+  const pendingSaveRef = useRef<Partial<PMDAConfig>>({});
+  const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const loadConfig = useCallback(async () => {
     setLoading(true);
@@ -43,28 +46,73 @@ export function GuidedOnboardingDialog({ open, onOpenChange }: Props) {
     void loadConfig();
   }, [loadConfig, open]);
 
-  const updateConfig = useCallback((updates: Partial<PMDAConfig>) => {
-    setConfig((prev) => ({ ...prev, ...updates }));
-    setDirty(true);
-  }, []);
+  useEffect(() => {
+    configRef.current = config;
+  }, [config]);
 
-  const saveConfig = useCallback(async () => {
-    if (!dirty) return true;
+  const flushPendingSave = useCallback(async (options?: { reloadAfter?: boolean; silent?: boolean }) => {
+    const payload = pendingSaveRef.current;
+    if (Object.keys(payload).length === 0) {
+      return true;
+    }
+
+    pendingSaveRef.current = {};
     setSaving(true);
     try {
-      const result = await api.saveConfig(config);
-      const refreshed = normalizeConfigForUI(await api.getConfig());
-      setConfig(refreshed);
-      setDirty(false);
-      toast.success(result.message || 'Onboarding settings saved');
+      const result = await api.saveConfig(payload);
+      if (options?.reloadAfter) {
+        const refreshed = normalizeConfigForUI(await api.getConfig());
+        configRef.current = refreshed;
+        setConfig(refreshed);
+      }
+      setDirty(Object.keys(pendingSaveRef.current).length > 0);
+      if (!options?.silent) {
+        toast.success(result.message || 'Onboarding settings saved');
+      }
       return true;
     } catch (error) {
+      pendingSaveRef.current = { ...payload, ...pendingSaveRef.current };
+      setDirty(true);
       toast.error(error instanceof Error ? error.message : 'Failed to save onboarding settings');
       return false;
     } finally {
       setSaving(false);
     }
-  }, [config, dirty]);
+  }, []);
+
+  const updateConfig = useCallback((updates: Partial<PMDAConfig>) => {
+    setConfig((prev) => {
+      const next = { ...prev, ...updates };
+      configRef.current = next;
+      return next;
+    });
+    pendingSaveRef.current = { ...pendingSaveRef.current, ...updates };
+    setDirty(true);
+    if (saveTimerRef.current) {
+      clearTimeout(saveTimerRef.current);
+    }
+    saveTimerRef.current = setTimeout(() => {
+      saveTimerRef.current = null;
+      void flushPendingSave({ silent: true, reloadAfter: false });
+    }, 500);
+  }, [flushPendingSave]);
+
+  const saveConfig = useCallback(async () => {
+    if (saveTimerRef.current) {
+      clearTimeout(saveTimerRef.current);
+      saveTimerRef.current = null;
+    }
+    if (!dirty && Object.keys(pendingSaveRef.current).length === 0) return true;
+    return flushPendingSave({ silent: false, reloadAfter: true });
+  }, [dirty, flushPendingSave]);
+
+  useEffect(() => {
+    return () => {
+      if (saveTimerRef.current) {
+        clearTimeout(saveTimerRef.current);
+      }
+    };
+  }, []);
 
   const configured = (config as api.ConfigResponse).configured === true || Boolean(String(config.FILES_ROOTS || '').trim());
 
