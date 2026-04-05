@@ -31,9 +31,12 @@ RUN mkdir -p /etc/postgresql-common && \
     apt-get update && \
     apt-get install -y --no-install-recommends \
       ffmpeg \
+      git \
       nodejs \
       npm \
       sqlite3 \
+      docker-cli \
+      docker-compose \
       libchromaprint-tools \
       tesseract-ocr \
       tesseract-ocr-eng \

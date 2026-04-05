@@ -26,6 +26,16 @@ import type {
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog';
 import { FolderBrowserInput } from '@/components/settings/FolderBrowserInput';
 import { Label } from '@/components/ui/label';
 import { Progress } from '@/components/ui/progress';
@@ -106,6 +116,8 @@ const WORKFLOW_OPTIONS: Array<{
     diagram: ['Current library', 'PMDA checks', 'Serve here'],
   },
 ];
+
+const LOCAL_STACK_RECOMMENDED_FREE_GB = 40;
 
 function normalizeFolderPath(input: string): string {
   const raw = String(input || '').trim();
@@ -426,6 +438,7 @@ export function OnboardingWizard({
   const [statusLoading, setStatusLoading] = useState<boolean>(true);
   const [scanActionBusy, setScanActionBusy] = useState<boolean>(false);
   const [runtimeActionBusy, setRuntimeActionBusy] = useState<boolean>(false);
+  const [localStackConfirmOpen, setLocalStackConfirmOpen] = useState<boolean>(false);
 
   const workflowMode = (config.LIBRARY_WORKFLOW_MODE || 'managed') as WorkflowMode;
   const workflowMeta = useMemo(
@@ -601,9 +614,9 @@ export function OnboardingWizard({
     ? (localStackDetectedCount === 2 ? 'Use detected local services' : 'Use detected service and create the rest')
     : 'Create local stack';
   const localStackActionDescription = localStackDetectedCount === 2
-    ? 'PMDA found an existing MusicBrainz mirror and an existing Ollama runtime on this server. It can adopt them directly.'
+    ? 'PMDA found an existing MusicBrainz mirror and an existing Ollama runtime on this server. It can adopt them directly after your confirmation.'
     : localStackDetectedCount === 1
-      ? 'PMDA found one existing local service on this server. It can adopt it and create only the missing part.'
+      ? 'PMDA found one existing local service on this server. It can adopt it and create only the missing part after your confirmation.'
       : 'No local metadata service was detected yet. PMDA will create the MusicBrainz mirror and the Ollama runtime.';
 
   const localStackChecklist = useMemo(() => {
@@ -633,8 +646,8 @@ export function OnboardingWizard({
         detail: musicbrainzReady
           ? 'Local MusicBrainz mirror is ready.'
           : (musicbrainzDetected
-              ? `Existing MusicBrainz mirror detected${managedMbCandidate?.published_url ? ` at ${managedMbCandidate.published_url}` : ''}. Click ${localStackActionLabel} to adopt it.`
-              : (managedMbBundle?.phase_message || (musicbrainzNotStarted ? 'Not created yet. Click Create local stack to start it.' : 'MusicBrainz mirror is starting.'))),
+              ? `Existing MusicBrainz mirror detected${managedMbCandidate?.published_url ? ` at ${managedMbCandidate.published_url}` : ''}. It will be adopted when you confirm local stack setup.`
+              : (managedMbBundle?.phase_message || (musicbrainzNotStarted ? 'Not created yet. It will start after you confirm local stack setup.' : 'MusicBrainz mirror is starting.'))),
         progress: musicbrainzNotStarted ? 0 : managedBundleProgress(managedMbBundle),
       },
       {
@@ -644,9 +657,9 @@ export function OnboardingWizard({
         detail: ollamaReady
           ? `Ollama is ready with ${ollamaModel} and ${ollamaHardModel}.`
           : (ollamaDetected
-              ? `Existing Ollama runtime detected${managedOllamaCandidate?.url ? ` at ${managedOllamaCandidate.url}` : ''}. Click ${localStackActionLabel} to adopt it and ensure ${ollamaModel} and ${ollamaHardModel}.`
+              ? `Existing Ollama runtime detected${managedOllamaCandidate?.url ? ` at ${managedOllamaCandidate.url}` : ''}. It will be adopted when you confirm local stack setup and PMDA will ensure ${ollamaModel} and ${ollamaHardModel}.`
               : (managedOllamaBundle?.phase_message || (ollamaNotStarted
-                  ? `Not created yet. Click Create local stack to install ${ollamaModel} and ${ollamaHardModel}.`
+                  ? `Not created yet. It will start after you confirm local stack setup and install ${ollamaModel} and ${ollamaHardModel}.`
                   : `Ollama is starting and still needs ${ollamaModel} and ${ollamaHardModel}.`))),
         progress: ollamaNotStarted ? 0 : managedBundleProgress(managedOllamaBundle, { requiredModels: [ollamaModel, ollamaHardModel] }),
       },
@@ -825,11 +838,11 @@ export function OnboardingWizard({
     }
   }, [bootstrap?.bootstrap_required, firstScanStarted, isModalPresentation, navigate, onClose, persistIfNeeded, scanProgress?.resume_available, scanProgress?.scanning]);
 
-  const bootstrapLocalStack = useCallback(async () => {
+  const bootstrapLocalStack = useCallback(async (): Promise<boolean> => {
     setRuntimeActionBusy(true);
     try {
       const persisted = await persistIfNeeded();
-      if (!persisted) return;
+      if (!persisted) return false;
 
       updateConfig({
         MANAGED_RUNTIME_CONFIG_ROOT: resolvedManagedConfigRoot,
@@ -855,6 +868,7 @@ export function OnboardingWizard({
       setManagedStatus(result.snapshot);
       toast.success('Local metadata stack creation started');
       void refreshStatus();
+      return true;
     } catch (error) {
       const fallbackStatus = await api.getManagedRuntimeStatus({ skipCandidates: true }).catch(() => null);
       if (fallbackStatus) {
@@ -866,10 +880,11 @@ export function OnboardingWizard({
           || ['preflight', 'creating', 'pulling', 'starting', 'waiting_health', 'ready'].includes(ollamaState)
         ) {
           toast('Local stack bootstrap is running in the background. Staying on the wizard and following live progress.');
-          return;
+          return true;
         }
       }
       toast.error(error instanceof Error ? error.message : 'Failed to create the local metadata stack');
+      return false;
     } finally {
       setRuntimeActionBusy(false);
     }
@@ -887,6 +902,22 @@ export function OnboardingWizard({
       if (container) container.scrollTo({ top: 0, behavior: 'smooth' });
     });
   }, [activeStep, persistIfNeeded]);
+
+  const confirmAndStartLocalStack = useCallback(async () => {
+    const started = await bootstrapLocalStack();
+    if (!started) return;
+    setLocalStackConfirmOpen(false);
+    await goToStep(3);
+  }, [bootstrapLocalStack, goToStep]);
+
+  const handleNextStep = useCallback(async () => {
+    if (activeStep >= STEP_ORDER.length - 1) return;
+    if (activeStep === 2 && selectedStackMode === 'local' && !localRuntimeReady && !localStackHasStarted && managedPreflightReady) {
+      setLocalStackConfirmOpen(true);
+      return;
+    }
+    await goToStep(activeStep + 1);
+  }, [activeStep, goToStep, localRuntimeReady, localStackHasStarted, managedPreflightReady, selectedStackMode]);
 
   const openAdvancedSection = useCallback((sectionId: string) => {
     if (isModalPresentation && onClose) onClose();
@@ -1185,7 +1216,7 @@ export function OnboardingWizard({
               <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-4 text-sm text-slate-300">
                 {selectedStackMode === 'online'
                   ? 'Preset applied: PMDA uses online metadata and does not require local runtime creation in the wizard.'
-                  : 'Preset applied: PMDA will prepare a local MusicBrainz mirror and local Ollama runtime from the final step if they are missing.'}
+                  : 'Preset applied: when you continue, PMDA will ask for confirmation before creating or adopting the local MusicBrainz mirror and local Ollama runtime.'}
               </div>
             </div>
           ) : null}
@@ -1201,8 +1232,8 @@ export function OnboardingWizard({
                 <div className="rounded-2xl border border-primary/20 bg-primary/10 p-4 text-sm text-slate-200">
                   <div className="font-medium text-white">Local metadata mode has two separate tracks.</div>
                   <p className="mt-2 text-xs leading-5 text-slate-300">
-                    Step 3 only chose the <span className="font-medium text-white">local preset</span>. It does not start downloads or containers by itself.
-                    Use <span className="font-medium text-white">Create local stack</span> to provision MusicBrainz + Ollama, and finish the required folders separately before the first scan can start.
+                    This step only chooses the <span className="font-medium text-white">local preset</span>. When you continue, PMDA asks for confirmation before creating or adopting MusicBrainz + Ollama.
+                    Step 4 then becomes the live progress view for provisioning and model downloads.
                   </p>
                 </div>
               ) : null}
@@ -1247,15 +1278,6 @@ export function OnboardingWizard({
                     </div>
                     {!localRuntimeReady ? (
                       <div className="flex flex-wrap items-center gap-2">
-                        <Button
-                          type="button"
-                          className="gap-2"
-                          onClick={() => void bootstrapLocalStack()}
-                          disabled={runtimeActionBusy || !managedPreflightReady}
-                        >
-                          {runtimeActionBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <FolderOutput className="h-4 w-4" />}
-                          {localStackActionLabel}
-                        </Button>
                         <Button type="button" variant="outline" size="sm" onClick={() => void refreshStatus()} disabled={statusLoading}>
                           {statusLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
                           Refresh status
@@ -1335,7 +1357,7 @@ export function OnboardingWizard({
                         {item.progress > 0 || item.done ? (
                           <Progress value={Math.max(0, Math.min(100, item.progress))} className="mt-3 h-1.5 bg-white/10" />
                         ) : (
-                          <div className="mt-3 text-[11px] uppercase tracking-[0.14em] text-slate-500">Starts after you click create local stack</div>
+                          <div className="mt-3 text-[11px] uppercase tracking-[0.14em] text-slate-500">Starts after you confirm local setup</div>
                         )}
                       </div>
                     );})}
@@ -1438,9 +1460,9 @@ export function OnboardingWizard({
             </Button>
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
               {activeStep < STEP_ORDER.length - 1 ? (
-                <Button type="button" className="gap-2" onClick={() => void goToStep(activeStep + 1)} disabled={isSaving}>
+                <Button type="button" className="gap-2" onClick={() => void handleNextStep()} disabled={isSaving || runtimeActionBusy}>
                   {isSaving ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
-                  Next
+                  {activeStep === 2 && selectedStackMode === 'local' && managedPreflightReady && !localRuntimeReady && !localStackHasStarted ? 'Continue' : 'Next'}
                 </Button>
               ) : (
                 <Button type="button" className="gap-2" onClick={() => void startOrResumeScan()} disabled={scanActionBusy || blockers.length > 0}>
@@ -1452,6 +1474,37 @@ export function OnboardingWizard({
           </div>
         </CardContent>
       </Card>
+
+      <AlertDialog open={localStackConfirmOpen} onOpenChange={setLocalStackConfirmOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Create the local metadata stack now?</AlertDialogTitle>
+            <AlertDialogDescription>
+              PMDA will create or adopt the local MusicBrainz mirror and Ollama runtime, then download the required AI models
+              <span className="font-mono"> {ollamaModel}</span>
+              {' '}and
+              <span className="font-mono"> {ollamaHardModel}</span>.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <div className="space-y-3 text-sm text-muted-foreground">
+            <p>Make sure <span className="font-mono text-foreground">{resolvedManagedDataRoot}</span> has at least <span className="font-semibold text-foreground">{LOCAL_STACK_RECOMMENDED_FREE_GB} GB</span> free. The MusicBrainz import is disk-intensive and the full setup can take a while depending on your connection and storage.</p>
+            <p>After confirmation, step 4 becomes the live progress view. You will see Docker checks, MusicBrainz provisioning, Ollama startup, and model downloads there.</p>
+          </div>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={runtimeActionBusy}>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              disabled={runtimeActionBusy}
+              onClick={(event) => {
+                event.preventDefault();
+                void confirmAndStartLocalStack();
+              }}
+            >
+              {runtimeActionBusy ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+              {localStackActionLabel}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }
