@@ -9,6 +9,7 @@ import { SourcesAutonomySettings } from '@/components/settings/SourcesAutonomySe
 import { LibraryWorkflowSettings } from '@/components/settings/LibraryWorkflowSettings';
 import { OnboardingWizard } from '@/components/settings/OnboardingWizard';
 import { GuidedOnboardingDialog } from '@/components/settings/GuidedOnboardingDialog';
+import { SettingsControlPlane } from '@/components/settings/SettingsControlPlane';
 import { ScalingSettings } from '@/components/settings/ScalingSettings';
 import { ProviderBadge } from '@/components/providers/ProviderBadge';
 import { ProviderIcon } from '@/components/providers/ProviderIcon';
@@ -513,6 +514,14 @@ function SettingsPage() {
     pickActiveFromHash();
     window.addEventListener('hashchange', pickActiveFromHash);
     return () => window.removeEventListener('hashchange', pickActiveFromHash);
+  }, []);
+
+  const openSettingsSection = useCallback((sectionId: string) => {
+    setActiveSettingsSection(sectionId);
+    window.history.replaceState(null, '', `#${sectionId}`);
+    requestAnimationFrame(() => {
+      document.getElementById(sectionId)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
   }, []);
 
   // Fetch the curated list of compatible OpenAI models for the dropdown (avoids manual typing).
@@ -1162,6 +1171,19 @@ function SettingsPage() {
           </div>
         )}
 
+        <div className="mb-6">
+          <SettingsControlPlane
+            config={config}
+            providersPreflight={providersPreflight}
+            providersChecking={providersChecking}
+            providersPreflightAt={providersPreflightAt}
+            onRefreshProviders={() => void refreshProviderStatus()}
+            onOpenGuidedSetup={() => setShowGuidedOnboarding(true)}
+            onOpenSection={openSettingsSection}
+            updateConfig={updateConfig}
+          />
+        </div>
+
         {/* Mobile: horizontal scroll nav */}
         <nav className="md:hidden mb-4 -mx-6 px-6 overflow-x-auto pb-3 border-b border-border" aria-label="Settings sections">
           <div className="flex gap-2 min-w-max">
@@ -1169,7 +1191,10 @@ function SettingsPage() {
               <a
                 key={id}
                 href={`#${id}`}
-                onClick={() => setActiveSettingsSection(id)}
+                onClick={(event) => {
+                  event.preventDefault();
+                  openSettingsSection(id);
+                }}
                 data-active={activeSettingsSection === id}
                 className="pmda-settings-nav-item shrink-0 whitespace-nowrap"
               >
@@ -1189,7 +1214,10 @@ function SettingsPage() {
                 <li key={id}>
                   <a
                     href={`#${id}`}
-                    onClick={() => setActiveSettingsSection(id)}
+                    onClick={(event) => {
+                      event.preventDefault();
+                      openSettingsSection(id);
+                    }}
                     data-active={activeSettingsSection === id}
                     className="pmda-settings-nav-item"
                   >
