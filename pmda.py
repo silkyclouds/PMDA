@@ -6448,6 +6448,17 @@ def _managed_runtime_bundle_status(bundle_type: str, *, include_candidates: bool
         thread = _MANAGED_RUNTIME_THREADS.get(bundle_type)
         running = bool(thread is not None and thread.is_alive())
     if bundle_type == _MANAGED_RUNTIME_MUSICBRAINZ_BUNDLE:
+        legacy_idle_cta = "Not started yet. Click Create local stack to provision MusicBrainz."
+        if (
+            not running
+            and str(bundle.get("state") or "").strip().lower() == "idle"
+            and str(bundle.get("phase") or "").strip().lower() == "idle"
+            and str(bundle.get("phase_message") or "").strip() == legacy_idle_cta
+        ):
+            bundle = _managed_runtime_bundle_upsert(
+                bundle_type,
+                phase_message="Not started yet. Continue from step 3 and confirm local setup to provision MusicBrainz.",
+            )
         stale_script_error = "Provision script not found:" in str(bundle.get("last_error") or bundle.get("phase_message") or "")
         if not running and stale_script_error and _managed_runtime_musicbrainz_script_path().exists():
             previous_error = str(bundle.get("last_error") or bundle.get("phase_message") or "").strip()
@@ -6455,14 +6466,14 @@ def _managed_runtime_bundle_status(bundle_type: str, *, include_candidates: bool
                 bundle_type,
                 state="idle",
                 phase="idle",
-                phase_message="Not started yet. Click Create local stack to provision MusicBrainz.",
+                phase_message="Not started yet. Continue from step 3 and confirm local setup to provision MusicBrainz.",
                 health={"available": False, "overall_status": "absent", "message": "Not started"},
                 services=[],
                 meta={},
                 last_error="",
             )
             if previous_error:
-                _managed_runtime_log(bundle_type, f"Cleared stale bootstrap failure after PMDA update: {previous_error}", service_name="musicbrainz")
+                _managed_runtime_log(bundle_type, "Cleared stale MusicBrainz bootstrap state after PMDA update.", service_name="musicbrainz")
         candidates = _managed_runtime_detect_musicbrainz_candidates() if include_candidates else []
         if bundle.get("effective_url"):
             bundle["health"] = _managed_runtime_health_check_musicbrainz(bundle.get("effective_url") or "")
