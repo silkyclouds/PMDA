@@ -5811,6 +5811,29 @@ def _managed_runtime_musicbrainz_internal_url(install_root: str) -> str:
     return f"http://{project_name}-musicbrainz-1:5000"
 
 
+def _managed_runtime_musicbrainz_script_path() -> Path:
+    return Path(__file__).resolve().parent / "scripts" / "provision_musicbrainz_mirror_unraid.sh"
+
+
+def _managed_runtime_eta_text(total_seconds: float | int | None) -> str:
+    try:
+        seconds = int(max(0, float(total_seconds or 0)))
+    except Exception:
+        return ""
+    if seconds <= 0:
+        return ""
+    hours, rem = divmod(seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    parts: list[str] = []
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes:
+        parts.append(f"{minutes}m")
+    if secs and not hours:
+        parts.append(f"{secs}s")
+    return " ".join(parts[:2]).strip()
+
+
 def _managed_runtime_capture_subprocess(
     cmd: list[str],
     *,
@@ -5821,6 +5844,7 @@ def _managed_runtime_capture_subprocess(
     phase_map: list[tuple[str, str, str]] | None = None,
 ) -> None:
     progress_re = re.compile(r"\b(\d{1,3})%\b")
+    eta_re = re.compile(r"\bETA\s*[:=]?\s*([^,;|]+)", re.IGNORECASE)
     proc = subprocess.Popen(
         cmd,
         cwd=cwd,
@@ -5838,20 +5862,34 @@ def _managed_runtime_capture_subprocess(
                 continue
             _managed_runtime_log(bundle_type, line, service_name=service_name)
             progress_match = progress_re.search(line)
+            eta_match = eta_re.search(line)
+            bundle_now = _managed_runtime_bundle_get(bundle_type)
+            meta_now = dict(bundle_now.get("meta") or {})
+            started_at = float(meta_now.get("started_at") or time.time())
+            meta_now.setdefault("started_at", started_at)
+            meta_now["last_output"] = line
             if progress_match is not None:
                 try:
                     progress_value = max(0, min(100, int(progress_match.group(1))))
                 except Exception:
                     progress_value = None
                 if progress_value is not None:
-                    bundle_now = _managed_runtime_bundle_get(bundle_type)
-                    meta_now = dict(bundle_now.get("meta") or {})
                     meta_now["progress"] = progress_value
-                    _managed_runtime_bundle_upsert(bundle_type, meta=meta_now)
+                    if 0 < progress_value < 100:
+                        elapsed = max(1.0, time.time() - started_at)
+                        eta_seconds = int((elapsed * (100.0 - progress_value)) / max(progress_value, 1))
+                        meta_now["eta_seconds"] = eta_seconds
+                        meta_now["eta_text"] = _managed_runtime_eta_text(eta_seconds)
+                    else:
+                        meta_now.pop("eta_seconds", None)
+                        meta_now.pop("eta_text", None)
+            if eta_match is not None:
+                eta_text = str(eta_match.group(1) or "").strip()
+                if eta_text:
+                    meta_now["eta_text"] = eta_text
+            _managed_runtime_bundle_upsert(bundle_type, meta=meta_now)
             for needle, phase, message in phase_map or []:
                 if needle and needle.lower() in line.lower():
-                    bundle_now = _managed_runtime_bundle_get(bundle_type)
-                    meta_now = dict(bundle_now.get("meta") or {})
                     if phase in {"preflight", "creating"}:
                         meta_now.setdefault("progress", 18 if phase == "preflight" else 24)
                     elif phase == "pulling":
@@ -6109,9 +6147,13 @@ def _managed_runtime_bootstrap_musicbrainz(payload: dict[str, Any]) -> None:
         Path(bundle_data_root).mkdir(parents=True, exist_ok=True)
         _managed_runtime_bundle_upsert(bundle_type, install_root=install_root, mode="managed", state="creating", phase="creating", phase_message="Provisioning MusicBrainz mirror bundle")
         _managed_runtime_ensure_network()
-        script_path = Path(__file__).resolve().parent / "scripts" / "provision_musicbrainz_mirror_unraid.sh"
+        script_path = _managed_runtime_musicbrainz_script_path()
         if not script_path.exists():
             raise RuntimeError(f"Provision script not found: {script_path}")
+        _managed_runtime_bundle_upsert(
+            bundle_type,
+            meta={"started_at": time.time(), "progress": 24},
+        )
         cmd = [
             str(script_path),
             "--install-root", install_root,
@@ -6172,6 +6214,7 @@ def _managed_runtime_bootstrap_musicbrainz(payload: dict[str, Any]) -> None:
                 {"name": service_name, "status": "healthy", "message": "Running"}
                 for service_name in list(candidate.get("services_present") or [])
             ],
+            meta={**dict(bundle.get("meta") or {}), "progress": 100},
             last_error="",
         )
         bundle["update_state"] = _managed_runtime_register_mb_update_schedule(bundle)
@@ -6405,6 +6448,21 @@ def _managed_runtime_bundle_status(bundle_type: str, *, include_candidates: bool
         thread = _MANAGED_RUNTIME_THREADS.get(bundle_type)
         running = bool(thread is not None and thread.is_alive())
     if bundle_type == _MANAGED_RUNTIME_MUSICBRAINZ_BUNDLE:
+        stale_script_error = "Provision script not found:" in str(bundle.get("last_error") or bundle.get("phase_message") or "")
+        if not running and stale_script_error and _managed_runtime_musicbrainz_script_path().exists():
+            previous_error = str(bundle.get("last_error") or bundle.get("phase_message") or "").strip()
+            bundle = _managed_runtime_bundle_upsert(
+                bundle_type,
+                state="idle",
+                phase="idle",
+                phase_message="Not started yet. Click Create local stack to provision MusicBrainz.",
+                health={"available": False, "overall_status": "absent", "message": "Not started"},
+                services=[],
+                meta={},
+                last_error="",
+            )
+            if previous_error:
+                _managed_runtime_log(bundle_type, f"Cleared stale bootstrap failure after PMDA update: {previous_error}", service_name="musicbrainz")
         candidates = _managed_runtime_detect_musicbrainz_candidates() if include_candidates else []
         if bundle.get("effective_url"):
             bundle["health"] = _managed_runtime_health_check_musicbrainz(bundle.get("effective_url") or "")

@@ -230,10 +230,40 @@ function hasManagedBundleStarted(bundle: ManagedRuntimeBundleStatus | null | und
   const mode = String(bundle.mode || '').trim().toLowerCase();
   const state = String(bundle.state || '').trim().toLowerCase();
   const phase = String(bundle.phase || '').trim().toLowerCase();
-  if (mode && mode !== 'absent') return true;
+  if (mode && mode !== 'absent') {
+    if ((state === 'idle' || state === 'failed') && !bundle.effective_url && !bundle.health?.available) {
+      return false;
+    }
+    return true;
+  }
   if (state && state !== 'idle' && state !== 'absent') return true;
   if (phase && phase !== 'idle') return true;
   return false;
+}
+
+function formatEtaSeconds(totalSeconds: number): string {
+  const seconds = Math.max(0, Math.round(Number(totalSeconds) || 0));
+  if (!seconds) return '';
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const secs = seconds % 60;
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  if (minutes > 0) return `${minutes}m ${secs}s`;
+  return `${secs}s`;
+}
+
+function managedBundleEta(bundle: ManagedRuntimeBundleStatus | null | undefined): string {
+  const meta = (bundle?.meta || {}) as Record<string, unknown>;
+  const explicit = String(meta.eta_text || '').trim();
+  if (explicit) return explicit;
+  const progress = Number(meta.progress);
+  const startedAt = Number(meta.started_at);
+  if (!Number.isFinite(progress) || progress <= 0 || progress >= 100 || !Number.isFinite(startedAt) || startedAt <= 0) {
+    return '';
+  }
+  const elapsed = Math.max(1, (Date.now() / 1000) - startedAt);
+  const remaining = elapsed * ((100 - progress) / progress);
+  return formatEtaSeconds(remaining);
 }
 
 function WorkflowDiagram({ nodes }: { nodes: string[] }) {
@@ -676,6 +706,7 @@ export function OnboardingWizard({
               ? `Existing MusicBrainz mirror detected${managedMbCandidate?.published_url ? ` at ${managedMbCandidate.published_url}` : ''}. It will be adopted when you confirm local stack setup.`
               : (managedMbBundle?.phase_message || (musicbrainzNotStarted ? 'Not created yet. It will start after you confirm local stack setup.' : 'MusicBrainz mirror is starting.'))),
         progress: musicbrainzNotStarted ? 0 : managedBundleProgress(managedMbBundle),
+        eta: managedBundleEta(managedMbBundle),
       },
       {
         key: 'ollama',
@@ -689,6 +720,7 @@ export function OnboardingWizard({
                   ? `Not created yet. It will start after you confirm local stack setup and install ${ollamaModel} and ${ollamaHardModel}.`
                   : `Ollama is starting and still needs ${ollamaModel} and ${ollamaHardModel}.`))),
         progress: ollamaNotStarted ? 0 : managedBundleProgress(managedOllamaBundle, { requiredModels: [ollamaModel, ollamaHardModel] }),
+        eta: managedBundleEta(managedOllamaBundle),
       },
     ];
   }, [localStackActionLabel, managedMbBundle, managedMbCandidate, managedOllamaBundle, managedOllamaCandidate, managedPreflightReady, managedStatus?.preflight.message, musicbrainzReady, ollamaHardModel, ollamaModel, ollamaReady, selectedStackMode, statusLoading]);
@@ -1378,6 +1410,9 @@ export function OnboardingWizard({
                           )}
                         </div>
                         <p className="mt-2 text-xs leading-5 text-slate-400">{item.detail}</p>
+                        {!item.done && item.eta ? (
+                          <div className="mt-2 text-[11px] uppercase tracking-[0.14em] text-primary/80">ETA {item.eta}</div>
+                        ) : null}
                         {item.progress > 0 || item.done ? (
                           <Progress value={Math.max(0, Math.min(100, item.progress))} className="mt-3 h-1.5 bg-white/10" />
                         ) : (
