@@ -3298,6 +3298,12 @@ def _mask_secret_value(value) -> str:
     return txt[:4] + "…"
 
 
+def _ollama_url_targets_managed_runtime(raw_url: str | None) -> bool:
+    parsed = urlparse(str(raw_url or "").strip())
+    host = (parsed.hostname or "").strip().lower()
+    return host in {"pmda-ollama", "ollama"}
+
+
 # Mask & dump effective config ------------------------------------------------
 for k, src in ENV_SOURCES.items():
     val = merged.get(k)
@@ -3383,10 +3389,21 @@ elif AI_PROVIDER.lower() == "ollama":
             if response.status_code == 200:
                 ai_provider_ready = True
                 logging.info("Ollama connection verified at %s", ollama_url)
+            elif _ollama_url_targets_managed_runtime(ollama_url):
+                logging.info(
+                    "Managed Ollama runtime is not started yet at %s; PMDA will provision or adopt it during local stack setup.",
+                    ollama_url,
+                )
             else:
                 logging.warning("Ollama not accessible at %s (HTTP %d)", ollama_url, response.status_code)
         except Exception as e:
-            logging.warning("Ollama connection test failed: %s", e)
+            if _ollama_url_targets_managed_runtime(ollama_url):
+                logging.info(
+                    "Managed Ollama runtime is not started yet at %s; PMDA will provision or adopt it during local stack setup.",
+                    ollama_url,
+                )
+            else:
+                logging.warning("Ollama connection test failed: %s", e)
     else:
         logging.info("No OLLAMA_URL provided; AI-driven selection disabled.")
 else:
@@ -3445,10 +3462,21 @@ def _reinit_ai_from_globals():
             if r.status_code == 200:
                 ollama_url = ollama_u
                 logging.info("Ollama re-verified at %s (settings applied)", ollama_url)
+            elif _ollama_url_targets_managed_runtime(ollama_u):
+                logging.info(
+                    "Managed Ollama runtime is not started yet at %s; PMDA will provision or adopt it during local stack setup.",
+                    ollama_u,
+                )
             else:
                 logging.warning("Ollama not accessible at %s (HTTP %d)", ollama_u, r.status_code)
         except Exception as e:
-            logging.warning("Ollama re-check failed: %s", e)
+            if _ollama_url_targets_managed_runtime(ollama_u):
+                logging.info(
+                    "Managed Ollama runtime is not started yet at %s; PMDA will provision or adopt it during local stack setup.",
+                    ollama_u,
+                )
+            else:
+                logging.warning("Ollama re-check failed: %s", e)
 
     if provider in {"openai", "openai-api", "openai-codex"}:
         if provider == "openai-codex":
@@ -60033,11 +60061,17 @@ def api_config_get():
         ).strip().lower(),
         "LIBRARY_INCLUDE_FORMAT_IN_FOLDER": get_setting_bool(
             "LIBRARY_INCLUDE_FORMAT_IN_FOLDER",
-            get_setting_bool("EXPORT_INCLUDE_ALBUM_FORMAT_IN_FOLDER", EXPORT_INCLUDE_ALBUM_FORMAT_IN_FOLDER),
+            get_setting_bool(
+                "EXPORT_INCLUDE_ALBUM_FORMAT_IN_FOLDER",
+                getattr(sys.modules[__name__], "EXPORT_INCLUDE_ALBUM_FORMAT_IN_FOLDER", False),
+            ),
         ),
         "LIBRARY_INCLUDE_TYPE_IN_FOLDER": get_setting_bool(
             "LIBRARY_INCLUDE_TYPE_IN_FOLDER",
-            get_setting_bool("EXPORT_INCLUDE_ALBUM_TYPE_IN_FOLDER", EXPORT_INCLUDE_ALBUM_TYPE_IN_FOLDER),
+            get_setting_bool(
+                "EXPORT_INCLUDE_ALBUM_TYPE_IN_FOLDER",
+                getattr(sys.modules[__name__], "EXPORT_INCLUDE_ALBUM_TYPE_IN_FOLDER", False),
+            ),
         ),
         "LIBRARY_WINNER_PLACEMENT_STRATEGY": str(
             get_setting("LIBRARY_WINNER_PLACEMENT_STRATEGY", LIBRARY_WINNER_PLACEMENT_STRATEGY or "move")
