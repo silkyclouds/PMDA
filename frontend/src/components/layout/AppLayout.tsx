@@ -11,6 +11,7 @@ import { WelcomeModal } from '@/components/WelcomeModal';
 import { GuidedOnboardingDialog } from '@/components/settings/GuidedOnboardingDialog';
 import { Progress } from '@/components/ui/progress';
 import * as api from '@/lib/api';
+import { normalizeConfigForUI } from '@/lib/configUtils';
 import { useAuth } from '@/contexts/AuthContext';
 
 const WELCOME_COOKIE = 'pmda_welcome_dismissed';
@@ -50,6 +51,141 @@ function setGuidedOnboardingFlag(open: boolean): void {
   } catch {
     // ignore
   }
+}
+
+function normalizeFolderPath(input: string): string {
+  const raw = String(input || '').trim();
+  if (!raw) return '';
+  if (raw === '/') return '/';
+  return raw.replace(/\/+$/, '') || raw;
+}
+
+function parsePathList(value: unknown): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const queue: unknown[] = [value];
+
+  while (queue.length > 0) {
+    const item = queue.shift();
+    if (item == null) continue;
+    if (Array.isArray(item)) {
+      queue.push(...item);
+      continue;
+    }
+    if (typeof item === 'string') {
+      const raw = item.trim();
+      if (!raw) continue;
+      if (raw.startsWith('[') || raw.startsWith('"')) {
+        try {
+          const parsed = JSON.parse(raw) as unknown;
+          if (parsed !== item) {
+            queue.push(parsed);
+            continue;
+          }
+        } catch {
+          // fall through
+        }
+      }
+      if (raw.includes(',')) {
+        const parts = raw.split(',').map((part) => part.trim()).filter(Boolean);
+        if (parts.length > 1) {
+          queue.push(...parts);
+          continue;
+        }
+      }
+      const normalized = normalizeFolderPath(raw);
+      if (normalized && !seen.has(normalized)) {
+        seen.add(normalized);
+        out.push(normalized);
+      }
+      continue;
+    }
+    const normalized = normalizeFolderPath(String(item));
+    if (normalized && !seen.has(normalized)) {
+      seen.add(normalized);
+      out.push(normalized);
+    }
+  }
+
+  return out;
+}
+
+function isBundleReady(bundle: api.ManagedRuntimeBundleStatus | null | undefined): boolean {
+  if (!bundle) return false;
+  return bundle.state === 'ready' && Boolean(bundle.health?.available);
+}
+
+function bundleModels(bundle: api.ManagedRuntimeBundleStatus | null | undefined): string[] {
+  const metaModels = Array.isArray(bundle?.meta?.models) ? bundle.meta.models : [];
+  const healthModels = Array.isArray(bundle?.health?.models) ? bundle.health.models : [];
+  return Array.from(new Set([...healthModels, ...metaModels].map((value) => String(value || '').trim()).filter(Boolean)));
+}
+
+function hasScanHistory(progress: api.ScanProgress | null | undefined): boolean {
+  if (!progress) return false;
+  return Boolean(
+    progress.scanning
+      || progress.scan_starting
+      || progress.resume_available
+      || progress.scan_resume_run_id
+      || progress.scan_start_time != null
+      || (progress.artists_total ?? 0) > 0
+      || (progress.detected_albums_total ?? 0) > 0
+      || (progress.scan_run_scope_total ?? 0) > 0
+      || progress.last_scan_summary,
+  );
+}
+
+function isOnboardingIncomplete(
+  rawConfig: api.ConfigResponse,
+  progress: api.ScanProgress | null,
+  managedStatus: api.ManagedRuntimeStatusResponse | null,
+): boolean {
+  const config = normalizeConfigForUI(rawConfig);
+  const workflowMode = String(config.LIBRARY_WORKFLOW_MODE || 'managed').trim().toLowerCase();
+  const intakeRoots = parsePathList(config.LIBRARY_INTAKE_ROOTS);
+  const sourceRoots = parsePathList(config.LIBRARY_SOURCE_ROOTS);
+  const servingRoot = String(config.LIBRARY_SERVING_ROOT || config.EXPORT_ROOT || '').trim();
+  const dupesRoot = String(config.LIBRARY_DUPES_ROOT || config.DUPE_ROOT || '').trim();
+  const incompleteRoot = String(config.LIBRARY_INCOMPLETE_ROOT || config.INCOMPLETE_ALBUMS_TARGET_DIR || '').trim();
+
+  const foldersReady = (
+    !(workflowMode === 'managed' && intakeRoots.length === 0)
+    && !((workflowMode === 'mirror' || workflowMode === 'inplace') && sourceRoots.length === 0)
+    && !((workflowMode === 'managed' || workflowMode === 'mirror') && !servingRoot)
+    && Boolean(dupesRoot)
+    && Boolean(incompleteRoot)
+  );
+
+  const localStackSelected = Boolean(
+    config.MUSICBRAINZ_MIRROR_ENABLED
+      || String(config.WEB_SEARCH_PROVIDER || '').trim().toLowerCase() === 'ollama'
+      || String(config.AI_PROVIDER || '').trim().toLowerCase() === 'ollama',
+  );
+
+  let localRuntimeReady = true;
+  if (localStackSelected) {
+    const managedConfigRoot = String(config.MANAGED_RUNTIME_CONFIG_ROOT || '').trim() || '/config/managed-runtime';
+    const managedDataRoot = String(config.MANAGED_RUNTIME_DATA_ROOT || '').trim() || '/config/managed-runtime-data';
+    const managedPreflightReady = Boolean(managedStatus?.preflight.available);
+    const musicbrainzBundle = managedStatus?.bundles?.musicbrainz_local || null;
+    const ollamaBundle = managedStatus?.bundles?.ollama_local || null;
+    const ollamaModel = String(config.OLLAMA_MODEL || '').trim() || 'qwen3:4b';
+    const ollamaHardModel = String(config.OLLAMA_COMPLEX_MODEL || '').trim() || 'qwen3:14b';
+    const availableModels = bundleModels(ollamaBundle);
+    const musicbrainzReady = isBundleReady(musicbrainzBundle);
+    const ollamaReady = isBundleReady(ollamaBundle)
+      && availableModels.includes(ollamaModel)
+      && availableModels.includes(ollamaHardModel);
+
+    localRuntimeReady = Boolean(managedConfigRoot)
+      && Boolean(managedDataRoot)
+      && managedPreflightReady
+      && musicbrainzReady
+      && ollamaReady;
+  }
+
+  return !foldersReady || !localRuntimeReady || !hasScanHistory(progress);
 }
 
 function RebootCountdown({ onComplete, onProgress }: { onComplete: () => void; onProgress: (countdown: number, progress: number) => void }) {
@@ -106,14 +242,29 @@ export function AppLayout() {
       setGuidedOnboardingFlag(false);
       return;
     }
-    Promise.all([api.getConfig(), api.getScanProgress()])
-      .then(([data, progress]) => {
+    let cancelled = false;
+    Promise.all([
+      api.getConfig(),
+      api.getScanProgress().catch(() => null),
+      api.getManagedRuntimeStatus({ skipCandidates: true }).catch(() => null),
+    ])
+      .then(([data, progress, managedStatus]) => {
+        if (cancelled) return;
         setConfig(data);
-        const hasConfiguredRoots = Boolean(String(data.FILES_ROOTS || '').trim());
+        const normalized = normalizeConfigForUI(data);
+        const hasConfiguredRoots = Boolean(String(normalized.FILES_ROOTS || '').trim());
         const configured = data.configured === true || hasConfiguredRoots;
-        const bootstrapPending = configured && Boolean(progress.bootstrap_required);
+        const bootstrapPending = configured && Boolean(progress?.bootstrap_required);
+        const onboardingIncomplete = isOnboardingIncomplete(data, progress, managedStatus);
+        const shouldOpenGuidedOnboarding = hasGuidedOnboardingFlag() || onboardingIncomplete;
+
         setWelcomeMode(bootstrapPending ? 'bootstrap' : 'welcome');
-        if (bootstrapPending) {
+
+        if (shouldOpenGuidedOnboarding) {
+          setShowGuidedOnboarding(true);
+          setGuidedOnboardingFlag(true);
+          setShowSettings(false);
+        } else if (bootstrapPending) {
           setShowSettings(true);
         } else if (!configured && !hasWelcomeCookie()) {
           setShowSettings(true);
@@ -122,11 +273,9 @@ export function AppLayout() {
         }
       })
       .catch(() => {});
-  }, [isAdmin]);
-
-  useEffect(() => {
-    if (!isAdmin) return;
-    setShowGuidedOnboarding(hasGuidedOnboardingFlag());
+    return () => {
+      cancelled = true;
+    };
   }, [isAdmin]);
 
   useEffect(() => {
