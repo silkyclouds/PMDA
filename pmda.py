@@ -6543,6 +6543,10 @@ def _managed_runtime_bundle_status(bundle_type: str, *, include_candidates: bool
     if bundle_type == _MANAGED_RUNTIME_MUSICBRAINZ_BUNDLE:
         legacy_idle_cta = "Not started yet. Click Create local stack to provision MusicBrainz."
         idle_confirmation_cta = "Not started yet. Confirm local setup to provision MusicBrainz."
+        latest_action_status = str((latest_action or {}).get("status") or "").strip().lower()
+        latest_action_error = str((latest_action or {}).get("error") or "").strip()
+        recent_logs = _managed_runtime_logs(bundle_type, limit=8) if not running else []
+        recent_messages = [str(row.get("message") or "").strip() for row in recent_logs]
         if (
             not running
             and str(bundle.get("state") or "").strip().lower() == "idle"
@@ -6553,9 +6557,29 @@ def _managed_runtime_bundle_status(bundle_type: str, *, include_candidates: bool
                 bundle_type,
                 phase_message=idle_confirmation_cta,
             )
+        if (
+            not running
+            and latest_action_status == "failed"
+            and str(bundle.get("state") or "").strip().lower() in _MANAGED_RUNTIME_ACTIVE_STATES
+        ):
+            failure_message = latest_action_error or str(bundle.get("last_error") or bundle.get("phase_message") or "").strip() or "MusicBrainz bootstrap failed"
+            bundle = _managed_runtime_bundle_upsert(
+                bundle_type,
+                state="failed",
+                phase="failed",
+                phase_message=failure_message,
+                last_error=failure_message,
+            )
         stale_script_error = "Provision script not found:" in str(bundle.get("last_error") or bundle.get("phase_message") or "")
-        if not running and stale_script_error and _managed_runtime_musicbrainz_script_path().exists():
-            previous_error = str(bundle.get("last_error") or bundle.get("phase_message") or "").strip()
+        stale_missing_curl_error = any("Missing required command: curl" in message for message in recent_messages)
+        recoverable_post_update_error = stale_script_error or stale_missing_curl_error
+        if (
+            not running
+            and recoverable_post_update_error
+            and _managed_runtime_musicbrainz_script_path().exists()
+            and shutil.which("curl")
+        ):
+            previous_error = str(bundle.get("last_error") or bundle.get("phase_message") or latest_action_error or "").strip()
             bundle = _managed_runtime_bundle_upsert(
                 bundle_type,
                 state="idle",
