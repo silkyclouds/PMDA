@@ -540,7 +540,7 @@ export function OnboardingWizard({
     return bundles.some((bundle) => {
       if (!bundle) return false;
       const state = String(bundle.state || '').trim().toLowerCase();
-      return state !== 'ready' && state !== 'failed' && state !== 'absent';
+      return state !== 'ready' && state !== 'failed' && state !== 'absent' && state !== 'idle';
     });
   }, [managedMbBundle, managedOllamaBundle, selectedStackMode]);
   const localStackHasStarted = useMemo(() => {

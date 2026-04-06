@@ -118,7 +118,11 @@ export function GuidedOnboardingDialog({ open, onOpenChange }: Props) {
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-4xl border-border/60 bg-card p-0 shadow-2xl">
+      <DialogContent
+        className="max-w-4xl border-border/60 bg-card p-0 shadow-2xl"
+        onPointerDownOutside={(event) => event.preventDefault()}
+        onEscapeKeyDown={(event) => event.preventDefault()}
+      >
         <DialogHeader className="sr-only">
           <DialogTitle>Guided onboarding</DialogTitle>
           <DialogDescription>
