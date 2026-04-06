@@ -30,6 +30,7 @@ RUN mkdir -p /etc/postgresql-common && \
     printf 'create_main_cluster = false\n' > /etc/postgresql-common/createcluster.conf && \
     apt-get update && \
     apt-get install -y --no-install-recommends \
+      curl \
       ffmpeg \
       git \
       nodejs \
