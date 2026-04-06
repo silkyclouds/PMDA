@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   AlertTriangle,
@@ -439,6 +439,7 @@ export function OnboardingWizard({
   const [scanActionBusy, setScanActionBusy] = useState<boolean>(false);
   const [runtimeActionBusy, setRuntimeActionBusy] = useState<boolean>(false);
   const [localStackConfirmOpen, setLocalStackConfirmOpen] = useState<boolean>(false);
+  const localStackAutoPromptedRef = useRef(false);
 
   const workflowMode = (config.LIBRARY_WORKFLOW_MODE || 'managed') as WorkflowMode;
   const workflowMeta = useMemo(
@@ -608,6 +609,32 @@ export function OnboardingWizard({
   const localRuntimeReady = selectedStackMode === 'online'
     ? true
     : managedRootsReady && managedPreflightReady && musicbrainzReady && ollamaReady;
+
+  useEffect(() => {
+    if (activeStep !== 3 || selectedStackMode !== 'local') {
+      localStackAutoPromptedRef.current = false;
+      return;
+    }
+    if (localRuntimeReady || localStackHasStarted || runtimeActionBusy || statusLoading || localStackConfirmOpen) {
+      return;
+    }
+    if (!managedPreflightReady) {
+      localStackAutoPromptedRef.current = false;
+      return;
+    }
+    if (localStackAutoPromptedRef.current) return;
+    localStackAutoPromptedRef.current = true;
+    setLocalStackConfirmOpen(true);
+  }, [
+    activeStep,
+    localRuntimeReady,
+    localStackConfirmOpen,
+    localStackHasStarted,
+    managedPreflightReady,
+    runtimeActionBusy,
+    selectedStackMode,
+    statusLoading,
+  ]);
 
   const localStackDetectedCount = (managedMbCandidate ? 1 : 0) + (managedOllamaCandidate ? 1 : 0);
   const localStackActionLabel = localStackDetectedCount > 0

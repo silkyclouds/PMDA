@@ -4942,6 +4942,1807 @@ def _settings_db_set_secret(key: str, value: str) -> None:
     _settings_db_set_value(key, _auth_encrypt(token))
 
 
+_MANAGED_RUNTIME_LOCK = threading.Lock()
+_MANAGED_RUNTIME_THREADS: dict[str, threading.Thread] = {}
+_MANAGED_RUNTIME_NETWORK_NAME = "pmda-managed-runtime"
+_MANAGED_RUNTIME_MUSICBRAINZ_BUNDLE = "musicbrainz_local"
+_MANAGED_RUNTIME_OLLAMA_BUNDLE = "ollama_local"
+_MANAGED_RUNTIME_BUNDLE_TYPES = (
+    _MANAGED_RUNTIME_MUSICBRAINZ_BUNDLE,
+    _MANAGED_RUNTIME_OLLAMA_BUNDLE,
+)
+_MANAGED_RUNTIME_READY_STATES = {"ready"}
+_MANAGED_RUNTIME_ACTIVE_STATES = {"preflight", "pulling", "creating", "importing", "waiting_health", "updating"}
+_MANAGED_RUNTIME_MB_DEFAULT_PROJECT = "musicbrainz-docker"
+_MANAGED_RUNTIME_OLLAMA_CONTAINER = "pmda-ollama"
+_MANAGED_RUNTIME_MB_DEFAULT_PORT = 5500
+_MANAGED_RUNTIME_OLLAMA_PORT = 11434
+_MANAGED_RUNTIME_MB_DEFAULT_UPDATE_INTERVAL_SEC = 7 * 24 * 3600
+_MANAGED_RUNTIME_GPU_VENDOR_MAP = {
+    "0x8086": "intel",
+    "0x10de": "nvidia",
+    "0x1002": "amd",
+    "0x1022": "amd",
+}
+_MANAGED_RUNTIME_OLLAMA_GPU_MODE_AUTO = "auto"
+_MANAGED_RUNTIME_OLLAMA_GPU_MODE_CPU = "cpu"
+_MANAGED_RUNTIME_OLLAMA_GPU_MODE_NVIDIA = "nvidia"
+_MANAGED_RUNTIME_OLLAMA_GPU_MODE_AMD_ROCM = "amd_rocm"
+_MANAGED_RUNTIME_OLLAMA_GPU_MODE_VULKAN = "vulkan"
+_MANAGED_RUNTIME_OLLAMA_GPU_MODE_VULKAN_INTEL = "vulkan_intel"
+_MANAGED_RUNTIME_OLLAMA_GPU_MODE_VULKAN_AMD = "vulkan_amd"
+_MANAGED_RUNTIME_OLLAMA_GPU_ALLOWED_MODES = {
+    _MANAGED_RUNTIME_OLLAMA_GPU_MODE_AUTO,
+    _MANAGED_RUNTIME_OLLAMA_GPU_MODE_CPU,
+    _MANAGED_RUNTIME_OLLAMA_GPU_MODE_NVIDIA,
+    _MANAGED_RUNTIME_OLLAMA_GPU_MODE_AMD_ROCM,
+    _MANAGED_RUNTIME_OLLAMA_GPU_MODE_VULKAN,
+    _MANAGED_RUNTIME_OLLAMA_GPU_MODE_VULKAN_INTEL,
+    _MANAGED_RUNTIME_OLLAMA_GPU_MODE_VULKAN_AMD,
+}
+
+
+def _managed_runtime_json_dumps(value: Any) -> str:
+    try:
+        return json.dumps(value or {}, ensure_ascii=False, sort_keys=True)
+    except Exception:
+        return "{}"
+
+
+def _managed_runtime_json_loads(raw: Any, default: Any) -> Any:
+    if raw in (None, ""):
+        return copy.deepcopy(default)
+    if isinstance(raw, (dict, list)):
+        return copy.deepcopy(raw)
+    try:
+        parsed = json.loads(str(raw))
+    except Exception:
+        return copy.deepcopy(default)
+    if isinstance(default, dict) and not isinstance(parsed, dict):
+        return copy.deepcopy(default)
+    if isinstance(default, list) and not isinstance(parsed, list):
+        return copy.deepcopy(default)
+    return parsed
+
+
+def _managed_runtime_bundle_defaults(bundle_type: str) -> dict[str, Any]:
+    return {
+        "bundle_type": str(bundle_type or "").strip(),
+        "mode": "absent",
+        "state": "idle",
+        "phase": "",
+        "phase_message": "",
+        "config_root": "",
+        "data_root": "",
+        "install_root": "",
+        "effective_url": "",
+        "ownership": "",
+        "health": {"available": False, "overall_status": "absent"},
+        "services": [],
+        "meta": {},
+        "last_error": "",
+        "update_state": {},
+        "created_at": 0.0,
+        "updated_at": 0.0,
+    }
+
+
+def _managed_runtime_bundle_get(bundle_type: str) -> dict[str, Any]:
+    bundle = _managed_runtime_bundle_defaults(bundle_type)
+    init_settings_db()
+    con = sqlite3.connect(str(SETTINGS_DB_FILE), timeout=10)
+    con.row_factory = sqlite3.Row
+    try:
+        cur = con.cursor()
+        cur.execute("SELECT * FROM managed_runtime_bundles WHERE bundle_type = ?", (bundle_type,))
+        row = cur.fetchone()
+    finally:
+        con.close()
+    if not row:
+        return bundle
+    bundle.update(
+        {
+            "mode": str(row["mode"] or "absent"),
+            "state": str(row["state"] or "idle"),
+            "phase": str(row["phase"] or ""),
+            "phase_message": str(row["phase_message"] or ""),
+            "config_root": str(row["config_root"] or ""),
+            "data_root": str(row["data_root"] or ""),
+            "install_root": str(row["install_root"] or ""),
+            "effective_url": str(row["effective_url"] or ""),
+            "ownership": str(row["ownership"] or ""),
+            "health": _managed_runtime_json_loads(row["health_json"], {"available": False, "overall_status": "absent"}),
+            "services": _managed_runtime_json_loads(row["services_json"], []),
+            "meta": _managed_runtime_json_loads(row["meta_json"], {}),
+            "last_error": str(row["last_error"] or ""),
+            "update_state": _managed_runtime_json_loads(row["update_state_json"], {}),
+            "created_at": float(row["created_at"] or 0.0),
+            "updated_at": float(row["updated_at"] or 0.0),
+        }
+    )
+    return bundle
+
+
+def _managed_runtime_bundle_upsert(bundle_type: str, **fields: Any) -> dict[str, Any]:
+    now = time.time()
+    bundle = _managed_runtime_bundle_get(bundle_type)
+    bundle.update({k: v for k, v in fields.items() if v is not None})
+    if not float(bundle.get("created_at") or 0.0):
+        bundle["created_at"] = now
+    bundle["updated_at"] = now
+    init_settings_db()
+    con = sqlite3.connect(str(SETTINGS_DB_FILE), timeout=10)
+    try:
+        con.execute("PRAGMA busy_timeout=5000;")
+        cur = con.cursor()
+        cur.execute(
+            """
+            INSERT INTO managed_runtime_bundles
+            (bundle_type, mode, state, phase, phase_message, config_root, data_root, install_root, effective_url, ownership, health_json, services_json, meta_json, last_error, update_state_json, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(bundle_type) DO UPDATE SET
+              mode = excluded.mode,
+              state = excluded.state,
+              phase = excluded.phase,
+              phase_message = excluded.phase_message,
+              config_root = excluded.config_root,
+              data_root = excluded.data_root,
+              install_root = excluded.install_root,
+              effective_url = excluded.effective_url,
+              ownership = excluded.ownership,
+              health_json = excluded.health_json,
+              services_json = excluded.services_json,
+              meta_json = excluded.meta_json,
+              last_error = excluded.last_error,
+              update_state_json = excluded.update_state_json,
+              updated_at = excluded.updated_at,
+              created_at = COALESCE(NULLIF(managed_runtime_bundles.created_at, 0), excluded.created_at)
+            """,
+            (
+                bundle_type,
+                str(bundle.get("mode") or "absent"),
+                str(bundle.get("state") or "idle"),
+                str(bundle.get("phase") or ""),
+                str(bundle.get("phase_message") or ""),
+                str(bundle.get("config_root") or ""),
+                str(bundle.get("data_root") or ""),
+                str(bundle.get("install_root") or ""),
+                str(bundle.get("effective_url") or ""),
+                str(bundle.get("ownership") or ""),
+                _managed_runtime_json_dumps(bundle.get("health") or {}),
+                _managed_runtime_json_dumps(bundle.get("services") or []),
+                _managed_runtime_json_dumps(bundle.get("meta") or {}),
+                str(bundle.get("last_error") or ""),
+                _managed_runtime_json_dumps(bundle.get("update_state") or {}),
+                float(bundle.get("created_at") or now),
+                float(bundle.get("updated_at") or now),
+            ),
+        )
+        con.commit()
+    finally:
+        con.close()
+    return bundle
+
+
+def _managed_runtime_log(bundle_type: str, message: str, *, service_name: str = "", level: str = "info") -> None:
+    bundle_name = str(bundle_type or "").strip() or "managed_runtime"
+    msg = str(message or "").strip()
+    if not msg:
+        return
+    level_norm = str(level or "info").strip().lower() or "info"
+    init_settings_db()
+    con = sqlite3.connect(str(SETTINGS_DB_FILE), timeout=10)
+    try:
+        con.execute("PRAGMA busy_timeout=5000;")
+        cur = con.cursor()
+        cur.execute(
+            "INSERT INTO managed_runtime_logs(bundle_type, service_name, level, message, created_at) VALUES(?, ?, ?, ?, ?)",
+            (bundle_name, str(service_name or ""), level_norm, msg, time.time()),
+        )
+        cur.execute(
+            """
+            DELETE FROM managed_runtime_logs
+            WHERE log_id NOT IN (
+                SELECT log_id
+                FROM managed_runtime_logs
+                WHERE bundle_type = ?
+                ORDER BY log_id DESC
+                LIMIT 500
+            )
+            AND bundle_type = ?
+            """,
+            (bundle_name, bundle_name),
+        )
+        con.commit()
+    finally:
+        con.close()
+    log_fn = logging.info
+    if level_norm == "warning":
+        log_fn = logging.warning
+    elif level_norm == "error":
+        log_fn = logging.error
+    elif level_norm == "debug":
+        log_fn = logging.debug
+    prefix = f"[ManagedRuntime][{bundle_name}]"
+    if service_name:
+        prefix = f"{prefix}[{service_name}]"
+    log_fn("%s %s", prefix, msg)
+
+
+def _managed_runtime_logs(bundle_type: str | None = None, *, service_name: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
+    init_settings_db()
+    safe_limit = max(1, min(int(limit or 200), 1000))
+    sql = "SELECT log_id, bundle_type, service_name, level, message, created_at FROM managed_runtime_logs"
+    where: list[str] = []
+    params: list[Any] = []
+    if bundle_type:
+        where.append("bundle_type = ?")
+        params.append(str(bundle_type))
+    if service_name:
+        where.append("service_name = ?")
+        params.append(str(service_name))
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY log_id DESC LIMIT ?"
+    params.append(safe_limit)
+    con = sqlite3.connect(str(SETTINGS_DB_FILE), timeout=10)
+    con.row_factory = sqlite3.Row
+    try:
+        cur = con.cursor()
+        cur.execute(sql, tuple(params))
+        rows = cur.fetchall()
+    finally:
+        con.close()
+    return [
+        {
+            "log_id": int(row["log_id"] or 0),
+            "bundle_type": str(row["bundle_type"] or ""),
+            "service_name": str(row["service_name"] or ""),
+            "level": str(row["level"] or "info"),
+            "message": str(row["message"] or ""),
+            "created_at": float(row["created_at"] or 0.0),
+        }
+        for row in rows
+    ]
+
+
+def _managed_runtime_action_update(action_id: str, bundle_type: str, action: str, status: str, *, payload: dict[str, Any] | None = None, result: dict[str, Any] | None = None, error: str = "", completed: bool = False) -> None:
+    now = time.time()
+    init_settings_db()
+    con = sqlite3.connect(str(SETTINGS_DB_FILE), timeout=10)
+    try:
+        con.execute("PRAGMA busy_timeout=5000;")
+        cur = con.cursor()
+        cur.execute(
+            """
+            INSERT INTO managed_runtime_actions(action_id, bundle_type, action, status, payload_json, result_json, error, created_at, updated_at, completed_at)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(action_id) DO UPDATE SET
+              status = excluded.status,
+              payload_json = excluded.payload_json,
+              result_json = excluded.result_json,
+              error = excluded.error,
+              updated_at = excluded.updated_at,
+              completed_at = excluded.completed_at
+            """,
+            (
+                str(action_id or ""),
+                str(bundle_type or ""),
+                str(action or ""),
+                str(status or "pending"),
+                _managed_runtime_json_dumps(payload or {}),
+                _managed_runtime_json_dumps(result or {}),
+                str(error or ""),
+                now,
+                now,
+                now if completed else None,
+            ),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def _managed_runtime_get_latest_action(bundle_type: str) -> dict[str, Any] | None:
+    init_settings_db()
+    con = sqlite3.connect(str(SETTINGS_DB_FILE), timeout=10)
+    con.row_factory = sqlite3.Row
+    try:
+        cur = con.cursor()
+        cur.execute(
+            """
+            SELECT action_id, bundle_type, action, status, payload_json, result_json, error, created_at, updated_at, completed_at
+            FROM managed_runtime_actions
+            WHERE bundle_type = ?
+            ORDER BY updated_at DESC, created_at DESC
+            LIMIT 1
+            """,
+            (str(bundle_type or ""),),
+        )
+        row = cur.fetchone()
+    finally:
+        con.close()
+    if not row:
+        return None
+    return {
+        "action_id": str(row["action_id"] or ""),
+        "bundle_type": str(row["bundle_type"] or ""),
+        "action": str(row["action"] or ""),
+        "status": str(row["status"] or ""),
+        "payload": _managed_runtime_json_loads(row["payload_json"], {}),
+        "result": _managed_runtime_json_loads(row["result_json"], {}),
+        "error": str(row["error"] or ""),
+        "created_at": float(row["created_at"] or 0.0),
+        "updated_at": float(row["updated_at"] or 0.0),
+        "completed_at": float(row["completed_at"] or 0.0) if row["completed_at"] is not None else None,
+    }
+
+
+def _managed_runtime_docker_cli() -> str:
+    return str(shutil.which("docker") or "").strip()
+
+
+def _managed_runtime_compose_cli() -> list[str]:
+    docker_cli = _managed_runtime_docker_cli()
+    if docker_cli:
+        try:
+            res = subprocess.run([docker_cli, "compose", "version"], capture_output=True, text=True, timeout=10)
+            if res.returncode == 0:
+                return [docker_cli, "compose"]
+        except Exception:
+            pass
+    compose_cli = str(shutil.which("docker-compose") or "").strip()
+    if compose_cli:
+        try:
+            res = subprocess.run([compose_cli, "version"], capture_output=True, text=True, timeout=10)
+            if res.returncode == 0:
+                return [compose_cli]
+        except Exception:
+            pass
+    return []
+
+
+def _managed_runtime_git_cli() -> str:
+    return str(shutil.which("git") or "").strip()
+
+
+def _managed_runtime_self_container_name() -> str:
+    return str(os.getenv("HOSTNAME") or "").strip()
+
+
+def _managed_runtime_sysfs_gpu_vendor(render_name: str) -> tuple[str, str]:
+    render_node = str(render_name or "").strip()
+    if not render_node:
+        return "", "unknown"
+    vendor_file = Path("/sys/class/drm") / render_node / "device" / "vendor"
+    try:
+        vendor_id = str(vendor_file.read_text(encoding="utf-8", errors="ignore") or "").strip().lower()
+    except Exception:
+        vendor_id = ""
+    vendor = _MANAGED_RUNTIME_GPU_VENDOR_MAP.get(vendor_id, "unknown") if vendor_id else "unknown"
+    return vendor_id, vendor
+
+
+def _managed_runtime_collect_dri_devices() -> list[dict[str, str]]:
+    devices: list[dict[str, str]] = []
+    dri_root = Path("/dev/dri")
+    if not dri_root.exists():
+        return devices
+    for node in sorted(dri_root.iterdir(), key=lambda item: item.name):
+        name = str(node.name or "")
+        if not name.startswith(("renderD", "card")):
+            continue
+        vendor_id, vendor = _managed_runtime_sysfs_gpu_vendor(name)
+        devices.append(
+            {
+                "path": str(node),
+                "name": name,
+                "kind": "render" if name.startswith("renderD") else "card",
+                "vendor_id": vendor_id,
+                "vendor": vendor,
+            }
+        )
+    return devices
+
+
+def _managed_runtime_gpu_probe() -> dict[str, Any]:
+    nvidia_devices = sorted(
+        {
+            str(path)
+            for path in list(Path("/dev").glob("nvidia[0-9]*")) + list(Path("/dev").glob("nvidiactl")) + list(Path("/dev").glob("nvidia-uvm*"))
+            if path.exists()
+        }
+    )
+    dri_devices = _managed_runtime_collect_dri_devices()
+    render_devices = [row for row in dri_devices if row.get("kind") == "render"]
+    card_devices = [row for row in dri_devices if row.get("kind") == "card"]
+    amd_render = [row for row in render_devices if row.get("vendor") == "amd"]
+    intel_render = [row for row in render_devices if row.get("vendor") == "intel"]
+    unknown_render = [row for row in render_devices if row.get("vendor") == "unknown"]
+    kfd_present = Path("/dev/kfd").exists()
+
+    available_modes: list[str] = []
+    recommended_mode = _MANAGED_RUNTIME_OLLAMA_GPU_MODE_CPU
+    message = "No GPU device was passed to the PMDA container; managed Ollama will run on CPU"
+
+    if nvidia_devices:
+        available_modes.append(_MANAGED_RUNTIME_OLLAMA_GPU_MODE_NVIDIA)
+        recommended_mode = _MANAGED_RUNTIME_OLLAMA_GPU_MODE_NVIDIA
+        message = "NVIDIA GPU devices detected; managed Ollama can request CUDA acceleration"
+    elif kfd_present and (amd_render or unknown_render):
+        available_modes.extend(
+            [
+                _MANAGED_RUNTIME_OLLAMA_GPU_MODE_AMD_ROCM,
+                _MANAGED_RUNTIME_OLLAMA_GPU_MODE_VULKAN_AMD,
+            ]
+        )
+        recommended_mode = _MANAGED_RUNTIME_OLLAMA_GPU_MODE_AMD_ROCM
+        message = "AMD GPU devices detected via /dev/kfd + /dev/dri; managed Ollama will prefer ROCm"
+    elif intel_render:
+        available_modes.extend(
+            [
+                _MANAGED_RUNTIME_OLLAMA_GPU_MODE_VULKAN_INTEL,
+                _MANAGED_RUNTIME_OLLAMA_GPU_MODE_VULKAN,
+            ]
+        )
+        recommended_mode = _MANAGED_RUNTIME_OLLAMA_GPU_MODE_VULKAN_INTEL
+        message = "Intel render devices detected via /dev/dri; managed Ollama can try experimental Vulkan acceleration"
+    elif amd_render:
+        available_modes.extend(
+            [
+                _MANAGED_RUNTIME_OLLAMA_GPU_MODE_VULKAN_AMD,
+                _MANAGED_RUNTIME_OLLAMA_GPU_MODE_VULKAN,
+            ]
+        )
+        recommended_mode = _MANAGED_RUNTIME_OLLAMA_GPU_MODE_VULKAN_AMD
+        message = "AMD render devices detected via /dev/dri; managed Ollama can try Vulkan acceleration"
+    elif unknown_render:
+        available_modes.append(_MANAGED_RUNTIME_OLLAMA_GPU_MODE_VULKAN)
+        recommended_mode = _MANAGED_RUNTIME_OLLAMA_GPU_MODE_VULKAN
+        message = "Render devices detected via /dev/dri; managed Ollama can try experimental Vulkan acceleration"
+
+    return {
+        "available": bool(available_modes),
+        "recommended_mode": recommended_mode,
+        "available_modes": available_modes,
+        "nvidia_devices": nvidia_devices,
+        "dri_devices": dri_devices,
+        "render_devices": render_devices,
+        "card_devices": card_devices,
+        "kfd_present": bool(kfd_present),
+        "message": message,
+    }
+
+
+def _managed_runtime_ollama_gpu_requested_mode() -> str:
+    requested = str(_get_config_from_db("MANAGED_OLLAMA_ACCELERATION_MODE", _MANAGED_RUNTIME_OLLAMA_GPU_MODE_AUTO) or _MANAGED_RUNTIME_OLLAMA_GPU_MODE_AUTO).strip().lower()
+    if requested not in _MANAGED_RUNTIME_OLLAMA_GPU_ALLOWED_MODES:
+        return _MANAGED_RUNTIME_OLLAMA_GPU_MODE_AUTO
+    return requested
+
+
+def _managed_runtime_ollama_gpu_profile(*, requested_mode: str | None = None) -> dict[str, Any]:
+    probe = _managed_runtime_gpu_probe()
+    requested = str(requested_mode or _managed_runtime_ollama_gpu_requested_mode() or _MANAGED_RUNTIME_OLLAMA_GPU_MODE_AUTO).strip().lower()
+    if requested not in _MANAGED_RUNTIME_OLLAMA_GPU_ALLOWED_MODES:
+        requested = _MANAGED_RUNTIME_OLLAMA_GPU_MODE_AUTO
+    selected = probe.get("recommended_mode") or _MANAGED_RUNTIME_OLLAMA_GPU_MODE_CPU
+    fallback_reason = ""
+    if requested == _MANAGED_RUNTIME_OLLAMA_GPU_MODE_CPU:
+        selected = _MANAGED_RUNTIME_OLLAMA_GPU_MODE_CPU
+    elif requested != _MANAGED_RUNTIME_OLLAMA_GPU_MODE_AUTO:
+        available_modes = set(probe.get("available_modes") or [])
+        if requested in available_modes:
+            selected = requested
+        else:
+            selected = _MANAGED_RUNTIME_OLLAMA_GPU_MODE_CPU
+            fallback_reason = f"Requested acceleration mode '{requested}' is not available from devices passed to PMDA"
+    device_paths: list[str] = []
+    env: dict[str, str] = {}
+    docker_args: list[str] = []
+    if selected == _MANAGED_RUNTIME_OLLAMA_GPU_MODE_NVIDIA:
+        docker_args.extend(["--gpus", "all"])
+        env["NVIDIA_VISIBLE_DEVICES"] = "all"
+        env["NVIDIA_DRIVER_CAPABILITIES"] = "compute,utility"
+    elif selected == _MANAGED_RUNTIME_OLLAMA_GPU_MODE_AMD_ROCM:
+        device_paths.extend(
+            [
+                "/dev/kfd",
+                *[str(row.get("path") or "") for row in probe.get("card_devices") or []],
+                *[str(row.get("path") or "") for row in probe.get("render_devices") or []],
+            ]
+        )
+    elif selected in {
+        _MANAGED_RUNTIME_OLLAMA_GPU_MODE_VULKAN,
+        _MANAGED_RUNTIME_OLLAMA_GPU_MODE_VULKAN_INTEL,
+        _MANAGED_RUNTIME_OLLAMA_GPU_MODE_VULKAN_AMD,
+    }:
+        device_paths.extend(
+            [
+                *[str(row.get("path") or "") for row in probe.get("card_devices") or []],
+                *[str(row.get("path") or "") for row in probe.get("render_devices") or []],
+            ]
+        )
+        env["OLLAMA_VULKAN"] = "1"
+    device_paths = [path for path in dict.fromkeys(device_paths) if path]
+    for path in device_paths:
+        docker_args.extend(["--device", f"{path}:{path}"])
+    active = selected != _MANAGED_RUNTIME_OLLAMA_GPU_MODE_CPU
+    mode_label = {
+        _MANAGED_RUNTIME_OLLAMA_GPU_MODE_CPU: "CPU",
+        _MANAGED_RUNTIME_OLLAMA_GPU_MODE_NVIDIA: "NVIDIA CUDA",
+        _MANAGED_RUNTIME_OLLAMA_GPU_MODE_AMD_ROCM: "AMD ROCm",
+        _MANAGED_RUNTIME_OLLAMA_GPU_MODE_VULKAN: "Vulkan",
+        _MANAGED_RUNTIME_OLLAMA_GPU_MODE_VULKAN_INTEL: "Intel Vulkan",
+        _MANAGED_RUNTIME_OLLAMA_GPU_MODE_VULKAN_AMD: "AMD Vulkan",
+    }.get(selected, selected.upper())
+    message = str(probe.get("message") or "")
+    if not active and requested != _MANAGED_RUNTIME_OLLAMA_GPU_MODE_CPU:
+        message = fallback_reason or message
+    return {
+        "requested_mode": requested,
+        "selected_mode": selected,
+        "mode_label": mode_label,
+        "active": active,
+        "device_paths": device_paths,
+        "env": env,
+        "docker_args": docker_args,
+        "probe": probe,
+        "fallback_reason": fallback_reason,
+        "message": message,
+    }
+
+
+def _managed_runtime_preflight() -> dict[str, Any]:
+    docker_socket = Path("/var/run/docker.sock")
+    docker_cli = _managed_runtime_docker_cli()
+    compose_cli = _managed_runtime_compose_cli()
+    git_cli = _managed_runtime_git_cli()
+    gpu_probe = _managed_runtime_gpu_probe()
+    compose_ok = False
+    docker_ok = False
+    docker_message = ""
+    if docker_cli and docker_socket.exists():
+        try:
+            res = subprocess.run([docker_cli, "version", "--format", "{{.Client.Version}}"], capture_output=True, text=True, timeout=10)
+            docker_ok = res.returncode == 0
+            docker_message = (res.stdout or res.stderr or "").strip()
+        except Exception as exc:
+            docker_message = str(exc)
+        compose_ok = bool(compose_cli)
+        if compose_cli and not docker_message:
+            docker_message = "Docker and Compose are available"
+    elif not docker_socket.exists():
+        docker_message = "Docker socket is not mounted at /var/run/docker.sock"
+    elif not docker_cli:
+        docker_message = "docker CLI is missing from the PMDA container"
+    return {
+        "available": bool(docker_ok and compose_ok),
+        "docker_socket": str(docker_socket),
+        "docker_socket_present": bool(docker_socket.exists()),
+        "docker_cli": docker_cli,
+        "compose_cli": " ".join(compose_cli),
+        "git_cli": git_cli,
+        "docker_ok": bool(docker_ok),
+        "compose_ok": bool(compose_ok),
+        "git_ok": bool(git_cli),
+        "message": docker_message or ("Docker is available" if docker_ok and compose_ok else "Docker preflight failed"),
+        "self_container": _managed_runtime_self_container_name(),
+        "gpu_probe": gpu_probe,
+    }
+
+
+def _managed_runtime_docker_ps(*, all_containers: bool = True) -> list[dict[str, Any]]:
+    docker_cli = _managed_runtime_docker_cli()
+    if not docker_cli:
+        return []
+    cmd = [docker_cli, "ps", "--format", "{{json .}}"]
+    if all_containers:
+        cmd.insert(2, "-a")
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+    except Exception:
+        return []
+    if res.returncode != 0:
+        return []
+    rows: list[dict[str, Any]] = []
+    for raw_line in (res.stdout or "").splitlines():
+        line = str(raw_line or "").strip()
+        if not line:
+            continue
+        try:
+            rows.append(json.loads(line))
+        except Exception:
+            continue
+    return rows
+
+
+def _managed_runtime_parse_ports(raw_ports: str) -> list[dict[str, Any]]:
+    ports = []
+    for chunk in str(raw_ports or "").split(","):
+        item = chunk.strip()
+        if not item:
+            continue
+        match = re.search(r"(?:(?P<host>[^:]+):)?(?P<host_port>\d+)->(?P<container_port>\d+)/(tcp|udp)", item)
+        if not match:
+            continue
+        ports.append(
+            {
+                "host": str(match.group("host") or "127.0.0.1"),
+                "host_port": int(match.group("host_port") or 0),
+                "container_port": int(match.group("container_port") or 0),
+            }
+        )
+    return ports
+
+
+def _managed_runtime_project_prefix(name: str, services: set[str]) -> str:
+    raw = str(name or "").strip()
+    for service in sorted(services, key=len, reverse=True):
+        suffix = f"-{service}-1"
+        if raw.endswith(suffix):
+            return raw[: -len(suffix)]
+    return raw
+
+
+def _managed_runtime_health_check_musicbrainz(base_url: str) -> dict[str, Any]:
+    url = str(base_url or "").strip().rstrip("/")
+    if not url:
+        return {"available": False, "overall_status": "unavailable", "message": "No URL configured"}
+    endpoint = f"{url}/ws/2/artist?query=artist:Radiohead&limit=1&fmt=json"
+    started = time.time()
+    try:
+        resp = requests.get(endpoint, timeout=20, headers={"User-Agent": "PMDA managed runtime/1.0"})
+        latency_ms = round((time.time() - started) * 1000.0, 1)
+        if resp.status_code != 200:
+            return {"available": False, "overall_status": "degraded", "message": f"HTTP {resp.status_code}", "latency_ms": latency_ms}
+        payload = resp.json() if resp.content else {}
+        count = int(len(payload.get("artists") or []))
+        return {
+            "available": True,
+            "overall_status": "healthy",
+            "message": f"MusicBrainz mirror reachable ({count} result(s))",
+            "latency_ms": latency_ms,
+        }
+    except requests.exceptions.Timeout:
+        return {"available": False, "overall_status": "degraded", "message": "Timed out"}
+    except requests.exceptions.ConnectionError:
+        return {"available": False, "overall_status": "unavailable", "message": "Connection failed"}
+    except Exception as exc:
+        return {"available": False, "overall_status": "degraded", "message": str(exc or "Health check failed")}
+
+
+def _managed_runtime_health_check_ollama(base_url: str) -> dict[str, Any]:
+    probe = _ollama_probe(str(base_url or ""))
+    return {
+        "available": bool(probe.get("ok")),
+        "overall_status": "healthy" if bool(probe.get("ok")) else "unavailable",
+        "message": str(probe.get("message") or ""),
+        "models": list(probe.get("models") or []),
+        "model_count": int(probe.get("model_count") or 0),
+    }
+
+
+def _managed_runtime_detect_musicbrainz_candidates() -> list[dict[str, Any]]:
+    service_names = {"db", "search", "indexer", "mq", "musicbrainz"}
+    grouped: dict[str, dict[str, Any]] = {}
+    for row in _managed_runtime_docker_ps():
+        name = str(row.get("Names") or "").strip()
+        match = re.match(r"^(?P<prefix>.+)-(?P<service>db|search|indexer|mq|musicbrainz)-\d+$", name)
+        if not match:
+            continue
+        prefix = str(match.group("prefix") or "").strip()
+        service = str(match.group("service") or "").strip()
+        candidate = grouped.setdefault(
+            prefix,
+            {
+                "id": prefix,
+                "bundle_type": _MANAGED_RUNTIME_MUSICBRAINZ_BUNDLE,
+                "services": {},
+                "published_url": "",
+                "project_name": prefix,
+            },
+        )
+        candidate["services"][service] = {
+            "name": name,
+            "status": str(row.get("State") or "").strip().lower(),
+            "image": str(row.get("Image") or "").strip(),
+            "ports": _managed_runtime_parse_ports(str(row.get("Ports") or "")),
+        }
+        if service == "musicbrainz":
+            for port in candidate["services"][service]["ports"]:
+                if int(port.get("container_port") or 0) == 5000 and int(port.get("host_port") or 0) > 0:
+                    candidate["published_url"] = f"http://127.0.0.1:{int(port['host_port'])}"
+                    break
+    out: list[dict[str, Any]] = []
+    for prefix, candidate in grouped.items():
+        services = candidate.get("services") or {}
+        service_count = len(services)
+        published_url = str(candidate.get("published_url") or "")
+        health = _managed_runtime_health_check_musicbrainz(published_url) if published_url else {"available": False, "overall_status": "unavailable", "message": "No published web port detected"}
+        out.append(
+            {
+                "id": prefix,
+                "project_name": prefix,
+                "bundle_type": _MANAGED_RUNTIME_MUSICBRAINZ_BUNDLE,
+                "services_present": sorted(services.keys()),
+                "service_count": service_count,
+                "expected_service_count": len(service_names),
+                "published_url": published_url,
+                "adoptable": service_count >= 3,
+                "health": health,
+            }
+        )
+    out.sort(key=lambda row: (not bool(row.get("health", {}).get("available")), -int(row.get("service_count") or 0), str(row.get("id") or "")))
+    return out
+
+
+def _managed_runtime_detect_ollama_candidates() -> list[dict[str, Any]]:
+    urls: list[str] = []
+    seen: set[str] = set()
+
+    def _add(url_text: str) -> None:
+        normalized = _normalize_ollama_probe_url(url_text)
+        if not normalized or normalized in seen:
+            return
+        seen.add(normalized)
+        urls.append(normalized)
+
+    current_url = str(_get_config_from_db("OLLAMA_URL", OLLAMA_URL) or "").strip()
+    if current_url:
+        _add(current_url)
+    for default_url in (
+        "http://127.0.0.1:11434",
+        "http://localhost:11434",
+        "http://host.docker.internal:11434",
+        f"http://{_MANAGED_RUNTIME_OLLAMA_CONTAINER}:11434",
+        "http://ollama:11434",
+    ):
+        _add(default_url)
+    for row in _managed_runtime_docker_ps():
+        name = str(row.get("Names") or "").strip()
+        if "ollama" not in name.lower():
+            continue
+        for port in _managed_runtime_parse_ports(str(row.get("Ports") or "")):
+            if int(port.get("container_port") or 0) == 11434 and int(port.get("host_port") or 0) > 0:
+                _add(f"http://127.0.0.1:{int(port['host_port'])}")
+    out: list[dict[str, Any]] = []
+    for idx, url in enumerate(urls):
+        probe = _ollama_probe(url)
+        out.append(
+            {
+                "id": f"ollama-{idx + 1}",
+                "bundle_type": _MANAGED_RUNTIME_OLLAMA_BUNDLE,
+                "url": probe.get("url") or url,
+                "adoptable": bool(probe.get("ok")),
+                "health": {
+                    "available": bool(probe.get("ok")),
+                    "overall_status": "healthy" if bool(probe.get("ok")) else "unavailable",
+                    "message": str(probe.get("message") or ""),
+                },
+                "models": list(probe.get("models") or []),
+                "model_count": int(probe.get("model_count") or 0),
+            }
+        )
+    out.sort(key=lambda row: (not bool(row.get("adoptable")), -int(row.get("model_count") or 0), str(row.get("url") or "")))
+    return out
+
+
+def _managed_runtime_ensure_network() -> None:
+    docker_cli = _managed_runtime_docker_cli()
+    if not docker_cli:
+        raise RuntimeError("docker CLI is missing")
+    inspect = subprocess.run([docker_cli, "network", "inspect", _MANAGED_RUNTIME_NETWORK_NAME], capture_output=True, text=True, timeout=10)
+    if inspect.returncode == 0:
+        return
+    res = subprocess.run([docker_cli, "network", "create", _MANAGED_RUNTIME_NETWORK_NAME], capture_output=True, text=True, timeout=20)
+    if res.returncode != 0 and "already exists" not in str(res.stderr or "").lower():
+        raise RuntimeError((res.stderr or res.stdout or "Failed to create managed runtime network").strip())
+
+
+def _managed_runtime_connect_container_to_network(container_name: str, *, alias: str | None = None) -> None:
+    docker_cli = _managed_runtime_docker_cli()
+    if not docker_cli:
+        raise RuntimeError("docker CLI is missing")
+    if not container_name:
+        return
+    cmd = [docker_cli, "network", "connect"]
+    if alias:
+        cmd.extend(["--alias", str(alias)])
+    cmd.extend([_MANAGED_RUNTIME_NETWORK_NAME, container_name])
+    res = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+    stderr = str(res.stderr or "").lower()
+    if res.returncode != 0 and "already exists" not in stderr and "endpoint with name" not in stderr:
+        raise RuntimeError((res.stderr or res.stdout or f"Failed to connect {container_name} to network").strip())
+
+
+def _managed_runtime_connect_self_to_network() -> None:
+    container_name = _managed_runtime_self_container_name()
+    if not container_name:
+        return
+    _managed_runtime_connect_container_to_network(container_name, alias="pmda")
+
+
+def _managed_runtime_musicbrainz_install_root(config_root: str) -> str:
+    root = Path(str(config_root or "").strip()).expanduser()
+    return str(root / _MANAGED_RUNTIME_MB_DEFAULT_PROJECT)
+
+
+def _managed_runtime_musicbrainz_data_root(data_root: str) -> str:
+    root = Path(str(data_root or "").strip()).expanduser()
+    return str(root / "musicbrainz-mirror")
+
+
+def _managed_runtime_ollama_data_root(data_root: str) -> str:
+    root = Path(str(data_root or "").strip()).expanduser()
+    return str(root / "ollama")
+
+
+def _managed_runtime_musicbrainz_internal_url(install_root: str) -> str:
+    project_name = Path(str(install_root or "").strip()).name or _MANAGED_RUNTIME_MB_DEFAULT_PROJECT
+    return f"http://{project_name}-musicbrainz-1:5000"
+
+
+def _managed_runtime_capture_subprocess(
+    cmd: list[str],
+    *,
+    bundle_type: str,
+    service_name: str = "",
+    cwd: str | None = None,
+    env: dict[str, str] | None = None,
+    phase_map: list[tuple[str, str, str]] | None = None,
+) -> None:
+    progress_re = re.compile(r"\b(\d{1,3})%\b")
+    proc = subprocess.Popen(
+        cmd,
+        cwd=cwd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    try:
+        assert proc.stdout is not None
+        for raw_line in proc.stdout:
+            line = str(raw_line or "").rstrip()
+            if not line:
+                continue
+            _managed_runtime_log(bundle_type, line, service_name=service_name)
+            progress_match = progress_re.search(line)
+            if progress_match is not None:
+                try:
+                    progress_value = max(0, min(100, int(progress_match.group(1))))
+                except Exception:
+                    progress_value = None
+                if progress_value is not None:
+                    bundle_now = _managed_runtime_bundle_get(bundle_type)
+                    meta_now = dict(bundle_now.get("meta") or {})
+                    meta_now["progress"] = progress_value
+                    _managed_runtime_bundle_upsert(bundle_type, meta=meta_now)
+            for needle, phase, message in phase_map or []:
+                if needle and needle.lower() in line.lower():
+                    bundle_now = _managed_runtime_bundle_get(bundle_type)
+                    meta_now = dict(bundle_now.get("meta") or {})
+                    if phase in {"preflight", "creating"}:
+                        meta_now.setdefault("progress", 18 if phase == "preflight" else 24)
+                    elif phase == "pulling":
+                        meta_now.setdefault("progress", 40)
+                    elif phase == "importing":
+                        meta_now.setdefault("progress", 41)
+                    _managed_runtime_bundle_upsert(bundle_type, state=phase, phase=phase, phase_message=message, meta=meta_now)
+                    break
+        proc.wait()
+    finally:
+        try:
+            if proc.stdout is not None:
+                proc.stdout.close()
+        except Exception:
+            pass
+    if proc.returncode != 0:
+        raise RuntimeError(f"Command failed ({proc.returncode}): {' '.join(cmd)}")
+
+
+def _managed_runtime_health_wait(bundle_type: str, url: str, checker, *, attempts: int = 60, sleep_sec: float = 5.0) -> dict[str, Any]:
+    last_health: dict[str, Any] = {}
+    for _ in range(max(1, int(attempts or 1))):
+        health = checker(url)
+        last_health = dict(health or {})
+        services = [
+            {
+                "name": bundle_type,
+                "status": "healthy" if bool(last_health.get("available")) else str(last_health.get("overall_status") or "waiting"),
+                "message": str(last_health.get("message") or ""),
+            }
+        ]
+        _managed_runtime_bundle_upsert(
+            bundle_type,
+            state="waiting_health",
+            phase="waiting_health",
+            phase_message=str(last_health.get("message") or "Waiting for service health"),
+            health=last_health,
+            services=services,
+        )
+        if bool(last_health.get("available")):
+            return last_health
+        time.sleep(max(0.1, float(sleep_sec)))
+    return last_health
+
+
+def _managed_runtime_register_mb_update_schedule(bundle: dict[str, Any]) -> dict[str, Any]:
+    update_state = dict(bundle.get("update_state") or {})
+    enabled = bool(
+        _parse_bool(
+            _get_config_from_db(
+                "MANAGED_MUSICBRAINZ_UPDATE_ENABLED",
+                update_state.get("enabled", True),
+            )
+        )
+    )
+    interval_hours_raw = _get_config_from_db(
+        "MANAGED_MUSICBRAINZ_REINDEX_INTERVAL_HOURS",
+        int(update_state.get("interval_sec") or _MANAGED_RUNTIME_MB_DEFAULT_UPDATE_INTERVAL_SEC) // 3600,
+    )
+    try:
+        interval_hours = max(1, min(24 * 30, int(interval_hours_raw or 24 * 7)))
+    except Exception:
+        interval_hours = 24 * 7
+    interval_sec = int(interval_hours * 3600)
+    if interval_sec <= 0:
+        interval_sec = _MANAGED_RUNTIME_MB_DEFAULT_UPDATE_INTERVAL_SEC
+    last_success_at = float(update_state.get("last_success_at") or 0.0)
+    next_planned_at = float(update_state.get("next_planned_at") or 0.0)
+    now = time.time()
+    if next_planned_at <= 0:
+        next_planned_at = (last_success_at or now) + interval_sec
+    update_state.update(
+        {
+            "enabled": enabled,
+            "interval_sec": interval_sec,
+            "last_success_at": last_success_at,
+            "next_planned_at": next_planned_at,
+            "strategy": "weekly_reindex",
+        }
+    )
+    return update_state
+
+
+def _managed_runtime_apply_musicbrainz_runtime(mode: str, base_url: str, mirror_name: str, *, config_root: str = "", data_root: str = "", install_root: str = "") -> None:
+    updates = {
+        "MUSICBRAINZ_MIRROR_ENABLED": True,
+        "MUSICBRAINZ_BASE_URL": str(base_url or "").strip(),
+        "MUSICBRAINZ_MIRROR_NAME": str(mirror_name or _MANAGED_RUNTIME_MB_DEFAULT_PROJECT).strip(),
+        "MUSICBRAINZ_RUNTIME_MODE": str(mode or "managed"),
+    }
+    if config_root:
+        updates["MANAGED_RUNTIME_CONFIG_ROOT"] = str(config_root)
+    if data_root:
+        updates["MANAGED_RUNTIME_DATA_ROOT"] = str(data_root)
+    if install_root:
+        updates["MANAGED_MUSICBRAINZ_INSTALL_ROOT"] = str(install_root)
+    for key, value in updates.items():
+        _settings_db_set_value(key, value)
+    _apply_settings_in_memory({"MUSICBRAINZ_MIRROR_ENABLED": True, "MUSICBRAINZ_BASE_URL": str(base_url or "").strip(), "MUSICBRAINZ_MIRROR_NAME": str(mirror_name or "").strip()})
+
+
+def _managed_runtime_apply_ollama_runtime(mode: str, url: str, fast_model: str, hard_model: str, *, config_root: str = "", data_root: str = "") -> None:
+    updates = {
+        "OLLAMA_URL": str(url or "").strip().rstrip("/"),
+        "OLLAMA_MODEL": str(fast_model or _ollama_model_configured()).strip() or "qwen3:4b",
+        "OLLAMA_COMPLEX_MODEL": str(hard_model or _ollama_complex_model_configured()).strip() or "qwen3:14b",
+        "OLLAMA_RUNTIME_MODE": str(mode or "managed"),
+    }
+    if config_root:
+        updates["MANAGED_RUNTIME_CONFIG_ROOT"] = str(config_root)
+    if data_root:
+        updates["MANAGED_RUNTIME_DATA_ROOT"] = str(data_root)
+    for key, value in updates.items():
+        _settings_db_set_value(key, value)
+    _apply_settings_in_memory(updates)
+
+
+def _managed_runtime_adopt_musicbrainz(candidate: dict[str, Any], *, mode: str = "adopted", config_root: str = "", data_root: str = "") -> dict[str, Any]:
+    url = str(candidate.get("published_url") or candidate.get("effective_url") or "").strip()
+    if not url:
+        raise RuntimeError("MusicBrainz candidate has no usable URL")
+    health = _managed_runtime_health_check_musicbrainz(url)
+    if not bool(health.get("available")):
+        raise RuntimeError(str(health.get("message") or "MusicBrainz candidate is not healthy"))
+    bundle = _managed_runtime_bundle_upsert(
+        _MANAGED_RUNTIME_MUSICBRAINZ_BUNDLE,
+        mode=str(mode or "adopted"),
+        state="ready",
+        phase="ready",
+        phase_message="MusicBrainz mirror adopted",
+        config_root=str(config_root or ""),
+        data_root=str(data_root or ""),
+        install_root=str(candidate.get("install_root") or ""),
+        effective_url=url,
+        ownership=str(candidate.get("project_name") or candidate.get("id") or ""),
+        health=health,
+        services=[
+            {"name": service_name, "status": "healthy", "message": "Detected from existing Docker stack"}
+            for service_name in list(candidate.get("services_present") or [])
+        ],
+        last_error="",
+    )
+    bundle["update_state"] = _managed_runtime_register_mb_update_schedule(bundle)
+    bundle = _managed_runtime_bundle_upsert(_MANAGED_RUNTIME_MUSICBRAINZ_BUNDLE, update_state=bundle["update_state"])
+    _managed_runtime_apply_musicbrainz_runtime(str(mode or "adopted"), url, _MANAGED_RUNTIME_MB_DEFAULT_PROJECT, config_root=config_root, data_root=data_root, install_root=str(candidate.get("install_root") or ""))
+    _managed_runtime_log(_MANAGED_RUNTIME_MUSICBRAINZ_BUNDLE, f"Adopted existing MusicBrainz runtime at {url}")
+    return bundle
+
+
+def _managed_runtime_adopt_ollama(candidate: dict[str, Any], *, fast_model: str, hard_model: str, mode: str = "adopted", config_root: str = "", data_root: str = "") -> dict[str, Any]:
+    url = str(candidate.get("url") or "").strip()
+    if not url:
+        raise RuntimeError("Ollama candidate has no usable URL")
+    health = _managed_runtime_health_check_ollama(url)
+    if not bool(health.get("available")):
+        raise RuntimeError(str(health.get("message") or "Ollama candidate is not healthy"))
+    models = list(health.get("models") or candidate.get("models") or [])
+    services = [{"name": "ollama", "status": "healthy", "message": f"{len(models)} model(s) available"}]
+    bundle = _managed_runtime_bundle_upsert(
+        _MANAGED_RUNTIME_OLLAMA_BUNDLE,
+        mode=str(mode or "adopted"),
+        state="ready",
+        phase="ready",
+        phase_message="Ollama adopted",
+        config_root=str(config_root or ""),
+        data_root=str(data_root or ""),
+        effective_url=url,
+        ownership=str(candidate.get("id") or ""),
+        health=health,
+        services=services,
+        meta={
+            "models": models,
+            "model_count": len(models),
+            "gpu": {
+                "requested_mode": _managed_runtime_ollama_gpu_requested_mode(),
+                "selected_mode": "external",
+                "mode_label": "External runtime",
+                "active": False,
+                "message": "PMDA adopted an existing Ollama runtime and cannot reconfigure its GPU profile",
+                "probe": _managed_runtime_gpu_probe(),
+            },
+        },
+        last_error="",
+    )
+    _managed_runtime_apply_ollama_runtime(str(mode or "adopted"), url, fast_model, hard_model, config_root=config_root, data_root=data_root)
+    _managed_runtime_log(_MANAGED_RUNTIME_OLLAMA_BUNDLE, f"Adopted existing Ollama runtime at {url}")
+    return bundle
+
+
+def _managed_runtime_ollama_pull_blocking(url: str, model_name: str, *, bundle_type: str) -> None:
+    _managed_runtime_log(bundle_type, f"Pulling Ollama model {model_name}", service_name="ollama")
+    response = requests.post(
+        f"{url.rstrip('/')}/api/pull",
+        json={"name": model_name, "stream": True},
+        stream=True,
+        timeout=(10, 900),
+    )
+    if response.status_code != 200:
+        detail = response.text[:400] if response.text else f"HTTP {response.status_code}"
+        raise RuntimeError(f"Ollama pull failed: {detail}")
+    for raw_line in response.iter_lines(decode_unicode=True):
+        if not raw_line:
+            continue
+        try:
+            payload = json.loads(raw_line)
+        except Exception:
+            continue
+        status_text = str(payload.get("status") or "pulling").strip() or "pulling"
+        completed = int(payload.get("completed") or 0)
+        total = int(payload.get("total") or 0)
+        progress = 0.0
+        if total > 0:
+            progress = max(0.0, min(100.0, (completed / total) * 100.0))
+        if payload.get("error"):
+            raise RuntimeError(str(payload.get("error")))
+        _managed_runtime_bundle_upsert(
+            bundle_type,
+            state="pulling",
+            phase="pulling",
+            phase_message=f"{status_text} ({model_name})",
+            meta={"current_model": model_name, "progress": progress, "completed": completed, "total": total},
+        )
+    if not _ollama_model_exists(url, model_name):
+        raise RuntimeError(f"Ollama did not report {model_name} after pull")
+    _managed_runtime_log(bundle_type, f"Ollama model ready: {model_name}", service_name="ollama")
+
+
+def _managed_runtime_bootstrap_musicbrainz(payload: dict[str, Any]) -> None:
+    bundle_type = _MANAGED_RUNTIME_MUSICBRAINZ_BUNDLE
+    config_root = str(payload.get("config_root") or "").strip()
+    data_root = str(payload.get("data_root") or "").strip()
+    action = str(payload.get("action") or "auto").strip().lower() or "auto"
+    mirror_name = str(payload.get("mirror_name") or "Managed local MusicBrainz").strip() or "Managed local MusicBrainz"
+    action_id = str(payload.get("action_id") or str(uuid.uuid4()))
+    _managed_runtime_action_update(action_id, bundle_type, "bootstrap", "running", payload=payload)
+    _managed_runtime_bundle_upsert(bundle_type, mode="managed" if action != "adopt" else "adopted", state="preflight", phase="preflight", phase_message="Checking Docker environment", config_root=config_root, data_root=data_root, last_error="")
+    try:
+        preflight = _managed_runtime_preflight()
+        if not bool(preflight.get("available")):
+            raise RuntimeError(str(preflight.get("message") or "Docker preflight failed"))
+        if action in {"auto", "adopt"}:
+            candidates = _managed_runtime_detect_musicbrainz_candidates()
+            candidate = next((row for row in candidates if bool(row.get("adoptable")) and bool((row.get("health") or {}).get("available"))), None)
+            if candidate is not None:
+                adopted = _managed_runtime_adopt_musicbrainz(candidate, mode="adopted", config_root=config_root, data_root=data_root)
+                _managed_runtime_action_update(action_id, bundle_type, "bootstrap", "completed", payload=payload, result=adopted, completed=True)
+                return
+            if action == "adopt":
+                raise RuntimeError("No adoptable MusicBrainz stack was detected")
+        if not config_root or not data_root:
+            raise RuntimeError("Managed local runtimes require both a config/runtime base dir and a data base dir")
+        install_root = _managed_runtime_musicbrainz_install_root(config_root)
+        bundle_data_root = _managed_runtime_musicbrainz_data_root(data_root)
+        Path(install_root).mkdir(parents=True, exist_ok=True)
+        Path(bundle_data_root).mkdir(parents=True, exist_ok=True)
+        _managed_runtime_bundle_upsert(bundle_type, install_root=install_root, mode="managed", state="creating", phase="creating", phase_message="Provisioning MusicBrainz mirror bundle")
+        _managed_runtime_ensure_network()
+        script_path = Path(__file__).resolve().parent / "scripts" / "provision_musicbrainz_mirror_unraid.sh"
+        if not script_path.exists():
+            raise RuntimeError(f"Provision script not found: {script_path}")
+        cmd = [
+            str(script_path),
+            "--install-root", install_root,
+            "--data-root", bundle_data_root,
+            "--host", "127.0.0.1",
+            "--port", str(_MANAGED_RUNTIME_MB_DEFAULT_PORT),
+        ]
+        token = _settings_db_get_secret("MUSICBRAINZ_REPLICATION_TOKEN")
+        token_file = ""
+        if token:
+            token_dir = Path(config_root).expanduser() / "managed-runtime" / "secrets"
+            token_dir.mkdir(parents=True, exist_ok=True)
+            token_file = str(token_dir / "musicbrainz_replication_token.txt")
+            Path(token_file).write_text(token + "\n", encoding="utf-8")
+            cmd.extend(["--token-file", token_file])
+        else:
+            cmd.append("--skip-replication")
+        phase_map = [
+            ("Building docker images", "pulling", "Building MusicBrainz images"),
+            ("Importing latest full MusicBrainz dumps", "importing", "Importing MusicBrainz dump"),
+            ("Building materialized tables", "creating", "Building MusicBrainz materialized tables"),
+            ("search index", "creating", "Bootstrapping MusicBrainz search indexes"),
+        ]
+        _managed_runtime_capture_subprocess(cmd, bundle_type=bundle_type, service_name="musicbrainz", phase_map=phase_map)
+        candidates = _managed_runtime_detect_musicbrainz_candidates()
+        candidate = next((row for row in candidates if str(row.get("project_name") or "") == Path(install_root).name), None)
+        if candidate is None:
+            candidate = next((row for row in candidates if bool(row.get("adoptable"))), None)
+        if candidate is None:
+            raise RuntimeError("Provisioning completed but no MusicBrainz Docker bundle was detected")
+        for service_name in list(candidate.get("services_present") or []):
+            container_name = f"{candidate.get('project_name')}-{service_name}-1"
+            _managed_runtime_connect_container_to_network(container_name)
+        _managed_runtime_connect_self_to_network()
+        internal_url = _managed_runtime_musicbrainz_internal_url(install_root)
+        health = _managed_runtime_health_wait(bundle_type, internal_url, _managed_runtime_health_check_musicbrainz, attempts=60, sleep_sec=10.0)
+        if not bool(health.get("available")):
+            published_url = str(candidate.get("published_url") or "")
+            if published_url:
+                health = _managed_runtime_health_wait(bundle_type, published_url, _managed_runtime_health_check_musicbrainz, attempts=6, sleep_sec=5.0)
+                if bool(health.get("available")):
+                    internal_url = published_url
+        if not bool(health.get("available")):
+            raise RuntimeError(str(health.get("message") or "MusicBrainz mirror did not become healthy"))
+        bundle = _managed_runtime_bundle_upsert(
+            bundle_type,
+            mode="managed",
+            state="ready",
+            phase="ready",
+            phase_message="MusicBrainz mirror ready",
+            config_root=config_root,
+            data_root=data_root,
+            install_root=install_root,
+            effective_url=internal_url,
+            ownership=str(candidate.get("project_name") or ""),
+            health=health,
+            services=[
+                {"name": service_name, "status": "healthy", "message": "Running"}
+                for service_name in list(candidate.get("services_present") or [])
+            ],
+            last_error="",
+        )
+        bundle["update_state"] = _managed_runtime_register_mb_update_schedule(bundle)
+        bundle = _managed_runtime_bundle_upsert(bundle_type, update_state=bundle["update_state"])
+        _managed_runtime_apply_musicbrainz_runtime("managed", internal_url, mirror_name, config_root=config_root, data_root=data_root, install_root=install_root)
+        _settings_db_set_value("MANAGED_RUNTIME_CONFIG_ROOT", config_root)
+        _settings_db_set_value("MANAGED_RUNTIME_DATA_ROOT", data_root)
+        _managed_runtime_action_update(action_id, bundle_type, "bootstrap", "completed", payload=payload, result=bundle, completed=True)
+    except Exception as exc:
+        message = str(exc or "MusicBrainz bootstrap failed")
+        _managed_runtime_bundle_upsert(bundle_type, state="failed", phase="failed", phase_message=message, last_error=message)
+        _managed_runtime_action_update(action_id, bundle_type, "bootstrap", "failed", payload=payload, error=message, completed=True)
+        _managed_runtime_log(bundle_type, message, level="error")
+        raise
+
+
+def _managed_runtime_bootstrap_ollama(payload: dict[str, Any]) -> None:
+    bundle_type = _MANAGED_RUNTIME_OLLAMA_BUNDLE
+    config_root = str(payload.get("config_root") or "").strip()
+    data_root = str(payload.get("data_root") or "").strip()
+    action = str(payload.get("action") or "auto").strip().lower() or "auto"
+    fast_model = str(payload.get("fast_model") or _ollama_model_configured()).strip() or "qwen3:4b"
+    hard_model = str(payload.get("hard_model") or _ollama_complex_model_configured()).strip() or "qwen3:14b"
+    action_id = str(payload.get("action_id") or str(uuid.uuid4()))
+    _managed_runtime_action_update(action_id, bundle_type, "bootstrap", "running", payload=payload)
+    _managed_runtime_bundle_upsert(bundle_type, mode="managed" if action != "adopt" else "adopted", state="preflight", phase="preflight", phase_message="Checking Docker environment", config_root=config_root, data_root=data_root, last_error="")
+    try:
+        preflight = _managed_runtime_preflight()
+        if not bool(preflight.get("docker_ok")):
+            raise RuntimeError(str(preflight.get("message") or "Docker preflight failed"))
+        if action in {"auto", "adopt"}:
+            candidates = _managed_runtime_detect_ollama_candidates()
+            candidate = next((row for row in candidates if bool(row.get("adoptable"))), None)
+            if candidate is not None:
+                adopted = _managed_runtime_adopt_ollama(candidate, fast_model=fast_model, hard_model=hard_model, mode="adopted", config_root=config_root, data_root=data_root)
+                _managed_runtime_action_update(action_id, bundle_type, "bootstrap", "completed", payload=payload, result=adopted, completed=True)
+                return
+            if action == "adopt":
+                raise RuntimeError("No adoptable Ollama runtime was detected")
+        if not config_root or not data_root:
+            raise RuntimeError("Managed local runtimes require both a config/runtime base dir and a data base dir")
+        _managed_runtime_ensure_network()
+        _managed_runtime_connect_self_to_network()
+        docker_cli = _managed_runtime_docker_cli()
+        ollama_data_root = _managed_runtime_ollama_data_root(data_root)
+        Path(ollama_data_root).mkdir(parents=True, exist_ok=True)
+        rm_res = subprocess.run([docker_cli, "rm", "-f", _MANAGED_RUNTIME_OLLAMA_CONTAINER], capture_output=True, text=True, timeout=20)
+        if rm_res.returncode == 0:
+            _managed_runtime_log(bundle_type, "Removed existing managed Ollama container before recreate", service_name="ollama")
+        gpu_profile = _managed_runtime_ollama_gpu_profile()
+
+        def _build_run_cmd(profile: dict[str, Any]) -> list[str]:
+            cmd = [
+                docker_cli,
+                "run",
+                "-d",
+                "--name",
+                _MANAGED_RUNTIME_OLLAMA_CONTAINER,
+                "--restart",
+                "unless-stopped",
+                "--network",
+                _MANAGED_RUNTIME_NETWORK_NAME,
+                "--volume",
+                f"{ollama_data_root}:/root/.ollama",
+                "-p",
+                f"{_MANAGED_RUNTIME_OLLAMA_PORT}:{_MANAGED_RUNTIME_OLLAMA_PORT}",
+            ]
+            cmd.extend(list(profile.get("docker_args") or []))
+            for key, value in dict(profile.get("env") or {}).items():
+                cmd.extend(["-e", f"{key}={value}"])
+            cmd.append("ollama/ollama:latest")
+            return cmd
+
+        active_profile = dict(gpu_profile)
+        _managed_runtime_bundle_upsert(
+            bundle_type,
+            state="creating",
+            phase="creating",
+            phase_message=f"Starting managed Ollama runtime ({active_profile.get('mode_label') or 'CPU'})",
+            config_root=config_root,
+            data_root=data_root,
+            meta={"gpu": active_profile},
+        )
+        start_res = subprocess.run(_build_run_cmd(active_profile), capture_output=True, text=True, timeout=30)
+        if start_res.returncode != 0 and str(active_profile.get("selected_mode") or "") != _MANAGED_RUNTIME_OLLAMA_GPU_MODE_CPU:
+            failure_detail = (start_res.stderr or start_res.stdout or "Failed to start managed Ollama container").strip()
+            _managed_runtime_log(
+                bundle_type,
+                f"GPU acceleration start failed for mode {active_profile.get('selected_mode')}: {failure_detail}. Retrying on CPU.",
+                level="warning",
+                service_name="ollama",
+            )
+            active_profile = _managed_runtime_ollama_gpu_profile(requested_mode=_MANAGED_RUNTIME_OLLAMA_GPU_MODE_CPU)
+            active_profile["fallback_reason"] = failure_detail
+            _managed_runtime_bundle_upsert(
+                bundle_type,
+                state="creating",
+                phase="creating",
+                phase_message="GPU start failed, retrying managed Ollama on CPU",
+                meta={"gpu": active_profile},
+            )
+            start_res = subprocess.run(_build_run_cmd(active_profile), capture_output=True, text=True, timeout=30)
+        if start_res.returncode != 0:
+            raise RuntimeError((start_res.stderr or start_res.stdout or "Failed to start managed Ollama container").strip())
+        container_id = str(start_res.stdout or "").strip()
+        _managed_runtime_log(
+            bundle_type,
+            f"Managed Ollama container started ({container_id[:12]}) using {active_profile.get('mode_label') or 'CPU'}",
+            service_name="ollama",
+        )
+        url = f"http://{_MANAGED_RUNTIME_OLLAMA_CONTAINER}:{_MANAGED_RUNTIME_OLLAMA_PORT}"
+        health = _managed_runtime_health_wait(bundle_type, url, _managed_runtime_health_check_ollama, attempts=30, sleep_sec=3.0)
+        if not bool(health.get("available")):
+            health = _managed_runtime_health_wait(bundle_type, f"http://127.0.0.1:{_MANAGED_RUNTIME_OLLAMA_PORT}", _managed_runtime_health_check_ollama, attempts=6, sleep_sec=3.0)
+            if bool(health.get("available")):
+                url = f"http://127.0.0.1:{_MANAGED_RUNTIME_OLLAMA_PORT}"
+        if not bool(health.get("available")) and bool(active_profile.get("active")):
+            failure_detail = str(health.get("message") or "Ollama did not become healthy with GPU acceleration")
+            _managed_runtime_log(
+                bundle_type,
+                f"GPU acceleration health check failed for mode {active_profile.get('selected_mode')}: {failure_detail}. Retrying on CPU.",
+                level="warning",
+                service_name="ollama",
+            )
+            subprocess.run([docker_cli, "rm", "-f", _MANAGED_RUNTIME_OLLAMA_CONTAINER], capture_output=True, text=True, timeout=20)
+            active_profile = _managed_runtime_ollama_gpu_profile(requested_mode=_MANAGED_RUNTIME_OLLAMA_GPU_MODE_CPU)
+            active_profile["fallback_reason"] = failure_detail
+            _managed_runtime_bundle_upsert(
+                bundle_type,
+                state="creating",
+                phase="creating",
+                phase_message="GPU health check failed, retrying managed Ollama on CPU",
+                meta={"gpu": active_profile},
+            )
+            start_res = subprocess.run(_build_run_cmd(active_profile), capture_output=True, text=True, timeout=30)
+            if start_res.returncode != 0:
+                raise RuntimeError((start_res.stderr or start_res.stdout or "Failed to start managed Ollama container after GPU fallback").strip())
+            url = f"http://{_MANAGED_RUNTIME_OLLAMA_CONTAINER}:{_MANAGED_RUNTIME_OLLAMA_PORT}"
+            health = _managed_runtime_health_wait(bundle_type, url, _managed_runtime_health_check_ollama, attempts=30, sleep_sec=3.0)
+            if not bool(health.get("available")):
+                health = _managed_runtime_health_wait(bundle_type, f"http://127.0.0.1:{_MANAGED_RUNTIME_OLLAMA_PORT}", _managed_runtime_health_check_ollama, attempts=6, sleep_sec=3.0)
+                if bool(health.get("available")):
+                    url = f"http://127.0.0.1:{_MANAGED_RUNTIME_OLLAMA_PORT}"
+        if not bool(health.get("available")):
+            raise RuntimeError(str(health.get("message") or "Ollama did not become healthy"))
+        _managed_runtime_bundle_upsert(
+            bundle_type,
+            state="pulling",
+            phase="pulling",
+            phase_message=f"Pulling {fast_model}",
+            effective_url=url,
+            health=health,
+            meta={"gpu": active_profile},
+        )
+        _managed_runtime_ollama_pull_blocking(url, fast_model, bundle_type=bundle_type)
+        if hard_model and hard_model != fast_model:
+            _managed_runtime_bundle_upsert(bundle_type, state="pulling", phase="pulling", phase_message=f"Pulling {hard_model}")
+            _managed_runtime_ollama_pull_blocking(url, hard_model, bundle_type=bundle_type)
+        final_health = _managed_runtime_health_check_ollama(url)
+        bundle = _managed_runtime_bundle_upsert(
+            bundle_type,
+            mode="managed",
+            state="ready",
+            phase="ready",
+            phase_message="Ollama ready",
+            config_root=config_root,
+            data_root=data_root,
+            effective_url=url,
+            ownership=_MANAGED_RUNTIME_OLLAMA_CONTAINER,
+            health=final_health,
+            services=[
+                {
+                    "name": "ollama",
+                    "status": "healthy" if bool(final_health.get("available")) else "degraded",
+                    "message": f"{str(final_health.get('message') or '')} • {active_profile.get('mode_label') or 'CPU'}".strip(" •"),
+                }
+            ],
+            meta={
+                "models": list(final_health.get("models") or []),
+                "model_count": int(final_health.get("model_count") or 0),
+                "gpu": active_profile,
+            },
+            last_error="",
+        )
+        _managed_runtime_apply_ollama_runtime("managed", url, fast_model, hard_model, config_root=config_root, data_root=data_root)
+        _settings_db_set_value("MANAGED_RUNTIME_CONFIG_ROOT", config_root)
+        _settings_db_set_value("MANAGED_RUNTIME_DATA_ROOT", data_root)
+        _managed_runtime_action_update(action_id, bundle_type, "bootstrap", "completed", payload=payload, result=bundle, completed=True)
+    except Exception as exc:
+        message = str(exc or "Ollama bootstrap failed")
+        _managed_runtime_bundle_upsert(bundle_type, state="failed", phase="failed", phase_message=message, last_error=message)
+        _managed_runtime_action_update(action_id, bundle_type, "bootstrap", "failed", payload=payload, error=message, completed=True)
+        _managed_runtime_log(bundle_type, message, level="error")
+        raise
+
+
+def _managed_runtime_bootstrap_worker(bundle_type: str, payload: dict[str, Any]) -> None:
+    try:
+        if bundle_type == _MANAGED_RUNTIME_MUSICBRAINZ_BUNDLE:
+            _managed_runtime_bootstrap_musicbrainz(payload)
+        elif bundle_type == _MANAGED_RUNTIME_OLLAMA_BUNDLE:
+            _managed_runtime_bootstrap_ollama(payload)
+        else:
+            raise RuntimeError(f"Unsupported managed runtime bundle: {bundle_type}")
+    finally:
+        with _MANAGED_RUNTIME_LOCK:
+            _MANAGED_RUNTIME_THREADS.pop(bundle_type, None)
+
+
+def _managed_runtime_launch_bootstrap(bundle_type: str, payload: dict[str, Any]) -> tuple[bool, str]:
+    with _MANAGED_RUNTIME_LOCK:
+        existing = _MANAGED_RUNTIME_THREADS.get(bundle_type)
+        if existing is not None and existing.is_alive():
+            return False, "bootstrap already running"
+        worker = threading.Thread(
+            target=_managed_runtime_bootstrap_worker,
+            args=(bundle_type, dict(payload or {})),
+            daemon=True,
+            name=f"managed-runtime-{bundle_type}",
+        )
+        _MANAGED_RUNTIME_THREADS[bundle_type] = worker
+        worker.start()
+    return True, "started"
+
+
+def _managed_runtime_bundle_status(bundle_type: str, *, include_candidates: bool = True) -> dict[str, Any]:
+    bundle = _managed_runtime_bundle_get(bundle_type)
+    latest_action = _managed_runtime_get_latest_action(bundle_type)
+    running = False
+    with _MANAGED_RUNTIME_LOCK:
+        thread = _MANAGED_RUNTIME_THREADS.get(bundle_type)
+        running = bool(thread is not None and thread.is_alive())
+    if bundle_type == _MANAGED_RUNTIME_MUSICBRAINZ_BUNDLE:
+        candidates = _managed_runtime_detect_musicbrainz_candidates() if include_candidates else []
+        if bundle.get("effective_url"):
+            bundle["health"] = _managed_runtime_health_check_musicbrainz(bundle.get("effective_url") or "")
+        healthy_candidate = next((row for row in candidates if bool((row.get("health") or {}).get("available")) and bool(row.get("published_url"))), None)
+        health_available = bool((bundle.get("health") or {}).get("available"))
+        if not running and healthy_candidate is not None and (
+            str(bundle.get("state") or "") in _MANAGED_RUNTIME_ACTIVE_STATES
+            or not str(bundle.get("effective_url") or "").strip()
+            or not health_available
+        ):
+            services_present = list(healthy_candidate.get("services_present") or [])
+            phase_message = "MusicBrainz mirror ready"
+            bundle = _managed_runtime_bundle_upsert(
+                bundle_type,
+                mode=str(bundle.get("mode") or "managed"),
+                state="ready",
+                phase="ready",
+                phase_message=phase_message,
+                effective_url=str(healthy_candidate.get("published_url") or ""),
+                ownership=str(healthy_candidate.get("project_name") or bundle.get("ownership") or ""),
+                health=dict(healthy_candidate.get("health") or {}),
+                services=[
+                    {"name": service_name, "status": "healthy", "message": "Detected on this server"}
+                    for service_name in services_present
+                ],
+                last_error="",
+            )
+            if latest_action and str(latest_action.get("status") or "") == "running":
+                _managed_runtime_action_update(
+                    str(latest_action.get("action_id") or ""),
+                    bundle_type,
+                    str(latest_action.get("action") or "bootstrap"),
+                    "completed",
+                    payload=dict(latest_action.get("payload") or {}),
+                    result=bundle,
+                    completed=True,
+                )
+        bundle["update_state"] = _managed_runtime_register_mb_update_schedule(bundle)
+        _managed_runtime_bundle_upsert(bundle_type, health=bundle.get("health") or {}, update_state=bundle.get("update_state") or {})
+    elif bundle_type == _MANAGED_RUNTIME_OLLAMA_BUNDLE:
+        candidates = _managed_runtime_detect_ollama_candidates() if include_candidates else []
+        if bundle.get("effective_url"):
+            bundle["health"] = _managed_runtime_health_check_ollama(bundle.get("effective_url") or "")
+        healthy_candidate = next((row for row in candidates if bool((row.get("health") or {}).get("available")) and bool(row.get("url"))), None)
+        health_available = bool((bundle.get("health") or {}).get("available"))
+        if not running and healthy_candidate is not None and (
+            str(bundle.get("state") or "") in _MANAGED_RUNTIME_ACTIVE_STATES
+            or not str(bundle.get("effective_url") or "").strip()
+            or not health_available
+        ):
+            models = list(healthy_candidate.get("models") or [])
+            bundle = _managed_runtime_bundle_upsert(
+                bundle_type,
+                mode=str(bundle.get("mode") or "adopted"),
+                state="ready",
+                phase="ready",
+                phase_message="Ollama ready",
+                effective_url=str(healthy_candidate.get("url") or ""),
+                health={
+                    "available": True,
+                    "overall_status": "healthy",
+                    "message": "Ollama reachable",
+                    "models": models,
+                    "model_count": len(models),
+                },
+                services=[{"name": "ollama", "status": "healthy", "message": f"{len(models)} model(s) available"}],
+                meta={
+                    **dict(bundle.get("meta") or {}),
+                    "models": models,
+                    "model_count": len(models),
+                },
+                last_error="",
+            )
+            if latest_action and str(latest_action.get("status") or "") == "running":
+                _managed_runtime_action_update(
+                    str(latest_action.get("action_id") or ""),
+                    bundle_type,
+                    str(latest_action.get("action") or "bootstrap"),
+                    "completed",
+                    payload=dict(latest_action.get("payload") or {}),
+                    result=bundle,
+                    completed=True,
+                )
+        _managed_runtime_bundle_upsert(bundle_type, health=bundle.get("health") or {})
+    else:
+        candidates = []
+    bundle["active"] = running or str(bundle.get("state") or "") in _MANAGED_RUNTIME_ACTIVE_STATES
+    bundle["latest_action"] = latest_action
+    bundle["candidates"] = candidates
+    return bundle
+
+
+def _managed_runtime_status_snapshot(*, include_candidates: bool = True) -> dict[str, Any]:
+    config_root = str(_get_config_from_db("MANAGED_RUNTIME_CONFIG_ROOT", "") or "").strip()
+    data_root = str(_get_config_from_db("MANAGED_RUNTIME_DATA_ROOT", "") or "").strip()
+    status = {
+        "preflight": _managed_runtime_preflight(),
+        "config_root": config_root,
+        "data_root": data_root,
+        "bundles": {
+            _MANAGED_RUNTIME_MUSICBRAINZ_BUNDLE: _managed_runtime_bundle_status(_MANAGED_RUNTIME_MUSICBRAINZ_BUNDLE, include_candidates=include_candidates),
+            _MANAGED_RUNTIME_OLLAMA_BUNDLE: _managed_runtime_bundle_status(_MANAGED_RUNTIME_OLLAMA_BUNDLE, include_candidates=include_candidates),
+        },
+    }
+    status["ready"] = all(
+        bool((status["bundles"].get(bundle_type) or {}).get("state") in _MANAGED_RUNTIME_READY_STATES)
+        for bundle_type in _MANAGED_RUNTIME_BUNDLE_TYPES
+        if str((status["bundles"].get(bundle_type) or {}).get("mode") or "absent") not in {"absent", "external"}
+    )
+    return status
+
+
+def _managed_runtime_musicbrainz_update_due(bundle: dict[str, Any]) -> bool:
+    update_state = dict(bundle.get("update_state") or {})
+    if not bool(update_state.get("enabled", True)):
+        return False
+    next_planned_at = float(update_state.get("next_planned_at") or 0.0)
+    if next_planned_at <= 0:
+        next_planned_at = time.time() + _MANAGED_RUNTIME_MB_DEFAULT_UPDATE_INTERVAL_SEC
+    return time.time() >= next_planned_at
+
+
+def _managed_runtime_run_musicbrainz_update() -> tuple[bool, str, dict]:
+    bundle = _managed_runtime_bundle_get(_MANAGED_RUNTIME_MUSICBRAINZ_BUNDLE)
+    if str(bundle.get("state") or "") not in _MANAGED_RUNTIME_READY_STATES:
+        return True, "Managed MusicBrainz update skipped (bundle not ready)", {"status": "skipped"}
+    install_root = str(bundle.get("install_root") or "").strip()
+    if not install_root:
+        return False, "Managed MusicBrainz install root is unknown", {}
+    with lock:
+        scanning_now = bool(state.get("scanning") or state.get("scan_starting") or state.get("scan_finalizing"))
+    if scanning_now:
+        update_state = dict(bundle.get("update_state") or {})
+        update_state["last_deferred_at"] = time.time()
+        update_state["last_deferred_reason"] = "scan_active"
+        update_state["next_planned_at"] = time.time() + 900.0
+        _managed_runtime_bundle_upsert(_MANAGED_RUNTIME_MUSICBRAINZ_BUNDLE, update_state=update_state)
+        return False, "Managed MusicBrainz update deferred until scans are idle", {"deferred": True}
+    script_path = Path(__file__).resolve().parent / "scripts" / "musicbrainz_mirror_reindex.sh"
+    if not script_path.exists():
+        return False, f"MusicBrainz reindex script not found: {script_path}", {}
+    _managed_runtime_bundle_upsert(_MANAGED_RUNTIME_MUSICBRAINZ_BUNDLE, state="updating", phase="updating", phase_message="Running scheduled MusicBrainz search reindex", last_error="")
+    try:
+        _managed_runtime_capture_subprocess(
+            [str(script_path), "--install-root", install_root],
+            bundle_type=_MANAGED_RUNTIME_MUSICBRAINZ_BUNDLE,
+            service_name="musicbrainz",
+            phase_map=[("reindex", "updating", "Reindexing MusicBrainz search")],
+        )
+        update_state = _managed_runtime_register_mb_update_schedule(bundle)
+        update_state["last_success_at"] = time.time()
+        update_state["last_error"] = ""
+        update_state["next_planned_at"] = time.time() + int(update_state.get("interval_sec") or _MANAGED_RUNTIME_MB_DEFAULT_UPDATE_INTERVAL_SEC)
+        bundle = _managed_runtime_bundle_upsert(
+            _MANAGED_RUNTIME_MUSICBRAINZ_BUNDLE,
+            state="ready",
+            phase="ready",
+            phase_message="MusicBrainz mirror ready",
+            update_state=update_state,
+            last_error="",
+        )
+        return True, "Managed MusicBrainz maintenance finished", {"update_state": bundle.get("update_state") or {}}
+    except Exception as exc:
+        message = str(exc or "Managed MusicBrainz maintenance failed")
+        update_state = dict(bundle.get("update_state") or {})
+        update_state["last_failure_at"] = time.time()
+        update_state["last_error"] = message
+        update_state["next_planned_at"] = time.time() + 3600.0
+        _managed_runtime_bundle_upsert(_MANAGED_RUNTIME_MUSICBRAINZ_BUNDLE, state="failed", phase="failed", phase_message=message, update_state=update_state, last_error=message)
+        _managed_runtime_log(_MANAGED_RUNTIME_MUSICBRAINZ_BUNDLE, message, level="error")
+        return False, message, {"update_state": update_state}
+
+
+def _managed_runtime_maybe_enqueue_due_jobs(now_ts: float | None = None) -> None:
+    now = float(now_ts or time.time())
+    bundle = _managed_runtime_bundle_get(_MANAGED_RUNTIME_MUSICBRAINZ_BUNDLE)
+    if str(bundle.get("mode") or "absent") not in {"managed", "adopted"}:
+        return
+    update_state = _managed_runtime_register_mb_update_schedule(bundle)
+    bundle = _managed_runtime_bundle_upsert(_MANAGED_RUNTIME_MUSICBRAINZ_BUNDLE, update_state=update_state)
+    next_planned_at = float((bundle.get("update_state") or {}).get("next_planned_at") or 0.0)
+    if next_planned_at <= 0 or now < next_planned_at:
+        return
+    with lock:
+        scan_active = bool(state.get("scanning") or state.get("scan_starting") or state.get("scan_finalizing"))
+    if scan_active:
+        update_state = dict(bundle.get("update_state") or {})
+        last_deferred_at = float(update_state.get("last_deferred_at") or 0.0)
+        if now - last_deferred_at >= 300.0:
+            update_state["last_deferred_at"] = now
+            update_state["last_deferred_reason"] = "scan_active"
+            update_state["next_planned_at"] = now + 900.0
+            _managed_runtime_bundle_upsert(_MANAGED_RUNTIME_MUSICBRAINZ_BUNDLE, update_state=update_state)
+        return
+    _scheduler_launch_job("managed_musicbrainz_update", "both", "managed_runtime", max_concurrency=1)
+
+
+def _managed_runtime_resolve_candidate(bundle_type: str, candidate_id: str = "", *, url: str = "", project_name: str = "") -> dict[str, Any] | None:
+    cid = str(candidate_id or "").strip()
+    normalized_url = str(url or "").strip()
+    project = str(project_name or "").strip()
+    if bundle_type == _MANAGED_RUNTIME_MUSICBRAINZ_BUNDLE:
+        candidates = _managed_runtime_detect_musicbrainz_candidates()
+        for candidate in candidates:
+            if cid and str(candidate.get("id") or "") == cid:
+                return candidate
+            if project and str(candidate.get("project_name") or "") == project:
+                return candidate
+            if normalized_url and normalized_url in {
+                str(candidate.get("published_url") or "").strip(),
+                str((candidate.get("health") or {}).get("url") or "").strip(),
+            }:
+                return candidate
+        return None
+    if bundle_type == _MANAGED_RUNTIME_OLLAMA_BUNDLE:
+        candidates = _managed_runtime_detect_ollama_candidates()
+        for candidate in candidates:
+            if cid and str(candidate.get("id") or "") == cid:
+                return candidate
+            if normalized_url and normalized_url == str(candidate.get("url") or "").strip():
+                return candidate
+        return None
+    return None
+
+
+def _managed_runtime_mb_compose_cmd(install_root: str, *args: str) -> list[str]:
+    compose_cli = _managed_runtime_compose_cli()
+    if not compose_cli:
+        raise RuntimeError("Docker Compose is missing from the PMDA container")
+    root = str(install_root or "").strip()
+    if not root:
+        raise RuntimeError("Managed MusicBrainz install root is missing")
+    compose_file = Path(root) / "docker-compose.yml"
+    if not compose_file.exists():
+        raise RuntimeError(f"MusicBrainz compose file not found under {root}")
+    if len(compose_cli) >= 2 and compose_cli[1] == "compose":
+        return [*compose_cli, "--project-directory", root, *args]
+    return [*compose_cli, "--project-directory", root, *args]
+
+
+def _managed_runtime_start_musicbrainz_bundle(bundle: dict[str, Any]) -> dict[str, Any]:
+    install_root = str(bundle.get("install_root") or "").strip()
+    _managed_runtime_capture_subprocess(
+        _managed_runtime_mb_compose_cmd(install_root, "up", "-d"),
+        bundle_type=_MANAGED_RUNTIME_MUSICBRAINZ_BUNDLE,
+        service_name="musicbrainz",
+        phase_map=[("starting", "creating", "Starting MusicBrainz bundle")],
+    )
+    _managed_runtime_connect_self_to_network()
+    return _managed_runtime_bundle_status(_MANAGED_RUNTIME_MUSICBRAINZ_BUNDLE, include_candidates=False)
+
+
+def _managed_runtime_stop_musicbrainz_bundle(bundle: dict[str, Any]) -> dict[str, Any]:
+    install_root = str(bundle.get("install_root") or "").strip()
+    _managed_runtime_capture_subprocess(
+        _managed_runtime_mb_compose_cmd(install_root, "stop"),
+        bundle_type=_MANAGED_RUNTIME_MUSICBRAINZ_BUNDLE,
+        service_name="musicbrainz",
+        phase_map=[("Stopping", "creating", "Stopping MusicBrainz bundle")],
+    )
+    return _managed_runtime_bundle_upsert(
+        _MANAGED_RUNTIME_MUSICBRAINZ_BUNDLE,
+        state="idle",
+        phase="idle",
+        phase_message="MusicBrainz bundle stopped",
+        health={"available": False, "overall_status": "stopped", "message": "Stopped"},
+    )
+
+
+def _managed_runtime_restart_musicbrainz_bundle(bundle: dict[str, Any]) -> dict[str, Any]:
+    install_root = str(bundle.get("install_root") or "").strip()
+    _managed_runtime_capture_subprocess(
+        _managed_runtime_mb_compose_cmd(install_root, "restart"),
+        bundle_type=_MANAGED_RUNTIME_MUSICBRAINZ_BUNDLE,
+        service_name="musicbrainz",
+        phase_map=[("Restarting", "creating", "Restarting MusicBrainz bundle")],
+    )
+    _managed_runtime_connect_self_to_network()
+    return _managed_runtime_bundle_status(_MANAGED_RUNTIME_MUSICBRAINZ_BUNDLE, include_candidates=False)
+
+
+def _managed_runtime_reset_musicbrainz_bundle(bundle: dict[str, Any]) -> dict[str, Any]:
+    install_root = str(bundle.get("install_root") or "").strip()
+    if install_root:
+        _managed_runtime_capture_subprocess(
+            _managed_runtime_mb_compose_cmd(install_root, "down"),
+            bundle_type=_MANAGED_RUNTIME_MUSICBRAINZ_BUNDLE,
+            service_name="musicbrainz",
+            phase_map=[("Stopping", "creating", "Stopping MusicBrainz bundle")],
+        )
+    cleared = _managed_runtime_bundle_upsert(
+        _MANAGED_RUNTIME_MUSICBRAINZ_BUNDLE,
+        mode="absent",
+        state="idle",
+        phase="idle",
+        phase_message="MusicBrainz managed runtime reset",
+        effective_url="",
+        install_root="",
+        ownership="",
+        health={"available": False, "overall_status": "absent", "message": "Reset"},
+        services=[],
+        meta={},
+        last_error="",
+    )
+    return cleared
+
+
+def _managed_runtime_start_ollama_bundle(bundle: dict[str, Any]) -> dict[str, Any]:
+    docker_cli = _managed_runtime_docker_cli()
+    if not docker_cli:
+        raise RuntimeError("docker CLI is missing from the PMDA container")
+    res = subprocess.run([docker_cli, "start", _MANAGED_RUNTIME_OLLAMA_CONTAINER], capture_output=True, text=True, timeout=20)
+    if res.returncode != 0:
+        raise RuntimeError((res.stderr or res.stdout or "Failed to start managed Ollama").strip())
+    _managed_runtime_connect_self_to_network()
+    return _managed_runtime_bundle_status(_MANAGED_RUNTIME_OLLAMA_BUNDLE, include_candidates=False)
+
+
+def _managed_runtime_stop_ollama_bundle(bundle: dict[str, Any]) -> dict[str, Any]:
+    docker_cli = _managed_runtime_docker_cli()
+    if not docker_cli:
+        raise RuntimeError("docker CLI is missing from the PMDA container")
+    res = subprocess.run([docker_cli, "stop", _MANAGED_RUNTIME_OLLAMA_CONTAINER], capture_output=True, text=True, timeout=20)
+    if res.returncode != 0:
+        raise RuntimeError((res.stderr or res.stdout or "Failed to stop managed Ollama").strip())
+    return _managed_runtime_bundle_upsert(
+        _MANAGED_RUNTIME_OLLAMA_BUNDLE,
+        state="idle",
+        phase="idle",
+        phase_message="Ollama runtime stopped",
+        health={"available": False, "overall_status": "stopped", "message": "Stopped"},
+    )
+
+
+def _managed_runtime_restart_ollama_bundle(bundle: dict[str, Any]) -> dict[str, Any]:
+    docker_cli = _managed_runtime_docker_cli()
+    if not docker_cli:
+        raise RuntimeError("docker CLI is missing from the PMDA container")
+    res = subprocess.run([docker_cli, "restart", _MANAGED_RUNTIME_OLLAMA_CONTAINER], capture_output=True, text=True, timeout=20)
+    if res.returncode != 0:
+        raise RuntimeError((res.stderr or res.stdout or "Failed to restart managed Ollama").strip())
+    _managed_runtime_connect_self_to_network()
+    return _managed_runtime_bundle_status(_MANAGED_RUNTIME_OLLAMA_BUNDLE, include_candidates=False)
+
+
+def _managed_runtime_reset_ollama_bundle(bundle: dict[str, Any]) -> dict[str, Any]:
+    docker_cli = _managed_runtime_docker_cli()
+    if not docker_cli:
+        raise RuntimeError("docker CLI is missing from the PMDA container")
+    subprocess.run([docker_cli, "rm", "-f", _MANAGED_RUNTIME_OLLAMA_CONTAINER], capture_output=True, text=True, timeout=20)
+    cleared = _managed_runtime_bundle_upsert(
+        _MANAGED_RUNTIME_OLLAMA_BUNDLE,
+        mode="absent",
+        state="idle",
+        phase="idle",
+        phase_message="Ollama managed runtime reset",
+        effective_url="",
+        ownership="",
+        health={"available": False, "overall_status": "absent", "message": "Reset"},
+        services=[],
+        meta={},
+        last_error="",
+    )
+    return cleared
+
+
 def _get_openai_codex_exchanged_api_key() -> str:
     key = str(getattr(sys.modules[__name__], "OPENAI_CODEX_EXCHANGED_API_KEY", "") or "").strip()
     if key:
@@ -8140,6 +9941,60 @@ def init_settings_db():
     )
     cur.execute("CREATE INDEX IF NOT EXISTS idx_ai_auth_profiles_provider_active ON ai_auth_profiles(provider_id, is_active, updated_at DESC)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_ai_auth_profiles_user_provider ON ai_auth_profiles(user_id, provider_id, is_active)")
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS managed_runtime_bundles (
+            bundle_type TEXT PRIMARY KEY,
+            mode TEXT NOT NULL DEFAULT 'absent',
+            state TEXT NOT NULL DEFAULT 'idle',
+            phase TEXT NOT NULL DEFAULT '',
+            phase_message TEXT NOT NULL DEFAULT '',
+            config_root TEXT NOT NULL DEFAULT '',
+            data_root TEXT NOT NULL DEFAULT '',
+            install_root TEXT NOT NULL DEFAULT '',
+            effective_url TEXT NOT NULL DEFAULT '',
+            ownership TEXT NOT NULL DEFAULT '',
+            health_json TEXT NOT NULL DEFAULT '{}',
+            services_json TEXT NOT NULL DEFAULT '[]',
+            meta_json TEXT NOT NULL DEFAULT '{}',
+            last_error TEXT NOT NULL DEFAULT '',
+            update_state_json TEXT NOT NULL DEFAULT '{}',
+            created_at REAL NOT NULL DEFAULT 0,
+            updated_at REAL NOT NULL DEFAULT 0
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS managed_runtime_logs (
+            log_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            bundle_type TEXT NOT NULL,
+            service_name TEXT NOT NULL DEFAULT '',
+            level TEXT NOT NULL DEFAULT 'info',
+            message TEXT NOT NULL,
+            created_at REAL NOT NULL DEFAULT 0
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS managed_runtime_actions (
+            action_id TEXT PRIMARY KEY,
+            bundle_type TEXT NOT NULL,
+            action TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            result_json TEXT NOT NULL DEFAULT '{}',
+            error TEXT NOT NULL DEFAULT '',
+            created_at REAL NOT NULL DEFAULT 0,
+            updated_at REAL NOT NULL DEFAULT 0,
+            completed_at REAL
+        )
+        """
+    )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_managed_runtime_logs_bundle_ts ON managed_runtime_logs(bundle_type, created_at DESC)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_managed_runtime_actions_bundle_status ON managed_runtime_actions(bundle_type, status, created_at DESC)")
 
     # Backward-compatible schema upgrades.
     cur.execute("PRAGMA table_info(auth_users)")
@@ -56727,6 +58582,182 @@ def api_ollama_pull():
     )
     worker.start()
     return jsonify(_ollama_pull_status_snapshot()), 202
+
+
+@app.get("/api/runtime/managed/status")
+def api_runtime_managed_status():
+    include_candidates = not bool(_parse_bool(request.args.get("skip_candidates")))
+    return jsonify(_managed_runtime_status_snapshot(include_candidates=include_candidates))
+
+
+@app.get("/api/runtime/managed/logs")
+def api_runtime_managed_logs():
+    bundle_type = str(request.args.get("bundle_type") or "").strip()
+    service_name = str(request.args.get("service_name") or "").strip()
+    try:
+        limit = max(1, min(500, int(request.args.get("limit") or 200)))
+    except Exception:
+        limit = 200
+    if bundle_type and bundle_type not in _MANAGED_RUNTIME_BUNDLE_TYPES:
+        return jsonify({"error": f"Unsupported bundle_type: {bundle_type}"}), 400
+    rows = _managed_runtime_logs(bundle_type or None, service_name=service_name or None, limit=limit)
+    return jsonify({"logs": rows, "bundle_type": bundle_type or None, "service_name": service_name or None})
+
+
+def _api_runtime_managed_common_roots(data: dict[str, Any]) -> tuple[str, str]:
+    config_root = str(
+        data.get("config_root")
+        or _get_config_from_db("MANAGED_RUNTIME_CONFIG_ROOT", "")
+        or ""
+    ).strip()
+    data_root = str(
+        data.get("data_root")
+        or _get_config_from_db("MANAGED_RUNTIME_DATA_ROOT", "")
+        or ""
+    ).strip()
+    return config_root, data_root
+
+
+@app.post("/api/runtime/managed/bootstrap")
+def api_runtime_managed_bootstrap():
+    data = request.get_json(silent=True) or {}
+    config_root, data_root = _api_runtime_managed_common_roots(data)
+    bundles_raw = data.get("bundles") if isinstance(data.get("bundles"), dict) else {}
+    bundle_requests: list[tuple[str, dict[str, Any]]] = []
+    if isinstance(data.get("bundle_type"), str) and str(data.get("bundle_type") or "").strip() in _MANAGED_RUNTIME_BUNDLE_TYPES:
+        bundle_type = str(data.get("bundle_type") or "").strip()
+        bundle_payload = dict(data.get("payload") or {})
+        bundle_requests.append((bundle_type, bundle_payload))
+    else:
+        if isinstance(bundles_raw.get("musicbrainz_local"), dict):
+            bundle_requests.append((_MANAGED_RUNTIME_MUSICBRAINZ_BUNDLE, dict(bundles_raw.get("musicbrainz_local") or {})))
+        if isinstance(bundles_raw.get("ollama_local"), dict):
+            bundle_requests.append((_MANAGED_RUNTIME_OLLAMA_BUNDLE, dict(bundles_raw.get("ollama_local") or {})))
+    if not bundle_requests:
+        return jsonify({"error": "No managed runtime bundles were requested"}), 400
+
+    results: list[dict[str, Any]] = []
+    status_code = 202
+    for bundle_type, bundle_payload in bundle_requests:
+        payload = dict(bundle_payload or {})
+        payload["config_root"] = config_root
+        payload["data_root"] = data_root
+        payload["action_id"] = str(uuid.uuid4())
+        started, message = _managed_runtime_launch_bootstrap(bundle_type, payload)
+        if not started:
+            status_code = 409
+        results.append(
+            {
+                "bundle_type": bundle_type,
+                "started": bool(started),
+                "message": str(message or ""),
+                "status": _managed_runtime_bundle_status(bundle_type, include_candidates=False),
+            }
+        )
+    return jsonify({"results": results, "snapshot": _managed_runtime_status_snapshot(include_candidates=False)}), status_code
+
+
+@app.post("/api/runtime/managed/adopt")
+def api_runtime_managed_adopt():
+    data = request.get_json(silent=True) or {}
+    bundle_type = str(data.get("bundle_type") or "").strip()
+    if bundle_type not in _MANAGED_RUNTIME_BUNDLE_TYPES:
+        return jsonify({"error": "bundle_type is required"}), 400
+    config_root, data_root = _api_runtime_managed_common_roots(data)
+    candidate = _managed_runtime_resolve_candidate(
+        bundle_type,
+        str(data.get("candidate_id") or "").strip(),
+        url=str(data.get("url") or "").strip(),
+        project_name=str(data.get("project_name") or "").strip(),
+    )
+    if candidate is None:
+        return jsonify({"error": "No matching adoptable runtime was found"}), 404
+    if bundle_type == _MANAGED_RUNTIME_MUSICBRAINZ_BUNDLE:
+        result = _managed_runtime_adopt_musicbrainz(candidate, mode="adopted", config_root=config_root, data_root=data_root)
+    else:
+        fast_model = str(data.get("fast_model") or _ollama_model_configured()).strip() or "qwen3:4b"
+        hard_model = str(data.get("hard_model") or _ollama_complex_model_configured()).strip() or "qwen3:14b"
+        result = _managed_runtime_adopt_ollama(candidate, fast_model=fast_model, hard_model=hard_model, mode="adopted", config_root=config_root, data_root=data_root)
+    return jsonify({"status": "ok", "bundle_type": bundle_type, "result": result, "snapshot": _managed_runtime_status_snapshot(include_candidates=False)})
+
+
+@app.post("/api/runtime/managed/action")
+def api_runtime_managed_action():
+    data = request.get_json(silent=True) or {}
+    bundle_type = str(data.get("bundle_type") or "").strip()
+    action = str(data.get("action") or "").strip().lower()
+    if bundle_type not in _MANAGED_RUNTIME_BUNDLE_TYPES:
+        return jsonify({"error": "bundle_type is required"}), 400
+    if not action:
+        return jsonify({"error": "action is required"}), 400
+    bundle = _managed_runtime_bundle_get(bundle_type)
+    if action == "refresh-health":
+        return jsonify({"status": "ok", "bundle_type": bundle_type, "result": _managed_runtime_bundle_status(bundle_type, include_candidates=True)})
+    if action in {"retry-bootstrap", "rebuild"}:
+        config_root, data_root = _api_runtime_managed_common_roots(data)
+        payload = {
+            "config_root": config_root or str(bundle.get("config_root") or ""),
+            "data_root": data_root or str(bundle.get("data_root") or ""),
+            "action": "create" if action == "rebuild" else "auto",
+            "action_id": str(uuid.uuid4()),
+        }
+        if bundle_type == _MANAGED_RUNTIME_MUSICBRAINZ_BUNDLE:
+            payload["mirror_name"] = str(data.get("mirror_name") or _get_config_from_db("MUSICBRAINZ_MIRROR_NAME", "Managed local MusicBrainz") or "Managed local MusicBrainz")
+        else:
+            payload["fast_model"] = str(data.get("fast_model") or _ollama_model_configured()).strip() or "qwen3:4b"
+            payload["hard_model"] = str(data.get("hard_model") or _ollama_complex_model_configured()).strip() or "qwen3:14b"
+        started, message = _managed_runtime_launch_bootstrap(bundle_type, payload)
+        return jsonify({"status": "accepted" if started else "blocked", "message": message, "bundle_type": bundle_type, "snapshot": _managed_runtime_status_snapshot(include_candidates=False)}), (202 if started else 409)
+    if action == "retry-update":
+        if bundle_type != _MANAGED_RUNTIME_MUSICBRAINZ_BUNDLE:
+            return jsonify({"error": "retry-update is only supported for MusicBrainz"}), 400
+        started, message, run_id = _scheduler_launch_job("managed_musicbrainz_update", "both", "managed_runtime", max_concurrency=1)
+        return jsonify({"status": "started" if started else "blocked", "message": message, "run_id": run_id, "snapshot": _managed_runtime_status_snapshot(include_candidates=True)}), (202 if started else 409)
+    if action == "pull-model":
+        if bundle_type != _MANAGED_RUNTIME_OLLAMA_BUNDLE:
+            return jsonify({"error": "pull-model is only supported for Ollama"}), 400
+        url = str(bundle.get("effective_url") or _get_config_from_db("OLLAMA_URL", OLLAMA_URL) or "").strip()
+        model_name = str(data.get("model") or "").strip()
+        if not url or not model_name:
+            return jsonify({"error": "Both an Ollama runtime URL and model name are required"}), 400
+        current = _ollama_pull_status_snapshot()
+        if bool(current.get("active")):
+            return jsonify({"status": "blocked", "message": "Another Ollama pull is already running", "active": current}), 409
+        worker = threading.Thread(target=_run_ollama_pull_async, args=(url, model_name), daemon=True, name="managed-ollama-model-pull")
+        worker.start()
+        _managed_runtime_bundle_upsert(bundle_type, state="pulling", phase="pulling", phase_message=f"Pulling {model_name}")
+        return jsonify({"status": "started", "message": f"Pulling {model_name}", "snapshot": _managed_runtime_status_snapshot(include_candidates=False)}), 202
+    if str(bundle.get("mode") or "") != "managed":
+        return jsonify({"error": f"Action '{action}' is only available for managed runtimes"}), 400
+    try:
+        if bundle_type == _MANAGED_RUNTIME_MUSICBRAINZ_BUNDLE:
+            if action == "start":
+                result = _managed_runtime_start_musicbrainz_bundle(bundle)
+            elif action == "stop":
+                result = _managed_runtime_stop_musicbrainz_bundle(bundle)
+            elif action == "restart":
+                result = _managed_runtime_restart_musicbrainz_bundle(bundle)
+            elif action == "reset":
+                result = _managed_runtime_reset_musicbrainz_bundle(bundle)
+            else:
+                return jsonify({"error": f"Unsupported action for MusicBrainz: {action}"}), 400
+        else:
+            if action == "start":
+                result = _managed_runtime_start_ollama_bundle(bundle)
+            elif action == "stop":
+                result = _managed_runtime_stop_ollama_bundle(bundle)
+            elif action == "restart":
+                result = _managed_runtime_restart_ollama_bundle(bundle)
+            elif action == "reset":
+                result = _managed_runtime_reset_ollama_bundle(bundle)
+            else:
+                return jsonify({"error": f"Unsupported action for Ollama: {action}"}), 400
+    except Exception as exc:
+        message = str(exc or f"Managed runtime action failed: {action}")
+        _managed_runtime_log(bundle_type, message, level="error")
+        _managed_runtime_bundle_upsert(bundle_type, last_error=message)
+        return jsonify({"error": message, "snapshot": _managed_runtime_status_snapshot(include_candidates=True)}), 500
+    return jsonify({"status": "ok", "bundle_type": bundle_type, "action": action, "result": result, "snapshot": _managed_runtime_status_snapshot(include_candidates=True)})
 
 
 @app.post("/api/ai/models")
