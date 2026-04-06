@@ -6449,15 +6449,16 @@ def _managed_runtime_bundle_status(bundle_type: str, *, include_candidates: bool
         running = bool(thread is not None and thread.is_alive())
     if bundle_type == _MANAGED_RUNTIME_MUSICBRAINZ_BUNDLE:
         legacy_idle_cta = "Not started yet. Click Create local stack to provision MusicBrainz."
+        idle_confirmation_cta = "Not started yet. Confirm local setup to provision MusicBrainz."
         if (
             not running
             and str(bundle.get("state") or "").strip().lower() == "idle"
             and str(bundle.get("phase") or "").strip().lower() == "idle"
-            and str(bundle.get("phase_message") or "").strip() == legacy_idle_cta
+            and str(bundle.get("phase_message") or "").strip() in {legacy_idle_cta, "Not started yet. Continue from step 3 and confirm local setup to provision MusicBrainz."}
         ):
             bundle = _managed_runtime_bundle_upsert(
                 bundle_type,
-                phase_message="Not started yet. Continue from step 3 and confirm local setup to provision MusicBrainz.",
+                phase_message=idle_confirmation_cta,
             )
         stale_script_error = "Provision script not found:" in str(bundle.get("last_error") or bundle.get("phase_message") or "")
         if not running and stale_script_error and _managed_runtime_musicbrainz_script_path().exists():
@@ -6466,7 +6467,7 @@ def _managed_runtime_bundle_status(bundle_type: str, *, include_candidates: bool
                 bundle_type,
                 state="idle",
                 phase="idle",
-                phase_message="Not started yet. Continue from step 3 and confirm local setup to provision MusicBrainz.",
+                phase_message=idle_confirmation_cta,
                 health={"available": False, "overall_status": "absent", "message": "Not started"},
                 services=[],
                 meta={},

@@ -547,6 +547,7 @@ export function OnboardingWizard({
     if (selectedStackMode !== 'local') return false;
     return hasManagedBundleStarted(managedMbBundle) || hasManagedBundleStarted(managedOllamaBundle);
   }, [managedMbBundle, managedOllamaBundle, selectedStackMode]);
+  const localStackProvisioningActive = selectedStackMode === 'local' && (runtimeActionBusy || localStackActivity);
 
   useEffect(() => {
     void refreshStatus();
@@ -645,7 +646,7 @@ export function OnboardingWizard({
       localStackAutoPromptedRef.current = false;
       return;
     }
-    if (localRuntimeReady || localStackHasStarted || runtimeActionBusy || statusLoading || localStackConfirmOpen) {
+    if (localRuntimeReady || localStackProvisioningActive || statusLoading || localStackConfirmOpen) {
       return;
     }
     if (!managedPreflightReady) {
@@ -659,9 +660,8 @@ export function OnboardingWizard({
     activeStep,
     localRuntimeReady,
     localStackConfirmOpen,
-    localStackHasStarted,
+    localStackProvisioningActive,
     managedPreflightReady,
-    runtimeActionBusy,
     selectedStackMode,
     statusLoading,
   ]);
@@ -675,6 +675,10 @@ export function OnboardingWizard({
     : localStackDetectedCount === 1
       ? 'PMDA found one existing local service on this server. It can adopt it and create only the missing part after your confirmation.'
       : 'No local metadata service was detected yet. PMDA will create the MusicBrainz mirror and the Ollama runtime.';
+  const localStackNeedsConfirmation = selectedStackMode === 'local'
+    && !localRuntimeReady
+    && managedPreflightReady
+    && !localStackProvisioningActive;
 
   const localStackChecklist = useMemo(() => {
     if (selectedStackMode !== 'local') return [];
@@ -684,6 +688,20 @@ export function OnboardingWizard({
       || String(managedMbBundle?.state || 'idle').trim().toLowerCase() === 'idle';
     const ollamaNotStarted = String(managedOllamaBundle?.mode || 'absent').trim().toLowerCase() === 'absent'
       || String(managedOllamaBundle?.state || 'idle').trim().toLowerCase() === 'idle';
+    const musicbrainzDetail = musicbrainzReady
+      ? 'Local MusicBrainz mirror is ready.'
+      : musicbrainzDetected
+        ? `Existing MusicBrainz mirror detected${managedMbCandidate?.published_url ? ` at ${managedMbCandidate.published_url}` : ''}. It will be adopted when you confirm local stack setup.`
+        : musicbrainzNotStarted
+          ? 'Not started yet. Confirm local setup below to provision MusicBrainz.'
+          : (managedMbBundle?.phase_message || 'MusicBrainz mirror is starting.');
+    const ollamaDetail = ollamaReady
+      ? `Ollama is ready with ${ollamaModel} and ${ollamaHardModel}.`
+      : ollamaDetected
+        ? `Existing Ollama runtime detected${managedOllamaCandidate?.url ? ` at ${managedOllamaCandidate.url}` : ''}. It will be adopted when you confirm local stack setup and PMDA will ensure ${ollamaModel} and ${ollamaHardModel}.`
+        : ollamaNotStarted
+          ? `Not started yet. Confirm local setup below to provision Ollama and install ${ollamaModel} and ${ollamaHardModel}.`
+          : (managedOllamaBundle?.phase_message || `Ollama is starting and still needs ${ollamaModel} and ${ollamaHardModel}.`);
     return [
       {
         key: 'docker',
@@ -700,11 +718,7 @@ export function OnboardingWizard({
         key: 'musicbrainz',
         label: 'MusicBrainz mirror',
         done: musicbrainzReady,
-        detail: musicbrainzReady
-          ? 'Local MusicBrainz mirror is ready.'
-          : (musicbrainzDetected
-              ? `Existing MusicBrainz mirror detected${managedMbCandidate?.published_url ? ` at ${managedMbCandidate.published_url}` : ''}. It will be adopted when you confirm local stack setup.`
-              : (managedMbBundle?.phase_message || (musicbrainzNotStarted ? 'Not created yet. It will start after you confirm local stack setup.' : 'MusicBrainz mirror is starting.'))),
+        detail: musicbrainzDetail,
         progress: musicbrainzNotStarted ? 0 : managedBundleProgress(managedMbBundle),
         eta: managedBundleEta(managedMbBundle),
       },
@@ -712,18 +726,12 @@ export function OnboardingWizard({
         key: 'ollama',
         label: 'Ollama + required models',
         done: ollamaReady,
-        detail: ollamaReady
-          ? `Ollama is ready with ${ollamaModel} and ${ollamaHardModel}.`
-          : (ollamaDetected
-              ? `Existing Ollama runtime detected${managedOllamaCandidate?.url ? ` at ${managedOllamaCandidate.url}` : ''}. It will be adopted when you confirm local stack setup and PMDA will ensure ${ollamaModel} and ${ollamaHardModel}.`
-              : (managedOllamaBundle?.phase_message || (ollamaNotStarted
-                  ? `Not created yet. It will start after you confirm local stack setup and install ${ollamaModel} and ${ollamaHardModel}.`
-                  : `Ollama is starting and still needs ${ollamaModel} and ${ollamaHardModel}.`))),
+        detail: ollamaDetail,
         progress: ollamaNotStarted ? 0 : managedBundleProgress(managedOllamaBundle, { requiredModels: [ollamaModel, ollamaHardModel] }),
         eta: managedBundleEta(managedOllamaBundle),
       },
     ];
-  }, [localStackActionLabel, managedMbBundle, managedMbCandidate, managedOllamaBundle, managedOllamaCandidate, managedPreflightReady, managedStatus?.preflight.message, musicbrainzReady, ollamaHardModel, ollamaModel, ollamaReady, selectedStackMode, statusLoading]);
+  }, [managedMbBundle, managedMbCandidate, managedOllamaBundle, managedOllamaCandidate, managedPreflightReady, managedStatus?.preflight.message, musicbrainzReady, ollamaHardModel, ollamaModel, ollamaReady, selectedStackMode, statusLoading]);
 
   const localStackProgress = useMemo(() => {
     if (selectedStackMode !== 'local' || localStackChecklist.length === 0) return 0;
@@ -734,7 +742,7 @@ export function OnboardingWizard({
   }, [localStackChecklist, selectedStackMode]);
 
   const localStackActivityRows = useMemo(() => {
-    if (selectedStackMode !== 'local' || !localStackHasStarted) return [];
+    if (selectedStackMode !== 'local' || !localStackProvisioningActive) return [];
     return [
       {
         key: 'docker',
@@ -756,7 +764,7 @@ export function OnboardingWizard({
       },
     ];
   }, [
-    localStackHasStarted,
+    localStackProvisioningActive,
     managedMbBundle,
     managedMbCandidate,
     managedOllamaBundle,
@@ -789,12 +797,12 @@ export function OnboardingWizard({
 
   const localStackRecentLogs = useMemo(() => {
     if (selectedStackMode !== 'local') return [];
-    const showLogs = runtimeActionBusy || localStackActivity || localStackHasStarted;
+    const showLogs = localStackProvisioningActive;
     if (!showLogs) return [];
     return managedRuntimeLogs
       .filter((entry) => entry.bundle_type === 'musicbrainz_local' || entry.bundle_type === 'ollama_local')
       .slice(0, 8);
-  }, [localStackActivity, localStackHasStarted, managedRuntimeLogs, runtimeActionBusy, selectedStackMode]);
+  }, [localStackProvisioningActive, managedRuntimeLogs, selectedStackMode]);
 
   const firstScanStarted = Boolean(
     scanProgress && (
@@ -825,21 +833,21 @@ export function OnboardingWizard({
     if (selectedStackMode === 'local' && !localRuntimeReady) {
       const detail = !managedPreflightReady
         ? (managedStatus?.preflight.message || 'Docker socket or runtime tooling is not ready.')
-        : !localStackHasStarted
-          ? `Nothing has started yet. Click ${localStackActionLabel} to create or adopt the local MusicBrainz + Ollama stack.`
+        : localStackNeedsConfirmation
+          ? 'PMDA is waiting for your confirmation to create or adopt the missing local MusicBrainz + Ollama services.'
           : !musicbrainzReady
-            ? (managedMbBundle?.phase_message || (managedMbCandidate ? 'An existing MusicBrainz mirror was detected. Use the local services button to adopt it.' : 'Managed MusicBrainz is not ready yet.'))
-            : (managedOllamaBundle?.phase_message || (managedOllamaCandidate ? 'An existing Ollama runtime was detected. Use the local services button to adopt it and ensure the required models.' : 'Managed Ollama or the required models are not ready yet.'));
+            ? (managedMbBundle?.phase_message || (managedMbCandidate ? 'An existing MusicBrainz mirror was detected and will be adopted after confirmation.' : 'Managed MusicBrainz is not ready yet.'))
+            : (managedOllamaBundle?.phase_message || (managedOllamaCandidate ? 'An existing Ollama runtime was detected and will be adopted after confirmation.' : 'Managed Ollama or the required models are not ready yet.'));
       next.push({
         key: 'local-runtime',
-        title: localStackHasStarted ? 'Local metadata stack is not ready yet' : 'Local metadata stack has not been started yet',
+        title: localStackProvisioningActive ? 'Local metadata stack is not ready yet' : 'Local metadata stack is waiting for confirmation',
         detail,
         sectionId: 'settings-scaling',
       });
     }
 
     return next;
-  }, [foldersReady, localRuntimeReady, localStackActionLabel, localStackHasStarted, managedMbBundle?.phase_message, managedMbCandidate, managedOllamaBundle?.phase_message, managedOllamaCandidate, managedPreflightReady, managedStatus?.preflight.message, missingFolderItems, musicbrainzReady, selectedStackMode]);
+  }, [foldersReady, localRuntimeReady, localStackNeedsConfirmation, localStackProvisioningActive, managedMbBundle?.phase_message, managedMbCandidate, managedOllamaBundle?.phase_message, managedOllamaCandidate, managedPreflightReady, managedStatus?.preflight.message, missingFolderItems, musicbrainzReady, selectedStackMode]);
 
   const completionCount = useMemo(() => {
     let count = 0;
@@ -971,12 +979,12 @@ export function OnboardingWizard({
 
   const handleNextStep = useCallback(async () => {
     if (activeStep >= STEP_ORDER.length - 1) return;
-    if (activeStep === 2 && selectedStackMode === 'local' && !localRuntimeReady && !localStackHasStarted && managedPreflightReady) {
+    if (activeStep === 2 && localStackNeedsConfirmation) {
       setLocalStackConfirmOpen(true);
       return;
     }
     await goToStep(activeStep + 1);
-  }, [activeStep, goToStep, localRuntimeReady, localStackHasStarted, managedPreflightReady, selectedStackMode]);
+  }, [activeStep, goToStep, localStackNeedsConfirmation]);
 
   const openAdvancedSection = useCallback((sectionId: string) => {
     if (isModalPresentation && onClose) onClose();
@@ -1326,14 +1334,19 @@ export function OnboardingWizard({
                       </p>
                       <p className="text-xs text-slate-400">{localStackActionDescription}</p>
                       <div className="flex flex-wrap items-center gap-2 pt-1">
-                        <Badge variant={localRuntimeReady ? 'default' : localStackHasStarted ? 'secondary' : 'outline'}>
-                          {localRuntimeReady ? 'Local stack ready' : localStackHasStarted ? 'Provisioning in progress' : 'Not started yet'}
+                        <Badge variant={localRuntimeReady ? 'default' : localStackProvisioningActive ? 'secondary' : managedPreflightReady ? 'outline' : 'destructive'}>
+                          {localRuntimeReady ? 'Local stack ready' : localStackProvisioningActive ? 'Provisioning in progress' : managedPreflightReady ? 'Waiting for confirmation' : 'Docker not ready'}
                         </Badge>
                         {managedPreflightReady ? <Badge variant="outline">Docker reachable</Badge> : <Badge variant="destructive">Docker not ready</Badge>}
                       </div>
                     </div>
                     {!localRuntimeReady ? (
                       <div className="flex flex-wrap items-center gap-2">
+                        {localStackNeedsConfirmation ? (
+                          <Button type="button" size="sm" onClick={() => setLocalStackConfirmOpen(true)} disabled={runtimeActionBusy}>
+                            Confirm local setup
+                          </Button>
+                        ) : null}
                         <Button type="button" variant="outline" size="sm" onClick={() => void refreshStatus()} disabled={statusLoading}>
                           {statusLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
                           Refresh status
@@ -1352,9 +1365,11 @@ export function OnboardingWizard({
                       <span>
                         {localRuntimeReady
                           ? 'All local services are ready'
-                          : localStackHasStarted
+                          : localStackProvisioningActive
                             ? 'Local stack creation progress'
-                            : 'Nothing has started yet'}
+                            : managedPreflightReady
+                              ? 'Waiting for confirmation to create the missing local services'
+                              : 'Docker is not ready yet'}
                       </span>
                       <span>{localRuntimeReady ? '100%' : `${localStackProgress}%`}</span>
                     </div>
@@ -1366,19 +1381,19 @@ export function OnboardingWizard({
                       <div>
                         <div className="text-sm font-semibold text-white">Runtime status</div>
                         <p className="mt-1 text-xs text-slate-400">
-                          {localStackHasStarted
+                          {localStackProvisioningActive
                             ? 'PMDA is now checking or creating the local services below.'
-                            : 'These are the only local services PMDA still needs before the local metadata stack is ready.'}
+                            : 'These are the only local services PMDA still needs before the local metadata stack is ready. Confirm local setup here to start the missing ones.'}
                         </p>
                       </div>
                       {!localRuntimeReady ? (
                         <Badge variant="outline" className="border-white/15 bg-white/5 text-slate-200">
-                          {localStackHasStarted ? 'Provisioning' : 'Idle'}
+                          {localStackProvisioningActive ? 'Provisioning' : managedPreflightReady ? 'Waiting for confirmation' : 'Idle'}
                         </Badge>
                       ) : null}
                     </div>
 
-                    {localStackHasStarted ? (
+                    {localStackProvisioningActive ? (
                       <div className="mt-3 space-y-3">
                         {localStackActivityRows.map((row) => (
                           <div key={row.key} className="flex items-start justify-between gap-3 rounded-2xl border border-white/10 bg-white/[0.02] px-3 py-3">
@@ -1521,7 +1536,7 @@ export function OnboardingWizard({
               {activeStep < STEP_ORDER.length - 1 ? (
                 <Button type="button" className="gap-2" onClick={() => void handleNextStep()} disabled={isSaving || runtimeActionBusy}>
                   {isSaving ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
-                  {activeStep === 2 && selectedStackMode === 'local' && managedPreflightReady && !localRuntimeReady && !localStackHasStarted ? 'Continue' : 'Next'}
+                  {activeStep === 2 && localStackNeedsConfirmation ? 'Continue' : 'Next'}
                 </Button>
               ) : (
                 <Button type="button" className="gap-2" onClick={() => void startOrResumeScan()} disabled={scanActionBusy || blockers.length > 0}>
