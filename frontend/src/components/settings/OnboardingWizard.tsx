@@ -1098,7 +1098,6 @@ export function OnboardingWizard({
                     selectLabel="Select intake folder"
                     browseRoot="/music"
                     lockToBrowseRoot
-                    allowManualEntry={false}
                   />
                 ) : null}
 
@@ -1112,7 +1111,6 @@ export function OnboardingWizard({
                     selectLabel={workflowMode === 'mirror' ? 'Select source library folder' : 'Select library folder'}
                     browseRoot="/music"
                     lockToBrowseRoot
-                    allowManualEntry={false}
                   />
                 ) : null}
 
@@ -1126,7 +1124,6 @@ export function OnboardingWizard({
                     selectLabel="Select serving library folder"
                     browseRoot="/music"
                     lockToBrowseRoot
-                    allowManualEntry={false}
                   />
                 ) : null}
 
