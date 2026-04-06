@@ -672,9 +672,9 @@ export function OnboardingWizard({
     : 'Create local stack';
   const localStackActionDescription = localStackDetectedCount === 2
     ? 'PMDA found an existing MusicBrainz mirror and an existing Ollama runtime on this server. It can adopt them directly after your confirmation.'
-    : localStackDetectedCount === 1
+        : localStackDetectedCount === 1
       ? 'PMDA found one existing local service on this server. It can adopt it and create only the missing part after your confirmation.'
-      : 'No local metadata service was detected yet. PMDA will create the MusicBrainz mirror and the Ollama runtime.';
+      : 'No local metadata service was detected yet. PMDA will create the MusicBrainz mirror and the Ollama runtime after your confirmation.';
   const localStackNeedsConfirmation = selectedStackMode === 'local'
     && !localRuntimeReady
     && managedPreflightReady
@@ -693,14 +693,14 @@ export function OnboardingWizard({
       : musicbrainzDetected
         ? `Existing MusicBrainz mirror detected${managedMbCandidate?.published_url ? ` at ${managedMbCandidate.published_url}` : ''}. It will be adopted when you confirm local stack setup.`
         : musicbrainzNotStarted
-          ? 'Not started yet. Confirm local setup below to provision MusicBrainz.'
+          ? 'Not started yet. PMDA will provision MusicBrainz after you confirm the local setup.'
           : (managedMbBundle?.phase_message || 'MusicBrainz mirror is starting.');
     const ollamaDetail = ollamaReady
       ? `Ollama is ready with ${ollamaModel} and ${ollamaHardModel}.`
       : ollamaDetected
         ? `Existing Ollama runtime detected${managedOllamaCandidate?.url ? ` at ${managedOllamaCandidate.url}` : ''}. It will be adopted when you confirm local stack setup and PMDA will ensure ${ollamaModel} and ${ollamaHardModel}.`
         : ollamaNotStarted
-          ? `Not started yet. Confirm local setup below to provision Ollama and install ${ollamaModel} and ${ollamaHardModel}.`
+          ? `Not started yet. PMDA will provision Ollama and install ${ollamaModel} and ${ollamaHardModel} after you confirm the local setup.`
           : (managedOllamaBundle?.phase_message || `Ollama is starting and still needs ${ollamaModel} and ${ollamaHardModel}.`);
     return [
       {
@@ -834,7 +834,7 @@ export function OnboardingWizard({
       const detail = !managedPreflightReady
         ? (managedStatus?.preflight.message || 'Docker socket or runtime tooling is not ready.')
         : localStackNeedsConfirmation
-          ? 'PMDA is waiting for your confirmation to create or adopt the missing local MusicBrainz + Ollama services.'
+          ? 'PMDA is waiting for your confirmation from step 3 to create or adopt the missing local MusicBrainz + Ollama services.'
           : !musicbrainzReady
             ? (managedMbBundle?.phase_message || (managedMbCandidate ? 'An existing MusicBrainz mirror was detected and will be adopted after confirmation.' : 'Managed MusicBrainz is not ready yet.'))
             : (managedOllamaBundle?.phase_message || (managedOllamaCandidate ? 'An existing Ollama runtime was detected and will be adopted after confirmation.' : 'Managed Ollama or the required models are not ready yet.'));
@@ -1342,11 +1342,6 @@ export function OnboardingWizard({
                     </div>
                     {!localRuntimeReady ? (
                       <div className="flex flex-wrap items-center gap-2">
-                        {localStackNeedsConfirmation ? (
-                          <Button type="button" size="sm" onClick={() => setLocalStackConfirmOpen(true)} disabled={runtimeActionBusy}>
-                            Confirm local setup
-                          </Button>
-                        ) : null}
                         <Button type="button" variant="outline" size="sm" onClick={() => void refreshStatus()} disabled={statusLoading}>
                           {statusLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
                           Refresh status
@@ -1383,7 +1378,9 @@ export function OnboardingWizard({
                         <p className="mt-1 text-xs text-slate-400">
                           {localStackProvisioningActive
                             ? 'PMDA is now checking or creating the local services below.'
-                            : 'These are the only local services PMDA still needs before the local metadata stack is ready. Confirm local setup here to start the missing ones.'}
+                            : localStackNeedsConfirmation
+                              ? 'These are the only local services PMDA still needs before the local metadata stack is ready. Step 3 opens the confirmation that starts the missing ones.'
+                              : 'These are the only local services PMDA still needs before the local metadata stack is ready.'}
                         </p>
                       </div>
                       {!localRuntimeReady ? (
@@ -1431,7 +1428,9 @@ export function OnboardingWizard({
                         {item.progress > 0 || item.done ? (
                           <Progress value={Math.max(0, Math.min(100, item.progress))} className="mt-3 h-1.5 bg-white/10" />
                         ) : (
-                          <div className="mt-3 text-[11px] uppercase tracking-[0.14em] text-slate-500">Starts after you confirm local setup</div>
+                          <div className="mt-3 text-[11px] uppercase tracking-[0.14em] text-slate-500">
+                            {localStackNeedsConfirmation ? 'Waiting for step 3 confirmation' : 'Not started yet'}
+                          </div>
                         )}
                       </div>
                     );})}

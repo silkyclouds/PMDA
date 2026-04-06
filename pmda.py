@@ -5585,6 +5585,27 @@ def _managed_runtime_docker_ps(*, all_containers: bool = True) -> list[dict[str,
     return rows
 
 
+def _managed_runtime_docker_inspect(name: str) -> dict[str, Any]:
+    docker_cli = _managed_runtime_docker_cli()
+    target = str(name or "").strip()
+    if not docker_cli or not target:
+        return {}
+    try:
+        res = subprocess.run([docker_cli, "inspect", target], capture_output=True, text=True, timeout=20)
+    except Exception:
+        return {}
+    if res.returncode != 0:
+        return {}
+    try:
+        payload = json.loads(res.stdout or "[]")
+    except Exception:
+        return {}
+    if isinstance(payload, list) and payload:
+        row = payload[0]
+        return row if isinstance(row, dict) else {}
+    return {}
+
+
 def _managed_runtime_parse_ports(raw_ports: str) -> list[dict[str, Any]]:
     ports = []
     for chunk in str(raw_ports or "").split(","):
@@ -5602,6 +5623,39 @@ def _managed_runtime_parse_ports(raw_ports: str) -> list[dict[str, Any]]:
             }
         )
     return ports
+
+
+def _managed_runtime_self_gateway_candidates() -> list[str]:
+    inspect = _managed_runtime_docker_inspect(_managed_runtime_self_container_name())
+    networks = (inspect.get("NetworkSettings") or {}).get("Networks") or {}
+    out: list[str] = []
+    for meta in (networks or {}).values():
+        gateway = str((meta or {}).get("Gateway") or "").strip()
+        if gateway and gateway not in {"0.0.0.0", "::"} and gateway not in out:
+            out.append(gateway)
+    return out
+
+
+def _managed_runtime_musicbrainz_published_urls(host: str, host_port: int) -> list[str]:
+    port = int(host_port or 0)
+    if port <= 0:
+        return []
+    normalized_host = str(host or "").strip().strip("[]")
+    urls: list[str] = []
+
+    def _add(url: str) -> None:
+        text = str(url or "").strip().rstrip("/")
+        if text and text not in urls:
+            urls.append(text)
+
+    if normalized_host and normalized_host not in {"0.0.0.0", "::", "127.0.0.1", "localhost"}:
+        _add(f"http://{normalized_host}:{port}")
+    for gateway in _managed_runtime_self_gateway_candidates():
+        _add(f"http://{gateway}:{port}")
+    _add(f"http://host.docker.internal:{port}")
+    if normalized_host in {"127.0.0.1", "localhost"}:
+        _add(f"http://{normalized_host}:{port}")
+    return urls
 
 
 def _managed_runtime_project_prefix(name: str, services: set[str]) -> str:
@@ -5631,13 +5685,14 @@ def _managed_runtime_health_check_musicbrainz(base_url: str) -> dict[str, Any]:
             "overall_status": "healthy",
             "message": f"MusicBrainz mirror reachable ({count} result(s))",
             "latency_ms": latency_ms,
+            "url": url,
         }
     except requests.exceptions.Timeout:
-        return {"available": False, "overall_status": "degraded", "message": "Timed out"}
+        return {"available": False, "overall_status": "degraded", "message": "Timed out", "url": url}
     except requests.exceptions.ConnectionError:
-        return {"available": False, "overall_status": "unavailable", "message": "Connection failed"}
+        return {"available": False, "overall_status": "unavailable", "message": "Connection failed", "url": url}
     except Exception as exc:
-        return {"available": False, "overall_status": "degraded", "message": str(exc or "Health check failed")}
+        return {"available": False, "overall_status": "degraded", "message": str(exc or "Health check failed"), "url": url}
 
 
 def _managed_runtime_health_check_ollama(base_url: str) -> dict[str, Any]:
@@ -5668,6 +5723,7 @@ def _managed_runtime_detect_musicbrainz_candidates() -> list[dict[str, Any]]:
                 "bundle_type": _MANAGED_RUNTIME_MUSICBRAINZ_BUNDLE,
                 "services": {},
                 "published_url": "",
+                "published_urls": [],
                 "project_name": prefix,
             },
         )
@@ -5680,14 +5736,23 @@ def _managed_runtime_detect_musicbrainz_candidates() -> list[dict[str, Any]]:
         if service == "musicbrainz":
             for port in candidate["services"][service]["ports"]:
                 if int(port.get("container_port") or 0) == 5000 and int(port.get("host_port") or 0) > 0:
-                    candidate["published_url"] = f"http://127.0.0.1:{int(port['host_port'])}"
+                    urls = _managed_runtime_musicbrainz_published_urls(str(port.get("host") or ""), int(port.get("host_port") or 0))
+                    candidate["published_urls"] = urls
+                    if urls:
+                        candidate["published_url"] = urls[0]
                     break
     out: list[dict[str, Any]] = []
     for prefix, candidate in grouped.items():
         services = candidate.get("services") or {}
         service_count = len(services)
+        published_urls = list(candidate.get("published_urls") or [])
         published_url = str(candidate.get("published_url") or "")
-        health = _managed_runtime_health_check_musicbrainz(published_url) if published_url else {"available": False, "overall_status": "unavailable", "message": "No published web port detected"}
+        health = {"available": False, "overall_status": "unavailable", "message": "No published web port detected", "url": ""}
+        for candidate_url in published_urls:
+            published_url = str(candidate_url or "").strip()
+            health = _managed_runtime_health_check_musicbrainz(published_url) if published_url else health
+            if bool(health.get("available")):
+                break
         out.append(
             {
                 "id": prefix,
@@ -5697,12 +5762,34 @@ def _managed_runtime_detect_musicbrainz_candidates() -> list[dict[str, Any]]:
                 "service_count": service_count,
                 "expected_service_count": len(service_names),
                 "published_url": published_url,
+                "published_urls": published_urls,
                 "adoptable": service_count >= 3,
                 "health": health,
             }
         )
     out.sort(key=lambda row: (not bool(row.get("health", {}).get("available")), -int(row.get("service_count") or 0), str(row.get("id") or "")))
     return out
+
+
+def _managed_runtime_prepare_musicbrainz_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
+    prepared = dict(candidate or {})
+    project_name = str(prepared.get("project_name") or prepared.get("id") or "").strip()
+    if not project_name:
+        return prepared
+    services_present = list(prepared.get("services_present") or [])
+    if not services_present:
+        return prepared
+    _managed_runtime_ensure_network()
+    for service_name in services_present:
+        _managed_runtime_connect_container_to_network(f"{project_name}-{service_name}-1")
+    _managed_runtime_connect_self_to_network()
+    internal_url = _managed_runtime_musicbrainz_internal_url(project_name)
+    health = _managed_runtime_health_check_musicbrainz(internal_url)
+    if bool(health.get("available")):
+        prepared["published_url"] = internal_url
+        prepared["effective_url"] = internal_url
+        prepared["health"] = health
+    return prepared
 
 
 def _managed_runtime_detect_ollama_candidates() -> list[dict[str, Any]]:
@@ -6133,6 +6220,12 @@ def _managed_runtime_bootstrap_musicbrainz(payload: dict[str, Any]) -> None:
         if action in {"auto", "adopt"}:
             candidates = _managed_runtime_detect_musicbrainz_candidates()
             candidate = next((row for row in candidates if bool(row.get("adoptable")) and bool((row.get("health") or {}).get("available"))), None)
+            if candidate is None:
+                fallback_candidate = next((row for row in candidates if bool(row.get("adoptable"))), None)
+                if fallback_candidate is not None:
+                    prepared_candidate = _managed_runtime_prepare_musicbrainz_candidate(fallback_candidate)
+                    if bool((prepared_candidate.get("health") or {}).get("available")):
+                        candidate = prepared_candidate
             if candidate is not None:
                 adopted = _managed_runtime_adopt_musicbrainz(candidate, mode="adopted", config_root=config_root, data_root=data_root)
                 _managed_runtime_action_update(action_id, bundle_type, "bootstrap", "completed", payload=payload, result=adopted, completed=True)
