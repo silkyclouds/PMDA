@@ -9,6 +9,7 @@ import { Badge } from '@/components/ui/badge';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { SimilarArtists } from '@/components/library/SimilarArtists';
 import { AuthenticatedImage } from '@/components/library/AuthenticatedImage';
+import { AlbumMatchSources } from '@/components/library/AlbumMatchSources';
 import { AlbumEditor } from '@/components/library/AlbumEditor';
 import { ImproveAlbumDialog } from '@/components/library/ImproveAlbumDialog';
 import { ProviderBadge } from '@/components/providers/ProviderBadge';
@@ -59,6 +60,7 @@ interface AlbumInfo {
   mb_identified?: boolean;
   /** MusicBrainz release-group ID when available (for link to MusicBrainz) */
   musicbrainz_release_group_id?: string;
+  strict_match_provider?: string;
   /** Fallback provider IDs/links when MBID is missing */
   discogs_release_id?: string;
   lastfm_album_mbid?: string;
@@ -1179,6 +1181,7 @@ export default function LibraryBrowser() {
                                               <Badge variant="outline" className="text-xs">{type}</Badge>
                                             </td>
                                             <td className="p-2">
+                                              <AlbumMatchSources album={album} className="mb-1" />
                                               <IssueBadges album={album} />
                                               {album.is_broken && album.broken_detail && (
                                                 <p className="mt-1 text-xs text-muted-foreground">
@@ -1298,6 +1301,7 @@ export default function LibraryBrowser() {
                                                 <div className="flex flex-wrap items-center gap-1 mt-2">
                                                   {album.format && <FormatBadge format={album.format} size="sm" className="text-xs" />}
                                                   <Badge variant="outline" className="text-xs">{type}</Badge>
+                                                  <AlbumMatchSources album={album} />
                                                   <IssueBadges album={album} />
                                                   {albumHasIssue(album) && (
                                                     <Button
