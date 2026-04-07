@@ -80249,7 +80249,7 @@ def _collapse_nested_album_folder_groups(
             continue
         parent_children[parent].append((folder_resolved, list(paths or [])))
 
-    cover_names = {name.lower() for name in _COVER_IMAGE_NAMES}
+    cover_names = {name.lower() for name in _COVER_NAMES}
     for parent, children in parent_children.items():
         if len(children) < 2:
             continue
