@@ -195,6 +195,25 @@ export function LibraryWorkflowSettings({ config, updateConfig, onSwitchToCustom
     updateConfig({ [key]: next.join(', ') } as Partial<PMDAConfig>);
   };
 
+  const applyWorkflowSelection = (nextMode: WorkflowMode) => {
+    const needsPublishedLibrary = nextMode === 'managed' || nextMode === 'mirror';
+    updateConfig({
+      LIBRARY_WORKFLOW_MODE: nextMode,
+      PIPELINE_ENABLE_EXPORT: needsPublishedLibrary,
+      EXPORT_LINK_STRATEGY: materialization,
+      LIBRARY_MATERIALIZATION_MODE: materialization,
+    });
+  };
+
+  const setMaterialization = (
+    value: NonNullable<PMDAConfig['LIBRARY_MATERIALIZATION_MODE']>,
+  ) => {
+    updateConfig({
+      LIBRARY_MATERIALIZATION_MODE: value,
+      EXPORT_LINK_STRATEGY: value,
+    });
+  };
+
   return (
     <Card id="settings-library-workflow" className="scroll-mt-24 border-success/20 bg-success/[0.04]">
       <CardHeader>
@@ -216,7 +235,7 @@ export function LibraryWorkflowSettings({ config, updateConfig, onSwitchToCustom
               <button
                 key={card.value}
                 type="button"
-                onClick={() => updateConfig({ LIBRARY_WORKFLOW_MODE: card.value })}
+                onClick={() => applyWorkflowSelection(card.value)}
                 className={`rounded-xl border p-4 text-left transition ${
                   active
                     ? 'border-primary/50 bg-primary/10 ring-1 ring-primary/20'
@@ -320,7 +339,7 @@ export function LibraryWorkflowSettings({ config, updateConfig, onSwitchToCustom
                 <Label>How PMDA should place albums into the library</Label>
                 <Select
                   value={materialization}
-                  onValueChange={(value: NonNullable<PMDAConfig['LIBRARY_MATERIALIZATION_MODE']>) => updateConfig({ LIBRARY_MATERIALIZATION_MODE: value })}
+                  onValueChange={setMaterialization}
                 >
                   <SelectTrigger>
                     <SelectValue placeholder="Select materialization mode" />

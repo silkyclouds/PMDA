@@ -2762,7 +2762,7 @@ merged = {
     # Extra artist image providers (optional)
     "FANART_API_KEY": _get("FANART_API_KEY", default="", cast=str),
     "THEAUDIODB_API_KEY": _get("THEAUDIODB_API_KEY", default="", cast=str),
-    "USE_BANDCAMP": _get("USE_BANDCAMP", default=False, cast=_parse_bool),
+    "USE_BANDCAMP": _get("USE_BANDCAMP", default=True, cast=_parse_bool),
     # Artist / metadata modes
     "ARTIST_CREDIT_MODE": _get("ARTIST_CREDIT_MODE", default="picard_like_default", cast=str),
     "CLASSICAL_NAME_PREFERENCE": _get("CLASSICAL_NAME_PREFERENCE", default="original", cast=str),
@@ -2941,7 +2941,7 @@ LASTFM_API_KEY: str = str(merged.get("LASTFM_API_KEY", "") or "")
 LASTFM_API_SECRET: str = str(merged.get("LASTFM_API_SECRET", "") or "")
 FANART_API_KEY: str = str(merged.get("FANART_API_KEY", "") or "")
 THEAUDIODB_API_KEY: str = str(merged.get("THEAUDIODB_API_KEY", "") or "")
-USE_BANDCAMP: bool = bool(merged.get("USE_BANDCAMP", False))
+USE_BANDCAMP: bool = bool(merged.get("USE_BANDCAMP", True))
 ARTIST_CREDIT_MODE: str = str(merged.get("ARTIST_CREDIT_MODE", "picard_like_default") or "picard_like_default").strip().lower()
 CLASSICAL_NAME_PREFERENCE: str = str(merged.get("CLASSICAL_NAME_PREFERENCE", "original") or "original").strip().lower()
 if CLASSICAL_NAME_PREFERENCE not in {"original", "english"}:
@@ -60275,7 +60275,7 @@ def api_config_get():
         "FANART_API_KEY_SET": _is_set(fanart_key_eff),
         "THEAUDIODB_API_KEY": str(theaudiodb_key_eff or ""),
         "THEAUDIODB_API_KEY_SET": _is_set(theaudiodb_key_eff),
-        "USE_BANDCAMP": False,
+        "USE_BANDCAMP": get_setting_bool("USE_BANDCAMP", USE_BANDCAMP),
         "JELLYFIN_URL": get_setting("JELLYFIN_URL", JELLYFIN_URL),
         "JELLYFIN_API_KEY": str(jellyfin_key_eff or ""),
         "JELLYFIN_API_KEY_SET": _is_set(jellyfin_key_eff),

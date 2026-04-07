@@ -1312,17 +1312,33 @@ function SettingsPage() {
   const postScanAsync = Boolean(config.PIPELINE_POST_SCAN_ASYNC ?? false);
   const scanFirstModeEnabled =
     schedulerPaused && !allowNonScanJobs && !postScanAsync;
-  const metadataMode = Boolean(
-    config.MUSICBRAINZ_MIRROR_ENABLED ||
-    String(config.WEB_SEARCH_PROVIDER || "")
+  const metadataMode = (() => {
+    const aiProvider = String(config.AI_PROVIDER || "")
       .trim()
-      .toLowerCase() === "ollama" ||
-    String(config.AI_PROVIDER || "")
+      .toLowerCase();
+    const webSearchProvider = String(config.WEB_SEARCH_PROVIDER || "")
       .trim()
-      .toLowerCase() === "ollama",
-  )
-    ? "local"
-    : "online";
+      .toLowerCase();
+    if (
+      config.MUSICBRAINZ_MIRROR_ENABLED ||
+      webSearchProvider === "ollama" ||
+      aiProvider === "ollama"
+    ) {
+      return "local";
+    }
+    if (
+      aiProvider === "openai" ||
+      aiProvider === "openai-api" ||
+      aiProvider === "anthropic" ||
+      aiProvider === "google" ||
+      Boolean(String(config.OPENAI_API_KEY || "").trim()) ||
+      Boolean(String(config.ANTHROPIC_API_KEY || "").trim()) ||
+      Boolean(String(config.GOOGLE_API_KEY || "").trim())
+    ) {
+      return "online";
+    }
+    return "local";
+  })();
   const resolvedManagedConfigRoot =
     String(config.MANAGED_RUNTIME_CONFIG_ROOT || "").trim() ||
     "/config/managed-runtime";
@@ -1524,6 +1540,22 @@ function SettingsPage() {
         updateConfig({ USE_LASTFM: !(config.USE_LASTFM !== false) }),
     },
     {
+      id: "bandcamp",
+      label: "Bandcamp",
+      enabled: config.USE_BANDCAMP !== false,
+      badge: config.USE_BANDCAMP !== false ? "Enabled" : "Off",
+      variant:
+        config.USE_BANDCAMP !== false
+          ? ("secondary" as const)
+          : ("outline" as const),
+      message:
+        config.USE_BANDCAMP !== false
+          ? "Enabled by default. No key required."
+          : "Bandcamp fallback is disabled for this scan.",
+      toggle: () =>
+        updateConfig({ USE_BANDCAMP: !(config.USE_BANDCAMP !== false) }),
+    },
+    {
       id: "acoustid",
       label: "AcoustID",
       enabled: config.USE_ACOUSTID !== false,
@@ -1637,6 +1669,7 @@ function SettingsPage() {
           SCAN_AI_POLICY: "local_only",
           WEB_SEARCH_PROVIDER: "ollama",
           AI_USAGE_LEVEL: "auto",
+          USE_BANDCAMP: config.USE_BANDCAMP ?? true,
         });
         return;
       }
@@ -1650,9 +1683,11 @@ function SettingsPage() {
         SCAN_AI_POLICY: "local_then_paid",
         WEB_SEARCH_PROVIDER: "auto",
         AI_USAGE_LEVEL: "auto",
+        USE_BANDCAMP: config.USE_BANDCAMP ?? true,
       });
     },
     [
+      config.USE_BANDCAMP,
       ollamaConfiguredHardModel,
       ollamaConfiguredModel,
       ollamaConfiguredUrl,
@@ -1981,6 +2016,31 @@ function SettingsPage() {
             <div className="grid gap-3 lg:grid-cols-2">
               <button
                 type="button"
+                onClick={() => applyMetadataModePreset("local")}
+                className={`rounded-2xl border p-4 text-left transition ${metadataMode === "local" ? "border-primary bg-primary/10 shadow-[0_0_0_1px_rgba(45,212,191,0.18)]" : "border-border/60 bg-background/40 hover:border-border"}`}
+              >
+                <div className="flex items-center justify-between gap-3">
+                  <div className="inline-flex h-10 w-10 items-center justify-center rounded-2xl bg-primary/10 text-primary">
+                    <Server className="h-5 w-5" />
+                  </div>
+                  <Badge
+                    variant={metadataMode === "local" ? "default" : "outline"}
+                  >
+                    {metadataMode === "local" ? "Selected" : "Recommended"}
+                  </Badge>
+                </div>
+                <div className="mt-4 text-base font-semibold text-foreground">
+                  Local stack
+                </div>
+                <p className="mt-2 text-sm text-muted-foreground">
+                  Uses a local MusicBrainz mirror and a managed Ollama runtime.
+                  Best when you want a self-hosted path with no recurring paid
+                  API bill for the default setup.
+                </p>
+              </button>
+
+              <button
+                type="button"
                 onClick={() => applyMetadataModePreset("online")}
                 className={`rounded-2xl border p-4 text-left transition ${metadataMode === "online" ? "border-primary bg-primary/10 shadow-[0_0_0_1px_rgba(45,212,191,0.18)]" : "border-border/60 bg-background/40 hover:border-border"}`}
               >
@@ -1998,32 +2058,9 @@ function SettingsPage() {
                   Online-assisted
                 </div>
                 <p className="mt-2 text-sm text-muted-foreground">
-                  Fastest first-run path. PMDA uses public metadata services and
-                  only falls back to heavier AI/provider logic when needed.
-                </p>
-              </button>
-
-              <button
-                type="button"
-                onClick={() => applyMetadataModePreset("local")}
-                className={`rounded-2xl border p-4 text-left transition ${metadataMode === "local" ? "border-primary bg-primary/10 shadow-[0_0_0_1px_rgba(45,212,191,0.18)]" : "border-border/60 bg-background/40 hover:border-border"}`}
-              >
-                <div className="flex items-center justify-between gap-3">
-                  <div className="inline-flex h-10 w-10 items-center justify-center rounded-2xl bg-primary/10 text-primary">
-                    <Server className="h-5 w-5" />
-                  </div>
-                  <Badge
-                    variant={metadataMode === "local" ? "default" : "outline"}
-                  >
-                    {metadataMode === "local" ? "Selected" : "Available"}
-                  </Badge>
-                </div>
-                <div className="mt-4 text-base font-semibold text-foreground">
-                  Local stack
-                </div>
-                <p className="mt-2 text-sm text-muted-foreground">
-                  Uses a local MusicBrainz mirror and a managed Ollama runtime.
-                  Best when you want a self-hosted path after the initial setup.
+                  Faster to bootstrap if you already have API keys. PMDA uses
+                  public metadata services and only escalates to external AI
+                  when needed.
                 </p>
               </button>
             </div>
@@ -2046,7 +2083,7 @@ function SettingsPage() {
                       AI policy: {selectedScanAiPolicyMeta.label}
                     </Badge>
                   </div>
-                  <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+                  <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-5">
                     {metadataProviderCards.map((provider) => (
                       <div
                         key={provider.id}
@@ -2060,6 +2097,7 @@ function SettingsPage() {
                                   provider.id as
                                     | "musicbrainz"
                                     | "discogs"
+                                    | "bandcamp"
                                     | "lastfm"
                                     | "acoustid"
                                 }
