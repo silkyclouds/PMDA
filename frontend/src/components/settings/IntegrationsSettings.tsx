@@ -1,37 +1,61 @@
-import { useMemo, useState } from 'react';
-import { Link2, Loader2, CheckCircle2, XCircle, SlidersHorizontal } from 'lucide-react';
-import { Input } from '@/components/ui/input';
-import { Label } from '@/components/ui/label';
-import { Switch } from '@/components/ui/switch';
-import { Button } from '@/components/ui/button';
-import { PasswordInput } from '@/components/ui/password-input';
-import { FieldTooltip } from '@/components/ui/field-tooltip';
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
-import * as api from '@/lib/api';
-import type { PMDAConfig, PlayerTarget } from '@/lib/api';
-import { toast } from 'sonner';
+import { useMemo, useState } from "react";
+import {
+  Link2,
+  Loader2,
+  CheckCircle2,
+  XCircle,
+  SlidersHorizontal,
+} from "lucide-react";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
+import { Button } from "@/components/ui/button";
+import { PasswordInput } from "@/components/ui/password-input";
+import { FieldTooltip } from "@/components/ui/field-tooltip";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import * as api from "@/lib/api";
+import type { PMDAConfig, PlayerTarget } from "@/lib/api";
+import { toast } from "sonner";
 
 interface IntegrationsSettingsProps {
   config: Partial<PMDAConfig>;
   updateConfig: (updates: Partial<PMDAConfig>) => void;
   errors: Record<string, string>;
+  hideHeader?: boolean;
 }
 
 const PLAYER_TARGETS: Array<{ value: PlayerTarget; label: string }> = [
-  { value: 'none', label: 'None' },
-  { value: 'plex', label: 'Plex' },
-  { value: 'jellyfin', label: 'Jellyfin' },
-  { value: 'navidrome', label: 'Navidrome' },
+  { value: "none", label: "None" },
+  { value: "plex", label: "Plex" },
+  { value: "jellyfin", label: "Jellyfin" },
+  { value: "navidrome", label: "Navidrome" },
 ];
 
-export function IntegrationsSettings({ config, updateConfig }: IntegrationsSettingsProps) {
+export function IntegrationsSettings({
+  config,
+  updateConfig,
+  hideHeader = false,
+}: IntegrationsSettingsProps) {
   const [testingPlayer, setTestingPlayer] = useState(false);
   const [refreshingPlayer, setRefreshingPlayer] = useState(false);
-  const [playerResult, setPlayerResult] = useState<{ success: boolean; message: string } | null>(null);
+  const [playerResult, setPlayerResult] = useState<{
+    success: boolean;
+    message: string;
+  } | null>(null);
 
   const playerTarget: PlayerTarget = useMemo(() => {
-    const value = String(config.PIPELINE_PLAYER_TARGET || 'none').trim().toLowerCase();
-    return (['none', 'plex', 'jellyfin', 'navidrome'].includes(value) ? value : 'none') as PlayerTarget;
+    const value = String(config.PIPELINE_PLAYER_TARGET || "none")
+      .trim()
+      .toLowerCase();
+    return (
+      ["none", "plex", "jellyfin", "navidrome"].includes(value) ? value : "none"
+    ) as PlayerTarget;
   }, [config.PIPELINE_PLAYER_TARGET]);
 
   const testPlayer = async () => {
@@ -51,12 +75,15 @@ export function IntegrationsSettings({ config, updateConfig }: IntegrationsSetti
       });
       setPlayerResult({ success: result.success, message: result.message });
       if (result.success) {
-        toast.success(result.message || 'Player connection successful');
+        toast.success(result.message || "Player connection successful");
       } else {
-        toast.error(result.message || 'Player connection failed');
+        toast.error(result.message || "Player connection failed");
       }
     } catch (error: unknown) {
-      const message = error instanceof Error ? error.message : 'Failed to test player connection';
+      const message =
+        error instanceof Error
+          ? error.message
+          : "Failed to test player connection";
       setPlayerResult({ success: false, message });
       toast.error(message);
     } finally {
@@ -69,12 +96,16 @@ export function IntegrationsSettings({ config, updateConfig }: IntegrationsSetti
     try {
       const result = await api.playerRefresh(playerTarget);
       if (result.success) {
-        toast.success(result.message || 'Player refresh triggered');
+        toast.success(result.message || "Player refresh triggered");
       } else {
-        toast.error(result.message || 'Failed to trigger player refresh');
+        toast.error(result.message || "Failed to trigger player refresh");
       }
     } catch (error: unknown) {
-      toast.error(error instanceof Error ? error.message : 'Failed to trigger player refresh');
+      toast.error(
+        error instanceof Error
+          ? error.message
+          : "Failed to trigger player refresh",
+      );
     } finally {
       setRefreshingPlayer(false);
     }
@@ -82,19 +113,21 @@ export function IntegrationsSettings({ config, updateConfig }: IntegrationsSetti
 
   return (
     <div className="space-y-6">
-      <div className="flex items-center gap-3 mb-4">
-        <div className="p-2 rounded-lg bg-primary/10">
-          <Link2 className="w-5 h-5 text-primary" />
+      {!hideHeader ? (
+        <div className="mb-4 flex items-center gap-3">
+          <div className="rounded-lg bg-primary/10 p-2">
+            <Link2 className="h-5 w-5 text-primary" />
+          </div>
+          <div>
+            <h3 className="font-medium">Pipeline & Integrations</h3>
+            <p className="text-sm text-muted-foreground">
+              Configure the automated pipeline and optional player sync.
+            </p>
+          </div>
         </div>
-        <div>
-          <h3 className="font-medium">Pipeline & Integrations</h3>
-          <p className="text-sm text-muted-foreground">
-            Configure the automated pipeline and optional player sync.
-          </p>
-        </div>
-      </div>
+      ) : null}
 
-      <div className="space-y-4 p-4 rounded-lg border border-border">
+      <div className="space-y-4 rounded-lg border border-border p-4">
         <div className="flex items-center gap-2">
           <SlidersHorizontal className="w-4 h-4 text-primary" />
           <h4 className="font-medium text-sm">Pipeline steps</h4>
@@ -104,11 +137,15 @@ export function IntegrationsSettings({ config, updateConfig }: IntegrationsSetti
           <div className="flex items-start justify-between p-3 rounded-lg bg-muted/50">
             <div className="space-y-0.5 flex-1">
               <Label>Match + Fix metadata</Label>
-              <p className="text-xs text-muted-foreground">Tags, album covers and artist images.</p>
+              <p className="text-xs text-muted-foreground">
+                Tags, album covers and artist images.
+              </p>
             </div>
             <Switch
               checked={config.PIPELINE_ENABLE_MATCH_FIX ?? true}
-              onCheckedChange={(checked) => updateConfig({ PIPELINE_ENABLE_MATCH_FIX: checked })}
+              onCheckedChange={(checked) =>
+                updateConfig({ PIPELINE_ENABLE_MATCH_FIX: checked })
+              }
               className="mt-1"
             />
           </div>
@@ -116,11 +153,15 @@ export function IntegrationsSettings({ config, updateConfig }: IntegrationsSetti
           <div className="flex items-start justify-between p-3 rounded-lg bg-muted/50">
             <div className="space-y-0.5 flex-1">
               <Label>Deduplicate</Label>
-              <p className="text-xs text-muted-foreground">Move duplicate loser albums to the dupe folder.</p>
+              <p className="text-xs text-muted-foreground">
+                Move duplicate loser albums to the dupe folder.
+              </p>
             </div>
             <Switch
               checked={config.PIPELINE_ENABLE_DEDUPE ?? true}
-              onCheckedChange={(checked) => updateConfig({ PIPELINE_ENABLE_DEDUPE: checked })}
+              onCheckedChange={(checked) =>
+                updateConfig({ PIPELINE_ENABLE_DEDUPE: checked })
+              }
               className="mt-1"
             />
           </div>
@@ -128,11 +169,15 @@ export function IntegrationsSettings({ config, updateConfig }: IntegrationsSetti
           <div className="flex items-start justify-between p-3 rounded-lg bg-muted/50">
             <div className="space-y-0.5 flex-1">
               <Label>Move incomplete albums</Label>
-              <p className="text-xs text-muted-foreground">Move incomplete albums to the configured incomplete folder.</p>
+              <p className="text-xs text-muted-foreground">
+                Move incomplete albums to the configured incomplete folder.
+              </p>
             </div>
             <Switch
               checked={config.PIPELINE_ENABLE_INCOMPLETE_MOVE ?? true}
-              onCheckedChange={(checked) => updateConfig({ PIPELINE_ENABLE_INCOMPLETE_MOVE: checked })}
+              onCheckedChange={(checked) =>
+                updateConfig({ PIPELINE_ENABLE_INCOMPLETE_MOVE: checked })
+              }
               className="mt-1"
             />
           </div>
@@ -141,12 +186,15 @@ export function IntegrationsSettings({ config, updateConfig }: IntegrationsSetti
             <div className="space-y-0.5 flex-1">
               <Label>Export files library</Label>
               <p className="text-xs text-muted-foreground">
-                Build/update the export tree. Folder + strategy are configured in <span className="text-foreground">Folders</span>.
+                Build/update the export tree. Folder + strategy are configured
+                in <span className="text-foreground">Folders</span>.
               </p>
             </div>
             <Switch
               checked={config.PIPELINE_ENABLE_EXPORT ?? false}
-              onCheckedChange={(checked) => updateConfig({ PIPELINE_ENABLE_EXPORT: checked })}
+              onCheckedChange={(checked) =>
+                updateConfig({ PIPELINE_ENABLE_EXPORT: checked })
+              }
               className="mt-1"
             />
           </div>
@@ -154,11 +202,15 @@ export function IntegrationsSettings({ config, updateConfig }: IntegrationsSetti
           <div className="flex items-start justify-between p-3 rounded-lg bg-muted/50">
             <div className="space-y-0.5 flex-1">
               <Label>Sync external player</Label>
-              <p className="text-xs text-muted-foreground">Trigger Plex/Jellyfin/Navidrome library refresh after scan.</p>
+              <p className="text-xs text-muted-foreground">
+                Trigger Plex/Jellyfin/Navidrome library refresh after scan.
+              </p>
             </div>
             <Switch
               checked={config.PIPELINE_ENABLE_PLAYER_SYNC ?? false}
-              onCheckedChange={(checked) => updateConfig({ PIPELINE_ENABLE_PLAYER_SYNC: checked })}
+              onCheckedChange={(checked) =>
+                updateConfig({ PIPELINE_ENABLE_PLAYER_SYNC: checked })
+              }
               className="mt-1"
             />
           </div>
@@ -182,7 +234,12 @@ export function IntegrationsSettings({ config, updateConfig }: IntegrationsSetti
           </div>
           <Select
             value={playerTarget}
-            onValueChange={(value) => updateConfig({ PIPELINE_PLAYER_TARGET: value as PMDAConfig['PIPELINE_PLAYER_TARGET'] })}
+            onValueChange={(value) =>
+              updateConfig({
+                PIPELINE_PLAYER_TARGET:
+                  value as PMDAConfig["PIPELINE_PLAYER_TARGET"],
+              })
+            }
           >
             <SelectTrigger id="player-target">
               <SelectValue placeholder="Select target" />
@@ -197,14 +254,14 @@ export function IntegrationsSettings({ config, updateConfig }: IntegrationsSetti
           </Select>
         </div>
 
-        {playerTarget === 'plex' && (
+        {playerTarget === "plex" && (
           <div className="space-y-3 pt-2 border-t border-border">
             <div className="space-y-2">
               <Label htmlFor="plex-url">Plex URL</Label>
               <Input
                 id="plex-url"
                 placeholder="http://192.168.1.100:32400"
-                value={config.PLEX_HOST || ''}
+                value={config.PLEX_HOST || ""}
                 onChange={(e) => updateConfig({ PLEX_HOST: e.target.value })}
               />
             </div>
@@ -213,21 +270,21 @@ export function IntegrationsSettings({ config, updateConfig }: IntegrationsSetti
               <PasswordInput
                 id="plex-token"
                 placeholder="x-plex-token"
-                value={config.PLEX_TOKEN || ''}
+                value={config.PLEX_TOKEN || ""}
                 onChange={(e) => updateConfig({ PLEX_TOKEN: e.target.value })}
               />
             </div>
           </div>
         )}
 
-        {playerTarget === 'jellyfin' && (
+        {playerTarget === "jellyfin" && (
           <div className="space-y-3 pt-2 border-t border-border">
             <div className="space-y-2">
               <Label htmlFor="jellyfin-url">Jellyfin URL</Label>
               <Input
                 id="jellyfin-url"
                 placeholder="http://192.168.1.100:8096"
-                value={config.JELLYFIN_URL || ''}
+                value={config.JELLYFIN_URL || ""}
                 onChange={(e) => updateConfig({ JELLYFIN_URL: e.target.value })}
               />
             </div>
@@ -236,22 +293,26 @@ export function IntegrationsSettings({ config, updateConfig }: IntegrationsSetti
               <PasswordInput
                 id="jellyfin-api-key"
                 placeholder="Enter Jellyfin API key"
-                value={config.JELLYFIN_API_KEY || ''}
-                onChange={(e) => updateConfig({ JELLYFIN_API_KEY: e.target.value })}
+                value={config.JELLYFIN_API_KEY || ""}
+                onChange={(e) =>
+                  updateConfig({ JELLYFIN_API_KEY: e.target.value })
+                }
               />
             </div>
           </div>
         )}
 
-        {playerTarget === 'navidrome' && (
+        {playerTarget === "navidrome" && (
           <div className="space-y-3 pt-2 border-t border-border">
             <div className="space-y-2">
               <Label htmlFor="navidrome-url">Navidrome URL</Label>
               <Input
                 id="navidrome-url"
                 placeholder="http://192.168.1.100:4533"
-                value={config.NAVIDROME_URL || ''}
-                onChange={(e) => updateConfig({ NAVIDROME_URL: e.target.value })}
+                value={config.NAVIDROME_URL || ""}
+                onChange={(e) =>
+                  updateConfig({ NAVIDROME_URL: e.target.value })
+                }
               />
             </div>
             <div className="space-y-2">
@@ -259,8 +320,10 @@ export function IntegrationsSettings({ config, updateConfig }: IntegrationsSetti
               <Input
                 id="navidrome-user"
                 placeholder="admin"
-                value={config.NAVIDROME_USERNAME || ''}
-                onChange={(e) => updateConfig({ NAVIDROME_USERNAME: e.target.value })}
+                value={config.NAVIDROME_USERNAME || ""}
+                onChange={(e) =>
+                  updateConfig({ NAVIDROME_USERNAME: e.target.value })
+                }
               />
             </div>
             <div className="space-y-2">
@@ -268,8 +331,10 @@ export function IntegrationsSettings({ config, updateConfig }: IntegrationsSetti
               <PasswordInput
                 id="navidrome-pass"
                 placeholder="Enter Navidrome password"
-                value={config.NAVIDROME_PASSWORD || ''}
-                onChange={(e) => updateConfig({ NAVIDROME_PASSWORD: e.target.value })}
+                value={config.NAVIDROME_PASSWORD || ""}
+                onChange={(e) =>
+                  updateConfig({ NAVIDROME_PASSWORD: e.target.value })
+                }
               />
             </div>
             <div className="space-y-2">
@@ -277,14 +342,16 @@ export function IntegrationsSettings({ config, updateConfig }: IntegrationsSetti
               <PasswordInput
                 id="navidrome-api-key"
                 placeholder="Optional if username/password is set"
-                value={config.NAVIDROME_API_KEY || ''}
-                onChange={(e) => updateConfig({ NAVIDROME_API_KEY: e.target.value })}
+                value={config.NAVIDROME_API_KEY || ""}
+                onChange={(e) =>
+                  updateConfig({ NAVIDROME_API_KEY: e.target.value })
+                }
               />
             </div>
           </div>
         )}
 
-        {playerTarget !== 'none' && (
+        {playerTarget !== "none" && (
           <div className="flex flex-wrap items-center gap-2 pt-2">
             <Button
               variant="secondary"
@@ -292,7 +359,9 @@ export function IntegrationsSettings({ config, updateConfig }: IntegrationsSetti
               disabled={testingPlayer}
               className="gap-1.5"
             >
-              {testingPlayer ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
+              {testingPlayer ? (
+                <Loader2 className="w-4 h-4 animate-spin" />
+              ) : null}
               Test connection
             </Button>
             <Button
@@ -301,30 +370,35 @@ export function IntegrationsSettings({ config, updateConfig }: IntegrationsSetti
               disabled={refreshingPlayer}
               className="gap-1.5"
             >
-              {refreshingPlayer ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
+              {refreshingPlayer ? (
+                <Loader2 className="w-4 h-4 animate-spin" />
+              ) : null}
               Trigger refresh now
             </Button>
           </div>
         )}
 
         {playerResult && (
-          <div className={`p-3 rounded-lg flex items-start gap-2 ${
-            playerResult.success
-              ? 'bg-success/10 border border-success/20'
-              : 'bg-destructive/10 border border-destructive/20'
-          }`}>
+          <div
+            className={`p-3 rounded-lg flex items-start gap-2 ${
+              playerResult.success
+                ? "bg-success/10 border border-success/20"
+                : "bg-destructive/10 border border-destructive/20"
+            }`}
+          >
             {playerResult.success ? (
               <CheckCircle2 className="w-4 h-4 text-success mt-0.5 shrink-0" />
             ) : (
               <XCircle className="w-4 h-4 text-destructive mt-0.5 shrink-0" />
             )}
-            <p className={`text-xs ${playerResult.success ? 'text-success' : 'text-destructive'}`}>
+            <p
+              className={`text-xs ${playerResult.success ? "text-success" : "text-destructive"}`}
+            >
               {playerResult.message}
             </p>
           </div>
         )}
       </div>
-
     </div>
   );
 }
