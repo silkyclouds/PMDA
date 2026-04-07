@@ -11,6 +11,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { FormatBadge } from '@/components/FormatBadge';
 import { AuthenticatedImage } from '@/components/library/AuthenticatedImage';
 import { AlbumArtworkGalleryDialog } from '@/components/library/AlbumArtworkGalleryDialog';
+import { AlbumMatchSources } from '@/components/library/AlbumMatchSources';
 import { AlbumRatingStars } from '@/components/library/AlbumRatingStars';
 import { EntityDiscoverDialog } from '@/components/library/EntityDiscoverDialog';
 import { SocialActivityBadges } from '@/components/social/SocialActivityBadges';
@@ -824,17 +825,14 @@ export default function AlbumPage() {
                       </Badge>
                     );
                   })()}
-                  {data.metadata_source ? (
-                    data.metadata_source_url ? (
-                      <ProviderLink
-                        provider={data.metadata_source}
-                        href={data.metadata_source_url}
-                        prefix="Source"
-                        className="inline-flex"
-                      />
-                    ) : (
-                      <ProviderBadge provider={data.metadata_source} prefix="Source" className="text-[11px]" />
-                    )
+                  <AlbumMatchSources album={data} />
+                  {data.metadata_source && data.metadata_source_url ? (
+                    <ProviderLink
+                      provider={data.metadata_source}
+                      href={data.metadata_source_url}
+                      prefix="Source"
+                      className="inline-flex"
+                    />
                   ) : null}
                   {data.bandcamp_album_url && String(data.metadata_source || '').trim().toLowerCase() !== 'bandcamp' ? (
                     <ProviderLink provider="bandcamp" href={data.bandcamp_album_url} className="inline-flex" />

@@ -3029,7 +3029,7 @@ def _ai_usage_level_overrides(level: str) -> dict[str, bool]:
     if normalized == "limited":
         return {
             "USE_AI_FOR_MB_MATCH": False,
-            "USE_AI_FOR_MB_VERIFY": True,
+            "USE_AI_FOR_MB_VERIFY": False,
             "USE_AI_FOR_DEDUPE": False,
             "USE_AI_VISION_FOR_COVER": False,
             "USE_AI_VISION_BEFORE_COVER_INJECT": False,
@@ -3038,6 +3038,17 @@ def _ai_usage_level_overrides(level: str) -> dict[str, bool]:
             "PROVIDER_IDENTITY_USE_AI": False,
         }
     if normalized == "auto":
+        return {
+            "USE_AI_FOR_MB_MATCH": False,
+            "USE_AI_FOR_MB_VERIFY": False,
+            "USE_AI_FOR_DEDUPE": False,
+            "USE_AI_VISION_FOR_COVER": False,
+            "USE_AI_VISION_BEFORE_COVER_INJECT": False,
+            "USE_WEB_SEARCH_FOR_MB": True,
+            "USE_AI_WEB_SEARCH_FALLBACK": False,
+            "PROVIDER_IDENTITY_USE_AI": False,
+        }
+    if normalized == "medium":
         return {
             "USE_AI_FOR_MB_MATCH": False,
             "USE_AI_FOR_MB_VERIFY": True,
@@ -3074,8 +3085,9 @@ def _ai_usage_level_overrides(level: str) -> dict[str, bool]:
 def _apply_ai_usage_level(level: str | None = None) -> str:
     """
     One single UX control for AI usage across the pipeline.
-    limited: cheapest/safest AI usage
-    medium: balanced defaults
+    limited: minimal AI, no scan-time verification
+    auto: provider-first scan defaults with lightweight local fallbacks
+    medium: balanced verification and provider identity assistance
     aggressive: maximum AI assistance
     """
     global AI_USAGE_LEVEL
@@ -19147,6 +19159,13 @@ def _rebuild_files_library_index(
         prefer_display_roots = bool(display_roots and display_root_norms != active_source_root_norms)
         use_published_payload = bool((published_count > 0 or files_scan_running) and not prefer_display_roots and not filesystem_roots_override)
         payload_source = "published_rows" if use_published_payload else ("library_roots" if prefer_display_roots or filesystem_roots_override else "filesystem_roots")
+        logging.info(
+            "Files library index rebuild starting (%s): source=%s display_roots=%s active_roots=%s",
+            reason,
+            payload_source,
+            display_roots,
+            active_source_roots,
+        )
 
         if use_published_payload:
             artists_map = published_artists
@@ -19165,6 +19184,12 @@ def _rebuild_files_library_index(
                 by_folder[p.parent].append(p)
             by_folder = _collapse_nested_album_folder_groups(by_folder, root_dirs=_files_root_dir_strings())
             folders = sorted(by_folder.items(), key=lambda x: str(x[0]).lower())
+            logging.info(
+                "Files library index discovered %d folder(s) under %d root(s) for source=%s",
+                len(folders),
+                len(roots_for_index),
+                payload_source,
+            )
             _files_index_set_state(total_folders=len(folders), phase="parsing")
             root_dirs = _files_root_dir_strings()
 
@@ -19876,10 +19901,16 @@ def _ensure_files_index_ready() -> tuple[bool, Optional[str]]:
         if not files_scan_running and _files_library_prefers_display_roots():
             current_source = _files_index_read_meta_value("source")
             if current_source != "library_roots":
-                _trigger_files_index_rebuild_async(
+                display_roots = _files_library_display_roots()
+                started = _trigger_files_index_rebuild_async(
                     reason="auto_switch_to_library_roots",
-                    filesystem_roots_override=_files_library_display_roots(),
+                    filesystem_roots_override=display_roots,
                 )
+                if started:
+                    logging.info(
+                        "Files library index switching to library roots: %s",
+                        ", ".join(display_roots) if display_roots else "(none)",
+                    )
         # One-time migration for legacy rows: align match flags with strict verification.
         # This keeps counters coherent even before a fresh full scan.
         try:

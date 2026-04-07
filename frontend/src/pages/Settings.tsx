@@ -235,19 +235,19 @@ const AI_USAGE_LEVELS: Array<{
     value: "auto",
     label: "Auto",
     description:
-      "Recommended. PMDA stays local-first, uses OCR/providers first, prefers self-hosted web search, and only escalates to paid AI when the case truly needs it.",
+      "Recommended. PMDA stays provider-first for scans, keeps AI verification off by default, and uses local web search before any paid escalation.",
   },
   {
     value: "limited",
     label: "Limited",
     description:
-      "AI only for truly ambiguous cases; no vision, no web MBID search, no AI duplicate arbitration.",
+      "Minimum AI usage. No scan-time verification, no vision, no web MBID search, and no AI duplicate arbitration.",
   },
   {
     value: "medium",
     label: "Medium",
     description:
-      "Balanced cost/accuracy: AI match verification + provider identity assistance; vision and web MBID stay disabled.",
+      "Balanced cost/accuracy: enables AI match verification and provider identity assistance; vision and paid web fallback stay disabled.",
   },
   {
     value: "aggressive",
