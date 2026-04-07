@@ -950,13 +950,29 @@ export function OnboardingWizard({
   }, [activeStep, localRuntimeReady, localStackConfirmOpen, localStackProvisioningActive, managedPreflightReady, selectedStackMode, statusLoading]);
 
   useEffect(() => {
-    if (activeStep !== 4) return;
-    void refreshProviderStatus({ quiet: true });
-  }, [activeStep, refreshProviderStatus]);
-
-  useEffect(() => {
     setProvidersPreflight(null);
   }, [
+    config.MUSICBRAINZ_EMAIL,
+    config.USE_MUSICBRAINZ,
+    config.DISCOGS_USER_TOKEN,
+    config.USE_DISCOGS,
+    config.LASTFM_API_KEY,
+    config.LASTFM_API_SECRET,
+    config.USE_LASTFM,
+    config.ACOUSTID_API_KEY,
+    config.USE_ACOUSTID,
+    config.USE_BANDCAMP,
+  ]);
+
+  useEffect(() => {
+    if (activeStep !== 4) return;
+    const timer = window.setTimeout(() => {
+      void refreshProviderStatus({ quiet: true });
+    }, 600);
+    return () => window.clearTimeout(timer);
+  }, [
+    activeStep,
+    refreshProviderStatus,
     config.MUSICBRAINZ_EMAIL,
     config.USE_MUSICBRAINZ,
     config.DISCOGS_USER_TOKEN,
@@ -2577,7 +2593,7 @@ export function OnboardingWizard({
                 <div className="rounded-3xl border border-emerald-500/25 bg-emerald-500/10 p-4 text-sm text-emerald-100">
                   <div className="flex items-center gap-2 font-medium">
                     <CheckCircle2 className="h-4 w-4" />
-                    Configuration minimale prête
+                    Minimum setup complete
                   </div>
                   <p className="mt-2 text-xs text-emerald-50/90">PMDA has the minimum safe setup to launch or resume the first full scan.</p>
                 </div>
