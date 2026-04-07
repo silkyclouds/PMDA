@@ -51,10 +51,57 @@ require_cmd() {
   }
 }
 
+trim() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "$value"
+}
+
+container_path_to_host() {
+  local container_path="$1"
+  local self_name="${HOSTNAME:-}"
+  if [[ -z "$self_name" || -z "$container_path" ]]; then
+    printf '%s\n' "$container_path"
+    return 0
+  fi
+  local mounts
+  mounts="$(docker inspect "$self_name" --format '{{range .Mounts}}{{println .Destination "|" .Source}}{{end}}' 2>/dev/null || true)"
+  if [[ -z "$mounts" ]]; then
+    printf '%s\n' "$container_path"
+    return 0
+  fi
+  while IFS='|' read -r raw_dest raw_src; do
+    local dest src suffix
+    dest="$(trim "$raw_dest")"
+    src="$(trim "$raw_src")"
+    if [[ -z "$dest" || -z "$src" ]]; then
+      continue
+    fi
+    if [[ "$container_path" == "$dest" ]]; then
+      printf '%s\n' "$src"
+      return 0
+    fi
+    if [[ "$container_path" == "$dest/"* ]]; then
+      suffix="${container_path#"$dest"}"
+      printf '%s%s\n' "$src" "$suffix"
+      return 0
+    fi
+  done <<< "$mounts"
+  printf '%s\n' "$container_path"
+}
+
 latest_release_tag() {
-  curl -fsSL https://api.github.com/repos/metabrainz/musicbrainz-docker/releases/latest \
+  curl -fsSL https://api.github.com/repos/metabrainz/musicbrainz-docker/releases/latest 2>/dev/null \
     | tr -d '\n' \
     | sed -nE 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p'
+}
+
+cached_release_tag() {
+  local repo_root="$1"
+  if [[ -d "$repo_root/.git" ]]; then
+    git -C "$repo_root" tag --list 'v*' --sort=-v:refname | head -n1
+  fi
 }
 
 write_file_if_changed() {
@@ -88,6 +135,7 @@ SKIP_SEARCH_BOOTSTRAP=0
 SKIP_REPLICATION=0
 USE_LOCAL_REINDEX=0
 FORCED_TAG=""
+DEFAULT_TAG="v-2026-02-12.0"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -127,7 +175,16 @@ if ! docker compose version >/dev/null 2>&1; then
   exit 1
 fi
 
-TAG="${FORCED_TAG:-$(latest_release_tag)}"
+TAG="${FORCED_TAG:-}"
+if [[ -z "$TAG" ]]; then
+  TAG="$(latest_release_tag || true)"
+fi
+if [[ -z "$TAG" ]]; then
+  TAG="$(cached_release_tag "$INSTALL_ROOT" || true)"
+fi
+if [[ -z "$TAG" ]]; then
+  TAG="$DEFAULT_TAG"
+fi
 if [[ -z "$TAG" ]]; then
   echo "Unable to resolve latest musicbrainz-docker release tag." >&2
   exit 1
@@ -139,6 +196,10 @@ fi
 if [[ -z "$DUMP_ROOT" ]]; then
   DUMP_ROOT="$DATA_ROOT"
 fi
+
+HOST_DATA_ROOT="$(container_path_to_host "$DATA_ROOT")"
+HOST_HOT_ROOT="$(container_path_to_host "$HOT_ROOT")"
+HOST_DUMP_ROOT="$(container_path_to_host "$DUMP_ROOT")"
 
 mkdir -p "$INSTALL_ROOT" \
   "$HOT_ROOT"/{mqdata,pgdata,solrdata} \
@@ -156,7 +217,7 @@ if [[ ! -d "$INSTALL_ROOT/.git" ]]; then
 fi
 
 cd "$INSTALL_ROOT"
-git fetch --tags origin
+git fetch --tags origin >/dev/null 2>&1 || echo "==> Could not refresh remote tags; using cached checkout data"
 git checkout -f "$TAG"
 
 write_file_if_changed ".env" <<EOF
@@ -164,9 +225,9 @@ MUSICBRAINZ_WEB_SERVER_HOST=${WEB_HOST}
 MUSICBRAINZ_WEB_SERVER_PORT=${WEB_PORT}
 MUSICBRAINZ_SERVER_PROCESSES=${SERVER_PROCESSES}
 MUSICBRAINZ_CRONTAB_PATH=./local/replication.cron
-MB_UNRAID_DATA_ROOT=${DATA_ROOT}
-MB_UNRAID_HOT_ROOT=${HOT_ROOT}
-MB_UNRAID_DUMP_ROOT=${DUMP_ROOT}
+MB_UNRAID_DATA_ROOT=${HOST_DATA_ROOT}
+MB_UNRAID_HOT_ROOT=${HOST_HOT_ROOT}
+MB_UNRAID_DUMP_ROOT=${HOST_DUMP_ROOT}
 MB_POSTGRES_SHARED_BUFFERS=${DB_SHARED_BUFFERS}
 MB_SOLR_HEAP=${SOLR_HEAP}
 COMPOSE_FILE=docker-compose.yml:local/compose/unraid-bindings.yml:local/compose/memory-settings.yml
@@ -245,6 +306,9 @@ echo "==> Install root: $INSTALL_ROOT"
 echo "==> Data root:    $DATA_ROOT"
 echo "==> Hot root:     $HOT_ROOT"
 echo "==> Dump root:    $DUMP_ROOT"
+echo "==> Host data:    $HOST_DATA_ROOT"
+echo "==> Host hot:     $HOST_HOT_ROOT"
+echo "==> Host dump:    $HOST_DUMP_ROOT"
 
 if [[ "$SKIP_BUILD" -eq 0 ]]; then
   echo "==> 15% Building docker images"

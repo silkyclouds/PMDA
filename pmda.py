@@ -5932,6 +5932,7 @@ def _managed_runtime_capture_subprocess(
 ) -> None:
     progress_re = re.compile(r"\b(\d{1,3})%\b")
     eta_re = re.compile(r"\bETA\s*[:=]?\s*([^,;|]+)", re.IGNORECASE)
+    recent_output: deque[str] = deque(maxlen=6)
     proc = subprocess.Popen(
         cmd,
         cwd=cwd,
@@ -5947,6 +5948,7 @@ def _managed_runtime_capture_subprocess(
             line = str(raw_line or "").rstrip()
             if not line:
                 continue
+            recent_output.append(line)
             _managed_runtime_log(bundle_type, line, service_name=service_name)
             progress_match = progress_re.search(line)
             eta_match = eta_re.search(line)
@@ -5993,6 +5995,9 @@ def _managed_runtime_capture_subprocess(
         except Exception:
             pass
     if proc.returncode != 0:
+        tail = " | ".join(recent_output).strip()
+        if tail:
+            raise RuntimeError(f"Command failed ({proc.returncode}): {' '.join(cmd)} :: {tail}")
         raise RuntimeError(f"Command failed ({proc.returncode}): {' '.join(cmd)}")
 
 
@@ -6570,9 +6575,13 @@ def _managed_runtime_bundle_status(bundle_type: str, *, include_candidates: bool
                 phase_message=failure_message,
                 last_error=failure_message,
             )
-        stale_script_error = "Provision script not found:" in str(bundle.get("last_error") or bundle.get("phase_message") or "")
+        stale_bundle_error = str(bundle.get("last_error") or bundle.get("phase_message") or "").strip()
+        stale_script_error = "Provision script not found:" in stale_bundle_error
         stale_missing_curl_error = any("Missing required command: curl" in message for message in recent_messages)
-        recoverable_post_update_error = stale_script_error or stale_missing_curl_error
+        stale_legacy_command_failure = stale_bundle_error.startswith(
+            "Command failed (1): /app/scripts/provision_musicbrainz_mirror_unraid.sh"
+        ) and "::" not in stale_bundle_error
+        recoverable_post_update_error = stale_script_error or stale_missing_curl_error or stale_legacy_command_failure
         if (
             not running
             and recoverable_post_update_error

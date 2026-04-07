@@ -118,6 +118,12 @@ const WORKFLOW_OPTIONS: Array<{
 ];
 
 const LOCAL_STACK_RECOMMENDED_FREE_GB = 40;
+const MANAGED_RUNTIME_ACTIVE_STATES = new Set(['preflight', 'pulling', 'creating', 'importing', 'waiting_health', 'updating']);
+const RECOVERABLE_MUSICBRAINZ_BOOTSTRAP_ERRORS = [
+  'Provision script not found:',
+  'Missing required command: curl',
+  'Command failed (1): /app/scripts/provision_musicbrainz_mirror_unraid.sh',
+];
 
 function normalizeFolderPath(input: string): string {
   const raw = String(input || '').trim();
@@ -188,6 +194,57 @@ function isBundleReady(bundle: ManagedRuntimeBundleStatus | null | undefined): b
   return bundle.state === 'ready' && Boolean(bundle.health?.available);
 }
 
+function bundleLatestActionStatus(bundle: ManagedRuntimeBundleStatus | null | undefined): string {
+  return String(bundle?.latest_action?.status || '').trim().toLowerCase();
+}
+
+function bundleFailureMessage(bundle: ManagedRuntimeBundleStatus | null | undefined): string {
+  return String(
+    bundle?.latest_action?.error
+    || bundle?.last_error
+    || bundle?.phase_message
+    || '',
+  ).trim();
+}
+
+function bundleHasRecoverableMusicBrainzFailure(bundle: ManagedRuntimeBundleStatus | null | undefined): boolean {
+  const text = bundleFailureMessage(bundle);
+  if (!text) return false;
+  return RECOVERABLE_MUSICBRAINZ_BOOTSTRAP_ERRORS.some((needle) => text.includes(needle));
+}
+
+function effectiveBundleState(bundle: ManagedRuntimeBundleStatus | null | undefined): string {
+  if (!bundle) return 'absent';
+  const state = String(bundle.state || '').trim().toLowerCase() || 'idle';
+  const latestStatus = bundleLatestActionStatus(bundle);
+  const hasReachableRuntime = Boolean(bundle.effective_url || bundle.health?.available);
+  if (
+    !hasReachableRuntime
+    && latestStatus === 'failed'
+    && (MANAGED_RUNTIME_ACTIVE_STATES.has(state) || state === 'failed')
+  ) {
+    return bundleHasRecoverableMusicBrainzFailure(bundle) ? 'idle' : 'failed';
+  }
+  return state;
+}
+
+function effectiveBundlePhase(bundle: ManagedRuntimeBundleStatus | null | undefined): string {
+  const state = effectiveBundleState(bundle);
+  if (state === 'idle' || state === 'failed' || state === 'ready') return state;
+  return String(bundle?.phase || '').trim().toLowerCase() || state;
+}
+
+function effectiveBundleMessage(
+  bundle: ManagedRuntimeBundleStatus | null | undefined,
+  fallbackIdleMessage = 'Not started yet.',
+): string {
+  if (!bundle) return fallbackIdleMessage;
+  const state = effectiveBundleState(bundle);
+  if (state === 'idle') return fallbackIdleMessage;
+  if (state === 'failed') return bundleFailureMessage(bundle) || 'Provisioning failed.';
+  return String(bundle.phase_message || '').trim() || fallbackIdleMessage;
+}
+
 function bundleModels(bundle: ManagedRuntimeBundleStatus | null | undefined): string[] {
   const metaModels = Array.isArray(bundle?.meta?.models) ? bundle.meta.models : [];
   const healthModels = Array.isArray(bundle?.health?.models) ? bundle.health.models : [];
@@ -205,11 +262,11 @@ function managedBundleProgress(
   const hasRequiredModels = requiredModels.length === 0 || requiredModels.every((model) => models.includes(model));
   if (isBundleReady(bundle) && hasRequiredModels) return 100;
 
-  const state = String(bundle.state || '').trim().toLowerCase();
-  const phase = String(bundle.phase || '').trim().toLowerCase();
+  const state = effectiveBundleState(bundle);
+  const phase = effectiveBundlePhase(bundle);
   const combined = `${state} ${phase}`;
   const metaProgressRaw = Number((bundle.meta as Record<string, unknown> | undefined)?.progress);
-  if (Number.isFinite(metaProgressRaw) && metaProgressRaw > 0) {
+  if (Number.isFinite(metaProgressRaw) && metaProgressRaw > 0 && state !== 'idle' && state !== 'failed') {
     return Math.max(0, Math.min(100, Math.round(metaProgressRaw)));
   }
 
@@ -228,8 +285,8 @@ function hasManagedBundleStarted(bundle: ManagedRuntimeBundleStatus | null | und
   if (!bundle) return false;
   if (bundle.effective_url || bundle.health?.available) return true;
   const mode = String(bundle.mode || '').trim().toLowerCase();
-  const state = String(bundle.state || '').trim().toLowerCase();
-  const phase = String(bundle.phase || '').trim().toLowerCase();
+  const state = effectiveBundleState(bundle);
+  const phase = effectiveBundlePhase(bundle);
   if (mode && mode !== 'absent') {
     if ((state === 'idle' || state === 'failed') && !bundle.effective_url && !bundle.health?.available) {
       return false;
@@ -682,26 +739,28 @@ export function OnboardingWizard({
 
   const localStackChecklist = useMemo(() => {
     if (selectedStackMode !== 'local') return [];
-    const musicbrainzDetected = Boolean(managedMbCandidate) && !musicbrainzReady && !managedMbBundle?.effective_url;
-    const ollamaDetected = Boolean(managedOllamaCandidate) && !ollamaReady && !managedOllamaBundle?.effective_url;
+    const musicbrainzIdleMessage = managedMbCandidate
+      ? `Existing MusicBrainz mirror detected${managedMbCandidate?.published_url ? ` at ${managedMbCandidate.published_url}` : ''}. It will be adopted when you confirm local stack setup.`
+      : 'Not started yet. PMDA will provision MusicBrainz after you confirm the local setup.';
+    const ollamaIdleMessage = managedOllamaCandidate
+      ? `Existing Ollama runtime detected${managedOllamaCandidate?.url ? ` at ${managedOllamaCandidate.url}` : ''}. It will be adopted when you confirm local stack setup and PMDA will ensure ${ollamaModel} and ${ollamaHardModel}.`
+      : `Not started yet. PMDA will provision Ollama and install ${ollamaModel} and ${ollamaHardModel} after you confirm the local setup.`;
+    const musicbrainzState = effectiveBundleState(managedMbBundle);
+    const ollamaState = effectiveBundleState(managedOllamaBundle);
     const musicbrainzNotStarted = String(managedMbBundle?.mode || 'absent').trim().toLowerCase() === 'absent'
-      || String(managedMbBundle?.state || 'idle').trim().toLowerCase() === 'idle';
+      || musicbrainzState === 'idle';
     const ollamaNotStarted = String(managedOllamaBundle?.mode || 'absent').trim().toLowerCase() === 'absent'
-      || String(managedOllamaBundle?.state || 'idle').trim().toLowerCase() === 'idle';
+      || ollamaState === 'idle';
     const musicbrainzDetail = musicbrainzReady
       ? 'Local MusicBrainz mirror is ready.'
-      : musicbrainzDetected
-        ? `Existing MusicBrainz mirror detected${managedMbCandidate?.published_url ? ` at ${managedMbCandidate.published_url}` : ''}. It will be adopted when you confirm local stack setup.`
-        : musicbrainzNotStarted
-          ? 'Not started yet. PMDA will provision MusicBrainz after you confirm the local setup.'
-          : (managedMbBundle?.phase_message || 'MusicBrainz mirror is starting.');
+      : musicbrainzNotStarted
+        ? musicbrainzIdleMessage
+        : effectiveBundleMessage(managedMbBundle, musicbrainzIdleMessage);
     const ollamaDetail = ollamaReady
       ? `Ollama is ready with ${ollamaModel} and ${ollamaHardModel}.`
-      : ollamaDetected
-        ? `Existing Ollama runtime detected${managedOllamaCandidate?.url ? ` at ${managedOllamaCandidate.url}` : ''}. It will be adopted when you confirm local stack setup and PMDA will ensure ${ollamaModel} and ${ollamaHardModel}.`
-        : ollamaNotStarted
-          ? `Not started yet. PMDA will provision Ollama and install ${ollamaModel} and ${ollamaHardModel} after you confirm the local setup.`
-          : (managedOllamaBundle?.phase_message || `Ollama is starting and still needs ${ollamaModel} and ${ollamaHardModel}.`);
+      : ollamaNotStarted
+        ? ollamaIdleMessage
+        : effectiveBundleMessage(managedOllamaBundle, ollamaIdleMessage);
     return [
       {
         key: 'docker',
@@ -720,7 +779,7 @@ export function OnboardingWizard({
         done: musicbrainzReady,
         detail: musicbrainzDetail,
         progress: musicbrainzNotStarted ? 0 : managedBundleProgress(managedMbBundle),
-        eta: managedBundleEta(managedMbBundle),
+        eta: musicbrainzNotStarted || musicbrainzState === 'failed' ? '' : managedBundleEta(managedMbBundle),
       },
       {
         key: 'ollama',
@@ -728,7 +787,7 @@ export function OnboardingWizard({
         done: ollamaReady,
         detail: ollamaDetail,
         progress: ollamaNotStarted ? 0 : managedBundleProgress(managedOllamaBundle, { requiredModels: [ollamaModel, ollamaHardModel] }),
-        eta: managedBundleEta(managedOllamaBundle),
+        eta: ollamaNotStarted || ollamaState === 'failed' ? '' : managedBundleEta(managedOllamaBundle),
       },
     ];
   }, [managedMbBundle, managedMbCandidate, managedOllamaBundle, managedOllamaCandidate, managedPreflightReady, managedStatus?.preflight.message, musicbrainzReady, ollamaHardModel, ollamaModel, ollamaReady, selectedStackMode, statusLoading]);
@@ -743,6 +802,12 @@ export function OnboardingWizard({
 
   const localStackActivityRows = useMemo(() => {
     if (selectedStackMode !== 'local' || !localStackProvisioningActive) return [];
+    const musicbrainzIdleMessage = managedMbCandidate
+      ? `Existing MusicBrainz mirror detected${managedMbCandidate?.published_url ? ` at ${managedMbCandidate.published_url}` : ''}. It will be adopted when you confirm local stack setup.`
+      : 'Preparing the local MusicBrainz mirror.';
+    const ollamaIdleMessage = managedOllamaCandidate
+      ? `Existing Ollama runtime detected${managedOllamaCandidate?.url ? ` at ${managedOllamaCandidate.url}` : ''}. It will be adopted when you confirm local stack setup.`
+      : `Preparing Ollama and models ${ollamaModel}, ${ollamaHardModel}.`;
     return [
       {
         key: 'docker',
@@ -753,14 +818,14 @@ export function OnboardingWizard({
       {
         key: 'musicbrainz',
         label: 'MusicBrainz mirror',
-        status: musicbrainzReady ? 'Ready' : (managedMbBundle?.phase || managedMbBundle?.state || 'Pending'),
-        detail: managedMbBundle?.phase_message || (managedMbCandidate ? 'Existing MusicBrainz mirror detected on this server.' : 'Preparing the local MusicBrainz mirror.'),
+        status: musicbrainzReady ? 'Ready' : (effectiveBundlePhase(managedMbBundle) || effectiveBundleState(managedMbBundle) || 'Pending'),
+        detail: effectiveBundleMessage(managedMbBundle, musicbrainzIdleMessage),
       },
       {
         key: 'ollama',
         label: 'Ollama + required models',
-        status: ollamaReady ? 'Ready' : (managedOllamaBundle?.phase || managedOllamaBundle?.state || 'Pending'),
-        detail: managedOllamaBundle?.phase_message || (managedOllamaCandidate ? 'Existing Ollama runtime detected on this server.' : `Preparing Ollama and models ${ollamaModel}, ${ollamaHardModel}.`),
+        status: ollamaReady ? 'Ready' : (effectiveBundlePhase(managedOllamaBundle) || effectiveBundleState(managedOllamaBundle) || 'Pending'),
+        detail: effectiveBundleMessage(managedOllamaBundle, ollamaIdleMessage),
       },
     ];
   }, [
