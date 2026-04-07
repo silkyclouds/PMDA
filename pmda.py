@@ -19195,6 +19195,14 @@ def _rebuild_files_library_index(
 
             for idx, (folder, files) in enumerate(folders, start=1):
                 _files_index_set_state(folders_processed=idx, current_folder=str(folder))
+                if idx == 1 or idx == len(folders) or (idx % 250) == 0:
+                    logging.info(
+                        "Files library index parsing %d/%d folder(s) for source=%s: %s",
+                        idx,
+                        len(folders),
+                        payload_source,
+                        str(folder),
+                    )
                 if not files:
                     continue
 
@@ -73665,7 +73673,13 @@ def api_library_album_detail(album_id: int):
                 or str(lastfm_album_mbid or "").strip()
                 or str(bandcamp_album_url or "").strip()
             )
-            allow_profile_for_album = bool(strict_match_verified)
+            allow_profile_for_album = bool(
+                strict_match_verified
+                or (
+                    bool(getattr(sys.modules[__name__], "USE_AI_FOR_SOFT_MATCH_PROFILES", False))
+                    and has_identity_hint
+                )
+            )
             prof = {}
             if allow_profile_for_album and artist_norm and title_norm:
                 try:
