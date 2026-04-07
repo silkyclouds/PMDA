@@ -5,6 +5,7 @@ import {
   ArrowRight,
   CheckCircle2,
   ChevronDown,
+  ExternalLink,
   FolderOutput,
   Globe,
   Loader2,
@@ -69,7 +70,7 @@ type Props = {
 type WorkflowMode = NonNullable<PMDAConfig['LIBRARY_WORKFLOW_MODE']>;
 type StackMode = 'online' | 'local';
 type ExternalAiProvider = 'openai-api' | 'anthropic' | 'google';
-type StepId = 'workflow' | 'folders' | 'metadata' | 'setup' | 'pipeline' | 'review';
+type StepId = 'workflow' | 'folders' | 'metadata' | 'runtime' | 'sources' | 'pipeline' | 'review';
 type DedupeMode = 'ignore' | 'detect' | 'move';
 type IncompleteMode = 'keep' | 'move';
 type ProviderStatus = {
@@ -99,9 +100,10 @@ const STEP_ORDER: Array<{ id: StepId; label: string; title: string }> = [
   { id: 'workflow', label: 'Step 1', title: 'Workflow' },
   { id: 'folders', label: 'Step 2', title: 'Folders' },
   { id: 'metadata', label: 'Step 3', title: 'Metadata mode' },
-  { id: 'setup', label: 'Step 4', title: 'Sources & runtime' },
-  { id: 'pipeline', label: 'Step 5', title: 'Pipeline' },
-  { id: 'review', label: 'Step 6', title: 'Review' },
+  { id: 'runtime', label: 'Step 4', title: 'Runtime / AI' },
+  { id: 'sources', label: 'Step 5', title: 'Metadata sources' },
+  { id: 'pipeline', label: 'Step 6', title: 'Pipeline' },
+  { id: 'review', label: 'Step 7', title: 'Review' },
 ];
 
 const WORKFLOW_OPTIONS: Array<{
@@ -147,26 +149,36 @@ const EXTERNAL_AI_OPTIONS: Array<{
   label: string;
   description: string;
   docsUrl: string;
+  docsLabel: string;
 }> = [
   {
     value: 'openai-api',
     label: 'OpenAI',
     description: 'Best when you want the broadest model choice and the smoothest validation path.',
     docsUrl: 'https://platform.openai.com/api-keys',
+    docsLabel: 'Create API key',
   },
   {
     value: 'anthropic',
     label: 'Anthropic',
     description: 'Useful if Claude is already your paid provider for higher-context reasoning.',
     docsUrl: 'https://console.anthropic.com/settings/keys',
+    docsLabel: 'Create API key',
   },
   {
     value: 'google',
     label: 'Google',
     description: 'Useful if Gemini is already your paid provider and you want one billing surface.',
     docsUrl: 'https://aistudio.google.com/app/apikey',
+    docsLabel: 'Create API key',
   },
 ];
+
+const METADATA_SOURCE_LINKS = {
+  discogs: 'https://www.discogs.com/settings/developers',
+  lastfm: 'https://www.last.fm/api/account/create',
+  acoustid: 'https://acoustid.org/new-application',
+} as const;
 
 const MATERIALIZATION_OPTIONS: Array<{
   value: NonNullable<PMDAConfig['EXPORT_LINK_STRATEGY']>;
@@ -743,6 +755,8 @@ export function OnboardingWizard({
   const refreshProviderStatus = useCallback(async (options?: { quiet?: boolean }) => {
     setProvidersChecking(true);
     try {
+      const persisted = await persistIfNeeded();
+      if (!persisted) return null;
       const next = await api.getProvidersPreflight();
       setProvidersPreflight(next);
       return next;
@@ -754,7 +768,7 @@ export function OnboardingWizard({
     } finally {
       setProvidersChecking(false);
     }
-  }, []);
+  }, [persistIfNeeded]);
 
   useEffect(() => {
     void refreshStatus();
@@ -936,9 +950,24 @@ export function OnboardingWizard({
   }, [activeStep, localRuntimeReady, localStackConfirmOpen, localStackProvisioningActive, managedPreflightReady, selectedStackMode, statusLoading]);
 
   useEffect(() => {
-    if (activeStep !== 3) return;
+    if (activeStep !== 4) return;
     void refreshProviderStatus({ quiet: true });
   }, [activeStep, refreshProviderStatus]);
+
+  useEffect(() => {
+    setProvidersPreflight(null);
+  }, [
+    config.MUSICBRAINZ_EMAIL,
+    config.USE_MUSICBRAINZ,
+    config.DISCOGS_USER_TOKEN,
+    config.USE_DISCOGS,
+    config.LASTFM_API_KEY,
+    config.LASTFM_API_SECRET,
+    config.USE_LASTFM,
+    config.ACOUSTID_API_KEY,
+    config.USE_ACOUSTID,
+    config.USE_BANDCAMP,
+  ]);
 
   useEffect(() => {
     if (selectedStackMode !== 'online') {
@@ -1126,10 +1155,9 @@ export function OnboardingWizard({
     && externalModels.length > 0
     && externalModels.includes(externalModel);
 
-  const metadataSetupReady = selectedStackMode === 'local'
-    ? localRuntimeReady && sourcesConfigured
-    : externalAiReady && sourcesConfigured;
-
+  const runtimeSetupReady = selectedStackMode === 'local'
+    ? localRuntimeReady
+    : externalAiReady;
   const localStackDetectedCount = (managedMbCandidate ? 1 : 0) + (managedOllamaCandidate ? 1 : 0);
   const localStackActionLabel = localStackDetectedCount > 0
     ? (localStackDetectedCount === 2 ? 'Use detected local services' : 'Use detected service and create the rest')
@@ -1270,13 +1298,15 @@ export function OnboardingWizard({
     );
   }, [config.JELLYFIN_API_KEY, config.JELLYFIN_URL, config.NAVIDROME_API_KEY, config.NAVIDROME_PASSWORD, config.NAVIDROME_URL, config.NAVIDROME_USERNAME, config.PLEX_HOST, config.PLEX_TOKEN, playerTarget]);
 
+  const sourcesStepReady = sourcesConfigured;
+
   const pipelineConfigReady = useMemo(() => {
     if (wantsPublishedLibrary && publishLibraryEnabled && !materializationMode) return false;
     if (!playerSyncReady) return false;
     return true;
   }, [materializationMode, playerSyncReady, publishLibraryEnabled, wantsPublishedLibrary]);
 
-  const launchReady = foldersReady && metadataSetupReady && pipelineConfigReady && pipelineStepConfirmed;
+  const launchReady = foldersReady && runtimeSetupReady && sourcesStepReady && pipelineConfigReady && pipelineStepConfirmed;
 
   const reviewFingerprint = JSON.stringify({
     workflowMode,
@@ -1329,11 +1359,11 @@ export function OnboardingWizard({
         title: 'Metadata sources still need configuration',
         detail: sourceIssues[0] || 'Add the missing provider credentials or switch the source off.',
         sectionId: 'settings-providers-advanced',
-        stepId: 'setup',
+        stepId: 'sources',
       });
     }
 
-    if (selectedStackMode === 'local' && !localRuntimeReady) {
+    if (selectedStackMode === 'local' && !runtimeSetupReady) {
       next.push({
         key: 'local-runtime',
         title: localStackProvisioningActive ? 'Local metadata stack is still preparing' : 'Local metadata stack is not ready yet',
@@ -1345,17 +1375,17 @@ export function OnboardingWizard({
               ? (managedMbBundle?.phase_message || 'Managed MusicBrainz is not ready yet.')
               : (managedOllamaBundle?.phase_message || 'Managed Ollama or the required models are not ready yet.'),
         sectionId: 'settings-scaling',
-        stepId: 'setup',
+        stepId: 'runtime',
       });
     }
 
-    if (selectedStackMode === 'online' && !externalAiReady) {
+    if (selectedStackMode === 'online' && !runtimeSetupReady) {
       next.push({
         key: 'external-ai',
         title: 'External AI provider is not ready',
         detail: externalValidationMessage || 'Validate the external provider and choose a compatible model.',
         sectionId: 'settings-ai',
-        stepId: 'setup',
+        stepId: 'runtime',
       });
     }
 
@@ -1381,18 +1411,19 @@ export function OnboardingWizard({
     }
 
     return next;
-  }, [externalAiReady, externalValidationMessage, foldersReady, localRuntimeReady, localStackNeedsConfirmation, localStackProvisioningActive, managedMbBundle?.phase_message, managedOllamaBundle?.phase_message, managedPreflightReady, managedStatus?.preflight.message, metadataSetupReady, missingFolderItems, musicbrainzReady, pipelineConfigReady, pipelineStepConfirmed, playerSyncReady, selectedStackMode, sourceIssues, sourcesConfigured]);
+  }, [externalValidationMessage, foldersReady, localStackNeedsConfirmation, localStackProvisioningActive, managedMbBundle?.phase_message, managedOllamaBundle?.phase_message, managedPreflightReady, managedStatus?.preflight.message, missingFolderItems, musicbrainzReady, pipelineConfigReady, pipelineStepConfirmed, playerSyncReady, runtimeSetupReady, selectedStackMode, sourceIssues, sourcesConfigured]);
 
   const completionCount = useMemo(() => {
     let count = 0;
     if (workflowMode) count += 1;
     if (foldersReady) count += 1;
     if (selectedStackMode === 'local' || selectedStackMode === 'online') count += 1;
-    if (metadataSetupReady) count += 1;
+    if (runtimeSetupReady) count += 1;
+    if (sourcesStepReady) count += 1;
     if (pipelineConfigReady && pipelineStepConfirmed) count += 1;
     if (launchReady) count += 1;
     return count;
-  }, [foldersReady, launchReady, metadataSetupReady, pipelineConfigReady, pipelineStepConfirmed, selectedStackMode, workflowMode]);
+  }, [foldersReady, launchReady, pipelineConfigReady, pipelineStepConfirmed, runtimeSetupReady, selectedStackMode, sourcesStepReady, workflowMode]);
 
   const wizardPercent = Math.round(((activeStep + 1) / STEP_ORDER.length) * 100);
 
@@ -1494,12 +1525,17 @@ export function OnboardingWizard({
       return;
     }
 
-    if (activeStep === 3 && !metadataSetupReady) {
-      toast.error(blockers.find((blocker) => blocker.stepId === 'setup')?.detail || 'Finish the metadata setup first.');
+    if (activeStep === 3 && !runtimeSetupReady) {
+      toast.error(blockers.find((blocker) => blocker.stepId === 'runtime')?.detail || 'Finish the runtime or external AI setup first.');
       return;
     }
 
-    if (activeStep === 4) {
+    if (activeStep === 4 && !sourcesStepReady) {
+      toast.error(blockers.find((blocker) => blocker.stepId === 'sources')?.detail || 'Finish the metadata source configuration first.');
+      return;
+    }
+
+    if (activeStep === 5) {
       if (!pipelineConfigReady) {
         toast.error(blockers.find((blocker) => blocker.stepId === 'pipeline')?.detail || 'Finish the pipeline choices first.');
         return;
@@ -1508,7 +1544,7 @@ export function OnboardingWizard({
     }
 
     await goToStep(activeStep + 1);
-  }, [activeStep, blockers, goToStep, localStackNeedsConfirmation, metadataSetupReady, pipelineConfigReady, selectedStackMode]);
+  }, [activeStep, blockers, goToStep, localStackNeedsConfirmation, pipelineConfigReady, runtimeSetupReady, selectedStackMode, sourcesStepReady]);
 
   const startOrResumeScan = useCallback(async () => {
     setScanActionBusy(true);
@@ -1598,31 +1634,31 @@ export function OnboardingWizard({
       label: 'Sources',
       value: sourceSummary || 'No source enabled',
       detail: sourcesConfigured ? 'All enabled sources are configured.' : sourceIssues[0] || 'A source still needs configuration.',
-      step: 3,
+      step: 4,
     },
     {
       label: 'Publish library',
       value: wantsPublishedLibrary ? (publishLibraryEnabled ? `On · ${materializationMode}` : 'Off') : 'Not needed',
       detail: wantsPublishedLibrary ? `Serving root: ${servingRoot || 'not set yet'}` : 'PMDA works directly inside the current library.',
-      step: 4,
+      step: 5,
     },
     {
       label: 'Duplicates',
       value: dedupeMode === 'ignore' ? 'Ignore' : dedupeMode === 'detect' ? 'Detect only' : 'Detect and move',
       detail: dupesRoot ? `Dupes folder: ${dupesRoot}` : 'No duplicates folder set yet.',
-      step: 4,
+      step: 5,
     },
     {
       label: 'Incompletes',
       value: incompleteMode === 'move' ? 'Move to incomplete folder' : 'Leave in place',
       detail: incompleteRoot ? `Incomplete folder: ${incompleteRoot}` : 'No incomplete folder set yet.',
-      step: 4,
+      step: 5,
     },
     {
       label: 'Player sync',
       value: playerTarget === 'none' ? 'Not now' : PLAYER_TARGET_OPTIONS.find((option) => option.value === playerTarget)?.label || playerTarget,
       detail: playerTarget === 'none' ? 'No external player refresh after the first scan.' : (playerSyncReady ? 'Credentials are present.' : 'Credentials still need to be completed.'),
-      step: 4,
+      step: 5,
     },
   ];
 
@@ -1693,7 +1729,7 @@ export function OnboardingWizard({
             </div>
             <h2 className="text-2xl font-semibold tracking-tight">Set the essentials, then launch the first scan.</h2>
             <p className="max-w-2xl text-sm text-slate-300">
-              Six steps only: choose the workflow, point PMDA at the right folders, pick local or external metadata, configure the required sources, decide the pipeline behavior, then review exactly what the first scan will do.
+              Seven short steps: choose the workflow, point PMDA at the right folders, pick local or external metadata, finish the runtime or AI setup, configure the required sources, decide the pipeline behavior, then review exactly what the first scan will do.
             </p>
           </div>
           <div className="space-y-3">
@@ -1708,7 +1744,8 @@ export function OnboardingWizard({
                   (step.id === 'workflow' && Boolean(workflowMode))
                   || (step.id === 'folders' && foldersReady)
                   || (step.id === 'metadata' && Boolean(selectedStackMode))
-                  || (step.id === 'setup' && metadataSetupReady)
+                  || (step.id === 'runtime' && runtimeSetupReady)
+                  || (step.id === 'sources' && sourcesStepReady)
                   || (step.id === 'pipeline' && pipelineConfigReady && pipelineStepConfirmed)
                   || (step.id === 'review' && launchReady)
                 );
@@ -1746,18 +1783,18 @@ export function OnboardingWizard({
                       onClick={() => applyWorkflowPreset(option.value)}
                       className={`rounded-3xl border p-4 text-left transition ${selected ? 'border-primary/50 bg-primary/12 shadow-[0_0_0_1px_rgba(59,130,246,0.18)]' : 'border-white/10 bg-white/[0.03] hover:border-white/20'}`}
                     >
-                      <div className="flex items-center justify-between gap-3">
+                      <div className="flex flex-wrap items-center gap-2">
+                        {option.value === 'managed' ? (
+                          <Badge variant="outline" className="border-emerald-500/35 bg-emerald-500/10 text-emerald-200">
+                            Recommended
+                          </Badge>
+                        ) : null}
+                        <Badge variant="outline" className="border-white/15 bg-white/5 text-slate-200">{option.modeName}</Badge>
+                        {selected ? <Badge className="bg-primary text-primary-foreground">Selected</Badge> : null}
+                      </div>
+                      <div className="mt-4">
                         <div className="inline-flex h-10 w-10 items-center justify-center rounded-2xl bg-white/5 text-primary">
                           <Workflow className="h-5 w-5" />
-                        </div>
-                        <div className="flex items-center gap-2">
-                          {option.value === 'managed' ? (
-                            <Badge variant="outline" className="border-emerald-500/35 bg-emerald-500/10 text-emerald-200">
-                              Recommended
-                            </Badge>
-                          ) : null}
-                          <Badge variant="outline" className="border-white/15 bg-white/5 text-slate-200">{option.modeName}</Badge>
-                          {selected ? <Badge className="bg-primary text-primary-foreground">Selected</Badge> : null}
                         </div>
                       </div>
                       <div className="mt-4 text-lg font-semibold text-white">{option.label}</div>
@@ -1875,13 +1912,13 @@ export function OnboardingWizard({
                   onClick={() => applyStackPreset('local')}
                   className={`rounded-3xl border p-5 text-left transition ${selectedStackMode === 'local' ? 'border-primary/50 bg-primary/12 shadow-[0_0_0_1px_rgba(59,130,246,0.18)]' : 'border-white/10 bg-white/[0.03] hover:border-white/20'}`}
                 >
-                  <div className="flex items-center justify-between gap-3">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Badge variant="outline" className="border-emerald-500/35 bg-emerald-500/10 text-emerald-200">Recommended</Badge>
+                    {selectedStackMode === 'local' ? <Badge className="bg-primary text-primary-foreground">Selected</Badge> : null}
+                  </div>
+                  <div className="mt-4">
                     <div className="inline-flex h-10 w-10 items-center justify-center rounded-2xl bg-white/5 text-primary">
                       <Server className="h-5 w-5" />
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <Badge variant="outline" className="border-emerald-500/35 bg-emerald-500/10 text-emerald-200">Recommended</Badge>
-                      {selectedStackMode === 'local' ? <Badge className="bg-primary text-primary-foreground">Selected</Badge> : null}
                     </div>
                   </div>
                   <div className="mt-4 text-lg font-semibold text-white">Local stack</div>
@@ -1894,11 +1931,13 @@ export function OnboardingWizard({
                   onClick={() => applyStackPreset('online')}
                   className={`rounded-3xl border p-5 text-left transition ${selectedStackMode === 'online' ? 'border-primary/50 bg-primary/12 shadow-[0_0_0_1px_rgba(59,130,246,0.18)]' : 'border-white/10 bg-white/[0.03] hover:border-white/20'}`}
                 >
-                  <div className="flex items-center justify-between gap-3">
+                  <div className="flex flex-wrap items-center gap-2">
+                    {selectedStackMode === 'online' ? <Badge className="bg-primary text-primary-foreground">Selected</Badge> : null}
+                  </div>
+                  <div className="mt-4">
                     <div className="inline-flex h-10 w-10 items-center justify-center rounded-2xl bg-white/5 text-primary">
                       <Globe className="h-5 w-5" />
                     </div>
-                    {selectedStackMode === 'online' ? <Badge className="bg-primary text-primary-foreground">Selected</Badge> : null}
                   </div>
                   <div className="mt-4 text-lg font-semibold text-white">External AI</div>
                   <p className="mt-2 text-sm leading-6 text-slate-300">
@@ -1914,14 +1953,20 @@ export function OnboardingWizard({
             </div>
           ) : null}
 
-          {activeStep === 3 ? (
+          {activeStep === 3 || activeStep === 4 ? (
             <div className="space-y-5">
               <div className="space-y-1">
-                <div className="text-sm font-semibold text-white">Configure the metadata setup</div>
-                <p className="text-sm text-slate-400">Keep only the sources you really want for the first scan. If a source is on, it must be configured here.</p>
+                <div className="text-sm font-semibold text-white">
+                  {activeStep === 3 ? 'Finish the runtime or external AI setup' : 'Configure the metadata sources'}
+                </div>
+                <p className="text-sm text-slate-400">
+                  {activeStep === 3
+                    ? 'This step is only about the local runtime or the external AI provider. Metadata sources come in the next step.'
+                    : 'Keep only the providers you really want in the first scan. If a source stays on, configure it here and use the provider links below to create any missing keys.'}
+                </p>
               </div>
 
-              {selectedStackMode === 'local' ? (
+              {activeStep === 3 && (selectedStackMode === 'local' ? (
                 <div className="space-y-4 rounded-3xl border border-white/10 bg-white/[0.03] p-4">
                   <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
                     <div className="space-y-1">
@@ -2078,7 +2123,18 @@ export function OnboardingWizard({
 
                   <div className="grid gap-4 lg:grid-cols-2">
                     <div className="space-y-2 rounded-2xl border border-white/10 bg-black/10 p-4">
-                      <Label className="text-sm text-white">API key</Label>
+                      <div className="flex items-center justify-between gap-3">
+                        <Label className="text-sm text-white">API key</Label>
+                        <a
+                          href={EXTERNAL_AI_OPTIONS.find((option) => option.value === selectedExternalProvider)?.docsUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="inline-flex items-center gap-1 text-xs text-primary hover:underline"
+                        >
+                          {EXTERNAL_AI_OPTIONS.find((option) => option.value === selectedExternalProvider)?.docsLabel || 'Create API key'}
+                          <ExternalLink className="h-3 w-3" />
+                        </a>
+                      </div>
                       <PasswordInput
                         value={selectedExternalProvider === 'openai-api' ? String(config.OPENAI_API_KEY || '') : selectedExternalProvider === 'anthropic' ? String(config.ANTHROPIC_API_KEY || '') : String(config.GOOGLE_API_KEY || '')}
                         onChange={(event) => {
@@ -2089,7 +2145,7 @@ export function OnboardingWizard({
                         }}
                         placeholder={selectedExternalProvider === 'openai-api' ? 'sk-...' : 'Enter your API key'}
                       />
-                      <p className="text-[11px] text-slate-500">{EXTERNAL_AI_OPTIONS.find((option) => option.value === selectedExternalProvider)?.docsUrl}</p>
+                      <p className="text-[11px] text-slate-500">The key is validated automatically. PMDA loads compatible models as soon as the provider responds correctly.</p>
                     </div>
                     <div className="space-y-2 rounded-2xl border border-white/10 bg-black/10 p-4">
                       <Label className="text-sm text-white">Validation</Label>
@@ -2121,8 +2177,9 @@ export function OnboardingWizard({
                     <p className="text-xs text-slate-400">PMDA only enables the next step after the provider is valid and one compatible model has been selected.</p>
                   </div>
                 </div>
-              )}
+              ))}
 
+              {activeStep === 4 ? (
               <div className="space-y-4 rounded-3xl border border-white/10 bg-white/[0.03] p-4">
                 <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
                   <div>
@@ -2140,7 +2197,7 @@ export function OnboardingWizard({
 
                 <div className="grid gap-3 lg:grid-cols-2">
                   <div className="rounded-2xl border border-white/10 bg-black/10 p-4 space-y-3">
-                    <div className="flex items-center justify-between gap-3">
+                    <div className="flex items-start justify-between gap-3">
                       <div>
                         <div className="text-sm font-semibold text-white">MusicBrainz</div>
                         <p className="text-xs text-slate-400">Required base source. Uses the local mirror when local mode is selected.</p>
@@ -2158,7 +2215,7 @@ export function OnboardingWizard({
                   </div>
 
                   <div className="rounded-2xl border border-white/10 bg-black/10 p-4 space-y-3">
-                    <div className="flex items-center justify-between gap-3">
+                    <div className="flex items-start justify-between gap-3">
                       <div>
                         <div className="text-sm font-semibold text-white">Discogs</div>
                         <p className="text-xs text-slate-400">Useful for release variants, labels and covers when MusicBrainz is not enough.</p>
@@ -2169,14 +2226,20 @@ export function OnboardingWizard({
                     <p className="text-xs leading-5 text-slate-400">{discogsStatus.message}</p>
                     {discogsEnabled ? (
                       <div className="space-y-2">
-                        <Label className="text-xs text-slate-200">User token</Label>
+                        <div className="flex items-center justify-between gap-3">
+                          <Label className="text-xs text-slate-200">User token</Label>
+                          <a href={METADATA_SOURCE_LINKS.discogs} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1 text-xs text-primary hover:underline">
+                            Get token
+                            <ExternalLink className="h-3 w-3" />
+                          </a>
+                        </div>
                         <PasswordInput value={String(config.DISCOGS_USER_TOKEN || '')} onChange={(event) => updateConfig({ DISCOGS_USER_TOKEN: event.target.value })} placeholder="Discogs user token" />
                       </div>
                     ) : null}
                   </div>
 
                   <div className="rounded-2xl border border-white/10 bg-black/10 p-4 space-y-3">
-                    <div className="flex items-center justify-between gap-3">
+                    <div className="flex items-start justify-between gap-3">
                       <div>
                         <div className="text-sm font-semibold text-white">Last.fm</div>
                         <p className="text-xs text-slate-400">Useful for genres and fallback artist metadata when other providers are incomplete.</p>
@@ -2188,7 +2251,13 @@ export function OnboardingWizard({
                     {lastfmEnabled ? (
                       <div className="grid gap-2 md:grid-cols-2">
                         <div className="space-y-2">
-                          <Label className="text-xs text-slate-200">API key</Label>
+                          <div className="flex items-center justify-between gap-3">
+                            <Label className="text-xs text-slate-200">API key</Label>
+                            <a href={METADATA_SOURCE_LINKS.lastfm} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1 text-xs text-primary hover:underline">
+                              Get key & secret
+                              <ExternalLink className="h-3 w-3" />
+                            </a>
+                          </div>
                           <Input value={String(config.LASTFM_API_KEY || '')} onChange={(event) => updateConfig({ LASTFM_API_KEY: event.target.value })} placeholder="Last.fm API key" />
                         </div>
                         <div className="space-y-2">
@@ -2200,7 +2269,7 @@ export function OnboardingWizard({
                   </div>
 
                   <div className="rounded-2xl border border-white/10 bg-black/10 p-4 space-y-3">
-                    <div className="flex items-center justify-between gap-3">
+                    <div className="flex items-start justify-between gap-3">
                       <div>
                         <div className="text-sm font-semibold text-white">AcoustID</div>
                         <p className="text-xs text-slate-400">Useful when tags are missing and PMDA needs fingerprint-based identification.</p>
@@ -2211,14 +2280,20 @@ export function OnboardingWizard({
                     <p className="text-xs leading-5 text-slate-400">{acoustidStatus.message}</p>
                     {acoustidEnabled ? (
                       <div className="space-y-2">
-                        <Label className="text-xs text-slate-200">API key</Label>
+                        <div className="flex items-center justify-between gap-3">
+                          <Label className="text-xs text-slate-200">API key</Label>
+                          <a href={METADATA_SOURCE_LINKS.acoustid} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1 text-xs text-primary hover:underline">
+                            Get API key
+                            <ExternalLink className="h-3 w-3" />
+                          </a>
+                        </div>
                         <PasswordInput value={String(config.ACOUSTID_API_KEY || '')} onChange={(event) => updateConfig({ ACOUSTID_API_KEY: event.target.value })} placeholder="AcoustID API key" />
                       </div>
                     ) : null}
                   </div>
 
                   <div className="rounded-2xl border border-white/10 bg-black/10 p-4 space-y-3 lg:col-span-2">
-                    <div className="flex items-center justify-between gap-3">
+                    <div className="flex items-start justify-between gap-3">
                       <div>
                         <div className="text-sm font-semibold text-white">Bandcamp</div>
                         <p className="text-xs text-slate-400">Enabled by default. No key required. Keeps an additional fallback path for independent releases.</p>
@@ -2251,10 +2326,11 @@ export function OnboardingWizard({
                   </div>
                 )}
               </div>
+              ) : null}
             </div>
           ) : null}
 
-          {activeStep === 4 ? (
+          {activeStep === 5 ? (
             <div className="space-y-5">
               <div className="space-y-1">
                 <div className="text-sm font-semibold text-white">Choose the pipeline behavior</div>
@@ -2465,7 +2541,7 @@ export function OnboardingWizard({
             </div>
           ) : null}
 
-          {activeStep === 5 ? (
+          {activeStep === 6 ? (
             <div className="space-y-5">
               <div className="space-y-1">
                 <div className="text-sm font-semibold text-white">Review before the first full scan</div>
@@ -2537,12 +2613,13 @@ export function OnboardingWizard({
                     isSaving
                     || runtimeActionBusy
                     || (activeStep === 1 && !foldersReady)
-                    || (activeStep === 3 && !metadataSetupReady)
-                    || (activeStep === 4 && !pipelineConfigReady)
+                    || (activeStep === 3 && !runtimeSetupReady)
+                    || (activeStep === 4 && !sourcesStepReady)
+                    || (activeStep === 5 && !pipelineConfigReady)
                   }
                 >
                   {isSaving ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
-                  {activeStep === 2 && localStackNeedsConfirmation ? 'Continue' : activeStep === 4 ? 'Review first scan' : 'Next'}
+                  {activeStep === 2 && localStackNeedsConfirmation ? 'Continue' : activeStep === 5 ? 'Review first scan' : 'Next'}
                 </Button>
               ) : (
                 <Button type="button" className="gap-2" onClick={() => void startOrResumeScan()} disabled={scanActionBusy || !launchReady}>
