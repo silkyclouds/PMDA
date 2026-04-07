@@ -5636,7 +5636,7 @@ def _managed_runtime_self_gateway_candidates() -> list[str]:
     return out
 
 
-def _managed_runtime_musicbrainz_published_urls(host: str, host_port: int) -> list[str]:
+def _managed_runtime_host_port_urls(host: str, host_port: int, *, include_loopback: bool = False) -> list[str]:
     port = int(host_port or 0)
     if port <= 0:
         return []
@@ -5653,9 +5653,13 @@ def _managed_runtime_musicbrainz_published_urls(host: str, host_port: int) -> li
     for gateway in _managed_runtime_self_gateway_candidates():
         _add(f"http://{gateway}:{port}")
     _add(f"http://host.docker.internal:{port}")
-    if normalized_host in {"127.0.0.1", "localhost"}:
+    if include_loopback and normalized_host in {"127.0.0.1", "localhost"}:
         _add(f"http://{normalized_host}:{port}")
     return urls
+
+
+def _managed_runtime_musicbrainz_published_urls(host: str, host_port: int) -> list[str]:
+    return _managed_runtime_host_port_urls(host, host_port, include_loopback=True)
 
 
 def _managed_runtime_project_prefix(name: str, services: set[str]) -> str:
@@ -5806,6 +5810,8 @@ def _managed_runtime_detect_ollama_candidates() -> list[dict[str, Any]]:
     current_url = str(_get_config_from_db("OLLAMA_URL", OLLAMA_URL) or "").strip()
     if current_url:
         _add(current_url)
+    for gateway in _managed_runtime_self_gateway_candidates():
+        _add(f"http://{gateway}:11434")
     for default_url in (
         "http://127.0.0.1:11434",
         "http://localhost:11434",
@@ -5820,7 +5826,12 @@ def _managed_runtime_detect_ollama_candidates() -> list[dict[str, Any]]:
             continue
         for port in _managed_runtime_parse_ports(str(row.get("Ports") or "")):
             if int(port.get("container_port") or 0) == 11434 and int(port.get("host_port") or 0) > 0:
-                _add(f"http://127.0.0.1:{int(port['host_port'])}")
+                for candidate_url in _managed_runtime_host_port_urls(
+                    str(port.get("host") or ""),
+                    int(port.get("host_port") or 0),
+                    include_loopback=True,
+                ):
+                    _add(candidate_url)
     out: list[dict[str, Any]] = []
     for idx, url in enumerate(urls):
         probe = _ollama_probe(url)
@@ -6695,19 +6706,21 @@ def _managed_runtime_bundle_status(bundle_type: str, *, include_candidates: bool
             bundle["health"] = _managed_runtime_health_check_ollama(bundle.get("effective_url") or "")
         healthy_candidate = next((row for row in candidates if bool((row.get("health") or {}).get("available")) and bool(row.get("url"))), None)
         health_available = bool((bundle.get("health") or {}).get("available"))
+        previous_effective_url = str(bundle.get("effective_url") or "").strip()
         if not running and healthy_candidate is not None and (
             str(bundle.get("state") or "") in _MANAGED_RUNTIME_ACTIVE_STATES
             or not str(bundle.get("effective_url") or "").strip()
             or not health_available
         ):
             models = list(healthy_candidate.get("models") or [])
+            effective_url = str(healthy_candidate.get("url") or "").strip()
             bundle = _managed_runtime_bundle_upsert(
                 bundle_type,
                 mode=str(bundle.get("mode") or "adopted"),
                 state="ready",
                 phase="ready",
                 phase_message="Ollama ready",
-                effective_url=str(healthy_candidate.get("url") or ""),
+                effective_url=effective_url,
                 health={
                     "available": True,
                     "overall_status": "healthy",
@@ -6723,6 +6736,15 @@ def _managed_runtime_bundle_status(bundle_type: str, *, include_candidates: bool
                 },
                 last_error="",
             )
+            if effective_url and effective_url != previous_effective_url:
+                _managed_runtime_apply_ollama_runtime(
+                    str(bundle.get("mode") or "adopted"),
+                    effective_url,
+                    _ollama_model_configured(),
+                    _ollama_complex_model_configured(),
+                    config_root=str(bundle.get("config_root") or ""),
+                    data_root=str(bundle.get("data_root") or ""),
+                )
             if latest_action and str(latest_action.get("status") or "") == "running":
                 _managed_runtime_action_update(
                     str(latest_action.get("action_id") or ""),
