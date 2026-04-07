@@ -5921,6 +5921,33 @@ def _managed_runtime_eta_text(total_seconds: float | int | None) -> str:
     return " ".join(parts[:2]).strip()
 
 
+def _managed_runtime_parse_eta_hint(value: str | None) -> int | None:
+    raw = str(value or "").strip().lower()
+    if not raw or raw in {"--:--:--", "--"}:
+        return None
+    colon_match = re.fullmatch(r"(?:(\d+):)?(\d{1,2}):(\d{2})", raw)
+    if colon_match:
+        hours = int(colon_match.group(1) or 0)
+        minutes = int(colon_match.group(2) or 0)
+        seconds = int(colon_match.group(3) or 0)
+        return max(0, (hours * 3600) + (minutes * 60) + seconds)
+    compact_match = re.fullmatch(r"(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?", raw)
+    if compact_match and any(group is not None for group in compact_match.groups()):
+        hours = int(compact_match.group(1) or 0)
+        minutes = int(compact_match.group(2) or 0)
+        seconds = int(compact_match.group(3) or 0)
+        return max(0, (hours * 3600) + (minutes * 60) + seconds)
+    return None
+
+
+def _managed_runtime_musicbrainz_download_progress(download_progress: int | float | None) -> int | None:
+    try:
+        pct = max(0.0, min(100.0, float(download_progress)))
+    except Exception:
+        return None
+    return max(40, min(72, int(round(40 + ((pct / 100.0) * 32.0)))))
+
+
 def _managed_runtime_capture_subprocess(
     cmd: list[str],
     *,
@@ -5930,8 +5957,9 @@ def _managed_runtime_capture_subprocess(
     env: dict[str, str] | None = None,
     phase_map: list[tuple[str, str, str]] | None = None,
 ) -> None:
-    progress_re = re.compile(r"\b(\d{1,3})%\b")
+    progress_re = re.compile(r"(?<!\d)(\d{1,3})%(?!\d)")
     eta_re = re.compile(r"\bETA\s*[:=]?\s*([^,;|]+)", re.IGNORECASE)
+    wget_progress_re = re.compile(r"(?<!\d)(\d{1,3})%\s+\S+\s+([0-9:]+|(?:\d+h)?(?:\d+m)?(?:\d+s)?|--:--:--)(?:\s|$)")
     recent_output: deque[str] = deque(maxlen=6)
     proc = subprocess.Popen(
         cmd,
@@ -5952,24 +5980,45 @@ def _managed_runtime_capture_subprocess(
             _managed_runtime_log(bundle_type, line, service_name=service_name)
             progress_match = progress_re.search(line)
             eta_match = eta_re.search(line)
+            wget_progress_match = wget_progress_re.search(line)
             bundle_now = _managed_runtime_bundle_get(bundle_type)
             meta_now = dict(bundle_now.get("meta") or {})
             started_at = float(meta_now.get("started_at") or time.time())
+            current_phase = str(bundle_now.get("phase") or "")
             meta_now.setdefault("started_at", started_at)
             meta_now["last_output"] = line
+            if wget_progress_match is not None:
+                try:
+                    download_progress = max(0, min(100, int(wget_progress_match.group(1))))
+                except Exception:
+                    download_progress = None
+                eta_hint = str(wget_progress_match.group(2) or "").strip()
+                if download_progress is not None:
+                    meta_now["download_progress"] = download_progress
+                    if bundle_type == _MANAGED_RUNTIME_MUSICBRAINZ_BUNDLE and current_phase == "importing":
+                        weighted_progress = _managed_runtime_musicbrainz_download_progress(download_progress)
+                        if weighted_progress is not None:
+                            meta_now["progress"] = weighted_progress
+                eta_seconds = _managed_runtime_parse_eta_hint(eta_hint)
+                if eta_seconds is not None:
+                    meta_now["eta_seconds"] = eta_seconds
+                    meta_now["eta_text"] = _managed_runtime_eta_text(eta_seconds)
+                elif eta_hint and eta_hint != "--:--:--":
+                    meta_now["eta_text"] = eta_hint
             if progress_match is not None:
                 try:
                     progress_value = max(0, min(100, int(progress_match.group(1))))
                 except Exception:
                     progress_value = None
                 if progress_value is not None:
-                    meta_now["progress"] = progress_value
-                    if 0 < progress_value < 100:
+                    if wget_progress_match is None or not (bundle_type == _MANAGED_RUNTIME_MUSICBRAINZ_BUNDLE and current_phase == "importing"):
+                        meta_now["progress"] = progress_value
+                    if wget_progress_match is None and 0 < progress_value < 100:
                         elapsed = max(1.0, time.time() - started_at)
                         eta_seconds = int((elapsed * (100.0 - progress_value)) / max(progress_value, 1))
                         meta_now["eta_seconds"] = eta_seconds
                         meta_now["eta_text"] = _managed_runtime_eta_text(eta_seconds)
-                    else:
+                    elif wget_progress_match is None:
                         meta_now.pop("eta_seconds", None)
                         meta_now.pop("eta_text", None)
             if eta_match is not None:

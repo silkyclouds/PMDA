@@ -281,6 +281,21 @@ function managedBundleProgress(
   return 8;
 }
 
+function managedBundleDisplayProgress(
+  bundle: ManagedRuntimeBundleStatus | null | undefined,
+  options?: { requiredModels?: string[] },
+): number {
+  if (!bundle) return 0;
+  const meta = (bundle.meta || {}) as Record<string, unknown>;
+  if (bundle.bundle_type === 'musicbrainz_local' && effectiveBundlePhase(bundle) === 'importing') {
+    const rawDownloadProgress = Number(meta.download_progress);
+    if (Number.isFinite(rawDownloadProgress) && rawDownloadProgress > 0) {
+      return Math.max(0, Math.min(100, Math.round(rawDownloadProgress)));
+    }
+  }
+  return managedBundleProgress(bundle, options);
+}
+
 function hasManagedBundleStarted(bundle: ManagedRuntimeBundleStatus | null | undefined): boolean {
   if (!bundle) return false;
   if (bundle.effective_url || bundle.health?.available) return true;
@@ -779,6 +794,7 @@ export function OnboardingWizard({
         done: musicbrainzReady,
         detail: musicbrainzDetail,
         progress: musicbrainzNotStarted ? 0 : managedBundleProgress(managedMbBundle),
+        displayProgress: musicbrainzNotStarted ? 0 : managedBundleDisplayProgress(managedMbBundle),
         eta: musicbrainzNotStarted || musicbrainzState === 'failed' ? '' : managedBundleEta(managedMbBundle),
       },
       {
@@ -787,6 +803,7 @@ export function OnboardingWizard({
         done: ollamaReady,
         detail: ollamaDetail,
         progress: ollamaNotStarted ? 0 : managedBundleProgress(managedOllamaBundle, { requiredModels: [ollamaModel, ollamaHardModel] }),
+        displayProgress: ollamaNotStarted ? 0 : managedBundleDisplayProgress(managedOllamaBundle, { requiredModels: [ollamaModel, ollamaHardModel] }),
         eta: ollamaNotStarted || ollamaState === 'failed' ? '' : managedBundleEta(managedOllamaBundle),
       },
     ];
@@ -799,6 +816,21 @@ export function OnboardingWizard({
     const total = serviceItems.reduce((sum, item) => sum + item.progress, 0);
     return Math.round(total / serviceItems.length);
   }, [localStackChecklist, selectedStackMode]);
+
+  const musicbrainzDisplayProgress = useMemo(
+    () => managedBundleDisplayProgress(managedMbBundle),
+    [managedMbBundle],
+  );
+
+  const musicbrainzDisplayEta = useMemo(
+    () => managedBundleEta(managedMbBundle),
+    [managedMbBundle],
+  );
+
+  const showMusicbrainzDownloadProgress = selectedStackMode === 'local'
+    && effectiveBundlePhase(managedMbBundle) === 'importing'
+    && !musicbrainzReady
+    && musicbrainzDisplayProgress > 0;
 
   const localStackActivityRows = useMemo(() => {
     if (selectedStackMode !== 'local' || !localStackProvisioningActive) return [];
@@ -1425,15 +1457,23 @@ export function OnboardingWizard({
                       <span>
                         {localRuntimeReady
                           ? 'All local services are ready'
-                          : localStackProvisioningActive
-                            ? 'Local stack creation progress'
-                            : managedPreflightReady
-                              ? 'Waiting for confirmation to create the missing local services'
-                              : 'Docker is not ready yet'}
+                          : showMusicbrainzDownloadProgress
+                            ? 'MusicBrainz dump download'
+                            : localStackProvisioningActive
+                              ? 'Local stack creation progress'
+                              : managedPreflightReady
+                                ? 'Waiting for confirmation to create the missing local services'
+                                : 'Docker is not ready yet'}
                       </span>
-                      <span>{localRuntimeReady ? '100%' : `${localStackProgress}%`}</span>
+                      <span>{localRuntimeReady ? '100%' : `${showMusicbrainzDownloadProgress ? musicbrainzDisplayProgress : localStackProgress}%`}</span>
                     </div>
-                    <Progress value={Math.max(0, Math.min(100, localStackProgress))} className="h-2 bg-white/10" />
+                    <Progress
+                      value={Math.max(0, Math.min(100, showMusicbrainzDownloadProgress ? musicbrainzDisplayProgress : localStackProgress))}
+                      className="h-2 bg-white/10"
+                    />
+                    {!localRuntimeReady && showMusicbrainzDownloadProgress && musicbrainzDisplayEta ? (
+                      <div className="text-[11px] uppercase tracking-[0.14em] text-primary/80">ETA {musicbrainzDisplayEta}</div>
+                    ) : null}
                   </div>
 
                   <div className="rounded-2xl border border-white/10 bg-black/10 p-4">
@@ -1473,7 +1513,8 @@ export function OnboardingWizard({
 
                     <div className="mt-3 grid gap-3 md:grid-cols-3">
                     {localStackChecklist.map((item) => {
-                      const itemBadge = item.done ? null : item.progress > 0 ? `${item.progress}%` : (item.detail.toLowerCase().includes('detected') ? 'Detected' : 'Not started');
+                      const itemDisplayProgress = Math.max(0, Math.min(100, Math.round(Number(item.displayProgress ?? item.progress) || 0)));
+                      const itemBadge = item.done ? null : itemDisplayProgress > 0 ? `${itemDisplayProgress}%` : (item.detail.toLowerCase().includes('detected') ? 'Detected' : 'Not started');
                       return (
                       <div key={item.key} className="rounded-2xl border border-white/10 bg-white/[0.02] p-3">
                         <div className="flex items-center justify-between gap-2">
@@ -1490,8 +1531,8 @@ export function OnboardingWizard({
                         {!item.done && item.eta ? (
                           <div className="mt-2 text-[11px] uppercase tracking-[0.14em] text-primary/80">ETA {item.eta}</div>
                         ) : null}
-                        {item.progress > 0 || item.done ? (
-                          <Progress value={Math.max(0, Math.min(100, item.progress))} className="mt-3 h-1.5 bg-white/10" />
+                        {itemDisplayProgress > 0 || item.done ? (
+                          <Progress value={item.done ? 100 : itemDisplayProgress} className="mt-3 h-1.5 bg-white/10" />
                         ) : (
                           <div className="mt-3 text-[11px] uppercase tracking-[0.14em] text-slate-500">
                             {localStackNeedsConfirmation ? 'Waiting for step 3 confirmation' : 'Not started yet'}
