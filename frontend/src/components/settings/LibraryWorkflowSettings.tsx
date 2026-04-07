@@ -77,7 +77,7 @@ const WORKFLOW_CARDS: Array<{
   {
     value: 'managed',
     label: 'Managed library',
-    description: 'Drop new music into intake folders and let PMDA build a clean serving library elsewhere.',
+    description: 'Recommended. Drop new music into intake folders and let PMDA build a clean serving library elsewhere.',
     scenario: 'I drop new albums into a holding area and want PMDA to build a clean library.',
   },
   {
@@ -224,7 +224,7 @@ export function LibraryWorkflowSettings({ config, updateConfig, onSwitchToCustom
           Library workflow
         </CardTitle>
         <CardDescription>
-          Choose how PMDA should interpret your folders: intake + clean library, mirrored library, or organize in place.
+          Recommended for most installs: keep an intake folder for new arrivals and let PMDA build a separate clean library.
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-5">
@@ -244,9 +244,14 @@ export function LibraryWorkflowSettings({ config, updateConfig, onSwitchToCustom
               >
                 <div className="flex items-center justify-between gap-3">
                   <div className="text-sm font-medium text-foreground">{card.label}</div>
-                  <Badge variant={active ? 'default' : 'outline'}>
-                    {active ? 'Selected' : 'Available'}
-                  </Badge>
+                  <div className="flex items-center gap-2">
+                    {card.value === 'managed' ? (
+                      <Badge variant="secondary">Recommended</Badge>
+                    ) : null}
+                    <Badge variant={active ? 'default' : 'outline'}>
+                      {active ? 'Selected' : 'Available'}
+                    </Badge>
+                  </div>
                 </div>
                 <p className="mt-2 text-xs text-muted-foreground">{card.description}</p>
                 <p className="mt-3 text-[11px] text-muted-foreground">

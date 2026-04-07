@@ -117,7 +117,7 @@ const WORKFLOW_OPTIONS: Array<{
     value: 'managed',
     label: 'Sort new arrivals',
     modeName: 'Managed',
-    description: 'Use this if new albums arrive in a separate intake folder first.',
+    description: 'Recommended. New albums land in an intake folder first, then PMDA builds the clean library separately.',
     whenToUse: 'You have one folder for new arrivals and another one for the final clean library.',
     asksFor: 'PMDA will ask for: intake folder, clean library, dupes, incomplete albums.',
     diagram: ['New arrivals', 'PMDA sorts', 'Final library'],
@@ -1732,9 +1732,9 @@ export function OnboardingWizard({
         <CardContent data-guided-onboarding-scroll="true" className="space-y-6 p-5 md:p-6">
           {activeStep === 0 ? (
             <div className="space-y-5">
-              <div className="space-y-1">
-                <div className="text-sm font-semibold text-white">How should PMDA work with your music folders?</div>
-                <p className="text-sm text-slate-400">Pick the situation that matches your current setup. PMDA will only ask for the folders required by that workflow.</p>
+            <div className="space-y-1">
+              <div className="text-sm font-semibold text-white">How should PMDA work with your music folders?</div>
+                <p className="text-sm text-slate-400">Pick the situation that matches your current setup. Recommended for most users: keep an intake folder for new arrivals and let PMDA build a separate clean library.</p>
               </div>
               <div className="grid gap-3 md:grid-cols-3">
                 {WORKFLOW_OPTIONS.map((option) => {
@@ -1751,6 +1751,11 @@ export function OnboardingWizard({
                           <Workflow className="h-5 w-5" />
                         </div>
                         <div className="flex items-center gap-2">
+                          {option.value === 'managed' ? (
+                            <Badge variant="outline" className="border-emerald-500/35 bg-emerald-500/10 text-emerald-200">
+                              Recommended
+                            </Badge>
+                          ) : null}
                           <Badge variant="outline" className="border-white/15 bg-white/5 text-slate-200">{option.modeName}</Badge>
                           {selected ? <Badge className="bg-primary text-primary-foreground">Selected</Badge> : null}
                         </div>
