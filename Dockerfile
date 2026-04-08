@@ -25,7 +25,9 @@ ENV PMDA_REDIS_HOST=127.0.0.1
 ENV PMDA_REDIS_PORT=6379
 ENV PMDA_REDIS_DB=0
 
-# libchromaprint-tools provides fpcalc for pyacoustid (AcousticID fingerprinting)
+# libchromaprint-tools provides fpcalc for pyacoustid (AcousticID fingerprinting).
+# Split heavy Debian installs so multi-arch buildx jobs do not exhaust APT archive space
+# on smaller builder roots, especially for arm64.
 RUN mkdir -p /etc/postgresql-common && \
     printf 'create_main_cluster = false\n' > /etc/postgresql-common/createcluster.conf && \
     apt-get update && \
@@ -33,12 +35,15 @@ RUN mkdir -p /etc/postgresql-common && \
       curl \
       ffmpeg \
       git \
-      nodejs \
-      npm \
       sqlite3 \
       docker-cli \
       docker-compose \
       libchromaprint-tools \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
       tesseract-ocr \
       tesseract-ocr-eng \
       tesseract-ocr-fra \
@@ -48,7 +53,15 @@ RUN mkdir -p /etc/postgresql-common && \
       postgresql \
       postgresql-contrib \
       redis-server \
-    && rm -rf /var/lib/apt/lists/*
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      nodejs \
+      npm \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
 # arm/v7 lacks wheels for some Python deps (e.g. Pillow/cffi), so compile toolchain is needed.
 RUN if [ "$TARGETARCH" = "arm" ] && [ "$TARGETVARIANT" = "v7" ]; then \
