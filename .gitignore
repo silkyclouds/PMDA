@@ -35,10 +35,11 @@ frontend/dist
 # Config / state – not needed at runtime (SQLite is source of truth)
 ai_prompt.txt
 config.json
-# state.db
-# cache.db
-# pmda.log
-# pmda.log.*
+state.db
+settings.db
+cache.db
+pmda.log
+pmda.log.*
 
 # IDE / OS
 .idea/

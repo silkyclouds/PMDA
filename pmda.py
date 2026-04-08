@@ -55,7 +55,7 @@ from collections import Counter, defaultdict, OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout, as_completed, wait
 from functools import lru_cache
 from pathlib import Path
-from typing import NamedTuple, List, Dict, Optional, Tuple, Any
+from typing import NamedTuple, List, Dict, Optional, Tuple, Any, Callable
 from urllib.parse import quote, quote_plus, unquote, urlparse
 
 import logging
@@ -2619,7 +2619,7 @@ merged = {
     "MB_FAST_FALLBACK_MODE": _get("MB_FAST_FALLBACK_MODE", default=False, cast=_parse_bool),
     # Provider identity arbitration (Discogs/Last.fm/Bandcamp when MB is unavailable).
     "PROVIDER_IDENTITY_STRICT": _get("PROVIDER_IDENTITY_STRICT", default=True, cast=_parse_bool),
-    "PROVIDER_IDENTITY_USE_AI": _get("PROVIDER_IDENTITY_USE_AI", default=True, cast=_parse_bool),
+    "PROVIDER_IDENTITY_USE_AI": _get("PROVIDER_IDENTITY_USE_AI", default=False, cast=_parse_bool),
     "MATCH_COVER_OCR_MODE": _get("MATCH_COVER_OCR_MODE", default="smart", cast=_normalize_match_cover_ocr_mode),
     "PROVIDER_IDENTITY_MIN_SCORE": _get(
         "PROVIDER_IDENTITY_MIN_SCORE",
@@ -2700,12 +2700,12 @@ merged = {
     "NAVIDROME_USERNAME": _get("NAVIDROME_USERNAME", default="", cast=str),
     "NAVIDROME_PASSWORD": _get("NAVIDROME_PASSWORD", default="", cast=str),
     "NAVIDROME_API_KEY": _get("NAVIDROME_API_KEY", default="", cast=str),
-    "USE_AI_FOR_MB_MATCH": _get("USE_AI_FOR_MB_MATCH", default=True, cast=_parse_bool),
-    "USE_AI_FOR_MB_VERIFY": _get("USE_AI_FOR_MB_VERIFY", default=True, cast=_parse_bool),
-    "USE_AI_FOR_DEDUPE": _get("USE_AI_FOR_DEDUPE", default=True, cast=_parse_bool),
+    "USE_AI_FOR_MB_MATCH": _get("USE_AI_FOR_MB_MATCH", default=False, cast=_parse_bool),
+    "USE_AI_FOR_MB_VERIFY": _get("USE_AI_FOR_MB_VERIFY", default=False, cast=_parse_bool),
+    "USE_AI_FOR_DEDUPE": _get("USE_AI_FOR_DEDUPE", default=False, cast=_parse_bool),
     # When enabled, album descriptions/reviews can also be auto-generated for SOFT_MATCH albums.
     "USE_AI_FOR_SOFT_MATCH_PROFILES": _get("USE_AI_FOR_SOFT_MATCH_PROFILES", default=True, cast=_parse_bool),
-    "USE_AI_VISION_FOR_COVER": _get("USE_AI_VISION_FOR_COVER", default=True, cast=_parse_bool),
+    "USE_AI_VISION_FOR_COVER": _get("USE_AI_VISION_FOR_COVER", default=False, cast=_parse_bool),
     "AI_CONFIDENCE_MIN": _get("AI_CONFIDENCE_MIN", default=50, cast=lambda x: int(x) if x is not None and str(x).strip().isdigit() else 50),
     "OPENAI_VISION_MODEL": _get("OPENAI_VISION_MODEL", default="", cast=str),
     "USE_AI_VISION_BEFORE_COVER_INJECT": _get("USE_AI_VISION_BEFORE_COVER_INJECT", default=True, cast=_parse_bool),
@@ -4706,12 +4706,8 @@ def _assistant_runtime_status(*, user_id: int | None = None) -> dict[str, Any]:
         requested_provider=requested_provider,
         user_id=uid,
     )
-    model_name = str(
-        getattr(sys.modules[__name__], "RESOLVED_MODEL", None)
-        or getattr(sys.modules[__name__], "OPENAI_MODEL", "")
-        or ""
-    ).strip()
     provider_norm = str(provider_effective or requested_provider).strip().lower()
+    model_name = _ai_model_display_name(provider_norm)
     if provider_norm == "openai-codex" and not model_name:
         model_name = "codex"
     return {
@@ -14922,6 +14918,7 @@ def _files_pg_init_schema() -> bool:
                         discogs_have_count INTEGER NOT NULL DEFAULT 0,
                         discogs_want_count INTEGER NOT NULL DEFAULT 0,
                         bandcamp_supporter_count INTEGER NOT NULL DEFAULT 0,
+                        bandcamp_supporter_comments_json TEXT NOT NULL DEFAULT '[]',
                         lastfm_scrobbles BIGINT NOT NULL DEFAULT 0,
                         lastfm_listeners BIGINT NOT NULL DEFAULT 0,
                         heat_score DOUBLE PRECISION,
@@ -14938,6 +14935,7 @@ def _files_pg_init_schema() -> bool:
                     ("discogs_have_count", "INTEGER NOT NULL DEFAULT 0"),
                     ("discogs_want_count", "INTEGER NOT NULL DEFAULT 0"),
                     ("bandcamp_supporter_count", "INTEGER NOT NULL DEFAULT 0"),
+                    ("bandcamp_supporter_comments_json", "TEXT NOT NULL DEFAULT '[]'"),
                     ("lastfm_scrobbles", "BIGINT NOT NULL DEFAULT 0"),
                     ("lastfm_listeners", "BIGINT NOT NULL DEFAULT 0"),
                     ("heat_score", "DOUBLE PRECISION"),
@@ -17362,6 +17360,15 @@ def _reco_upsert_track_embeddings_for_album_ids(conn, album_ids: list[int]) -> i
 def _files_index_set_state(**updates) -> None:
     with lock:
         st = dict(state.get("files_index") or {})
+        now = time.time()
+        current_phase = str(st.get("phase") or "").strip()
+        next_phase = str(updates.get("phase") or current_phase).strip()
+        if next_phase and next_phase != current_phase:
+            updates.setdefault("phase_started_at", now)
+            updates.setdefault("phase_eta_seconds", None)
+            updates.setdefault("phase_rate_per_sec", None)
+            updates.setdefault("phase_progress", None)
+        updates.setdefault("updated_at", now)
         st.update(updates)
         state["files_index"] = st
 
@@ -17369,6 +17376,41 @@ def _files_index_set_state(**updates) -> None:
 def _files_index_get_state() -> dict:
     with lock:
         return dict(state.get("files_index") or {})
+
+
+def _files_index_progress_metrics(
+    processed: Any,
+    total: Any,
+    *,
+    started_at: Any = None,
+) -> tuple[Optional[float], Optional[int], Optional[float]]:
+    try:
+        processed_n = max(0, int(processed or 0))
+    except Exception:
+        processed_n = 0
+    try:
+        total_n = max(0, int(total or 0))
+    except Exception:
+        total_n = 0
+    if total_n <= 0:
+        return None, None, None
+    ratio = min(1.0, float(processed_n) / float(total_n))
+    progress = round(ratio * 100.0, 2)
+    try:
+        started_val = float(started_at or 0.0)
+    except Exception:
+        started_val = 0.0
+    if started_val <= 0.0 or processed_n <= 0 or processed_n >= total_n:
+        return progress, None, None
+    elapsed = max(0.0, time.time() - started_val)
+    if elapsed <= 0.0:
+        return progress, None, None
+    rate = float(processed_n) / elapsed
+    if rate <= 0.0:
+        return progress, None, None
+    remaining = max(0, total_n - processed_n)
+    eta_seconds = int(round(float(remaining) / rate)) if remaining > 0 else 0
+    return progress, eta_seconds, round(rate, 2)
 
 
 _MEDIA_CACHE_SIZES = (96, 192, 320, 512, 640)
@@ -18427,12 +18469,15 @@ def _files_is_files_root_dir(p: Path, *, root_dirs: Optional[set[str]] = None) -
     if not p:
         return False
     roots = root_dirs if isinstance(root_dirs, set) else _files_root_dir_strings()
+    p_txt = str(p)
+    if p_txt in roots:
+        return True
     try:
         if str(p.resolve()) in roots:
             return True
     except Exception:
         pass
-    return str(p) in roots
+    return False
 
 
 def _files_guess_artist_folder(
@@ -19127,9 +19172,13 @@ def _rebuild_files_library_index(
             started_at=started_at,
             finished_at=None,
             phase="discovering",
+            phase_message="Scanning library folders",
             current_folder=None,
             folders_processed=0,
             total_folders=0,
+            collapsed_groups=0,
+            entries_scanned=0,
+            discovered_audio_files=0,
             artists=0,
             albums=0,
             tracks=0,
@@ -19174,15 +19223,164 @@ def _rebuild_files_library_index(
                 total_folders=max(published_count, 0),
                 folders_processed=max(published_count, 0),
                 phase="parsing",
+                phase_message="Reading published scan rows",
                 current_folder="published_scan_rows",
+                phase_progress=100.0,
+                phase_eta_seconds=0,
+                phase_rate_per_sec=None,
             )
         else:
             roots_for_index = display_roots or active_source_roots
-            audio_files = _iter_audio_files_under_roots(roots_for_index)
-            by_folder: dict[Path, list[Path]] = defaultdict(list)
-            for p in audio_files:
-                by_folder[p.parent].append(p)
-            by_folder = _collapse_nested_album_folder_groups(by_folder, root_dirs=_files_root_dir_strings())
+            last_group_log = {"ts": 0.0, "audio": 0, "folders": 0}
+
+            def _on_group_progress(payload: dict[str, Any]) -> None:
+                try:
+                    _files_index_set_state(
+                        phase="discovering",
+                        phase_message=(
+                            f"Discovered {int(payload.get('folders_found') or 0):,} folder groups "
+                            f"and {int(payload.get('files_found') or 0):,} audio files"
+                        ),
+                        current_folder=str(payload.get("root") or ""),
+                        folders_processed=int(payload.get("folders_found") or 0),
+                        total_folders=int(payload.get("folders_found") or 0),
+                        entries_scanned=int(payload.get("entries_scanned") or 0),
+                        discovered_audio_files=int(payload.get("files_found") or 0),
+                        tracks=int(payload.get("files_found") or 0),
+                        phase_progress=None,
+                        phase_eta_seconds=None,
+                        phase_rate_per_sec=None,
+                    )
+                except Exception:
+                    pass
+                now = time.time()
+                audio_found = int(payload.get("files_found") or 0)
+                folders_found = int(payload.get("folders_found") or 0)
+                should_log = (
+                    last_group_log["ts"] == 0.0
+                    or (now - float(last_group_log["ts"] or 0.0)) >= 15.0
+                    or (audio_found - int(last_group_log["audio"] or 0)) >= 50000
+                    or (folders_found - int(last_group_log["folders"] or 0)) >= 5000
+                )
+                if should_log:
+                    logging.info(
+                        "Files library index discovering source=%s root=%s roots=%d/%d visited=%d audio=%d folders=%d",
+                        payload_source,
+                        str(payload.get("root") or ""),
+                        int(payload.get("roots_done") or 0),
+                        int(payload.get("roots_total") or len(roots_for_index)),
+                        int(payload.get("entries_scanned") or 0),
+                        audio_found,
+                        folders_found,
+                    )
+                    last_group_log["ts"] = now
+                    last_group_log["audio"] = audio_found
+                    last_group_log["folders"] = folders_found
+
+            roots_for_index_set = set()
+            for root in (roots_for_index or []):
+                if not str(root or "").strip():
+                    continue
+                try:
+                    roots_for_index_set.add(str(path_for_fs_access(Path(root)).resolve()))
+                except Exception:
+                    roots_for_index_set.add(str(root))
+            by_folder = _group_audio_files_by_folder_under_roots(
+                roots_for_index,
+                progress_cb=_on_group_progress,
+                progress_every=500,
+                heartbeat_seconds=10.0,
+            )
+            discovered_audio_files = sum(len(paths or []) for paths in by_folder.values())
+            _files_index_set_state(
+                phase="collapsing",
+                phase_message=f"Checking 0 / {len(by_folder):,} discovered folder groups",
+                current_folder="collapsing_release_segments",
+                total_folders=len(by_folder),
+                folders_processed=0,
+                collapsed_groups=0,
+                discovered_audio_files=discovered_audio_files,
+                tracks=discovered_audio_files,
+                phase_progress=0.0,
+                phase_eta_seconds=None,
+                phase_rate_per_sec=None,
+            )
+            logging.info(
+                "Files library index collapsing %d discovered folder group(s) for source=%s",
+                len(by_folder),
+                payload_source,
+            )
+            collapse_started_at = time.time()
+            collapse_last_state = {"ts": 0.0, "processed": 0, "collapsed": 0}
+
+            def _on_collapse_progress(payload: dict[str, Any]) -> None:
+                now = time.time()
+                parent_raw = str(payload.get("parent") or "").strip()
+                if not parent_raw and (now - float(collapse_last_state["ts"] or 0.0)) < 1.0:
+                    return
+                parents_processed = int(payload.get("parents_processed") or 0)
+                parents_total = int(payload.get("parents_total") or len(by_folder))
+                collapsed_groups = int(payload.get("collapsed_groups") or 0)
+                phase_progress, phase_eta_seconds, phase_rate_per_sec = _files_index_progress_metrics(
+                    parents_processed,
+                    parents_total,
+                    started_at=collapse_started_at,
+                )
+                collapse_elapsed = max(0.0, now - collapse_started_at)
+                if parents_processed < 1000 or collapse_elapsed < 60.0:
+                    phase_eta_seconds = None
+                    phase_rate_per_sec = None
+                try:
+                    _files_index_set_state(
+                        phase="collapsing",
+                        phase_message=(
+                            f"Checked {parents_processed:,} / {parents_total:,} folder groups "
+                            f"· merged {collapsed_groups:,}"
+                        ),
+                        current_folder=parent_raw or "collapsing_release_segments",
+                        folders_processed=parents_processed,
+                        total_folders=parents_total,
+                        collapsed_groups=collapsed_groups,
+                        tracks=discovered_audio_files,
+                        phase_progress=phase_progress,
+                        phase_eta_seconds=phase_eta_seconds,
+                        phase_rate_per_sec=phase_rate_per_sec,
+                    )
+                except Exception:
+                    pass
+                should_log = (
+                    collapse_last_state["ts"] == 0.0
+                    or (now - float(collapse_last_state["ts"] or 0.0)) >= 15.0
+                    or parents_processed == parents_total
+                    or (parents_processed - int(collapse_last_state["processed"] or 0)) >= 5000
+                    or (collapsed_groups - int(collapse_last_state["collapsed"] or 0)) >= 200
+                )
+                if should_log:
+                    eta_label = (
+                        f"{int(phase_eta_seconds // 60)}m {int(phase_eta_seconds % 60)}s"
+                        if isinstance(phase_eta_seconds, int) and phase_eta_seconds >= 0
+                        else "warming_up"
+                    )
+                    logging.info(
+                        "Files library index collapsing source=%s checked=%d/%d (%.2f%%) merged=%d rate=%.2f groups/s eta=%s current=%s",
+                        payload_source,
+                        parents_processed,
+                        parents_total,
+                        float(phase_progress or 0.0),
+                        collapsed_groups,
+                        float(phase_rate_per_sec or 0.0),
+                        eta_label,
+                        parent_raw or "collapsing_release_segments",
+                    )
+                collapse_last_state["ts"] = now
+                collapse_last_state["processed"] = parents_processed
+                collapse_last_state["collapsed"] = collapsed_groups
+
+            by_folder = _collapse_nested_album_folder_groups(
+                by_folder,
+                root_dirs=roots_for_index_set or _files_root_dir_strings(),
+                progress_cb=_on_collapse_progress,
+            )
             folders = sorted(by_folder.items(), key=lambda x: str(x[0]).lower())
             logging.info(
                 "Files library index discovered %d folder(s) under %d root(s) for source=%s",
@@ -19190,11 +19388,32 @@ def _rebuild_files_library_index(
                 len(roots_for_index),
                 payload_source,
             )
-            _files_index_set_state(total_folders=len(folders), phase="parsing")
-            root_dirs = _files_root_dir_strings()
+            parsing_started_at = time.time()
+            _files_index_set_state(
+                total_folders=len(folders),
+                folders_processed=0,
+                phase="parsing",
+                phase_message=f"Reading 0 / {len(folders):,} normalized album folders",
+                phase_progress=0.0,
+                phase_eta_seconds=None,
+                phase_rate_per_sec=None,
+            )
+            root_dirs = roots_for_index_set or _files_root_dir_strings()
 
             for idx, (folder, files) in enumerate(folders, start=1):
-                _files_index_set_state(folders_processed=idx, current_folder=str(folder))
+                phase_progress, phase_eta_seconds, phase_rate_per_sec = _files_index_progress_metrics(
+                    idx,
+                    len(folders),
+                    started_at=parsing_started_at,
+                )
+                _files_index_set_state(
+                    folders_processed=idx,
+                    current_folder=str(folder),
+                    phase_message=f"Reading {idx:,} / {len(folders):,} normalized album folders",
+                    phase_progress=phase_progress,
+                    phase_eta_seconds=phase_eta_seconds,
+                    phase_rate_per_sec=phase_rate_per_sec,
+                )
                 if idx == 1 or idx == len(folders) or (idx % 250) == 0:
                     logging.info(
                         "Files library index parsing %d/%d folder(s) for source=%s: %s",
@@ -19264,6 +19483,14 @@ def _rebuild_files_library_index(
                     tag_dicts,
                     fallback=folder.name.replace("_", " ").strip() or "Unknown Album",
                 )
+                if _folder_has_release_segment_children(folder, files):
+                    inferred_artist_name, inferred_album_title = _infer_artist_album_from_folder(folder, list(files or []))
+                    if inferred_artist_name and (
+                        (artist_name or "").strip().lower() in {"unknown", "unknown artist", "various", "various artists"}
+                    ):
+                        artist_name = inferred_artist_name
+                    if inferred_album_title:
+                        album_title = _sanitize_album_title_display(inferred_album_title)
                 label = _pick_album_label_from_tag_dicts(tag_dicts)
                 artist_norm = _norm_artist_key(artist_name) or "unknown artist"
                 title_norm = norm_album_for_dedup(album_title, normalize_parenthetical=True)
@@ -19307,10 +19534,10 @@ def _rebuild_files_library_index(
                         missing_indices = []
                     else:
                         is_broken, _actual_count_from_indices, gaps = _detect_gaps_in_indices(indices)
-                        if is_broken and _classical_gap_anomaly_should_be_ignored(
+                        if is_broken and _incomplete_gap_should_be_tolerated(
                             first_tags,
                             actual_count=actual_track_count,
-                            max_idx=max_idx,
+                            expected_count=max_idx,
                             gaps=gaps,
                         ):
                             is_broken = False
@@ -19382,10 +19609,24 @@ def _rebuild_files_library_index(
             if primary_link and str(primary_link.get("artist_norm") or "").strip():
                 album["artist_norm"] = str(primary_link.get("artist_norm") or "").strip()
 
-        _files_index_set_state(phase="media_prepare")
+        _files_index_set_state(
+            phase="media_prepare",
+            phase_message="Preparing artwork and cached media",
+            phase_progress=76.0,
+            phase_eta_seconds=None,
+            phase_rate_per_sec=None,
+        )
         covers_promoted, artists_promoted = _promote_files_media_paths_to_cache(artists_map, albums_payload)
 
-        _files_index_set_state(phase="writing", artists=len(artists_map), albums=len(albums_payload))
+        _files_index_set_state(
+            phase="writing",
+            phase_message="Updating the library database",
+            phase_progress=86.0,
+            phase_eta_seconds=None,
+            phase_rate_per_sec=None,
+            artists=len(artists_map),
+            albums=len(albums_payload),
+        )
 
         conn = _files_pg_connect()
         if conn is None:
@@ -19637,21 +19878,39 @@ def _rebuild_files_library_index(
                     """)
                     _files_index_write_meta(cur, "last_reason", reason)
                     _files_index_write_meta(cur, "last_build_ts", str(int(time.time())))
-                    _files_index_write_meta(cur, "artists", str(len(artists_map)))
-                    _files_index_write_meta(cur, "albums", str(len(albums_payload)))
-                    _files_index_write_meta(cur, "tracks", str(total_tracks))
-                    _files_index_write_meta(cur, "source", payload_source)
-                _files_index_set_state(phase="embeddings")
+                _files_index_write_meta(cur, "artists", str(len(artists_map)))
+                _files_index_write_meta(cur, "albums", str(len(albums_payload)))
+                _files_index_write_meta(cur, "tracks", str(total_tracks))
+                _files_index_write_meta(cur, "source", payload_source)
+                _files_index_set_state(
+                    phase="embeddings",
+                    phase_message="Refreshing recommendations index",
+                    phase_progress=92.0,
+                    phase_eta_seconds=None,
+                    phase_rate_per_sec=None,
+                )
                 reco_embeddings_count = _reco_build_track_embeddings(conn)
                 with conn.cursor() as cur:
                     _files_index_write_meta(cur, "track_embeddings", str(reco_embeddings_count))
         finally:
             conn.close()
 
-        _files_index_set_state(phase="artist_enrichment")
+        _files_index_set_state(
+            phase="artist_enrichment",
+            phase_message="Enriching artist pages",
+            phase_progress=96.0,
+            phase_eta_seconds=None,
+            phase_rate_per_sec=None,
+        )
         _files_enrich_artists_blocking(artists_map)
         artists_map = _files_refresh_artist_media_map_from_db(artists_map)
-        _files_index_set_state(phase="media_cache")
+        _files_index_set_state(
+            phase="media_cache",
+            phase_message="Finalizing media cache",
+            phase_progress=99.0,
+            phase_eta_seconds=None,
+            phase_rate_per_sec=None,
+        )
         covers_cached, artists_cached = _precache_files_media_assets(artists_map, albums_payload)
         _files_cache_invalidate_all()
         elapsed = round(time.time() - started_at, 2)
@@ -19659,6 +19918,10 @@ def _rebuild_files_library_index(
             running=False,
             finished_at=time.time(),
             phase="done",
+            phase_message="Library rebuild complete",
+            phase_progress=100.0,
+            phase_eta_seconds=0,
+            phase_rate_per_sec=None,
             current_folder=None,
             artists=len(artists_map),
             albums=len(albums_payload),
@@ -19703,6 +19966,10 @@ def _rebuild_files_library_index(
             running=False,
             finished_at=time.time(),
             phase="error",
+            phase_message=str(e),
+            phase_progress=None,
+            phase_eta_seconds=None,
+            phase_rate_per_sec=None,
             current_folder=None,
             error=str(e),
         )
@@ -20404,6 +20671,7 @@ def _files_get_album_profiles_cached(artist_norm: str, title_norms: list[str]) -
                     discogs_have_count,
                     discogs_want_count,
                     bandcamp_supporter_count,
+                    bandcamp_supporter_comments_json,
                     lastfm_scrobbles,
                     lastfm_listeners,
                     heat_score,
@@ -20420,6 +20688,10 @@ def _files_get_album_profiles_cached(artist_norm: str, title_norms: list[str]) -
                 tags = json.loads(row[3] or "[]") if row[3] else []
             except Exception:
                 tags = []
+            try:
+                bandcamp_supporter_comments = json.loads(row[12] or "[]") if row[12] else []
+            except Exception:
+                bandcamp_supporter_comments = []
             out[str(row[0] or "")] = {
                 "description": row[1] or "",
                 "short_description": row[2] or "",
@@ -20433,10 +20705,11 @@ def _files_get_album_profiles_cached(artist_norm: str, title_norms: list[str]) -
                 "discogs_have_count": int(row[9] or 0),
                 "discogs_want_count": int(row[10] or 0),
                 "bandcamp_supporter_count": int(row[11] or 0),
-                "lastfm_scrobbles": int(row[12] or 0),
-                "lastfm_listeners": int(row[13] or 0),
-                "heat_score": float(row[14]) if row[14] is not None else None,
-                "heat_label": str(row[15] or "").strip() or None,
+                "bandcamp_supporter_comments": _sanitize_bandcamp_supporter_comments(bandcamp_supporter_comments),
+                "lastfm_scrobbles": int(row[13] or 0),
+                "lastfm_listeners": int(row[14] or 0),
+                "heat_score": float(row[15]) if row[15] is not None else None,
+                "heat_label": str(row[16] or "").strip() or None,
             }
             for alt_key in _profile_title_norm_variants(str(row[0] or "")):
                 if alt_key not in out:
@@ -20480,6 +20753,8 @@ def _files_upsert_artist_profile(conn, artist_norm: str, artist_name: str, profi
 
 def _files_upsert_album_profile(conn, artist_norm: str, title_norm: str, album_title: str, profile: dict) -> None:
     tags_json = json.dumps((profile or {}).get("tags") or [])
+    bandcamp_supporter_comments = _sanitize_bandcamp_supporter_comments((profile or {}).get("bandcamp_supporter_comments") or [])
+    bandcamp_supporter_comments_json = json.dumps(bandcamp_supporter_comments, ensure_ascii=True)
     public_rating_raw = (profile or {}).get("public_rating")
     try:
         public_rating = float(public_rating_raw) if public_rating_raw is not None else None
@@ -20536,6 +20811,7 @@ def _files_upsert_album_profile(conn, artist_norm: str, title_norm: str, album_t
                 discogs_have_count,
                 discogs_want_count,
                 bandcamp_supporter_count,
+                bandcamp_supporter_comments_json,
                 lastfm_scrobbles,
                 lastfm_listeners,
                 heat_score,
@@ -20555,6 +20831,7 @@ def _files_upsert_album_profile(conn, artist_norm: str, title_norm: str, album_t
                 discogs_have_count = EXCLUDED.discogs_have_count,
                 discogs_want_count = EXCLUDED.discogs_want_count,
                 bandcamp_supporter_count = EXCLUDED.bandcamp_supporter_count,
+                bandcamp_supporter_comments_json = EXCLUDED.bandcamp_supporter_comments_json,
                 lastfm_scrobbles = EXCLUDED.lastfm_scrobbles,
                 lastfm_listeners = EXCLUDED.lastfm_listeners,
                 heat_score = EXCLUDED.heat_score,
@@ -20575,6 +20852,7 @@ def _files_upsert_album_profile(conn, artist_norm: str, title_norm: str, album_t
                 discogs_have_count,
                 discogs_want_count,
                 bandcamp_supporter_count,
+                bandcamp_supporter_comments_json,
                 lastfm_scrobbles,
                 lastfm_listeners,
                 heat_score,
@@ -20603,12 +20881,14 @@ def _album_profile_has_payload(profile: dict | None) -> bool:
         "lastfm_scrobbles",
         "lastfm_listeners",
         "heat_score",
-    ):
+        ):
         try:
             if float(profile.get(key) or 0) > 0:
                 return True
         except Exception:
             continue
+    if _sanitize_bandcamp_supporter_comments((profile or {}).get("bandcamp_supporter_comments") or []):
+        return True
     return False
 
 
@@ -21704,7 +21984,7 @@ def _files_try_artist_image_refresh(
         )
 
     lf_mbid = str(lastfm_info.get("mbid") or mb_identity.get("mbid") or "").strip()
-    if lf_mbid and not classical_like_entity:
+    if lf_mbid:
         try:
             fanart_url = (_fetch_artist_image_fanart(lf_mbid) or "").strip()
         except Exception:
@@ -21712,15 +21992,14 @@ def _files_try_artist_image_refresh(
         if fanart_url:
             _append_candidate("fanart", fanart_url, title=str(mb_identity.get("name") or artist_name))
 
-    if not classical_like_entity:
-        lf_img = str(lastfm_info.get("image_url") or "").strip()
-        if lf_img and not _is_probably_placeholder_artist_image_url(lf_img):
-            _append_candidate(
-                "lastfm",
-                lf_img,
-                title=str(mb_identity.get("name") or artist_name),
-                summary=str(lastfm_info.get("bio") or lastfm_info.get("short_bio") or "").strip(),
-            )
+    lf_img = str(lastfm_info.get("image_url") or "").strip()
+    if lf_img and not _is_probably_placeholder_artist_image_url(lf_img):
+        _append_candidate(
+            "lastfm",
+            lf_img,
+            title=str(mb_identity.get("name") or artist_name),
+            summary=str(lastfm_info.get("bio") or lastfm_info.get("short_bio") or "").strip(),
+        )
 
     if classical_like_entity and not ensemble_like_entity:
         mb_title = str(mb_identity.get("name") or artist_name).strip()
@@ -21790,8 +22069,9 @@ def _files_try_artist_image_refresh(
         if commons_url:
             _append_candidate("commons", commons_url, title=str(mb_identity.get("name") or artist_name))
 
-    if not fast_mode and not classical_like_entity:
+    if not fast_mode:
         for fetch_provider, fetcher in (
+            ("bandcamp", _fetch_artist_image_bandcamp),
             ("audiodb", _fetch_artist_image_audiodb),
             ("discogs", _fetch_artist_image_discogs),
         ):
@@ -21805,12 +22085,12 @@ def _files_try_artist_image_refresh(
                     break
 
     preferred_order = (
-        ["wikipedia", "commons", "fanart", "lastfm", "audiodb", "discogs"]
+        ["wikipedia", "commons", "fanart", "lastfm", "bandcamp", "audiodb", "discogs"]
         if ensemble_like_entity
         else (
-            ["musicbrainz_url", "wikipedia", "commons", "fanart", "lastfm", "audiodb", "discogs"]
+            ["musicbrainz_url", "wikipedia", "commons", "fanart", "lastfm", "bandcamp", "audiodb", "discogs"]
             if classical_like_entity
-            else ["fanart", "lastfm", "wikipedia", "commons", "audiodb", "discogs"]
+            else ["fanart", "lastfm", "bandcamp", "wikipedia", "commons", "audiodb", "discogs"]
         )
     )
     ordered_candidates: list[dict[str, str]] = []
@@ -22493,6 +22773,11 @@ def _run_files_profile_enrichment_job(
                                 norm_key = str(raw_norm or "").strip()
                                 if not norm_key:
                                     continue
+                                soft_profiles_allowed = (
+                                    bool(getattr(sys.modules[__name__], "USE_AI_FOR_SOFT_MATCH_PROFILES", False))
+                                    if allow_soft_profiles is None
+                                    else bool(allow_soft_profiles)
+                                )
                                 strict_ok = bool(strict_verified)
                                 has_identity_hint = bool(
                                     strict_ok
@@ -22502,22 +22787,8 @@ def _run_files_profile_enrichment_job(
                                     or str(lastfm_album_mbid or "").strip()
                                     or str(bandcamp_album_url or "").strip()
                                 )
-                                can_fetch = bool(
-                                    strict_ok
-                                    or (
-                                        bool(getattr(sys.modules[__name__], "USE_AI_FOR_SOFT_MATCH_PROFILES", False))
-                                        and has_identity_hint
-                                    )
-                                )
+                                can_fetch = bool(strict_ok or (soft_profiles_allowed and has_identity_hint))
                                 if not can_fetch:
-                                    if has_identity_hint:
-                                        logging.info(
-                                            "[Profile Enrich] skip soft album profile artist=%s album=%s provider=%s strict=%s",
-                                            str(artist_name or "").strip() or "Unknown Artist",
-                                            str(album_title_db or "").strip() or "Unknown Album",
-                                            str(metadata_source or "").strip() or "unknown",
-                                            bool(strict_ok),
-                                        )
                                     continue
                                 norm_match_flags[norm_key] = True
                                 if strict_ok:
@@ -22835,25 +23106,27 @@ def _run_files_similar_images_warm_job(*, job_key: str, artist_norm: str, names:
                         f_url = (_fetch_artist_image_fanart(lf_mbid) or "").strip()
                     except Exception:
                         f_url = ""
-                        if f_url and not classical_like_entity:
-                            try:
-                                with conn.transaction():
-                                    outp = _files_cache_external_artist_image(
-                                        conn,
-                                        artist_name=sname,
-                                        provider="fanart",
-                                        image_url=f_url,
-                                        max_px=640,
-                                        entity_kind=entity_kind,
-                                        role_hints=role_hints,
-                                    )
-                                if outp:
-                                    continue
-                            except Exception:
-                                pass
+                    if f_url:
+                        try:
+                            with conn.transaction():
+                                outp = _files_cache_external_artist_image(
+                                    conn,
+                                    artist_name=sname,
+                                    provider="fanart",
+                                    image_url=f_url,
+                                    max_px=640,
+                                    entity_kind=entity_kind,
+                                    role_hints=role_hints,
+                                    page_title=sname,
+                                    page_summary=str((lf.get("bio") or lf.get("short_bio") or "") if isinstance(lf, dict) else ""),
+                                )
+                            if outp:
+                                continue
+                        except Exception:
+                            pass
 
                 # 1b) Last.fm image (fallback).
-                if img_url and not _is_probably_placeholder_artist_image_url(img_url) and not classical_like_entity:
+                if img_url and not _is_probably_placeholder_artist_image_url(img_url):
                     try:
                         with conn.transaction():
                             outp = _files_cache_external_artist_image(
@@ -22864,6 +23137,32 @@ def _run_files_similar_images_warm_job(*, job_key: str, artist_norm: str, names:
                                 max_px=640,
                                 entity_kind=entity_kind,
                                 role_hints=role_hints,
+                                page_title=sname,
+                                page_summary=str((lf.get("bio") or lf.get("short_bio") or "") if isinstance(lf, dict) else ""),
+                            )
+                        if outp:
+                            continue
+                    except Exception:
+                        pass
+
+                # 1c) Bandcamp artist page/search image.
+                try:
+                    bcurl = (_fetch_artist_image_bandcamp(sname) or "").strip()
+                except Exception:
+                    bcurl = ""
+                if bcurl:
+                    try:
+                        with conn.transaction():
+                            outp = _files_cache_external_artist_image(
+                                conn,
+                                artist_name=sname,
+                                provider="bandcamp",
+                                image_url=bcurl,
+                                max_px=640,
+                                entity_kind=entity_kind,
+                                role_hints=role_hints,
+                                page_title=sname,
+                                page_summary="Bandcamp artist page",
                             )
                         if outp:
                             continue
@@ -22910,7 +23209,7 @@ def _run_files_similar_images_warm_job(*, job_key: str, artist_norm: str, names:
                     aurl = (_fetch_artist_image_audiodb(sname) or "").strip()
                 except Exception:
                     aurl = ""
-                if aurl and not classical_like_entity:
+                if aurl:
                     try:
                         with conn.transaction():
                             outp = _files_cache_external_artist_image(
@@ -22921,6 +23220,7 @@ def _run_files_similar_images_warm_job(*, job_key: str, artist_norm: str, names:
                                 max_px=640,
                                 entity_kind=entity_kind,
                                 role_hints=role_hints,
+                                page_title=sname,
                             )
                         if outp:
                             continue
@@ -22932,7 +23232,7 @@ def _run_files_similar_images_warm_job(*, job_key: str, artist_norm: str, names:
                     durl = (_fetch_artist_image_discogs(sname) or "").strip()
                 except Exception:
                     durl = ""
-                if durl and not classical_like_entity:
+                if durl:
                     try:
                         with conn.transaction():
                             outp = _files_cache_external_artist_image(
@@ -22943,6 +23243,7 @@ def _run_files_similar_images_warm_job(*, job_key: str, artist_norm: str, names:
                                 max_px=640,
                                 entity_kind=entity_kind,
                                 role_hints=role_hints,
+                                page_title=sname,
                             )
                         if outp:
                             continue
@@ -22974,6 +23275,7 @@ def _run_files_similar_images_warm_job(*, job_key: str, artist_norm: str, names:
                                 max_px=640,
                                 entity_kind=entity_kind,
                                 role_hints=role_hints,
+                                page_title=sname,
                             )
                         if outp:
                             continue
@@ -24401,20 +24703,45 @@ def _assistant_insert_message(conn, *, session_id: str, role: str, content: str,
         role_norm = "user"
     ctx_json = json.dumps(context or {}, ensure_ascii=True)
     meta_json = json.dumps(metadata or {}, ensure_ascii=True)
-    with conn.transaction():
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO assistant_messages(session_id, role, content, context_json, metadata_json, created_at)
-                VALUES (%s, %s, %s, %s, %s, NOW())
-                RETURNING id, EXTRACT(EPOCH FROM created_at)::BIGINT
-                """,
-                (sid, role_norm, (content or "").strip(), ctx_json, meta_json),
-            )
-            row = cur.fetchone() or [0, 0]
-            msg_id = int(row[0] or 0)
-            created_at = int(row[1] or 0)
-            cur.execute("UPDATE assistant_sessions SET updated_at = NOW() WHERE session_id = %s", (sid,))
+    def _insert_with(target_conn):
+        with target_conn.transaction():
+            with target_conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO assistant_messages(session_id, role, content, context_json, metadata_json, created_at)
+                    VALUES (%s, %s, %s, %s, %s, NOW())
+                    RETURNING id, EXTRACT(EPOCH FROM created_at)::BIGINT
+                    """,
+                    (sid, role_norm, (content or "").strip(), ctx_json, meta_json),
+                )
+                row = cur.fetchone() or [0, 0]
+                msg_id = int(row[0] or 0)
+                created_at = int(row[1] or 0)
+                cur.execute("UPDATE assistant_sessions SET updated_at = NOW() WHERE session_id = %s", (sid,))
+                return msg_id, created_at
+
+    try:
+        msg_id, created_at = _insert_with(conn)
+    except Exception as exc:
+        err_txt = str(exc or "").strip().lower()
+        retryable = (
+            "idle-session timeout" in err_txt
+            or "terminating connection due to idle-session timeout" in err_txt
+            or "connection is closed" in err_txt
+        )
+        if not retryable:
+            raise
+        logging.warning("Assistant insert retrying on fresh PG connection after idle timeout for session=%s", sid)
+        retry_conn = _files_pg_connect()
+        if retry_conn is None:
+            raise
+        try:
+            msg_id, created_at = _insert_with(retry_conn)
+        finally:
+            try:
+                retry_conn.close()
+            except Exception:
+                pass
     # Include context/metadata in the returned payload so the UI can render citations/links immediately
     # without requiring a separate history fetch.
     return {
@@ -25691,6 +26018,57 @@ def _assistant_tool_artist_similar(conn, *, artist_id: int, base_url: str, limit
 
     patched = _files_attach_similar_artist_refs(conn, similar[:limit], base)
     return artist_name, (source or "").strip(), (patched or [])[:limit]
+
+
+def _assistant_try_handle_smalltalk_query(user_message: str) -> dict:
+    text = re.sub(r"\s+", " ", str(user_message or "").strip())
+    if not text:
+        return {"handled": False}
+    lowered = text.lower()
+    normalized = _normalize_identity_text_strict(text)
+    if len(normalized) > 80:
+        return {"handled": False}
+    lang = _assistant_lang_for_message(text)
+    greeting_patterns = (
+        r"^(hi|hello|hey|yo|sup|good morning|good afternoon|good evening)\b",
+        r"^(salut|bonjour|bonsoir|coucou)\b",
+    )
+    thanks_patterns = (
+        r"^(thanks|thank you|thx)\b",
+        r"^(merci|merci beaucoup)\b",
+    )
+    if any(re.search(pattern, lowered, flags=re.IGNORECASE) for pattern in greeting_patterns):
+        if lang == "fr":
+            assistant_text = (
+                "Salut. PMDA Intelligence est prête. Tu peux me demander n'importe quoi sur la bibliothèque: "
+                "albums, artistes, labels, doublons, incomplets, recommandations ou playlists."
+            )
+        else:
+            assistant_text = (
+                "Hi. PMDA Intelligence is ready. Ask about your library: albums, artists, labels, duplicates, "
+                "incompletes, recommendations, or playlists."
+            )
+        return {
+            "handled": True,
+            "assistant_text": assistant_text,
+            "citations": [],
+            "links": [],
+            "tool": "smalltalk_v1",
+        }
+    if any(re.search(pattern, lowered, flags=re.IGNORECASE) for pattern in thanks_patterns):
+        assistant_text = (
+            "Avec plaisir. Tu peux continuer avec une question sur la bibliothèque."
+            if lang == "fr"
+            else "You’re welcome. You can continue with any question about the library."
+        )
+        return {
+            "handled": True,
+            "assistant_text": assistant_text,
+            "citations": [],
+            "links": [],
+            "tool": "smalltalk_v1",
+        }
+    return {"handled": False}
 
 
 def _assistant_try_handle_tool_query(conn, *, user_message: str, context_artist_id: int, base_url: str) -> dict:
@@ -27466,10 +27844,19 @@ state = {
         "running": False,
         "started_at": None,
         "finished_at": None,
+        "updated_at": None,
         "phase": None,
+        "phase_started_at": None,
+        "phase_message": "",
+        "phase_progress": None,
+        "phase_eta_seconds": None,
+        "phase_rate_per_sec": None,
         "current_folder": None,
         "folders_processed": 0,
         "total_folders": 0,
+        "collapsed_groups": 0,
+        "entries_scanned": 0,
+        "discovered_audio_files": 0,
         "artists": 0,
         "albums": 0,
         "tracks": 0,
@@ -29433,6 +29820,100 @@ def _iter_audio_files_under_roots(
     return merged
 
 
+def _group_audio_files_by_folder_under_roots(
+    roots: list[str],
+    *,
+    progress_cb=None,
+    progress_every: int = 250,
+    heartbeat_seconds: float = 10.0,
+) -> dict[Path, list[Path]]:
+    """
+    Walk roots once and group discovered audio files directly by album folder.
+
+    This avoids the rebuild path's previous "collect every audio file first, then regroup"
+    pattern, which is unnecessarily expensive on large Unraid/FUSE shares such as a
+    pre-existing serving library.
+    """
+    roots_list = [str(r) for r in (roots or []) if r]
+    roots_total = len(roots_list)
+    if roots_total <= 0:
+        return {}
+
+    progress_every = max(1, int(progress_every)) if progress_every else 0
+    heartbeat_seconds = float(heartbeat_seconds or 0.0)
+    progress_enabled = callable(progress_cb)
+
+    by_folder: dict[Path, list[Path]] = defaultdict(list)
+    seen_paths: set[str] = set()
+    entries_scanned = 0
+    files_found = 0
+    folders_with_audio = 0
+    roots_done = 0
+    last_heartbeat = time.monotonic()
+
+    def _emit_progress(*, root: str, force: bool = False) -> None:
+        nonlocal last_heartbeat
+        if not progress_enabled:
+            return
+        if not force and heartbeat_seconds > 0:
+            now = time.monotonic()
+            if (now - last_heartbeat) < heartbeat_seconds:
+                return
+            last_heartbeat = now
+        try:
+            progress_cb(
+                {
+                    "root": root,
+                    "roots_done": roots_done,
+                    "roots_total": roots_total,
+                    "entries_scanned": entries_scanned,
+                    "files_found": files_found,
+                    "folders_found": folders_with_audio,
+                }
+            )
+        except Exception:
+            pass
+
+    for root_path in roots_list:
+        base = Path(root_path)
+        if not base.exists():
+            roots_done += 1
+            _emit_progress(root=str(base), force=True)
+            continue
+        stack: list[str] = [str(base)]
+        while stack:
+            current = stack.pop()
+            try:
+                with os.scandir(current) as it:
+                    for entry in it:
+                        entries_scanned += 1
+                        try:
+                            if entry.is_dir(follow_symlinks=False):
+                                stack.append(entry.path)
+                            elif entry.is_file(follow_symlinks=False) and AUDIO_RE.search(entry.name):
+                                p = Path(entry.path)
+                                sp = str(p)
+                                if sp in seen_paths:
+                                    continue
+                                seen_paths.add(sp)
+                                parent = p.parent
+                                if parent not in by_folder:
+                                    folders_with_audio += 1
+                                by_folder[parent].append(p)
+                                files_found += 1
+                                if progress_every > 0 and (files_found % progress_every == 0):
+                                    _emit_progress(root=str(base), force=True)
+                        except (OSError, PermissionError):
+                            continue
+                        _emit_progress(root=str(base), force=False)
+            except (FileNotFoundError, NotADirectoryError, PermissionError, OSError):
+                continue
+        roots_done += 1
+        _emit_progress(root=str(base), force=True)
+
+    return by_folder
+
+
 def _iter_audio_files_under_roots_checkpointed(
     roots: list[str],
     *,
@@ -30725,12 +31206,63 @@ def editions_share_confident_signal(ed_list: List[dict]) -> bool:
 
     return False
 
+def _folder_is_release_segment_container(
+    folder_path: Path | str | None,
+    *,
+    album_title: str = "",
+) -> bool:
+    """
+    Detect child folders that are very likely release segments/work slices rather than
+    standalone albums. Those folders must not be treated as broken albums simply because
+    they contain a subset of a parent release.
+    """
+    if not folder_path:
+        return False
+    try:
+        folder = path_for_fs_access(Path(folder_path))
+    except Exception:
+        folder = Path(str(folder_path))
+    try:
+        if not folder.exists() or not folder.is_dir():
+            return False
+    except Exception:
+        return False
+    if not _files_child_folder_name_looks_release_segment(folder.name):
+        title_norm = _normalize_identity_text_strict(str(album_title or ""))
+        if not title_norm or not _files_child_folder_name_looks_release_segment(title_norm):
+            return False
+    parent = folder.parent
+    if not parent or parent == folder:
+        return False
+    if _files_is_files_root_dir(parent, root_dirs=_files_root_dir_strings()):
+        return False
+    try:
+        sibling_dirs = [child for child in parent.iterdir() if child.is_dir()]
+    except Exception:
+        sibling_dirs = []
+    segment_siblings = sum(
+        1 for child in sibling_dirs
+        if _files_child_folder_name_looks_release_segment(child.name)
+    )
+    if segment_siblings >= 2:
+        return True
+    try:
+        if album_folder_has_cover(parent):
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def detect_broken_album(
     db_conn,
     album_id: int,
     tracks: List[Track],
     mb_release_group_info: dict | None,
     tags: dict | None = None,
+    *,
+    folder_path: Path | str | None = None,
+    album_title: str = "",
 ) -> tuple[bool, int | None, int, list]:
     """
     Detect if an album is broken (missing tracks).
@@ -30741,6 +31273,10 @@ def detect_broken_album(
     2. Heuristic: gaps in track indices (configurable thresholds)
     """
     actual_count = len(tracks)
+    release_segment_folder = _folder_is_release_segment_container(
+        folder_path,
+        album_title=album_title,
+    )
     if actual_count == 0:
         return True, 0, 0, []
     
@@ -30776,31 +31312,30 @@ def detect_broken_album(
         if expected > 0:
             # Source-specific tolerance:
             # - MusicBrainz release-group track_count can vary across editions; keep a tolerance.
-            # - Provider tracklists (Discogs/Last.fm/Bandcamp) are often exact for the chosen identity candidate;
-            #   when we use them as expected size, treat any shortfall as broken.
+            # - Provider tracklists are useful hints, but they are not safe enough to classify a
+            #   release as incomplete on a tiny shortfall alone; one-track edition deltas are common.
             src = str(mb_release_group_info.get("source") or "").strip().lower()
+            missing_indices: list[int] = []
+            try:
+                indices_set = set(track_indices or [])
+                if expected <= 500:
+                    missing_indices = [i for i in range(1, expected + 1) if i not in indices_set]
+                else:
+                    missing_indices = [i for i in range(1, min(expected, 200) + 1) if i not in indices_set]
+            except Exception:
+                missing_indices = []
             if src == "provider_tracklist":
                 broken_by_expected = actual_count < expected
             else:
                 broken_by_expected = actual_count < int(expected * 0.90)
             if broken_by_expected:
-                # Best-effort missing indices: combine gaps + missing tail indices.
-                missing_indices: list[int] = []
-                try:
-                    indices_set = set(track_indices or [])
-                    # Cap to avoid giant arrays on very large releases.
-                    if expected <= 500:
-                        missing_indices = [i for i in range(1, expected + 1) if i not in indices_set]
-                    else:
-                        # Only report a small preview for huge track counts.
-                        missing_indices = [i for i in range(1, min(expected, 200) + 1) if i not in indices_set]
-                except Exception:
-                    missing_indices = []
-                if _classical_gap_anomaly_should_be_ignored(
+                if release_segment_folder:
+                    return False, None, actual_count, []
+                if _incomplete_gap_should_be_tolerated(
                     tags,
                     actual_count=actual_count,
-                    max_idx=expected,
-                    gaps=_missing_indices_to_gap_pairs(missing_indices),
+                    expected_count=expected,
+                    missing_indices=missing_indices,
                 ):
                     return False, None, actual_count, []
                 return True, expected, actual_count, missing_indices
@@ -30809,6 +31344,8 @@ def detect_broken_album(
     # treat the album as incomplete. This is the most reliable deterministic signal in both Plex
     # and Files mode, and avoids moving "gaps" albums as duplicates.
     if gaps:
+        if release_segment_folder:
+            return False, None, actual_count, []
         missing_indices: list[int] = []
         for start_i, end_i in gaps:
             try:
@@ -30818,10 +31355,11 @@ def detect_broken_album(
             if len(missing_indices) > 5000:
                 missing_indices = missing_indices[:5000]
                 break
-        if _classical_gap_anomaly_should_be_ignored(
+        if _incomplete_gap_should_be_tolerated(
             tags,
             actual_count=actual_count,
-            max_idx=max_idx,
+            expected_count=max_idx,
+            missing_indices=missing_indices,
             gaps=gaps,
         ):
             return False, None, actual_count, []
@@ -30907,6 +31445,59 @@ def _classical_gap_anomaly_should_be_ignored(
     if missing_total > 1:
         return False
     return True
+
+
+def _incomplete_gap_should_be_tolerated(
+    tags: dict | None,
+    *,
+    actual_count: int,
+    expected_count: int = 0,
+    missing_indices: list[int] | None = None,
+    gaps: list[tuple[int, int]] | None = None,
+) -> bool:
+    actual_total = max(0, int(actual_count or 0))
+    expected_total = max(0, int(expected_count or 0))
+    gap_pairs = list(gaps or [])
+    if not gap_pairs and missing_indices:
+        gap_pairs = _missing_indices_to_gap_pairs(missing_indices)
+    if gap_pairs and _classical_gap_anomaly_should_be_ignored(
+        tags,
+        actual_count=actual_total,
+        max_idx=expected_total or max((end for _start, end in gap_pairs), default=0),
+        gaps=gap_pairs,
+    ):
+        return True
+    missing_flat: list[int] = []
+    for value in list(missing_indices or []):
+        try:
+            parsed = int(value)
+        except Exception:
+            continue
+        if parsed > 0:
+            missing_flat.append(parsed)
+    if not missing_flat and gap_pairs:
+        for start_i, end_i in gap_pairs:
+            try:
+                missing_flat.extend(list(range(int(start_i) + 1, int(end_i))))
+            except Exception:
+                continue
+    missing_flat = sorted(set(x for x in missing_flat if x > 0))
+    missing_total = len(missing_flat)
+    if actual_total < 6 or missing_total <= 0:
+        return False
+    tail_only_missing = bool(
+        expected_total > 0
+        and missing_flat
+        and missing_flat == list(range(actual_total + 1, expected_total + 1))
+    )
+    if tail_only_missing:
+        if missing_total <= 1 and actual_total >= 6:
+            return True
+        if missing_total <= 2 and actual_total >= 12:
+            return True
+    if len(gap_pairs) == 1 and missing_total == 1 and actual_total >= 10:
+        return True
+    return False
 
 
 def _missing_indices_to_gap_pairs(values: list[int] | None) -> list[tuple[int, int]]:
@@ -37014,6 +37605,8 @@ def _infer_identity_from_local_context_ai(
     if not should_try:
         return {}
 
+    if not bool(getattr(sys.modules[__name__], "PROVIDER_IDENTITY_USE_AI", False)):
+        return {}
     stable_filename_identity = bool(filename_artist_hint and filename_album_hint)
     if stable_filename_identity:
         local_artist_norm = _normalize_identity_text_strict(local_artist_txt)
@@ -40128,6 +40721,8 @@ def scan_duplicates(
                 e["tracks"],
                 mb_hint,
                 tags=first_track_tags,
+                folder_path=e.get("folder"),
+                album_title=str(e.get("title_raw") or e.get("album_title") or ""),
             )
             strict_reject_reason = str(e.get("strict_reject_reason") or "").strip().lower()
             e['is_broken'] = is_broken
@@ -45645,10 +46240,10 @@ def _publish_files_library_artist_from_items(
                         missing_indices = []
                     else:
                         is_broken, _actual_count_from_indices, gaps = _detect_gaps_in_indices(indices)
-                        if is_broken and _classical_gap_anomaly_should_be_ignored(
+                        if is_broken and _incomplete_gap_should_be_tolerated(
                             tags,
                             actual_count=actual_track_count,
-                            max_idx=max_idx,
+                            expected_count=max_idx,
                             gaps=gaps,
                         ):
                             is_broken = False
@@ -48198,7 +48793,15 @@ def _build_files_editions(
             return _cancel_discovery()
         for p in audio_files:
             by_folder[p.parent].append(p)
-    by_folder = _collapse_nested_album_folder_groups(by_folder, root_dirs=_files_root_dir_strings())
+    discovery_root_dirs = set()
+    for root in (roots or []):
+        if not str(root or "").strip():
+            continue
+        try:
+            discovery_root_dirs.add(str(path_for_fs_access(Path(root)).resolve()))
+        except Exception:
+            discovery_root_dirs.add(str(root))
+    by_folder = _collapse_nested_album_folder_groups(by_folder, root_dirs=discovery_root_dirs or _files_root_dir_strings())
     with lock:
         discovery_entries_scanned_live = int(state.get("scan_discovery_entries_scanned") or 0)
         discovery_albums_found_live = int(state.get("scan_discovery_albums_found") or 0)
@@ -48469,6 +49072,12 @@ def _build_files_editions(
         artist_name = _pick_album_artist_from_tag_dicts([first_tags], default="Unknown Artist")
         album_title_tag = _pick_album_title_from_tag_dicts([first_tags], fallback=folder.name.replace("_", " "))
         album_title_tag = _sanitize_album_title_display(album_title_tag)
+        if _folder_has_release_segment_children(folder, ordered_paths):
+            inferred_artist_name, inferred_album_title = _infer_artist_album_from_folder(folder, ordered_paths)
+            if inferred_artist_name:
+                artist_name = inferred_artist_name
+            if inferred_album_title:
+                album_title_tag = _sanitize_album_title_display(inferred_album_title)
         # Untagged albums: use folder structure as fallback identity.
         if (artist_name or "").strip().lower() in {"unknown", "unknown artist", "various", "various artists"}:
             try:
@@ -54250,6 +54859,37 @@ def _safe_bounded_float(value: Any, minimum: float = 0.0, maximum: float = 5.0) 
     return max(minimum, min(maximum, out))
 
 
+def _sanitize_bandcamp_supporter_comments(value: Any, *, limit: int = 12) -> list[dict[str, str | None]]:
+    out: list[dict[str, str | None]] = []
+    seen: set[tuple[str, str]] = set()
+    if not isinstance(value, list):
+        return out
+    for raw in value:
+        if not isinstance(raw, dict):
+            continue
+        text = re.sub(r"\s+", " ", str(raw.get("text") or raw.get("why") or "").strip())
+        author = re.sub(r"\s+", " ", str(raw.get("author") or raw.get("name") or raw.get("username") or "").strip())
+        url = str(raw.get("url") or "").strip() or None
+        avatar_url = str(raw.get("avatar_url") or "").strip() or None
+        if not text:
+            continue
+        dedupe_key = (author.lower(), text.lower())
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        out.append(
+            {
+                "author": author or None,
+                "text": text,
+                "url": url,
+                "avatar_url": avatar_url,
+            }
+        )
+        if len(out) >= max(1, int(limit or 12)):
+            break
+    return out
+
+
 def _album_heat_label(score: float | None) -> str | None:
     return None
 
@@ -54300,6 +54940,7 @@ def _merge_album_public_metrics(*metrics_sources: dict[str, Any]) -> dict[str, A
         "discogs_have_count": 0,
         "discogs_want_count": 0,
         "bandcamp_supporter_count": 0,
+        "bandcamp_supporter_comments": [],
         "lastfm_scrobbles": 0,
         "lastfm_listeners": 0,
         "heat_score": None,
@@ -54314,6 +54955,9 @@ def _merge_album_public_metrics(*metrics_sources: dict[str, Any]) -> dict[str, A
         merged["discogs_have_count"] = max(int(merged["discogs_have_count"] or 0), _safe_nonneg_int(metrics.get("discogs_have_count")))
         merged["discogs_want_count"] = max(int(merged["discogs_want_count"] or 0), _safe_nonneg_int(metrics.get("discogs_want_count")))
         merged["bandcamp_supporter_count"] = max(int(merged["bandcamp_supporter_count"] or 0), _safe_nonneg_int(metrics.get("bandcamp_supporter_count")))
+        cand_comments = _sanitize_bandcamp_supporter_comments(metrics.get("bandcamp_supporter_comments") or [])
+        if cand_comments and len(cand_comments) > len(merged.get("bandcamp_supporter_comments") or []):
+            merged["bandcamp_supporter_comments"] = cand_comments
         merged["lastfm_scrobbles"] = max(int(merged["lastfm_scrobbles"] or 0), _safe_nonneg_int(metrics.get("lastfm_scrobbles")))
         merged["lastfm_listeners"] = max(int(merged["lastfm_listeners"] or 0), _safe_nonneg_int(metrics.get("lastfm_listeners")))
         cand_rating = _safe_bounded_float(metrics.get("public_rating"))
@@ -55970,6 +56614,35 @@ def _fetch_bandcamp_album_info(artist_name: str, album_title: str) -> Optional[d
                     supporter_count = len(re.findall(r'"@type"\s*:\s*"Person"', sponsor_block.group(1), flags=re.IGNORECASE))
         except Exception:
             supporter_count = 0
+        supporter_comments: list[dict[str, str | None]] = []
+        try:
+            shown_reviews_block = re.search(
+                r'&quot;shown_reviews&quot;:\[(.*?)\](?:,&quot;shown_thumbs&quot;:|,&quot;more_reviews_available&quot;:)',
+                page,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            if shown_reviews_block:
+                decoded_reviews = html.unescape(f"[{shown_reviews_block.group(1)}]")
+                parsed_reviews = json.loads(decoded_reviews)
+                if isinstance(parsed_reviews, list):
+                    raw_comments: list[dict[str, Any]] = []
+                    for item in parsed_reviews:
+                        if not isinstance(item, dict):
+                            continue
+                        username = re.sub(r"\s+", " ", str(item.get("username") or "").strip())
+                        image_id = _safe_nonneg_int(item.get("image_id"))
+                        avatar_url = f"https://f4.bcbits.com/img/{image_id}_42.jpg" if image_id > 0 else None
+                        raw_comments.append(
+                            {
+                                "author": str(item.get("name") or username or "").strip() or None,
+                                "text": re.sub(r"\s+", " ", str(item.get("why") or item.get("text") or "").strip()),
+                                "url": f"https://bandcamp.com/{username}" if username else None,
+                                "avatar_url": avatar_url,
+                            }
+                        )
+                    supporter_comments = _sanitize_bandcamp_supporter_comments(raw_comments)
+        except Exception:
+            supporter_comments = []
 
         return {
             "title": title,
@@ -55982,6 +56655,7 @@ def _fetch_bandcamp_album_info(artist_name: str, album_title: str) -> Optional[d
             "description": description,
             "album_url": album_url,
             "bandcamp_supporter_count": supporter_count,
+            "bandcamp_supporter_comments": supporter_comments,
         }
 
     try:
@@ -60398,7 +61072,7 @@ def api_config_get():
         "SCAN_AI_LOCAL_BULK_MODEL": _ollama_model_configured(),
         "SCAN_AI_LOCAL_HARD_MODEL": _ollama_complex_model_configured(),
         "SCAN_AI_LOCAL_HARD_AVAILABLE": _ollama_model_available(_ollama_complex_model_configured()),
-        "USE_MUSICBRAINZ": True,
+        "USE_MUSICBRAINZ": get_setting_bool("USE_MUSICBRAINZ", True),
         "MUSICBRAINZ_EMAIL": get_setting("MUSICBRAINZ_EMAIL", MUSICBRAINZ_EMAIL),
         "MB_RETRY_NOT_FOUND": get_setting_bool("MB_RETRY_NOT_FOUND", MB_RETRY_NOT_FOUND),
         "MB_SEARCH_ALBUM_TIMEOUT_SEC": max(
@@ -60424,7 +61098,7 @@ def api_config_get():
         ),
         "MB_FAST_FALLBACK_MODE": get_setting_bool("MB_FAST_FALLBACK_MODE", MB_FAST_FALLBACK_MODE),
         "PROVIDER_IDENTITY_STRICT": get_setting_bool("PROVIDER_IDENTITY_STRICT", PROVIDER_IDENTITY_STRICT),
-        "PROVIDER_IDENTITY_USE_AI": get_setting_bool("PROVIDER_IDENTITY_USE_AI", PROVIDER_IDENTITY_USE_AI),
+        "PROVIDER_IDENTITY_USE_AI": bool(PROVIDER_IDENTITY_USE_AI),
         "MATCH_COVER_OCR_MODE": _normalize_match_cover_ocr_mode(get_setting("MATCH_COVER_OCR_MODE", MATCH_COVER_OCR_MODE)),
         "PROVIDER_IDENTITY_MIN_SCORE": get_setting("PROVIDER_IDENTITY_MIN_SCORE", PROVIDER_IDENTITY_MIN_SCORE),
         "PROVIDER_IDENTITY_SCORE_MARGIN": get_setting("PROVIDER_IDENTITY_SCORE_MARGIN", PROVIDER_IDENTITY_SCORE_MARGIN),
@@ -60441,7 +61115,7 @@ def api_config_get():
         "USE_AI_VISION_BEFORE_COVER_INJECT": bool(USE_AI_VISION_BEFORE_COVER_INJECT),
         "USE_WEB_SEARCH_FOR_MB": bool(USE_WEB_SEARCH_FOR_MB),
         "WEB_SEARCH_PROVIDER": _normalize_web_search_provider(get_setting("WEB_SEARCH_PROVIDER", WEB_SEARCH_PROVIDER)),
-        "USE_AI_WEB_SEARCH_FALLBACK": get_setting_bool("USE_AI_WEB_SEARCH_FALLBACK", USE_AI_WEB_SEARCH_FALLBACK),
+        "USE_AI_WEB_SEARCH_FALLBACK": bool(USE_AI_WEB_SEARCH_FALLBACK),
         "SCHEDULER_ALLOW_NON_SCAN_JOBS": get_setting_bool("SCHEDULER_ALLOW_NON_SCAN_JOBS", SCHEDULER_ALLOW_NON_SCAN_JOBS),
         "AI_MAX_CALLS_PER_SCAN": 0,
         "AI_CALL_COOLDOWN_SEC": 0.0,
@@ -60451,7 +61125,7 @@ def api_config_get():
         "SERPER_API_KEY_SET": _is_set(serper_key_eff),
         "SEARXNG_URL": str(searxng_url_eff or "").strip(),
         "SEARXNG_URL_SET": _is_set(searxng_url_eff),
-        "USE_ACOUSTID": True,
+        "USE_ACOUSTID": get_setting_bool("USE_ACOUSTID", USE_ACOUSTID),
         "ACOUSTID_API_KEY": str(acoustid_key_eff or ""),
         "ACOUSTID_API_KEY_SET": _is_set(acoustid_key_eff),
         "USE_ACOUSTID_WHEN_TAGGED": False,
@@ -60499,10 +61173,10 @@ def api_config_get():
         "LIVE_DEDUPE_MODE": get_setting("LIVE_DEDUPE_MODE", LIVE_DEDUPE_MODE),
         "SCAN_DISABLE_CACHE": get_setting_bool("SCAN_DISABLE_CACHE", SCAN_DISABLE_CACHE),
         "DISABLE_PATH_CROSSCHECK": get_setting_bool("DISABLE_PATH_CROSSCHECK", DISABLE_PATH_CROSSCHECK),
-        "USE_DISCOGS": True,
+        "USE_DISCOGS": get_setting_bool("USE_DISCOGS", USE_DISCOGS),
         "DISCOGS_USER_TOKEN": str(discogs_token_eff or ""),
         "DISCOGS_USER_TOKEN_SET": _is_set(discogs_token_eff),
-        "USE_LASTFM": True,
+        "USE_LASTFM": get_setting_bool("USE_LASTFM", USE_LASTFM),
         "LASTFM_API_KEY": str(lastfm_key_eff or ""),
         "LASTFM_API_KEY_SET": _is_set(lastfm_key_eff),
         "LASTFM_API_SECRET": str(lastfm_secret_eff or ""),
@@ -60526,9 +61200,9 @@ def api_config_get():
         "NAVIDROME_PASSWORD_SET": _is_set(navidrome_pass_eff),
         "NAVIDROME_API_KEY": str(navidrome_key_eff or ""),
         "NAVIDROME_API_KEY_SET": _is_set(navidrome_key_eff),
-        "SKIP_MB_FOR_LIVE_ALBUMS": True,
-        "TRACKLIST_MATCH_MIN": "0.9",
-        "LIVE_ALBUMS_MB_STRICT": False,
+        "SKIP_MB_FOR_LIVE_ALBUMS": get_setting_bool("SKIP_MB_FOR_LIVE_ALBUMS", SKIP_MB_FOR_LIVE_ALBUMS),
+        "TRACKLIST_MATCH_MIN": get_setting("TRACKLIST_MATCH_MIN", TRACKLIST_MATCH_MIN),
+        "LIVE_ALBUMS_MB_STRICT": get_setting_bool("LIVE_ALBUMS_MB_STRICT", LIVE_ALBUMS_MB_STRICT),
         "INCOMPLETE_ALBUMS_TARGET_DIR": get_setting("INCOMPLETE_ALBUMS_TARGET_DIR", "/dupes/incomplete_albums"),
         # Library backend and file-library settings
         "LIBRARY_MODE": "files",
@@ -61523,6 +62197,16 @@ def api_config_put():
         updates["CLASSICAL_NAME_PREFERENCE"] = _normalize_classical_name_preference(updates.get("CLASSICAL_NAME_PREFERENCE"))
     if "SCAN_AI_POLICY" in updates:
         updates["SCAN_AI_POLICY"] = _normalize_scan_ai_policy(str(updates.get("SCAN_AI_POLICY") or "local_only"))
+        if updates["SCAN_AI_POLICY"] == "local_only":
+            updates.update(
+                {
+                    "USE_AI_FOR_MB_MATCH": False,
+                    "USE_AI_FOR_MB_VERIFY": False,
+                    "USE_AI_FOR_DEDUPE": False,
+                    "PROVIDER_IDENTITY_USE_AI": False,
+                    "USE_AI_WEB_SEARCH_FALLBACK": False,
+                }
+            )
     if "SCAN_PAID_PROVIDER_ORDER" in updates:
         updates["SCAN_PAID_PROVIDER_ORDER"] = ",".join(
             _normalize_ordered_values(
@@ -64153,7 +64837,15 @@ def _run_incomplete_albums_scan():
                         if state.get("incomplete_scan"):
                             state["incomplete_scan"]["progress"] = processed
                     continue
-                is_broken, _exp, actual_count, _gaps = detect_broken_album(db_conn, aid, tracks, None, tags=None)
+                is_broken, _exp, actual_count, _gaps = detect_broken_album(
+                    db_conn,
+                    aid,
+                    tracks,
+                    None,
+                    tags=None,
+                    folder_path=folder_path,
+                    album_title=str(album_title or ""),
+                )
                 if not is_broken:
                     processed += 1
                     with lock:
@@ -66959,6 +67651,68 @@ def _collapse_files_album_browse_rows(rows: Sequence[Mapping[str, Any]]) -> list
     return collapsed
 
 
+def _library_label_logo_cache_key(label: str) -> str:
+    return f"library:label:logo:{str(label or '').strip().lower()}"
+
+
+def _library_label_logo_lookup(label: str, *, refresh: bool = False) -> tuple[str, str]:
+    label_text = str(label or "").strip()
+    if not label_text:
+        return ("", "")
+    cache_key = _library_label_logo_cache_key(label_text)
+    if not refresh:
+        cached = _files_cache_get_json(cache_key)
+        if isinstance(cached, dict):
+            return (
+                str(cached.get("logo_url") or "").strip(),
+                str(cached.get("logo_provider") or "").strip(),
+            )
+    logo_url = ""
+    logo_provider = ""
+    try:
+        if USE_DISCOGS:
+            d = _discogs_client()
+            if d is not None:
+                results = d.search(label_text, type="label")
+                page = _discogs_call("label logo search page=1", lambda: results.page(1))
+                picked = None
+                for it in page or []:
+                    data = getattr(it, "data", None)
+                    if not isinstance(data, dict):
+                        continue
+                    lab_name = str(data.get("title") or data.get("name") or "").strip()
+                    if not lab_name:
+                        continue
+                    if _provider_identity_text_score(label_text, lab_name) >= 0.78:
+                        picked = data
+                        break
+                if isinstance(picked, dict):
+                    lid = _parse_int_loose(picked.get("id"), 0)
+                    if lid > 0:
+                        ldata = _discogs_call("label logo data", lambda: d.label(int(lid)).data)
+                        if isinstance(ldata, dict):
+                            images = ldata.get("images") or []
+                            if isinstance(images, list):
+                                for image in images:
+                                    if not isinstance(image, dict):
+                                        continue
+                                    candidate_url = str(image.get("uri150") or image.get("uri") or "").strip()
+                                    if candidate_url:
+                                        logo_url = candidate_url
+                                        logo_provider = "discogs"
+                                        break
+    except DiscogsRateLimited:
+        pass
+    except Exception:
+        logging.debug("Label logo lookup failed for '%s'", label_text, exc_info=True)
+    _files_cache_set_json(
+        cache_key,
+        {"logo_url": logo_url, "logo_provider": logo_provider},
+        ttl=(60 * 60 * 12) if logo_url else (60 * 20),
+    )
+    return (logo_url, logo_provider)
+
+
 def _files_box_set_context(conn, album_id: int) -> dict[str, Any] | None:
     album_id = int(album_id or 0)
     if album_id <= 0:
@@ -67238,6 +67992,8 @@ def api_library_albums():
                     COALESCE(alb.discogs_release_id, '') AS discogs_release_id,
                     COALESCE(alb.lastfm_album_mbid, '') AS lastfm_album_mbid,
                     COALESCE(alb.bandcamp_album_url, '') AS bandcamp_album_url,
+                    COALESCE(alb.metadata_source, '') AS metadata_source,
+                    COALESCE(alb.strict_match_provider, '') AS strict_match_provider,
                     ar.id AS artist_id,
                     COALESCE(ar.name, '') AS artist_name
                 FROM files_albums alb
@@ -67266,8 +68022,10 @@ def api_library_albums():
                     "discogs_release_id": str(row[8] or "").strip(),
                     "lastfm_album_mbid": str(row[9] or "").strip(),
                     "bandcamp_album_url": str(row[10] or "").strip(),
-                    "artist_id": int(row[11] or 0),
-                    "artist_name": str(row[12] or "").strip(),
+                    "metadata_source": str(row[11] or "").strip(),
+                    "strict_match_provider": str(row[12] or "").strip(),
+                    "artist_id": int(row[13] or 0),
+                    "artist_name": str(row[14] or "").strip(),
                 }
                 for row in cur.fetchall()
             ]
@@ -67391,6 +68149,12 @@ def api_library_albums():
                     "format": (fmt or "").strip() or None,
                     "is_lossless": bool(is_lossless),
                     "mb_identified": bool(mb_identified),
+                    "musicbrainz_release_group_id": str(page_row.get("musicbrainz_release_group_id") or "").strip() or None,
+                    "discogs_release_id": str(page_row.get("discogs_release_id") or "").strip() or None,
+                    "lastfm_album_mbid": str(page_row.get("lastfm_album_mbid") or "").strip() or None,
+                    "bandcamp_album_url": str(page_row.get("bandcamp_album_url") or "").strip() or None,
+                    "metadata_source": str(page_row.get("metadata_source") or "").strip() or None,
+                    "strict_match_provider": str(page_row.get("strict_match_provider") or "").strip() or None,
                     "has_cover": has_cover_effective,
                     "thumb": thumb,
                     "artist_id": arid,
@@ -67459,6 +68223,12 @@ def api_library_digest():
                     alb.is_lossless,
                     alb.has_cover,
                     alb.mb_identified,
+                    COALESCE(alb.musicbrainz_release_group_id, '') AS musicbrainz_release_group_id,
+                    COALESCE(alb.discogs_release_id, '') AS discogs_release_id,
+                    COALESCE(alb.lastfm_album_mbid, '') AS lastfm_album_mbid,
+                    COALESCE(alb.bandcamp_album_url, '') AS bandcamp_album_url,
+                    COALESCE(alb.metadata_source, '') AS metadata_source,
+                    COALESCE(alb.strict_match_provider, '') AS strict_match_provider,
                     ar.id AS artist_id,
                     ar.name AS artist_name,
                     ar.name_norm AS artist_norm,
@@ -67498,6 +68268,12 @@ def api_library_digest():
             is_lossless,
             has_cover,
             mb_identified,
+            musicbrainz_release_group_id,
+            discogs_release_id,
+            lastfm_album_mbid,
+            bandcamp_album_url,
+            metadata_source,
+            strict_match_provider,
             artist_id,
             artist_name,
             artist_norm,
@@ -67571,6 +68347,12 @@ def api_library_digest():
                     "format": (fmt or "").strip() or None,
                     "is_lossless": bool(is_lossless),
                     "mb_identified": bool(mb_identified),
+                    "musicbrainz_release_group_id": str(musicbrainz_release_group_id or "").strip() or None,
+                    "discogs_release_id": str(discogs_release_id or "").strip() or None,
+                    "lastfm_album_mbid": str(lastfm_album_mbid or "").strip() or None,
+                    "bandcamp_album_url": str(bandcamp_album_url or "").strip() or None,
+                    "metadata_source": str(metadata_source or "").strip() or None,
+                    "strict_match_provider": str(strict_match_provider or "").strip() or None,
                     "thumb": thumb,
                     "artist_id": arid,
                     "artist_name": artist_name or "",
@@ -69076,6 +69858,7 @@ def api_library_labels():
 
         base_url = request.url_root.rstrip("/")
         labels = []
+        logo_lookup_budget = 10 if refresh else 0
         for r in rows:
             label_value = str((r[0] or "")).strip()
             if not label_value:
@@ -69086,7 +69869,19 @@ def api_library_labels():
             thumb = None
             if album_id > 0 and has_cover:
                 thumb = f"{base_url}/api/library/files/album/{album_id}/cover?size=96"
-            labels.append({"value": label_value, "count": count, "thumb": thumb})
+            logo_url, logo_provider = _library_label_logo_lookup(label_value, refresh=False)
+            if refresh and not logo_url and logo_lookup_budget > 0:
+                logo_url, logo_provider = _library_label_logo_lookup(label_value, refresh=True)
+                logo_lookup_budget -= 1
+            labels.append(
+                {
+                    "value": label_value,
+                    "count": count,
+                    "thumb": thumb,
+                    "logo_url": logo_url or None,
+                    "logo_provider": logo_provider or None,
+                }
+            )
         payload = {"labels": labels, "total": total, "limit": int(limit), "offset": int(offset)}
         _files_cache_set_json(cache_key, payload, ttl=45)
         return jsonify(payload)
@@ -69791,6 +70586,12 @@ def api_library_recently_played_albums():
                         alb.is_lossless,
                         alb.has_cover,
                         alb.mb_identified,
+                        COALESCE(alb.musicbrainz_release_group_id, '') AS musicbrainz_release_group_id,
+                        COALESCE(alb.discogs_release_id, '') AS discogs_release_id,
+                        COALESCE(alb.lastfm_album_mbid, '') AS lastfm_album_mbid,
+                        COALESCE(alb.bandcamp_album_url, '') AS bandcamp_album_url,
+                        COALESCE(alb.metadata_source, '') AS metadata_source,
+                        COALESCE(alb.strict_match_provider, '') AS strict_match_provider,
                         ar.id AS artist_id,
                         ar.name AS artist_name,
                         COALESCE(pr.short_description, '') AS short_description,
@@ -69808,7 +70609,7 @@ def api_library_recently_played_albums():
                     (album_ids,),
                 )
                 alb_rows = cur.fetchall()
-                for album_id, title, year, genre, label, tags_json, track_count, fmt, is_lossless, has_cover, mb_identified, artist_id, artist_name, short_desc, profile_source, _ord in alb_rows:
+                for album_id, title, year, genre, label, tags_json, track_count, fmt, is_lossless, has_cover, mb_identified, musicbrainz_release_group_id, discogs_release_id, lastfm_album_mbid, bandcamp_album_url, metadata_source, strict_match_provider, artist_id, artist_name, short_desc, profile_source, _ord in alb_rows:
                     aid = int(album_id or 0)
                     arid = int(artist_id or 0)
                     thumb = f"{base_url}/api/library/files/album/{aid}/cover?size=512" if bool(has_cover) else None
@@ -69853,6 +70654,12 @@ def api_library_recently_played_albums():
                             "format": (fmt or "").strip() or None,
                             "is_lossless": bool(is_lossless),
                             "mb_identified": bool(mb_identified),
+                            "musicbrainz_release_group_id": str(musicbrainz_release_group_id or "").strip() or None,
+                            "discogs_release_id": str(discogs_release_id or "").strip() or None,
+                            "lastfm_album_mbid": str(lastfm_album_mbid or "").strip() or None,
+                            "bandcamp_album_url": str(bandcamp_album_url or "").strip() or None,
+                            "metadata_source": str(metadata_source or "").strip() or None,
+                            "strict_match_provider": str(strict_match_provider or "").strip() or None,
                             "thumb": thumb,
                             "artist_id": arid,
                             "artist_name": artist_name or "",
@@ -69967,7 +70774,10 @@ def api_library_liked_summary():
                 SELECT alb.id, alb.title, ar.id, ar.name, alb.year, alb.has_cover,
                        COALESCE(alb.label, ''), COALESCE(alb.genre, ''), COALESCE(alb.tags_json, '[]'),
                        alb.track_count, COALESCE(alb.format, ''), alb.is_lossless,
-                       ur.rating, pr.public_rating, COALESCE(pr.public_rating_votes, 0), pr.heat_score
+                       ur.rating, pr.public_rating, COALESCE(pr.public_rating_votes, 0), pr.heat_score,
+                       COALESCE(alb.musicbrainz_release_group_id, ''), COALESCE(alb.discogs_release_id, ''),
+                       COALESCE(alb.lastfm_album_mbid, ''), COALESCE(alb.bandcamp_album_url, ''),
+                       COALESCE(alb.metadata_source, ''), COALESCE(alb.strict_match_provider, '')
                 FROM files_user_entity_likes l
                 JOIN files_albums alb ON alb.id = l.entity_id
                 JOIN files_artists ar ON ar.id = alb.artist_id
@@ -70001,6 +70811,12 @@ def api_library_liked_summary():
                         "public_rating": float(row[13]) if row[13] is not None else None,
                         "public_rating_votes": int(row[14] or 0) if row[14] is not None else None,
                         "heat_score": float(row[15]) if row[15] is not None else None,
+                        "musicbrainz_release_group_id": str(row[16] or "").strip() or None,
+                        "discogs_release_id": str(row[17] or "").strip() or None,
+                        "lastfm_album_mbid": str(row[18] or "").strip() or None,
+                        "bandcamp_album_url": str(row[19] or "").strip() or None,
+                        "metadata_source": str(row[20] or "").strip() or None,
+                        "strict_match_provider": str(row[21] or "").strip() or None,
                     }
                 )
             cur.execute(
@@ -70067,7 +70883,10 @@ def api_library_liked_summary():
                 SELECT alb.id, alb.title, ar.id, ar.name, alb.year, alb.has_cover,
                        COALESCE(alb.label, ''), COALESCE(alb.genre, ''), COALESCE(alb.tags_json, '[]'),
                        alb.track_count, COALESCE(alb.format, ''), alb.is_lossless,
-                       ur.rating, pr.public_rating, COALESCE(pr.public_rating_votes, 0), pr.heat_score
+                       ur.rating, pr.public_rating, COALESCE(pr.public_rating_votes, 0), pr.heat_score,
+                       COALESCE(alb.musicbrainz_release_group_id, ''), COALESCE(alb.discogs_release_id, ''),
+                       COALESCE(alb.lastfm_album_mbid, ''), COALESCE(alb.bandcamp_album_url, ''),
+                       COALESCE(alb.metadata_source, ''), COALESCE(alb.strict_match_provider, '')
                 FROM files_albums alb
                 JOIN files_artists ar ON ar.id = alb.artist_id
                 LEFT JOIN files_user_album_ratings ur ON ur.user_id = %s AND ur.album_id = alb.id
@@ -70115,6 +70934,12 @@ def api_library_liked_summary():
                         "public_rating": float(row[13]) if row[13] is not None else None,
                         "public_rating_votes": int(row[14] or 0) if row[14] is not None else None,
                         "heat_score": float(row[15]) if row[15] is not None else None,
+                        "musicbrainz_release_group_id": str(row[16] or "").strip() or None,
+                        "discogs_release_id": str(row[17] or "").strip() or None,
+                        "lastfm_album_mbid": str(row[18] or "").strip() or None,
+                        "bandcamp_album_url": str(row[19] or "").strip() or None,
+                        "metadata_source": str(row[20] or "").strip() or None,
+                        "strict_match_provider": str(row[21] or "").strip() or None,
                     }
                 )
         return jsonify(payload)
@@ -71790,11 +72615,12 @@ def api_library_artist_detail(artist_id):
                                 gap_pairs.append((start - 1, prev + 1))
                                 start = prev = value
                             gap_pairs.append((start - 1, prev + 1))
-                        if _classical_gap_anomaly_should_be_ignored(
+                        if _incomplete_gap_should_be_tolerated(
                             meta,
                             actual_count=int(broken_detail.get("actual_track_count") or 0),
-                            max_idx=max_idx,
+                            expected_count=max_idx,
                             gaps=gap_pairs,
+                            missing_indices=missing_flat,
                         ):
                             is_broken = False
                             broken_detail = None
@@ -73699,6 +74525,7 @@ def api_library_album_detail(album_id: int):
                             COALESCE(discogs_have_count, 0),
                             COALESCE(discogs_want_count, 0),
                             COALESCE(bandcamp_supporter_count, 0),
+                            COALESCE(bandcamp_supporter_comments_json, '[]'),
                             COALESCE(lastfm_scrobbles, 0),
                             COALESCE(lastfm_listeners, 0),
                             heat_score,
@@ -73725,9 +74552,10 @@ def api_library_album_detail(album_id: int):
                             "discogs_have_count": int(prow[8] or 0),
                             "discogs_want_count": int(prow[9] or 0),
                             "bandcamp_supporter_count": int(prow[10] or 0),
-                            "lastfm_scrobbles": int(prow[11] or 0),
-                            "lastfm_listeners": int(prow[12] or 0),
-                            "heat_score": float(prow[13]) if prow[13] is not None else None,
+                            "bandcamp_supporter_comments": _sanitize_bandcamp_supporter_comments(_safe_json_load(prow[11], fallback=[])),
+                            "lastfm_scrobbles": int(prow[12] or 0),
+                            "lastfm_listeners": int(prow[13] or 0),
+                            "heat_score": float(prow[14]) if prow[14] is not None else None,
                             "heat_label": None,
                         }
                 except Exception:
@@ -73988,6 +74816,7 @@ def api_library_album_detail(album_id: int):
                     "discogs_have_count": int(prof.get("discogs_have_count") or 0),
                     "discogs_want_count": int(prof.get("discogs_want_count") or 0),
                     "bandcamp_supporter_count": int(prof.get("bandcamp_supporter_count") or 0),
+                    "bandcamp_supporter_comments": _sanitize_bandcamp_supporter_comments(prof.get("bandcamp_supporter_comments") or []),
                     "lastfm_scrobbles": int(prof.get("lastfm_scrobbles") or 0),
                     "lastfm_listeners": int(prof.get("lastfm_listeners") or 0),
                 },
@@ -75739,21 +76568,11 @@ def _artist_external_image_requires_authoritative_refresh(
         str(entity_kind or "").strip().lower() in {"orchestra", "ensemble", "choir", "chorus"}
         or roles.intersection({"orchestra", "ensemble", "choir", "chorus"})
     )
-    if provider_low in _ARTIST_WEAK_CLASSICAL_IMAGE_PROVIDERS:
+    if provider_low in {"wikipedia", "commons"} and url_low and "wikimedia.org" not in url_low and "wikipedia.org" not in url_low:
         return True
-    if provider_low == "web_authoritative" and url_low and "wikimedia.org" not in url_low and "wikipedia.org" not in url_low:
-        return True
-    if provider_low == "musicbrainz_url":
-        # MusicBrainz URL relations are an authoritative identity source for person-like
-        # classical entities once the final image URL has passed relevance checks.
-        # Keep ensemble-like entities stricter because Spotify/CDN avatars often collapse
-        # to venue/concert-hall imagery or generic logos for orchestras/choirs.
-        if ensemble_like and url_low and "i.scdn.co/image/" in url_low:
-            return True
-        return False
     if ensemble_like and url_low and "i.scdn.co/image/" in url_low:
         return True
-    if provider_low == "wikipedia" and url_low and "wikimedia.org" not in url_low and "wikipedia.org" not in url_low:
+    if provider_low == "web_authoritative" and url_low and "i.scdn.co/image/" in url_low and ensemble_like:
         return True
     return False
 
@@ -75765,11 +76584,7 @@ def _artist_image_provider_allowed_for_entity(
     role_hints: list[str] | tuple[str, ...] | None = None,
 ) -> bool:
     provider_low = str(provider or "").strip().lower()
-    if not provider_low:
-        return False
-    if not _artist_entity_is_classical_like(entity_kind=entity_kind, role_hints=role_hints):
-        return True
-    return provider_low in {"wikipedia", "commons", "musicbrainz_url", "web_authoritative"}
+    return bool(provider_low)
 
 
 def _paths_refer_to_same_file(left: str | Path | None, right: str | Path | None) -> bool:
@@ -75849,22 +76664,15 @@ def _artist_external_image_requires_authoritative_refresh_sql(
     )
     weak_classical_expr = (
         f"({classical_expr} AND ("
-        f"{provider_expr} IN ('web','discogs','lastfm','fanart','audiodb','musicbrainz')"
-        f" OR ({provider_expr} = 'wikipedia' AND {url_expr} <> '' AND {url_expr} NOT LIKE '%wikimedia.org%' AND {url_expr} NOT LIKE '%wikipedia.org%')"
-        f" OR ({provider_expr} = 'musicbrainz_url' AND ({kind_expr} IN ('orchestra','ensemble','choir','chorus')"
-        f" OR {roles_expr} LIKE '%orchestra%'"
-        f" OR {roles_expr} LIKE '%ensemble%'"
-        f" OR {roles_expr} LIKE '%choir%'"
-        f" OR {roles_expr} LIKE '%chorus%'))"
-        f" OR (({kind_expr} IN ('orchestra','ensemble','choir','chorus')"
+        f"(({kind_expr} IN ('orchestra','ensemble','choir','chorus')"
         f" OR {roles_expr} LIKE '%orchestra%'"
         f" OR {roles_expr} LIKE '%ensemble%'"
         f" OR {roles_expr} LIKE '%choir%'"
         f" OR {roles_expr} LIKE '%chorus%') AND {url_expr} LIKE '%i.scdn.co/image/%')"
-        f" OR {suspicious_expr}"
+        f" OR ({provider_expr} IN ('wikipedia','commons') AND {url_expr} <> '' AND {url_expr} NOT LIKE '%wikimedia.org%' AND {url_expr} NOT LIKE '%wikipedia.org%')"
         f"))"
     )
-    sql = f"({placeholder_expr} OR {weak_classical_expr})"
+    sql = f"({placeholder_expr} OR {suspicious_expr} OR {weak_classical_expr})"
     # psycopg still parses % in SQL text for placeholders even inside LIKE literals.
     # Doubling them keeps LIKE semantics intact while preventing placeholder parsing.
     return sql.replace("%", "%%")
@@ -76081,6 +76889,119 @@ def _fetch_artist_image_lastfm(artist_name: str) -> Optional[str]:
     except Exception as e:
         logging.warning("Last.fm artist.getInfo failed for %s: %s", artist_name, e)
         return None
+
+
+def _fetch_artist_image_bandcamp(artist_name: str) -> Optional[str]:
+    """Get an artist image URL from Bandcamp artist search / artist page. Returns URL or None."""
+    if not USE_BANDCAMP:
+        return None
+    artist_query = " ".join(str(artist_name or "").split()).strip()
+    if not artist_query:
+        return None
+    global _last_bandcamp_request
+    headers = {
+        "User-Agent": "PMDA/1.0 (artist image lookup; https://github.com/silkyclouds/PMDA)",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    def _bandcamp_get(url: str) -> Optional[str]:
+        global _last_bandcamp_request
+        with _bandcamp_lock:
+            now = time.time()
+            wait = 5.0 - (now - _last_bandcamp_request)
+            if wait > 0:
+                time.sleep(wait)
+            _last_bandcamp_request = time.time()
+        try:
+            resp = requests.get(url, headers=headers, timeout=(6, 25), allow_redirects=True)
+            if resp.status_code != 200:
+                return None
+            return resp.text
+        except Exception:
+            return None
+
+    def _upgrade_bcbits_size(url: str) -> list[str]:
+        out: list[str] = []
+        raw = str(url or "").strip()
+        if not raw:
+            return out
+        out.append(raw)
+        m = re.search(r"(_)(\d+)(\.[a-zA-Z0-9]+(?:\?.*)?)$", raw)
+        if m:
+            out.append(f"{raw[:m.start(2)]}0{m.group(3)}")
+            out.append(f"{raw[:m.start(2)]}42{m.group(3)}")
+        return _dedupe_keep_order(out)
+
+    search_url = f"https://bandcamp.com/search?q={quote_plus(artist_query)}&item_type=b"
+    search_page = _bandcamp_get(search_url)
+    if not search_page:
+        return None
+
+    artist_norm = _norm_artist_key(artist_query)
+    candidates: list[tuple[float, str, str, str]] = []
+    for idx, item in enumerate(re.findall(r'<li class="searchresult.*?</li>', search_page, flags=re.IGNORECASE | re.DOTALL)[:10]):
+        item_type = re.search(r'<div class="itemtype">\s*(.*?)\s*</div>', item, flags=re.IGNORECASE | re.DOTALL)
+        item_type_clean = html.unescape(re.sub(r"<[^>]+>", " ", item_type.group(1))).strip().upper() if item_type else ""
+        if item_type_clean != "ARTIST":
+            continue
+        heading = re.search(r'<div class="heading">\s*<a[^>]*>(.*?)</a>', item, flags=re.IGNORECASE | re.DOTALL)
+        display_name = html.unescape(re.sub(r"<[^>]+>", " ", heading.group(1))).strip() if heading else ""
+        href_match = re.search(r'<a class="artcont" href="([^"]+)"', item, flags=re.IGNORECASE)
+        href = html.unescape(href_match.group(1)).strip() if href_match else ""
+        img_match = re.search(r'<img[^>]+src="([^"]+)"', item, flags=re.IGNORECASE)
+        img = html.unescape(img_match.group(1)).strip() if img_match else ""
+        score = 0.0
+        if display_name and _artist_image_alias_candidate_is_compatible(artist_query, display_name):
+            score += 4.0
+        display_norm = _norm_artist_key(display_name)
+        if artist_norm and display_norm:
+            if artist_norm == display_norm:
+                score += 2.0
+            elif artist_norm in display_norm or display_norm in artist_norm:
+                score += 1.0
+        if href:
+            host_label = _norm_artist_key((urlparse(href).netloc or "").split(".")[0])
+            if artist_norm and host_label:
+                if artist_norm == host_label:
+                    score += 1.5
+                elif artist_norm in host_label or host_label in artist_norm:
+                    score += 0.75
+        score += max(0.0, 0.25 - (idx * 0.03))
+        if score <= 0.0:
+            continue
+        candidates.append((score, display_name or artist_query, href, img))
+
+    if not candidates:
+        return None
+
+    for _score, display_name, href, img in sorted(candidates, key=lambda item: item[0], reverse=True)[:4]:
+        image_candidates: list[str] = []
+        clean_href = href.split("?", 1)[0].strip() if href else ""
+        if clean_href:
+            artist_page = _bandcamp_get(clean_href)
+            if artist_page:
+                og_img = re.search(r'<meta\s+property="og:image"\s+content="([^"]+)"', artist_page, flags=re.IGNORECASE)
+                if og_img:
+                    image_candidates.extend(_upgrade_bcbits_size(html.unescape(og_img.group(1)).strip()))
+                image_candidates.extend(
+                    _upgrade_bcbits_size(match)
+                    for match in re.findall(
+                        r"(https?://f\d+\.bcbits\.com/img/[a-z]\d+_[0-9]+\.[a-zA-Z0-9]+(?:\?[^\"]*)?)",
+                        artist_page,
+                        flags=re.IGNORECASE,
+                    )[:6]
+                )
+        image_candidates.extend(_upgrade_bcbits_size(img))
+        flat_candidates: list[str] = []
+        for value in image_candidates:
+            if isinstance(value, list):
+                flat_candidates.extend(value)
+            elif isinstance(value, str):
+                flat_candidates.append(value)
+        for candidate_url in _dedupe_keep_order(flat_candidates):
+            if candidate_url and not _is_probably_placeholder_artist_image_url(candidate_url):
+                return candidate_url
+    return None
 
 
 def _fetch_artist_image_discogs(artist_name: str) -> Optional[str]:
@@ -76553,7 +77474,17 @@ def _artist_image_url_looks_relevant(
             }
         )
     )
-    trusted_domains = ("fanart.tv", "theaudiodb.com", "last.fm", "discogs.com", "wikimedia.org", "wikipedia.org", "musicbrainz.org")
+    trusted_domains = (
+        "fanart.tv",
+        "theaudiodb.com",
+        "last.fm",
+        "discogs.com",
+        "wikimedia.org",
+        "wikipedia.org",
+        "musicbrainz.org",
+        "bandcamp.com",
+        "bcbits.com",
+    )
     trusted_host = bool(
         host
         and any(host == domain or host.endswith(f".{domain}") for domain in trusted_domains)
@@ -76574,8 +77505,6 @@ def _artist_image_url_looks_relevant(
             return False
         if person_like and "ab676161" in low_url:
             return True
-    if classical_like and not wiki_like:
-        return False
     if not wiki_like:
         if ensemble_like and building_like:
             return False
@@ -76605,6 +77534,8 @@ def _artist_image_url_looks_relevant(
                 and any(term in person_context for term in musician_terms)
             ):
                 return True
+            if trusted_host and context_relevant and any(term in person_context for term in musician_terms):
+                return True
             return False
         if ensemble_like:
             if event_like or building_like:
@@ -76615,6 +77546,8 @@ def _artist_image_url_looks_relevant(
                 entity_kind=entity_kind,
                 role_hints=role_hints,
             ):
+                return True
+            if trusted_host and context_relevant:
                 return True
             return False
         if host and not trusted_host:
@@ -77039,20 +77972,26 @@ def _fetch_and_save_artist_image(
     if USE_LASTFM:
         url = _fetch_artist_image_lastfm(artist_name)
         if url and not _is_probably_placeholder_artist_image_url(url):
-            saved = _download_and_save(url, "lastfm")
+            saved = _download_and_save(url, "lastfm", page_title=artist_name)
+            if saved:
+                return saved
+    if USE_BANDCAMP:
+        url = _fetch_artist_image_bandcamp(artist_name)
+        if url and not _is_probably_placeholder_artist_image_url(url):
+            saved = _download_and_save(url, "bandcamp", page_title=artist_name, page_summary="Bandcamp artist page")
             if saved:
                 return saved
     # TheAudioDB (name-based) – optional.
     url = _fetch_artist_image_audiodb(artist_name)
     if url:
-        saved = _download_and_save(url, "audiodb")
+        saved = _download_and_save(url, "audiodb", page_title=artist_name)
         if saved:
             return saved
     # Discogs
     if USE_DISCOGS:
         url = _fetch_artist_image_discogs(artist_name)
         if url:
-            saved = _download_and_save(url, "discogs")
+            saved = _download_and_save(url, "discogs", page_title=artist_name)
             if saved:
                 return saved
     # Web search fallback (Serper + OpenGraph) when other providers did not yield an image
@@ -80162,6 +81101,8 @@ def _infer_artist_album_from_folder(folder_path: Path, audio_files: List[Path]) 
     artist_name = "Unknown"
     album_title_str = folder_path.name or "Unknown Album"
     folder_name_raw = str(folder_path.name or "").strip()
+    release_segment_children = _folder_release_segment_child_dirs(folder_path, audio_files)
+    segmented_release = len(release_segment_children) >= 2
 
     def _clean_folder_token(token: str) -> str:
         txt = str(token or "").strip().replace("_", " ")
@@ -80183,10 +81124,13 @@ def _infer_artist_album_from_folder(folder_path: Path, audio_files: List[Path]) 
         return (artist_name, album_title_str)
     first_tags = extract_tags(audio_files[0])
     artist_name = (
-        (first_tags.get("artist") or first_tags.get("albumartist") or "").strip()
+        (first_tags.get("albumartist") or first_tags.get("artist") or first_tags.get("composer") or "").strip()
         or artist_name
     )
-    album_title_str = (first_tags.get("album") or "").strip() or album_title_str
+    if segmented_release:
+        album_title_str = folder_path.name.replace("_", " ").strip() or album_title_str
+    else:
+        album_title_str = (first_tags.get("album") or "").strip() or album_title_str
     # Folder-based fallback is more reliable than filename parsing for album identity.
     # For untagged albums, parent folder is almost always the artist.
     if (artist_name or "").strip().lower() in {"unknown", "unknown artist", "various", "various artists"}:
@@ -80196,7 +81140,7 @@ def _infer_artist_album_from_folder(folder_path: Path, audio_files: List[Path]) 
             parent_name = ""
         if parent_name:
             artist_name = parent_name
-    if artist_name == "Unknown" or album_title_str == folder_path.name:
+    if artist_name == "Unknown" or (album_title_str == folder_path.name and not segmented_release):
         parts = audio_files[0].stem.split(" - ")
         if len(parts) >= 2:
             artist_name = artist_name if artist_name != "Unknown" else parts[0].strip()
@@ -80226,10 +81170,44 @@ def _files_child_folder_name_looks_release_segment(name: str) -> bool:
     )
 
 
+def _folder_release_segment_child_dirs(folder_path: Path, audio_files: list[Path] | None) -> list[Path]:
+    """
+    Return immediate child directories that look like work/disc segments under `folder_path`.
+    """
+    folder = Path(folder_path)
+    child_dirs: dict[str, Path] = {}
+    direct_audio_present = False
+    for raw_path in audio_files or []:
+        try:
+            p = Path(raw_path)
+            rel = p.relative_to(folder)
+        except Exception:
+            continue
+        parts = list(rel.parts)
+        if len(parts) <= 1:
+            direct_audio_present = True
+            continue
+        child = folder / parts[0]
+        child_dirs[str(child)] = child
+    if direct_audio_present or len(child_dirs) < 2:
+        return []
+    segment_children = [child for child in child_dirs.values() if _files_child_folder_name_looks_release_segment(child.name)]
+    if len(segment_children) < 2:
+        return []
+    if len(segment_children) != len(child_dirs):
+        return []
+    return sorted(segment_children, key=lambda p: str(p).lower())
+
+
+def _folder_has_release_segment_children(folder_path: Path, audio_files: list[Path] | None) -> bool:
+    return len(_folder_release_segment_child_dirs(folder_path, audio_files)) >= 2
+
+
 def _collapse_nested_album_folder_groups(
     by_folder: dict[Path, list[Path]],
     *,
     root_dirs: Optional[set[str]] = None,
+    progress_cb: Optional[Callable[[dict[str, Any]], None]] = None,
 ) -> dict[Path, list[Path]]:
     """
     Collapse child work/disc folders into one parent album folder when they clearly belong
@@ -80250,36 +81228,93 @@ def _collapse_nested_album_folder_groups(
     """
     if not by_folder:
         return by_folder
+
+    def _normalize_child_entry(
+        entry: Any,
+    ) -> tuple[Path, list[Path], dict[str, Any]] | None:
+        if not isinstance(entry, (tuple, list)):
+            return None
+        if len(entry) == 2:
+            child_raw, paths_raw = entry
+            tags_raw: Any = {}
+        elif len(entry) >= 3:
+            child_raw, paths_raw, tags_raw = entry[:3]
+        else:
+            return None
+        try:
+            child_path = Path(child_raw)
+        except Exception:
+            return None
+        ordered_paths = [Path(p) for p in (paths_raw or [])]
+        tags_dict = tags_raw if isinstance(tags_raw, dict) else {}
+        return (child_path, ordered_paths, tags_dict)
+
     roots = root_dirs if isinstance(root_dirs, set) else _files_root_dir_strings()
     collapsed = dict(by_folder)
     parent_children: dict[Path, list[tuple[Path, list[Path]]]] = defaultdict(list)
     for folder, paths in by_folder.items():
-        try:
-            folder_resolved = folder.resolve()
-        except Exception:
-            folder_resolved = folder
-        parent = folder_resolved.parent
-        if not parent or parent == folder_resolved or _files_is_files_root_dir(parent, root_dirs=roots):
+        folder_key = Path(folder)
+        parent = folder_key.parent
+        if not parent or parent == folder_key:
             continue
-        parent_children[parent].append((folder_resolved, list(paths or [])))
+        if _files_is_files_root_dir(parent, root_dirs=roots):
+            continue
+        try:
+            resolved_parent = folder_key.resolve().parent
+        except Exception:
+            resolved_parent = None
+        if resolved_parent and resolved_parent != parent and _files_is_files_root_dir(
+            resolved_parent,
+            root_dirs=roots,
+        ):
+            continue
+        parent_children[parent].append((folder_key, paths or []))
 
     cover_names = {name.lower() for name in _COVER_NAMES}
-    for parent, children in parent_children.items():
+    total_parents = len(parent_children)
+    collapsed_groups = 0
+    for idx, (parent, children) in enumerate(parent_children.items(), start=1):
+        if progress_cb and (idx == 1 or idx % 200 == 0):
+            try:
+                progress_cb(
+                    {
+                        "phase": "collapsing",
+                        "parent": str(parent),
+                        "parents_processed": idx,
+                        "parents_total": total_parents,
+                        "collapsed_groups": collapsed_groups,
+                    }
+                )
+            except Exception:
+                pass
         if len(children) < 2:
             continue
+        parent_has_cover = False
+        try:
+            parent_has_cover = any(
+                p.is_file() and p.name.lower() in cover_names
+                for p in parent.iterdir()
+            )
+        except Exception:
+            parent_has_cover = False
         if parent in by_folder:
             # Parent already contains direct audio; keep the explicit grouping.
             continue
 
+        prepared_children: list[tuple[Path, list[Path], dict[str, Any], str, str]] = []
         identity_groups: dict[tuple[str, str], list[tuple[Path, list[Path], dict[str, Any]]]] = defaultdict(list)
-        for child, paths in children:
-            ordered = sorted((paths or []), key=lambda p: str(p))
+        for raw_child in children:
+            normalized_child = _normalize_child_entry(raw_child)
+            if not normalized_child:
+                continue
+            child, ordered, existing_tags = normalized_child
             if not ordered:
                 continue
             try:
-                first_tags = extract_tags(ordered[0]) or {}
+                first_tags = existing_tags or extract_tags(ordered[0]) or {}
             except Exception:
                 first_tags = {}
+            first_tags = first_tags if isinstance(first_tags, dict) else {}
             album_title = _sanitize_album_title_display(
                 _pick_album_title_from_tag_dicts([first_tags], fallback="")
             )
@@ -80290,27 +81325,42 @@ def _collapse_nested_album_folder_groups(
                 else ""
             )
             artist_norm = _norm_artist_key(artist_name) if artist_name else ""
-            if not album_norm:
-                continue
-            identity_groups[(album_norm, artist_norm)].append(
-                (child, ordered, first_tags if isinstance(first_tags, dict) else {})
-            )
+            prepared_children.append((child, ordered, first_tags, album_norm, artist_norm))
+            if album_norm:
+                identity_groups[(album_norm, artist_norm)].append((child, ordered, first_tags))
 
         qualifying = [(key, items) for key, items in identity_groups.items() if len(items) >= 2]
-        if len(qualifying) != 1:
+        items: list[tuple[Path, list[Path], dict[str, Any]]] | None = None
+        if len(qualifying) == 1:
+            (_album_norm, _artist_norm), items = qualifying[0]
+        else:
+            if not parent_has_cover:
+                continue
+            segment_items: list[tuple[Path, list[Path], dict[str, Any]]] = []
+            for child, ordered, child_tags, _album_norm, _artist_norm in prepared_children:
+                if not _files_child_folder_name_looks_release_segment(child.name):
+                    continue
+                segment_items.append((child, ordered, child_tags))
+            if len(segment_items) < 2 or len(segment_items) != len(prepared_children):
+                continue
+            contributor_keys: set[str] = set()
+            for _child, _ordered, tags in segment_items:
+                contributor = (
+                    str(tags.get("albumartist") or tags.get("artist") or tags.get("composer") or "").strip()
+                )
+                contributor_norm = _norm_artist_key(contributor)
+                if contributor_norm:
+                    contributor_keys.add(contributor_norm)
+            if len(contributor_keys) > 1:
+                continue
+            items = segment_items
+
+        if not items:
             continue
-        (_album_norm, _artist_norm), items = qualifying[0]
+
         segment_votes = sum(
             1 for child, _paths, _tags in items if _files_child_folder_name_looks_release_segment(child.name)
         )
-        parent_has_cover = False
-        try:
-            parent_has_cover = any(
-                p.is_file() and p.name.lower() in cover_names
-                for p in parent.iterdir()
-            )
-        except Exception:
-            parent_has_cover = False
         if segment_votes < max(1, len(items) // 2) and not parent_has_cover:
             continue
 
@@ -80329,6 +81379,20 @@ def _collapse_nested_album_folder_groups(
         for child, _ordered, _tags in items:
             collapsed.pop(child, None)
         collapsed[parent] = sorted(combined_paths, key=lambda p: str(p))
+        collapsed_groups += 1
+        if progress_cb:
+            try:
+                progress_cb(
+                    {
+                        "phase": "collapsing",
+                        "parent": str(parent),
+                        "parents_processed": idx,
+                        "parents_total": total_parents,
+                        "collapsed_groups": collapsed_groups,
+                    }
+                )
+            except Exception:
+                pass
         logging.info(
             "FILES discovery: collapsed %d child album folder(s) into parent release folder %s",
             len(items),
@@ -81037,6 +82101,14 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
                             prov = ""
                     if not url:
                         try:
+                            url = (_fetch_artist_image_bandcamp(artist_name) or "").strip()
+                            if url:
+                                prov = "bandcamp"
+                        except Exception:
+                            url = ""
+                            prov = ""
+                    if not url:
+                        try:
                             w = _fetch_wikipedia_artist_bio_best(artist_name) or {}
                             if isinstance(w, dict):
                                 url = str(w.get("image_url") or "").strip()
@@ -81061,6 +82133,8 @@ def _improve_folder_by_path(folder_path: Path) -> dict:
                                 provider=prov,
                                 image_url=url,
                                 max_px=640,
+                                page_title=artist_name,
+                                page_summary=("Bandcamp artist page" if prov == "bandcamp" else ""),
                             )
                         if external_cached_path:
                             pmda_artist_provider = prov
@@ -86070,6 +87144,32 @@ def api_assistant_chat():
         ai_error = str(runtime_status.get("ai_error") or "").strip() or "AI is not configured"
         force_llm_rag = bool(ai_ready) and _assistant_should_force_llm_rag(user_message)
 
+        smalltalk = _assistant_try_handle_smalltalk_query(user_message)
+        if smalltalk.get("handled"):
+            assistant_msg_row = _assistant_insert_message(
+                conn,
+                session_id=session_id,
+                role="assistant",
+                content=str(smalltalk.get("assistant_text") or "").strip(),
+                context=ctx,
+                metadata={
+                    "provider": "pmda_assistant",
+                    "model": str(smalltalk.get("tool") or "smalltalk_v1"),
+                    "context_inferred": bool(context_inferred),
+                    "citations": [],
+                    "links": [],
+                    "tool": str(smalltalk.get("tool") or "smalltalk_v1"),
+                },
+            )
+            return jsonify(
+                {
+                    "session_id": session_id,
+                    "user_message": user_msg_row,
+                    "assistant_message": assistant_msg_row,
+                    "citations": [],
+                }
+            )
+
         # Fast path: answer common DB-grounded questions without paying LLM tokens.
         tool = {"handled": False}
         if not force_llm_rag:
@@ -86182,15 +87282,15 @@ def api_assistant_chat():
             web_results=web_results,
         )
 
-        provider = getattr(sys.modules[__name__], "AI_PROVIDER", "openai")
-        model = getattr(sys.modules[__name__], "RESOLVED_MODEL", None) or getattr(sys.modules[__name__], "OPENAI_MODEL", "gpt-4o-mini")
+        provider = str(runtime_status.get("ai_provider") or getattr(sys.modules[__name__], "AI_PROVIDER", "openai"))
+        model = str(runtime_status.get("ai_model") or _ai_model_display_name(provider) or "").strip()
         assistant_text = call_ai_provider_longform(
             provider,
             model,
             system_msg,
             prompt,
             max_tokens=900,
-            analysis_type="other",
+            analysis_type="assistant_chat",
         )
 
         assistant_links = _assistant_links_from_citations(

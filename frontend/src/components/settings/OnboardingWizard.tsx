@@ -70,9 +70,12 @@ type Props = {
 type WorkflowMode = NonNullable<PMDAConfig['LIBRARY_WORKFLOW_MODE']>;
 type StackMode = 'online' | 'local';
 type ExternalAiProvider = 'openai-api' | 'anthropic' | 'google';
-type StepId = 'workflow' | 'folders' | 'metadata' | 'runtime' | 'sources' | 'pipeline' | 'review';
+type StepId = 'workflow' | 'folders' | 'metadata' | 'runtime' | 'sources' | 'rules' | 'pipeline' | 'review';
+type MatchPolicy = 'soft' | 'perfect';
 type DedupeMode = 'ignore' | 'detect' | 'move';
-type IncompleteMode = 'keep' | 'move';
+type DedupeFormatStrategy = 'quality' | 'balanced' | 'compact';
+type DedupeSensitivity = 'safe' | 'aggressive';
+type IncompleteMode = 'keep' | 'obvious' | 'strict';
 type ProviderStatus = {
   variant: 'default' | 'secondary' | 'outline' | 'destructive';
   label: string;
@@ -102,9 +105,14 @@ const STEP_ORDER: Array<{ id: StepId; label: string; title: string }> = [
   { id: 'metadata', label: 'Step 3', title: 'Metadata mode' },
   { id: 'runtime', label: 'Step 4', title: 'Runtime / AI' },
   { id: 'sources', label: 'Step 5', title: 'Metadata sources' },
-  { id: 'pipeline', label: 'Step 6', title: 'Pipeline' },
-  { id: 'review', label: 'Step 7', title: 'Review' },
+  { id: 'rules', label: 'Step 6', title: 'Rules' },
+  { id: 'pipeline', label: 'Step 7', title: 'Pipeline' },
+  { id: 'review', label: 'Step 8', title: 'Review' },
 ];
+
+const FORMAT_PRESET_QUALITY = ['dsf', 'aif', 'aiff', 'wav', 'flac', 'alac', 'ape', 'm4a', 'mp4', 'ogg', 'opus', 'mp3', 'wma', 'aac'];
+const FORMAT_PRESET_BALANCED = ['flac', 'alac', 'wav', 'aif', 'aiff', 'dsf', 'm4a', 'ogg', 'opus', 'mp3', 'aac', 'ape', 'wma', 'mp4'];
+const FORMAT_PRESET_COMPACT = ['opus', 'ogg', 'aac', 'm4a', 'mp3', 'flac', 'alac', 'wav', 'aif', 'aiff', 'dsf', 'ape', 'wma', 'mp4'];
 
 const WORKFLOW_OPTIONS: Array<{
   value: WorkflowMode;
@@ -272,6 +280,23 @@ function stringifyPathList(paths: string[]): string {
     .map((path) => normalizeFolderPath(path))
     .filter(Boolean)
     .join(', ');
+}
+
+function normalizeFormatPreference(raw: unknown): string[] {
+  if (Array.isArray(raw)) {
+    return raw.map((value) => String(value || '').trim().toLowerCase()).filter(Boolean);
+  }
+  const text = String(raw || '').trim();
+  if (!text) return [];
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    if (Array.isArray(parsed)) {
+      return parsed.map((value) => String(value || '').trim().toLowerCase()).filter(Boolean);
+    }
+  } catch {
+    // fall through
+  }
+  return text.split(',').map((value) => value.trim().toLowerCase()).filter(Boolean);
 }
 
 function isBundleReady(bundle: ManagedRuntimeBundleStatus | null | undefined): boolean {
@@ -713,12 +738,30 @@ export function OnboardingWizard({
   const wantsPublishedLibrary = workflowNeedsPublishedLibrary(workflowMode);
   const publishLibraryEnabled = wantsPublishedLibrary ? Boolean(config.PIPELINE_ENABLE_EXPORT) : false;
   const materializationMode = (config.EXPORT_LINK_STRATEGY || config.LIBRARY_MATERIALIZATION_MODE || 'hardlink') as NonNullable<PMDAConfig['EXPORT_LINK_STRATEGY']>;
+  const formatPreference = useMemo(
+    () => normalizeFormatPreference(config.FORMAT_PREFERENCE).filter(Boolean),
+    [config.FORMAT_PREFERENCE],
+  );
+  const matchPolicy: MatchPolicy = Number(config.TRACKLIST_MATCH_MIN ?? 0.8) >= 0.97 ? 'perfect' : 'soft';
   const dedupeMode: DedupeMode = !Boolean(config.PIPELINE_ENABLE_DEDUPE)
     ? 'ignore'
     : Boolean(config.AUTO_MOVE_DUPES)
       ? 'move'
       : 'detect';
-  const incompleteMode: IncompleteMode = Boolean(config.PIPELINE_ENABLE_INCOMPLETE_MOVE) ? 'move' : 'keep';
+  const dedupeFormatStrategy: DedupeFormatStrategy = useMemo(() => {
+    const first = formatPreference[0] || '';
+    if (['opus', 'ogg', 'aac', 'mp3', 'm4a'].includes(first)) return 'compact';
+    if (first === 'flac' || first === 'alac') return 'balanced';
+    return 'quality';
+  }, [formatPreference]);
+  const dedupeSensitivity: DedupeSensitivity = String(config.LIVE_DEDUPE_MODE || 'safe').trim().toLowerCase() === 'aggressive'
+    ? 'aggressive'
+    : 'safe';
+  const incompleteMode: IncompleteMode = !Boolean(config.PIPELINE_ENABLE_INCOMPLETE_MOVE)
+    ? 'keep'
+    : (Number(config.BROKEN_ALBUM_CONSECUTIVE_THRESHOLD ?? 2) <= 1 || Number(config.BROKEN_ALBUM_PERCENTAGE_THRESHOLD ?? 0.25) <= 0.12)
+      ? 'strict'
+      : 'obvious';
   const playerTarget = (Boolean(config.PIPELINE_ENABLE_PLAYER_SYNC)
     ? (config.PIPELINE_PLAYER_TARGET || 'none')
     : 'none') as NonNullable<PMDAConfig['PIPELINE_PLAYER_TARGET']>;
@@ -793,6 +836,14 @@ export function OnboardingWizard({
     if (config.USE_LASTFM === undefined) updates.USE_LASTFM = true;
     if (config.USE_BANDCAMP === undefined) updates.USE_BANDCAMP = true;
     if (config.USE_ACOUSTID === undefined) updates.USE_ACOUSTID = true;
+    if (config.TRACKLIST_MATCH_MIN === undefined) updates.TRACKLIST_MATCH_MIN = 0.8;
+    if (config.USE_AI_FOR_SOFT_MATCH_PROFILES === undefined) updates.USE_AI_FOR_SOFT_MATCH_PROFILES = true;
+    if (config.LIVE_ALBUMS_MB_STRICT === undefined) updates.LIVE_ALBUMS_MB_STRICT = false;
+    if (config.LIVE_DEDUPE_MODE === undefined) updates.LIVE_DEDUPE_MODE = 'safe';
+    if (config.NORMALIZE_PARENTHETICAL_FOR_DEDUPE === undefined) updates.NORMALIZE_PARENTHETICAL_FOR_DEDUPE = true;
+    if (config.REPROCESS_INCOMPLETE_ALBUMS === undefined) updates.REPROCESS_INCOMPLETE_ALBUMS = true;
+    if (config.BROKEN_ALBUM_CONSECUTIVE_THRESHOLD === undefined) updates.BROKEN_ALBUM_CONSECUTIVE_THRESHOLD = 2;
+    if (config.BROKEN_ALBUM_PERCENTAGE_THRESHOLD === undefined) updates.BROKEN_ALBUM_PERCENTAGE_THRESHOLD = 0.25;
 
     const hasExplicitMetadataChoice = Boolean(
       config.MUSICBRAINZ_MIRROR_ENABLED !== undefined
@@ -816,6 +867,11 @@ export function OnboardingWizard({
         SCAN_AI_POLICY: 'local_only',
         WEB_SEARCH_PROVIDER: 'ollama',
         AI_USAGE_LEVEL: 'auto',
+        USE_AI_FOR_MB_MATCH: false,
+        USE_AI_FOR_MB_VERIFY: false,
+        USE_AI_FOR_DEDUPE: false,
+        PROVIDER_IDENTITY_USE_AI: false,
+        USE_AI_WEB_SEARCH_FALLBACK: false,
       });
     }
 
@@ -823,7 +879,7 @@ export function OnboardingWizard({
       updateConfig(updates);
     }
     initializedDefaultsRef.current = true;
-  }, [config.AI_PROVIDER, config.MUSICBRAINZ_MIRROR_ENABLED, config.MUSICBRAINZ_RUNTIME_MODE, config.OLLAMA_RUNTIME_MODE, config.OLLAMA_URL, config.USE_ACOUSTID, config.USE_BANDCAMP, config.USE_DISCOGS, config.USE_LASTFM, config.USE_MUSICBRAINZ, config.WEB_SEARCH_PROVIDER, ollamaHardModel, ollamaModel, ollamaUrl, updateConfig]);
+  }, [config.AI_PROVIDER, config.BROKEN_ALBUM_CONSECUTIVE_THRESHOLD, config.BROKEN_ALBUM_PERCENTAGE_THRESHOLD, config.LIVE_ALBUMS_MB_STRICT, config.LIVE_DEDUPE_MODE, config.MUSICBRAINZ_MIRROR_ENABLED, config.MUSICBRAINZ_RUNTIME_MODE, config.NORMALIZE_PARENTHETICAL_FOR_DEDUPE, config.OLLAMA_RUNTIME_MODE, config.OLLAMA_URL, config.REPROCESS_INCOMPLETE_ALBUMS, config.TRACKLIST_MATCH_MIN, config.USE_ACOUSTID, config.USE_AI_FOR_SOFT_MATCH_PROFILES, config.USE_BANDCAMP, config.USE_DISCOGS, config.USE_LASTFM, config.USE_MUSICBRAINZ, config.WEB_SEARCH_PROVIDER, ollamaHardModel, ollamaModel, ollamaUrl, updateConfig]);
 
   const applyWorkflowPreset = useCallback((mode: WorkflowMode) => {
     const nextUpdates: Partial<PMDAConfig> = {
@@ -851,6 +907,11 @@ export function OnboardingWizard({
         SCAN_AI_POLICY: 'local_only',
         WEB_SEARCH_PROVIDER: 'ollama',
         AI_USAGE_LEVEL: 'auto',
+        USE_AI_FOR_MB_MATCH: false,
+        USE_AI_FOR_MB_VERIFY: false,
+        USE_AI_FOR_DEDUPE: false,
+        PROVIDER_IDENTITY_USE_AI: false,
+        USE_AI_WEB_SEARCH_FALLBACK: false,
         USE_BANDCAMP: config.USE_BANDCAMP ?? true,
       });
       return;
@@ -866,6 +927,11 @@ export function OnboardingWizard({
       SCAN_AI_POLICY: 'paid_only',
       WEB_SEARCH_PROVIDER: 'auto',
       AI_USAGE_LEVEL: 'auto',
+      USE_AI_FOR_MB_MATCH: false,
+      USE_AI_FOR_MB_VERIFY: false,
+      USE_AI_FOR_DEDUPE: false,
+      PROVIDER_IDENTITY_USE_AI: false,
+      USE_AI_WEB_SEARCH_FALLBACK: false,
       USE_BANDCAMP: config.USE_BANDCAMP ?? true,
     });
   }, [config.AI_PROVIDER, config.USE_BANDCAMP, ollamaHardModel, ollamaModel, ollamaUrl, updateConfig]);
@@ -879,6 +945,11 @@ export function OnboardingWizard({
       SCAN_AI_POLICY: 'paid_only',
       WEB_SEARCH_PROVIDER: 'auto',
       AI_USAGE_LEVEL: 'auto',
+      USE_AI_FOR_MB_MATCH: false,
+      USE_AI_FOR_MB_VERIFY: false,
+      USE_AI_FOR_DEDUPE: false,
+      PROVIDER_IDENTITY_USE_AI: false,
+      USE_AI_WEB_SEARCH_FALLBACK: false,
     };
     if (provider === 'openai-api') {
       updates.OPENAI_API_KEY = String(config.OPENAI_API_KEY || '');
@@ -1315,6 +1386,7 @@ export function OnboardingWizard({
   }, [config.JELLYFIN_API_KEY, config.JELLYFIN_URL, config.NAVIDROME_API_KEY, config.NAVIDROME_PASSWORD, config.NAVIDROME_URL, config.NAVIDROME_USERNAME, config.PLEX_HOST, config.PLEX_TOKEN, playerTarget]);
 
   const sourcesStepReady = sourcesConfigured;
+  const rulesReady = Boolean(matchPolicy && dedupeFormatStrategy && dedupeSensitivity && incompleteMode);
 
   const pipelineConfigReady = useMemo(() => {
     if (wantsPublishedLibrary && publishLibraryEnabled && !materializationMode) return false;
@@ -1322,7 +1394,7 @@ export function OnboardingWizard({
     return true;
   }, [materializationMode, playerSyncReady, publishLibraryEnabled, wantsPublishedLibrary]);
 
-  const launchReady = foldersReady && runtimeSetupReady && sourcesStepReady && pipelineConfigReady && pipelineStepConfirmed;
+  const launchReady = foldersReady && runtimeSetupReady && sourcesStepReady && rulesReady && pipelineConfigReady && pipelineStepConfirmed;
 
   const reviewFingerprint = JSON.stringify({
     workflowMode,
@@ -1330,6 +1402,7 @@ export function OnboardingWizard({
     selectedExternalProvider,
     externalModel,
     sourcesConfigured,
+    matchPolicy,
     musicbrainzEnabled,
     discogsEnabled,
     lastfmEnabled,
@@ -1338,7 +1411,13 @@ export function OnboardingWizard({
     publishLibraryEnabled,
     materializationMode,
     dedupeMode,
+    dedupeFormatStrategy,
+    dedupeSensitivity,
     incompleteMode,
+    reprocessIncompleteAlbums: Boolean(config.REPROCESS_INCOMPLETE_ALBUMS),
+    brokenAlbumConsecutiveThreshold: Number(config.BROKEN_ALBUM_CONSECUTIVE_THRESHOLD ?? 0),
+    brokenAlbumPercentageThreshold: Number(config.BROKEN_ALBUM_PERCENTAGE_THRESHOLD ?? 0),
+    normalizeParenthetical: Boolean(config.NORMALIZE_PARENTHETICAL_FOR_DEDUPE),
     playerTarget,
     playerSyncReady,
     localRuntimeReady,
@@ -1420,8 +1499,8 @@ export function OnboardingWizard({
     if (!pipelineStepConfirmed) {
       next.push({
         key: 'pipeline-review',
-        title: 'Pipeline step has not been reviewed yet',
-        detail: 'Open the pipeline step and confirm how PMDA should publish, move duplicates, and handle incompletes.',
+        title: 'Rules and pipeline still need a final review',
+        detail: 'Open the rules and pipeline steps, then confirm the final launch review.',
         stepId: 'pipeline',
       });
     }
@@ -1436,10 +1515,11 @@ export function OnboardingWizard({
     if (selectedStackMode === 'local' || selectedStackMode === 'online') count += 1;
     if (runtimeSetupReady) count += 1;
     if (sourcesStepReady) count += 1;
-    if (pipelineConfigReady && pipelineStepConfirmed) count += 1;
+    if (rulesReady) count += 1;
+    if (pipelineConfigReady) count += 1;
     if (launchReady) count += 1;
     return count;
-  }, [foldersReady, launchReady, pipelineConfigReady, pipelineStepConfirmed, runtimeSetupReady, selectedStackMode, sourcesStepReady, workflowMode]);
+  }, [foldersReady, launchReady, pipelineConfigReady, rulesReady, runtimeSetupReady, selectedStackMode, sourcesStepReady, workflowMode]);
 
   const wizardPercent = Math.round(((activeStep + 1) / STEP_ORDER.length) * 100);
 
@@ -1552,6 +1632,13 @@ export function OnboardingWizard({
     }
 
     if (activeStep === 5) {
+      if (!rulesReady) {
+        toast.error('Finish the matching, duplicate and incomplete rules first.');
+        return;
+      }
+    }
+
+    if (activeStep === 6) {
       if (!pipelineConfigReady) {
         toast.error(blockers.find((blocker) => blocker.stepId === 'pipeline')?.detail || 'Finish the pipeline choices first.');
         return;
@@ -1560,7 +1647,7 @@ export function OnboardingWizard({
     }
 
     await goToStep(activeStep + 1);
-  }, [activeStep, blockers, goToStep, localStackNeedsConfirmation, pipelineConfigReady, runtimeSetupReady, selectedStackMode, sourcesStepReady]);
+  }, [activeStep, blockers, goToStep, localStackNeedsConfirmation, pipelineConfigReady, rulesReady, runtimeSetupReady, selectedStackMode, sourcesStepReady]);
 
   const startOrResumeScan = useCallback(async () => {
     setScanActionBusy(true);
@@ -1612,8 +1699,54 @@ export function OnboardingWizard({
     updateConfig({ PIPELINE_ENABLE_DEDUPE: true, AUTO_MOVE_DUPES: true });
   }, [updateConfig]);
 
+  const setMatchPolicy = useCallback((policy: MatchPolicy) => {
+    if (policy === 'perfect') {
+      updateConfig({
+        TRACKLIST_MATCH_MIN: 0.98,
+        USE_AI_FOR_SOFT_MATCH_PROFILES: false,
+      });
+      return;
+    }
+    updateConfig({
+      TRACKLIST_MATCH_MIN: 0.8,
+      USE_AI_FOR_SOFT_MATCH_PROFILES: true,
+    });
+  }, [updateConfig]);
+
+  const setDedupeFormatStrategy = useCallback((strategy: DedupeFormatStrategy) => {
+    if (strategy === 'compact') {
+      updateConfig({ FORMAT_PREFERENCE: FORMAT_PRESET_COMPACT });
+      return;
+    }
+    if (strategy === 'balanced') {
+      updateConfig({ FORMAT_PREFERENCE: FORMAT_PRESET_BALANCED });
+      return;
+    }
+    updateConfig({ FORMAT_PREFERENCE: FORMAT_PRESET_QUALITY });
+  }, [updateConfig]);
+
+  const setDedupeSensitivity = useCallback((sensitivity: DedupeSensitivity) => {
+    updateConfig({ LIVE_DEDUPE_MODE: sensitivity });
+  }, [updateConfig]);
+
   const setIncompleteHandling = useCallback((mode: IncompleteMode) => {
-    updateConfig({ PIPELINE_ENABLE_INCOMPLETE_MOVE: mode === 'move' });
+    if (mode === 'keep') {
+      updateConfig({ PIPELINE_ENABLE_INCOMPLETE_MOVE: false });
+      return;
+    }
+    if (mode === 'strict') {
+      updateConfig({
+        PIPELINE_ENABLE_INCOMPLETE_MOVE: true,
+        BROKEN_ALBUM_CONSECUTIVE_THRESHOLD: 1,
+        BROKEN_ALBUM_PERCENTAGE_THRESHOLD: 0.1,
+      });
+      return;
+    }
+    updateConfig({
+      PIPELINE_ENABLE_INCOMPLETE_MOVE: true,
+      BROKEN_ALBUM_CONSECUTIVE_THRESHOLD: 2,
+      BROKEN_ALBUM_PERCENTAGE_THRESHOLD: 0.25,
+    });
   }, [updateConfig]);
 
   const setPlayerTarget = useCallback((target: NonNullable<PMDAConfig['PIPELINE_PLAYER_TARGET']>) => {
@@ -1653,28 +1786,36 @@ export function OnboardingWizard({
       step: 4,
     },
     {
+      label: 'Match policy',
+      value: matchPolicy === 'soft' ? 'Soft matches accepted' : 'Perfect matches only',
+      detail: matchPolicy === 'soft'
+        ? 'More near-matches survive and can still be enriched by providers.'
+        : 'PMDA stays conservative and leaves more releases unmatched.',
+      step: 4,
+    },
+    {
+      label: 'Duplicate rules',
+      value: dedupeMode === 'ignore' ? 'Ignore' : dedupeMode === 'detect' ? 'Detect only' : 'Detect and move',
+      detail: `${dedupeFormatStrategy === 'quality' ? 'Prefer best audio quality' : dedupeFormatStrategy === 'compact' ? 'Prefer smaller files' : 'Prefer balanced winners'} · ${dedupeSensitivity === 'aggressive' ? 'broader grouping' : 'safer grouping'}`,
+      step: 5,
+    },
+    {
+      label: 'Incomplete rules',
+      value: incompleteMode === 'keep' ? 'Keep everything in place' : incompleteMode === 'strict' ? 'Move even small gaps' : 'Move only obvious gaps',
+      detail: Boolean(config.REPROCESS_INCOMPLETE_ALBUMS) ? 'Incomplete releases stay eligible for repair in future runs.' : 'Incomplete releases are not auto-retried later.',
+      step: 5,
+    },
+    {
       label: 'Publish library',
       value: wantsPublishedLibrary ? (publishLibraryEnabled ? `On · ${materializationMode}` : 'Off') : 'Not needed',
       detail: wantsPublishedLibrary ? `Serving root: ${servingRoot || 'not set yet'}` : 'PMDA works directly inside the current library.',
-      step: 5,
-    },
-    {
-      label: 'Duplicates',
-      value: dedupeMode === 'ignore' ? 'Ignore' : dedupeMode === 'detect' ? 'Detect only' : 'Detect and move',
-      detail: dupesRoot ? `Dupes folder: ${dupesRoot}` : 'No duplicates folder set yet.',
-      step: 5,
-    },
-    {
-      label: 'Incompletes',
-      value: incompleteMode === 'move' ? 'Move to incomplete folder' : 'Leave in place',
-      detail: incompleteRoot ? `Incomplete folder: ${incompleteRoot}` : 'No incomplete folder set yet.',
-      step: 5,
+      step: 6,
     },
     {
       label: 'Player sync',
       value: playerTarget === 'none' ? 'Not now' : PLAYER_TARGET_OPTIONS.find((option) => option.value === playerTarget)?.label || playerTarget,
       detail: playerTarget === 'none' ? 'No external player refresh after the first scan.' : (playerSyncReady ? 'Credentials are present.' : 'Credentials still need to be completed.'),
-      step: 5,
+      step: 6,
     },
   ];
 
@@ -1691,7 +1832,7 @@ export function OnboardingWizard({
                 Guided setup
               </CardTitle>
               <CardDescription>
-                Use the short setup flow to lock workflow, folders, metadata, pipeline behavior and the first scan review in one place.
+                Use the short setup flow to lock workflow, folders, metadata, rules, pipeline behavior and the first scan review in one place.
               </CardDescription>
             </div>
             <Button type="button" className="gap-2 self-start" onClick={onOpenGuidedSetup}>
@@ -1745,7 +1886,7 @@ export function OnboardingWizard({
             </div>
             <h2 className="text-2xl font-semibold tracking-tight">Set the essentials, then launch the first scan.</h2>
             <p className="max-w-2xl text-sm text-slate-300">
-              Seven short steps: choose the workflow, point PMDA at the right folders, pick local or external metadata, finish the runtime or AI setup, configure the required sources, decide the pipeline behavior, then review exactly what the first scan will do.
+              Eight short steps: choose the workflow, point PMDA at the right folders, pick local or external metadata, finish the runtime or AI setup, configure the required sources, define the matching and quarantine rules, decide the pipeline behavior, then review exactly what the first scan will do.
             </p>
           </div>
           <div className="space-y-3">
@@ -1754,7 +1895,7 @@ export function OnboardingWizard({
               <span>{launchReady ? 'Ready to scan' : `${completionCount}/${STEP_ORDER.length} steps ready`}</span>
             </div>
             <Progress value={wizardPercent} className="h-2 bg-white/10" />
-            <div className="grid gap-2 sm:grid-cols-3 xl:grid-cols-6">
+            <div className="grid gap-2 sm:grid-cols-2 md:grid-cols-4 xl:grid-cols-8">
               {STEP_ORDER.map((step, index) => {
                 const complete = (
                   (step.id === 'workflow' && Boolean(workflowMode))
@@ -1762,7 +1903,8 @@ export function OnboardingWizard({
                   || (step.id === 'metadata' && Boolean(selectedStackMode))
                   || (step.id === 'runtime' && runtimeSetupReady)
                   || (step.id === 'sources' && sourcesStepReady)
-                  || (step.id === 'pipeline' && pipelineConfigReady && pipelineStepConfirmed)
+                  || (step.id === 'rules' && rulesReady)
+                  || (step.id === 'pipeline' && pipelineConfigReady)
                   || (step.id === 'review' && launchReady)
                 );
                 const active = index === activeStep;
@@ -2321,6 +2463,46 @@ export function OnboardingWizard({
                   </div>
                 </div>
 
+                <div className="space-y-4 rounded-3xl border border-white/10 bg-white/[0.03] p-4">
+                  <div>
+                    <div className="text-sm font-semibold text-white">Match policy</div>
+                    <p className="mt-1 text-xs text-slate-400">Decide how conservative PMDA should be before it keeps a near-match. Soft matches are recommended for the first scan and stay grounded in provider evidence.</p>
+                  </div>
+                  <div className="grid gap-3 md:grid-cols-2">
+                    {[
+                      {
+                        value: 'soft' as const,
+                        label: 'Soft matches accepted',
+                        description: 'Recommended. Keeps strong near-matches alive, which helps obscure releases, alternate editions and provider enrichment.',
+                        tradeoff: 'More metadata lands automatically, but a few releases may still need manual review later.',
+                      },
+                      {
+                        value: 'perfect' as const,
+                        label: 'Perfect matches only',
+                        description: 'Use this if you want the most conservative scan and prefer PMDA to leave uncertain releases unmatched.',
+                        tradeoff: 'Safer library, but more albums will stay unmatched and fewer provider profiles will be pulled.',
+                      },
+                    ].map((option) => {
+                      const active = matchPolicy === option.value;
+                      return (
+                        <button
+                          key={option.value}
+                          type="button"
+                          onClick={() => setMatchPolicy(option.value)}
+                          className={`rounded-2xl border p-4 text-left transition ${active ? 'border-primary/45 bg-primary/12' : 'border-white/10 bg-white/[0.03] hover:border-white/20'}`}
+                        >
+                          <div className="flex items-center justify-between gap-3">
+                            <div className="text-sm font-semibold text-white">{option.label}</div>
+                            {active ? <Badge className="bg-primary text-primary-foreground">Selected</Badge> : null}
+                          </div>
+                          <p className="mt-2 text-xs leading-5 text-slate-300">{option.description}</p>
+                          <p className="mt-3 text-[11px] leading-5 text-slate-500">{option.tradeoff}</p>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
                 {sourceIssues.length > 0 ? (
                   <div className="rounded-2xl border border-amber-500/25 bg-amber-500/10 p-4 text-sm text-amber-100">
                     <div className="flex items-center gap-2 font-medium">
@@ -2349,8 +2531,205 @@ export function OnboardingWizard({
           {activeStep === 5 ? (
             <div className="space-y-5">
               <div className="space-y-1">
+                <div className="text-sm font-semibold text-white">Define the matching and quarantine rules</div>
+                <p className="text-sm text-slate-400">Keep this simple: decide how strict matching should be, how PMDA should pick duplicate winners, and when an album is incomplete enough to leave the clean path.</p>
+              </div>
+
+              <div className="grid gap-4 xl:grid-cols-[1.1fr,0.9fr]">
+                <div className="space-y-4 rounded-3xl border border-white/10 bg-white/[0.03] p-4">
+                  <div>
+                    <div className="text-sm font-semibold text-white">Duplicates</div>
+                    <p className="mt-1 text-xs text-slate-400">Choose whether PMDA should ignore duplicates, flag them for review, or move the losing editions automatically.</p>
+                  </div>
+                  <div className="grid gap-3 md:grid-cols-3">
+                    {[
+                      { value: 'ignore' as const, label: 'Ignore', description: 'Do not run the dedupe stage.' },
+                      { value: 'detect' as const, label: 'Detect only', description: 'Show duplicate groups but keep every edition in place.' },
+                      { value: 'move' as const, label: 'Detect and move', description: 'Move losing editions to the duplicates folder automatically.' },
+                    ].map((option) => {
+                      const active = dedupeMode === option.value;
+                      return (
+                        <button
+                          key={option.value}
+                          type="button"
+                          onClick={() => setDedupeMode(option.value)}
+                          className={`rounded-2xl border p-4 text-left transition ${active ? 'border-primary/45 bg-primary/12' : 'border-white/10 bg-white/[0.03] hover:border-white/20'}`}
+                        >
+                          <div className="flex items-center justify-between gap-3">
+                            <div className="text-sm font-semibold text-white">{option.label}</div>
+                            {active ? <Badge className="bg-primary text-primary-foreground">Selected</Badge> : null}
+                          </div>
+                          <p className="mt-2 text-xs leading-5 text-slate-400">{option.description}</p>
+                        </button>
+                      );
+                    })}
+                  </div>
+
+                  <div className="space-y-3">
+                    <div>
+                      <div className="text-sm font-semibold text-white">When two editions compete, what should win?</div>
+                      <p className="mt-1 text-xs text-slate-400">PMDA already prefers fuller tracklists when two releases are credible. This choice decides the audio bias on top of that.</p>
+                    </div>
+                    <div className="grid gap-3 md:grid-cols-3">
+                      {[
+                        {
+                          value: 'quality' as const,
+                          label: 'Best audio quality',
+                          description: 'Prefer the highest-fidelity codecs first, then use other signals to break ties.',
+                        },
+                        {
+                          value: 'balanced' as const,
+                          label: 'Balanced winner',
+                          description: 'Keep lossless near the top, but stay a bit more practical for mixed libraries.',
+                        },
+                        {
+                          value: 'compact' as const,
+                          label: 'Smaller files first',
+                          description: 'Prefer portable/compressed versions when quality is not the main priority.',
+                        },
+                      ].map((option) => {
+                        const active = dedupeFormatStrategy === option.value;
+                        return (
+                          <button
+                            key={option.value}
+                            type="button"
+                            onClick={() => setDedupeFormatStrategy(option.value)}
+                            className={`rounded-2xl border p-4 text-left transition ${active ? 'border-primary/45 bg-primary/12' : 'border-white/10 bg-white/[0.03] hover:border-white/20'}`}
+                          >
+                            <div className="flex items-center justify-between gap-3">
+                              <div className="text-sm font-semibold text-white">{option.label}</div>
+                              {active ? <Badge className="bg-primary text-primary-foreground">Selected</Badge> : null}
+                            </div>
+                            <p className="mt-2 text-xs leading-5 text-slate-400">{option.description}</p>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  <div className="grid gap-3 md:grid-cols-[1fr,auto] md:items-start">
+                    <div className="space-y-3 rounded-2xl border border-white/10 bg-black/10 p-4">
+                      <div>
+                        <div className="text-sm font-semibold text-white">Duplicate sensitivity</div>
+                        <p className="mt-1 text-xs text-slate-400">Use a safer mode when you want fewer false merges. Use broader grouping when your folders contain many variant suffixes for the same release.</p>
+                      </div>
+                      <div className="grid gap-3 md:grid-cols-2">
+                        {[
+                          {
+                            value: 'safe' as const,
+                            label: 'Safer grouping',
+                            description: 'Recommended. More conservative around edge cases and near-duplicates.',
+                          },
+                          {
+                            value: 'aggressive' as const,
+                            label: 'Broader grouping',
+                            description: 'Merges more borderline duplicate candidates, which can save time in noisier libraries.',
+                          },
+                        ].map((option) => {
+                          const active = dedupeSensitivity === option.value;
+                          return (
+                            <button
+                              key={option.value}
+                              type="button"
+                              onClick={() => setDedupeSensitivity(option.value)}
+                              className={`rounded-2xl border p-4 text-left transition ${active ? 'border-primary/45 bg-primary/12' : 'border-white/10 bg-white/[0.03] hover:border-white/20'}`}
+                            >
+                              <div className="flex items-center justify-between gap-3">
+                                <div className="text-sm font-semibold text-white">{option.label}</div>
+                                {active ? <Badge className="bg-primary text-primary-foreground">Selected</Badge> : null}
+                              </div>
+                              <p className="mt-2 text-xs leading-5 text-slate-400">{option.description}</p>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                    <div className="rounded-2xl border border-white/10 bg-black/10 p-4 md:w-[280px]">
+                      <div className="flex items-start justify-between gap-3">
+                        <div>
+                          <div className="text-sm font-semibold text-white">Treat suffixes as the same release</div>
+                          <p className="mt-1 text-xs text-slate-400">Examples: <span className="font-mono text-slate-200">Album (FLAC)</span> and <span className="font-mono text-slate-200">Album</span>.</p>
+                        </div>
+                        <Switch
+                          checked={config.NORMALIZE_PARENTHETICAL_FOR_DEDUPE ?? true}
+                          onCheckedChange={(checked) => updateConfig({ NORMALIZE_PARENTHETICAL_FOR_DEDUPE: checked })}
+                        />
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="space-y-4 rounded-3xl border border-white/10 bg-white/[0.03] p-4">
+                  <div>
+                    <div className="text-sm font-semibold text-white">Incomplete albums</div>
+                    <p className="mt-1 text-xs text-slate-400">Choose how strict PMDA should be before it moves a release into the incomplete folder.</p>
+                  </div>
+                  {[
+                    {
+                      value: 'keep' as const,
+                      label: 'Keep everything in place',
+                      description: 'Do not quarantine incomplete albums automatically.',
+                    },
+                    {
+                      value: 'obvious' as const,
+                      label: 'Move only obvious gaps',
+                      description: 'Recommended. Keeps likely alt editions in place, but moves releases with clear missing chunks.',
+                    },
+                    {
+                      value: 'strict' as const,
+                      label: 'Move even small gaps',
+                      description: 'Use this only if you want the clean library to reject near-complete albums too.',
+                    },
+                  ].map((option) => {
+                    const active = incompleteMode === option.value;
+                    return (
+                      <button
+                        key={option.value}
+                        type="button"
+                        onClick={() => setIncompleteHandling(option.value)}
+                        className={`rounded-2xl border p-4 text-left transition ${active ? 'border-primary/45 bg-primary/12' : 'border-white/10 bg-white/[0.03] hover:border-white/20'}`}
+                      >
+                        <div className="flex items-center justify-between gap-3">
+                          <div className="text-sm font-semibold text-white">{option.label}</div>
+                          {active ? <Badge className="bg-primary text-primary-foreground">Selected</Badge> : null}
+                        </div>
+                        <p className="mt-2 text-xs leading-5 text-slate-400">{option.description}</p>
+                      </button>
+                    );
+                  })}
+
+                  <div className="rounded-2xl border border-white/10 bg-black/10 p-4">
+                    <div className="flex items-start justify-between gap-3">
+                      <div>
+                        <div className="text-sm font-semibold text-white">Keep repairing incomplete albums later</div>
+                        <p className="mt-1 text-xs text-slate-400">When on, future runs can keep trying to fill missing metadata or artwork for albums that were not complete yet.</p>
+                      </div>
+                      <Switch
+                        checked={Boolean(config.REPROCESS_INCOMPLETE_ALBUMS)}
+                        onCheckedChange={(checked) => updateConfig({ REPROCESS_INCOMPLETE_ALBUMS: checked })}
+                      />
+                    </div>
+                  </div>
+
+                  <div className="rounded-2xl border border-white/10 bg-black/10 p-4 text-xs leading-6 text-slate-400">
+                    <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Current outcome</div>
+                    <p className="mt-2">
+                      Duplicates folder: <span className="font-mono text-slate-200">{dupesRoot || 'not set yet'}</span>
+                    </p>
+                    <p>
+                      Incomplete folder: <span className="font-mono text-slate-200">{incompleteRoot || 'not set yet'}</span>
+                    </p>
+                  </div>
+                </div>
+              </div>
+            </div>
+          ) : null}
+
+          {activeStep === 6 ? (
+            <div className="space-y-5">
+              <div className="space-y-1">
                 <div className="text-sm font-semibold text-white">Choose the pipeline behavior</div>
-                <p className="text-sm text-slate-400">This is the minimum PMDA behavior that must be explicit before the first scan can start.</p>
+                <p className="text-sm text-slate-400">This is the execution layer: publish the clean library if needed, then optionally refresh a player when the run finishes.</p>
               </div>
 
               {wantsPublishedLibrary ? (
@@ -2415,63 +2794,6 @@ export function OnboardingWizard({
                   This workflow serves the current library directly, so PMDA will not build a second published tree.
                 </div>
               )}
-
-              <div className="grid gap-4 lg:grid-cols-2">
-                <div className="space-y-4 rounded-3xl border border-white/10 bg-white/[0.03] p-4">
-                  <div>
-                    <div className="text-sm font-semibold text-white">Duplicates</div>
-                    <p className="mt-1 text-xs text-slate-400">Choose whether PMDA should ignore duplicates, detect them only, or move duplicate losers automatically.</p>
-                  </div>
-                  {[
-                    { value: 'ignore' as const, label: 'Ignore', description: 'Do not run the dedupe stage.' },
-                    { value: 'detect' as const, label: 'Detect only', description: 'Keep duplicates visible but do not move anything automatically.' },
-                    { value: 'move' as const, label: 'Detect and move', description: 'Move duplicate losers to the duplicates folder automatically.' },
-                  ].map((option) => {
-                    const active = dedupeMode === option.value;
-                    return (
-                      <button
-                        key={option.value}
-                        type="button"
-                        onClick={() => setDedupeMode(option.value)}
-                        className={`rounded-2xl border p-4 text-left transition ${active ? 'border-primary/45 bg-primary/12' : 'border-white/10 bg-white/[0.03] hover:border-white/20'}`}
-                      >
-                        <div className="flex items-center justify-between gap-3">
-                          <div className="text-sm font-semibold text-white">{option.label}</div>
-                          {active ? <Badge className="bg-primary text-primary-foreground">Selected</Badge> : null}
-                        </div>
-                        <p className="mt-2 text-xs leading-5 text-slate-400">{option.description}</p>
-                      </button>
-                    );
-                  })}
-                </div>
-
-                <div className="space-y-4 rounded-3xl border border-white/10 bg-white/[0.03] p-4">
-                  <div>
-                    <div className="text-sm font-semibold text-white">Incomplete albums</div>
-                    <p className="mt-1 text-xs text-slate-400">Choose whether incomplete releases should stay in place or move to the quarantine folder.</p>
-                  </div>
-                  {[
-                    { value: 'move' as const, label: 'Move to incomplete folder', description: 'Keep the clean library isolated from releases with missing tracks.' },
-                    { value: 'keep' as const, label: 'Leave in place', description: 'Do not move incomplete albums automatically.' },
-                  ].map((option) => {
-                    const active = incompleteMode === option.value;
-                    return (
-                      <button
-                        key={option.value}
-                        type="button"
-                        onClick={() => setIncompleteHandling(option.value)}
-                        className={`rounded-2xl border p-4 text-left transition ${active ? 'border-primary/45 bg-primary/12' : 'border-white/10 bg-white/[0.03] hover:border-white/20'}`}
-                      >
-                        <div className="flex items-center justify-between gap-3">
-                          <div className="text-sm font-semibold text-white">{option.label}</div>
-                          {active ? <Badge className="bg-primary text-primary-foreground">Selected</Badge> : null}
-                        </div>
-                        <p className="mt-2 text-xs leading-5 text-slate-400">{option.description}</p>
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
 
               <div className="space-y-4 rounded-3xl border border-white/10 bg-white/[0.03] p-4">
                 <div>
@@ -2557,7 +2879,7 @@ export function OnboardingWizard({
             </div>
           ) : null}
 
-          {activeStep === 6 ? (
+          {activeStep === 7 ? (
             <div className="space-y-5">
               <div className="space-y-1">
                 <div className="text-sm font-semibold text-white">Review before the first full scan</div>
@@ -2631,11 +2953,12 @@ export function OnboardingWizard({
                     || (activeStep === 1 && !foldersReady)
                     || (activeStep === 3 && !runtimeSetupReady)
                     || (activeStep === 4 && !sourcesStepReady)
-                    || (activeStep === 5 && !pipelineConfigReady)
+                    || (activeStep === 5 && !rulesReady)
+                    || (activeStep === 6 && !pipelineConfigReady)
                   }
                 >
                   {isSaving ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
-                  {activeStep === 2 && localStackNeedsConfirmation ? 'Continue' : activeStep === 5 ? 'Review first scan' : 'Next'}
+                  {activeStep === 2 && localStackNeedsConfirmation ? 'Continue' : activeStep === 6 ? 'Review first scan' : 'Next'}
                 </Button>
               ) : (
                 <Button type="button" className="gap-2" onClick={() => void startOrResumeScan()} disabled={scanActionBusy || !launchReady}>

@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Link, Outlet, useLocation, useSearchParams } from 'react-router-dom';
+import { useQuery } from '@tanstack/react-query';
 
+import { LibraryIndexStatusBanner } from '@/components/library/LibraryIndexStatusBanner';
 import { Button } from '@/components/ui/button';
 import { useAuth } from '@/contexts/AuthContext';
 import * as api from '@/lib/api';
@@ -37,6 +39,16 @@ export default function LibraryLayout() {
   const [config, setConfig] = useState<Partial<PMDAConfig>>({});
   const includeUnmatched = true;
   const { scope } = useLibraryQuery();
+  const { data: filesIndexStatus } = useQuery<api.LibraryFilesIndexStatus>({
+    queryKey: ['library-files-index-status'],
+    queryFn: api.getLibraryFilesIndexStatus,
+    refetchInterval: (query) => {
+      const status = query.state.data;
+      return status?.running ? 2500 : 8000;
+    },
+    refetchIntervalInBackground: true,
+    staleTime: 0,
+  });
 
   const setScope = useCallback((nextScope: api.LibraryBrowseScope) => {
     setSearchParams((prev) => {
@@ -151,7 +163,14 @@ export default function LibraryLayout() {
     return () => {
       cancelled = true;
     };
-  }, [location.pathname, location.search, scope, statsScopes]);
+  }, [
+    filesIndexStatus?.finished_at,
+    filesIndexStatus?.running,
+    location.pathname,
+    location.search,
+    scope,
+    statsScopes,
+  ]);
 
   const stats = statsByScope[scope] ?? null;
   const libraryStats = statsByScope.library ?? null;
@@ -248,6 +267,9 @@ export default function LibraryLayout() {
     };
   }, [scope, statsByScope]);
 
+  const libraryRoot = String(config.LIBRARY_SERVING_ROOT || config.EXPORT_ROOT || '').trim();
+  const outletRefreshKey = String(filesIndexStatus?.finished_at || filesIndexStatus?.started_at || 'library-static');
+
   return (
     <>
       <div className="px-4 md:px-6 pt-4 pb-1">
@@ -299,8 +321,12 @@ export default function LibraryLayout() {
             ) : null}
           </div>
         </div>
+        <LibraryIndexStatusBanner status={filesIndexStatus} libraryRoot={libraryRoot} />
       </div>
-      <Outlet context={{ includeUnmatched, scope, setScope, stats, statsByScope, statsReady, libraryIsEmpty, visibleScopes, emptyState }} />
+      <Outlet
+        key={outletRefreshKey}
+        context={{ includeUnmatched, scope, setScope, stats, statsByScope, statsReady, libraryIsEmpty, visibleScopes, emptyState }}
+      />
     </>
   );
 }

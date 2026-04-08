@@ -81,7 +81,7 @@ export default function LibraryLabels() {
 
   useEffect(() => {
     if (labels.length === 0) return;
-    const missing = labels.filter((labelItem) => !String(labelItem.thumb || '').trim());
+    const missing = labels.filter((labelItem) => !String(labelItem.logo_url || '').trim() && !String(labelItem.thumb || '').trim());
     if (missing.length === 0) return;
     if (logoRefreshAttemptsRef.current >= 3) return;
 
@@ -196,9 +196,9 @@ export default function LibraryLabels() {
                 <div className="flex items-center justify-between gap-3">
                   <div className="min-w-0 flex items-center gap-2">
                     <div className="h-20 w-20 rounded-md overflow-hidden border border-border/60 bg-muted shrink-0 flex items-center justify-center">
-                      {l.thumb ? (
+                      {l.logo_url || l.thumb ? (
                         <AuthenticatedImage
-                          src={l.thumb}
+                          src={l.logo_url || l.thumb}
                           alt={l.value}
                           className="h-full w-full object-contain bg-muted p-2"
                           fallback={<Building2 className="h-6 w-6 text-muted-foreground shrink-0" />}

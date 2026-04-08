@@ -1669,6 +1669,11 @@ function SettingsPage() {
           SCAN_AI_POLICY: "local_only",
           WEB_SEARCH_PROVIDER: "ollama",
           AI_USAGE_LEVEL: "auto",
+          USE_AI_FOR_MB_MATCH: false,
+          USE_AI_FOR_MB_VERIFY: false,
+          USE_AI_FOR_DEDUPE: false,
+          PROVIDER_IDENTITY_USE_AI: false,
+          USE_AI_WEB_SEARCH_FALLBACK: false,
           USE_BANDCAMP: config.USE_BANDCAMP ?? true,
         });
         return;
@@ -1683,6 +1688,11 @@ function SettingsPage() {
         SCAN_AI_POLICY: "local_then_paid",
         WEB_SEARCH_PROVIDER: "auto",
         AI_USAGE_LEVEL: "auto",
+        USE_AI_FOR_MB_MATCH: false,
+        USE_AI_FOR_MB_VERIFY: false,
+        USE_AI_FOR_DEDUPE: false,
+        PROVIDER_IDENTITY_USE_AI: false,
+        USE_AI_WEB_SEARCH_FALLBACK: false,
         USE_BANDCAMP: config.USE_BANDCAMP ?? true,
       });
     },

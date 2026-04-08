@@ -834,6 +834,8 @@ export interface PMDAConfig {
   SCAN_AI_EFFECTIVE_BATCH?: string;
   /** Effective web-search layer for the scan pipeline. */
   SCAN_AI_EFFECTIVE_WEB_SEARCH?: string;
+  /** Allow AI arbitration while comparing provider identity candidates. */
+  PROVIDER_IDENTITY_USE_AI?: boolean;
   OPENAI_API_KEY: string;
   OPENAI_API_KEY_SET?: boolean;
   OPENAI_ENABLE_API_KEY_MODE?: boolean;
@@ -2269,6 +2271,8 @@ export interface LibraryFacetItem {
   value: string;
   count: number;
   thumb?: string | null;
+  logo_url?: string | null;
+  logo_provider?: string | null;
 }
 
 export interface LibraryFacetYearItem {
@@ -4435,6 +4439,36 @@ export async function postFilesExportRebuild(): Promise<{ status: string; messag
 /** Files backend: drop and rebuild the indexed library from FILES_ROOTS. */
 export async function postLibraryFilesIndexRebuild(): Promise<{ status: string; message?: string; progress?: unknown }> {
   return fetchApi<{ status: string; message?: string; progress?: unknown }>('/api/library/files-index/rebuild', { method: 'POST' });
+}
+
+export interface LibraryFilesIndexStatus {
+  running: boolean;
+  started_at?: number | null;
+  finished_at?: number | null;
+  updated_at?: number | null;
+  phase?: string | null;
+  phase_started_at?: number | null;
+  phase_message?: string | null;
+  phase_progress?: number | null;
+  phase_eta_seconds?: number | null;
+  phase_rate_per_sec?: number | null;
+  current_folder?: string | null;
+  folders_processed?: number;
+  total_folders?: number;
+  collapsed_groups?: number;
+  entries_scanned?: number;
+  discovered_audio_files?: number;
+  artists?: number;
+  albums?: number;
+  tracks?: number;
+  indexed_artists?: number;
+  indexed_albums?: number;
+  indexed_tracks?: number;
+  error?: string | null;
+}
+
+export async function getLibraryFilesIndexStatus(): Promise<LibraryFilesIndexStatus> {
+  return fetchApi<LibraryFilesIndexStatus>('/api/library/files-index/status');
 }
 
 /** Files backend: export progress (running, tracks_done, total_tracks, albums_done, total_albums, error). */
