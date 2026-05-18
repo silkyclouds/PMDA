@@ -16,6 +16,7 @@ import {
 import { Bar, Doughnut, Line } from 'react-chartjs-2';
 
 import * as api from '@/lib/api';
+import { AuthenticatedImage } from '@/components/library/AuthenticatedImage';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
@@ -252,21 +253,53 @@ export default function ListeningStatsPage() {
               ) : (
                 <div className="space-y-2">
                   {(data?.top_tracks || []).slice(0, 10).map((t) => (
-                    <div key={`pt-${t.track_id}`} className="flex items-center justify-between gap-3 border border-border/60 rounded-lg px-3 py-2">
-                      <div className="min-w-0">
+                    <div key={`pt-${t.track_id}`} className="flex items-center justify-between gap-3 rounded-lg border border-border/60 px-3 py-2">
+                      <div className="flex min-w-0 items-center gap-3">
                         <button
                           type="button"
-                          className="text-sm font-medium truncate hover:underline"
-                          onClick={() => navigate(`/library/artist/${t.artist_id}`)}
-                          title="Open artist"
+                          className="relative h-10 w-10 shrink-0 overflow-hidden rounded-md border border-border/60 bg-muted/40"
+                          onClick={() => navigate(`/library/album/${t.album_id}?track_id=${t.track_id}`)}
+                          title={`Open ${t.album_title}`}
                         >
-                          {t.track_title}
+                          {t.album_id > 0 ? (
+                            <AuthenticatedImage
+                              src={`/api/library/files/album/${t.album_id}/cover?size=80`}
+                              alt={t.album_title}
+                              className="h-full w-full object-cover"
+                            />
+                          ) : null}
                         </button>
-                        <div className="text-xs text-muted-foreground truncate">
-                          {t.artist_name} · {t.album_title}
+                        <div className="min-w-0">
+                          <button
+                            type="button"
+                            className="block max-w-full truncate text-left text-sm font-medium hover:underline"
+                            onClick={() => navigate(`/library/album/${t.album_id}?track_id=${t.track_id}`)}
+                            title="Open album and jump to this track"
+                          >
+                            {t.track_title}
+                          </button>
+                          <div className="truncate text-xs text-muted-foreground">
+                            <button
+                              type="button"
+                              className="hover:text-foreground hover:underline"
+                              onClick={() => navigate(`/library/artist/${t.artist_id}`)}
+                              title="Open artist"
+                            >
+                              {t.artist_name}
+                            </button>
+                            <span> · </span>
+                            <button
+                              type="button"
+                              className="hover:text-foreground hover:underline"
+                              onClick={() => navigate(`/library/album/${t.album_id}`)}
+                              title="Open album"
+                            >
+                              {t.album_title}
+                            </button>
+                          </div>
                         </div>
                       </div>
-                      <div className="flex items-center gap-2 shrink-0">
+                      <div className="flex shrink-0 items-center gap-2">
                         <Badge variant="outline" className="text-[10px]">
                           {fmtDuration(t.seconds)}
                         </Badge>

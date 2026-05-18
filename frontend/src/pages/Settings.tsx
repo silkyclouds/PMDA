@@ -44,9 +44,9 @@ const DANGER_PRESETS: Array<{
     id: 'reset_all_keep_settings',
     title: 'Reset PMDA (keep settings)',
     description:
-      'Fully resets PMDA library data: media cache, scan/cache state, published library, playlists, likes, recommendations, notifications, concerts, assistant/RAG data, and playback history. Settings, users, OAuth/API credentials, and folder/provider configuration are preserved.',
-    buttonLabel: 'Reset PMDA now',
-    resetActions: ['media_cache', 'cache_db', 'state_db', 'files_index'],
+      "Fully resets PMDA library data: media cache, scan/cache state, published library, playlists, likes, recommendations, notifications, concerts, assistant/RAG data, and playback history. Settings, users, OAuth/API credentials, and folder/provider configuration are preserved.",
+    buttonLabel: "Reset PMDA now",
+    resetActions: ["media_cache", "cache_db", "state_db", "files_index"],
   },
 ];
 
@@ -190,6 +190,34 @@ export default function Settings() {
     }, 350);
   }, [flushPendingSave]);
 
+  const openGuidedOnboarding = useCallback(() => {
+    window.dispatchEvent(new CustomEvent("pmda:open-guided-onboarding"));
+  }, []);
+
+  const refreshManagedRuntimeStatus = useCallback(
+    async (options?: { quiet?: boolean }) => {
+      setManagedRuntimeLoading(true);
+      try {
+        const status = await api.getManagedRuntimeStatus();
+        setManagedRuntimeStatus(status);
+        return status;
+      } catch (e) {
+        if (!options?.quiet) {
+          toast.error(
+            getApiErrorMessage(e) ||
+              (e instanceof Error
+                ? e.message
+                : "Failed to load local stack status"),
+          );
+        }
+        return null;
+      } finally {
+        setManagedRuntimeLoading(false);
+      }
+    },
+    [getApiErrorMessage],
+  );
+
   const refreshProviderStatus = useCallback(async () => {
     setProvidersChecking(true);
     try {
@@ -220,14 +248,22 @@ export default function Settings() {
         actions: preset.resetActions,
         restart: true,
       });
-      if (result.status === 'blocked') {
-        toast.error(result.message || 'Stop the running scan before using Danger Zone actions.');
+      if (result.status === "blocked") {
+        toast.error(
+          result.message ||
+            "Stop the running scan before using Danger Zone actions.",
+        );
         return;
       }
-      if (result.status === 'partial' || (result.errors && result.errors.length > 0)) {
-        toast.error(result.message || 'Maintenance action completed with errors.');
+      if (
+        result.status === "partial" ||
+        (result.errors && result.errors.length > 0)
+      ) {
+        toast.error(
+          result.message || "Maintenance action completed with errors.",
+        );
       } else {
-        toast.success(result.message || 'Maintenance action completed.');
+        toast.success(result.message || "Maintenance action completed.");
       }
       if (result.restart_initiated) {
         setDangerDialogOpen(false);
@@ -323,6 +359,33 @@ export default function Settings() {
             </Button>
           </div>
         </div>
+        <div className="flex items-center gap-2">
+          {lastSaved === true && (
+            <span className="text-sm font-medium text-success flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-success/10">
+              <Check className="w-4 h-4" /> Saved
+            </span>
+          )}
+          <Button
+            onClick={saveConfig}
+            disabled={isSaving}
+            variant="outline"
+            size="sm"
+            className="gap-2"
+          >
+            {isSaving ? (
+              <>
+                <Loader2 className="w-4 h-4 animate-spin" />
+                Saving...
+              </>
+            ) : (
+              <>
+                <Save className="w-4 h-4" />
+                Save all now
+              </>
+            )}
+          </Button>
+        </div>
+      </div>
 
         <SettingsControlPlane
           config={config}

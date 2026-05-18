@@ -146,7 +146,7 @@ export function GlobalSearch({ className }: { className?: string }) {
 
   return (
     <div ref={rootRef} className={cn('relative w-full', className)}>
-      <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground pointer-events-none" />
+      <Search className="pointer-events-none absolute left-3.5 top-1/2 h-4.5 w-4.5 -translate-y-1/2 text-primary/80 transition-colors" />
       <Input
         value={query}
         onChange={(e) => setQuery(e.target.value)}

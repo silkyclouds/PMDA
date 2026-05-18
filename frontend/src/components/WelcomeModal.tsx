@@ -12,9 +12,10 @@ interface WelcomeModalProps {
   onClose: () => void;
   config?: ConfigResponse | null;
   mode?: 'welcome' | 'bootstrap';
+  onOpenGuidedOnboarding?: () => void;
 }
 
-export function WelcomeModal({ onClose, config, mode = 'welcome' }: WelcomeModalProps) {
+export function WelcomeModal({ onClose, config, mode = 'welcome', onOpenGuidedOnboarding }: WelcomeModalProps) {
   const navigate = useNavigate();
   const [showOnboarding, setShowOnboarding] = useState(false);
   const mounts = config?.container_mounts;
@@ -59,8 +60,8 @@ export function WelcomeModal({ onClose, config, mode = 'welcome' }: WelcomeModal
     );
   }
 
-  const goToScan = () => {
-    navigate('/scan');
+  const openGuidedOnboarding = () => {
+    onOpenGuidedOnboarding?.();
     onClose();
   };
 

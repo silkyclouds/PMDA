@@ -1256,6 +1256,82 @@ export default function Statistics() {
 
   const enrichmentOverallTotal = Number(enrichmentSources?.overall?.total || 0);
 
+  const providerNoTracklistCauseLabels = useMemo<Record<string, string>>(
+    () => ({
+      api_or_parser: 'API / parser',
+      edition: 'Edition mismatch',
+      absence_real: 'No usable tracklist',
+    }),
+    [],
+  );
+
+  const providerNoTracklistByCauseEntries = useMemo(
+    () => Object.entries(current.providerNoTracklistByCause || {}).sort((a, b) => Number(b[1] || 0) - Number(a[1] || 0)),
+    [current.providerNoTracklistByCause],
+  );
+
+  const providerNoTracklistByProviderEntries = useMemo(
+    () => Object.entries(current.providerNoTracklistByProvider || {}).sort((a, b) => Number(b[1] || 0) - Number(a[1] || 0)),
+    [current.providerNoTracklistByProvider],
+  );
+
+  const enrichmentProviderLabels = useMemo(() => {
+    const providers = Object.entries(enrichmentSources?.overall?.providers || {})
+      .sort((a, b) => Number(b[1] || 0) - Number(a[1] || 0))
+      .map(([provider]) => provider);
+    return providers.length > 0 ? providers : ['bandcamp', 'discogs', 'lastfm', 'musicbrainz'];
+  }, [enrichmentSources]);
+
+  const enrichmentProviderColors = useMemo(() => {
+    const palette: Record<string, { bg: string; border: string }> = {
+      bandcamp: { bg: 'rgba(168,85,247,0.85)', border: '#9333ea' },
+      discogs: { bg: 'rgba(34,197,94,0.85)', border: '#16a34a' },
+      lastfm: { bg: 'rgba(249,115,22,0.85)', border: '#ea580c' },
+      musicbrainz: { bg: 'rgba(59,130,246,0.85)', border: '#2563eb' },
+      wikipedia: { bg: 'rgba(107,114,128,0.85)', border: '#4b5563' },
+      fanart: { bg: 'rgba(236,72,153,0.85)', border: '#db2777' },
+      audiodb: { bg: 'rgba(6,182,212,0.85)', border: '#0891b2' },
+      unknown: { bg: 'rgba(148,163,184,0.85)', border: '#64748b' },
+    };
+    return enrichmentProviderLabels.map((provider) => palette[provider] || { bg: 'rgba(148,163,184,0.85)', border: '#64748b' });
+  }, [enrichmentProviderLabels]);
+
+  const enrichmentOverallData = useMemo(() => {
+    const providerMap = enrichmentSources?.overall?.providers || {};
+    return {
+      labels: enrichmentProviderLabels,
+      datasets: [
+        {
+          data: enrichmentProviderLabels.map((provider) => Number(providerMap[provider] || 0)),
+          backgroundColor: enrichmentProviderColors.map((c) => c.bg),
+          borderColor: enrichmentProviderColors.map((c) => c.border),
+          borderWidth: 1,
+        },
+      ],
+    };
+  }, [enrichmentProviderColors, enrichmentProviderLabels, enrichmentSources]);
+
+  const enrichmentBreakdownData = useMemo(() => {
+    const rows = [
+      ['Album profiles', enrichmentSources?.album_profiles?.providers || {}],
+      ['Artist profiles', enrichmentSources?.artist_profiles?.providers || {}],
+      ['Artist images', enrichmentSources?.artist_images?.providers || {}],
+      ['Label logos', enrichmentSources?.label_logos?.providers || {}],
+    ];
+    return {
+      labels: rows.map(([label]) => label),
+      datasets: enrichmentProviderLabels.map((provider, idx) => ({
+        label: provider,
+        data: rows.map(([, providerMap]) => Number((providerMap as Record<string, number>)[provider] || 0)),
+        backgroundColor: enrichmentProviderColors[idx]?.bg || 'rgba(148,163,184,0.85)',
+        borderColor: enrichmentProviderColors[idx]?.border || '#64748b',
+        borderWidth: 1,
+      })),
+    };
+  }, [enrichmentProviderColors, enrichmentProviderLabels, enrichmentSources]);
+
+  const enrichmentOverallTotal = Number(enrichmentSources?.overall?.total || 0);
+
   const aiCallsBreakdownData = useMemo(() => {
     return {
       labels: ['Provider identity', 'MB verify', 'Web MBID', 'Vision'],

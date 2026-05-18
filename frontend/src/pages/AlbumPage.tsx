@@ -12,6 +12,7 @@ import { Textarea } from '@/components/ui/textarea';
 import { FormatBadge } from '@/components/FormatBadge';
 import { AuthenticatedImage } from '@/components/library/AuthenticatedImage';
 import { AlbumArtworkGalleryDialog } from '@/components/library/AlbumArtworkGalleryDialog';
+import { AlbumMatchSources } from '@/components/library/AlbumMatchSources';
 import { AlbumRatingStars } from '@/components/library/AlbumRatingStars';
 import { EntityDiscoverDialog } from '@/components/library/EntityDiscoverDialog';
 import { SocialActivityBadges } from '@/components/social/SocialActivityBadges';
@@ -798,6 +799,16 @@ export default function AlbumPage() {
                     <Badge variant="outline" className={cn("gap-1.5 text-[11px]", badgeKindClass('year'))}>
                       <Calendar className="w-3 h-3" />
                       {data.year}
+                    </Badge>
+                  ) : null}
+                  {data.is_box_set ? (
+                    <Badge variant="outline" className={cn("text-[11px]", badgeKindClass('source'))}>
+                      Box set
+                    </Badge>
+                  ) : null}
+                  {Number(data.box_set_disc_count || 0) > 1 ? (
+                    <Badge variant="outline" className={cn("text-[11px]", badgeKindClass('count'))}>
+                      {data.box_set_disc_count} discs
                     </Badge>
                   ) : null}
                   <Badge variant="outline" className={cn("text-[11px]", badgeKindClass('count'))}>

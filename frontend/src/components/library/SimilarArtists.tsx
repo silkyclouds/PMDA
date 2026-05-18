@@ -48,6 +48,7 @@ export function SimilarArtists({ artistId, artistName }: SimilarArtistsProps) {
   const [source, setSource] = useState<string>('');
   const [loading, setLoading] = useState(false);
   const { toast } = useToast();
+  const refreshAttemptsRef = useRef(0);
 
   const artistKey = (a: SimilarArtist): string => {
     const mbid = (a.mbid || '').trim();
@@ -86,6 +87,7 @@ export function SimilarArtists({ artistId, artistName }: SimilarArtistsProps) {
 
   useEffect(() => {
     if (artistId) {
+      refreshAttemptsRef.current = 0;
       loadSimilarArtists();
     }
   }, [artistId]);

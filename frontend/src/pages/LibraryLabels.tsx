@@ -29,6 +29,7 @@ export default function LibraryLabels() {
   const requestIdRef = useRef(0);
   const sentinelRef = useRef<HTMLDivElement | null>(null);
   const loadingMoreRef = useRef(false);
+  const logoRefreshAttemptsRef = useRef(0);
 
   const fetchLabels = useCallback(async (opts: { reset: boolean; pageOffset: number }) => {
     const rid = ++requestIdRef.current;
@@ -74,8 +75,46 @@ export default function LibraryLabels() {
       return;
     }
     setOffset(0);
+    logoRefreshAttemptsRef.current = 0;
     void fetchLabels({ reset: true, pageOffset: 0 });
   }, [search, genre, year, includeUnmatched, fetchLabels, libraryIsEmpty]);
+
+  useEffect(() => {
+    if (labels.length === 0) return;
+    const missing = labels.filter((labelItem) => !String(labelItem.logo_url || '').trim() && !String(labelItem.thumb || '').trim());
+    if (missing.length === 0) return;
+    if (logoRefreshAttemptsRef.current >= 3) return;
+
+    let cancelled = false;
+    const attemptNo = logoRefreshAttemptsRef.current;
+    const timer = setTimeout(async () => {
+      if (cancelled) return;
+      logoRefreshAttemptsRef.current += 1;
+      try {
+        const res = await api.getLibraryLabels({
+          search: search.trim() || undefined,
+          genre: genre || undefined,
+          year: year ?? undefined,
+          includeUnmatched,
+          scope,
+          limit,
+          offset: 0,
+          refresh: true,
+        });
+        if (cancelled) return;
+        const list = Array.isArray(res.labels) ? res.labels : [];
+        setLabels(list);
+        setTotal(typeof res.total === 'number' ? res.total : 0);
+        setOffset(list.length);
+      } catch {
+        // Best-effort only.
+      }
+    }, 1800 + attemptNo * 2600);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [genre, includeUnmatched, labels, limit, scope, search, year]);
 
   const canLoadMore = labels.length < total && !loading;
   const loadMore = useCallback(async () => {

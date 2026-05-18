@@ -36,6 +36,7 @@ import os
 import secrets
 import shutil
 import uuid
+import itertools
 import ipaddress
 import tempfile
 import filecmp
@@ -1308,11 +1309,55 @@ def _get_from_sqlite(key: str, default=None):
 # Location of baked‑in template for AI prompt (shipped inside the image)
 DEFAULT_PROMPT_PATH  = BASE_DIR / "ai_prompt.txt"
 AI_PROMPT_FILE = CONFIG_DIR / "ai_prompt.txt"
+DEFAULT_AI_PROMPT_TEXT = """We have multiple rips of the *same* album. Choose exactly **one** edition as the "best".
+Before deciding, classify the release as classical or not.
+
+Classification rule (must appear as the FIRST bullet in your rationale):
+- If the work is by a classical composer or the metadata looks classical (composer/conductor/orchestra/opus numbers, “Symphony”, “Concerto”, “Sonata”, BWV/K./Op., etc.), add **[CLASSICAL:YES]**.
+- Otherwise add **[CLASSICAL:NO]**.
+
+If [CLASSICAL:YES], treat different interpretations as different releases:
+- Two editions are the *same interpretation* only if:
+  (a) they share a MusicBrainz ID (release, release-group, or album MBID), OR
+  (b) they have the same release year (from tags date/originaldate) AND the same total runtime (to the second).
+- If neither (a) nor (b) is true, they are NOT duplicates. Pick the technically best *within the same-interpretation cluster only*. If no same-interpretation cluster exists, pick the technically best but add a bullet **“different interpretation detected”**.
+
+General priority rules (apply inside a valid cluster):
+1. Audio format: prefer lossless (FLAC/ALAC) over lossy (MP3/AAC).
+2. Bit depth: higher is better (24-bit > 16-bit).
+3. Track count: more complete editions win (bonus tracks included).
+4. File count: more audio files (multi-disc/extras) preferred.
+5. Bitrate: higher average is better.
+6. Track filenames: prefer meaningful names over generic numbering.
+7. Parentheses in titles:
+   - “feat./ft.” does NOT create a new track version.
+   - “mix/remix/version/edit/rework”: if remixer differs → treat as different; same remixer → can be considered duplicate.
+8. Singles/EPs: editions with same normalized title are duplicates; choose best by the rules above.
+9. MusicBrainz ID:
+   - Same MBID → same release.
+   - Different MBIDs → different releases unless everything else (track list, bit-depth, duration) is identical.
+10. Release year: a newer remaster is preferred only if it offers better technical quality or extra tracks.
+
+Extra instructions:
+- Analyse **all editions**.
+- If any **bonus/extra tracks** exist only in non-selected editions, list them in the final output after the last pipe.
+- Ignore “fuzzy” inference for non-ASCII/CJK titles; rely on explicit metadata only.
+
+⚠️ Output rules (must follow exactly):
+- Return **one single line only**.
+- The line must contain **exactly two "|" characters**.
+- Format: <chosen_index>|<rationale>|<comma-separated list of bonus tracks>
+- If no bonus tracks exist, still include the final pipe but leave it empty.
+- Do not add any explanations, comments, or extra lines.
+"""
 
 # Ensure ai_prompt.txt exists -------------------------------------------
 if not AI_PROMPT_FILE.exists():
     logging.info("ai_prompt.txt not found — default prompt created")
-    shutil.copyfile(DEFAULT_PROMPT_PATH, AI_PROMPT_FILE)
+    if DEFAULT_PROMPT_PATH.exists():
+        shutil.copyfile(DEFAULT_PROMPT_PATH, AI_PROMPT_FILE)
+    else:
+        AI_PROMPT_FILE.write_text(DEFAULT_AI_PROMPT_TEXT, encoding="utf-8")
 
 # Plex is no longer a PMDA source database. SECTION_IDS are retained only as an
 # optional preference for post-publication Plex player refresh; PMDA never opens
@@ -1618,7 +1663,7 @@ merged = {
     "MB_FAST_FALLBACK_MODE": _get("MB_FAST_FALLBACK_MODE", default=False, cast=_parse_bool),
     # Provider identity arbitration (Discogs/Last.fm/Bandcamp when MB is unavailable).
     "PROVIDER_IDENTITY_STRICT": _get("PROVIDER_IDENTITY_STRICT", default=True, cast=_parse_bool),
-    "PROVIDER_IDENTITY_USE_AI": _get("PROVIDER_IDENTITY_USE_AI", default=True, cast=_parse_bool),
+    "PROVIDER_IDENTITY_USE_AI": _get("PROVIDER_IDENTITY_USE_AI", default=False, cast=_parse_bool),
     "MATCH_COVER_OCR_MODE": _get("MATCH_COVER_OCR_MODE", default="smart", cast=_normalize_match_cover_ocr_mode),
     "PROVIDER_IDENTITY_MIN_SCORE": _get(
         "PROVIDER_IDENTITY_MIN_SCORE",
@@ -2448,6 +2493,12 @@ def _mask_secret_value(value) -> str:
     return txt[:4] + "…"
 
 
+def _ollama_url_targets_managed_runtime(raw_url: str | None) -> bool:
+    parsed = urlparse(str(raw_url or "").strip())
+    host = (parsed.hostname or "").strip().lower()
+    return host in {"pmda-ollama", "ollama"}
+
+
 # Mask & dump effective config ------------------------------------------------
 _DISABLED_LEGACY_CONFIG_LOG_KEYS = {
     "PLEX_DB_PATH",
@@ -2548,10 +2599,21 @@ elif AI_PROVIDER.lower() == "ollama":
             if response.status_code == 200:
                 ai_provider_ready = True
                 logging.info("Ollama connection verified at %s", ollama_url)
+            elif _ollama_url_targets_managed_runtime(ollama_url):
+                logging.info(
+                    "Managed Ollama runtime is not started yet at %s; PMDA will provision or adopt it during local stack setup.",
+                    ollama_url,
+                )
             else:
                 logging.warning("Ollama not accessible at %s (HTTP %d)", ollama_url, response.status_code)
         except Exception as e:
-            logging.warning("Ollama connection test failed: %s", e)
+            if _ollama_url_targets_managed_runtime(ollama_url):
+                logging.info(
+                    "Managed Ollama runtime is not started yet at %s; PMDA will provision or adopt it during local stack setup.",
+                    ollama_url,
+                )
+            else:
+                logging.warning("Ollama connection test failed: %s", e)
     else:
         logging.info("No OLLAMA_URL provided; AI-driven selection disabled.")
 else:
@@ -5492,6 +5554,7 @@ init_cache_db()
 
 # ───────────────────── Files Library Index (PostgreSQL + Redis) ─────────────────────
 _FILES_PG_SCHEMA_READY = False
+_FILES_PG_SCHEMA_INIT_LOCK = threading.Lock()
 _FILES_REDIS_CLIENT = None
 _FILES_CACHE_LOCAL_ENABLED = True
 _FILES_LOCAL_CACHE: "OrderedDict[str, dict]" = OrderedDict()
@@ -5591,6 +5654,35 @@ def _files_pg_is_connection_dropped_error(exc: Any) -> bool:
     return _files_pg_runtime.files_pg_is_connection_dropped_error(exc)
 
 
+def _files_pg_error_text(exc: Any) -> str:
+    try:
+        return " ".join(str(exc or "").split()).strip().lower()
+    except Exception:
+        return ""
+
+
+def _files_pg_is_connection_dropped_error(exc: Any) -> bool:
+    if exc is None:
+        return False
+    cls_name = str(getattr(exc.__class__, "__name__", "") or "").strip().lower()
+    text = _files_pg_error_text(exc)
+    markers = (
+        "server closed the connection unexpectedly",
+        "terminating connection due to",
+        "consuming input failed",
+        "connection is closed",
+        "connection already closed",
+        "broken pipe",
+        "connection reset by peer",
+        "admin shutdown",
+    )
+    if any(marker in text for marker in markers):
+        return True
+    return cls_name in {"operationalerror", "interfaceerror"} and (
+        "connection" in text or "server" in text or "input failed" in text
+    )
+
+
 @contextmanager
 def _files_pg_connection(*, autocommit: bool = True):
     with _files_pg_runtime.files_pg_connection_for_runtime(sys.modules[__name__], autocommit=autocommit) as conn:
@@ -5643,6 +5735,14 @@ def _files_pg_init_schema() -> bool:
         _FILES_PG_SCHEMA_READY = True
     return bool(ok)
 
+
+
+def _ensure_files_pg_schema_ready() -> tuple[bool, Optional[str]]:
+    if _get_library_mode() != "files":
+        return False, "LIBRARY_MODE is not 'files'"
+    if not _files_pg_init_schema():
+        return False, "PostgreSQL is unavailable"
+    return True, None
 
 def _files_migrate_external_artist_images_norm_keys(cur) -> None:
     return _artist_maintenance.migrate_external_artist_images_norm_keys(
@@ -6922,10 +7022,12 @@ def _files_root_dir_strings() -> set[str]:
     when we are at a library root while walking parent folders.
     """
     out: set[str] = set()
-    for r in (_effective_files_roots(enabled_only=True) or FILES_ROOTS or []):
+    roots_seen: set[str] = set()
+    for r in list(_effective_files_roots(enabled_only=True) or FILES_ROOTS or []) + list(_files_library_display_roots()):
         rs = str(r or "").strip()
-        if not rs:
+        if not rs or rs in roots_seen:
             continue
+        roots_seen.add(rs)
         try:
             p = path_for_fs_access(Path(rs))
         except Exception:
@@ -6938,16 +7040,61 @@ def _files_root_dir_strings() -> set[str]:
     return out
 
 
+def _configured_files_serving_root() -> str:
+    root = str(
+        _get_config_from_db(
+            "LIBRARY_SERVING_ROOT",
+            _get_config_from_db("EXPORT_ROOT", EXPORT_ROOT),
+        )
+        or ""
+    ).strip()
+    return root
+
+
+def _files_library_display_roots() -> list[str]:
+    """
+    Return the filesystem roots that should back the visible PMDA library.
+
+    In managed/mirror workflows the serving/export root is the real user-facing library.
+    The intake roots are still the scan source, but the library pages must reflect the
+    final published library when it exists.
+    """
+    roots: list[str] = []
+    serving_root = _configured_files_serving_root()
+    if serving_root:
+        roots.append(serving_root)
+    if not roots:
+        roots.extend(str(r or "").strip() for r in (_effective_files_roots(enabled_only=True) or FILES_ROOTS or []))
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for raw in roots:
+        txt = str(raw or "").strip()
+        if not txt:
+            continue
+        try:
+            norm = str(path_for_fs_access(Path(txt)).resolve())
+        except Exception:
+            norm = txt
+        if norm in seen:
+            continue
+        seen.add(norm)
+        deduped.append(txt)
+    return deduped
+
+
 def _files_is_files_root_dir(p: Path, *, root_dirs: Optional[set[str]] = None) -> bool:
     if not p:
         return False
     roots = root_dirs if isinstance(root_dirs, set) else _files_root_dir_strings()
+    p_txt = str(p)
+    if p_txt in roots:
+        return True
     try:
         if str(p.resolve()) in roots:
             return True
     except Exception:
         pass
-    return str(p) in roots
+    return False
 
 
 def _files_guess_artist_folder(
@@ -7280,7 +7427,11 @@ def _rebuild_files_library_index(reason: str = "manual", wait_if_running: bool =
     )
 
 
-def _trigger_files_index_rebuild_async(reason: str = "manual") -> bool:
+def _trigger_files_index_rebuild_async(
+    reason: str = "manual",
+    *,
+    filesystem_roots_override: list[str] | None = None,
+) -> bool:
     if files_index_lock.locked():
         return False
     embed_build_lock = globals().get("_FILES_RECO_EMBED_BUILD_LOCK")
@@ -7295,6 +7446,8 @@ def _trigger_files_index_rebuild_async(reason: str = "manual") -> bool:
     if reason_norm.startswith("scan_artist_ready_"):
         artist_hint = reason_norm[len("scan_artist_ready_") :].strip() or None
 
+    roots_override = [str(r or "").strip() for r in (filesystem_roots_override or []) if str(r or "").strip()]
+
     def _runner():
         if artist_hint:
             _rebuild_files_library_index_for_artist(
@@ -7303,7 +7456,11 @@ def _trigger_files_index_rebuild_async(reason: str = "manual") -> bool:
                 wait_if_running=False,
             )
             return
-        _rebuild_files_library_index(reason=reason_norm, wait_if_running=False)
+        _rebuild_files_library_index(
+            reason=reason_norm,
+            wait_if_running=False,
+            filesystem_roots_override=roots_override or None,
+        )
 
     tname = "files-index-rebuild-artist" if artist_hint else "files-index-rebuild"
     threading.Thread(target=_runner, name=tname, daemon=True).start()
@@ -10265,6 +10422,100 @@ def _group_audio_files_by_folder_under_roots(*args: Any, **kwargs: Any) -> Any:
     return _audio_runtime._group_audio_files_by_folder_under_roots_for_runtime(sys.modules[__name__], *args, **kwargs)
 
 
+def _group_audio_files_by_folder_under_roots(
+    roots: list[str],
+    *,
+    progress_cb=None,
+    progress_every: int = 250,
+    heartbeat_seconds: float = 10.0,
+) -> dict[Path, list[Path]]:
+    """
+    Walk roots once and group discovered audio files directly by album folder.
+
+    This avoids the rebuild path's previous "collect every audio file first, then regroup"
+    pattern, which is unnecessarily expensive on large Unraid/FUSE shares such as a
+    pre-existing serving library.
+    """
+    roots_list = [str(r) for r in (roots or []) if r]
+    roots_total = len(roots_list)
+    if roots_total <= 0:
+        return {}
+
+    progress_every = max(1, int(progress_every)) if progress_every else 0
+    heartbeat_seconds = float(heartbeat_seconds or 0.0)
+    progress_enabled = callable(progress_cb)
+
+    by_folder: dict[Path, list[Path]] = defaultdict(list)
+    seen_paths: set[str] = set()
+    entries_scanned = 0
+    files_found = 0
+    folders_with_audio = 0
+    roots_done = 0
+    last_heartbeat = time.monotonic()
+
+    def _emit_progress(*, root: str, force: bool = False) -> None:
+        nonlocal last_heartbeat
+        if not progress_enabled:
+            return
+        if not force and heartbeat_seconds > 0:
+            now = time.monotonic()
+            if (now - last_heartbeat) < heartbeat_seconds:
+                return
+            last_heartbeat = now
+        try:
+            progress_cb(
+                {
+                    "root": root,
+                    "roots_done": roots_done,
+                    "roots_total": roots_total,
+                    "entries_scanned": entries_scanned,
+                    "files_found": files_found,
+                    "folders_found": folders_with_audio,
+                }
+            )
+        except Exception:
+            pass
+
+    for root_path in roots_list:
+        base = Path(root_path)
+        if not base.exists():
+            roots_done += 1
+            _emit_progress(root=str(base), force=True)
+            continue
+        stack: list[str] = [str(base)]
+        while stack:
+            current = stack.pop()
+            try:
+                with os.scandir(current) as it:
+                    for entry in it:
+                        entries_scanned += 1
+                        try:
+                            if entry.is_dir(follow_symlinks=False):
+                                stack.append(entry.path)
+                            elif entry.is_file(follow_symlinks=False) and AUDIO_RE.search(entry.name):
+                                p = Path(entry.path)
+                                sp = str(p)
+                                if sp in seen_paths:
+                                    continue
+                                seen_paths.add(sp)
+                                parent = p.parent
+                                if parent not in by_folder:
+                                    folders_with_audio += 1
+                                by_folder[parent].append(p)
+                                files_found += 1
+                                if progress_every > 0 and (files_found % progress_every == 0):
+                                    _emit_progress(root=str(base), force=True)
+                        except (OSError, PermissionError):
+                            continue
+                        _emit_progress(root=str(base), force=False)
+            except (FileNotFoundError, NotADirectoryError, PermissionError, OSError):
+                continue
+        roots_done += 1
+        _emit_progress(root=str(base), force=True)
+
+    return by_folder
+
+
 def _iter_audio_files_under_roots_checkpointed(
     roots: list[str],
     *,
@@ -11168,6 +11419,59 @@ def _classical_gap_anomaly_should_be_ignored(
         max_idx=max_idx,
         gaps=gaps,
     )
+
+
+def _incomplete_gap_should_be_tolerated(
+    tags: dict | None,
+    *,
+    actual_count: int,
+    expected_count: int = 0,
+    missing_indices: list[int] | None = None,
+    gaps: list[tuple[int, int]] | None = None,
+) -> bool:
+    actual_total = max(0, int(actual_count or 0))
+    expected_total = max(0, int(expected_count or 0))
+    gap_pairs = list(gaps or [])
+    if not gap_pairs and missing_indices:
+        gap_pairs = _missing_indices_to_gap_pairs(missing_indices)
+    if gap_pairs and _classical_gap_anomaly_should_be_ignored(
+        tags,
+        actual_count=actual_total,
+        max_idx=expected_total or max((end for _start, end in gap_pairs), default=0),
+        gaps=gap_pairs,
+    ):
+        return True
+    missing_flat: list[int] = []
+    for value in list(missing_indices or []):
+        try:
+            parsed = int(value)
+        except Exception:
+            continue
+        if parsed > 0:
+            missing_flat.append(parsed)
+    if not missing_flat and gap_pairs:
+        for start_i, end_i in gap_pairs:
+            try:
+                missing_flat.extend(list(range(int(start_i) + 1, int(end_i))))
+            except Exception:
+                continue
+    missing_flat = sorted(set(x for x in missing_flat if x > 0))
+    missing_total = len(missing_flat)
+    if actual_total < 6 or missing_total <= 0:
+        return False
+    tail_only_missing = bool(
+        expected_total > 0
+        and missing_flat
+        and missing_flat == list(range(actual_total + 1, expected_total + 1))
+    )
+    if tail_only_missing:
+        if missing_total <= 1 and actual_total >= 6:
+            return True
+        if missing_total <= 2 and actual_total >= 12:
+            return True
+    if len(gap_pairs) == 1 and missing_total == 1 and actual_total >= 10:
+        return True
+    return False
 
 
 def _missing_indices_to_gap_pairs(values: list[int] | None) -> list[tuple[int, int]]:
@@ -14036,6 +14340,7 @@ def _build_files_editions(
     scan_type: str = "full",
     *,
     respect_scan_controls: bool = True,
+    roots_override: list[str] | None = None,
 ) -> tuple[list[tuple[int, str, list[int]]], int, dict]:
     return _files_editions_runtime.build_files_editions_for_runtime(
         sys.modules[__name__],
@@ -15059,6 +15364,37 @@ def _safe_bounded_float(value: Any, minimum: float = 0.0, maximum: float = 5.0) 
     if not math.isfinite(out):
         return None
     return max(minimum, min(maximum, out))
+
+
+def _sanitize_bandcamp_supporter_comments(value: Any, *, limit: int = 12) -> list[dict[str, str | None]]:
+    out: list[dict[str, str | None]] = []
+    seen: set[tuple[str, str]] = set()
+    if not isinstance(value, list):
+        return out
+    for raw in value:
+        if not isinstance(raw, dict):
+            continue
+        text = re.sub(r"\s+", " ", str(raw.get("text") or raw.get("why") or "").strip())
+        author = re.sub(r"\s+", " ", str(raw.get("author") or raw.get("name") or raw.get("username") or "").strip())
+        url = str(raw.get("url") or "").strip() or None
+        avatar_url = str(raw.get("avatar_url") or "").strip() or None
+        if not text:
+            continue
+        dedupe_key = (author.lower(), text.lower())
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        out.append(
+            {
+                "author": author or None,
+                "text": text,
+                "url": url,
+                "avatar_url": avatar_url,
+            }
+        )
+        if len(out) >= max(1, int(limit or 12)):
+            break
+    return out
 
 
 def _album_heat_label(score: float | None) -> str | None:
@@ -18421,6 +18757,258 @@ def _folder_has_release_segment_children(*args: Any, **kwargs: Any) -> Any:
 def _collapse_nested_album_folder_groups(*args: Any, **kwargs: Any) -> Any:
     return _audio_runtime._collapse_nested_album_folder_groups_for_runtime(sys.modules[__name__], *args, **kwargs)
 
+
+
+def _files_child_folder_name_looks_release_segment(name: str) -> bool:
+    txt = str(name or "").strip()
+    if not txt:
+        return False
+    norm = _normalize_identity_text_strict(txt)
+    if not norm:
+        return False
+    if re.match(r"^(?:cd|disc|disk|part|pt|act|scene|movement|mvmt|side|volume|vol|book)\b", norm):
+        return True
+    if re.match(r"^(?:disc|cd)?\s*\d{1,2}$", norm):
+        return True
+    if re.match(r"^[a-d]$", norm):
+        return True
+    return bool(
+        re.search(
+            r"\b(?:symphony|concerto|sonata|suite|requiem|mass|quartet|quintet|trio|prelude|fugue|overture|movement|act|scene)\b",
+            norm,
+        )
+    )
+
+
+def _folder_release_segment_child_dirs(folder_path: Path, audio_files: list[Path] | None) -> list[Path]:
+    """
+    Return immediate child directories that look like work/disc segments under `folder_path`.
+    """
+    folder = Path(folder_path)
+    child_dirs: dict[str, Path] = {}
+    direct_audio_present = False
+    for raw_path in audio_files or []:
+        try:
+            p = Path(raw_path)
+            rel = p.relative_to(folder)
+        except Exception:
+            continue
+        parts = list(rel.parts)
+        if len(parts) <= 1:
+            direct_audio_present = True
+            continue
+        child = folder / parts[0]
+        child_dirs[str(child)] = child
+    if direct_audio_present or len(child_dirs) < 2:
+        return []
+    segment_children = [child for child in child_dirs.values() if _files_child_folder_name_looks_release_segment(child.name)]
+    if len(segment_children) < 2:
+        return []
+    if len(segment_children) != len(child_dirs):
+        return []
+    return sorted(segment_children, key=lambda p: str(p).lower())
+
+
+def _folder_has_release_segment_children(folder_path: Path, audio_files: list[Path] | None) -> bool:
+    return len(_folder_release_segment_child_dirs(folder_path, audio_files)) >= 2
+
+
+def _collapse_nested_album_folder_groups(
+    by_folder: dict[Path, list[Path]],
+    *,
+    root_dirs: Optional[set[str]] = None,
+    progress_cb: Optional[Callable[[dict[str, Any]], None]] = None,
+) -> dict[Path, list[Path]]:
+    """
+    Collapse child work/disc folders into one parent album folder when they clearly belong
+    to the same release.
+
+    This fixes structures like:
+      Album Root/
+        Symphony No32/
+        Symphony No35/
+        Symphony No38/
+
+    or:
+      Album Root/
+        Disc 1/
+        Disc 2/
+
+    without collapsing normal artist folders that merely contain different albums.
+    """
+    if not by_folder:
+        return by_folder
+
+    def _normalize_child_entry(
+        entry: Any,
+    ) -> tuple[Path, list[Path], dict[str, Any]] | None:
+        if not isinstance(entry, (tuple, list)):
+            return None
+        if len(entry) == 2:
+            child_raw, paths_raw = entry
+            tags_raw: Any = {}
+        elif len(entry) >= 3:
+            child_raw, paths_raw, tags_raw = entry[:3]
+        else:
+            return None
+        try:
+            child_path = Path(child_raw)
+        except Exception:
+            return None
+        ordered_paths = [Path(p) for p in (paths_raw or [])]
+        tags_dict = tags_raw if isinstance(tags_raw, dict) else {}
+        return (child_path, ordered_paths, tags_dict)
+
+    roots = root_dirs if isinstance(root_dirs, set) else _files_root_dir_strings()
+    collapsed = dict(by_folder)
+    parent_children: dict[Path, list[tuple[Path, list[Path]]]] = defaultdict(list)
+    for folder, paths in by_folder.items():
+        folder_key = Path(folder)
+        parent = folder_key.parent
+        if not parent or parent == folder_key:
+            continue
+        if _files_is_files_root_dir(parent, root_dirs=roots):
+            continue
+        try:
+            resolved_parent = folder_key.resolve().parent
+        except Exception:
+            resolved_parent = None
+        if resolved_parent and resolved_parent != parent and _files_is_files_root_dir(
+            resolved_parent,
+            root_dirs=roots,
+        ):
+            continue
+        parent_children[parent].append((folder_key, paths or []))
+
+    cover_names = {name.lower() for name in _COVER_NAMES}
+    total_parents = len(parent_children)
+    collapsed_groups = 0
+    for idx, (parent, children) in enumerate(parent_children.items(), start=1):
+        if progress_cb and (idx == 1 or idx % 200 == 0):
+            try:
+                progress_cb(
+                    {
+                        "phase": "collapsing",
+                        "parent": str(parent),
+                        "parents_processed": idx,
+                        "parents_total": total_parents,
+                        "collapsed_groups": collapsed_groups,
+                    }
+                )
+            except Exception:
+                pass
+        if len(children) < 2:
+            continue
+        parent_has_cover = False
+        try:
+            parent_has_cover = any(
+                p.is_file() and p.name.lower() in cover_names
+                for p in parent.iterdir()
+            )
+        except Exception:
+            parent_has_cover = False
+        if parent in by_folder:
+            # Parent already contains direct audio; keep the explicit grouping.
+            continue
+
+        prepared_children: list[tuple[Path, list[Path], dict[str, Any], str, str]] = []
+        identity_groups: dict[tuple[str, str], list[tuple[Path, list[Path], dict[str, Any]]]] = defaultdict(list)
+        for raw_child in children:
+            normalized_child = _normalize_child_entry(raw_child)
+            if not normalized_child:
+                continue
+            child, ordered, existing_tags = normalized_child
+            if not ordered:
+                continue
+            try:
+                first_tags = existing_tags or extract_tags(ordered[0]) or {}
+            except Exception:
+                first_tags = {}
+            first_tags = first_tags if isinstance(first_tags, dict) else {}
+            album_title = _sanitize_album_title_display(
+                _pick_album_title_from_tag_dicts([first_tags], fallback="")
+            )
+            artist_name = _pick_album_artist_from_tag_dicts([first_tags], default="")
+            album_norm = (
+                norm_album_for_dedup(album_title, normalize_parenthetical=True)
+                if album_title
+                else ""
+            )
+            artist_norm = _norm_artist_key(artist_name) if artist_name else ""
+            prepared_children.append((child, ordered, first_tags, album_norm, artist_norm))
+            if album_norm:
+                identity_groups[(album_norm, artist_norm)].append((child, ordered, first_tags))
+
+        qualifying = [(key, items) for key, items in identity_groups.items() if len(items) >= 2]
+        items: list[tuple[Path, list[Path], dict[str, Any]]] | None = None
+        if len(qualifying) == 1:
+            (_album_norm, _artist_norm), items = qualifying[0]
+        else:
+            if not parent_has_cover:
+                continue
+            segment_items: list[tuple[Path, list[Path], dict[str, Any]]] = []
+            for child, ordered, child_tags, _album_norm, _artist_norm in prepared_children:
+                if not _files_child_folder_name_looks_release_segment(child.name):
+                    continue
+                segment_items.append((child, ordered, child_tags))
+            if len(segment_items) < 2 or len(segment_items) != len(prepared_children):
+                continue
+            contributor_keys: set[str] = set()
+            for _child, _ordered, tags in segment_items:
+                contributor = (
+                    str(tags.get("albumartist") or tags.get("artist") or tags.get("composer") or "").strip()
+                )
+                contributor_norm = _norm_artist_key(contributor)
+                if contributor_norm:
+                    contributor_keys.add(contributor_norm)
+            if len(contributor_keys) > 1:
+                continue
+            items = segment_items
+
+        if not items:
+            continue
+
+        segment_votes = sum(
+            1 for child, _paths, _tags in items if _files_child_folder_name_looks_release_segment(child.name)
+        )
+        if segment_votes < max(1, len(items) // 2) and not parent_has_cover:
+            continue
+
+        combined_paths: list[Path] = []
+        seen_paths: set[str] = set()
+        for child, ordered, _tags in items:
+            for path in ordered:
+                key = str(path)
+                if key in seen_paths:
+                    continue
+                seen_paths.add(key)
+                combined_paths.append(path)
+        if len(combined_paths) <= max(len(items), 1):
+            continue
+
+        for child, _ordered, _tags in items:
+            collapsed.pop(child, None)
+        collapsed[parent] = sorted(combined_paths, key=lambda p: str(p))
+        collapsed_groups += 1
+        if progress_cb:
+            try:
+                progress_cb(
+                    {
+                        "phase": "collapsing",
+                        "parent": str(parent),
+                        "parents_processed": idx,
+                        "parents_total": total_parents,
+                        "collapsed_groups": collapsed_groups,
+                    }
+                )
+            except Exception:
+                pass
+        logging.info(
+            "FILES discovery: collapsed %d child album folder(s) into parent release folder %s",
+            len(items),
+            parent,
+        )
+    return collapsed
 
 
 def _improve_folder_by_path(folder_path: Path) -> dict:

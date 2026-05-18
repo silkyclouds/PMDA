@@ -601,6 +601,32 @@ export default function ArtistPage() {
   }, [details, fetchProfile, profileEnriching]);
 
   useEffect(() => {
+    if (!details || loading) return;
+    if (autoMissingDataRefreshArtistIdRef.current === details.artist_id) return;
+    const heroMissing = !Boolean(details.artist_has_image && details.artist_thumb);
+    const bioMissing = !String(profile?.bio || profile?.short_bio || '').trim();
+    const similarMissing = fallbackSimilar.length > 0 && fallbackSimilar.some((artist) => !artist.image_url || isProbablyPlaceholderArtistImageUrl(artist.image_url));
+    if (!heroMissing && !bioMissing && !similarMissing) return;
+
+    autoMissingDataRefreshArtistIdRef.current = details.artist_id;
+    let cancelled = false;
+    const timers: Array<ReturnType<typeof setTimeout>> = [];
+    const delays = [1600, 4800, 11000];
+    for (const delay of delays) {
+      const timer = setTimeout(() => {
+        if (cancelled) return;
+        void fetchArtist(true);
+        void fetchProfile(true);
+      }, delay);
+      timers.push(timer);
+    }
+    return () => {
+      cancelled = true;
+      for (const timer of timers) clearTimeout(timer);
+    };
+  }, [details, fallbackSimilar, fetchArtist, fetchProfile, loading, profile]);
+
+  useEffect(() => {
     if (!details) return;
     if (similarWarmupArtistIdRef.current === details.artist_id) return;
 

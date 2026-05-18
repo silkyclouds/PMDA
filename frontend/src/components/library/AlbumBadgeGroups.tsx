@@ -17,6 +17,7 @@ type AlbumBadgeGroupsProps = {
   bitDepth?: number | null;
   year?: number | string | null;
   trackCount?: number | null;
+  boxSetDiscCount?: number | null;
   genres?: string[] | null;
   label?: string | null;
   onGenreClick?: (genre: string) => void;
@@ -50,6 +51,7 @@ export function AlbumBadgeGroups({
   bitDepth,
   year,
   trackCount,
+  boxSetDiscCount,
   genres,
   label,
   onGenreClick,
@@ -106,6 +108,11 @@ export function AlbumBadgeGroups({
             {Number(trackCount || 0) > 0 ? (
               <Badge variant="outline" className={cn(badgeClass, badgeKindClass('count'))}>
                 {trackCount}t
+              </Badge>
+            ) : null}
+            {Number(boxSetDiscCount || 0) > 1 ? (
+              <Badge variant="outline" className={cn(badgeClass, badgeKindClass('source'))}>
+                {boxSetDiscCount} discs
               </Badge>
             ) : null}
           </div>

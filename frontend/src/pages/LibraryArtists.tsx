@@ -42,6 +42,7 @@ export default function LibraryArtists() {
   const requestIdRef = useRef(0);
   const sentinelRef = useRef<HTMLDivElement | null>(null);
   const loadingMoreRef = useRef(false);
+  const imageRefreshAttemptsRef = useRef(0);
   const gridTemplateColumns = getLibraryGridTemplateColumns(tileSize, isMobile, 160, 320);
 
   const fetchArtists = useCallback(async (opts: { reset: boolean; pageOffset: number; refresh?: boolean; pageLimit?: number; silent?: boolean }) => {
