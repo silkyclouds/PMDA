@@ -3487,3 +3487,43 @@
   - Direct Flask routes in `pmda.py`: `0`.
   - Direct blueprint registration in `pmda.py`: `0`.
   - This checkpoint is ready for Docker image publication and Unraid smoke validation.
+
+## 2026-05-18 Publish Checkpoint: Runtime Refactor Beta/Latest And Unraid Deploy
+
+- GitHub safety:
+  - Backed up the pre-publish `origin/main` state to `backup/pre-refactor-publish-20260518-152628`.
+  - Published the refactor branch `silk/pmda-runtime-refactor-20260518` at commit `c4a3ad66232863ea45761b6f89e93c10fa1d3528`.
+  - Also backed up the refactor state before attempting to reconcile with remote main as `backup/refactor-before-origin-main-merge-20260518-154052`.
+  - Important: `origin/main` is still `42` commits ahead of the local refactor branch lineage. A direct merge produced many conflicts across frontend/runtime files and was aborted; do not fast-forward or force-update `main` until that reconciliation is done deliberately.
+- Validation before image publish:
+  - `python3 -m py_compile pmda.py pmda_discovery/files_watcher_runtime.py scripts/pmda_bootstrap_gate.py` passed.
+  - Static gates passed: `scripts/pmda_bootstrap_gate.py`, `scripts/legacy_cleanup_gate.py`, `scripts/pipeline_audit_gate.py`.
+  - Watcher/files focused tests passed: `62 passed, 2 warnings, 7 subtests passed`.
+  - Full backend suite passed: `732 passed, 3 warnings, 7 subtests passed`.
+  - Frontend production build passed: `npm run build`.
+- Docker publication:
+  - Built with `scripts/build_with_classical_gate.sh --with-latest`.
+  - Pushed `meaning/pmda:beta` and `meaning/pmda:latest`.
+  - Published image digest: `meaning/pmda@sha256:5b8ec04a126f44c6f8738a1787f008ff358aca75f508a176f2cf7e6e11b35dbc`.
+  - Local image id: `sha256:85907d824f2935f4d59d635342ae323866f41a326d0e0bc652372acc65b8a040`.
+- Unraid deployment:
+  - Recreated the Unraid `PMDA` container from `meaning/pmda:latest`, preserving the previous live container as `PMDA_pre_runtime_refactor_20260518-153543`.
+  - Deployment backup directory: `/mnt/cache/appdata/PMDA/backups/runtime-refactor-20260518-153543`.
+  - New container id prefix: `73d3ed2e979e`.
+  - Existing mounts/env were preserved, including `/mnt:/host_mnt:ro`, `STORAGE_POWER_SAVER_ENABLED=true`, and the current files workflow roots.
+- Unraid smoke validation:
+  - Boot logs show files mode active, Plex DB source checks disabled, watcher manager started, MusicBrainz queue initialized, and files index ready.
+  - Error scan since deploy found no `Traceback`, `Killed`, `statement timeout`, `OperationalError`, `RuntimeError`, or segmentation fault.
+  - Authenticated API smoke:
+    - `/api/library/files-index/status`: `200` in `0.006s`, `indexed_albums=65708`, `indexed_artists=49010`, `indexed_tracks=627512`.
+    - `/api/library/albums?sort=recent&limit=96&offset=0&include_unmatched=1&scope=library`: `200`, `96` albums, `total=61096`, `has_more=true`, roughly `3.3-4.7s`.
+    - Album pagination offsets `0`, `96`, `192` each returned `96` albums under the `12s` UI timeout.
+    - `/api/library/artists?sort=alpha&limit=120&offset=0&include_unmatched=1&scope=library`: `200`, `120` artists, `total=39253`, `has_more=true`, roughly `0.5-0.6s`.
+    - `/api/scan/progress` and `/api/progress` returned `200`; first uncached progress call was slow once, then repeated calls were sub-second.
+    - `/api/runtime/managed/status?skip_candidates=true` returned `200` in `0.09s`; full runtime managed status is still slow (`~33s`) and should not be used as a frequent UI polling endpoint.
+- Rollback:
+  - If this image misbehaves on Unraid, restore the previous container with:
+    - `docker stop PMDA`
+    - `docker rm PMDA`
+    - `docker rename PMDA_pre_runtime_refactor_20260518-153543 PMDA`
+    - `docker start PMDA`
